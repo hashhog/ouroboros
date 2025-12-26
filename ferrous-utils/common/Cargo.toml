@@ -1,0 +1,11 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitcoin = { version = "0.32", features = ["serde"] }
+bitcoin_hashes = "0.18"
+secp256k1 = "0.31"
+serde = { version = "1.0", features = ["derive"] }
+

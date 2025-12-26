@@ -1,0 +1,19 @@
+[package]
+name = "sync"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "sync"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+common = { path = "../common" }
+pyo3 = { version = "0.27", features = ["auto-initialize"] }
+tokio = { version = "1", features = ["full"] }
+rocksdb = "0.24"
+bitcoin = { version = "0.32", features = ["serde"] }
+bitcoin_hashes = "0.18"
+secp256k1 = "0.31"
+serde = { version = "1.0", features = ["derive"] }
+
