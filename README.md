@@ -10,13 +10,13 @@ A Bitcoin node implementation in Python with Rust extensions.
 - Transaction and block validation
 - RPC server (FastAPI)
 - Wallet functionality
-- RocksDB database backend
+- LevelDB database backend
 
 ## Requirements
 
-- Python 3.10-3.12 (Python 3.13 has limited support for some dependencies)
+- Python 3.10+ (including 3.13)
 - Rust toolchain (for building extensions)
-- System dependencies for RocksDB (see setup instructions)
+- System dependencies for LevelDB (see setup instructions)
 
 ## Installation
 
@@ -40,7 +40,7 @@ This will:
 1. Install Rust: https://rustup.rs/
 2. Install system dependencies (Fedora/RHEL):
    ```bash
-   sudo dnf install gcc gcc-c++ clang glibc-devel openssl-devel pkg-config python3-devel snappy-devel zlib-devel bzip2-devel lz4-devel libzstd-devel
+   sudo dnf install gcc gcc-c++ clang glibc-devel openssl-devel pkg-config python3-devel leveldb-devel snappy-devel
    ```
 3. Install Python dependencies:
    ```bash
