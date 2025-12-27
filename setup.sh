@@ -79,11 +79,8 @@ if [ "$OS" == "linux" ]; then
             python3-dev \
             python3-pip \
             python3-venv \
-            libsnappy-dev \
-            zlib1g-dev \
-            libbz2-dev \
-            liblz4-dev \
-            libzstd-dev
+            libleveldb-dev \
+            libsnappy-dev
     elif command -v dnf &> /dev/null; then
         print_status "Installing dependencies with dnf (Fedora/RHEL)..."
         sudo dnf install -y \
@@ -95,11 +92,8 @@ if [ "$OS" == "linux" ]; then
             pkg-config \
             python3-devel \
             python3-pip \
-            snappy-devel \
-            zlib-devel \
-            bzip2-devel \
-            lz4-devel \
-            libzstd-devel
+            leveldb-devel \
+            snappy-devel
     elif command -v yum &> /dev/null; then
         print_status "Installing dependencies with yum (RHEL/CentOS)..."
         sudo yum install -y \
@@ -111,11 +105,8 @@ if [ "$OS" == "linux" ]; then
             pkg-config \
             python3-devel \
             python3-pip \
-            snappy-devel \
-            zlib-devel \
-            bzip2-devel \
-            lz4-devel \
-            zstd-devel
+            leveldb-devel \
+            snappy-devel
     else
         print_warning "Package manager not recognized. Please install dependencies manually:"
         echo "  - build-essential / gcc, g++, clang"
@@ -123,15 +114,15 @@ if [ "$OS" == "linux" ]; then
         echo "  - libssl-dev"
         echo "  - pkg-config"
         echo "  - python3-dev, python3-pip"
-        echo "  - Compression libraries: snappy, zlib, bzip2, lz4, zstd"
+        echo "  - LevelDB and snappy libraries"
     fi
 elif [ "$OS" == "macos" ]; then
     if command -v brew &> /dev/null; then
         print_status "Installing dependencies with Homebrew (macOS)..."
-        brew install snappy zstd lz4 openssl pkg-config
+        brew install leveldb snappy openssl pkg-config
     else
         print_warning "Homebrew not found. Please install dependencies manually:"
-        echo "  brew install snappy zstd lz4 openssl pkg-config"
+        echo "  brew install leveldb snappy openssl pkg-config"
     fi
 else
     print_warning "OS not recognized. Please install dependencies manually."
