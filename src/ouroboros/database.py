@@ -3,8 +3,14 @@
 import asyncio
 from pathlib import Path
 from typing import Optional, Any, Union
-import rocksdb
 from concurrent.futures import ThreadPoolExecutor
+
+try:
+    import rocksdb
+    _ROCKSDB_AVAILABLE = True
+except ImportError:
+    _ROCKSDB_AVAILABLE = False
+    rocksdb = None  # type: ignore
 
 
 class Database:
@@ -16,7 +22,17 @@ class Database:
         Args:
             db_path: Path to the RocksDB database directory
             max_open_files: Maximum number of open files
+            
+        Raises:
+            ImportError: If rocksdb package is not available (e.g., Python 3.13+)
         """
+        if not _ROCKSDB_AVAILABLE:
+            raise ImportError(
+                "rocksdb package is not available. "
+                "On Python 3.13+, rocksdb may not be supported. "
+                "Please use Python 3.10-3.12, or install rocksdb manually."
+            )
+        
         self.db_path = Path(db_path)
         self.db_path.mkdir(parents=True, exist_ok=True)
         
@@ -26,7 +42,7 @@ class Database:
         
         # Use thread pool executor for async operations
         self.executor = ThreadPoolExecutor(max_workers=4)
-        self.db: Optional[rocksdb.DB] = None
+        self.db: Optional[Any] = None
 
     async def open(self) -> None:
         """Open the database connection."""
