@@ -21,7 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    # Note: Python 3.13 may have compatibility issues with rocksdb package
+    # Note: Python 3.13 supported with LevelDB
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Internet",
     "Topic :: System :: Networking",
@@ -36,8 +36,8 @@ dependencies = [
     # Data validation
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
-    # Database (Note: rocksdb doesn't support Python 3.13+ yet; use Python 3.10-3.12)
-    "rocksdb>=0.7.0; python_version<'3.13'",
+    # Database
+    "plyvel>=1.5.0",
     # Async file I/O
     "aiofiles>=23.2.0",
 ]

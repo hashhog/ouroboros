@@ -45,16 +45,13 @@ jobs:
             libclang-dev \
             libssl-dev \
             pkg-config \
-            libsnappy-dev \
-            zlib1g-dev \
-            libbz2-dev \
-            liblz4-dev \
-            libzstd-dev
+            libleveldb-dev \
+            libsnappy-dev
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install snappy zstd lz4
+          brew install leveldb snappy
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5

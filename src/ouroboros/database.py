@@ -1,4 +1,4 @@
-"""Database layer using RocksDB."""
+"""Database layer using LevelDB."""
 
 import asyncio
 from pathlib import Path
@@ -6,39 +6,35 @@ from typing import Optional, Any, Union
 from concurrent.futures import ThreadPoolExecutor
 
 try:
-    import rocksdb
-    _ROCKSDB_AVAILABLE = True
+    import plyvel
+    _LEVELDB_AVAILABLE = True
 except ImportError:
-    _ROCKSDB_AVAILABLE = False
-    rocksdb = None  # type: ignore
+    _LEVELDB_AVAILABLE = False
+    plyvel = None  # type: ignore
 
 
 class Database:
-    """RocksDB database wrapper."""
+    """LevelDB database wrapper."""
 
-    def __init__(self, db_path: Union[str, Path], max_open_files: int = 3000) -> None:
+    def __init__(self, db_path: Union[str, Path], create_if_missing: bool = True) -> None:
         """Initialize the database.
         
         Args:
-            db_path: Path to the RocksDB database directory
-            max_open_files: Maximum number of open files
+            db_path: Path to the LevelDB database directory
+            create_if_missing: Create database if it doesn't exist
             
         Raises:
-            ImportError: If rocksdb package is not available (e.g., Python 3.13+)
+            ImportError: If plyvel package is not available
         """
-        if not _ROCKSDB_AVAILABLE:
+        if not _LEVELDB_AVAILABLE:
             raise ImportError(
-                "rocksdb package is not available. "
-                "On Python 3.13+, rocksdb may not be supported. "
-                "Please use Python 3.10-3.12, or install rocksdb manually."
+                "plyvel package is not available. "
+                "Please install it with: pip install plyvel"
             )
         
         self.db_path = Path(db_path)
         self.db_path.mkdir(parents=True, exist_ok=True)
-        
-        opts = rocksdb.Options()
-        opts.create_if_missing = True
-        opts.max_open_files = max_open_files
+        self.create_if_missing = create_if_missing
         
         # Use thread pool executor for async operations
         self.executor = ThreadPoolExecutor(max_workers=4)
@@ -49,9 +45,9 @@ class Database:
         loop = asyncio.get_event_loop()
         self.db = await loop.run_in_executor(
             self.executor,
-            rocksdb.DB,
+            plyvel.DB,
             str(self.db_path),
-            rocksdb.Options(create_if_missing=True, max_open_files=3000)
+            create_if_missing=self.create_if_missing
         )
 
     async def close(self) -> None:
@@ -64,6 +60,7 @@ class Database:
     def _close_db(self) -> None:
         """Close the database (called from executor)."""
         if self.db:
+            self.db.close()
             self.db = None
 
     async def get(self, key: bytes) -> Optional[bytes]:
@@ -79,10 +76,7 @@ class Database:
             raise RuntimeError("Database not open")
         
         loop = asyncio.get_event_loop()
-        try:
-            return await loop.run_in_executor(self.executor, self.db.get, key)
-        except rocksdb.errors.NotFoundError:
-            return None
+        return await loop.run_in_executor(self.executor, self.db.get, key)
 
     async def put(self, key: bytes, value: bytes) -> None:
         """Store a key-value pair.
@@ -130,12 +124,9 @@ class Database:
         if not self.db:
             return
         
-        batch = rocksdb.WriteBatch()
-        for key, value in updates.items():
-            if value is None:
-                batch.delete(key)
-            else:
-                batch.put(key, value)
-        
-        self.db.write(batch)
-
+        with self.db.write_batch() as batch:
+            for key, value in updates.items():
+                if value is None:
+                    batch.delete(key)
+                else:
+                    batch.put(key, value)

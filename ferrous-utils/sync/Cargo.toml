@@ -11,7 +11,7 @@ crate-type = ["cdylib", "rlib"]
 common = { path = "../common" }
 pyo3 = { version = "0.27", features = ["auto-initialize"] }
 tokio = { version = "1", features = ["full"] }
-rocksdb = "0.24"
+leveldb = "0.8"
 bitcoin = { version = "0.32", features = ["serde"] }
 bitcoin_hashes = "0.18"
 secp256k1 = "0.31"
