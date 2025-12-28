@@ -77,6 +77,12 @@ cargo test --workspace
 pytest
 ```
 
+## Examples
+
+See the `examples/` directory for usage examples:
+
+- `rust_extension_example.py` - Demonstrates using the Rust extension module from Python
+
 ## Project Structure
 
 ```
