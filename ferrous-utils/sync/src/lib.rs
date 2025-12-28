@@ -73,6 +73,35 @@ impl SyncEngine {
         // Convert UTXO to PyUTXO when returning
         Ok(vec![])
     }
+
+    /// Get example UTXOs for demonstration purposes
+    fn get_example_utxos(&self) -> PyResult<Vec<PyUTXO>> {
+        use bitcoin::ScriptBuf;
+        use bitcoin::hashes::Hash;
+        
+        // Create some example UTXOs for demonstration
+        let mut utxos = Vec::new();
+        
+        // Example UTXO 1
+        let txid1 = bitcoin::Txid::from_byte_array([1u8; 32]);
+        let script1 = ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14, 0x88, 0xac]); // P2PKH script
+        let utxo1 = UTXO::new(txid1, 0, 50_000_000, script1); // 0.5 BTC
+        utxos.push(PyUTXO::from(utxo1));
+        
+        // Example UTXO 2
+        let txid2 = bitcoin::Txid::from_byte_array([2u8; 32]);
+        let script2 = ScriptBuf::from_bytes(vec![0x51]); // OP_1
+        let utxo2 = UTXO::new(txid2, 1, 100_000_000, script2); // 1.0 BTC
+        utxos.push(PyUTXO::from(utxo2));
+        
+        // Example UTXO 3
+        let txid3 = bitcoin::Txid::from_byte_array([3u8; 32]);
+        let script3 = ScriptBuf::from_bytes(vec![0x52]); // OP_2
+        let utxo3 = UTXO::new(txid3, 0, 25_000_000, script3); // 0.25 BTC
+        utxos.push(PyUTXO::from(utxo3));
+        
+        Ok(utxos)
+    }
 }
 
 #[cfg(test)]
