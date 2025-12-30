@@ -82,3 +82,4 @@ class RPCServer:
         """Get the FastAPI application."""
         return self.app
 
+
