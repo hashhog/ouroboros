@@ -96,3 +96,4 @@ class Wallet:
         # TODO: Implement transaction history
         return []
 
+
