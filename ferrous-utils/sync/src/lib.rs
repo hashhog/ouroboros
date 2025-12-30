@@ -1,7 +1,7 @@
 // Fast sync module with PyO3 bindings
 
 use pyo3::prelude::*;
-use common::UTXO;
+use common::{UTXO, OutPointWrapper};
 
 /// Fast sync module for Bitcoin blockchain synchronization
 #[pymodule]
@@ -28,9 +28,9 @@ pub struct PyUTXO {
 impl From<UTXO> for PyUTXO {
     fn from(utxo: UTXO) -> Self {
         Self {
-            txid: utxo.txid.to_string(),
-            vout: utxo.vout,
-            value: utxo.value,
+            txid: utxo.txid().to_string(),
+            vout: utxo.vout(),
+            value: utxo.value(),
             script_pubkey: utxo.script_pubkey.as_bytes().to_vec(),
         }
     }
@@ -39,9 +39,9 @@ impl From<UTXO> for PyUTXO {
 impl From<&UTXO> for PyUTXO {
     fn from(utxo: &UTXO) -> Self {
         Self {
-            txid: utxo.txid.to_string(),
-            vout: utxo.vout,
-            value: utxo.value,
+            txid: utxo.txid().to_string(),
+            vout: utxo.vout(),
+            value: utxo.value(),
             script_pubkey: utxo.script_pubkey.as_bytes().to_vec(),
         }
     }
@@ -84,20 +84,23 @@ impl SyncEngine {
         
         // Example UTXO 1
         let txid1 = bitcoin::Txid::from_byte_array([1u8; 32]);
+        let outpoint1 = OutPointWrapper::from_txid_vout(txid1, 0);
         let script1 = ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14, 0x88, 0xac]); // P2PKH script
-        let utxo1 = UTXO::new(txid1, 0, 50_000_000, script1); // 0.5 BTC
+        let utxo1 = UTXO::new(outpoint1, 50_000_000, script1, None, false); // 0.5 BTC
         utxos.push(PyUTXO::from(utxo1));
         
         // Example UTXO 2
         let txid2 = bitcoin::Txid::from_byte_array([2u8; 32]);
+        let outpoint2 = OutPointWrapper::from_txid_vout(txid2, 1);
         let script2 = ScriptBuf::from_bytes(vec![0x51]); // OP_1
-        let utxo2 = UTXO::new(txid2, 1, 100_000_000, script2); // 1.0 BTC
+        let utxo2 = UTXO::new(outpoint2, 100_000_000, script2, None, false); // 1.0 BTC
         utxos.push(PyUTXO::from(utxo2));
         
         // Example UTXO 3
         let txid3 = bitcoin::Txid::from_byte_array([3u8; 32]);
+        let outpoint3 = OutPointWrapper::from_txid_vout(txid3, 0);
         let script3 = ScriptBuf::from_bytes(vec![0x52]); // OP_2
-        let utxo3 = UTXO::new(txid3, 0, 25_000_000, script3); // 0.25 BTC
+        let utxo3 = UTXO::new(outpoint3, 25_000_000, script3, None, false); // 0.25 BTC
         utxos.push(PyUTXO::from(utxo3));
         
         Ok(utxos)
@@ -113,8 +116,9 @@ mod tests {
 
     fn create_test_utxo() -> UTXO {
         let txid = bitcoin::Txid::from_byte_array([0u8; 32]);
+        let outpoint = OutPointWrapper::from_txid_vout(txid, 0);
         let script_pubkey = ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14, 0x88, 0xac]);
-        UTXO::new(txid, 0, 100000, script_pubkey)
+        UTXO::new(outpoint, 100000, script_pubkey, Some(1), false)
     }
 
     #[test]
@@ -122,9 +126,9 @@ mod tests {
         let utxo = create_test_utxo();
         let py_utxo = PyUTXO::from(&utxo);
 
-        assert_eq!(py_utxo.txid, utxo.txid.to_string());
-        assert_eq!(py_utxo.vout, utxo.vout);
-        assert_eq!(py_utxo.value, utxo.value);
+        assert_eq!(py_utxo.txid, utxo.txid().to_string());
+        assert_eq!(py_utxo.vout, utxo.vout());
+        assert_eq!(py_utxo.value, utxo.value());
         assert_eq!(py_utxo.script_pubkey, utxo.script_pubkey.as_bytes().to_vec());
     }
 
@@ -133,9 +137,9 @@ mod tests {
         let utxo = create_test_utxo();
         let py_utxo = PyUTXO::from(utxo.clone());
 
-        assert_eq!(py_utxo.txid, utxo.txid.to_string());
-        assert_eq!(py_utxo.vout, utxo.vout);
-        assert_eq!(py_utxo.value, utxo.value);
+        assert_eq!(py_utxo.txid, utxo.txid().to_string());
+        assert_eq!(py_utxo.vout, utxo.vout());
+        assert_eq!(py_utxo.value, utxo.value());
     }
 
     #[test]
@@ -193,9 +197,11 @@ mod tests {
     #[test]
     fn test_pyutxo_conversion_multiple() {
         let utxo1 = create_test_utxo();
-        let mut utxo2 = create_test_utxo();
-        utxo2.value = 200000;
-        utxo2.vout = 1;
+        // Create a second UTXO with different values
+        let txid2 = bitcoin::Txid::from_byte_array([1u8; 32]);
+        let outpoint2 = OutPointWrapper::from_txid_vout(txid2, 1);
+        let script_pubkey2 = ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14, 0x88, 0xac]);
+        let utxo2 = UTXO::new(outpoint2, 200000, script_pubkey2, Some(1), false);
 
         let py_utxos: Vec<PyUTXO> = vec![&utxo1, &utxo2]
             .into_iter()
@@ -215,7 +221,8 @@ mod tests {
         let script_bytes = vec![0x76, 0xa9, 0x14, 0x88, 0xac];
         let script = ScriptBuf::from_bytes(script_bytes.clone());
         let txid = bitcoin::Txid::from_byte_array([1u8; 32]);
-        let utxo = UTXO::new(txid, 0, 50000, script);
+        let outpoint = OutPointWrapper::from_txid_vout(txid, 0);
+        let utxo = UTXO::new(outpoint, 50000, script, None, false);
 
         let py_utxo = PyUTXO::from(&utxo);
         assert_eq!(py_utxo.script_pubkey, script_bytes);
