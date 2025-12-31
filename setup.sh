@@ -45,7 +45,7 @@ echo "📦 Step 1: Installing Rust toolchain..."
 if command -v rustc &> /dev/null; then
     RUST_VERSION=$(rustc --version)
     print_status "Rust is already installed: $RUST_VERSION"
-    
+
     # Check if rustup is installed
     if command -v rustup &> /dev/null; then
         echo "  Updating Rust toolchain..."
@@ -144,11 +144,11 @@ echo "📦 Step 3: Checking Python installation..."
 if command -v python3 &> /dev/null; then
     PYTHON_VERSION=$(python3 --version)
     print_status "Python found: $PYTHON_VERSION"
-    
+
     # Check if Python version is >= 3.10
     PYTHON_MAJOR=$(python3 -c 'import sys; print(sys.version_info.major)')
     PYTHON_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
-    
+
     if [ "$PYTHON_MAJOR" -lt 3 ] || ([ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 10 ]); then
         print_error "Python 3.10+ is required. Found Python $PYTHON_MAJOR.$PYTHON_MINOR"
         exit 1
@@ -238,4 +238,3 @@ echo "  3. Start development:"
 echo "     ouroboros --help"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-

@@ -1,10 +1,10 @@
 """Command-line interface for the Bitcoin node."""
 
 import asyncio
-import sys
 from pathlib import Path
-from typing import Optional
+
 import click
+
 from ouroboros.node import BitcoinNode
 
 
@@ -47,21 +47,21 @@ def start(
     p2p_port: int,
 ) -> None:
     """Start the Bitcoin node."""
-    click.echo(f"Starting Ouroboros Bitcoin node...")
+    click.echo("Starting Ouroboros Bitcoin node...")
     click.echo(f"  Network: {network}")
     click.echo(f"  Data directory: {datadir}")
     click.echo(f"  RPC port: {rpc_port}")
     click.echo(f"  P2P port: {p2p_port}")
-    
+
     config = {
         "datadir": str(datadir),
         "network": network,
         "rpc_port": rpc_port,
         "p2p_port": p2p_port,
     }
-    
+
     node = BitcoinNode(config=config)
-    
+
     try:
         asyncio.run(node.run())
     except KeyboardInterrupt:
@@ -118,5 +118,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

@@ -1,15 +1,13 @@
 """Peer-to-peer networking module."""
 
-from typing import List, Optional
-
 
 class P2PManager:
     """Manages peer-to-peer connections."""
 
-    def __init__(self, node: Optional[object] = None):
+    def __init__(self, node: object | None = None):
         """Initialize P2P manager."""
         self.node = node
-        self.peers: List[object] = []
+        self.peers: list[object] = []
 
     async def connect_to_peer(self, host: str, port: int) -> None:
         """Connect to a peer."""
@@ -30,4 +28,3 @@ class P2PManager:
         """Start listening for incoming connections."""
         # TODO: Implement server listening
         pass
-
