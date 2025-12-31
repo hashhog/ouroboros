@@ -1,24 +1,23 @@
 // Shared Bitcoin types with custom wrappers and serialization
 
-pub mod types;
 pub mod crypto;
 pub mod serialize;
+pub mod types;
 
 // Re-export all types for convenience
 pub use types::{
-    BlockHeaderWrapper, BlockWrapper, TransactionWrapper, TxInWrapper, TxOutWrapper,
-    OutPointWrapper, UTXO, BlockMetadata,
+    BlockHeaderWrapper, BlockMetadata, BlockWrapper, OutPointWrapper, TransactionWrapper,
+    TxInWrapper, TxOutWrapper, UTXO,
 };
 
 // Re-export crypto functions
 pub use crypto::{
-    verify_ecdsa_signature, double_sha256, hash160, compute_merkle_root,
-    bits_to_target, target_to_bits,
+    bits_to_target, compute_merkle_root, double_sha256, hash160, target_to_bits,
+    verify_ecdsa_signature,
 };
 
 // Re-export serialization functions
 pub use serialize::{
-    BitcoinSerialize, BitcoinDeserialize, SerializeError,
-    encode_varint, decode_varint,
-    serialize_to_vec, deserialize_from_slice,
+    decode_varint, deserialize_from_slice, encode_varint, serialize_to_vec, BitcoinDeserialize,
+    BitcoinSerialize, SerializeError,
 };

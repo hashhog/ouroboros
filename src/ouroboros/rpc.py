@@ -1,30 +1,33 @@
 """RPC server implementation using FastAPI."""
 
-from typing import Any, Dict, Optional
+from typing import Any
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 
 class RPCRequest(BaseModel):
     """RPC request model."""
+
     method: str
-    params: Optional[Dict[str, Any]] = None
-    id: Optional[int] = None
+    params: dict[str, Any] | None = None
+    id: int | None = None
 
 
 class RPCResponse(BaseModel):
     """RPC response model."""
-    result: Optional[Any] = None
-    error: Optional[Dict[str, Any]] = None
-    id: Optional[int] = None
+
+    result: Any | None = None
+    error: dict[str, Any] | None = None
+    id: int | None = None
 
 
 class RPCServer:
     """RPC server for Bitcoin node."""
 
-    def __init__(self, node: Optional[Any] = None) -> None:
+    def __init__(self, node: Any | None = None) -> None:
         """Initialize the RPC server.
-        
+
         Args:
             node: Reference to the Bitcoin node instance
         """
@@ -34,9 +37,9 @@ class RPCServer:
 
     def _setup_routes(self) -> None:
         """Set up RPC routes."""
-        
+
         @self.app.get("/")
-        async def root() -> Dict[str, str]:
+        async def root() -> dict[str, str]:
             """Root endpoint."""
             return {"message": "Ouroboros Bitcoin Node RPC"}
 
@@ -47,26 +50,23 @@ class RPCServer:
                 result = await self._handle_rpc_method(request.method, request.params or {})
                 return RPCResponse(result=result, id=request.id)
             except Exception as e:
-                return RPCResponse(
-                    error={"code": -1, "message": str(e)},
-                    id=request.id
-                )
+                return RPCResponse(error={"code": -1, "message": str(e)}, id=request.id)
 
         @self.app.get("/health")
-        async def health() -> Dict[str, str]:
+        async def health() -> dict[str, str]:
             """Health check endpoint."""
             return {"status": "healthy"}
 
-    async def _handle_rpc_method(self, method: str, params: Dict[str, Any]) -> Any:
+    async def _handle_rpc_method(self, method: str, params: dict[str, Any]) -> Any:
         """Handle RPC method calls.
-        
+
         Args:
             method: RPC method name
             params: Method parameters
-            
+
         Returns:
             Method result
-            
+
         Raises:
             HTTPException: If method is not found
         """
@@ -81,5 +81,3 @@ class RPCServer:
     def get_app(self) -> FastAPI:
         """Get the FastAPI application."""
         return self.app
-
-
