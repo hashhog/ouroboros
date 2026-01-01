@@ -129,7 +129,7 @@ impl BlockchainDB {
     }
 
     /// Get a block by its height
-    /// 
+    ///
     /// Note: This requires storing the block hash when storing block metadata.
     /// We store it as a prefix in the BLOCK_INDEX_CF value: [32-byte hash][BlockMetadata bytes]
     pub fn get_block_by_height(&self, height: u32) -> Result<Option<BlockWrapper>> {
@@ -147,7 +147,7 @@ impl BlockchainDB {
                 }
                 let mut hash_bytes = [0u8; 32];
                 hash_bytes.copy_from_slice(&data[0..32]);
-                
+
                 // Get block by hash
                 self.get_block(&hash_bytes)
             }
@@ -174,7 +174,7 @@ impl BlockchainDB {
     }
 
     /// Spend a UTXO (remove from chainstate and track in spent CF)
-    /// 
+    ///
     /// Returns the UTXO that was spent, or None if it didn't exist
     pub fn spend_utxo(&self, outpoint: &OutPoint, spending_txid: &[u8; 32]) -> Result<Option<UTXO>> {
         let txid_bytes = *outpoint.txid.as_byte_array();
@@ -344,4 +344,3 @@ fn create_cf_options() -> Options {
 
     opts
 }
-
