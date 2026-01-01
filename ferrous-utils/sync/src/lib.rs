@@ -1,7 +1,9 @@
 // Fast sync module with PyO3 bindings
 
+pub mod storage;
+
+use common::{OutPointWrapper, UTXO};
 use pyo3::prelude::*;
-use common::{UTXO, OutPointWrapper};
 
 /// Fast sync module for Bitcoin blockchain synchronization
 #[pymodule]
@@ -76,33 +78,33 @@ impl SyncEngine {
 
     /// Get example UTXOs for demonstration purposes
     fn get_example_utxos(&self) -> PyResult<Vec<PyUTXO>> {
-        use bitcoin::ScriptBuf;
         use bitcoin::hashes::Hash;
-        
+        use bitcoin::ScriptBuf;
+
         // Create some example UTXOs for demonstration
         let mut utxos = Vec::new();
-        
+
         // Example UTXO 1
         let txid1 = bitcoin::Txid::from_byte_array([1u8; 32]);
         let outpoint1 = OutPointWrapper::from_txid_vout(txid1, 0);
         let script1 = ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14, 0x88, 0xac]); // P2PKH script
         let utxo1 = UTXO::new(outpoint1, 50_000_000, script1, None, false); // 0.5 BTC
         utxos.push(PyUTXO::from(utxo1));
-        
+
         // Example UTXO 2
         let txid2 = bitcoin::Txid::from_byte_array([2u8; 32]);
         let outpoint2 = OutPointWrapper::from_txid_vout(txid2, 1);
         let script2 = ScriptBuf::from_bytes(vec![0x51]); // OP_1
         let utxo2 = UTXO::new(outpoint2, 100_000_000, script2, None, false); // 1.0 BTC
         utxos.push(PyUTXO::from(utxo2));
-        
+
         // Example UTXO 3
         let txid3 = bitcoin::Txid::from_byte_array([3u8; 32]);
         let outpoint3 = OutPointWrapper::from_txid_vout(txid3, 0);
         let script3 = ScriptBuf::from_bytes(vec![0x52]); // OP_2
         let utxo3 = UTXO::new(outpoint3, 25_000_000, script3, None, false); // 0.25 BTC
         utxos.push(PyUTXO::from(utxo3));
-        
+
         Ok(utxos)
     }
 }
@@ -110,9 +112,9 @@ impl SyncEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::UTXO;
-    use bitcoin::ScriptBuf;
     use bitcoin::hashes::Hash;
+    use bitcoin::ScriptBuf;
+    use common::UTXO;
 
     fn create_test_utxo() -> UTXO {
         let txid = bitcoin::Txid::from_byte_array([0u8; 32]);
@@ -129,7 +131,10 @@ mod tests {
         assert_eq!(py_utxo.txid, utxo.txid().to_string());
         assert_eq!(py_utxo.vout, utxo.vout());
         assert_eq!(py_utxo.value, utxo.value());
-        assert_eq!(py_utxo.script_pubkey, utxo.script_pubkey.as_bytes().to_vec());
+        assert_eq!(
+            py_utxo.script_pubkey,
+            utxo.script_pubkey.as_bytes().to_vec()
+        );
     }
 
     #[test]
@@ -164,11 +169,8 @@ mod tests {
     #[test]
     fn test_sync_engine_sync_blocks() {
         let mut engine = SyncEngine::new();
-        let blocks = vec![
-            vec![1, 2, 3, 4],
-            vec![5, 6, 7, 8],
-        ];
-        
+        let blocks = vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]];
+
         let result = engine.sync_blocks(blocks.clone());
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), blocks.len());
@@ -178,7 +180,7 @@ mod tests {
     fn test_sync_engine_sync_empty_blocks() {
         let mut engine = SyncEngine::new();
         let blocks = vec![];
-        
+
         let result = engine.sync_blocks(blocks);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
@@ -188,7 +190,7 @@ mod tests {
     fn test_sync_engine_get_utxos() {
         let engine = SyncEngine::new();
         let result = engine.get_utxos();
-        
+
         assert!(result.is_ok());
         let utxos = result.unwrap();
         assert_eq!(utxos.len(), 0); // Currently returns empty vec
@@ -228,4 +230,3 @@ mod tests {
         assert_eq!(py_utxo.script_pubkey, script_bytes);
     }
 }
-

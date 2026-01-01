@@ -1,8 +1,5 @@
 """Block and transaction validation logic."""
 
-from typing import Optional
-from pydantic import BaseModel
-
 
 class BlockValidator:
     """Validates Bitcoin blocks."""
@@ -13,10 +10,10 @@ class BlockValidator:
 
     async def validate_block(self, block: bytes) -> bool:
         """Validate a Bitcoin block.
-        
+
         Args:
             block: Raw block data
-            
+
         Returns:
             True if block is valid, False otherwise
         """
@@ -25,10 +22,10 @@ class BlockValidator:
 
     async def validate_block_header(self, header: bytes) -> bool:
         """Validate a block header.
-        
+
         Args:
             header: Raw block header data
-            
+
         Returns:
             True if header is valid, False otherwise
         """
@@ -45,10 +42,10 @@ class TransactionValidator:
 
     async def validate_transaction(self, transaction: bytes) -> bool:
         """Validate a Bitcoin transaction.
-        
+
         Args:
             transaction: Raw transaction data
-            
+
         Returns:
             True if transaction is valid, False otherwise
         """
@@ -57,10 +54,10 @@ class TransactionValidator:
 
     async def validate_transaction_inputs(self, transaction: bytes) -> bool:
         """Validate transaction inputs.
-        
+
         Args:
             transaction: Raw transaction data
-            
+
         Returns:
             True if inputs are valid, False otherwise
         """
@@ -70,6 +67,5 @@ class TransactionValidator:
 
 class ValidationError(Exception):
     """Raised when validation fails."""
+
     pass
-
-

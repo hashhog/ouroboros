@@ -3,17 +3,18 @@
 __version__ = "0.1.0"
 
 # Core modules
+from ouroboros.database import Database
+from ouroboros.mempool import Mempool
 from ouroboros.node import BitcoinNode
 from ouroboros.p2p import P2PManager
-from ouroboros.mempool import Mempool
-from ouroboros.validation import BlockValidator, TransactionValidator
-from ouroboros.database import Database
-from ouroboros.wallet import Wallet
 from ouroboros.rpc import RPCServer
+from ouroboros.validation import BlockValidator, TransactionValidator
+from ouroboros.wallet import Wallet
 
 # Rust extension module (if available)
 try:
-    from sync import SyncEngine, PyUTXO  # noqa: F401
+    from sync import PyUTXO, SyncEngine  # noqa: F401
+
     _RUST_EXTENSION_AVAILABLE = True
 except ImportError:
     _RUST_EXTENSION_AVAILABLE = False
@@ -32,4 +33,3 @@ __all__ = [
 
 if _RUST_EXTENSION_AVAILABLE:
     __all__.extend(["SyncEngine", "PyUTXO"])
-

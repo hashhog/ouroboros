@@ -1,12 +1,13 @@
 """Database layer using RocksDB."""
 
 import asyncio
-from pathlib import Path
-from typing import Optional, Any, Union
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
 
 try:
     import rocksdb
+
     _ROCKSDB_AVAILABLE = True
 except ImportError:
     _ROCKSDB_AVAILABLE = False
@@ -16,13 +17,13 @@ except ImportError:
 class Database:
     """RocksDB database wrapper."""
 
-    def __init__(self, db_path: Union[str, Path], max_open_files: int = 3000) -> None:
+    def __init__(self, db_path: str | Path, max_open_files: int = 3000) -> None:
         """Initialize the database.
-        
+
         Args:
             db_path: Path to the RocksDB database directory
             max_open_files: Maximum number of open files
-            
+
         Raises:
             ImportError: If rocksdb package is not available (e.g., Python 3.13+)
         """
@@ -32,17 +33,17 @@ class Database:
                 "On Python 3.13+, rocksdb may not be supported. "
                 "Please use Python 3.10-3.12, or install rocksdb manually."
             )
-        
+
         self.db_path = Path(db_path)
         self.db_path.mkdir(parents=True, exist_ok=True)
-        
+
         opts = rocksdb.Options()
         opts.create_if_missing = True
         opts.max_open_files = max_open_files
-        
+
         # Use thread pool executor for async operations
         self.executor = ThreadPoolExecutor(max_workers=4)
-        self.db: Optional[Any] = None
+        self.db: Any | None = None
 
     async def open(self) -> None:
         """Open the database connection."""
@@ -51,7 +52,7 @@ class Database:
             self.executor,
             rocksdb.DB,
             str(self.db_path),
-            rocksdb.Options(create_if_missing=True, max_open_files=3000)
+            rocksdb.Options(create_if_missing=True, max_open_files=3000),
         )
 
     async def close(self) -> None:
@@ -66,18 +67,18 @@ class Database:
         if self.db:
             self.db = None
 
-    async def get(self, key: bytes) -> Optional[bytes]:
+    async def get(self, key: bytes) -> bytes | None:
         """Get a value by key.
-        
+
         Args:
             key: Database key
-            
+
         Returns:
             Value if found, None otherwise
         """
         if not self.db:
             raise RuntimeError("Database not open")
-        
+
         loop = asyncio.get_event_loop()
         try:
             return await loop.run_in_executor(self.executor, self.db.get, key)
@@ -86,56 +87,51 @@ class Database:
 
     async def put(self, key: bytes, value: bytes) -> None:
         """Store a key-value pair.
-        
+
         Args:
             key: Database key
             value: Value to store
         """
         if not self.db:
             raise RuntimeError("Database not open")
-        
+
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(self.executor, self.db.put, key, value)
 
     async def delete(self, key: bytes) -> None:
         """Delete a key-value pair.
-        
+
         Args:
             key: Database key
         """
         if not self.db:
             raise RuntimeError("Database not open")
-        
+
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(self.executor, self.db.delete, key)
 
-    async def write_batch(self, updates: dict[bytes, Optional[bytes]]) -> None:
+    async def write_batch(self, updates: dict[bytes, bytes | None]) -> None:
         """Write multiple key-value pairs atomically.
-        
+
         Args:
             updates: Dictionary mapping keys to values (None means delete)
         """
         if not self.db:
             raise RuntimeError("Database not open")
-        
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            self.executor,
-            self._write_batch_sync,
-            updates
-        )
 
-    def _write_batch_sync(self, updates: dict[bytes, Optional[bytes]]) -> None:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self.executor, self._write_batch_sync, updates)
+
+    def _write_batch_sync(self, updates: dict[bytes, bytes | None]) -> None:
         """Write batch synchronously (called from executor)."""
         if not self.db:
             return
-        
+
         batch = rocksdb.WriteBatch()
         for key, value in updates.items():
             if value is None:
                 batch.delete(key)
             else:
                 batch.put(key, value)
-        
-        self.db.write(batch)
 
+        self.db.write(batch)
