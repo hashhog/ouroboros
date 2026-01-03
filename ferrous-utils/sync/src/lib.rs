@@ -1,6 +1,7 @@
 // Fast sync module with PyO3 bindings
 
 pub mod storage;
+pub mod validate;
 
 use common::{OutPointWrapper, UTXO};
 use pyo3::prelude::*;
