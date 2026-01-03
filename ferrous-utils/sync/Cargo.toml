@@ -18,6 +18,7 @@ secp256k1 = "0.31"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 num_cpus = "1.16"
+primitive-types = { version = "0.13", features = ["serde"] }
 
 [dev-dependencies]
 tempdir = "0.3"
