@@ -1341,6 +1341,7 @@ dependencies = [
  "criterion",
  "hex",
  "num_cpus",
+ "primitive-types",
  "pyo3",
  "rand 0.8.5",
  "rocksdb",
