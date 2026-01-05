@@ -1,6 +1,8 @@
-// Proof of Work validation module
+// Block validation modules
 
+pub mod header;
 pub mod pow;
 
-// Re-export pow functions for convenience
+// Re-export functions for convenience
+pub use header::*;
 pub use pow::*;
