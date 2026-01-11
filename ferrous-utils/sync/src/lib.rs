@@ -2,6 +2,7 @@
 
 pub mod storage;
 pub mod validate;
+pub mod network;
 
 use common::{OutPointWrapper, UTXO};
 use pyo3::prelude::*;
