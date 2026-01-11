@@ -19,6 +19,7 @@ serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 num_cpus = "1.16"
 primitive-types = { version = "0.13", features = ["serde"] }
+rand = "0.8"
 
 [dev-dependencies]
 tempdir = "0.3"
