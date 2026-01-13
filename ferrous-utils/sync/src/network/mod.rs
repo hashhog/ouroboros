@@ -2,7 +2,9 @@
 
 pub mod messages;
 pub mod peer;
+pub mod peer_manager;
 
 pub use messages::*;
 pub use peer::*;
+pub use peer_manager::*;
 
