@@ -502,10 +502,16 @@ impl PeerManager {
         peers.keys().copied().collect()
     }
 
-    /// Get a peer by address
+    /// Get a peer by address (removes from map)
     pub async fn get_peer(&mut self, addr: SocketAddr) -> Option<Peer> {
         let mut peers = self.peers.lock().await;
         peers.remove(&addr)
+    }
+
+    /// Add a peer back to the map (for use after temporarily removing it)
+    pub async fn add_peer(&mut self, addr: SocketAddr, peer: Peer) {
+        let mut peers = self.peers.lock().await;
+        peers.insert(addr, peer);
     }
 
     /// Disconnect from a peer
