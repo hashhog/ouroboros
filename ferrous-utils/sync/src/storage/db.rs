@@ -136,7 +136,7 @@ impl BlockchainDB {
         let cf = self.db.cf_handle(BLOCK_INDEX_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_CF.to_string()))?;
         let key = encode_height(height);
-
+        
         match self.db.get_cf(cf, key)? {
             Some(data) => {
                 // First 32 bytes are the block hash, rest is BlockMetadata
@@ -150,6 +150,27 @@ impl BlockchainDB {
 
                 // Get block by hash
                 self.get_block(&hash_bytes)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get block hash by height (from header metadata)
+    pub fn get_block_hash_by_height(&self, height: u32) -> Result<Option<[u8; 32]>> {
+        let cf = self.db.cf_handle(BLOCK_INDEX_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_CF.to_string()))?;
+        let key = encode_height(height);
+        
+        match self.db.get_cf(cf, key)? {
+            Some(data) => {
+                if data.len() < 32 {
+                    return Err(DbError::InvalidData(
+                        "Block index data too short".to_string(),
+                    ));
+                }
+                let mut hash_bytes = [0u8; 32];
+                hash_bytes.copy_from_slice(&data[0..32]);
+                Ok(Some(hash_bytes))
             }
             None => Ok(None),
         }
