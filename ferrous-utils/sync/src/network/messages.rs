@@ -183,7 +183,8 @@ impl Message {
 }
 
 /// Calculate message checksum (first 4 bytes of double SHA-256)
-fn calculate_checksum(payload: &[u8]) -> u32 {
+/// Calculate message checksum (first 4 bytes of double SHA256)
+pub fn calculate_checksum(payload: &[u8]) -> u32 {
     let hash = double_sha256(payload);
     u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]])
 }
