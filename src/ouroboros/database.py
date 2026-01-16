@@ -196,7 +196,8 @@ class BlockchainDatabase:
         # Database operations are already atomic via RocksDB
         return False
     
-    def _py_block_to_block(self, py_block: sync.PyBlock) -> Block:
+    def _py_block_to_block(self, py_block) -> Block:
+        # Type hint: py_block should be sync.PyBlock if available
         """Convert PyBlock to Block"""
         transactions = []
         for py_tx in py_block.transactions:
