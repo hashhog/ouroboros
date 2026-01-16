@@ -1,137 +1,236 @@
-"""Database layer using RocksDB."""
+"""
+Python wrapper for blockchain database operations.
 
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from typing import Any
+This module provides a high-level Python interface to the Rust blockchain database
+implementation, allowing Python code to interact with the blockchain storage layer.
+"""
 
-try:
-    import rocksdb
-
-    _ROCKSDB_AVAILABLE = True
-except ImportError:
-    _ROCKSDB_AVAILABLE = False
-    rocksdb = None  # type: ignore
+from typing import Optional, List, Tuple, Dict, Any
+from dataclasses import dataclass
+import sync  # Rust extension module
 
 
-class Database:
-    """RocksDB database wrapper."""
+@dataclass
+class Block:
+    """Bitcoin block representation"""
+    version: int
+    prev_blockhash: bytes
+    merkle_root: bytes
+    timestamp: int
+    bits: int
+    nonce: int
+    transactions: List['Transaction']
+    hash: bytes
+    
+    def hash(self) -> bytes:
+        """Compute block hash"""
+        return self.hash
+    
+    def serialize(self) -> bytes:
+        """Serialize to bytes"""
+        # This would serialize the block to Bitcoin protocol format
+        # For now, return NotImplemented as it requires full BlockWrapper reconstruction
+        raise NotImplementedError("Block serialization requires Rust BlockWrapper")
+    
+    @classmethod
+    def deserialize(cls, data: bytes) -> 'Block':
+        """Deserialize from bytes"""
+        # This would deserialize from Bitcoin protocol format
+        # For now, return NotImplemented as it requires BitcoinDeserialize
+        raise NotImplementedError("Block deserialization requires Rust BitcoinDeserialize")
 
-    def __init__(self, db_path: str | Path, max_open_files: int = 3000) -> None:
-        """Initialize the database.
 
-        Args:
-            db_path: Path to the RocksDB database directory
-            max_open_files: Maximum number of open files
+@dataclass
+class Transaction:
+    """Bitcoin transaction representation"""
+    txid: bytes
+    version: int
+    locktime: int
+    inputs: List['TxIn']
+    outputs: List['TxOut']
 
-        Raises:
-            ImportError: If rocksdb package is not available (e.g., Python 3.13+)
+
+@dataclass
+class TxIn:
+    """Bitcoin transaction input"""
+    prev_txid: bytes
+    prev_vout: int
+    script_sig: bytes
+    sequence: int
+
+
+@dataclass
+class TxOut:
+    """Bitcoin transaction output"""
+    value: int
+    script_pubkey: bytes
+
+
+class BlockchainDatabase:
+    """Read/write access to blockchain data using Rust backend"""
+    
+    def __init__(self, data_dir: str):
         """
-        if not _ROCKSDB_AVAILABLE:
-            raise ImportError(
-                "rocksdb package is not available. "
-                "On Python 3.13+, rocksdb may not be supported. "
-                "Please use Python 3.10-3.12, or install rocksdb manually."
-            )
-
-        self.db_path = Path(db_path)
-        self.db_path.mkdir(parents=True, exist_ok=True)
-
-        opts = rocksdb.Options()
-        opts.create_if_missing = True
-        opts.max_open_files = max_open_files
-
-        # Use thread pool executor for async operations
-        self.executor = ThreadPoolExecutor(max_workers=4)
-        self.db: Any | None = None
-
-    async def open(self) -> None:
-        """Open the database connection."""
-        loop = asyncio.get_event_loop()
-        self.db = await loop.run_in_executor(
-            self.executor,
-            rocksdb.DB,
-            str(self.db_path),
-            rocksdb.Options(create_if_missing=True, max_open_files=3000),
-        )
-
-    async def close(self) -> None:
-        """Close the database connection."""
-        if self.db:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(self.executor, self._close_db)
-            self.executor.shutdown(wait=True)
-
-    def _close_db(self) -> None:
-        """Close the database (called from executor)."""
-        if self.db:
-            self.db = None
-
-    async def get(self, key: bytes) -> bytes | None:
-        """Get a value by key.
-
+        Initialize blockchain database.
+        
         Args:
-            key: Database key
-
+            data_dir: Path to database directory
+        """
+        self._db = sync.PyBlockchainDB(data_dir)
+        self._data_dir = data_dir
+    
+    def get_block(self, block_hash: bytes) -> Optional[Block]:
+        """
+        Get block by hash.
+        
+        Args:
+            block_hash: 32-byte block hash
+            
         Returns:
-            Value if found, None otherwise
+            Block object or None if not found
         """
-        if not self.db:
-            raise RuntimeError("Database not open")
-
-        loop = asyncio.get_event_loop()
-        try:
-            return await loop.run_in_executor(self.executor, self.db.get, key)
-        except rocksdb.errors.NotFoundError:
+        if len(block_hash) != 32:
+            raise ValueError("Block hash must be 32 bytes")
+        
+        py_block = self._db.get_block(block_hash)
+        if py_block is None:
             return None
-
-    async def put(self, key: bytes, value: bytes) -> None:
-        """Store a key-value pair.
-
-        Args:
-            key: Database key
-            value: Value to store
+        
+        return self._py_block_to_block(py_block)
+    
+    def get_block_by_height(self, height: int) -> Optional[Block]:
         """
-        if not self.db:
-            raise RuntimeError("Database not open")
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.executor, self.db.put, key, value)
-
-    async def delete(self, key: bytes) -> None:
-        """Delete a key-value pair.
-
+        Get block by height.
+        
         Args:
-            key: Database key
+            height: Block height
+            
+        Returns:
+            Block object or None if not found
         """
-        if not self.db:
-            raise RuntimeError("Database not open")
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.executor, self.db.delete, key)
-
-    async def write_batch(self, updates: dict[bytes, bytes | None]) -> None:
-        """Write multiple key-value pairs atomically.
-
+        py_block = self._db.get_block_by_height(height)
+        if py_block is None:
+            return None
+        
+        return self._py_block_to_block(py_block)
+    
+    def get_utxo(self, txid: bytes, vout: int) -> Optional[Dict[str, Any]]:
+        """
+        Get UTXO.
+        
         Args:
-            updates: Dictionary mapping keys to values (None means delete)
+            txid: Transaction ID (32 bytes)
+            vout: Output index
+            
+        Returns:
+            UTXO dictionary with keys: txid, vout, value, script_pubkey
+            or None if not found
         """
-        if not self.db:
-            raise RuntimeError("Database not open")
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.executor, self._write_batch_sync, updates)
-
-    def _write_batch_sync(self, updates: dict[bytes, bytes | None]) -> None:
-        """Write batch synchronously (called from executor)."""
-        if not self.db:
-            return
-
-        batch = rocksdb.WriteBatch()
-        for key, value in updates.items():
-            if value is None:
-                batch.delete(key)
-            else:
-                batch.put(key, value)
-
-        self.db.write(batch)
+        if len(txid) != 32:
+            raise ValueError("Transaction ID must be 32 bytes")
+        
+        py_utxo = self._db.get_utxo(txid, vout)
+        if py_utxo is None:
+            return None
+        
+        return {
+            'txid': py_utxo.txid,
+            'vout': py_utxo.vout,
+            'value': py_utxo.value,
+            'script_pubkey': bytes(py_utxo.script_pubkey),
+        }
+    
+    def store_block(self, block: Block) -> None:
+        """
+        Store new block.
+        
+        Args:
+            block: Block object to store
+            
+        Note:
+            This requires reconstructing the Rust BlockWrapper, which is complex.
+            For now, use the Rust API directly via FastSync or BlockSync.
+        """
+        raise NotImplementedError(
+            "store_block requires BlockWrapper reconstruction. "
+            "Use Rust API directly via FastSync.store_block() or BlockSync"
+        )
+    
+    def update_utxo_set(
+        self,
+        spent: List[Tuple[bytes, int]],
+        created: List[Dict[str, Any]]
+    ) -> None:
+        """
+        Atomic UTXO update.
+        
+        Args:
+            spent: List of (txid, vout) tuples for spent UTXOs
+            created: List of UTXO dictionaries with keys: txid, vout, value, script_pubkey
+            
+        Note:
+            This requires reconstructing Rust UTXO objects, which is complex.
+            For now, use the Rust API directly.
+        """
+        raise NotImplementedError(
+            "update_utxo_set requires UTXO reconstruction. "
+            "Use Rust API directly via BlockchainDB.batch_update_utxos()"
+        )
+    
+    def get_best_block(self) -> Tuple[bytes, int]:
+        """
+        Get chain tip.
+        
+        Returns:
+            Tuple of (block_hash, height)
+        """
+        hash_bytes, height = self._db.get_best_block()
+        return (bytes(hash_bytes), height)
+    
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        # Database operations are already atomic via RocksDB
+        return False
+    
+    def _py_block_to_block(self, py_block: sync.PyBlock) -> Block:
+        """Convert PyBlock to Block"""
+        transactions = []
+        for py_tx in py_block.transactions:
+            inputs = [
+                TxIn(
+                    prev_txid=bytes(py_in.prev_txid),
+                    prev_vout=py_in.prev_vout,
+                    script_sig=bytes(py_in.script_sig),
+                    sequence=py_in.sequence,
+                )
+                for py_in in py_tx.inputs
+            ]
+            outputs = [
+                TxOut(
+                    value=py_out.value,
+                    script_pubkey=bytes(py_out.script_pubkey),
+                )
+                for py_out in py_tx.outputs
+            ]
+            transactions.append(Transaction(
+                txid=bytes(py_tx.txid),
+                version=py_tx.version,
+                locktime=py_tx.locktime,
+                inputs=inputs,
+                outputs=outputs,
+            ))
+        
+        return Block(
+            version=py_block.version,
+            prev_blockhash=bytes(py_block.prev_blockhash),
+            merkle_root=bytes(py_block.merkle_root),
+            timestamp=py_block.timestamp,
+            bits=py_block.bits,
+            nonce=py_block.nonce,
+            transactions=transactions,
+            hash=bytes(py_block.hash),
+        )
