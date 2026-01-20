@@ -48,6 +48,52 @@ class Transaction:
     locktime: int
     inputs: List['TxIn']
     outputs: List['TxOut']
+    
+    def serialize(self) -> bytes:
+        """
+        Serialize transaction to bytes for fee calculation.
+        
+        This is a simplified serialization for size estimation.
+        For full Bitcoin protocol serialization, use the Rust layer.
+        """
+        # Version (4 bytes)
+        data = self.version.to_bytes(4, 'little')
+        
+        # Input count (varint)
+        data += self._encode_varint(len(self.inputs))
+        
+        # Inputs
+        for tx_in in self.inputs:
+            data += tx_in.prev_txid  # 32 bytes
+            data += tx_in.prev_vout.to_bytes(4, 'little')
+            data += self._encode_varint(len(tx_in.script_sig))
+            data += tx_in.script_sig
+            data += tx_in.sequence.to_bytes(4, 'little')
+        
+        # Output count (varint)
+        data += self._encode_varint(len(self.outputs))
+        
+        # Outputs
+        for tx_out in self.outputs:
+            data += tx_out.value.to_bytes(8, 'little')
+            data += self._encode_varint(len(tx_out.script_pubkey))
+            data += tx_out.script_pubkey
+        
+        # Locktime (4 bytes)
+        data += self.locktime.to_bytes(4, 'little')
+        
+        return data
+    
+    def _encode_varint(self, value: int) -> bytes:
+        """Encode variable-length integer"""
+        if value < 0xfd:
+            return bytes([value])
+        elif value <= 0xffff:
+            return b'\xfd' + value.to_bytes(2, 'little')
+        elif value <= 0xffffffff:
+            return b'\xfe' + value.to_bytes(4, 'little')
+        else:
+            return b'\xff' + value.to_bytes(8, 'little')
 
 
 @dataclass
