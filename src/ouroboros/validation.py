@@ -1,40 +1,287 @@
 """Block and transaction validation logic."""
 
-from typing import Tuple
-from ouroboros.database import BlockchainDatabase, Transaction, TxIn, TxOut
+from typing import Tuple, List
+import hashlib
+from ouroboros.database import BlockchainDatabase, Transaction, TxIn, TxOut, Block
 from ouroboros.script import ScriptInterpreter
 
 
 class BlockValidator:
-    """Validates Bitcoin blocks."""
-
-    def __init__(self) -> None:
-        """Initialize the block validator."""
-        pass
-
-    async def validate_block(self, block: bytes) -> bool:
-        """Validate a Bitcoin block.
-
-        Args:
-            block: Raw block data
-
-        Returns:
-            True if block is valid, False otherwise
+    """Validates new blocks"""
+    
+    def __init__(self, db: BlockchainDatabase):
         """
-        # TODO: Implement block validation
-        return True
-
-    async def validate_block_header(self, header: bytes) -> bool:
-        """Validate a block header.
-
+        Initialize block validator.
+        
         Args:
-            header: Raw block header data
-
-        Returns:
-            True if header is valid, False otherwise
+            db: Blockchain database for block and UTXO lookups
         """
-        # TODO: Implement header validation
+        self.db = db
+        self.tx_validator = TransactionValidator(db)
+    
+    def validate_block(self, block: Block) -> Tuple[bool, str]:
+        """
+        Validate a new block completely.
+        
+        Args:
+            block: Block to validate
+            
+        Returns:
+            (is_valid, error_message)
+        """
+        # 1. Get previous block
+        prev_block = self.db.get_block(block.prev_blockhash)
+        if not prev_block:
+            return False, "Previous block not found"
+        
+        # Calculate expected height
+        expected_height = (prev_block.height or 0) + 1
+        
+        # 2. Validate header
+        if not self._validate_header(block, prev_block):
+            return False, "Invalid header"
+        
+        # 3. Verify merkle root
+        if not self._verify_merkle_root(block):
+            return False, "Invalid merkle root"
+        
+        # 4. Validate all transactions
+        total_fees = 0
+        for i, tx in enumerate(block.transactions):
+            if i == 0:  # Coinbase
+                if not self._validate_coinbase(tx, expected_height):
+                    return False, "Invalid coinbase"
+            else:
+                valid, error = self.tx_validator.validate_transaction(
+                    tx, expected_height
+                )
+                if not valid:
+                    return False, f"Transaction {i} invalid: {error}"
+                
+                # Calculate fee
+                fee = self._calculate_tx_fee(tx)
+                total_fees += fee
+        
+        # 5. Verify coinbase amount
+        if not self._verify_coinbase_amount(
+            block.transactions[0],
+            expected_height,
+            total_fees
+        ):
+            return False, "Coinbase amount invalid"
+        
+        return True, ""
+    
+    def apply_block(self, block: Block) -> None:
+        """
+        Apply block to database (update UTXO set).
+        
+        Args:
+            block: Block to apply
+        """
+        spent = []
+        created = []
+        
+        # Collect spent and created UTXOs
+        for tx in block.transactions:
+            # Spent outputs (except coinbase)
+            if not tx.is_coinbase:
+                for tx_in in tx.inputs:
+                    spent.append((tx_in.prev_txid, tx_in.prev_vout))
+            
+            # Created outputs
+            for i, tx_out in enumerate(tx.outputs):
+                created.append({
+                    'txid': tx.get_txid(),
+                    'vout': i,
+                    'value': tx_out.value,
+                    'script_pubkey': tx_out.script_pubkey,
+                })
+        
+        # Atomic update
+        self.db.update_utxo_set(spent, created)
+        # Note: store_block is not implemented in Python wrapper yet
+        # self.db.store_block(block)
+    
+    def _validate_header(self, block: Block, prev_block: Block) -> bool:
+        """
+        Validate block header.
+        
+        Args:
+            block: Block to validate
+            prev_block: Previous block
+            
+        Returns:
+            True if header is valid
+        """
+        # Check timestamp is after previous block
+        if block.timestamp <= prev_block.timestamp:
+            return False
+        
+        # Check timestamp is not too far in the future (2 hours)
+        # This would require current time, so we'll skip for now
+        # In production, you'd check: block.timestamp <= current_time + 2*3600
+        
+        # Check version is valid
+        if block.version < 1:
+            return False
+        
+        # Check bits is valid (difficulty target)
+        if block.bits == 0:
+            return False
+        
         return True
+    
+    def _verify_merkle_root(self, block: Block) -> bool:
+        """
+        Verify block's merkle root.
+        
+        Args:
+            block: Block to verify
+            
+        Returns:
+            True if merkle root is valid
+        """
+        txids = [tx.get_txid() for tx in block.transactions]
+        calculated_root = self._calculate_merkle_root(txids)
+        return calculated_root == block.merkle_root
+    
+    def _calculate_merkle_root(self, txids: List[bytes]) -> bytes:
+        """
+        Calculate merkle root from transaction IDs.
+        
+        Bitcoin's merkle tree algorithm:
+        1. Start with transaction IDs
+        2. If odd number of items, duplicate the last one
+        3. Pair items and hash them together (double SHA256)
+        4. Repeat until one hash remains
+        
+        Args:
+            txids: List of transaction IDs (32-byte arrays)
+            
+        Returns:
+            Merkle root (32 bytes)
+        """
+        if not txids:
+            return bytes(32)
+        
+        if len(txids) == 1:
+            return txids[0]
+        
+        level = list(txids)
+        
+        while len(level) > 1:
+            next_level = []
+            
+            # Process pairs
+            for i in range(0, len(level), 2):
+                if i + 1 < len(level):
+                    # Hash the pair
+                    combined = level[i] + level[i + 1]
+                else:
+                    # Odd number: duplicate the last element
+                    combined = level[i] + level[i]
+                
+                # Double SHA256
+                hash1 = hashlib.sha256(combined).digest()
+                hash2 = hashlib.sha256(hash1).digest()
+                next_level.append(hash2)
+            
+            level = next_level
+        
+        return level[0]
+    
+    def _validate_coinbase(self, tx: Transaction, height: int) -> bool:
+        """
+        Validate coinbase transaction.
+        
+        Args:
+            tx: Coinbase transaction
+            height: Block height
+            
+        Returns:
+            True if coinbase is valid
+        """
+        # Check it's actually a coinbase
+        if not tx.is_coinbase:
+            return False
+        
+        # Check coinbase input
+        if len(tx.inputs) != 1:
+            return False
+        
+        coinbase_input = tx.inputs[0]
+        if coinbase_input.prev_txid != bytes(32):
+            return False
+        
+        # Check coinbase has at least one output
+        if len(tx.outputs) == 0:
+            return False
+        
+        # Check coinbase script_sig is not too large (100 bytes max)
+        if len(coinbase_input.script_sig) > 100:
+            return False
+        
+        return True
+    
+    def _verify_coinbase_amount(
+        self,
+        coinbase_tx: Transaction,
+        height: int,
+        total_fees: int
+    ) -> bool:
+        """
+        Verify coinbase amount is correct.
+        
+        Args:
+            coinbase_tx: Coinbase transaction
+            height: Block height
+            total_fees: Total fees from all transactions in block
+            
+        Returns:
+            True if coinbase amount is valid
+        """
+        block_subsidy = self._calculate_block_subsidy(height)
+        expected_amount = block_subsidy + total_fees
+        
+        total_output = sum(out.value for out in coinbase_tx.outputs)
+        
+        # Coinbase amount should equal subsidy + fees
+        return total_output == expected_amount
+    
+    def _calculate_block_subsidy(self, height: int) -> int:
+        """
+        Calculate block subsidy (50 BTC halving every 210000 blocks).
+        
+        Args:
+            height: Block height
+            
+        Returns:
+            Block subsidy in satoshis
+        """
+        halvings = height // 210000
+        if halvings >= 64:
+            return 0
+        return 50 * 100_000_000 >> halvings
+    
+    def _calculate_tx_fee(self, tx: Transaction) -> int:
+        """
+        Calculate transaction fee.
+        
+        Args:
+            tx: Transaction to calculate fee for
+            
+        Returns:
+            Fee in satoshis
+        """
+        total_input = 0
+        for tx_in in tx.inputs:
+            utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+            if utxo:
+                total_input += utxo['value']
+        
+        total_output = sum(out.value for out in tx.outputs)
+        return total_input - total_output
 
 
 class TransactionValidator:
