@@ -184,6 +184,29 @@ class NetworkAddress:
     ip: bytes = b'\x00' * 16  # IPv6 (IPv4 mapped to IPv6)
     port: int = 0
     
+    @classmethod
+    def from_ipv4(cls, ip: str, port: int, services: int = 1) -> 'NetworkAddress':
+        """
+        Create network address from IPv4 address.
+        
+        Args:
+            ip: IPv4 address as string (e.g., "192.168.1.1")
+            port: Port number
+            services: Services flags
+            
+        Returns:
+            NetworkAddress instance with IPv4-mapped IPv6 address
+        """
+        parts = ip.split('.')
+        if len(parts) != 4:
+            raise ValueError(f"Invalid IPv4 address: {ip}")
+        
+        ipv4_bytes = bytes([int(p) for p in parts])
+        # Create IPv4-mapped IPv6 address (::ffff:ipv4)
+        ipv6_bytes = b'\x00' * 10 + b'\xff\xff' + ipv4_bytes
+        
+        return cls(services=services, ip=ipv6_bytes, port=port)
+    
     def serialize(self) -> bytes:
         """Serialize network address"""
         data = struct.pack('<Q', self.services)  # Services (8 bytes)
