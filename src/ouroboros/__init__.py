@@ -8,6 +8,7 @@ from ouroboros.mempool import Mempool
 from ouroboros.node import BitcoinNode
 from ouroboros.p2p import P2PManager
 from ouroboros.peer import Peer, PeerState
+from ouroboros.block_sync import BlockSync
 from ouroboros.rpc import RPCServer
 from ouroboros.validation import BlockValidator, TransactionValidator, ValidationError
 from ouroboros.script import ScriptInterpreter
@@ -62,6 +63,7 @@ __all__ = [
     "BlockHeader",
     "Peer",
     "PeerState",
+    "BlockSync",
     "MAGIC_MAINNET",
     "MAGIC_TESTNET",
     "MAGIC_REGTEST",
