@@ -10,6 +10,25 @@ from ouroboros.p2p import P2PManager
 from ouroboros.rpc import RPCServer
 from ouroboros.validation import BlockValidator, TransactionValidator, ValidationError
 from ouroboros.script import ScriptInterpreter
+from ouroboros.p2p_messages import (
+    NetworkMessage,
+    VersionMessage,
+    InvMessage,
+    GetDataMessage,
+    BlockMessage,
+    TxMessage,
+    GetHeadersMessage,
+    HeadersMessage,
+    PingMessage,
+    PongMessage,
+    NetworkAddress,
+    BlockHeader,
+    MAGIC_MAINNET,
+    MAGIC_TESTNET,
+    MAGIC_REGTEST,
+    INV_TYPE_TX,
+    INV_TYPE_BLOCK,
+)
 from ouroboros.wallet import Wallet
 from ouroboros.sync_manager import SyncManager, SyncProgress
 
@@ -28,6 +47,23 @@ __all__ = [
     "TransactionValidator",
     "ValidationError",
     "ScriptInterpreter",
+    "NetworkMessage",
+    "VersionMessage",
+    "InvMessage",
+    "GetDataMessage",
+    "BlockMessage",
+    "TxMessage",
+    "GetHeadersMessage",
+    "HeadersMessage",
+    "PingMessage",
+    "PongMessage",
+    "NetworkAddress",
+    "BlockHeader",
+    "MAGIC_MAINNET",
+    "MAGIC_TESTNET",
+    "MAGIC_REGTEST",
+    "INV_TYPE_TX",
+    "INV_TYPE_BLOCK",
     "Database",
     "BlockchainDatabase",
     "Wallet",
