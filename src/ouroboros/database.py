@@ -6,8 +6,9 @@ implementation, allowing Python code to interact with the blockchain storage lay
 """
 
 from typing import Optional, List, Tuple, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import sync  # Rust extension module
+import hashlib
 
 
 @dataclass
@@ -21,6 +22,7 @@ class Block:
     nonce: int
     transactions: List['Transaction']
     hash: bytes
+    height: Optional[int] = None  # Block height (if known)
     
     def hash(self) -> bytes:
         """Compute block hash"""
@@ -48,6 +50,15 @@ class Transaction:
     locktime: int
     inputs: List['TxIn']
     outputs: List['TxOut']
+    
+    @property
+    def is_coinbase(self) -> bool:
+        """Check if this is a coinbase transaction"""
+        return len(self.inputs) == 1 and self.inputs[0].prev_txid == bytes(32)
+    
+    def get_txid(self) -> bytes:
+        """Get transaction ID"""
+        return self.txid
     
     def serialize(self) -> bytes:
         """
