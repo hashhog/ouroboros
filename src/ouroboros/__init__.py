@@ -8,7 +8,8 @@ from ouroboros.mempool import Mempool
 from ouroboros.node import BitcoinNode
 from ouroboros.p2p import P2PManager
 from ouroboros.rpc import RPCServer
-from ouroboros.validation import BlockValidator, TransactionValidator
+from ouroboros.validation import BlockValidator, TransactionValidator, ValidationError
+from ouroboros.script import ScriptInterpreter
 from ouroboros.wallet import Wallet
 from ouroboros.sync_manager import SyncManager, SyncProgress
 
@@ -25,6 +26,8 @@ __all__ = [
     "Mempool",
     "BlockValidator",
     "TransactionValidator",
+    "ValidationError",
+    "ScriptInterpreter",
     "Database",
     "BlockchainDatabase",
     "Wallet",
