@@ -244,7 +244,7 @@ class RPCServer:
             "blocks": best_height,
             "headers": best_height,
             "bestblockhash": best_hash.hex() if isinstance(best_hash, bytes) else best_hash,
-            "difficulty": 1.0,  # TODO: Calculate actual difficulty
+            "difficulty": self.node.get_current_difficulty(),
             "mediantime": int(time.time()),  # TODO: Calculate median time
             "verificationprogress": 1.0 if self._is_synced() else 0.0,
             "chainwork": "0x0",  # TODO: Calculate chainwork
@@ -321,7 +321,7 @@ class RPCServer:
                 "mediantime": block.timestamp,
                 "nonce": block.nonce,
                 "bits": hex(block.bits),
-                "difficulty": 1.0,  # TODO: Calculate from bits
+                "difficulty": self.node.get_difficulty(block.bits),
                 "chainwork": "0x0",  # TODO: Calculate chainwork
                 "nTx": len(block.transactions) if hasattr(block, 'transactions') else 0,
                 "previousblockhash": block.prev_blockhash.hex() if isinstance(block.prev_blockhash, bytes) else str(block.prev_blockhash),
