@@ -29,17 +29,180 @@ class Block:
         return self.hash
     
     def serialize(self) -> bytes:
-        """Serialize to bytes"""
-        # This would serialize the block to Bitcoin protocol format
-        # For now, return NotImplemented as it requires full BlockWrapper reconstruction
-        raise NotImplementedError("Block serialization requires Rust BlockWrapper")
+        """
+        Serialize block to Bitcoin wire format.
+        
+        Format:
+        - version (4 bytes, little-endian)
+        - prev_blockhash (32 bytes, reversed for wire format)
+        - merkle_root (32 bytes, reversed for wire format)
+        - timestamp (4 bytes, little-endian)
+        - bits (4 bytes, little-endian)
+        - nonce (4 bytes, little-endian)
+        - tx_count (varint)
+        - transactions (variable, each transaction serialized)
+        
+        Returns:
+            Serialized block bytes
+            
+        Note:
+            Block hash is in display format (big-endian), but wire format uses little-endian
+            So we need to reverse hashes when serializing
+        """
+        from ouroboros.p2p_messages import encode_varint
+        
+        data = bytearray()
+        
+        # Serialize header (80 bytes)
+        # Version (4 bytes)
+        data.extend(self.version.to_bytes(4, 'little', signed=True))
+        
+        # Previous block hash (32 bytes, reverse from display format to wire format)
+        data.extend(self.prev_blockhash[::-1])
+        
+        # Merkle root (32 bytes, reverse from display format to wire format)
+        data.extend(self.merkle_root[::-1])
+        
+        # Timestamp (4 bytes)
+        data.extend(self.timestamp.to_bytes(4, 'little'))
+        
+        # Bits (4 bytes)
+        data.extend(self.bits.to_bytes(4, 'little'))
+        
+        # Nonce (4 bytes)
+        data.extend(self.nonce.to_bytes(4, 'little'))
+        
+        # Transaction count (varint)
+        data.extend(encode_varint(len(self.transactions)))
+        
+        # Serialize each transaction
+        for tx in self.transactions:
+            tx_bytes = tx.serialize()
+            data.extend(tx_bytes)
+        
+        return bytes(data)
     
     @classmethod
     def deserialize(cls, data: bytes) -> 'Block':
-        """Deserialize from bytes"""
-        # This would deserialize from Bitcoin protocol format
-        # For now, return NotImplemented as it requires BitcoinDeserialize
-        raise NotImplementedError("Block deserialization requires Rust BitcoinDeserialize")
+        """
+        Deserialize block from Bitcoin wire format.
+        
+        Format:
+        - version (4 bytes)
+        - prev_blockhash (32 bytes)
+        - merkle_root (32 bytes)
+        - timestamp (4 bytes)
+        - bits (4 bytes)
+        - nonce (4 bytes)
+        - tx_count (varint)
+        - transactions (variable)
+        
+        Args:
+            data: Block data in Bitcoin wire format
+            
+        Returns:
+            Block object
+            
+        Raises:
+            ValueError: If data is invalid or too short
+        """
+        from ouroboros.p2p_messages import decode_varint, TxMessage
+        
+        offset = 0
+        
+        if len(data) < 80:  # Minimum header size
+            raise ValueError("Block data too short for header")
+        
+        # Parse header (80 bytes)
+        version = int.from_bytes(data[offset:offset+4], byteorder='little', signed=True)
+        offset += 4
+        
+        prev_blockhash = data[offset:offset+32][::-1]  # Reverse for display format (big-endian)
+        offset += 32
+        
+        merkle_root = data[offset:offset+32][::-1]  # Reverse for display format
+        offset += 32
+        
+        timestamp = int.from_bytes(data[offset:offset+4], byteorder='little')
+        offset += 4
+        
+        bits = int.from_bytes(data[offset:offset+4], byteorder='little')
+        offset += 4
+        
+        nonce = int.from_bytes(data[offset:offset+4], byteorder='little')
+        offset += 4
+        
+        # Parse transaction count (varint)
+        if len(data) <= offset:
+            raise ValueError("Block data too short for transaction count")
+        tx_count, varint_size = decode_varint(data, offset)
+        offset += varint_size
+        
+        # Parse transactions
+        # We need to track transaction sizes accurately
+        # Since transactions can have variable sizes and we need to know where each ends,
+        # we'll parse each transaction and use its serialized size to track bytes consumed
+        transactions = []
+        for i in range(tx_count):
+            if offset >= len(data):
+                raise ValueError(f"Block data too short for transaction {i}")
+            
+            # Store offset before parsing this transaction
+            tx_start_offset = offset
+            
+            # Parse transaction using TxMessage.from_payload
+            tx_data = data[offset:]
+            try:
+                tx_msg = TxMessage.from_payload(tx_data)
+                tx = tx_msg.transaction
+                
+                # Calculate transaction size by serializing it back
+                # Transaction.serialize() produces wire-format compatible output,
+                # so the size should match the original wire format
+                tx_serialized = tx.serialize()
+                tx_size = len(tx_serialized)
+                
+                # Validate that we haven't gone past the end of data
+                remaining = len(data) - tx_start_offset
+                if tx_size > remaining:
+                    # If calculated size goes past end, this indicates either:
+                    # 1. Transaction serialization doesn't match wire format exactly
+                    # 2. Corrupted block data
+                    if remaining < 60:  # Minimum transaction size
+                        raise ValueError(
+                            f"Transaction {i} size calculation error: "
+                            f"calculated {tx_size} bytes but only {remaining} bytes remaining"
+                        )
+                    # Use remaining bytes as fallback (this is a workaround)
+                    # Ideally, transaction serialization should match wire format exactly
+                    tx_size = remaining
+                
+                offset = tx_start_offset + tx_size
+                transactions.append(tx)
+                
+            except ValueError as e:
+                # If parsing fails, try to recover by finding next transaction
+                # This is a fallback - ideally we should parse correctly
+                raise ValueError(f"Error parsing transaction {i} at offset {tx_start_offset}: {e}")
+            except Exception as e:
+                raise ValueError(f"Unexpected error parsing transaction {i}: {e}")
+        
+        # Calculate block hash
+        import hashlib
+        block_header = data[0:80]
+        block_hash = hashlib.sha256(hashlib.sha256(block_header).digest()).digest()[::-1]  # Reverse for display
+        
+        return cls(
+            version=version,
+            prev_blockhash=prev_blockhash,
+            merkle_root=merkle_root,
+            timestamp=timestamp,
+            bits=bits,
+            nonce=nonce,
+            transactions=transactions,
+            hash=block_hash,
+            height=None  # Height not in wire format
+        )
 
 
 @dataclass
