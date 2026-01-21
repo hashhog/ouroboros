@@ -437,13 +437,163 @@ class TxMessage:
     
     @classmethod
     def from_payload(cls, payload: bytes) -> 'TxMessage':
-        """Parse from payload"""
-        # Note: Transaction deserialization requires full Bitcoin protocol decoding
-        # For now, this is a placeholder that would need the Rust layer
-        raise NotImplementedError(
-            "Transaction deserialization requires full Bitcoin protocol decoding. "
-            "Use Rust TransactionWrapper for proper deserialization."
+        """
+        Deserialize transaction message from payload.
+        
+        Format:
+        - version (4 bytes, little-endian)
+        - flags/inputs count (varint or segwit flag)
+        - inputs (variable)
+          - prev_txid (32 bytes)
+          - prev_vout (4 bytes, little-endian)
+          - script_sig length (varint)
+          - script_sig (variable)
+          - sequence (4 bytes, little-endian)
+        - outputs (variable)
+          - value (8 bytes, little-endian)
+          - script_pubkey length (varint)
+          - script_pubkey (variable)
+        - locktime (4 bytes, little-endian)
+        - witness data (if segwit flag present)
+        """
+        from ouroboros.database import Transaction, TxIn, TxOut
+        
+        offset = 0
+        
+        # Parse version (4 bytes)
+        if len(payload) < 4:
+            raise ValueError("Payload too short for version")
+        version = int.from_bytes(payload[offset:offset+4], byteorder='little', signed=True)
+        offset += 4
+        
+        # Check for segwit flag (0x00, 0x01)
+        has_witness = False
+        if len(payload) > offset + 2 and payload[offset] == 0x00 and payload[offset+1] == 0x01:
+            has_witness = True
+            offset += 2
+        
+        # Parse inputs count (varint)
+        if len(payload) <= offset:
+            raise ValueError("Payload too short for inputs count")
+        inputs_count, varint_size = decode_varint(payload, offset)
+        offset += varint_size
+        
+        # Parse inputs
+        inputs = []
+        for i in range(inputs_count):
+            if len(payload) < offset + 36:  # 32 + 4 minimum
+                raise ValueError(f"Payload too short for input {i}")
+            
+            # prev_txid (32 bytes, reversed for display format)
+            prev_txid = payload[offset:offset+32][::-1]  # Reverse for big-endian
+            offset += 32
+            
+            # prev_vout (4 bytes)
+            prev_vout = int.from_bytes(payload[offset:offset+4], byteorder='little')
+            offset += 4
+            
+            # script_sig length (varint)
+            script_sig_len, varint_size = decode_varint(payload, offset)
+            offset += varint_size
+            
+            # script_sig
+            if len(payload) < offset + script_sig_len:
+                raise ValueError(f"Payload too short for script_sig in input {i}")
+            script_sig = payload[offset:offset+script_sig_len]
+            offset += script_sig_len
+            
+            # sequence (4 bytes)
+            if len(payload) < offset + 4:
+                raise ValueError(f"Payload too short for sequence in input {i}")
+            sequence = int.from_bytes(payload[offset:offset+4], byteorder='little')
+            offset += 4
+            
+            inputs.append(TxIn(
+                prev_txid=prev_txid,
+                prev_vout=prev_vout,
+                script_sig=script_sig,
+                sequence=sequence
+            ))
+        
+        # Parse outputs count (varint)
+        if len(payload) <= offset:
+            raise ValueError("Payload too short for outputs count")
+        outputs_count, varint_size = decode_varint(payload, offset)
+        offset += varint_size
+        
+        # Parse outputs
+        outputs = []
+        for i in range(outputs_count):
+            if len(payload) < offset + 8:  # value minimum
+                raise ValueError(f"Payload too short for value in output {i}")
+            
+            # value (8 bytes)
+            value = int.from_bytes(payload[offset:offset+8], byteorder='little')
+            offset += 8
+            
+            # script_pubkey length (varint)
+            script_pubkey_len, varint_size = decode_varint(payload, offset)
+            offset += varint_size
+            
+            # script_pubkey
+            if len(payload) < offset + script_pubkey_len:
+                raise ValueError(f"Payload too short for script_pubkey in output {i}")
+            script_pubkey = payload[offset:offset+script_pubkey_len]
+            offset += script_pubkey_len
+            
+            outputs.append(TxOut(
+                value=value,
+                script_pubkey=script_pubkey
+            ))
+        
+        # Parse witness data if present (for SegWit transactions)
+        # Note: We parse witness data but don't store it in Transaction object yet
+        # as it's not in the current Transaction dataclass structure
+        if has_witness:
+            for i in range(inputs_count):
+                # Witness stack count (varint)
+                if len(payload) <= offset:
+                    raise ValueError(f"Payload too short for witness stack count in input {i}")
+                stack_count, varint_size = decode_varint(payload, offset)
+                offset += varint_size
+                
+                # Witness stack items
+                for j in range(stack_count):
+                    item_len, varint_size = decode_varint(payload, offset)
+                    offset += varint_size
+                    if len(payload) < offset + item_len:
+                        raise ValueError(f"Payload too short for witness item {j} in input {i}")
+                    # Skip witness item data (not storing for now)
+                    offset += item_len
+        
+        # Parse locktime (4 bytes)
+        if len(payload) < offset + 4:
+            raise ValueError("Payload too short for locktime")
+        locktime = int.from_bytes(payload[offset:offset+4], byteorder='little')
+        offset += 4
+        
+        # Create Transaction object
+        # Note: Transaction requires txid which we calculate from the serialized transaction
+        # For now, we'll create it with a placeholder txid and let it be calculated later
+        # The actual txid should be calculated from the transaction hash
+        transaction = Transaction(
+            txid=bytes(32),  # Placeholder - should be calculated from transaction hash
+            version=version,
+            locktime=locktime,
+            inputs=inputs,
+            outputs=outputs
         )
+        
+        # Calculate actual txid from transaction
+        # Transaction ID is double SHA256 of the transaction (without witness data)
+        # For now, we'll calculate it from the serialized version without witness
+        # Note: This is a simplified calculation - full txid requires proper serialization
+        import hashlib
+        tx_bytes = transaction.serialize()
+        txid = hashlib.sha256(hashlib.sha256(tx_bytes).digest()).digest()
+        transaction.txid = txid
+        
+        return cls(transaction=transaction)
 
 
 @dataclass
