@@ -431,3 +431,7 @@ class PeerManager:
             "avg_latency": avg_latency,
             "avg_score": avg_score,
         }
+
+
+# Alias for backward compatibility
+P2PManager = PeerManager
