@@ -394,15 +394,119 @@ class BitcoinNode:
         except:
             return 0
     
+    def _calculate_block_work(self, bits: int) -> int:
+        """
+        Calculate proof-of-work for a block.
+        
+        Formula: work = (2^256) / (target + 1)
+        Where target is decoded from bits.
+        
+        Args:
+            bits: Compact target (32-bit integer)
+            
+        Returns:
+            Work value as integer (can be very large)
+        """
+        # Extract target from bits (same as difficulty calculation)
+        mantissa = bits & 0x007fffff
+        exponent = (bits >> 24) & 0xff
+        
+        if mantissa == 0:
+            return 0
+        
+        # Calculate target: mantissa * 2^(8*(exponent-3))
+        if exponent <= 3:
+            target = mantissa >> (8 * (3 - exponent))
+        else:
+            target = mantissa << (8 * (exponent - 3))
+        
+        # Calculate work = (2^256) / (target + 1)
+        # Use Python's integer math for precision
+        max_target = 2**256
+        work = max_target // (target + 1)
+        
+        return work
+    
+    def _calculate_chainwork_at_height(self, height: int) -> int:
+        """
+        Calculate cumulative chainwork up to height.
+        
+        This recursively calculates chainwork from genesis, caching results.
+        
+        Args:
+            height: Block height
+            
+        Returns:
+            Cumulative chainwork at this height
+        """
+        if not self.db:
+            return 0
+        
+        try:
+            # Check cache first
+            block = self.db.get_block_by_height(height)
+            if not block:
+                return 0
+            
+            block_hash = block.hash if hasattr(block, 'hash') else self.db.get_block_hash_by_height(height)
+            if not block_hash:
+                return 0
+            
+            cached_chainwork = self.db.get_block_chainwork(block_hash)
+            if cached_chainwork > 0:
+                return cached_chainwork
+            
+            # Calculate chainwork
+            if height == 0:
+                # Genesis block
+                work = self._calculate_block_work(block.bits)
+                chainwork = work
+            else:
+                # Get previous block chainwork
+                prev_block = self.db.get_block_by_height(height - 1)
+                if not prev_block:
+                    # Need to calculate from genesis
+                    prev_chainwork = self._calculate_chainwork_at_height(height - 1)
+                else:
+                    prev_hash = prev_block.hash if hasattr(prev_block, 'hash') else self.db.get_block_hash_by_height(height - 1)
+                    if prev_hash:
+                        prev_chainwork = self.db.get_block_chainwork(prev_hash)
+                        if prev_chainwork == 0:
+                            # Calculate recursively
+                            prev_chainwork = self._calculate_chainwork_at_height(height - 1)
+                    else:
+                        prev_chainwork = self._calculate_chainwork_at_height(height - 1)
+                
+                # Calculate current block work
+                work = self._calculate_block_work(block.bits)
+                chainwork = prev_chainwork + work
+            
+            # Cache chainwork
+            self.db.store_block_chainwork(block_hash, chainwork)
+            
+            return chainwork
+        
+        except Exception as e:
+            logger.error(f"Error calculating chainwork at height {height}: {e}", exc_info=True)
+            return 0
+    
     def get_chainwork(self) -> str:
         """
         Get chain work (hex).
         
         Returns:
-            Chain work as hex string (placeholder)
+            Chain work as hex string
         """
-        # TODO: Implement chainwork calculation
-        return "0x0"
+        if not self.db:
+            return "0x0"
+        
+        try:
+            _, best_height = self.db.get_best_block()
+            chainwork = self._calculate_chainwork_at_height(best_height)
+            return f"0x{chainwork:x}"
+        except Exception as e:
+            logger.error(f"Error getting chainwork: {e}", exc_info=True)
+            return "0x0"
     
     def get_confirmations(self, height: int) -> int:
         """
@@ -443,10 +547,17 @@ class BitcoinNode:
             height: Block height
             
         Returns:
-            Chain work as hex string (placeholder)
+            Chain work as hex string
         """
-        # TODO: Implement chainwork calculation
-        return "0x0"
+        if not self.db:
+            return "0x0"
+        
+        try:
+            chainwork = self._calculate_chainwork_at_height(height)
+            return f"0x{chainwork:x}"
+        except Exception as e:
+            logger.error(f"Error getting chainwork at height {height}: {e}", exc_info=True)
+            return "0x0"
     
     async def run(self) -> None:
         """
