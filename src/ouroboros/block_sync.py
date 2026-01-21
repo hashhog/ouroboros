@@ -230,45 +230,39 @@ class BlockSync:
     async def handle_block(self, msg: NetworkMessage, peer: Peer):
         """Handle block delivery"""
         try:
-            # Note: BlockMessage.from_payload requires full Bitcoin protocol decoding
-            # For now, we'll need to use the Rust layer or implement proper deserialization
-            # This is a placeholder that shows the structure
+            from ouroboros.database import Block
+            from ouroboros.p2p_messages import InvMessage, INV_TYPE_BLOCK
             
-            # In a real implementation, you would:
-            # block_msg = BlockMessage.from_payload(msg.payload)
-            # block = block_msg.block
+            # Deserialize block from payload
+            block = Block.deserialize(msg.payload)
+            block_hash = block.hash
             
-            # For now, we'll log that we received a block
-            logger.debug(f"Received block message from {peer.host}:{peer.port} ({len(msg.payload)} bytes)")
-            
-            # TODO: Deserialize block using Rust BlockWrapper or implement full deserialization
-            # block_hash = block.hash()
-            
-            # Remove from requested
-            # if block_hash in self.requested_blocks:
-            #     del self.requested_blocks[block_hash]
+            # Remove from requested blocks
+            if block_hash in self.requested_blocks:
+                del self.requested_blocks[block_hash]
             
             # Validate block
-            # valid, error = self.validator.validate_block(block)
+            valid, error = self.validator.validate_block(block)
             
-            # if valid:
-            #     # Apply to database
-            #     self.validator.apply_block(block)
-            #     logger.info(f"✓ New block {block.height}: {block_hash.hex()[:16]}...")
-            
-            #     # Broadcast to other peers
-            #     inv = InvMessage(inventory=[(INV_TYPE_BLOCK, block_hash)])
-            #     if hasattr(self.peer_manager, 'broadcast'):
-            #         await self.peer_manager.broadcast(inv.to_network_message(...))
-            # else:
-            #     logger.warning(f"✗ Invalid block: {error}")
-            #     peer.adjust_score(-10)  # Penalize for invalid block
-            #     if hasattr(self.peer_manager, 'ban_peer'):
-            #         addr = f"{peer.host}:{peer.port}"
-            #         self.peer_manager.ban_peer(addr, duration=3600)
+            if valid:
+                # Apply to database
+                self.validator.apply_block(block)
+                block_height = block.height if hasattr(block, 'height') and block.height else 0
+                logger.info(f"✓ New block {block_height}: {block_hash.hex()[:16]}...")
+                
+                # Broadcast to other peers
+                inv = InvMessage(inventory=[(INV_TYPE_BLOCK, block_hash)])
+                if hasattr(self.peer_manager, 'broadcast'):
+                    await self.peer_manager.broadcast(inv.to_network_message())
+            else:
+                logger.warning(f"✗ Invalid block: {error}")
+                peer.adjust_score(-10)  # Penalize for invalid block
+                if hasattr(self.peer_manager, 'ban_peer'):
+                    addr = f"{peer.host}:{peer.port}"
+                    self.peer_manager.ban_peer(addr, duration=3600)
         
         except Exception as e:
-            logger.error(f"Error handling block from {peer.host}:{peer.port}: {e}")
+            logger.error(f"Error handling block from {peer.host}:{peer.port}: {e}", exc_info=True)
             peer.adjust_score(-5)
     
     async def handle_headers(self, msg: NetworkMessage, peer: Peer):
