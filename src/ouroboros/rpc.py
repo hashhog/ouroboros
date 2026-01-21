@@ -325,7 +325,7 @@ class RPCServer:
                 "chainwork": self.node.get_chainwork_at_height(block_height) if block_height is not None else "0x0",
                 "nTx": len(block.transactions) if hasattr(block, 'transactions') else 0,
                 "previousblockhash": block.prev_blockhash.hex() if isinstance(block.prev_blockhash, bytes) else str(block.prev_blockhash),
-                "nextblockhash": None,  # TODO: implement
+                "nextblockhash": self._get_next_block_hash(block_height) if block_height is not None else None,
                 "tx": [
                     tx.get_txid().hex() if hasattr(tx, 'get_txid') else str(tx.txid)
                     for tx in block.transactions
@@ -511,6 +511,43 @@ class RPCServer:
             pass
         
         return 0
+    
+    def _get_next_block_hash(self, height: int) -> Optional[str]:
+        """
+        Get next block hash for a given block height.
+        
+        Args:
+            height: Block height
+            
+        Returns:
+            Next block hash as hex string, or None if no next block
+        """
+        if not hasattr(self.node, 'db') or not self.node.db:
+            return None
+        
+        try:
+            # Get next block at height + 1
+            next_block = self.node.db.get_block_by_height(height + 1)
+            if next_block:
+                # Try to get hash from block object
+                if hasattr(next_block, 'hash') and next_block.hash:
+                    next_hash = next_block.hash
+                    if isinstance(next_hash, bytes):
+                        return next_hash.hex()
+                    return str(next_hash)
+                
+                # Fallback: get hash by height
+                next_hash = self.node.db.get_block_hash_by_height(height + 1)
+                if next_hash:
+                    if isinstance(next_hash, bytes):
+                        return next_hash.hex()
+                    return str(next_hash)
+            
+            return None
+        
+        except Exception as e:
+            logger.debug(f"Error getting next block hash for height {height}: {e}")
+            return None
     
     def get_app(self) -> FastAPI:
         """Get the FastAPI application"""
