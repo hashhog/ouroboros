@@ -308,15 +308,72 @@ class BitcoinNode:
         """
         return self.synced
     
+    def _bits_to_difficulty(self, bits: int) -> float:
+        """
+        Convert compact target (bits) to difficulty.
+        
+        Formula: difficulty = difficulty_1_target / target
+        Where target is decoded from compact representation (bits).
+        Difficulty 1 corresponds to target 0x1d00ffff.
+        
+        Args:
+            bits: Compact target (32-bit integer)
+            
+        Returns:
+            Difficulty value
+        """
+        # Extract mantissa and exponent from bits
+        mantissa = bits & 0x007fffff
+        exponent = (bits >> 24) & 0xff
+        
+        if mantissa == 0:
+            return float('inf')
+        
+        # Calculate target: mantissa * 2^(8*(exponent-3))
+        if exponent <= 3:
+            target = mantissa >> (8 * (3 - exponent))
+        else:
+            target = mantissa << (8 * (exponent - 3))
+        
+        # Handle zero target (infinite difficulty)
+        if target == 0:
+            return float('inf')
+        
+        # Difficulty 1 corresponds to target 0x1d00ffff
+        # For 0x1d00ffff: exponent=0x1d (29), mantissa=0x00ffff
+        # target = 0x00ffff * 256^(29-3) = 0x00ffff * 256^26
+        difficulty_1_target = 0x00ffff * (256 ** 26)
+        
+        # Calculate difficulty = difficulty_1_target / target
+        difficulty = difficulty_1_target / target
+        
+        return difficulty
+    
     def get_current_difficulty(self) -> float:
         """
-        Get current difficulty.
+        Get current difficulty from best block.
         
         Returns:
-            Current difficulty (placeholder)
+            Current difficulty
         """
-        # TODO: Implement difficulty calculation from current block bits
-        return 1.0
+        if not self.db:
+            return 1.0
+        
+        try:
+            # Get best block from database
+            best_hash, best_height = self.db.get_best_block()
+            block = self.db.get_block(best_hash)
+            
+            if not block:
+                return 1.0
+            
+            # Extract bits field from block header
+            bits = block.bits
+            return self._bits_to_difficulty(bits)
+        
+        except Exception as e:
+            logger.error(f"Error calculating current difficulty: {e}", exc_info=True)
+            return 1.0
     
     def get_median_time(self) -> int:
         """
@@ -374,10 +431,9 @@ class BitcoinNode:
             bits: Compact difficulty target
             
         Returns:
-            Difficulty value (placeholder)
+            Difficulty value
         """
-        # TODO: Implement difficulty calculation from bits
-        return 1.0
+        return self._bits_to_difficulty(bits)
     
     def get_chainwork_at_height(self, height: int) -> str:
         """
