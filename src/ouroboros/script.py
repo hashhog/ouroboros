@@ -43,8 +43,8 @@ class ScriptInterpreter:
         combined_script = script_sig + script_pubkey
         
         try:
-            # Execute the script
-            stack = self._execute_script(combined_script, tx, input_index)
+            # Execute the script (pass script_pubkey for signature hash calculation)
+            stack = self._execute_script(combined_script, tx, input_index, script_pubkey)
             
             # Script is valid if stack is non-empty and top element is truthy
             if not stack:
@@ -66,7 +66,8 @@ class ScriptInterpreter:
         self,
         script: bytes,
         tx: Transaction,
-        input_index: int
+        input_index: int,
+        script_pubkey: bytes
     ) -> List[bytes]:
         """
         Execute a Bitcoin script.
@@ -75,6 +76,7 @@ class ScriptInterpreter:
             script: Script bytes to execute
             tx: Transaction context
             input_index: Index of input being verified
+            script_pubkey: Script pubkey for signature hash calculation
             
         Returns:
             Stack after execution
@@ -171,23 +173,41 @@ class ScriptInterpreter:
                     raise ValueError("OP_EQUALVERIFY failed")
                 continue
             
-            # OP_CHECKSIG (0xac) - Simplified version
-            # In a full implementation, this would verify ECDSA signatures
+            # OP_CHECKSIG (0xac) - ECDSA signature verification
             if opcode == 0xac:
                 if len(stack) < 2:
                     raise ValueError("Stack underflow")
                 pubkey = stack.pop()
                 sig = stack.pop()
-                # For now, we'll do a basic check
-                # A full implementation would verify the ECDSA signature
-                # against the transaction hash and public key
-                # This is a placeholder - in production, use proper ECDSA verification
+                
+                # Signature format: DER signature + SIGHASH type (1 byte)
                 if len(sig) < 1 or len(pubkey) < 1:
                     stack.append(b'\x00')
-                else:
-                    # Placeholder: assume valid if signature format looks correct
-                    # Real implementation needs ECDSA verification
-                    stack.append(b'\x01')
+                    continue
+                
+                # Extract SIGHASH type (last byte)
+                sighash_type = sig[-1]
+                der_sig = sig[:-1]
+                
+                # Verify signature
+                try:
+                    # Calculate signature hash for this transaction/input
+                    # Note: Full implementation requires proper SignatureHash calculation
+                    # which depends on sighash_type (SIGHASH_ALL, SIGHASH_SINGLE, SIGHASH_NONE, etc.)
+                    # script_pubkey is passed from verify() method for signature hash calculation
+                    message_hash = self._calculate_signature_hash(tx, input_index, script_pubkey, sighash_type)
+                    
+                    # Verify ECDSA signature
+                    result = self._verify_ecdsa_signature(message_hash, der_sig, pubkey)
+                    
+                    if result:
+                        stack.append(b'\x01')
+                    else:
+                        stack.append(b'\x00')
+                
+                except Exception as e:
+                    # Any error during verification means invalid signature
+                    stack.append(b'\x00')
                 continue
             
             # OP_CHECKMULTISIG (0xae) - Simplified version
@@ -225,3 +245,131 @@ class ScriptInterpreter:
     def _hash256(self, data: bytes) -> bytes:
         """Compute double SHA256"""
         return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+    
+    def _calculate_signature_hash(
+        self,
+        transaction: Transaction,
+        input_index: int,
+        script_code: bytes,
+        sighash_type: int
+    ) -> bytes:
+        """
+        Calculate hash for ECDSA signature verification.
+        
+        This implements a simplified version of Bitcoin's SignatureHash.
+        Full implementation should follow BIP 143 (SegWit) or legacy format
+        depending on transaction type.
+        
+        Args:
+            transaction: The transaction being signed
+            input_index: Index of the input being verified
+            script_code: Script code (scriptPubKey for legacy, witness script for SegWit)
+            sighash_type: SIGHASH type (last byte of signature)
+            
+        Returns:
+            32-byte hash for signature verification
+        """
+        # Simplified signature hash calculation
+        # TODO: Implement full SignatureHash following Bitcoin Core specification
+        # Reference: https://en.bitcoin.it/wiki/OP_CHECKSIG
+        
+        # For now, create a basic hash from transaction data
+        # This is a placeholder - full implementation needs proper serialization
+        # of the transaction with appropriate inputs/outputs based on sighash_type
+        
+        # Basic approach: hash transaction version + inputs + outputs + locktime
+        # + the specific input's script_code + sighash_type
+        # This is NOT correct Bitcoin SignatureHash but provides a structure
+        
+        data = transaction.version.to_bytes(4, 'little')
+        
+        # Hash inputs (simplified - full version needs to handle sighash_type)
+        data += len(transaction.inputs).to_bytes(1, 'little')
+        for i, tx_in in enumerate(transaction.inputs):
+            if i == input_index:
+                # For the input being verified, use script_code
+                data += script_code
+            else:
+                # For other inputs, use empty script (simplified)
+                data += b''
+            data += tx_in.sequence.to_bytes(4, 'little')
+        
+        # Hash outputs
+        data += len(transaction.outputs).to_bytes(1, 'little')
+        for tx_out in transaction.outputs:
+            data += tx_out.value.to_bytes(8, 'little')
+            data += len(tx_out.script_pubkey).to_bytes(1, 'little')
+            data += tx_out.script_pubkey
+        
+        # Locktime and sighash type
+        data += transaction.locktime.to_bytes(4, 'little')
+        data += bytes([sighash_type])
+        
+        # Double SHA256 (Bitcoin's hash)
+        return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+    
+    def _verify_ecdsa_signature(self, message_hash: bytes, der_sig: bytes, pubkey: bytes) -> bool:
+        """
+        Verify ECDSA signature using secp256k1 curve.
+        
+        Args:
+            message_hash: 32-byte message hash
+            der_sig: DER-encoded signature (without SIGHASH byte)
+            pubkey: Public key (compressed 33 bytes or uncompressed 65 bytes)
+            
+        Returns:
+            True if signature is valid, False otherwise
+        """
+        try:
+            # Try to use secp256k1 library if available
+            try:
+                import secp256k1
+                
+                # Create public key object
+                pubkey_obj = secp256k1.PublicKey(pubkey, raw=True)
+                
+                # Parse DER signature
+                # Bitcoin uses low-S signatures, and DER encoding
+                # Note: This is simplified - full implementation needs proper DER parsing
+                if len(der_sig) < 8:
+                    return False
+                
+                # For now, try to verify using secp256k1
+                # This is a simplified version - proper implementation needs
+                # to parse DER signature correctly
+                try:
+                    result = pubkey_obj.ecdsa_verify(message_hash, der_sig, raw=True)
+                    return result
+                except Exception:
+                    # If direct verification fails, try parsing DER signature
+                    # For now, return False as a safe default
+                    return False
+            
+            except ImportError:
+                # Fallback: Use ecdsa library if available
+                try:
+                    import ecdsa
+                    from ecdsa import SigningKey, VerifyingKey, SECP256k1
+                    from ecdsa.util import sigencode_der, sigdecode_der
+                    
+                    # This requires proper DER signature parsing
+                    # For now, this is a placeholder
+                    return False
+                
+                except ImportError:
+                    # No ECDSA library available - use basic validation
+                    # This is NOT secure - just validates format
+                    if len(message_hash) != 32:
+                        return False
+                    if len(pubkey) != 33 and len(pubkey) != 65:
+                        return False
+                    if len(der_sig) < 8:  # Minimum DER signature size
+                        return False
+                    
+                    # Placeholder: return False to be safe
+                    # In production, proper ECDSA verification is required
+                    return False
+        
+        except Exception:
+            # Any error means invalid signature
+            return False

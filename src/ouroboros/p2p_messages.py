@@ -417,12 +417,9 @@ class BlockMessage:
     @classmethod
     def from_payload(cls, payload: bytes) -> 'BlockMessage':
         """Parse from payload"""
-        # Note: Block deserialization is complex and requires full Bitcoin protocol decoding
-        # For now, this is a placeholder that would need the Rust layer
-        raise NotImplementedError(
-            "Block deserialization requires full Bitcoin protocol decoding. "
-            "Use Rust BlockWrapper for proper deserialization."
-        )
+        from ouroboros.database import Block
+        block = Block.deserialize(payload)
+        return cls(block=block)
 
 
 @dataclass
