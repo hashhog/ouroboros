@@ -4,7 +4,7 @@ __version__ = "0.1.0"
 
 # Core modules
 from ouroboros.database import BlockchainDatabase
-from ouroboros.mempool import Mempool
+from ouroboros.mempool import Mempool, MempoolEntry
 from ouroboros.node import BitcoinNode
 from ouroboros.p2p import P2PManager
 from ouroboros.peer import Peer, PeerState
@@ -45,6 +45,7 @@ __all__ = [
     "BitcoinNode",
     "P2PManager",
     "Mempool",
+    "MempoolEntry",
     "BlockValidator",
     "TransactionValidator",
     "ValidationError",
