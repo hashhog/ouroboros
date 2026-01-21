@@ -244,6 +244,66 @@ class BlockchainDatabase:
         hash_bytes, height = self._db.get_best_block()
         return (bytes(hash_bytes), height)
     
+    def get_block_hash_by_height(self, height: int) -> Optional[bytes]:
+        """
+        Get block hash by height.
+        
+        Args:
+            height: Block height
+            
+        Returns:
+            Block hash (32 bytes) or None if not found
+        """
+        try:
+            block_hash = self._db.get_block_hash_by_height(height)
+            if block_hash is None:
+                return None
+            return bytes(block_hash)
+        except Exception:
+            # Fallback: get block by height and extract hash
+            block = self.get_block_by_height(height)
+            if block:
+                return block.hash if hasattr(block, 'hash') else None
+            return None
+    
+    def store_block_chainwork(self, block_hash: bytes, chainwork: int) -> None:
+        """
+        Store chainwork for a block.
+        
+        Args:
+            block_hash: 32-byte block hash
+            chainwork: Chainwork value (integer)
+            
+        Note:
+            This uses a simple in-memory cache. For persistence,
+            consider adding to the Rust database backend.
+        """
+        if not hasattr(self, '_chainwork_cache'):
+            self._chainwork_cache: Dict[bytes, int] = {}
+        
+        if len(block_hash) != 32:
+            raise ValueError("Block hash must be 32 bytes")
+        
+        self._chainwork_cache[block_hash] = chainwork
+    
+    def get_block_chainwork(self, block_hash: bytes) -> int:
+        """
+        Get chainwork for a block.
+        
+        Args:
+            block_hash: 32-byte block hash
+            
+        Returns:
+            Chainwork value or 0 if not found
+        """
+        if not hasattr(self, '_chainwork_cache'):
+            self._chainwork_cache: Dict[bytes, int] = {}
+        
+        if len(block_hash) != 32:
+            raise ValueError("Block hash must be 32 bytes")
+        
+        return self._chainwork_cache.get(block_hash, 0)
+    
     def __enter__(self):
         """Context manager entry"""
         return self
