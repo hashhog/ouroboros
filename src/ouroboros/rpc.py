@@ -245,7 +245,7 @@ class RPCServer:
             "headers": best_height,
             "bestblockhash": best_hash.hex() if isinstance(best_hash, bytes) else best_hash,
             "difficulty": self.node.get_current_difficulty(),
-            "mediantime": int(time.time()),  # TODO: Calculate median time
+            "mediantime": self.node.get_median_time(),
             "verificationprogress": 1.0 if self._is_synced() else 0.0,
             "chainwork": self.node.get_chainwork(),
             "pruned": False,
@@ -318,7 +318,7 @@ class RPCServer:
                 "version": block.version,
                 "merkleroot": block.merkle_root.hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
                 "time": block.timestamp,
-                "mediantime": block.timestamp,
+                "mediantime": self.node.get_median_time(block_height) if block_height is not None else block.timestamp,
                 "nonce": block.nonce,
                 "bits": hex(block.bits),
                 "difficulty": self.node.get_difficulty(block.bits),
