@@ -375,23 +375,48 @@ class BitcoinNode:
             logger.error(f"Error calculating current difficulty: {e}", exc_info=True)
             return 1.0
     
-    def get_median_time(self) -> int:
+    def get_median_time(self, height: Optional[int] = None) -> int:
         """
         Get median time of last 11 blocks.
         
+        Implementation:
+        1. If height is None, get best block height
+        2. Get timestamps of blocks from max(0, height-10) to height (11 blocks)
+        3. Sort timestamps
+        4. Return median (6th element, index 5)
+        
+        Args:
+            height: Block height (None for current best)
+            
         Returns:
-            Median timestamp (placeholder)
+            Median timestamp (Unix epoch)
         """
-        # TODO: Implement median time calculation
         if not self.db:
             return 0
         
         try:
-            _, best_height = self.db.get_best_block()
-            # For now, return current time
-            import time
-            return int(time.time())
-        except:
+            if height is None:
+                _, height = self.db.get_best_block()
+            
+            # Get timestamps of last 11 blocks (or fewer if not enough blocks)
+            timestamps = []
+            start_height = max(0, height - 10)
+            
+            for h in range(start_height, height + 1):
+                block = self.db.get_block_by_height(h)
+                if block and hasattr(block, 'timestamp'):
+                    timestamps.append(block.timestamp)
+            
+            if not timestamps:
+                return 0
+            
+            # Sort and return median
+            timestamps.sort()
+            median_index = len(timestamps) // 2
+            return timestamps[median_index]
+        
+        except Exception as e:
+            logger.error(f"Error calculating median time at height {height}: {e}", exc_info=True)
             return 0
     
     def _calculate_block_work(self, bits: int) -> int:
