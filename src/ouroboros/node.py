@@ -269,22 +269,18 @@ class BitcoinNode:
             try:
                 from ouroboros.p2p_messages import TxMessage
                 
-                # Note: Full transaction deserialization requires Rust layer
-                # For now, this is a placeholder
-                logger.debug(f"Received transaction message ({len(msg.payload)} bytes)")
+                # Deserialize transaction
+                tx_msg = TxMessage.from_payload(msg.payload)
+                tx = tx_msg.transaction
                 
-                # TODO: Deserialize transaction
-                # tx_msg = TxMessage.from_payload(msg.payload)
-                # tx = tx_msg.transaction
-                # 
-                # # Add to mempool
-                # _, height = self.db.get_best_block()
-                # success, error = self.mempool.add_transaction(tx, height)
-                # 
-                # if success:
-                #     logger.info(f"Added transaction {tx.get_txid().hex()[:16]}... to mempool")
-                # else:
-                #     logger.debug(f"Rejected transaction: {error}")
+                # Add to mempool
+                _, height = self.db.get_best_block()
+                success, error = self.mempool.add_transaction(tx, height)
+                
+                if success:
+                    logger.info(f"Added transaction {tx.get_txid().hex()[:16]}... to mempool")
+                else:
+                    logger.debug(f"Rejected transaction: {error}")
             
             except Exception as e:
                 logger.error(f"Error handling transaction: {e}", exc_info=True)
