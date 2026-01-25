@@ -391,27 +391,55 @@ class BitcoinNode:
         """
         Get median time of last 11 blocks.
         
+        The median time is the median timestamp of the last 11 blocks (or fewer
+        if not enough blocks exist). This is used in Bitcoin to prevent timestamp
+        manipulation attacks.
+        
         Implementation:
         1. If height is None, get best block height
-        2. Get timestamps of blocks from max(0, height-10) to height (11 blocks)
-        3. Sort timestamps
-        4. Return median (6th element, index 5)
+        2. Get blocks from max(0, height-10) to height (11 blocks total)
+        3. Extract timestamps from each block
+        4. Sort timestamps
+        5. Return median (middle value, index 5 for 11 blocks)
         
         Args:
-            height: Block height (None for current best)
+            height: Block height (None for current best block)
             
         Returns:
-            Median timestamp (Unix epoch)
+            Median timestamp (Unix epoch seconds)
         """
+        import time
+        
         if not self.db:
-            return 0
+            return int(time.time())
         
         try:
+            # Get height if not provided
             if height is None:
                 _, height = self.db.get_best_block()
             
             # Get timestamps of last 11 blocks (or fewer if not enough blocks)
             timestamps = []
+            for h in range(max(0, height - 10), height + 1):
+                try:
+                    block_hash = self.db.get_block_hash_by_height(h)
+                    if not block_hash:
+                        continue
+                    block = self.db.get_block(block_hash)
+                    if block:
+                        timestamps.append(block.timestamp)
+                except Exception as e:
+                    logger.debug(f"Error getting block at height {h} for median time: {e}")
+                    continue
+            
+            if not timestamps:
+                # No blocks found, return current time as fallback
+                return int(time.time())
+            
+            # Sort and get median
+            timestamps.sort()
+            median_index = len(timestamps) // 2
+            return timestamps[median_index]
             start_height = max(0, height - 10)
             
             for h in range(start_height, height + 1):
