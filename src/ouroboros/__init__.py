@@ -33,6 +33,7 @@ from ouroboros.p2p_messages import (
 )
 from ouroboros.wallet import Wallet
 from ouroboros.sync_manager import SyncManager, SyncProgress
+from ouroboros.config import NodeConfig
 
 # Rust extension module
 from sync import PyUTXO, SyncEngine  # noqa: F401
@@ -79,4 +80,5 @@ __all__ = [
     "SyncProgress",
     "SyncEngine",
     "PyUTXO",
+    "NodeConfig",
 ]
