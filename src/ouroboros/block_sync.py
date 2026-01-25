@@ -432,6 +432,87 @@ class BlockSync:
                 except Exception as e:
                     logger.error(f"Failed to re-request block: {e}")
     
+    async def _find_transaction_in_blocks(self, txid: bytes, max_height: int, min_height: int = 0) -> Optional['Transaction']:
+        """
+        Find a transaction by txid by searching through blocks.
+        
+        Args:
+            txid: Transaction ID to find
+            max_height: Maximum height to search (inclusive)
+            min_height: Minimum height to search (inclusive)
+            
+        Returns:
+            Transaction if found, None otherwise
+        """
+        # Search backwards from max_height to min_height
+        for height in range(max_height, min_height - 1, -1):
+            try:
+                block = self.db.get_block_by_height(height)
+                if not block:
+                    continue
+                
+                # Search transactions in this block
+                for tx in block.transactions:
+                    if tx.get_txid() == txid:
+                        return tx
+            except Exception as e:
+                logger.debug(f"Error searching block at height {height}: {e}")
+                continue
+        
+        return None
+    
+    async def _restore_utxos_from_block(self, block: Block, max_search_height: int) -> List[Tuple[bytes, int, int, bytes]]:
+        """
+        Restore UTXOs that were spent in this block.
+        
+        For each non-coinbase transaction input, we need to:
+        1. Find the transaction that created the UTXO (prev_txid)
+        2. Get the output data from that transaction
+        3. Return UTXO data: (txid, vout, value, script_pubkey)
+        
+        Args:
+            block: Block being disconnected
+            max_search_height: Maximum block height to search for transactions
+            
+        Returns:
+            List of (txid, vout, value, script_pubkey) tuples for UTXOs to restore
+        """
+        utxos_to_restore = []
+        
+        for tx in block.transactions:
+            if tx.is_coinbase:
+                continue
+            
+            for tx_in in tx.inputs:
+                # Find the transaction that created this UTXO
+                prev_tx = await self._find_transaction_in_blocks(tx_in.prev_txid, max_search_height)
+                if not prev_tx:
+                    logger.warning(
+                        f"Previous transaction {tx_in.prev_txid.hex()[:16]}... not found "
+                        f"when disconnecting block, cannot restore UTXO"
+                    )
+                    continue
+                
+                # Get the output that was spent
+                if tx_in.prev_vout >= len(prev_tx.outputs):
+                    logger.warning(
+                        f"Invalid vout {tx_in.prev_vout} for transaction "
+                        f"{tx_in.prev_txid.hex()[:16]}..."
+                    )
+                    continue
+                
+                output = prev_tx.outputs[tx_in.prev_vout]
+                
+                # Add to restore list
+                utxos_to_restore.append((
+                    tx_in.prev_txid,  # txid
+                    tx_in.prev_vout,  # vout
+                    output.value,     # value
+                    output.script_pubkey  # script_pubkey
+                ))
+        
+        return utxos_to_restore
+    
     async def _handle_reorg(self, new_block: Block, new_chain_tip: bytes):
         """
         Handle chain reorganization.
@@ -465,20 +546,26 @@ class BlockSync:
             new_chain = []
             
             # Build current chain back to reasonable depth (e.g., 100 blocks)
+            # Also track heights for transaction search
             temp_hash = current_hash
+            temp_height = current_height
             for i in range(100):
                 if temp_hash is None:
                     break
                 block = self.db.get_block(temp_hash)
                 if not block:
                     break
-                current_chain.append((temp_hash, block))
+                # Store with height for easier lookup
+                current_chain.append((temp_hash, block, temp_height))
                 temp_hash = block.prev_blockhash
+                temp_height -= 1
                 if temp_hash == bytes(32):  # Genesis block
                     break
             
             # Build new chain back
+            # Estimate height for new chain (will be refined when we find common ancestor)
             temp_hash = new_chain_tip
+            temp_height = current_height  # Start with current height as estimate
             for i in range(100):
                 if temp_hash is None:
                     break
@@ -488,28 +575,30 @@ class BlockSync:
                     # Need to request from network - for now, log and return
                     logger.warning(f"Block {temp_hash.hex()[:16]}... not in database, cannot complete reorg")
                     return False
-                new_chain.append((temp_hash, block))
+                # Store with height estimate
+                new_chain.append((temp_hash, block, temp_height))
                 # Check if we found common ancestor
-                if temp_hash in [h for h, _ in current_chain]:
-                    # Found common ancestor
+                if temp_hash in [h for h, _, _ in current_chain]:
+                    # Found common ancestor - update height estimate
+                    for curr_h, _, curr_ht in current_chain:
+                        if curr_h == temp_hash:
+                            temp_height = curr_ht
+                            break
                     break
                 temp_hash = block.prev_blockhash
+                temp_height -= 1
                 if temp_hash == bytes(32):  # Genesis block
                     break
             
             # Find common ancestor
             common_ancestor = None
             common_ancestor_height = 0
-            for curr_hash, curr_block in current_chain:
-                for new_hash, new_block in new_chain:
+            for curr_hash, curr_block, curr_height in current_chain:
+                for new_hash, new_block, new_height in new_chain:
                     if curr_hash == new_hash:
                         common_ancestor = curr_hash
-                        # Get height of common ancestor
-                        if hasattr(curr_block, 'height') and curr_block.height is not None:
-                            common_ancestor_height = curr_block.height
-                        else:
-                            # Estimate from chain position
-                            common_ancestor_height = current_height - len([h for h, _ in current_chain if h != curr_hash])
+                        # Use the height from current_chain
+                        common_ancestor_height = curr_height
                         break
                 if common_ancestor:
                     break
@@ -522,54 +611,61 @@ class BlockSync:
             
             logger.info(
                 f"Reorg: common ancestor at height {common_ancestor_height}, "
-                f"disconnecting {len([h for h, _ in current_chain if h != common_ancestor])} blocks, "
-                f"connecting {len([h for h, _ in new_chain if h != common_ancestor])} blocks"
+                f"disconnecting {len([h for h, _, _ in current_chain if h != common_ancestor])} blocks, "
+                f"connecting {len([h for h, _, _ in new_chain if h != common_ancestor])} blocks"
             )
             
             # Disconnect blocks from current chain (in reverse order)
             blocks_to_disconnect = [
-                (h, b) for h, b in current_chain
+                (h, b, ht) for h, b, ht in current_chain
                 if h != common_ancestor
             ]
             
-            for curr_hash, curr_block in reversed(blocks_to_disconnect):
+            # Get current height for transaction search
+            current_height = common_ancestor_height + len(blocks_to_disconnect)
+            
+            for curr_hash, curr_block, curr_height in reversed(blocks_to_disconnect):
                 logger.debug(f"Disconnecting block {curr_hash.hex()[:16]}...")
                 
-                # Restore UTXOs (reverse the effects of this block)
-                spent_to_restore = []
-                created_to_remove = []
-                
-                for tx in curr_block.transactions:
-                    if not tx.is_coinbase:
-                        # Restore spent UTXOs
-                        for tx_in in tx.inputs:
-                            # We need to get the UTXO that was spent
-                            # For now, we'll need to reconstruct it from the transaction
-                            # that created it - this requires looking up the previous transaction
-                            # Note: This is simplified - full implementation needs proper UTXO restoration
-                            spent_to_restore.append((tx_in.prev_txid, tx_in.prev_vout))
-                    
-                    # Remove created UTXOs
-                    for i, tx_out in enumerate(tx.outputs):
-                        created_to_remove.append((tx.get_txid(), i))
-                
-                # Update UTXO set (restore spent, remove created)
-                # Note: update_utxo_set is not fully implemented in Python wrapper
-                # This would need to be done via Rust API or implemented properly
+                # Restore UTXOs that were spent in this block
                 try:
-                    # Reverse the update: restore spent UTXOs, remove created ones
-                    # This is a placeholder - full implementation needs proper UTXO management
-                    logger.debug(f"Would restore {len(spent_to_restore)} UTXOs, remove {len(created_to_remove)} UTXOs")
+                    utxos_to_restore = await self._restore_utxos_from_block(curr_block, current_height)
+                    
+                    if utxos_to_restore:
+                        logger.info(f"Restoring {len(utxos_to_restore)} UTXOs from disconnected block")
+                        for txid, vout, value, script_pubkey in utxos_to_restore:
+                            try:
+                                self.db.restore_utxo(txid, vout, value, script_pubkey)
+                            except Exception as e:
+                                logger.error(
+                                    f"Error restoring UTXO {txid.hex()[:16]}...:{vout}: {e}"
+                                )
+                    else:
+                        logger.debug("No UTXOs to restore from this block")
                 except Exception as e:
-                    logger.error(f"Error updating UTXO set during disconnect: {e}")
+                    logger.error(f"Error collecting UTXOs to restore: {e}")
+                
+                # Remove UTXOs that were created in this block
+                for tx in curr_block.transactions:
+                    txid = tx.get_txid()
+                    for i, tx_out in enumerate(tx.outputs):
+                        try:
+                            self.db.remove_utxo(txid, i)
+                        except Exception as e:
+                            logger.error(
+                                f"Error removing UTXO {txid.hex()[:16]}...:{i}: {e}"
+                            )
+                
+                # Update current_height for next iteration
+                current_height -= 1
             
             # Connect blocks from new chain (in forward order)
             blocks_to_connect = [
-                (h, b) for h, b in new_chain
+                (h, b, ht) for h, b, ht in new_chain
                 if h != common_ancestor
             ]
             
-            for new_hash, new_block in blocks_to_connect:
+            for new_hash, new_block, new_height in blocks_to_connect:
                 logger.debug(f"Connecting block {new_hash.hex()[:16]}...")
                 
                 # Validate block
@@ -586,10 +682,14 @@ class BlockSync:
                     return False
             
             # Update best block
-            new_height = common_ancestor_height + len(blocks_to_connect)
+            if blocks_to_connect:
+                final_height = blocks_to_connect[-1][2]  # Height of last block
+            else:
+                final_height = common_ancestor_height
+            
             # Note: set_best_block may not be implemented - this is a placeholder
             # In full implementation, would update best block hash and height
-            logger.info(f"Reorg handled: new tip at height {new_height}")
+            logger.info(f"Reorg handled: new tip at height {final_height}")
             
             self.reorg_depth += 1
             return True
