@@ -18,6 +18,7 @@ from ouroboros.p2p import PeerManager
 from ouroboros.block_sync import BlockSync
 from ouroboros.rpc import RPCServer
 from ouroboros.sync_manager import SyncManager
+from ouroboros.config import NodeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +31,23 @@ class BitcoinNode:
         Initialize Bitcoin node.
         
         Args:
-            data_dir: Data directory path
-            network: Network name (mainnet, testnet, regtest)
-            config: Additional configuration dictionary
+            data_dir: Data directory path (can be overridden by config file)
+            network: Network name (mainnet, testnet, regtest) (can be overridden by config file)
+            config: Additional configuration dictionary (overrides config file)
         """
-        self.data_dir = str(Path(data_dir).expanduser())
-        self.network = network
-        self.config = config or {}
+        # Load configuration file
+        config_file = config.get('config_file') if config else None
+        self.node_config = NodeConfig(config_file)
+        
+        # Merge config file with provided config (provided config takes precedence)
+        config_dict = self.node_config.to_dict()
+        if config:
+            config_dict.update(config)
+        self.config = config_dict
+        
+        # Set data_dir and network from config (with fallback to parameters)
+        self.data_dir = str(Path(self.config.get('datadir', data_dir)).expanduser())
+        self.network = self.config.get('network', network)
         
         # Core components
         self.db: Optional[BlockchainDatabase] = None
@@ -65,9 +76,13 @@ class BitcoinNode:
         Start the Bitcoin node.
         
         Args:
-            rpc_port: RPC server port
-            p2p_port: P2P network port (currently not used, but kept for API compatibility)
+            rpc_port: RPC server port (can be overridden by config)
+            p2p_port: P2P network port (can be overridden by config)
         """
+        # Use config values if available, otherwise use parameters
+        rpc_port = self.config.get('rpc_port', rpc_port)
+        p2p_port = self.config.get('p2p_port', p2p_port)
+        
         logger.info(f"Starting Bitcoin Hybrid Node ({self.network})")
         
         # Setup signal handlers for graceful shutdown
@@ -110,7 +125,8 @@ class BitcoinNode:
             # Initialize peer manager
             _, best_height = self.db.get_best_block()
             logger.info(f"Initializing peer manager (current height: {best_height})...")
-            self.peer_manager = PeerManager(self.network, max_peers=8)
+            max_peers = self.config.get('max_connections', 8)
+            self.peer_manager = PeerManager(self.network, max_peers=max_peers)
             await self.peer_manager.start(best_height)
             
             # Initialize block sync
