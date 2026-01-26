@@ -268,6 +268,48 @@ class Transaction:
             return b'\xfe' + value.to_bytes(4, 'little')
         else:
             return b'\xff' + value.to_bytes(8, 'little')
+    
+    def get_weight(self) -> int:
+        """
+        Calculate transaction weight for SegWit transactions.
+        
+        Weight = (non-witness bytes * 4) + witness bytes
+        
+        For non-SegWit transactions (current implementation):
+        - weight = size * 4
+        - This is because non-witness bytes = total size, witness bytes = 0
+        
+        For SegWit transactions (when witness data is stored):
+        - Would need to calculate non-witness bytes separately
+        - Would need to calculate witness bytes separately
+        
+        Returns:
+            Transaction weight
+        """
+        # Get non-witness size (current serialize() excludes witness)
+        non_witness_bytes = len(self.serialize())
+        
+        # For now, assume no witness data (non-SegWit transaction)
+        # TODO: When witness data is stored in Transaction, calculate witness bytes
+        witness_bytes = 0
+        
+        # Weight = (non-witness bytes * 4) + witness bytes
+        return (non_witness_bytes * 4) + witness_bytes
+    
+    def get_vsize(self) -> int:
+        """
+        Calculate virtual size (vsize) for SegWit transactions.
+        
+        vsize = (weight + 3) // 4  (round up)
+        
+        For non-SegWit transactions, vsize = size (since weight = size * 4)
+        
+        Returns:
+            Virtual size in bytes
+        """
+        weight = self.get_weight()
+        # vsize = ceil(weight / 4) = (weight + 3) // 4
+        return (weight + 3) // 4
 
 
 @dataclass
