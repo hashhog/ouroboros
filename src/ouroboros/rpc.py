@@ -18,6 +18,7 @@ from collections import defaultdict
 from pydantic import BaseModel
 
 from ouroboros.database import Transaction, TxIn, TxOut, Block
+from ouroboros.script import disassemble_script
 
 logger = logging.getLogger(__name__)
 
@@ -420,49 +421,259 @@ class RPCServer:
             "relayfee": 0.00001,
         }
     
+    async def rpc_getrawmempool(self, verbose: bool = False) -> Union[List[str], Dict[str, Dict[str, Any]]]:
+        """
+        Get all transaction IDs in mempool.
+        
+        Args:
+            verbose: If True, return detailed information for each transaction
+            
+        Returns:
+            If verbose=False: List of transaction IDs (hex strings)
+            If verbose=True: Dictionary mapping txid to transaction info
+        """
+        if not hasattr(self.node, 'mempool') or not self.node.mempool:
+            return [] if not verbose else {}
+        
+        txids = list(self.node.mempool.transactions.keys())
+        
+        if not verbose:
+            return [txid.hex() if isinstance(txid, bytes) else str(txid) for txid in txids]
+        
+        # Return detailed information
+        result = {}
+        for txid in txids:
+            entry = self.node.mempool.get_transaction_entry(txid)
+            if entry:
+                txid_hex = txid.hex() if isinstance(txid, bytes) else str(txid)
+                result[txid_hex] = {
+                    "size": entry.size,
+                    "fee": entry.fee,
+                    "time": entry.time,
+                    "height": entry.height,
+                    "startingpriority": 0.0,  # TODO: Calculate priority
+                    "currentpriority": 0.0,    # TODO: Calculate priority
+                    "depends": []  # TODO: Track dependencies
+                }
+        
+        return result
+    
+    async def rpc_getblockheader(self, blockhash: str, verbose: bool = True) -> Union[str, Dict[str, Any]]:
+        """
+        Get block header information.
+        
+        Args:
+            blockhash: Block hash (hex string)
+            verbose: If True, return JSON object; if False, return hex-encoded header
+            
+        Returns:
+            If verbose=True: Dictionary with header fields
+            If verbose=False: Hex-encoded block header (80 bytes)
+        """
+        try:
+            block_hash = bytes.fromhex(blockhash)
+            if not hasattr(self.node, 'db') or not self.node.db:
+                raise HTTPException(status_code=500, detail="Database not available")
+            
+            block = self.node.db.get_block(block_hash)
+            
+            if not block:
+                raise HTTPException(status_code=404, detail="Block not found")
+            
+            if not verbose:
+                # Return hex-encoded header (80 bytes)
+                # Serialize block header
+                header_data = bytearray()
+                header_data.extend(block.version.to_bytes(4, 'little', signed=True))
+                header_data.extend(block.prev_blockhash[::-1])  # Reverse for wire format
+                header_data.extend(block.merkle_root[::-1])
+                header_data.extend(block.timestamp.to_bytes(4, 'little'))
+                header_data.extend(block.bits.to_bytes(4, 'little'))
+                header_data.extend(block.nonce.to_bytes(4, 'little'))
+                return header_data.hex()
+            
+            # Return verbose JSON
+            block_height = block.height if hasattr(block, 'height') and block.height is not None else None
+            
+            # Get confirmations
+            confirmations = 0
+            if block_height is not None:
+                best_hash, best_height = self.node.db.get_best_block()
+                confirmations = max(0, best_height - block_height + 1) if best_height >= block_height else 0
+            
+            return {
+                "hash": blockhash,
+                "confirmations": confirmations,
+                "height": block_height if block_height is not None else 0,
+                "version": block.version,
+                "versionHex": f"{block.version:08x}",
+                "merkleroot": block.merkle_root.hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
+                "time": block.timestamp,
+                "mediantime": self.node.get_median_time(block_height) if block_height is not None else block.timestamp,
+                "nonce": block.nonce,
+                "bits": f"{block.bits:08x}",
+                "difficulty": self.node.get_difficulty(block.bits),
+                "chainwork": self.node.get_chainwork_at_height(block_height) if block_height is not None else "0x0",
+                "previousblockhash": block.prev_blockhash.hex() if block.prev_blockhash != bytes(32) else None,
+                "nextblockhash": self._get_next_block_hash(block_height) if block_height is not None else None
+            }
+        
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error getting block header: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    async def rpc_gettxout(self, txid: str, n: int, includemempool: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        Get UTXO information by outpoint.
+        
+        Args:
+            txid: Transaction ID (hex string)
+            n: Output index (vout)
+            includemempool: If True, also check mempool
+            
+        Returns:
+            Dictionary with UTXO information, or None if spent/not found
+        """
+        try:
+            txid_bytes = bytes.fromhex(txid)
+            
+            # First check mempool if enabled
+            if includemempool and hasattr(self.node, 'mempool') and self.node.mempool:
+                # Check if transaction is in mempool
+                if self.node.mempool.has_transaction(txid_bytes):
+                    tx = self.node.mempool.get_transaction(txid_bytes)
+                    if tx and n < len(tx.outputs):
+                        output = tx.outputs[n]
+                        script_pubkey_bytes = output.script_pubkey if isinstance(output.script_pubkey, bytes) else bytes(output.script_pubkey)
+                        return {
+                            "bestblock": None,  # TODO: Get best block hash
+                            "confirmations": 0,
+                            "value": output.value / 100000000.0,  # Convert to BTC
+                            "scriptPubKey": {
+                                "asm": disassemble_script(script_pubkey_bytes),
+                                "hex": output.script_pubkey.hex() if isinstance(output.script_pubkey, bytes) else str(output.script_pubkey),
+                                "type": self._get_script_type(output.script_pubkey)
+                            },
+                            "coinbase": False
+                        }
+            
+            # Check database (confirmed UTXOs)
+            if not hasattr(self.node, 'db') or not self.node.db:
+                return None
+            
+            utxo = self.node.db.get_utxo(txid_bytes, n)
+            if not utxo:
+                return None
+            
+            # Get block height for confirmations
+            # Try to find which block contains this transaction
+            block_height = 0  # Placeholder - would need transaction index
+            best_hash, best_height = self.node.db.get_best_block()
+            confirmations = max(0, best_height - block_height + 1) if block_height else 0
+            
+            script_pubkey = utxo['script_pubkey']
+            if isinstance(script_pubkey, bytes):
+                script_hex = script_pubkey.hex()
+                script_pubkey_bytes = script_pubkey
+            else:
+                script_hex = str(script_pubkey)
+                script_pubkey_bytes = bytes(script_pubkey)
+            
+            return {
+                "bestblock": best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash),
+                "confirmations": confirmations,
+                "value": utxo['value'] / 100000000.0,  # Convert to BTC
+                "scriptPubKey": {
+                    "asm": disassemble_script(script_pubkey_bytes),
+                    "hex": script_hex,
+                    "type": self._get_script_type(script_pubkey)
+                },
+                "coinbase": False  # TODO: Check if coinbase
+            }
+        
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid transaction ID: {e}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error getting txout: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+    
     # Helper methods
     
     def _tx_to_dict(self, tx: Transaction) -> Dict[str, Any]:
-        """Convert transaction to dictionary"""
+        """
+        Convert transaction to dictionary for RPC response.
+        
+        Includes proper SegWit weight and vsize calculations.
+        """
         txid = tx.get_txid() if hasattr(tx, 'get_txid') else tx.txid
         txid_hex = txid.hex() if isinstance(txid, bytes) else str(txid)
         
+        # Calculate weight and vsize using transaction methods
+        if hasattr(tx, 'get_weight') and hasattr(tx, 'get_vsize'):
+            weight = tx.get_weight()
+            vsize = tx.get_vsize()
+        else:
+            # Fallback: assume non-SegWit transaction
+            tx_size = len(tx.serialize())
+            weight = tx_size * 4
+            vsize = tx_size
+        
         return {
             "txid": txid_hex,
-            "hash": txid_hex,  # TODO: Add wtxid for segwit
+            "hash": txid_hex,  # TODO: Add wtxid for segwit (witness transaction ID)
             "version": tx.version,
             "size": len(tx.serialize()),
-            "vsize": len(tx.serialize()),  # TODO: Calculate vsize for segwit
-            "weight": len(tx.serialize()) * 4,  # TODO: Calculate weight
+            "vsize": vsize,  # Virtual size for SegWit
+            "weight": weight,  # Transaction weight
             "locktime": tx.locktime,
-            "vin": [self._vin_to_dict(vin) for vin in tx.inputs],
+            "vin": [self._vin_to_dict(vin, i, tx) for i, vin in enumerate(tx.inputs)],
             "vout": [self._vout_to_dict(vout, i) for i, vout in enumerate(tx.outputs)],
         }
     
-    def _vin_to_dict(self, vin: TxIn) -> Dict[str, Any]:
-        """Convert input to dictionary"""
+    def _vin_to_dict(self, vin: TxIn, index: int = 0, tx: Optional[Transaction] = None) -> Dict[str, Any]:
+        """
+        Convert input to dictionary.
+        
+        Args:
+            vin: Transaction input
+            index: Input index (for potential witness data)
+            tx: Transaction (for potential witness data)
+        """
         prev_txid = vin.prev_txid.hex() if isinstance(vin.prev_txid, bytes) else str(vin.prev_txid)
         script_sig = vin.script_sig.hex() if isinstance(vin.script_sig, bytes) else str(vin.script_sig)
         
-        return {
+        result = {
             "txid": prev_txid,
             "vout": vin.prev_vout,
             "scriptSig": {
-                "asm": "",  # TODO: disassemble script
+                "asm": disassemble_script(vin.script_sig),  # Disassemble script
                 "hex": script_sig,
             },
             "sequence": vin.sequence,
         }
+        
+        # TODO: Add witness data when it's stored in Transaction
+        # if tx and hasattr(tx, 'witness') and tx.witness and index < len(tx.witness):
+        #     result["txinwitness"] = [item.hex() for item in tx.witness[index]]
+        
+        return result
     
     def _vout_to_dict(self, vout: TxOut, n: int) -> Dict[str, Any]:
         """Convert output to dictionary"""
         script_pubkey = vout.script_pubkey.hex() if isinstance(vout.script_pubkey, bytes) else bytes(vout.script_pubkey).hex()
+        script_pubkey_bytes = vout.script_pubkey if isinstance(vout.script_pubkey, bytes) else bytes(vout.script_pubkey)
         
         return {
             "value": vout.value / 100_000_000,  # Convert satoshis to BTC
             "n": n,
             "scriptPubKey": {
-                "asm": "",  # TODO: disassemble script
+                "asm": disassemble_script(script_pubkey_bytes),
                 "hex": script_pubkey,
                 "type": self._get_script_type(vout.script_pubkey),
             },

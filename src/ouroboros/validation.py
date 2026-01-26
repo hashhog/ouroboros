@@ -100,8 +100,10 @@ class BlockValidator:
         
         # Atomic update
         self.db.update_utxo_set(spent, created)
-        # Note: store_block is not implemented in Python wrapper yet
-        # self.db.store_block(block)
+        # Note: Blocks are stored via the Rust API during sync (FastSync/BlockSync).
+        # The Python store_block() method is not implemented because it requires
+        # reconstructing the Rust BlockWrapper, which is complex. Blocks are
+        # automatically stored when syncing via the Rust layer.
     
     def _validate_header(self, block: Block, prev_block: Block) -> bool:
         """
