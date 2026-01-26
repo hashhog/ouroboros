@@ -2,7 +2,8 @@
 Bitcoin script interpreter for transaction validation.
 
 This module implements a basic Bitcoin script interpreter that can verify
-standard script types (P2PKH, P2SH, P2WPKH, P2WSH, etc.).
+standard script types (P2PKH, P2SH, P2WPKH, P2WSH, etc.), and also provides
+script disassembly functionality for human-readable script representation.
 """
 
 import hashlib
