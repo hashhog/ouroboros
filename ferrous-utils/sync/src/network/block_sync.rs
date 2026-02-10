@@ -138,13 +138,31 @@ pub struct BlockSync {
     progress_cache: Arc<StdMutex<BlockProgressCache>>,
 }
 
+/// Rolling window for speed calculation (seconds)
+const SPEED_WINDOW_SECS: f64 = 10.0;
+/// Max block timestamps to keep for rolling window
+const MAX_SPEED_WINDOW_SAMPLES: usize = 1000;
+
 /// Synchronization statistics
-#[derive(Debug, Default)]
 struct SyncStats {
     blocks_downloaded: u32,
     blocks_validated: u32,
     start_time: Option<Instant>,
     last_update: Option<Instant>,
+    /// Timestamps of recently stored blocks for rolling-window speed
+    block_timestamps: VecDeque<Instant>,
+}
+
+impl Default for SyncStats {
+    fn default() -> Self {
+        Self {
+            blocks_downloaded: 0,
+            blocks_validated: 0,
+            start_time: None,
+            last_update: None,
+            block_timestamps: VecDeque::new(),
+        }
+    }
 }
 
 /// Cached progress for sync UI - updated when blocks are received, read by get_sync_progress
@@ -459,10 +477,15 @@ impl BlockSync {
                                             hm.remove(&hash_bytes);
                                         }
                                         {
+                                            let now = Instant::now();
                                             let mut stats = self.stats.lock().await;
                                             stats.blocks_downloaded += 1;
                                             stats.blocks_validated += 1;
-                                            stats.last_update = Some(Instant::now());
+                                            stats.last_update = Some(now);
+                                            stats.block_timestamps.push_back(now);
+                                            if stats.block_timestamps.len() > MAX_SPEED_WINDOW_SAMPLES {
+                                                stats.block_timestamps.pop_front();
+                                            }
                                             let total = stats.blocks_downloaded;
                                             let should_log = !is_verbose() && total % BATCH_LOG_INTERVAL == 0;
                                             drop(stats);
@@ -929,6 +952,10 @@ impl BlockSync {
     }
 
     /// Update progress statistics, cache for UI, and call callback
+    ///
+    /// Flow: compute_progress() calculates blocks_per_second (rolling 10s window when available),
+    /// updates progress_cache for get_sync_progress() (Python polls ~1s via sync_manager),
+    /// and invokes progress_callback if set. Called after each block is stored.
     async fn update_progress(&self) {
         let (blocks_downloaded, speed, eta) = match self.compute_progress().await {
             Some((d, s, e)) => (d, s, e),
@@ -968,14 +995,21 @@ impl BlockSync {
     }
 
     async fn compute_progress(&self) -> Option<(u32, f64, f64)> {
-        let (blocks_downloaded, start_time, last_update) = {
+        let (blocks_downloaded, start_time, last_update, block_timestamps) = {
             let stats = self.stats.lock().await;
             let start = stats.start_time?;
-            (stats.blocks_downloaded, start, stats.last_update)
+            let timestamps: VecDeque<Instant> = stats.block_timestamps.iter().copied().collect();
+            (
+                stats.blocks_downloaded,
+                start,
+                stats.last_update,
+                timestamps,
+            )
         };
 
+        let now = Instant::now();
         let elapsed = last_update
-            .unwrap_or_else(Instant::now)
+            .unwrap_or(now)
             .duration_since(start_time)
             .as_secs_f64();
 
@@ -983,7 +1017,31 @@ impl BlockSync {
             return Some((blocks_downloaded, 0.0, 0.0));
         }
 
-        let speed = blocks_downloaded as f64 / elapsed;
+        // Use rolling-window speed when we have enough data (more responsive than average)
+        let speed = if block_timestamps.len() >= 2 {
+            let cutoff = now - Duration::from_secs_f64(SPEED_WINDOW_SECS);
+            let recent_count = block_timestamps.iter().filter(|&&t| t >= cutoff).count();
+            if recent_count > 0 {
+                let window_elapsed = {
+                    let first = block_timestamps
+                        .iter()
+                        .filter(|&&t| t >= cutoff)
+                        .min()
+                        .copied()
+                        .unwrap_or(now);
+                    now.duration_since(first).as_secs_f64()
+                };
+                if window_elapsed >= 0.5 {
+                    recent_count as f64 / window_elapsed
+                } else {
+                    blocks_downloaded as f64 / elapsed
+                }
+            } else {
+                blocks_downloaded as f64 / elapsed
+            }
+        } else {
+            blocks_downloaded as f64 / elapsed
+        };
 
         let queue_len = {
             let queue = self.download_queue.lock().await;
@@ -1111,6 +1169,18 @@ mod tests {
     fn test_block_sync_new() {
         let (_temp_dir, _block_sync) = create_test_block_sync();
         // Just verify it can be created
+    }
+
+    #[test]
+    fn test_progress_stats_initial() {
+        let (_temp_dir, block_sync) = create_test_block_sync();
+        // Before sync_blocks, cache has defaults; get_progress_stats returns Some
+        let stats = block_sync.get_progress_stats();
+        assert!(stats.is_some());
+        let (blocks, speed, eta) = stats.unwrap();
+        assert_eq!(blocks, 0);
+        assert_eq!(speed, 0.0);
+        assert_eq!(eta, 0.0);
     }
 
     /// Receive and process incoming block messages from peers
