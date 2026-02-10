@@ -1,7 +1,7 @@
 //! Bitcoin P2P parallel block download and validation
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use bitcoin::Network;
 use bitcoin::hashes::Hash;
@@ -81,6 +81,8 @@ pub struct BlockSync {
     progress_callback: Option<ProgressCallback>,
     /// Statistics
     stats: Arc<Mutex<SyncStats>>,
+    /// Cached progress for get_sync_progress (sync-readable, no await needed)
+    progress_cache: Arc<StdMutex<BlockProgressCache>>,
 }
 
 /// Synchronization statistics
@@ -90,6 +92,14 @@ struct SyncStats {
     blocks_validated: u32,
     start_time: Option<Instant>,
     last_update: Option<Instant>,
+}
+
+/// Cached progress for sync UI - updated when blocks are received, read by get_sync_progress
+#[derive(Debug, Default, Clone)]
+pub struct BlockProgressCache {
+    pub blocks_downloaded: u32,
+    pub blocks_per_second: f64,
+    pub eta_seconds: f64,
 }
 
 impl BlockSync {
@@ -111,6 +121,7 @@ impl BlockSync {
             max_concurrent: 16,
             progress_callback: None,
             stats: Arc::new(Mutex::new(SyncStats::default())),
+            progress_cache: Arc::new(StdMutex::new(BlockProgressCache::default())),
         }
     }
 
@@ -140,6 +151,9 @@ impl BlockSync {
 
         // Fill download queue with missing blocks
         self.fill_download_queue(start_height, end_height).await?;
+
+        // Initialize progress cache so get_sync_progress can report block sync
+        self.init_progress_cache();
 
         let queue_size = {
             let queue = self.download_queue.lock().await;
@@ -350,7 +364,10 @@ impl BlockSync {
                                                             stats.blocks_validated += 1;
                                                             stats.last_update = Some(Instant::now());
                                                         }
-                                                        
+
+                                                        // Update progress cache for UI (blocks_per_second, eta)
+                                                        self.update_progress().await;
+
                                                         received_any = true;
                                                     }
                                                 } else {
@@ -816,40 +833,81 @@ impl BlockSync {
         Err(BlockSyncError::BlockTimeout(height))
     }
 
-    /// Update progress statistics and call callback
+    /// Update progress statistics, cache for UI, and call callback
     async fn update_progress(&self) {
-        let stats = self.stats.lock().await;
-        
-        if let Some(start_time) = stats.start_time {
-            let elapsed = stats.last_update
-                .unwrap_or_else(Instant::now)
-                .duration_since(start_time)
-                .as_secs_f64();
-            
-            if elapsed > 0.0 && stats.blocks_validated > 0 {
-                let speed = stats.blocks_validated as f64 / elapsed;
-                
-                // Estimate remaining blocks (simplified)
-                let queue_len = {
-                    let queue = self.download_queue.lock().await;
-                    queue.len()
-                };
-                let in_flight_len = {
-                    let in_flight = self.in_flight.lock().await;
-                    in_flight.len()
-                };
-                let remaining = queue_len as u32 + in_flight_len as u32;
-                let eta = if speed > 0.0 {
-                    remaining as f64 / speed
-                } else {
-                    0.0
-                };
+        let (blocks_downloaded, speed, eta) = match self.compute_progress().await {
+            Some((d, s, e)) => (d, s, e),
+            None => return,
+        };
 
-                if let Some(ref callback) = self.progress_callback {
-                    callback(stats.blocks_validated, stats.blocks_downloaded, speed, eta);
-                }
-            }
+        // Update cache for get_sync_progress (called from sync Python code)
+        {
+            let mut cache = self.progress_cache.lock().unwrap();
+            cache.blocks_downloaded = blocks_downloaded;
+            cache.blocks_per_second = speed;
+            cache.eta_seconds = eta;
         }
+
+        if let Some(ref callback) = self.progress_callback {
+            let stats = self.stats.lock().await;
+            callback(stats.blocks_validated, stats.blocks_downloaded, speed, eta);
+        }
+    }
+
+    /// Get cached progress stats for UI (sync, no await - called from get_sync_progress)
+    pub fn get_progress_stats(&self) -> Option<(u32, f64, f64)> {
+        let cache = self.progress_cache.lock().ok()?;
+        Some((
+            cache.blocks_downloaded,
+            cache.blocks_per_second,
+            cache.eta_seconds,
+        ))
+    }
+
+    /// Mark that block sync has started (enables progress reporting)
+    fn init_progress_cache(&self) {
+        let mut cache = self.progress_cache.lock().unwrap();
+        cache.blocks_downloaded = 0;
+        cache.blocks_per_second = 0.0;
+        cache.eta_seconds = 0.0;
+    }
+
+    async fn compute_progress(&self) -> Option<(u32, f64, f64)> {
+        let (blocks_downloaded, start_time, last_update) = {
+            let stats = self.stats.lock().await;
+            let start = stats.start_time?;
+            (stats.blocks_downloaded, start, stats.last_update)
+        };
+
+        let elapsed = last_update
+            .unwrap_or_else(Instant::now)
+            .duration_since(start_time)
+            .as_secs_f64();
+
+        if elapsed <= 0.0 {
+            return Some((blocks_downloaded, 0.0, 0.0));
+        }
+
+        let speed = blocks_downloaded as f64 / elapsed;
+
+        let queue_len = {
+            let queue = self.download_queue.lock().await;
+            queue.len()
+        };
+        let in_flight_len = {
+            let in_flight = self.in_flight.lock().await;
+            in_flight.len()
+        };
+        let remaining = queue_len as u32 + in_flight_len as u32;
+        let eta = if speed > 0.0 {
+            remaining as f64 / speed
+        } else if remaining > 0 {
+            f64::MAX // Unknown ETA
+        } else {
+            0.0
+        };
+
+        Some((blocks_downloaded, speed, eta))
     }
 
     /// Receive and process incoming block messages from peers
