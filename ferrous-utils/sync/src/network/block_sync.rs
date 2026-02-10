@@ -57,6 +57,13 @@ pub type Result<T> = std::result::Result<T, BlockSyncError>;
 /// Default timeout when waiting for block messages from a peer.
 /// Can be overridden via OUROBOROS_BLOCK_RECEIVE_TIMEOUT_SECS or set_receive_timeout_secs().
 const DEFAULT_RECEIVE_TIMEOUT_SECS: u64 = 30;
+/// Interval for batch progress logging (blocks) when not verbose
+const BATCH_LOG_INTERVAL: u32 = 50;
+
+/// Check if verbose debug logging is enabled (OUROBOROS_VERBOSE=1)
+fn is_verbose() -> bool {
+    std::env::var("OUROBOROS_VERBOSE").as_deref() == Ok("1")
+}
 /// Default max in-flight block requests (Bitcoin Core uses 16 per peer; with 8 peers ~128 total)
 const DEFAULT_MAX_IN_FLIGHT: usize = 128;
 /// Timeout before re-queueing an in-flight request so another peer can try
@@ -289,7 +296,9 @@ impl BlockSync {
                             }
                         });
                     }
-                    eprintln!("[block-sync] Spawned {} long-lived peer receive tasks", peer_tasks.len());
+                    if is_verbose() {
+                        eprintln!("[block-sync] Spawned {} long-lived peer receive tasks", peer_tasks.len());
+                    }
                 }
             }
 
@@ -386,14 +395,16 @@ impl BlockSync {
                     });
                     let mut hash_map = self.hash_to_height.lock().await;
                     hash_map.insert(*block_hash, *height);
-                    eprintln!("Requested block {} from {}", height, peer_addr);
+                        if is_verbose() {
+                            eprintln!("Requested block {} from {}", height, peer_addr);
+                        }
                 } else {
                     let mut queue = self.download_queue.lock().await;
                     queue.push_back(*height);
                 }
             }
 
-            if !assignments.is_empty() {
+            if !assignments.is_empty() && is_verbose() {
                 eprintln!("Sent {} block requests", assignments.len());
             }
 
@@ -452,6 +463,12 @@ impl BlockSync {
                                             stats.blocks_downloaded += 1;
                                             stats.blocks_validated += 1;
                                             stats.last_update = Some(Instant::now());
+                                            let total = stats.blocks_downloaded;
+                                            let should_log = !is_verbose() && total % BATCH_LOG_INTERVAL == 0;
+                                            drop(stats);
+                                            if should_log {
+                                                eprintln!("[block-sync] Received {} blocks", total);
+                                            }
                                         }
                                         self.update_progress().await;
                                     }
@@ -740,7 +757,9 @@ impl BlockSync {
                 .ok_or(BlockSyncError::NoPeersAvailable)?;
 
             // Request block
-            eprintln!("Requesting block at height {} from peer {}", height, peer_addr);
+            if is_verbose() {
+                eprintln!("Requesting block at height {} from peer {}", height, peer_addr);
+            }
             self.request_block(height, peer_addr).await?;
         }
 
@@ -819,7 +838,9 @@ impl BlockSync {
             peer.send_message(msg).await
                 .map_err(|e| BlockSyncError::PeerManager(PeerManagerError::Peer(e)))?;
             peer_manager.add_peer(peer_addr, peer).await;
-            eprintln!("Sent GetData request for block at height {} to peer {}", height, peer_addr);
+            if is_verbose() {
+                eprintln!("Sent GetData request for block at height {} to peer {}", height, peer_addr);
+            }
         } else {
             return Err(BlockSyncError::PeerManager(PeerManagerError::PeerNotFound(peer_addr)));
         }
@@ -1011,7 +1032,9 @@ impl BlockSync {
                                 // Deserialize block message
                                 match BlockMessage::deserialize_payload(&msg.payload) {
                                     Ok(block_msg) => {
-                                        eprintln!("Received block message from peer {}", peer_addr);
+                                        if is_verbose() {
+                                            eprintln!("Received block message from peer {}", peer_addr);
+                                        }
                                         // Put peer back before processing
                                         peer_manager.add_peer(*peer_addr, peer).await;
                                         (*peer_addr, Some(block_msg))
@@ -1113,10 +1136,12 @@ mod tests {
                     Ok(Ok(msg)) => {
                         if msg.command == "block" {
                             // Deserialize block message
-                            match BlockMessage::deserialize_payload(&msg.payload) {
-                                Ok(block_msg) => {
-                                    eprintln!("Received block message from peer {}", peer_addr);
-                                    // Process the block
+                                match BlockMessage::deserialize_payload(&msg.payload) {
+                                    Ok(block_msg) => {
+                                        if is_verbose() {
+                                            eprintln!("Received block message from peer {}", peer_addr);
+                                        }
+                                        // Process the block
                                     if let Err(e) = self.process_incoming_block(*peer_addr, block_msg).await {
                                         eprintln!("Error processing block from {}: {}", peer_addr, e);
                                     }
