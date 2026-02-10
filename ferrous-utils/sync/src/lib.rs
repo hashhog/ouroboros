@@ -575,6 +575,9 @@ impl FastSync {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Database not initialized")
                 })?;
 
+                // Note: Genesis block initialization is handled by header sync
+                // when it detects an empty database
+
                 // Start peer manager
                 let peer_manager = self.peer_manager.as_ref().ok_or_else(|| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Peer manager not initialized")
@@ -615,14 +618,25 @@ impl FastSync {
                         )
                     })?;
 
-                    // Sync blocks (estimate end height - in practice this would be dynamic)
-                    // For now, sync up to a reasonable height or until caught up
-                    let end_height = current_height + 1000; // Simplified - would check actual tip
-                    block_sync.sync_blocks(current_height, end_height).await.map_err(|e| {
+                    eprintln!("Header sync completed. Starting block sync from height {}...", current_height);
+                    
+                    // For block sync, we want to sync all blocks from genesis to current height
+                    // Since we only have headers, we need to download the full blocks
+                    // Start from height 0 (genesis) and go up to current_height
+                    let start_height = 0u32;
+                    let end_height = current_height;
+                    
+                    eprintln!("Block sync: downloading blocks from height {} to {}", start_height, end_height);
+                    
+                    block_sync.sync_blocks(start_height, end_height).await.map_err(|e| {
                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                             format!("Block sync failed: {}", e)
                         )
                     })?;
+                    
+                    eprintln!("Block sync completed successfully!");
+                } else {
+                    eprintln!("Warning: Block sync not initialized, skipping block download");
                 }
 
                 Ok(())
@@ -643,12 +657,28 @@ impl FastSync {
             )
         })?;
 
-        // For now, use a fixed total height (in practice this would be the current tip)
-        // This is a simplified version
-        let total_height = current_height + 100; // Placeholder
+        // For testnet, approximate current tip (testnet has ~2.8M blocks as of 2024)
+        // For mainnet, it's much higher. We'll use a reasonable estimate.
+        // In a real implementation, we'd query peers for the current tip.
+        // Update: Testnet is actually much higher now (16M+ blocks as of 2025)
+        let estimated_tip = match self.network {
+            Network::Testnet => 18_000_000u32, // Updated estimate for 2025
+            Network::Testnet4 => 100_000u32,   // Testnet4 is newer (~90k blocks as of 2025)
+            Network::Bitcoin => 900_000u32,   // Approximate as of 2024
+            _ => 1_000_000u32,
+        };
 
-        let progress_percent = if total_height > 0 {
-            (current_height as f64 / total_height as f64) * 100.0
+        // Use the maximum of estimated tip and current height + 1
+        // This ensures we always have a reasonable total, even if we're ahead of the estimate
+        let total_height = estimated_tip.max(current_height.saturating_add(1));
+
+        // Calculate progress - ensure we show accurate percentage
+        let progress_percent = if total_height > 0 && current_height > 0 {
+            let percent = (current_height as f64 / total_height as f64) * 100.0;
+            // Don't cap at 99% - show actual progress up to 100%
+            percent.min(100.0)
+        } else if current_height == 0 {
+            0.0
         } else {
             100.0
         };
