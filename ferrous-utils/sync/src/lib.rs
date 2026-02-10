@@ -684,12 +684,20 @@ impl FastSync {
             100.0
         };
 
+        // Use block sync stats when available (during block download phase)
+        let (blocks_per_second, eta_seconds) = self
+            .block_sync
+            .as_ref()
+            .and_then(|bs| bs.get_progress_stats())
+            .map(|(_, speed, eta)| (speed, eta))
+            .unwrap_or((0.0, 0.0));
+
         Ok(SyncProgress {
             current_height,
             total_height,
             progress_percent: progress_percent.min(100.0),
-            blocks_per_second: 0.0, // TODO: Track from sync stats
-            eta_seconds: 0, // TODO: Calculate from speed
+            blocks_per_second,
+            eta_seconds: eta_seconds.min(u64::MAX as f64) as u64,
         })
     }
 

@@ -174,7 +174,7 @@ def sync(ctx, reset):
             progress.update(
                 task,
                 completed=prog.progress_percent,
-                blocks=f"{prog.current_height:,} headers",
+                blocks=f"{prog.current_height:,} blocks",
                 speed=prog.blocks_per_second,
             )
             
