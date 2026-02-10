@@ -15,6 +15,7 @@ use crate::network::messages::{
 };
 use crate::validate::block::{BlockValidator, BlockValidationError};
 use crate::storage::db::{BlockchainDB, DbError};
+use crate::chain_params::genesis_block_hash;
 use common::BlockWrapper;
 
 /// Block sync error types
@@ -188,12 +189,16 @@ impl BlockSync {
                         }
                         let height = queue.pop_front().unwrap();
                         
-                        // Get block hash for this height
+                        // Get block hash for this height (fallback to genesis for height 0)
                         let block_hash = match self.db.get_block_hash_by_height(height) {
                             Ok(Some(hash)) => hash,
                             Ok(None) => {
-                                eprintln!("No hash found for height {}, skipping", height);
-                                continue;
+                                if height == 0 {
+                                    genesis_block_hash(self.network)
+                                } else {
+                                    eprintln!("No hash found for height {}, skipping", height);
+                                    continue;
+                                }
                             }
                             Err(e) => {
                                 eprintln!("DB error for height {}: {}, skipping", height, e);
@@ -694,11 +699,15 @@ impl BlockSync {
             return Ok(());
         }
 
-        // Get block hash from header metadata (headers must be synced first)
+        // Get block hash from header metadata (fallback to genesis for height 0)
         let block_hash = match self.db.get_block_hash_by_height(height) {
             Ok(Some(hash)) => hash,
             Ok(None) => {
-                return Err(BlockSyncError::BlockNotFound(height));
+                if height == 0 {
+                    genesis_block_hash(self.network)
+                } else {
+                    return Err(BlockSyncError::BlockNotFound(height));
+                }
             }
             Err(e) => {
                 return Err(BlockSyncError::Database(e));
@@ -768,37 +777,38 @@ impl BlockSync {
                 .copied();
 
             if let Some(new_peer_addr) = new_peer {
-                // Get block hash and re-request
-                match self.db.get_block_hash_by_height(height) {
-                    Ok(Some(block_hash)) => {
-                        let inv_item = InvItem {
-                            inv_type: INV_TYPE_BLOCK,
-                            hash: block_hash,
-                        };
-                        let get_data = GetDataMessage::new(vec![inv_item]);
-                        let msg = get_data.to_message(self.network);
-                        
-                        drop(peer_manager);
-                        let mut peer_manager = self.peer_manager.lock().await;
-                        if let Err(_e) = peer_manager.request_from_best_peer(msg).await {
-                            return Err(BlockSyncError::BlockTimeout(height));
-                        }
-                        
-                        // Update in-flight request with new peer
-                        {
-                            let mut in_flight = self.in_flight.lock().await;
-                            in_flight.insert(height, InFlightRequest {
-                                peer_addr: new_peer_addr,
-                                requested_at: Instant::now(),
-                                retry_count: request.retry_count + 1,
-                            });
-                        }
-                        return Ok(());
-                    }
+                // Get block hash and re-request (fallback to genesis for height 0)
+                let block_hash = match self.db.get_block_hash_by_height(height) {
+                    Ok(Some(h)) => h,
+                    Ok(None) if height == 0 => genesis_block_hash(self.network),
                     _ => {
                         return Err(BlockSyncError::BlockTimeout(height));
                     }
+                };
+
+                let inv_item = InvItem {
+                    inv_type: INV_TYPE_BLOCK,
+                    hash: block_hash,
+                };
+                let get_data = GetDataMessage::new(vec![inv_item]);
+                let msg = get_data.to_message(self.network);
+
+                drop(peer_manager);
+                let mut peer_manager = self.peer_manager.lock().await;
+                if let Err(_e) = peer_manager.request_from_best_peer(msg).await {
+                    return Err(BlockSyncError::BlockTimeout(height));
                 }
+
+                // Update in-flight request with new peer
+                {
+                    let mut in_flight = self.in_flight.lock().await;
+                    in_flight.insert(height, InFlightRequest {
+                        peer_addr: new_peer_addr,
+                        requested_at: Instant::now(),
+                        retry_count: request.retry_count + 1,
+                    });
+                }
+                return Ok(());
             }
         }
 
