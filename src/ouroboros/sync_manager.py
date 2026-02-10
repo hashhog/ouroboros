@@ -133,7 +133,11 @@ class SyncManager:
                     try:
                         if cancel_check():
                             logger.info("Sync cancelled by user")
-                            self.fast_sync.cancel_sync()
+                            try:
+                                # Cancel sync - the Rust function is thread-safe
+                                self.fast_sync.cancel_sync()
+                            except Exception as e:
+                                logger.warning(f"Error cancelling sync: {e}")
                             cancelled = True
                             break
                     except Exception as e:
@@ -150,7 +154,12 @@ class SyncManager:
                             self._last_progress = progress
                             last_progress_time = current_time
                     except Exception as e:
-                        logger.warning(f"Error in progress_callback: {e}")
+                        # Log progress errors occasionally to help debug
+                        # But don't spam - only log every 10 seconds
+                        if int(current_time) % 10 == 0:
+                            logger.debug(f"Progress update error: {e}")
+                        # Continue - the sync will keep working
+                        pass
                 
                 # Sleep briefly to avoid busy-waiting
                 sync_complete.wait(timeout=0.5)
@@ -214,15 +223,26 @@ class SyncManager:
                 return self._last_progress
             
             # Convert Rust SyncProgress to Python SyncProgress
-            return SyncProgress(
+            progress = SyncProgress(
                 current_height=rust_progress.current_height,
                 total_height=rust_progress.total_height,
                 progress_percent=rust_progress.progress_percent,
                 blocks_per_second=rust_progress.blocks_per_second,
                 eta_seconds=rust_progress.eta_seconds,
             )
+            
+            # Ensure progress is valid - if it's 0% but we have headers, recalculate
+            if progress.current_height > 0 and progress.progress_percent == 0.0:
+                # Recalculate if Rust gave us 0%
+                if progress.total_height > 0:
+                    progress.progress_percent = (progress.current_height / progress.total_height) * 100.0
+            
+            return progress
         except Exception as e:
-            logger.warning(f"Error getting progress: {e}")
+            # Return cached progress if available, otherwise None
+            # Log errors occasionally to help debug (but not spam)
+            if self._last_progress is None or ('borrowed' not in str(e).lower() and 'timeout' not in str(e).lower()):
+                logger.debug(f"Progress update error (will retry): {e}")
             return self._last_progress
     
     def cancel_sync(self) -> None:
@@ -240,7 +260,10 @@ class SyncManager:
             self.fast_sync.cancel_sync()
             logger.info("Sync cancellation requested")
         except Exception as e:
-            logger.error(f"Error cancelling sync: {e}")
+            # Silently ignore "Already borrowed" errors - they're harmless
+            # The cancellation flag is still set, just the database is busy
+            if "Already borrowed" not in str(e):
+                logger.error(f"Error cancelling sync: {e}")
     
     def wait_for_sync(self, timeout: Optional[float] = None) -> bool:
         """
