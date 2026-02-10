@@ -1,5 +1,6 @@
 // Fast sync module with PyO3 bindings
 
+pub mod chain_params;
 pub mod storage;
 pub mod validate;
 pub mod network;

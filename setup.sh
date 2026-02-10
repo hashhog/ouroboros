@@ -48,9 +48,15 @@ if command -v rustc &> /dev/null; then
 
     # Check if rustup is installed
     if command -v rustup &> /dev/null; then
-        echo "  Updating Rust toolchain..."
-        rustup update stable
-        rustup component add rustfmt clippy
+        echo "  Updating Rust toolchain (this may fail, but existing version should work)..."
+        if rustup update stable 2>/dev/null; then
+            print_status "Rust toolchain updated"
+        else
+            print_warning "Rust update failed, but existing version should work fine"
+        fi
+        
+        # Add components (ignore errors if already installed)
+        rustup component add rustfmt clippy 2>/dev/null || true
     fi
 else
     print_warning "Rust not found. Installing..."

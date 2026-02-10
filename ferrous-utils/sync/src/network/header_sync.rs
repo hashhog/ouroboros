@@ -15,6 +15,7 @@ use crate::network::messages::{
 };
 use crate::validate::header::{HeaderValidator, HeaderValidationError};
 use crate::storage::db::{BlockchainDB, DbError};
+use crate::chain_params::{genesis_block_hash, genesis_block_timestamp};
 use common::{BlockHeaderWrapper, BlockMetadata};
 
 /// Header sync error types
@@ -577,6 +578,22 @@ impl HeaderSync {
         };
         let (prev_height, is_empty) = db_was_empty_at_start;
         let was_empty = is_empty; // Capture the value to use throughout
+
+        // When database was empty and we're receiving block 1, 2, 3... (start_height=1),
+        // we never receive the genesis header. Store genesis metadata at height 0 so
+        // block sync can request the genesis block by hash.
+        if was_empty && start_height == 1 {
+            let genesis_hash = genesis_block_hash(self.network);
+            let genesis_timestamp = genesis_block_timestamp(self.network);
+            let metadata = BlockMetadata::new(
+                0,
+                [0u8; 32], // Chainwork for genesis (minimal)
+                genesis_timestamp,
+            );
+            self.db.store_block_metadata(0, &genesis_hash, &metadata)
+                .map_err(|e| HeaderSyncError::Database(e))?;
+            eprintln!("Stored genesis block metadata at height 0");
+        }
 
         // Get previous header for validation (only if database is not empty)
         // When we only have metadata (header sync), we have best block hash but no full block
