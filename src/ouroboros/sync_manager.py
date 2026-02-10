@@ -123,9 +123,18 @@ class SyncManager:
             self._sync_thread = threading.Thread(target=sync_worker, daemon=True)
             self._sync_thread.start()
             
-            # Monitor progress
-            last_progress_time = time.time()
+            # Monitor progress - do initial update immediately so user sees progress from start
+            last_progress_time = 0.0  # Ensures first callback fires right away
             cancelled = False
+            
+            if progress_callback is not None:
+                try:
+                    progress = self.get_progress()
+                    if progress is not None:
+                        progress_callback(progress)
+                        self._last_progress = progress
+                except Exception:
+                    pass  # Ignore initial errors (e.g. DB not yet initialized)
             
             while not sync_complete.is_set():
                 # Check for cancellation
