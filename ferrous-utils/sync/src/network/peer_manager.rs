@@ -630,6 +630,20 @@ impl PeerManager {
         peers.insert(addr, peer);
     }
 
+    /// Remove all peers from the map (for concurrent receive - caller must add them back)
+    pub async fn drain_peers(&mut self) -> HashMap<SocketAddr, Peer> {
+        let mut peers = self.peers.lock().await;
+        std::mem::take(&mut *peers)
+    }
+
+    /// Add multiple peers back to the map
+    pub async fn add_peers(&mut self, peer_map: HashMap<SocketAddr, Peer>) {
+        let mut peers = self.peers.lock().await;
+        for (addr, peer) in peer_map {
+            peers.insert(addr, peer);
+        }
+    }
+
     /// Disconnect from a peer
     pub async fn disconnect_peer(&mut self, addr: SocketAddr) -> Result<()> {
         let mut peers = self.peers.lock().await;
