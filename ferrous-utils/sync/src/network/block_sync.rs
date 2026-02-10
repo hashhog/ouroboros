@@ -1,17 +1,19 @@
 //! Bitcoin P2P parallel block download and validation
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use bitcoin::Network;
 use bitcoin::hashes::Hash;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use thiserror::Error;
 
 use crate::network::peer_manager::{PeerManager, PeerManagerError};
-use crate::network::peer::{PeerError, PeerState};
+use crate::network::peer::{Peer, PeerError, PeerState};
 use crate::network::messages::{
     GetDataMessage, BlockMessage, InvItem, INV_TYPE_BLOCK,
+    Message, PingMessage, PongMessage,
 };
 use crate::validate::block::{BlockValidator, BlockValidationError};
 use crate::storage::db::{BlockchainDB, DbError};
@@ -71,6 +73,18 @@ fn is_disconnect_error(e: &PeerError) -> bool {
                 ..
             }
     )
+}
+
+/// Events from concurrent per-peer receive tasks
+enum RecvEvent {
+    Message(SocketAddr, Message),
+    PeerDone(SocketAddr, Peer, PeerDoneReason),
+}
+
+/// Reason a peer receive task finished
+enum PeerDoneReason {
+    Timeout,
+    Error(PeerError),
 }
 
 /// Progress callback type
@@ -306,25 +320,17 @@ impl BlockSync {
                 eprintln!("Sent {} block requests", assignments.len());
             }
 
-            // 3. Wait for and receive block responses from peers (sequential with short timeout for faster cycling)
+            // 3. Wait for and receive block responses from peers (concurrent from all peers)
             let mut received_any = false;
             {
-                let peer_manager_guard = self.peer_manager.lock().await;
-                let mut connected_peers = peer_manager_guard.connected_peers().await;
-                drop(peer_manager_guard);
+                let mut peer_manager = self.peer_manager.lock().await;
+                let peer_map = peer_manager.drain_peers().await;
+                drop(peer_manager);
 
                 let in_flight_count = self.in_flight.lock().await.len();
                 if !assignments.is_empty() {
-                    eprintln!("[block-sync] Waiting for blocks from {} peers (in-flight: {})", connected_peers.len(), in_flight_count);
+                    eprintln!("[block-sync] Waiting for blocks from {} peers (in-flight: {})", peer_map.len(), in_flight_count);
                 }
-
-                let peers_with_requests: std::collections::HashSet<std::net::SocketAddr> = {
-                    let in_flight = self.in_flight.lock().await;
-                    in_flight.values().map(|r| r.peer_addr).collect()
-                };
-                connected_peers.sort_by_key(|addr| {
-                    if peers_with_requests.contains(addr) { 0 } else { 1 }
-                });
 
                 let wait_time = if assignments.is_empty() {
                     Duration::from_millis(500)
@@ -332,113 +338,140 @@ impl BlockSync {
                     Duration::from_secs(RECEIVE_TIMEOUT_SECS)
                 };
 
-                for peer_addr in connected_peers.iter() {
-                    let mut should_add_peer_back = true;
-                    let mut peer_manager = self.peer_manager.lock().await;
-                    if let Some(mut peer) = peer_manager.get_peer(*peer_addr).await {
-                        loop {
-                            match tokio::time::timeout(wait_time, peer.receive_message()).await {
-                                Ok(Ok(msg)) => {
-                                    if msg.command == "block" {
-                                        match BlockMessage::deserialize_payload(&msg.payload) {
-                                            Ok(block_msg) => {
-                                                let block = block_msg.block;
-                                                let block_hash = block.block_hash();
-                                                let hash_bytes = *block_hash.as_byte_array();
-                                                let height_opt = {
-                                                    let hash_map = self.hash_to_height.lock().await;
-                                                    hash_map.get(&hash_bytes).copied()
-                                                };
-                                                if let Some(height) = height_opt {
-                                                    let block_wrapper = BlockWrapper::from(block);
-                                                    if let Err(e) = self.db.store_block(&block_wrapper) {
-                                                        eprintln!("Failed to store block {}: {}", height, e);
-                                                    } else {
-                                                        let (_best_hash, best_height) = self.db.get_best_block()
-                                                            .unwrap_or(([0u8; 32], 0));
-                                                        if height > best_height {
-                                                            let _ = self.db.update_best_block(&hash_bytes, height);
-                                                        }
-                                                        {
-                                                            let mut in_flight = self.in_flight.lock().await;
-                                                            in_flight.remove(&height);
-                                                            let mut hm = self.hash_to_height.lock().await;
-                                                            hm.remove(&hash_bytes);
-                                                        }
-                                                        {
-                                                            let mut stats = self.stats.lock().await;
-                                                            stats.blocks_downloaded += 1;
-                                                            stats.blocks_validated += 1;
-                                                            stats.last_update = Some(Instant::now());
-                                                        }
-                                                        self.update_progress().await;
-                                                        received_any = true;
+                if peer_map.is_empty() {
+                    // No peers - nothing to receive
+                } else {
+                    let (tx, mut rx) = mpsc::unbounded_channel();
+                    let network = self.network;
+
+                    for (addr, peer) in peer_map {
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let addr = addr;
+                            let mut peer = peer;
+                            loop {
+                                match tokio::time::timeout(wait_time, peer.receive_message()).await {
+                                    Ok(Ok(msg)) => {
+                                        if msg.command == "block" {
+                                            let _ = tx.send(RecvEvent::Message(addr, msg));
+                                        } else if msg.command == "ping" {
+                                            if let Ok(ping) = PingMessage::deserialize_payload(&msg.payload) {
+                                                let pong_msg = PongMessage::new(ping.nonce).to_message(network);
+                                                let _ = peer.send_message(pong_msg).await;
+                                            }
+                                        }
+                                        // inv and other: ignore, continue receive loop
+                                    }
+                                    Ok(Err(e)) => {
+                                        eprintln!("Error receiving from {}: {}", addr, e);
+                                        let _ = tx.send(RecvEvent::PeerDone(addr, peer, PeerDoneReason::Error(e)));
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        let _ = tx.send(RecvEvent::PeerDone(addr, peer, PeerDoneReason::Timeout));
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    drop(tx);
+
+                    // Process events from channel until all senders closed
+                    while let Some(event) = rx.recv().await {
+                        match event {
+                            RecvEvent::Message(peer_addr, msg) => {
+                                if msg.command == "block" {
+                                    match BlockMessage::deserialize_payload(&msg.payload) {
+                                        Ok(block_msg) => {
+                                            let block = block_msg.block;
+                                            let block_hash = block.block_hash();
+                                            let hash_bytes = *block_hash.as_byte_array();
+                                            let height_opt = {
+                                                let hash_map = self.hash_to_height.lock().await;
+                                                hash_map.get(&hash_bytes).copied()
+                                            };
+                                            if let Some(height) = height_opt {
+                                                let block_wrapper = BlockWrapper::from(block);
+                                                if let Err(e) = self.db.store_block(&block_wrapper) {
+                                                    eprintln!("Failed to store block {}: {}", height, e);
+                                                } else {
+                                                    let (_best_hash, best_height) = self.db.get_best_block()
+                                                        .unwrap_or(([0u8; 32], 0));
+                                                    if height > best_height {
+                                                        let _ = self.db.update_best_block(&hash_bytes, height);
                                                     }
+                                                    {
+                                                        let mut in_flight = self.in_flight.lock().await;
+                                                        in_flight.remove(&height);
+                                                        let mut hm = self.hash_to_height.lock().await;
+                                                        hm.remove(&hash_bytes);
+                                                    }
+                                                    {
+                                                        let mut stats = self.stats.lock().await;
+                                                        stats.blocks_downloaded += 1;
+                                                        stats.blocks_validated += 1;
+                                                        stats.last_update = Some(Instant::now());
+                                                    }
+                                                    self.update_progress().await;
+                                                    received_any = true;
                                                 }
                                             }
-                                            Err(e) => eprintln!("Failed to deserialize block from {}: {}", peer_addr, e),
                                         }
-                                        continue;
-                                    } else if msg.command == "ping" {
-                                        use crate::network::messages::{PingMessage, PongMessage};
-                                        if let Ok(ping) = PingMessage::deserialize_payload(&msg.payload) {
-                                            let pong_msg = PongMessage::new(ping.nonce).to_message(self.network);
-                                            let _ = peer.send_message(pong_msg).await;
-                                        }
-                                        continue;
-                                    } else if msg.command == "inv" {
-                                        continue;
-                                    } else {
-                                        continue;
+                                        Err(e) => eprintln!("Failed to deserialize block from {}: {}", peer_addr, e),
                                     }
                                 }
-                                Ok(Err(e)) => {
-                                    eprintln!("Error receiving from {}: {}", peer_addr, e);
-                                    if is_disconnect_error(&e) {
-                                        let mut in_flight = self.in_flight.lock().await;
-                                        let mut queue = self.download_queue.lock().await;
-                                        let to_requeue: Vec<u32> = in_flight
-                                            .iter()
-                                            .filter(|(_, r)| r.peer_addr == *peer_addr)
-                                            .map(|(h, _)| *h)
-                                            .collect();
-                                        for height in &to_requeue {
-                                            in_flight.remove(height);
-                                            queue.push_back(*height);
+                            }
+                            RecvEvent::PeerDone(addr, peer, reason) => {
+                                let should_add_peer_back = match &reason {
+                                    PeerDoneReason::Timeout => {
+                                        if !assignments.is_empty() {
+                                            let mut in_flight = self.in_flight.lock().await;
+                                            let mut queue = self.download_queue.lock().await;
+                                            let to_requeue: Vec<u32> = in_flight
+                                                .iter()
+                                                .filter(|(_, r)| r.peer_addr == addr)
+                                                .map(|(h, _)| *h)
+                                                .collect();
+                                            for height in &to_requeue {
+                                                in_flight.remove(height);
+                                                queue.push_back(*height);
+                                            }
+                                            if !to_requeue.is_empty() {
+                                                eprintln!("[block-sync] Timeout from {} - re-queued {} blocks for another peer", addr, to_requeue.len());
+                                            }
                                         }
-                                        if !to_requeue.is_empty() {
-                                            eprintln!("[block-sync] Re-queued {} blocks from disconnected peer {}", to_requeue.len(), peer_addr);
-                                        }
-                                        should_add_peer_back = false;
+                                        true
                                     }
-                                    break;
-                                }
-                                Err(_) => {
-                                    if !assignments.is_empty() {
-                                        let mut in_flight = self.in_flight.lock().await;
-                                        let mut queue = self.download_queue.lock().await;
-                                        let to_requeue: Vec<u32> = in_flight
-                                            .iter()
-                                            .filter(|(_, r)| r.peer_addr == *peer_addr)
-                                            .map(|(h, _)| *h)
-                                            .collect();
-                                        for height in &to_requeue {
-                                            in_flight.remove(height);
-                                            queue.push_back(*height);
-                                        }
-                                        if !to_requeue.is_empty() {
-                                            eprintln!("[block-sync] Timeout from {} - re-queued {} blocks for another peer", peer_addr, to_requeue.len());
+                                    PeerDoneReason::Error(e) => {
+                                        if is_disconnect_error(e) {
+                                            let mut in_flight = self.in_flight.lock().await;
+                                            let mut queue = self.download_queue.lock().await;
+                                            let to_requeue: Vec<u32> = in_flight
+                                                .iter()
+                                                .filter(|(_, r)| r.peer_addr == addr)
+                                                .map(|(h, _)| *h)
+                                                .collect();
+                                            for height in &to_requeue {
+                                                in_flight.remove(height);
+                                                queue.push_back(*height);
+                                            }
+                                            if !to_requeue.is_empty() {
+                                                eprintln!("[block-sync] Re-queued {} blocks from disconnected peer {}", to_requeue.len(), addr);
+                                            }
+                                            false
+                                        } else {
+                                            true
                                         }
                                     }
-                                    break;
+                                };
+                                if should_add_peer_back {
+                                    let mut pm = self.peer_manager.lock().await;
+                                    pm.add_peer(addr, peer).await;
                                 }
                             }
                         }
-                        if should_add_peer_back {
-                            peer_manager.add_peer(*peer_addr, peer).await;
-                        }
                     }
-                    drop(peer_manager);
                 }
             }
 
