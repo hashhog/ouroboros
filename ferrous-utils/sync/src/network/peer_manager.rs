@@ -145,20 +145,84 @@ impl PeerManager {
 
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(30)); // Run every 30 seconds
+            let mut dns_retry_interval = tokio::time::interval(Duration::from_secs(60)); // Retry DNS every 60 seconds
+            let mut dns_retry_count = 0u32;
 
             loop {
-                interval.tick().await;
-                Self::maintain_connections_internal(
-                    &peers,
-                    &known_addrs,
-                    &banned_peers,
-                    network,
-                    &user_agent,
-                    start_height,
-                    min_peers,
-                    target_peers,
-                )
-                .await;
+                tokio::select! {
+                    _ = interval.tick() => {
+                        Self::maintain_connections_internal(
+                            &peers,
+                            &known_addrs,
+                            &banned_peers,
+                            network,
+                            &user_agent,
+                            start_height,
+                            min_peers,
+                            target_peers,
+                        )
+                        .await;
+                    }
+                    _ = dns_retry_interval.tick() => {
+                        // Periodically retry DNS seeds, especially for testnet4
+                        let peers_map = peers.lock().await;
+                        let connected_count = peers_map.len();
+                        drop(peers_map);
+                        
+                        // Retry DNS if we have no or very few peers
+                        if connected_count < min_peers {
+                            dns_retry_count += 1;
+                            eprintln!("Retrying DNS seed resolution (attempt {})...", dns_retry_count);
+                            
+                            // Retry DNS seed resolution
+                            let dns_seeds = match network {
+                                Network::Bitcoin => vec![
+                                    "seed.bitcoin.sipa.be:8333",
+                                    "dnsseed.bluematt.me:8333",
+                                    "dnsseed.bitcoin.dashjr.org:8333",
+                                ],
+                                Network::Testnet => vec![
+                                    "testnet-seed.bitcoin.jonasschnelli.ch:18333",
+                                    "seed.tbtc.petertodd.org:18333",
+                                    "seed.testnet.bitcoin.sprovoost.nl:18333",
+                                ],
+                                Network::Testnet4 => vec![
+                                    "seed.testnet4.bitcoin.sprovoost.nl:48333",
+                                    "seed.testnet4.wiz.biz:48333",
+                                ],
+                                Network::Signet => vec![
+                                    "seed.signet.bitcoin.sprovoost.nl:38333",
+                                ],
+                                Network::Regtest => vec![],
+                            };
+                            
+                            let mut new_addrs = Vec::new();
+                            for seed in dns_seeds {
+                                match lookup_host(seed).await {
+                                    Ok(addrs) => {
+                                        for addr in addrs {
+                                            new_addrs.push(addr);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if dns_retry_count % 5 == 0 { // Log every 5th attempt
+                                            eprintln!("DNS seed {} still not resolving: {}", seed, e);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Add newly resolved addresses
+                            if !new_addrs.is_empty() {
+                                let mut known = known_addrs.lock().await;
+                                for addr in &new_addrs {
+                                    known.insert(*addr);
+                                }
+                                eprintln!("Resolved {} new peer address(es) from DNS seeds", new_addrs.len());
+                            }
+                        }
+                    }
+                }
             }
         });
 
@@ -191,7 +255,8 @@ impl PeerManager {
                 "seed.signet.bitcoin.sprovoost.nl:38333",
             ],
             Network::Testnet4 => vec![
-                "seed.testnet4.bitcoin.jonasschnelli.ch:18334",
+                "seed.testnet4.bitcoin.sprovoost.nl:48333",
+                "seed.testnet4.wiz.biz:48333",
             ],
         };
 
@@ -211,12 +276,42 @@ impl PeerManager {
             }
         }
 
+        // Add hardcoded peers for networks that might have DNS issues
+        // Testnet4 is newer and might not have reliable DNS seeds
+        let hardcoded_peers: Vec<&str> = match self.network {
+            Network::Testnet4 => vec![
+                // Add known testnet4 peers here if available
+                // For now, we'll rely on DNS seeds and peer discovery
+            ],
+            _ => vec![],
+        };
+
+        // Resolve hardcoded peers
+        for peer in hardcoded_peers {
+            match lookup_host(peer).await {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        resolved_addrs.push(addr);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to resolve hardcoded peer {}: {}", peer, e);
+                }
+            }
+        }
+
         // Add resolved addresses to known addresses
         {
             let mut known = self.known_addrs.lock().await;
             for addr in &resolved_addrs {
                 known.insert(*addr);
             }
+        }
+
+        // If we have no resolved addresses, log a warning but don't fail
+        // The peer manager will continue to try to discover peers through other means
+        if resolved_addrs.is_empty() {
+            eprintln!("Warning: No peers resolved from DNS seeds. Peer discovery may be limited.");
         }
 
         // Connect to up to 8 peers
@@ -227,7 +322,14 @@ impl PeerManager {
             }
         }
 
+        // For testnet4, be more lenient - allow starting even if no peers initially
+        // The peer manager will continue to try to discover peers
         if connected == 0 {
+            if self.network == Network::Testnet4 {
+                eprintln!("Warning: No peers resolved for testnet4. Will retry peer discovery.");
+                // Don't fail immediately for testnet4 - allow retries
+                return Ok(());
+            }
             return Err(PeerManagerError::NoPeersAvailable);
         }
 
@@ -436,12 +538,26 @@ impl PeerManager {
     ///
     /// Returns the address of the peer that received the message.
     pub async fn request_from_best_peer(&mut self, msg: Message) -> Result<SocketAddr> {
-        // Find peer with lowest latency
+        self.request_from_best_peer_excluding(msg, &[]).await
+    }
+
+    /// Send a request to the best peer, excluding specific peers.
+    ///
+    /// Returns the address of the peer that received the message.
+    pub async fn request_from_best_peer_excluding(
+        &mut self,
+        msg: Message,
+        exclude: &[SocketAddr],
+    ) -> Result<SocketAddr> {
+        let exclude_set: std::collections::HashSet<SocketAddr> = exclude.iter().copied().collect();
+        // Find peer with lowest latency, excluding specified peers
         let best_addr = {
             let peers_map = self.peers.lock().await;
             peers_map
                 .iter()
-                .filter(|(_, peer)| peer.state() == PeerState::Connected)
+                .filter(|(addr, peer)| {
+                    peer.state() == PeerState::Connected && !exclude_set.contains(addr)
+                })
                 .min_by(|(_, a), (_, b)| {
                     a.score()
                         .avg_latency_ms

@@ -9,6 +9,8 @@ pub const MAGIC_MAINNET: u32 = 0xD9B4BEF9;
 pub const MAGIC_TESTNET: u32 = 0x0709110B;
 pub const MAGIC_REGTEST: u32 = 0xDAB5BFFA;
 pub const MAGIC_SIGNET: u32 = 0x40CF030A;
+/// Testnet4 (BIP-94): 0x1c 0x16 0x3f 0x28 little-endian
+pub const MAGIC_TESTNET4: u32 = 0x283f161c;
 
 /// Get magic bytes for a network
 pub fn get_magic(network: Network) -> u32 {
@@ -17,7 +19,7 @@ pub fn get_magic(network: Network) -> u32 {
         Network::Testnet => MAGIC_TESTNET,
         Network::Regtest => MAGIC_REGTEST,
         Network::Signet => MAGIC_SIGNET,
-        Network::Testnet4 => MAGIC_TESTNET, // Testnet4 uses same magic as Testnet
+        Network::Testnet4 => MAGIC_TESTNET4,
     }
 }
 
