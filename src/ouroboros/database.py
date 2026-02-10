@@ -7,7 +7,7 @@ implementation, allowing Python code to interact with the blockchain storage lay
 
 from typing import Optional, List, Tuple, Dict, Any
 from dataclasses import dataclass, field
-import sync  # Rust extension module
+import sync  # Rust extension module (required)
 import hashlib
 
 

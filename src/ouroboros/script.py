@@ -374,3 +374,102 @@ class ScriptInterpreter:
         except Exception:
             # Any error means invalid signature
             return False
+
+
+def disassemble_script(script: bytes) -> str:
+    """
+    Disassemble Bitcoin script to human-readable ASM format.
+    
+    Args:
+        script: Script bytes
+        
+    Returns:
+        Human-readable script assembly (e.g., "OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG")
+    """
+    if not script:
+        return ""
+    
+    asm_parts = []
+    i = 0
+    
+    while i < len(script):
+        opcode = script[i]
+        i += 1
+        
+        # Data push opcodes
+        if opcode == 0x00:
+            asm_parts.append("OP_0")
+        elif 0x01 <= opcode <= 0x4b:
+            # Direct push
+            data_len = opcode
+            if i + data_len > len(script):
+                break
+            data = script[i:i+data_len]
+            asm_parts.append(data.hex())
+            i += data_len
+        elif opcode == 0x4c:  # OP_PUSHDATA1
+            if i >= len(script):
+                break
+            data_len = script[i]
+            i += 1
+            if i + data_len > len(script):
+                break
+            data = script[i:i+data_len]
+            asm_parts.append(data.hex())
+            i += data_len
+        elif opcode == 0x4d:  # OP_PUSHDATA2
+            if i + 1 >= len(script):
+                break
+            data_len = int.from_bytes(script[i:i+2], 'little')
+            i += 2
+            if i + data_len > len(script):
+                break
+            data = script[i:i+data_len]
+            asm_parts.append(data.hex())
+            i += data_len
+        elif opcode == 0x4e:  # OP_PUSHDATA4
+            if i + 3 >= len(script):
+                break
+            data_len = int.from_bytes(script[i:i+4], 'little')
+            i += 4
+            if i + data_len > len(script):
+                break
+            data = script[i:i+data_len]
+            asm_parts.append(data.hex())
+            i += data_len
+        else:
+            # Opcode name
+            opcode_name = _get_opcode_name(opcode)
+            asm_parts.append(opcode_name)
+    
+    return " ".join(asm_parts)
+
+
+def _get_opcode_name(opcode: int) -> str:
+    """Get opcode name from opcode value"""
+    opcode_names = {
+        0x76: "OP_DUP",
+        0xa9: "OP_HASH160",
+        0x88: "OP_EQUALVERIFY",
+        0xac: "OP_CHECKSIG",
+        0x87: "OP_EQUAL",
+        0x6a: "OP_RETURN",
+        0x51: "OP_1",
+        0x52: "OP_2",
+        0x53: "OP_3",
+        0x54: "OP_4",
+        0x55: "OP_5",
+        0x56: "OP_6",
+        0x57: "OP_7",
+        0x58: "OP_8",
+        0x59: "OP_9",
+        0x5a: "OP_10",
+        0x5b: "OP_11",
+        0x5c: "OP_12",
+        0x5d: "OP_13",
+        0x5e: "OP_14",
+        0x5f: "OP_15",
+        0x60: "OP_16",
+        # Add more opcodes as needed
+    }
+    return opcode_names.get(opcode, f"OP_UNKNOWN_{opcode:02x}")
