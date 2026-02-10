@@ -54,9 +54,9 @@ pub enum BlockSyncError {
 /// Result type for block sync operations
 pub type Result<T> = std::result::Result<T, BlockSyncError>;
 
-/// Timeout when waiting for block messages from a peer.
-/// Shorter timeout = faster cycling through peers. 30s balances responsiveness with slow peers.
-const RECEIVE_TIMEOUT_SECS: u64 = 30;
+/// Default timeout when waiting for block messages from a peer.
+/// Can be overridden via OUROBOROS_BLOCK_RECEIVE_TIMEOUT_SECS or set_receive_timeout_secs().
+const DEFAULT_RECEIVE_TIMEOUT_SECS: u64 = 30;
 /// Default max in-flight block requests (Bitcoin Core uses 16 per peer; with 8 peers ~128 total)
 const DEFAULT_MAX_IN_FLIGHT: usize = 128;
 /// Timeout before re-queueing an in-flight request so another peer can try
@@ -112,6 +112,8 @@ pub struct BlockSync {
     hash_to_height: Arc<Mutex<HashMap<[u8; 32], u32>>>,
     /// Maximum concurrent downloads
     max_concurrent: usize,
+    /// Receive timeout in seconds (configurable via env or set_receive_timeout_secs)
+    receive_timeout_secs: u64,
     /// Progress callback: (downloaded, total, speed_blocks_per_sec, eta_seconds)
     progress_callback: Option<ProgressCallback>,
     /// Statistics
@@ -145,6 +147,11 @@ impl BlockSync {
         db: Arc<BlockchainDB>,
         network: Network,
     ) -> Self {
+        let receive_timeout_secs = std::env::var("OUROBOROS_BLOCK_RECEIVE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_RECEIVE_TIMEOUT_SECS);
+
         Self {
             peer_manager,
             validator,
@@ -154,10 +161,16 @@ impl BlockSync {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             hash_to_height: Arc::new(Mutex::new(HashMap::new())),
             max_concurrent: DEFAULT_MAX_IN_FLIGHT,
+            receive_timeout_secs,
             progress_callback: None,
             stats: Arc::new(Mutex::new(SyncStats::default())),
             progress_cache: Arc::new(StdMutex::new(BlockProgressCache::default())),
         }
+    }
+
+    /// Set receive timeout in seconds (for tuning without recompiling)
+    pub fn set_receive_timeout_secs(&mut self, secs: u64) {
+        self.receive_timeout_secs = secs;
     }
 
     /// Set progress callback
@@ -194,7 +207,7 @@ impl BlockSync {
             let queue = self.download_queue.lock().await;
             queue.len()
         };
-        eprintln!("Block sync: {} blocks to download", queue_size);
+        eprintln!("Block sync: {} blocks to download (receive timeout: {}s)", queue_size, self.receive_timeout_secs);
 
         let batch_size = self.max_concurrent;
 
@@ -335,7 +348,7 @@ impl BlockSync {
                 let wait_time = if assignments.is_empty() {
                     Duration::from_millis(500)
                 } else {
-                    Duration::from_secs(RECEIVE_TIMEOUT_SECS)
+                    Duration::from_secs(self.receive_timeout_secs)
                 };
 
                 if peer_map.is_empty() {
