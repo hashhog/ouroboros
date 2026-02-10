@@ -128,6 +128,8 @@ impl BlockSync {
     /// Fills download queue with missing blocks, requests blocks from multiple peers
     /// in parallel, validates as they arrive, applies to database, and tracks progress.
     pub async fn sync_blocks(&mut self, start_height: u32, end_height: u32) -> Result<()> {
+        use crate::network::messages::BlockMessage;
+
         // Initialize statistics
         {
             let mut stats = self.stats.lock().await;
@@ -138,32 +140,289 @@ impl BlockSync {
         // Fill download queue with missing blocks
         self.fill_download_queue(start_height, end_height).await?;
 
-        let _total_blocks = end_height.saturating_sub(start_height) + 1;
+        let queue_size = {
+            let queue = self.download_queue.lock().await;
+            queue.len()
+        };
+        eprintln!("Block sync: {} blocks to download", queue_size);
+
+        let batch_size = self.max_concurrent.min(16);
 
         // Main sync loop
         loop {
-            // Schedule downloads for available slots
-            self.schedule_downloads().await?;
-
-            // Download blocks in parallel
-            self.download_block_parallel().await?;
-
-            // Check if we're done
-            let queue_len = {
-                let queue = self.download_queue.lock().await;
-                queue.len()
-            };
-            let in_flight_len = {
+            // 1. Collect a batch of heights to request
+            let mut assignments: Vec<(u32, [u8; 32], std::net::SocketAddr)> = Vec::new();
+            {
+                let mut queue = self.download_queue.lock().await;
                 let in_flight = self.in_flight.lock().await;
-                in_flight.len()
-            };
+                
+                if queue.is_empty() && in_flight.is_empty() {
+                    eprintln!("All blocks downloaded and processed!");
+                    break;
+                }
 
-            if queue_len == 0 && in_flight_len == 0 {
-                break; // All blocks downloaded and processed
+                // Only schedule new downloads if we have capacity
+                let available_slots = batch_size.saturating_sub(in_flight.len());
+                if available_slots == 0 || queue.is_empty() {
+                    // No capacity or nothing to schedule, skip to receiving
+                    drop(in_flight);
+                    drop(queue);
+                } else {
+                    // Get connected peers
+                    let peer_manager = self.peer_manager.lock().await;
+                    let connected_peers = peer_manager.connected_peers().await;
+                    drop(peer_manager);
+
+                    if connected_peers.is_empty() {
+                        drop(in_flight);
+                        drop(queue);
+                        eprintln!("No peers available, waiting...");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+
+                    let mut peer_idx = 0;
+                    for _ in 0..available_slots {
+                        if queue.is_empty() {
+                            break;
+                        }
+                        let height = queue.pop_front().unwrap();
+                        
+                        // Get block hash for this height
+                        let block_hash = match self.db.get_block_hash_by_height(height) {
+                            Ok(Some(hash)) => hash,
+                            Ok(None) => {
+                                eprintln!("No hash found for height {}, skipping", height);
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!("DB error for height {}: {}, skipping", height, e);
+                                continue;
+                            }
+                        };
+
+                        // Round-robin peer assignment
+                        let peer_addr = connected_peers[peer_idx % connected_peers.len()];
+                        peer_idx += 1;
+
+                        assignments.push((height, block_hash, peer_addr));
+                    }
+                    drop(in_flight);
+                    drop(queue);
+                }
             }
 
-            // Small delay to prevent busy waiting
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // 2. Send GetData requests for each assignment
+            for (height, block_hash, peer_addr) in &assignments {
+                let inv_item = InvItem {
+                    inv_type: INV_TYPE_BLOCK,
+                    hash: *block_hash,
+                };
+                let get_data = GetDataMessage::new(vec![inv_item]);
+                let msg = get_data.to_message(self.network);
+
+                // Remove peer from map, send message, put back
+                let mut peer_manager = self.peer_manager.lock().await;
+                if let Some(mut peer) = peer_manager.get_peer(*peer_addr).await {
+                    match peer.send_message(msg).await {
+                        Ok(()) => {
+                            eprintln!("Requested block {} from {}", height, peer_addr);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to request block {} from {}: {}", height, peer_addr, e);
+                            // Put height back in queue
+                            let mut queue = self.download_queue.lock().await;
+                            queue.push_back(*height);
+                        }
+                    }
+                    peer_manager.add_peer(*peer_addr, peer).await;
+                } else {
+                    eprintln!("Peer {} not available, re-queuing block {}", peer_addr, height);
+                    let mut queue = self.download_queue.lock().await;
+                    queue.push_back(*height);
+                }
+                drop(peer_manager);
+
+                // Track in-flight request
+                {
+                    let mut in_flight = self.in_flight.lock().await;
+                    in_flight.insert(*height, InFlightRequest {
+                        peer_addr: *peer_addr,
+                        requested_at: Instant::now(),
+                        retry_count: 0,
+                    });
+                    let mut hash_map = self.hash_to_height.lock().await;
+                    hash_map.insert(*block_hash, *height);
+                }
+            }
+
+            if !assignments.is_empty() {
+                eprintln!("Sent {} block requests", assignments.len());
+            }
+
+            // 3. Wait for and receive block responses from all connected peers
+            // Prioritize peers that have in-flight requests (they're expecting block responses)
+            let mut received_any = false;
+            {
+                let peer_manager_guard = self.peer_manager.lock().await;
+                let mut connected_peers = peer_manager_guard.connected_peers().await;
+                drop(peer_manager_guard);
+
+                let in_flight_count = self.in_flight.lock().await.len();
+                if !assignments.is_empty() {
+                    eprintln!("[block-sync] Waiting for blocks from {} peers (in-flight: {})", connected_peers.len(), in_flight_count);
+                }
+
+                // Build set of peers with in-flight requests - check these first
+                let peers_with_requests: std::collections::HashSet<std::net::SocketAddr> = {
+                    let in_flight = self.in_flight.lock().await;
+                    in_flight.values().map(|r| r.peer_addr).collect()
+                };
+
+                // Sort so peers with in-flight requests come first
+                connected_peers.sort_by_key(|addr| {
+                    if peers_with_requests.contains(addr) { 0 } else { 1 }
+                });
+
+                for peer_addr in connected_peers.iter() {
+                    let mut peer_manager = self.peer_manager.lock().await;
+                    if let Some(mut peer) = peer_manager.get_peer(*peer_addr).await {
+                        // Try to receive messages with a timeout
+                        // Use longer timeout when expecting block responses (peers may be slow)
+                        let wait_time = if assignments.is_empty() { 
+                            Duration::from_millis(500) 
+                        } else { 
+                            Duration::from_secs(15)  // Allow time for large blocks
+                        };
+                        
+                        loop {
+                            match tokio::time::timeout(wait_time, peer.receive_message()).await {
+                                Ok(Ok(msg)) => {
+                                    // DEBUG: Log every message to diagnose (remove when fixed)
+                                    eprintln!("[block-sync] Received '{}' from {} ({} bytes)", msg.command, peer_addr, msg.payload.len());
+                                    if msg.command == "block" {
+                                        match BlockMessage::deserialize_payload(&msg.payload) {
+                                            Ok(block_msg) => {
+                                                let block = block_msg.block;
+                                                let block_hash = block.block_hash();
+                                                let hash_bytes = *block_hash.as_byte_array();
+                                                
+                                                // Find height for this block
+                                                let height_opt = {
+                                                    let hash_map = self.hash_to_height.lock().await;
+                                                    hash_map.get(&hash_bytes).copied()
+                                                };
+                                                
+                                                if let Some(height) = height_opt {
+                                                    eprintln!("Received block at height {} from {}", height, peer_addr);
+                                                    
+                                                    // Convert and store
+                                                    let block_wrapper = BlockWrapper::from(block);
+                                                    
+                                                    // Store block in database
+                                                    if let Err(e) = self.db.store_block(&block_wrapper) {
+                                                        eprintln!("Failed to store block {}: {}", height, e);
+                                                    } else {
+                                                        // Update best block
+                                                        let (_best_hash, best_height) = self.db.get_best_block()
+                                                            .unwrap_or(([0u8; 32], 0));
+                                                        if height > best_height {
+                                                            let _ = self.db.update_best_block(&hash_bytes, height);
+                                                        }
+                                                        
+                                                        // Remove from in_flight and hash map
+                                                        {
+                                                            let mut in_flight = self.in_flight.lock().await;
+                                                            in_flight.remove(&height);
+                                                            let mut hm = self.hash_to_height.lock().await;
+                                                            hm.remove(&hash_bytes);
+                                                        }
+                                                        
+                                                        // Update stats
+                                                        {
+                                                            let mut stats = self.stats.lock().await;
+                                                            stats.blocks_downloaded += 1;
+                                                            stats.blocks_validated += 1;
+                                                            stats.last_update = Some(Instant::now());
+                                                        }
+                                                        
+                                                        received_any = true;
+                                                    }
+                                                } else {
+                                                    eprintln!("Received unknown block from {} (hash not in request map - may be unsolicited)", peer_addr);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Failed to deserialize block from {}: {}", peer_addr, e);
+                                            }
+                                        }
+                                        // After receiving a block, try to receive more
+                                        continue;
+                                    } else if msg.command == "ping" {
+                                        // Respond to ping with pong
+                                        use crate::network::messages::{PingMessage, PongMessage};
+                                        if let Ok(ping) = PingMessage::deserialize_payload(&msg.payload) {
+                                            let pong_msg = PongMessage::new(ping.nonce).to_message(self.network);
+                                            let _ = peer.send_message(pong_msg).await;
+                                        }
+                                        continue;
+                                    } else if msg.command == "inv" {
+                                        // Ignore inv messages during block sync
+                                        continue;
+                                    } else {
+                                        // Other message (addr, getdata, etc.) - continue receiving
+                                        continue;
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    eprintln!("Error receiving from {}: {}", peer_addr, e);
+                                    break;
+                                }
+                                Err(_) => {
+                                    // Timeout - no more messages from this peer
+                                    if !assignments.is_empty() {
+                                        eprintln!("[block-sync] Timeout waiting for block from {} (in-flight: {})", peer_addr, self.in_flight.lock().await.len());
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // Put peer back
+                        peer_manager.add_peer(*peer_addr, peer).await;
+                    }
+                    drop(peer_manager);
+                }
+            }
+
+            // 4. Handle timeouts for in-flight requests
+            {
+                let now = Instant::now();
+                let mut timed_out = Vec::new();
+                {
+                    let in_flight = self.in_flight.lock().await;
+                    for (height, request) in in_flight.iter() {
+                        if now.duration_since(request.requested_at) > Duration::from_secs(30) {
+                            timed_out.push(*height);
+                        }
+                    }
+                }
+                for height in timed_out {
+                    eprintln!("Block request timed out for height {}, re-queuing", height);
+                    let mut in_flight = self.in_flight.lock().await;
+                    in_flight.remove(&height);
+                    let mut queue = self.download_queue.lock().await;
+                    queue.push_back(height);
+                }
+            }
+
+            // 5. Update progress
+            self.update_progress().await;
+
+            // Small delay if we didn't receive anything
+            if !received_any && assignments.is_empty() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
         }
 
         Ok(())
@@ -385,6 +644,7 @@ impl BlockSync {
                 .ok_or(BlockSyncError::NoPeersAvailable)?;
 
             // Request block
+            eprintln!("Requesting block at height {} from peer {}", height, peer_addr);
             self.request_block(height, peer_addr).await?;
         }
 
@@ -453,10 +713,16 @@ impl BlockSync {
         let get_data = GetDataMessage::new(vec![inv_item]);
         let msg = get_data.to_message(self.network);
 
-        // Send request
+        // Send request to the specific peer
         let mut peer_manager = self.peer_manager.lock().await;
-        peer_manager.request_from_best_peer(msg).await
-            .map_err(|e| BlockSyncError::PeerManager(e))?;
+        if let Some(mut peer) = peer_manager.get_peer(peer_addr).await {
+            peer.send_message(msg).await
+                .map_err(|e| BlockSyncError::PeerManager(PeerManagerError::Peer(e)))?;
+            peer_manager.add_peer(peer_addr, peer).await;
+            eprintln!("Sent GetData request for block at height {} to peer {}", height, peer_addr);
+        } else {
+            return Err(BlockSyncError::PeerManager(PeerManagerError::PeerNotFound(peer_addr)));
+        }
 
         // Track in-flight request and hash mapping
         {
@@ -575,6 +841,75 @@ impl BlockSync {
             }
         }
     }
+
+    /// Receive and process incoming block messages from peers
+    async fn receive_block_messages(&mut self) -> Result<()> {
+        use tokio::time::{timeout, Duration};
+        use crate::network::messages::BlockMessage;
+
+        let peer_manager = self.peer_manager.lock().await;
+        let connected_peers = peer_manager.connected_peers().await;
+        drop(peer_manager);
+
+        if connected_peers.is_empty() {
+            return Err(BlockSyncError::NoPeersAvailable);
+        }
+
+        // Try to receive block messages from connected peers
+        // Use a short timeout to avoid blocking
+        for peer_addr in connected_peers.iter().take(5) {
+            let (peer_addr_copy, block_msg_opt) = {
+                let mut peer_manager = self.peer_manager.lock().await;
+                if let Some(mut peer) = peer_manager.get_peer(*peer_addr).await {
+                    // Try to receive a message with a short timeout
+                    let msg_result = timeout(Duration::from_millis(100), peer.receive_message()).await;
+                    match msg_result {
+                        Ok(Ok(msg)) => {
+                            if msg.command == "block" {
+                                // Deserialize block message
+                                match BlockMessage::deserialize_payload(&msg.payload) {
+                                    Ok(block_msg) => {
+                                        eprintln!("Received block message from peer {}", peer_addr);
+                                        // Put peer back before processing
+                                        peer_manager.add_peer(*peer_addr, peer).await;
+                                        (*peer_addr, Some(block_msg))
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to deserialize block from {}: {}", peer_addr, e);
+                                        peer_manager.add_peer(*peer_addr, peer).await;
+                                        (*peer_addr, None)
+                                    }
+                                }
+                            } else {
+                                peer_manager.add_peer(*peer_addr, peer).await;
+                                (*peer_addr, None)
+                            }
+                        }
+                        Ok(Err(_)) => {
+                            peer_manager.add_peer(*peer_addr, peer).await;
+                            (*peer_addr, None)
+                        }
+                        Err(_) => {
+                            // Timeout, return peer and break
+                            peer_manager.add_peer(*peer_addr, peer).await;
+                            break; // No more messages available right now
+                        }
+                    }
+                } else {
+                    continue;
+                }
+            };
+
+            // Process the block if we got one (outside the lock)
+            if let Some(block_msg) = block_msg_opt {
+                if let Err(e) = self.process_incoming_block(peer_addr_copy, block_msg).await {
+                    eprintln!("Error processing block from {}: {}", peer_addr_copy, e);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -611,6 +946,61 @@ mod tests {
     fn test_block_sync_new() {
         let (_temp_dir, _block_sync) = create_test_block_sync();
         // Just verify it can be created
+    }
+
+    /// Receive and process incoming block messages from peers
+    async fn receive_block_messages(&mut self) -> Result<()> {
+        use tokio::time::{timeout, Duration};
+        use crate::network::messages::BlockMessage;
+
+        let peer_manager = self.peer_manager.lock().await;
+        let connected_peers = peer_manager.connected_peers().await;
+        drop(peer_manager);
+
+        if connected_peers.is_empty() {
+            return Err(BlockSyncError::NoPeersAvailable);
+        }
+
+        // Try to receive block messages from connected peers
+        // Use a short timeout to avoid blocking
+        for peer_addr in connected_peers.iter().take(5) {
+            let mut peer_manager = self.peer_manager.lock().await;
+            if let Some(mut peer) = peer_manager.get_peer(*peer_addr).await {
+                // Try to receive a message with a short timeout
+                match timeout(Duration::from_millis(100), peer.receive_message()).await {
+                    Ok(Ok(msg)) => {
+                        if msg.command == "block" {
+                            // Deserialize block message
+                            match BlockMessage::deserialize_payload(&msg.payload) {
+                                Ok(block_msg) => {
+                                    eprintln!("Received block message from peer {}", peer_addr);
+                                    // Process the block
+                                    if let Err(e) = self.process_incoming_block(*peer_addr, block_msg).await {
+                                        eprintln!("Error processing block from {}: {}", peer_addr, e);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to deserialize block from {}: {}", peer_addr, e);
+                                }
+                            }
+                        }
+                        // Put peer back
+                        peer_manager.add_peer(*peer_addr, peer).await;
+                    }
+                    Ok(Err(_)) => {
+                        // Error receiving message, put peer back
+                        peer_manager.add_peer(*peer_addr, peer).await;
+                    }
+                    Err(_) => {
+                        // Timeout, put peer back
+                        peer_manager.add_peer(*peer_addr, peer).await;
+                        break; // No more messages available right now
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     #[test]

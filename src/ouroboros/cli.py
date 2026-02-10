@@ -1,6 +1,7 @@
 """Command-line interface for the Bitcoin node."""
 
 import asyncio
+import shutil
 import signal
 import sys
 from pathlib import Path
@@ -79,7 +80,7 @@ def expand_path(path_str: str) -> Path:
 @click.option(
     "--network",
     default="mainnet",
-    type=click.Choice(["mainnet", "testnet", "regtest"]),
+    type=click.Choice(["mainnet", "testnet", "testnet3", "testnet4", "regtest", "signet"]),
     help="Bitcoin network",
 )
 @click.pass_context
@@ -95,14 +96,33 @@ def cli(ctx, data_dir, network):
 
 
 @cli.command()
+@click.option(
+    "--reset",
+    is_flag=True,
+    help="Clear chainstate before syncing (use when headers don't connect)",
+)
 @click.pass_context
-def sync(ctx):
+def sync(ctx, reset):
     """Synchronize blockchain (initial download)"""
     global _sync_manager, _cancelled
     _cancelled = False
     
     data_dir = ctx.obj["data_dir"]
     network = ctx.obj["network"]
+    
+    if reset:
+        data_path = Path(data_dir)
+        if data_path.exists():
+            config_file = data_path / "ouroboros.conf"
+            for item in list(data_path.iterdir()):
+                if item != config_file:
+                    if item.is_file():
+                        item.unlink()
+                    elif item.is_dir():
+                        shutil.rmtree(item)
+            console.print("[yellow]Chainstate cleared.[/yellow]")
+        else:
+            data_path.mkdir(parents=True, exist_ok=True)
     
     console.print(Panel.fit(
         f"[bold]Blockchain Synchronization[/bold]\n"
@@ -130,7 +150,7 @@ def sync(ctx):
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         TextColumn("•"),
-        TextColumn("[cyan]{task.fields[blocks]}[/cyan] blocks"),
+        TextColumn("[cyan]{task.fields[blocks]}[/cyan]"),
         TextColumn("•"),
         TextColumn("[yellow]{task.fields[speed]:.1f} blocks/s[/yellow]"),
         TextColumn("•"),
@@ -154,7 +174,7 @@ def sync(ctx):
             progress.update(
                 task,
                 completed=prog.progress_percent,
-                blocks=f"{prog.current_height:,}/{prog.total_height:,}",
+                blocks=f"{prog.current_height:,} headers",
                 speed=prog.blocks_per_second,
             )
             
@@ -182,7 +202,7 @@ def sync(ctx):
             success = _sync_manager.perform_initial_sync(
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
-                progress_interval=1.0,
+                progress_interval=1.0,  # Update every second for better UX
             )
             
             if success:
