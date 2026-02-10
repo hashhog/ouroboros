@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use thiserror::Error;
 
 use crate::network::peer_manager::{PeerManager, PeerManagerError};
-use crate::network::peer::PeerError;
+use crate::network::peer::{PeerError, PeerState};
 use crate::network::messages::{
     GetDataMessage, BlockMessage, InvItem, INV_TYPE_BLOCK,
 };
@@ -51,6 +51,27 @@ pub enum BlockSyncError {
 
 /// Result type for block sync operations
 pub type Result<T> = std::result::Result<T, BlockSyncError>;
+
+/// Timeout when waiting for block messages from a peer.
+/// Shorter timeout = faster cycling through peers. 30s balances responsiveness with slow peers.
+const RECEIVE_TIMEOUT_SECS: u64 = 30;
+/// Default max in-flight block requests (Bitcoin Core uses 16 per peer; with 8 peers ~128 total)
+const DEFAULT_MAX_IN_FLIGHT: usize = 128;
+/// Timeout before re-queueing an in-flight request so another peer can try
+const IN_FLIGHT_TIMEOUT_SECS: u64 = 60;
+
+/// Check if a peer error indicates the peer has disconnected (do not re-add to pool)
+fn is_disconnect_error(e: &PeerError) -> bool {
+    matches!(
+        e,
+        PeerError::ConnectionClosed
+            | PeerError::Disconnected
+            | PeerError::InvalidState {
+                actual: PeerState::Disconnected,
+                ..
+            }
+    )
+}
 
 /// Progress callback type
 pub type ProgressCallback = Box<dyn Fn(u32, u32, f64, f64) + Send + Sync>; // downloaded, total, speed, eta
@@ -118,7 +139,7 @@ impl BlockSync {
             download_queue: Arc::new(Mutex::new(VecDeque::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             hash_to_height: Arc::new(Mutex::new(HashMap::new())),
-            max_concurrent: 16,
+            max_concurrent: DEFAULT_MAX_IN_FLIGHT,
             progress_callback: None,
             stats: Arc::new(Mutex::new(SyncStats::default())),
             progress_cache: Arc::new(StdMutex::new(BlockProgressCache::default())),
@@ -132,7 +153,7 @@ impl BlockSync {
 
     /// Set maximum concurrent downloads
     pub fn set_max_concurrent(&mut self, max: usize) {
-        self.max_concurrent = max.min(32); // Cap at 32
+        self.max_concurrent = max.min(256); // Cap at 256 (16 per peer × 16 peers)
     }
 
     /// Main block synchronization function
@@ -161,7 +182,7 @@ impl BlockSync {
         };
         eprintln!("Block sync: {} blocks to download", queue_size);
 
-        let batch_size = self.max_concurrent.min(16);
+        let batch_size = self.max_concurrent;
 
         // Main sync loop
         loop {
@@ -240,30 +261,36 @@ impl BlockSync {
                 let get_data = GetDataMessage::new(vec![inv_item]);
                 let msg = get_data.to_message(self.network);
 
-                // Remove peer from map, send message, put back
+                // Remove peer from map, send message, put back (unless disconnected)
                 let mut peer_manager = self.peer_manager.lock().await;
-                if let Some(mut peer) = peer_manager.get_peer(*peer_addr).await {
-                    match peer.send_message(msg).await {
+                let (send_ok, _add_peer_back) = if let Some(mut peer) = peer_manager.get_peer(*peer_addr).await {
+                    let result = match peer.send_message(msg).await {
                         Ok(()) => {
                             eprintln!("Requested block {} from {}", height, peer_addr);
+                            (true, true)
                         }
                         Err(e) => {
                             eprintln!("Failed to request block {} from {}: {}", height, peer_addr, e);
-                            // Put height back in queue
                             let mut queue = self.download_queue.lock().await;
                             queue.push_back(*height);
+                            drop(queue);
+                            (false, !is_disconnect_error(&e))
                         }
+                    };
+                    if result.1 {
+                        peer_manager.add_peer(*peer_addr, peer).await;
                     }
-                    peer_manager.add_peer(*peer_addr, peer).await;
+                    result
                 } else {
                     eprintln!("Peer {} not available, re-queuing block {}", peer_addr, height);
                     let mut queue = self.download_queue.lock().await;
                     queue.push_back(*height);
-                }
+                    (false, false)
+                };
                 drop(peer_manager);
 
-                // Track in-flight request
-                {
+                // Track in-flight only when send succeeded
+                if send_ok {
                     let mut in_flight = self.in_flight.lock().await;
                     in_flight.insert(*height, InFlightRequest {
                         peer_addr: *peer_addr,
@@ -279,8 +306,7 @@ impl BlockSync {
                 eprintln!("Sent {} block requests", assignments.len());
             }
 
-            // 3. Wait for and receive block responses from all connected peers
-            // Prioritize peers that have in-flight requests (they're expecting block responses)
+            // 3. Wait for and receive block responses from peers (sequential with short timeout for faster cycling)
             let mut received_any = false;
             {
                 let peer_manager_guard = self.peer_manager.lock().await;
@@ -292,96 +318,68 @@ impl BlockSync {
                     eprintln!("[block-sync] Waiting for blocks from {} peers (in-flight: {})", connected_peers.len(), in_flight_count);
                 }
 
-                // Build set of peers with in-flight requests - check these first
                 let peers_with_requests: std::collections::HashSet<std::net::SocketAddr> = {
                     let in_flight = self.in_flight.lock().await;
                     in_flight.values().map(|r| r.peer_addr).collect()
                 };
-
-                // Sort so peers with in-flight requests come first
                 connected_peers.sort_by_key(|addr| {
                     if peers_with_requests.contains(addr) { 0 } else { 1 }
                 });
 
+                let wait_time = if assignments.is_empty() {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(RECEIVE_TIMEOUT_SECS)
+                };
+
                 for peer_addr in connected_peers.iter() {
+                    let mut should_add_peer_back = true;
                     let mut peer_manager = self.peer_manager.lock().await;
                     if let Some(mut peer) = peer_manager.get_peer(*peer_addr).await {
-                        // Try to receive messages with a timeout
-                        // Use longer timeout when expecting block responses (peers may be slow)
-                        let wait_time = if assignments.is_empty() { 
-                            Duration::from_millis(500) 
-                        } else { 
-                            Duration::from_secs(15)  // Allow time for large blocks
-                        };
-                        
                         loop {
                             match tokio::time::timeout(wait_time, peer.receive_message()).await {
                                 Ok(Ok(msg)) => {
-                                    // DEBUG: Log every message to diagnose (remove when fixed)
-                                    eprintln!("[block-sync] Received '{}' from {} ({} bytes)", msg.command, peer_addr, msg.payload.len());
                                     if msg.command == "block" {
                                         match BlockMessage::deserialize_payload(&msg.payload) {
                                             Ok(block_msg) => {
                                                 let block = block_msg.block;
                                                 let block_hash = block.block_hash();
                                                 let hash_bytes = *block_hash.as_byte_array();
-                                                
-                                                // Find height for this block
                                                 let height_opt = {
                                                     let hash_map = self.hash_to_height.lock().await;
                                                     hash_map.get(&hash_bytes).copied()
                                                 };
-                                                
                                                 if let Some(height) = height_opt {
-                                                    eprintln!("Received block at height {} from {}", height, peer_addr);
-                                                    
-                                                    // Convert and store
                                                     let block_wrapper = BlockWrapper::from(block);
-                                                    
-                                                    // Store block in database
                                                     if let Err(e) = self.db.store_block(&block_wrapper) {
                                                         eprintln!("Failed to store block {}: {}", height, e);
                                                     } else {
-                                                        // Update best block
                                                         let (_best_hash, best_height) = self.db.get_best_block()
                                                             .unwrap_or(([0u8; 32], 0));
                                                         if height > best_height {
                                                             let _ = self.db.update_best_block(&hash_bytes, height);
                                                         }
-                                                        
-                                                        // Remove from in_flight and hash map
                                                         {
                                                             let mut in_flight = self.in_flight.lock().await;
                                                             in_flight.remove(&height);
                                                             let mut hm = self.hash_to_height.lock().await;
                                                             hm.remove(&hash_bytes);
                                                         }
-                                                        
-                                                        // Update stats
                                                         {
                                                             let mut stats = self.stats.lock().await;
                                                             stats.blocks_downloaded += 1;
                                                             stats.blocks_validated += 1;
                                                             stats.last_update = Some(Instant::now());
                                                         }
-
-                                                        // Update progress cache for UI (blocks_per_second, eta)
                                                         self.update_progress().await;
-
                                                         received_any = true;
                                                     }
-                                                } else {
-                                                    eprintln!("Received unknown block from {} (hash not in request map - may be unsolicited)", peer_addr);
                                                 }
                                             }
-                                            Err(e) => {
-                                                eprintln!("Failed to deserialize block from {}: {}", peer_addr, e);
-                                            }
+                                            Err(e) => eprintln!("Failed to deserialize block from {}: {}", peer_addr, e),
                                         }
-                                        // After receiving a block, try to receive more
                                         continue;
                                     } else if msg.command == "ping" {
-                                        // Respond to ping with pong
                                         use crate::network::messages::{PingMessage, PongMessage};
                                         if let Ok(ping) = PingMessage::deserialize_payload(&msg.payload) {
                                             let pong_msg = PongMessage::new(ping.nonce).to_message(self.network);
@@ -389,29 +387,56 @@ impl BlockSync {
                                         }
                                         continue;
                                     } else if msg.command == "inv" {
-                                        // Ignore inv messages during block sync
                                         continue;
                                     } else {
-                                        // Other message (addr, getdata, etc.) - continue receiving
                                         continue;
                                     }
                                 }
                                 Ok(Err(e)) => {
                                     eprintln!("Error receiving from {}: {}", peer_addr, e);
+                                    if is_disconnect_error(&e) {
+                                        let mut in_flight = self.in_flight.lock().await;
+                                        let mut queue = self.download_queue.lock().await;
+                                        let to_requeue: Vec<u32> = in_flight
+                                            .iter()
+                                            .filter(|(_, r)| r.peer_addr == *peer_addr)
+                                            .map(|(h, _)| *h)
+                                            .collect();
+                                        for height in &to_requeue {
+                                            in_flight.remove(height);
+                                            queue.push_back(*height);
+                                        }
+                                        if !to_requeue.is_empty() {
+                                            eprintln!("[block-sync] Re-queued {} blocks from disconnected peer {}", to_requeue.len(), peer_addr);
+                                        }
+                                        should_add_peer_back = false;
+                                    }
                                     break;
                                 }
                                 Err(_) => {
-                                    // Timeout - no more messages from this peer
                                     if !assignments.is_empty() {
-                                        eprintln!("[block-sync] Timeout waiting for block from {} (in-flight: {})", peer_addr, self.in_flight.lock().await.len());
+                                        let mut in_flight = self.in_flight.lock().await;
+                                        let mut queue = self.download_queue.lock().await;
+                                        let to_requeue: Vec<u32> = in_flight
+                                            .iter()
+                                            .filter(|(_, r)| r.peer_addr == *peer_addr)
+                                            .map(|(h, _)| *h)
+                                            .collect();
+                                        for height in &to_requeue {
+                                            in_flight.remove(height);
+                                            queue.push_back(*height);
+                                        }
+                                        if !to_requeue.is_empty() {
+                                            eprintln!("[block-sync] Timeout from {} - re-queued {} blocks for another peer", peer_addr, to_requeue.len());
+                                        }
                                     }
                                     break;
                                 }
                             }
                         }
-                        
-                        // Put peer back
-                        peer_manager.add_peer(*peer_addr, peer).await;
+                        if should_add_peer_back {
+                            peer_manager.add_peer(*peer_addr, peer).await;
+                        }
                     }
                     drop(peer_manager);
                 }
@@ -424,7 +449,7 @@ impl BlockSync {
                 {
                     let in_flight = self.in_flight.lock().await;
                     for (height, request) in in_flight.iter() {
-                        if now.duration_since(request.requested_at) > Duration::from_secs(30) {
+                        if now.duration_since(request.requested_at) > Duration::from_secs(IN_FLIGHT_TIMEOUT_SECS) {
                             timed_out.push(*height);
                         }
                     }
@@ -476,7 +501,7 @@ impl BlockSync {
 
     /// Download blocks in parallel (up to max_concurrent)
     ///
-    /// Requests up to 16 blocks simultaneously from different peers,
+    /// Requests up to max_concurrent blocks simultaneously from different peers,
     /// handles responses as they arrive.
     pub async fn download_block_parallel(&mut self) -> Result<()> {
         // Get current in-flight requests
@@ -490,7 +515,7 @@ impl BlockSync {
         let mut timed_out = Vec::new();
 
         for (height, request) in &in_flight_map {
-            if now.duration_since(request.requested_at) > Duration::from_secs(30) {
+            if now.duration_since(request.requested_at) > Duration::from_secs(IN_FLIGHT_TIMEOUT_SECS) {
                 timed_out.push(*height);
             }
         }

@@ -13,7 +13,7 @@ use pyo3::prelude::*;
 use tokio::sync::Mutex;
 
 use common::{OutPointWrapper, UTXO, BlockWrapper, BlockHeaderWrapper};
-use crate::storage::db::BlockchainDB;
+use crate::storage::db::{BlockchainDB, DbError};
 use crate::validate::header::HeaderValidator;
 use crate::validate::block::BlockValidator;
 use crate::network::peer_manager::PeerManager;
@@ -651,12 +651,16 @@ impl FastSync {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Database not initialized")
         })?;
 
-        // Get current height
-        let (_, current_height) = db.get_best_block().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Failed to get best block: {}", e)
-            )
-        })?;
+        // Get current height (0 if DB is empty / no best block yet)
+        let current_height = match db.get_best_block() {
+            Ok((_, h)) => h,
+            Err(DbError::BlockNotFound) => 0,
+            Err(e) => {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to get best block: {}", e),
+                ));
+            }
+        };
 
         // For testnet, approximate current tip (testnet has ~2.8M blocks as of 2024)
         // For mainnet, it's much higher. We'll use a reasonable estimate.
