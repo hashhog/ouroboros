@@ -651,8 +651,8 @@ impl FastSync {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Database not initialized")
         })?;
 
-        // Get current height (0 if DB is empty / no best block yet)
-        let current_height = match db.get_best_block() {
+        // Get current height from DB (0 if empty / no best block yet)
+        let db_height = match db.get_best_block() {
             Ok((_, h)) => h,
             Err(DbError::BlockNotFound) => 0,
             Err(e) => {
@@ -662,39 +662,57 @@ impl FastSync {
             }
         };
 
-        // For testnet, approximate current tip (testnet has ~2.8M blocks as of 2024)
-        // For mainnet, it's much higher. We'll use a reasonable estimate.
-        // In a real implementation, we'd query peers for the current tip.
-        // Update: Testnet is actually much higher now (16M+ blocks as of 2025)
-        let estimated_tip = match self.network {
-            Network::Testnet => 18_000_000u32, // Updated estimate for 2025
-            Network::Testnet4 => 100_000u32,   // Testnet4 is newer (~90k blocks as of 2025)
-            Network::Bitcoin => 900_000u32,   // Approximate as of 2024
-            _ => 1_000_000u32,
-        };
+        // When block sync is active, use its stats for accurate progress (blocks_downloaded updates
+        // as blocks are stored; DB best_block may lag). Otherwise use DB height.
+        let block_sync_stats = self.block_sync.as_ref().and_then(|bs| bs.get_progress_stats());
 
-        // Use the maximum of estimated tip and current height + 1
-        // This ensures we always have a reasonable total, even if we're ahead of the estimate
-        let total_height = estimated_tip.max(current_height.saturating_add(1));
+        let (current_height, total_height, progress_percent, blocks_per_second, eta_seconds) =
+            if let Some((blocks_downloaded, total_to_download, speed, eta)) = block_sync_stats {
+                if total_to_download > 0 {
+                    // Block sync active: use blocks_downloaded for accurate live progress
+                    let current = blocks_downloaded.max(db_height);
+                    let total = total_to_download;
+                    let percent = if total > 0 {
+                        ((current as f64 / total as f64) * 100.0).min(100.0)
+                    } else {
+                        0.0
+                    };
+                    (current, total, percent, speed, eta)
+                } else {
+                    // Block sync not fully initialized, fall back to DB
+                    (db_height, 0, 0.0, speed, eta)
+                }
+            } else {
+                // No block sync (e.g. header-only phase): use DB height and estimated tip
+                let estimated_tip = match self.network {
+                    Network::Testnet => 18_000_000u32,
+                    Network::Testnet4 => 150_000u32, // testnet4 tip varies; 122k+ as of 2025
+                    Network::Bitcoin => 900_000u32,
+                    _ => 1_000_000u32,
+                };
+                let total = estimated_tip.max(db_height.saturating_add(1));
+                let percent = if total > 0 && db_height > 0 {
+                    ((db_height as f64 / total as f64) * 100.0).min(100.0)
+                } else if db_height == 0 {
+                    0.0
+                } else {
+                    100.0
+                };
+                (db_height, total, percent, 0.0, 0.0)
+            };
 
-        // Calculate progress - ensure we show accurate percentage
-        let progress_percent = if total_height > 0 && current_height > 0 {
-            let percent = (current_height as f64 / total_height as f64) * 100.0;
-            // Don't cap at 99% - show actual progress up to 100%
-            percent.min(100.0)
-        } else if current_height == 0 {
-            0.0
+        // If we have block sync stats but total was 0, we still need total_height for display
+        let total_height = if total_height == 0 {
+            let estimated_tip = match self.network {
+                Network::Testnet => 18_000_000u32,
+                Network::Testnet4 => 150_000u32,
+                Network::Bitcoin => 900_000u32,
+                _ => 1_000_000u32,
+            };
+            estimated_tip.max(current_height.saturating_add(1))
         } else {
-            100.0
+            total_height
         };
-
-        // Use block sync stats when available (during block download phase)
-        let (blocks_per_second, eta_seconds) = self
-            .block_sync
-            .as_ref()
-            .and_then(|bs| bs.get_progress_stats())
-            .map(|(_, speed, eta)| (speed, eta))
-            .unwrap_or((0.0, 0.0));
 
         Ok(SyncProgress {
             current_height,

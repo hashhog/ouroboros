@@ -55,6 +55,11 @@ pub enum HeaderSyncError {
 /// Result type for header sync operations
 pub type Result<T> = std::result::Result<T, HeaderSyncError>;
 
+/// Check if verbose debug logging is enabled (OUROBOROS_VERBOSE=1)
+fn is_verbose() -> bool {
+    std::env::var("OUROBOROS_VERBOSE").as_deref() == Ok("1")
+}
+
 /// Progress callback type
 pub type ProgressCallback = Box<dyn Fn(u32, u32, f64) + Send + Sync>;
 
@@ -299,7 +304,9 @@ impl HeaderSync {
         
         // If locator is empty (empty database), use genesis hash for the network
         if locator.is_empty() {
-            eprintln!("Requesting headers from genesis");
+            if is_verbose() {
+                eprintln!("Requesting headers from genesis");
+            }
             let genesis_hash = match self.network {
                 Network::Bitcoin => [
                     0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3, 0x72,
@@ -347,7 +354,9 @@ impl HeaderSync {
                 })?
         };
 
-        eprintln!("Requesting headers from peer {} (starting from height {})", peer_addr, start_height);
+        if is_verbose() {
+            eprintln!("Requesting headers from peer {} (starting from height {})", peer_addr, start_height);
+        }
 
         // Receive headers response with timeout
         // Filter out non-headers messages (verack, ping, pong, inv, etc.)
@@ -366,7 +375,9 @@ impl HeaderSync {
             
             // If it's a headers message, use it
             if msg.command == "headers" {
-                eprintln!("Received headers message from peer {}", peer_addr);
+                if is_verbose() {
+                    eprintln!("Received headers message from peer {}", peer_addr);
+                }
                 break msg;
             }
             
@@ -394,7 +405,7 @@ impl HeaderSync {
             }
             
             // Log unexpected messages but continue waiting (reduce verbosity)
-            if !matches!(msg.command.as_str(), "sendcmpct" | "feefilter" | "inv" | "addr" | "verack" | "pong" | "ping") {
+            if is_verbose() && !matches!(msg.command.as_str(), "sendcmpct" | "feefilter" | "inv" | "addr" | "verack" | "pong" | "ping") {
                 eprintln!("Received unexpected message: '{}', continuing to wait for headers...", msg.command);
             }
         };
@@ -409,7 +420,9 @@ impl HeaderSync {
         let headers_msg = HeadersMessage::deserialize_payload(&response_msg.payload)
             .map_err(|e| HeaderSyncError::Unknown(format!("Failed to deserialize headers: {}", e)))?;
 
-        eprintln!("Deserialized {} headers from peer {}", headers_msg.headers.len(), peer_addr);
+        if is_verbose() {
+            eprintln!("Deserialized {} headers from peer {}", headers_msg.headers.len(), peer_addr);
+        }
 
         // Extract headers (verify tx_count is 0 for headers message)
         let headers: Vec<bitcoin::blockdata::block::Header> = headers_msg
@@ -467,14 +480,15 @@ impl HeaderSync {
                         _ => bitcoin::BlockHash::all_zeros(),
                     };
                     
-                    if first_header.prev_blockhash == genesis_hash {
-                        eprintln!("Received headers starting from block 1 (after genesis)");
-                    } else if first_header.prev_blockhash == bitcoin::BlockHash::all_zeros() {
-                        eprintln!("Received genesis block header");
-                    } else {
-                        // Accept anyway - will become our chain
-                        eprintln!("Database empty: accepting headers starting from non-genesis (prev_blockhash: {:?})", 
-                                 first_header.prev_blockhash);
+                    if is_verbose() {
+                        if first_header.prev_blockhash == genesis_hash {
+                            eprintln!("Received headers starting from block 1 (after genesis)");
+                        } else if first_header.prev_blockhash == bitcoin::BlockHash::all_zeros() {
+                            eprintln!("Received genesis block header");
+                        } else {
+                            eprintln!("Database empty: accepting headers starting from non-genesis (prev_blockhash: {:?})", 
+                                     first_header.prev_blockhash);
+                        }
                     }
                 }
             }
@@ -570,7 +584,7 @@ impl HeaderSync {
             }
             Err(_) => {
                 // Database is empty - accept headers as-is
-                if start_height == 0 {
+                if is_verbose() && start_height == 0 {
                     eprintln!("Database empty: accepting headers starting from height {}", start_height);
                 }
                 (0, true) // Database is empty - remember this for entire batch
@@ -592,7 +606,9 @@ impl HeaderSync {
             );
             self.db.store_block_metadata(0, &genesis_hash, &metadata)
                 .map_err(|e| HeaderSyncError::Database(e))?;
-            eprintln!("Stored genesis block metadata at height 0");
+            if is_verbose() {
+                eprintln!("Stored genesis block metadata at height 0");
+            }
         }
 
         // Get previous header for validation (only if database is not empty)
@@ -642,7 +658,7 @@ impl HeaderSync {
                     // Full validation skipped (no prev header for median time); chain link is verified
                 } else {
                     // Database was empty at start - skip validation for first header
-                    if current_height == 0 || (current_height < 100 && current_height % 10 == 0) || current_height % 10000 == 0 {
+                    if is_verbose() && (current_height == 0 || (current_height < 100 && current_height % 10 == 0) || current_height % 10000 == 0) {
                         eprintln!("Skipping validation for first header (database was empty at start, height {})", current_height);
                     }
                 }
@@ -662,7 +678,7 @@ impl HeaderSync {
                 if was_empty && current_height < 1000 {
                     // Skip validation for first 1000 headers when database was empty at start
                     // This allows us to bootstrap the chain
-                    if current_height % 100 == 0 {
+                    if is_verbose() && current_height % 100 == 0 {
                         eprintln!("Skipping validation for header at height {} (bootstrap mode, i={})", current_height, i);
                     }
                 } else {

@@ -13,7 +13,7 @@ use crate::network::peer_manager::{PeerManager, PeerManagerError};
 use crate::network::peer::{Peer, PeerError, PeerState};
 use crate::network::messages::{
     GetDataMessage, BlockMessage, InvItem, INV_TYPE_BLOCK,
-    Message, PingMessage, PongMessage,
+    Message, MessageError, PingMessage, PongMessage,
 };
 use crate::validate::block::{BlockValidator, BlockValidationError};
 use crate::storage::db::{BlockchainDB, DbError};
@@ -79,6 +79,16 @@ fn is_disconnect_error(e: &PeerError) -> bool {
                 actual: PeerState::Disconnected,
                 ..
             }
+    )
+}
+
+/// Check if error indicates stream desync (PayloadSizeExceeded, InvalidMagic).
+/// These are common during block sync when connection is corrupted; suppress log spam unless verbose.
+fn is_protocol_desync_error(e: &PeerError) -> bool {
+    matches!(
+        e,
+        PeerError::Message(MessageError::PayloadSizeExceeded { .. })
+            | PeerError::Message(MessageError::InvalidMagic { .. })
     )
 }
 
@@ -151,6 +161,8 @@ struct SyncStats {
 #[derive(Debug, Default, Clone)]
 pub struct BlockProgressCache {
     pub blocks_downloaded: u32,
+    /// Total blocks to download in this sync run (0 = not in block sync)
+    pub total_to_download: u32,
     pub blocks_per_second: f64,
     pub eta_seconds: f64,
 }
@@ -217,19 +229,25 @@ impl BlockSync {
         // Fill download queue with missing blocks
         self.fill_download_queue(start_height, end_height).await?;
 
-        // Initialize progress cache so get_sync_progress can report block sync
-        self.init_progress_cache();
-
         let queue_size = {
             let queue = self.download_queue.lock().await;
             queue.len()
         };
+        // Use actual sync target (chain tip) for progress, not queue_size - so progress shows
+        // e.g. 50k/122155 when resuming, not 0/22k
+        let total_sync_target = end_height.saturating_sub(start_height) + 1;
+        self.init_progress_cache(total_sync_target);
+
         eprintln!("Block sync: {} blocks to download (receive timeout: {}s)", queue_size, self.receive_timeout_secs);
 
         let batch_size = self.max_concurrent;
 
         // Shared channel: all peer tasks send events (Message, PeerDone) to main
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<RecvEvent>();
+
+        // Exponential backoff when waiting for peers: 1s, 2s, 5s, 10s (cap at 10s)
+        let mut no_peers_wait_secs: u64 = 1;
+        let mut no_peers_wait_since = tokio::time::Instant::now();
 
         // Main sync loop - long-lived peer tasks architecture (see BLOCK_SYNC_ARCHITECTURE.md)
         loop {
@@ -243,10 +261,24 @@ impl BlockSync {
 
                     if peer_map.is_empty() {
                         drop(peer_tasks);
-                        eprintln!("No peers available, waiting...");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let elapsed = no_peers_wait_since.elapsed();
+                        if elapsed.as_secs() >= 300 {
+                            eprintln!(
+                                "No peers available for >5 minutes. Check network/firewall. Waiting {}s...",
+                                no_peers_wait_secs
+                            );
+                        } else {
+                            eprintln!("No peers available, waiting {}s...", no_peers_wait_secs);
+                        }
+                        tokio::time::sleep(Duration::from_secs(no_peers_wait_secs)).await;
+                        no_peers_wait_secs = match no_peers_wait_secs {
+                            1 => 2,
+                            2 => 5,
+                            _ => 10,
+                        };
                         continue;
                     }
+                    no_peers_wait_secs = 1;
 
                     let network = self.network;
                     let event_tx = event_tx.clone();
@@ -273,7 +305,9 @@ impl BlockSync {
                                                 }
                                             }
                                             Err(e) => {
-                                                eprintln!("Error receiving from {}: {}", addr, e);
+                                                if is_verbose() || !is_protocol_desync_error(&e) {
+                                                    eprintln!("Error receiving from {}: {}", addr, e);
+                                                }
                                                 let _ = event_tx.send(RecvEvent::PeerDone(addr, peer, PeerDoneReason::Error(e)));
                                                 return;
                                             }
@@ -525,12 +559,21 @@ impl BlockSync {
                         }
                     }
                 }
-                for height in timed_out {
-                    eprintln!("Block request timed out for height {}, re-queuing", height);
+                if !timed_out.is_empty() {
+                    timed_out.sort();
+                    let n = timed_out.len();
+                    let range = if n == 1 {
+                        format!("height {}", timed_out[0])
+                    } else {
+                        format!("heights {}-{}", timed_out[0], timed_out[n - 1])
+                    };
+                    eprintln!("Block request timed out for {} block(s) ({}), re-queuing", n, range);
                     let mut in_flight = self.in_flight.lock().await;
-                    in_flight.remove(&height);
                     let mut queue = self.download_queue.lock().await;
-                    queue.push_back(height);
+                    for height in timed_out {
+                        in_flight.remove(&height);
+                        queue.push_back(height);
+                    }
                 }
             }
 
@@ -950,19 +993,23 @@ impl BlockSync {
     }
 
     /// Get cached progress stats for UI (sync, no await - called from get_sync_progress)
-    pub fn get_progress_stats(&self) -> Option<(u32, f64, f64)> {
+    /// Returns (blocks_downloaded, total_to_download, blocks_per_second, eta_seconds).
+    /// total_to_download is 0 when not in block sync.
+    pub fn get_progress_stats(&self) -> Option<(u32, u32, f64, f64)> {
         let cache = self.progress_cache.lock().ok()?;
         Some((
             cache.blocks_downloaded,
+            cache.total_to_download,
             cache.blocks_per_second,
             cache.eta_seconds,
         ))
     }
 
     /// Mark that block sync has started (enables progress reporting)
-    fn init_progress_cache(&self) {
+    fn init_progress_cache(&self, total_to_download: u32) {
         let mut cache = self.progress_cache.lock().unwrap();
         cache.blocks_downloaded = 0;
+        cache.total_to_download = total_to_download;
         cache.blocks_per_second = 0.0;
         cache.eta_seconds = 0.0;
     }
