@@ -41,6 +41,11 @@ pub enum PeerManagerError {
 /// Result type for peer manager operations
 pub type Result<T> = std::result::Result<T, PeerManagerError>;
 
+/// Check if verbose debug logging is enabled (OUROBOROS_VERBOSE=1)
+fn is_verbose() -> bool {
+    std::env::var("OUROBOROS_VERBOSE").as_deref() == Ok("1")
+}
+
 /// Peer ban information
 #[derive(Debug, Clone)]
 struct BannedPeer {
@@ -142,9 +147,12 @@ impl PeerManager {
         let start_height = self.start_height;
         let min_peers = self.min_peers;
         let target_peers = self.target_peers;
+        let max_peers = self.max_peers;
 
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(30)); // Run every 30 seconds
+            let mut interval = interval(Duration::from_secs(30)); // Run every 30 seconds normally
+            let mut fast_interval = tokio::time::interval(Duration::from_secs(10)); // Run every 10s when low on peers
+            fast_interval.tick().await; // skip first immediate tick
             let mut dns_retry_interval = tokio::time::interval(Duration::from_secs(60)); // Retry DNS every 60 seconds
             let mut dns_retry_count = 0u32;
 
@@ -160,8 +168,27 @@ impl PeerManager {
                             start_height,
                             min_peers,
                             target_peers,
+                            max_peers,
                         )
                         .await;
+                    }
+                    _ = fast_interval.tick() => {
+                        // When low on peers, run maintenance more frequently for faster recovery
+                        let count = peers.lock().await.len();
+                        if count < min_peers {
+                            Self::maintain_connections_internal(
+                                &peers,
+                                &known_addrs,
+                                &banned_peers,
+                                network,
+                                &user_agent,
+                                start_height,
+                                min_peers,
+                                target_peers,
+                                max_peers,
+                            )
+                            .await;
+                        }
                     }
                     _ = dns_retry_interval.tick() => {
                         // Periodically retry DNS seeds, especially for testnet4
@@ -172,7 +199,9 @@ impl PeerManager {
                         // Retry DNS if we have no or very few peers
                         if connected_count < min_peers {
                             dns_retry_count += 1;
-                            eprintln!("Retrying DNS seed resolution (attempt {})...", dns_retry_count);
+                            if dns_retry_count == 1 || dns_retry_count % 5 == 0 {
+                                eprintln!("Retrying DNS seed resolution (attempt {})...", dns_retry_count);
+                            }
                             
                             // Retry DNS seed resolution
                             let dns_seeds = match network {
@@ -218,7 +247,9 @@ impl PeerManager {
                                 for addr in &new_addrs {
                                     known.insert(*addr);
                                 }
-                                eprintln!("Resolved {} new peer address(es) from DNS seeds", new_addrs.len());
+                                if is_verbose() {
+                                    eprintln!("Resolved {} new peer address(es) from DNS seeds", new_addrs.len());
+                                }
                             }
                         }
                     }
@@ -403,7 +434,7 @@ impl PeerManager {
     /// Maintain peer connections
     ///
     /// Keeps 8-10 outbound connections, replaces disconnected peers,
-    /// and disconnects misbehaving peers.
+    /// and disconnects misbehaving peers. Actively connects to known addresses when below target.
     async fn maintain_connections_internal(
         peers: &Arc<Mutex<HashMap<SocketAddr, Peer>>>,
         known_addrs: &Arc<Mutex<HashSet<SocketAddr>>>,
@@ -413,6 +444,7 @@ impl PeerManager {
         start_height: i32,
         min_peers: usize,
         target_peers: usize,
+        max_peers: usize,
     ) {
         // Remove disconnected peers
         {
@@ -453,34 +485,60 @@ impl PeerManager {
         {
             let peers_map = peers.lock().await;
             let current_peers = peers_map.len();
+            let connected_addrs: HashSet<SocketAddr> = peers_map.keys().copied().collect();
+            drop(peers_map);
 
-            if current_peers < target_peers {
-                drop(peers_map); // Release lock before async operations
+            if current_peers >= target_peers || current_peers >= max_peers {
+                return;
+            }
 
-                let known = known_addrs.lock().await;
-                let banned = banned_peers.lock().await;
+            let needed = (target_peers - current_peers).min(max_peers - current_peers);
 
-                // Find candidates that are not connected, not banned, and not backed off
-                let candidates: Vec<SocketAddr> = known
-                    .iter()
-                    .filter(|addr| {
-                        !banned
+            let known = known_addrs.lock().await;
+            let banned = banned_peers.lock().await;
+
+            // Find candidates that are not connected, not banned, and not backed off
+            let candidates: Vec<SocketAddr> = known
+                .iter()
+                .filter(|addr| {
+                    !connected_addrs.contains(addr)
+                        && !banned
                             .get(addr)
                             .map(|b| b.is_banned() || b.is_backed_off())
                             .unwrap_or(false)
-                    })
-                    .take(target_peers - current_peers)
-                    .copied()
-                    .collect();
+                })
+                .take(needed)
+                .copied()
+                .collect();
 
-                drop(known);
-                drop(banned);
+            drop(known);
+            drop(banned);
 
-                // Attempt to connect to candidates
-                for addr in candidates {
-                    // This is simplified - in a real implementation, we'd spawn tasks
-                    // For now, we'll just log that we'd connect
-                    eprintln!("Would connect to peer: {}", addr);
+            // Attempt to connect to candidates
+            for addr in candidates {
+                match Peer::connect(addr, network, user_agent.to_string(), start_height).await {
+                    Ok(mut peer) => {
+                        {
+                            let mut banned = banned_peers.lock().await;
+                            if let Some(banned_peer) = banned.get_mut(&addr) {
+                                banned_peer.reset_backoff();
+                            }
+                        }
+                        let mut peers_map = peers.lock().await;
+                        if peers_map.len() < max_peers && !peers_map.contains_key(&addr) {
+                            peers_map.insert(addr, peer);
+                            if is_verbose() {
+                                eprintln!("Connected to peer: {}", addr);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        let mut banned = banned_peers.lock().await;
+                        banned
+                            .entry(addr)
+                            .or_insert_with(|| BannedPeer::new(Duration::ZERO))
+                            .record_failed_connection();
+                    }
                 }
             }
         }
@@ -497,6 +555,7 @@ impl PeerManager {
             self.start_height,
             self.min_peers,
             self.target_peers,
+            self.max_peers,
         )
         .await;
     }
