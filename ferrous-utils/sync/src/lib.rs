@@ -1,6 +1,8 @@
 // Fast sync module with PyO3 bindings
 
 pub mod chain_params;
+
+use std::env;
 pub mod storage;
 pub mod validate;
 pub mod network;
@@ -12,20 +14,37 @@ use bitcoin::hashes::Hash;
 use pyo3::prelude::*;
 use tokio::sync::Mutex;
 
-use common::{OutPointWrapper, UTXO, BlockWrapper, BlockHeaderWrapper};
+use common::{OutPointWrapper, UTXO, BlockWrapper, BlockHeaderWrapper, BlockMetadata};
 use crate::storage::db::{BlockchainDB, DbError};
 use crate::validate::header::HeaderValidator;
 use crate::validate::block::BlockValidator;
 use crate::network::peer_manager::PeerManager;
 use crate::network::header_sync::HeaderSync;
-use crate::network::block_sync::BlockSync;
+use crate::network::block_sync::{BlockSync, BlockProgressCache};
+
+/// Initialize logging. If RUST_LOG is not set, defaults to sync=warn.
+/// When OUROBOROS_VERBOSE=1, sets RUST_LOG=sync=debug for verbose output.
+fn init_logging() {
+    if env::var("RUST_LOG").is_err() {
+        let level = if env::var("OUROBOROS_VERBOSE").as_deref() == Ok("1") {
+            "sync=debug"
+        } else {
+            "sync=warn"
+        };
+        env::set_var("RUST_LOG", level);
+    }
+    let _ = env_logger::try_init();
+}
 
 /// Fast sync module for Bitcoin blockchain synchronization
 #[pymodule]
 fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    init_logging();
     m.add_class::<PyUTXO>()?;
     m.add_class::<SyncEngine>()?;
     m.add_class::<FastSync>()?;
+    m.add_class::<SyncCanceller>()?;
+    m.add_class::<SyncProgressReporter>()?;
     m.add_class::<SyncProgress>()?;
     m.add_class::<PyBlockchainDB>()?;
     m.add_class::<PyBlock>()?;
@@ -455,6 +474,128 @@ impl SyncEngine {
     }
 }
 
+/// Progress reporter that reads from shared cache without borrowing FastSync.
+/// Use this during sync to avoid "Already borrowed" when the sync thread holds FastSync.
+#[pyclass]
+pub struct SyncProgressReporter {
+    db: Arc<BlockchainDB>,
+    progress_cache: Arc<StdMutex<BlockProgressCache>>,
+    network: Network,
+}
+
+#[pymethods]
+impl SyncProgressReporter {
+    /// Get current sync progress. Safe to call while sync is running (no FastSync borrow).
+    fn get_progress(&self) -> PyResult<SyncProgress> {
+        let db_height = match self.db.get_best_block() {
+            Ok((_, h)) => h,
+            Err(DbError::BlockNotFound) => 0,
+            Err(e) => {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to get best block: {}", e),
+                ));
+            }
+        };
+
+        let cache = self.progress_cache.lock().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Progress cache lock error: {}", e),
+            )
+        })?;
+
+        let (current_height, total_height, progress_percent, blocks_per_second, eta_seconds, phase, total_known) =
+            if cache.total_to_download > 0 {
+                // Block phase: show "blocks we have / block height (chain tip)"
+                // blocks_we_have = had at start + downloaded this run
+                let blocks_downloaded = cache.blocks_downloaded;
+                let total_chain_blocks = cache.total_chain_blocks.max(1);
+                let total_to_download = cache.total_to_download;
+                let blocks_we_have = total_chain_blocks
+                    .saturating_sub(total_to_download)
+                    .saturating_add(blocks_downloaded);
+                // block_height = tip (0-indexed), i.e. total_chain_blocks - 1; use total_chain_blocks for %
+                let block_height = total_chain_blocks;
+                let percent = if block_height > 0 {
+                    ((blocks_we_have as f64 / block_height as f64) * 100.0).min(100.0)
+                } else {
+                    0.0
+                };
+                (
+                    blocks_we_have,
+                    block_height,
+                    percent,
+                    cache.blocks_per_second,
+                    cache.eta_seconds,
+                    "block",
+                    true, // block phase always has known total
+                )
+            } else {
+                // Header phase
+                let total_known = cache.header_sync_tip.is_some();
+                let estimated_tip = match self.network {
+                    Network::Testnet => 18_000_000u32,
+                    Network::Testnet4 => 150_000u32,
+                    Network::Bitcoin => 900_000u32,
+                    _ => 1_000_000u32,
+                };
+                // Use discovered tip when we got a short batch (chain shorter than estimate)
+                let total = cache
+                    .header_sync_tip
+                    .map(|h| h.saturating_add(1))
+                    .unwrap_or_else(|| estimated_tip.max(db_height.saturating_add(1)));
+                // blocks_in_chain = db_height + 1 (genesis + blocks 1..tip)
+                let blocks_in_chain = db_height.saturating_add(1);
+                // When total not known, don't show misleading % - use 0 (CLI shows "requesting..." instead)
+                let percent = if total_known && total > 0 {
+                    ((blocks_in_chain as f64 / total as f64) * 100.0).min(100.0)
+                } else {
+                    0.0
+                };
+                (
+                    blocks_in_chain,
+                    total,
+                    percent,
+                    0.0,
+                    0.0,
+                    "header",
+                    total_known,
+                )
+            };
+
+        // Cap ETA at 999h to avoid overflow/absurd display when speed is very low
+        const MAX_ETA_SECS: u64 = 999 * 3600;
+        let eta_capped = eta_seconds.min(MAX_ETA_SECS as f64) as u64;
+
+        Ok(SyncProgress {
+            current_height,
+            total_height,
+            progress_percent: progress_percent.min(100.0),
+            blocks_per_second,
+            eta_seconds: eta_capped,
+            phase: phase.to_string(),
+            total_known,
+        })
+    }
+}
+
+/// Handle to cancel sync without borrowing FastSync (avoids "Already borrowed" when sync is running).
+#[pyclass]
+pub struct SyncCanceller {
+    cancelled: Arc<StdMutex<bool>>,
+}
+
+#[pymethods]
+impl SyncCanceller {
+    /// Request sync to stop. Safe to call from any thread.
+    fn cancel(&self) -> PyResult<()> {
+        let mut c = self.cancelled.lock().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock error: {}", e))
+        })?;
+        *c = true;
+        Ok(())
+    }
+}
+
 /// Sync progress information
 #[pyclass]
 #[derive(Clone)]
@@ -469,6 +610,12 @@ pub struct SyncProgress {
     pub blocks_per_second: f64,
     #[pyo3(get)]
     pub eta_seconds: u64,
+    /// Phase: "header" (syncing headers) or "block" (downloading full blocks)
+    #[pyo3(get)]
+    pub phase: String,
+    /// When false (header phase, tip unknown): CLI should show "Requesting current block height..." instead of %
+    #[pyo3(get)]
+    pub total_known: bool,
 }
 
 /// Fast sync orchestrator for Bitcoin blockchain
@@ -480,6 +627,9 @@ pub struct FastSync {
     peer_manager: Option<Arc<Mutex<PeerManager>>>,
     header_sync: Option<HeaderSync>,
     block_sync: Option<BlockSync>,
+    /// Shared progress cache: updated by block_sync, read by SyncProgressReporter.
+    /// Allows progress polling during sync without borrowing FastSync (avoids "Already borrowed").
+    progress_cache: Arc<StdMutex<BlockProgressCache>>,
     /// Cancellation flag
     cancelled: Arc<StdMutex<bool>>,
 }
@@ -525,12 +675,15 @@ impl FastSync {
             50, // max_peers
         )));
 
+        let progress_cache = Arc::new(StdMutex::new(BlockProgressCache::default()));
+
         // Create sync components
         let header_sync = HeaderSync::new(
             Arc::clone(&peer_manager),
             Arc::clone(&header_validator),
             Arc::clone(&db),
             network_enum,
+            Some(Arc::clone(&progress_cache)),
         );
 
         let block_sync = BlockSync::new(
@@ -538,6 +691,7 @@ impl FastSync {
             block_validator,
             Arc::clone(&db),
             network_enum,
+            Arc::clone(&progress_cache),
         );
 
         Ok(Self {
@@ -547,7 +701,21 @@ impl FastSync {
             peer_manager: Some(peer_manager),
             header_sync: Some(header_sync),
             block_sync: Some(block_sync),
+            progress_cache,
             cancelled: Arc::new(StdMutex::new(false)),
+        })
+    }
+
+    /// Get a progress reporter that can be used during sync without borrowing FastSync.
+    /// Call this before starting sync; use reporter.get_progress() while sync runs.
+    fn get_progress_reporter(&self) -> PyResult<SyncProgressReporter> {
+        let db = self.db.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Database not initialized")
+        })?;
+        Ok(SyncProgressReporter {
+            db: Arc::clone(db),
+            progress_cache: Arc::clone(&self.progress_cache),
+            network: self.network,
         })
     }
 
@@ -555,7 +723,10 @@ impl FastSync {
     ///
     /// Phase 1: Sync headers
     /// Phase 2: Sync blocks
-    fn sync_blockchain(&mut self, py: Python) -> PyResult<()> {
+    ///
+    /// If `limit` is set, only sync the first N blocks (useful for quick validation).
+    #[pyo3(signature = (limit=None))]
+    fn sync_blockchain(&mut self, py: Python, limit: Option<u32>) -> PyResult<()> {
         // Reset cancellation flag
         {
             let mut cancelled = self.cancelled.lock().unwrap();
@@ -576,8 +747,22 @@ impl FastSync {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Database not initialized")
                 })?;
 
-                // Note: Genesis block initialization is handled by header sync
-                // when it detects an empty database
+                // Initialize genesis block if database is empty (enables header sync to proceed)
+                if db.get_best_block().is_err() {
+                    let genesis_hash = crate::chain_params::genesis_block_hash(self.network);
+                    let genesis_timestamp = crate::chain_params::genesis_block_timestamp(self.network);
+                    let metadata = BlockMetadata::new(0, [0u8; 32], genesis_timestamp);
+                    db.store_block_metadata(0, &genesis_hash, &metadata).map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            format!("Failed to store genesis metadata: {}", e),
+                        )
+                    })?;
+                    db.update_best_block(&genesis_hash, 0).map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            format!("Failed to set genesis as best block: {}", e),
+                        )
+                    })?;
+                }
 
                 // Start peer manager
                 let peer_manager = self.peer_manager.as_ref().ok_or_else(|| {
@@ -619,15 +804,15 @@ impl FastSync {
                         )
                     })?;
 
-                    eprintln!("Header sync completed. Starting block sync from height {}...", current_height);
+                    log::info!("Header sync completed. Starting block sync from height {}...", current_height);
                     
                     // For block sync, we want to sync all blocks from genesis to current height
                     // Since we only have headers, we need to download the full blocks
-                    // Start from height 0 (genesis) and go up to current_height
+                    // Start from height 0 (genesis) and go up to current_height (or limit if set)
                     let start_height = 0u32;
-                    let end_height = current_height;
+                    let end_height = limit.map(|n| n.min(current_height)).unwrap_or(current_height);
                     
-                    eprintln!("Block sync: downloading blocks from height {} to {}", start_height, end_height);
+                    log::info!("Block sync: downloading blocks from height {} to {}", start_height, end_height);
                     
                     block_sync.sync_blocks(start_height, end_height).await.map_err(|e| {
                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
@@ -635,9 +820,9 @@ impl FastSync {
                         )
                     })?;
                     
-                    eprintln!("Block sync completed successfully!");
+                    log::info!("Block sync completed successfully!");
                 } else {
-                    eprintln!("Warning: Block sync not initialized, skipping block download");
+                    log::warn!("Block sync not initialized, skipping block download");
                 }
 
                 Ok(())
@@ -666,21 +851,21 @@ impl FastSync {
         // as blocks are stored; DB best_block may lag). Otherwise use DB height.
         let block_sync_stats = self.block_sync.as_ref().and_then(|bs| bs.get_progress_stats());
 
-        let (current_height, total_height, progress_percent, blocks_per_second, eta_seconds) =
+        let (current_height, total_height, progress_percent, blocks_per_second, eta_seconds, phase, total_known) =
             if let Some((blocks_downloaded, total_to_download, speed, eta)) = block_sync_stats {
                 if total_to_download > 0 {
-                    // Block sync active: use blocks_downloaded for accurate live progress
-                    let current = blocks_downloaded.max(db_height);
+                    // Block sync active: use blocks_downloaded only (not db_height)
+                    let current = blocks_downloaded;
                     let total = total_to_download;
                     let percent = if total > 0 {
                         ((current as f64 / total as f64) * 100.0).min(100.0)
                     } else {
                         0.0
                     };
-                    (current, total, percent, speed, eta)
+                    (current, total, percent, speed, eta, "block", true)
                 } else {
                     // Block sync not fully initialized, fall back to DB
-                    (db_height, 0, 0.0, speed, eta)
+                    (db_height, 0, 0.0, speed, eta, "header", false)
                 }
             } else {
                 // No block sync (e.g. header-only phase): use DB height and estimated tip
@@ -698,7 +883,7 @@ impl FastSync {
                 } else {
                     100.0
                 };
-                (db_height, total, percent, 0.0, 0.0)
+                (db_height, total, percent, 0.0, 0.0, "header", false)
             };
 
         // If we have block sync stats but total was 0, we still need total_height for display
@@ -714,12 +899,18 @@ impl FastSync {
             total_height
         };
 
+        // Cap ETA at 999h to avoid overflow/absurd display
+        const MAX_ETA_SECS: u64 = 999 * 3600;
+        let eta_capped = eta_seconds.min(MAX_ETA_SECS as f64) as u64;
+
         Ok(SyncProgress {
             current_height,
             total_height,
             progress_percent: progress_percent.min(100.0),
             blocks_per_second,
-            eta_seconds: eta_seconds.min(u64::MAX as f64) as u64,
+            eta_seconds: eta_capped,
+            phase: phase.to_string(),
+            total_known,
         })
     }
 
@@ -730,11 +921,12 @@ impl FastSync {
         Ok(false)
     }
 
-    /// Cancel synchronization
-    fn cancel_sync(&mut self) -> PyResult<()> {
-        let mut cancelled = self.cancelled.lock().unwrap();
-        *cancelled = true;
-        Ok(())
+    /// Get a canceller handle. Use this instead of cancel_sync() to avoid "Already borrowed"
+    /// when sync is running in another thread.
+    fn get_canceller(&self) -> SyncCanceller {
+        SyncCanceller {
+            cancelled: Arc::clone(&self.cancelled),
+        }
     }
 }
 
