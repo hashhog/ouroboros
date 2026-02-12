@@ -1,6 +1,6 @@
 //! Bitcoin P2P headers-first synchronization
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use bitcoin::Network;
 use bitcoin::hashes::Hash;
@@ -11,11 +11,12 @@ use thiserror::Error;
 use crate::network::peer_manager::{PeerManager, PeerManagerError};
 use crate::network::peer::PeerError;
 use crate::network::messages::{
-    GetHeadersMessage, HeadersMessage,
+    GetHeadersMessage, HeadersMessage, MessageError,
 };
 use crate::validate::header::{HeaderValidator, HeaderValidationError};
 use crate::storage::db::{BlockchainDB, DbError};
 use crate::chain_params::{genesis_block_hash, genesis_block_timestamp};
+use crate::network::block_sync::BlockProgressCache;
 use common::{BlockHeaderWrapper, BlockMetadata};
 
 /// Header sync error types
@@ -39,8 +40,12 @@ pub enum HeaderSyncError {
     #[error("Invalid header response")]
     InvalidHeaderResponse,
 
-    #[error("Headers don't connect to chain (from peer {0})")]
-    HeadersDontConnect(String),
+    #[error("Headers don't connect to chain. {message}")]
+    HeadersDontConnect {
+        message: String,
+        /// Peer that sent the headers (for excluding on retry)
+        peer_addr: Option<std::net::SocketAddr>,
+    },
 
     #[error("Chain reorganization detected")]
     ChainReorg,
@@ -55,9 +60,16 @@ pub enum HeaderSyncError {
 /// Result type for header sync operations
 pub type Result<T> = std::result::Result<T, HeaderSyncError>;
 
-/// Check if verbose debug logging is enabled (OUROBOROS_VERBOSE=1)
-fn is_verbose() -> bool {
-    std::env::var("OUROBOROS_VERBOSE").as_deref() == Ok("1")
+/// Build reset hint for HeadersDontConnect errors
+fn reset_hint(network: Network) -> String {
+    let net_str = match network {
+        Network::Bitcoin => "mainnet",
+        Network::Testnet => "testnet",
+        Network::Testnet4 => "testnet4",
+        Network::Regtest => "regtest",
+        Network::Signet => "signet",
+    };
+    format!("Try: ouroboros --network {} sync --reset", net_str)
 }
 
 /// Progress callback type
@@ -69,6 +81,8 @@ pub struct HeaderSync {
     validator: Arc<HeaderValidator>,
     db: Arc<BlockchainDB>,
     network: Network,
+    /// Shared progress cache: set header_sync_tip when we discover chain tip (short batch)
+    progress_cache: Option<Arc<StdMutex<BlockProgressCache>>>,
     /// Progress callback: (downloaded, total_estimated, percentage)
     progress_callback: Option<ProgressCallback>,
 }
@@ -80,12 +94,14 @@ impl HeaderSync {
         validator: Arc<HeaderValidator>,
         db: Arc<BlockchainDB>,
         network: Network,
+        progress_cache: Option<Arc<StdMutex<BlockProgressCache>>>,
     ) -> Self {
         Self {
             peer_manager,
             validator,
             db,
             network,
+            progress_cache,
             progress_callback: None,
         }
     }
@@ -101,7 +117,7 @@ impl HeaderSync {
     /// validates the chain, stores validated headers, and returns final height.
     pub async fn sync_headers(&mut self) -> Result<u32> {
         // Wait for at least one peer to be connected
-        eprintln!("Waiting for peers to connect...");
+        log::info!("Waiting for peers to connect...");
         let mut wait_count = 0;
         loop {
             // Check if we have any connected peers
@@ -111,13 +127,13 @@ impl HeaderSync {
             };
             
             if connected_count > 0 {
-                eprintln!("Found {} connected peer(s), starting header sync...", connected_count);
+                log::info!("Found {} connected peer(s), starting header sync...", connected_count);
                 break;
             }
             
             wait_count += 1;
             if wait_count % 5 == 0 {
-                eprintln!("Still waiting for peers to connect... ({}s)", wait_count);
+                log::debug!("Still waiting for peers to connect... ({}s)", wait_count);
             }
             if wait_count > 120 {
                 return Err(HeaderSyncError::NoPeersAvailable);
@@ -153,38 +169,40 @@ impl HeaderSync {
                 Err(HeaderSyncError::NoPeersAvailable) => {
                     // If we excluded peers due to HeadersDontConnect, we may have excluded all
                     if !excluded_peers.is_empty() {
-                        eprintln!("All peers sent headers that didn't connect. Chainstate may be inconsistent.");
-                        eprintln!("Try: ouroboros sync --reset (or rm -rf <data-dir>/* and re-run sync)");
-                        return Err(HeaderSyncError::HeadersDontConnect(
-                            "No peers with matching chain. Reset chainstate and retry.".to_string(),
-                        ));
+                        let hint = reset_hint(self.network);
+                        log::error!("All peers sent headers that didn't connect. Chainstate may be inconsistent.");
+                        log::error!("{}", hint);
+                        return Err(HeaderSyncError::HeadersDontConnect {
+                            message: format!("No peers with matching chain. {}", hint),
+                            peer_addr: None,
+                        });
                     }
                     // Wait a bit and retry
-                    eprintln!("No peers available, waiting 5 seconds...");
+                    log::debug!("No peers available, waiting 5 seconds...");
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
                 Err(HeaderSyncError::Peer(crate::network::peer::PeerError::ConnectionClosed)) => {
                     // Peer disconnected, wait and retry with a different peer
-                    eprintln!("Peer disconnected, retrying with different peer in 2 seconds...");
+                    log::debug!("Peer disconnected, retrying with different peer in 2 seconds...");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
                 Err(HeaderSyncError::Peer(crate::network::peer::PeerError::Timeout)) => {
                     // Connection timeout, retry
-                    eprintln!("Connection timeout, retrying in 2 seconds...");
+                    log::debug!("Connection timeout, retrying in 2 seconds...");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
                 Err(HeaderSyncError::Peer(crate::network::peer::PeerError::Io(ref msg))) => {
                     // I/O errors (broken pipe, write errors, etc.) - retry with different peer
                     if msg.contains("Broken pipe") || msg.contains("Write error") || msg.contains("Connection") {
-                        eprintln!("Peer I/O error ({}), retrying with different peer in 2 seconds...", msg);
+                        log::debug!("Peer I/O error ({}), retrying with different peer in 2 seconds...", msg);
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
                     // Other I/O errors - still retry
-                    eprintln!("Peer I/O error: {}, retrying in 2 seconds...", msg);
+                    log::debug!("Peer I/O error: {}, retrying in 2 seconds...", msg);
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
@@ -195,7 +213,7 @@ impl HeaderSync {
                        error_msg.contains("Write error") || 
                        error_msg.contains("Connection") ||
                        error_msg.contains("I/O error") {
-                        eprintln!("Peer manager I/O error ({}), retrying with different peer in 2 seconds...", error_msg);
+                        log::debug!("Peer manager I/O error ({}), retrying with different peer in 2 seconds...", error_msg);
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
@@ -203,23 +221,23 @@ impl HeaderSync {
                     if let crate::network::peer_manager::PeerManagerError::Peer(ref peer_err) = pm_err {
                         match peer_err {
                             crate::network::peer::PeerError::ConnectionClosed => {
-                                eprintln!("Peer disconnected (via manager), retrying with different peer in 2 seconds...");
+                                log::debug!("Peer disconnected (via manager), retrying with different peer in 2 seconds...");
                                 tokio::time::sleep(Duration::from_secs(2)).await;
                                 continue;
                             }
                             crate::network::peer::PeerError::Timeout => {
-                                eprintln!("Connection timeout (via manager), retrying in 2 seconds...");
+                                log::debug!("Connection timeout (via manager), retrying in 2 seconds...");
                                 tokio::time::sleep(Duration::from_secs(2)).await;
                                 continue;
                             }
                             crate::network::peer::PeerError::Io(ref msg) => {
-                                eprintln!("Peer I/O error (via manager, {}), retrying in 2 seconds...", msg);
+                                log::debug!("Peer I/O error (via manager, {}), retrying in 2 seconds...", msg);
                                 tokio::time::sleep(Duration::from_secs(2)).await;
                                 continue;
                             }
                             _ => {
                                 // Other peer errors - still retry
-                                eprintln!("Peer manager error ({}), retrying in 2 seconds...", error_msg);
+                                log::debug!("Peer manager error ({}), retrying in 2 seconds...", error_msg);
                                 tokio::time::sleep(Duration::from_secs(2)).await;
                                 continue;
                             }
@@ -227,29 +245,37 @@ impl HeaderSync {
                     }
                     // For non-peer errors from peer manager, check if it's recoverable
                     if error_msg.contains("No peers available") {
-                        eprintln!("No peers available (via manager), waiting 5 seconds...");
+                        log::debug!("No peers available (via manager), waiting 5 seconds...");
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         continue;
                     }
                     // If we can't handle it, return the error
                     return Err(HeaderSyncError::PeerManager(pm_err.clone()));
                 }
-                Err(HeaderSyncError::HeadersDontConnect(peer_str)) => {
-                    // Retry with a different peer - add this peer to exclude list
-                    if let Ok(addr) = peer_str.parse::<std::net::SocketAddr>() {
+                Err(HeaderSyncError::HeadersDontConnect { message, peer_addr }) => {
+                    // Retry with a different peer - exclude the peer that sent bad headers
+                    if let Some(addr) = peer_addr {
                         if !excluded_peers.contains(&addr) {
                             excluded_peers.push(addr);
-                            eprintln!("Retrying with different peer (excluding {}); excluded so far: {}", peer_str, excluded_peers.len());
+                            log::debug!(
+                                "Retrying with different peer (excluding {}); excluded so far: {}",
+                                addr, excluded_peers.len()
+                            );
                         }
                         continue;
                     }
-                    return Err(HeaderSyncError::HeadersDontConnect(peer_str));
+                    return Err(HeaderSyncError::HeadersDontConnect { message, peer_addr: None });
                 }
                 Err(e) => return Err(e),
             };
 
             if headers.is_empty() {
-                // No more headers available (we're synced)
+                // No more headers available (we're at chain tip)
+                if let Some(ref cache) = self.progress_cache {
+                    if let Ok(mut c) = cache.lock() {
+                        c.header_sync_tip = Some(current_height);
+                    }
+                }
                 break;
             }
 
@@ -280,8 +306,15 @@ impl HeaderSync {
                 callback(downloaded, estimated_total, percentage.min(100.0));
             }
 
-            // If we got fewer than BATCH_SIZE headers, we're done
+            // If we got fewer than BATCH_SIZE headers, we're at chain tip
+            // current_height = save_start + len is the next height; tip = current_height - 1
             if headers.len() < BATCH_SIZE as usize {
+                if let Some(ref cache) = self.progress_cache {
+                    if let Ok(mut c) = cache.lock() {
+                        let tip = current_height.saturating_sub(1);
+                        c.header_sync_tip = Some(tip);
+                    }
+                }
                 break;
             }
         }
@@ -302,34 +335,10 @@ impl HeaderSync {
         // Build locator
         let mut locator = self.build_locator(start_height)?;
         
-        // If locator is empty (empty database), use genesis hash for the network
+        // If locator is empty (empty database), use genesis hash from chain params
         if locator.is_empty() {
-            if is_verbose() {
-                eprintln!("Requesting headers from genesis");
-            }
-            let genesis_hash = match self.network {
-                Network::Bitcoin => [
-                    0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3, 0x72,
-                    0xc1, 0xa6, 0xa2, 0x46, 0xae, 0x63, 0xf7, 0x4f,
-                    0x93, 0x1e, 0x83, 0x65, 0xe1, 0x5a, 0x08, 0x9c,
-                    0x68, 0xd6, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00,
-                ],
-                Network::Testnet => [
-                    0x43, 0x49, 0x7f, 0xd7, 0xf8, 0x26, 0x95, 0x71,
-                    0x08, 0xf4, 0xa3, 0x0f, 0xd9, 0xce, 0xc3, 0xae,
-                    0xba, 0x79, 0x97, 0x20, 0x84, 0xe9, 0x0e, 0xad,
-                    0x01, 0xea, 0x33, 0x09, 0x00, 0x00, 0x00, 0x00,
-                ],
-                // Testnet4 genesis: 00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043 (internal byte order)
-                Network::Testnet4 => [
-                    0x43, 0xf0, 0x8b, 0xda, 0xb0, 0x50, 0xe3, 0x5b,
-                    0x56, 0x7c, 0x86, 0x4b, 0x91, 0xf4, 0x7f, 0x50,
-                    0xae, 0x72, 0x5a, 0xe2, 0xde, 0x53, 0xbc, 0xfb,
-                    0xba, 0xf2, 0x84, 0xda, 0x00, 0x00, 0x00, 0x00,
-                ],
-                _ => [0u8; 32], // For other networks, use all zeros
-            };
-            locator.push(genesis_hash);
+            log::debug!("Requesting headers from genesis");
+            locator.push(genesis_block_hash(self.network));
         }
         
         // Build GetHeaders message
@@ -349,14 +358,12 @@ impl HeaderSync {
             let mut peer_manager = self.peer_manager.lock().await;
             peer_manager.get_peer(peer_addr).await
                 .ok_or_else(|| {
-                    eprintln!("Peer {} not found in peer manager", peer_addr);
+                    log::warn!("Peer {} not found in peer manager", peer_addr);
                     HeaderSyncError::NoPeersAvailable
                 })?
         };
 
-        if is_verbose() {
-            eprintln!("Requesting headers from peer {} (starting from height {})", peer_addr, start_height);
-        }
+        log::debug!("Requesting headers from peer {} (starting from height {})", peer_addr, start_height);
 
         // Receive headers response with timeout
         // Filter out non-headers messages (verack, ping, pong, inv, etc.)
@@ -364,20 +371,28 @@ impl HeaderSync {
             let msg = match timeout(Duration::from_secs(60), peer.receive_message()).await {
                 Ok(Ok(msg)) => msg,
                 Ok(Err(e)) => {
-                    eprintln!("Error receiving message from peer {}: {}", peer_addr, e);
+                    // Suppress desync errors (Payload size exceeds, Invalid magic) at warn level
+                    let is_desync = matches!(
+                        &e,
+                        PeerError::Message(MessageError::PayloadSizeExceeded { .. })
+                            | PeerError::Message(MessageError::InvalidMagic { .. })
+                    );
+                    if is_desync {
+                        log::debug!("Error receiving message from peer {}: {}", peer_addr, e);
+                    } else {
+                        log::warn!("Error receiving message from peer {}: {}", peer_addr, e);
+                    }
                     return Err(HeaderSyncError::Peer(e));
                 }
                 Err(_) => {
-                    eprintln!("Timeout waiting for headers from peer {}", peer_addr);
+                    log::debug!("Timeout waiting for headers from peer {}", peer_addr);
                     return Err(HeaderSyncError::Timeout);
                 }
             };
             
             // If it's a headers message, use it
             if msg.command == "headers" {
-                if is_verbose() {
-                    eprintln!("Received headers message from peer {}", peer_addr);
-                }
+                log::debug!("Received headers message from peer {}", peer_addr);
                 break msg;
             }
             
@@ -390,7 +405,7 @@ impl HeaderSync {
                     let pong = PongMessage::new(ping.nonce);
                     let pong_msg = pong.to_message(self.network);
                     if let Err(e) = peer.send_message(pong_msg).await {
-                        eprintln!("Failed to send pong: {}", e);
+                        log::warn!("Failed to send pong: {}", e);
                         return Err(HeaderSyncError::Peer(crate::network::peer::PeerError::Io(format!("Failed to send pong: {}", e))));
                     }
                 }
@@ -404,9 +419,9 @@ impl HeaderSync {
                 continue;
             }
             
-            // Log unexpected messages but continue waiting (reduce verbosity)
-            if is_verbose() && !matches!(msg.command.as_str(), "sendcmpct" | "feefilter" | "inv" | "addr" | "verack" | "pong" | "ping") {
-                eprintln!("Received unexpected message: '{}', continuing to wait for headers...", msg.command);
+            // Log unexpected messages at debug level
+            if !matches!(msg.command.as_str(), "sendcmpct" | "feefilter" | "inv" | "addr" | "verack" | "pong" | "ping") {
+                log::debug!("Received unexpected message: '{}', continuing to wait for headers...", msg.command);
             }
         };
 
@@ -420,9 +435,7 @@ impl HeaderSync {
         let headers_msg = HeadersMessage::deserialize_payload(&response_msg.payload)
             .map_err(|e| HeaderSyncError::Unknown(format!("Failed to deserialize headers: {}", e)))?;
 
-        if is_verbose() {
-            eprintln!("Deserialized {} headers from peer {}", headers_msg.headers.len(), peer_addr);
-        }
+        log::debug!("Deserialized {} headers from peer {}", headers_msg.headers.len(), peer_addr);
 
         // Extract headers (verify tx_count is 0 for headers message)
         let headers: Vec<bitcoin::blockdata::block::Header> = headers_msg
@@ -431,8 +444,7 @@ impl HeaderSync {
             .map(|h| {
                 // Verify tx_count is 0 (headers message shouldn't include transactions)
                 if h.tx_count != 0 {
-                    // Log warning but continue
-                    eprintln!("Warning: Headers message has non-zero tx_count: {}", h.tx_count);
+                    log::warn!("Headers message has non-zero tx_count: {}", h.tx_count);
                 }
                 h.header
             })
@@ -445,13 +457,34 @@ impl HeaderSync {
             
             // If database is empty, accept any headers
             match self.db.get_best_block() {
-                Ok((best_hash, _best_height)) => {
+                Ok((best_hash, best_height)) => {
                     // Check first header connects to our chain (use best_hash; we may only have metadata, not full block)
                     let best_header_hash = bitcoin::BlockHash::from_byte_array(best_hash);
                     if first_header.prev_blockhash != best_header_hash {
-                        eprintln!("Headers don't connect: first header prev_blockhash {:?} != best block hash {:?} (try different peer or reset chainstate)",
-                                 first_header.prev_blockhash, best_header_hash);
-                        return Err(HeaderSyncError::HeadersDontConnect(peer_addr.to_string()));
+                        // Try reorg recovery: peer may be on a longer chain that reorged
+                        let prev_hash_bytes = first_header.prev_blockhash.to_byte_array();
+                        if let Ok(Some(common_height)) =
+                            self.db.find_height_of_hash(&prev_hash_bytes, best_height)
+                        {
+                            // Common ancestor found - reorg detected. Rewind to that height.
+                            log::info!(
+                                "Chain reorg detected: rewinding from height {} to {} (common ancestor)",
+                                best_height, common_height
+                            );
+                            self.db
+                                .update_best_block(&prev_hash_bytes, common_height)
+                                .map_err(|e| HeaderSyncError::Database(e))?;
+                            // Headers now connect (first header's prev = our new best)
+                        } else {
+                            // No common ancestor - chainstate likely inconsistent
+                            let hint = reset_hint(self.network);
+                            log::error!("Headers don't connect: first header prev_blockhash {:?} != best block hash {:?}", first_header.prev_blockhash, best_header_hash);
+                            log::error!("{}", hint);
+                            return Err(HeaderSyncError::HeadersDontConnect {
+                                message: format!("First header doesn't connect (from peer {}). {}", peer_addr, hint),
+                                peer_addr: Some(peer_addr),
+                            });
+                        }
                     }
                 }
                 Err(_) => {
@@ -480,15 +513,13 @@ impl HeaderSync {
                         _ => bitcoin::BlockHash::all_zeros(),
                     };
                     
-                    if is_verbose() {
-                        if first_header.prev_blockhash == genesis_hash {
-                            eprintln!("Received headers starting from block 1 (after genesis)");
-                        } else if first_header.prev_blockhash == bitcoin::BlockHash::all_zeros() {
-                            eprintln!("Received genesis block header");
-                        } else {
-                            eprintln!("Database empty: accepting headers starting from non-genesis (prev_blockhash: {:?})", 
-                                     first_header.prev_blockhash);
-                        }
+                    if first_header.prev_blockhash == genesis_hash {
+                        log::debug!("Received headers starting from block 1 (after genesis)");
+                    } else if first_header.prev_blockhash == bitcoin::BlockHash::all_zeros() {
+                        log::debug!("Received genesis block header");
+                    } else {
+                        log::debug!("Database empty: accepting headers starting from non-genesis (prev_blockhash: {:?})", 
+                                 first_header.prev_blockhash);
                     }
                 }
             }
@@ -584,8 +615,8 @@ impl HeaderSync {
             }
             Err(_) => {
                 // Database is empty - accept headers as-is
-                if is_verbose() && start_height == 0 {
-                    eprintln!("Database empty: accepting headers starting from height {}", start_height);
+                if start_height == 0 {
+                    log::debug!("Database empty: accepting headers starting from height {}", start_height);
                 }
                 (0, true) // Database is empty - remember this for entire batch
             }
@@ -606,9 +637,7 @@ impl HeaderSync {
             );
             self.db.store_block_metadata(0, &genesis_hash, &metadata)
                 .map_err(|e| HeaderSyncError::Database(e))?;
-            if is_verbose() {
-                eprintln!("Stored genesis block metadata at height 0");
-            }
+            log::debug!("Stored genesis block metadata at height 0");
         }
 
         // Get previous header for validation (only if database is not empty)
@@ -637,11 +666,13 @@ impl HeaderSync {
                 if let Some(ref prev_header) = prev_header_opt {
                     // Database has full blocks - validate connection and run full validation
                     if header.inner().prev_blockhash != prev_header.block_hash() {
-                        eprintln!("First header doesn't connect: prev_blockhash {:?} != prev_header hash {:?}",
-                                 header.inner().prev_blockhash, prev_header.block_hash());
-                        return Err(HeaderSyncError::HeadersDontConnect(
-                            "First header doesn't connect to previous".to_string(),
-                        ));
+                        let hint = reset_hint(self.network);
+                        log::error!("First header doesn't connect: prev_blockhash {:?} != prev_header hash {:?}", header.inner().prev_blockhash, prev_header.block_hash());
+                        log::error!("{}", hint);
+                        return Err(HeaderSyncError::HeadersDontConnect {
+                            message: format!("First header doesn't connect to previous. {}", hint),
+                            peer_addr: None,
+                        });
                     }
                     self.validator.validate_header(header, prev_header)
                         .map_err(|e| HeaderSyncError::Validation(e))?;
@@ -649,17 +680,19 @@ impl HeaderSync {
                     // Header-only sync: check connection using best block hash
                     let expected_prev = bitcoin::BlockHash::from_byte_array(*best_hash);
                     if header.inner().prev_blockhash != expected_prev {
-                        eprintln!("First header doesn't connect: prev_blockhash {:?} != best block hash {:?}",
-                                 header.inner().prev_blockhash, expected_prev);
-                        return Err(HeaderSyncError::HeadersDontConnect(
-                            "First header doesn't connect to best block".to_string(),
-                        ));
+                        let hint = reset_hint(self.network);
+                        log::error!("First header doesn't connect: prev_blockhash {:?} != best block hash {:?}", header.inner().prev_blockhash, expected_prev);
+                        log::error!("{}", hint);
+                        return Err(HeaderSyncError::HeadersDontConnect {
+                            message: format!("First header doesn't connect to best block. {}", hint),
+                            peer_addr: None,
+                        });
                     }
                     // Full validation skipped (no prev header for median time); chain link is verified
                 } else {
                     // Database was empty at start - skip validation for first header
-                    if is_verbose() && (current_height == 0 || (current_height < 100 && current_height % 10 == 0) || current_height % 10000 == 0) {
-                        eprintln!("Skipping validation for first header (database was empty at start, height {})", current_height);
+                    if current_height == 0 || (current_height < 100 && current_height % 10 == 0) || current_height % 10000 == 0 {
+                        log::debug!("Skipping validation for first header (database was empty at start, height {})", current_height);
                     }
                 }
                 // Set prev_header for next iteration
@@ -668,9 +701,11 @@ impl HeaderSync {
                 // Subsequent headers must connect to previous in this batch
                 let prev_in_batch = &header_wrappers[i - 1];
                 if header.inner().prev_blockhash != prev_in_batch.block_hash() {
-                    return Err(HeaderSyncError::HeadersDontConnect(
-                        "Headers in batch don't connect".to_string(),
-                    ));
+                    let hint = reset_hint(self.network);
+                    return Err(HeaderSyncError::HeadersDontConnect {
+                        message: format!("Headers in batch don't connect. {}", hint),
+                        peer_addr: None,
+                    });
                 }
                 // Validate header with validator
                 // For empty database, skip validation for first 1000 headers to bootstrap
@@ -678,13 +713,13 @@ impl HeaderSync {
                 if was_empty && current_height < 1000 {
                     // Skip validation for first 1000 headers when database was empty at start
                     // This allows us to bootstrap the chain
-                    if is_verbose() && current_height % 100 == 0 {
-                        eprintln!("Skipping validation for header at height {} (bootstrap mode, i={})", current_height, i);
+                    if current_height % 100 == 0 {
+                        log::debug!("Skipping validation for header at height {} (bootstrap mode, i={})", current_height, i);
                     }
                 } else {
                     self.validator.validate_header(header, prev_in_batch)
                         .map_err(|e| {
-                            eprintln!("Header validation failed at height {} (i={}, was_empty={}): {}", current_height, i, was_empty, e);
+                            log::error!("Header validation failed at height {} (i={}, was_empty={}): {}", current_height, i, was_empty, e);
                             HeaderSyncError::Validation(e)
                         })?;
                 }

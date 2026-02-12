@@ -344,10 +344,10 @@ impl Peer {
         // Parse payload size from header
         let payload_size = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
         
-        // Sanity check: payload_size > 8MB likely indicates stream desync (garbage interpreted as
-        // header). Max valid block ~4MB; 8MB catches obvious garbage (e.g. 3.6GB) while allowing
-        // any real block.
-        const SANITY_MAX_PAYLOAD: u32 = 8 * 1024 * 1024; // 8MB
+        // Sanity check: payload_size > 4MB likely indicates stream desync (garbage interpreted as
+        // header). Bitcoin blocks are rarely > 2MB; 4MB catches obvious garbage (e.g. 3.6GB) while
+        // allowing any real block.
+        const SANITY_MAX_PAYLOAD: u32 = 4 * 1024 * 1024; // 4MB
         if payload_size > SANITY_MAX_PAYLOAD {
             self.state = PeerState::Disconnected;
             return Err(PeerError::Message(MessageError::PayloadSizeExceeded {
