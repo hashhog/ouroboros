@@ -118,11 +118,21 @@ impl Message {
         // Read payload size (4 bytes)
         let payload_size = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
 
+        // Early sanity check: payload_size > 4MB likely indicates stream desync. Bitcoin blocks
+        // are rarely > 2MB; values in the billions are garbage.
+        const SANITY_MAX_PAYLOAD: u32 = 4 * 1024 * 1024; // 4MB
+        if payload_size > SANITY_MAX_PAYLOAD {
+            return Err(MessageError::PayloadSizeExceeded {
+                size: payload_size,
+                limit: SANITY_MAX_PAYLOAD,
+            });
+        }
+
         // Read checksum (4 bytes)
         let checksum = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
 
-        // Validate payload size
-        const MAX_PAYLOAD_SIZE: u32 = 32 * 1024 * 1024; // 32MB limit
+        // Protocol limit: 32MB (Bitcoin P2P spec)
+        const MAX_PAYLOAD_SIZE: u32 = 32 * 1024 * 1024;
         if payload_size > MAX_PAYLOAD_SIZE {
             return Err(MessageError::PayloadSizeExceeded {
                 size: payload_size,

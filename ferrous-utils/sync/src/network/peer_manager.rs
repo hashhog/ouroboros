@@ -41,9 +41,23 @@ pub enum PeerManagerError {
 /// Result type for peer manager operations
 pub type Result<T> = std::result::Result<T, PeerManagerError>;
 
-/// Check if verbose debug logging is enabled (OUROBOROS_VERBOSE=1)
-fn is_verbose() -> bool {
-    std::env::var("OUROBOROS_VERBOSE").as_deref() == Ok("1")
+/// Check if IPv4-only mode is requested (OUROBOROS_PREFER_IPV4=1)
+fn prefer_ipv4_only() -> bool {
+    std::env::var("OUROBOROS_PREFER_IPV4").as_deref() == Ok("1")
+}
+
+/// Sort and optionally filter peer addresses: IPv4 first, IPv6 second.
+/// When OUROBOROS_PREFER_IPV4=1, filters out IPv6 entirely.
+fn sort_addrs_prefer_ipv4(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    if prefer_ipv4_only() {
+        addrs.retain(|a| a.is_ipv4());
+    }
+    addrs.sort_by(|a, b| {
+        let a_v4 = a.is_ipv4();
+        let b_v4 = b.is_ipv4();
+        a_v4.cmp(&b_v4).reverse() // IPv4 (true) before IPv6 (false)
+    });
+    addrs
 }
 
 /// Peer ban information
@@ -87,6 +101,9 @@ impl BannedPeer {
     }
 }
 
+/// Expiry for desync blacklist (5 minutes)
+const DESYNC_BLACKLIST_SECS: u64 = 300;
+
 /// Bitcoin P2P peer manager
 pub struct PeerManager {
     /// Active peer connections
@@ -97,6 +114,8 @@ pub struct PeerManager {
     known_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
     /// Banned peers with ban duration
     banned_peers: Arc<Mutex<HashMap<SocketAddr, BannedPeer>>>,
+    /// Peers that sent corrupted data (Payload size exceeds, Invalid magic). Expires after 5 min.
+    desync_blacklist: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
     /// Bitcoin network
     network: Network,
     /// User agent string
@@ -122,12 +141,36 @@ impl PeerManager {
             max_peers,
             known_addrs: Arc::new(Mutex::new(HashSet::new())),
             banned_peers: Arc::new(Mutex::new(HashMap::new())),
+            desync_blacklist: Arc::new(Mutex::new(HashMap::new())),
             network,
             user_agent,
             start_height,
             min_peers: 8,
             target_peers: 10,
         }
+    }
+
+    /// Blacklist a peer that sent corrupted data (Payload size exceeds, Invalid magic).
+    /// Peer won't be reconnected for 5 minutes.
+    pub async fn blacklist_peer_desync(&mut self, addr: SocketAddr) {
+        let mut list = self.desync_blacklist.lock().await;
+        list.insert(addr, Instant::now());
+    }
+
+    /// Check if peer is blacklisted for desync (and prune expired entries)
+    fn is_desync_blacklisted(blacklist: &mut HashMap<SocketAddr, Instant>, addr: SocketAddr) -> bool {
+        let now = Instant::now();
+        let expiry = Duration::from_secs(DESYNC_BLACKLIST_SECS);
+        let before = blacklist.len();
+        blacklist.retain(|_, t| now.duration_since(*t) < expiry);
+        let removed = before.saturating_sub(blacklist.len());
+        if removed > 0 {
+            log::debug!("Desync blacklist: {} peer(s) expired after {}s cooldown, can retry", removed, DESYNC_BLACKLIST_SECS);
+        }
+        blacklist
+            .get(&addr)
+            .map(|t| now.duration_since(*t) < expiry)
+            .unwrap_or(false)
     }
 
     /// Start the peer manager
@@ -142,6 +185,7 @@ impl PeerManager {
         let peers = Arc::clone(&self.peers);
         let known_addrs = Arc::clone(&self.known_addrs);
         let banned_peers = Arc::clone(&self.banned_peers);
+        let desync_blacklist = Arc::clone(&self.desync_blacklist);
         let network = self.network;
         let user_agent = self.user_agent.clone();
         let start_height = self.start_height;
@@ -163,6 +207,7 @@ impl PeerManager {
                             &peers,
                             &known_addrs,
                             &banned_peers,
+                            &desync_blacklist,
                             network,
                             &user_agent,
                             start_height,
@@ -180,6 +225,7 @@ impl PeerManager {
                                 &peers,
                                 &known_addrs,
                                 &banned_peers,
+                                &desync_blacklist,
                                 network,
                                 &user_agent,
                                 start_height,
@@ -200,7 +246,7 @@ impl PeerManager {
                         if connected_count < min_peers {
                             dns_retry_count += 1;
                             if dns_retry_count == 1 || dns_retry_count % 5 == 0 {
-                                eprintln!("Retrying DNS seed resolution (attempt {})...", dns_retry_count);
+                                log::debug!("Retrying DNS seed resolution (attempt {})...", dns_retry_count);
                             }
                             
                             // Retry DNS seed resolution
@@ -235,7 +281,7 @@ impl PeerManager {
                                     }
                                     Err(e) => {
                                         if dns_retry_count % 5 == 0 { // Log every 5th attempt
-                                            eprintln!("DNS seed {} still not resolving: {}", seed, e);
+                                            log::warn!("DNS seed {} still not resolving: {}", seed, e);
                                         }
                                     }
                                 }
@@ -247,9 +293,7 @@ impl PeerManager {
                                 for addr in &new_addrs {
                                     known.insert(*addr);
                                 }
-                                if is_verbose() {
-                                    eprintln!("Resolved {} new peer address(es) from DNS seeds", new_addrs.len());
-                                }
+                                log::debug!("Resolved {} new peer address(es) from DNS seeds", new_addrs.len());
                             }
                         }
                     }
@@ -302,7 +346,7 @@ impl PeerManager {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to resolve DNS seed {}: {}", seed, e);
+                    log::warn!("Failed to resolve DNS seed {}: {}", seed, e);
                 }
             }
         }
@@ -326,10 +370,16 @@ impl PeerManager {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to resolve hardcoded peer {}: {}", peer, e);
+                    log::warn!("Failed to resolve hardcoded peer {}: {}", peer, e);
                 }
             }
         }
+
+        // Prefer IPv4 (Testnet4 and others: IPv6 often fails to connect)
+        if prefer_ipv4_only() {
+            log::info!("Using IPv4-only mode (OUROBOROS_PREFER_IPV4=1)");
+        }
+        resolved_addrs = sort_addrs_prefer_ipv4(resolved_addrs);
 
         // Add resolved addresses to known addresses
         {
@@ -342,10 +392,10 @@ impl PeerManager {
         // If we have no resolved addresses, log a warning but don't fail
         // The peer manager will continue to try to discover peers through other means
         if resolved_addrs.is_empty() {
-            eprintln!("Warning: No peers resolved from DNS seeds. Peer discovery may be limited.");
+            log::warn!("No peers resolved from DNS seeds. Peer discovery may be limited.");
         }
 
-        // Connect to up to 8 peers
+        // Connect to up to 8 peers (IPv4 first when sorted)
         let mut connected = 0;
         for addr in resolved_addrs.into_iter().take(8) {
             if self.connect_to_peer(addr).await.is_ok() {
@@ -357,7 +407,7 @@ impl PeerManager {
         // The peer manager will continue to try to discover peers
         if connected == 0 {
             if self.network == Network::Testnet4 {
-                eprintln!("Warning: No peers resolved for testnet4. Will retry peer discovery.");
+                log::warn!("No peers resolved for testnet4. Will retry peer discovery.");
                 // Don't fail immediately for testnet4 - allow retries
                 return Ok(());
             }
@@ -376,6 +426,14 @@ impl PeerManager {
                 if banned_peer.is_banned() || banned_peer.is_backed_off() {
                     return Err(PeerManagerError::Peer(PeerError::Disconnected));
                 }
+            }
+        }
+
+        // Check desync blacklist (peer sent corrupted data recently)
+        {
+            let mut list = self.desync_blacklist.lock().await;
+            if Self::is_desync_blacklisted(&mut list, addr) {
+                return Err(PeerManagerError::Peer(PeerError::Disconnected));
             }
         }
 
@@ -439,6 +497,7 @@ impl PeerManager {
         peers: &Arc<Mutex<HashMap<SocketAddr, Peer>>>,
         known_addrs: &Arc<Mutex<HashSet<SocketAddr>>>,
         banned_peers: &Arc<Mutex<HashMap<SocketAddr, BannedPeer>>>,
+        desync_blacklist: &Arc<Mutex<HashMap<SocketAddr, Instant>>>,
         network: Network,
         user_agent: &str,
         start_height: i32,
@@ -497,8 +556,8 @@ impl PeerManager {
             let known = known_addrs.lock().await;
             let banned = banned_peers.lock().await;
 
-            // Find candidates that are not connected, not banned, and not backed off
-            let candidates: Vec<SocketAddr> = known
+            // Find candidates that are not connected, not banned, not backed off, not desync-blacklisted
+            let mut candidates: Vec<SocketAddr> = known
                 .iter()
                 .filter(|addr| {
                     !connected_addrs.contains(addr)
@@ -507,12 +566,21 @@ impl PeerManager {
                             .map(|b| b.is_banned() || b.is_backed_off())
                             .unwrap_or(false)
                 })
-                .take(needed)
                 .copied()
                 .collect();
 
             drop(known);
             drop(banned);
+
+            // Filter out desync-blacklisted peers
+            {
+                let mut list = desync_blacklist.lock().await;
+                candidates.retain(|addr| !Self::is_desync_blacklisted(&mut list, *addr));
+            }
+
+            // Prefer IPv4 (IPv6 often fails on Testnet4 and restricted networks)
+            candidates = sort_addrs_prefer_ipv4(candidates);
+            candidates.truncate(needed);
 
             // Attempt to connect to candidates
             for addr in candidates {
@@ -527,9 +595,7 @@ impl PeerManager {
                         let mut peers_map = peers.lock().await;
                         if peers_map.len() < max_peers && !peers_map.contains_key(&addr) {
                             peers_map.insert(addr, peer);
-                            if is_verbose() {
-                                eprintln!("Connected to peer: {}", addr);
-                            }
+                            log::debug!("Connected to peer: {}", addr);
                         }
                     }
                     Err(_) => {
@@ -550,6 +616,7 @@ impl PeerManager {
             &self.peers,
             &self.known_addrs,
             &self.banned_peers,
+            &self.desync_blacklist,
             self.network,
             &self.user_agent,
             self.start_height,
