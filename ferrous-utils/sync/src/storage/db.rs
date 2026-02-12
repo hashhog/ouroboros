@@ -176,6 +176,20 @@ impl BlockchainDB {
         }
     }
 
+    /// Find the height of a block hash by searching backwards from max_height.
+    /// Used for reorg detection: when headers don't connect, check if the peer's
+    /// prev_blockhash exists in our chain (common ancestor).
+    pub fn find_height_of_hash(&self, hash: &[u8; 32], max_height: u32) -> Result<Option<u32>> {
+        for h in (0..=max_height).rev() {
+            if let Ok(Some(stored_hash)) = self.get_block_hash_by_height(h) {
+                if &stored_hash == hash {
+                    return Ok(Some(h));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     // ========== UTXO Set Methods ==========
 
     /// Add a UTXO to the chainstate
