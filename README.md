@@ -67,6 +67,11 @@ ouroboros --help
 
 ## Development
 
+After changing Rust code, rebuild the extension:
+```bash
+maturin develop --manifest-path ferrous-utils/sync/Cargo.toml
+```
+
 Run tests:
 
 ```bash

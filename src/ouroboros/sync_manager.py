@@ -28,6 +28,8 @@ class SyncProgress:
     progress_percent: float
     blocks_per_second: float
     eta_seconds: int
+    phase: str = "header"  # "header" or "block"
+    total_known: bool = True  # False in header phase until we know actual chain tip
     
     def __str__(self) -> str:
         """Human-readable progress string"""
@@ -73,6 +75,10 @@ class SyncManager:
             )
         
         self.fast_sync = sync.FastSync(data_dir, network)
+        # Progress reporter reads from shared cache without borrowing FastSync.
+        self._progress_reporter = self.fast_sync.get_progress_reporter()
+        # Canceller avoids "Already borrowed" - don't call fast_sync methods while sync runs
+        self._canceller = self.fast_sync.get_canceller()
         self.data_dir = data_dir
         self.network = network
         self._sync_thread: Optional[threading.Thread] = None
@@ -83,7 +89,8 @@ class SyncManager:
     def perform_initial_sync(self, 
                             progress_callback: Optional[Callable[[SyncProgress], None]] = None,
                             cancel_check: Optional[Callable[[], bool]] = None,
-                            progress_interval: float = 5.0) -> bool:
+                            progress_interval: float = 5.0,
+                            limit: Optional[int] = None) -> bool:
         """
         Run initial blockchain sync.
         
@@ -91,6 +98,7 @@ class SyncManager:
             progress_callback: Called periodically with progress info
             cancel_check: Called periodically, return True to cancel
             progress_interval: Seconds between progress reports (default: 5.0)
+            limit: If set, sync only the first N blocks (for quick validation)
             
         Returns:
             True if completed, False if cancelled or error occurred
@@ -112,7 +120,11 @@ class SyncManager:
                 """Worker thread that runs the sync"""
                 try:
                     # Run sync (this blocks until complete or cancelled)
-                    self.fast_sync.sync_blockchain()
+                    self.fast_sync.sync_blockchain(limit=limit)
+                    sync_complete.set()
+                except KeyboardInterrupt:
+                    # Expected when user cancels - don't log noisy traceback
+                    sync_exception[0] = KeyboardInterrupt("Sync cancelled")
                     sync_complete.set()
                 except Exception as e:
                     logger.error(f"Sync error: {e}", exc_info=True)
@@ -143,8 +155,7 @@ class SyncManager:
                         if cancel_check():
                             logger.info("Sync cancelled by user")
                             try:
-                                # Cancel sync - the Rust function is thread-safe
-                                self.fast_sync.cancel_sync()
+                                self._canceller.cancel()
                             except Exception as e:
                                 logger.warning(f"Error cancelling sync: {e}")
                             cancelled = True
@@ -184,8 +195,16 @@ class SyncManager:
                 return False
             
             if cancelled:
+                # Still do final progress update so user sees accurate state (e.g. 100% if at tip)
+                if progress_callback is not None:
+                    try:
+                        progress = self.get_progress()
+                        if progress is not None:
+                            progress_callback(progress)
+                    except Exception as e:
+                        logger.debug(f"Error in final progress_callback after cancel: {e}")
                 return False
-            
+
             # Final progress report
             if progress_callback is not None:
                 try:
@@ -223,14 +242,17 @@ class SyncManager:
         """
         Get current sync progress.
         
+        Uses SyncProgressReporter to read from shared cache, avoiding "Already borrowed"
+        when the sync thread holds FastSync.
+        
         Returns:
             SyncProgress object or None if unavailable
         """
         try:
-            rust_progress = self.fast_sync.get_sync_progress()
+            rust_progress = self._progress_reporter.get_progress()
             if rust_progress is None:
                 return self._last_progress
-            
+
             # Convert Rust SyncProgress to Python SyncProgress
             progress = SyncProgress(
                 current_height=rust_progress.current_height,
@@ -238,41 +260,39 @@ class SyncManager:
                 progress_percent=rust_progress.progress_percent,
                 blocks_per_second=rust_progress.blocks_per_second,
                 eta_seconds=rust_progress.eta_seconds,
+                phase=getattr(rust_progress, "phase", "header"),
+                total_known=getattr(rust_progress, "total_known", True),
             )
-            
-            # Ensure progress is valid - if it's 0% but we have headers, recalculate
-            if progress.current_height > 0 and progress.progress_percent == 0.0:
-                # Recalculate if Rust gave us 0%
+
+            # When total_known is False we intentionally use 0% (CLI shows "Requesting...").
+            # Do not recalculate - that would show a misleading percentage.
+            if progress.total_known and progress.current_height > 0 and progress.progress_percent == 0.0:
                 if progress.total_height > 0:
                     progress.progress_percent = (progress.current_height / progress.total_height) * 100.0
-            
+
             return progress
         except Exception as e:
-            # Return cached progress if available, otherwise None
-            # Log errors occasionally to help debug (but not spam)
-            if self._last_progress is None or ('borrowed' not in str(e).lower() and 'timeout' not in str(e).lower()):
+            if self._last_progress is None:
                 logger.debug(f"Progress update error (will retry): {e}")
             return self._last_progress
     
     def cancel_sync(self) -> None:
         """
         Cancel ongoing sync operation.
-        
+
         This is a graceful cancellation - the sync will stop at the next
-        safe point and save its progress.
+        safe point and save its progress. Uses a separate canceller handle
+        to avoid "Already borrowed" when the sync thread holds FastSync.
         """
         if not self._is_running:
             logger.warning("No sync in progress")
             return
-        
+
         try:
-            self.fast_sync.cancel_sync()
+            self._canceller.cancel()
             logger.info("Sync cancellation requested")
         except Exception as e:
-            # Silently ignore "Already borrowed" errors - they're harmless
-            # The cancellation flag is still set, just the database is busy
-            if "Already borrowed" not in str(e):
-                logger.error(f"Error cancelling sync: {e}")
+            logger.error(f"Error cancelling sync: {e}")
     
     def wait_for_sync(self, timeout: Optional[float] = None) -> bool:
         """

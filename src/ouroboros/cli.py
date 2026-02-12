@@ -14,7 +14,6 @@ from rich.progress import (
     SpinnerColumn,
     BarColumn,
     TextColumn,
-    TimeRemainingColumn,
     TaskID,
 )
 from rich.table import Table
@@ -31,28 +30,34 @@ console = Console()
 _sync_manager: Optional[SyncManager] = None
 _node: Optional[BitcoinNode] = None
 _cancelled = False
+_interruption_shown = False
 
 
 def handle_sigint(signum, frame):
-    """Handle SIGINT (Ctrl+C) gracefully."""
-    global _cancelled, _sync_manager, _node
+    """Handle SIGINT (Ctrl+C) gracefully.
+
+    Sets _cancelled and requests sync/node stop. Does NOT call sys.exit() here -
+    the main sync loop will see the flag and exit cleanly. Calling sys.exit() from
+    a signal handler while threads are running causes segfaults (Rust/PyO3 tear-down).
+    """
+    global _cancelled, _sync_manager, _node, _interruption_shown
     _cancelled = True
-    
-    console.print("\n[yellow]Interruption received. Shutting down gracefully...[/yellow]")
-    
+
+    if not _interruption_shown:
+        _interruption_shown = True
+        console.print("\n[yellow]Interruption received. Shutting down gracefully...[/yellow]")
+
     if _sync_manager is not None:
         try:
             _sync_manager.cancel_sync()
         except Exception as e:
             console.print(f"[red]Error cancelling sync: {e}[/red]")
-    
+
     if _node is not None:
         try:
             asyncio.run(_node.stop())
         except Exception as e:
             console.print(f"[red]Error stopping node: {e}[/red]")
-    
-    sys.exit(0)
 
 
 def handle_sigterm(signum, frame):
@@ -99,13 +104,21 @@ def cli(ctx, data_dir, network):
 @click.option(
     "--reset",
     is_flag=True,
-    help="Clear chainstate before syncing (use when headers don't connect)",
+    help="Clear chainstate before syncing. Use when you see 'Headers don't connect' or after switching networks.",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=None,
+    metavar="N",
+    help="Sync only the first N blocks (useful for quick validation).",
 )
 @click.pass_context
-def sync(ctx, reset):
+def sync(ctx, reset, limit):
     """Synchronize blockchain (initial download)"""
-    global _sync_manager, _cancelled
+    global _sync_manager, _cancelled, _interruption_shown
     _cancelled = False
+    _interruption_shown = False
     
     data_dir = ctx.obj["data_dir"]
     network = ctx.obj["network"]
@@ -124,10 +137,12 @@ def sync(ctx, reset):
         else:
             data_path.mkdir(parents=True, exist_ok=True)
     
+    limit_info = f"\nBlock limit: [cyan]{limit}[/cyan]" if limit else ""
     console.print(Panel.fit(
         f"[bold]Blockchain Synchronization[/bold]\n"
         f"Network: [cyan]{network}[/cyan]\n"
-        f"Data directory: [cyan]{data_dir}[/cyan]",
+        f"Data directory: [cyan]{data_dir}[/cyan]"
+        f"{limit_info}",
         border_style="blue"
     ))
     
@@ -151,47 +166,63 @@ def sync(ctx, reset):
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         TextColumn("•"),
         TextColumn("[cyan]{task.fields[blocks]}[/cyan]"),
-        TextColumn("•"),
-        TextColumn("[yellow]{task.fields[speed]:.1f} blocks/s[/yellow]"),
-        TextColumn("•"),
-        TimeRemainingColumn(),
+        TextColumn("[yellow]{task.fields[speed_str]}[/yellow]"),
         console=console,
     ) as progress:
         task = progress.add_task(
             "[cyan]Syncing blockchain...",
             total=100.0,
             blocks="0",
-            speed=0.0,
+            speed_str="",
         )
         
+        _last_phase: Optional[str] = None
+
         def progress_callback(prog: SyncProgress):
             """Update progress bar with sync status."""
+            nonlocal _last_phase
             global _cancelled
             if _cancelled:
                 return
+
+            # Reset progress bar when transitioning from header to block phase
+            if prog.phase == "block" and _last_phase == "header":
+                progress.update(task, completed=0)
+            _last_phase = prog.phase
+
+            # Block count display: "X blocks / chain_height" during block phase, "X headers" during header
+            if prog.phase == "block" and prog.total_height > 0:
+                blocks_str = f"{prog.current_height:,} blocks / {prog.total_height:,}"
+                speed_str = f" • {prog.blocks_per_second:.1f} blocks/s • "
+            else:
+                blocks_str = f"{prog.current_height:,} headers"
+                speed_str = " • "
             
             # Update progress
             progress.update(
                 task,
                 completed=prog.progress_percent,
-                blocks=f"{prog.current_height:,} blocks",
-                speed=prog.blocks_per_second,
+                blocks=blocks_str,
+                speed_str=speed_str,
             )
             
-            # Update description with ETA
-            if prog.eta_seconds < 60:
-                eta_str = f"{prog.eta_seconds}s"
+            # Update description: show "Requesting current block height..." when total unknown
+            if not prog.total_known:
+                desc = "[cyan]Syncing blockchain... Requesting current block height...[/cyan]"
+            elif prog.eta_seconds >= 999 * 3600:  # Capped = unknown
+                desc = "[cyan]Syncing blockchain... ETA: —[/cyan]"
+            elif prog.eta_seconds < 60:
+                desc = f"[cyan]Syncing blockchain... ETA: {prog.eta_seconds}s[/cyan]"
             elif prog.eta_seconds < 3600:
                 eta_str = f"{prog.eta_seconds // 60}m {prog.eta_seconds % 60}s"
+                desc = f"[cyan]Syncing blockchain... ETA: {eta_str}[/cyan]"
             else:
                 hours = prog.eta_seconds // 3600
                 minutes = (prog.eta_seconds % 3600) // 60
                 eta_str = f"{hours}h {minutes}m"
+                desc = f"[cyan]Syncing blockchain... ETA: {eta_str}[/cyan]"
             
-            progress.update(
-                task,
-                description=f"[cyan]Syncing blockchain... ETA: {eta_str}[/cyan]",
-            )
+            progress.update(task, description=desc)
         
         def cancel_check() -> bool:
             """Check if sync should be cancelled."""
@@ -203,6 +234,7 @@ def sync(ctx, reset):
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
                 progress_interval=1.0,  # Update every second for better UX
+                limit=limit,
             )
             
             if success:
