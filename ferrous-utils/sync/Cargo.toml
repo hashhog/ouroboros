@@ -9,6 +9,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 common = { path = "../common" }
+log = "0.4"
+env_logger = "0.11"
 pyo3 = { version = "0.27", features = ["auto-initialize"] }
 tokio = { version = "1", features = ["full"] }
 rocksdb = "0.24"
