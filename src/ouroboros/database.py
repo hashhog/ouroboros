@@ -566,42 +566,62 @@ class BlockchainDatabase:
                 return block.hash if hasattr(block, 'hash') else None
             return None
     
+    def get_chainwork_by_height(self, height: int) -> int:
+        """
+        Get chainwork at a given height (persisted in Rust BlockMetadata).
+
+        Returns:
+            Chainwork value (integer) or 0 if not found
+        """
+        try:
+            cw_bytes = bytes(self._db.get_chainwork_by_height(height))
+        except AttributeError:
+            # Rust module not yet rebuilt with get_chainwork_by_height
+            return 0
+        if len(cw_bytes) != 32:
+            return 0
+        return int.from_bytes(cw_bytes, "big")
+
     def store_block_chainwork(self, block_hash: bytes, chainwork: int) -> None:
         """
-        Store chainwork for a block.
-        
-        Args:
-            block_hash: 32-byte block hash
-            chainwork: Chainwork value (integer)
-            
-        Note:
-            This uses a simple in-memory cache. For persistence,
-            consider adding to the Rust database backend.
+        Store chainwork for a block (in-memory fallback when not in Rust metadata).
+
+        Chainwork is persisted in Rust BlockMetadata during sync. This cache is used
+        when computing chainwork for blocks synced before persistence was added.
         """
-        if not hasattr(self, '_chainwork_cache'):
+        if not hasattr(self, "_chainwork_cache"):
             self._chainwork_cache: Dict[bytes, int] = {}
-        
+
         if len(block_hash) != 32:
             raise ValueError("Block hash must be 32 bytes")
-        
+
         self._chainwork_cache[block_hash] = chainwork
-    
-    def get_block_chainwork(self, block_hash: bytes) -> int:
+
+    def get_block_chainwork(self, block_hash: bytes, height: Optional[int] = None) -> int:
         """
         Get chainwork for a block.
-        
+
+        Prefers persisted chainwork from Rust (via height) when available.
+        Falls back to in-memory cache for legacy blocks.
+
         Args:
             block_hash: 32-byte block hash
-            
+            height: Block height (optional); if provided, fetches from persisted metadata first
+
         Returns:
             Chainwork value or 0 if not found
         """
-        if not hasattr(self, '_chainwork_cache'):
-            self._chainwork_cache: Dict[bytes, int] = {}
-        
+        if height is not None:
+            persisted = self.get_chainwork_by_height(height)
+            if persisted > 0:
+                return persisted
+
+        if not hasattr(self, "_chainwork_cache"):
+            self._chainwork_cache = {}
+
         if len(block_hash) != 32:
             raise ValueError("Block hash must be 32 bytes")
-        
+
         return self._chainwork_cache.get(block_hash, 0)
     
     def __enter__(self):
