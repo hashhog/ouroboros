@@ -1,6 +1,7 @@
 // Fast sync module with PyO3 bindings
 
 pub mod chain_params;
+pub mod chainwork;
 
 use std::env;
 pub mod storage;
@@ -380,6 +381,16 @@ impl PyBlockchainDB {
         Ok(())
     }
     
+    /// Get chainwork at height (from block metadata, persisted in DB)
+    fn get_chainwork_by_height(&self, height: u32) -> PyResult<Vec<u8>> {
+        match self.db.get_chainwork_by_height(height) {
+            Ok(cw) => Ok(cw.to_vec()),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e),
+            )),
+        }
+    }
+
     /// Get best block (chain tip)
     fn get_best_block(&self) -> PyResult<(Vec<u8>, u32)> {
         match self.db.get_best_block() {
@@ -751,7 +762,9 @@ impl FastSync {
                 if db.get_best_block().is_err() {
                     let genesis_hash = crate::chain_params::genesis_block_hash(self.network);
                     let genesis_timestamp = crate::chain_params::genesis_block_timestamp(self.network);
-                    let metadata = BlockMetadata::new(0, [0u8; 32], genesis_timestamp);
+                    let genesis_bits = crate::chain_params::genesis_bits(self.network);
+                    let genesis_chainwork = crate::chainwork::compute_chainwork(&[0u8; 32], genesis_bits);
+                    let metadata = BlockMetadata::new(0, genesis_chainwork, genesis_timestamp);
                     db.store_block_metadata(0, &genesis_hash, &metadata).map_err(|e| {
                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                             format!("Failed to store genesis metadata: {}", e),
