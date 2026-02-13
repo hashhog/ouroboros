@@ -13,7 +13,7 @@ pub use types::{
 // Re-export crypto functions
 pub use crypto::{
     bits_to_target, compute_merkle_root, double_sha256, hash160, target_to_bits,
-    verify_ecdsa_signature,
+    verify_ecdsa_signature, verify_ecdsa_signature_der,
 };
 
 // Re-export serialization functions
