@@ -549,16 +549,21 @@ class BitcoinNode:
             return 0
         
         try:
-            # Check cache first
+            # Prefer persisted chainwork from Rust BlockMetadata (computed during sync)
+            persisted_chainwork = self.db.get_chainwork_by_height(height)
+            if persisted_chainwork > 0:
+                return persisted_chainwork
+
+            # Fallback: compute and cache (for blocks synced before chainwork persistence)
             block = self.db.get_block_by_height(height)
             if not block:
                 return 0
-            
-            block_hash = block.hash if hasattr(block, 'hash') else self.db.get_block_hash_by_height(height)
+
+            block_hash = block.hash if hasattr(block, "hash") else self.db.get_block_hash_by_height(height)
             if not block_hash:
                 return 0
-            
-            cached_chainwork = self.db.get_block_chainwork(block_hash)
+
+            cached_chainwork = self.db.get_block_chainwork(block_hash, height)
             if cached_chainwork > 0:
                 return cached_chainwork
             
@@ -574,9 +579,9 @@ class BitcoinNode:
                     # Need to calculate from genesis
                     prev_chainwork = self._calculate_chainwork_at_height(height - 1)
                 else:
-                    prev_hash = prev_block.hash if hasattr(prev_block, 'hash') else self.db.get_block_hash_by_height(height - 1)
+                    prev_hash = prev_block.hash if hasattr(prev_block, "hash") else self.db.get_block_hash_by_height(height - 1)
                     if prev_hash:
-                        prev_chainwork = self.db.get_block_chainwork(prev_hash)
+                        prev_chainwork = self.db.get_block_chainwork(prev_hash, height - 1)
                         if prev_chainwork == 0:
                             # Calculate recursively
                             prev_chainwork = self._calculate_chainwork_at_height(height - 1)

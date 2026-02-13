@@ -15,7 +15,8 @@ use crate::network::messages::{
 };
 use crate::validate::header::{HeaderValidator, HeaderValidationError};
 use crate::storage::db::{BlockchainDB, DbError};
-use crate::chain_params::{genesis_block_hash, genesis_block_timestamp};
+use crate::chain_params::{genesis_block_hash, genesis_block_timestamp, genesis_bits};
+use crate::chainwork::compute_chainwork;
 use crate::network::block_sync::BlockProgressCache;
 use common::{BlockHeaderWrapper, BlockMetadata};
 
@@ -630,9 +631,11 @@ impl HeaderSync {
         if was_empty && start_height == 1 {
             let genesis_hash = genesis_block_hash(self.network);
             let genesis_timestamp = genesis_block_timestamp(self.network);
+            let genesis_bits = genesis_bits(self.network);
+            let genesis_chainwork = compute_chainwork(&[0u8; 32], genesis_bits);
             let metadata = BlockMetadata::new(
                 0,
-                [0u8; 32], // Chainwork for genesis (minimal)
+                genesis_chainwork,
                 genesis_timestamp,
             );
             self.db.store_block_metadata(0, &genesis_hash, &metadata)
@@ -727,13 +730,24 @@ impl HeaderSync {
                 prev_header_opt = Some(header.clone());
             }
 
-            // Store header metadata
+            // Store header metadata with chainwork
             let hash = header.block_hash();
             let hash_bytes = *hash.as_byte_array();
             let timestamp = header.inner().time;
+            let bits = header.inner().bits.to_consensus();
+            let prev_chainwork = if current_height == 0 {
+                [0u8; 32]
+            } else {
+                self.db
+                    .get_block_metadata(current_height - 1)
+                    .map_err(|e| HeaderSyncError::Database(e))?
+                    .map(|m| m.chainwork)
+                    .unwrap_or([0u8; 32])
+            };
+            let chainwork = compute_chainwork(&prev_chainwork, bits);
             let metadata = BlockMetadata::new(
                 current_height,
-                [0u8; 32], // TODO: Calculate chainwork
+                chainwork,
                 timestamp as u32,
             );
 
