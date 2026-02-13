@@ -42,6 +42,38 @@ pub fn verify_ecdsa_signature(
     }
 }
 
+/// Verify an ECDSA signature (DER-encoded, as used in Bitcoin script_sig).
+///
+/// # Arguments
+/// * `der_sig` - The signature in DER encoding (without SIGHASH byte; caller strips it)
+/// * `pubkey` - The public key in SEC1 format (33 or 65 bytes)
+/// * `msg` - The message hash (32 bytes, double-SHA256 of the signed data)
+///
+/// # Returns
+/// * `Ok(true)` if signature is valid
+/// * `Ok(false)` if signature is invalid
+/// * `Err` if there's an error parsing the signature or public key
+pub fn verify_ecdsa_signature_der(
+    der_sig: &[u8],
+    pubkey: &[u8],
+    msg: &[u8],
+) -> Result<bool, Secp256k1Error> {
+    let secp = Secp256k1::verification_only();
+    let pubkey = PublicKey::from_slice(pubkey)?;
+    let signature = Signature::from_der(der_sig)?;
+
+    if msg.len() != 32 {
+        return Err(Secp256k1Error::InvalidMessage);
+    }
+    let msg_array: [u8; 32] = msg.try_into().map_err(|_| Secp256k1Error::InvalidMessage)?;
+    let message = Message::from_digest(msg_array);
+
+    match secp.verify_ecdsa(message, &signature, &pubkey) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
 /// Compute double SHA-256 hash
 ///
 /// # Arguments

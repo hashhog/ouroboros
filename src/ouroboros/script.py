@@ -211,12 +211,29 @@ class ScriptInterpreter:
                     stack.append(b'\x00')
                 continue
             
-            # OP_CHECKMULTISIG (0xae) - Simplified version
+            # OP_CHECKMULTISIG (0xae) - k-of-n signature verification
+            # Stack order (top to bottom): n, pub1..pubn, k, sig1..sigk, dummy
+            # Ref: en.bitcoin.it/wiki/OP_CHECKMULTISIG
             if opcode == 0xae:
-                # This is a complex opcode that requires multiple signatures
-                # For now, return a placeholder
-                # Real implementation needs full multisig verification
-                stack.append(b'\x01')
+                if len(stack) < 4:
+                    raise ValueError("Stack underflow for OP_CHECKMULTISIG")
+                n = self._read_num(stack.pop())
+                if n < 0 or n > 20:
+                    raise ValueError("OP_CHECKMULTISIG n out of range")
+                pubkeys = [stack.pop() for _ in range(n)]
+                if len(pubkeys) != n:
+                    raise ValueError("Stack underflow for OP_CHECKMULTISIG pubkeys")
+                k = self._read_num(stack.pop())
+                if k < 0 or k > n:
+                    raise ValueError("OP_CHECKMULTISIG k out of range")
+                sigs = [stack.pop() for _ in range(k)]
+                if len(sigs) != k:
+                    raise ValueError("Stack underflow for OP_CHECKMULTISIG sigs")
+                stack.pop()  # Dummy (Bitcoin bug - extra pop, must be OP_0 per BIP147)
+                valid = self._verify_multisig(
+                    sigs, pubkeys, k, tx, input_index, script_pubkey
+                )
+                stack.append(b'\x01' if valid else b'\x00')
                 continue
             
             # OP_0, OP_1-OP_16 (push empty array or numbers 1-16)
@@ -247,6 +264,23 @@ class ScriptInterpreter:
         """Compute double SHA256"""
         return hashlib.sha256(hashlib.sha256(data).digest()).digest()
     
+    def _read_num(self, data: bytes) -> int:
+        """Read script number from stack (empty = 0, else minimal little-endian)."""
+        if not data:
+            return 0
+        return int.from_bytes(data, 'little')
+
+    def _encode_varint(self, value: int) -> bytes:
+        """Encode variable-length integer for script serialization."""
+        if value < 0xfd:
+            return bytes([value])
+        elif value <= 0xffff:
+            return b'\xfd' + value.to_bytes(2, 'little')
+        elif value <= 0xffffffff:
+            return b'\xfe' + value.to_bytes(4, 'little')
+        else:
+            return b'\xff' + value.to_bytes(8, 'little')
+
     def _calculate_signature_hash(
         self,
         transaction: Transaction,
@@ -255,125 +289,166 @@ class ScriptInterpreter:
         sighash_type: int
     ) -> bytes:
         """
-        Calculate hash for ECDSA signature verification.
-        
-        This implements a simplified version of Bitcoin's SignatureHash.
-        Full implementation should follow BIP 143 (SegWit) or legacy format
-        depending on transaction type.
-        
+        Calculate Bitcoin legacy SignatureHash for ECDSA verification.
+
+        Follows en.bitcoin.it/wiki/OP_CHECKSIG.
+        Supports SIGHASH_ALL, SIGHASH_NONE, SIGHASH_SINGLE, SIGHASH_ANYONECANPAY.
+
         Args:
             transaction: The transaction being signed
             input_index: Index of the input being verified
-            script_code: Script code (scriptPubKey for legacy, witness script for SegWit)
+            script_code: Script code (scriptPubKey for P2PKH)
             sighash_type: SIGHASH type (last byte of signature)
-            
+
         Returns:
             32-byte hash for signature verification
         """
-        # Simplified signature hash calculation
-        # TODO: Implement full SignatureHash following Bitcoin Core specification
-        # Reference: https://en.bitcoin.it/wiki/OP_CHECKSIG
-        
-        # For now, create a basic hash from transaction data
-        # This is a placeholder - full implementation needs proper serialization
-        # of the transaction with appropriate inputs/outputs based on sighash_type
-        
-        # Basic approach: hash transaction version + inputs + outputs + locktime
-        # + the specific input's script_code + sighash_type
-        # This is NOT correct Bitcoin SignatureHash but provides a structure
-        
-        data = transaction.version.to_bytes(4, 'little')
-        
-        # Hash inputs (simplified - full version needs to handle sighash_type)
-        data += len(transaction.inputs).to_bytes(1, 'little')
-        for i, tx_in in enumerate(transaction.inputs):
+        base_type = sighash_type & 0x1f
+        anyone_can_pay = (sighash_type & 0x80) != 0
+
+        if base_type not in (0x01, 0, 0x02, 0x03):
+            base_type = 0x01
+
+        data = bytearray()
+        data.extend(transaction.version.to_bytes(4, 'little'))
+
+        # Build inputs to serialize
+        if anyone_can_pay:
+            inputs_to_serialize = [(input_index, transaction.inputs[input_index])]
+        else:
+            inputs_to_serialize = list(enumerate(transaction.inputs))
+
+        data.extend(self._encode_varint(len(inputs_to_serialize)))
+
+        for i, tx_in in inputs_to_serialize:
+            data.extend(tx_in.prev_txid)
+            data.extend(tx_in.prev_vout.to_bytes(4, 'little'))
             if i == input_index:
-                # For the input being verified, use script_code
-                data += script_code
+                data.extend(self._encode_varint(len(script_code)))
+                data.extend(script_code)
             else:
-                # For other inputs, use empty script (simplified)
-                data += b''
-            data += tx_in.sequence.to_bytes(4, 'little')
-        
-        # Hash outputs
-        data += len(transaction.outputs).to_bytes(1, 'little')
-        for tx_out in transaction.outputs:
-            data += tx_out.value.to_bytes(8, 'little')
-            data += len(tx_out.script_pubkey).to_bytes(1, 'little')
-            data += tx_out.script_pubkey
-        
-        # Locktime and sighash type
-        data += transaction.locktime.to_bytes(4, 'little')
-        data += bytes([sighash_type])
-        
-        # Double SHA256 (Bitcoin's hash)
-        return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+                data.extend(b'\x00')
+            seq = 0 if base_type in (0x02, 0x03) and i != input_index else tx_in.sequence
+            data.extend(seq.to_bytes(4, 'little'))
+
+        if base_type == 0x01 or base_type == 0:  # SIGHASH_ALL
+            data.extend(self._encode_varint(len(transaction.outputs)))
+            for tx_out in transaction.outputs:
+                data.extend(tx_out.value.to_bytes(8, 'little'))
+                data.extend(self._encode_varint(len(tx_out.script_pubkey)))
+                data.extend(tx_out.script_pubkey)
+        elif base_type == 0x02:  # SIGHASH_NONE
+            data.extend(b'\x00')  # Zero outputs
+        elif base_type == 0x03:  # SIGHASH_SINGLE
+            if input_index >= len(transaction.outputs):
+                return bytes(32)
+            data.extend(self._encode_varint(input_index + 1))
+            for j, tx_out in enumerate(transaction.outputs):
+                if j == input_index:
+                    data.extend(tx_out.value.to_bytes(8, 'little'))
+                    data.extend(self._encode_varint(len(tx_out.script_pubkey)))
+                    data.extend(tx_out.script_pubkey)
+                else:
+                    data.extend((-1).to_bytes(8, 'little', signed=True))
+                    data.extend(b'\x00')
+
+        data.extend(transaction.locktime.to_bytes(4, 'little'))
+        data.extend(sighash_type.to_bytes(4, 'little'))
+
+        return hashlib.sha256(hashlib.sha256(bytes(data)).digest()).digest()
     
     def _verify_ecdsa_signature(self, message_hash: bytes, der_sig: bytes, pubkey: bytes) -> bool:
         """
-        Verify ECDSA signature using secp256k1 curve.
-        
+        Verify ECDSA signature using secp256k1 (Rust sync module or Python coincurve).
+
         Args:
-            message_hash: 32-byte message hash
+            message_hash: 32-byte double-SHA256 of signed data
             der_sig: DER-encoded signature (without SIGHASH byte)
-            pubkey: Public key (compressed 33 bytes or uncompressed 65 bytes)
-            
+            pubkey: Public key (compressed 33 or uncompressed 65 bytes)
+
         Returns:
             True if signature is valid, False otherwise
         """
-        try:
-            # Try to use secp256k1 library if available
-            try:
-                import secp256k1
-                
-                # Create public key object
-                pubkey_obj = secp256k1.PublicKey(pubkey, raw=True)
-                
-                # Parse DER signature
-                # Bitcoin uses low-S signatures, and DER encoding
-                # Note: This is simplified - full implementation needs proper DER parsing
-                if len(der_sig) < 8:
-                    return False
-                
-                # For now, try to verify using secp256k1
-                # This is a simplified version - proper implementation needs
-                # to parse DER signature correctly
-                try:
-                    result = pubkey_obj.ecdsa_verify(message_hash, der_sig, raw=True)
-                    return result
-                except Exception:
-                    # If direct verification fails, try parsing DER signature
-                    # For now, return False as a safe default
-                    return False
-            
-            except ImportError:
-                # Fallback: Use ecdsa library if available
-                try:
-                    import ecdsa
-                    from ecdsa import SigningKey, VerifyingKey, SECP256k1
-                    from ecdsa.util import sigencode_der, sigdecode_der
-                    
-                    # This requires proper DER signature parsing
-                    # For now, this is a placeholder
-                    return False
-                
-                except ImportError:
-                    # No ECDSA library available - use basic validation
-                    # This is NOT secure - just validates format
-                    if len(message_hash) != 32:
-                        return False
-                    if len(pubkey) != 33 and len(pubkey) != 65:
-                        return False
-                    if len(der_sig) < 8:  # Minimum DER signature size
-                        return False
-                    
-                    # Placeholder: return False to be safe
-                    # In production, proper ECDSA verification is required
-                    return False
-        
-        except Exception:
-            # Any error means invalid signature
+        if len(message_hash) != 32 or len(der_sig) < 8:
             return False
+        if len(pubkey) not in (33, 65):
+            return False
+
+        try:
+            import sync
+            return sync.verify_ecdsa(der_sig, pubkey, message_hash)
+        except (ImportError, AttributeError, ValueError):
+            pass
+
+        try:
+            from coincurve import PublicKey
+            pk = PublicKey(pubkey)
+            return pk.verify(der_sig, message_hash)
+        except ImportError:
+            pass
+        except Exception:
+            return False
+
+        return False
+
+    def _verify_multisig(
+        self,
+        sigs: List[bytes],
+        pubkeys: List[bytes],
+        k: int,
+        tx: Transaction,
+        input_index: int,
+        script_pubkey: bytes
+    ) -> bool:
+        """
+        Verify k-of-n multisig: k signatures must match k of n pubkeys in order.
+
+        Bitcoin rule: For each sig, try pubkeys in order. If sig matches pubkey,
+        advance both indices. If not, advance only pubkey index. All k sigs must match.
+
+        Args:
+            sigs: Signatures (stack order: top first)
+            pubkeys: Public keys (stack order: top first)
+            k: Number of required signatures
+            tx: Transaction being verified
+            input_index: Input index
+            script_pubkey: Script pubkey for signature hash (P2SH: redeem script)
+
+        Returns:
+            True if exactly k signatures verify
+        """
+        if k == 0:
+            return True
+        if k > len(sigs) or k > len(pubkeys):
+            return False
+
+        # For multisig, script_code is the redeem script (OP_m pubkeys... OP_n OP_CHECKMULTISIG)
+        # In P2SH, script_pubkey passed here is the redeem script from script_sig
+        script_code = script_pubkey
+
+        sig_idx = 0
+        key_idx = 0
+        matched = 0
+
+        while sig_idx < len(sigs) and key_idx < len(pubkeys) and matched < k:
+            sig = sigs[sig_idx]
+            pubkey = pubkeys[key_idx]
+
+            if len(sig) < 1:
+                key_idx += 1
+                continue
+
+            sighash_type = sig[-1]
+            der_sig = sig[:-1]
+
+            message_hash = self._calculate_signature_hash(tx, input_index, script_code, sighash_type)
+            if self._verify_ecdsa_signature(message_hash, der_sig, pubkey):
+                sig_idx += 1
+                matched += 1
+
+            key_idx += 1
+
+        return matched == k
 
 
 def disassemble_script(script: bytes) -> str:

@@ -16,6 +16,7 @@ use pyo3::prelude::*;
 use tokio::sync::Mutex;
 
 use common::{OutPointWrapper, UTXO, BlockWrapper, BlockHeaderWrapper, BlockMetadata};
+use common::verify_ecdsa_signature_der;
 use crate::storage::db::{BlockchainDB, DbError};
 use crate::validate::header::HeaderValidator;
 use crate::validate::block::BlockValidator;
@@ -37,10 +38,23 @@ fn init_logging() {
     let _ = env_logger::try_init();
 }
 
+/// Verify ECDSA signature (DER-encoded, as in Bitcoin script_sig).
+#[pyfunction]
+fn verify_ecdsa(der_sig: Vec<u8>, pubkey: Vec<u8>, msg_hash: Vec<u8>) -> PyResult<bool> {
+    match verify_ecdsa_signature_der(&der_sig, &pubkey, &msg_hash) {
+        Ok(valid) => Ok(valid),
+        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "ECDSA verification error: {}",
+            e
+        ))),
+    }
+}
+
 /// Fast sync module for Bitcoin blockchain synchronization
 #[pymodule]
 fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_logging();
+    m.add_function(pyo3::wrap_pyfunction!(verify_ecdsa, m)?)?;
     m.add_class::<PyUTXO>()?;
     m.add_class::<SyncEngine>()?;
     m.add_class::<FastSync>()?;
