@@ -739,11 +739,8 @@ class RPCServer:
             },
             "sequence": vin.sequence,
         }
-        
-        # TODO: Add witness data when it's stored in Transaction
-        # if tx and hasattr(tx, 'witness') and tx.witness and index < len(tx.witness):
-        #     result["txinwitness"] = [item.hex() for item in tx.witness[index]]
-        
+        if vin.witness:
+            result["txinwitness"] = [item.hex() for item in vin.witness]
         return result
     
     def _vout_to_dict(self, vout: TxOut, n: int) -> Dict[str, Any]:
