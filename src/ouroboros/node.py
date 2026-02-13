@@ -11,6 +11,9 @@ import logging
 from typing import Optional
 from pathlib import Path
 
+from rich.console import Console
+from rich.panel import Panel
+
 from ouroboros.database import BlockchainDatabase
 from ouroboros.validation import BlockValidator, TransactionValidator
 from ouroboros.mempool import Mempool
@@ -102,6 +105,7 @@ class BitcoinNode:
             # Initialize database
             logger.info(f"Initializing database at {self.data_dir}")
             self.db = BlockchainDatabase(self.data_dir)
+            logger.info("Database initialized")
             
             # Initialize validators
             logger.info("Initializing validators...")
@@ -128,6 +132,8 @@ class BitcoinNode:
             max_peers = self.config.get('max_connections', 8)
             self.peer_manager = PeerManager(self.network, max_peers=max_peers)
             await self.peer_manager.start(best_height)
+            peer_count = len(self.peer_manager.get_all_ready_peers()) if self.peer_manager else 0
+            logger.info(f"Peer manager started ({peer_count} peers)")
             
             # Initialize block sync
             logger.info("Initializing block synchronization...")
@@ -135,7 +141,7 @@ class BitcoinNode:
             await self.block_sync.start()
             
             # Start RPC server
-            logger.info(f"Starting RPC server on port {rpc_port}...")
+            logger.info(f"RPC server listening on 127.0.0.1:{rpc_port}")
             rpc_username = self.config.get('rpc_username')
             rpc_password = self.config.get('rpc_password')
             self.rpc_server = RPCServer(
@@ -152,7 +158,10 @@ class BitcoinNode:
             
             self.running = True
             logger.info("Bitcoin node started successfully")
-            
+
+            # Print status block to terminal
+            self._print_startup_status(rpc_port, p2p_port)
+
             # Main loop (will exit when shutdown event is set)
             await self._main_loop()
             
@@ -250,6 +259,44 @@ class BitcoinNode:
         except Exception as e:
             logger.error(f"Error in periodic tasks: {e}", exc_info=True)
     
+    def _print_startup_status(self, rpc_port: int, p2p_port: int) -> None:
+        """Print a clear status block to the terminal when node starts."""
+        console = Console()
+        try:
+            best_hash, best_height = self.db.get_best_block()
+            hash_hex = best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash)
+            hash_truncated = f"{hash_hex[:16]}..." if len(hash_hex) > 16 else hash_hex
+        except Exception:
+            best_height = 0
+            hash_truncated = "—"
+
+        # Check sync status via SyncManager for accuracy
+        try:
+            sync_mgr = SyncManager(self.data_dir, self.network)
+            is_synced = sync_mgr.is_synced()
+        except Exception:
+            is_synced = self.synced
+
+        lines = [
+            f"Network: [cyan]{self.network}[/cyan]",
+            f"Data directory: [cyan]{self.data_dir}[/cyan]",
+            f"Best block height: [cyan]{best_height:,}[/cyan]",
+            f"Best block hash: [cyan]{hash_truncated}[/cyan]",
+            f"RPC port: [cyan]{rpc_port}[/cyan]",
+            f"P2P port: [cyan]{p2p_port}[/cyan]",
+        ]
+        if not is_synced:
+            lines.append("")
+            lines.append("[yellow]⚠ Blockchain not fully synced — run 'ouroboros sync' first[/yellow]")
+        lines.append("")
+        lines.append("[bold green]Node is running. Press Ctrl+C to stop.[/bold green]")
+
+        console.print(Panel.fit(
+            "\n".join(lines),
+            title="[bold]Ouroboros Node Status[/bold]",
+            border_style="green",
+        ))
+
     def _check_synced(self) -> bool:
         """
         Check if blockchain is synced.
