@@ -89,8 +89,10 @@ pub fn calculate_next_difficulty(prev_bits: u32, actual_timespan: u32) -> u32 {
 
 /// Calculate work done for a given target
 ///
-/// Work is defined as the maximum possible target divided by the actual target.
-/// This represents the "effort" required to find a block with that target.
+/// Uses Bitcoin Core formula: work = (~target / (target + 1)) + 1
+/// This equals 2^256 / (target + 1) (we use the equivalent form to avoid overflow).
+///
+/// Ref: bitcoin/src/chain.cpp GetBitsProof
 ///
 /// # Arguments
 /// * `target` - The proof-of-work target as U256
@@ -101,12 +103,16 @@ pub fn calculate_work(target: U256) -> U256 {
     if target.is_zero() {
         return U256::zero();
     }
+    // Avoid overflow: target + 1 would overflow if target == max_value
+    if target == U256::max_value() {
+        return U256::one();
+    }
 
-    // Maximum target (minimum difficulty) is 2^256 - 1
-    let max_target = U256::max_value();
-
-    // Work = max_target / target
-    max_target / target
+    // Bitcoin Core: work = (~target / (target + 1)) + 1
+    // ~target = (2^256 - 1) - target for 256-bit unsigned
+    let target_plus_one = target + U256::one();
+    let not_target = !target;
+    (not_target / target_plus_one) + U256::one()
 }
 
 #[cfg(test)]
@@ -152,13 +158,15 @@ mod tests {
 
     #[test]
     fn test_calculate_work() {
-        // Test work calculation
+        // Test work calculation with Bitcoin Core formula: (~target / (target+1)) + 1
         let target = U256::from(1u64) << 200; // Very hard target
         let work = calculate_work(target);
 
-        let max_target = U256::max_value();
-        let expected_work = max_target / target;
+        let target_plus_one = target + U256::one();
+        let not_target = !target;
+        let expected_work = (not_target / target_plus_one) + U256::one();
         assert_eq!(work, expected_work);
+        assert!(work > U256::one());
 
         // Test with zero target
         let work_zero = calculate_work(U256::zero());
@@ -289,17 +297,18 @@ mod tests {
 
     #[test]
     fn test_work_calculation_edge_cases() {
-        // Test work calculation edge cases
+        // Test work calculation edge cases (Bitcoin Core formula: (~target / (target+1)) + 1)
 
-        // Maximum target (minimum difficulty)
+        // Maximum target (minimum difficulty) - avoid overflow on target+1
         let max_target = U256::max_value();
         let work_max = calculate_work(max_target);
-        assert_eq!(work_max, U256::one()); // Work = max_target / max_target = 1
+        assert_eq!(work_max, U256::one());
 
-        // Minimum target (maximum difficulty)
+        // Minimum target (maximum difficulty): work = (~1 / 2) + 1 = (2^256-2)/2 + 1 = 2^255
         let min_target = U256::one();
         let work_min = calculate_work(min_target);
-        assert_eq!(work_min, U256::max_value()); // Work = max_target / 1 = max_target
+        let expected_min = (U256::from(1u64) << 255);
+        assert_eq!(work_min, expected_min);
 
         // Zero target (invalid)
         let work_zero = calculate_work(U256::zero());
