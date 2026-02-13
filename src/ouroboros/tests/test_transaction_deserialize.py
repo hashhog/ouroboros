@@ -95,7 +95,10 @@ class TestTransactionDeserialize(unittest.TestCase):
         self.assertEqual(len(tx.inputs), 1)
         self.assertEqual(len(tx.outputs), 1)
         self.assertFalse(tx.is_coinbase)
+        self.assertTrue(tx.has_witness)
         self.assertEqual(tx.inputs[0].script_sig, b'')  # SegWit: script_sig empty
+        self.assertIsNotNone(tx.inputs[0].witness)
+        self.assertEqual(len(tx.inputs[0].witness), 2)  # signature + pubkey
         self.assertEqual(tx.outputs[0].value, 100000)
         self.assertEqual(tx.locktime, 0)
         self.assertEqual(len(tx.txid), 32)

@@ -14,6 +14,11 @@ src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
 from ouroboros.database import Transaction, TxIn, TxOut
+from ouroboros.p2p_messages import TxMessage
+
+
+def hex_to_bytes(hex_str: str) -> bytes:
+    return bytes.fromhex(hex_str.replace("\n", "").replace(" ", ""))
 
 
 class TestSegWit(unittest.TestCase):
@@ -181,9 +186,30 @@ class TestSegWit(unittest.TestCase):
             
             # Check that vsize <= size (for non-SegWit, they should be equal)
             self.assertLessEqual(tx_dict["vsize"], tx_dict["size"])
-            
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_segwit_weight_vsize(self):
+        """Test weight and vsize for SegWit transaction with witness data"""
+        hex_tx = (
+            "02000000000101ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433"
+            "2211000000000000ffffffff01a0860100000000001976a9145834479edbbe0539b31f"
+            "fd3a8f8ebadc2165ed0188ac0247304402202e8d8677912f73909ffbdb3ee87d10cce41d"
+            "398ee206e534fa18330b566ece34022004f944f018a03c9f5b4cf0e9b0ae4f14049b55e"
+            "7b6810a6ac26cd67cb4dcb31f01210279be667ef9dcbbac55a06295ce870b07029bfcdb"
+            "2dce28d959f2815b16f8179800000000"
+        )
+        tx = TxMessage.from_payload(hex_to_bytes(hex_tx)).transaction
+
+        self.assertTrue(tx.has_witness)
+        witness_bytes = tx.get_witness_bytes()
+        self.assertGreater(witness_bytes, 0)
+        weight = tx.get_weight()
+        vsize = tx.get_vsize()
+        self.assertEqual(vsize, (weight + 3) // 4)
+        # SegWit vsize should be less than full serialized size (witness counts 1x, base 4x)
+        full_size = len(hex_tx) // 2
+        self.assertLessEqual(vsize, full_size)
 
 
 if __name__ == '__main__':
