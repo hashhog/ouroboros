@@ -399,24 +399,22 @@ def status(ctx):
 
 @cli.command()
 @click.argument("address")
+@click.option("--network", default="mainnet", help="Network (mainnet/testnet)")
 @click.pass_context
-def getbalance(ctx, address):
+def getbalance(ctx, address, network):
     """Get balance for address"""
     data_dir = ctx.obj["data_dir"]
-    
+
     console.print(f"[cyan]Getting balance for address: {address}[/cyan]")
-    
+
     try:
         db = BlockchainDatabase(data_dir)
-        
-        # TODO: Implement balance calculation from UTXO set
-        # For now, this is a placeholder
-        console.print("[yellow]Balance calculation not yet implemented[/yellow]")
-        console.print(
-            "[dim]This requires scanning the UTXO set for outputs matching "
-            "the address script pubkey.[/dim]"
-        )
-    
+        balance_sat = db.get_balance(address, network)
+        balance_btc = balance_sat / 100_000_000
+        console.print(f"[green]Balance: {balance_btc:.8f} BTC ({balance_sat} satoshis)[/green]")
+    except ValueError as e:
+        console.print(f"[red]✗ Invalid address: {e}[/red]")
+        sys.exit(1)
     except Exception as e:
         console.print(f"[red]✗ Error getting balance: {e}[/red]")
         sys.exit(1)
