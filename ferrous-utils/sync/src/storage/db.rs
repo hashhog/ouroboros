@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bitcoin::OutPoint;
 use bitcoin::hashes::Hash;
-use rocksdb::{ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
 use thiserror::Error;
 
 use common::{
@@ -270,6 +270,25 @@ impl BlockchainDB {
         };
 
         self.db.get_cf(cf, &key).map(|opt| opt.is_some()).unwrap_or(false)
+    }
+
+    /// Iterate all UTXOs in the chainstate (for address balance/scan).
+    pub fn iter_utxos(&self) -> Result<Vec<UTXO>> {
+        let cf = self.db
+            .cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+
+        let mut utxos = Vec::new();
+        let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+
+        for item in iter {
+            let (_key, value) = item.map_err(|e| DbError::RocksDb(e))?;
+            if let Ok((utxo, _)) = UTXO::bitcoin_deserialize(&value) {
+                utxos.push(utxo);
+            }
+        }
+
+        Ok(utxos)
     }
 
     // ========== Chain State Methods ==========
