@@ -107,12 +107,44 @@ class TestMedianTime(unittest.TestCase):
         # Test with None database
         node_no_db = BitcoinNode(data_dir=self.temp_dir, network="regtest")
         node_no_db.db = None
-        
+
         median_time = node_no_db.get_median_time()
         # Should return current time as fallback
         current_time = int(time.time())
         self.assertGreaterEqual(median_time, current_time - 1)
         self.assertLessEqual(median_time, current_time + 1)
+
+    def test_median_time_eleven_blocks_sorted(self):
+        """11 blocks with known timestamps -> median is the 6th sorted value (index 5)"""
+        # Timestamps for blocks 0-10: use unsorted values, median should be 500
+        test_timestamps = [100, 900, 200, 800, 300, 500, 700, 400, 600, 150, 850]
+        # Sorted: [100, 150, 200, 300, 400, 500, 600, 700, 800, 850, 900]
+        # Median (index 5) = 500
+        expected_median = 500
+
+        class MockBlock:
+            def __init__(self, ts):
+                self.timestamp = ts
+
+        class MockDB:
+            def get_best_block(self):
+                return (bytes(32), 10)
+
+            def get_block_hash_by_height(self, h):
+                if 0 <= h <= 10:
+                    return bytes([h] * 32)  # Unique hash per height
+                return None
+
+            def get_block(self, block_hash):
+                if len(block_hash) == 32:
+                    h = block_hash[0]  # Hash encodes height (0-10)
+                    if h <= 10:
+                        return MockBlock(test_timestamps[h])
+                return None
+
+        self.node.db = MockDB()
+        median_time = self.node.get_median_time(height=10)
+        self.assertEqual(median_time, expected_median)
 
 
 if __name__ == '__main__':
