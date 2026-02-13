@@ -35,6 +35,7 @@ class BlockSync:
         db: BlockchainDatabase,
         validator: BlockValidator,
         peer_manager,  # PeerManager or compatible interface
+        mempool=None,  # Optional mempool for re-adding txs after reorg
     ):
         """
         Initialize block synchronizer.
@@ -42,12 +43,15 @@ class BlockSync:
         Args:
             db: Blockchain database
             validator: Block validator
-            peer_manager: Peer manager instance (must have get_all_ready_peers, 
+            peer_manager: Peer manager instance (must have get_all_ready_peers,
                          get_best_peer, broadcast methods)
+            mempool: Optional mempool to re-validate and re-add transactions
+                     from disconnected blocks after reorg
         """
         self.db = db
         self.validator = validator
         self.peer_manager = peer_manager
+        self.mempool = mempool
         
         # Track requested blocks (hash -> request_time)
         self.requested_blocks: Dict[bytes, float] = {}
@@ -562,20 +566,22 @@ class BlockSync:
                 if temp_hash == bytes(32):  # Genesis block
                     break
             
-            # Build new chain back
-            # Estimate height for new chain (will be refined when we find common ancestor)
+            # Build new chain back (new_block is the tip we received, may not be in db yet)
             temp_hash = new_chain_tip
-            temp_height = current_height  # Start with current height as estimate
+            temp_height = current_height
             for i in range(100):
                 if temp_hash is None:
                     break
-                # Try to get from database
-                block = self.db.get_block(temp_hash)
+                # Use the block we received if it's the tip; otherwise get from db
+                if temp_hash == new_chain_tip and new_block.hash == new_chain_tip:
+                    block = new_block
+                else:
+                    block = self.db.get_block(temp_hash)
                 if not block:
-                    # Need to request from network - for now, log and return
-                    logger.warning(f"Block {temp_hash.hex()[:16]}... not in database, cannot complete reorg")
+                    logger.warning(
+                        f"Block {temp_hash.hex()[:16]}... not in database, cannot complete reorg"
+                    )
                     return False
-                # Store with height estimate
                 new_chain.append((temp_hash, block, temp_height))
                 # Check if we found common ancestor
                 if temp_hash in [h for h, _, _ in current_chain]:
@@ -659,12 +665,13 @@ class BlockSync:
                 # Update current_height for next iteration
                 current_height -= 1
             
-            # Connect blocks from new chain (in forward order)
+            # Connect blocks from new chain (ancestor+1 to tip; new_chain is tip-first so reverse)
             blocks_to_connect = [
                 (h, b, ht) for h, b, ht in new_chain
                 if h != common_ancestor
             ]
-            
+            blocks_to_connect = list(reversed(blocks_to_connect))
+
             for new_hash, new_block, new_height in blocks_to_connect:
                 logger.debug(f"Connecting block {new_hash.hex()[:16]}...")
                 
@@ -680,17 +687,37 @@ class BlockSync:
                 except Exception as e:
                     logger.error(f"Error applying block during reorg: {e}")
                     return False
+                
+                # Remove transactions now in block from mempool
+                if self.mempool:
+                    self.mempool.remove_block_transactions(new_block)
             
             # Update best block
             if blocks_to_connect:
-                final_height = blocks_to_connect[-1][2]  # Height of last block
+                final_hash = blocks_to_connect[-1][0]
+                final_height = blocks_to_connect[-1][2]
+                try:
+                    self.db.update_best_block(final_hash, final_height)
+                except Exception as e:
+                    logger.error(f"Failed to update best block after reorg: {e}")
+                    return False
             else:
                 final_height = common_ancestor_height
-            
-            # Note: set_best_block may not be implemented - this is a placeholder
-            # In full implementation, would update best block hash and height
+                final_hash = common_ancestor
+
+            # Re-add transactions from disconnected blocks to mempool (re-validate)
+            if self.mempool:
+                for curr_hash, curr_block, _ in reversed(blocks_to_disconnect):
+                    for tx in curr_block.transactions:
+                        if not tx.is_coinbase:
+                            _, best_h = self.db.get_best_block()
+                            success, _ = self.mempool.add_transaction(tx, best_h)
+                            if success:
+                                logger.debug(
+                                    f"Re-added tx {tx.get_txid().hex()[:16]}... to mempool"
+                                )
+
             logger.info(f"Reorg handled: new tip at height {final_height}")
-            
             self.reorg_depth += 1
             return True
         

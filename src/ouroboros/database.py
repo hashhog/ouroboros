@@ -543,6 +543,18 @@ class BlockchainDatabase:
         """
         hash_bytes, height = self._db.get_best_block()
         return (bytes(hash_bytes), height)
+
+    def update_best_block(self, block_hash: bytes, height: int) -> None:
+        """
+        Update the chain tip. Used during reorg.
+        
+        Args:
+            block_hash: 32-byte block hash of new tip
+            height: Block height of new tip
+        """
+        if len(block_hash) != 32:
+            raise ValueError("Block hash must be 32 bytes")
+        self._db.update_best_block(block_hash, height)
     
     def get_balance(self, address: str, network: str = "mainnet") -> int:
         """
