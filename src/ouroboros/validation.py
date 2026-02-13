@@ -6,6 +6,24 @@ from ouroboros.database import BlockchainDatabase, Transaction, TxIn, TxOut, Blo
 from ouroboros.script import ScriptInterpreter
 
 
+def _bits_to_target(bits: int) -> int:
+    """
+    Decode difficulty target from compact bits (nBits) format.
+
+    Ref: bitcoin/src/pow.cpp, node.py _calculate_block_work
+    Format: target = mantissa * 256^(exponent-3)
+    """
+    mantissa = bits & 0x007FFFFF
+    exponent = (bits >> 24) & 0xFF
+
+    if mantissa == 0:
+        return 0
+
+    if exponent <= 3:
+        return mantissa >> (8 * (3 - exponent))
+    return mantissa << (8 * (exponent - 3))
+
+
 class BlockValidator:
     """Validates new blocks"""
     
@@ -131,9 +149,18 @@ class BlockValidator:
         # Check bits is valid (difficulty target)
         if block.bits == 0:
             return False
-        
+
+        # Proof-of-work: block hash must meet difficulty target
+        # Ref: bitcoin/src/pow.cpp CheckProofOfWork
+        header = block.serialize()[:80]
+        block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()
+        hash_as_int = int.from_bytes(block_hash, "little")
+        target = _bits_to_target(block.bits)
+        if hash_as_int > target:
+            return False
+
         return True
-    
+
     def _verify_merkle_root(self, block: Block) -> bool:
         """
         Verify block's merkle root.
