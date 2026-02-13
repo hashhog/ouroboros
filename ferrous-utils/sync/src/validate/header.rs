@@ -87,11 +87,10 @@ impl HeaderValidator {
         self.validate_difficulty(inner, prev_inner)?;
 
         // 5. Check proof of work (most expensive check last)
-        // TODO: Fix PoW validation - temporarily disabled for initial sync
-        // let target = bits_to_target(inner.bits.to_consensus());
-        // if !validate_pow(header, target) {
-        //     return Err(HeaderValidationError::InvalidPow);
-        // }
+        let target = bits_to_target(inner.bits.to_consensus());
+        if !validate_pow(header, target) {
+            return Err(HeaderValidationError::InvalidPow);
+        }
 
         Ok(())
     }
