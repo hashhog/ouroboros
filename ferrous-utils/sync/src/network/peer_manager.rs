@@ -101,8 +101,37 @@ impl BannedPeer {
     }
 }
 
-/// Expiry for desync blacklist (5 minutes)
-const DESYNC_BLACKLIST_SECS: u64 = 300;
+/// Max peer connections. Configurable via OUROBOROS_MAX_PEERS. Default 125 (matches Bitcoin Core DEFAULT_MAX_PEER_CONNECTIONS).
+pub fn max_peers_from_env() -> usize {
+    std::env::var("OUROBOROS_MAX_PEERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(125)
+}
+
+/// Peer targets for block sync. Configurable via OUROBOROS_MIN_PEERS and OUROBOROS_TARGET_PEERS.
+fn peer_targets_from_env() -> (usize, usize) {
+    let min = std::env::var("OUROBOROS_MIN_PEERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let target = std::env::var("OUROBOROS_TARGET_PEERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    (min, target)
+}
+
+/// Expiry for desync blacklist. Configurable via OUROBOROS_DESYNC_BLACKLIST_SECS (default 120).
+/// Bitcoin Core disconnects on such errors and does not blacklist; our blacklist is a conservative
+/// measure to avoid reconnecting to persistently bad peers. A shorter value speeds recovery when
+/// many peers desync at once (e.g. after mass PayloadSizeExceeded).
+fn desync_blacklist_secs() -> u64 {
+    std::env::var("OUROBOROS_DESYNC_BLACKLIST_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120)
+}
 
 /// Bitcoin P2P peer manager
 pub struct PeerManager {
@@ -114,7 +143,7 @@ pub struct PeerManager {
     known_addrs: Arc<Mutex<HashSet<SocketAddr>>>,
     /// Banned peers with ban duration
     banned_peers: Arc<Mutex<HashMap<SocketAddr, BannedPeer>>>,
-    /// Peers that sent corrupted data (Payload size exceeds, Invalid magic). Expires after 5 min.
+    /// Peers that sent corrupted data (Payload size exceeds, Invalid magic). Expires per OUROBOROS_DESYNC_BLACKLIST_SECS.
     desync_blacklist: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
     /// Bitcoin network
     network: Network,
@@ -136,6 +165,7 @@ impl PeerManager {
         start_height: i32,
         max_peers: usize,
     ) -> Self {
+        let (min_peers, target_peers) = peer_targets_from_env();
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
             max_peers,
@@ -145,13 +175,13 @@ impl PeerManager {
             network,
             user_agent,
             start_height,
-            min_peers: 8,
-            target_peers: 10,
+            min_peers,
+            target_peers,
         }
     }
 
     /// Blacklist a peer that sent corrupted data (Payload size exceeds, Invalid magic).
-    /// Peer won't be reconnected for 5 minutes.
+    /// Peer won't be reconnected for desync_blacklist_secs().
     pub async fn blacklist_peer_desync(&mut self, addr: SocketAddr) {
         let mut list = self.desync_blacklist.lock().await;
         list.insert(addr, Instant::now());
@@ -160,12 +190,13 @@ impl PeerManager {
     /// Check if peer is blacklisted for desync (and prune expired entries)
     fn is_desync_blacklisted(blacklist: &mut HashMap<SocketAddr, Instant>, addr: SocketAddr) -> bool {
         let now = Instant::now();
-        let expiry = Duration::from_secs(DESYNC_BLACKLIST_SECS);
+        let secs = desync_blacklist_secs();
+        let expiry = Duration::from_secs(secs);
         let before = blacklist.len();
         blacklist.retain(|_, t| now.duration_since(*t) < expiry);
         let removed = before.saturating_sub(blacklist.len());
         if removed > 0 {
-            log::debug!("Desync blacklist: {} peer(s) expired after {}s cooldown, can retry", removed, DESYNC_BLACKLIST_SECS);
+            log::debug!("Desync blacklist: {} peer(s) expired after {}s cooldown, can retry", removed, secs);
         }
         blacklist
             .get(&addr)
@@ -353,10 +384,17 @@ impl PeerManager {
 
         // Add hardcoded peers for networks that might have DNS issues
         // Testnet4 is newer and might not have reliable DNS seeds
+        // Fallback when DNS resolves but connections fail; from bitcoin/contrib/seeds/nodes_testnet4.txt
         let hardcoded_peers: Vec<&str> = match self.network {
             Network::Testnet4 => vec![
-                // Add known testnet4 peers here if available
-                // For now, we'll rely on DNS seeds and peer discovery
+                "5.182.4.106:48333",
+                "18.189.156.102:48333",
+                "51.158.61.33:48333",
+                "103.165.192.207:48333",
+                "104.237.131.138:48333",
+                "35.201.167.154:48333",
+                "38.102.86.40:48333",
+                "89.166.29.73:48333",
             ],
             _ => vec![],
         };
@@ -795,8 +833,8 @@ mod tests {
             50,
         );
         assert_eq!(manager.max_peers, 50);
-        assert_eq!(manager.min_peers, 8);
-        assert_eq!(manager.target_peers, 10);
+        assert_eq!(manager.min_peers, 10);
+        assert_eq!(manager.target_peers, 12);
     }
 
     #[tokio::test]

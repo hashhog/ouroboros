@@ -667,12 +667,12 @@ impl FastSync {
         let header_validator = Arc::new(HeaderValidator::new(Arc::clone(&db), network_enum));
         let block_validator = Arc::new(BlockValidator::new(Arc::clone(&db), network_enum));
 
-        // Create peer manager
+        // Create peer manager (max_peers=125 matches Bitcoin Core DEFAULT_MAX_PEER_CONNECTIONS)
         let peer_manager = Arc::new(Mutex::new(PeerManager::new(
             network_enum,
             "/bitcoin-hybrid:0.1.0/".to_string(),
             0, // start_height
-            50, // max_peers
+            crate::network::peer_manager::max_peers_from_env(),
         )));
 
         let progress_cache = Arc::new(StdMutex::new(BlockProgressCache::default()));
