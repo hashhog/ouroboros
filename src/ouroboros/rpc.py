@@ -392,16 +392,52 @@ class RPCServer:
         hexstring: str,
         maxfeerate: Optional[float] = None
     ) -> str:
-        """Broadcast transaction"""
+        """
+        Broadcast a raw transaction to the network.
+
+        Accepts hex-encoded raw transaction, deserializes, adds to mempool,
+        and broadcasts inv to peers. Peers that want the tx will send getdata;
+        we respond with the full tx via the getdata handler.
+        """
         try:
-            tx_data = bytes.fromhex(hexstring)
-            # TODO: Deserialize transaction
-            # For now, this is a placeholder
-            raise HTTPException(status_code=500, detail="Transaction deserialization not fully implemented")
+            tx_data = bytes.fromhex(hexstring.strip())
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid hex string: {e}")
-        except Exception as e:
+
+        try:
+            from ouroboros.p2p_messages import TxMessage, InvMessage, INV_TYPE_TX
+        except ImportError:
+            raise HTTPException(status_code=500, detail="P2P messages not available")
+
+        try:
+            tx_msg = TxMessage.from_payload(tx_data)
+            tx = tx_msg.transaction
+        except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid transaction: {e}")
+
+        # Reject coinbase
+        if tx.is_coinbase:
+            raise HTTPException(status_code=400, detail="Coinbase transactions cannot be broadcast")
+
+        if not hasattr(self.node, 'mempool') or not self.node.mempool:
+            raise HTTPException(status_code=500, detail="Mempool not available")
+
+        _, best_height = self.node.db.get_best_block()
+        success, error = self.node.mempool.add_transaction(tx, best_height)
+
+        if not success:
+            if error == "Already in mempool":
+                return tx.txid.hex()
+            raise HTTPException(status_code=400, detail=error)
+
+        # Broadcast inv to peers
+        txid = tx.txid
+        inv = InvMessage(inventory=[(INV_TYPE_TX, txid)])
+        inv_msg = inv.to_network_message(self.node.network)
+        if hasattr(self.node, 'peer_manager') and self.node.peer_manager:
+            await self.node.peer_manager.broadcast(inv_msg)
+
+        return txid.hex()
     
     async def rpc_getnetworkinfo(self) -> Dict[str, Any]:
         """Return network information"""
