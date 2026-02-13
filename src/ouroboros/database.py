@@ -213,6 +213,7 @@ class Transaction:
     locktime: int
     inputs: List['TxIn']
     outputs: List['TxOut']
+    has_witness: bool = False  # True if SegWit (marker 0x00, flag 0x01)
     
     @property
     def is_coinbase(self) -> bool:
@@ -269,31 +270,36 @@ class Transaction:
         else:
             return b'\xff' + value.to_bytes(8, 'little')
     
+    def get_witness_bytes(self) -> int:
+        """
+        Return serialized witness size in bytes.
+
+        For non-SegWit: 0.
+        For SegWit: sum of witness encoding (varint stack count + varint len + data per item).
+        Ref: BIP 141, bitcoin/src/primitives/transaction.cpp
+        """
+        if not self.has_witness:
+            return 0
+        total = 0
+        for tx_in in self.inputs:
+            if tx_in.witness is None:
+                continue
+            total += len(self._encode_varint(len(tx_in.witness)))
+            for item in tx_in.witness:
+                total += len(self._encode_varint(len(item))) + len(item)
+        return total
+
     def get_weight(self) -> int:
         """
         Calculate transaction weight for SegWit transactions.
-        
+
         Weight = (non-witness bytes * 4) + witness bytes
-        
-        For non-SegWit transactions (current implementation):
-        - weight = size * 4
-        - This is because non-witness bytes = total size, witness bytes = 0
-        
-        For SegWit transactions (when witness data is stored):
-        - Would need to calculate non-witness bytes separately
-        - Would need to calculate witness bytes separately
-        
-        Returns:
-            Transaction weight
+        Ref: BIP 141, bitcoin/src/primitives/transaction.cpp GetTransactionWeight
         """
-        # Get non-witness size (current serialize() excludes witness)
         non_witness_bytes = len(self.serialize())
-        
-        # For now, assume no witness data (non-SegWit transaction)
-        # TODO: When witness data is stored in Transaction, calculate witness bytes
-        witness_bytes = 0
-        
-        # Weight = (non-witness bytes * 4) + witness bytes
+        if self.has_witness:
+            non_witness_bytes += 2  # marker 0x00 + flag 0x01
+        witness_bytes = self.get_witness_bytes()
         return (non_witness_bytes * 4) + witness_bytes
     
     def get_vsize(self) -> int:
@@ -319,6 +325,7 @@ class TxIn:
     prev_vout: int
     script_sig: bytes
     sequence: int
+    witness: Optional[List[bytes]] = None  # SegWit witness stack; None = non-SegWit
 
 
 @dataclass
