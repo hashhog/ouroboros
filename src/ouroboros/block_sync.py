@@ -6,6 +6,7 @@ handling new block announcements, validation, and chain reorganization.
 """
 
 import asyncio
+import hashlib
 import time
 import logging
 from typing import Dict, Set, Optional, List, Tuple, Callable
@@ -320,6 +321,12 @@ class BlockSync:
             logger.error(f"Error handling block from {peer.host}:{peer.port}: {e}", exc_info=True)
             peer.adjust_score(-5)
     
+    def _header_to_block_hash(self, header) -> bytes:
+        """Compute block hash from header (display format)."""
+        header_bytes = header.serialize()
+        block_hash_raw = hashlib.sha256(hashlib.sha256(header_bytes).digest()).digest()
+        return block_hash_raw[::-1]
+
     async def handle_headers(self, msg: NetworkMessage, peer: Peer):
         """Handle headers message"""
         try:
@@ -330,14 +337,24 @@ class BlockSync:
             
             logger.info(f"Received {len(headers_msg.headers)} headers from {peer.host}:{peer.port}")
             
-            # Process headers and request blocks
+            # Request blocks for headers we don't have
+            to_request = []
             for header in headers_msg.headers:
-                # Check if we have this block
-                # Note: We'd need to compute block hash from header
-                # For now, this is a placeholder
-                pass
+                block_hash = self._header_to_block_hash(header)
+                if not self.db.get_block(block_hash) and block_hash not in self.requested_blocks:
+                    to_request.append((INV_TYPE_BLOCK, block_hash))
+                    self.requested_blocks[block_hash] = time.time()
             
-            # TODO: Request blocks for headers we don't have
+            if to_request:
+                try:
+                    getdata = GetDataMessage(inventory=to_request)
+                    network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
+                    getdata_msg = getdata.to_network_message(network)
+                    await peer.send_message(getdata_msg)
+                    logger.info(f"Requested {len(to_request)} blocks for headers from {peer.host}:{peer.port}")
+                except Exception as e:
+                    logger.error(f"Failed to send getdata for headers: {e}")
+                    peer.adjust_score(-2)
         
         except Exception as e:
             logger.error(f"Error handling headers from {peer.host}:{peer.port}: {e}")

@@ -258,6 +258,43 @@ class Transaction:
         data += self.locktime.to_bytes(4, 'little')
         
         return data
+
+    def serialize_with_witness(self) -> bytes:
+        """
+        Serialize transaction including witness (SegWit wire format).
+        Used for wtxid: SHA256D of this equals witness txid for SegWit txs.
+        """
+        data = bytearray()
+        data.extend(self.version.to_bytes(4, 'little', signed=True))
+        if self.has_witness:
+            data.extend(b'\x00\x01')  # marker, flag
+        data.extend(self._encode_varint(len(self.inputs)))
+        for tx_in in self.inputs:
+            data.extend(tx_in.prev_txid)
+            data.extend(tx_in.prev_vout.to_bytes(4, 'little'))
+            data.extend(self._encode_varint(len(tx_in.script_sig)))
+            data.extend(tx_in.script_sig)
+            data.extend(tx_in.sequence.to_bytes(4, 'little'))
+        data.extend(self._encode_varint(len(self.outputs)))
+        for tx_out in self.outputs:
+            data.extend(tx_out.value.to_bytes(8, 'little'))
+            data.extend(self._encode_varint(len(tx_out.script_pubkey)))
+            data.extend(tx_out.script_pubkey)
+        if self.has_witness:
+            for tx_in in self.inputs:
+                witness = tx_in.witness or []
+                data.extend(self._encode_varint(len(witness)))
+                for item in witness:
+                    data.extend(self._encode_varint(len(item)))
+                    data.extend(item)
+        data.extend(self.locktime.to_bytes(4, 'little'))
+        return bytes(data)
+
+    def get_wtxid(self) -> bytes:
+        """Witness transaction ID: double SHA256 of full serialization including witness."""
+        if not self.has_witness:
+            return self.get_txid()
+        return hashlib.sha256(hashlib.sha256(self.serialize_with_witness()).digest()).digest()
     
     def _encode_varint(self, value: int) -> bytes:
         """Encode variable-length integer"""
