@@ -59,6 +59,11 @@ class BlockSync:
         # Track received blocks (hash -> Block)
         self.received_blocks: Dict[bytes, Block] = {}
         
+        # Orphan blocks: hash -> Block (blocks whose parent is not in our chain)
+        # Ref: bitcoin/src/net_processing.cpp orphan_work_set, ProcessOrphanTx
+        self.orphan_blocks: Dict[bytes, Block] = {}
+        self._max_orphans = 100
+        
         # Track pending headers requests
         self.pending_headers: Dict[bytes, float] = {}  # locator_hash -> request_time
         
@@ -247,6 +252,29 @@ class BlockSync:
             if block_hash in self.requested_blocks:
                 del self.requested_blocks[block_hash]
             
+            # Orphan check: parent not in our chain
+            prev_block = self.db.get_block(block.prev_blockhash)
+            if prev_block is None:
+                if len(self.orphan_blocks) >= self._max_orphans:
+                    logger.warning(
+                        f"Orphan pool full ({self._max_orphans}), dropping orphan "
+                        f"{block_hash.hex()[:16]}..."
+                    )
+                    return
+                self.orphan_blocks[block_hash] = block
+                logger.info(f"Stored orphan block {block_hash.hex()[:16]}... (parent unknown)")
+                # Request parent via getdata
+                if block.prev_blockhash not in self.requested_blocks:
+                    self.requested_blocks[block.prev_blockhash] = time.time()
+                    try:
+                        getdata = GetDataMessage(inventory=[(INV_TYPE_BLOCK, block.prev_blockhash)])
+                        network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
+                        await peer.send_message(getdata.to_network_message(network))
+                        logger.debug(f"Requested orphan parent {block.prev_blockhash.hex()[:16]}...")
+                    except Exception as e:
+                        logger.debug(f"Failed to request orphan parent: {e}")
+                return
+            
             # Validate block
             valid, error = self.validator.validate_block(block)
             
@@ -273,6 +301,9 @@ class BlockSync:
                 
                 block_height = block.height if hasattr(block, 'height') and block.height else 0
                 logger.info(f"✓ New block {block_height}: {block_hash.hex()[:16]}...")
+                
+                # Process orphans that may now have their parent
+                await self._process_orphans(block_hash)
                 
                 # Broadcast to other peers
                 inv = InvMessage(inventory=[(INV_TYPE_BLOCK, block_hash)])
@@ -312,6 +343,47 @@ class BlockSync:
             logger.error(f"Error handling headers from {peer.host}:{peer.port}: {e}")
             peer.adjust_score(-2)
     
+    async def _process_orphans(self, applied_block_hash: bytes) -> None:
+        """
+        Process orphan blocks that may now have their parent in our chain.
+        Recursively processes orphans as we connect blocks.
+        
+        Ref: bitcoin/src/net_processing.cpp ProcessOrphanTx
+        """
+        to_process = [
+            (h, b) for h, b in self.orphan_blocks.items()
+            if b.prev_blockhash == applied_block_hash
+        ]
+        
+        for block_hash, block in to_process:
+            del self.orphan_blocks[block_hash]
+            
+            valid, error = self.validator.validate_block(block)
+            if not valid:
+                logger.warning(f"Orphan block {block_hash.hex()[:16]}... invalid: {error}")
+                continue
+            
+            # Orphan extends the block we just applied; check if it matches current tip
+            current_hash, _ = self.db.get_best_block()
+            if block.prev_blockhash != current_hash:
+                # Orphan's parent is not current tip; might need reorg
+                reorg_success = await self._handle_reorg(block, block_hash)
+                if not reorg_success:
+                    logger.error("Failed to handle reorg for orphan")
+                else:
+                    await self._process_orphans(block_hash)
+            else:
+                self.validator.apply_block(block)
+                block_height = block.height if hasattr(block, 'height') and block.height else 0
+                logger.info(f"✓ Connected orphan block {block_height}: {block_hash.hex()[:16]}...")
+                
+                if hasattr(self.peer_manager, 'broadcast'):
+                    inv = InvMessage(inventory=[(INV_TYPE_BLOCK, block_hash)])
+                    network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
+                    await self.peer_manager.broadcast(inv.to_network_message(network))
+                
+                await self._process_orphans(block_hash)
+
     async def _catch_up(self, peer: Peer, our_height: int):
         """Request blocks to catch up"""
         try:
@@ -691,6 +763,9 @@ class BlockSync:
                 # Remove transactions now in block from mempool
                 if self.mempool:
                     self.mempool.remove_block_transactions(new_block)
+                
+                # Process orphans that may now have their parent
+                await self._process_orphans(new_hash)
             
             # Update best block
             if blocks_to_connect:
