@@ -41,6 +41,11 @@ dependencies = [
     "rocksdb>=0.7.0; python_version<'3.13'",
     # Async file I/O
     "aiofiles>=23.2.0",
+    # Address decoding (P2PKH, P2SH, P2WPKH)
+    "base58>=2.1.0",
+    "bech32>=1.2.0",
+    # ECDSA verification fallback (when sync module unavailable)
+    "coincurve>=19.0.0",
 ]
 
 [project.optional-dependencies]
