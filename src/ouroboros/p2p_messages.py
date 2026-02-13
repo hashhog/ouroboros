@@ -407,12 +407,8 @@ class BlockMessage:
     
     def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
         """Convert to network message"""
-        # Note: Block serialization is complex and requires full Bitcoin protocol encoding
-        # For now, this is a placeholder that would need the Rust layer
-        raise NotImplementedError(
-            "Block serialization requires full Bitcoin protocol encoding. "
-            "Use Rust BlockWrapper for proper serialization."
-        )
+        payload = self.block.serialize()
+        return NetworkMessage(command="block", payload=payload, magic=get_magic(network))
     
     @classmethod
     def from_payload(cls, payload: bytes) -> 'BlockMessage':
