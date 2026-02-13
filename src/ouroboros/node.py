@@ -477,28 +477,14 @@ class BitcoinNode:
                 # No blocks found, return current time as fallback
                 return int(time.time())
             
-            # Sort and get median
+            # Sort and get median (middle of last 11 blocks, index 5 for 11 blocks)
             timestamps.sort()
             median_index = len(timestamps) // 2
             return timestamps[median_index]
-            start_height = max(0, height - 10)
-            
-            for h in range(start_height, height + 1):
-                block = self.db.get_block_by_height(h)
-                if block and hasattr(block, 'timestamp'):
-                    timestamps.append(block.timestamp)
-            
-            if not timestamps:
-                return 0
-            
-            # Sort and return median
-            timestamps.sort()
-            median_index = len(timestamps) // 2
-            return timestamps[median_index]
-        
+
         except Exception as e:
             logger.error(f"Error calculating median time at height {height}: {e}", exc_info=True)
-            return 0
+            return int(time.time())  # Fallback when DB empty or error
     
     def _calculate_block_work(self, bits: int) -> int:
         """
