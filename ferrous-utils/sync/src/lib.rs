@@ -414,6 +414,22 @@ impl PyBlockchainDB {
             )),
         }
     }
+
+    /// Update the best block (chain tip). Used during reorg.
+    fn update_best_block(&self, block_hash: &[u8], height: u32) -> PyResult<()> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+        self.db.update_best_block(&hash_bytes, height).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
     
     /// Context manager support for transactions
     fn __enter__(&self) -> PyResult<Self> {
