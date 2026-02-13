@@ -1,0 +1,55 @@
+# Ouroboros Bitcoin Node Configuration
+# Copy to data_dir/ouroboros.conf or use --config /path/to/ouroboros.conf
+# Format: key=value, one per line. Lines starting with # are comments.
+# Environment variables OROBOROS_<KEY> override config (e.g. OROBOROS_DATADIR).
+
+# ------------------------------------------------------------------------------
+# Network
+# ------------------------------------------------------------------------------
+# Network to connect to: mainnet, testnet, testnet3, testnet4, regtest, signet
+network=mainnet
+
+# Data directory (blockchain, chainstate, logs)
+# Overridden by OROBOROS_DATADIR environment variable
+datadir=~/.ouroboros
+
+# ------------------------------------------------------------------------------
+# RPC Server
+# ------------------------------------------------------------------------------
+# RPC server port (mainnet: 8332, testnet: 18332, regtest: 18443)
+rpcport=8332
+
+# RPC authentication (set both for basic auth)
+# rpcuser=
+# rpcpassword=
+
+# Allowed RPC client IPs (comma-separated; 127.0.0.1 = localhost only)
+rpcallowip=127.0.0.1
+
+# ------------------------------------------------------------------------------
+# P2P / Connections
+# ------------------------------------------------------------------------------
+# Maximum number of peer connections
+maxconnections=125
+
+# ------------------------------------------------------------------------------
+# Logging / Debug
+# ------------------------------------------------------------------------------
+# Enable debug logging (0=off, 1=on)
+debug=0
+
+# Add timestamps to log messages (0=off, 1=on)
+logtimestamps=1
+
+# ------------------------------------------------------------------------------
+# Chain-specific options (Bitcoin-style [section])
+# Options in [testnet4] override defaults when network=testnet4
+# ------------------------------------------------------------------------------
+# [testnet4]
+# network=testnet4
+# rpcport=18332
+# datadir=~/.ouroboros/testnet4
+
+# [regtest]
+# network=regtest
+# rpcport=18443
