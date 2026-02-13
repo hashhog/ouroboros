@@ -1,6 +1,6 @@
 //! Bitcoin P2P parallel block download and validation
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -496,7 +496,7 @@ impl BlockSync {
                     });
                     let mut hash_map = self.hash_to_height.lock().await;
                     hash_map.insert(*block_hash, *height);
-                    log::debug!("Requested block {} from {}", height, peer_addr);
+                    log::trace!("Requested block {} from {}", height, peer_addr);
                 } else {
                     let mut queue = self.download_queue.lock().await;
                     queue.push_back(*height);
@@ -504,7 +504,8 @@ impl BlockSync {
             }
 
             if !assignments.is_empty() {
-                log::debug!("Sent {} block requests", assignments.len());
+                let num_peers = assignments.iter().map(|(_, _, a)| *a).collect::<HashSet<_>>().len();
+                log::debug!("Sent {} block requests to {} peer(s)", assignments.len(), num_peers);
             }
 
             // 3. Receive events (drain channel with timeout - process all available blocks)
@@ -907,7 +908,7 @@ impl BlockSync {
                 .ok_or(BlockSyncError::NoPeersAvailable)?;
 
             // Request block
-            log::debug!("Requesting block at height {} from peer {}", height, peer_addr);
+            log::trace!("Requesting block at height {} from peer {}", height, peer_addr);
             self.request_block(height, peer_addr).await?;
         }
 
@@ -986,7 +987,7 @@ impl BlockSync {
             peer.send_message(msg).await
                 .map_err(|e| BlockSyncError::PeerManager(PeerManagerError::Peer(e)))?;
             peer_manager.add_peer(peer_addr, peer).await;
-            log::debug!("Sent GetData request for block at height {} to peer {}", height, peer_addr);
+            log::trace!("Sent GetData request for block at height {} to peer {}", height, peer_addr);
         } else {
             return Err(BlockSyncError::PeerManager(PeerManagerError::PeerNotFound(peer_addr)));
         }
