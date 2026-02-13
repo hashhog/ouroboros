@@ -130,12 +130,76 @@ class TestRPCMethods(unittest.TestCase):
     def test_gettxout_without_mempool(self):
         """Test that gettxout skips mempool when includemempool=False"""
         import asyncio
-        
+
         async def test():
             fake_txid = "0" * 64
             result = await self.rpc_server.rpc_gettxout(fake_txid, 0, includemempool=False)
             self.assertIsNone(result)
-        
+
+        asyncio.run(test())
+
+    def test_sendrawtransaction_method_exists(self):
+        """Test that sendrawtransaction method exists"""
+        self.assertTrue(hasattr(self.rpc_server, 'rpc_sendrawtransaction'))
+        self.assertTrue(callable(getattr(self.rpc_server, 'rpc_sendrawtransaction', None)))
+
+    def test_sendrawtransaction_invalid_hex(self):
+        """Test sendrawtransaction rejects invalid hex"""
+        import asyncio
+        from fastapi import HTTPException
+
+        async def test():
+            with self.assertRaises(HTTPException) as ctx:
+                await self.rpc_server.rpc_sendrawtransaction("nothex")
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertIn("Invalid hex", ctx.exception.detail)
+
+        asyncio.run(test())
+
+    def test_sendrawtransaction_coinbase_rejected(self):
+        """Test sendrawtransaction rejects coinbase transactions"""
+        import asyncio
+        from fastapi import HTTPException
+
+        # Genesis block coinbase tx hex
+        coinbase_hex = (
+            "01000000010000000000000000000000000000000000000000000000000000000000000000"
+            "ffffffff1d030f8d13049faa805a063538706f6f6c0c00010000fe22030000000000ffffff"
+            "ff015341cb04000000001976a914f11298ce777cb5db5c09250cad4eb856b1e366ef88ac"
+            "00000000"
+        )
+
+        async def test():
+            with self.assertRaises(HTTPException) as ctx:
+                await self.rpc_server.rpc_sendrawtransaction(coinbase_hex)
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertIn("Coinbase", ctx.exception.detail)
+
+        asyncio.run(test())
+
+    def test_sendrawtransaction_mempool_unavailable(self):
+        """Test sendrawtransaction when mempool is not available"""
+        import asyncio
+        from fastapi import HTTPException
+
+        # Valid non-coinbase tx (P2PKH from Bitcoin Core test)
+        tx_hex = (
+            "01000000018594c5bdcaec8f06b78b596f31cd292a294fd031e24eec716f43dac91ea7494d"
+            "000000008a4730440220131432090a6af42da3e8335ff110831b41a44f4e9d18d88f5d5027"
+            "8380696c7202200fc2e48938f323ad13625890c0ea926c8a189c08b8efc38376b20c8a218"
+            "8e96e01410479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817"
+            "98483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8fffffff"
+            "f01a0860100000000001976a9145834479edbbe0539b31ffd3a8f8ebadc2165ed0188ac00"
+            "000000"
+        )
+
+        async def test():
+            # Node has no mempool (not started) -> 500
+            with self.assertRaises(HTTPException) as ctx:
+                await self.rpc_server.rpc_sendrawtransaction(tx_hex)
+            self.assertEqual(ctx.exception.status_code, 500)
+            self.assertIn("Mempool", ctx.exception.detail)
+
         asyncio.run(test())
 
 
