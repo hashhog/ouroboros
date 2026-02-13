@@ -301,8 +301,8 @@ def start(ctx, rpc_port, p2p_port):
         f"[bold]Starting Bitcoin Node[/bold]\n"
         f"Network: [cyan]{network}[/cyan]\n"
         f"Data directory: [cyan]{data_dir}[/cyan]\n"
-        f"RPC port: [cyan]{rpc_port}[/cyan]\n"
-        f"P2P port: [cyan]{p2p_port}[/cyan]",
+        f"RPC port: [cyan]{rpc_port}[/cyan] | P2P port: [cyan]{p2p_port}[/cyan]\n\n"
+        f"[dim]Node will display status when ready. Press Ctrl+C to stop.[/dim]",
         border_style="green"
     ))
     
@@ -311,8 +311,7 @@ def start(ctx, rpc_port, p2p_port):
         sync_manager = SyncManager(data_dir, network)
         if not sync_manager.is_synced():
             console.print(
-                "[yellow]⚠ Warning: Blockchain is not fully synchronized. "
-                "Run 'sync' command first to download the blockchain.[/yellow]"
+                "[yellow]⚠ Blockchain not fully synced — run 'ouroboros sync' first[/yellow]"
             )
             if not click.confirm("Continue anyway?", default=False):
                 return
@@ -331,10 +330,8 @@ def start(ctx, rpc_port, p2p_port):
         }
         
         _node = BitcoinNode(config=config)
-        
-        console.print("[green]Starting node...[/green]")
-        
-        # Run node (this blocks until interrupted)
+
+        # Run node (blocks until Ctrl+C — status panel shown when ready)
         try:
             asyncio.run(_node.run())
         except KeyboardInterrupt:
