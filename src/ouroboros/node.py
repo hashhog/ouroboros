@@ -370,43 +370,37 @@ class BitcoinNode:
     def _bits_to_difficulty(self, bits: int) -> float:
         """
         Convert compact target (bits) to difficulty.
-        
-        Formula: difficulty = difficulty_1_target / target
-        Where target is decoded from compact representation (bits).
-        Difficulty 1 corresponds to target 0x1d00ffff.
-        
+
+        Uses Bitcoin Core GetDifficulty formula from rpc/blockchain.cpp:
+        - nShift = (nBits >> 24) & 0xff
+        - dDiff = 0x0000ffff / (nBits & 0x00ffffff)
+        - while nShift < 29: dDiff *= 256; nShift += 1
+        - while nShift > 29: dDiff /= 256; nShift -= 1
+
+        Difficulty 1 corresponds to bits 0x1d00ffff.
+
         Args:
             bits: Compact target (32-bit integer)
-            
+
         Returns:
             Difficulty value
         """
-        # Extract mantissa and exponent from bits
-        mantissa = bits & 0x007fffff
-        exponent = (bits >> 24) & 0xff
-        
+        n_shift = (bits >> 24) & 0xFF
+        mantissa = bits & 0x00FFFFFF
+
         if mantissa == 0:
-            return float('inf')
-        
-        # Calculate target: mantissa * 2^(8*(exponent-3))
-        if exponent <= 3:
-            target = mantissa >> (8 * (3 - exponent))
-        else:
-            target = mantissa << (8 * (exponent - 3))
-        
-        # Handle zero target (infinite difficulty)
-        if target == 0:
-            return float('inf')
-        
-        # Difficulty 1 corresponds to target 0x1d00ffff
-        # For 0x1d00ffff: exponent=0x1d (29), mantissa=0x00ffff
-        # target = 0x00ffff * 256^(29-3) = 0x00ffff * 256^26
-        difficulty_1_target = 0x00ffff * (256 ** 26)
-        
-        # Calculate difficulty = difficulty_1_target / target
-        difficulty = difficulty_1_target / target
-        
-        return difficulty
+            return float("inf")
+
+        d_diff = 0x0000FFFF / float(mantissa)
+
+        while n_shift < 29:
+            d_diff *= 256.0
+            n_shift += 1
+        while n_shift > 29:
+            d_diff /= 256.0
+            n_shift -= 1
+
+        return d_diff
     
     def get_current_difficulty(self) -> float:
         """
