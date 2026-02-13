@@ -137,7 +137,9 @@ class BitcoinNode:
             
             # Initialize block sync
             logger.info("Initializing block synchronization...")
-            self.block_sync = BlockSync(self.db, self.validator, self.peer_manager)
+            self.block_sync = BlockSync(
+                self.db, self.validator, self.peer_manager, mempool=self.mempool
+            )
             await self.block_sync.start()
             
             # Start RPC server
