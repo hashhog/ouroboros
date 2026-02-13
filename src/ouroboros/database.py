@@ -544,6 +544,68 @@ class BlockchainDatabase:
         hash_bytes, height = self._db.get_best_block()
         return (bytes(hash_bytes), height)
     
+    def get_balance(self, address: str, network: str = "mainnet") -> int:
+        """
+        Get total balance for an address (sum of all UTXOs matching script_pubkey).
+
+        Args:
+            address: Bitcoin address (P2PKH, P2SH, or P2WPKH)
+            network: "mainnet" or "testnet" for address decoding
+
+        Returns:
+            Balance in satoshis
+        """
+        from ouroboros.address import address_to_script_pubkey
+
+        script_pubkey = address_to_script_pubkey(address, network)
+        return self._balance_for_script_pubkey(script_pubkey)
+
+    def list_unspent_by_address(
+        self, address: str, network: str = "mainnet"
+    ) -> List[Dict[str, Any]]:
+        """
+        List unspent outputs for an address.
+
+        Args:
+            address: Bitcoin address (P2PKH, P2SH, or P2WPKH)
+            network: "mainnet" or "testnet" for address decoding
+
+        Returns:
+            List of dicts with keys: txid, vout, value, script_pubkey
+        """
+        from ouroboros.address import address_to_script_pubkey
+
+        script_pubkey = address_to_script_pubkey(address, network)
+        return self._list_unspent_for_script_pubkey(script_pubkey)
+
+    def _balance_for_script_pubkey(self, script_pubkey: bytes) -> int:
+        """Sum UTXO values matching script_pubkey."""
+        total = 0
+        for utxo in self._iter_matching_utxos(script_pubkey):
+            total += utxo["value"]
+        return total
+
+    def _list_unspent_for_script_pubkey(self, script_pubkey: bytes) -> List[Dict[str, Any]]:
+        """List UTXOs matching script_pubkey."""
+        return list(self._iter_matching_utxos(script_pubkey))
+
+    def _iter_matching_utxos(self, script_pubkey: bytes):
+        """Yield UTXO dicts matching script_pubkey."""
+        try:
+            py_utxos = self._db.get_utxos()
+        except AttributeError:
+            return
+        for py_utxo in py_utxos:
+            spk = bytes(py_utxo.script_pubkey)
+            if spk == script_pubkey:
+                txid_hex = py_utxo.txid if isinstance(py_utxo.txid, str) else py_utxo.txid.hex()
+                yield {
+                    "txid": txid_hex,
+                    "vout": py_utxo.vout,
+                    "value": py_utxo.value,
+                    "script_pubkey": spk,
+                }
+
     def get_block_hash_by_height(self, height: int) -> Optional[bytes]:
         """
         Get block hash by height.

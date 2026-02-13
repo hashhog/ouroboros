@@ -445,11 +445,14 @@ impl SyncEngine {
         Ok(blocks.len())
     }
 
-    /// Get UTXO set
+    /// Get all UTXOs from chainstate (for address balance/scan).
     fn get_utxos(&self) -> PyResult<Vec<PyUTXO>> {
-        // TODO: Implement UTXO retrieval
-        // Convert UTXO to PyUTXO when returning
-        Ok(vec![])
+        match self.db.iter_utxos() {
+            Ok(utxos) => Ok(utxos.iter().map(PyUTXO::from).collect()),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to iterate UTXOs: {}", e),
+            )),
+        }
     }
 
     /// Get example UTXOs for demonstration purposes
