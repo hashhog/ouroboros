@@ -38,9 +38,10 @@ class BitcoinNode:
             network: Network name (mainnet, testnet, regtest) (can be overridden by config file)
             config: Additional configuration dictionary (overrides config file)
         """
-        # Load configuration file
-        config_file = config.get('config_file') if config else None
-        self.node_config = NodeConfig(config_file)
+        # Load configuration file (--config or datadir/ouroboros.conf)
+        config_path = config.get('config_path') or config.get('config_file') if config else None
+        data_dir_for_config = config.get('datadir', data_dir) if config else data_dir
+        self.node_config = NodeConfig(config_path=config_path, data_dir=data_dir_for_config)
         
         # Merge config file with provided config (provided config takes precedence)
         config_dict = self.node_config.to_dict()
