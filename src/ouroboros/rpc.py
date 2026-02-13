@@ -585,8 +585,15 @@ class RPCServer:
                     if tx and n < len(tx.outputs):
                         output = tx.outputs[n]
                         script_pubkey_bytes = output.script_pubkey if isinstance(output.script_pubkey, bytes) else bytes(output.script_pubkey)
+                        best_hash = None
+                        if hasattr(self.node, 'db') and self.node.db:
+                            try:
+                                best_hash, _ = self.node.db.get_best_block()
+                                best_hash = best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash)
+                            except Exception:
+                                pass
                         return {
-                            "bestblock": None,  # TODO: Get best block hash
+                            "bestblock": best_hash,
                             "confirmations": 0,
                             "value": output.value / 100000000.0,  # Convert to BTC
                             "scriptPubKey": {
@@ -594,7 +601,7 @@ class RPCServer:
                                 "hex": output.script_pubkey.hex() if isinstance(output.script_pubkey, bytes) else str(output.script_pubkey),
                                 "type": self._get_script_type(output.script_pubkey)
                             },
-                            "coinbase": False
+                            "coinbase": tx.is_coinbase,
                         }
             
             # Check database (confirmed UTXOs)
@@ -619,6 +626,7 @@ class RPCServer:
                 script_hex = str(script_pubkey)
                 script_pubkey_bytes = bytes(script_pubkey)
             
+            coinbase = self._is_coinbase_output(txid_bytes)
             return {
                 "bestblock": best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash),
                 "confirmations": confirmations,
@@ -628,7 +636,7 @@ class RPCServer:
                     "hex": script_hex,
                     "type": self._get_script_type(script_pubkey)
                 },
-                "coinbase": False  # TODO: Check if coinbase
+                "coinbase": coinbase,
             }
         
         except ValueError as e:
@@ -706,9 +714,13 @@ class RPCServer:
             weight = tx_size * 4
             vsize = tx_size
         
+        hash_hex = (
+            tx.get_wtxid().hex() if hasattr(tx, 'get_wtxid') and tx.has_witness
+            else txid_hex
+        )
         return {
             "txid": txid_hex,
-            "hash": txid_hex,  # TODO: Add wtxid for segwit (witness transaction ID)
+            "hash": hash_hex,  # wtxid for SegWit, txid for non-SegWit
             "version": tx.version,
             "size": len(tx.serialize()),
             "vsize": vsize,  # Virtual size for SegWit
@@ -776,6 +788,26 @@ class RPCServer:
             return "pubkey"  # P2PK
         else:
             return "nonstandard"
+
+    def _is_coinbase_output(self, txid: bytes) -> bool:
+        """
+        Check if a transaction (that created a UTXO) is a coinbase transaction.
+        Searches blocks from genesis to tip. Returns False if not found.
+        """
+        if not hasattr(self.node, 'db') or not self.node.db:
+            return False
+        try:
+            _, best_height = self.node.db.get_best_block()
+            for h in range(best_height + 1):
+                block = self.node.db.get_block_by_height(h)
+                if not block:
+                    continue
+                for tx in block.transactions:
+                    if tx.get_txid() == txid:
+                        return tx.is_coinbase
+            return False
+        except Exception:
+            return False
     
     def _is_synced(self) -> bool:
         """Check if node is synced"""
