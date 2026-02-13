@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -169,8 +170,9 @@ def sync(ctx, reset, limit):
         TextColumn("[yellow]{task.fields[speed_str]}[/yellow]"),
         console=console,
     ) as progress:
+        # TODO: Peer count and desync warnings - expose from Rust BlockProgressCache when available
         task = progress.add_task(
-            "[cyan]Syncing blockchain...",
+            "[cyan]Phase: Header sync • Starting...[/cyan]",
             total=100.0,
             blocks="0",
             speed_str="",
@@ -191,13 +193,17 @@ def sync(ctx, reset, limit):
             _last_phase = prog.phase
 
             # Block count display: "X blocks / chain_height" during block phase, "X headers" during header
-            if prog.phase == "block" and prog.total_height > 0:
-                blocks_str = f"{prog.current_height:,} blocks / {prog.total_height:,}"
+            if prog.phase == "block":
+                blocks_str = (
+                    f"{prog.current_height:,} blocks / {prog.total_height:,}"
+                    if prog.total_height > 0
+                    else f"{prog.current_height:,} blocks"
+                )
                 speed_str = f" • {prog.blocks_per_second:.1f} blocks/s • "
             else:
                 blocks_str = f"{prog.current_height:,} headers"
                 speed_str = " • "
-            
+
             # Update progress
             progress.update(
                 task,
@@ -205,30 +211,45 @@ def sync(ctx, reset, limit):
                 blocks=blocks_str,
                 speed_str=speed_str,
             )
-            
-            # Update description: show "Requesting current block height..." when total unknown
-            if not prog.total_known:
-                desc = "[cyan]Syncing blockchain... Requesting current block height...[/cyan]"
-            elif prog.eta_seconds >= 999 * 3600:  # Capped = unknown
-                desc = "[cyan]Syncing blockchain... ETA: —[/cyan]"
-            elif prog.eta_seconds < 60:
-                desc = f"[cyan]Syncing blockchain... ETA: {prog.eta_seconds}s[/cyan]"
-            elif prog.eta_seconds < 3600:
-                eta_str = f"{prog.eta_seconds // 60}m {prog.eta_seconds % 60}s"
-                desc = f"[cyan]Syncing blockchain... ETA: {eta_str}[/cyan]"
+
+            # Description with phase label (blocks/speed in columns to avoid duplication)
+            if prog.phase == "header":
+                if not prog.total_known:
+                    desc = "[cyan]Phase: Header sync • Requesting current block height...[/cyan]"
+                else:
+                    desc = f"[cyan]Phase: Header sync • {prog.current_height:,} headers[/cyan]"
             else:
-                hours = prog.eta_seconds // 3600
-                minutes = (prog.eta_seconds % 3600) // 60
-                eta_str = f"{hours}h {minutes}m"
-                desc = f"[cyan]Syncing blockchain... ETA: {eta_str}[/cyan]"
-            
+                # Block phase: phase label + ETA
+                if prog.eta_seconds >= 999 * 3600:
+                    eta_str = "—"
+                elif prog.eta_seconds < 60:
+                    eta_str = f"{prog.eta_seconds}s"
+                elif prog.eta_seconds < 3600:
+                    eta_str = f"{prog.eta_seconds // 60}m {prog.eta_seconds % 60}s"
+                else:
+                    hours = prog.eta_seconds // 3600
+                    minutes = (prog.eta_seconds % 3600) // 60
+                    eta_str = f"{hours}h {minutes}m"
+                desc = f"[cyan]Phase: Block sync • ETA: {eta_str}[/cyan]"
+
             progress.update(task, description=desc)
         
         def cancel_check() -> bool:
             """Check if sync should be cancelled."""
             return _cancelled
-        
+
+        def format_duration(secs: float) -> str:
+            """Format duration for display."""
+            if secs < 60:
+                return f"{secs:.1f}s"
+            if secs < 3600:
+                return f"{int(secs // 60)}m {int(secs % 60)}s"
+            h = int(secs // 3600)
+            m = int((secs % 3600) // 60)
+            return f"{h}h {m}m"
+
         # Start sync
+        sync_start_time = time.time()
         try:
             success = _sync_manager.perform_initial_sync(
                 progress_callback=progress_callback,
@@ -236,10 +257,17 @@ def sync(ctx, reset, limit):
                 progress_interval=1.0,  # Update every second for better UX
                 limit=limit,
             )
-            
+
             if success:
                 progress.update(task, completed=100.0)
-                console.print("\n[green]✓ Blockchain synchronization completed successfully![/green]")
+                duration_secs = time.time() - sync_start_time
+                final_progress = _sync_manager.get_progress() or _sync_manager.last_progress
+                final_height = final_progress.current_height if final_progress else 0
+                console.print(
+                    "\n[green]✓ Blockchain synchronization completed[/green] "
+                    f"• Height: [cyan]{final_height:,}[/cyan] "
+                    f"• Duration: [cyan]{format_duration(duration_secs)}[/cyan]"
+                )
             elif _cancelled:
                 console.print("\n[yellow]Synchronization cancelled by user[/yellow]")
             else:
