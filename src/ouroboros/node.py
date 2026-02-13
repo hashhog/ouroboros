@@ -324,39 +324,72 @@ class BitcoinNode:
     
     def _register_handlers(self):
         """Register message handlers with peers"""
-        if not self.peer_manager or not self.mempool:
+        if not self.peer_manager:
             return
-        
+
         async def handle_tx(msg):
             """Handle incoming transaction"""
+            if not self.mempool:
+                return
             try:
                 from ouroboros.p2p_messages import TxMessage
-                
-                # Deserialize transaction
+
                 tx_msg = TxMessage.from_payload(msg.payload)
                 tx = tx_msg.transaction
-                
-                # Add to mempool
+
                 _, height = self.db.get_best_block()
                 success, error = self.mempool.add_transaction(tx, height)
-                
+
                 if success:
                     logger.info(f"Added transaction {tx.get_txid().hex()[:16]}... to mempool")
                 else:
                     logger.debug(f"Rejected transaction: {error}")
-            
+
             except Exception as e:
                 logger.error(f"Error handling transaction: {e}", exc_info=True)
-        
-        # Register with all peers
+
+        def _make_getdata_handler(peer):
+            """Handle getdata: respond with tx from mempool or block from db"""
+            async def handler(msg):
+                try:
+                    from ouroboros.p2p_messages import (
+                        GetDataMessage,
+                        TxMessage,
+                        InvMessage,
+                        INV_TYPE_TX,
+                        INV_TYPE_BLOCK,
+                    )
+
+                    getdata = GetDataMessage.from_payload(msg.payload)
+                    network = getattr(peer, 'network', 'mainnet')
+
+                    for inv_type, inv_hash in getdata.inventory:
+                        if inv_type == INV_TYPE_TX and self.mempool:
+                            tx = self.mempool.get_transaction(inv_hash)
+                            if tx:
+                                tx_msg = TxMessage(transaction=tx)
+                                await peer.send_message(tx_msg.to_network_message(network))
+                                logger.debug(f"Sent tx {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
+                        elif inv_type == INV_TYPE_BLOCK:
+                            block = self.db.get_block(inv_hash)
+                            if block:
+                                from ouroboros.p2p_messages import BlockMessage
+                                block_msg = BlockMessage(block=block)
+                                await peer.send_message(block_msg.to_network_message(network))
+                                logger.debug(f"Sent block {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
+                except Exception as e:
+                    logger.error(f"Error handling getdata from {peer.host}:{peer.port}: {e}")
+
+            return handler
+
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             peers = self.peer_manager.get_all_ready_peers()
             for peer in peers:
                 if hasattr(peer, 'register_handler'):
                     peer.register_handler("tx", handle_tx)
-        
-        # Also register for new peers that connect
-        logger.info("Transaction handlers registered")
+                    peer.register_handler("getdata", _make_getdata_handler(peer))
+
+        logger.info("Transaction and getdata handlers registered")
     
     def is_synced(self) -> bool:
         """
