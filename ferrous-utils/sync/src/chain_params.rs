@@ -29,6 +29,13 @@ pub fn genesis_block_hash(network: Network) -> [u8; 32] {
     }
 }
 
+/// Genesis block bits (compact target) for each network.
+/// All use 0x1d00ffff (difficulty 1).
+pub fn genesis_bits(network: Network) -> u32 {
+    let _ = network;
+    0x1d00ffff
+}
+
 /// Genesis block timestamp (Unix time) for each network
 pub fn genesis_block_timestamp(network: Network) -> u32 {
     match network {
