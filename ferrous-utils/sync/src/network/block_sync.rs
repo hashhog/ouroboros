@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use bitcoin::Network;
@@ -142,6 +143,8 @@ pub struct BlockSync {
     stats: Arc<Mutex<SyncStats>>,
     /// Cached progress for get_sync_progress (sync-readable, no await needed)
     progress_cache: Arc<StdMutex<BlockProgressCache>>,
+    /// Total PayloadSizeExceeded + InvalidMagic since start (for debugging peer droughts)
+    desync_count: Arc<AtomicU64>,
 }
 
 /// Rolling window for speed calculation (seconds)
@@ -229,6 +232,7 @@ impl BlockSync {
             progress_callback: None,
             stats: Arc::new(Mutex::new(SyncStats::default())),
             progress_cache,
+            desync_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -301,38 +305,43 @@ impl BlockSync {
                 let mut peer_tasks = self.peer_tasks.lock().await;
                 if peer_tasks.is_empty() {
                     let mut peer_manager = self.peer_manager.lock().await;
-                    let peer_map = peer_manager.drain_peers().await;
-                    drop(peer_manager);
+                    let mut peer_map = peer_manager.drain_peers().await;
 
                     if peer_map.is_empty() {
                         // Trigger peer manager to try connecting (don't just wait for background task)
-                        let mut peer_manager = self.peer_manager.lock().await;
                         peer_manager.maintain_connections().await;
+                        // Re-check before sleeping: maintain_connections may have just connected peers
+                        peer_map = peer_manager.drain_peers().await;
                         drop(peer_manager);
 
-                        drop(peer_tasks);
-                        let elapsed = no_peers_wait_since.elapsed();
-                        // Rate-limit: only log "No peers for >5 min" at most once per 60 seconds
-                        let should_log_warn = elapsed.as_secs() >= 300
-                            && last_no_peers_warn_log
-                                .map(|t| t.elapsed().as_secs() >= 60)
-                                .unwrap_or(true);
-                        if should_log_warn {
-                            log::warn!(
-                                "No peers available for >5 minutes. Check network/firewall. Waiting {}s...",
-                                no_peers_wait_secs
-                            );
-                            last_no_peers_warn_log = Some(Instant::now());
-                        } else {
-                            log::debug!("No peers available, waiting {}s...", no_peers_wait_secs);
+                        if peer_map.is_empty() {
+                            drop(peer_tasks);
+                            let elapsed = no_peers_wait_since.elapsed();
+                            // Rate-limit: only log "No peers for >5 min" at most once per 60 seconds
+                            let should_log_warn = elapsed.as_secs() >= 300
+                                && last_no_peers_warn_log
+                                    .map(|t| t.elapsed().as_secs() >= 60)
+                                    .unwrap_or(true);
+                            if should_log_warn {
+                                let total_desync = self.desync_count.load(Ordering::Relaxed);
+                                log::warn!(
+                                    "No peers available for >5 minutes ({} desyncs since start). Check network/firewall. Waiting {}s...",
+                                    total_desync,
+                                    no_peers_wait_secs
+                                );
+                                last_no_peers_warn_log = Some(Instant::now());
+                            } else {
+                                log::debug!("No peers available, waiting {}s...", no_peers_wait_secs);
+                            }
+                            tokio::time::sleep(Duration::from_secs(no_peers_wait_secs)).await;
+                            no_peers_wait_secs = match no_peers_wait_secs {
+                                1 => 2,
+                                2 => 5,
+                                _ => 10,
+                            };
+                            continue;
                         }
-                        tokio::time::sleep(Duration::from_secs(no_peers_wait_secs)).await;
-                        no_peers_wait_secs = match no_peers_wait_secs {
-                            1 => 2,
-                            2 => 5,
-                            _ => 10,
-                        };
-                        continue;
+                        // Re-check found peers; skip sleep and spawn them below
                     }
                     no_peers_wait_secs = 1;
 
@@ -603,6 +612,7 @@ impl BlockSync {
                             } else if is_disconnect_error(e) || is_protocol_desync_error(e) {
                                 // Don't re-add peers that disconnected or sent corrupted data (stream desync).
                                 if is_protocol_desync_error(e) {
+                                    self.desync_count.fetch_add(1, Ordering::Relaxed);
                                     let mut pm = self.peer_manager.lock().await;
                                     pm.blacklist_peer_desync(addr).await;
                                 }
