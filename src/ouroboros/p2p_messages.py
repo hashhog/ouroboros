@@ -505,7 +505,8 @@ class TxMessage:
                 prev_txid=prev_txid,
                 prev_vout=prev_vout,
                 script_sig=script_sig,
-                sequence=sequence
+                sequence=sequence,
+                witness=None,
             ))
         
         # Parse outputs count (varint)
@@ -540,8 +541,6 @@ class TxMessage:
             ))
         
         # Parse witness data if present (for SegWit transactions)
-        # Note: We parse witness data but don't store it in Transaction object yet
-        # as it's not in the current Transaction dataclass structure
         if has_witness:
             for i in range(inputs_count):
                 # Witness stack count (varint)
@@ -551,13 +550,22 @@ class TxMessage:
                 offset += varint_size
                 
                 # Witness stack items
+                witness_stack = []
                 for j in range(stack_count):
                     item_len, varint_size = decode_varint(payload, offset)
                     offset += varint_size
                     if len(payload) < offset + item_len:
                         raise ValueError(f"Payload too short for witness item {j} in input {i}")
-                    # Skip witness item data (not storing for now)
+                    witness_stack.append(payload[offset:offset + item_len])
                     offset += item_len
+                # Update input with witness data
+                inputs[i] = TxIn(
+                    prev_txid=inputs[i].prev_txid,
+                    prev_vout=inputs[i].prev_vout,
+                    script_sig=inputs[i].script_sig,
+                    sequence=inputs[i].sequence,
+                    witness=witness_stack,
+                )
         
         # Parse locktime (4 bytes)
         if len(payload) < offset + 4:
@@ -566,15 +574,13 @@ class TxMessage:
         offset += 4
         
         # Create Transaction object
-        # Note: Transaction requires txid which we calculate from the serialized transaction
-        # For now, we'll create it with a placeholder txid and let it be calculated later
-        # The actual txid should be calculated from the transaction hash
         transaction = Transaction(
-            txid=bytes(32),  # Placeholder - should be calculated from transaction hash
+            txid=bytes(32),  # Placeholder - calculated below from non-witness serialization
             version=version,
             locktime=locktime,
             inputs=inputs,
-            outputs=outputs
+            outputs=outputs,
+            has_witness=has_witness,
         )
         
         # Calculate actual txid from transaction
