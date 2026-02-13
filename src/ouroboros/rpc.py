@@ -638,7 +638,53 @@ class RPCServer:
         except Exception as e:
             logger.error(f"Error getting txout: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
-    
+
+    async def rpc_listunspent(
+        self,
+        minconf: int = 1,
+        maxconf: int = 9999999,
+        addresses: Optional[List[str]] = None,
+        include_unsafe: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        List unspent outputs, optionally filtered by addresses.
+
+        Args:
+            minconf: Minimum confirmations (ignored for v1 - all confirmed)
+            maxconf: Maximum confirmations
+            addresses: Optional list of addresses to filter
+            include_unsafe: Include untrusted outputs
+
+        Returns:
+            List of unspent output dicts
+        """
+        if not hasattr(self.node, 'db') or not self.node.db:
+            return []
+
+        network = getattr(self.node, 'network', 'mainnet')
+        result = []
+
+        if addresses:
+            for addr in addresses:
+                try:
+                    utxos = self.node.db.list_unspent_by_address(addr, network)
+                    for u in utxos:
+                        result.append({
+                            "txid": u["txid"],
+                            "vout": u["vout"],
+                            "scriptPubKey": u["script_pubkey"].hex(),
+                            "amount": u["value"] / 100_000_000.0,
+                            "confirmations": 1,  # In chainstate = confirmed
+                            "spendable": True,
+                        })
+                except ValueError:
+                    continue  # Skip invalid addresses
+        else:
+            # No address filter: would need to iterate all (expensive). Return empty for now.
+            pass
+
+        return result
+
     # Helper methods
     
     def _tx_to_dict(self, tx: Transaction) -> Dict[str, Any]:
