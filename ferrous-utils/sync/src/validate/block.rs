@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::storage::{BlockchainDB, DbError};
 use common::{BlockWrapper, BlockHeaderWrapper, BlockMetadata, TransactionWrapper, OutPointWrapper, UTXO};
+use crate::chainwork::compute_chainwork;
 use common::crypto::compute_merkle_root;
 
 use super::header::{HeaderValidator, HeaderValidationError};
@@ -334,14 +335,20 @@ impl BlockValidator {
         // Store block
         self.db.store_block(block)?;
 
-        // Store block metadata
-        // Note: header.time is already u32 in bitcoin 0.32
+        // Store block metadata with chainwork
         let timestamp = inner.header.time;
-        let metadata = BlockMetadata::new(
-            height,
-            [0u8; 32], // TODO: calculate chainwork
-            timestamp,
-        );
+        let bits = inner.header.bits.to_consensus();
+        let prev_chainwork = if height == 0 {
+            [0u8; 32]
+        } else {
+            self.db
+                .get_block_metadata(height - 1)
+                .ok()
+                .and_then(|opt| opt.map(|m| m.chainwork))
+                .unwrap_or([0u8; 32])
+        };
+        let chainwork = compute_chainwork(&prev_chainwork, bits);
+        let metadata = BlockMetadata::new(height, chainwork, timestamp);
         self.db.store_block_metadata(height, &block_hash, &metadata)?;
 
         // Update best block

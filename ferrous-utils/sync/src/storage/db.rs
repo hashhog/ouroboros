@@ -328,6 +328,15 @@ impl BlockchainDB {
         Ok(())
     }
 
+    /// Get chainwork at a given height (from block metadata).
+    /// Returns chainwork as 32-byte big-endian, or zeros if not found.
+    pub fn get_chainwork_by_height(&self, height: u32) -> Result<[u8; 32]> {
+        match self.get_block_metadata(height)? {
+            Some(meta) => Ok(meta.chainwork),
+            None => Ok([0u8; 32]),
+        }
+    }
+
     /// Get block metadata by height
     pub fn get_block_metadata(&self, height: u32) -> Result<Option<BlockMetadata>> {
         let cf = self.db.cf_handle(BLOCK_INDEX_CF)
