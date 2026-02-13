@@ -726,36 +726,20 @@ class RPCServer:
     def _get_next_block_hash(self, height: int) -> Optional[str]:
         """
         Get next block hash for a given block height.
-        
-        Args:
-            height: Block height
-            
-        Returns:
-            Next block hash as hex string, or None if no next block
+
+        Returns block at height+1 hash as hex, or None if at tip.
+        Ref: bitcoin/src/rpc/blockchain.cpp blockToJSON
         """
-        if not hasattr(self.node, 'db') or not self.node.db:
+        if not hasattr(self.node, "db") or not self.node.db:
             return None
-        
+
         try:
-            # Get next block at height + 1
-            next_block = self.node.db.get_block_by_height(height + 1)
-            if next_block:
-                # Try to get hash from block object
-                if hasattr(next_block, 'hash') and next_block.hash:
-                    next_hash = next_block.hash
-                    if isinstance(next_hash, bytes):
-                        return next_hash.hex()
-                    return str(next_hash)
-                
-                # Fallback: get hash by height
-                next_hash = self.node.db.get_block_hash_by_height(height + 1)
-                if next_hash:
-                    if isinstance(next_hash, bytes):
-                        return next_hash.hex()
-                    return str(next_hash)
-            
-            return None
-        
+            next_hash = self.node.db.get_block_hash_by_height(height + 1)
+            if next_hash is None:
+                return None  # At tip, no next block
+            if isinstance(next_hash, bytes):
+                return next_hash.hex()
+            return str(next_hash)
         except Exception as e:
             logger.debug(f"Error getting next block hash for height {height}: {e}")
             return None
