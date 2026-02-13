@@ -1,6 +1,7 @@
 """Command-line interface for the Bitcoin node."""
 
 import asyncio
+import os
 import shutil
 import signal
 import sys
@@ -80,8 +81,14 @@ def expand_path(path_str: str) -> Path:
 @click.option(
     "--data-dir",
     default="~/.ouroboros",
-    help="Data directory",
+    help="Data directory (overridden by OROBOROS_DATADIR env)",
     callback=lambda ctx, param, value: str(expand_path(value)),
+)
+@click.option(
+    "--config",
+    "config_file",
+    default=None,
+    help="Path to ouroboros.conf (default: data_dir/ouroboros.conf)",
 )
 @click.option(
     "--network",
@@ -90,14 +97,19 @@ def expand_path(path_str: str) -> Path:
     help="Bitcoin network",
 )
 @click.pass_context
-def cli(ctx, data_dir, network):
+def cli(ctx, data_dir, config_file, network):
     """Bitcoin Hybrid Node - Rust sync, Python operations"""
+    # OROBOROS_DATADIR overrides --data-dir
+    if os.environ.get("OUROBOROS_DATADIR"):
+        data_dir = str(expand_path(os.environ["OUROBOROS_DATADIR"]))
     # Ensure data directory exists
     Path(data_dir).mkdir(parents=True, exist_ok=True)
-    
+    # Config path: --config or data_dir/ouroboros.conf
+    config_path = config_file or str(Path(data_dir) / "ouroboros.conf")
     ctx.obj = {
         "data_dir": data_dir,
         "network": network,
+        "config_path": config_path,
     }
 
 
@@ -322,11 +334,13 @@ def start(ctx, rpc_port, p2p_port):
     
     # Create and start node
     try:
+        config_path = ctx.obj.get("config_path", str(Path(data_dir) / "ouroboros.conf"))
         config = {
             "datadir": data_dir,
             "network": network,
             "rpc_port": rpc_port,
             "p2p_port": p2p_port,
+            "config_path": config_path,
         }
         
         _node = BitcoinNode(config=config)
