@@ -21,8 +21,9 @@ pub fn validate_pow(header: &BlockHeaderWrapper, target: U256) -> bool {
     // Compute double SHA-256
     let hash = double_sha256(&header_bytes);
 
-    // Convert hash to U256 (big-endian interpretation)
-    let hash_u256 = U256::from_big_endian(&hash);
+    // Convert hash to U256 (little-endian - Bitcoin's internal format for PoW comparison)
+    // See: https://learnmeabitcoin.com/technical/general/byte-order/
+    let hash_u256 = U256::from_little_endian(&hash);
 
     // Header hash must be <= target
     hash_u256 <= target

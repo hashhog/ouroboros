@@ -118,27 +118,17 @@ impl Message {
         // Read payload size (4 bytes)
         let payload_size = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
 
-        // Early sanity check: payload_size > 4MB likely indicates stream desync. Bitcoin blocks
-        // are rarely > 2MB; values in the billions are garbage.
-        const SANITY_MAX_PAYLOAD: u32 = 4 * 1024 * 1024; // 4MB
-        if payload_size > SANITY_MAX_PAYLOAD {
+        // Match Bitcoin Core MAX_PROTOCOL_MESSAGE_LENGTH (net.h): 4 * 1000 * 1000
+        const MAX_PROTOCOL_MESSAGE_LENGTH: u32 = 4_000_000;
+        if payload_size > MAX_PROTOCOL_MESSAGE_LENGTH {
             return Err(MessageError::PayloadSizeExceeded {
                 size: payload_size,
-                limit: SANITY_MAX_PAYLOAD,
+                limit: MAX_PROTOCOL_MESSAGE_LENGTH,
             });
         }
 
         // Read checksum (4 bytes)
         let checksum = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-
-        // Protocol limit: 32MB (Bitcoin P2P spec)
-        const MAX_PAYLOAD_SIZE: u32 = 32 * 1024 * 1024;
-        if payload_size > MAX_PAYLOAD_SIZE {
-            return Err(MessageError::PayloadSizeExceeded {
-                size: payload_size,
-                limit: MAX_PAYLOAD_SIZE,
-            });
-        }
 
         // Read payload
         if data.len() < 24 + payload_size as usize {
@@ -363,9 +353,18 @@ impl VersionMessage {
             .map_err(|e| MessageError::DeserializationError(format!("Nonce: {}", e)))?;
         
         // User agent (varint length + bytes)
+        // Bitcoin Core MAX_SUBVERSION_LENGTH = 256
         let (ua_len, consumed) = decode_varint(decoder)
             .map_err(|e| MessageError::DeserializationError(format!("User agent length: {}", e)))?;
+        if ua_len > 256 {
+            return Err(MessageError::DeserializationError(
+                format!("User agent too long: {} > 256", ua_len),
+            ));
+        }
         decoder = &decoder[consumed..];
+        if decoder.len() < ua_len as usize {
+            return Err(MessageError::InvalidFormat);
+        }
         let user_agent = String::from_utf8(decoder[..ua_len as usize].to_vec())
             .map_err(|e| MessageError::DeserializationError(format!("User agent: {}", e)))?;
         decoder = &decoder[ua_len as usize..];
@@ -965,7 +964,7 @@ mod tests {
             addr_recv.clone(),
             addr_from.clone(),
             12345,
-            "/bitcoin-hybrid:0.1.0/".to_string(),
+            "/Ouroboros:0.1.0/".to_string(),
             0,
             true,
         );
