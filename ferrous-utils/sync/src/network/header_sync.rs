@@ -782,7 +782,7 @@ mod tests {
         let validator = Arc::new(HeaderValidator::new(Arc::clone(&db), Network::Bitcoin));
         let peer_manager = Arc::new(Mutex::new(PeerManager::new(
             Network::Bitcoin,
-            "/bitcoin-hybrid:0.1.0/".to_string(),
+            "/Ouroboros:0.1.0/".to_string(),
             0,
             50,
         )));

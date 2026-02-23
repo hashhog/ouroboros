@@ -11,7 +11,8 @@ use tokio::sync::{mpsc, Mutex};
 use thiserror::Error;
 
 use crate::network::peer_manager::{PeerManager, PeerManagerError};
-use crate::network::peer::{Peer, PeerError, PeerState};
+use crate::network::peer::{Peer, PeerError, PeerState, read_network_message, DiagnosticReader};
+use tokio::io::AsyncWriteExt;
 use crate::network::messages::{
     GetDataMessage, BlockMessage, InvItem, INV_TYPE_BLOCK,
     Message, MessageError, PingMessage, PongMessage,
@@ -55,16 +56,25 @@ pub enum BlockSyncError {
 /// Result type for block sync operations
 pub type Result<T> = std::result::Result<T, BlockSyncError>;
 
-/// Default receive timeout for block messages (large blocks on slow links).
-/// Can be overridden via OUROBOROS_BLOCK_RECEIVE_TIMEOUT_SECS or set_receive_timeout_secs().
-const DEFAULT_RECEIVE_TIMEOUT_SECS: u64 = 120;
+/// Default receive timeout for block messages. Aggressive enough to detect dead peers
+/// without prematurely dropping slow ones. Override via OUROBOROS_BLOCK_RECEIVE_TIMEOUT_SECS.
+const DEFAULT_RECEIVE_TIMEOUT_SECS: u64 = 60;
 /// Interval for batch progress logging (blocks) when not verbose
 const BATCH_LOG_INTERVAL: u32 = 50;
 
-/// Default max in-flight block requests (Bitcoin Core uses 16 per peer; with 8 peers ~128 total)
+/// Default max in-flight block requests (Bitcoin Core uses 16 per peer; with 8 peers ~128 total).
+/// Overridable via OUROBOROS_MAX_IN_FLIGHT (e.g. 64 when peers are slow to reduce pressure).
 const DEFAULT_MAX_IN_FLIGHT: usize = 128;
-/// Timeout before re-queueing an in-flight request so another peer can try
-const IN_FLIGHT_TIMEOUT_SECS: u64 = 60;
+/// Max requests per peer (Bitcoin Core ~16). Prevents overloading a single peer when we have few connections.
+const MAX_IN_FLIGHT_PER_PEER: usize = 16;
+
+/// Default stalling timeout base in seconds. Bitcoin Core uses 2s; we default to 5s since we have
+/// fewer peers and slower reconnection. Override via OUROBOROS_STALLING_TIMEOUT_SECS.
+const DEFAULT_STALLING_TIMEOUT_SECS: u64 = 5;
+/// Maximum stalling timeout after adaptive increases. Bitcoin Core caps at 64s.
+const MAX_STALLING_TIMEOUT_SECS: u64 = 64;
+/// Factor to decay the stalling timeout toward the base when progress is made (0.85 = 15% reduction).
+const STALLING_TIMEOUT_DECAY: f64 = 0.85;
 
 /// Check if a peer error indicates the peer has disconnected (do not re-add to pool)
 fn is_disconnect_error(e: &PeerError) -> bool {
@@ -135,6 +145,13 @@ pub struct BlockSync {
     max_concurrent: usize,
     /// Receive timeout in seconds (configurable via env or set_receive_timeout_secs)
     receive_timeout_secs: u64,
+    /// Adaptive stalling timeout: current value in seconds. Starts at stalling_timeout_base,
+    /// doubles when stalls are detected, decays toward base when progress is made.
+    stalling_timeout_secs: Arc<std::sync::atomic::AtomicU64>,
+    /// Base stalling timeout (configurable via OUROBOROS_STALLING_TIMEOUT_SECS)
+    stalling_timeout_base: u64,
+    /// Per-peer last progress timestamp: updated when a peer delivers a block
+    peer_last_progress: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
     /// Long-lived peer tasks: addr -> command sender (None until first drain)
     peer_tasks: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<PeerTaskCommand>>>>,
     /// Progress callback: (downloaded, total, speed_blocks_per_sec, eta_seconds)
@@ -145,6 +162,8 @@ pub struct BlockSync {
     progress_cache: Arc<StdMutex<BlockProgressCache>>,
     /// Total PayloadSizeExceeded + InvalidMagic since start (for debugging peer droughts)
     desync_count: Arc<AtomicU64>,
+    /// Height -> peer that timed out; avoid re-assigning to same peer (cleared when assigned to different peer)
+    avoid_peer_for_height: Arc<Mutex<HashMap<u32, SocketAddr>>>,
 }
 
 /// Rolling window for speed calculation (seconds)
@@ -218,6 +237,17 @@ impl BlockSync {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_RECEIVE_TIMEOUT_SECS);
 
+        let stalling_timeout_base = std::env::var("OUROBOROS_STALLING_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_STALLING_TIMEOUT_SECS);
+
+        let max_concurrent = std::env::var("OUROBOROS_MAX_IN_FLIGHT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map(|n: usize| n.min(256))
+            .unwrap_or(DEFAULT_MAX_IN_FLIGHT);
+
         Self {
             peer_manager,
             validator,
@@ -226,13 +256,17 @@ impl BlockSync {
             download_queue: Arc::new(Mutex::new(VecDeque::new())),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             hash_to_height: Arc::new(Mutex::new(HashMap::new())),
-            max_concurrent: DEFAULT_MAX_IN_FLIGHT,
+            max_concurrent,
             receive_timeout_secs,
+            stalling_timeout_secs: Arc::new(std::sync::atomic::AtomicU64::new(stalling_timeout_base)),
+            stalling_timeout_base,
+            peer_last_progress: Arc::new(Mutex::new(HashMap::new())),
             peer_tasks: Arc::new(Mutex::new(HashMap::new())),
             progress_callback: None,
             stats: Arc::new(Mutex::new(SyncStats::default())),
             progress_cache,
             desync_count: Arc::new(AtomicU64::new(0)),
+            avoid_peer_for_height: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -278,10 +312,11 @@ impl BlockSync {
             .map(|(_, h)| h)
             .unwrap_or(0);
         log::info!(
-            "Block sync: db has best_height={}, queue_size={} blocks to download (receive timeout: {}s)",
+            "Block sync: db has best_height={}, queue_size={} blocks to download (receive timeout: {}s, stalling timeout: {}s adaptive)",
             best_height,
             queue_size,
-            self.receive_timeout_secs
+            self.receive_timeout_secs,
+            self.stalling_timeout_base
         );
 
         // Progress: blocks in our chain / total chain blocks. total_chain_blocks = end_height + 1.
@@ -297,6 +332,7 @@ impl BlockSync {
         let mut no_peers_wait_secs: u64 = 1;
         let mut no_peers_wait_since = tokio::time::Instant::now();
         let mut last_no_peers_warn_log: Option<Instant> = None;
+        let mut last_diag_log: Option<Instant> = None;
 
         // Main sync loop - long-lived peer tasks architecture (see BLOCK_SYNC_ARCHITECTURE.md)
         loop {
@@ -346,57 +382,80 @@ impl BlockSync {
                     no_peers_wait_secs = 1;
 
                     let network = self.network;
-                    let receive_timeout_secs = self.receive_timeout_secs;
                     let event_tx = event_tx.clone();
-                    for (addr, mut peer) in peer_map {
-                        peer.set_timeout(Duration::from_secs(receive_timeout_secs));
+                    let now_init = Instant::now();
+                    for (addr, peer) in peer_map {
+                        self.peer_last_progress.lock().await.insert(addr, now_init);
                         let (cmd_tx, mut cmd_rx) = mpsc::channel::<PeerTaskCommand>(32);
                         peer_tasks.insert(addr, cmd_tx);
 
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
-                            let addr = addr;
-                            let mut peer = peer;
-                            loop {
-                                tokio::select! {
-                                    result = peer.receive_message() => {
-                                        match result {
-                                            Ok(msg) => {
-                                                if msg.command == "block" {
-                                                    let _ = event_tx.send(RecvEvent::Message(addr, msg));
-                                                } else if msg.command == "ping" {
-                                                    if let Ok(ping) = PingMessage::deserialize_payload(&msg.payload) {
-                                                        let pong_msg = PongMessage::new(ping.nonce).to_message(network);
-                                                        let _ = peer.send_message(pong_msg).await;
+                            // Split the TCP stream so reads and writes are independent.
+                            // This prevents tokio::select! from cancelling a read_exact
+                            // mid-stream when a SendGetData command arrives — the root
+                            // cause of InvalidMagic / PayloadSizeExceeded desyncs.
+                            let (stream, _, _) = peer.into_parts();
+                            let (read_half, mut write_half) = stream.into_split();
+                            let mut diag_reader = DiagnosticReader::new(read_half);
+
+                            let done_reason: PeerDoneReason = 'task: loop {
+                                // Pin the receive future so it survives select! iterations.
+                                // When the cmd branch wins, recv_fut is NOT cancelled — it
+                                // continues where it left off on the next poll.
+                                let recv_fut = read_network_message(&mut diag_reader, network);
+                                tokio::pin!(recv_fut);
+
+                                loop {
+                                    tokio::select! {
+                                        result = &mut recv_fut => {
+                                            match result {
+                                                Ok(msg) => {
+                                                    if msg.command == "block" {
+                                                        let _ = event_tx.send(RecvEvent::Message(addr, msg));
+                                                    } else if msg.command == "ping" {
+                                                        if let Ok(ping) = PingMessage::deserialize_payload(&msg.payload) {
+                                                            let pong_msg = PongMessage::new(ping.nonce).to_message(network);
+                                                            let data = pong_msg.serialize();
+                                                            if let Err(e) = write_half.write_all(&data).await {
+                                                                log::warn!("Failed to send pong to {}: {}", addr, e);
+                                                            }
+                                                        }
                                                     }
+                                                    break; // inner loop → create new recv_fut
                                                 }
-                                            }
-                                            Err(e) => {
-                                                if is_protocol_desync_error(&e) {
-                                                    log::debug!("Error receiving from {}: {}", addr, e);
-                                                } else {
-                                                    log::warn!("Error receiving from {}: {}", addr, e);
+                                                Err(e) => {
+                                                    if is_protocol_desync_error(&e) {
+                                                        log::debug!("Error receiving from {}: {}", addr, e);
+                                                    } else {
+                                                        log::warn!("Error receiving from {}: {}", addr, e);
+                                                    }
+                                                    break 'task PeerDoneReason::Error(e);
                                                 }
-                                                let _ = event_tx.send(RecvEvent::PeerDone(addr, peer, PeerDoneReason::Error(e)));
-                                                return;
                                             }
                                         }
-                                    }
-                                    cmd = cmd_rx.recv() => {
-                                        match cmd {
-                                            Some(PeerTaskCommand::SendGetData(msg)) => {
-                                                if let Err(e) = peer.send_message(msg).await {
-                                                    log::warn!("Failed to send GetData to {}: {}", addr, e);
+                                        cmd = cmd_rx.recv() => {
+                                            match cmd {
+                                                Some(PeerTaskCommand::SendGetData(msg)) => {
+                                                    let data = msg.serialize();
+                                                    if let Err(e) = write_half.write_all(&data).await {
+                                                        log::warn!("Failed to send GetData to {}: {}", addr, e);
+                                                    }
                                                 }
-                                            }
-                                            Some(PeerTaskCommand::Shutdown) | None => {
-                                                let _ = event_tx.send(RecvEvent::PeerDone(addr, peer, PeerDoneReason::Shutdown));
-                                                return;
+                                                Some(PeerTaskCommand::Shutdown) | None => {
+                                                    break 'task PeerDoneReason::Shutdown;
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
+                            };
+
+                            // Reunite stream halves and reconstruct Peer for PeerDone handler
+                            let read_half = diag_reader.into_inner();
+                            let stream = read_half.reunite(write_half).expect("same TcpStream");
+                            let peer = Peer::from_stream(stream, addr, network);
+                            let _ = event_tx.send(RecvEvent::PeerDone(addr, peer, done_reason));
                         });
                     }
                     log::debug!("[block-sync] Spawned {} long-lived peer receive tasks", peer_tasks.len());
@@ -440,13 +499,30 @@ impl BlockSync {
                 let available_peers: Vec<SocketAddr> = peer_tasks.keys().copied().collect();
                 drop(peer_tasks);
 
-                let available_slots = batch_size.saturating_sub(in_flight.len());
+                // Count in-flight per peer to respect MAX_IN_FLIGHT_PER_PEER (avoid overloading one peer)
+                let mut per_peer_count: HashMap<SocketAddr, usize> = HashMap::new();
+                for req in in_flight.values() {
+                    *per_peer_count.entry(req.peer_addr).or_insert(0) += 1;
+                }
+
+                let mut avoid = self.avoid_peer_for_height.lock().await;
+                let total_slots = batch_size.saturating_sub(in_flight.len());
                 let mut peer_idx = 0;
-                for _ in 0..available_slots {
+                for _ in 0..total_slots {
                     if queue.is_empty() || available_peers.is_empty() {
                         break;
                     }
                     let height = queue.pop_front().unwrap();
+                    let exclude_addr = avoid.get(&height).copied();
+                    let peers_for_height: Vec<SocketAddr> = available_peers
+                        .iter()
+                        .filter(|a| exclude_addr != Some(**a))
+                        .copied()
+                        .collect();
+                    if peers_for_height.is_empty() {
+                        queue.push_front(height);
+                        continue;
+                    }
                     let block_hash = match self.db.get_block_hash_by_height(height) {
                         Ok(Some(hash)) => hash,
                         Ok(None) => {
@@ -464,20 +540,47 @@ impl BlockSync {
                             continue;
                         }
                     };
-                    let peer_addr = available_peers[peer_idx % available_peers.len()];
-                    peer_idx += 1;
+                    // Find a peer under the per-peer cap (round-robin through peers that have capacity)
+                    let mut attempts = 0;
+                    let peer_addr = loop {
+                        let addr = peers_for_height[peer_idx % peers_for_height.len()];
+                        peer_idx += 1;
+                        let count = per_peer_count.get(&addr).copied().unwrap_or(0);
+                        if count < MAX_IN_FLIGHT_PER_PEER {
+                            *per_peer_count.entry(addr).or_insert(0) += 1;
+                            avoid.remove(&height);
+                            break Some(addr);
+                        }
+                        attempts += 1;
+                        if attempts >= peers_for_height.len() {
+                            queue.push_front(height);
+                            break None;
+                        }
+                    };
+                    let Some(peer_addr) = peer_addr else {
+                        break;
+                    };
                     assignments.push((height, block_hash, peer_addr));
                 }
                 drop(in_flight);
                 drop(queue);
             }
 
+            // Batch GetData by peer: one message per peer with multiple blocks (reduces round-trips)
+            let mut by_peer: HashMap<SocketAddr, Vec<(u32, [u8; 32])>> = HashMap::new();
             for (height, block_hash, peer_addr) in &assignments {
-                let inv_item = InvItem {
-                    inv_type: INV_TYPE_BLOCK,
-                    hash: *block_hash,
-                };
-                let get_data = GetDataMessage::new(vec![inv_item]);
+                by_peer.entry(*peer_addr).or_default().push((*height, *block_hash));
+            }
+
+            for (peer_addr, blocks) in &by_peer {
+                let inv_items: Vec<InvItem> = blocks
+                    .iter()
+                    .map(|(_, hash)| InvItem {
+                        inv_type: INV_TYPE_BLOCK,
+                        hash: *hash,
+                    })
+                    .collect();
+                let get_data = GetDataMessage::new(inv_items);
                 let msg = get_data.to_message(self.network);
 
                 let mut peer_tasks = self.peer_tasks.lock().await;
@@ -488,24 +591,33 @@ impl BlockSync {
                 };
                 drop(peer_tasks);
                 if send_ok {
+                    let now = Instant::now();
                     let mut in_flight = self.in_flight.lock().await;
-                    in_flight.insert(*height, InFlightRequest {
-                        peer_addr: *peer_addr,
-                        requested_at: Instant::now(),
-                        retry_count: 0,
-                    });
                     let mut hash_map = self.hash_to_height.lock().await;
-                    hash_map.insert(*block_hash, *height);
-                    log::trace!("Requested block {} from {}", height, peer_addr);
+                    for (height, block_hash) in blocks {
+                        in_flight.insert(*height, InFlightRequest {
+                            peer_addr: *peer_addr,
+                            requested_at: now,
+                            retry_count: 0,
+                        });
+                        hash_map.insert(*block_hash, *height);
+                    }
+                    log::trace!("Requested {} block(s) from {}", blocks.len(), peer_addr);
                 } else {
                     let mut queue = self.download_queue.lock().await;
-                    queue.push_back(*height);
+                    for (height, _) in blocks {
+                        queue.push_back(*height);
+                    }
                 }
             }
 
             if !assignments.is_empty() {
-                let num_peers = assignments.iter().map(|(_, _, a)| *a).collect::<HashSet<_>>().len();
-                log::debug!("Sent {} block requests to {} peer(s)", assignments.len(), num_peers);
+                let num_peers = by_peer.len();
+                log::debug!(
+                    "Sent {} block requests to {} peer(s) (batched)",
+                    assignments.len(),
+                    num_peers
+                );
             }
 
             // 3. Receive events (drain channel with timeout - process all available blocks)
@@ -558,6 +670,21 @@ impl BlockSync {
                                             let mut hm = self.hash_to_height.lock().await;
                                             hm.remove(&hash_bytes);
                                         }
+                                        // Record peer progress and decay stalling timeout
+                                        {
+                                            self.peer_last_progress.lock().await
+                                                .insert(peer_addr, Instant::now());
+                                            let cur = self.stalling_timeout_secs.load(Ordering::Relaxed);
+                                            if cur > self.stalling_timeout_base {
+                                                let new_val = ((cur as f64) * STALLING_TIMEOUT_DECAY) as u64;
+                                                let new_val = new_val.max(self.stalling_timeout_base);
+                                                if self.stalling_timeout_secs.compare_exchange(
+                                                    cur, new_val, Ordering::Relaxed, Ordering::Relaxed
+                                                ).is_ok() && new_val < cur {
+                                                    log::debug!("Decreased stalling timeout to {}s", new_val);
+                                                }
+                                            }
+                                        }
                                         {
                                             let now = Instant::now();
                                             let mut stats = self.stats.lock().await;
@@ -585,6 +712,7 @@ impl BlockSync {
                 }
                 RecvEvent::PeerDone(addr, peer, reason) => {
                     self.peer_tasks.lock().await.remove(&addr);
+                    self.peer_last_progress.lock().await.remove(&addr);
                     let should_add_peer_back = match &reason {
                         PeerDoneReason::Timeout => {
                             // Unreachable: timeouts are reported as Error(PeerError::Timeout)
@@ -611,11 +739,17 @@ impl BlockSync {
                                 }
                                 false
                             } else if is_disconnect_error(e) || is_protocol_desync_error(e) {
-                                // Don't re-add peers that disconnected or sent corrupted data (stream desync).
+                                // Disconnect without blacklisting (Bitcoin Core behavior).
+                                // With the split-stream fix, desyncs should be extremely rare.
+                                // When they do occur (genuine corruption), just disconnect and
+                                // let the peer reconnect naturally — don't drain the peer pool.
                                 if is_protocol_desync_error(e) {
                                     self.desync_count.fetch_add(1, Ordering::Relaxed);
-                                    let mut pm = self.peer_manager.lock().await;
-                                    pm.blacklist_peer_desync(addr).await;
+                                    let total = self.desync_count.load(Ordering::Relaxed);
+                                    log::info!(
+                                        "[block-sync] Protocol desync from {} (total: {}), disconnecting without blacklist",
+                                        addr, total
+                                    );
                                 }
                                 let mut in_flight = self.in_flight.lock().await;
                                 let mut queue = self.download_queue.lock().await;
@@ -645,38 +779,128 @@ impl BlockSync {
             }
             } // end receive loop
 
-            // 4. Handle timeouts for in-flight requests
+            // 4. Adaptive stalling detection (Bitcoin Core-style)
+            //
+            // For each peer with in-flight requests, check if it has made progress
+            // (delivered any block) within the current stalling timeout. If not,
+            // disconnect the peer, requeue its blocks, and increase the stalling timeout.
+            // When blocks are delivered (above), the timeout decays back toward the base.
             {
                 let now = Instant::now();
-                let mut timed_out = Vec::new();
+                let current_stalling_timeout = Duration::from_secs(
+                    self.stalling_timeout_secs.load(Ordering::Relaxed)
+                );
+
+                // Find peers with in-flight requests that have stalled
+                let mut stalled_peers: HashSet<SocketAddr> = HashSet::new();
                 {
                     let in_flight = self.in_flight.lock().await;
-                    for (height, request) in in_flight.iter() {
-                        if now.duration_since(request.requested_at) > Duration::from_secs(IN_FLIGHT_TIMEOUT_SECS) {
-                            timed_out.push(*height);
+                    let peer_progress = self.peer_last_progress.lock().await;
+
+                    // Collect peers that have in-flight requests
+                    let mut peers_with_inflight: HashMap<SocketAddr, usize> = HashMap::new();
+                    for req in in_flight.values() {
+                        *peers_with_inflight.entry(req.peer_addr).or_insert(0) += 1;
+                    }
+
+                    for (addr, _count) in &peers_with_inflight {
+                        let last_progress = peer_progress.get(addr).copied()
+                            .unwrap_or(now - current_stalling_timeout - Duration::from_secs(1));
+                        if now.duration_since(last_progress) > current_stalling_timeout {
+                            stalled_peers.insert(*addr);
                         }
                     }
                 }
-                if !timed_out.is_empty() {
-                    timed_out.sort();
-                    let n = timed_out.len();
-                    let range = if n == 1 {
-                        format!("height {}", timed_out[0])
-                    } else {
-                        format!("heights {}-{}", timed_out[0], timed_out[n - 1])
-                    };
-                    log::warn!("Block request timed out for {} block(s) ({}), re-queuing", n, range);
+
+                if !stalled_peers.is_empty() {
+                    // Requeue all blocks from stalled peers
                     let mut in_flight = self.in_flight.lock().await;
                     let mut queue = self.download_queue.lock().await;
-                    for height in timed_out {
-                        in_flight.remove(&height);
-                        queue.push_back(height);
+                    let mut avoid = self.avoid_peer_for_height.lock().await;
+                    let mut total_requeued = 0u32;
+
+                    for &stalled_addr in &stalled_peers {
+                        let to_requeue: Vec<u32> = in_flight
+                            .iter()
+                            .filter(|(_, r)| r.peer_addr == stalled_addr)
+                            .map(|(h, _)| *h)
+                            .collect();
+                        for &height in &to_requeue {
+                            avoid.insert(height, stalled_addr);
+                            in_flight.remove(&height);
+                            queue.push_back(height);
+                        }
+                        total_requeued += to_requeue.len() as u32;
+                    }
+                    drop(in_flight);
+                    drop(queue);
+                    drop(avoid);
+
+                    // Increase stalling timeout (double, capped at MAX)
+                    let old_timeout = self.stalling_timeout_secs.load(Ordering::Relaxed);
+                    let new_timeout = (old_timeout * 2).min(MAX_STALLING_TIMEOUT_SECS);
+                    self.stalling_timeout_secs.store(new_timeout, Ordering::Relaxed);
+
+                    log::warn!(
+                        "Peer stalling: {} peer(s) made no progress for {}s, re-queued {} block(s). Stalling timeout: {}s -> {}s",
+                        stalled_peers.len(),
+                        old_timeout,
+                        total_requeued,
+                        old_timeout,
+                        new_timeout
+                    );
+
+                    // Disconnect stalled peers (shutdown their tasks)
+                    let mut peer_tasks = self.peer_tasks.lock().await;
+                    for &stalled_addr in &stalled_peers {
+                        if let Some(cmd_tx) = peer_tasks.remove(&stalled_addr) {
+                            let _ = cmd_tx.send(PeerTaskCommand::Shutdown).await;
+                        }
+                        self.peer_last_progress.lock().await.remove(&stalled_addr);
                     }
                 }
             }
 
             // 5. Update progress
             self.update_progress().await;
+
+            // 6. Optional diagnostic logging (OUROBOROS_SYNC_DIAG=1, every 60s)
+            if std::env::var("OUROBOROS_SYNC_DIAG").map(|s| s == "1" || s.eq_ignore_ascii_case("true")).unwrap_or(false) {
+                let should_log = last_diag_log
+                    .map(|t| t.elapsed().as_secs() >= 60)
+                    .unwrap_or(true);
+                if should_log {
+                    let (peer_count, in_flight_total, per_peer, queue_len, blocks_per_sec, desync_total) = {
+                        let peer_tasks = self.peer_tasks.lock().await;
+                        let in_flight = self.in_flight.lock().await;
+                        let queue = self.download_queue.lock().await;
+                        let mut per_peer: HashMap<SocketAddr, usize> = HashMap::new();
+                        for r in in_flight.values() {
+                            *per_peer.entry(r.peer_addr).or_insert(0) += 1;
+                        }
+                        let speed = self.progress_cache.lock().map(|c| c.blocks_per_second).unwrap_or(0.0);
+                        (
+                            peer_tasks.len(),
+                            in_flight.len(),
+                            per_peer,
+                            queue.len(),
+                            speed,
+                            self.desync_count.load(Ordering::Relaxed),
+                        )
+                    };
+                    let per_peer_str: String = per_peer
+                        .iter()
+                        .map(|(a, n)| format!("{}:{}", a, n))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let stalling_timeout = self.stalling_timeout_secs.load(Ordering::Relaxed);
+                    log::info!(
+                        "[sync-diag] peers={} in_flight={} queue={} blocks/s={:.1} desyncs={} stalling_timeout={}s per_peer=[{}]",
+                        peer_count, in_flight_total, queue_len, blocks_per_sec, desync_total, stalling_timeout, per_peer_str
+                    );
+                    last_diag_log = Some(Instant::now());
+                }
+            }
         }
 
         Ok(())
@@ -710,41 +934,47 @@ impl BlockSync {
     ///
     /// Requests up to max_concurrent blocks simultaneously from different peers,
     /// handles responses as they arrive.
-    /// Uses batched timeout logging (same as main sync loop) when re-queuing timed-out blocks.
+    /// Uses adaptive stalling timeout (same as main sync loop) when re-queuing stalled blocks.
     pub async fn download_block_parallel(&mut self) -> Result<()> {
-        // Check for timeouts and re-queue (batched, matches main sync loop)
         let now = Instant::now();
+        let current_stalling_timeout = Duration::from_secs(
+            self.stalling_timeout_secs.load(Ordering::Relaxed)
+        );
         let timed_out: Vec<u32> = {
             let in_flight = self.in_flight.lock().await;
             in_flight
                 .iter()
-                .filter(|(_, r)| now.duration_since(r.requested_at) > Duration::from_secs(IN_FLIGHT_TIMEOUT_SECS))
+                .filter(|(_, r)| now.duration_since(r.requested_at) > current_stalling_timeout)
                 .map(|(h, _)| *h)
                 .collect()
         };
 
         if !timed_out.is_empty() {
-            let mut sorted = timed_out;
-            sorted.sort();
+            let timed_out_with_peers: Vec<(u32, SocketAddr)> = {
+                let in_flight = self.in_flight.lock().await;
+                timed_out
+                    .iter()
+                    .filter_map(|&h| in_flight.get(&h).map(|r| (h, r.peer_addr)))
+                    .collect()
+            };
+            let mut sorted = timed_out_with_peers;
+            sorted.sort_by_key(|(h, _)| *h);
             let n = sorted.len();
             let range = if n == 1 {
-                format!("height {}", sorted[0])
+                format!("height {}", sorted[0].0)
             } else {
-                format!("heights {}-{}", sorted[0], sorted[n - 1])
+                format!("heights {}-{}", sorted[0].0, sorted[n - 1].0)
             };
-            log::warn!("Block request timed out for {} block(s) ({}), re-queuing", n, range);
+            log::warn!("Block request stalled for {} block(s) ({}), re-queuing (avoiding stalled peers)", n, range);
             let mut in_flight = self.in_flight.lock().await;
             let mut queue = self.download_queue.lock().await;
-            for height in sorted {
+            let mut avoid = self.avoid_peer_for_height.lock().await;
+            for (height, peer_addr) in sorted {
+                avoid.insert(height, peer_addr);
                 in_flight.remove(&height);
                 queue.push_back(height);
             }
         }
-
-        // Note: In a real implementation, we'd have a message handler that routes
-        // incoming block messages to process_incoming_block() as they arrive.
-        // For now, the caller should call process_incoming_block() when a block
-        // message is received from a peer.
 
         Ok(())
     }
@@ -1279,7 +1509,7 @@ mod tests {
         let validator = Arc::new(BlockValidator::new(Arc::clone(&db), Network::Bitcoin));
         let peer_manager = Arc::new(Mutex::new(PeerManager::new(
             Network::Bitcoin,
-            "/bitcoin-hybrid:0.1.0/".to_string(),
+            "/Ouroboros:0.1.0/".to_string(),
             0,
             50,
         )));

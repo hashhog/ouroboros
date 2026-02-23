@@ -223,7 +223,7 @@ impl Peer {
 
         let version_msg = VersionMessage::new(
             70015, // Protocol version
-            0, // Services
+            1,     // Services: NODE_NETWORK (full node capability)
             timestamp,
             addr_recv,
             remote_addr,
@@ -324,46 +324,34 @@ impl Peer {
         Ok(msg)
     }
 
-    /// Internal message receiving (without state/score checks)
+    /// Internal message receiving (without state/score checks).
     ///
-    /// ## Stream consumption audit (Step 1.1)
-    /// - **Header read success**: 24 bytes consumed.
-    /// - **PayloadSizeExceeded** (before payload read): 24 bytes consumed; stream desynced.
-    /// - **Payload read failure** (e.g. connection closed mid-read): 24 + partial payload consumed;
-    ///   stream left in bad state; next read will see remaining bytes of partial payload.
-    /// - **Deserialize failure** (InvalidMagic, InvalidChecksum, etc.): 24 + full payload consumed;
-    ///   stream is aligned for next message if the header was real, but desynced if header was garbage.
-    /// - **Success**: 24 + payload consumed; stream aligned for next message.
+    /// Aligned with Bitcoin Core V1Transport behaviour:
+    /// - Bad magic or oversized payload → disconnect.
+    /// - Bad checksum or invalid command type → drop message, continue.
     async fn receive_message_internal(&mut self) -> Result<Message> {
-        const SANITY_MAX_PAYLOAD: u32 = 4 * 1024 * 1024; // 4MB
-        const PROTOCOL_MAX_PAYLOAD: u32 = 32 * 1024 * 1024; // 32MB
+        const MAX_PROTOCOL_MESSAGE_LENGTH: u32 = 4_000_000;
         const RESYNC_SCAN_LIMIT: usize = 1024 * 1024; // 1MB
 
         let try_resync = std::env::var("OUROBOROS_TRY_RESYNC").is_ok_and(|v| v == "1");
         let expected_magic = get_magic(self.network);
 
         loop {
-            // --- Read message header (24 bytes) ---
             let mut header = [0u8; 24];
             self.stream
                 .read_exact(&mut header)
                 .await
                 .map_err(|e| {
-                    // Consumed: 0..min(24, bytes_available). Stream may have partial data.
+                    self.state = PeerState::Disconnected;
                     if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        self.state = PeerState::Disconnected;
                         PeerError::ConnectionClosed
                     } else {
-                        self.state = PeerState::Disconnected;
                         PeerError::Io(format!("Read error: {}", e))
                     }
                 })?;
 
-            // Step 1.3: Validate magic early, before allocating or reading payload.
-            // This fails fast on desync (e.g. when header bytes are from middle of block payload).
             let header_magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
             if header_magic != expected_magic {
-                // Consumed: 24 bytes. Stream desynced.
                 if try_resync {
                     if let Some(msg) = self.try_magic_resync(expected_magic, RESYNC_SCAN_LIMIT).await? {
                         return Ok(msg);
@@ -377,12 +365,17 @@ impl Peer {
                 }));
             }
 
-            // Parse payload size from header
+            // Validate command type (Bitcoin Core IsMessageTypeValid):
+            // chars before first null must be printable ASCII, after must be 0x00.
+            let command_bytes = &header[4..16];
+            let null_pos = command_bytes.iter().position(|&b| b == 0).unwrap_or(12);
+            let cmd_slice = &command_bytes[..null_pos];
+            let command_valid = cmd_slice.iter().all(|&b| b >= b' ' && b <= 0x7f)
+                && command_bytes[null_pos..].iter().all(|&b| b == 0);
+
             let payload_size = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
 
-            // Sanity check: payload_size > 4MB likely indicates stream desync.
-            if payload_size > SANITY_MAX_PAYLOAD {
-                // Consumed: 24 bytes. Stream desynced.
+            if payload_size > MAX_PROTOCOL_MESSAGE_LENGTH {
                 if try_resync {
                     if let Some(msg) = self.try_magic_resync(expected_magic, RESYNC_SCAN_LIMIT).await? {
                         return Ok(msg);
@@ -391,55 +384,53 @@ impl Peer {
                 self.state = PeerState::Disconnected;
                 return Err(PeerError::Message(MessageError::PayloadSizeExceeded {
                     size: payload_size,
-                    limit: SANITY_MAX_PAYLOAD,
+                    limit: MAX_PROTOCOL_MESSAGE_LENGTH,
                 }));
             }
 
-            // Protocol limit: 32MB (Bitcoin P2P spec)
-            if payload_size > PROTOCOL_MAX_PAYLOAD {
-                self.state = PeerState::Disconnected;
-                return Err(PeerError::Message(MessageError::PayloadSizeExceeded {
-                    size: payload_size,
-                    limit: PROTOCOL_MAX_PAYLOAD,
-                }));
-            }
+            let checksum = u32::from_le_bytes([header[20], header[21], header[22], header[23]]);
 
-            // --- Read payload ---
             let mut payload = vec![0u8; payload_size as usize];
             if payload_size > 0 {
                 self.stream
                     .read_exact(&mut payload)
                     .await
                     .map_err(|e| {
-                        // Consumed: 24 + partial payload. Stream in bad state.
                         self.state = PeerState::Disconnected;
                         PeerError::Io(format!("Read payload error: {}", e))
                     })?;
             }
 
-            // --- Deserialize and validate (checksum, command) ---
-            let full_message = [&header[..], &payload[..]].concat();
-            match Message::deserialize(&full_message, self.network) {
-                Ok(msg) => return Ok(msg),
-                Err(e) => {
-                    // Consumed: 24 + full payload. Stream may be desynced if header was garbage.
-                    // Only resync on InvalidMagic/InvalidFormat; InvalidChecksum means we consumed
-                    // a complete message and the stream is aligned for the next one.
-                    if try_resync
-                        && matches!(
-                            &e,
-                            MessageError::InvalidMagic { .. } | MessageError::InvalidFormat
-                        )
-                    {
-                        if let Some(msg) = self.try_magic_resync(expected_magic, RESYNC_SCAN_LIMIT).await? {
-                            return Ok(msg);
-                        }
-                    }
-                    self.state = PeerState::Disconnected;
-                    self.score.record_failure();
-                    return Err(PeerError::Message(e));
-                }
+            // Bad checksum → drop message, don't disconnect (Bitcoin Core compat).
+            let calculated_checksum = crate::network::messages::calculate_checksum(&payload);
+            if checksum != calculated_checksum {
+                log::warn!(
+                    "Bad checksum (size={}): expected {:08x}, got {:08x} — dropping",
+                    payload_size, calculated_checksum, checksum
+                );
+                continue;
             }
+
+            // Invalid command → drop message, don't disconnect (Bitcoin Core compat).
+            if !command_valid || cmd_slice.is_empty() {
+                log::debug!(
+                    "Invalid message type, dropping (size={}): cmd_bytes={}",
+                    payload_size,
+                    command_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                );
+                continue;
+            }
+
+            let command = String::from_utf8(cmd_slice.to_vec())
+                .map_err(|e| PeerError::Message(MessageError::InvalidCommand(format!("Invalid UTF-8: {}", e))))?;
+
+            return Ok(Message {
+                magic: expected_magic,
+                command,
+                payload_size,
+                checksum,
+                payload,
+            });
         }
     }
 
@@ -494,9 +485,8 @@ impl Peer {
                     })?;
 
                 let payload_size = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
-                const SANITY_MAX: u32 = 4 * 1024 * 1024;
-                const PROTOCOL_MAX: u32 = 32 * 1024 * 1024;
-                if payload_size > SANITY_MAX || payload_size > PROTOCOL_MAX {
+                const MAX_PROTOCOL_MESSAGE_LENGTH: u32 = 4_000_000;
+                if payload_size > MAX_PROTOCOL_MESSAGE_LENGTH {
                     // Garbage size; not a real header. Continue scanning.
                     wlen = 0;
                     bytes_scanned += 24; // Account for consumed header
@@ -604,6 +594,236 @@ impl Peer {
     /// Check if peer is connected
     pub fn is_connected(&self) -> bool {
         self.state == PeerState::Connected
+    }
+
+    /// Consume this peer and return its TCP stream, address, and network.
+    ///
+    /// Used by block sync tasks that split the stream into read/write halves
+    /// for concurrent, cancellation-safe I/O. Call `from_stream` to reconstruct.
+    pub fn into_parts(self) -> (TcpStream, SocketAddr, Network) {
+        (self.stream, self.addr, self.network)
+    }
+
+    /// Reconstruct a connected peer from a TCP stream.
+    ///
+    /// Used to reconstitute a Peer after splitting for block sync tasks.
+    /// The peer is set to Connected state with a default score.
+    pub fn from_stream(stream: TcpStream, addr: SocketAddr, network: Network) -> Self {
+        Self {
+            addr,
+            stream,
+            version: None,
+            services: 0,
+            state: PeerState::Connected,
+            network,
+            score: PeerScore::default(),
+            default_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Ring buffer that wraps an async reader and records the last N bytes read.
+/// Used for post-mortem diagnostics when a stream desync (InvalidMagic /
+/// PayloadSizeExceeded) is detected — the buffer contents reveal what data
+/// preceded the corrupt header.
+pub struct DiagnosticReader<R> {
+    inner: R,
+    ring: Vec<u8>,
+    pos: usize,
+    len: usize,
+}
+
+impl<R> DiagnosticReader<R> {
+    const CAPACITY: usize = 256;
+
+    pub fn new(reader: R) -> Self {
+        Self {
+            inner: reader,
+            ring: vec![0u8; Self::CAPACITY],
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    fn record(&mut self, data: &[u8]) {
+        for &b in data {
+            self.ring[self.pos] = b;
+            self.pos = (self.pos + 1) % Self::CAPACITY;
+            if self.len < Self::CAPACITY {
+                self.len += 1;
+            }
+        }
+    }
+
+    /// Return the last N bytes in order (oldest first).
+    pub fn dump_hex(&self) -> String {
+        if self.len == 0 {
+            return String::from("(empty)");
+        }
+        let start = if self.len < Self::CAPACITY {
+            0
+        } else {
+            self.pos
+        };
+        let mut out = String::with_capacity(self.len * 3);
+        for i in 0..self.len {
+            let idx = (start + i) % Self::CAPACITY;
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push_str(&format!("{:02x}", self.ring[idx]));
+        }
+        out
+    }
+
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: AsyncReadExt + Unpin> DiagnosticReader<R> {
+    async fn read_exact_recorded(&mut self, buf: &mut [u8]) -> std::result::Result<(), std::io::Error> {
+        self.inner.read_exact(buf).await?;
+        self.record(buf);
+        Ok(())
+    }
+}
+
+/// Read a single Bitcoin P2P message from an async reader wrapped in a
+/// [`DiagnosticReader`].
+///
+/// Designed for long-lived block sync tasks where the TCP stream is split into
+/// read/write halves. When called via a pinned future (`tokio::pin!` +
+/// `&mut future`) inside `tokio::select!`, the read is never interrupted
+/// mid-stream, preventing desyncs from async cancellation.
+///
+/// Behaviour aligned with Bitcoin Core's V1Transport (`net.cpp`):
+/// - **Bad magic / oversized payload** → disconnect (return Err).
+/// - **Bad checksum** → drop the message and read the next one (Bitcoin Core
+///   sets `reject_message = true` but keeps the connection alive).
+/// - **Invalid command type** (non-ASCII, non-zero padding after null) → drop
+///   and continue, matching `IsMessageTypeValid()` in `protocol.cpp`.
+///
+/// On desync, logs the last 256 bytes from the ring buffer for post-mortem
+/// analysis.
+pub async fn read_network_message<R: AsyncReadExt + Unpin>(
+    reader: &mut DiagnosticReader<R>,
+    network: Network,
+) -> Result<Message> {
+    // Bitcoin Core uses 4 * 1000 * 1000 (MAX_PROTOCOL_MESSAGE_LENGTH in net.h).
+    // We match that exactly for parity.
+    const MAX_PROTOCOL_MESSAGE_LENGTH: u32 = 4_000_000;
+
+    let expected_magic = get_magic(network);
+
+    loop {
+        // Read 24-byte message header
+        let mut header = [0u8; 24];
+        reader.read_exact_recorded(&mut header).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                PeerError::ConnectionClosed
+            } else {
+                PeerError::Io(format!("Read header error: {}", e))
+            }
+        })?;
+
+        // Validate magic
+        let header_magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        if header_magic != expected_magic {
+            log::warn!(
+                "Stream desync: InvalidMagic expected={:08x} got={:08x} header={} ring_buffer=[{}]",
+                expected_magic,
+                header_magic,
+                header.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                reader.dump_hex()
+            );
+            return Err(PeerError::Message(MessageError::InvalidMagic {
+                expected: expected_magic,
+                actual: header_magic,
+            }));
+        }
+
+        // Parse command — match Bitcoin Core's IsMessageTypeValid():
+        // bytes before first null must be printable ASCII (' '..=0x7f),
+        // bytes after first null must all be 0x00.
+        let command_bytes = &header[4..16];
+        let null_pos = command_bytes.iter().position(|&b| b == 0).unwrap_or(12);
+        let cmd_slice = &command_bytes[..null_pos];
+
+        let command_valid = cmd_slice.iter().all(|&b| b >= b' ' && b <= 0x7f)
+            && command_bytes[null_pos..].iter().all(|&b| b == 0);
+
+        let command = if command_valid && !cmd_slice.is_empty() {
+            // Safe: we verified printable ASCII above
+            String::from_utf8(cmd_slice.to_vec()).ok()
+        } else {
+            None
+        };
+
+        // Parse payload size
+        let payload_size = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
+
+        if payload_size > MAX_PROTOCOL_MESSAGE_LENGTH {
+            log::warn!(
+                "Stream desync: PayloadSizeExceeded size={} limit={} cmd={} header={} ring_buffer=[{}]",
+                payload_size,
+                MAX_PROTOCOL_MESSAGE_LENGTH,
+                command.as_deref().unwrap_or("(invalid)"),
+                header.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                reader.dump_hex()
+            );
+            return Err(PeerError::Message(MessageError::PayloadSizeExceeded {
+                size: payload_size,
+                limit: MAX_PROTOCOL_MESSAGE_LENGTH,
+            }));
+        }
+
+        // Parse checksum from header
+        let checksum = u32::from_le_bytes([header[20], header[21], header[22], header[23]]);
+
+        // Read payload
+        let mut payload = vec![0u8; payload_size as usize];
+        if payload_size > 0 {
+            reader.read_exact_recorded(&mut payload).await.map_err(|e| {
+                PeerError::Io(format!(
+                    "Read payload error (cmd={}, size={}): {}",
+                    command.as_deref().unwrap_or("?"), payload_size, e
+                ))
+            })?;
+        }
+
+        // Verify checksum — Bitcoin Core behaviour: bad checksum → reject message,
+        // don't disconnect. The stream is still aligned (we consumed header + payload).
+        let calculated_checksum = crate::network::messages::calculate_checksum(&payload);
+        if checksum != calculated_checksum {
+            log::warn!(
+                "Bad checksum (cmd={}, size={}): expected {:08x}, got {:08x} — dropping message (Bitcoin Core compat)",
+                command.as_deref().unwrap_or("?"),
+                payload_size,
+                calculated_checksum,
+                checksum
+            );
+            continue;
+        }
+
+        // Invalid command type — Bitcoin Core rejects but keeps connection.
+        // Stream is aligned since we read the full payload.
+        let Some(command) = command else {
+            log::debug!(
+                "Invalid message type, dropping (size={}): cmd_bytes={}",
+                payload_size,
+                header[4..16].iter().map(|b| format!("{:02x}", b)).collect::<String>()
+            );
+            continue;
+        };
+
+        return Ok(Message {
+            magic: expected_magic,
+            command,
+            payload_size,
+            checksum,
+            payload,
+        });
     }
 }
 
