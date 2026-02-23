@@ -22,6 +22,7 @@ from ouroboros.block_sync import BlockSync
 from ouroboros.rpc import RPCServer
 from ouroboros.sync_manager import SyncManager
 from ouroboros.config import NodeConfig
+from ouroboros.fee_estimator import FeeEstimator
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,9 @@ class BitcoinNode:
         self.validator: Optional[BlockValidator] = None
         self.tx_validator: Optional[TransactionValidator] = None
         self.mempool: Optional[Mempool] = None
+        
+        # Fee estimator
+        self.fee_estimator: Optional[FeeEstimator] = None
         
         # Network components
         self.peer_manager: Optional[PeerManager] = None
@@ -117,6 +121,9 @@ class BitcoinNode:
             logger.info("Initializing mempool...")
             self.mempool = Mempool(self.tx_validator)
             
+            # Initialize fee estimator
+            self.fee_estimator = FeeEstimator()
+            
             # Check if blockchain is synced
             self.synced = self._check_synced()
             
@@ -139,7 +146,9 @@ class BitcoinNode:
             # Initialize block sync
             logger.info("Initializing block synchronization...")
             self.block_sync = BlockSync(
-                self.db, self.validator, self.peer_manager, mempool=self.mempool
+                self.db, self.validator, self.peer_manager,
+                mempool=self.mempool,
+                fee_estimator=self.fee_estimator,
             )
             await self.block_sync.start()
             

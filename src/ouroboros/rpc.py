@@ -693,6 +693,75 @@ class RPCServer:
 
         return result
 
+    async def rpc_estimatesmartfee(
+        self,
+        conf_target: int = 6,
+        estimate_mode: str = "economical",
+    ) -> Dict[str, Any]:
+        """
+        Estimate the fee rate needed for a transaction to confirm
+        within conf_target blocks.
+
+        Returns a dict matching Bitcoin Core's format:
+            {"feerate": <BTC/kB>, "blocks": <conf_target>}
+        or  {"errors": [...], "blocks": <conf_target>}
+
+        Reference: Bitcoin Core estimatesmartfee (rpc/fees.cpp)
+        """
+        conf_target = max(1, min(conf_target, 1008))
+
+        fee_estimator = getattr(self.node, 'fee_estimator', None)
+        if fee_estimator is None:
+            return {
+                "errors": ["Fee estimation not available"],
+                "blocks": conf_target,
+            }
+
+        fee_rate = fee_estimator.estimate_fee_per_kb(conf_target)
+        if fee_rate is None:
+            return {
+                "errors": ["Insufficient data for reliable estimate"],
+                "blocks": conf_target,
+            }
+
+        return {
+            "feerate": fee_rate,
+            "blocks": conf_target,
+        }
+
+    async def rpc_validateaddress(self, address: str) -> Dict[str, Any]:
+        """
+        Validate a Bitcoin address and return information about it.
+
+        Reference: Bitcoin Core validateaddress (rpc/misc.cpp)
+        """
+        from ouroboros.address import address_to_script_pubkey
+
+        result: Dict[str, Any] = {
+            "isvalid": False,
+            "address": address,
+        }
+
+        network = getattr(self.node, 'network', 'mainnet')
+
+        try:
+            script_pubkey = address_to_script_pubkey(address, network=network)
+        except Exception:
+            return result
+
+        result["isvalid"] = True
+        result["scriptPubKey"] = script_pubkey.hex()
+
+        script_type = self._get_script_type(script_pubkey)
+        result["isscript"] = script_type in ("scripthash", "witness_v0_scripthash")
+        result["iswitness"] = script_type.startswith("witness_")
+
+        if result["iswitness"]:
+            result["witness_version"] = script_pubkey[0] if script_pubkey[0] != 0 else 0
+            result["witness_program"] = script_pubkey[2:].hex()
+
+        return result
+
     # Helper methods
     
     def _tx_to_dict(self, tx: Transaction) -> Dict[str, Any]:
