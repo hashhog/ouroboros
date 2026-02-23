@@ -39,7 +39,7 @@ fn test_version_message_protocol_compliance() {
         addr_recv.clone(),
         addr_from.clone(),
         12345, // Nonce
-        "/bitcoin-hybrid:0.1.0/".to_string(),
+        "/Ouroboros:0.1.0/".to_string(),
         0,     // Start height
         true,  // Relay
     );

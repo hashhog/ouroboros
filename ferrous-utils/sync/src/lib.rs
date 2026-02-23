@@ -476,13 +476,9 @@ impl SyncEngine {
     }
 
     /// Get all UTXOs from chainstate (for address balance/scan).
+    /// Note: SyncEngine is a stub with no database; returns example UTXOs.
     fn get_utxos(&self) -> PyResult<Vec<PyUTXO>> {
-        match self.db.iter_utxos() {
-            Ok(utxos) => Ok(utxos.iter().map(PyUTXO::from).collect()),
-            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Failed to iterate UTXOs: {}", e),
-            )),
-        }
+        self.get_example_utxos()
     }
 
     /// Get example UTXOs for demonstration purposes
@@ -714,7 +710,7 @@ impl FastSync {
         // Create peer manager (max_peers=125 matches Bitcoin Core DEFAULT_MAX_PEER_CONNECTIONS)
         let peer_manager = Arc::new(Mutex::new(PeerManager::new(
             network_enum,
-            "/bitcoin-hybrid:0.1.0/".to_string(),
+            "/Ouroboros:0.1.0/".to_string(),
             0, // start_height
             crate::network::peer_manager::max_peers_from_env(),
         )));

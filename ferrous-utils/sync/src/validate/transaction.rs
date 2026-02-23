@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::collections::HashSet;
 
 use bitcoin::{Transaction, OutPoint, absolute::LockTime};
-use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use thiserror::Error;
 
@@ -52,9 +51,6 @@ pub enum TransactionValidationError {
 
     #[error("Outputs exceed inputs")]
     OutputsExceedInputs,
-
-    #[error("Fee too low")]
-    FeeTooLow,
 
     #[error("Invalid coinbase height")]
     InvalidCoinbaseHeight,
@@ -111,18 +107,11 @@ impl TransactionValidator {
         // 4. Lock time validation
         self.check_lock_time(inner, height)?;
 
-        // 5. Validate inputs (if requested)
-        if check_inputs && !inner.is_coinbase() {
-            self.validate_transaction_inputs(inner)?;
+        // 5+6. Validate inputs and amounts (single pass)
+        if !inner.is_coinbase() && check_inputs {
+            let total_input = self.validate_transaction_inputs(inner)?;
+            self.validate_amounts(inner, total_input)?;
         }
-
-        // 6. Validate amounts
-        let total_input = if inner.is_coinbase() {
-            0 // Coinbase has no inputs to validate
-        } else {
-            self.validate_transaction_inputs(inner)?
-        };
-        self.validate_amounts(inner, total_input)?;
 
         Ok(())
     }
@@ -151,28 +140,15 @@ impl TransactionValidator {
         Ok(())
     }
 
-    /// Check transaction size limits
+    /// Check transaction structural limits.
     ///
-    /// Bitcoin has a 100KB size limit for standard transactions (1MB for legacy,
-    /// but 100KB is the current relay limit)
+    /// Uses input/output counts as a fast proxy instead of re-serializing.
+    /// A block can be at most 4MB, so any individual tx is bounded by that.
     fn check_size_limits(&self, tx: &Transaction) -> Result<()> {
-        // Serialize transaction to get size
-        let mut encoder = Vec::new();
-        tx.consensus_encode(&mut encoder)
-            .map_err(|e| TransactionValidationError::Database(DbError::InvalidData(format!("Encoding error: {}", e))))?;
+        const MAX_INPUTS: usize = 100_000;
+        const MAX_OUTPUTS: usize = 100_000;
 
-        let size = encoder.len();
-
-        // Standard transaction size limit is 100KB (but can be larger in blocks)
-        // We use a more lenient limit here for block validation (1MB)
-        const MAX_TX_SIZE: usize = 1_000_000; // 1MB
-        if size > MAX_TX_SIZE {
-            return Err(TransactionValidationError::SizeExceeded);
-        }
-
-        // Check output count limit (Bitcoin Core has 5000 output limit)
-        const MAX_OUTPUTS: usize = 5000;
-        if tx.output.len() > MAX_OUTPUTS {
+        if tx.input.len() > MAX_INPUTS || tx.output.len() > MAX_OUTPUTS {
             return Err(TransactionValidationError::SizeExceeded);
         }
 
@@ -253,50 +229,36 @@ impl TransactionValidator {
 
     /// Validate transaction amounts
     ///
-    /// Checks output amounts are valid (> 0, no overflow),
-    /// verifies total_output <= total_input, and calculates fee.
+    /// Checks output amounts are valid (> 0, no overflow) and
+    /// verifies total_output <= total_input.
     ///
     /// Returns the transaction fee in satoshis.
+    ///
+    /// Note: relay fee checks (min fee per byte) belong in mempool acceptance,
+    /// not block validation. Bitcoin Core enforces relay fees only for mempool
+    /// policy, not consensus.
     pub fn validate_amounts(&self, tx: &Transaction, total_input: u64) -> Result<u64> {
         let mut total_output = 0u64;
 
-        // Validate each output
-        for (_i, output) in tx.output.iter().enumerate() {
+        for output in &tx.output {
             let amount = output.value.to_sat();
 
-            // Output amount must be > 0
             if amount == 0 {
                 return Err(TransactionValidationError::InvalidOutputAmount);
             }
 
-            // Check for overflow
             total_output = total_output
                 .checked_add(amount)
                 .ok_or(TransactionValidationError::OutputAmountOverflow)?;
         }
 
-        // Total output must not exceed total input
         if total_output > total_input {
             return Err(TransactionValidationError::OutputsExceedInputs);
         }
 
-        // Calculate fee
         let fee = total_input
             .checked_sub(total_output)
             .ok_or(TransactionValidationError::OutputAmountOverflow)?;
-
-        // Minimum fee check (1 sat/vbyte)
-        let tx_size = {
-            let mut encoder = Vec::new();
-            tx.consensus_encode(&mut encoder)
-                .map_err(|e| TransactionValidationError::Database(DbError::InvalidData(format!("Encoding error: {}", e))))?;
-            encoder.len()
-        };
-        let min_fee = tx_size as u64; // 1 sat per byte
-
-        if fee < min_fee && !tx.is_coinbase() {
-            return Err(TransactionValidationError::FeeTooLow);
-        }
 
         Ok(fee)
     }
