@@ -37,6 +37,7 @@ class BlockSync:
         validator: BlockValidator,
         peer_manager,  # PeerManager or compatible interface
         mempool=None,  # Optional mempool for re-adding txs after reorg
+        fee_estimator=None,  # Optional FeeEstimator to feed confirmed-block fee data
     ):
         """
         Initialize block synchronizer.
@@ -48,11 +49,14 @@ class BlockSync:
                          get_best_peer, broadcast methods)
             mempool: Optional mempool to re-validate and re-add transactions
                      from disconnected blocks after reorg
+            fee_estimator: Optional FeeEstimator to record fee rates from
+                          confirmed blocks
         """
         self.db = db
         self.validator = validator
         self.peer_manager = peer_manager
         self.mempool = mempool
+        self.fee_estimator = fee_estimator
         
         # Track requested blocks (hash -> request_time)
         self.requested_blocks: Dict[bytes, float] = {}
@@ -301,6 +305,18 @@ class BlockSync:
                     self.validator.apply_block(block)
                 
                 block_height = block.height if hasattr(block, 'height') and block.height else 0
+                
+                # Feed fee estimator before removing txs from mempool
+                if self.fee_estimator is not None and block_height > 0:
+                    try:
+                        self.fee_estimator.process_block(block, block_height, self.mempool)
+                    except Exception as e:
+                        logger.debug(f"Fee estimator error: {e}")
+                
+                # Remove confirmed transactions from mempool
+                if self.mempool is not None:
+                    self.mempool.remove_block_transactions(block)
+                
                 logger.info(f"✓ New block {block_height}: {block_hash.hex()[:16]}...")
                 
                 # Process orphans that may now have their parent
