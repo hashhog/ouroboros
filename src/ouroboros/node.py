@@ -23,6 +23,7 @@ from ouroboros.rpc import RPCServer
 from ouroboros.sync_manager import SyncManager
 from ouroboros.config import NodeConfig
 from ouroboros.fee_estimator import FeeEstimator
+from ouroboros.wallet import Wallet
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,9 @@ class BitcoinNode:
         
         # Fee estimator
         self.fee_estimator: Optional[FeeEstimator] = None
+        
+        # Wallet
+        self.wallet: Optional[Wallet] = None
         
         # Network components
         self.peer_manager: Optional[PeerManager] = None
@@ -123,6 +127,10 @@ class BitcoinNode:
             
             # Initialize fee estimator
             self.fee_estimator = FeeEstimator()
+            
+            # Initialize wallet
+            self.wallet = Wallet(self.data_dir, self.network)
+            self.wallet.set_database(self.db)
             
             # Check if blockchain is synced
             self.synced = self._check_synced()
