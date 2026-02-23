@@ -693,6 +693,80 @@ class RPCServer:
 
         return result
 
+    async def rpc_getnewaddress(
+        self,
+        label: str = "",
+        address_type: str = "bech32",
+    ) -> str:
+        """
+        Generate a new address.
+
+        Reference: Bitcoin Core getnewaddress (wallet/rpc/addresses.cpp)
+        """
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="Wallet not loaded")
+        return await wallet.generate_new_address(label)
+
+    async def rpc_sendtoaddress(
+        self,
+        address: str,
+        amount: float,
+        comment: str = "",
+        comment_to: str = "",
+        subtractfeefromamount: bool = False,
+        conf_target: int = 6,
+    ) -> str:
+        """
+        Send bitcoin to an address. Returns the txid.
+
+        Reference: Bitcoin Core sendtoaddress (wallet/rpc/spend.cpp)
+        """
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="Wallet not loaded")
+
+        amount_sat = int(round(amount * 1e8))
+        if amount_sat <= 0:
+            raise HTTPException(status_code=400, detail="Invalid amount")
+
+        fee_rate = None
+        fee_estimator = getattr(self.node, "fee_estimator", None)
+        if fee_estimator is not None:
+            fee_rate = fee_estimator.estimate_fee(conf_target)
+        if fee_rate is None:
+            fee_rate = 2  # fallback: 2 sat/vB
+
+        raw_hex = await wallet.send_transaction(
+            address, amount_sat, int(fee_rate)
+        )
+        txid = await self.rpc_sendrawtransaction(raw_hex)
+        return txid
+
+    async def rpc_getwalletinfo(self) -> Dict[str, Any]:
+        """
+        Return wallet state info.
+
+        Reference: Bitcoin Core getwalletinfo (wallet/rpc/wallet.cpp)
+        """
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="Wallet not loaded")
+
+        balance = await wallet.get_balance()
+        addresses = await wallet.get_addresses()
+
+        return {
+            "walletname": wallet.name,
+            "walletversion": 1,
+            "balance": balance / 1e8,
+            "unconfirmed_balance": 0.0,
+            "immature_balance": 0.0,
+            "txcount": 0,
+            "keypoolsize": len(addresses),
+            "paytxfee": 0.0,
+        }
+
     async def rpc_estimatesmartfee(
         self,
         conf_target: int = 6,
