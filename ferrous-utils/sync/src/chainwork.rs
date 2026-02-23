@@ -10,9 +10,7 @@ use crate::validate::pow::{bits_to_target, calculate_work};
 
 /// Convert chainwork U256 to 32-byte big-endian (Bitcoin Core format)
 pub fn chainwork_to_bytes(cw: U256) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    cw.to_big_endian(&mut bytes);
-    bytes
+    cw.to_big_endian()
 }
 
 /// Convert 32-byte big-endian chainwork to U256

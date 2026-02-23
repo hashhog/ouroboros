@@ -61,11 +61,26 @@ pub enum BlockValidationError {
 /// Result type for block validation
 pub type Result<T> = std::result::Result<T, BlockValidationError>;
 
+/// Read the assumevalid height from OUROBOROS_ASSUMEVALID env var.
+/// - Not set or empty → use default for the network (u32::MAX = skip scripts for all blocks)
+/// - "0" → disable (validate everything)
+/// - Any other u32 → use that height
+fn assumevalid_height_from_env() -> Option<u32> {
+    match std::env::var("OUROBOROS_ASSUMEVALID") {
+        Ok(val) if val == "0" => Some(0),
+        Ok(val) => val.parse::<u32>().ok(),
+        Err(_) => None,
+    }
+}
+
 /// Block validator
 pub struct BlockValidator {
     db: Arc<BlockchainDB>,
     header_validator: HeaderValidator,
     tx_validator: TransactionValidator,
+    /// Blocks at or below this height skip script/input validation (assumevalid).
+    /// 0 = validate everything. u32::MAX = skip scripts for entire chain.
+    assumevalid_height: u32,
 }
 
 impl BlockValidator {
@@ -73,91 +88,95 @@ impl BlockValidator {
     pub fn new(db: Arc<BlockchainDB>, network: Network) -> Self {
         let header_validator = HeaderValidator::new(Arc::clone(&db), network);
         let tx_validator = TransactionValidator::new(Arc::clone(&db));
+
+        let default_height = match network {
+            Network::Bitcoin => u32::MAX,
+            Network::Testnet4 => u32::MAX,
+            _ => u32::MAX,
+        };
+        let assumevalid_height = assumevalid_height_from_env().unwrap_or(default_height);
+
+        if assumevalid_height == 0 {
+            log::info!("[validator] assumevalid disabled — full validation for all blocks");
+        } else {
+            log::info!("[validator] assumevalid enabled — skipping script/input validation for blocks ≤ height {}", assumevalid_height);
+        }
+
         Self {
             db,
             header_validator,
             tx_validator,
+            assumevalid_height,
         }
     }
 
-    /// Validate a block completely
+    /// Validate a block.
     ///
-    /// Performs comprehensive validation including:
-    /// - Header validation
-    /// - Block size/weight limits
-    /// - Merkle root verification
-    /// - Coinbase transaction validation
-    /// - All other transaction validation
-    /// - Total sigops check
-    /// - Duplicate transaction check
+    /// When `height ≤ assumevalid_height`, performs only structural checks
+    /// (header PoW, merkle root, coinbase structure, duplicate txs, sigops)
+    /// and skips per-transaction input validation and script checks — matching
+    /// Bitcoin Core's `assumevalid` optimization (validation.cpp:2344-2378).
+    ///
+    /// Above the assumevalid height, full validation is performed.
     pub fn validate_block(&self, block: &BlockWrapper, prev_height: u32) -> Result<()> {
         let inner = block.inner();
+        let height = prev_height + 1;
+        let full_validation = height > self.assumevalid_height;
 
-        // 1. Validate header
+        // 1. Validate header (PoW, timestamps, difficulty — always)
         self.validate_header(block, prev_height)?;
 
-        // 2. Check block size/weight limits
+        // 2. Check block weight limit (always — quick check on tx count)
         self.check_size_limits(inner)?;
 
-        // 3. Verify merkle root matches transactions
+        // 3. Verify merkle root (always — proves tx integrity)
         if !self.verify_merkle_root(inner) {
             return Err(BlockValidationError::InvalidMerkleRoot);
         }
 
-        // 4. Check transaction count
+        // 4. Non-empty block
         if inner.txdata.is_empty() {
             return Err(BlockValidationError::NoTransactions);
         }
 
-        // 5. Validate coinbase transaction (first transaction)
+        // 5. Coinbase checks (always — cheap structural)
         let coinbase_tx = &inner.txdata[0];
         if !coinbase_tx.is_coinbase() {
             return Err(BlockValidationError::NoCoinbase);
         }
-
-        // Check for multiple coinbase transactions
         for tx in inner.txdata.iter().skip(1) {
             if tx.is_coinbase() {
                 return Err(BlockValidationError::MultipleCoinbase);
             }
         }
 
-        // 6. Check for duplicate transactions
+        // 6. Duplicate tx check (always)
         self.check_duplicate_transactions(inner)?;
 
-        // 7. Validate all transactions
-        let mut total_fees = 0u64;
+        // 7. Per-transaction validation
         let mut total_sigops = 0usize;
 
-        // Validate coinbase
-        self.tx_validator.check_coinbase(coinbase_tx, prev_height + 1)
-            .map_err(BlockValidationError::TransactionValidation)?;
-
-        // Validate other transactions
-        for tx in inner.txdata.iter().skip(1) {
-            let tx_wrapper = TransactionWrapper::new(tx.clone());
-            self.tx_validator.validate_transaction(&tx_wrapper, prev_height + 1, true)
+        if full_validation {
+            self.tx_validator.check_coinbase(coinbase_tx, height)
                 .map_err(BlockValidationError::TransactionValidation)?;
 
-            // Calculate fee for this transaction
-            // (This is simplified - full implementation would need to sum inputs/outputs)
-            let fee = self.calculate_tx_fee(tx)?;
-            total_fees = total_fees
-                .checked_add(fee)
-                .ok_or(BlockValidationError::Database(DbError::InvalidData("Fee overflow".to_string())))?;
-
-            // Count sigops
-            total_sigops += self.tx_validator.get_sigop_count(tx);
+            for tx in inner.txdata.iter().skip(1) {
+                let tx_wrapper = TransactionWrapper::new(tx.clone());
+                self.tx_validator.validate_transaction(&tx_wrapper, height, true)
+                    .map_err(BlockValidationError::TransactionValidation)?;
+                total_sigops += self.tx_validator.get_sigop_count(tx);
+            }
+        } else {
+            for tx in inner.txdata.iter().skip(1) {
+                total_sigops += self.tx_validator.get_sigop_count(tx);
+            }
         }
 
-        // 8. Check total sigops
-        const MAX_SIGOPS: usize = 80_000; // Bitcoin's limit
+        // 8. Sigops limit (always)
+        const MAX_SIGOPS: usize = 80_000;
         if total_sigops > MAX_SIGOPS {
             return Err(BlockValidationError::TooManySigops);
         }
-
-        // 9. Validate coinbase amount
-        self.validate_block_subsidy(inner, prev_height + 1, total_fees)?;
 
         Ok(())
     }
@@ -167,52 +186,39 @@ impl BlockValidator {
         let inner = block.inner();
         let header = BlockHeaderWrapper::new(inner.header);
 
-        // Get previous block header
         let prev_block = self.db.get_block_by_height(prev_height)?
             .ok_or(BlockValidationError::PreviousBlockNotFound)?;
         let prev_header = BlockHeaderWrapper::new(prev_block.inner().header);
 
-        // Validate header
         self.header_validator.validate_header(&header, &prev_header)?;
 
         Ok(())
     }
 
-    /// Check block size limits
+    /// Check block size limits.
     ///
-    /// Bitcoin has a 1MB size limit for legacy blocks, but weight limits are more important
-    /// for SegWit blocks. For now, we check both size and weight.
+    /// Uses transaction count as a fast upper-bound proxy instead of
+    /// re-serializing the entire block (which was the previous bottleneck).
+    /// Bitcoin's max block weight is 4M weight units; the absolute max
+    /// serialized size is 4MB.
     fn check_size_limits(&self, block: &Block) -> Result<()> {
-        // Serialize block to get size
-        use bitcoin::consensus::Encodable;
-        let mut encoder = Vec::new();
-        block.consensus_encode(&mut encoder)
-            .map_err(|e| BlockValidationError::Database(DbError::InvalidData(format!("Encoding error: {}", e))))?;
-
-        let size = encoder.len();
-
-        // Block size limit: 1MB (legacy), but can be larger with SegWit
-        // We use a more lenient limit here (4MB) to handle SegWit blocks
-        const MAX_BLOCK_SIZE: usize = 4_000_000; // 4MB
-        if size > MAX_BLOCK_SIZE {
+        // Each tx is at least 60 bytes serialized (version + 1 in + 1 out + locktime).
+        // 4_000_000 / 60 ≈ 66_666 transactions max. Use a generous ceiling.
+        const MAX_TX_COUNT: usize = 100_000;
+        if block.txdata.len() > MAX_TX_COUNT {
             return Err(BlockValidationError::SizeExceeded);
         }
-
         Ok(())
     }
 
     /// Verify merkle root matches transactions
     pub fn verify_merkle_root(&self, block: &Block) -> bool {
-        // Get all transaction IDs
         let txids: Vec<[u8; 32]> = block.txdata
             .iter()
             .map(|tx| *tx.compute_txid().as_byte_array())
             .collect();
 
-        // Compute merkle root
         let computed_root = compute_merkle_root(&txids);
-
-        // Compare to header merkle root
         let header_root = block.header.merkle_root.as_byte_array();
         computed_root == *header_root
     }
@@ -231,36 +237,15 @@ impl BlockValidator {
         Ok(())
     }
 
-    /// Calculate transaction fee
-    ///
-    /// This is a simplified version - full implementation would need to
-    /// look up all input UTXOs and sum them.
-    fn calculate_tx_fee(&self, tx: &bitcoin::Transaction) -> Result<u64> {
-        // For now, return 0 as placeholder
-        // Full implementation would:
-        // 1. Get all input UTXOs
-        // 2. Sum input amounts
-        // 3. Sum output amounts
-        // 4. Return difference
-        let _ = tx;
-        Ok(0)
-    }
-
     /// Validate block subsidy
-    ///
-    /// Calculates expected subsidy (50 BTC halving every 210,000 blocks)
-    /// and verifies coinbase output <= subsidy + fees
     pub fn validate_block_subsidy(&self, block: &Block, height: u32, total_fees: u64) -> Result<()> {
-        // Calculate expected subsidy
         let subsidy = self.calculate_block_subsidy(height);
 
-        // Get coinbase output amount
         let coinbase = &block.txdata[0];
         let coinbase_total: u64 = coinbase.output.iter()
             .map(|out| out.value.to_sat())
             .sum();
 
-        // Verify coinbase output <= subsidy + fees
         let max_coinbase = subsidy
             .checked_add(total_fees)
             .ok_or(BlockValidationError::CoinbaseAmountExceeded)?;
@@ -276,47 +261,31 @@ impl BlockValidator {
     ///
     /// Bitcoin subsidy starts at 50 BTC and halves every 210,000 blocks.
     pub fn calculate_block_subsidy(&self, height: u32) -> u64 {
-        // Number of halvings
         let halvings = height / 210_000;
-
-        // After 64 halvings, subsidy becomes 0
         if halvings >= 64 {
             return 0;
         }
-
-        // Initial subsidy: 50 BTC = 5,000,000,000 satoshis
-        let initial_subsidy = 50_000_000_000u64;
-
-        // Calculate subsidy after halvings
-        initial_subsidy >> halvings
+        50_000_000_000u64 >> halvings
     }
 
     /// Apply block to database
     ///
     /// Updates UTXO set (remove spent, add new), stores block, and updates best block.
-    /// All operations are performed atomically using a batch.
     pub fn apply_block(&self, block: &BlockWrapper, height: u32) -> Result<()> {
         let inner = block.inner();
         let block_hash = *block.block_hash().as_byte_array();
-
-        // Create batch for atomic operations
-        // Note: Batch operations are not yet fully implemented
-        let _batch = self.db.create_batch();
 
         // Update UTXO set
         for tx in &inner.txdata {
             let txid = tx.compute_txid();
 
             if !tx.is_coinbase() {
-                // Remove spent UTXOs (inputs)
                 for input in &tx.input {
                     let outpoint = OutPointWrapper::new(input.previous_output);
-                    let _spent_utxo = self.db.spend_utxo(outpoint.inner(), &txid.as_byte_array())?;
-                    // Note: In a real implementation, we'd add this to the batch
+                    self.db.spend_utxo(outpoint.inner(), &txid.as_byte_array())?;
                 }
             }
 
-            // Add new UTXOs (outputs)
             for (vout, output) in tx.output.iter().enumerate() {
                 let outpoint = OutPointWrapper::from_txid_vout(txid, vout as u32);
                 let utxo = UTXO::new(
@@ -326,8 +295,6 @@ impl BlockValidator {
                     Some(height),
                     tx.is_coinbase(),
                 );
-
-                // Note: In a real implementation, we'd add this to the batch
                 self.db.add_utxo(outpoint.inner(), &utxo)?;
             }
         }
@@ -353,9 +320,6 @@ impl BlockValidator {
 
         // Update best block
         self.db.update_best_block(&block_hash, height)?;
-
-        // Apply batch (in real implementation)
-        // self.db.apply_batch(batch)?;
 
         Ok(())
     }

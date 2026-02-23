@@ -110,15 +110,17 @@ pub fn max_peers_from_env() -> usize {
 }
 
 /// Peer targets for block sync. Configurable via OUROBOROS_MIN_PEERS and OUROBOROS_TARGET_PEERS.
+/// Bitcoin Core uses 8 full-relay + 2 block-relay = 10 outbound but replenishes instantly.
+/// We default to 16 target / 12 min for more parallelism and resilience to peer loss.
 fn peer_targets_from_env() -> (usize, usize) {
     let min = std::env::var("OUROBOROS_MIN_PEERS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
+        .unwrap_or(12);
     let target = std::env::var("OUROBOROS_TARGET_PEERS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(12);
+        .unwrap_or(16);
     (min, target)
 }
 
@@ -225,8 +227,8 @@ impl PeerManager {
         let max_peers = self.max_peers;
 
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(30)); // Run every 30 seconds normally
-            let mut fast_interval = tokio::time::interval(Duration::from_secs(10)); // Run every 10s when low on peers
+            let mut interval = interval(Duration::from_secs(10)); // Normal maintenance every 10s (was 30s)
+            let mut fast_interval = tokio::time::interval(Duration::from_secs(3)); // Fast maintenance every 3s when low on peers (was 10s)
             fast_interval.tick().await; // skip first immediate tick
             let mut dns_retry_interval = tokio::time::interval(Duration::from_secs(60)); // Retry DNS every 60 seconds
             let mut dns_retry_count = 0u32;
@@ -433,13 +435,22 @@ impl PeerManager {
             log::warn!("No peers resolved from DNS seeds. Peer discovery may be limited.");
         }
 
-        // Connect to up to 8 peers (IPv4 first when sorted)
-        let mut connected = 0;
-        for addr in resolved_addrs.into_iter().take(8) {
-            if self.connect_to_peer(addr).await.is_ok() {
-                connected += 1;
-            }
-        }
+        // Connect to initial peers concurrently (up to target_peers, IPv4 first when sorted).
+        // Concurrent connections avoid the serial 10s-timeout-per-peer bottleneck that made
+        // initial startup slow when some seed peers were unreachable.
+        let initial_target = self.target_peers;
+        let candidates: Vec<SocketAddr> = resolved_addrs.into_iter().take(initial_target * 2).collect();
+        let connected = Self::connect_to_peers_concurrent(
+            &self.peers,
+            &self.banned_peers,
+            &self.desync_blacklist,
+            self.network,
+            &self.user_agent,
+            self.start_height,
+            self.max_peers,
+            initial_target,
+            candidates,
+        ).await;
 
         // For testnet4, be more lenient - allow starting even if no peers initially
         // The peer manager will continue to try to discover peers
@@ -455,82 +466,79 @@ impl PeerManager {
         Ok(())
     }
 
-    /// Connect to a specific peer
-    async fn connect_to_peer(&mut self, addr: SocketAddr) -> Result<()> {
-        // Check if peer is banned
-        {
-            let banned = self.banned_peers.lock().await;
-            if let Some(banned_peer) = banned.get(&addr) {
-                if banned_peer.is_banned() || banned_peer.is_backed_off() {
-                    return Err(PeerManagerError::Peer(PeerError::Disconnected));
-                }
-            }
+    /// Connect to multiple peers concurrently (up to `needed` successful connections).
+    ///
+    /// Spawns all connection attempts in parallel, collects results, and adds successful
+    /// connections to the peers map. Returns the number of successful connections.
+    /// This avoids the serial 10s-timeout-per-peer bottleneck.
+    async fn connect_to_peers_concurrent(
+        peers: &Arc<Mutex<HashMap<SocketAddr, Peer>>>,
+        banned_peers: &Arc<Mutex<HashMap<SocketAddr, BannedPeer>>>,
+        _desync_blacklist: &Arc<Mutex<HashMap<SocketAddr, Instant>>>,
+        network: Network,
+        user_agent: &str,
+        start_height: i32,
+        max_peers: usize,
+        needed: usize,
+        candidates: Vec<SocketAddr>,
+    ) -> usize {
+        if candidates.is_empty() || needed == 0 {
+            return 0;
         }
 
-        // Check desync blacklist (peer sent corrupted data recently)
-        {
-            let mut list = self.desync_blacklist.lock().await;
-            if Self::is_desync_blacklisted(&mut list, addr) {
-                return Err(PeerManagerError::Peer(PeerError::Disconnected));
-            }
+        // Spawn concurrent connection attempts (try more than needed, take first N successes)
+        let mut handles = Vec::with_capacity(candidates.len());
+        for addr in candidates {
+            let ua = user_agent.to_string();
+            handles.push(tokio::spawn(async move {
+                let result = Peer::connect(addr, network, ua, start_height).await;
+                (addr, result)
+            }));
         }
 
-        // Check connection limit
-        {
-            let peers = self.peers.lock().await;
-            if peers.len() >= self.max_peers {
-                return Err(PeerManagerError::ConnectionLimitReached);
+        // Collect results
+        let mut connected = 0usize;
+        for handle in handles {
+            if connected >= needed {
+                handle.abort();
+                continue;
             }
-            if peers.contains_key(&addr) {
-                return Ok(()); // Already connected
-            }
-        }
-
-        // Attempt connection
-        match Peer::connect(
-            addr,
-            self.network,
-            self.user_agent.clone(),
-            self.start_height,
-        )
-        .await
-        {
-            Ok(mut peer) => {
-                // Reset backoff on successful connection
-                {
-                    let mut banned = self.banned_peers.lock().await;
-                    if let Some(banned_peer) = banned.get_mut(&addr) {
-                        banned_peer.reset_backoff();
+            match handle.await {
+                Ok((addr, Ok(peer))) => {
+                    let mut peers_map = peers.lock().await;
+                    if peers_map.len() < max_peers && !peers_map.contains_key(&addr) {
+                        peers_map.insert(addr, peer);
+                        connected += 1;
+                        log::debug!("Connected to peer: {}", addr);
+                    }
+                    drop(peers_map);
+                    // Reset backoff on success
+                    let mut banned = banned_peers.lock().await;
+                    if let Some(bp) = banned.get_mut(&addr) {
+                        bp.reset_backoff();
                     }
                 }
-
-                // Add to peers map
-                {
-                    let mut peers = self.peers.lock().await;
-                    peers.insert(addr, peer);
-                }
-
-                Ok(())
-            }
-            Err(e) => {
-                // Record failed connection for exponential backoff
-                {
-                    let mut banned = self.banned_peers.lock().await;
+                Ok((addr, Err(_))) => {
+                    let mut banned = banned_peers.lock().await;
                     banned
                         .entry(addr)
                         .or_insert_with(|| BannedPeer::new(Duration::ZERO))
                         .record_failed_connection();
                 }
-
-                Err(PeerManagerError::Peer(e))
+                Err(_join_err) => {} // task panicked or was cancelled
             }
         }
+
+        if connected > 0 {
+            log::info!("Connected to {} new peer(s) concurrently", connected);
+        }
+        connected
     }
 
     /// Maintain peer connections
     ///
-    /// Keeps 8-10 outbound connections, replaces disconnected peers,
-    /// and disconnects misbehaving peers. Actively connects to known addresses when below target.
+    /// Removes disconnected/misbehaving peers, then concurrently connects to new peers
+    /// to reach target_peers. Runs on 10s interval normally, 3s when below min_peers.
     async fn maintain_connections_internal(
         peers: &Arc<Mutex<HashMap<SocketAddr, Peer>>>,
         known_addrs: &Arc<Mutex<HashSet<SocketAddr>>>,
@@ -578,7 +586,7 @@ impl PeerManager {
             }
         }
 
-        // Connect to new peers if below target
+        // Connect to new peers concurrently if below target
         {
             let peers_map = peers.lock().await;
             let current_peers = peers_map.len();
@@ -594,7 +602,6 @@ impl PeerManager {
             let known = known_addrs.lock().await;
             let banned = banned_peers.lock().await;
 
-            // Find candidates that are not connected, not banned, not backed off, not desync-blacklisted
             let mut candidates: Vec<SocketAddr> = known
                 .iter()
                 .filter(|addr| {
@@ -616,35 +623,21 @@ impl PeerManager {
                 candidates.retain(|addr| !Self::is_desync_blacklisted(&mut list, *addr));
             }
 
-            // Prefer IPv4 (IPv6 often fails on Testnet4 and restricted networks)
+            // Prefer IPv4, try more candidates than needed to account for failures
             candidates = sort_addrs_prefer_ipv4(candidates);
-            candidates.truncate(needed);
+            candidates.truncate(needed * 2);
 
-            // Attempt to connect to candidates
-            for addr in candidates {
-                match Peer::connect(addr, network, user_agent.to_string(), start_height).await {
-                    Ok(mut peer) => {
-                        {
-                            let mut banned = banned_peers.lock().await;
-                            if let Some(banned_peer) = banned.get_mut(&addr) {
-                                banned_peer.reset_backoff();
-                            }
-                        }
-                        let mut peers_map = peers.lock().await;
-                        if peers_map.len() < max_peers && !peers_map.contains_key(&addr) {
-                            peers_map.insert(addr, peer);
-                            log::debug!("Connected to peer: {}", addr);
-                        }
-                    }
-                    Err(_) => {
-                        let mut banned = banned_peers.lock().await;
-                        banned
-                            .entry(addr)
-                            .or_insert_with(|| BannedPeer::new(Duration::ZERO))
-                            .record_failed_connection();
-                    }
-                }
-            }
+            Self::connect_to_peers_concurrent(
+                peers,
+                banned_peers,
+                desync_blacklist,
+                network,
+                user_agent,
+                start_height,
+                max_peers,
+                needed,
+                candidates,
+            ).await;
         }
     }
 
@@ -828,20 +821,20 @@ mod tests {
     fn test_peer_manager_new() {
         let manager = PeerManager::new(
             Network::Bitcoin,
-            "/bitcoin-hybrid:0.1.0/".to_string(),
+            "/Ouroboros:0.1.0/".to_string(),
             0,
             50,
         );
         assert_eq!(manager.max_peers, 50);
-        assert_eq!(manager.min_peers, 10);
-        assert_eq!(manager.target_peers, 12);
+        assert_eq!(manager.min_peers, 12);
+        assert_eq!(manager.target_peers, 16);
     }
 
     #[tokio::test]
     async fn test_peer_manager_known_addrs() {
         let mut manager = PeerManager::new(
             Network::Bitcoin,
-            "/bitcoin-hybrid:0.1.0/".to_string(),
+            "/Ouroboros:0.1.0/".to_string(),
             0,
             50,
         );

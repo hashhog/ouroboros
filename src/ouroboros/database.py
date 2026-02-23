@@ -681,7 +681,10 @@ class BlockchainDatabase:
             # Fallback: get block by height and extract hash
             block = self.get_block_by_height(height)
             if block:
-                return block.hash if hasattr(block, 'hash') else None
+                h = getattr(block, "hash", None)
+            if h is None:
+                return None
+            return bytes(h() if callable(h) else h)
             return None
     
     def get_chainwork_by_height(self, height: int) -> int:
@@ -788,5 +791,5 @@ class BlockchainDatabase:
             bits=py_block.bits,
             nonce=py_block.nonce,
             transactions=transactions,
-            hash=bytes(py_block.hash),
+            hash=bytes(py_block.hash() if callable(getattr(py_block, "hash", None)) else py_block.hash),
         )
