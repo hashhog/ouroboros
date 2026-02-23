@@ -4,7 +4,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
 
-**A Bitcoin full node CLI that syncs the blockchain in hours, not days, using Rust for fast I/O and Python for operations.**
+**A Bitcoin full node CLI that syncs the blockchain using Rust for fast I/O and Python for operations.**
 
 Ouroboros is a hybrid Bitcoin node: Rust handles the heavy lifting (header sync, block download, chain validation) while Python provides the CLI, RPC server, mempool, and script execution. Run it as a standalone node, query balances by address, or use it as a development tool for Bitcoin applications.
 
