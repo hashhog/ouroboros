@@ -24,6 +24,13 @@ from ouroboros.sync_manager import SyncManager
 from ouroboros.config import NodeConfig
 from ouroboros.fee_estimator import FeeEstimator
 from ouroboros.wallet import Wallet
+from ouroboros.cookie_auth import generate_cookie, delete_cookie
+from ouroboros.metrics import (
+    init_metrics,
+    update_chain_metrics,
+    update_mempool_metrics,
+    NODE_INFO,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,10 +167,14 @@ class BitcoinNode:
             )
             await self.block_sync.start()
             
-            # Start RPC server
-            logger.info(f"RPC server listening on 127.0.0.1:{rpc_port}")
+            # RPC authentication: explicit config > cookie file
             rpc_username = self.config.get('rpc_username')
             rpc_password = self.config.get('rpc_password')
+            if not (rpc_username and rpc_password):
+                rpc_username, rpc_password = generate_cookie(self.data_dir)
+
+            # Start RPC server
+            logger.info(f"RPC server listening on 127.0.0.1:{rpc_port}")
             self.rpc_server = RPCServer(
                 self,
                 port=rpc_port,
@@ -172,6 +183,13 @@ class BitcoinNode:
                 rate_limit=True
             )
             self._rpc_task = asyncio.create_task(self.rpc_server.start())
+
+            # Prometheus metrics (best-effort; disabled if prometheus_client not installed)
+            metrics_port = int(self.config.get('metrics_port', 9332))
+            if init_metrics(port=metrics_port):
+                from ouroboros.metrics import NODE_INFO as _node_info
+                if _node_info is not None:
+                    _node_info.info({"version": "0.1.0", "network": self.network})
             
             # Register message handlers
             self._register_handlers()
@@ -218,6 +236,9 @@ class BitcoinNode:
                 except asyncio.CancelledError:
                     pass
             
+            # Remove cookie file on clean shutdown
+            delete_cookie(self.data_dir)
+
             logger.info("Bitcoin node stopped")
             
         except Exception as e:
@@ -256,7 +277,7 @@ class BitcoinNode:
                 if self.synced:
                     logger.info("Blockchain is now fully synced")
             
-            # Log statistics
+            # Log statistics and update Prometheus gauges
             if self.db:
                 best_hash, best_height = self.db.get_best_block()
                 peer_count = (
@@ -275,6 +296,9 @@ class BitcoinNode:
                     f"Peers: {peer_count}, "
                     f"Mempool: {mempool_size} txs"
                 )
+
+                update_chain_metrics(best_height, self.get_current_difficulty(), peer_count)
+                update_mempool_metrics(self.mempool.total_size if self.mempool else 0, mempool_size)
         
         except Exception as e:
             logger.error(f"Error in periodic tasks: {e}", exc_info=True)
