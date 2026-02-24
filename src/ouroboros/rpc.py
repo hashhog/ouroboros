@@ -44,6 +44,172 @@ class JSONRPCResponse(BaseModel):
     id: Optional[Union[int, str]] = None
 
 
+
+# ---------------------------------------------------------------------------
+# Partial Merkle tree helpers (CMerkleBlock serialization / deserialization)
+# Reference: Bitcoin Core merkleblock.cpp, CPartialMerkleTree
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+import math as _math
+import struct as _struct
+
+
+def _dsha256(data: bytes) -> bytes:
+    return _hashlib.sha256(_hashlib.sha256(data).digest()).digest()
+
+
+def _encode_varint(n: int) -> bytes:
+    if n < 0xFD:
+        return _struct.pack('<B', n)
+    elif n <= 0xFFFF:
+        return b'\xfd' + _struct.pack('<H', n)
+    elif n <= 0xFFFFFFFF:
+        return b'\xfe' + _struct.pack('<I', n)
+    else:
+        return b'\xff' + _struct.pack('<Q', n)
+
+
+def _read_varint(data: bytes, offset: int) -> tuple:
+    first = data[offset]
+    if first < 0xFD:
+        return first, offset + 1
+    elif first == 0xFD:
+        return _struct.unpack_from('<H', data, offset + 1)[0], offset + 3
+    elif first == 0xFE:
+        return _struct.unpack_from('<I', data, offset + 1)[0], offset + 5
+    else:
+        return _struct.unpack_from('<Q', data, offset + 1)[0], offset + 9
+
+
+def _tree_width(n_tx: int, height: int) -> int:
+    """Number of nodes at a given height in a Merkle tree with n_tx leaves."""
+    return (n_tx + (1 << height) - 1) >> height
+
+
+def _calc_tree_hash(txids: list, n_tx: int, height: int, pos: int) -> bytes:
+    """Compute the hash of a subtree rooted at (height, pos)."""
+    if height == 0:
+        return txids[pos] if pos < n_tx else b'\x00' * 32
+    left = _calc_tree_hash(txids, n_tx, height - 1, pos * 2)
+    right_pos = pos * 2 + 1
+    if right_pos < _tree_width(n_tx, height - 1):
+        right = _calc_tree_hash(txids, n_tx, height - 1, right_pos)
+    else:
+        right = left
+    return _dsha256(left + right)
+
+
+def _build_partial_merkle_tree(block, txids: list, matches: list) -> bytes:
+    """
+    Serialize a partial Merkle tree in the CMerkleBlock wire format.
+
+    ``block`` must have a ``.serialize()`` returning at least 80 bytes of
+    header.  ``txids`` is the ordered list of 32-byte txids.  ``matches``
+    is a parallel bool list indicating which txids should be provable.
+    """
+    n = len(txids)
+    height = 0
+    while (1 << height) < n:
+        height += 1
+
+    hashes: list = []
+    bits: list = []
+
+    def _traverse(h: int, pos: int):
+        start = pos << h
+        end = min((pos + 1) << h, n)
+        parent_match = any(matches[i] for i in range(start, end))
+        bits.append(parent_match)
+
+        if h == 0 or not parent_match:
+            if h == 0:
+                hashes.append(txids[pos] if pos < n else b'\x00' * 32)
+            else:
+                hashes.append(_calc_tree_hash(txids, n, h, pos))
+        else:
+            _traverse(h - 1, pos * 2)
+            if pos * 2 + 1 < _tree_width(n, h - 1):
+                _traverse(h - 1, pos * 2 + 1)
+
+    _traverse(height, 0)
+
+    result = bytearray(block.serialize()[:80])
+    result += _struct.pack('<I', n)
+    result += _encode_varint(len(hashes))
+    for h in hashes:
+        result += h
+    flag_bytes = bytearray((len(bits) + 7) // 8)
+    for i, b in enumerate(bits):
+        if b:
+            flag_bytes[i // 8] |= 1 << (i % 8)
+    result += _encode_varint(len(flag_bytes))
+    result += flag_bytes
+
+    return bytes(result)
+
+
+def _parse_partial_merkle_tree(data: bytes) -> tuple:
+    """
+    Deserialize a partial Merkle tree payload (everything after the
+    80-byte header) and return ``(matched_txids, merkle_root)``.
+    """
+    offset = 0
+    n_tx = _struct.unpack_from('<I', data, offset)[0]
+    offset += 4
+
+    n_hashes, offset = _read_varint(data, offset)
+    hashes = []
+    for _ in range(n_hashes):
+        hashes.append(data[offset:offset + 32])
+        offset += 32
+
+    n_flag_bytes, offset = _read_varint(data, offset)
+    flag_bits_raw = data[offset:offset + n_flag_bytes]
+
+    all_bits = []
+    for byte_val in flag_bits_raw:
+        for bit_pos in range(8):
+            all_bits.append(bool(byte_val & (1 << bit_pos)))
+
+    height = 0
+    while (1 << height) < n_tx:
+        height += 1
+
+    hash_idx = [0]
+    bit_idx = [0]
+    matched: list = []
+
+    def _consume(h: int, pos: int) -> bytes:
+        if bit_idx[0] >= len(all_bits):
+            return b'\x00' * 32
+        parent_match = all_bits[bit_idx[0]]
+        bit_idx[0] += 1
+
+        if h == 0:
+            cur_hash = hashes[hash_idx[0]] if hash_idx[0] < len(hashes) else b'\x00' * 32
+            hash_idx[0] += 1
+            if parent_match:
+                matched.append(cur_hash)
+            return cur_hash
+
+        if not parent_match:
+            cur_hash = hashes[hash_idx[0]] if hash_idx[0] < len(hashes) else b'\x00' * 32
+            hash_idx[0] += 1
+            return cur_hash
+
+        left = _consume(h - 1, pos * 2)
+        right_pos = pos * 2 + 1
+        if right_pos < _tree_width(n_tx, h - 1):
+            right = _consume(h - 1, right_pos)
+        else:
+            right = left
+        return _dsha256(left + right)
+
+    computed_root = _consume(height, 0)
+    return matched, computed_root
+
+
 class RPCServer:
     """Bitcoin JSON-RPC server"""
     
@@ -835,6 +1001,166 @@ class RPCServer:
             result["witness_program"] = script_pubkey[2:].hex()
 
         return result
+
+    async def rpc_gettxoutproof(
+        self,
+        txids: List[str],
+        blockhash: Optional[str] = None,
+    ) -> str:
+        """
+        Return a hex-encoded Merkle proof that transactions were included
+        in a block.
+
+        Wire format (CMerkleBlock):
+          block_header (80 bytes)
+          total_transactions (uint32 LE)
+          hash_count (varint) + hashes (32 bytes each)
+          flag_byte_count (varint) + flag_bytes
+
+        Reference: Bitcoin Core gettxoutproof (rpc/rawtransaction.cpp),
+                   merkleblock.cpp CPartialMerkleTree
+        """
+        if not txids:
+            raise HTTPException(status_code=400, detail="txids must not be empty")
+
+        db = getattr(self.node, "db", None)
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        target_set = set()
+        for txid_hex in txids:
+            try:
+                target_set.add(bytes.fromhex(txid_hex))
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid txid: {txid_hex}")
+
+        # Find the block
+        block = None
+        if blockhash:
+            try:
+                block = db.get_block(bytes.fromhex(blockhash))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid blockhash")
+        else:
+            _, best_height = db.get_best_block()
+            for h in range(best_height, max(best_height - 100, -1), -1):
+                b = db.get_block_by_height(h)
+                if b is None:
+                    continue
+                block_txids = {tx.get_txid() for tx in b.transactions}
+                if target_set & block_txids:
+                    block = b
+                    break
+
+        if block is None:
+            raise HTTPException(status_code=404, detail="Block not found")
+
+        all_txids = [tx.get_txid() for tx in block.transactions]
+        for t in target_set:
+            if t not in all_txids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Transaction {t.hex()} not found in block",
+                )
+
+        matches = [txid in target_set for txid in all_txids]
+        proof = _build_partial_merkle_tree(block, all_txids, matches)
+        return proof.hex()
+
+    async def rpc_verifytxoutproof(self, proof: str) -> List[str]:
+        """
+        Verify a Merkle proof and return the proven txids.
+
+        Reference: Bitcoin Core verifytxoutproof (rpc/rawtransaction.cpp)
+        """
+        import hashlib as _hl
+
+        try:
+            proof_bytes = bytes.fromhex(proof)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid hex")
+
+        if len(proof_bytes) < 84:
+            raise HTTPException(status_code=400, detail="Proof too short")
+
+        header_bytes = proof_bytes[:80]
+        block_hash = _hl.sha256(_hl.sha256(header_bytes).digest()).digest()
+
+        db = getattr(self.node, "db", None)
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        block = db.get_block(block_hash)
+        if block is None:
+            raise HTTPException(status_code=400, detail="Block not in chain")
+
+        merkle_root_in_header = header_bytes[36:68]
+        matched, computed_root = _parse_partial_merkle_tree(proof_bytes[80:])
+
+        if computed_root != merkle_root_in_header:
+            raise HTTPException(status_code=400, detail="Merkle root mismatch")
+
+        return [txid.hex() for txid in matched]
+
+    async def rpc_getmininginfo(self) -> Dict[str, Any]:
+        """
+        Return mining-related information.
+
+        Reference: Bitcoin Core getmininginfo (rpc/mining.cpp)
+        """
+        db = getattr(self.node, "db", None)
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        _, height = db.get_best_block()
+        mempool = getattr(self.node, "mempool", None)
+
+        return {
+            "blocks": height,
+            "difficulty": self.node.get_current_difficulty(),
+            "networkhashps": 0,
+            "pooledtx": len(mempool.get_all_transactions()) if mempool else 0,
+            "chain": getattr(self.node, "network", "mainnet"),
+            "warnings": "",
+        }
+
+    async def rpc_submitblock(self, hexdata: str) -> Optional[str]:
+        """
+        Submit a mined block to the network.
+
+        Returns None on success, an error string on failure.
+
+        Reference: Bitcoin Core submitblock (rpc/mining.cpp)
+        """
+        from ouroboros.database import Block as _Block
+
+        try:
+            block_bytes = bytes.fromhex(hexdata)
+        except ValueError:
+            return "Invalid hex"
+
+        try:
+            block = _Block.deserialize(block_bytes)
+        except Exception as e:
+            return f"Block deserialization failed: {e}"
+
+        block_sync = getattr(self.node, "block_sync", None)
+        if block_sync is None:
+            return "Block sync not available"
+
+        try:
+            valid, error = block_sync.validator.validate_block(block)
+            if not valid:
+                return error or "Block validation failed"
+
+            block_sync.validator.apply_block(block)
+
+            if block_sync.mempool is not None:
+                block_sync.mempool.remove_block_transactions(block)
+
+            return None
+        except Exception as e:
+            return str(e)
 
     # Helper methods
     
