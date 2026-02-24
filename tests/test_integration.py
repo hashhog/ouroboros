@@ -374,3 +374,154 @@ class TestRPCMethodsExist:
         rpc, d = self._get_rpc()
         assert callable(getattr(rpc, "rpc_getwalletinfo", None))
         import shutil; shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Schnorr / Taproot (BIP 340, 341, 342)
+# ---------------------------------------------------------------------------
+
+
+class TestSchnorrSignature:
+    """BIP 340 Schnorr signature verification."""
+
+    def test_sign_and_verify(self):
+        from coincurve import PrivateKey, PublicKeyXOnly
+        from ouroboros.script import ScriptInterpreter
+
+        si = ScriptInterpreter()
+        pk = PrivateKey()
+        xonly = PublicKeyXOnly.from_secret(pk.secret)
+        msg = hashlib.sha256(b"schnorr test").digest()
+        sig = pk.sign_schnorr(msg)
+        assert si._verify_schnorr_signature(msg, sig, xonly.format())
+
+    def test_wrong_message_fails(self):
+        from coincurve import PrivateKey, PublicKeyXOnly
+        from ouroboros.script import ScriptInterpreter
+
+        si = ScriptInterpreter()
+        pk = PrivateKey()
+        xonly = PublicKeyXOnly.from_secret(pk.secret)
+        msg = hashlib.sha256(b"correct").digest()
+        sig = pk.sign_schnorr(msg)
+        wrong = hashlib.sha256(b"wrong").digest()
+        assert not si._verify_schnorr_signature(wrong, sig, xonly.format())
+
+    def test_bad_lengths_rejected(self):
+        from ouroboros.script import ScriptInterpreter
+
+        si = ScriptInterpreter()
+        msg = b"\x00" * 32
+        assert not si._verify_schnorr_signature(msg, b"\x00" * 63, b"\x00" * 32)
+        assert not si._verify_schnorr_signature(msg, b"\x00" * 64, b"\x00" * 31)
+
+
+class TestTaggedHash:
+    def test_deterministic(self):
+        from ouroboros.script import _tagged_hash
+
+        h1 = _tagged_hash("TapSighash", b"data")
+        h2 = _tagged_hash("TapSighash", b"data")
+        assert h1 == h2
+        assert len(h1) == 32
+
+    def test_different_tags(self):
+        from ouroboros.script import _tagged_hash
+
+        h1 = _tagged_hash("TapLeaf", b"data")
+        h2 = _tagged_hash("TapBranch", b"data")
+        assert h1 != h2
+
+
+class TestTaprootTweakPubkey:
+    def test_tweak_produces_valid_key(self):
+        from coincurve import PrivateKey, PublicKeyXOnly
+        from ouroboros.script import ScriptInterpreter
+
+        si = ScriptInterpreter()
+        pk = PrivateKey()
+        xonly = PublicKeyXOnly.from_secret(pk.secret)
+        tweak = hashlib.sha256(b"tap tweak").digest()
+        result = si._taproot_tweak_pubkey(xonly.format(), tweak)
+        assert result is not None
+        tweaked_x, parity = result
+        assert len(tweaked_x) == 32
+        assert parity in (0, 1)
+
+    def test_different_tweaks_different_keys(self):
+        from coincurve import PrivateKey, PublicKeyXOnly
+        from ouroboros.script import ScriptInterpreter
+
+        si = ScriptInterpreter()
+        pk = PrivateKey()
+        xonly = PublicKeyXOnly.from_secret(pk.secret)
+        t1 = hashlib.sha256(b"tweak1").digest()
+        t2 = hashlib.sha256(b"tweak2").digest()
+        r1 = si._taproot_tweak_pubkey(xonly.format(), t1)
+        r2 = si._taproot_tweak_pubkey(xonly.format(), t2)
+        assert r1 is not None and r2 is not None
+        assert r1[0] != r2[0]
+
+
+class TestBech32mAddress:
+    """P2TR (bech32m) address encoding/decoding."""
+
+    def test_known_p2tr_mainnet(self):
+        addr = "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0"
+        spk = address_to_script_pubkey(addr, "mainnet")
+        assert len(spk) == 34
+        assert spk[0] == 0x51  # OP_1
+        assert spk[1] == 0x20  # push 32 bytes
+
+    def test_p2tr_roundtrip(self):
+        from ouroboros.address import _bech32m_encode, _bech32m_decode
+        import bech32 as _b32
+
+        program = hashlib.sha256(b"roundtrip test").digest()
+        addr = _bech32m_encode("bc", 1, program)
+        assert addr.startswith("bc1p")
+        _, ver, data5 = _bech32m_decode(addr)
+        assert ver == 1
+        decoded = bytes(_b32.convertbits(data5, 5, 8, False))
+        assert decoded == program
+
+    def test_p2tr_testnet(self):
+        from ouroboros.address import _bech32m_encode
+
+        program = hashlib.sha256(b"testnet taproot").digest()
+        addr = _bech32m_encode("tb", 1, program)
+        assert addr.startswith("tb1p")
+        spk = address_to_script_pubkey(addr, "testnet")
+        assert spk[0] == 0x51
+        assert spk[2:] == program
+
+    def test_p2wpkh_still_works(self):
+        key = WalletKey.generate("mainnet")
+        addr = key.get_p2wpkh_address()
+        spk = address_to_script_pubkey(addr, "mainnet")
+        assert spk[0] == 0x00 and spk[1] == 0x14
+
+    def test_invalid_bech32m_rejected(self):
+        from ouroboros.address import _bech32m_decode
+
+        hrp, ver, data = _bech32m_decode("bc1invalidaddress")
+        assert hrp is None
+
+
+class TestEncodeScriptNum:
+    def test_zero(self):
+        from ouroboros.script import ScriptInterpreter
+        si = ScriptInterpreter()
+        assert si._encode_script_num(0) == b""
+
+    def test_positive(self):
+        from ouroboros.script import ScriptInterpreter
+        si = ScriptInterpreter()
+        assert si._encode_script_num(1) == b"\x01"
+        assert si._encode_script_num(127) == b"\x7f"
+        assert si._encode_script_num(128) == b"\x80\x00"
+
+    def test_negative(self):
+        from ouroboros.script import ScriptInterpreter
+        si = ScriptInterpreter()
+        assert si._encode_script_num(-1) == b"\x81"
