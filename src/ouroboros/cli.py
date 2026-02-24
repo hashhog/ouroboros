@@ -96,14 +96,25 @@ def expand_path(path_str: str) -> Path:
     type=click.Choice(["mainnet", "testnet", "testnet3", "testnet4", "regtest", "signet"]),
     help="Bitcoin network",
 )
+@click.option("--debug", is_flag=True, help="Enable debug logging")
+@click.option("--log-json", is_flag=True, help="Emit structured JSON log lines")
 @click.pass_context
-def cli(ctx, data_dir, config_file, network):
+def cli(ctx, data_dir, config_file, network, debug, log_json):
     """Bitcoin Hybrid Node - Rust sync, Python operations"""
+    from ouroboros.logging_config import configure_logging
+
     # OROBOROS_DATADIR overrides --data-dir
     if os.environ.get("OUROBOROS_DATADIR"):
         data_dir = str(expand_path(os.environ["OUROBOROS_DATADIR"]))
     # Ensure data directory exists
     Path(data_dir).mkdir(parents=True, exist_ok=True)
+
+    configure_logging(
+        debug=debug,
+        json_format=log_json,
+        log_file=str(Path(data_dir) / "ouroboros.log") if not debug else None,
+    )
+
     # Config path: --config or data_dir/ouroboros.conf
     config_path = config_file or str(Path(data_dir) / "ouroboros.conf")
     ctx.obj = {
