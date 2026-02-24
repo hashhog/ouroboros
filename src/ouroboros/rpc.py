@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from ouroboros.database import Transaction, TxIn, TxOut, Block
 from ouroboros.script import disassemble_script
+from ouroboros.metrics import record_rpc_request
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +290,7 @@ class RPCServer:
                         id=request.id
                     )
             
+            t0 = time.monotonic()
             try:
                 # Get method handler
                 method_name = f"rpc_{request.method}"
@@ -328,6 +330,8 @@ class RPCServer:
                     },
                     id=request.id
                 )
+            finally:
+                record_rpc_request(request.method, time.monotonic() - t0)
         
         @self.app.get("/health")
         async def health():

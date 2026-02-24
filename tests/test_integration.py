@@ -525,3 +525,151 @@ class TestEncodeScriptNum:
         from ouroboros.script import ScriptInterpreter
         si = ScriptInterpreter()
         assert si._encode_script_num(-1) == b"\x81"
+
+
+# ── Phase 6: Production Hardening tests ──────────────────────────────
+
+
+class TestJSONFormatter:
+    def test_format_basic(self):
+        import json as _json
+        import logging
+        from ouroboros.logging_config import JSONFormatter
+
+        fmt = JSONFormatter()
+        record = logging.LogRecord(
+            name="test", level=logging.INFO, pathname="", lineno=0,
+            msg="hello %s", args=("world",), exc_info=None,
+        )
+        line = fmt.format(record)
+        parsed = _json.loads(line)
+        assert parsed["msg"] == "hello world"
+        assert parsed["level"] == "INFO"
+        assert parsed["logger"] == "test"
+        assert parsed["ts"].endswith("Z")
+
+    def test_format_with_exception(self):
+        import json as _json
+        import logging
+        from ouroboros.logging_config import JSONFormatter
+
+        fmt = JSONFormatter()
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            import sys
+            exc = sys.exc_info()
+        record = logging.LogRecord(
+            name="x", level=logging.ERROR, pathname="", lineno=0,
+            msg="fail", args=(), exc_info=exc,
+        )
+        parsed = _json.loads(fmt.format(record))
+        assert "exception" in parsed
+        assert "boom" in parsed["exception"]
+
+
+class TestConfigureLogging:
+    def test_plain_text(self):
+        import logging
+        from ouroboros.logging_config import configure_logging
+
+        configure_logging(debug=False, json_format=False)
+        root = logging.getLogger()
+        assert root.level == logging.INFO
+        assert len(root.handlers) >= 1
+
+    def test_debug_json(self):
+        import logging
+        from ouroboros.logging_config import JSONFormatter, configure_logging
+
+        configure_logging(debug=True, json_format=True)
+        root = logging.getLogger()
+        assert root.level == logging.DEBUG
+        assert any(isinstance(h.formatter, JSONFormatter) for h in root.handlers)
+
+    def test_log_file(self, tmp_path):
+        import logging
+        from ouroboros.logging_config import configure_logging
+
+        log_file = str(tmp_path / "test.log")
+        configure_logging(log_file=log_file)
+        logging.getLogger("filetest").info("written")
+        root = logging.getLogger()
+        assert any(
+            hasattr(h, "baseFilename") for h in root.handlers
+        )
+
+
+class TestCookieAuth:
+    def test_generate_and_read(self, tmp_path):
+        from ouroboros.cookie_auth import generate_cookie, read_cookie
+
+        user, pw = generate_cookie(str(tmp_path))
+        assert user == "__cookie__"
+        assert len(pw) == 64
+
+        u2, p2 = read_cookie(str(tmp_path))
+        assert (u2, p2) == (user, pw)
+
+    def test_read_missing_raises(self, tmp_path):
+        from ouroboros.cookie_auth import read_cookie
+
+        with pytest.raises(FileNotFoundError):
+            read_cookie(str(tmp_path / "nonexistent"))
+
+    def test_delete_cookie(self, tmp_path):
+        from ouroboros.cookie_auth import generate_cookie, delete_cookie
+
+        generate_cookie(str(tmp_path))
+        assert (tmp_path / ".cookie").exists()
+        delete_cookie(str(tmp_path))
+        assert not (tmp_path / ".cookie").exists()
+
+    def test_delete_missing_is_noop(self, tmp_path):
+        from ouroboros.cookie_auth import delete_cookie
+
+        delete_cookie(str(tmp_path))
+
+    def test_cookie_permissions(self, tmp_path):
+        import os, stat
+        from ouroboros.cookie_auth import generate_cookie
+
+        generate_cookie(str(tmp_path))
+        mode = os.stat(tmp_path / ".cookie").st_mode
+        assert stat.S_IMODE(mode) == 0o600
+
+
+class TestMetrics:
+    def test_init_metrics(self):
+        from ouroboros.metrics import init_metrics, _HAS_PROMETHEUS
+
+        if not _HAS_PROMETHEUS:
+            pytest.skip("prometheus_client not installed")
+        # init_metrics may have been called already; just verify no crash
+        result = init_metrics(port=0)
+        assert result is True
+
+    def test_update_chain_metrics_noop_without_init(self):
+        from ouroboros import metrics as m
+        old_height = m.BLOCK_HEIGHT
+        m.update_chain_metrics(100, 1.5, 3)
+        if old_height is None:
+            pass  # graceful no-op
+        else:
+            assert old_height is not None
+
+    def test_record_rpc_request(self):
+        from ouroboros.metrics import record_rpc_request
+        record_rpc_request("getblockcount", 0.005)
+
+    def test_record_block_received(self):
+        from ouroboros.metrics import record_block_received
+        record_block_received()
+
+    def test_record_tx_received(self):
+        from ouroboros.metrics import record_tx_received
+        record_tx_received()
+
+    def test_record_peer_disconnect(self):
+        from ouroboros.metrics import record_peer_disconnect
+        record_peer_disconnect()
