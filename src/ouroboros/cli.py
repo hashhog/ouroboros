@@ -188,10 +188,10 @@ def sync(ctx, reset, limit):
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TextColumn("•"),
-        TextColumn("[cyan]{task.fields[blocks]}[/cyan]"),
+        TextColumn("[cyan]• {task.fields[blocks]}[/cyan]"),
         TextColumn("[yellow]{task.fields[speed_str]}[/yellow]"),
         console=console,
+        redirect_stderr=True,
     ) as progress:
         # TODO: Peer count and desync warnings - expose from Rust BlockProgressCache when available
         task = progress.add_task(
@@ -222,10 +222,10 @@ def sync(ctx, reset, limit):
                     if prog.total_height > 0
                     else f"{prog.current_height:,} blocks"
                 )
-                speed_str = f" • {prog.blocks_per_second:.1f} blocks/s • "
+                speed_str = f"• {prog.blocks_per_second:.1f} blocks/s"
             else:
                 blocks_str = f"{prog.current_height:,} headers"
-                speed_str = " • "
+                speed_str = ""
 
             # Update progress
             progress.update(
