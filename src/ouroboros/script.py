@@ -2,15 +2,30 @@
 Bitcoin script interpreter for transaction validation.
 
 This module implements a basic Bitcoin script interpreter that can verify
-standard script types (P2PKH, P2SH, P2WPKH, P2WSH, etc.), and also provides
-script disassembly functionality for human-readable script representation.
+standard script types (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, etc.), and also
+provides script disassembly functionality for human-readable script
+representation.
+
+Taproot support (BIP 340/341/342):
+- Schnorr signature verification via coincurve or Rust extension
+- Key-path spending (single witness element = Schnorr sig)
+- Script-path spending (witness = [...script inputs, script, control block])
+- OP_CHECKSIGADD for tapscript multisig
+- Taproot-specific sighash (epoch 0x00, tagged hashes)
 """
 
 import hashlib
+import struct
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
 from ouroboros.database import Transaction, TxIn
+
+
+def _tagged_hash(tag: str, data: bytes) -> bytes:
+    """BIP 340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data)."""
+    tag_hash = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(tag_hash + tag_hash + data).digest()
 
 
 class ScriptInterpreter:
@@ -450,6 +465,596 @@ class ScriptInterpreter:
 
         return matched == k
 
+    # ------------------------------------------------------------------
+    # Schnorr / Taproot (BIP 340, 341, 342)
+    # ------------------------------------------------------------------
+
+    def _verify_schnorr_signature(
+        self, message_hash: bytes, signature: bytes, pubkey_x: bytes
+    ) -> bool:
+        """
+        Verify a BIP 340 Schnorr signature.
+
+        Args:
+            message_hash: 32-byte sighash
+            signature: 64-byte Schnorr signature
+            pubkey_x: 32-byte x-only public key
+
+        Reference: BIP 340
+        """
+        if len(signature) != 64 or len(pubkey_x) != 32:
+            return False
+
+        try:
+            import sync
+            return sync.verify_schnorr(message_hash, signature, pubkey_x)
+        except (ImportError, AttributeError):
+            pass
+
+        try:
+            from coincurve import PublicKeyXOnly
+            pk = PublicKeyXOnly(pubkey_x)
+            return pk.verify(signature, message_hash)
+        except ImportError:
+            pass
+        except Exception:
+            return False
+
+        return False
+
+    def verify_taproot(
+        self,
+        tx: Transaction,
+        input_index: int,
+        witness: List[bytes],
+        script_pubkey: bytes,
+        input_amounts: Optional[List[int]] = None,
+        input_script_pubkeys: Optional[List[bytes]] = None,
+    ) -> bool:
+        """
+        Verify a Taproot (witness v1) spend.
+
+        script_pubkey format: OP_1 <32-byte tweaked pubkey>
+        Key-path: witness = [signature]
+        Script-path: witness = [...inputs, script, control_block]
+
+        Reference: BIP 341
+        """
+        if len(script_pubkey) != 34 or script_pubkey[0] != 0x51 or script_pubkey[1] != 0x20:
+            return False
+
+        output_pubkey = script_pubkey[2:]
+
+        if not witness:
+            return False
+
+        # Annex detection: if last witness element starts with 0x50, it's the annex
+        annex = None
+        effective_witness = list(witness)
+        if len(effective_witness) >= 2 and effective_witness[-1] and effective_witness[-1][0] == 0x50:
+            annex = effective_witness.pop()
+
+        if len(effective_witness) == 1:
+            return self._verify_taproot_keypath(
+                tx, input_index, effective_witness[0], output_pubkey,
+                input_amounts, input_script_pubkeys, annex,
+            )
+
+        if len(effective_witness) >= 2:
+            return self._verify_taproot_scriptpath(
+                tx, input_index, effective_witness, output_pubkey,
+                input_amounts, input_script_pubkeys, annex,
+            )
+
+        return False
+
+    def _verify_taproot_keypath(
+        self,
+        tx: Transaction,
+        input_index: int,
+        sig_element: bytes,
+        output_pubkey: bytes,
+        input_amounts: Optional[List[int]] = None,
+        input_script_pubkeys: Optional[List[bytes]] = None,
+        annex: Optional[bytes] = None,
+    ) -> bool:
+        """
+        Key-path spend: witness is a single Schnorr signature (64 or 65 bytes).
+
+        Reference: BIP 341 key path spending
+        """
+        sighash_type = 0x00
+        sig = sig_element
+        if len(sig) == 65:
+            sighash_type = sig[-1]
+            sig = sig[:-1]
+            if sighash_type == 0x00:
+                return False  # explicit 0x00 is invalid per BIP 341
+        elif len(sig) != 64:
+            return False
+
+        sighash = self._compute_taproot_sighash(
+            tx, input_index, sighash_type,
+            input_amounts=input_amounts,
+            input_script_pubkeys=input_script_pubkeys,
+            annex=annex,
+            ext_flag=0,
+        )
+        return self._verify_schnorr_signature(sighash, sig, output_pubkey)
+
+    def _verify_taproot_scriptpath(
+        self,
+        tx: Transaction,
+        input_index: int,
+        witness: List[bytes],
+        output_pubkey: bytes,
+        input_amounts: Optional[List[int]] = None,
+        input_script_pubkeys: Optional[List[bytes]] = None,
+        annex: Optional[bytes] = None,
+    ) -> bool:
+        """
+        Script-path spend: witness = [...script_inputs, tapscript, control_block].
+
+        Validates the control block Merkle proof against the output key,
+        then executes the tapscript under BIP 342 rules.
+
+        Reference: BIP 341 script path spending
+        """
+        if len(witness) < 2:
+            return False
+
+        control_block = witness[-1]
+        tap_script = witness[-2]
+        script_inputs = witness[:-2]
+
+        if len(control_block) < 33 or (len(control_block) - 33) % 32 != 0:
+            return False
+
+        leaf_version = control_block[0] & 0xfe
+        internal_key = control_block[1:33]
+        merkle_path = control_block[33:]
+
+        # Compute tapleaf hash
+        leaf_hash = _tagged_hash(
+            "TapLeaf",
+            bytes([leaf_version]) + self._ser_script_size(tap_script) + tap_script,
+        )
+
+        # Walk up the Merkle path
+        k = leaf_hash
+        for i in range(0, len(merkle_path), 32):
+            branch = merkle_path[i:i + 32]
+            if k < branch:
+                k = _tagged_hash("TapBranch", k + branch)
+            else:
+                k = _tagged_hash("TapBranch", branch + k)
+
+        # Compute the tweaked key: P + hash(P || root) * G
+        tweak = _tagged_hash("TapTweak", internal_key + k)
+
+        tweaked = self._taproot_tweak_pubkey(internal_key, tweak)
+        if tweaked is None:
+            return False
+
+        # The y-parity of the output key must match control_block[0] & 1
+        tweaked_x, tweaked_parity = tweaked
+        if tweaked_x != output_pubkey:
+            return False
+        if (control_block[0] & 1) != tweaked_parity:
+            return False
+
+        # Execute the tapscript (BIP 342)
+        if leaf_version == 0xc0:
+            sighash = self._compute_taproot_sighash(
+                tx, input_index, 0x00,
+                input_amounts=input_amounts,
+                input_script_pubkeys=input_script_pubkeys,
+                annex=annex,
+                ext_flag=1,
+                tap_leaf_hash=leaf_hash,
+            )
+            return self._execute_tapscript(
+                tap_script, script_inputs, tx, input_index, sighash,
+                input_amounts, input_script_pubkeys, annex, leaf_hash,
+            )
+
+        return False
+
+    def _taproot_tweak_pubkey(
+        self, internal_key: bytes, tweak: bytes
+    ) -> Optional[Tuple[bytes, int]]:
+        """
+        Compute tweaked x-only pubkey: lift internal_key to a point, add
+        tweak*G, return (x_bytes, parity).
+        """
+        try:
+            from coincurve import PublicKeyXOnly
+            pk = PublicKeyXOnly(internal_key)
+            pk.tweak_add(tweak)  # mutates in-place, sets pk.parity
+            return pk.format(), int(pk.parity)
+        except (ImportError, AttributeError):
+            pass
+        except Exception:
+            return None
+
+        try:
+            import sync
+            result = sync.taproot_tweak_pubkey(internal_key, tweak)
+            return result
+        except (ImportError, AttributeError):
+            pass
+        except Exception:
+            return None
+
+        return None
+
+    def _ser_script_size(self, script: bytes) -> bytes:
+        """CompactSize-encode the length of a script."""
+        n = len(script)
+        if n < 0xFD:
+            return struct.pack('<B', n)
+        elif n <= 0xFFFF:
+            return b'\xfd' + struct.pack('<H', n)
+        elif n <= 0xFFFFFFFF:
+            return b'\xfe' + struct.pack('<I', n)
+        else:
+            return b'\xff' + struct.pack('<Q', n)
+
+    def _compute_taproot_sighash(
+        self,
+        tx: Transaction,
+        input_index: int,
+        sighash_type: int,
+        *,
+        input_amounts: Optional[List[int]] = None,
+        input_script_pubkeys: Optional[List[bytes]] = None,
+        annex: Optional[bytes] = None,
+        ext_flag: int = 0,
+        tap_leaf_hash: Optional[bytes] = None,
+    ) -> bytes:
+        """
+        Compute the signature hash for a Taproot spend (BIP 341 §4).
+
+        Uses tagged hash "TapSighash" and commits to all inputs' amounts
+        and scriptPubKeys (unlike BIP 143 which only commits to the
+        current input's amount).
+
+        Reference: BIP 341 §4 (Signature validation rules)
+        """
+        # Determine hash type components
+        anyone_can_pay = (sighash_type & 0x80) != 0
+        base_type = sighash_type & 0x03  # 0=default/all, 1=all, 2=none, 3=single
+        if sighash_type == 0:
+            base_type = 0  # SIGHASH_DEFAULT = SIGHASH_ALL
+
+        data = bytearray()
+
+        # Epoch (0x00)
+        data.append(0x00)
+
+        # Hash type
+        data.append(sighash_type)
+
+        # Transaction data
+        data.extend(struct.pack('<i', tx.version))
+        data.extend(struct.pack('<I', tx.locktime))
+
+        if not anyone_can_pay:
+            # sha_prevouts: SHA256 of all outpoints
+            prevouts = bytearray()
+            for inp in tx.inputs:
+                prevouts.extend(inp.prev_txid)
+                prevouts.extend(struct.pack('<I', inp.prev_vout))
+            data.extend(hashlib.sha256(bytes(prevouts)).digest())
+
+            # sha_amounts: SHA256 of all input amounts
+            if input_amounts:
+                amounts = bytearray()
+                for amt in input_amounts:
+                    amounts.extend(struct.pack('<q', amt))
+                data.extend(hashlib.sha256(bytes(amounts)).digest())
+            else:
+                data.extend(b'\x00' * 32)
+
+            # sha_scriptpubkeys: SHA256 of all input scriptPubKeys (compact-size prefixed)
+            if input_script_pubkeys:
+                spks = bytearray()
+                for spk in input_script_pubkeys:
+                    spks.extend(self._ser_script_size(spk))
+                    spks.extend(spk)
+                data.extend(hashlib.sha256(bytes(spks)).digest())
+            else:
+                data.extend(b'\x00' * 32)
+
+            # sha_sequences: SHA256 of all sequences
+            seqs = bytearray()
+            for inp in tx.inputs:
+                seqs.extend(struct.pack('<I', inp.sequence))
+            data.extend(hashlib.sha256(bytes(seqs)).digest())
+
+        if base_type not in (2, 3):  # not NONE and not SINGLE
+            # sha_outputs: SHA256 of all outputs
+            outs = bytearray()
+            for out in tx.outputs:
+                outs.extend(struct.pack('<q', out.value))
+                outs.extend(self._ser_script_size(out.script_pubkey))
+                outs.extend(out.script_pubkey)
+            data.extend(hashlib.sha256(bytes(outs)).digest())
+
+        # Spend type: (ext_flag << 1) | annex_present
+        annex_present = 1 if annex else 0
+        spend_type = (ext_flag << 1) | annex_present
+        data.append(spend_type)
+
+        if anyone_can_pay:
+            inp = tx.inputs[input_index]
+            data.extend(inp.prev_txid)
+            data.extend(struct.pack('<I', inp.prev_vout))
+            if input_amounts and input_index < len(input_amounts):
+                data.extend(struct.pack('<q', input_amounts[input_index]))
+            else:
+                data.extend(struct.pack('<q', 0))
+            if input_script_pubkeys and input_index < len(input_script_pubkeys):
+                spk = input_script_pubkeys[input_index]
+                data.extend(self._ser_script_size(spk))
+                data.extend(spk)
+            else:
+                data.extend(b'\x00')
+            data.extend(struct.pack('<I', inp.sequence))
+        else:
+            data.extend(struct.pack('<I', input_index))
+
+        if annex:
+            data.extend(hashlib.sha256(
+                self._ser_script_size(annex) + annex
+            ).digest())
+
+        if base_type == 2:  # SIGHASH_NONE
+            pass
+        elif base_type == 3:  # SIGHASH_SINGLE
+            if input_index < len(tx.outputs):
+                out = tx.outputs[input_index]
+                out_data = struct.pack('<q', out.value) + self._ser_script_size(out.script_pubkey) + out.script_pubkey
+                data.extend(hashlib.sha256(out_data).digest())
+            else:
+                data.extend(b'\x00' * 32)
+
+        # Extension (script path)
+        if ext_flag == 1 and tap_leaf_hash:
+            data.extend(tap_leaf_hash)
+            data.append(0x00)  # key_version
+            data.extend(struct.pack('<i', -1))  # codesep_pos = -1 (none executed)
+
+        return _tagged_hash("TapSighash", bytes(data))
+
+    def _execute_tapscript(
+        self,
+        script: bytes,
+        witness_inputs: List[bytes],
+        tx: Transaction,
+        input_index: int,
+        default_sighash: bytes,
+        input_amounts: Optional[List[int]] = None,
+        input_script_pubkeys: Optional[List[bytes]] = None,
+        annex: Optional[bytes] = None,
+        leaf_hash: Optional[bytes] = None,
+    ) -> bool:
+        """
+        Execute a tapscript (BIP 342).
+
+        Differences from legacy script:
+        - OP_CHECKSIG uses Schnorr (not ECDSA)
+        - OP_CHECKMULTISIG is disabled, replaced by OP_CHECKSIGADD
+        - Signature validation failure is immediate script failure (not push 0)
+        - Unknown leaf versions are treated as OP_SUCCESS
+        """
+        stack: List[bytes] = list(witness_inputs)
+        op_count = 0
+        max_ops = 201
+
+        i = 0
+        while i < len(script):
+            opcode = script[i]
+            i += 1
+            op_count += 1
+            if op_count > max_ops:
+                return False
+
+            # Data pushes
+            if 1 <= opcode <= 75:
+                if i + opcode > len(script):
+                    return False
+                stack.append(script[i:i + opcode])
+                i += opcode
+                continue
+            if opcode == 0x4c:  # OP_PUSHDATA1
+                if i >= len(script):
+                    return False
+                dlen = script[i]; i += 1
+                if i + dlen > len(script):
+                    return False
+                stack.append(script[i:i + dlen]); i += dlen
+                continue
+            if opcode == 0x4d:  # OP_PUSHDATA2
+                if i + 2 > len(script):
+                    return False
+                dlen = int.from_bytes(script[i:i+2], 'little'); i += 2
+                if i + dlen > len(script):
+                    return False
+                stack.append(script[i:i + dlen]); i += dlen
+                continue
+
+            if opcode == 0x00:  # OP_0
+                stack.append(b'')
+                continue
+            if 0x51 <= opcode <= 0x60:  # OP_1 .. OP_16
+                stack.append(bytes([opcode - 0x50]))
+                continue
+
+            # OP_DUP
+            if opcode == 0x76:
+                if not stack: return False
+                stack.append(stack[-1])
+                continue
+            # OP_DROP
+            if opcode == 0x75:
+                if not stack: return False
+                stack.pop()
+                continue
+            # OP_EQUAL
+            if opcode == 0x87:
+                if len(stack) < 2: return False
+                a, b = stack.pop(), stack.pop()
+                stack.append(b'\x01' if a == b else b'')
+                continue
+            # OP_EQUALVERIFY
+            if opcode == 0x88:
+                if len(stack) < 2: return False
+                if stack.pop() != stack.pop(): return False
+                continue
+            # OP_HASH160
+            if opcode == 0xa9:
+                if not stack: return False
+                stack.append(self._hash160(stack.pop()))
+                continue
+
+            # OP_CHECKSIG — Schnorr in tapscript
+            if opcode == 0xac:
+                if len(stack) < 2: return False
+                pubkey = stack.pop()
+                sig = stack.pop()
+                if not sig:
+                    stack.append(b'')
+                    continue
+                if len(pubkey) == 32:
+                    sighash_type = 0x00
+                    raw_sig = sig
+                    if len(sig) == 65:
+                        sighash_type = sig[-1]
+                        raw_sig = sig[:-1]
+                        if sighash_type == 0x00:
+                            return False
+                    elif len(sig) != 64:
+                        return False
+
+                    if sighash_type != 0x00:
+                        sighash = self._compute_taproot_sighash(
+                            tx, input_index, sighash_type,
+                            input_amounts=input_amounts,
+                            input_script_pubkeys=input_script_pubkeys,
+                            annex=annex,
+                            ext_flag=1,
+                            tap_leaf_hash=leaf_hash,
+                        )
+                    else:
+                        sighash = default_sighash
+
+                    if not self._verify_schnorr_signature(sighash, raw_sig, pubkey):
+                        return False
+                    stack.append(b'\x01')
+                else:
+                    return False
+                continue
+
+            # OP_CHECKSIGVERIFY
+            if opcode == 0xad:
+                if len(stack) < 2: return False
+                pubkey = stack.pop()
+                sig = stack.pop()
+                if len(pubkey) != 32 or not sig:
+                    return False
+                sighash_type = 0x00
+                raw_sig = sig
+                if len(sig) == 65:
+                    sighash_type = sig[-1]; raw_sig = sig[:-1]
+                    if sighash_type == 0x00: return False
+                elif len(sig) != 64:
+                    return False
+                sh = default_sighash if sighash_type == 0x00 else self._compute_taproot_sighash(
+                    tx, input_index, sighash_type,
+                    input_amounts=input_amounts,
+                    input_script_pubkeys=input_script_pubkeys,
+                    annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
+                )
+                if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
+                    return False
+                continue
+
+            # OP_CHECKSIGADD (0xba) — BIP 342
+            if opcode == 0xba:
+                if len(stack) < 3: return False
+                pubkey = stack.pop()
+                n = self._read_num(stack.pop())
+                sig = stack.pop()
+
+                if not sig:
+                    stack.append(self._encode_script_num(n))
+                    continue
+                if len(pubkey) != 32:
+                    return False
+
+                sighash_type = 0x00
+                raw_sig = sig
+                if len(sig) == 65:
+                    sighash_type = sig[-1]; raw_sig = sig[:-1]
+                    if sighash_type == 0x00: return False
+                elif len(sig) != 64:
+                    return False
+
+                sh = default_sighash if sighash_type == 0x00 else self._compute_taproot_sighash(
+                    tx, input_index, sighash_type,
+                    input_amounts=input_amounts,
+                    input_script_pubkeys=input_script_pubkeys,
+                    annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
+                )
+                if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
+                    return False
+                stack.append(self._encode_script_num(n + 1))
+                continue
+
+            # OP_CHECKMULTISIG / OP_CHECKMULTISIGVERIFY are disabled in tapscript
+            if opcode in (0xae, 0xaf):
+                return False
+
+            # OP_SUCCESS range: opcodes 80, 98, 126-129, 131-134, 137-138,
+            # 141-142, 149-153, 187-254 — the script succeeds unconditionally
+            if opcode in _TAPSCRIPT_OP_SUCCESS:
+                return True
+
+        if not stack:
+            return False
+        top = stack[-1]
+        if isinstance(top, bytes):
+            return len(top) > 0 and any(b != 0 for b in top)
+        return bool(top)
+
+    def _encode_script_num(self, n: int) -> bytes:
+        """Encode an integer as a Bitcoin script number (minimal CScriptNum)."""
+        if n == 0:
+            return b''
+        negative = n < 0
+        absn = abs(n)
+        result = bytearray()
+        while absn > 0:
+            result.append(absn & 0xFF)
+            absn >>= 8
+        if result[-1] & 0x80:
+            result.append(0x80 if negative else 0x00)
+        elif negative:
+            result[-1] |= 0x80
+        return bytes(result)
+
+
+# Opcodes that trigger OP_SUCCESS in tapscript (BIP 342).
+_TAPSCRIPT_OP_SUCCESS = frozenset(
+    [80, 98]
+    + list(range(126, 130))
+    + list(range(131, 135))
+    + [137, 138, 141, 142]
+    + list(range(149, 154))
+    + list(range(187, 255))
+)
+
 
 def disassemble_script(script: bytes) -> str:
     """
@@ -545,6 +1150,10 @@ def _get_opcode_name(opcode: int) -> str:
         0x5e: "OP_14",
         0x5f: "OP_15",
         0x60: "OP_16",
-        # Add more opcodes as needed
+        0x75: "OP_DROP",
+        0xad: "OP_CHECKSIGVERIFY",
+        0xae: "OP_CHECKMULTISIG",
+        0xaf: "OP_CHECKMULTISIGVERIFY",
+        0xba: "OP_CHECKSIGADD",
     }
     return opcode_names.get(opcode, f"OP_UNKNOWN_{opcode:02x}")
