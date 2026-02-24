@@ -1513,11 +1513,13 @@ mod tests {
             0,
             50,
         )));
+        let progress_cache = Arc::new(StdMutex::new(BlockProgressCache::default()));
         let block_sync = BlockSync::new(
             peer_manager,
             validator,
             db,
             Network::Bitcoin,
+            progress_cache,
         );
         (temp_dir, block_sync)
     }
@@ -1531,68 +1533,12 @@ mod tests {
     #[test]
     fn test_progress_stats_initial() {
         let (_temp_dir, block_sync) = create_test_block_sync();
-        // Before sync_blocks, cache has defaults; get_progress_stats returns Some
         let stats = block_sync.get_progress_stats();
         assert!(stats.is_some());
-        let (blocks, speed, eta) = stats.unwrap();
+        let (blocks, _total, speed, eta) = stats.unwrap();
         assert_eq!(blocks, 0);
         assert_eq!(speed, 0.0);
         assert_eq!(eta, 0.0);
-    }
-
-    /// Receive and process incoming block messages from peers
-    async fn receive_block_messages(&mut self) -> Result<()> {
-        use tokio::time::{timeout, Duration};
-        use crate::network::messages::BlockMessage;
-
-        let peer_manager = self.peer_manager.lock().await;
-        let connected_peers = peer_manager.connected_peers().await;
-        drop(peer_manager);
-
-        if connected_peers.is_empty() {
-            return Err(BlockSyncError::NoPeersAvailable);
-        }
-
-        // Try to receive block messages from connected peers
-        // Use a short timeout to avoid blocking
-        for peer_addr in connected_peers.iter().take(5) {
-            let mut peer_manager = self.peer_manager.lock().await;
-            if let Some(mut peer) = peer_manager.get_peer(*peer_addr).await {
-                // Try to receive a message with a short timeout
-                match timeout(Duration::from_millis(100), peer.receive_message()).await {
-                    Ok(Ok(msg)) => {
-                        if msg.command == "block" {
-                            // Deserialize block message
-                                match BlockMessage::deserialize_payload(&msg.payload) {
-                                    Ok(block_msg) => {
-                                        log::debug!("Received block message from peer {}", peer_addr);
-                                        // Process the block
-                                    if let Err(e) = self.process_incoming_block(*peer_addr, block_msg).await {
-                                        log::warn!("Error processing block from {}: {}", peer_addr, e);
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to deserialize block from {}: {}", peer_addr, e);
-                                }
-                            }
-                        }
-                        // Put peer back
-                        peer_manager.add_peer(*peer_addr, peer).await;
-                    }
-                    Ok(Err(_)) => {
-                        // Error receiving message, put peer back
-                        peer_manager.add_peer(*peer_addr, peer).await;
-                    }
-                    Err(_) => {
-                        // Timeout, put peer back
-                        peer_manager.add_peer(*peer_addr, peer).await;
-                        break; // No more messages available right now
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     #[test]
