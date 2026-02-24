@@ -1056,7 +1056,7 @@ mod tests {
 
         assert!(result.is_ok());
         let utxos = result.unwrap();
-        assert_eq!(utxos.len(), 0); // Currently returns empty vec
+        assert_eq!(utxos.len(), 3); // Returns 3 example/demo UTXOs
     }
 
     #[test]

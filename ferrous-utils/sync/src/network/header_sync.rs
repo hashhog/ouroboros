@@ -791,6 +791,7 @@ mod tests {
             validator,
             db,
             Network::Bitcoin,
+            None,
         );
         (temp_dir, header_sync)
     }
