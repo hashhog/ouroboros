@@ -83,13 +83,16 @@ jobs:
 
       - name: Install Python dependencies & build Rust extension
         run: |
-          python -m pip install --upgrade pip
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
           pip install maturin
           pip install -e ".[dev]"
           maturin develop --manifest-path ferrous-utils/sync/Cargo.toml
 
       - name: Run all tests
         run: |
+          source .venv/bin/activate
           pytest tests/ -v
           python -m pytest src/ouroboros/tests/ -v || true
 
