@@ -37,8 +37,7 @@ dependencies = [
     # Data validation
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
-    # Database (Note: rocksdb doesn't support Python 3.13+ yet; use Python 3.10-3.12)
-    "rocksdb>=0.7.0; python_version<'3.13'",
+    # Note: RocksDB is accessed via the Rust extension (librocksdb-sys), not a Python package
     # Async file I/O
     "aiofiles>=23.2.0",
     # Address decoding (P2PKH, P2SH, P2WPKH)
