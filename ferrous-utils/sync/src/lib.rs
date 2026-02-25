@@ -79,6 +79,8 @@ pub struct PyUTXO {
     pub value: u64,
     #[pyo3(get)]
     pub script_pubkey: Vec<u8>,
+    #[pyo3(get)]
+    pub height: Option<u32>,
 }
 
 impl From<UTXO> for PyUTXO {
@@ -88,6 +90,7 @@ impl From<UTXO> for PyUTXO {
             vout: utxo.vout(),
             value: utxo.value(),
             script_pubkey: utxo.script_pubkey.as_bytes().to_vec(),
+            height: utxo.height,
         }
     }
 }
@@ -99,6 +102,7 @@ impl From<&UTXO> for PyUTXO {
             vout: utxo.vout(),
             value: utxo.value(),
             script_pubkey: utxo.script_pubkey.as_bytes().to_vec(),
+            height: utxo.height,
         }
     }
 }
