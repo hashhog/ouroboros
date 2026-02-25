@@ -794,3 +794,89 @@ class PongMessage:
             raise ValueError("Not enough data for pong nonce")
         nonce = struct.unpack('<Q', payload[0:8])[0]
         return cls(nonce=nonce)
+
+
+# ── BIP 152 Compact Block messages ──────────────────────────────────
+
+
+@dataclass
+class SendCmpctMessage:
+    """
+    ``sendcmpct`` — negotiate compact block support.
+
+    Sent after the version handshake.
+    announce: True = high-bandwidth mode (peer sends cmpctblock unsolicited)
+    version: compact-block protocol version (1 or 2; 2 uses wtxid for SipHash)
+    """
+    announce: bool = False
+    version: int = 2
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = struct.pack('<BQ', int(self.announce), self.version)
+        return NetworkMessage(
+            command="sendcmpct", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'SendCmpctMessage':
+        if len(payload) < 9:
+            raise ValueError("sendcmpct payload too short")
+        announce = bool(payload[0])
+        version = struct.unpack('<Q', payload[1:9])[0]
+        return cls(announce=announce, version=version)
+
+
+@dataclass
+class CmpctBlockMessage:
+    """``cmpctblock`` — compact block announcement."""
+    payload_bytes: bytes
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        return NetworkMessage(
+            command="cmpctblock", payload=self.payload_bytes,
+            magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'CmpctBlockMessage':
+        return cls(payload_bytes=payload)
+
+    def to_compact_block(self):
+        from ouroboros.compact_blocks import CompactBlock
+        return CompactBlock.deserialize(self.payload_bytes)
+
+
+@dataclass
+class GetBlockTxnMessage:
+    """``getblocktxn`` — request missing transactions."""
+    payload_bytes: bytes
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        return NetworkMessage(
+            command="getblocktxn", payload=self.payload_bytes,
+            magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'GetBlockTxnMessage':
+        return cls(payload_bytes=payload)
+
+    def to_request(self):
+        from ouroboros.compact_blocks import BlockTransactionsRequest
+        return BlockTransactionsRequest.deserialize(self.payload_bytes)
+
+
+@dataclass
+class BlockTxnMessage:
+    """``blocktxn`` — response with missing transactions."""
+    payload_bytes: bytes
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        return NetworkMessage(
+            command="blocktxn", payload=self.payload_bytes,
+            magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'BlockTxnMessage':
+        return cls(payload_bytes=payload)
+
+    def to_block_transactions(self):
+        from ouroboros.compact_blocks import BlockTransactions
+        return BlockTransactions.deserialize(self.payload_bytes)
