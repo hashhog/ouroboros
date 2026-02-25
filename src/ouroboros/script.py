@@ -99,291 +99,537 @@ class ScriptInterpreter:
         """
         stack: List[bytes] = []
         altstack: List[bytes] = []
+        exec_stack: List[bool] = []
         op_count = 0
-        max_op_count = 201  # Bitcoin script limit
-        
+
+        _DISABLED = frozenset([
+            0x7e, 0x7f, 0x80, 0x81,  # CAT, SUBSTR, LEFT, RIGHT
+            0x83, 0x84, 0x85, 0x86,  # INVERT, AND, OR, XOR
+            0x8d, 0x8e,              # 2MUL, 2DIV
+            0x95, 0x96, 0x97, 0x98, 0x99,  # MUL, DIV, MOD, LSHIFT, RSHIFT
+        ])
+
         i = 0
         while i < len(script):
             opcode = script[i]
             i += 1
-            
-            # Check op count limit
-            op_count += 1
-            if op_count > max_op_count:
-                raise ValueError("Too many operations")
-            
-            # Data push operations (0x01-0x4b)
+
+            executing = not exec_stack or all(exec_stack)
+
+            # OP_VERIF / OP_VERNOTIF are always invalid
+            if opcode in (0x65, 0x66):
+                raise ValueError(f"Invalid opcode 0x{opcode:02x}")
+
+            # ── Data push (always consume bytes; only push when executing) ──
+            push_data = None
             if 1 <= opcode <= 75:
-                data_len = opcode
-                if i + data_len > len(script):
+                n = opcode
+                if i + n > len(script):
                     raise ValueError("Invalid data push")
-                data = script[i:i + data_len]
-                stack.append(data)
-                i += data_len
-                continue
-            
-            # OP_PUSHDATA1 (0x4c)
-            if opcode == 0x4c:
+                push_data = script[i:i + n]; i += n
+            elif opcode == 0x4c:
                 if i >= len(script):
                     raise ValueError("Invalid OP_PUSHDATA1")
-                data_len = script[i]
-                i += 1
-                if i + data_len > len(script):
-                    raise ValueError("Invalid OP_PUSHDATA1 data")
-                data = script[i:i + data_len]
-                stack.append(data)
-                i += data_len
-                continue
-            
-            # OP_PUSHDATA2 (0x4d)
-            if opcode == 0x4d:
+                n = script[i]; i += 1
+                if i + n > len(script):
+                    raise ValueError("Invalid OP_PUSHDATA1")
+                push_data = script[i:i + n]; i += n
+            elif opcode == 0x4d:
                 if i + 2 > len(script):
                     raise ValueError("Invalid OP_PUSHDATA2")
-                data_len = int.from_bytes(script[i:i+2], 'little')
-                i += 2
-                if i + data_len > len(script):
-                    raise ValueError("Invalid OP_PUSHDATA2 data")
-                data = script[i:i + data_len]
-                stack.append(data)
-                i += data_len
-                continue
-            
-            # OP_PUSHDATA4 (0x4e)
-            if opcode == 0x4e:
+                n = int.from_bytes(script[i:i + 2], 'little'); i += 2
+                if i + n > len(script):
+                    raise ValueError("Invalid OP_PUSHDATA2")
+                push_data = script[i:i + n]; i += n
+            elif opcode == 0x4e:
                 if i + 4 > len(script):
                     raise ValueError("Invalid OP_PUSHDATA4")
-                data_len = int.from_bytes(script[i:i+4], 'little')
-                i += 4
-                if i + data_len > len(script):
-                    raise ValueError("Invalid OP_PUSHDATA4 data")
-                data = script[i:i + data_len]
-                stack.append(data)
-                i += data_len
+                n = int.from_bytes(script[i:i + 4], 'little'); i += 4
+                if i + n > len(script):
+                    raise ValueError("Invalid OP_PUSHDATA4")
+                push_data = script[i:i + n]; i += n
+
+            if push_data is not None:
+                if executing:
+                    stack.append(push_data)
                 continue
-            
-            # OP_DUP (0x76)
-            if opcode == 0x76:
-                if not stack:
-                    raise ValueError("Stack underflow")
-                stack.append(stack[-1])
+
+            # Op count (opcodes > OP_16 only, regardless of exec state)
+            if opcode > 0x60:
+                op_count += 1
+                if op_count > 201:
+                    raise ValueError("Too many operations")
+
+            if opcode in _DISABLED:
+                raise ValueError(f"Disabled opcode 0x{opcode:02x}")
+
+            # ── Flow control (always processed for nesting) ─────────────
+            if opcode == 0x63:  # OP_IF
+                val = False
+                if executing:
+                    if not stack:
+                        raise ValueError("OP_IF: stack underflow")
+                    val = self._cast_to_bool(stack.pop())
+                exec_stack.append(val)
                 continue
-            
-            # OP_HASH160 (0xa9)
-            if opcode == 0xa9:
-                if not stack:
-                    raise ValueError("Stack underflow")
-                data = stack.pop()
-                # SHA256 then RIPEMD160
-                sha256_hash = hashlib.sha256(data).digest()
-                ripemd160 = hashlib.new('ripemd160', sha256_hash).digest()
-                stack.append(ripemd160)
+            if opcode == 0x64:  # OP_NOTIF
+                val = False
+                if executing:
+                    if not stack:
+                        raise ValueError("OP_NOTIF: stack underflow")
+                    val = not self._cast_to_bool(stack.pop())
+                exec_stack.append(val)
                 continue
-            
-            # OP_EQUALVERIFY (0x88)
-            if opcode == 0x88:
-                if len(stack) < 2:
-                    raise ValueError("Stack underflow")
-                a = stack.pop()
-                b = stack.pop()
-                if a != b:
-                    raise ValueError("OP_EQUALVERIFY failed")
+            if opcode == 0x67:  # OP_ELSE
+                if not exec_stack:
+                    raise ValueError("OP_ELSE without OP_IF")
+                exec_stack[-1] = not exec_stack[-1]
                 continue
-            
-            # OP_CHECKSIG (0xac) - ECDSA signature verification
-            if opcode == 0xac:
-                if len(stack) < 2:
-                    raise ValueError("Stack underflow")
-                pubkey = stack.pop()
-                sig = stack.pop()
-                
-                # Signature format: DER signature + SIGHASH type (1 byte)
-                if len(sig) < 1 or len(pubkey) < 1:
-                    stack.append(b'\x00')
-                    continue
-                
-                # Extract SIGHASH type (last byte)
-                sighash_type = sig[-1]
-                der_sig = sig[:-1]
-                
-                # Verify signature
-                try:
-                    # Calculate signature hash for this transaction/input
-                    # Note: Full implementation requires proper SignatureHash calculation
-                    # which depends on sighash_type (SIGHASH_ALL, SIGHASH_SINGLE, SIGHASH_NONE, etc.)
-                    # script_pubkey is passed from verify() method for signature hash calculation
-                    message_hash = self._calculate_signature_hash(tx, input_index, script_pubkey, sighash_type)
-                    
-                    # Verify ECDSA signature
-                    result = self._verify_ecdsa_signature(message_hash, der_sig, pubkey)
-                    
-                    if result:
-                        stack.append(b'\x01')
-                    else:
-                        stack.append(b'\x00')
-                
-                except Exception as e:
-                    # Any error during verification means invalid signature
-                    stack.append(b'\x00')
+            if opcode == 0x68:  # OP_ENDIF
+                if not exec_stack:
+                    raise ValueError("OP_ENDIF without OP_IF")
+                exec_stack.pop()
                 continue
-            
-            # OP_CHECKMULTISIG (0xae) - k-of-n signature verification
-            # Stack order (top to bottom): n, pub1..pubn, k, sig1..sigk, dummy
-            # Ref: en.bitcoin.it/wiki/OP_CHECKMULTISIG
-            if opcode == 0xae:
-                if len(stack) < 4:
-                    raise ValueError("Stack underflow for OP_CHECKMULTISIG")
-                n = self._read_num(stack.pop())
-                if n < 0 or n > 20:
-                    raise ValueError("OP_CHECKMULTISIG n out of range")
-                pubkeys = [stack.pop() for _ in range(n)]
-                if len(pubkeys) != n:
-                    raise ValueError("Stack underflow for OP_CHECKMULTISIG pubkeys")
-                k = self._read_num(stack.pop())
-                if k < 0 or k > n:
-                    raise ValueError("OP_CHECKMULTISIG k out of range")
-                sigs = [stack.pop() for _ in range(k)]
-                if len(sigs) != k:
-                    raise ValueError("Stack underflow for OP_CHECKMULTISIG sigs")
-                stack.pop()  # Dummy (Bitcoin bug - extra pop, must be OP_0 per BIP147)
-                valid = self._verify_multisig(
-                    sigs, pubkeys, k, tx, input_index, script_pubkey
-                )
-                stack.append(b'\x01' if valid else b'\x00')
+
+            if not executing:
                 continue
-            
-            # OP_0, OP_1-OP_16 (push empty array or numbers 1-16)
-            if opcode == 0x00:  # OP_0
+
+            # ════════════════════════════════════════════════════════════
+            #  From here on, the opcode is being executed.
+            # ════════════════════════════════════════════════════════════
+
+            # ── Constants ───────────────────────────────────────────────
+            if opcode == 0x00:  # OP_0 / OP_FALSE
                 stack.append(b'')
                 continue
-            
-            if 0x51 <= opcode <= 0x60:  # OP_1 to OP_16
-                num = opcode - 0x50
-                stack.append(bytes([num]))
-                continue
-
-            # OP_1NEGATE (0x4f)
-            if opcode == 0x4f:
+            if opcode == 0x4f:  # OP_1NEGATE
                 stack.append(b'\x81')
                 continue
+            if 0x51 <= opcode <= 0x60:  # OP_1 .. OP_16
+                stack.append(bytes([opcode - 0x50]))
+                continue
 
-            # OP_DROP (0x75)
-            if opcode == 0x75:
+            # ── Flow control ────────────────────────────────────────────
+            if opcode == 0x61:  # OP_NOP
+                continue
+            if opcode == 0x69:  # OP_VERIFY
+                if not stack:
+                    raise ValueError("OP_VERIFY: stack underflow")
+                if not self._cast_to_bool(stack.pop()):
+                    raise ValueError("OP_VERIFY failed")
+                continue
+            if opcode == 0x6a:  # OP_RETURN
+                raise ValueError("OP_RETURN encountered")
+
+            # ── Reserved (fail when executed) ───────────────────────────
+            if opcode in (0x50, 0x62, 0x89, 0x8a):
+                raise ValueError(f"Reserved opcode 0x{opcode:02x}")
+
+            # ── Stack manipulation ──────────────────────────────────────
+            if opcode == 0x6b:  # OP_TOALTSTACK
+                if not stack:
+                    raise ValueError("OP_TOALTSTACK: stack underflow")
+                altstack.append(stack.pop())
+                continue
+            if opcode == 0x6c:  # OP_FROMALTSTACK
+                if not altstack:
+                    raise ValueError("OP_FROMALTSTACK: altstack empty")
+                stack.append(altstack.pop())
+                continue
+            if opcode == 0x6d:  # OP_2DROP
+                if len(stack) < 2:
+                    raise ValueError("OP_2DROP: stack underflow")
+                stack.pop(); stack.pop()
+                continue
+            if opcode == 0x6e:  # OP_2DUP
+                if len(stack) < 2:
+                    raise ValueError("OP_2DUP: stack underflow")
+                stack.extend(stack[-2:])
+                continue
+            if opcode == 0x6f:  # OP_3DUP
+                if len(stack) < 3:
+                    raise ValueError("OP_3DUP: stack underflow")
+                stack.extend(stack[-3:])
+                continue
+            if opcode == 0x70:  # OP_2OVER
+                if len(stack) < 4:
+                    raise ValueError("OP_2OVER: stack underflow")
+                stack.extend(stack[-4:-2])
+                continue
+            if opcode == 0x71:  # OP_2ROT
+                if len(stack) < 6:
+                    raise ValueError("OP_2ROT: stack underflow")
+                pair = stack[-6:-4]
+                del stack[-6:-4]
+                stack.extend(pair)
+                continue
+            if opcode == 0x72:  # OP_2SWAP
+                if len(stack) < 4:
+                    raise ValueError("OP_2SWAP: stack underflow")
+                stack[-4:] = stack[-2:] + stack[-4:-2]
+                continue
+            if opcode == 0x73:  # OP_IFDUP
+                if not stack:
+                    raise ValueError("OP_IFDUP: stack underflow")
+                if self._cast_to_bool(stack[-1]):
+                    stack.append(stack[-1])
+                continue
+            if opcode == 0x74:  # OP_DEPTH
+                stack.append(self._encode_script_num(len(stack)))
+                continue
+            if opcode == 0x75:  # OP_DROP
                 if not stack:
                     raise ValueError("OP_DROP: stack underflow")
                 stack.pop()
                 continue
+            if opcode == 0x76:  # OP_DUP
+                if not stack:
+                    raise ValueError("OP_DUP: stack underflow")
+                stack.append(stack[-1])
+                continue
+            if opcode == 0x77:  # OP_NIP
+                if len(stack) < 2:
+                    raise ValueError("OP_NIP: stack underflow")
+                del stack[-2]
+                continue
+            if opcode == 0x78:  # OP_OVER
+                if len(stack) < 2:
+                    raise ValueError("OP_OVER: stack underflow")
+                stack.append(stack[-2])
+                continue
+            if opcode == 0x79:  # OP_PICK
+                if not stack:
+                    raise ValueError("OP_PICK: stack underflow")
+                n = self._read_signed_num(stack.pop())
+                if n < 0 or n >= len(stack):
+                    raise ValueError("OP_PICK: index out of range")
+                stack.append(stack[-(n + 1)])
+                continue
+            if opcode == 0x7a:  # OP_ROLL
+                if not stack:
+                    raise ValueError("OP_ROLL: stack underflow")
+                n = self._read_signed_num(stack.pop())
+                if n < 0 or n >= len(stack):
+                    raise ValueError("OP_ROLL: index out of range")
+                val = stack[-(n + 1)]
+                del stack[-(n + 1)]
+                stack.append(val)
+                continue
+            if opcode == 0x7b:  # OP_ROT
+                if len(stack) < 3:
+                    raise ValueError("OP_ROT: stack underflow")
+                stack.append(stack[-3])
+                del stack[-4]
+                continue
+            if opcode == 0x7c:  # OP_SWAP
+                if len(stack) < 2:
+                    raise ValueError("OP_SWAP: stack underflow")
+                stack[-1], stack[-2] = stack[-2], stack[-1]
+                continue
+            if opcode == 0x7d:  # OP_TUCK
+                if len(stack) < 2:
+                    raise ValueError("OP_TUCK: stack underflow")
+                stack.insert(-2, stack[-1])
+                continue
 
-            # OP_EQUAL (0x87)
-            if opcode == 0x87:
+            # ── Splice ──────────────────────────────────────────────────
+            if opcode == 0x82:  # OP_SIZE (does not pop)
+                if not stack:
+                    raise ValueError("OP_SIZE: stack underflow")
+                stack.append(self._encode_script_num(len(stack[-1])))
+                continue
+
+            # ── Bitwise logic ───────────────────────────────────────────
+            if opcode == 0x87:  # OP_EQUAL
                 if len(stack) < 2:
                     raise ValueError("OP_EQUAL: stack underflow")
-                a = stack.pop()
-                b = stack.pop()
+                a, b = stack.pop(), stack.pop()
                 stack.append(b'\x01' if a == b else b'')
                 continue
-
-            # OP_VERIFY (0x69)
-            if opcode == 0x69:
-                if not stack:
-                    raise ValueError("OP_VERIFY: stack underflow")
-                val = stack.pop()
-                if not val or val == b'\x00':
-                    raise ValueError("OP_VERIFY failed")
+            if opcode == 0x88:  # OP_EQUALVERIFY
+                if len(stack) < 2:
+                    raise ValueError("OP_EQUALVERIFY: stack underflow")
+                if stack.pop() != stack.pop():
+                    raise ValueError("OP_EQUALVERIFY failed")
                 continue
 
-            # OP_RETURN (0x6a) — provably unspendable
-            if opcode == 0x6a:
-                raise ValueError("OP_RETURN encountered")
+            # ── Arithmetic (unary) ──────────────────────────────────────
+            if opcode == 0x8b:  # OP_1ADD
+                if not stack:
+                    raise ValueError("OP_1ADD: stack underflow")
+                stack.append(self._encode_script_num(self._read_signed_num(stack.pop()) + 1))
+                continue
+            if opcode == 0x8c:  # OP_1SUB
+                if not stack:
+                    raise ValueError("OP_1SUB: stack underflow")
+                stack.append(self._encode_script_num(self._read_signed_num(stack.pop()) - 1))
+                continue
+            if opcode == 0x8f:  # OP_NEGATE
+                if not stack:
+                    raise ValueError("OP_NEGATE: stack underflow")
+                stack.append(self._encode_script_num(-self._read_signed_num(stack.pop())))
+                continue
+            if opcode == 0x90:  # OP_ABS
+                if not stack:
+                    raise ValueError("OP_ABS: stack underflow")
+                stack.append(self._encode_script_num(abs(self._read_signed_num(stack.pop()))))
+                continue
+            if opcode == 0x91:  # OP_NOT
+                if not stack:
+                    raise ValueError("OP_NOT: stack underflow")
+                stack.append(self._encode_script_num(int(self._read_signed_num(stack.pop()) == 0)))
+                continue
+            if opcode == 0x92:  # OP_0NOTEQUAL
+                if not stack:
+                    raise ValueError("OP_0NOTEQUAL: stack underflow")
+                stack.append(self._encode_script_num(int(self._read_signed_num(stack.pop()) != 0)))
+                continue
 
-            # OP_CHECKLOCKTIMEVERIFY (0xb1) — BIP 65
-            # Peek at top stack element and compare against tx.locktime.
-            # Ref: bitcoin/src/script/interpreter.cpp CheckLockTime()
-            if opcode == 0xb1:
+            # ── Arithmetic (binary) ─────────────────────────────────────
+            if opcode in (0x93, 0x94, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e,
+                          0x9f, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4):
+                if len(stack) < 2:
+                    raise ValueError(f"Arithmetic opcode 0x{opcode:02x}: stack underflow")
+                bn_b = self._read_signed_num(stack.pop())
+                bn_a = self._read_signed_num(stack.pop())
+                if opcode == 0x93:    # OP_ADD
+                    r = bn_a + bn_b
+                elif opcode == 0x94:  # OP_SUB
+                    r = bn_a - bn_b
+                elif opcode == 0x9a:  # OP_BOOLAND
+                    r = int(bn_a != 0 and bn_b != 0)
+                elif opcode == 0x9b:  # OP_BOOLOR
+                    r = int(bn_a != 0 or bn_b != 0)
+                elif opcode == 0x9c:  # OP_NUMEQUAL
+                    r = int(bn_a == bn_b)
+                elif opcode == 0x9d:  # OP_NUMEQUALVERIFY
+                    if bn_a != bn_b:
+                        raise ValueError("OP_NUMEQUALVERIFY failed")
+                    continue
+                elif opcode == 0x9e:  # OP_NUMNOTEQUAL
+                    r = int(bn_a != bn_b)
+                elif opcode == 0x9f:  # OP_LESSTHAN
+                    r = int(bn_a < bn_b)
+                elif opcode == 0xa0:  # OP_GREATERTHAN
+                    r = int(bn_a > bn_b)
+                elif opcode == 0xa1:  # OP_LESSTHANOREQUAL
+                    r = int(bn_a <= bn_b)
+                elif opcode == 0xa2:  # OP_GREATERTHANOREQUAL
+                    r = int(bn_a >= bn_b)
+                elif opcode == 0xa3:  # OP_MIN
+                    r = min(bn_a, bn_b)
+                elif opcode == 0xa4:  # OP_MAX
+                    r = max(bn_a, bn_b)
+                else:
+                    raise ValueError(f"Unknown arithmetic opcode 0x{opcode:02x}")
+                stack.append(self._encode_script_num(r))
+                continue
+
+            if opcode == 0xa5:  # OP_WITHIN  (ternary: x min max)
+                if len(stack) < 3:
+                    raise ValueError("OP_WITHIN: stack underflow")
+                mx = self._read_signed_num(stack.pop())
+                mn = self._read_signed_num(stack.pop())
+                x = self._read_signed_num(stack.pop())
+                stack.append(self._encode_script_num(int(mn <= x < mx)))
+                continue
+
+            # ── Crypto ──────────────────────────────────────────────────
+            if opcode == 0xa6:  # OP_RIPEMD160
+                if not stack:
+                    raise ValueError("OP_RIPEMD160: stack underflow")
+                stack.append(hashlib.new('ripemd160', stack.pop()).digest())
+                continue
+            if opcode == 0xa7:  # OP_SHA1
+                if not stack:
+                    raise ValueError("OP_SHA1: stack underflow")
+                stack.append(hashlib.sha1(stack.pop()).digest())
+                continue
+            if opcode == 0xa8:  # OP_SHA256
+                if not stack:
+                    raise ValueError("OP_SHA256: stack underflow")
+                stack.append(hashlib.sha256(stack.pop()).digest())
+                continue
+            if opcode == 0xa9:  # OP_HASH160
+                if not stack:
+                    raise ValueError("OP_HASH160: stack underflow")
+                stack.append(self._hash160(stack.pop()))
+                continue
+            if opcode == 0xaa:  # OP_HASH256
+                if not stack:
+                    raise ValueError("OP_HASH256: stack underflow")
+                stack.append(self._hash256(stack.pop()))
+                continue
+
+            # OP_CODESEPARATOR (0xab)
+            if opcode == 0xab:
+                continue
+
+            # ── Signature verification ──────────────────────────────────
+            if opcode == 0xac:  # OP_CHECKSIG
+                if len(stack) < 2:
+                    raise ValueError("OP_CHECKSIG: stack underflow")
+                pubkey = stack.pop()
+                sig = stack.pop()
+                if len(sig) < 1 or len(pubkey) < 1:
+                    stack.append(b'\x00')
+                    continue
+                sighash_type = sig[-1]
+                der_sig = sig[:-1]
+                try:
+                    msg = self._calculate_signature_hash(
+                        tx, input_index, script_pubkey, sighash_type)
+                    ok = self._verify_ecdsa_signature(msg, der_sig, pubkey)
+                    stack.append(b'\x01' if ok else b'\x00')
+                except Exception:
+                    stack.append(b'\x00')
+                continue
+
+            if opcode == 0xad:  # OP_CHECKSIGVERIFY
+                if len(stack) < 2:
+                    raise ValueError("OP_CHECKSIGVERIFY: stack underflow")
+                pubkey = stack.pop()
+                sig = stack.pop()
+                if len(sig) < 1 or len(pubkey) < 1:
+                    raise ValueError("OP_CHECKSIGVERIFY failed")
+                sighash_type = sig[-1]
+                der_sig = sig[:-1]
+                try:
+                    msg = self._calculate_signature_hash(
+                        tx, input_index, script_pubkey, sighash_type)
+                    if not self._verify_ecdsa_signature(msg, der_sig, pubkey):
+                        raise ValueError("OP_CHECKSIGVERIFY failed")
+                except ValueError:
+                    raise
+                except Exception:
+                    raise ValueError("OP_CHECKSIGVERIFY failed")
+                continue
+
+            if opcode == 0xae:  # OP_CHECKMULTISIG
+                if len(stack) < 1:
+                    raise ValueError("OP_CHECKMULTISIG: stack underflow")
+                n = self._read_num(stack.pop())
+                if n < 0 or n > 20:
+                    raise ValueError("OP_CHECKMULTISIG n out of range")
+                op_count += n
+                if op_count > 201:
+                    raise ValueError("Too many operations")
+                if len(stack) < n:
+                    raise ValueError("OP_CHECKMULTISIG: stack underflow")
+                pubkeys = [stack.pop() for _ in range(n)]
+                if not stack:
+                    raise ValueError("OP_CHECKMULTISIG: stack underflow")
+                k = self._read_num(stack.pop())
+                if k < 0 or k > n:
+                    raise ValueError("OP_CHECKMULTISIG k out of range")
+                if len(stack) < k:
+                    raise ValueError("OP_CHECKMULTISIG: stack underflow")
+                sigs = [stack.pop() for _ in range(k)]
+                if not stack:
+                    raise ValueError("OP_CHECKMULTISIG: missing dummy")
+                stack.pop()
+                valid = self._verify_multisig(
+                    sigs, pubkeys, k, tx, input_index, script_pubkey)
+                stack.append(b'\x01' if valid else b'\x00')
+                continue
+
+            if opcode == 0xaf:  # OP_CHECKMULTISIGVERIFY
+                if not stack:
+                    raise ValueError("OP_CHECKMULTISIGVERIFY: stack underflow")
+                n = self._read_num(stack.pop())
+                if n < 0 or n > 20:
+                    raise ValueError("OP_CHECKMULTISIGVERIFY n out of range")
+                op_count += n
+                if op_count > 201:
+                    raise ValueError("Too many operations")
+                if len(stack) < n:
+                    raise ValueError("OP_CHECKMULTISIGVERIFY: stack underflow")
+                pubkeys = [stack.pop() for _ in range(n)]
+                if not stack:
+                    raise ValueError("OP_CHECKMULTISIGVERIFY: stack underflow")
+                k = self._read_num(stack.pop())
+                if k < 0 or k > n:
+                    raise ValueError("OP_CHECKMULTISIGVERIFY k out of range")
+                if len(stack) < k:
+                    raise ValueError("OP_CHECKMULTISIGVERIFY: stack underflow")
+                sigs = [stack.pop() for _ in range(k)]
+                if not stack:
+                    raise ValueError("OP_CHECKMULTISIGVERIFY: missing dummy")
+                stack.pop()
+                if not self._verify_multisig(
+                    sigs, pubkeys, k, tx, input_index, script_pubkey):
+                    raise ValueError("OP_CHECKMULTISIGVERIFY failed")
+                continue
+
+            # ── Timelocks (BIP 65 / BIP 112) ────────────────────────────
+            if opcode == 0xb1:  # OP_CHECKLOCKTIMEVERIFY
                 if not stack:
                     raise ValueError("OP_CHECKLOCKTIMEVERIFY: stack empty")
-
                 lock_value = self._read_signed_num(stack[-1], max_len=5)
-
                 if lock_value < 0:
                     raise ValueError("OP_CHECKLOCKTIMEVERIFY: negative locktime")
-
                 LOCKTIME_THRESHOLD = 500_000_000
                 tx_locktime = tx.locktime
-
-                # Both must be the same type (height or timestamp)
                 if not (
                     (tx_locktime < LOCKTIME_THRESHOLD and lock_value < LOCKTIME_THRESHOLD) or
                     (tx_locktime >= LOCKTIME_THRESHOLD and lock_value >= LOCKTIME_THRESHOLD)
                 ):
                     raise ValueError("OP_CHECKLOCKTIMEVERIFY: locktime type mismatch")
-
                 if lock_value > tx_locktime:
                     raise ValueError("OP_CHECKLOCKTIMEVERIFY: unsatisfied")
-
-                # Input must not be finalized (sequence == 0xffffffff bypasses locktime)
                 if tx.inputs[input_index].sequence == 0xffffffff:
                     raise ValueError("OP_CHECKLOCKTIMEVERIFY: input is finalized")
-
                 continue
 
-            # OP_CHECKSEQUENCEVERIFY (0xb2) — BIP 112
-            # Peek at top stack element and compare against input nSequence
-            # for relative lock-time enforcement.
-            # Ref: bitcoin/src/script/interpreter.cpp CheckSequence()
-            if opcode == 0xb2:
+            if opcode == 0xb2:  # OP_CHECKSEQUENCEVERIFY
                 if not stack:
                     raise ValueError("OP_CHECKSEQUENCEVERIFY: stack empty")
-
                 lock_value = self._read_signed_num(stack[-1], max_len=5)
-
                 if lock_value < 0:
                     raise ValueError("OP_CHECKSEQUENCEVERIFY: negative sequence")
-
-                SEQUENCE_DISABLE = 1 << 31   # 0x80000000
-                SEQUENCE_TYPE = 1 << 22      # 0x00400000
-                SEQUENCE_MASK = 0x0000ffff
-
-                # Disable flag in operand → NOP
-                if lock_value & SEQUENCE_DISABLE:
+                SEQ_DISABLE = 1 << 31
+                SEQ_TYPE = 1 << 22
+                SEQ_MASK = 0x0000ffff
+                if lock_value & SEQ_DISABLE:
                     continue
-
-                # BIP 68 only applies to tx version >= 2
                 if tx.version < 2:
                     raise ValueError("OP_CHECKSEQUENCEVERIFY: tx version < 2")
-
-                tx_sequence = tx.inputs[input_index].sequence
-
-                # Input must not have disable flag set
-                if tx_sequence & SEQUENCE_DISABLE:
+                tx_seq = tx.inputs[input_index].sequence
+                if tx_seq & SEQ_DISABLE:
                     raise ValueError("OP_CHECKSEQUENCEVERIFY: input disable flag set")
-
-                # Mask to consensus bits and compare
-                mask = SEQUENCE_TYPE | SEQUENCE_MASK
-                tx_masked = tx_sequence & mask
+                mask = SEQ_TYPE | SEQ_MASK
+                tx_masked = tx_seq & mask
                 lock_masked = lock_value & mask
-
-                # Both must be same type (height-based or time-based)
                 if not (
-                    (tx_masked < SEQUENCE_TYPE and lock_masked < SEQUENCE_TYPE) or
-                    (tx_masked >= SEQUENCE_TYPE and lock_masked >= SEQUENCE_TYPE)
+                    (tx_masked < SEQ_TYPE and lock_masked < SEQ_TYPE) or
+                    (tx_masked >= SEQ_TYPE and lock_masked >= SEQ_TYPE)
                 ):
                     raise ValueError("OP_CHECKSEQUENCEVERIFY: type mismatch")
-
                 if lock_masked > tx_masked:
                     raise ValueError("OP_CHECKSEQUENCEVERIFY: unsatisfied")
-
                 continue
 
-            # OP_NOP1, OP_NOP4-OP_NOP10 — reserved NOPs (must be actual no-ops)
+            # ── Reserved NOPs ───────────────────────────────────────────
             if opcode in (0xb0, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9):
                 continue
 
-            # Remaining opcodes not yet implemented — allow silently for now
-            # (A.4 in FULL_NODE_COMPLETION_ROADMAP covers the full set)
-            pass
-        
+            raise ValueError(f"Unknown opcode 0x{opcode:02x}")
+
+        if exec_stack:
+            raise ValueError("Unbalanced OP_IF/OP_ENDIF")
+
         return stack
     
+    @staticmethod
+    def _cast_to_bool(data: bytes) -> bool:
+        """Bitcoin CastToBool: false iff all-zero bytes or negative zero (0x80)."""
+        for idx in range(len(data)):
+            if data[idx] != 0:
+                if idx == len(data) - 1 and data[idx] == 0x80:
+                    return False
+                return True
+        return False
+
     def _hash160(self, data: bytes) -> bytes:
         """Compute HASH160 (RIPEMD160(SHA256(data)))"""
         sha256_hash = hashlib.sha256(data).digest()
@@ -1267,42 +1513,47 @@ def disassemble_script(script: bytes) -> str:
 def _get_opcode_name(opcode: int) -> str:
     """Get opcode name from opcode value"""
     opcode_names = {
-        0x76: "OP_DUP",
-        0xa9: "OP_HASH160",
-        0x88: "OP_EQUALVERIFY",
-        0xac: "OP_CHECKSIG",
-        0x87: "OP_EQUAL",
-        0x6a: "OP_RETURN",
-        0x51: "OP_1",
-        0x52: "OP_2",
-        0x53: "OP_3",
-        0x54: "OP_4",
-        0x55: "OP_5",
-        0x56: "OP_6",
-        0x57: "OP_7",
-        0x58: "OP_8",
-        0x59: "OP_9",
-        0x5a: "OP_10",
-        0x5b: "OP_11",
-        0x5c: "OP_12",
-        0x5d: "OP_13",
-        0x5e: "OP_14",
-        0x5f: "OP_15",
-        0x60: "OP_16",
-        0x75: "OP_DROP",
-        0xad: "OP_CHECKSIGVERIFY",
-        0xae: "OP_CHECKMULTISIG",
-        0xaf: "OP_CHECKMULTISIGVERIFY",
+        0x00: "OP_0",
+        0x4f: "OP_1NEGATE",
+        0x51: "OP_1", 0x52: "OP_2", 0x53: "OP_3", 0x54: "OP_4",
+        0x55: "OP_5", 0x56: "OP_6", 0x57: "OP_7", 0x58: "OP_8",
+        0x59: "OP_9", 0x5a: "OP_10", 0x5b: "OP_11", 0x5c: "OP_12",
+        0x5d: "OP_13", 0x5e: "OP_14", 0x5f: "OP_15", 0x60: "OP_16",
+        0x61: "OP_NOP",
+        0x63: "OP_IF", 0x64: "OP_NOTIF",
+        0x67: "OP_ELSE", 0x68: "OP_ENDIF",
+        0x69: "OP_VERIFY", 0x6a: "OP_RETURN",
+        0x6b: "OP_TOALTSTACK", 0x6c: "OP_FROMALTSTACK",
+        0x6d: "OP_2DROP", 0x6e: "OP_2DUP", 0x6f: "OP_3DUP",
+        0x70: "OP_2OVER", 0x71: "OP_2ROT", 0x72: "OP_2SWAP",
+        0x73: "OP_IFDUP", 0x74: "OP_DEPTH",
+        0x75: "OP_DROP", 0x76: "OP_DUP",
+        0x77: "OP_NIP", 0x78: "OP_OVER",
+        0x79: "OP_PICK", 0x7a: "OP_ROLL",
+        0x7b: "OP_ROT", 0x7c: "OP_SWAP", 0x7d: "OP_TUCK",
+        0x82: "OP_SIZE",
+        0x87: "OP_EQUAL", 0x88: "OP_EQUALVERIFY",
+        0x8b: "OP_1ADD", 0x8c: "OP_1SUB",
+        0x8f: "OP_NEGATE", 0x90: "OP_ABS",
+        0x91: "OP_NOT", 0x92: "OP_0NOTEQUAL",
+        0x93: "OP_ADD", 0x94: "OP_SUB",
+        0x9a: "OP_BOOLAND", 0x9b: "OP_BOOLOR",
+        0x9c: "OP_NUMEQUAL", 0x9d: "OP_NUMEQUALVERIFY",
+        0x9e: "OP_NUMNOTEQUAL",
+        0x9f: "OP_LESSTHAN", 0xa0: "OP_GREATERTHAN",
+        0xa1: "OP_LESSTHANOREQUAL", 0xa2: "OP_GREATERTHANOREQUAL",
+        0xa3: "OP_MIN", 0xa4: "OP_MAX", 0xa5: "OP_WITHIN",
+        0xa6: "OP_RIPEMD160", 0xa7: "OP_SHA1",
+        0xa8: "OP_SHA256", 0xa9: "OP_HASH160", 0xaa: "OP_HASH256",
+        0xab: "OP_CODESEPARATOR",
+        0xac: "OP_CHECKSIG", 0xad: "OP_CHECKSIGVERIFY",
+        0xae: "OP_CHECKMULTISIG", 0xaf: "OP_CHECKMULTISIGVERIFY",
         0xb0: "OP_NOP1",
         0xb1: "OP_CHECKLOCKTIMEVERIFY",
         0xb2: "OP_CHECKSEQUENCEVERIFY",
-        0xb3: "OP_NOP4",
-        0xb4: "OP_NOP5",
-        0xb5: "OP_NOP6",
-        0xb6: "OP_NOP7",
-        0xb7: "OP_NOP8",
-        0xb8: "OP_NOP9",
-        0xb9: "OP_NOP10",
+        0xb3: "OP_NOP4", 0xb4: "OP_NOP5", 0xb5: "OP_NOP6",
+        0xb6: "OP_NOP7", 0xb7: "OP_NOP8",
+        0xb8: "OP_NOP9", 0xb9: "OP_NOP10",
         0xba: "OP_CHECKSIGADD",
     }
     return opcode_names.get(opcode, f"OP_UNKNOWN_{opcode:02x}")
