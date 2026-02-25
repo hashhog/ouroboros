@@ -260,13 +260,127 @@ class ScriptInterpreter:
                 num = opcode - 0x50
                 stack.append(bytes([num]))
                 continue
-            
-            # For other opcodes, we'll raise an error for now
-            # In a full implementation, we'd handle all opcodes
-            if opcode not in [0x75, 0x6a, 0x87, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f]:
-                # Unknown opcode - for now, allow it but log a warning
-                # In production, you'd want stricter validation
-                pass
+
+            # OP_1NEGATE (0x4f)
+            if opcode == 0x4f:
+                stack.append(b'\x81')
+                continue
+
+            # OP_DROP (0x75)
+            if opcode == 0x75:
+                if not stack:
+                    raise ValueError("OP_DROP: stack underflow")
+                stack.pop()
+                continue
+
+            # OP_EQUAL (0x87)
+            if opcode == 0x87:
+                if len(stack) < 2:
+                    raise ValueError("OP_EQUAL: stack underflow")
+                a = stack.pop()
+                b = stack.pop()
+                stack.append(b'\x01' if a == b else b'')
+                continue
+
+            # OP_VERIFY (0x69)
+            if opcode == 0x69:
+                if not stack:
+                    raise ValueError("OP_VERIFY: stack underflow")
+                val = stack.pop()
+                if not val or val == b'\x00':
+                    raise ValueError("OP_VERIFY failed")
+                continue
+
+            # OP_RETURN (0x6a) — provably unspendable
+            if opcode == 0x6a:
+                raise ValueError("OP_RETURN encountered")
+
+            # OP_CHECKLOCKTIMEVERIFY (0xb1) — BIP 65
+            # Peek at top stack element and compare against tx.locktime.
+            # Ref: bitcoin/src/script/interpreter.cpp CheckLockTime()
+            if opcode == 0xb1:
+                if not stack:
+                    raise ValueError("OP_CHECKLOCKTIMEVERIFY: stack empty")
+
+                lock_value = self._read_signed_num(stack[-1], max_len=5)
+
+                if lock_value < 0:
+                    raise ValueError("OP_CHECKLOCKTIMEVERIFY: negative locktime")
+
+                LOCKTIME_THRESHOLD = 500_000_000
+                tx_locktime = tx.locktime
+
+                # Both must be the same type (height or timestamp)
+                if not (
+                    (tx_locktime < LOCKTIME_THRESHOLD and lock_value < LOCKTIME_THRESHOLD) or
+                    (tx_locktime >= LOCKTIME_THRESHOLD and lock_value >= LOCKTIME_THRESHOLD)
+                ):
+                    raise ValueError("OP_CHECKLOCKTIMEVERIFY: locktime type mismatch")
+
+                if lock_value > tx_locktime:
+                    raise ValueError("OP_CHECKLOCKTIMEVERIFY: unsatisfied")
+
+                # Input must not be finalized (sequence == 0xffffffff bypasses locktime)
+                if tx.inputs[input_index].sequence == 0xffffffff:
+                    raise ValueError("OP_CHECKLOCKTIMEVERIFY: input is finalized")
+
+                continue
+
+            # OP_CHECKSEQUENCEVERIFY (0xb2) — BIP 112
+            # Peek at top stack element and compare against input nSequence
+            # for relative lock-time enforcement.
+            # Ref: bitcoin/src/script/interpreter.cpp CheckSequence()
+            if opcode == 0xb2:
+                if not stack:
+                    raise ValueError("OP_CHECKSEQUENCEVERIFY: stack empty")
+
+                lock_value = self._read_signed_num(stack[-1], max_len=5)
+
+                if lock_value < 0:
+                    raise ValueError("OP_CHECKSEQUENCEVERIFY: negative sequence")
+
+                SEQUENCE_DISABLE = 1 << 31   # 0x80000000
+                SEQUENCE_TYPE = 1 << 22      # 0x00400000
+                SEQUENCE_MASK = 0x0000ffff
+
+                # Disable flag in operand → NOP
+                if lock_value & SEQUENCE_DISABLE:
+                    continue
+
+                # BIP 68 only applies to tx version >= 2
+                if tx.version < 2:
+                    raise ValueError("OP_CHECKSEQUENCEVERIFY: tx version < 2")
+
+                tx_sequence = tx.inputs[input_index].sequence
+
+                # Input must not have disable flag set
+                if tx_sequence & SEQUENCE_DISABLE:
+                    raise ValueError("OP_CHECKSEQUENCEVERIFY: input disable flag set")
+
+                # Mask to consensus bits and compare
+                mask = SEQUENCE_TYPE | SEQUENCE_MASK
+                tx_masked = tx_sequence & mask
+                lock_masked = lock_value & mask
+
+                # Both must be same type (height-based or time-based)
+                if not (
+                    (tx_masked < SEQUENCE_TYPE and lock_masked < SEQUENCE_TYPE) or
+                    (tx_masked >= SEQUENCE_TYPE and lock_masked >= SEQUENCE_TYPE)
+                ):
+                    raise ValueError("OP_CHECKSEQUENCEVERIFY: type mismatch")
+
+                if lock_masked > tx_masked:
+                    raise ValueError("OP_CHECKSEQUENCEVERIFY: unsatisfied")
+
+                continue
+
+            # OP_NOP1, OP_NOP4-OP_NOP10 — reserved NOPs (must be actual no-ops)
+            if opcode in (0xb0, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9):
+                continue
+
+            # Remaining opcodes not yet implemented — allow silently for now
+            # (A.4 in FULL_NODE_COMPLETION_ROADMAP covers the full set)
+            pass
         
         return stack
     
@@ -284,6 +398,31 @@ class ScriptInterpreter:
         if not data:
             return 0
         return int.from_bytes(data, 'little')
+
+    def _read_signed_num(self, data: bytes, max_len: int = 4) -> int:
+        """
+        Decode a CScriptNum: signed little-endian with the MSB of the
+        last byte used as a sign bit.  Enforces minimal encoding.
+
+        Bitcoin Core: ``CScriptNum(stacktop(-1), fRequireMinimal, max_len)``
+        """
+        if not data:
+            return 0
+        if len(data) > max_len:
+            raise ValueError(f"CScriptNum overflow ({len(data)} > {max_len})")
+
+        # Minimal encoding check (Bitcoin Core CScriptNum constructor)
+        if data[-1] & 0x7f == 0:
+            if len(data) <= 1 or not (data[-2] & 0x80):
+                raise ValueError("Non-minimal CScriptNum encoding")
+
+        # Decode magnitude (little-endian, ignoring sign bit)
+        result = int.from_bytes(data, 'little')
+        if data[-1] & 0x80:
+            # Negative: clear the sign bit and negate
+            result &= ~(0x80 << ((len(data) - 1) * 8))
+            result = -result
+        return result
 
     def _encode_varint(self, value: int) -> bytes:
         """Encode variable-length integer for script serialization."""
@@ -1154,6 +1293,16 @@ def _get_opcode_name(opcode: int) -> str:
         0xad: "OP_CHECKSIGVERIFY",
         0xae: "OP_CHECKMULTISIG",
         0xaf: "OP_CHECKMULTISIGVERIFY",
+        0xb0: "OP_NOP1",
+        0xb1: "OP_CHECKLOCKTIMEVERIFY",
+        0xb2: "OP_CHECKSEQUENCEVERIFY",
+        0xb3: "OP_NOP4",
+        0xb4: "OP_NOP5",
+        0xb5: "OP_NOP6",
+        0xb6: "OP_NOP7",
+        0xb7: "OP_NOP8",
+        0xb8: "OP_NOP9",
+        0xb9: "OP_NOP10",
         0xba: "OP_CHECKSIGADD",
     }
     return opcode_names.get(opcode, f"OP_UNKNOWN_{opcode:02x}")
