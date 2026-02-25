@@ -527,7 +527,7 @@ class TestEncodeScriptNum:
         assert si._encode_script_num(-1) == b"\x81"
 
 
-# ── Phase 6: Production Hardening tests ──────────────────────────────
+# ── Logging, Cookie Auth & Metrics ────────────────────────────────────
 
 
 class TestJSONFormatter:
@@ -675,7 +675,7 @@ class TestMetrics:
         record_peer_disconnect()
 
 
-# ── Phase A.1 + A.2: Timelock Opcodes ────────────────────────────────
+# ── Timelock Opcodes (BIP 65 / BIP 112) ──────────────────────────────
 
 
 def _make_tx(locktime=0, version=2, sequence=0xfffffffe):
@@ -793,7 +793,7 @@ class TestTimelockOpcodes:
         assert stack == [b"\x01"]
 
 
-# ── Phase A.3: BIP 68 nSequence Relative Locktime ────────────────────
+# ── BIP 68 nSequence Relative Locktime ────────────────────────────────
 
 
 class _MockDB:
@@ -851,7 +851,7 @@ class TestBIP68SequenceLocks:
         assert v.check_sequence_locks(tx, block_height=101, block_mtp=0)
 
 
-# ── Phase A.4: Additional Script Opcodes ─────────────────────────────
+# ── Script Opcodes (flow control, stack, arithmetic, hashes) ─────────
 
 
 class TestScriptOpcodes:
@@ -990,3 +990,64 @@ class TestScriptOpcodes:
         assert not cb(b'\x80')       # negative zero
         assert cb(b'\x01')
         assert cb(b'\x80\x01')       # non-zero byte before last
+
+
+# ── BIP 152 Compact Blocks ────────────────────────────────────────────
+
+
+class TestCompactBlocks:
+    """BIP 152 compact block relay: SipHash, short IDs, reconstruction."""
+
+    def test_siphash_deterministic(self):
+        from ouroboros.compact_blocks import _siphash_2_4
+        key = b'\x00' * 16
+        assert _siphash_2_4(key, b'') == _siphash_2_4(key, b'')
+        assert _siphash_2_4(key, b'a') != _siphash_2_4(key, b'b')
+
+    def test_short_txid_48_bits(self):
+        from ouroboros.compact_blocks import short_txid, compute_siphash_key
+        header = b'\x01' * 80
+        key = compute_siphash_key(header, nonce=42)
+        assert len(key) == 16
+        sid = short_txid(key, b'\xaa' * 32)
+        assert 0 <= sid < (1 << 48)
+
+    def test_compact_block_roundtrip(self):
+        """Build a CompactBlock from a block, serialize, deserialize."""
+        from ouroboros.compact_blocks import CompactBlock, PrefilledTransaction
+        from ouroboros.database import Transaction, TxIn, TxOut
+
+        coinbase = Transaction(
+            txid=b'\x00' * 32, version=1, locktime=0,
+            inputs=[TxIn(b'\x00' * 32, 0xffffffff, b'\x04\xff\xff', 0xffffffff)],
+            outputs=[TxOut(5000000000, b'\x51')],
+        )
+        cb = CompactBlock(
+            header=b'\x02' * 80, nonce=123,
+            short_ids=[0xAABBCCDDEE, 0x112233445566],
+            prefilled_txs=[PrefilledTransaction(index=0, tx=coinbase)],
+        )
+        data = cb.serialize()
+        cb2 = CompactBlock.deserialize(data)
+        assert cb2.header == cb.header
+        assert cb2.nonce == cb.nonce
+        assert cb2.short_ids == cb.short_ids
+        assert len(cb2.prefilled_txs) == 1
+        assert cb2.prefilled_txs[0].index == 0
+
+    def test_block_txn_request_roundtrip(self):
+        from ouroboros.compact_blocks import BlockTransactionsRequest
+        req = BlockTransactionsRequest(block_hash=b'\xff' * 32, indices=[0, 5, 6])
+        data = req.serialize()
+        req2 = BlockTransactionsRequest.deserialize(data)
+        assert req2.block_hash == req.block_hash
+        assert req2.indices == req.indices
+
+    def test_sendcmpct_message(self):
+        from ouroboros.p2p_messages import SendCmpctMessage
+        msg = SendCmpctMessage(announce=True, version=2)
+        nm = msg.to_network_message("mainnet")
+        assert nm.command == "sendcmpct"
+        parsed = SendCmpctMessage.from_payload(nm.payload)
+        assert parsed.announce is True
+        assert parsed.version == 2
