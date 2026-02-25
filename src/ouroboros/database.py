@@ -444,6 +444,7 @@ class BlockchainDatabase:
             'vout': py_utxo.vout,
             'value': py_utxo.value,
             'script_pubkey': bytes(py_utxo.script_pubkey),
+            'height': getattr(py_utxo, 'height', None),
         }
     
     def store_block(self, block: Block) -> None:
@@ -600,6 +601,23 @@ class BlockchainDatabase:
             raise ValueError("Block hash must be 32 bytes")
         self._db.update_best_block(block_hash, height)
     
+    def get_median_time_past(self, height: int) -> Optional[int]:
+        """
+        Compute the median-time-past for a given block height.
+
+        MTP is the median of the timestamps of the previous 11 blocks
+        (or fewer if near the genesis block).  Used for BIP 68 / BIP 113.
+        """
+        timestamps = []
+        for h in range(max(0, height - 10), height + 1):
+            block = self.get_block_by_height(h)
+            if block is not None:
+                timestamps.append(block.timestamp)
+        if not timestamps:
+            return None
+        timestamps.sort()
+        return timestamps[len(timestamps) // 2]
+
     def get_balance(self, address: str, network: str = "mainnet") -> int:
         """
         Get total balance for an address (sum of all UTXOs matching script_pubkey).
