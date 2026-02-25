@@ -673,3 +673,179 @@ class TestMetrics:
     def test_record_peer_disconnect(self):
         from ouroboros.metrics import record_peer_disconnect
         record_peer_disconnect()
+
+
+# ── Phase A.1 + A.2: Timelock Opcodes ────────────────────────────────
+
+
+def _make_tx(locktime=0, version=2, sequence=0xfffffffe):
+    """Build a minimal Transaction for script testing."""
+    from ouroboros.database import Transaction, TxIn, TxOut
+    return Transaction(
+        txid=b"\x00" * 32,
+        version=version,
+        locktime=locktime,
+        inputs=[
+            TxIn(
+                prev_txid=b"\x01" * 32,
+                prev_vout=0,
+                script_sig=b"",
+                sequence=sequence,
+            )
+        ],
+        outputs=[
+            TxOut(value=50000, script_pubkey=b"\x00" * 25),
+        ],
+    )
+
+
+class TestTimelockOpcodes:
+    """BIP 65 (OP_CHECKLOCKTIMEVERIFY) and BIP 112 (OP_CHECKSEQUENCEVERIFY)."""
+
+    @staticmethod
+    def _encode_scriptnum(value):
+        if value == 0:
+            return b""
+        neg = value < 0
+        absval = abs(value)
+        result = []
+        while absval > 0:
+            result.append(absval & 0xff)
+            absval >>= 8
+        if result[-1] & 0x80:
+            result.append(0x80 if neg else 0x00)
+        elif neg:
+            result[-1] |= 0x80
+        return bytes(result)
+
+    def _run_cltv(self, lock_value, tx_locktime, sequence=0xfffffffe):
+        from ouroboros.script import ScriptInterpreter
+        si = ScriptInterpreter()
+        tx = _make_tx(locktime=tx_locktime, sequence=sequence)
+        lock_bytes = self._encode_scriptnum(lock_value)
+        script = bytes([len(lock_bytes)]) + lock_bytes + b"\xb1"
+        si._execute_script(script, tx, 0, b"")
+
+    def _run_csv(self, lock_value, sequence, version=2):
+        from ouroboros.script import ScriptInterpreter
+        si = ScriptInterpreter()
+        tx = _make_tx(version=version, sequence=sequence, locktime=0)
+        lock_bytes = self._encode_scriptnum(lock_value)
+        script = bytes([len(lock_bytes)]) + lock_bytes + b"\xb2"
+        si._execute_script(script, tx, 0, b"")
+
+    def test_read_signed_num(self):
+        from ouroboros.script import ScriptInterpreter
+        si = ScriptInterpreter()
+        assert si._read_signed_num(b"") == 0
+        assert si._read_signed_num(b"\x05") == 5
+        assert si._read_signed_num(b"\x85") == -5
+        assert si._read_signed_num(b"\x80\x00") == 128
+        assert si._read_signed_num(b"\x80\x80") == -128
+        assert si._read_signed_num(b"\x01\x00\x00\x00\x01", max_len=5) == (1 << 32) + 1
+        with pytest.raises(ValueError, match="overflow"):
+            si._read_signed_num(b"\x01\x02\x03\x04\x05", max_len=4)
+        with pytest.raises(ValueError, match="Non-minimal"):
+            si._read_signed_num(b"\x05\x00")
+
+    def test_cltv_satisfied_and_unsatisfied(self):
+        self._run_cltv(100, 200)           # height satisfied
+        self._run_cltv(500, 500)           # exact match
+        self._run_cltv(500_000_100, 500_000_200)  # timestamp satisfied
+        with pytest.raises(ValueError, match="unsatisfied"):
+            self._run_cltv(500, 100)
+
+    def test_cltv_type_mismatch_and_negative(self):
+        with pytest.raises(ValueError, match="type mismatch"):
+            self._run_cltv(100, 500_000_100)
+        with pytest.raises(ValueError, match="negative"):
+            self._run_cltv(-1, 100)
+
+    def test_cltv_finalized_input(self):
+        with pytest.raises(ValueError, match="finalized"):
+            self._run_cltv(100, 200, sequence=0xffffffff)
+
+    def test_cltv_peeks_not_pops(self):
+        from ouroboros.script import ScriptInterpreter
+        si = ScriptInterpreter()
+        tx = _make_tx(locktime=200)
+        stack = si._execute_script(b"\x01\x64\xb1\x75\x51", tx, 0, b"")
+        assert stack == [b"\x01"]
+
+    def test_csv_satisfied_and_unsatisfied(self):
+        self._run_csv(10, 15)
+        self._run_csv(10, 10)
+        with pytest.raises(ValueError, match="unsatisfied"):
+            self._run_csv(15, 10)
+
+    def test_csv_disable_flag_is_nop(self):
+        self._run_csv((1 << 31) | 999, 0)
+
+    def test_csv_version_1_rejected(self):
+        with pytest.raises(ValueError, match="version"):
+            self._run_csv(10, 15, version=1)
+
+    def test_csv_peeks_not_pops(self):
+        from ouroboros.script import ScriptInterpreter
+        si = ScriptInterpreter()
+        tx = _make_tx(version=2, sequence=20, locktime=0)
+        stack = si._execute_script(b"\x01\x0a\xb2\x75\x51", tx, 0, b"")
+        assert stack == [b"\x01"]
+
+
+# ── Phase A.3: BIP 68 nSequence Relative Locktime ────────────────────
+
+
+class _MockDB:
+    """Minimal mock for TransactionValidator.check_sequence_locks tests."""
+
+    def __init__(self, utxo_height, utxo_mtp=0):
+        self._utxo_height = utxo_height
+        self._utxo_mtp = utxo_mtp
+
+    def get_utxo(self, txid, vout):
+        return {
+            'txid': txid, 'vout': vout,
+            'value': 50000, 'script_pubkey': b"\x00" * 25,
+            'height': self._utxo_height,
+        }
+
+    def get_median_time_past(self, height):
+        return self._utxo_mtp
+
+
+class TestBIP68SequenceLocks:
+    """BIP 68: nSequence relative locktime enforcement in TransactionValidator."""
+
+    TYPE_FLAG = 1 << 22
+    DISABLE  = 1 << 31
+
+    def _validator(self, utxo_height, utxo_mtp=0):
+        from ouroboros.validation import TransactionValidator
+        return TransactionValidator(_MockDB(utxo_height, utxo_mtp))
+
+    def test_height_lock_satisfied_and_rejected(self):
+        v = self._validator(utxo_height=100)
+        tx_ok = _make_tx(version=2, sequence=5)
+        assert v.check_sequence_locks(tx_ok, block_height=110, block_mtp=0)
+        tx_fail = _make_tx(version=2, sequence=20)
+        assert not v.check_sequence_locks(tx_fail, block_height=110, block_mtp=0)
+
+    def test_time_lock_satisfied_and_rejected(self):
+        v = self._validator(utxo_height=100, utxo_mtp=1_000_000)
+        seq_ok = self.TYPE_FLAG | 10   # 10 * 512 = 5120 s required
+        tx_ok = _make_tx(version=2, sequence=seq_ok)
+        assert v.check_sequence_locks(tx_ok, block_height=200, block_mtp=1_006_000)
+        seq_fail = self.TYPE_FLAG | 20  # 10240 s required
+        tx_fail = _make_tx(version=2, sequence=seq_fail)
+        assert not v.check_sequence_locks(tx_fail, block_height=200, block_mtp=1_006_000)
+
+    def test_version_1_skips_check(self):
+        v = self._validator(utxo_height=100)
+        tx = _make_tx(version=1, sequence=9999)
+        assert v.check_sequence_locks(tx, block_height=101, block_mtp=0)
+
+    def test_disable_flag_skips_input(self):
+        v = self._validator(utxo_height=100)
+        tx = _make_tx(version=2, sequence=self.DISABLE | 9999)
+        assert v.check_sequence_locks(tx, block_height=101, block_mtp=0)
