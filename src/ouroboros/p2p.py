@@ -14,7 +14,10 @@ from typing import List, Dict, Set, Optional
 from collections import defaultdict
 
 from ouroboros.peer import Peer, PeerState
-from ouroboros.p2p_messages import NetworkMessage
+from ouroboros.p2p_messages import (
+    NetworkMessage, SendCmpctMessage, CmpctBlockMessage,
+    GetBlockTxnMessage, BlockTxnMessage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,12 @@ class PeerManager:
         
         self.running = False
         self._maintenance_task: Optional[asyncio.Task] = None
+
+        # BIP 152 compact-block state
+        self.compact_block_version: int = 2
+        self.cmpct_peers: Set[str] = set()  # peers that support compact blocks
+        self._mempool = None  # set via set_mempool()
+        self._on_compact_block = None  # callback(block_hash, txs_or_None, missing)
     
     async def start(self, start_height: int = 0):
         """
@@ -207,6 +216,8 @@ class PeerManager:
             if await peer.connect(start_height, retry=False):
                 self.peers[addr] = peer
                 self.retry_counts[addr] = 0  # Reset retry count on success
+                self._register_compact_handlers(peer, addr)
+                asyncio.ensure_future(self.negotiate_compact_blocks(peer))
                 logger.info(f"Connected to peer {addr} ({len(self.peers)}/{self.max_peers})")
             else:
                 # Failed to connect
@@ -280,6 +291,69 @@ class PeerManager:
                 logger.error(f"Error in maintain_connections: {e}")
                 await asyncio.sleep(30)
     
+    # ── BIP 152 Compact Blocks ───────────────────────────────────────
+
+    def set_mempool(self, mempool) -> None:
+        """Provide the mempool for compact block reconstruction."""
+        self._mempool = mempool
+
+    def set_compact_block_handler(self, handler) -> None:
+        """Register a callback for incoming compact blocks.
+
+        handler(block_hash: bytes, txs: Optional[List[Transaction]],
+                missing_indices: List[int]) -> None
+        """
+        self._on_compact_block = handler
+
+    async def negotiate_compact_blocks(self, peer: Peer) -> None:
+        """Send ``sendcmpct`` to a newly-connected peer."""
+        msg = SendCmpctMessage(announce=False, version=self.compact_block_version)
+        try:
+            await peer.send_message(msg.to_network_message(self.network))
+            logger.debug(f"Sent sendcmpct (v{self.compact_block_version}) to "
+                         f"{peer.host}:{peer.port}")
+        except Exception as e:
+            logger.warning(f"Failed to send sendcmpct to {peer.host}:{peer.port}: {e}")
+
+    def _register_compact_handlers(self, peer: Peer, addr: str) -> None:
+        """Wire up compact-block message handlers on a peer."""
+        async def on_sendcmpct(msg: NetworkMessage):
+            sc = SendCmpctMessage.from_payload(msg.payload)
+            if sc.version in (1, 2):
+                self.cmpct_peers.add(addr)
+                logger.info(f"Peer {addr} supports compact blocks v{sc.version}")
+
+        async def on_cmpctblock(msg: NetworkMessage):
+            from ouroboros.compact_blocks import CompactBlock
+            cb = CompactBlock.deserialize(msg.payload)
+            if self._mempool is not None:
+                txs, missing = cb.reconstruct(self._mempool)
+            else:
+                txs, missing = None, list(range(
+                    len(cb.short_ids) + len(cb.prefilled_txs)))
+            if self._on_compact_block:
+                self._on_compact_block(cb.block_hash, txs, missing)
+            if missing:
+                from ouroboros.compact_blocks import BlockTransactionsRequest
+                req = BlockTransactionsRequest(
+                    block_hash=cb.block_hash, indices=missing)
+                gbt = GetBlockTxnMessage(payload_bytes=req.serialize())
+                try:
+                    await peer.send_message(
+                        gbt.to_network_message(self.network))
+                except Exception as e:
+                    logger.warning(f"Failed to send getblocktxn to {addr}: {e}")
+
+        async def on_blocktxn(msg: NetworkMessage):
+            from ouroboros.compact_blocks import BlockTransactions
+            bt = BlockTransactions.deserialize(msg.payload)
+            if self._on_compact_block:
+                self._on_compact_block(bt.block_hash, bt.transactions, [])
+
+        peer.register_handler("sendcmpct", on_sendcmpct)
+        peer.register_handler("cmpctblock", on_cmpctblock)
+        peer.register_handler("blocktxn", on_blocktxn)
+
     def get_best_peer(self) -> Optional[Peer]:
         """
         Get peer with lowest latency.
