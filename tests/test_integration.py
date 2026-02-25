@@ -849,3 +849,144 @@ class TestBIP68SequenceLocks:
         v = self._validator(utxo_height=100)
         tx = _make_tx(version=2, sequence=self.DISABLE | 9999)
         assert v.check_sequence_locks(tx, block_height=101, block_mtp=0)
+
+
+# ── Phase A.4: Additional Script Opcodes ─────────────────────────────
+
+
+class TestScriptOpcodes:
+    """Additional script opcodes: flow control, stack, arithmetic, hashes."""
+
+    def _run(self, script_hex, locktime=0, sequence=0xfffffffe):
+        from ouroboros.script import ScriptInterpreter
+        si = ScriptInterpreter()
+        tx = _make_tx(locktime=locktime, sequence=sequence)
+        return si._execute_script(bytes.fromhex(script_hex), tx, 0, b"")
+
+    def test_if_else_endif(self):
+        # OP_1 OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF → [2]
+        s = self._run("5163 52 67 53 68")
+        assert s == [b'\x02']
+        # OP_0 OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF → [3]
+        s = self._run("0063 52 67 53 68")
+        assert s == [b'\x03']
+
+    def test_notif(self):
+        # OP_0 OP_NOTIF OP_5 OP_ENDIF → [5]
+        s = self._run("0064 55 68")
+        assert s == [b'\x05']
+
+    def test_nested_if(self):
+        # OP_1 OP_IF OP_0 OP_IF OP_2 OP_ELSE OP_3 OP_ENDIF OP_ENDIF → [3]
+        s = self._run("5163 0063 52 67 53 68 68")
+        assert s == [b'\x03']
+
+    def test_unbalanced_if_fails(self):
+        with pytest.raises(ValueError, match="Unbalanced"):
+            self._run("5163 52")  # OP_1 OP_IF OP_2 (no ENDIF)
+
+    def test_stack_ops(self):
+        # SWAP: push 1 2, swap → [2, 1]
+        assert self._run("5152 7c") == [b'\x02', b'\x01']
+        # ROT: push 1 2 3, rot → [2, 3, 1]
+        assert self._run("515253 7b") == [b'\x02', b'\x03', b'\x01']
+        # OVER: push 1 2, over → [1, 2, 1]
+        assert self._run("5152 78") == [b'\x01', b'\x02', b'\x01']
+        # NIP: push 1 2, nip → [2]
+        assert self._run("5152 77") == [b'\x02']
+        # TUCK: push 1 2, tuck → [2, 1, 2]
+        assert self._run("5152 7d") == [b'\x02', b'\x01', b'\x02']
+        # 2DUP: push 1 2, 2dup → [1, 2, 1, 2]
+        assert self._run("5152 6e") == [b'\x01', b'\x02', b'\x01', b'\x02']
+        # 2DROP: push 1 2 3, 2drop → [1]
+        assert self._run("515253 6d") == [b'\x01']
+
+    def test_pick_and_roll(self):
+        # push 10 20 30, OP_2 OP_PICK → [..., 10]
+        s = self._run("010a 0114 011e 52 79")
+        assert s[-1] == b'\x0a'
+        assert len(s) == 4
+        # push 10 20 30, OP_2 OP_ROLL → 10 moved to top, len=3
+        s = self._run("010a 0114 011e 52 7a")
+        assert s[-1] == b'\x0a'
+        assert len(s) == 3
+
+    def test_altstack(self):
+        # push 42, toaltstack, push 99, fromaltstack → [99, 42]
+        s = self._run("012a 6b 0163 6c")
+        assert s == [b'\x63', b'\x2a']
+
+    def test_depth_and_size(self):
+        # push "abc"(3 bytes), OP_SIZE → [b"abc", 3]
+        s = self._run("03616263 82")
+        assert s[0] == b'abc'
+        assert s[1] == b'\x03'
+        # OP_1 OP_2 OP_DEPTH → [1, 2, 2]
+        s = self._run("5152 74")
+        assert s == [b'\x01', b'\x02', b'\x02']
+
+    def test_arithmetic(self):
+        # 3 + 5 = 8
+        assert self._run("5355 93") == [b'\x08']
+        # 5 - 3 = 2
+        assert self._run("5553 94") == [b'\x02']
+        # 1ADD(4) = 5
+        assert self._run("54 8b") == [b'\x05']
+        # 1SUB(4) = 3
+        assert self._run("54 8c") == [b'\x03']
+        # NEGATE(5) = -5
+        assert self._run("55 8f") == [b'\x85']
+        # ABS(-5) = 5
+        assert self._run("0185 90") == [b'\x05']
+        # NOT(0) = 1, NOT(1) = 0
+        assert self._run("00 91") == [b'\x01']
+        assert self._run("51 91") == [b'']
+
+    def test_comparisons(self):
+        # 3 < 5 → 1
+        assert self._run("5355 9f") == [b'\x01']
+        # 5 < 3 → 0
+        assert self._run("5553 9f") == [b'']
+        # 3 == 3 (NUMEQUAL) → 1
+        assert self._run("5353 9c") == [b'\x01']
+        # MIN(3,5) = 3, MAX(3,5) = 5
+        assert self._run("5355 a3") == [b'\x03']
+        assert self._run("5355 a4") == [b'\x05']
+
+    def test_within(self):
+        # WITHIN(3, 1, 5) → true (1 <= 3 < 5)
+        assert self._run("535155 a5") == [b'\x01']
+        # WITHIN(5, 1, 5) → false (5 not < 5)
+        assert self._run("555155 a5") == [b'']
+
+    def test_hash_opcodes(self):
+        import hashlib
+        data = b'\x42'
+        # OP_SHA256
+        s = self._run("0142 a8")
+        assert s == [hashlib.sha256(data).digest()]
+        # OP_HASH256 (double SHA256)
+        s = self._run("0142 aa")
+        assert s == [hashlib.sha256(hashlib.sha256(data).digest()).digest()]
+        # OP_RIPEMD160
+        s = self._run("0142 a6")
+        assert s == [hashlib.new('ripemd160', data).digest()]
+
+    def test_disabled_opcodes_fail(self):
+        for op in ['7e', '7f', '83', '95']:
+            with pytest.raises(ValueError, match="Disabled"):
+                self._run(f"5152 {op}")
+
+    def test_op_return_fails(self):
+        with pytest.raises(ValueError, match="OP_RETURN"):
+            self._run("6a")
+
+    def test_cast_to_bool(self):
+        from ouroboros.script import ScriptInterpreter
+        cb = ScriptInterpreter._cast_to_bool
+        assert not cb(b'')
+        assert not cb(b'\x00')
+        assert not cb(b'\x00\x00')
+        assert not cb(b'\x80')       # negative zero
+        assert cb(b'\x01')
+        assert cb(b'\x80\x01')       # non-zero byte before last
