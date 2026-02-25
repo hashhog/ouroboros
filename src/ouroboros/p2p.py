@@ -18,6 +18,7 @@ from ouroboros.p2p_messages import (
     NetworkMessage, SendCmpctMessage, CmpctBlockMessage,
     GetBlockTxnMessage, BlockTxnMessage,
 )
+from ouroboros.banman import BanManager
 
 logger = logging.getLogger(__name__)
 
@@ -43,20 +44,30 @@ DNS_SEEDS_TESTNET = [
 class PeerManager:
     """Manages peer connections and discovery"""
     
-    def __init__(self, network: str = "mainnet", max_peers: int = 8):
+    def __init__(
+        self,
+        network: str = "mainnet",
+        max_peers: int = 8,
+        data_dir: Optional[str] = None,
+    ):
         """
         Initialize peer manager.
         
         Args:
             network: Network name (mainnet, testnet, regtest)
             max_peers: Maximum number of connected peers
+            data_dir: Data directory for persisting bans
         """
         self.network = network
         self.max_peers = max_peers
         
         self.peers: Dict[str, Peer] = {}  # addr -> Peer
         self.known_addrs: Set[str] = set()
-        self.banned_addrs: Dict[str, float] = {}  # addr -> unban_time
+
+        self.ban_manager = BanManager(
+            data_dir=data_dir,
+            on_ban=self._on_peer_banned,
+        )
         
         # Connection retry tracking (addr -> retry_count)
         self.retry_counts: Dict[str, int] = defaultdict(int)
@@ -67,9 +78,9 @@ class PeerManager:
 
         # BIP 152 compact-block state
         self.compact_block_version: int = 2
-        self.cmpct_peers: Set[str] = set()  # peers that support compact blocks
-        self._mempool = None  # set via set_mempool()
-        self._on_compact_block = None  # callback(block_hash, txs_or_None, missing)
+        self.cmpct_peers: Set[str] = set()
+        self._mempool = None
+        self._on_compact_block = None
     
     async def start(self, start_height: int = 0):
         """
@@ -178,7 +189,7 @@ class PeerManager:
             for addr_info in addrs:
                 ip = addr_info[4][0]
                 addr = f"{ip}:{port}"
-                if addr not in self.banned_addrs:
+                if not self.ban_manager.is_banned(addr):
                     self.known_addrs.add(addr)
                     count += 1
             
@@ -195,8 +206,7 @@ class PeerManager:
             available = (
                 self.known_addrs
                 - set(self.peers.keys())
-                - {addr for addr, unban_time in self.banned_addrs.items()
-                   if time.time() < unban_time}
+                - {a for a in self.known_addrs if self.ban_manager.is_banned(a)}
             )
             
             if not available:
@@ -429,27 +439,30 @@ class PeerManager:
         await asyncio.gather(*tasks, return_exceptions=True)
         logger.debug(f"Broadcast {msg.command} to {len(ready_peers)} peers")
     
-    def ban_peer(self, addr: str, duration: int = 3600):
+    def ban_peer(self, addr: str, duration: int = 86400):
         """
         Ban a peer temporarily.
         
         Args:
             addr: Peer address (host:port)
-            duration: Ban duration in seconds (default: 1 hour)
+            duration: Ban duration in seconds (default: 24 hours)
         """
-        unban_time = time.time() + duration
-        self.banned_addrs[addr] = unban_time
-        
-        if addr in self.peers:
-            peer = self.peers[addr]
-            asyncio.create_task(peer.disconnect())
-            del self.peers[addr]
-        
-        # Remove from known addresses
-        self.known_addrs.discard(addr)
-        
-        logger.warning(f"Banned peer {addr} for {duration} seconds")
-    
+        self.ban_manager.ban_duration = duration
+        self.ban_manager.ban(addr)
+
+    def _on_peer_banned(self, ip: str) -> None:
+        """Callback from BanManager — disconnect and forget the peer."""
+        matching = [a for a in list(self.peers) if a.startswith(ip)]
+        for addr in matching:
+            peer = self.peers.pop(addr, None)
+            if peer:
+                asyncio.ensure_future(peer.disconnect())
+        self.known_addrs.discard(ip)
+
+    def record_misbehavior(self, addr: str, score: int, reason: str) -> None:
+        """Record misbehavior for a peer; auto-bans at threshold."""
+        self.ban_manager.record_misbehavior(addr, score, reason)
+
     def unban_peer(self, addr: str):
         """
         Unban a peer.
@@ -457,9 +470,7 @@ class PeerManager:
         Args:
             addr: Peer address (host:port)
         """
-        if addr in self.banned_addrs:
-            del self.banned_addrs[addr]
-            logger.info(f"Unbanned peer {addr}")
+        self.ban_manager.unban(addr)
     
     def add_peer_address(self, addr: str):
         """
@@ -468,7 +479,7 @@ class PeerManager:
         Args:
             addr: Peer address (host:port)
         """
-        if addr not in self.banned_addrs:
+        if not self.ban_manager.is_banned(addr):
             self.known_addrs.add(addr)
             logger.debug(f"Added peer address: {addr}")
     
@@ -501,7 +512,7 @@ class PeerManager:
             "connected": len(self.peers),
             "ready": len(ready_peers),
             "known": len(self.known_addrs),
-            "banned": len(self.banned_addrs),
+            "banned": len(self.ban_manager.list_banned()),
             "avg_latency": avg_latency,
             "avg_score": avg_score,
         }
