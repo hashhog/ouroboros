@@ -63,7 +63,10 @@ class BlockValidator:
         if not self._verify_merkle_root(block):
             return False, "Invalid merkle root"
         
-        # 4. Validate all transactions
+        # 4. Compute median-time-past for BIP 68
+        block_mtp = self.db.get_median_time_past(expected_height - 1) or 0
+
+        # 5. Validate all transactions
         total_fees = 0
         for i, tx in enumerate(block.transactions):
             if i == 0:  # Coinbase
@@ -71,7 +74,7 @@ class BlockValidator:
                     return False, "Invalid coinbase"
             else:
                 valid, error = self.tx_validator.validate_transaction(
-                    tx, expected_height
+                    tx, expected_height, block_mtp
                 )
                 if not valid:
                     return False, f"Transaction {i} invalid: {error}"
@@ -80,7 +83,7 @@ class BlockValidator:
                 fee = self._calculate_tx_fee(tx)
                 total_fees += fee
         
-        # 5. Verify coinbase amount
+        # 6. Verify coinbase amount
         if not self._verify_coinbase_amount(
             block.transactions[0],
             expected_height,
@@ -326,13 +329,16 @@ class TransactionValidator:
         self.db = db
         self.script_interpreter = ScriptInterpreter()
         
-    def validate_transaction(self, tx: Transaction, height: int) -> Tuple[bool, str]:
+    def validate_transaction(
+        self, tx: Transaction, height: int, block_mtp: int = 0
+    ) -> Tuple[bool, str]:
         """
         Validate transaction.
         
         Args:
             tx: Transaction to validate
-            height: Block height (for coinbase validation)
+            height: Block height
+            block_mtp: Block median-time-past (for BIP 68 time-based locks)
             
         Returns:
             (is_valid, error_message)
@@ -364,6 +370,10 @@ class TransactionValidator:
         min_fee = self._calculate_min_fee(tx)
         if fee < min_fee:
             return False, f"Fee too low: {fee} < {min_fee} (minimum {min_fee} satoshis)"
+        
+        # 6. BIP 68 relative lock-time
+        if not self.check_sequence_locks(tx, height, block_mtp):
+            return False, "BIP 68 sequence lock not satisfied"
         
         return True, ""
     
@@ -420,6 +430,54 @@ class TransactionValidator:
             input_index
         )
     
+    # ── BIP 68 constants ──────────────────────────────────────────────
+    SEQUENCE_DISABLE = 1 << 31       # 0x80000000
+    SEQUENCE_TYPE    = 1 << 22       # 0x00400000  (time-based if set)
+    SEQUENCE_MASK    = 0x0000ffff
+
+    def check_sequence_locks(
+        self, tx: Transaction, block_height: int, block_mtp: int
+    ) -> bool:
+        """
+        BIP 68: verify relative lock-time constraints on every input.
+
+        Called before a v2+ transaction is accepted into a block.
+        For each input whose disable flag is NOT set:
+          - height-based: UTXO must be buried by at least (sequence & MASK) blocks
+          - time-based:   MTP must exceed UTXO's MTP by (sequence & MASK) * 512 s
+        """
+        if tx.version < 2:
+            return True
+
+        for inp in tx.inputs:
+            if inp.sequence & self.SEQUENCE_DISABLE:
+                continue
+
+            utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
+            if utxo is None:
+                return False
+
+            utxo_height = utxo.get('height')
+            if utxo_height is None:
+                continue  # no height metadata — skip (assumevalid-era UTXO)
+
+            if inp.sequence & self.SEQUENCE_TYPE:
+                # Time-based: units of 512 seconds
+                required = (inp.sequence & self.SEQUENCE_MASK) * 512
+                utxo_mtp = self.db.get_median_time_past(utxo_height)
+                if utxo_mtp is None:
+                    continue
+                if block_mtp - utxo_mtp < required:
+                    return False
+            else:
+                # Height-based
+                required = inp.sequence & self.SEQUENCE_MASK
+                depth = block_height - utxo_height
+                if depth < required:
+                    return False
+
+        return True
+
     def _calculate_min_fee(self, tx: Transaction) -> int:
         """
         Calculate minimum relay fee (1 sat/vbyte).
