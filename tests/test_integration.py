@@ -1051,3 +1051,57 @@ class TestCompactBlocks:
         parsed = SendCmpctMessage.from_payload(nm.payload)
         assert parsed.announce is True
         assert parsed.version == 2
+
+
+# ── Peer Misbehavior Tracking & Banning ──────────────────────────────
+
+
+class TestBanManager:
+    """BanManager: scoring, auto-ban, expiry, persistence."""
+
+    def test_score_accumulation_and_auto_ban(self):
+        from ouroboros.banman import BanManager
+        bm = BanManager(ban_threshold=100)
+        bm.record_misbehavior("1.2.3.4", 50, "bad headers")
+        assert not bm.is_banned("1.2.3.4")
+        assert bm.get_score("1.2.3.4") == 50
+        bm.record_misbehavior("1.2.3.4", 60, "invalid block")
+        assert bm.is_banned("1.2.3.4")
+        assert bm.get_score("1.2.3.4") == 0  # score cleared on ban
+
+    def test_instant_ban(self):
+        from ouroboros.banman import BanManager
+        bm = BanManager(ban_threshold=100)
+        bm.record_misbehavior("5.6.7.8", 100, "invalid block header")
+        assert bm.is_banned("5.6.7.8")
+
+    def test_ban_expires(self):
+        from ouroboros.banman import BanManager
+        bm = BanManager(ban_threshold=100, ban_duration=1)
+        bm.ban("9.8.7.6")
+        assert bm.is_banned("9.8.7.6")
+        bm.banned["9.8.7.6"] = 0  # force expiry
+        assert not bm.is_banned("9.8.7.6")
+
+    def test_manual_unban(self):
+        from ouroboros.banman import BanManager
+        bm = BanManager(ban_threshold=100)
+        bm.ban("10.0.0.1")
+        assert bm.is_banned("10.0.0.1")
+        bm.unban("10.0.0.1")
+        assert not bm.is_banned("10.0.0.1")
+
+    def test_persistence(self, tmp_path):
+        from ouroboros.banman import BanManager
+        bm1 = BanManager(ban_threshold=100, data_dir=str(tmp_path))
+        bm1.ban("1.1.1.1")
+        assert (tmp_path / "bans.json").exists()
+        bm2 = BanManager(ban_threshold=100, data_dir=str(tmp_path))
+        assert bm2.is_banned("1.1.1.1")
+
+    def test_on_ban_callback(self):
+        from ouroboros.banman import BanManager
+        banned_ips = []
+        bm = BanManager(ban_threshold=50, on_ban=banned_ips.append)
+        bm.record_misbehavior("2.2.2.2", 50, "test")
+        assert banned_ips == ["2.2.2.2"]
