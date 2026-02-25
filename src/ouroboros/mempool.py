@@ -79,11 +79,13 @@ class Mempool:
         if not valid:
             return False, error
         
-        # Check for conflicts (double spends)
-        for tx_in in tx.inputs:
-            outpoint: OutPoint = (tx_in.prev_txid, tx_in.prev_vout)
-            if outpoint in self.spent_outputs:
-                return False, "Double spend detected"
+        # Check for conflicts (double spends) — attempt BIP 125 RBF
+        has_conflict = any(
+            (tx_in.prev_txid, tx_in.prev_vout) in self.spent_outputs
+            for tx_in in tx.inputs
+        )
+        if has_conflict:
+            return self.try_replace(tx, height)
         
         # Check mempool size
         tx_size = len(tx.serialize())
@@ -243,6 +245,139 @@ class Mempool:
             'avg_fee_rate': sum(fee_rates) / len(fee_rates),
         }
     
+    # ── BIP 125 Replace-By-Fee ────────────────────────────────────────
+
+    INCREMENTAL_RELAY_FEE = 1000  # satoshis (matches Bitcoin Core's default)
+    MAX_REPLACEMENT_EVICTIONS = 100
+
+    def _find_conflicts(self, tx: Transaction) -> Set[bytes]:
+        """Return txids of mempool entries whose inputs overlap with *tx*."""
+        conflicts: Set[bytes] = set()
+        for tx_in in tx.inputs:
+            op: OutPoint = (tx_in.prev_txid, tx_in.prev_vout)
+            if op in self.spent_outputs:
+                for txid, entry in self.transactions.items():
+                    for existing_in in entry.tx.inputs:
+                        if (existing_in.prev_txid, existing_in.prev_vout) == op:
+                            conflicts.add(txid)
+        return conflicts
+
+    def _collect_descendants(self, txid: bytes) -> Set[bytes]:
+        """Return *txid* plus every descendant in the mempool."""
+        result: Set[bytes] = {txid}
+        queue = [txid]
+        while queue:
+            parent = queue.pop()
+            for child_txid, child_entry in self.transactions.items():
+                if child_txid in result:
+                    continue
+                for inp in child_entry.tx.inputs:
+                    if inp.prev_txid == parent:
+                        result.add(child_txid)
+                        queue.append(child_txid)
+                        break
+        return result
+
+    def try_replace(
+        self, new_tx: Transaction, height: int
+    ) -> Tuple[bool, str]:
+        """
+        BIP 125 Replace-By-Fee.
+
+        Rules (following bitcoin/src/policy/rbf.cpp):
+        1. Every directly-conflicting tx must signal replaceability
+           (at least one input with sequence < 0xfffffffe).
+        2. The new tx may not spend any *new* unconfirmed inputs that
+           the original transactions did not already spend.
+        3. Total evictions (conflicts + descendants) <= 100.
+        4. New tx fee must strictly exceed the sum of all evicted fees.
+        5. New tx fee must also cover the incremental relay cost.
+
+        Returns (success, error_message).  On success the conflicts
+        (and their descendants) are removed and the new tx is added.
+        """
+        conflicts = self._find_conflicts(new_tx)
+        if not conflicts:
+            return False, "No conflicts to replace"
+
+        # Rule 1: all direct conflicts must signal replaceability
+        for c_txid in conflicts:
+            c_entry = self.transactions[c_txid]
+            if not any(inp.sequence < 0xFFFFFFFE for inp in c_entry.tx.inputs):
+                return False, "Conflicting tx does not signal replaceability"
+
+        # Gather full eviction set (conflicts + descendants)
+        to_evict: Set[bytes] = set()
+        for c_txid in conflicts:
+            to_evict |= self._collect_descendants(c_txid)
+
+        # Rule 3: eviction count limit
+        if len(to_evict) > self.MAX_REPLACEMENT_EVICTIONS:
+            return False, (
+                f"Replacement would evict {len(to_evict)} txs "
+                f"(max {self.MAX_REPLACEMENT_EVICTIONS})"
+            )
+
+        # Rule 2: new tx must not introduce new unconfirmed inputs
+        old_unconfirmed: Set[OutPoint] = set()
+        for txid in to_evict:
+            entry = self.transactions[txid]
+            for inp in entry.tx.inputs:
+                op: OutPoint = (inp.prev_txid, inp.prev_vout)
+                if inp.prev_txid in self.transactions:
+                    old_unconfirmed.add(op)
+        for inp in new_tx.inputs:
+            op = (inp.prev_txid, inp.prev_vout)
+            if inp.prev_txid in self.transactions and op not in old_unconfirmed:
+                return False, "Replacement introduces new unconfirmed input"
+
+        # Calculate new tx fee
+        new_size = len(new_tx.serialize())
+        total_input = 0
+        for inp in new_tx.inputs:
+            utxo = self.validator.db.get_utxo(inp.prev_txid, inp.prev_vout)
+            if utxo:
+                total_input += utxo['value']
+        total_output = sum(out.value for out in new_tx.outputs)
+        new_fee = total_input - total_output
+
+        # Sum of fees from all evicted transactions
+        old_fees = sum(self.transactions[t].fee for t in to_evict)
+
+        # Rule 4: strictly higher fee
+        if new_fee <= old_fees:
+            return False, (
+                f"Replacement fee {new_fee} does not exceed "
+                f"evicted fees {old_fees}"
+            )
+
+        # Rule 5: covers incremental relay cost
+        if new_fee < old_fees + self.INCREMENTAL_RELAY_FEE:
+            return False, "Replacement does not cover incremental relay fee"
+
+        # All checks passed — evict and add
+        for txid in to_evict:
+            self.remove_transaction(txid)
+
+        new_fee_rate = new_fee / new_size if new_size > 0 else 0
+        new_txid = new_tx.get_txid()
+        entry = MempoolEntry(
+            tx=new_tx, fee=new_fee, fee_rate=new_fee_rate,
+            size=new_size, time_added=time.time(), height_added=height,
+        )
+        self.transactions[new_txid] = entry
+        self.current_size += new_size
+        for inp in new_tx.inputs:
+            self.spent_outputs.add((inp.prev_txid, inp.prev_vout))
+        self._insert_sorted_by_fee_rate(new_txid, new_fee_rate)
+
+        logger.info(
+            f"RBF: replaced {len(to_evict)} tx(s) with "
+            f"{new_txid.hex()[:16]}... (fee {new_fee}, "
+            f"rate {new_fee_rate:.2f} sat/vB)"
+        )
+        return True, ""
+
     def _insert_sorted_by_fee_rate(self, txid: bytes, fee_rate: float):
         """
         Insert txid into sorted list by fee rate.

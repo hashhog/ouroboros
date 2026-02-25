@@ -1105,3 +1105,149 @@ class TestBanManager:
         bm = BanManager(ban_threshold=50, on_ban=banned_ips.append)
         bm.record_misbehavior("2.2.2.2", 50, "test")
         assert banned_ips == ["2.2.2.2"]
+
+
+# ── Replace-By-Fee (BIP 125) ─────────────────────────────────────────
+
+
+class _StubValidator:
+    """Minimal validator stub that always accepts transactions."""
+
+    def __init__(self, utxo_values: dict):
+        self.db = _StubUTXODB(utxo_values)
+
+    def validate_transaction(self, tx, height, block_mtp=0):
+        return True, ""
+
+
+class _StubUTXODB:
+    """Maps (prev_txid, prev_vout) -> {'value': int}."""
+
+    def __init__(self, mapping: dict):
+        self._m = mapping
+
+    def get_utxo(self, txid, vout):
+        return self._m.get((txid, vout))
+
+
+def _rbf_tx(txid, inputs, outputs, version=2, sequence=0xFFFFFFFD):
+    """Build a Transaction for RBF tests.
+
+    *inputs*: list of (prev_txid, prev_vout).
+    *outputs*: list of output values.
+    """
+    from ouroboros.database import Transaction, TxIn, TxOut
+
+    return Transaction(
+        txid=txid,
+        version=version,
+        locktime=0,
+        inputs=[
+            TxIn(prev_txid=pt, prev_vout=pv, script_sig=b"", sequence=sequence)
+            for pt, pv in inputs
+        ],
+        outputs=[TxOut(value=v, script_pubkey=b"\x51") for v in outputs],
+    )
+
+
+class TestReplaceByFee:
+    """BIP 125 Replace-By-Fee in Mempool."""
+
+    def _pool(self, utxo_values):
+        from ouroboros.mempool import Mempool
+        return Mempool(validator=_StubValidator(utxo_values))
+
+    def test_basic_rbf(self):
+        utxo = {(b"\x01" * 32, 0): {"value": 100_000}}
+        pool = self._pool(utxo)
+
+        tx_a = _rbf_tx(b"\xaa" * 32, [(b"\x01" * 32, 0)], [90_000])
+        ok, _ = pool.add_transaction(tx_a, height=100)
+        assert ok
+
+        tx_b = _rbf_tx(b"\xbb" * 32, [(b"\x01" * 32, 0)], [80_000])
+        ok, err = pool.add_transaction(tx_b, height=100)
+        assert ok, err
+        assert not pool.has_transaction(b"\xaa" * 32)
+        assert pool.has_transaction(b"\xbb" * 32)
+
+    def test_rbf_rejected_no_signal(self):
+        utxo = {(b"\x01" * 32, 0): {"value": 100_000}}
+        pool = self._pool(utxo)
+
+        tx_a = _rbf_tx(b"\xaa" * 32, [(b"\x01" * 32, 0)], [90_000],
+                        sequence=0xFFFFFFFF)
+        ok, _ = pool.add_transaction(tx_a, height=100)
+        assert ok
+
+        tx_b = _rbf_tx(b"\xbb" * 32, [(b"\x01" * 32, 0)], [80_000])
+        ok, err = pool.add_transaction(tx_b, height=100)
+        assert not ok
+        assert "replaceability" in err
+
+    def test_rbf_rejected_lower_fee(self):
+        utxo = {(b"\x01" * 32, 0): {"value": 100_000}}
+        pool = self._pool(utxo)
+
+        tx_a = _rbf_tx(b"\xaa" * 32, [(b"\x01" * 32, 0)], [50_000])
+        ok, _ = pool.add_transaction(tx_a, height=100)
+        assert ok
+
+        tx_b = _rbf_tx(b"\xbb" * 32, [(b"\x01" * 32, 0)], [60_000])
+        ok, err = pool.add_transaction(tx_b, height=100)
+        assert not ok
+        assert "fee" in err.lower()
+
+    def test_rbf_evicts_descendants(self):
+        utxo = {
+            (b"\x01" * 32, 0): {"value": 100_000},
+            (b"\xaa" * 32, 0): {"value": 90_000},
+        }
+        pool = self._pool(utxo)
+
+        tx_parent = _rbf_tx(b"\xaa" * 32, [(b"\x01" * 32, 0)], [90_000])
+        ok, _ = pool.add_transaction(tx_parent, height=100)
+        assert ok
+
+        tx_child = _rbf_tx(b"\xcc" * 32, [(b"\xaa" * 32, 0)], [80_000])
+        ok, _ = pool.add_transaction(tx_child, height=100)
+        assert ok
+
+        tx_replacement = _rbf_tx(b"\xbb" * 32, [(b"\x01" * 32, 0)], [5_000])
+        ok, err = pool.add_transaction(tx_replacement, height=100)
+        assert ok, err
+        assert not pool.has_transaction(b"\xaa" * 32)
+        assert not pool.has_transaction(b"\xcc" * 32)
+        assert pool.has_transaction(b"\xbb" * 32)
+
+    def test_rbf_too_many_evictions(self):
+        from ouroboros.mempool import Mempool, MempoolEntry
+        import time as _time
+
+        utxo = {(b"\x01" * 32, 0): {"value": 10_000_000}}
+        pool = self._pool(utxo)
+
+        tx_parent = _rbf_tx(b"\xaa" * 32, [(b"\x01" * 32, 0)], [9_900_000])
+        ok, _ = pool.add_transaction(tx_parent, height=100)
+        assert ok
+
+        prev_txid = b"\xaa" * 32
+        for i in range(100):
+            child_txid = bytes([i + 2]) + b"\x00" * 31
+            child = _rbf_tx(child_txid, [(prev_txid, 0)], [40_000])
+            entry = MempoolEntry(
+                tx=child, fee=10_000, fee_rate=1.0,
+                size=250, time_added=_time.time(), height_added=100,
+            )
+            pool.transactions[child.get_txid()] = entry
+            pool.current_size += 250
+            for inp in child.inputs:
+                pool.spent_outputs.add((inp.prev_txid, inp.prev_vout))
+            prev_txid = child_txid
+
+        assert len(pool.transactions) == 101
+
+        tx_b = _rbf_tx(b"\xbb" * 32, [(b"\x01" * 32, 0)], [100_000])
+        ok, err = pool.add_transaction(tx_b, height=100)
+        assert not ok
+        assert "evict" in err.lower()
