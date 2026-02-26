@@ -11,7 +11,10 @@ import struct
 
 import pytest
 
-from ouroboros.wallet import WalletKey, Wallet, HDKey
+from ouroboros.wallet import (
+    WalletKey, Wallet, HDKey,
+    encrypt_wallet_data, decrypt_wallet_data,
+)
 from ouroboros.fee_estimator import FeeEstimator, BlockFeeData
 from ouroboros.address import address_to_script_pubkey
 from ouroboros.rpc import (
@@ -1352,3 +1355,91 @@ class TestHDKey:
         a2 = await w2.generate_new_address()
 
         assert a1 == a2
+
+
+# ── Encrypted Wallet ─────────────────────────────────────────────────
+
+
+class TestEncryptedWallet:
+    """AES-256-GCM wallet encryption with scrypt KDF."""
+
+    def test_encrypt_decrypt_roundtrip(self):
+        data = b"secret wallet payload 1234567890"
+        blob = encrypt_wallet_data(data, "hunter2")
+        assert blob != data
+        assert len(blob) > len(data)
+        recovered = decrypt_wallet_data(blob, "hunter2")
+        assert recovered == data
+
+    def test_wrong_passphrase_raises(self):
+        blob = encrypt_wallet_data(b"payload", "correct")
+        with pytest.raises(ValueError, match="Decryption failed"):
+            decrypt_wallet_data(blob, "wrong")
+
+    def test_corrupt_blob_raises(self):
+        with pytest.raises(ValueError):
+            decrypt_wallet_data(b"tooshort", "any")
+
+    @pytest.mark.asyncio
+    async def test_wallet_encrypt_unlock_cycle(self, temp_data_dir):
+        w = Wallet(temp_data_dir, "mainnet", name="enc1")
+        addr = await w.generate_new_address("key-0")
+        w.encrypt("mypass")
+
+        # Reload — wallet should be locked
+        w2 = Wallet(temp_data_dir, "mainnet", name="enc1")
+        assert w2.is_encrypted
+        assert w2.is_locked
+        assert len(w2.keys) == 0
+
+        # Unlock with correct passphrase
+        w2.unlock("mypass")
+        assert not w2.is_locked
+        assert len(w2.keys) == 1
+        addrs = await w2.get_addresses()
+        assert addrs[0].address == addr
+
+    @pytest.mark.asyncio
+    async def test_wallet_lock_wipes_memory(self, temp_data_dir):
+        w = Wallet(temp_data_dir, "mainnet", name="enc2")
+        await w.generate_new_address()
+        w.encrypt("pass123")
+        assert len(w.keys) == 1
+
+        w.lock()
+        assert w.is_locked
+        assert len(w.keys) == 0
+
+    @pytest.mark.asyncio
+    async def test_wallet_change_passphrase(self, temp_data_dir):
+        w = Wallet(temp_data_dir, "mainnet", name="enc3")
+        addr = await w.generate_new_address()
+        w.encrypt("old_pass")
+
+        w.change_passphrase("old_pass", "new_pass")
+
+        # Old passphrase no longer works
+        w2 = Wallet(temp_data_dir, "mainnet", name="enc3")
+        with pytest.raises(ValueError):
+            w2.unlock("old_pass")
+
+        # New passphrase works
+        w3 = Wallet(temp_data_dir, "mainnet", name="enc3")
+        w3.unlock("new_pass")
+        assert len(w3.keys) == 1
+        addrs = await w3.get_addresses()
+        assert addrs[0].address == addr
+
+    @pytest.mark.asyncio
+    async def test_encrypted_hd_wallet(self, temp_data_dir):
+        seed = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+        w = Wallet(temp_data_dir, "mainnet", name="enc_hd")
+        w.init_hd(seed)
+        a0 = await w.generate_new_address()
+        w.encrypt("hdpass")
+
+        w2 = Wallet(temp_data_dir, "mainnet", name="enc_hd")
+        w2.unlock("hdpass")
+        assert w2.is_hd
+        a1 = await w2.generate_new_address()
+        assert a0 != a1  # next index advanced
