@@ -3,9 +3,14 @@ Bitcoin wallet: key management, address derivation, coin selection, and transact
 
 Supports P2WPKH (bech32) and P2PKH (legacy) addresses. Keys are stored
 as WIF in a JSON wallet file under {data_dir}/wallets/{name}.json.
+
+BIP 32 hierarchical deterministic (HD) derivation and BIP 44/84
+derivation paths are supported when the wallet is initialised from
+a seed via ``Wallet.init_hd()``.
 """
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -16,11 +21,16 @@ from typing import Dict, List, Optional, Tuple
 
 import base58
 import bech32
-from coincurve import PrivateKey
+from coincurve import PrivateKey, PublicKey
 
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+# secp256k1 curve order
+SECP256K1_ORDER = (
+    0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+)
 
 
 class AddressInfo(BaseModel):
@@ -46,6 +56,161 @@ def _hash160(data: bytes) -> bytes:
 
 def _dsha256(data: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+
+
+class HDKey:
+    """
+    BIP 32 extended key (private).
+
+    Supports master-key generation from a seed, child derivation
+    (normal and hardened), path-string parsing (e.g. ``m/84'/0'/0'/0/0``),
+    and xprv / xpub serialisation.
+    """
+
+    # BIP 32 version bytes
+    _XPRV_MAINNET = 0x0488ADE4
+    _XPUB_MAINNET = 0x0488B21E
+    _XPRV_TESTNET = 0x04358394
+    _XPUB_TESTNET = 0x043587CF
+
+    def __init__(
+        self,
+        private_key: bytes,
+        chain_code: bytes,
+        depth: int = 0,
+        parent_fingerprint: bytes = b"\x00\x00\x00\x00",
+        child_index: int = 0,
+        network: str = "mainnet",
+    ):
+        if len(private_key) != 32:
+            raise ValueError("private_key must be 32 bytes")
+        if len(chain_code) != 32:
+            raise ValueError("chain_code must be 32 bytes")
+        self.private_key = private_key
+        self.chain_code = chain_code
+        self.depth = depth
+        self.parent_fingerprint = parent_fingerprint
+        self.child_index = child_index
+        self.network = network
+
+    # ── public key helpers ────────────────────────────────────────────
+
+    @property
+    def public_key(self) -> bytes:
+        """Compressed SEC public key (33 bytes)."""
+        return PublicKey.from_secret(self.private_key).format(compressed=True)
+
+    @property
+    def fingerprint(self) -> bytes:
+        """First 4 bytes of HASH160(pubkey) — used as parent id."""
+        return _hash160(self.public_key)[:4]
+
+    # ── BIP 32 master key ─────────────────────────────────────────────
+
+    @classmethod
+    def from_seed(cls, seed: bytes, network: str = "mainnet") -> "HDKey":
+        """Derive the BIP 32 master key from a binary seed (16-64 bytes)."""
+        if not 16 <= len(seed) <= 64:
+            raise ValueError("Seed must be 16–64 bytes")
+        I = hmac.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
+        key = I[:32]
+        if int.from_bytes(key, "big") == 0 or int.from_bytes(key, "big") >= SECP256K1_ORDER:
+            raise ValueError("Invalid master key (out of range)")
+        return cls(private_key=key, chain_code=I[32:], network=network)
+
+    # ── child derivation ──────────────────────────────────────────────
+
+    def derive_child(self, index: int, hardened: bool = False) -> "HDKey":
+        """Derive a child extended key at *index*."""
+        if hardened:
+            index |= 0x80000000
+        if index & 0x80000000:
+            data = b"\x00" + self.private_key + index.to_bytes(4, "big")
+        else:
+            data = self.public_key + index.to_bytes(4, "big")
+
+        I = hmac.new(self.chain_code, data, hashlib.sha512).digest()
+        il = int.from_bytes(I[:32], "big")
+        if il >= SECP256K1_ORDER:
+            raise ValueError("Derived key is out of range")
+        child_int = (il + int.from_bytes(self.private_key, "big")) % SECP256K1_ORDER
+        if child_int == 0:
+            raise ValueError("Derived key is zero")
+        child_key = child_int.to_bytes(32, "big")
+        return HDKey(
+            private_key=child_key,
+            chain_code=I[32:],
+            depth=self.depth + 1,
+            parent_fingerprint=self.fingerprint,
+            child_index=index,
+            network=self.network,
+        )
+
+    # ── path derivation ───────────────────────────────────────────────
+
+    def derive_path(self, path: str) -> "HDKey":
+        """
+        Derive from a BIP 32 path string, e.g. ``"m/84'/0'/0'/0/0"``.
+
+        ``'`` or ``h`` marks hardened derivation.
+        """
+        parts = path.strip().split("/")
+        if parts[0] != "m":
+            raise ValueError(f"Path must start with 'm': {path}")
+        node = self
+        for part in parts[1:]:
+            hardened = part.endswith("'") or part.endswith("h")
+            idx = int(part.rstrip("'h"))
+            node = node.derive_child(idx, hardened=hardened)
+        return node
+
+    # ── conversion to WalletKey ───────────────────────────────────────
+
+    def to_wallet_key(self) -> "WalletKey":
+        return WalletKey(self.private_key, self.network)
+
+    # ── xprv / xpub serialisation (BIP 32) ────────────────────────────
+
+    def serialize_xprv(self) -> str:
+        """Base58check-encoded extended private key (xprv / tprv)."""
+        ver = self._XPRV_MAINNET if self.network == "mainnet" else self._XPRV_TESTNET
+        return self._serialize_extended(ver, b"\x00" + self.private_key)
+
+    def serialize_xpub(self) -> str:
+        """Base58check-encoded extended public key (xpub / tpub)."""
+        ver = self._XPUB_MAINNET if self.network == "mainnet" else self._XPUB_TESTNET
+        return self._serialize_extended(ver, self.public_key)
+
+    def _serialize_extended(self, version: int, key_data: bytes) -> str:
+        payload = struct.pack(">I", version)
+        payload += bytes([self.depth])
+        payload += self.parent_fingerprint
+        payload += struct.pack(">I", self.child_index)
+        payload += self.chain_code
+        payload += key_data
+        return base58.b58encode_check(payload).decode()
+
+    @classmethod
+    def from_xprv(cls, xprv: str, network: str = "mainnet") -> "HDKey":
+        """Deserialise a base58check xprv / tprv string."""
+        raw = base58.b58decode_check(xprv)
+        if len(raw) != 78:
+            raise ValueError("Invalid extended key length")
+        depth = raw[4]
+        parent_fp = raw[5:9]
+        child_idx = struct.unpack(">I", raw[9:13])[0]
+        chain_code = raw[13:45]
+        if raw[45] != 0:
+            raise ValueError("Not an extended private key")
+        private_key = raw[46:78]
+        return cls(
+            private_key=private_key,
+            chain_code=chain_code,
+            depth=depth,
+            parent_fingerprint=parent_fp,
+            child_index=child_idx,
+            network=network,
+        )
 
 
 class WalletKey:
@@ -117,6 +282,9 @@ class Wallet:
     }
     """
 
+    # Default BIP 84 derivation base for native SegWit
+    HD_BASE_PATH = "m/84'/0'/0'/0"
+
     def __init__(
         self,
         data_dir: str,
@@ -129,27 +297,73 @@ class Wallet:
         self.wallet_path = self.data_dir / "wallets" / f"{name}.json"
         self.keys: List[Dict] = []
         self.db = None  # set via set_database()
+        self._hd_seed: Optional[bytes] = None
+        self._hd_next_index: int = 0
+        self._hd_base_path: str = self.HD_BASE_PATH
         self._load_or_create()
+
+    # ── HD seed management ────────────────────────────────────────────
+
+    def init_hd(self, seed: bytes, base_path: Optional[str] = None) -> str:
+        """
+        Initialise the wallet in HD mode from a BIP 32 seed.
+
+        Returns the xprv of the master key.
+        """
+        master = HDKey.from_seed(seed, self.network)
+        self._hd_seed = seed
+        self._hd_next_index = 0
+        if base_path is not None:
+            self._hd_base_path = base_path
+        self._save()
+        logger.info(f"Wallet '{self.name}' initialised in HD mode")
+        return master.serialize_xprv()
+
+    @property
+    def is_hd(self) -> bool:
+        return self._hd_seed is not None
+
+    def get_hd_master(self) -> Optional[HDKey]:
+        if self._hd_seed is None:
+            return None
+        return HDKey.from_seed(self._hd_seed, self.network)
+
+    # ── persistence ───────────────────────────────────────────────────
 
     def _load_or_create(self) -> None:
         if self.wallet_path.exists():
             with open(self.wallet_path) as f:
                 data = json.load(f)
             self.keys = data.get("keys", [])
-            logger.info(f"Loaded wallet '{self.name}' with {len(self.keys)} keys")
+            hd = data.get("hd")
+            if hd:
+                self._hd_seed = bytes.fromhex(hd["seed_hex"])
+                self._hd_next_index = hd.get("next_index", 0)
+                self._hd_base_path = hd.get("base_path", self.HD_BASE_PATH)
+            logger.info(
+                f"Loaded wallet '{self.name}' with {len(self.keys)} keys"
+                + (" (HD)" if self._hd_seed else "")
+            )
         else:
             self.wallet_path.parent.mkdir(parents=True, exist_ok=True)
             self._save()
             logger.info(f"Created new wallet '{self.name}'")
 
     def _save(self) -> None:
+        payload: Dict = {
+            "version": 1,
+            "network": self.network,
+            "keys": self.keys,
+        }
+        if self._hd_seed is not None:
+            payload["hd"] = {
+                "seed_hex": self._hd_seed.hex(),
+                "next_index": self._hd_next_index,
+                "base_path": self._hd_base_path,
+            }
         tmp = self.wallet_path.with_suffix(".tmp")
         with open(tmp, "w") as f:
-            json.dump(
-                {"version": 1, "network": self.network, "keys": self.keys},
-                f,
-                indent=2,
-            )
+            json.dump(payload, f, indent=2)
         tmp.rename(self.wallet_path)
 
     def set_database(self, db) -> None:
@@ -161,7 +375,14 @@ class Wallet:
         return WalletKey.from_wif(key_data["wif"], self.network)
 
     async def generate_new_address(self, label: str | None = None) -> str:
-        key = WalletKey.generate(self.network)
+        if self._hd_seed is not None:
+            path = f"{self._hd_base_path}/{self._hd_next_index}"
+            hd = HDKey.from_seed(self._hd_seed, self.network).derive_path(path)
+            key = hd.to_wallet_key()
+            self._hd_next_index += 1
+        else:
+            key = WalletKey.generate(self.network)
+
         self.keys.append({
             "wif": key.to_wif(),
             "label": label or "",
