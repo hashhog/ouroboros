@@ -11,7 +11,7 @@ import struct
 
 import pytest
 
-from ouroboros.wallet import WalletKey, Wallet
+from ouroboros.wallet import WalletKey, Wallet, HDKey
 from ouroboros.fee_estimator import FeeEstimator, BlockFeeData
 from ouroboros.address import address_to_script_pubkey
 from ouroboros.rpc import (
@@ -1251,3 +1251,104 @@ class TestReplaceByFee:
         ok, err = pool.add_transaction(tx_b, height=100)
         assert not ok
         assert "evict" in err.lower()
+
+
+# ── HD Key Derivation (BIP 32 / BIP 44) ──────────────────────────────
+
+# BIP 32 test vector 1 seed (from https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki)
+_TV1_SEED = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+
+
+class TestHDKey:
+    """BIP 32 hierarchical deterministic key derivation."""
+
+    def test_master_from_seed_vector1(self):
+        master = HDKey.from_seed(_TV1_SEED)
+        xprv = master.serialize_xprv()
+        expected = (
+            "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk"
+            "4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRN"
+            "NU3TGtRBeJgk33yuGBxrMPHi"
+        )
+        assert xprv == expected, f"unexpected xprv: {xprv}"
+
+    def test_master_xpub_vector1(self):
+        master = HDKey.from_seed(_TV1_SEED)
+        xpub = master.serialize_xpub()
+        expected = (
+            "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9g"
+            "SE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD2"
+            "65TMg7usUDFdp6W1EGMcet8"
+        )
+        assert xpub == expected, f"unexpected xpub: {xpub}"
+
+    def test_child_derivation_hardened(self):
+        master = HDKey.from_seed(_TV1_SEED)
+        child = master.derive_child(0, hardened=True)
+        assert child.depth == 1
+        assert child.parent_fingerprint == master.fingerprint
+        xprv = child.serialize_xprv()
+        expected = (
+            "xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8B"
+            "r5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZ"
+            "G7XnxHrnYeSvkzY7d2bhkJ7"
+        )
+        assert xprv == expected, f"unexpected child xprv: {xprv}"
+
+    def test_path_derivation(self):
+        master = HDKey.from_seed(_TV1_SEED)
+        # m/0'/1
+        child = master.derive_path("m/0'/1")
+        xprv = child.serialize_xprv()
+        expected = (
+            "xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntz"
+            "niatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY"
+            "3H2EU4pWcQDnRnrVA1xe8fs"
+        )
+        assert xprv == expected, f"unexpected path xprv: {xprv}"
+
+    def test_xprv_roundtrip(self):
+        master = HDKey.from_seed(_TV1_SEED)
+        xprv_str = master.serialize_xprv()
+        restored = HDKey.from_xprv(xprv_str)
+        assert restored.private_key == master.private_key
+        assert restored.chain_code == master.chain_code
+        assert restored.depth == master.depth
+
+    def test_wallet_key_conversion(self):
+        master = HDKey.from_seed(_TV1_SEED)
+        wk = master.to_wallet_key()
+        assert wk.secret == master.private_key
+        addr = wk.get_p2wpkh_address()
+        assert addr.startswith("bc1q")
+
+    @pytest.mark.asyncio
+    async def test_wallet_hd_address_generation(self, temp_data_dir):
+        w = Wallet(temp_data_dir, "mainnet")
+        w.init_hd(_TV1_SEED)
+        a0 = await w.generate_new_address()
+        a1 = await w.generate_new_address()
+        assert a0.startswith("bc1q")
+        assert a1.startswith("bc1q")
+        assert a0 != a1
+
+        # Reload wallet and verify HD state persisted
+        w2 = Wallet(temp_data_dir, "mainnet")
+        assert w2.is_hd
+        assert w2._hd_next_index == 2
+        addrs = await w2.get_addresses()
+        assert len(addrs) == 2
+        assert addrs[0].address == a0
+
+    @pytest.mark.asyncio
+    async def test_wallet_hd_deterministic(self, temp_data_dir):
+        """Two wallets from the same seed produce the same addresses."""
+        w1 = Wallet(temp_data_dir, "mainnet", name="hd1")
+        w1.init_hd(_TV1_SEED)
+        a1 = await w1.generate_new_address()
+
+        w2 = Wallet(temp_data_dir, "mainnet", name="hd2")
+        w2.init_hd(_TV1_SEED)
+        a2 = await w2.generate_new_address()
+
+        assert a1 == a2
