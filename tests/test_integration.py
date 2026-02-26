@@ -14,6 +14,7 @@ import pytest
 from ouroboros.wallet import (
     WalletKey, Wallet, HDKey,
     encrypt_wallet_data, decrypt_wallet_data,
+    select_coins, select_coins_bnb, select_coins_knapsack, select_coins_srd,
 )
 from ouroboros.fee_estimator import FeeEstimator, BlockFeeData
 from ouroboros.address import address_to_script_pubkey
@@ -1579,3 +1580,353 @@ class TestPSBT:
         psbt = PSBT.from_transaction(tx)
         with pytest.raises(ValueError, match="not finalised"):
             psbt.extract_transaction()
+
+
+# ── BIP 324 v2 P2P Transport ─────────────────────────────────────────
+
+
+class TestV2Transport:
+    """BIP 324 encrypted P2P transport."""
+
+    def test_handshake_key_exchange(self):
+        from ouroboros.transport_v2 import V2Handshake
+        initiator = V2Handshake(initiator=True)
+        responder = V2Handshake(initiator=False)
+
+        assert len(initiator.local_pubkey_bytes) == 64
+        assert len(responder.local_pubkey_bytes) == 64
+
+        initiator.receive_remote_pubkey(responder.local_pubkey_bytes)
+        responder.receive_remote_pubkey(initiator.local_pubkey_bytes)
+
+        i_send, i_recv = initiator.derive_session_keys()
+        r_send, r_recv = responder.derive_session_keys()
+
+        assert len(i_send) == 32
+        assert i_send == r_recv
+        assert i_recv == r_send
+
+    def test_encrypt_decrypt_roundtrip(self):
+        from ouroboros.transport_v2 import V2Handshake, V2Transport
+        initiator = V2Handshake(initiator=True)
+        responder = V2Handshake(initiator=False)
+        initiator.receive_remote_pubkey(responder.local_pubkey_bytes)
+        responder.receive_remote_pubkey(initiator.local_pubkey_bytes)
+
+        i_transport = V2Transport.from_handshake(initiator)
+        r_transport = V2Transport.from_handshake(responder)
+
+        payload = b"version\x00\x00\x00\x00\x00" + b"\x01" * 50
+        packet = i_transport.encrypt_message(payload)
+        decrypted, is_decoy, consumed = r_transport.decrypt_message(packet)
+        assert decrypted == payload
+        assert not is_decoy
+        assert consumed == len(packet)
+
+    def test_decoy_flag(self):
+        from ouroboros.transport_v2 import V2Handshake, V2Transport
+        initiator = V2Handshake(initiator=True)
+        responder = V2Handshake(initiator=False)
+        initiator.receive_remote_pubkey(responder.local_pubkey_bytes)
+        responder.receive_remote_pubkey(initiator.local_pubkey_bytes)
+
+        i_transport = V2Transport.from_handshake(initiator)
+        r_transport = V2Transport.from_handshake(responder)
+
+        packet = i_transport.encrypt_message(b"dummy", decoy=True)
+        decrypted, is_decoy, _ = r_transport.decrypt_message(packet)
+        assert is_decoy
+        assert decrypted == b"dummy"
+
+    def test_multiple_messages(self):
+        from ouroboros.transport_v2 import V2Handshake, V2Transport
+        initiator = V2Handshake(initiator=True)
+        responder = V2Handshake(initiator=False)
+        initiator.receive_remote_pubkey(responder.local_pubkey_bytes)
+        responder.receive_remote_pubkey(initiator.local_pubkey_bytes)
+
+        i_transport = V2Transport.from_handshake(initiator)
+        r_transport = V2Transport.from_handshake(responder)
+
+        for i in range(10):
+            msg = f"message_{i}".encode()
+            packet = i_transport.encrypt_message(msg)
+            decrypted, _, _ = r_transport.decrypt_message(packet)
+            assert decrypted == msg
+
+    def test_rekey_happens(self):
+        from ouroboros.transport_v2 import CipherState, REKEY_INTERVAL
+        cs = CipherState(key=b"\xaa" * 32)
+        original_key = cs.key
+        for _ in range(REKEY_INTERVAL):
+            cs.encrypt(b"x")
+        assert cs.key != original_key
+        assert cs.nonce_counter == 0
+
+
+# ── Block Pruning ─────────────────────────────────────────────────────
+
+
+class TestBlockPruner:
+    """Block pruning: discard old block data to save disk space."""
+
+    def test_prune_old_blocks(self, tmp_path):
+        from ouroboros.pruning import BlockPruner
+
+        blocks_dir = tmp_path / "blocks"
+        blocks_dir.mkdir()
+        for h in range(500):
+            (blocks_dir / f"{h}.dat").write_bytes(b"\x00" * 1000)
+
+        pruner = BlockPruner(str(tmp_path), keep_blocks=288)
+        removed = pruner.prune_blocks(current_height=499)
+        assert removed == 212  # 500 - 288 = 212
+        assert not (blocks_dir / "0.dat").exists()
+        assert not (blocks_dir / "211.dat").exists()
+        assert (blocks_dir / "212.dat").exists()
+
+    def test_prune_respects_keep_blocks(self, tmp_path):
+        from ouroboros.pruning import BlockPruner
+
+        blocks_dir = tmp_path / "blocks"
+        blocks_dir.mkdir()
+        for h in range(100):
+            (blocks_dir / f"{h}.dat").write_bytes(b"\x00" * 100)
+
+        pruner = BlockPruner(str(tmp_path), keep_blocks=288)
+        removed = pruner.prune_blocks(current_height=99)
+        assert removed == 0  # not enough blocks to prune
+
+    def test_prune_state_persistence(self, tmp_path):
+        from ouroboros.pruning import BlockPruner
+
+        blocks_dir = tmp_path / "blocks"
+        blocks_dir.mkdir()
+        for h in range(400):
+            (blocks_dir / f"{h}.dat").write_bytes(b"\x00" * 500)
+
+        pruner1 = BlockPruner(str(tmp_path), keep_blocks=288)
+        pruner1.prune_blocks(current_height=399)
+
+        pruner2 = BlockPruner(str(tmp_path), keep_blocks=288)
+        assert pruner2.record.lowest_unpruned == 112
+        assert len(pruner2.record.pruned_heights) == 112
+
+    def test_prune_to_target(self, tmp_path):
+        from ouroboros.pruning import BlockPruner
+
+        blocks_dir = tmp_path / "blocks"
+        blocks_dir.mkdir()
+        for h in range(500):
+            (blocks_dir / f"{h}.dat").write_bytes(b"\x00" * 10_000)
+
+        pruner = BlockPruner(str(tmp_path), target_size_mb=3, keep_blocks=288)
+        removed = pruner.prune_to_target(current_height=499)
+        assert removed > 0
+        assert pruner.get_blocks_size() <= 3_000_000
+
+    def test_is_pruned(self, tmp_path):
+        from ouroboros.pruning import BlockPruner
+
+        blocks_dir = tmp_path / "blocks"
+        blocks_dir.mkdir()
+        for h in range(400):
+            (blocks_dir / f"{h}.dat").write_bytes(b"\x00" * 100)
+
+        pruner = BlockPruner(str(tmp_path), keep_blocks=288)
+        pruner.prune_blocks(current_height=399)
+        assert pruner.is_pruned(0)
+        assert pruner.is_pruned(50)
+        assert not pruner.is_pruned(300)
+
+
+# ── getblocktemplate RPC ──────────────────────────────────────────────
+
+
+class TestGetBlockTemplate:
+    """getblocktemplate RPC: block assembly for mining."""
+
+    def test_template_structure(self):
+        """Verify the template dict has all required fields."""
+        from ouroboros.rpc import RPCServer
+        import asyncio
+
+        class _MockBlock:
+            version = 0x20000000
+            bits = 0x1d00ffff
+            hash = b"\xab" * 32
+            timestamp = 1700000000
+
+            def serialize(self):
+                return b"\x00" * 80
+
+        class _MockDB:
+            def get_best_block(self):
+                return b"\xab" * 32, 100
+
+            def get_block(self, h):
+                return _MockBlock()
+
+        class _MockNode:
+            db = _MockDB()
+            mempool = None
+            network = "mainnet"
+
+            def get_median_time(self, h):
+                return 1699999000
+
+        server = RPCServer(_MockNode(), port=0, rate_limit=False)
+        template = asyncio.get_event_loop().run_until_complete(
+            server.rpc_getblocktemplate()
+        )
+        assert template["height"] == 101
+        assert template["previousblockhash"] == (b"\xab" * 32).hex()
+        assert template["coinbasevalue"] > 0
+        assert "target" in template
+        assert "bits" in template
+        assert "transactions" in template
+        assert isinstance(template["transactions"], list)
+
+
+# ── ZMQ Notifications ────────────────────────────────────────────────
+
+
+class TestZMQPublisher:
+    """ZMQ publisher: hashblock, hashtx, rawblock, rawtx."""
+
+    def test_publish_without_start_is_noop(self):
+        from ouroboros.zmq_publisher import ZMQPublisher
+        pub = ZMQPublisher()
+        assert not pub.is_running
+
+        class _FakeBlock:
+            hash = b"\x01" * 32
+            def serialize(self):
+                return b"\x00" * 80
+
+        pub.notify_block(_FakeBlock())  # should not raise
+
+    def test_sequence_counter_increments(self):
+        from ouroboros.zmq_publisher import ZMQPublisher
+        pub = ZMQPublisher()
+        assert pub._sequences[pub.TOPIC_HASH_BLOCK] == 0
+        assert pub._sequences[pub.TOPIC_HASH_TX] == 0
+
+    def test_topics_defined(self):
+        from ouroboros.zmq_publisher import ZMQPublisher
+        assert ZMQPublisher.TOPIC_HASH_BLOCK == b"hashblock"
+        assert ZMQPublisher.TOPIC_HASH_TX == b"hashtx"
+        assert ZMQPublisher.TOPIC_RAW_BLOCK == b"rawblock"
+        assert ZMQPublisher.TOPIC_RAW_TX == b"rawtx"
+
+
+# ── Coin Selection (BnB / Knapsack / SRD) ────────────────────────────
+
+
+def _utxo(value: int) -> dict:
+    """Minimal UTXO dict for coin selection tests."""
+    return {"value": value}
+
+
+class TestCoinSelection:
+    """Branch-and-Bound, Knapsack, and Single Random Draw coin selection."""
+
+    # ── Branch and Bound ──────────────────────────────────────────
+
+    def test_bnb_exact_match(self):
+        utxos = [_utxo(50_000), _utxo(30_000), _utxo(20_000)]
+        # target where 50k + 30k - input fees is exact
+        result = select_coins_bnb(utxos, 70_000, fee_rate=0.0)
+        assert result is not None
+        total = sum(u["value"] for u in result)
+        assert total == 70_000
+
+    def test_bnb_returns_none_when_no_exact_match(self):
+        utxos = [_utxo(50_000), _utxo(30_000)]
+        # target that can't be hit exactly within cost_of_change
+        result = select_coins_bnb(utxos, 60_001, fee_rate=0.0, cost_of_change=1)
+        assert result is None
+
+    def test_bnb_prefers_fewer_inputs(self):
+        utxos = [_utxo(100_000), _utxo(50_000), _utxo(50_000)]
+        result = select_coins_bnb(utxos, 100_000, fee_rate=0.0)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["value"] == 100_000
+
+    def test_bnb_accounts_for_input_fees(self):
+        utxos = [_utxo(10_000), _utxo(10_000)]
+        # With fee_rate=1.0, each input costs 68 sat, so effective = 9932 each
+        result = select_coins_bnb(utxos, 19_864, fee_rate=1.0)
+        assert result is not None
+        assert len(result) == 2
+
+    # ── Knapsack ──────────────────────────────────────────────────
+
+    def test_knapsack_finds_solution(self):
+        utxos = [_utxo(20_000), _utxo(30_000), _utxo(50_000)]
+        result = select_coins_knapsack(utxos, 40_000, fee_rate=1.0)
+        assert result is not None
+        total = sum(u["value"] for u in result)
+        assert total >= 40_000
+
+    def test_knapsack_returns_none_insufficient(self):
+        utxos = [_utxo(100)]
+        result = select_coins_knapsack(utxos, 1_000_000, fee_rate=1.0)
+        assert result is None
+
+    def test_knapsack_prefers_smaller_overshoot(self):
+        utxos = [_utxo(100_000), _utxo(50_000), _utxo(51_000)]
+        # Run many times — knapsack should usually find 51k (close to 50k target)
+        results = []
+        for _ in range(50):
+            r = select_coins_knapsack(utxos, 50_000, fee_rate=0.0, iterations=200)
+            if r is not None:
+                results.append(sum(u["value"] for u in r))
+        assert len(results) > 0
+        assert min(results) <= 51_000
+
+    # ── Single Random Draw ────────────────────────────────────────
+
+    def test_srd_finds_solution(self):
+        utxos = [_utxo(10_000), _utxo(20_000), _utxo(30_000)]
+        result = select_coins_srd(utxos, 25_000, fee_rate=0.0)
+        assert result is not None
+        total = sum(u["value"] for u in result)
+        assert total >= 25_000
+
+    def test_srd_returns_none_insufficient(self):
+        utxos = [_utxo(100), _utxo(200)]
+        result = select_coins_srd(utxos, 1_000_000, fee_rate=0.0)
+        assert result is None
+
+    # ── Three-tier select_coins ───────────────────────────────────
+
+    def test_select_coins_succeeds(self):
+        utxos = [_utxo(100_000), _utxo(50_000), _utxo(30_000)]
+        selected, fee, algo = select_coins(utxos, 45_000, fee_rate=1.0)
+        assert selected is not None
+        total = sum(u["value"] for u in selected)
+        assert total >= 45_000 + fee
+        assert algo in ("bnb", "knapsack", "srd")
+
+    def test_select_coins_raises_insufficient(self):
+        utxos = [_utxo(100)]
+        with pytest.raises(ValueError, match="Insufficient funds"):
+            select_coins(utxos, 1_000_000, fee_rate=1.0)
+
+    def test_select_coins_uses_bnb_for_exact(self):
+        # BnB target = amount + non_input_fee(1 output, fee_rate=1.0)
+        #            = amount + int((11 + 31) * 1.0) + 1 = amount + 43
+        # BnB effective value = utxo_value - int(68 * 1.0) = utxo_value - 68
+        # For exact match: eff_value == bnb_target
+        #   utxo_value - 68 == amount + 43  →  utxo_value == amount + 111
+        _, _, algo = select_coins([_utxo(50_111)], 50_000, fee_rate=1.0)
+        assert algo == "bnb"
+
+    def test_select_coins_falls_through(self):
+        utxos = [_utxo(v) for v in range(1000, 50_000, 1000)]
+        selected, fee, algo = select_coins(utxos, 100_000, fee_rate=1.0)
+        assert selected is not None
+        total = sum(u["value"] for u in selected)
+        assert total >= 100_000 + fee
