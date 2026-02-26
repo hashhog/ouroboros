@@ -50,6 +50,50 @@ class TransactionInfo(BaseModel):
     timestamp: int | None = None
 
 
+# ── Wallet encryption (AES-256-GCM + scrypt) ─────────────────────────
+
+def encrypt_wallet_data(plaintext: bytes, passphrase: str) -> bytes:
+    """
+    Encrypt arbitrary wallet data with a passphrase.
+
+    Layout: salt(16) || nonce(12) || ciphertext+tag(...)
+
+    KDF: scrypt  (N=2^18, r=8, p=1, dkLen=32)
+    AEAD: AES-256-GCM
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+    salt = os.urandom(16)
+    kdf = Scrypt(salt=salt, length=32, n=2 ** 18, r=8, p=1)
+    key = kdf.derive(passphrase.encode("utf-8"))
+    nonce = os.urandom(12)
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext, None)
+    return salt + nonce + ciphertext
+
+
+def decrypt_wallet_data(blob: bytes, passphrase: str) -> bytes:
+    """
+    Decrypt data produced by :func:`encrypt_wallet_data`.
+
+    Raises ``ValueError`` on wrong passphrase or corrupt data.
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+    if len(blob) < 28:
+        raise ValueError("Encrypted blob too short")
+    salt = blob[:16]
+    nonce = blob[16:28]
+    ciphertext = blob[28:]
+    kdf = Scrypt(salt=salt, length=32, n=2 ** 18, r=8, p=1)
+    key = kdf.derive(passphrase.encode("utf-8"))
+    try:
+        return AESGCM(key).decrypt(nonce, ciphertext, None)
+    except Exception:
+        raise ValueError("Decryption failed (wrong passphrase or corrupt data)")
+
+
 def _hash160(data: bytes) -> bytes:
     return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
 
@@ -300,6 +344,8 @@ class Wallet:
         self._hd_seed: Optional[bytes] = None
         self._hd_next_index: int = 0
         self._hd_base_path: str = self.HD_BASE_PATH
+        self._passphrase: Optional[str] = None
+        self._encrypted_blob: Optional[bytes] = None
         self._load_or_create()
 
     # ── HD seed management ────────────────────────────────────────────
@@ -334,6 +380,15 @@ class Wallet:
         if self.wallet_path.exists():
             with open(self.wallet_path) as f:
                 data = json.load(f)
+            if data.get("encrypted"):
+                self._encrypted_blob = bytes.fromhex(data["ciphertext"])
+                self.keys = []
+                logger.info(
+                    f"Loaded encrypted wallet '{self.name}' — "
+                    "call unlock(passphrase) to decrypt"
+                )
+                return
+            self._encrypted_blob = None
             self.keys = data.get("keys", [])
             hd = data.get("hd")
             if hd:
@@ -345,26 +400,109 @@ class Wallet:
                 + (" (HD)" if self._hd_seed else "")
             )
         else:
+            self._encrypted_blob = None
             self.wallet_path.parent.mkdir(parents=True, exist_ok=True)
             self._save()
             logger.info(f"Created new wallet '{self.name}'")
 
     def _save(self) -> None:
-        payload: Dict = {
-            "version": 1,
-            "network": self.network,
+        inner: Dict = {
             "keys": self.keys,
         }
         if self._hd_seed is not None:
-            payload["hd"] = {
+            inner["hd"] = {
                 "seed_hex": self._hd_seed.hex(),
                 "next_index": self._hd_next_index,
                 "base_path": self._hd_base_path,
             }
+
+        if self._passphrase is not None:
+            plaintext = json.dumps(inner).encode("utf-8")
+            blob = encrypt_wallet_data(plaintext, self._passphrase)
+            outer: Dict = {
+                "version": 1,
+                "network": self.network,
+                "encrypted": True,
+                "ciphertext": blob.hex(),
+            }
+        else:
+            outer = {"version": 1, "network": self.network, **inner}
+
         tmp = self.wallet_path.with_suffix(".tmp")
         with open(tmp, "w") as f:
-            json.dump(payload, f, indent=2)
+            json.dump(outer, f, indent=2)
         tmp.rename(self.wallet_path)
+
+    # ── encryption / decryption ──────────────────────────────────────
+
+    @property
+    def is_encrypted(self) -> bool:
+        """True when the on-disk wallet is encrypted (may still be unlocked in memory)."""
+        return self._encrypted_blob is not None or self._passphrase is not None
+
+    @property
+    def is_locked(self) -> bool:
+        """True when the wallet is encrypted and has not been unlocked yet."""
+        return self._encrypted_blob is not None and self._passphrase is None
+
+    def encrypt(self, passphrase: str) -> None:
+        """
+        Encrypt the wallet with *passphrase* and persist.
+
+        After this call every subsequent ``_save()`` writes ciphertext.
+        """
+        if not passphrase:
+            raise ValueError("Passphrase must not be empty")
+        self._passphrase = passphrase
+        self._encrypted_blob = None
+        self._save()
+        logger.info(f"Wallet '{self.name}' encrypted")
+
+    def unlock(self, passphrase: str) -> None:
+        """Decrypt an encrypted wallet that was loaded from disk."""
+        if self._encrypted_blob is None:
+            raise ValueError("Wallet is not encrypted")
+        plaintext = decrypt_wallet_data(self._encrypted_blob, passphrase)
+        data = json.loads(plaintext.decode("utf-8"))
+        self.keys = data.get("keys", [])
+        hd = data.get("hd")
+        if hd:
+            self._hd_seed = bytes.fromhex(hd["seed_hex"])
+            self._hd_next_index = hd.get("next_index", 0)
+            self._hd_base_path = hd.get("base_path", self.HD_BASE_PATH)
+        self._passphrase = passphrase
+        self._encrypted_blob = None
+        logger.info(f"Wallet '{self.name}' unlocked")
+
+    def lock(self) -> None:
+        """Re-lock the wallet: save encrypted and wipe in-memory keys."""
+        if self._passphrase is None:
+            raise ValueError("Wallet is not unlocked")
+        self._save()
+        self._encrypted_blob = self._read_encrypted_blob()
+        self.keys = []
+        self._hd_seed = None
+        self._hd_next_index = 0
+        self._passphrase = None
+        logger.info(f"Wallet '{self.name}' locked")
+
+    def _read_encrypted_blob(self) -> Optional[bytes]:
+        if self.wallet_path.exists():
+            with open(self.wallet_path) as f:
+                data = json.load(f)
+            if data.get("encrypted"):
+                return bytes.fromhex(data["ciphertext"])
+        return None
+
+    def change_passphrase(self, old_passphrase: str, new_passphrase: str) -> None:
+        """Re-encrypt the wallet with a new passphrase."""
+        if not new_passphrase:
+            raise ValueError("New passphrase must not be empty")
+        if self._passphrase is None and self._encrypted_blob is not None:
+            self.unlock(old_passphrase)
+        self._passphrase = new_passphrase
+        self._save()
+        logger.info(f"Wallet '{self.name}' passphrase changed")
 
     def set_database(self, db) -> None:
         self.db = db
