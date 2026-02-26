@@ -14,6 +14,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import struct
 import time
 from pathlib import Path
@@ -100,6 +101,260 @@ def _hash160(data: bytes) -> bytes:
 
 def _dsha256(data: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+
+
+# ── Coin Selection Algorithms ─────────────────────────────────────────
+#
+# Reference: bitcoin/src/wallet/coinselection.cpp
+#
+# Each function takes a list of UTXO dicts (must have "value": int)
+# and a target amount (including fee).  They return a list of selected
+# UTXOs or None on failure.
+#
+# P2WPKH cost model used throughout:
+#   - Input cost:  68 vB
+#   - Output cost: 31 vB
+#   - Overhead:    11 vB (fixed)
+#   - Cost of change = 31 (output) + 68 (later spending it) = 99 vB
+# ──────────────────────────────────────────────────────────────────────
+
+INPUT_VBYTES = 68
+OUTPUT_VBYTES = 31
+OVERHEAD_VBYTES = 11
+COST_OF_CHANGE_VBYTES = INPUT_VBYTES + OUTPUT_VBYTES  # 99 vB
+
+# BnB search limit (matches Bitcoin Core)
+BNB_MAX_TRIES = 100_000
+
+
+def _estimate_fee(n_inputs: int, n_outputs: int, fee_rate: float) -> int:
+    vsize = OVERHEAD_VBYTES + n_inputs * INPUT_VBYTES + n_outputs * OUTPUT_VBYTES
+    return int(vsize * fee_rate) + 1
+
+
+def select_coins_bnb(
+    utxos: List[Dict],
+    target: int,
+    fee_rate: float,
+    *,
+    cost_of_change: Optional[int] = None,
+) -> Optional[List[Dict]]:
+    """
+    Branch-and-Bound coin selection (exact match, no change output).
+
+    Searches for a subset of UTXOs whose total value equals the target
+    plus fees within [target, target + cost_of_change).  An exact match
+    avoids creating a change output, saving ~99 vB.
+
+    Returns selected UTXOs or None if no exact match is found within
+    BNB_MAX_TRIES iterations.
+    """
+    if cost_of_change is None:
+        cost_of_change = int(COST_OF_CHANGE_VBYTES * fee_rate) + 1
+
+    sorted_utxos = sorted(utxos, key=lambda u: u["value"], reverse=True)
+    n = len(sorted_utxos)
+    if n == 0:
+        return None
+
+    best: Optional[List[int]] = None
+    best_waste = float("inf")
+    current: List[int] = []
+    current_value = 0
+    tries = 0
+
+    # Effective values (value minus cost to spend the input)
+    input_fee = int(INPUT_VBYTES * fee_rate)
+    eff_values = [u["value"] - input_fee for u in sorted_utxos]
+
+    # Pre-compute suffix sums of effective values for early pruning
+    suffix_sum = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix_sum[i] = suffix_sum[i + 1] + max(0, eff_values[i])
+
+    def backtrack(idx: int) -> None:
+        nonlocal current_value, best, best_waste, tries
+
+        if tries >= BNB_MAX_TRIES:
+            return
+
+        if current_value >= target:
+            waste = current_value - target
+            if waste < cost_of_change and waste < best_waste:
+                best_waste = waste
+                best = list(current)
+            return
+
+        if idx >= n:
+            return
+
+        remaining = suffix_sum[idx]
+        if current_value + remaining < target:
+            return
+
+        tries += 1
+
+        # Include utxo[idx]
+        ev = eff_values[idx]
+        if ev > 0:
+            current.append(idx)
+            current_value += ev
+            backtrack(idx + 1)
+            current_value -= ev
+            current.pop()
+
+        # Exclude utxo[idx]
+        backtrack(idx + 1)
+
+    backtrack(0)
+
+    if best is None:
+        return None
+    return [sorted_utxos[i] for i in best]
+
+
+def select_coins_knapsack(
+    utxos: List[Dict],
+    target: int,
+    fee_rate: float,
+    *,
+    iterations: int = 1000,
+) -> Optional[List[Dict]]:
+    """
+    Knapsack coin selection (randomised approximation).
+
+    Repeatedly performs a random pass over the UTXOs, including each
+    with 50% probability.  Tracks the closest-to-target result that
+    is >= target.  Falls back to the smallest single UTXO >= target
+    if one exists and is better.
+
+    Returns selected UTXOs or None if insufficient funds.
+    """
+    input_fee = int(INPUT_VBYTES * fee_rate)
+    effective = [(u, u["value"] - input_fee) for u in utxos if u["value"] > input_fee]
+    if not effective:
+        return None
+
+    total_eff = sum(ev for _, ev in effective)
+    if total_eff < target:
+        return None
+
+    best_selection: Optional[List[Dict]] = None
+    best_overshoot = float("inf")
+
+    # Check if any single UTXO covers the target exactly or near-exactly
+    for u, ev in effective:
+        if ev >= target:
+            overshoot = ev - target
+            if overshoot < best_overshoot:
+                best_overshoot = overshoot
+                best_selection = [u]
+
+    for _ in range(iterations):
+        selected: List[Dict] = []
+        selected_value = 0
+
+        shuffled = list(effective)
+        random.shuffle(shuffled)
+
+        for u, ev in shuffled:
+            if random.random() < 0.5:
+                selected.append(u)
+                selected_value += ev
+                if selected_value >= target:
+                    break
+
+        if selected_value >= target:
+            overshoot = selected_value - target
+            if overshoot < best_overshoot:
+                best_overshoot = overshoot
+                best_selection = list(selected)
+
+    return best_selection
+
+
+def select_coins_srd(
+    utxos: List[Dict],
+    target: int,
+    fee_rate: float,
+) -> Optional[List[Dict]]:
+    """
+    Single Random Draw coin selection (last-resort fallback).
+
+    Shuffles UTXOs and greedily adds them until the target is met.
+    Simple but produces a valid selection when BnB and Knapsack fail.
+
+    Returns selected UTXOs or None if insufficient funds.
+    """
+    input_fee = int(INPUT_VBYTES * fee_rate)
+    pool = [u for u in utxos if u["value"] > input_fee]
+    random.shuffle(pool)
+
+    selected: List[Dict] = []
+    total = 0
+    for u in pool:
+        selected.append(u)
+        total += u["value"] - input_fee
+        if total >= target:
+            return selected
+
+    return None
+
+
+def _non_input_fee(n_outputs: int, fee_rate: float) -> int:
+    """Fee for overhead + outputs only (inputs are accounted by effective value)."""
+    return int((OVERHEAD_VBYTES + n_outputs * OUTPUT_VBYTES) * fee_rate) + 1
+
+
+def select_coins(
+    utxos: List[Dict],
+    target_amount: int,
+    fee_rate: float,
+) -> Tuple[List[Dict], int, str]:
+    """
+    Three-tier coin selection matching Bitcoin Core's strategy.
+
+    1. Branch-and-Bound — try for an exact match (no change)
+    2. Knapsack — randomised approximation
+    3. Single Random Draw — last-resort shuffle-and-grab
+
+    Args:
+        utxos: Available UTXOs (each must have ``"value": int``).
+        target_amount: Destination amount in satoshis.
+        fee_rate: Fee rate in sat/vB.
+
+    Returns:
+        (selected_utxos, estimated_fee, algorithm_used)
+
+    Raises:
+        ValueError: Insufficient funds across all strategies.
+    """
+    # BnB: target = amount + (overhead + 1 output fee).
+    # BnB internally subtracts per-input cost from each UTXO's effective value.
+    bnb_target = target_amount + _non_input_fee(1, fee_rate)
+    result = select_coins_bnb(utxos, bnb_target, fee_rate)
+    if result is not None:
+        fee = _estimate_fee(len(result), 1, fee_rate)
+        return result, fee, "bnb"
+
+    # Knapsack / SRD: target = amount + (overhead + 2 output fees).
+    # Input fees are handled inside each algorithm via effective values.
+    change_target = target_amount + _non_input_fee(2, fee_rate)
+
+    result = select_coins_knapsack(utxos, change_target, fee_rate)
+    if result is not None:
+        fee = _estimate_fee(len(result), 2, fee_rate)
+        return result, fee, "knapsack"
+
+    result = select_coins_srd(utxos, change_target, fee_rate)
+    if result is not None:
+        fee = _estimate_fee(len(result), 2, fee_rate)
+        return result, fee, "srd"
+
+    raise ValueError(
+        f"Insufficient funds: cannot cover {target_amount} sat + fees "
+        f"at {fee_rate} sat/vB"
+    )
 
 
 class HDKey:
@@ -581,32 +836,19 @@ class Wallet:
         self, amount: int, fee_rate: float
     ) -> Tuple[List[Dict], int]:
         """
-        Select UTXOs to fund a transaction.  Largest-first strategy.
+        Select UTXOs to fund a transaction.
+
+        Uses Bitcoin Core's three-tier strategy:
+        1. Branch-and-Bound (exact match, avoids change)
+        2. Knapsack (randomised approximation)
+        3. Single Random Draw (greedy fallback)
 
         Returns (selected_utxos, estimated_fee).
         Raises ValueError on insufficient funds.
         """
         all_utxos = self._collect_utxos()
-        all_utxos.sort(key=lambda u: u["value"], reverse=True)
-
-        selected: List[Dict] = []
-        total_in = 0
-
-        for utxo in all_utxos:
-            selected.append(utxo)
-            total_in += utxo["value"]
-
-            # P2WPKH spending: ~68 vB/input, ~31 vB/output, ~10.5 vB overhead
-            est_vsize = 11 + len(selected) * 68 + 2 * 31
-            est_fee = int(est_vsize * fee_rate) + 1
-
-            if total_in >= amount + est_fee:
-                return selected, est_fee
-
-        raise ValueError(
-            f"Insufficient funds: have {total_in} sat, "
-            f"need {amount} + fee"
-        )
+        selected, est_fee, _algo = select_coins(all_utxos, amount, fee_rate)
+        return selected, est_fee
 
     # --- BIP 143 sighash -------------------------------------------------------
 

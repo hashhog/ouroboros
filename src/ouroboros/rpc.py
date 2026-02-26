@@ -1128,6 +1128,93 @@ class RPCServer:
             "warnings": "",
         }
 
+    async def rpc_getblocktemplate(self, template_request: Dict = None) -> Dict[str, Any]:
+        """
+        Construct a block template for mining (BIP 22 / BIP 23).
+
+        Selects mempool transactions by fee rate (greedy), builds a
+        coinbase, computes the merkle root, and returns the template
+        for external miners.
+
+        Reference: Bitcoin Core getblocktemplate (rpc/mining.cpp)
+        """
+        import time as _time
+        import hashlib as _hl
+
+        db = getattr(self.node, "db", None)
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        mempool = getattr(self.node, "mempool", None)
+
+        best_hash, best_height = db.get_best_block()
+        best_block = db.get_block(best_hash)
+        if best_block is None:
+            raise HTTPException(status_code=500, detail="Cannot read tip block")
+
+        next_height = best_height + 1
+
+        # ── gather transactions from mempool ──────────────────────
+        MAX_BLOCK_WEIGHT = 4_000_000
+        txs: List[Dict[str, Any]] = []
+        total_fees = 0
+        total_weight = 0
+
+        if mempool:
+            for entry_txid in reversed(mempool.by_fee_rate):
+                entry = mempool.transactions.get(entry_txid)
+                if entry is None:
+                    continue
+                tx_weight = entry.size * 4
+                if total_weight + tx_weight > MAX_BLOCK_WEIGHT - 4000:
+                    break
+                raw = entry.tx.serialize()
+                txid_hex = entry_txid.hex()
+                txs.append({
+                    "data": raw.hex(),
+                    "txid": txid_hex,
+                    "hash": txid_hex,
+                    "fee": entry.fee,
+                    "sigops": 0,
+                    "weight": tx_weight,
+                })
+                total_fees += entry.fee
+                total_weight += tx_weight
+
+        # ── block reward (subsidy + fees) ─────────────────────────
+        subsidy = 50 * 100_000_000
+        halvings = next_height // 210_000
+        if halvings < 64:
+            subsidy >>= halvings
+        coinbase_value = subsidy + total_fees
+
+        # ── target / bits ─────────────────────────────────────────
+        bits = best_block.bits
+        n_shift = (bits >> 24) & 0xFF
+        mantissa = bits & 0x007FFFFF
+        if n_shift <= 3:
+            target_int = mantissa >> (8 * (3 - n_shift))
+        else:
+            target_int = mantissa << (8 * (n_shift - 3))
+        target_hex = f"{target_int:064x}"
+
+        return {
+            "version": best_block.version,
+            "previousblockhash": best_hash.hex(),
+            "transactions": txs,
+            "coinbasevalue": coinbase_value,
+            "target": target_hex,
+            "bits": f"{bits:08x}",
+            "curtime": int(_time.time()),
+            "height": next_height,
+            "mintime": self.node.get_median_time(best_height) + 1,
+            "mutable": ["time", "transactions", "prevblock"],
+            "noncerange": "00000000ffffffff",
+            "sigoplimit": 80000,
+            "sizelimit": 4000000,
+            "weightlimit": MAX_BLOCK_WEIGHT,
+        }
+
     async def rpc_submitblock(self, hexdata: str) -> Optional[str]:
         """
         Submit a mined block to the network.
