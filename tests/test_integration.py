@@ -1443,3 +1443,139 @@ class TestEncryptedWallet:
         assert w2.is_hd
         a1 = await w2.generate_new_address()
         assert a0 != a1  # next index advanced
+
+
+# ── PSBT (BIP 174) ───────────────────────────────────────────────────
+
+
+def _make_psbt_tx():
+    """Build a simple unsigned Transaction for PSBT tests."""
+    from ouroboros.database import Transaction, TxIn, TxOut
+
+    return Transaction(
+        txid=b"\x00" * 32,
+        version=2,
+        locktime=0,
+        inputs=[
+            TxIn(b"\xaa" * 32, 0, b"", 0xFFFFFFFD),
+            TxIn(b"\xbb" * 32, 1, b"", 0xFFFFFFFD),
+        ],
+        outputs=[
+            TxOut(50_000, b"\x00\x14" + b"\x11" * 20),
+            TxOut(40_000, b"\x00\x14" + b"\x22" * 20),
+        ],
+    )
+
+
+class TestPSBT:
+    """BIP 174 Partially Signed Bitcoin Transactions."""
+
+    def test_serialize_deserialize_roundtrip(self):
+        from ouroboros.psbt import PSBT
+        tx = _make_psbt_tx()
+        psbt = PSBT.from_transaction(tx)
+        data = psbt.serialize()
+        assert data[:5] == b"psbt\xff"
+        psbt2 = PSBT.deserialize(data)
+        assert len(psbt2.inputs) == 2
+        assert len(psbt2.outputs) == 2
+        assert psbt2.tx.version == 2
+        assert psbt2.tx.locktime == 0
+
+    def test_roundtrip_preserves_tx_structure(self):
+        from ouroboros.psbt import PSBT
+        tx = _make_psbt_tx()
+        psbt = PSBT.from_transaction(tx)
+        data = psbt.serialize()
+        psbt2 = PSBT.deserialize(data)
+        assert psbt2.tx.inputs[0].prev_txid == b"\xaa" * 32
+        assert psbt2.tx.inputs[1].prev_vout == 1
+        assert psbt2.tx.outputs[0].value == 50_000
+        assert psbt2.tx.outputs[1].script_pubkey == b"\x00\x14" + b"\x22" * 20
+
+    def test_partial_sig_roundtrip(self):
+        from ouroboros.psbt import PSBT
+        tx = _make_psbt_tx()
+        psbt = PSBT.from_transaction(tx)
+        fake_pub = b"\x02" + b"\xab" * 32
+        fake_sig = b"\x30" + b"\xcd" * 70
+        psbt.inputs[0].partial_sigs[fake_pub] = fake_sig
+        data = psbt.serialize()
+        psbt2 = PSBT.deserialize(data)
+        assert fake_pub in psbt2.inputs[0].partial_sigs
+        assert psbt2.inputs[0].partial_sigs[fake_pub] == fake_sig
+
+    def test_witness_utxo_roundtrip(self):
+        from ouroboros.psbt import PSBT
+        tx = _make_psbt_tx()
+        psbt = PSBT.from_transaction(tx)
+        psbt.inputs[0].witness_utxo = (100_000, b"\x00\x14" + b"\x33" * 20)
+        data = psbt.serialize()
+        psbt2 = PSBT.deserialize(data)
+        assert psbt2.inputs[0].witness_utxo == (100_000, b"\x00\x14" + b"\x33" * 20)
+
+    def test_combine_merges_sigs(self):
+        from ouroboros.psbt import PSBT
+        tx = _make_psbt_tx()
+        psbt_a = PSBT.from_transaction(tx)
+        psbt_b = PSBT.from_transaction(tx)
+
+        pub_a = b"\x02" + b"\x01" * 32
+        pub_b = b"\x02" + b"\x02" * 32
+        psbt_a.inputs[0].partial_sigs[pub_a] = b"\x30sig_a"
+        psbt_b.inputs[0].partial_sigs[pub_b] = b"\x30sig_b"
+
+        combined = psbt_a.combine(psbt_b)
+        assert pub_a in combined.inputs[0].partial_sigs
+        assert pub_b in combined.inputs[0].partial_sigs
+
+    def test_finalize_p2wpkh(self):
+        from ouroboros.psbt import PSBT
+        tx = _make_psbt_tx()
+        psbt = PSBT.from_transaction(tx)
+        pub = b"\x02" + b"\xab" * 32
+        sig = b"\x30" + b"\xcd" * 70 + b"\x01"
+        psbt.inputs[0].witness_utxo = (100_000, b"\x00\x14" + b"\x33" * 20)
+        psbt.inputs[0].partial_sigs[pub] = sig
+        psbt.inputs[1].witness_utxo = (80_000, b"\x00\x14" + b"\x44" * 20)
+        psbt.inputs[1].partial_sigs[pub] = sig
+
+        psbt.finalize()
+        assert psbt.inputs[0].final_script_witness is not None
+        assert len(psbt.inputs[0].partial_sigs) == 0
+
+    def test_extract_transaction(self):
+        from ouroboros.psbt import PSBT
+        tx = _make_psbt_tx()
+        psbt = PSBT.from_transaction(tx)
+        pub = b"\x02" + b"\xab" * 32
+        sig = b"\x30" + b"\xcd" * 70 + b"\x01"
+        for i in range(2):
+            psbt.inputs[i].witness_utxo = (100_000, b"\x00\x14" + b"\x55" * 20)
+            psbt.inputs[i].partial_sigs[pub] = sig
+
+        psbt.finalize()
+        final_tx = psbt.extract_transaction()
+        assert final_tx.has_witness
+        assert final_tx.inputs[0].witness is not None
+        assert len(final_tx.inputs[0].witness) == 2
+        assert final_tx.inputs[0].witness[0] == sig
+        assert final_tx.inputs[0].witness[1] == pub
+
+    def test_decode_output(self):
+        from ouroboros.psbt import PSBT
+        tx = _make_psbt_tx()
+        psbt = PSBT.from_transaction(tx)
+        psbt.inputs[0].sighash_type = 1
+        decoded = psbt.decode()
+        assert decoded["tx"]["version"] == 2
+        assert len(decoded["inputs"]) == 2
+        assert decoded["inputs"][0]["sighash_type"] == 1
+        assert len(decoded["outputs"]) == 2
+
+    def test_extract_raises_if_not_finalized(self):
+        from ouroboros.psbt import PSBT
+        tx = _make_psbt_tx()
+        psbt = PSBT.from_transaction(tx)
+        with pytest.raises(ValueError, match="not finalised"):
+            psbt.extract_transaction()
