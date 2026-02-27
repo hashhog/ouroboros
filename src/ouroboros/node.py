@@ -176,8 +176,12 @@ class BitcoinNode:
             _, best_height = self.db.get_best_block()
             logger.info(f"Initializing peer manager (current height: {best_height})...")
             max_peers = self.config.get('max_connections', 8)
+            p2p_transport = 2 if self.config.get('v2transport') else 1
             self.peer_manager = PeerManager(
-                self.network, max_peers=max_peers, data_dir=self.data_dir
+                self.network,
+                max_peers=max_peers,
+                data_dir=self.data_dir,
+                transport_version=p2p_transport,
             )
             await self.peer_manager.start(best_height)
             peer_count = len(self.peer_manager.get_all_ready_peers()) if self.peer_manager else 0

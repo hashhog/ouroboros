@@ -25,6 +25,7 @@ from ouroboros.p2p_messages import (
     MAGIC_TESTNET,
     MAGIC_REGTEST,
 )
+from ouroboros.transport_v2 import V2Handshake, V2Transport
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,13 @@ class PeerState(Enum):
 class Peer:
     """Manages connection to a single Bitcoin peer"""
     
-    def __init__(self, host: str, port: int, network: str = "mainnet"):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        network: str = "mainnet",
+        transport_version: int = 1,
+    ):
         """
         Initialize peer connection.
         
@@ -49,14 +56,20 @@ class Peer:
             host: Peer hostname or IP address
             port: Peer port number
             network: Network name (mainnet, testnet, regtest)
+            transport_version: 1 for classic plaintext, 2 for BIP 324 encrypted
         """
         self.host = host
         self.port = port
         self.network = network
+        self.transport_version = transport_version
         self.state = PeerState.DISCONNECTED
         
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
+        
+        # BIP 324 v2 transport (set after successful negotiation)
+        self._v2_transport: Optional[V2Transport] = None
+        self._v2_recv_buffer: bytes = b""
         
         self.version: Optional[int] = None
         self.services: int = 0
@@ -101,7 +114,18 @@ class Peer:
                 )
                 
                 self.state = PeerState.CONNECTED
-                
+
+                # BIP 324 v2 transport negotiation (before version handshake)
+                if self.transport_version == 2:
+                    try:
+                        await self._negotiate_v2()
+                    except Exception as v2_err:
+                        logger.warning(
+                            f"v2 transport negotiation failed with "
+                            f"{self.host}:{self.port}, falling back to v1: {v2_err}"
+                        )
+                        self._v2_transport = None
+
                 # Perform handshake
                 await self._handshake(start_height)
                 
@@ -142,6 +166,37 @@ class Peer:
         logger.error(f"Failed to connect to {self.host}:{self.port} after {max_attempts} attempts")
         return False
     
+    async def _negotiate_v2(self) -> None:
+        """
+        Negotiate BIP 324 v2 encrypted transport.
+
+        Both sides exchange 64-byte ElligatorSwift-encoded public keys,
+        compute the shared ECDH secret, and derive per-direction
+        ChaCha20-Poly1305 symmetric keys.
+
+        Reference: BIP 324, bitcoin/src/net.cpp ProcessTransport()
+        """
+        if not self.reader or not self.writer:
+            raise Exception("Not connected")
+
+        handshake = V2Handshake(initiator=True)
+
+        # Send our 64-byte ElligatorSwift public key
+        self.writer.write(handshake.local_pubkey_bytes)
+        await self.writer.drain()
+
+        # Read the peer's 64-byte ElligatorSwift public key
+        remote_pubkey = await asyncio.wait_for(
+            self.reader.readexactly(64),
+            timeout=10.0,
+        )
+
+        handshake.receive_remote_pubkey(remote_pubkey)
+        self._v2_transport = V2Transport.from_handshake(handshake)
+        logger.info(
+            f"BIP 324 v2 transport established with {self.host}:{self.port}"
+        )
+
     async def _handshake(self, start_height: int):
         """Perform version handshake"""
         self.state = PeerState.HANDSHAKING
@@ -226,6 +281,10 @@ class Peer:
             raise Exception("Not connected")
         
         data = msg.serialize()
+
+        if self._v2_transport is not None:
+            data = self._v2_transport.encrypt_message(data)
+
         self.writer.write(data)
         await self.writer.drain()
         
@@ -247,7 +306,12 @@ class Peer:
         """
         if not self.reader:
             raise Exception("Not connected")
-        
+
+        # ── v2 encrypted path ────────────────────────────────────────
+        if self._v2_transport is not None:
+            return await self._receive_v2_message(timeout)
+
+        # ── v1 plaintext path ────────────────────────────────────────
         # Read header (24 bytes)
         header = await asyncio.wait_for(
             self.reader.readexactly(24),
@@ -287,6 +351,47 @@ class Peer:
         logger.debug(f"Received {command} from {self.host}:{self.port} ({len(payload)} bytes)")
         
         return NetworkMessage(command=command, payload=payload, magic=magic)
+
+    async def _receive_v2_message(self, timeout: float) -> NetworkMessage:
+        """
+        Receive and decrypt a BIP 324 v2 message.
+
+        The v2 packet format is:
+          encrypted_length (3 + 16 bytes) || encrypted_payload (N + 16 bytes)
+
+        Decoy packets (flag=DECOY) are silently consumed and the next
+        genuine message is returned.
+        """
+        while True:
+            # Read the encrypted length field (3 bytes + 16-byte Poly1305 tag)
+            enc_length = await asyncio.wait_for(
+                self.reader.readexactly(3 + 16),
+                timeout=timeout,
+            )
+
+            length_plain = self._v2_transport.recv_cipher.decrypt(enc_length)
+            msg_len = int.from_bytes(length_plain, "little")
+
+            if msg_len > 32 * 1024 * 1024:
+                raise Exception(f"v2 payload too large: {msg_len} bytes")
+
+            # Read the encrypted payload (msg_len + 16-byte tag)
+            enc_payload = await asyncio.wait_for(
+                self.reader.readexactly(msg_len + 16),
+                timeout=timeout,
+            )
+
+            inner = self._v2_transport.recv_cipher.decrypt(enc_payload)
+            from ouroboros.transport_v2 import PacketType
+            is_decoy = inner[0] == PacketType.DECOY
+            payload = inner[1:]
+
+            if is_decoy:
+                logger.debug(f"Discarded decoy packet from {self.host}:{self.port}")
+                continue
+
+            # The payload is the original v1 serialised NetworkMessage
+            return NetworkMessage.deserialize(payload, network=self.network)
     
     async def listen(self):
         """
