@@ -240,6 +240,25 @@ class Peer:
         msg = await self.receive_message(timeout=30.0)
         if msg.command != "verack":
             raise Exception(f"Expected verack, got {msg.command}")
+
+        # Post-handshake feature negotiation messages
+        from ouroboros.p2p_messages import (
+            SendHeadersMessage, SendCmpctMessage,
+            FeeFilterMessage, WtxidRelayMessage, SendAddrV2Message,
+        )
+        try:
+            await self.send_message(
+                SendHeadersMessage().to_network_message(self.network))
+            await self.send_message(
+                SendCmpctMessage(announce=False, version=2).to_network_message(self.network))
+            await self.send_message(
+                FeeFilterMessage(feerate=1000).to_network_message(self.network))
+            await self.send_message(
+                WtxidRelayMessage().to_network_message(self.network))
+            await self.send_message(
+                SendAddrV2Message().to_network_message(self.network))
+        except Exception as feat_err:
+            logger.debug(f"Feature negotiation error (non-fatal): {feat_err}")
     
     def _create_network_address(self, host: str, port: int) -> NetworkAddress:
         """

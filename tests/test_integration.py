@@ -1159,7 +1159,7 @@ class TestReplaceByFee:
 
     def _pool(self, utxo_values):
         from ouroboros.mempool import Mempool
-        return Mempool(validator=_StubValidator(utxo_values))
+        return Mempool(validator=_StubValidator(utxo_values), require_standard=False)
 
     def test_basic_rbf(self):
         utxo = {(b"\x01" * 32, 0): {"value": 100_000}}
