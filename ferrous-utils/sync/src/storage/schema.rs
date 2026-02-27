@@ -91,6 +91,15 @@ pub const SPENT_CF: &str = "spent";
 /// Column family name for metadata
 pub const META_CF: &str = "meta";
 
+/// Column family name for transaction index (txid -> block location)
+///
+/// **Key**: `txid` (32 bytes, Txid as bytes)
+/// **Value**: `[block_hash (32 bytes)][height (4 bytes LE)][tx_position (4 bytes LE)]`
+///
+/// Enables O(1) lookup of any confirmed transaction by its txid.
+/// Populated during `apply_block()`, removed during `disconnect_block()`.
+pub const TX_INDEX_CF: &str = "tx_index";
+
 /// Metadata keys
 pub mod meta_keys {
     /// Key for best block hash in META_CF
@@ -107,6 +116,18 @@ pub mod meta_keys {
 
     /// Key for whether pruning is enabled
     pub const PRUNING_ENABLED: &[u8] = b"pruning_enabled";
+
+    /// Key for two-phase commit crash recovery.
+    ///
+    /// Written before apply_block touches UTXO set (Phase 1), deleted after
+    /// BEST_BLOCK_HASH/BEST_HEIGHT are updated (Phase 2).
+    ///
+    /// Value format: `[32-byte old_tip_hash][4-byte old_tip_height][32-byte new_block_hash][4-byte new_height]`
+    /// (72 bytes total).
+    ///
+    /// If this key exists on startup, a crash occurred mid-apply and the
+    /// database must be rolled back to `old_tip_hash` / `old_tip_height`.
+    pub const HEAD_BLOCKS: &[u8] = b"head_blocks";
 }
 
 /// Encode a block hash as a 32-byte key
@@ -327,6 +348,7 @@ pub fn get_column_families() -> Vec<String> {
         CHAINSTATE_CF.to_string(),
         SPENT_CF.to_string(),
         META_CF.to_string(),
+        TX_INDEX_CF.to_string(),
     ]
 }
 
@@ -411,12 +433,13 @@ mod tests {
     #[test]
     fn test_column_families() {
         let cfs = get_column_families();
-        assert_eq!(cfs.len(), 5);
+        assert_eq!(cfs.len(), 6);
         assert!(cfs.contains(&BLOCKS_CF.to_string()));
         assert!(cfs.contains(&BLOCK_INDEX_CF.to_string()));
         assert!(cfs.contains(&CHAINSTATE_CF.to_string()));
         assert!(cfs.contains(&SPENT_CF.to_string()));
         assert!(cfs.contains(&META_CF.to_string()));
+        assert!(cfs.contains(&TX_INDEX_CF.to_string()));
     }
 
     #[test]
