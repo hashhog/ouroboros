@@ -763,6 +763,29 @@ class BlockchainDatabase:
 
         return self._chainwork_cache.get(block_hash, 0)
     
+    # ── Pruning (delegated to Rust) ─────────────────────────────────
+
+    def prune_blocks_range(self, from_height: int, to_height: int) -> int:
+        """Delete raw block data for heights [from_height, to_height].
+        Block index (headers/metadata) is preserved. Returns count removed."""
+        return self._db.prune_blocks_range(from_height, to_height)
+
+    def prune_block_at_height(self, height: int) -> bool:
+        """Delete raw block data at *height*. Returns True if removed."""
+        return self._db.prune_block_at_height(height)
+
+    def get_prune_height(self) -> int:
+        """Lowest height whose block body is still available (0 = never pruned)."""
+        return self._db.get_prune_height()
+
+    def has_block_data(self, height: int) -> bool:
+        """True when the full block body exists for *height*."""
+        return self._db.has_block_data(height)
+
+    def estimate_blocks_size(self) -> int:
+        """Approximate total bytes of all block bodies in RocksDB."""
+        return self._db.estimate_blocks_size()
+
     def __enter__(self):
         """Context manager entry"""
         return self

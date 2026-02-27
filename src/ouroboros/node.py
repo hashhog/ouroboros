@@ -26,6 +26,7 @@ from ouroboros.fee_estimator import FeeEstimator
 from ouroboros.wallet import Wallet
 from ouroboros.cookie_auth import generate_cookie, delete_cookie
 from ouroboros.zmq_publisher import ZMQPublisher
+from ouroboros.pruning import BlockPruner
 from ouroboros.metrics import (
     init_metrics,
     update_chain_metrics,
@@ -85,6 +86,9 @@ class BitcoinNode:
         # Sync manager
         self.sync_manager: Optional[SyncManager] = None
         
+        # Block pruner
+        self.pruner: Optional[BlockPruner] = None
+
         # ZMQ publisher
         self.zmq_publisher: Optional[ZMQPublisher] = None
 
@@ -143,6 +147,21 @@ class BitcoinNode:
             self.wallet = Wallet(self.data_dir, self.network)
             self.wallet.set_database(self.db)
             
+            # Initialize block pruner (optional — enabled when prune=<MB> is set)
+            prune_target = self.config.get('prune')
+            if prune_target:
+                prune_mb = int(prune_target)
+                keep = int(self.config.get('prune_keep_blocks', 288))
+                self.pruner = BlockPruner(
+                    db=self.db,
+                    target_size_mb=prune_mb,
+                    keep_blocks=keep,
+                )
+                logger.info(
+                    f"Block pruning enabled (target {prune_mb} MB, "
+                    f"keep {self.pruner.keep_blocks} blocks)"
+                )
+
             # Check if blockchain is synced
             self.synced = self._check_synced()
             
@@ -322,7 +341,16 @@ class BitcoinNode:
 
                 update_chain_metrics(best_height, self.get_current_difficulty(), peer_count)
                 update_mempool_metrics(self.mempool.total_size if self.mempool else 0, mempool_size)
-        
+
+                # Run block pruning if enabled
+                if self.pruner is not None:
+                    try:
+                        removed = self.pruner.prune_to_target(best_height)
+                        if removed > 0:
+                            logger.info(f"Pruned {removed} old block(s)")
+                    except Exception as prune_err:
+                        logger.debug(f"Pruning error: {prune_err}")
+
         except Exception as e:
             logger.error(f"Error in periodic tasks: {e}", exc_info=True)
     

@@ -101,6 +101,12 @@ pub mod meta_keys {
 
     /// Key for chainstate version in META_CF
     pub const CHAINSTATE_VERSION: &[u8] = b"chainstate_version";
+
+    /// Key for pruning state: lowest block height whose data is still available
+    pub const PRUNE_HEIGHT: &[u8] = b"prune_height";
+
+    /// Key for whether pruning is enabled
+    pub const PRUNING_ENABLED: &[u8] = b"pruning_enabled";
 }
 
 /// Encode a block hash as a 32-byte key
