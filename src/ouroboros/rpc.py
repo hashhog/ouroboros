@@ -913,6 +913,173 @@ class RPCServer:
         txid = await self.rpc_sendrawtransaction(raw_hex)
         return txid
 
+    async def rpc_sethdseed(self, seed_hex: str = None) -> Dict[str, Any]:
+        """
+        Initialise the wallet in HD (BIP 32 / BIP 44) mode.
+
+        If *seed_hex* is provided it is used as the master seed;
+        otherwise a cryptographically random 32-byte seed is generated.
+
+        Reference: Bitcoin Core sethdseed (wallet/rpc/wallet.cpp)
+        """
+        import os
+
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            return JSONRPCResponse(
+                error={"code": -18, "message": "Wallet not loaded"}, id=None
+            )
+
+        if seed_hex is not None:
+            try:
+                seed = bytes.fromhex(seed_hex)
+            except ValueError:
+                return JSONRPCResponse(
+                    error={"code": -8, "message": "seed_hex must be valid hex"},
+                    id=None,
+                )
+            if not 16 <= len(seed) <= 64:
+                return JSONRPCResponse(
+                    error={
+                        "code": -8,
+                        "message": "Seed must be 16–64 bytes",
+                    },
+                    id=None,
+                )
+        else:
+            seed = os.urandom(32)
+
+        xprv = wallet.init_hd(seed)
+        master = wallet.get_hd_master()
+        return {
+            "seed_hex": seed.hex(),
+            "xprv": xprv,
+            "xpub": master.serialize_xpub() if master else None,
+            "message": "HD wallet initialized",
+        }
+
+    async def rpc_encryptwallet(self, passphrase: str) -> str:
+        """
+        Encrypt the wallet with a passphrase.
+
+        Reference: Bitcoin Core encryptwallet (wallet/rpc/encrypt.cpp)
+        """
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            return JSONRPCResponse(
+                error={"code": -18, "message": "Wallet not loaded"}, id=None
+            )
+        if wallet.is_encrypted:
+            return JSONRPCResponse(
+                error={
+                    "code": -15,
+                    "message": "Error: running with an encrypted wallet, "
+                    "but encryptwallet was called.",
+                },
+                id=None,
+            )
+        wallet.encrypt(passphrase)
+        return (
+            "wallet encrypted; The keypool has been flushed and a new HD seed "
+            "was set. You need to make a new backup. Restart recommended."
+        )
+
+    async def rpc_walletpassphrase(
+        self, passphrase: str, timeout: int = 60
+    ) -> bool:
+        """
+        Unlock an encrypted wallet for *timeout* seconds.
+
+        Reference: Bitcoin Core walletpassphrase (wallet/rpc/encrypt.cpp)
+        """
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            return JSONRPCResponse(
+                error={"code": -18, "message": "Wallet not loaded"}, id=None
+            )
+        if not wallet.is_encrypted:
+            return JSONRPCResponse(
+                error={
+                    "code": -15,
+                    "message": "Error: running with an unencrypted wallet, "
+                    "but walletpassphrase was called.",
+                },
+                id=None,
+            )
+        try:
+            wallet.unlock(passphrase)
+        except ValueError:
+            return JSONRPCResponse(
+                error={
+                    "code": -14,
+                    "message": "Error: The wallet passphrase entered was incorrect.",
+                },
+                id=None,
+            )
+        return True
+
+    async def rpc_walletlock(self) -> bool:
+        """
+        Lock the wallet, wiping the decryption key from memory.
+
+        Reference: Bitcoin Core walletlock (wallet/rpc/encrypt.cpp)
+        """
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            return JSONRPCResponse(
+                error={"code": -18, "message": "Wallet not loaded"}, id=None
+            )
+        if not wallet.is_encrypted:
+            return JSONRPCResponse(
+                error={
+                    "code": -15,
+                    "message": "Error: running with an unencrypted wallet, "
+                    "but walletlock was called.",
+                },
+                id=None,
+            )
+        try:
+            wallet.lock()
+        except ValueError:
+            return JSONRPCResponse(
+                error={
+                    "code": -15,
+                    "message": "Error: wallet is already locked.",
+                },
+                id=None,
+            )
+        return True
+
+    async def rpc_walletpassphrasechange(
+        self, old_passphrase: str, new_passphrase: str
+    ) -> bool:
+        """
+        Change the wallet passphrase.
+
+        Reference: Bitcoin Core walletpassphrasechange (wallet/rpc/encrypt.cpp)
+        """
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            return JSONRPCResponse(
+                error={"code": -18, "message": "Wallet not loaded"}, id=None
+            )
+        if not wallet.is_encrypted:
+            return JSONRPCResponse(
+                error={
+                    "code": -15,
+                    "message": "Error: running with an unencrypted wallet, "
+                    "but walletpassphrasechange was called.",
+                },
+                id=None,
+            )
+        try:
+            wallet.change_passphrase(old_passphrase, new_passphrase)
+        except ValueError as exc:
+            return JSONRPCResponse(
+                error={"code": -14, "message": str(exc)}, id=None
+            )
+        return True
+
     async def rpc_getwalletinfo(self) -> Dict[str, Any]:
         """
         Return wallet state info.
@@ -926,7 +1093,7 @@ class RPCServer:
         balance = await wallet.get_balance()
         addresses = await wallet.get_addresses()
 
-        return {
+        info: Dict[str, Any] = {
             "walletname": wallet.name,
             "walletversion": 1,
             "balance": balance / 1e8,
@@ -935,7 +1102,169 @@ class RPCServer:
             "txcount": 0,
             "keypoolsize": len(addresses),
             "paytxfee": 0.0,
+            "hd": wallet.is_hd,
+            "encrypted": wallet.is_encrypted,
+            "locked": wallet.is_locked,
         }
+
+        if wallet.is_hd:
+            info["hd_next_index"] = wallet._hd_next_index
+            master = wallet.get_hd_master()
+            if master:
+                info["hd_master_xpub"] = master.serialize_xpub()
+
+        return info
+
+    # ── PSBT RPCs (BIP 174) ────────────────────────────────────────────
+
+    async def rpc_decodepsbt(self, psbt_base64: str) -> Dict[str, Any]:
+        """
+        Decode a base64-encoded PSBT into a human-readable dict.
+
+        Reference: Bitcoin Core decodepsbt (rpc/rawtransaction.cpp)
+        """
+        import base64 as b64
+        from ouroboros.psbt import PSBT
+
+        try:
+            raw = b64.b64decode(psbt_base64, validate=True)
+        except Exception:
+            return JSONRPCResponse(
+                error={"code": -22, "message": "TX decode failed: invalid base64"},
+                id=None,
+            )
+        try:
+            psbt = PSBT.deserialize(raw)
+        except Exception as exc:
+            return JSONRPCResponse(
+                error={"code": -22, "message": f"TX decode failed: {exc}"},
+                id=None,
+            )
+        return psbt.decode()
+
+    async def rpc_combinepsbt(self, psbts: List[str]) -> str:
+        """
+        Combine multiple base64-encoded PSBTs into one.
+
+        Reference: Bitcoin Core combinepsbt (rpc/rawtransaction.cpp)
+        """
+        import base64 as b64
+        from ouroboros.psbt import PSBT
+
+        if not psbts or len(psbts) < 2:
+            return JSONRPCResponse(
+                error={"code": -8, "message": "At least two PSBTs required"},
+                id=None,
+            )
+        try:
+            decoded = [PSBT.deserialize(b64.b64decode(p, validate=True)) for p in psbts]
+        except Exception as exc:
+            return JSONRPCResponse(
+                error={"code": -22, "message": f"TX decode failed: {exc}"},
+                id=None,
+            )
+        combined = decoded[0]
+        for other in decoded[1:]:
+            combined = combined.combine(other)
+        return b64.b64encode(combined.serialize()).decode("ascii")
+
+    async def rpc_finalizepsbt(
+        self, psbt_base64: str, extract: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Finalise a PSBT. If *extract* is true and all inputs are finalised,
+        extract the network transaction.
+
+        Reference: Bitcoin Core finalizepsbt (rpc/rawtransaction.cpp)
+        """
+        import base64 as b64
+        from ouroboros.psbt import PSBT
+
+        try:
+            raw = b64.b64decode(psbt_base64, validate=True)
+            psbt = PSBT.deserialize(raw)
+        except Exception as exc:
+            return JSONRPCResponse(
+                error={"code": -22, "message": f"TX decode failed: {exc}"},
+                id=None,
+            )
+
+        psbt.finalize()
+
+        complete = all(
+            inp.final_script_sig is not None or inp.final_script_witness is not None
+            for inp in psbt.inputs
+        )
+
+        if extract and complete:
+            tx = psbt.extract_transaction()
+            return {
+                "hex": tx.serialize_with_witness().hex(),
+                "complete": True,
+            }
+        return {
+            "psbt": b64.b64encode(psbt.serialize()).decode("ascii"),
+            "complete": complete,
+        }
+
+    async def rpc_createpsbt(
+        self,
+        inputs: List[Dict[str, Any]],
+        outputs: List[Dict[str, Any]],
+        locktime: int = 0,
+    ) -> str:
+        """
+        Create an unsigned PSBT from raw inputs and outputs.
+
+        *inputs*: ``[{"txid": "<hex>", "vout": <n>}, ...]``
+        *outputs*: ``[{"<address>": <amount_sat>}, ...]``
+
+        Reference: Bitcoin Core createpsbt (rpc/rawtransaction.cpp)
+        """
+        import base64 as b64
+        from ouroboros.psbt import PSBT
+        from ouroboros.database import Transaction, TxIn, TxOut
+        from ouroboros.address import address_to_script_pubkey
+
+        tx_inputs: List[TxIn] = []
+        for inp in inputs:
+            txid = inp.get("txid", "")
+            vout = inp.get("vout", 0)
+            sequence = inp.get("sequence", 0xFFFFFFFF)
+            try:
+                prev_hash = bytes.fromhex(txid)
+            except ValueError:
+                return JSONRPCResponse(
+                    error={"code": -8, "message": f"Invalid txid: {txid}"},
+                    id=None,
+                )
+            tx_inputs.append(TxIn(
+                prev_tx_hash=prev_hash,
+                prev_output_index=vout,
+                script_sig=b"",
+                sequence=sequence,
+            ))
+
+        tx_outputs: List[TxOut] = []
+        for out in outputs:
+            for address, amount in out.items():
+                try:
+                    spk = address_to_script_pubkey(address)
+                except Exception:
+                    return JSONRPCResponse(
+                        error={"code": -5, "message": f"Invalid address: {address}"},
+                        id=None,
+                    )
+                tx_outputs.append(TxOut(value=int(amount), script_pubkey=spk))
+
+        tx = Transaction(
+            version=2,
+            inputs=tx_inputs,
+            outputs=tx_outputs,
+            locktime=locktime,
+        )
+        psbt = PSBT.from_transaction(tx)
+        return b64.b64encode(psbt.serialize()).decode("ascii")
 
     async def rpc_estimatesmartfee(
         self,
