@@ -880,3 +880,216 @@ class BlockTxnMessage:
     def to_block_transactions(self):
         from ouroboros.compact_blocks import BlockTransactions
         return BlockTransactions.deserialize(self.payload_bytes)
+
+
+# ── Additional P2P messages for chain-tip operation ──────────────────
+
+
+@dataclass
+class SendHeadersMessage:
+    """
+    ``sendheaders`` (BIP 130) — request that the peer announce new blocks
+    via ``headers`` messages instead of ``inv``.  Empty payload.
+    """
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        return NetworkMessage(
+            command="sendheaders", payload=b'', magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'SendHeadersMessage':
+        return cls()
+
+
+@dataclass
+class FeeFilterMessage:
+    """
+    ``feefilter`` (BIP 133) — tell the peer not to relay transactions
+    below *feerate* (in sat/kB).
+    """
+    feerate: int = 1000  # satoshis per 1000 bytes
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = struct.pack('<Q', self.feerate)
+        return NetworkMessage(
+            command="feefilter", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'FeeFilterMessage':
+        if len(payload) < 8:
+            raise ValueError("feefilter payload too short")
+        feerate = struct.unpack('<Q', payload[:8])[0]
+        return cls(feerate=feerate)
+
+
+@dataclass
+class WtxidRelayMessage:
+    """
+    ``wtxidrelay`` (BIP 339) — signal that the node wants to use witness
+    txids for transaction relay.  Empty payload.  Sent before VERACK.
+    """
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        return NetworkMessage(
+            command="wtxidrelay", payload=b'', magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'WtxidRelayMessage':
+        return cls()
+
+
+@dataclass
+class SendAddrV2Message:
+    """
+    ``sendaddrv2`` (BIP 155) — signal that the node supports ADDRv2
+    messages.  Empty payload.  Sent before VERACK.
+    """
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        return NetworkMessage(
+            command="sendaddrv2", payload=b'', magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'SendAddrV2Message':
+        return cls()
+
+
+@dataclass
+class AddrV2Message:
+    """
+    ``addrv2`` (BIP 155) — extended address message supporting IPv6,
+    Tor v3, I2P, and CJDNS addresses.
+    """
+    addresses: List[dict] = field(default_factory=list)
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        data = encode_varint(len(self.addresses))
+        for addr in self.addresses:
+            data += struct.pack('<I', addr.get('time', int(time.time())))
+            data += encode_varint(addr.get('services', 0))
+            net_id = addr.get('network_id', 1)  # 1=IPv4, 2=IPv6
+            data += struct.pack('B', net_id)
+            addr_bytes = addr.get('addr', b'\x00' * 4)
+            data += encode_varint(len(addr_bytes))
+            data += addr_bytes
+            data += struct.pack('>H', addr.get('port', 8333))
+        return NetworkMessage(
+            command="addrv2", payload=data, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'AddrV2Message':
+        offset = 0
+        count, consumed = decode_varint(payload, offset)
+        offset += consumed
+        addresses = []
+        for _ in range(count):
+            if offset + 4 > len(payload):
+                break
+            ts = struct.unpack('<I', payload[offset:offset+4])[0]
+            offset += 4
+            services, consumed = decode_varint(payload, offset)
+            offset += consumed
+            net_id = payload[offset]; offset += 1
+            addr_len, consumed = decode_varint(payload, offset)
+            offset += consumed
+            addr_bytes = payload[offset:offset + addr_len]
+            offset += addr_len
+            port = struct.unpack('>H', payload[offset:offset+2])[0]
+            offset += 2
+            addresses.append({
+                'time': ts, 'services': services,
+                'network_id': net_id, 'addr': addr_bytes, 'port': port,
+            })
+        return cls(addresses=addresses)
+
+
+@dataclass
+class NotFoundMessage:
+    """
+    ``notfound`` — sent in reply to ``getdata`` when the requested
+    inventory items are not available.
+    """
+    inventory: List[Tuple[int, bytes]]
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        inv_msg = InvMessage(self.inventory)
+        payload = inv_msg.serialize_payload()
+        return NetworkMessage(
+            command="notfound", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'NotFoundMessage':
+        inv = InvMessage.from_payload(payload)
+        return cls(inventory=inv.inventory)
+
+
+@dataclass
+class MempoolMessage:
+    """
+    ``mempool`` (BIP 35) — request the peer's mempool contents as
+    ``inv`` messages.  Empty payload.
+    """
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        return NetworkMessage(
+            command="mempool", payload=b'', magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'MempoolMessage':
+        return cls()
+
+
+@dataclass
+class AddrMessage:
+    """``addr`` — list of known peer addresses."""
+    addresses: List[Tuple[int, NetworkAddress]] = field(default_factory=list)
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        data = encode_varint(len(self.addresses))
+        for ts, addr in self.addresses:
+            data += struct.pack('<I', ts)
+            data += addr.serialize()
+        return NetworkMessage(
+            command="addr", payload=data, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'AddrMessage':
+        offset = 0
+        count, consumed = decode_varint(payload, offset)
+        offset += consumed
+        addresses = []
+        for _ in range(count):
+            ts = struct.unpack('<I', payload[offset:offset+4])[0]
+            offset += 4
+            addr, consumed = NetworkAddress.from_payload(payload, offset)
+            offset += consumed
+            addresses.append((ts, addr))
+        return cls(addresses=addresses)
+
+
+@dataclass
+class GetBlocksMessage:
+    """``getblocks`` — request block inventory."""
+    version: int = 70015
+    locator_hashes: List[bytes] = field(default_factory=list)
+    hash_stop: bytes = b'\x00' * 32
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        data = struct.pack('<i', self.version)
+        data += encode_varint(len(self.locator_hashes))
+        for h in self.locator_hashes:
+            data += h
+        data += self.hash_stop
+        return NetworkMessage(
+            command="getblocks", payload=data, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'GetBlocksMessage':
+        offset = 0
+        version = struct.unpack('<i', payload[offset:offset+4])[0]; offset += 4
+        count, consumed = decode_varint(payload, offset); offset += consumed
+        hashes = []
+        for _ in range(count):
+            hashes.append(payload[offset:offset+32]); offset += 32
+        hash_stop = payload[offset:offset+32]
+        return cls(version=version, locator_hashes=hashes, hash_stop=hash_stop)
