@@ -268,15 +268,41 @@ impl BlockValidator {
         50_000_000_000u64 >> halvings
     }
 
-    /// Apply block to database
+    /// Apply block to database using a two-phase commit for crash safety.
     ///
-    /// Updates UTXO set (remove spent, add new), stores block, and updates best block.
+    /// **Phase 1**: Write HEAD_BLOCKS marker to META_CF, then apply all UTXO
+    /// changes (spend inputs, create outputs) and store the block body +
+    /// metadata.
+    ///
+    /// **Phase 2**: Update BEST_BLOCK_HASH / BEST_HEIGHT, then delete the
+    /// HEAD_BLOCKS marker.
+    ///
+    /// If the process crashes between Phase 1 and Phase 2, the HEAD_BLOCKS
+    /// marker will persist and `BlockchainDB::recover_from_crash()` (called
+    /// on next startup) will roll back the partial apply using undo data in
+    /// SPENT_CF.
+    ///
+    /// Ref: Bitcoin Core txdb.cpp DB_HEAD_BLOCKS pattern.
     pub fn apply_block(&self, block: &BlockWrapper, height: u32) -> Result<()> {
         let inner = block.inner();
         let block_hash = *block.block_hash().as_byte_array();
 
-        // Update UTXO set
-        for tx in &inner.txdata {
+        // ── Phase 1: Write HEAD_BLOCKS marker ───────────────────────
+        // Record old tip so crash recovery knows where to roll back to.
+        let (old_tip_hash, old_tip_height) = if height == 0 {
+            ([0u8; 32], 0u32)
+        } else {
+            self.db.get_best_block().unwrap_or(([0u8; 32], 0))
+        };
+        self.db.write_head_blocks(
+            &old_tip_hash,
+            old_tip_height,
+            &block_hash,
+            height,
+        )?;
+
+        // ── UTXO mutations + transaction index ────────────────────
+        for (tx_pos, tx) in inner.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
 
             if !tx.is_coinbase() {
@@ -297,12 +323,19 @@ impl BlockValidator {
                 );
                 self.db.add_utxo(outpoint.inner(), &utxo)?;
             }
+
+            // Store transaction index: txid → (block_hash, height, position)
+            self.db.store_tx_index(
+                txid.as_byte_array(),
+                &block_hash,
+                height,
+                tx_pos as u32,
+            )?;
         }
 
-        // Store block
+        // Store block body + metadata
         self.db.store_block(block)?;
 
-        // Store block metadata with chainwork
         let timestamp = inner.header.time;
         let bits = inner.header.bits.to_consensus();
         let prev_chainwork = if height == 0 {
@@ -318,45 +351,70 @@ impl BlockValidator {
         let metadata = BlockMetadata::new(height, chainwork, timestamp);
         self.db.store_block_metadata(height, &block_hash, &metadata)?;
 
-        // Update best block
+        // ── Phase 2: Update chain tip + delete marker ───────────────
         self.db.update_best_block(&block_hash, height)?;
+        self.db.delete_head_blocks()?;
 
         Ok(())
     }
 
-    /// Disconnect block (reverse UTXO changes)
+    /// Disconnect a block — reverse UTXO changes made by `apply_block()`.
     ///
-    /// This is used for blockchain reorganizations (reorgs).
-    /// Reverses the UTXO changes made by apply_block.
-    pub fn disconnect_block(&self, block: &BlockWrapper) -> Result<()> {
+    /// Used for blockchain reorganizations (reorgs).  Processes transactions
+    /// in reverse order:
+    ///
+    /// 1. Remove UTXOs *created* by this block (outputs → delete from chainstate).
+    /// 2. Restore UTXOs *spent* by this block (inputs → read undo data from
+    ///    SPENT_CF, re-add to chainstate, delete undo record).
+    /// 3. Update `BEST_BLOCK_HASH` / `BEST_HEIGHT` to the previous block.
+    ///
+    /// The block index entry (height → hash + metadata) and the block body in
+    /// BLOCKS_CF are **not** removed — callers may choose to keep or prune them.
+    pub fn disconnect_block(&self, block: &BlockWrapper, height: u32) -> Result<()> {
         let inner = block.inner();
 
-        // Reverse UTXO changes
+        // Process transactions in reverse order (last tx first)
         for tx in inner.txdata.iter().rev() {
             let txid = tx.compute_txid();
 
-            // Remove new UTXOs (outputs)
+            // 1. Remove outputs (UTXOs created by this block)
             for vout in 0..tx.output.len() {
                 let outpoint = OutPointWrapper::from_txid_vout(txid, vout as u32);
-                // Note: In a real implementation, we'd remove this UTXO from the database
-                let _ = outpoint;
+                self.db.delete_utxo(outpoint.inner())?;
             }
 
+            // 2. Restore inputs (UTXOs spent by this block)
             if !tx.is_coinbase() {
-                // Restore spent UTXOs (inputs)
                 for input in &tx.input {
                     let outpoint = OutPointWrapper::new(input.previous_output);
-                    // Note: In a real implementation, we'd restore this UTXO from the spent CF
-                    let _ = outpoint;
+                    // Read undo record from SPENT_CF
+                    match self.db.get_spent_utxo(outpoint.inner())? {
+                        Some((_spending_txid, utxo)) => {
+                            // Restore the UTXO to chainstate
+                            self.db.add_utxo(outpoint.inner(), &utxo)?;
+                            // Remove the undo record
+                            self.db.delete_spent_record(outpoint.inner())?;
+                        }
+                        None => {
+                            log::warn!(
+                                "disconnect_block: no undo record for outpoint {:?} — \
+                                 UTXO cannot be restored",
+                                input.previous_output,
+                            );
+                        }
+                    }
                 }
             }
+
+            // 3. Remove transaction index entry
+            self.db.delete_tx_index(txid.as_byte_array())?;
         }
 
-        // Note: In a full implementation, we would:
-        // 1. Remove block from database
-        // 2. Restore UTXOs from spent CF back to chainstate CF
-        // 3. Remove new UTXOs from chainstate CF
-        // 4. Update best block pointer
+        // 3. Update best block to the previous block
+        if height > 0 {
+            let prev_hash = *inner.header.prev_blockhash.as_byte_array();
+            self.db.update_best_block(&prev_hash, height - 1)?;
+        }
 
         Ok(())
     }
