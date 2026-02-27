@@ -364,9 +364,45 @@ class PeerManager:
             if self._on_compact_block:
                 self._on_compact_block(bt.block_hash, bt.transactions, [])
 
+        async def on_sendheaders(msg: NetworkMessage):
+            logger.debug(f"Peer {addr} wants headers announcements")
+
+        async def on_feefilter(msg: NetworkMessage):
+            from ouroboros.p2p_messages import FeeFilterMessage
+            ff = FeeFilterMessage.from_payload(msg.payload)
+            logger.debug(f"Peer {addr} feefilter: {ff.feerate} sat/kB")
+
+        async def on_wtxidrelay(msg: NetworkMessage):
+            logger.debug(f"Peer {addr} supports wtxid relay")
+
+        async def on_sendaddrv2(msg: NetworkMessage):
+            logger.debug(f"Peer {addr} supports addrv2")
+
+        async def on_notfound(msg: NetworkMessage):
+            from ouroboros.p2p_messages import NotFoundMessage
+            nf = NotFoundMessage.from_payload(msg.payload)
+            logger.debug(f"Peer {addr} notfound: {len(nf.inventory)} items")
+
+        async def on_mempool(msg: NetworkMessage):
+            if self._mempool is not None:
+                all_txids = list(self._mempool.transactions.keys())
+                if all_txids:
+                    from ouroboros.p2p_messages import InvMessage, INV_TYPE_TX
+                    inv = InvMessage([(INV_TYPE_TX, txid) for txid in all_txids[:50000]])
+                    try:
+                        await peer.send_message(inv.to_network_message(self.network))
+                    except Exception as e:
+                        logger.warning(f"Failed to send mempool inv to {addr}: {e}")
+
         peer.register_handler("sendcmpct", on_sendcmpct)
         peer.register_handler("cmpctblock", on_cmpctblock)
         peer.register_handler("blocktxn", on_blocktxn)
+        peer.register_handler("sendheaders", on_sendheaders)
+        peer.register_handler("feefilter", on_feefilter)
+        peer.register_handler("wtxidrelay", on_wtxidrelay)
+        peer.register_handler("sendaddrv2", on_sendaddrv2)
+        peer.register_handler("notfound", on_notfound)
+        peer.register_handler("mempool", on_mempool)
 
     def get_best_peer(self) -> Optional[Peer]:
         """

@@ -1,7 +1,7 @@
 """
 Bitcoin script interpreter for transaction validation.
 
-This module implements a basic Bitcoin script interpreter that can verify
+This module implements a Bitcoin script interpreter that can verify
 standard script types (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, etc.), and also
 provides script disassembly functionality for human-readable script
 representation.
@@ -22,10 +22,206 @@ from dataclasses import dataclass
 from ouroboros.database import Transaction, TxIn
 
 
+# ---------------------------------------------------------------------------
+# Script verification flags (matching Bitcoin Core src/script/interpreter.h)
+# ---------------------------------------------------------------------------
+
+SCRIPT_VERIFY_NONE = 0
+SCRIPT_VERIFY_P2SH = (1 << 0)
+SCRIPT_VERIFY_STRICTENC = (1 << 1)
+SCRIPT_VERIFY_DERSIG = (1 << 2)          # BIP 66
+SCRIPT_VERIFY_LOW_S = (1 << 3)           # BIP 62 rule 5
+SCRIPT_VERIFY_NULLDUMMY = (1 << 4)       # BIP 147
+SCRIPT_VERIFY_SIGPUSHONLY = (1 << 5)     # BIP 62 rule 2
+SCRIPT_VERIFY_MINIMALDATA = (1 << 6)     # BIP 62 rule 3/4
+SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS = (1 << 7)
+SCRIPT_VERIFY_CLEANSTACK = (1 << 8)      # BIP 62 rule 6
+SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY = (1 << 9)   # BIP 65
+SCRIPT_VERIFY_CHECKSEQUENCEVERIFY = (1 << 10)  # BIP 112
+SCRIPT_VERIFY_WITNESS = (1 << 11)        # BIP 141
+SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM = (1 << 12)
+SCRIPT_VERIFY_MINIMALIF = (1 << 13)
+SCRIPT_VERIFY_NULLFAIL = (1 << 14)
+SCRIPT_VERIFY_WITNESS_PUBKEYTYPE = (1 << 15)
+SCRIPT_VERIFY_CONST_SCRIPTCODE = (1 << 16)
+SCRIPT_VERIFY_TAPROOT = (1 << 17)        # BIP 341
+
+# Maximum push data size in bytes
+MAX_SCRIPT_ELEMENT_SIZE = 520
+MAX_STACK_SIZE = 1000
+MAX_SCRIPT_SIZE = 10000
+MAX_OPS_PER_SCRIPT = 201
+MAX_PUBKEYS_PER_MULTISIG = 20
+
+# Softfork activation heights (mainnet)
+BIP16_ACTIVATION_HEIGHT = 173805
+BIP34_ACTIVATION_HEIGHT = 227931
+BIP65_ACTIVATION_HEIGHT = 388381
+BIP66_ACTIVATION_HEIGHT = 363725
+BIP68_ACTIVATION_HEIGHT = 419328
+SEGWIT_ACTIVATION_HEIGHT = 481824
+TAPROOT_ACTIVATION_HEIGHT = 709632
+
+# secp256k1 curve order / 2, for low-S enforcement
+SECP256K1_ORDER_HALF = (
+    0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140 // 2
+)
+
+
+def get_flags_for_height(height: int) -> int:
+    """Return the script verification flags appropriate for *height*."""
+    flags = SCRIPT_VERIFY_NONE
+    if height >= BIP16_ACTIVATION_HEIGHT:
+        flags |= SCRIPT_VERIFY_P2SH
+    if height >= BIP66_ACTIVATION_HEIGHT:
+        flags |= SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S
+    if height >= BIP65_ACTIVATION_HEIGHT:
+        flags |= SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
+    if height >= BIP68_ACTIVATION_HEIGHT:
+        flags |= SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
+    if height >= SEGWIT_ACTIVATION_HEIGHT:
+        flags |= (SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_NULLDUMMY
+                   | SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_CLEANSTACK
+                   | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
+                   | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE)
+    if height >= TAPROOT_ACTIVATION_HEIGHT:
+        flags |= SCRIPT_VERIFY_TAPROOT
+    return flags
+
+
 def _tagged_hash(tag: str, data: bytes) -> bytes:
     """BIP 340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data)."""
     tag_hash = hashlib.sha256(tag.encode()).digest()
     return hashlib.sha256(tag_hash + tag_hash + data).digest()
+
+
+def _is_push_only(script: bytes) -> bool:
+    """Return True if *script* contains only push operations (BIP 62 rule 2)."""
+    i = 0
+    while i < len(script):
+        opcode = script[i]
+        i += 1
+        if opcode > 0x60:  # OP_16 = 0x60
+            return False
+        if 1 <= opcode <= 75:
+            i += opcode
+        elif opcode == 0x4c:
+            if i >= len(script):
+                return False
+            n = script[i]; i += 1 + n
+        elif opcode == 0x4d:
+            if i + 2 > len(script):
+                return False
+            n = int.from_bytes(script[i:i+2], 'little'); i += 2 + n
+        elif opcode == 0x4e:
+            if i + 4 > len(script):
+                return False
+            n = int.from_bytes(script[i:i+4], 'little'); i += 4 + n
+    return True
+
+
+def _is_push_only_simple(script: bytes) -> bool:
+    """Simplified push-only check: only data pushes and OP_0 through OP_16."""
+    i = 0
+    while i < len(script):
+        opcode = script[i]
+        i += 1
+        if opcode == 0x00:
+            continue
+        if 0x01 <= opcode <= 0x4b:
+            i += opcode
+        elif opcode == 0x4c:
+            if i >= len(script):
+                return False
+            n = script[i]; i += 1 + n
+        elif opcode == 0x4d:
+            if i + 2 > len(script):
+                return False
+            n = int.from_bytes(script[i:i+2], 'little'); i += 2 + n
+        elif opcode == 0x4e:
+            if i + 4 > len(script):
+                return False
+            n = int.from_bytes(script[i:i+4], 'little'); i += 4 + n
+        elif opcode == 0x4f:
+            continue
+        elif 0x51 <= opcode <= 0x60:
+            continue
+        else:
+            return False
+    return True
+
+
+def _check_der_signature(sig: bytes) -> bool:
+    """Validate strict DER encoding (BIP 66)."""
+    if len(sig) < 9:
+        return False
+    if len(sig) > 73:
+        return False
+    if sig[0] != 0x30:
+        return False
+    if sig[1] != len(sig) - 3:
+        return False
+    len_r = sig[3]
+    if 5 + len_r >= len(sig):
+        return False
+    len_s = sig[5 + len_r]
+    if len_r + len_s + 7 != len(sig):
+        return False
+    if sig[2] != 0x02:
+        return False
+    if len_r == 0:
+        return False
+    if sig[4] & 0x80:
+        return False
+    if len_r > 1 and sig[4] == 0x00 and not (sig[5] & 0x80):
+        return False
+    if sig[len_r + 4] != 0x02:
+        return False
+    if len_s == 0:
+        return False
+    if sig[len_r + 6] & 0x80:
+        return False
+    if len_s > 1 and sig[len_r + 6] == 0x00 and not (sig[len_r + 7] & 0x80):
+        return False
+    return True
+
+
+def _check_low_s(sig_without_hashtype: bytes) -> bool:
+    """Check that S value in DER sig is in the lower half of the curve order."""
+    if len(sig_without_hashtype) < 6:
+        return True
+    if sig_without_hashtype[0] != 0x30:
+        return True
+    len_r = sig_without_hashtype[3]
+    s_start = 6 + len_r
+    len_s = sig_without_hashtype[5 + len_r]
+    if s_start + len_s > len(sig_without_hashtype):
+        return True
+    s_bytes = sig_without_hashtype[s_start:s_start + len_s]
+    s_val = int.from_bytes(s_bytes, 'big')
+    return s_val <= SECP256K1_ORDER_HALF
+
+
+def _get_witness_version_and_program(script_pubkey: bytes) -> Optional[Tuple[int, bytes]]:
+    """
+    If script_pubkey is a witness program, return (version, program).
+    Witness programs: OP_n <2..40 bytes>
+    """
+    if len(script_pubkey) < 4 or len(script_pubkey) > 42:
+        return None
+    version_opcode = script_pubkey[0]
+    if version_opcode == 0x00:
+        version = 0
+    elif 0x51 <= version_opcode <= 0x60:
+        version = version_opcode - 0x50
+    else:
+        return None
+    program_len = script_pubkey[1]
+    if program_len + 2 != len(script_pubkey):
+        return None
+    if program_len < 2 or program_len > 40:
+        return None
+    return version, script_pubkey[2:]
 
 
 class ScriptInterpreter:
@@ -40,64 +236,294 @@ class ScriptInterpreter:
         script_sig: bytes,
         script_pubkey: bytes,
         tx: Transaction,
-        input_index: int
+        input_index: int,
+        flags: int = SCRIPT_VERIFY_NONE,
+        amount: int = 0,
+        input_amounts: Optional[List[int]] = None,
+        input_script_pubkeys: Optional[List[bytes]] = None,
     ) -> bool:
         """
-        Verify a script signature against a script pubkey.
-        
-        Args:
-            script_sig: Script signature from transaction input
-            script_pubkey: Script pubkey from UTXO
-            tx: The transaction being verified
-            input_index: Index of the input being verified
-            
-        Returns:
-            True if script verification passes, False otherwise
+        Verify a script against the consensus rules indicated by *flags*.
+
+        This follows Bitcoin Core's VerifyScript() logic:
+        1. (optional) Check scriptSig is push-only (SIGPUSHONLY)
+        2. Execute scriptSig -> stack
+        3. Copy stack (for P2SH)
+        4. Execute scriptPubKey with the stack
+        5. Top of stack must be truthy
+        6. If P2SH, deserialize and execute redeem script
+        7. If witness program detected, verify witness
+        8. Enforce clean stack
         """
-        # Combine script_sig and script_pubkey for execution
-        # In Bitcoin, we execute: script_sig + script_pubkey
-        combined_script = script_sig + script_pubkey
-        
         try:
-            # Execute the script (pass script_pubkey for signature hash calculation)
-            stack = self._execute_script(combined_script, tx, input_index, script_pubkey)
-            
-            # Script is valid if stack is non-empty and top element is truthy
-            if not stack:
+            # SIGPUSHONLY: scriptSig must contain only data pushes
+            if (flags & SCRIPT_VERIFY_SIGPUSHONLY) and not _is_push_only_simple(script_sig):
                 return False
-            
-            # Check if top element is non-zero (truthy in Bitcoin script)
-            top = stack[-1]
-            if isinstance(top, bytes):
-                # Non-empty byte array is truthy, but empty array is falsy
-                # Exception: any non-zero value in a byte array is truthy
-                return len(top) > 0 and any(b != 0 for b in top)
-            return bool(top)
-        
+
+            # Step 1: Execute scriptSig
+            stack = self._execute_script(
+                script_sig, tx, input_index, script_pubkey, flags)
+
+            # Step 2: Copy stack for P2SH evaluation later
+            stack_copy = list(stack) if (flags & SCRIPT_VERIFY_P2SH) else []
+
+            # Step 3: Execute scriptPubKey with the resulting stack
+            stack = self._execute_script(
+                script_pubkey, tx, input_index, script_pubkey, flags,
+                initial_stack=stack)
+
+            if not stack or not self._cast_to_bool(stack[-1]):
+                return False
+
+            # Step 4: Check for witness programs in scriptPubKey
+            witness = None
+            if hasattr(tx, 'inputs') and input_index < len(tx.inputs):
+                witness = getattr(tx.inputs[input_index], 'witness', None)
+
+            wp = _get_witness_version_and_program(script_pubkey)
+            if (flags & SCRIPT_VERIFY_WITNESS) and wp is not None:
+                version, program = wp
+                if script_sig:
+                    return False  # scriptSig must be empty for native witness
+                if not self._verify_witness_program(
+                    tx, input_index, version, program,
+                    witness or [], flags, amount,
+                    input_amounts, input_script_pubkeys,
+                ):
+                    return False
+                # Witness programs define their own clean-stack semantics
+                return True
+
+            # Step 5: P2SH evaluation
+            if (flags & SCRIPT_VERIFY_P2SH) and self._is_p2sh(script_pubkey):
+                if not _is_push_only_simple(script_sig):
+                    return False
+                if not stack_copy:
+                    return False
+                redeem_script = stack_copy[-1]
+
+                # Check for witness program inside P2SH (P2SH-P2WPKH, P2SH-P2WSH)
+                wp_inner = _get_witness_version_and_program(redeem_script)
+                if (flags & SCRIPT_VERIFY_WITNESS) and wp_inner is not None:
+                    version, program = wp_inner
+                    if script_sig != bytes([len(redeem_script)]) + redeem_script:
+                        # scriptSig must be exactly a single push of the redeem script
+                        if not _is_push_only_simple(script_sig):
+                            return False
+                    return self._verify_witness_program(
+                        tx, input_index, version, program,
+                        witness or [], flags, amount,
+                        input_amounts, input_script_pubkeys,
+                    )
+
+                redeem_stack = self._execute_script(
+                    redeem_script, tx, input_index, redeem_script, flags,
+                    initial_stack=stack_copy[:-1])
+                if not redeem_stack or not self._cast_to_bool(redeem_stack[-1]):
+                    return False
+                if (flags & SCRIPT_VERIFY_CLEANSTACK) and len(redeem_stack) != 1:
+                    return False
+                return True
+
+            # Step 6: Clean stack
+            if (flags & SCRIPT_VERIFY_CLEANSTACK) and len(stack) != 1:
+                return False
+
+            return True
+
         except Exception:
-            # Any exception during script execution means invalid script
             return False
+
+    def _is_p2sh(self, script: bytes) -> bool:
+        """OP_HASH160 <20 bytes> OP_EQUAL"""
+        return (len(script) == 23
+                and script[0] == 0xa9
+                and script[1] == 0x14
+                and script[22] == 0x87)
+
+    def _verify_witness_program(
+        self,
+        tx: Transaction,
+        input_index: int,
+        version: int,
+        program: bytes,
+        witness: List[bytes],
+        flags: int,
+        amount: int = 0,
+        input_amounts: Optional[List[int]] = None,
+        input_script_pubkeys: Optional[List[bytes]] = None,
+    ) -> bool:
+        """Verify a segregated witness program (BIP 141)."""
+        if version == 0:
+            if len(program) == 20:
+                return self._verify_witness_v0_keyhash(
+                    tx, input_index, program, witness, flags, amount)
+            elif len(program) == 32:
+                return self._verify_witness_v0_scripthash(
+                    tx, input_index, program, witness, flags, amount)
+            else:
+                return False
+        elif version == 1 and len(program) == 32:
+            if flags & SCRIPT_VERIFY_TAPROOT:
+                # Build the expected scriptPubKey: OP_1 <32-byte key>
+                spk = bytes([0x51, 0x20]) + program
+                return self.verify_taproot(
+                    tx, input_index, witness, spk,
+                    input_amounts, input_script_pubkeys)
+            return True  # unknown witness version succeeds
+        elif flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM:
+            return False
+        return True  # unknown witness version succeeds
+
+    def _verify_witness_v0_keyhash(
+        self, tx: Transaction, input_index: int,
+        keyhash: bytes, witness: List[bytes],
+        flags: int, amount: int,
+    ) -> bool:
+        """P2WPKH: witness = [sig, pubkey], keyhash = HASH160(pubkey)."""
+        if len(witness) != 2:
+            return False
+        sig, pubkey = witness[0], witness[1]
+        if self._hash160(pubkey) != keyhash:
+            return False
+        # Build implicit P2PKH script: OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY OP_CHECKSIG
+        script_code = (
+            b'\x76\xa9\x14' + keyhash + b'\x88\xac'
+        )
+        if not sig:
+            return False
+        sighash_type = sig[-1]
+        der_sig = sig[:-1]
+        if (flags & SCRIPT_VERIFY_DERSIG) and not _check_der_signature(sig):
+            return False
+        if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
+            return False
+        msg = self._compute_segwit_v0_sighash(
+            tx, input_index, script_code, amount, sighash_type)
+        if not self._verify_ecdsa_signature(msg, der_sig, pubkey):
+            if flags & SCRIPT_VERIFY_NULLFAIL:
+                return False
+            return False
+        return True
+
+    def _verify_witness_v0_scripthash(
+        self, tx: Transaction, input_index: int,
+        scripthash: bytes, witness: List[bytes],
+        flags: int, amount: int,
+    ) -> bool:
+        """P2WSH: witness = [...stack, witness_script], scripthash = SHA256(witness_script)."""
+        if len(witness) < 1:
+            return False
+        witness_script = witness[-1]
+        if hashlib.sha256(witness_script).digest() != scripthash:
+            return False
+        if len(witness_script) > MAX_SCRIPT_SIZE:
+            return False
+        stack = list(witness[:-1])
+        stack = self._execute_script(
+            witness_script, tx, input_index, witness_script, flags,
+            initial_stack=stack, is_witness_v0=True, witness_amount=amount)
+        if not stack or not self._cast_to_bool(stack[-1]):
+            return False
+        if len(stack) != 1:
+            return False
+        return True
     
+    def _compute_segwit_v0_sighash(
+        self,
+        tx: Transaction,
+        input_index: int,
+        script_code: bytes,
+        amount: int,
+        sighash_type: int,
+    ) -> bytes:
+        """BIP 143 sighash for SegWit v0 transactions."""
+        base_type = sighash_type & 0x1f
+        anyone_can_pay = (sighash_type & 0x80) != 0
+        if base_type == 0:
+            base_type = 0x01
+
+        # hashPrevouts
+        if not anyone_can_pay:
+            prevouts = bytearray()
+            for inp in tx.inputs:
+                prevouts.extend(inp.prev_txid)
+                prevouts.extend(struct.pack('<I', inp.prev_vout))
+            hash_prevouts = hashlib.sha256(hashlib.sha256(bytes(prevouts)).digest()).digest()
+        else:
+            hash_prevouts = b'\x00' * 32
+
+        # hashSequence
+        if not anyone_can_pay and base_type not in (0x02, 0x03):
+            seqs = bytearray()
+            for inp in tx.inputs:
+                seqs.extend(struct.pack('<I', inp.sequence))
+            hash_sequence = hashlib.sha256(hashlib.sha256(bytes(seqs)).digest()).digest()
+        else:
+            hash_sequence = b'\x00' * 32
+
+        # hashOutputs
+        if base_type not in (0x02, 0x03):
+            outs = bytearray()
+            for out in tx.outputs:
+                outs.extend(struct.pack('<q', out.value))
+                outs.extend(self._encode_varint(len(out.script_pubkey)))
+                outs.extend(out.script_pubkey)
+            hash_outputs = hashlib.sha256(hashlib.sha256(bytes(outs)).digest()).digest()
+        elif base_type == 0x03 and input_index < len(tx.outputs):
+            out = tx.outputs[input_index]
+            single_out = struct.pack('<q', out.value)
+            single_out += self._encode_varint(len(out.script_pubkey))
+            single_out += out.script_pubkey
+            hash_outputs = hashlib.sha256(hashlib.sha256(single_out).digest()).digest()
+        else:
+            hash_outputs = b'\x00' * 32
+
+        inp = tx.inputs[input_index]
+        data = bytearray()
+        data.extend(struct.pack('<i', tx.version))
+        data.extend(hash_prevouts)
+        data.extend(hash_sequence)
+        data.extend(inp.prev_txid)
+        data.extend(struct.pack('<I', inp.prev_vout))
+        data.extend(self._encode_varint(len(script_code)))
+        data.extend(script_code)
+        data.extend(struct.pack('<q', amount))
+        data.extend(struct.pack('<I', inp.sequence))
+        data.extend(hash_outputs)
+        data.extend(struct.pack('<I', tx.locktime))
+        data.extend(struct.pack('<I', sighash_type))
+
+        return hashlib.sha256(hashlib.sha256(bytes(data)).digest()).digest()
+
     def _execute_script(
         self,
         script: bytes,
         tx: Transaction,
         input_index: int,
-        script_pubkey: bytes
+        script_pubkey: bytes,
+        flags: int = SCRIPT_VERIFY_NONE,
+        initial_stack: Optional[List[bytes]] = None,
+        is_witness_v0: bool = False,
+        witness_amount: int = 0,
     ) -> List[bytes]:
         """
         Execute a Bitcoin script.
-        
+
         Args:
             script: Script bytes to execute
             tx: Transaction context
             input_index: Index of input being verified
             script_pubkey: Script pubkey for signature hash calculation
-            
+            flags: Script verification flags
+            initial_stack: Pre-populated stack (for P2SH / witness evaluation)
+            is_witness_v0: True when executing inside a SegWit v0 context
+            witness_amount: Input amount (needed for BIP 143 sighash)
+
         Returns:
             Stack after execution
         """
-        stack: List[bytes] = []
+        stack: List[bytes] = list(initial_stack) if initial_stack else []
         altstack: List[bytes] = []
         exec_stack: List[bool] = []
         op_count = 0
@@ -151,7 +577,11 @@ class ScriptInterpreter:
 
             if push_data is not None:
                 if executing:
+                    if len(push_data) > MAX_SCRIPT_ELEMENT_SIZE:
+                        raise ValueError(f"Push data exceeds {MAX_SCRIPT_ELEMENT_SIZE} bytes")
                     stack.append(push_data)
+                    if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                        raise ValueError("Stack size exceeded")
                 continue
 
             # Op count (opcodes > OP_16 only, regardless of exec state)
@@ -471,16 +901,33 @@ class ScriptInterpreter:
                     raise ValueError("OP_CHECKSIG: stack underflow")
                 pubkey = stack.pop()
                 sig = stack.pop()
-                if len(sig) < 1 or len(pubkey) < 1:
+                if not sig:
                     stack.append(b'\x00')
                     continue
-                sighash_type = sig[-1]
+                if len(pubkey) < 1:
+                    if (flags & SCRIPT_VERIFY_NULLFAIL) and sig:
+                        raise ValueError("NULLFAIL: non-empty sig for empty pubkey")
+                    stack.append(b'\x00')
+                    continue
+                if (flags & SCRIPT_VERIFY_DERSIG) and not _check_der_signature(sig):
+                    raise ValueError("Non-DER signature")
                 der_sig = sig[:-1]
+                if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
+                    raise ValueError("Non-low-S signature")
+                sighash_type = sig[-1]
                 try:
-                    msg = self._calculate_signature_hash(
-                        tx, input_index, script_pubkey, sighash_type)
+                    if is_witness_v0:
+                        msg = self._compute_segwit_v0_sighash(
+                            tx, input_index, script_pubkey, witness_amount, sighash_type)
+                    else:
+                        msg = self._calculate_signature_hash(
+                            tx, input_index, script_pubkey, sighash_type)
                     ok = self._verify_ecdsa_signature(msg, der_sig, pubkey)
+                    if not ok and (flags & SCRIPT_VERIFY_NULLFAIL):
+                        raise ValueError("NULLFAIL: signature verification failed with non-empty sig")
                     stack.append(b'\x01' if ok else b'\x00')
+                except ValueError:
+                    raise
                 except Exception:
                     stack.append(b'\x00')
                 continue
@@ -490,13 +937,21 @@ class ScriptInterpreter:
                     raise ValueError("OP_CHECKSIGVERIFY: stack underflow")
                 pubkey = stack.pop()
                 sig = stack.pop()
-                if len(sig) < 1 or len(pubkey) < 1:
+                if not sig or len(pubkey) < 1:
                     raise ValueError("OP_CHECKSIGVERIFY failed")
-                sighash_type = sig[-1]
+                if (flags & SCRIPT_VERIFY_DERSIG) and not _check_der_signature(sig):
+                    raise ValueError("Non-DER signature")
                 der_sig = sig[:-1]
+                if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
+                    raise ValueError("Non-low-S signature")
+                sighash_type = sig[-1]
                 try:
-                    msg = self._calculate_signature_hash(
-                        tx, input_index, script_pubkey, sighash_type)
+                    if is_witness_v0:
+                        msg = self._compute_segwit_v0_sighash(
+                            tx, input_index, script_pubkey, witness_amount, sighash_type)
+                    else:
+                        msg = self._calculate_signature_hash(
+                            tx, input_index, script_pubkey, sighash_type)
                     if not self._verify_ecdsa_signature(msg, der_sig, pubkey):
                         raise ValueError("OP_CHECKSIGVERIFY failed")
                 except ValueError:
@@ -509,10 +964,10 @@ class ScriptInterpreter:
                 if len(stack) < 1:
                     raise ValueError("OP_CHECKMULTISIG: stack underflow")
                 n = self._read_num(stack.pop())
-                if n < 0 or n > 20:
+                if n < 0 or n > MAX_PUBKEYS_PER_MULTISIG:
                     raise ValueError("OP_CHECKMULTISIG n out of range")
                 op_count += n
-                if op_count > 201:
+                if op_count > MAX_OPS_PER_SCRIPT:
                     raise ValueError("Too many operations")
                 if len(stack) < n:
                     raise ValueError("OP_CHECKMULTISIG: stack underflow")
@@ -527,9 +982,17 @@ class ScriptInterpreter:
                 sigs = [stack.pop() for _ in range(k)]
                 if not stack:
                     raise ValueError("OP_CHECKMULTISIG: missing dummy")
-                stack.pop()
+                dummy = stack.pop()
+                # BIP 147: NULLDUMMY - dummy element must be empty
+                if (flags & SCRIPT_VERIFY_NULLDUMMY) and dummy:
+                    raise ValueError("NULLDUMMY: dummy element is not empty")
                 valid = self._verify_multisig(
-                    sigs, pubkeys, k, tx, input_index, script_pubkey)
+                    sigs, pubkeys, k, tx, input_index, script_pubkey,
+                    flags, is_witness_v0, witness_amount)
+                if not valid and (flags & SCRIPT_VERIFY_NULLFAIL):
+                    for s in sigs:
+                        if s:
+                            raise ValueError("NULLFAIL: non-empty sig in failed multisig")
                 stack.append(b'\x01' if valid else b'\x00')
                 continue
 
@@ -537,10 +1000,10 @@ class ScriptInterpreter:
                 if not stack:
                     raise ValueError("OP_CHECKMULTISIGVERIFY: stack underflow")
                 n = self._read_num(stack.pop())
-                if n < 0 or n > 20:
+                if n < 0 or n > MAX_PUBKEYS_PER_MULTISIG:
                     raise ValueError("OP_CHECKMULTISIGVERIFY n out of range")
                 op_count += n
-                if op_count > 201:
+                if op_count > MAX_OPS_PER_SCRIPT:
                     raise ValueError("Too many operations")
                 if len(stack) < n:
                     raise ValueError("OP_CHECKMULTISIGVERIFY: stack underflow")
@@ -555,9 +1018,12 @@ class ScriptInterpreter:
                 sigs = [stack.pop() for _ in range(k)]
                 if not stack:
                     raise ValueError("OP_CHECKMULTISIGVERIFY: missing dummy")
-                stack.pop()
+                dummy = stack.pop()
+                if (flags & SCRIPT_VERIFY_NULLDUMMY) and dummy:
+                    raise ValueError("NULLDUMMY: dummy element is not empty")
                 if not self._verify_multisig(
-                    sigs, pubkeys, k, tx, input_index, script_pubkey):
+                    sigs, pubkeys, k, tx, input_index, script_pubkey,
+                    flags, is_witness_v0, witness_amount):
                     raise ValueError("OP_CHECKMULTISIGVERIFY failed")
                 continue
 
@@ -798,32 +1264,17 @@ class ScriptInterpreter:
         k: int,
         tx: Transaction,
         input_index: int,
-        script_pubkey: bytes
+        script_pubkey: bytes,
+        flags: int = SCRIPT_VERIFY_NONE,
+        is_witness_v0: bool = False,
+        witness_amount: int = 0,
     ) -> bool:
-        """
-        Verify k-of-n multisig: k signatures must match k of n pubkeys in order.
-
-        Bitcoin rule: For each sig, try pubkeys in order. If sig matches pubkey,
-        advance both indices. If not, advance only pubkey index. All k sigs must match.
-
-        Args:
-            sigs: Signatures (stack order: top first)
-            pubkeys: Public keys (stack order: top first)
-            k: Number of required signatures
-            tx: Transaction being verified
-            input_index: Input index
-            script_pubkey: Script pubkey for signature hash (P2SH: redeem script)
-
-        Returns:
-            True if exactly k signatures verify
-        """
+        """Verify k-of-n multisig."""
         if k == 0:
             return True
         if k > len(sigs) or k > len(pubkeys):
             return False
 
-        # For multisig, script_code is the redeem script (OP_m pubkeys... OP_n OP_CHECKMULTISIG)
-        # In P2SH, script_pubkey passed here is the redeem script from script_sig
         script_code = script_pubkey
 
         sig_idx = 0
@@ -838,10 +1289,19 @@ class ScriptInterpreter:
                 key_idx += 1
                 continue
 
-            sighash_type = sig[-1]
+            if (flags & SCRIPT_VERIFY_DERSIG) and not _check_der_signature(sig):
+                return False
             der_sig = sig[:-1]
+            if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
+                return False
 
-            message_hash = self._calculate_signature_hash(tx, input_index, script_code, sighash_type)
+            sighash_type = sig[-1]
+            if is_witness_v0:
+                message_hash = self._compute_segwit_v0_sighash(
+                    tx, input_index, script_code, witness_amount, sighash_type)
+            else:
+                message_hash = self._calculate_signature_hash(
+                    tx, input_index, script_code, sighash_type)
             if self._verify_ecdsa_signature(message_hash, der_sig, pubkey):
                 sig_idx += 1
                 matched += 1

@@ -2,11 +2,12 @@
 Transaction mempool management.
 
 This module implements the unconfirmed transaction pool with fee rate
-sorting, double spend detection, and size management.
+sorting, double spend detection, size management, ancestor/descendant
+limits, and standardness checks.
 """
 
 from typing import Dict, List, Set, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 import logging
 
@@ -18,6 +19,64 @@ logger = logging.getLogger(__name__)
 # OutPoint is a tuple of (txid: bytes, vout: int)
 OutPoint = Tuple[bytes, int]
 
+# Policy constants matching Bitcoin Core
+MAX_STANDARD_TX_WEIGHT = 400_000
+MIN_STANDARD_TX_NONWITNESS_SIZE = 65
+MAX_ANCESTOR_COUNT = 25
+MAX_DESCENDANT_COUNT = 25
+MAX_ANCESTOR_SIZE_KVB = 101
+MAX_DESCENDANT_SIZE_KVB = 101
+DUST_RELAY_TX_FEE = 3000  # sat/kB
+DEFAULT_MIN_RELAY_TX_FEE = 1000  # sat/kvB
+MEMPOOL_EXPIRY_HOURS = 336  # 14 days
+TX_MAX_STANDARD_VERSION = 2
+
+
+def _get_dust_threshold(script_pubkey: bytes) -> int:
+    """Calculate the dust threshold for a given output script."""
+    # P2PKH/P2SH cost: 34 + 148 = 182 bytes
+    # P2WPKH cost: 31 + 68 = 99 bytes (roughly)
+    # P2WSH cost: 43 + 68 = 111 bytes
+    # P2TR cost: 43 + 57.5 = 100.5 bytes
+    if len(script_pubkey) == 22 and script_pubkey[0] == 0x00:
+        n_size = 99  # P2WPKH
+    elif len(script_pubkey) == 34 and script_pubkey[0] in (0x00, 0x51):
+        n_size = 110  # P2WSH or P2TR
+    elif len(script_pubkey) == 23 and script_pubkey[0] == 0xa9:
+        n_size = 182  # P2SH
+    else:
+        n_size = 182  # P2PKH and others
+    return (n_size * DUST_RELAY_TX_FEE) // 1000
+
+
+def _is_standard_tx(tx: Transaction) -> Tuple[bool, str]:
+    """Check if a transaction is standard (policy, not consensus)."""
+    if tx.version < 1 or tx.version > TX_MAX_STANDARD_VERSION:
+        return False, f"Non-standard version: {tx.version}"
+
+    tx_bytes = tx.serialize()
+    tx_size = len(tx_bytes)
+    # Weight approximation: non-witness size * 3 + total size
+    tx_weight = tx_size * 4  # conservative upper bound
+    if tx_weight > MAX_STANDARD_TX_WEIGHT:
+        return False, f"Transaction weight {tx_weight} exceeds {MAX_STANDARD_TX_WEIGHT}"
+
+    if tx_size < MIN_STANDARD_TX_NONWITNESS_SIZE:
+        return False, f"Transaction too small: {tx_size} < {MIN_STANDARD_TX_NONWITNESS_SIZE}"
+
+    # Check for dust outputs
+    dust_count = 0
+    for out in tx.outputs:
+        if out.script_pubkey and out.script_pubkey[0] == 0x6a:
+            continue  # OP_RETURN is okay
+        threshold = _get_dust_threshold(out.script_pubkey)
+        if out.value < threshold:
+            dust_count += 1
+    if dust_count > 0:
+        return False, f"Transaction has {dust_count} dust output(s)"
+
+    return True, ""
+
 
 @dataclass
 class MempoolEntry:
@@ -28,6 +87,10 @@ class MempoolEntry:
     size: int
     time_added: float
     height_added: int
+    ancestor_count: int = 1
+    ancestor_size: int = 0
+    descendant_count: int = 1
+    descendant_size: int = 0
 
 
 class Mempool:
@@ -36,7 +99,8 @@ class Mempool:
     def __init__(
         self,
         validator: TransactionValidator,
-        max_size: int = 300_000_000  # 300 MB
+        max_size: int = 300_000_000,  # 300 MB
+        require_standard: bool = True,
     ):
         """
         Initialize mempool.
@@ -44,9 +108,11 @@ class Mempool:
         Args:
             validator: Transaction validator
             max_size: Maximum mempool size in bytes (default: 300 MB)
+            require_standard: Enforce standardness policy (disable for regtest/tests)
         """
         self.validator = validator
         self.max_size = max_size
+        self.require_standard = require_standard
         
         self.transactions: Dict[bytes, MempoolEntry] = {}  # txid -> entry
         self.spent_outputs: Set[OutPoint] = set()
@@ -73,8 +139,14 @@ class Mempool:
         # Check if already in mempool
         if txid in self.transactions:
             return False, "Already in mempool"
+
+        # Standardness checks (policy, not consensus)
+        if self.require_standard:
+            is_std, reason = _is_standard_tx(tx)
+            if not is_std:
+                return False, f"Non-standard transaction: {reason}"
         
-        # Validate transaction
+        # Validate transaction (consensus)
         valid, error = self.validator.validate_transaction(tx, height)
         if not valid:
             return False, error
@@ -86,11 +158,26 @@ class Mempool:
         )
         if has_conflict:
             return self.try_replace(tx, height)
+
+        # Ancestor/descendant limits
+        ancestors = self._get_ancestors(tx)
+        if len(ancestors) + 1 > MAX_ANCESTOR_COUNT:
+            return False, (
+                f"Too many ancestors: {len(ancestors) + 1} > {MAX_ANCESTOR_COUNT}")
+        ancestor_size = sum(self.transactions[a].size for a in ancestors if a in self.transactions)
+        tx_size = len(tx.serialize())
+        if (ancestor_size + tx_size) // 1000 > MAX_ANCESTOR_SIZE_KVB:
+            return False, "Ancestor size limit exceeded"
+
+        for a_txid in ancestors:
+            if a_txid in self.transactions:
+                entry = self.transactions[a_txid]
+                if entry.descendant_count + 1 > MAX_DESCENDANT_COUNT:
+                    return False, (
+                        f"Too many descendants for ancestor {a_txid.hex()[:16]}...")
         
         # Check mempool size
-        tx_size = len(tx.serialize())
         if self.current_size + tx_size > self.max_size:
-            # Evict lowest fee rate transactions
             self._evict_low_fee_txs(tx_size)
         
         # Calculate fee
@@ -100,7 +187,6 @@ class Mempool:
             if utxo:
                 total_input += utxo['value']
             else:
-                # UTXO not found - this shouldn't happen after validation
                 return False, f"UTXO not found: {tx_in.prev_txid.hex()[:16]}...:{tx_in.prev_vout}"
         
         total_output = sum(out.value for out in tx.outputs)
@@ -110,6 +196,11 @@ class Mempool:
             return False, "Negative fee"
         
         fee_rate = fee / tx_size if tx_size > 0 else 0
+
+        # Minimum relay fee
+        min_relay = (tx_size * DEFAULT_MIN_RELAY_TX_FEE) // 1000
+        if fee < min_relay:
+            return False, f"Below minimum relay fee: {fee} < {min_relay}"
         
         # Add to mempool
         entry = MempoolEntry(
@@ -118,7 +209,9 @@ class Mempool:
             fee_rate=fee_rate,
             size=tx_size,
             time_added=time.time(),
-            height_added=height
+            height_added=height,
+            ancestor_count=len(ancestors) + 1,
+            ancestor_size=ancestor_size + tx_size,
         )
         
         self.transactions[txid] = entry
@@ -128,6 +221,12 @@ class Mempool:
         for tx_in in tx.inputs:
             outpoint: OutPoint = (tx_in.prev_txid, tx_in.prev_vout)
             self.spent_outputs.add(outpoint)
+
+        # Update ancestor descendant counts
+        for a_txid in ancestors:
+            if a_txid in self.transactions:
+                self.transactions[a_txid].descendant_count += 1
+                self.transactions[a_txid].descendant_size += tx_size
         
         # Insert sorted by fee rate
         self._insert_sorted_by_fee_rate(txid, fee_rate)
@@ -137,6 +236,39 @@ class Mempool:
             f"(fee: {fee}, rate: {fee_rate:.2f} sat/vbyte)"
         )
         return True, ""
+
+    def _get_ancestors(self, tx: Transaction) -> Set[bytes]:
+        """Return txids of all mempool ancestors of *tx*."""
+        result: Set[bytes] = set()
+        queue = []
+        for inp in tx.inputs:
+            if inp.prev_txid in self.transactions:
+                queue.append(inp.prev_txid)
+                result.add(inp.prev_txid)
+        while queue:
+            parent = queue.pop()
+            entry = self.transactions.get(parent)
+            if entry is None:
+                continue
+            for inp in entry.tx.inputs:
+                if inp.prev_txid in self.transactions and inp.prev_txid not in result:
+                    result.add(inp.prev_txid)
+                    queue.append(inp.prev_txid)
+        return result
+
+    def expire_old_transactions(self, current_time: Optional[float] = None) -> int:
+        """Remove transactions that have been in the mempool too long."""
+        now = current_time or time.time()
+        cutoff = now - (MEMPOOL_EXPIRY_HOURS * 3600)
+        expired = [
+            txid for txid, entry in self.transactions.items()
+            if entry.time_added < cutoff
+        ]
+        for txid in expired:
+            self.remove_transaction(txid)
+        if expired:
+            logger.info(f"Expired {len(expired)} old mempool transactions")
+        return len(expired)
     
     def remove_transaction(self, txid: bytes):
         """
