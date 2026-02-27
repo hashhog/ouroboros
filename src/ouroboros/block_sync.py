@@ -76,12 +76,18 @@ class BlockSync:
         self.last_best_hash: Optional[bytes] = None
         self.reorg_depth: int = 0
         
+        self._zmq_publisher = None
+
         self.running = False
         self._sync_task: Optional[asyncio.Task] = None
         
         # Message handlers per peer (peer -> handler_dict)
         self._peer_handlers: Dict[Peer, Dict[str, Callable]] = defaultdict(dict)
     
+    def set_zmq_publisher(self, publisher) -> None:
+        """Attach a ZMQPublisher for real-time block/tx notifications."""
+        self._zmq_publisher = publisher
+
     async def start(self):
         """Start block synchronization"""
         if self.running:
@@ -318,7 +324,10 @@ class BlockSync:
                     self.mempool.remove_block_transactions(block)
                 
                 logger.info(f"✓ New block {block_height}: {block_hash.hex()[:16]}...")
-                
+
+                if self._zmq_publisher:
+                    self._zmq_publisher.notify_block(block)
+
                 # Process orphans that may now have their parent
                 await self._process_orphans(block_hash)
                 

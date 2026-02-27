@@ -25,6 +25,7 @@ from ouroboros.config import NodeConfig
 from ouroboros.fee_estimator import FeeEstimator
 from ouroboros.wallet import Wallet
 from ouroboros.cookie_auth import generate_cookie, delete_cookie
+from ouroboros.zmq_publisher import ZMQPublisher
 from ouroboros.metrics import (
     init_metrics,
     update_chain_metrics,
@@ -84,6 +85,9 @@ class BitcoinNode:
         # Sync manager
         self.sync_manager: Optional[SyncManager] = None
         
+        # ZMQ publisher
+        self.zmq_publisher: Optional[ZMQPublisher] = None
+
         # State
         self.running = False
         self.synced = False
@@ -186,6 +190,18 @@ class BitcoinNode:
             )
             self._rpc_task = asyncio.create_task(self.rpc_server.start())
 
+            # ZMQ publisher (optional — enabled when zmq_endpoint or zmqpubhashblock is set)
+            zmq_endpoint = (
+                self.config.get('zmqpubhashblock')
+                or self.config.get('zmq_endpoint')
+            )
+            if zmq_endpoint:
+                self.zmq_publisher = ZMQPublisher(endpoint=zmq_endpoint)
+                await self.zmq_publisher.start()
+                logger.info(f"ZMQ publisher started on {zmq_endpoint}")
+                if self.block_sync:
+                    self.block_sync.set_zmq_publisher(self.zmq_publisher)
+
             # Prometheus metrics (best-effort; disabled if prometheus_client not installed)
             metrics_port = int(self.config.get('metrics_port', 9332))
             if init_metrics(port=metrics_port):
@@ -238,6 +254,11 @@ class BitcoinNode:
                 except asyncio.CancelledError:
                     pass
             
+            # Stop ZMQ publisher
+            if self.zmq_publisher:
+                logger.info("Stopping ZMQ publisher...")
+                await self.zmq_publisher.stop()
+
             # Remove cookie file on clean shutdown
             delete_cookie(self.data_dir)
 
@@ -388,6 +409,8 @@ class BitcoinNode:
 
                 if success:
                     logger.info(f"Added transaction {tx.get_txid().hex()[:16]}... to mempool")
+                    if self.zmq_publisher:
+                        self.zmq_publisher.notify_transaction(tx)
                 else:
                     logger.debug(f"Rejected transaction: {error}")
 
