@@ -410,7 +410,10 @@ class RPCServer:
         if hasattr(self.node, 'config'):
             network = self.node.config.get('network', network)
         
-        return {
+        pruner = getattr(self.node, "pruner", None)
+        pruned = pruner is not None and pruner.prune_height > 0
+
+        info: Dict[str, Any] = {
             "chain": network,
             "blocks": best_height,
             "headers": best_height,
@@ -419,9 +422,14 @@ class RPCServer:
             "mediantime": self.node.get_median_time(),
             "verificationprogress": 1.0 if self._is_synced() else 0.0,
             "chainwork": self.node.get_chainwork(),
-            "pruned": False,
+            "pruned": pruned,
             "softforks": {},
         }
+
+        if pruner is not None:
+            info.update(pruner.get_prune_info())
+
+        return info
     
     async def rpc_getblockcount(self) -> int:
         """Return block count"""
@@ -1581,6 +1589,39 @@ class RPCServer:
             return None
         except Exception as e:
             return str(e)
+
+    async def rpc_pruneblockchain(self, height: int) -> int:
+        """
+        Prune block data up to the given height.
+
+        Returns the height of the last block pruned.
+
+        Reference: Bitcoin Core pruneblockchain (rpc/blockchain.cpp)
+        """
+        pruner = getattr(self.node, "pruner", None)
+        if pruner is None:
+            return JSONRPCResponse(
+                error={
+                    "code": -1,
+                    "message": "Cannot prune blocks because node is not "
+                    "in prune mode. Start with -prune=<target_size_mb>.",
+                },
+                id=None,
+            )
+
+        _, best_height = self.node.db.get_best_block()
+        max_height = best_height - pruner.keep_blocks
+        target = min(height, max_height)
+        if target < 0:
+            target = 0
+
+        from_height = pruner.prune_height
+        if from_height > target:
+            return from_height
+
+        removed = self.node.db.prune_blocks_range(from_height, target)
+        logger.info(f"RPC pruneblockchain: pruned {removed} blocks up to height {target}")
+        return target
 
     # Helper methods
     

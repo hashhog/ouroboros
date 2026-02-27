@@ -1667,73 +1667,93 @@ class TestV2Transport:
 # ── Block Pruning ─────────────────────────────────────────────────────
 
 
+class _MockPruneDB:
+    """In-memory mock of PyBlockchainDB pruning interface for testing."""
+
+    def __init__(self, block_count: int, block_size: int = 1000):
+        self._blocks = {h: b"\x00" * block_size for h in range(block_count)}
+        self._prune_height = 0
+
+    def prune_blocks_range(self, from_height, to_height):
+        removed = 0
+        for h in range(from_height, to_height + 1):
+            if h in self._blocks:
+                del self._blocks[h]
+                removed += 1
+        self._prune_height = to_height + 1
+        return removed
+
+    def prune_block_at_height(self, height):
+        if height in self._blocks:
+            del self._blocks[height]
+            if height >= self._prune_height:
+                self._prune_height = height + 1
+            return True
+        return False
+
+    def get_prune_height(self):
+        return self._prune_height
+
+    def has_block_data(self, height):
+        return height in self._blocks
+
+    def estimate_blocks_size(self):
+        return sum(len(v) for v in self._blocks.values())
+
+    def get_best_block(self):
+        if not self._blocks:
+            return (b"\x00" * 32, 0)
+        max_h = max(self._blocks.keys())
+        return (b"\x00" * 32, max_h)
+
+
 class TestBlockPruner:
-    """Block pruning: discard old block data to save disk space."""
+    """Block pruning: discard old block data via RocksDB backend."""
 
-    def test_prune_old_blocks(self, tmp_path):
+    def test_prune_old_blocks(self):
         from ouroboros.pruning import BlockPruner
 
-        blocks_dir = tmp_path / "blocks"
-        blocks_dir.mkdir()
-        for h in range(500):
-            (blocks_dir / f"{h}.dat").write_bytes(b"\x00" * 1000)
-
-        pruner = BlockPruner(str(tmp_path), keep_blocks=288)
+        db = _MockPruneDB(500, block_size=1000)
+        pruner = BlockPruner(db=db, keep_blocks=288)
         removed = pruner.prune_blocks(current_height=499)
-        assert removed == 212  # 500 - 288 = 212
-        assert not (blocks_dir / "0.dat").exists()
-        assert not (blocks_dir / "211.dat").exists()
-        assert (blocks_dir / "212.dat").exists()
+        assert removed == 212  # heights 0–211
+        assert not db.has_block_data(0)
+        assert not db.has_block_data(211)
+        assert db.has_block_data(212)
 
-    def test_prune_respects_keep_blocks(self, tmp_path):
+    def test_prune_respects_keep_blocks(self):
         from ouroboros.pruning import BlockPruner
 
-        blocks_dir = tmp_path / "blocks"
-        blocks_dir.mkdir()
-        for h in range(100):
-            (blocks_dir / f"{h}.dat").write_bytes(b"\x00" * 100)
-
-        pruner = BlockPruner(str(tmp_path), keep_blocks=288)
+        db = _MockPruneDB(100, block_size=100)
+        pruner = BlockPruner(db=db, keep_blocks=288)
         removed = pruner.prune_blocks(current_height=99)
-        assert removed == 0  # not enough blocks to prune
+        assert removed == 0
 
-    def test_prune_state_persistence(self, tmp_path):
+    def test_prune_state_persistence(self):
         from ouroboros.pruning import BlockPruner
 
-        blocks_dir = tmp_path / "blocks"
-        blocks_dir.mkdir()
-        for h in range(400):
-            (blocks_dir / f"{h}.dat").write_bytes(b"\x00" * 500)
+        db = _MockPruneDB(400, block_size=500)
+        pruner = BlockPruner(db=db, keep_blocks=288)
+        pruner.prune_blocks(current_height=399)
+        assert pruner.prune_height == 112
 
-        pruner1 = BlockPruner(str(tmp_path), keep_blocks=288)
-        pruner1.prune_blocks(current_height=399)
+        pruner2 = BlockPruner(db=db, keep_blocks=288)
+        assert pruner2.prune_height == 112
 
-        pruner2 = BlockPruner(str(tmp_path), keep_blocks=288)
-        assert pruner2.record.lowest_unpruned == 112
-        assert len(pruner2.record.pruned_heights) == 112
-
-    def test_prune_to_target(self, tmp_path):
+    def test_prune_to_target(self):
         from ouroboros.pruning import BlockPruner
 
-        blocks_dir = tmp_path / "blocks"
-        blocks_dir.mkdir()
-        for h in range(500):
-            (blocks_dir / f"{h}.dat").write_bytes(b"\x00" * 10_000)
-
-        pruner = BlockPruner(str(tmp_path), target_size_mb=3, keep_blocks=288)
+        db = _MockPruneDB(500, block_size=10_000)
+        pruner = BlockPruner(db=db, target_size_mb=3, keep_blocks=288)
         removed = pruner.prune_to_target(current_height=499)
         assert removed > 0
-        assert pruner.get_blocks_size() <= 3_000_000
+        assert db.estimate_blocks_size() <= 3_000_000
 
-    def test_is_pruned(self, tmp_path):
+    def test_is_pruned(self):
         from ouroboros.pruning import BlockPruner
 
-        blocks_dir = tmp_path / "blocks"
-        blocks_dir.mkdir()
-        for h in range(400):
-            (blocks_dir / f"{h}.dat").write_bytes(b"\x00" * 100)
-
-        pruner = BlockPruner(str(tmp_path), keep_blocks=288)
+        db = _MockPruneDB(400, block_size=100)
+        pruner = BlockPruner(db=db, keep_blocks=288)
         pruner.prune_blocks(current_height=399)
         assert pruner.is_pruned(0)
         assert pruner.is_pruned(50)
