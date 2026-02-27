@@ -49,6 +49,7 @@ class PeerManager:
         network: str = "mainnet",
         max_peers: int = 8,
         data_dir: Optional[str] = None,
+        transport_version: int = 1,
     ):
         """
         Initialize peer manager.
@@ -57,9 +58,12 @@ class PeerManager:
             network: Network name (mainnet, testnet, regtest)
             max_peers: Maximum number of connected peers
             data_dir: Data directory for persisting bans
+            transport_version: Default P2P transport version for new peers
+                               (1 = plaintext v1, 2 = BIP 324 encrypted)
         """
         self.network = network
         self.max_peers = max_peers
+        self.transport_version = transport_version
         
         self.peers: Dict[str, Peer] = {}  # addr -> Peer
         self.known_addrs: Set[str] = set()
@@ -221,7 +225,7 @@ class PeerManager:
             
             # Try to connect
             host, port = addr.split(':')
-            peer = Peer(host, int(port), self.network)
+            peer = Peer(host, int(port), self.network, transport_version=self.transport_version)
             
             if await peer.connect(start_height, retry=False):
                 self.peers[addr] = peer
