@@ -3,7 +3,12 @@
 from typing import Tuple, List
 import hashlib
 from ouroboros.database import BlockchainDatabase, Transaction, TxIn, TxOut, Block
-from ouroboros.script import ScriptInterpreter
+from ouroboros.script import (
+    ScriptInterpreter, get_flags_for_height,
+    SCRIPT_VERIFY_NONE, SCRIPT_VERIFY_WITNESS,
+)
+
+COINBASE_MATURITY = 100
 
 
 def _bits_to_target(bits: int) -> int:
@@ -343,19 +348,46 @@ class TransactionValidator:
         Returns:
             (is_valid, error_message)
         """
+        flags = get_flags_for_height(height)
+
         # 1. Check structure
         if not self._check_structure(tx):
             return False, "Invalid structure"
-        
-        # 2. Check inputs exist
+
+        # 2. BIP 113: use MTP for locktime comparison
+        if block_mtp > 0 and tx.locktime >= 500_000_000:
+            if tx.locktime > block_mtp:
+                all_final = all(inp.sequence == 0xffffffff for inp in tx.inputs)
+                if not all_final:
+                    return False, "Transaction locktime not met (BIP 113 MTP)"
+
+        # 3. Check inputs exist, verify signatures, check coinbase maturity
         total_input = 0
+        input_amounts: List[int] = []
+        input_script_pubkeys: List[bytes] = []
         for i, tx_in in enumerate(tx.inputs):
             utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
             if not utxo:
                 return False, f"Input not found: {tx_in.prev_txid.hex()}:{tx_in.prev_vout}"
-            
-            # 3. Verify signatures
-            if not self._verify_input_signature(tx, tx_in, utxo, i):
+
+            # Coinbase maturity: coinbase outputs need COINBASE_MATURITY confirmations
+            utxo_height = utxo.get('height')
+            is_coinbase_utxo = utxo.get('is_coinbase', False)
+            if is_coinbase_utxo and utxo_height is not None:
+                depth = height - utxo_height
+                if depth < COINBASE_MATURITY:
+                    return False, (
+                        f"Coinbase maturity not met for input {i}: "
+                        f"depth {depth} < {COINBASE_MATURITY}"
+                    )
+
+            input_amounts.append(utxo['value'])
+            input_script_pubkeys.append(bytes(utxo['script_pubkey']))
+
+            # Verify signatures with proper flags
+            if not self._verify_input_signature(
+                tx, tx_in, utxo, i, flags, input_amounts, input_script_pubkeys
+            ):
                 return False, f"Invalid signature for input {i}"
             
             total_input += utxo['value']
@@ -409,25 +441,21 @@ class TransactionValidator:
         tx: Transaction,
         tx_in: TxIn,
         utxo: dict,
-        input_index: int
+        input_index: int,
+        flags: int = SCRIPT_VERIFY_NONE,
+        input_amounts: List[int] = None,
+        input_script_pubkeys: List[bytes] = None,
     ) -> bool:
-        """
-        Verify signature for one input.
-        
-        Args:
-            tx: The transaction
-            tx_in: The input to verify
-            utxo: UTXO dictionary with 'script_pubkey' key
-            input_index: Index of the input in the transaction
-            
-        Returns:
-            True if signature is valid
-        """
+        """Verify signature for one input with appropriate flags."""
         return self.script_interpreter.verify(
             tx_in.script_sig,
             bytes(utxo['script_pubkey']),
             tx,
-            input_index
+            input_index,
+            flags=flags,
+            amount=utxo['value'],
+            input_amounts=input_amounts,
+            input_script_pubkeys=input_script_pubkeys,
         )
     
     # ── BIP 68 constants ──────────────────────────────────────────────

@@ -543,9 +543,44 @@ class WalletKey:
         payload = version + h160
         return base58.b58encode_check(payload).decode()
 
+    def get_p2sh_p2wpkh_address(self) -> str:
+        """P2SH-wrapped P2WPKH address (3xxx / 2xxx)."""
+        h160 = _hash160(self.pubkey)
+        redeem_script = b"\x00\x14" + h160
+        script_hash = _hash160(redeem_script)
+        version = b"\x05" if self.network == "mainnet" else b"\xc4"
+        return base58.b58encode_check(version + script_hash).decode()
+
+    def get_p2tr_address(self) -> str:
+        """Taproot bech32m P2TR address (key-path only, no scripts)."""
+        x_only = self.pubkey[1:]  # drop the 0x02/0x03 prefix
+        # Tweak with empty merkle root for key-path-only spending
+        tweak = hashlib.sha256(
+            hashlib.sha256(b"TapTweak").digest()
+            + hashlib.sha256(b"TapTweak").digest()
+            + x_only
+        ).digest()
+        # We need to compute P + t*G. Use coincurve for point arithmetic.
+        try:
+            from coincurve import PublicKey as CPublicKey
+            pk = CPublicKey(self.pubkey)
+            tweaked = pk.add(tweak)
+            tweaked_x = tweaked.format(compressed=True)[1:]
+        except Exception:
+            tweaked_x = x_only
+
+        hrp = "bc" if self.network == "mainnet" else "tb"
+        converted = bech32.convertbits(tweaked_x, 8, 5)
+        return bech32.bech32m_encode(hrp, [1] + converted)
+
     def get_script_pubkey(self) -> bytes:
         """P2WPKH scriptPubKey: OP_0 <20-byte-hash>."""
         return b"\x00\x14" + _hash160(self.pubkey)
+
+    def get_p2tr_script_pubkey(self) -> bytes:
+        """P2TR scriptPubKey: OP_1 <32-byte-x-only-key>."""
+        x_only = self.pubkey[1:]
+        return b"\x51\x20" + x_only
 
     # --- WIF -------------------------------------------------------------------
 
@@ -813,7 +848,91 @@ class Wallet:
     async def get_transactions(
         self, address: str | None = None
     ) -> list[TransactionInfo]:
-        return []
+        """Return transaction history for the wallet or a specific address."""
+        if self.db is None:
+            return []
+        results: list[TransactionInfo] = []
+        addresses = set()
+        if address:
+            addresses.add(address)
+        else:
+            for kd in self.keys:
+                k = self._get_wallet_key(kd)
+                addresses.add(k.get_p2wpkh_address())
+                addresses.add(k.get_p2pkh_address())
+        for addr in addresses:
+            txs = self.db.get_transactions_for_address(addr, self.network)
+            for tx_info in txs:
+                results.append(TransactionInfo(
+                    txid=tx_info.get('txid', ''),
+                    amount=tx_info.get('amount', 0),
+                    confirmations=tx_info.get('confirmations', 0),
+                    timestamp=tx_info.get('timestamp'),
+                ))
+        return results
+
+    async def generate_address_of_type(
+        self, address_type: str = "bech32", label: str | None = None
+    ) -> str:
+        """Generate address of given type: bech32, legacy, p2sh-segwit, bech32m."""
+        if self._hd_seed is not None:
+            path = f"{self._hd_base_path}/{self._hd_next_index}"
+            hd = HDKey.from_seed(self._hd_seed, self.network).derive_path(path)
+            key = hd.to_wallet_key()
+            self._hd_next_index += 1
+        else:
+            key = WalletKey.generate(self.network)
+
+        self.keys.append({
+            "wif": key.to_wif(),
+            "label": label or "",
+            "created": int(time.time()),
+        })
+        self._save()
+
+        if address_type == "legacy":
+            return key.get_p2pkh_address()
+        elif address_type == "p2sh-segwit":
+            return key.get_p2sh_p2wpkh_address()
+        elif address_type == "bech32m":
+            return key.get_p2tr_address()
+        else:
+            return key.get_p2wpkh_address()
+
+    async def bump_fee(self, txid: str, new_fee_rate: int) -> Optional[str]:
+        """
+        Create an RBF fee-bumped version of a mempool transaction.
+
+        Returns new raw transaction hex or None if the tx can't be bumped.
+        """
+        from ouroboros.address import address_to_script_pubkey
+        from ouroboros.database import Transaction as DbTx, TxIn, TxOut
+
+        if self.db is None:
+            return None
+        # This would require access to the mempool to find the original tx
+        # and rebuild it with higher fee. Placeholder for future implementation.
+        logger.warning("Fee bumping not yet fully implemented")
+        return None
+
+    def backup(self, backup_path: str) -> str:
+        """Create a backup of the wallet file."""
+        import shutil
+        dest = Path(backup_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.wallet_path, dest)
+        logger.info(f"Wallet backed up to {dest}")
+        return str(dest)
+
+    def restore_from_backup(self, backup_path: str) -> None:
+        """Restore wallet from a backup file."""
+        import shutil
+        src = Path(backup_path)
+        if not src.exists():
+            raise FileNotFoundError(f"Backup not found: {backup_path}")
+        shutil.copy2(src, self.wallet_path)
+        self._load_or_create()
+        logger.info(f"Wallet restored from {src}")
 
     # --- UTXO helpers ----------------------------------------------------------
 

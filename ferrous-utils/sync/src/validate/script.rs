@@ -296,41 +296,10 @@ impl ScriptInterpreter {
                 let result = b - a; // Note: stack order
                 stack.push(Self::encode_num(result));
             }
-            OP_MUL => {
-                let a = Self::decode_num(&stack.pop()?)?;
-                let b = Self::decode_num(&stack.pop()?)?;
-                let result = a * b;
-                stack.push(Self::encode_num(result));
-            }
-            OP_DIV => {
-                let divisor = Self::decode_num(&stack.pop()?)?;
-                let dividend = Self::decode_num(&stack.pop()?)?;
-                if divisor == 0 {
-                    return Err(ScriptError::ExecutionError("Division by zero".to_string()));
-                }
-                let result = dividend / divisor;
-                stack.push(Self::encode_num(result));
-            }
-            OP_MOD => {
-                let modulus = Self::decode_num(&stack.pop()?)?;
-                let value = Self::decode_num(&stack.pop()?)?;
-                if modulus == 0 {
-                    return Err(ScriptError::ExecutionError("Modulo by zero".to_string()));
-                }
-                let result = value % modulus;
-                stack.push(Self::encode_num(result));
-            }
-            OP_LSHIFT => {
-                let shift = Self::decode_num(&stack.pop()?)? as u32;
-                let value = Self::decode_num(&stack.pop()?)?;
-                let result = value << (shift & 31); // Limit shift to 31 bits
-                stack.push(Self::encode_num(result));
-            }
-            OP_RSHIFT => {
-                let shift = Self::decode_num(&stack.pop()?)? as u32;
-                let value = Self::decode_num(&stack.pop()?)?;
-                let result = value >> (shift & 31); // Limit shift to 31 bits
-                stack.push(Self::encode_num(result));
+            OP_MUL | OP_DIV | OP_MOD | OP_LSHIFT | OP_RSHIFT => {
+                return Err(ScriptError::ExecutionError(
+                    format!("Disabled opcode: {:?}", opcode),
+                ));
             }
             OP_MIN => {
                 let a = Self::decode_num(&stack.pop()?)?;
@@ -887,12 +856,21 @@ mod tests {
         stack.push(vec![4]);
         ScriptInterpreter::execute_opcode(OP_SUB, &mut stack).unwrap();
         assert_eq!(stack.pop().unwrap(), vec![6]);
+    }
 
-        // Test OP_MUL: 3 * 4 = 12
+    #[test]
+    fn test_disabled_opcodes() {
+        let mut stack = Stack::new();
         stack.push(vec![3]);
         stack.push(vec![4]);
-        ScriptInterpreter::execute_opcode(OP_MUL, &mut stack).unwrap();
-        assert_eq!(stack.pop().unwrap(), vec![12]);
+        let result = ScriptInterpreter::execute_opcode(OP_MUL, &mut stack);
+        assert!(result.is_err());
+
+        let mut stack = Stack::new();
+        stack.push(vec![4]);
+        stack.push(vec![2]);
+        let result = ScriptInterpreter::execute_opcode(OP_DIV, &mut stack);
+        assert!(result.is_err());
     }
 
     #[test]
