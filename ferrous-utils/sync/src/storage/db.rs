@@ -378,6 +378,120 @@ impl BlockchainDB {
         }
     }
 
+    // ========== Pruning Methods ==========
+
+    /// Delete the raw block data for blocks at heights in [from_height, to_height].
+    ///
+    /// The block index (height -> hash + metadata) is preserved so the node
+    /// can still serve headers and knows which blocks existed.  Only the full
+    /// serialised block bytes in BLOCKS_CF are removed.
+    ///
+    /// This mirrors Bitcoin Core's `PruneOneBlockFile()` which deletes the
+    /// block body but keeps the block-index entry (CBlockIndex).
+    ///
+    /// Returns the number of blocks actually pruned.
+    pub fn prune_blocks_range(&self, from_height: u32, to_height: u32) -> Result<u32> {
+        let blocks_cf = self.db.cf_handle(BLOCKS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
+        let index_cf = self.db.cf_handle(BLOCK_INDEX_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_CF.to_string()))?;
+
+        let mut removed = 0u32;
+
+        for height in from_height..=to_height {
+            let key = encode_height(height);
+            // Look up the block hash from the index
+            if let Some(data) = self.db.get_cf(index_cf, &key)? {
+                if data.len() >= 32 {
+                    let hash = &data[0..32];
+                    // Delete block body from BLOCKS_CF (if it still exists)
+                    if self.db.get_cf(blocks_cf, hash)?.is_some() {
+                        self.db.delete_cf(blocks_cf, hash)?;
+                        removed += 1;
+                    }
+                }
+            }
+        }
+
+        // Persist the new prune height
+        if removed > 0 {
+            self.set_prune_height(to_height + 1)?;
+        }
+
+        Ok(removed)
+    }
+
+    /// Delete the raw block data for a single block height.
+    /// Returns true if a block was actually deleted.
+    pub fn prune_block_at_height(&self, height: u32) -> Result<bool> {
+        let n = self.prune_blocks_range(height, height)?;
+        Ok(n > 0)
+    }
+
+    /// Get the lowest height whose block data has NOT been pruned.
+    /// Returns 0 if pruning has never run.
+    pub fn get_prune_height(&self) -> Result<u32> {
+        let cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        match self.db.get_cf(cf, meta_keys::PRUNE_HEIGHT)? {
+            Some(data) if data.len() == 4 => {
+                Ok(u32::from_le_bytes(data.try_into().unwrap()))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// Set the lowest unpruned height.
+    fn set_prune_height(&self, height: u32) -> Result<()> {
+        let cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        self.db.put_cf(cf, meta_keys::PRUNE_HEIGHT, height.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// Check whether the block body exists for a given height.
+    /// Returns false for pruned blocks (index exists but body doesn't).
+    pub fn has_block_data(&self, height: u32) -> Result<bool> {
+        let blocks_cf = self.db.cf_handle(BLOCKS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
+        let index_cf = self.db.cf_handle(BLOCK_INDEX_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_CF.to_string()))?;
+
+        let key = encode_height(height);
+        match self.db.get_cf(index_cf, &key)? {
+            Some(data) if data.len() >= 32 => {
+                let hash = &data[0..32];
+                Ok(self.db.get_cf(blocks_cf, hash)?.is_some())
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Estimate the total size in bytes of all block data in BLOCKS_CF.
+    ///
+    /// Uses RocksDB's SST file metadata for a fast (approximate) answer.
+    /// Falls back to iterating if the property is unavailable.
+    pub fn estimate_blocks_size(&self) -> Result<u64> {
+        let cf = self.db.cf_handle(BLOCKS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
+
+        // Try the fast RocksDB property first
+        if let Ok(Some(size_str)) = self.db.property_value_cf(cf, "rocksdb.estimate-live-data-size") {
+            if let Ok(size) = size_str.parse::<u64>() {
+                return Ok(size);
+            }
+        }
+
+        // Fallback: iterate and sum value lengths
+        let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+        let mut total: u64 = 0;
+        for item in iter {
+            let (_key, value) = item.map_err(DbError::RocksDb)?;
+            total += value.len() as u64;
+        }
+        Ok(total)
+    }
+
     // ========== Batch Operations ==========
 
     /// Create a new write batch

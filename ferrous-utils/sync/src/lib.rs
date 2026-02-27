@@ -435,6 +435,56 @@ impl PyBlockchainDB {
         })
     }
     
+    // ========== Pruning Methods ==========
+
+    /// Delete raw block data for heights in [from_height, to_height].
+    /// Block index (headers + metadata) is preserved.
+    /// Returns the number of blocks pruned.
+    fn prune_blocks_range(&self, from_height: u32, to_height: u32) -> PyResult<u32> {
+        self.db.prune_blocks_range(from_height, to_height).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Prune error: {}", e)
+            )
+        })
+    }
+
+    /// Delete raw block data at a single height. Returns True if data was deleted.
+    fn prune_block_at_height(&self, height: u32) -> PyResult<bool> {
+        self.db.prune_block_at_height(height).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Prune error: {}", e)
+            )
+        })
+    }
+
+    /// Get the lowest block height whose data has NOT been pruned.
+    /// Returns 0 if pruning has never run.
+    fn get_prune_height(&self) -> PyResult<u32> {
+        self.db.get_prune_height().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
+
+    /// Check whether block body data exists for a given height.
+    fn has_block_data(&self, height: u32) -> PyResult<bool> {
+        self.db.has_block_data(height).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
+
+    /// Estimate total size of all block data in bytes (approximate).
+    fn estimate_blocks_size(&self) -> PyResult<u64> {
+        self.db.estimate_blocks_size().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
+
     /// Context manager support for transactions
     fn __enter__(&self) -> PyResult<Self> {
         Ok(self.clone())
