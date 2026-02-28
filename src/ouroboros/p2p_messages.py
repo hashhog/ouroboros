@@ -29,6 +29,19 @@ INV_TYPE_BLOCK = 2
 INV_TYPE_FILTERED_BLOCK = 3
 INV_TYPE_COMPACT_BLOCK = 4
 
+# Witness-aware inventory types (SegWit / BIP 339)
+MSG_WITNESS_FLAG = 1 << 30           # 0x40000000
+MSG_WITNESS_TX = MSG_WITNESS_FLAG | INV_TYPE_TX      # 0x40000001
+MSG_WITNESS_BLOCK = MSG_WITNESS_FLAG | INV_TYPE_BLOCK  # 0x40000002
+MSG_WTX = 5  # BIP 339 wtxid-based relay
+
+# Service flags (protocol version field)
+NODE_NETWORK = 1 << 0           # 0x0001 — full block history
+NODE_BLOOM = 1 << 2             # 0x0004 — BIP 111 bloom filters
+NODE_WITNESS = 1 << 3           # 0x0008 — SegWit (BIP 144)
+NODE_NETWORK_LIMITED = 1 << 10  # 0x0400 — BIP 159 pruned node (last 288 blocks)
+NODE_P2P_V2 = 1 << 11          # 0x0800 — BIP 324 encrypted transport
+
 
 def get_magic(network: str) -> int:
     """Get magic bytes for a network"""
@@ -1068,6 +1081,19 @@ class AddrMessage:
 
 
 @dataclass
+class GetAddrMessage:
+    """``getaddr`` — request known peer addresses (empty payload)."""
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        return NetworkMessage(
+            command="getaddr", payload=b"", magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> "GetAddrMessage":
+        return cls()
+
+
+@dataclass
 class GetBlocksMessage:
     """``getblocks`` — request block inventory."""
     version: int = 70015
@@ -1093,3 +1119,150 @@ class GetBlocksMessage:
             hashes.append(payload[offset:offset+32]); offset += 32
         hash_stop = payload[offset:offset+32]
         return cls(version=version, locator_hashes=hashes, hash_stop=hash_stop)
+
+
+# ── BIP 330 Erlay Transaction Reconciliation messages ────────────────
+
+
+@dataclass
+class SendTxRcnclMessage:
+    """
+    ``sendtxrcncl`` (BIP 330) — negotiate transaction reconciliation.
+
+    Sent during the version handshake (after VERACK, before any INV/TX
+    messages).  Both peers must send ``sendtxrcncl`` for Erlay to be
+    active on the connection.
+
+    Fields:
+        version: reconciliation protocol version (currently 1)
+        salt: 64-bit random salt used to compute short txid mappings
+              for set reconciliation.  Each side provides its own salt;
+              the actual sketch salt is derived from both.
+    """
+    version: int = 1
+    salt: int = 0
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = struct.pack('<I', self.version)
+        payload += struct.pack('<Q', self.salt)
+        return NetworkMessage(
+            command="sendtxrcncl", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'SendTxRcnclMessage':
+        if len(payload) < 12:
+            raise ValueError("sendtxrcncl payload too short")
+        version = struct.unpack('<I', payload[:4])[0]
+        salt = struct.unpack('<Q', payload[4:12])[0]
+        return cls(version=version, salt=salt)
+
+
+@dataclass
+class ReqTxRcnclMessage:
+    """
+    ``reqtxrcncl`` (BIP 330) — request reconciliation with a peer.
+
+    Sent by the reconciliation initiator to begin a sketch-based
+    set reconciliation round.
+
+    Fields:
+        set_size: number of transactions in the sender's local
+                  reconciliation set for this peer (helps receiver
+                  choose an appropriate sketch capacity).
+        q: a fixed-point fraction (uint16, Q=q/2^15) encoding the
+           estimated ratio of the symmetric difference to set_size.
+           This guides sketch capacity selection.
+    """
+    set_size: int = 0
+    q: int = 1  # Q coefficient — fraction * 2^15
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = struct.pack('<I', self.set_size)
+        payload += struct.pack('<H', self.q)
+        return NetworkMessage(
+            command="reqtxrcncl", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'ReqTxRcnclMessage':
+        if len(payload) < 6:
+            raise ValueError("reqtxrcncl payload too short")
+        set_size = struct.unpack('<I', payload[:4])[0]
+        q = struct.unpack('<H', payload[4:6])[0]
+        return cls(set_size=set_size, q=q)
+
+
+@dataclass
+class SketchMessage:
+    """
+    ``sketch`` (BIP 330) — carry a minisketch-encoded sketch.
+
+    Sent by the reconciliation responder in reply to ``reqtxrcncl``.
+    The sketch encodes the responder's reconciliation set so that
+    the initiator can compute the symmetric difference.
+
+    Fields:
+        sketch_data: raw minisketch bytes (variable length, depends
+                     on the agreed capacity).
+    """
+    sketch_data: bytes = b''
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = encode_varint(len(self.sketch_data))
+        payload += self.sketch_data
+        return NetworkMessage(
+            command="sketch", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'SketchMessage':
+        offset = 0
+        length, consumed = decode_varint(payload, offset)
+        offset += consumed
+        if len(payload) < offset + length:
+            raise ValueError("sketch payload too short")
+        sketch_data = payload[offset:offset + length]
+        return cls(sketch_data=sketch_data)
+
+
+@dataclass
+class ReconcilDiffMessage:
+    """
+    ``reconcildiff`` (BIP 330) — exchange set differences after
+    reconciliation.
+
+    Sent by the initiator after decoding the sketch difference.
+    Contains the list of short txids that the initiator has but
+    the responder is missing, and requests the txids the responder
+    has that the initiator is missing.
+
+    Fields:
+        success: whether sketch decoding succeeded
+        ask_shortids: short txids the sender wants (responder has, sender lacks)
+    """
+    success: bool = True
+    ask_shortids: List[int] = field(default_factory=list)
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = struct.pack('<B', 1 if self.success else 0)
+        payload += encode_varint(len(self.ask_shortids))
+        for sid in self.ask_shortids:
+            payload += struct.pack('<I', sid)
+        return NetworkMessage(
+            command="reconcildiff", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'ReconcilDiffMessage':
+        if len(payload) < 1:
+            raise ValueError("reconcildiff payload too short")
+        offset = 0
+        success = bool(payload[offset])
+        offset += 1
+        count, consumed = decode_varint(payload, offset)
+        offset += consumed
+        ask_shortids = []
+        for _ in range(count):
+            if offset + 4 > len(payload):
+                raise ValueError("reconcildiff payload truncated")
+            sid = struct.unpack('<I', payload[offset:offset + 4])[0]
+            ask_shortids.append(sid)
+            offset += 4
+        return cls(success=success, ask_shortids=ask_shortids)
