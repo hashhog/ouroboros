@@ -34,7 +34,7 @@ from ouroboros.transport_v2 import V2Handshake, V2Transport
 logger = logging.getLogger(__name__)
 
 
-# ── SOCKS5 constants (RFC 1928) ──────────────────────────────────────
+# SOCKS5 constants (RFC 1928)
 
 SOCKS5_VERSION = 0x05
 SOCKS5_AUTH_NONE = 0x00
@@ -51,14 +51,7 @@ def is_onion_host(host: str) -> bool:
 
 
 def parse_proxy_addr(proxy_str: str) -> Tuple[str, int]:
-    """Parse a ``host:port`` proxy string.
-
-    Returns:
-        (host, port) tuple.
-
-    Raises:
-        ValueError: if format is invalid.
-    """
+    """Parse a ``host:port`` proxy string and return ``(host, port)``; raises ValueError if invalid."""
     if not proxy_str:
         raise ValueError("empty proxy string")
     # Handle IPv6 bracket notation [::1]:9050
@@ -81,24 +74,10 @@ async def socks5_connect(
     dest_port: int,
     timeout: float = 10.0,
 ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """Establish a TCP connection through a SOCKS5 proxy.
+    """Establish a TCP connection through a SOCKS5 proxy (RFC 1928, no-auth, CONNECT).
 
-    Implements the SOCKS5 handshake (RFC 1928) with no-auth method and
-    the CONNECT command.  For .onion addresses the hostname is sent as a
-    domain name so the proxy (Tor) performs the resolution.
-
-    Args:
-        proxy_host: SOCKS5 proxy hostname or IP.
-        proxy_port: SOCKS5 proxy port.
-        dest_host:  Target hostname or IP (may be a .onion address).
-        dest_port:  Target port.
-        timeout:    Connection and handshake timeout in seconds.
-
-    Returns:
-        (reader, writer) connected to *dest_host:dest_port* via the proxy.
-
-    Raises:
-        Exception: On connection or SOCKS5 negotiation failure.
+    Sends *dest_host* as a domain name so the proxy (Tor) resolves .onion addresses.
+    Returns ``(reader, writer)`` connected to *dest_host:dest_port* via the proxy.
     """
     # 1. TCP connect to the proxy
     reader, writer = await asyncio.wait_for(
@@ -203,22 +182,7 @@ class Peer:
         relay_txs: bool = True,
         proxy: Optional[str] = None,
     ):
-        """
-        Initialize peer connection.
-
-        Args:
-            host: Peer hostname or IP address (may be a .onion address)
-            port: Peer port number
-            network: Network name (mainnet, testnet, regtest)
-            transport_version: 1 for classic plaintext, 2 for BIP 324 encrypted
-            inbound: True if this peer connected to us (inbound)
-            relay_txs: If False, this is a block-relay-only connection —
-                       skip feefilter, tx INVs, addr gossip, sendcmpct, and
-                       wtxidrelay during handshake (BIP 37 relay field = False).
-            proxy: SOCKS5 proxy address as ``host:port`` (e.g. ``127.0.0.1:9050``).
-                   When set, outbound connections are tunnelled through this proxy.
-                   Required for .onion addresses.
-        """
+        """Initialize peer connection."""
         self.host = host
         self.port = port
         self.network = network
@@ -271,16 +235,7 @@ class Peer:
         self._retry_delay = 5.0  # seconds
     
     async def connect(self, start_height: int = 0, retry: bool = True) -> bool:
-        """
-        Connect to peer and complete handshake.
-        
-        Args:
-            start_height: Our blockchain height for version message
-            retry: Whether to retry on failure
-            
-        Returns:
-            True if connection successful, False otherwise
-        """
+        """Connect to the peer, complete the version handshake, and start background tasks."""
         max_attempts = self._max_retries + 1 if retry else 1
         
         for attempt in range(max_attempts):
@@ -370,20 +325,9 @@ class Peer:
         writer: asyncio.StreamWriter,
         start_height: int = 0,
     ) -> bool:
-        """
-        Accept an inbound peer connection.
+        """Accept an already-established inbound connection and complete the reversed handshake.
 
-        The TCP connection is already established by the server.  The
-        handshake is reversed compared to outbound: we wait for the remote
-        version message first, then reply with our own version + verack.
-
-        Args:
-            reader: Stream reader from asyncio.start_server callback
-            writer: Stream writer from asyncio.start_server callback
-            start_height: Our blockchain height for the version message
-
-        Returns:
-            True if the handshake completed successfully
+        Waits for the peer's version first, then sends ours — the opposite of outbound order.
         """
         try:
             self.reader = reader
@@ -453,7 +397,7 @@ class Peer:
             addr_recv=addr_recv,
             addr_from=addr_from,
             nonce=self._generate_nonce(),
-            user_agent="/bitcoin-hybrid:0.1.0/",
+            user_agent='/bitcoin-hybrid:0.1.0/',
             start_height=start_height,
             relay=True,
         )
@@ -490,15 +434,6 @@ class Peer:
             logger.debug(f"Feature negotiation error (non-fatal): {feat_err}")
 
     async def _negotiate_v2(self) -> None:
-        """
-        Negotiate BIP 324 v2 encrypted transport.
-
-        Both sides exchange 64-byte ElligatorSwift-encoded public keys,
-        compute the shared ECDH secret, and derive per-direction
-        ChaCha20-Poly1305 symmetric keys.
-
-        Reference: BIP 324, bitcoin/src/net.cpp ProcessTransport()
-        """
         if not self.reader or not self.writer:
             raise Exception("Not connected")
 
@@ -613,16 +548,7 @@ class Peer:
             logger.debug(f"Feature negotiation error (non-fatal): {feat_err}")
     
     def _create_network_address(self, host: str, port: int) -> NetworkAddress:
-        """
-        Create network address from host and port.
-
-        Args:
-            host: Hostname or IP address (may be .onion)
-            port: Port number
-
-        Returns:
-            NetworkAddress instance
-        """
+        """Create network address from host and port."""
         our_services = NODE_NETWORK | NODE_WITNESS
 
         # .onion addresses — use all-zeros IP (the real routing happens
@@ -642,16 +568,12 @@ class Peer:
         except (ValueError, AttributeError):
             pass
 
+        # TODO: handle IPv6
         # Default to all zeros (unknown address)
         return NetworkAddress(services=our_services, ip=b'\x00' * 16, port=port)
     
     async def send_message(self, msg: NetworkMessage):
-        """
-        Send a message to peer.
-        
-        Args:
-            msg: NetworkMessage to send
-        """
+        """Serialize and write *msg* to the peer (encrypted if BIP 324 v2 is active)."""
         if self.state != PeerState.READY and self.state != PeerState.HANDSHAKING:
             raise Exception(f"Cannot send message in state {self.state}")
         
@@ -669,27 +591,15 @@ class Peer:
         logger.debug(f"Sent {msg.command} to {self.host}:{self.port}")
     
     async def receive_message(self, timeout: float = 30.0) -> NetworkMessage:
-        """
-        Receive a message from peer.
-        
-        Args:
-            timeout: Timeout in seconds
-            
-        Returns:
-            NetworkMessage instance
-            
-        Raises:
-            asyncio.TimeoutError: If timeout exceeded
-            Exception: If message format is invalid
-        """
+        """Read and parse the next message from the peer (v1 or BIP 324 v2); raises on timeout or bad format."""
         if not self.reader:
             raise Exception("Not connected")
 
-        # ── v2 encrypted path ────────────────────────────────────────
+        # v2 encrypted path
         if self._v2_transport is not None:
             return await self._receive_v2_message(timeout)
 
-        # ── v1 plaintext path ────────────────────────────────────────
+        # v1 plaintext path
         # Read header (24 bytes)
         header = await asyncio.wait_for(
             self.reader.readexactly(24),
@@ -731,15 +641,7 @@ class Peer:
         return NetworkMessage(command=command, payload=payload, magic=magic)
 
     async def _receive_v2_message(self, timeout: float) -> NetworkMessage:
-        """
-        Receive and decrypt a BIP 324 v2 message.
-
-        The v2 packet format is:
-          encrypted_length (3 + 16 bytes) || encrypted_payload (N + 16 bytes)
-
-        Decoy packets (flag=DECOY) are silently consumed and the next
-        genuine message is returned.
-        """
+        """Receive and decrypt a BIP 324 v2 message."""
         while True:
             # Read the encrypted length field (3 bytes + 16-byte Poly1305 tag)
             enc_length = await asyncio.wait_for(
@@ -772,11 +674,7 @@ class Peer:
             return NetworkMessage.deserialize(payload, network=self.network)
     
     async def listen(self):
-        """
-        Listen for messages and dispatch to handlers.
-        
-        This method runs in a loop until the peer disconnects.
-        """
+        """Message receive loop: dispatches to registered handlers until disconnected."""
         try:
             while self.state == PeerState.READY:
                 try:
@@ -836,7 +734,6 @@ class Peer:
             await self.disconnect()
     
     async def _ping_loop(self):
-        """Periodically send ping messages"""
         try:
             while self.state == PeerState.READY:
                 await asyncio.sleep(120.0)  # Ping every 2 minutes
@@ -848,13 +745,7 @@ class Peer:
             logger.error(f"Error in ping loop for {self.host}:{self.port}: {e}")
     
     def register_handler(self, command: str, handler: Callable):
-        """
-        Register message handler.
-        
-        Args:
-            command: Message command name (e.g., "inv", "block", "tx")
-            handler: Async function that takes a NetworkMessage as argument
-        """
+        """Register *handler* to be called when a message with *command* is received."""
         self.message_handlers[command] = handler
         logger.debug(f"Registered handler for {command} on {self.host}:{self.port}")
     
@@ -900,16 +791,10 @@ class Peer:
         self.writer = None
     
     def _generate_nonce(self) -> int:
-        """Generate random nonce"""
         return random.randint(0, 2**64 - 1)
     
     def adjust_score(self, delta: int):
-        """
-        Adjust peer reputation score.
-        
-        Args:
-            delta: Score change (positive or negative)
-        """
+        """Adjust the peer's reputation score by *delta* (result clamped to [0, 100])."""
         self.score = max(0, min(100, self.score + delta))
         if self.score == 0:
             logger.warning(f"Peer {self.host}:{self.port} banned (score=0)")
@@ -919,7 +804,6 @@ class Peer:
         return self.state == PeerState.READY
     
     def __repr__(self) -> str:
-        """String representation"""
         direction = "in" if self.inbound else "out"
         relay = "block-only" if not self.relay_txs else "full"
         return f"Peer({self.host}:{self.port}, {direction}, {relay}, state={self.state.name}, score={self.score})"

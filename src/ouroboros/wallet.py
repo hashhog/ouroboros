@@ -56,17 +56,10 @@ class TransactionInfo(BaseModel):
     timestamp: int | None = None
 
 
-# ── Wallet encryption (AES-256-GCM + scrypt) ─────────────────────────
+# Wallet encryption (AES-256-GCM + scrypt)
 
 def encrypt_wallet_data(plaintext: bytes, passphrase: str) -> bytes:
-    """
-    Encrypt arbitrary wallet data with a passphrase.
-
-    Layout: salt(16) || nonce(12) || ciphertext+tag(...)
-
-    KDF: scrypt  (N=2^18, r=8, p=1, dkLen=32)
-    AEAD: AES-256-GCM
-    """
+    """Encrypt wallet data with *passphrase* (scrypt + AES-256-GCM); output: salt(16)||nonce(12)||ct."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
@@ -79,11 +72,7 @@ def encrypt_wallet_data(plaintext: bytes, passphrase: str) -> bytes:
 
 
 def decrypt_wallet_data(blob: bytes, passphrase: str) -> bytes:
-    """
-    Decrypt data produced by :func:`encrypt_wallet_data`.
-
-    Raises ``ValueError`` on wrong passphrase or corrupt data.
-    """
+    """Decrypt data produced by :func:`encrypt_wallet_data`; raises ValueError on wrong passphrase."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
@@ -108,7 +97,7 @@ def _dsha256(data: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
 
 
-# ── Coin Selection Algorithms ─────────────────────────────────────────
+# --- Coin Selection Algorithms ---
 #
 # Reference: bitcoin/src/wallet/coinselection.cpp
 #
@@ -121,14 +110,13 @@ def _dsha256(data: bytes) -> bytes:
 #   - Output cost: 31 vB
 #   - Overhead:    11 vB (fixed)
 #   - Cost of change = 31 (output) + 68 (later spending it) = 99 vB
-# ──────────────────────────────────────────────────────────────────────
 
 INPUT_VBYTES = 68
 OUTPUT_VBYTES = 31
 OVERHEAD_VBYTES = 11
 COST_OF_CHANGE_VBYTES = INPUT_VBYTES + OUTPUT_VBYTES  # 99 vB
 
-# BnB search limit (matches Bitcoin Core)
+# BnB search limit
 BNB_MAX_TRIES = 100_000
 
 # Default long-term fee rate (sat/vB) used by the waste metric.
@@ -311,7 +299,6 @@ def select_coins_srd(
 
 
 def _non_input_fee(n_outputs: int, fee_rate: float) -> int:
-    """Fee for overhead + outputs only (inputs are accounted by effective value)."""
     return int((OVERHEAD_VBYTES + n_outputs * OUTPUT_VBYTES) * fee_rate) + 1
 
 
@@ -321,22 +308,6 @@ def _selection_waste(
     long_term_fee_rate: float,
     has_change: bool,
 ) -> float:
-    """
-    Compute the *waste metric* for a coin-selection result.
-
-    Mirrors Bitcoin Core's ``GetSelectionWaste()`` in
-    ``wallet/coinselection.cpp``.
-
-    waste = total_input_weight × (fee_rate − long_term_fee_rate)
-          + change_cost
-
-    * ``total_input_weight`` — sum of ``INPUT_VBYTES`` per selected UTXO.
-    * ``change_cost`` — 0 when BnB finds an exact match (no change output),
-      otherwise ``COST_OF_CHANGE_VBYTES × fee_rate`` (cost to create **and
-      later spend** the change output).
-    * When ``fee_rate < long_term_fee_rate`` the first term is negative,
-      favouring solutions that consolidate more inputs while fees are cheap.
-    """
     total_input_weight = len(selected) * INPUT_VBYTES
     timing_cost = total_input_weight * (fee_rate - long_term_fee_rate)
     change_cost = 0.0 if not has_change else COST_OF_CHANGE_VBYTES * fee_rate
@@ -350,30 +321,10 @@ def select_coins(
     *,
     long_term_fee_rate: float = DEFAULT_LONG_TERM_FEE_RATE,
 ) -> Tuple[List[Dict], int, str]:
-    """
-    Three-tier coin selection matching Bitcoin Core's strategy with
-    waste-metric optimisation.
+    """Three-tier coin selection with waste-metric optimisation (BnB → Knapsack → SRD).
 
-    Runs **all three** algorithms, computes the waste metric for each
-    successful result, and returns the one with the lowest waste.
-
-    Algorithms:
-        1. Branch-and-Bound — exact match (no change output)
-        2. Knapsack — randomised approximation
-        3. Single Random Draw — last-resort shuffle-and-grab
-
-    Args:
-        utxos: Available UTXOs (each must have ``"value": int``).
-        target_amount: Destination amount in satoshis.
-        fee_rate: Fee rate in sat/vB.
-        long_term_fee_rate: Long-term fee rate in sat/vB (default 10).
-            Used by the waste metric to evaluate input-weight timing cost.
-
-    Returns:
-        (selected_utxos, estimated_fee, algorithm_used)
-
-    Raises:
-        ValueError: Insufficient funds across all strategies.
+    Returns ``(selected_utxos, estimated_fee, algorithm_used)``; raises ValueError if funds
+    are insufficient.
     """
     # Collect (result, fee, algo_name, has_change) for every algorithm
     # that returns a valid selection.
@@ -450,7 +401,7 @@ class HDKey:
         self.child_index = child_index
         self.network = network
 
-    # ── public key helpers ────────────────────────────────────────────
+    # public key helpers
 
     @property
     def public_key(self) -> bytes:
@@ -462,7 +413,7 @@ class HDKey:
         """First 4 bytes of HASH160(pubkey) — used as parent id."""
         return _hash160(self.public_key)[:4]
 
-    # ── BIP 32 master key ─────────────────────────────────────────────
+    # BIP 32 master key
 
     @classmethod
     def from_seed(cls, seed: bytes, network: str = "mainnet") -> "HDKey":
@@ -475,7 +426,7 @@ class HDKey:
             raise ValueError("Invalid master key (out of range)")
         return cls(private_key=key, chain_code=I[32:], network=network)
 
-    # ── child derivation ──────────────────────────────────────────────
+    # child derivation
 
     def derive_child(self, index: int, hardened: bool = False) -> "HDKey":
         """Derive a child extended key at *index*."""
@@ -503,14 +454,10 @@ class HDKey:
             network=self.network,
         )
 
-    # ── path derivation ───────────────────────────────────────────────
+    # path derivation
 
     def derive_path(self, path: str) -> "HDKey":
-        """
-        Derive from a BIP 32 path string, e.g. ``"m/84'/0'/0'/0/0"``.
-
-        ``'`` or ``h`` marks hardened derivation.
-        """
+        """Derive a child key from a BIP 32 path like ``"m/84'/0'/0'/0/0"`` (``'``/``h`` = hardened)."""
         parts = path.strip().split("/")
         if parts[0] != "m":
             raise ValueError(f"Path must start with 'm': {path}")
@@ -521,12 +468,10 @@ class HDKey:
             node = node.derive_child(idx, hardened=hardened)
         return node
 
-    # ── conversion to WalletKey ───────────────────────────────────────
-
     def to_wallet_key(self) -> "WalletKey":
         return WalletKey(self.private_key, self.network)
 
-    # ── xprv / xpub serialisation (BIP 32) ────────────────────────────
+    # xprv / xpub serialisation (BIP 32)
 
     def serialize_xprv(self) -> str:
         """Base58check-encoded extended private key (xprv / tprv)."""
@@ -701,14 +646,10 @@ class Wallet:
         self._encrypted_blob: Optional[bytes] = None
         self._load_or_create()
 
-    # ── HD seed management ────────────────────────────────────────────
+    # HD seed management #
 
     def init_hd(self, seed: bytes, base_path: Optional[str] = None) -> str:
-        """
-        Initialise the wallet in HD mode from a BIP 32 seed.
-
-        Returns the xprv of the master key.
-        """
+        """Initialise the wallet in HD mode from a BIP 32 *seed*; returns the xprv of the master key."""
         master = HDKey.from_seed(seed, self.network)
         self._hd_seed = seed
         self._hd_next_index = 0
@@ -727,7 +668,7 @@ class Wallet:
             return None
         return HDKey.from_seed(self._hd_seed, self.network)
 
-    # ── persistence ───────────────────────────────────────────────────
+    # persistence
 
     def _load_or_create(self) -> None:
         from ouroboros.descriptors import DescriptorEntry
@@ -797,7 +738,7 @@ class Wallet:
             json.dump(outer, f, indent=2)
         tmp.rename(self.wallet_path)
 
-    # ── encryption / decryption ──────────────────────────────────────
+    # --- encryption / decryption ---
 
     @property
     def is_encrypted(self) -> bool:
@@ -810,11 +751,7 @@ class Wallet:
         return self._encrypted_blob is not None and self._passphrase is None
 
     def encrypt(self, passphrase: str) -> None:
-        """
-        Encrypt the wallet with *passphrase* and persist.
-
-        After this call every subsequent ``_save()`` writes ciphertext.
-        """
+        """Encrypt the wallet with *passphrase* and persist; every subsequent save writes ciphertext."""
         if not passphrase:
             raise ValueError("Passphrase must not be empty")
         self._passphrase = passphrase
@@ -999,23 +936,11 @@ class Wallet:
     async def bump_fee(
         self, txid: str, new_fee_rate: int, *, sign: bool = True
     ) -> Optional[str]:
-        """
-        Create an RBF fee-bumped version of a mempool transaction.
+        """Create an RBF fee-bumped version of *txid* at *new_fee_rate* sat/vB.
 
-        Finds the original transaction in the mempool, verifies it signals
-        RBF (any input with sequence < 0xFFFFFFFE), then builds a
-        replacement with a higher fee by reducing the change output or
-        adding a new input when the change is insufficient.
-
-        Args:
-            txid: Hex transaction ID of the original transaction.
-            new_fee_rate: Target fee rate in sat/vB.
-            sign: If True (default), sign and submit to mempool.
-                  If False, return unsigned raw hex (for PSBT workflow).
-
-        Returns:
-            New transaction hex (signed and broadcast when *sign=True*,
-            unsigned otherwise), or None on failure.
+        Verifies the original signals RBF (sequence < 0xFFFFFFFE), then reduces
+        the change output (or adds a new input) to cover the higher fee.
+        Returns signed tx hex when *sign=True*, unsigned hex otherwise, or None on failure.
         """
         from ouroboros.database import Transaction, TxIn, TxOut
 
@@ -1023,7 +948,7 @@ class Wallet:
             logger.warning("bump_fee: database or mempool not available")
             return None
 
-        # ── 1. Look up the original tx in mempool ────────────────────
+        # 1. Look up the original tx in mempool
         txid_bytes = bytes.fromhex(txid)
         entry = self.mempool.get_transaction_entry(txid_bytes)
         if entry is None:
@@ -1032,7 +957,7 @@ class Wallet:
         orig_tx = entry.tx
         orig_fee = entry.fee
 
-        # ── 2. Verify RBF signal ─────────────────────────────────────
+        # 2. Verify RBF signal
         rbf_signaled = any(inp.sequence < 0xFFFFFFFE for inp in orig_tx.inputs)
         if not rbf_signaled:
             logger.warning(
@@ -1042,7 +967,7 @@ class Wallet:
             )
             return None
 
-        # ── 3. Gather input values and wallet keys ───────────────────
+        # 3. Gather input values and wallet keys
         # Build a lookup of wallet script_pubkeys → WalletKey
         wallet_spk_map: Dict[bytes, "WalletKey"] = {}
         for kd in self.keys:
@@ -1077,7 +1002,7 @@ class Wallet:
 
         total_input_value = sum(input_values)
 
-        # ── 4. Calculate target fee ──────────────────────────────────
+        # 4. Calculate target fee
         # Start with the same outputs; adjust change later.
         new_outputs = [
             TxOut(value=out.value, script_pubkey=out.script_pubkey)
@@ -1104,7 +1029,7 @@ class Wallet:
         total_output_value = sum(o.value for o in new_outputs)
         fee_increase_needed = target_fee - (total_input_value - total_output_value)
 
-        # ── 5. Identify and reduce the change output ─────────────────
+        # 5. Identify and reduce the change output
         # The change output is the one paying to a wallet address.
         change_idx: Optional[int] = None
         for i, out in enumerate(new_outputs):
@@ -1168,7 +1093,7 @@ class Wallet:
                     )
                     return None
 
-        # ── 6. Build the new transaction ─────────────────────────────
+        # 6. Build the new transaction
         new_tx = Transaction(
             txid=b"\x00" * 32,
             version=orig_tx.version,
@@ -1179,7 +1104,7 @@ class Wallet:
         )
 
         if sign:
-            # ── 7. Sign all inputs ───────────────────────────────────
+            # 7. Sign all inputs
             for i, inp in enumerate(new_inputs):
                 if i < len(input_keys) and input_keys[i] is not None:
                     key = input_keys[i]
@@ -1197,7 +1122,7 @@ class Wallet:
             # Compute real txid
             new_tx.txid = _dsha256(new_tx.serialize())
 
-            # ── 8. Submit via mempool.try_replace() ──────────────────
+            # 8. Submit via mempool.try_replace()
             _, best_height = self.db.get_best_block()
             success, error = self.mempool.try_replace(new_tx, best_height)
             if not success:
@@ -1228,12 +1153,7 @@ class Wallet:
         total_input_value: int,
         orig_fee: int,
     ) -> bool:
-        """
-        Add a new wallet UTXO to cover the fee increase when the change
-        output is insufficient.  May also add a new change output.
-
-        Returns True on success, False if no suitable UTXO is found.
-        """
+        """Add a new wallet UTXO to cover the fee increase when the change."""
         from ouroboros.database import TxIn, TxOut
 
         # Collect UTXOs not already used by the transaction
@@ -1312,8 +1232,8 @@ class Wallet:
         """
         Import one or more output descriptors into the wallet.
 
-        Each element of *requests* is a dict matching the Bitcoin Core
-        ``importdescriptors`` RPC format::
+        Each element of *requests* is a dict in the ``importdescriptors``
+        RPC format::
 
             {
                 "desc": "wpkh(xpub.../0/*)#checksum",
@@ -1414,13 +1334,7 @@ class Wallet:
     def deriveaddresses(
         self, desc_str: str, range_param: Optional[List[int]] = None
     ) -> List[str]:
-        """
-        Derive addresses from a descriptor string.
-
-        *range_param* is ``[start, end]`` (inclusive on both ends, matching
-        Bitcoin Core's ``deriveaddresses`` RPC).  If the descriptor is not a
-        range descriptor, *range_param* must be ``None``.
-        """
+        """Derive addresses from *desc_str*; *range_param* is ``[start, end]`` (inclusive) or None for non-range descriptors."""
         from ouroboros.descriptors import parse_descriptor, add_checksum
 
         if "#" not in desc_str:
@@ -1459,12 +1373,7 @@ class Wallet:
     def generate_descriptor_address(
         self, desc_index: int = 0, label: str | None = None
     ) -> str:
-        """
-        Generate the next address from a descriptor and advance its index.
-
-        *desc_index* selects which imported descriptor to use (default: first
-        active external descriptor).
-        """
+        """Derive the next address from descriptor *desc_index* (default: first active external) and advance its index."""
         # Find the target descriptor
         active_external = [
             d for d in self.descriptors
@@ -1508,7 +1417,6 @@ class Wallet:
     # --- UTXO helpers ----------------------------------------------------------
 
     def _collect_utxos(self) -> List[Dict]:
-        """Collect all spendable UTXOs across wallet keys."""
         if self.db is None:
             return []
         utxos: List[Dict] = []
@@ -1528,21 +1436,6 @@ class Wallet:
         fee_rate: float,
         long_term_fee_rate: float = DEFAULT_LONG_TERM_FEE_RATE,
     ) -> Tuple[List[Dict], int]:
-        """
-        Select UTXOs to fund a transaction.
-
-        Runs all three coin-selection algorithms (Branch-and-Bound,
-        Knapsack, Single Random Draw) and picks the result with the
-        lowest *waste metric*.
-
-        Args:
-            amount: Destination amount in satoshis.
-            fee_rate: Current fee rate in sat/vB.
-            long_term_fee_rate: Long-term fee rate in sat/vB (default 10).
-
-        Returns (selected_utxos, estimated_fee).
-        Raises ValueError on insufficient funds.
-        """
         all_utxos = self._collect_utxos()
         selected, est_fee, _algo = select_coins(
             all_utxos, amount, fee_rate,
@@ -1607,17 +1500,7 @@ class Wallet:
         amount: int,
         fee_rate: int | None = None,
     ) -> str:
-        """
-        Build, sign, and return a raw transaction hex.
-
-        Args:
-            to_address: Destination address
-            amount: Amount in satoshis
-            fee_rate: Fee rate in sat/vB (default 2)
-
-        Returns:
-            Raw transaction hex ready for broadcast via sendrawtransaction
-        """
+        """Build, sign, and return a raw transaction hex sending *amount* sats to *to_address* at *fee_rate* sat/vB."""
         from ouroboros.address import address_to_script_pubkey
         from ouroboros.database import Transaction, TxIn, TxOut
 

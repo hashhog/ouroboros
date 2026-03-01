@@ -49,7 +49,7 @@ from ouroboros.descriptors import (
 )
 
 
-# ── Known test vectors ───────────────────────────────────────────────────
+# Known test vectors
 #
 # BIP 84 test vector xpub (from BIP 84 / Bitcoin Core test data):
 #   m/84'/0'/0' xpub from seed
@@ -71,9 +71,7 @@ _TEST_PUBKEY_HEX = (
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════
 # Checksum tests
-# ═══════════════════════════════════════════════════════════════════════
 
 
 class TestDescriptorChecksum:
@@ -112,9 +110,7 @@ class TestDescriptorChecksum:
         assert descriptor_checksum(desc) == descriptor_checksum(desc)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Extended public key tests
-# ═══════════════════════════════════════════════════════════════════════
+# --- Extended public key tests ---
 
 
 class TestExtendedPubKey:
@@ -170,9 +166,7 @@ class TestExtendedPubKey:
         assert child0.public_key != child1.public_key
 
 
-# ═══════════════════════════════════════════════════════════════════════
 # Key expression parsing tests
-# ═══════════════════════════════════════════════════════════════════════
 
 
 class TestKeyExpression:
@@ -234,9 +228,7 @@ class TestKeyExpression:
             _parse_key_expression("deadbeef")  # too short
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Descriptor parsing tests
-# ═══════════════════════════════════════════════════════════════════════
+# Descriptor parsing tests #
 
 
 class TestDescriptorParsing:
@@ -307,9 +299,7 @@ class TestDescriptorParsing:
             parse_descriptor(f"multi(3,{_TEST_PUBKEY_HEX},{pk2})")
 
 
-# ═══════════════════════════════════════════════════════════════════════
 # Address derivation tests
-# ═══════════════════════════════════════════════════════════════════════
 
 
 class TestAddressDerivation:
@@ -371,9 +361,7 @@ class TestAddressDerivation:
         assert last_10 == all_20[10:]
 
 
-# ═══════════════════════════════════════════════════════════════════════
 # Script pubkey derivation tests
-# ═══════════════════════════════════════════════════════════════════════
 
 
 class TestScriptPubKey:
@@ -413,9 +401,7 @@ class TestScriptPubKey:
         assert len(spk) == 34
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Multisig script tests
-# ═══════════════════════════════════════════════════════════════════════
+# --- Multisig script tests ---
 
 
 class TestMultisigScript:
@@ -439,9 +425,7 @@ class TestMultisigScript:
             _make_multisig_script(2, [pk])
 
 
-# ═══════════════════════════════════════════════════════════════════════
 # DescriptorEntry serialisation tests
-# ═══════════════════════════════════════════════════════════════════════
 
 
 class TestDescriptorEntry:
@@ -475,9 +459,7 @@ class TestDescriptorEntry:
         assert restored.descriptor.is_range
 
 
-# ═══════════════════════════════════════════════════════════════════════
 # Wallet integration tests
-# ═══════════════════════════════════════════════════════════════════════
 
 
 class TestWalletDescriptorIntegration:
@@ -610,9 +592,7 @@ class TestWalletDescriptorIntegration:
         assert wallet_addrs == direct_addrs
 
 
-# ═══════════════════════════════════════════════════════════════════════
 # Cross-verification: wpkh xpub derivation against HDKey
-# ═══════════════════════════════════════════════════════════════════════
 
 
 class TestCrossVerification:

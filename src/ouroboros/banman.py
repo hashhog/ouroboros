@@ -17,7 +17,7 @@ from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Misbehavior score table (following Bitcoin Core) ─────────────────
+# Misbehavior score table #
 
 SCORE_INVALID_BLOCK_HEADER = 100
 SCORE_INVALID_BLOCK = 100
@@ -48,14 +48,6 @@ class BanManager:
         data_dir: Optional[str] = None,
         on_ban: Optional[Callable[[str], None]] = None,
     ):
-        """
-        Args:
-            ban_threshold: Cumulative score that triggers a ban.
-            ban_duration:  Ban length in seconds (default 24 h).
-            data_dir:      If set, persist bans to ``<data_dir>/bans.json``.
-            on_ban:        Optional callback invoked with the IP when a ban
-                           is triggered (used by PeerManager to disconnect).
-        """
         self.ban_threshold = ban_threshold
         self.ban_duration = ban_duration
         self._data_dir = data_dir
@@ -67,7 +59,7 @@ class BanManager:
         if data_dir:
             self._load_bans()
 
-    # ── Public API ──────────────────────────────────────────────────
+    # Public API
 
     def record_misbehavior(self, ip: str, score: int, reason: str) -> None:
         """Add *score* points for *ip*.  Ban if threshold is reached."""
@@ -129,7 +121,7 @@ class BanManager:
         return dict(self.banned)
 
     def sweep_expired(self) -> int:
-        """Remove expired bans.  Returns count of bans removed."""
+        """Remove expired bans and return how many were removed."""
         now = time.time()
         expired = [ip for ip, t in self.banned.items() if t <= now]
         for ip in expired:
@@ -138,7 +130,7 @@ class BanManager:
             self._save_bans()
         return len(expired)
 
-    # ── Persistence ─────────────────────────────────────────────────
+    # --- Persistence ---
 
     def _bans_path(self) -> Path:
         return Path(self._data_dir) / "bans.json"

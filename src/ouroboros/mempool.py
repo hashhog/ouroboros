@@ -20,10 +20,9 @@ from ouroboros.validation import TransactionValidator
 
 logger = logging.getLogger(__name__)
 
-# OutPoint is a tuple of (txid: bytes, vout: int)
 OutPoint = Tuple[bytes, int]
 
-# Policy constants matching Bitcoin Core
+# Policy constants
 MAX_STANDARD_TX_WEIGHT = 400_000
 MIN_STANDARD_TX_NONWITNESS_SIZE = 65
 MAX_ANCESTOR_COUNT = 25
@@ -40,13 +39,12 @@ TX_V3_MAX_VSIZE = 10_000  # max vsize for a v3 child of an unconfirmed v3 parent
 TX_V3_ANCESTOR_LIMIT = 2  # v3 tx may have at most 1 unconfirmed ancestor (self + 1)
 TX_V3_DESCENDANT_LIMIT = 2  # v3 tx may have at most 1 unconfirmed descendant (self + 1)
 
-# Package validation limits (BIP 331 / Bitcoin Core policy)
+# Package validation limits (BIP 331)
 MAX_PACKAGE_COUNT = 25
 MAX_PACKAGE_WEIGHT = 404_000  # weight units
 
 
 def _get_dust_threshold(script_pubkey: bytes) -> int:
-    """Calculate the dust threshold for a given output script."""
     # P2PKH/P2SH cost: 34 + 148 = 182 bytes
     # P2WPKH cost: 31 + 68 = 99 bytes (roughly)
     # P2WSH cost: 43 + 68 = 111 bytes
@@ -63,12 +61,6 @@ def _get_dust_threshold(script_pubkey: bytes) -> int:
 
 
 def _has_ephemeral_dust(tx: Transaction) -> List[int]:
-    """Return indices of outputs below the dust threshold.
-
-    For v3 transactions these are "ephemeral dust" outputs that are only
-    valid when spent within the same package (Bitcoin Core
-    ``policy/ephemeral_policy.cpp``).
-    """
     dust_indices: List[int] = []
     for idx, out in enumerate(tx.outputs):
         if out.script_pubkey and out.script_pubkey[0] == 0x6a:
@@ -80,7 +72,6 @@ def _has_ephemeral_dust(tx: Transaction) -> List[int]:
 
 
 def _is_standard_tx(tx: Transaction) -> Tuple[bool, str]:
-    """Check if a transaction is standard (policy, not consensus)."""
     if tx.version < 1 or tx.version > TX_MAX_STANDARD_VERSION:
         return False, f"Non-standard version: {tx.version}"
 
@@ -120,7 +111,7 @@ class MempoolEntry:
     descendant_size: int = 0
 
 
-# ── Orphan transaction pool ──────────────────────────────────────────
+# Orphan transaction pool
 MAX_ORPHAN_TRANSACTIONS = 100
 ORPHAN_EXPIRY_SECONDS = 20 * 60  # 20 minutes
 
@@ -199,7 +190,6 @@ class OrphanPool:
         return len(self.orphans)
 
     def _evict_random(self) -> None:
-        """Evict a random orphan to make room."""
         if not self.orphans:
             return
         victim = random.choice(list(self.orphans))
@@ -216,14 +206,7 @@ class Mempool:
         max_size: int = 300_000_000,  # 300 MB
         require_standard: bool = True,
     ):
-        """
-        Initialize mempool.
-        
-        Args:
-            validator: Transaction validator
-            max_size: Maximum mempool size in bytes (default: 300 MB)
-            require_standard: Enforce standardness policy (disable for regtest/tests)
-        """
+        """Initialize mempool."""
         self.validator = validator
         self.max_size = max_size
         self.require_standard = require_standard
@@ -256,16 +239,7 @@ class Mempool:
         return fee_rate_copy, txs_copy
 
     def add_transaction(self, tx: Transaction, height: int) -> Tuple[bool, str]:
-        """
-        Add transaction to mempool.
-
-        Args:
-            tx: Transaction to add
-            height: Current block height
-
-        Returns:
-            (success, error_message)
-        """
+        """Validate and add *tx* to the mempool at *height*; returns ``(ok, error_message)``."""
         with self._lock:
             return self._add_transaction_inner(tx, height)
 
@@ -287,7 +261,7 @@ class Mempool:
             if not is_std:
                 return False, f"Non-standard transaction: {reason}"
 
-        # ── Ephemeral dust: reject v3 txs with dust when submitted
+        # Ephemeral dust: reject v3 txs with dust when submitted
         # individually (ephemeral dust is only valid inside packages).
         if tx.version == 3:
             dust_indices = _has_ephemeral_dust(tx)
@@ -322,9 +296,8 @@ class Mempool:
         if has_conflict:
             return self.try_replace(tx, height)
 
-        # ── TRUC (v3 transaction) policy checks ─────────────────────
-        # Reference: Bitcoin Core policy/truc_policy.cpp
-        # Must come before general ancestor/descendant limits.
+        # TRUC (v3 transaction) policy checks — must come before general
+        # ancestor/descendant limits.
         if tx.version == 3:
             truc_ok, truc_err = self._check_v3_policy(tx)
             if not truc_ok:
@@ -347,7 +320,7 @@ class Mempool:
         if len(ancestors) + 1 > MAX_ANCESTOR_COUNT:
             return False, (
                 f"Too many ancestors: {len(ancestors) + 1} > {MAX_ANCESTOR_COUNT}")
-        ancestor_size = sum(self.transactions[a].size for a in ancestors if a in self.transactions)
+        ancestor_size = sum(self.transactions[a].size for a in ancestors if a in self.transactions)  # TODO: this could be cached
         tx_size = len(tx.serialize())
         if (ancestor_size + tx_size) // 1000 > MAX_ANCESTOR_SIZE_KVB:
             return False, "Ancestor size limit exceeded"
@@ -379,11 +352,12 @@ class Mempool:
             return False, "Negative fee"
         
         fee_rate = fee / tx_size if tx_size > 0 else 0
+        # print(f'fee_rate={fee_rate}, target={min_relay}')
 
         # Minimum relay fee
         min_relay = (tx_size * DEFAULT_MIN_RELAY_TX_FEE) // 1000
         if fee < min_relay:
-            return False, f"Below minimum relay fee: {fee} < {min_relay}"
+            return False, "Below minimum relay fee: %d < %d" % (fee, min_relay)
         
         # Add to mempool
         entry = MempoolEntry(
@@ -425,7 +399,6 @@ class Mempool:
         return True, ""
 
     def _get_ancestors(self, tx: Transaction) -> Set[bytes]:
-        """Return txids of all mempool ancestors of *tx*."""
         result: Set[bytes] = set()
         queue = []
         for inp in tx.inputs:
@@ -443,18 +416,10 @@ class Mempool:
                     queue.append(inp.prev_txid)
         return result
 
-    # ── TRUC (v3) helpers ──────────────────────────────────────────
+    # --- TRUC (v3) helpers ---
 
     def _check_v3_policy(self, tx: Transaction) -> Tuple[bool, str]:
-        """Enforce TRUC policy for a v3 transaction being added.
-
-        Checks (matching Bitcoin Core ``CheckNewPackageForV3Violation``):
-        1. Max 1 unconfirmed ancestor.
-        2. Each unconfirmed v3 parent may have at most 1 child already.
-        3. If child of an unconfirmed v3 parent, child vsize ≤ TX_V3_MAX_VSIZE.
-
-        Returns (ok, error_message).
-        """
+        """Enforce TRUC policy for a v3 transaction being added."""
         ancestors = self._get_ancestors(tx)
 
         # Rule 1: at most 1 unconfirmed ancestor
@@ -490,7 +455,6 @@ class Mempool:
         return True, ""
 
     def _get_v3_children(self, parent_txid: bytes) -> List[bytes]:
-        """Return txids of direct mempool children of *parent_txid*."""
         children: List[bytes] = []
         for child_txid, child_entry in self.transactions.items():
             for inp in child_entry.tx.inputs:
@@ -500,11 +464,6 @@ class Mempool:
         return children
 
     def _recalculate_ancestors(self, txid: bytes) -> None:
-        """Recompute ancestor_count and ancestor_size for *txid*.
-
-        Called after a removal to fix stale counts for descendants of
-        the removed transaction.
-        """
         entry = self.transactions.get(txid)
         if entry is None:
             return
@@ -516,12 +475,7 @@ class Mempool:
         )
 
     def _update_descendants_after_removal(self, removed_txid: bytes) -> None:
-        """After removing *removed_txid*, fix ancestor/descendant counts
-        for every transaction that was affected.
-
-        - Descendants of the removed tx: recalculate ancestor counts.
-        - Ancestors of the removed tx: decrement descendant counts.
-        """
+        """After removing *removed_txid*, fix ancestor/descendant counts."""
         removed_entry_size = 0
         # We need the removed entry's info, but it's already deleted.
         # Instead, find descendants by scanning the mempool for any tx
@@ -589,11 +543,6 @@ class Mempool:
                 )
 
     def _resolve_orphans(self, parent_txid: bytes, height: int) -> int:
-        """Try to accept orphans that were waiting on *parent_txid*.
-
-        Recursively processes: an accepted orphan may itself be a parent
-        of another orphan.  Returns the number of orphans accepted.
-        """
         accepted = 0
         work_queue = [parent_txid]
 
@@ -624,7 +573,6 @@ class Mempool:
             return self._expire_old_transactions_inner(current_time)
 
     def _expire_old_transactions_inner(self, current_time: Optional[float] = None) -> int:
-        """Unlocked implementation of expire_old_transactions."""
         now = current_time or time.time()
         cutoff = now - (MEMPOOL_EXPIRY_HOURS * 3600)
         expired = [
@@ -655,7 +603,6 @@ class Mempool:
             self._remove_transaction_inner(txid, _skip_recount)
 
     def _remove_transaction_inner(self, txid: bytes, _skip_recount: bool = False):
-        """Unlocked implementation of remove_transaction."""
         if txid not in self.transactions:
             return
 
@@ -688,7 +635,6 @@ class Mempool:
             self._remove_block_transactions_inner(block)
 
     def _remove_block_transactions_inner(self, block):
-        """Unlocked implementation of remove_block_transactions."""
         removed_ids: List[bytes] = []
         for tx in block.transactions:
             if not tx.is_coinbase:
@@ -733,11 +679,12 @@ class Mempool:
     def get_all_transactions(self) -> List[Transaction]:
         """
         Get all transactions in mempool.
-        
+
         Returns:
             List of all transactions
         """
-        return [entry.tx for entry in self.transactions.values()]
+        txs = [entry.tx for entry in self.transactions.values()]
+        return txs
     
     def get_transactions_by_fee_rate(self, limit: Optional[int] = None) -> List[Transaction]:
         """
@@ -782,13 +729,12 @@ class Mempool:
             'orphan_count': self.orphan_pool.size(),
         }
     
-    # ── BIP 125 Replace-By-Fee ────────────────────────────────────────
+    # BIP 125 Replace-By-Fee #
 
-    INCREMENTAL_RELAY_FEE = 1000  # satoshis (matches Bitcoin Core's default)
+    INCREMENTAL_RELAY_FEE = 1000  # sat/kvB
     MAX_REPLACEMENT_EVICTIONS = 100
 
     def _find_conflicts(self, tx: Transaction) -> Set[bytes]:
-        """Return txids of mempool entries whose inputs overlap with *tx*."""
         conflicts: Set[bytes] = set()
         for tx_in in tx.inputs:
             op: OutPoint = (tx_in.prev_txid, tx_in.prev_vout)
@@ -800,7 +746,6 @@ class Mempool:
         return conflicts
 
     def _collect_descendants(self, txid: bytes) -> Set[bytes]:
-        """Return *txid* plus every descendant in the mempool."""
         result: Set[bytes] = {txid}
         queue = [txid]
         while queue:
@@ -844,7 +789,7 @@ class Mempool:
         if not conflicts:
             return False, "No conflicts to replace"
 
-        # ── TRUC (v3) replacement constraints ────────────────────────
+        # TRUC (v3) replacement constraints
         if new_tx.version == 3:
             # The replacement itself must obey v3 ancestor limits.
             # After evicting conflicts we should end up with ≤ 1
@@ -981,13 +926,6 @@ class Mempool:
         return True, ""
 
     def _insert_sorted_by_fee_rate(self, txid: bytes, fee_rate: float):
-        """
-        Insert txid into sorted list by fee rate.
-        
-        Args:
-            txid: Transaction ID to insert
-            fee_rate: Fee rate of the transaction
-        """
         # Binary search and insert (maintains sorted order: lowest to highest)
         left, right = 0, len(self.by_fee_rate)
         
@@ -1002,12 +940,6 @@ class Mempool:
         self.by_fee_rate.insert(left, txid)
     
     def _evict_low_fee_txs(self, needed_space: int):
-        """
-        Evict lowest fee rate transactions to free space.
-        
-        Args:
-            needed_space: Bytes needed to be freed
-        """
         freed = 0
         evicted_count = 0
         
@@ -1036,7 +968,7 @@ class Mempool:
             self.current_size = 0
             logger.info(f"Cleared mempool ({count} transactions removed)")
 
-    # ── Persistence ──────────────────────────────────────────────────
+    # Persistence
 
     MEMPOOL_DUMP_VERSION = 1
 
@@ -1197,7 +1129,7 @@ class Mempool:
         """
         return self.transactions.get(txid)
 
-    # ── Package Validation / CPFP ────────────────────────────────────
+    # --- Package Validation / CPFP ---
 
     def validate_package(
         self, txs: List[Transaction], height: int
@@ -1241,7 +1173,7 @@ class Mempool:
             seen_txids.add(txid)
 
         # Check total weight
-        total_weight = sum(tx.get_weight() for tx in txs)
+        total_weight = sum([tx.get_weight() for tx in txs])
         if total_weight > MAX_PACKAGE_WEIGHT:
             return False, (
                 f"Package weight {total_weight} exceeds {MAX_PACKAGE_WEIGHT}"
@@ -1271,7 +1203,7 @@ class Mempool:
                         f"tx at position {i} spends output of tx at position {parent_pos}"
                     )
 
-        # ── Ephemeral dust check for v3 transactions ─────────────────
+        # Ephemeral dust check for v3 transactions
         # Any v3 tx in the package that has dust outputs must have every
         # such output spent by another transaction within the same package.
         # Reference: Bitcoin Core policy/ephemeral_policy.cpp

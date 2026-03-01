@@ -24,13 +24,7 @@ if TYPE_CHECKING:
 
 
 def _siphash_2_4(key: bytes, data: bytes) -> int:
-    """
-    SipHash-2-4 keyed hash (returns 64-bit integer).
-
-    Pure-Python implementation following the reference C code.
-    key: 16 bytes (k0 || k1, little-endian u64s).
-    data: arbitrary bytes.
-    """
+    """SipHash-2-4 keyed hash (returns 64-bit integer)."""
     assert len(key) == 16
     k0 = int.from_bytes(key[0:8], "little")
     k1 = int.from_bytes(key[8:16], "little")
@@ -88,21 +82,13 @@ def _siphash_2_4(key: bytes, data: bytes) -> int:
 
 
 def compute_siphash_key(header: bytes, nonce: int) -> bytes:
-    """
-    Derive the 16-byte SipHash key from a block header and nonce.
-
-    key = SHA256(header(80 bytes) || nonce(8 bytes LE))[0:16]
-    """
+    """Derive the 16-byte SipHash key: SHA256(header || nonce_le64)[:16]."""
     h = hashlib.sha256(header + struct.pack("<Q", nonce)).digest()
     return h[:16]
 
 
 def short_txid(siphash_key: bytes, txid: bytes) -> int:
-    """
-    Compute a 6-byte (48-bit) short transaction ID.
-
-    short_id = SipHash-2-4(key, txid) & 0xFFFFFFFFFFFF
-    """
+    """Compute a 48-bit short tx ID via SipHash-2-4."""
     return _siphash_2_4(siphash_key, txid) & 0xFFFFFFFFFFFF
 
 
@@ -140,16 +126,11 @@ class CompactBlock:
     def reconstruct(
         self, mempool: 'Mempool'
     ) -> Tuple[Optional[List['Transaction']], List[int]]:
-        """
-        Attempt to reconstruct the full transaction list from the mempool.
+        """Reconstruct the tx list from the mempool.
 
-        Returns:
-            (txs, missing_indices)
-            - If all transactions are found, txs is the ordered list and
-              missing_indices is empty.
-            - Otherwise, txs is None and missing_indices lists the
-              compact-block indices that could not be resolved (the caller
-              should send ``getblocktxn``).
+        Returns ``(txs, missing_indices)``.  If all short IDs matched,
+        *missing_indices* is empty; otherwise *txs* is None and
+        *missing_indices* lists slots the caller should fetch via ``getblocktxn``.
         """
         key = self.siphash_key()
 
@@ -190,7 +171,7 @@ class CompactBlock:
             return None, missing
         return txs, []  # type: ignore[return-value]
 
-    # ── Wire-format serialization / deserialization ─────────────────
+    # Wire-format serialization / deserialization
 
     def serialize(self) -> bytes:
         """Serialize to BIP 152 ``cmpctblock`` payload."""
