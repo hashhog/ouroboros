@@ -45,7 +45,7 @@ from ouroboros.wallet import (
 )
 
 
-# ── Lightweight stand-ins for database.py dataclasses ────────────────
+# Lightweight stand-ins for database.py dataclasses
 # We redefine them here so we don't trigger the `import sync` error.
 
 @dataclass
@@ -170,7 +170,7 @@ class MempoolEntry:
     descendant_size: int = 0
 
 
-# ── Mock objects ─────────────────────────────────────────────────────
+# Mock objects
 
 
 class MockMempool:
@@ -297,7 +297,7 @@ class MockDB:
         return []
 
 
-# ── Helpers ──────────────────────────────────────────────────────────
+# --- Helpers ---
 
 
 def make_key() -> WalletKey:
@@ -334,7 +334,7 @@ def make_funding_tx(
     return tx, txid
 
 
-# ── Test Cases ───────────────────────────────────────────────────────
+# Test Cases #
 
 
 class TestBumpFee(unittest.TestCase):
@@ -416,7 +416,7 @@ class TestBumpFee(unittest.TestCase):
         self.mempool.add_entry(orig_tx, fee=fee, height=100)
         return orig_tx, funding_txid
 
-    # ── Core bump_fee tests ──────────────────────────────────────────
+    # Core bump_fee tests
 
     def test_bump_fee_basic(self):
         """bump_fee succeeds and returns a new txid."""

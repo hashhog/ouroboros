@@ -4,7 +4,7 @@ ZeroMQ notification publisher.
 Publishes real-time events over ZMQ PUB sockets for external
 consumers (block explorers, wallets, monitoring, etc.).
 
-Topics (matching Bitcoin Core):
+Topics:
   - ``hashblock``  — 32-byte block hash (on new tip)
   - ``hashtx``     — 32-byte txid (on mempool acceptance)
   - ``rawblock``   — full serialised block
@@ -100,7 +100,7 @@ class ZMQPublisher:
         self._socket.send_multipart([topic, data, struct.pack("<I", seq)])
         self._sequences[topic] = (seq + 1) & 0xFFFFFFFF
 
-    # ── public notification API ───────────────────────────────────
+    # public notification API
 
     def notify_block(self, block) -> None:
         """Publish hashblock and rawblock for a new block."""

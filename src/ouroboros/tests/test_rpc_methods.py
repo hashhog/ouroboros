@@ -559,7 +559,7 @@ class TestMempoolEntryRPCs(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    # ── getmempoolentry ──────────────────────────────────────────────
+    # getmempoolentry
 
     def test_getmempoolentry_all_fields(self):
         """getmempoolentry returns all required fields."""
@@ -674,7 +674,7 @@ class TestMempoolEntryRPCs(unittest.TestCase):
 
         asyncio.run(test())
 
-    # ── getmempoolancestors ──────────────────────────────────────────
+    # getmempoolancestors
 
     def test_getmempoolancestors_non_verbose(self):
         """Non-verbose returns list of ancestor txid hex strings."""
@@ -718,7 +718,7 @@ class TestMempoolEntryRPCs(unittest.TestCase):
 
         asyncio.run(test())
 
-    # ── getmempooldescendants ────────────────────────────────────────
+    # getmempooldescendants
 
     def test_getmempooldescendants_non_verbose(self):
         """Non-verbose returns list of descendant txid hex strings."""

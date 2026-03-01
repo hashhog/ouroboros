@@ -63,7 +63,6 @@ class JSONRPCResponse(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Partial Merkle tree helpers (CMerkleBlock serialization / deserialization)
-# Reference: Bitcoin Core merkleblock.cpp, CPartialMerkleTree
 # ---------------------------------------------------------------------------
 
 import hashlib as _hashlib
@@ -99,12 +98,10 @@ def _read_varint(data: bytes, offset: int) -> tuple:
 
 
 def _tree_width(n_tx: int, height: int) -> int:
-    """Number of nodes at a given height in a Merkle tree with n_tx leaves."""
     return (n_tx + (1 << height) - 1) >> height
 
 
 def _calc_tree_hash(txids: list, n_tx: int, height: int, pos: int) -> bytes:
-    """Compute the hash of a subtree rooted at (height, pos)."""
     if height == 0:
         return txids[pos] if pos < n_tx else b'\x00' * 32
     left = _calc_tree_hash(txids, n_tx, height - 1, pos * 2)
@@ -117,13 +114,7 @@ def _calc_tree_hash(txids: list, n_tx: int, height: int, pos: int) -> bytes:
 
 
 def _build_partial_merkle_tree(block, txids: list, matches: list) -> bytes:
-    """
-    Serialize a partial Merkle tree in the CMerkleBlock wire format.
-
-    ``block`` must have a ``.serialize()`` returning at least 80 bytes of
-    header.  ``txids`` is the ordered list of 32-byte txids.  ``matches``
-    is a parallel bool list indicating which txids should be provable.
-    """
+    """Serialize a partial Merkle tree in the CMerkleBlock wire format."""
     n = len(txids)
     height = 0
     while (1 << height) < n:
@@ -166,10 +157,7 @@ def _build_partial_merkle_tree(block, txids: list, matches: list) -> bytes:
 
 
 def _parse_partial_merkle_tree(data: bytes) -> tuple:
-    """
-    Deserialize a partial Merkle tree payload (everything after the
-    80-byte header) and return ``(matched_txids, merkle_root)``.
-    """
+    """Deserialize a partial Merkle tree payload (everything after the."""
     offset = 0
     n_tx = _struct.unpack_from('<I', data, offset)[0]
     offset += 4
@@ -237,16 +225,7 @@ class RPCServer:
         password: Optional[str] = None,
         rate_limit: bool = True
     ):
-        """
-        Initialize RPC server.
-        
-        Args:
-            node: BitcoinNode instance
-            port: RPC server port
-            username: RPC username (optional, for authentication)
-            password: RPC password (optional, for authentication)
-            rate_limit: Enable rate limiting
-        """
+        """Initialize RPC server."""
         self.node = node
         self.port = port
         self.username = username
@@ -394,7 +373,6 @@ class RPCServer:
             return await self.rpc_getblockfilter(blockhash, filtertype)
 
     async def _get_credentials(self, request: Request) -> Optional[HTTPBasicCredentials]:
-        """Get and validate credentials if authentication is enabled"""
         if not self.security:
             return None
         
@@ -407,7 +385,6 @@ class RPCServer:
             raise HTTPException(status_code=401, detail="Authentication required")
     
     def _get_client_ip_from_request(self, request: Request) -> str:
-        """Get client IP address for rate limiting"""
         # Try to get real IP from headers (for proxies)
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
@@ -420,7 +397,6 @@ class RPCServer:
         return "127.0.0.1"
     
     def _check_rate_limit(self, client_ip: str) -> bool:
-        """Check if client has exceeded rate limit"""
         now = time.time()
         requests = _rate_limit_store[client_ip]
         
@@ -591,7 +567,7 @@ class RPCServer:
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid transaction ID")
 
-        # ── 1. Mempool lookup (fast) ─────────────────────────────────
+        # 1. Mempool lookup (fast)
         if hasattr(self.node, 'mempool') and self.node.mempool:
             tx = self.node.mempool.get_transaction(tx_hash)
             if tx:
@@ -599,7 +575,7 @@ class RPCServer:
                     return self._tx_to_dict(tx)
                 return tx.serialize().hex()
 
-        # ── 2. Blockchain lookup ─────────────────────────────────────
+        # 2. Blockchain lookup
         block = None
         block_hash_bytes = None
         block_height = None
@@ -728,7 +704,7 @@ class RPCServer:
                 peers = list(self.node.peer_manager.peers.values()) if isinstance(self.node.peer_manager.peers, dict) else []
         
         return {
-            "version": 240000,  # Bitcoin Core compatible version
+            "version": 240000,
             "subversion": "/bitcoin-hybrid:0.1.0/",
             "protocolversion": 70015,
             "connections": len(peers),
@@ -1040,8 +1016,6 @@ class RPCServer:
     ) -> str:
         """
         Generate a new address.
-
-        Reference: Bitcoin Core getnewaddress (wallet/rpc/addresses.cpp)
         """
         wallet = getattr(self.node, "wallet", None)
         if wallet is None:
@@ -1059,8 +1033,6 @@ class RPCServer:
     ) -> str:
         """
         Send bitcoin to an address. Returns the txid.
-
-        Reference: Bitcoin Core sendtoaddress (wallet/rpc/spend.cpp)
         """
         wallet = getattr(self.node, "wallet", None)
         if wallet is None:
@@ -1089,8 +1061,6 @@ class RPCServer:
 
         If *seed_hex* is provided it is used as the master seed;
         otherwise a cryptographically random 32-byte seed is generated.
-
-        Reference: Bitcoin Core sethdseed (wallet/rpc/wallet.cpp)
         """
         import os
 
@@ -1131,8 +1101,6 @@ class RPCServer:
     async def rpc_encryptwallet(self, passphrase: str) -> str:
         """
         Encrypt the wallet with a passphrase.
-
-        Reference: Bitcoin Core encryptwallet (wallet/rpc/encrypt.cpp)
         """
         wallet = getattr(self.node, "wallet", None)
         if wallet is None:
@@ -1159,8 +1127,6 @@ class RPCServer:
     ) -> bool:
         """
         Unlock an encrypted wallet for *timeout* seconds.
-
-        Reference: Bitcoin Core walletpassphrase (wallet/rpc/encrypt.cpp)
         """
         wallet = getattr(self.node, "wallet", None)
         if wallet is None:
@@ -1191,8 +1157,6 @@ class RPCServer:
     async def rpc_walletlock(self) -> bool:
         """
         Lock the wallet, wiping the decryption key from memory.
-
-        Reference: Bitcoin Core walletlock (wallet/rpc/encrypt.cpp)
         """
         wallet = getattr(self.node, "wallet", None)
         if wallet is None:
@@ -1225,8 +1189,6 @@ class RPCServer:
     ) -> bool:
         """
         Change the wallet passphrase.
-
-        Reference: Bitcoin Core walletpassphrasechange (wallet/rpc/encrypt.cpp)
         """
         wallet = getattr(self.node, "wallet", None)
         if wallet is None:
@@ -1253,8 +1215,6 @@ class RPCServer:
     async def rpc_getwalletinfo(self) -> Dict[str, Any]:
         """
         Return wallet state info.
-
-        Reference: Bitcoin Core getwalletinfo (wallet/rpc/wallet.cpp)
         """
         wallet = getattr(self.node, "wallet", None)
         if wallet is None:
@@ -1285,13 +1245,11 @@ class RPCServer:
 
         return info
 
-    # ── PSBT RPCs (BIP 174) ────────────────────────────────────────────
+    # PSBT RPCs (BIP 174)
 
     async def rpc_decodepsbt(self, psbt_base64: str) -> Dict[str, Any]:
         """
         Decode a base64-encoded PSBT into a human-readable dict.
-
-        Reference: Bitcoin Core decodepsbt (rpc/rawtransaction.cpp)
         """
         import base64 as b64
         from ouroboros.psbt import PSBT
@@ -1315,8 +1273,6 @@ class RPCServer:
     async def rpc_combinepsbt(self, psbts: List[str]) -> str:
         """
         Combine multiple base64-encoded PSBTs into one.
-
-        Reference: Bitcoin Core combinepsbt (rpc/rawtransaction.cpp)
         """
         import base64 as b64
         from ouroboros.psbt import PSBT
@@ -1344,8 +1300,6 @@ class RPCServer:
         """
         Finalise a PSBT. If *extract* is true and all inputs are finalised,
         extract the network transaction.
-
-        Reference: Bitcoin Core finalizepsbt (rpc/rawtransaction.cpp)
         """
         import base64 as b64
         from ouroboros.psbt import PSBT
@@ -1388,8 +1342,6 @@ class RPCServer:
 
         *inputs*: ``[{"txid": "<hex>", "vout": <n>}, ...]``
         *outputs*: ``[{"<address>": <amount_sat>}, ...]``
-
-        Reference: Bitcoin Core createpsbt (rpc/rawtransaction.cpp)
         """
         import base64 as b64
         from ouroboros.psbt import PSBT
@@ -1445,11 +1397,9 @@ class RPCServer:
         Estimate the fee rate needed for a transaction to confirm
         within conf_target blocks.
 
-        Returns a dict matching Bitcoin Core's format:
+        Returns:
             {"feerate": <BTC/kB>, "blocks": <conf_target>}
-        or  {"errors": [...], "blocks": <conf_target>}
-
-        Reference: Bitcoin Core estimatesmartfee (rpc/fees.cpp)
+            or {"errors": [...], "blocks": <conf_target>}
         """
         conf_target = max(1, min(conf_target, 1008))
 
@@ -1475,8 +1425,6 @@ class RPCServer:
     async def rpc_validateaddress(self, address: str) -> Dict[str, Any]:
         """
         Validate a Bitcoin address and return information about it.
-
-        Reference: Bitcoin Core validateaddress (rpc/misc.cpp)
         """
         from ouroboros.address import address_to_script_pubkey
 
@@ -1519,9 +1467,6 @@ class RPCServer:
           total_transactions (uint32 LE)
           hash_count (varint) + hashes (32 bytes each)
           flag_byte_count (varint) + flag_bytes
-
-        Reference: Bitcoin Core gettxoutproof (rpc/rawtransaction.cpp),
-                   merkleblock.cpp CPartialMerkleTree
         """
         if not txids:
             raise HTTPException(status_code=400, detail="txids must not be empty")
@@ -1573,8 +1518,6 @@ class RPCServer:
     async def rpc_verifytxoutproof(self, proof: str) -> List[str]:
         """
         Verify a Merkle proof and return the proven txids.
-
-        Reference: Bitcoin Core verifytxoutproof (rpc/rawtransaction.cpp)
         """
         import hashlib as _hl
 
@@ -1608,8 +1551,6 @@ class RPCServer:
     async def rpc_getmininginfo(self) -> Dict[str, Any]:
         """
         Return mining-related information.
-
-        Reference: Bitcoin Core getmininginfo (rpc/mining.cpp)
         """
         db = getattr(self.node, "db", None)
         if db is None:
@@ -1634,8 +1575,6 @@ class RPCServer:
         Selects mempool transactions by fee rate (greedy), builds a
         coinbase, computes the merkle root, and returns the template
         for external miners.
-
-        Reference: Bitcoin Core getblocktemplate (rpc/mining.cpp)
         """
         import time as _time
         import hashlib as _hl
@@ -1653,7 +1592,7 @@ class RPCServer:
 
         next_height = best_height + 1
 
-        # ── gather transactions from mempool (dependency-aware) ───
+        # gather transactions from mempool (dependency-aware)
         MAX_BLOCK_WEIGHT = 4_000_000
         txs: List[Dict[str, Any]] = []
         total_fees = 0
@@ -1677,7 +1616,6 @@ class RPCServer:
             included: set = set()
 
             def _collect_ancestors(txid: bytes, already: set) -> List[bytes]:
-                """BFS to collect all un-included ancestors in topological order."""
                 needed = []
                 queue = [txid]
                 visited = set()
@@ -1704,7 +1642,7 @@ class RPCServer:
                             remaining.remove(t)
                 return ordered
 
-            # ── Compute ancestor fee rate for each mempool entry ──
+            # Compute ancestor fee rate for each mempool entry
             # ancestor_fee_rate = (entry.fee + sum(ancestor fees))
             #                   / (entry.size + sum(ancestor sizes))
             # Reference: Bitcoin Core BlockAssembler::addPackageTransactions()
@@ -1760,7 +1698,6 @@ class RPCServer:
                     tw = e.size * 4
                     raw = e.tx.serialize()
 
-                    # ── Compute sigops cost (matches _validate_block_limits) ──
                     tx_sigops_cost = 0
 
                     # Legacy sigops (outputs + inputs) × WITNESS_SCALE_FACTOR
@@ -1811,7 +1748,7 @@ class RPCServer:
         else:
             snap_txs = {}
 
-        # ── witness commitment ────────────────────────────────────
+        # witness commitment
         # Compute the SegWit witness merkle root from selected txs.
         # wtxids: coinbase is 32 zero-bytes, then each selected tx's wtxid.
         wtxids: List[bytes] = [bytes(32)]  # coinbase placeholder
@@ -1847,14 +1784,14 @@ class RPCServer:
         witness_commitment_script = bytes.fromhex("6a24aa21a9ed") + commitment
         default_witness_commitment = witness_commitment_script.hex()
 
-        # ── block reward (subsidy + fees) ─────────────────────────
+        # block reward (subsidy + fees)
         subsidy = 50 * 100_000_000
         halvings = next_height // 210_000
         if halvings < 64:
             subsidy >>= halvings
         coinbase_value = subsidy + total_fees
 
-        # ── target / bits ─────────────────────────────────────────
+        # target / bits
         bits = best_block.bits
         n_shift = (bits >> 24) & 0xFF
         mantissa = bits & 0x007FFFFF
@@ -1887,8 +1824,6 @@ class RPCServer:
         Submit a mined block to the network.
 
         Returns None on success, an error string on failure.
-
-        Reference: Bitcoin Core submitblock (rpc/mining.cpp)
         """
         from ouroboros.database import Block as _Block
 
@@ -1925,8 +1860,6 @@ class RPCServer:
         Prune block data up to the given height.
 
         Returns the height of the last block pruned.
-
-        Reference: Bitcoin Core pruneblockchain (rpc/blockchain.cpp)
         """
         pruner = getattr(self.node, "pruner", None)
         if pruner is None:
@@ -1953,7 +1886,7 @@ class RPCServer:
         logger.info(f"RPC pruneblockchain: pruned {removed} blocks up to height {target}")
         return target
 
-    # ── Additional RPC methods ─────────────────────────────────────────
+    # --- Additional RPC methods ---
 
     async def rpc_help(self, command: str = "") -> str:
         """List all available RPC commands, or get help for a specific command."""
@@ -2249,7 +2182,6 @@ class RPCServer:
 
     @staticmethod
     def _compute_merkle_root(txids: list) -> bytes:
-        """Compute merkle root from a list of txids."""
         import hashlib
         if not txids:
             return bytes(32)
@@ -2740,8 +2672,7 @@ class RPCServer:
         (parents before children).  The package is evaluated as a unit so
         that a child can pay for a low-fee parent (CPFP).
 
-        Returns a result dict compatible with Bitcoin Core's ``submitpackage``
-        RPC, including per-transaction results with txid, vsize, and fees.
+        Returns per-transaction results with txid, vsize, and fees.
         """
         if not isinstance(package, list) or len(package) == 0:
             raise HTTPException(
@@ -2986,7 +2917,7 @@ class RPCServer:
         """Return the status of indices."""
         return {}
 
-    # ── Fee Bumping (RBF) ──────────────────────────────────────────────
+    # Fee Bumping (RBF)
 
     async def rpc_bumpfee(
         self, txid: str, options: Optional[Dict[str, Any]] = None
@@ -3007,7 +2938,6 @@ class RPCServer:
             Dict with ``txid`` (new txid), ``origfee`` (BTC),
             ``fee`` (BTC), and ``errors`` list.
 
-        Reference: Bitcoin Core ``bumpfee`` (wallet/rpc/spend.cpp)
         """
         wallet = getattr(self.node, "wallet", None)
         if wallet is None:
@@ -3093,7 +3023,6 @@ class RPCServer:
             Dict with ``psbt`` (unsigned raw hex), ``origfee`` (BTC),
             ``fee`` (BTC), and ``errors`` list.
 
-        Reference: Bitcoin Core ``psbtbumpfee`` (wallet/rpc/spend.cpp)
         """
         wallet = getattr(self.node, "wallet", None)
         if wallet is None:
@@ -3157,11 +3086,7 @@ class RPCServer:
         }
 
     def _format_mempool_entry(self, entry, txid_bytes: bytes) -> Dict[str, Any]:
-        """Format a MempoolEntry into the Bitcoin Core-compatible dict.
-
-        Computes ``depends`` (unconfirmed parent txids) and ``spentby``
-        (unconfirmed child txids) by scanning the mempool.
-        """
+        """Format a MempoolEntry into the standard mempool dict."""
         mempool = self.node.mempool
 
         # -- depends: unconfirmed parents of this tx -----------------------
@@ -3462,11 +3387,7 @@ class RPCServer:
     # Helper methods
 
     def _tx_to_dict(self, tx: Transaction) -> Dict[str, Any]:
-        """
-        Convert transaction to dictionary for RPC response.
-        
-        Includes proper SegWit weight and vsize calculations.
-        """
+        """Convert transaction to dictionary for RPC response."""
         txid = tx.get_txid() if hasattr(tx, 'get_txid') else tx.txid
         txid_hex = txid.hex() if isinstance(txid, bytes) else str(txid)
         
@@ -3497,14 +3418,6 @@ class RPCServer:
         }
     
     def _vin_to_dict(self, vin: TxIn, index: int = 0, tx: Optional[Transaction] = None) -> Dict[str, Any]:
-        """
-        Convert input to dictionary.
-        
-        Args:
-            vin: Transaction input
-            index: Input index (for potential witness data)
-            tx: Transaction (for potential witness data)
-        """
         prev_txid = vin.prev_txid.hex() if isinstance(vin.prev_txid, bytes) else str(vin.prev_txid)
         script_sig = vin.script_sig.hex() if isinstance(vin.script_sig, bytes) else str(vin.script_sig)
         
@@ -3522,7 +3435,6 @@ class RPCServer:
         return result
     
     def _vout_to_dict(self, vout: TxOut, n: int) -> Dict[str, Any]:
-        """Convert output to dictionary"""
         script_pubkey = vout.script_pubkey.hex() if isinstance(vout.script_pubkey, bytes) else bytes(vout.script_pubkey).hex()
         script_pubkey_bytes = vout.script_pubkey if isinstance(vout.script_pubkey, bytes) else bytes(vout.script_pubkey)
         
@@ -3537,7 +3449,6 @@ class RPCServer:
         }
     
     def _get_script_type(self, script: bytes) -> str:
-        """Determine script type"""
         if not isinstance(script, bytes):
             script = bytes(script)
         
@@ -3560,10 +3471,6 @@ class RPCServer:
             return "nonstandard"
 
     def _is_coinbase_output(self, txid: bytes) -> bool:
-        """
-        Check if a transaction (that created a UTXO) is a coinbase transaction.
-        Searches blocks from genesis to tip. Returns False if not found.
-        """
         if not hasattr(self.node, 'db') or not self.node.db:
             return False
         try:
@@ -3580,7 +3487,6 @@ class RPCServer:
             return False
     
     def _is_synced(self) -> bool:
-        """Check if node is synced"""
         if hasattr(self.node, 'is_synced'):
             return self.node.is_synced()
         if hasattr(self.node, 'sync_manager'):
@@ -3588,7 +3494,6 @@ class RPCServer:
         return True  # Assume synced if can't check
     
     def _get_confirmations(self, height: Optional[int]) -> int:
-        """Get confirmation count for a block"""
         if height is None:
             return 0
         
@@ -3605,12 +3510,6 @@ class RPCServer:
         return 0
     
     def _get_next_block_hash(self, height: int) -> Optional[str]:
-        """
-        Get next block hash for a given block height.
-
-        Returns block at height+1 hash as hex, or None if at tip.
-        Ref: bitcoin/src/rpc/blockchain.cpp blockToJSON
-        """
         if not hasattr(self.node, "db") or not self.node.db:
             return None
 

@@ -127,11 +127,11 @@ class NetworkMessage:
         checksum = calculate_checksum(self.payload)
         cmd_bytes = command_to_bytes(self.command)
         
-        data = struct.pack('<I', self.magic)  # Magic
-        data += cmd_bytes  # Command (12 bytes)
-        data += struct.pack('<I', len(self.payload))  # Payload length
-        data += checksum  # Checksum (4 bytes)
-        data += self.payload  # Payload
+        data = struct.pack('<I', self.magic)
+        data += cmd_bytes
+        data += struct.pack('<I', len(self.payload))
+        data += checksum
+        data += self.payload
         
         return data
     
@@ -160,17 +160,13 @@ class NetworkMessage:
                 f"Invalid magic bytes: expected {expected_magic:08x}, got {magic:08x}"
             )
         
-        # Command (12 bytes, null-padded)
         cmd_bytes = data[4:16].rstrip(b'\x00')
         command = cmd_bytes.decode('ascii')
-        
-        # Payload length
+
         payload_size = struct.unpack('<I', data[16:20])[0]
-        
-        # Checksum
+
         checksum = data[20:24]
-        
-        # Payload
+
         if len(data) < 24 + payload_size:
             raise ValueError(f"Not enough data for payload: need {24 + payload_size}, got {len(data)}")
         
@@ -254,7 +250,6 @@ class VersionMessage:
     relay: bool = True
     
     def __post_init__(self):
-        """Set default timestamp if not provided"""
         if self.timestamp == 0:
             self.timestamp = int(time.time())
     
@@ -809,7 +804,7 @@ class PongMessage:
         return cls(nonce=nonce)
 
 
-# ── BIP 152 Compact Block messages ──────────────────────────────────
+# BIP 152 Compact Block messages
 
 
 @dataclass
@@ -895,7 +890,7 @@ class BlockTxnMessage:
         return BlockTransactions.deserialize(self.payload_bytes)
 
 
-# ── Additional P2P messages for chain-tip operation ──────────────────
+# --- Additional P2P messages for chain-tip operation ---
 
 
 @dataclass
@@ -1121,7 +1116,7 @@ class GetBlocksMessage:
         return cls(version=version, locator_hashes=hashes, hash_stop=hash_stop)
 
 
-# ── BIP 330 Erlay Transaction Reconciliation messages ────────────────
+# BIP 330 Erlay Transaction Reconciliation messages
 
 
 @dataclass

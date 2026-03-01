@@ -24,14 +24,14 @@ from ouroboros.database import Transaction, TxIn
 
 
 class SigVersion(IntEnum):
-    """Script signature verification context (matches Bitcoin Core)."""
+    """Script signature verification context."""
     BASE = 0          # Legacy pre-SegWit
     WITNESS_V0 = 1    # SegWit v0 (BIP 141/143)
     TAPSCRIPT = 2     # Tapscript (BIP 342)
 
 
 # ---------------------------------------------------------------------------
-# Script verification flags (matching Bitcoin Core src/script/interpreter.h)
+# Script verification flags (src/script/interpreter.h)
 # ---------------------------------------------------------------------------
 
 SCRIPT_VERIFY_NONE = 0
@@ -93,11 +93,7 @@ SECP256K1_ORDER_HALF = (
 
 
 def get_flags_for_height(height: int, block_hash: bytes | None = None) -> int:
-    """Return the script verification flags appropriate for *height*.
-
-    If *block_hash* (internal byte order) is provided, check for historical
-    exceptions matching Bitcoin Core's script_flag_exceptions.
-    """
+    """Script verification flags for *height*; checks historical exceptions when *block_hash* is given."""
     # Check for historical exception blocks first
     if block_hash is not None and block_hash in _SCRIPT_FLAG_EXCEPTIONS:
         return _SCRIPT_FLAG_EXCEPTIONS[block_hash]
@@ -126,13 +122,11 @@ def get_flags_for_height(height: int, block_hash: bytes | None = None) -> int:
 
 
 def _tagged_hash(tag: str, data: bytes) -> bytes:
-    """BIP 340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data)."""
     tag_hash = hashlib.sha256(tag.encode()).digest()
     return hashlib.sha256(tag_hash + tag_hash + data).digest()
 
 
 def _is_push_only(script: bytes) -> bool:
-    """Return True if *script* contains only push operations (BIP 62 rule 2)."""
     i = 0
     while i < len(script):
         opcode = script[i]
@@ -157,7 +151,6 @@ def _is_push_only(script: bytes) -> bool:
 
 
 def _is_push_only_simple(script: bytes) -> bool:
-    """Simplified push-only check: only data pushes and OP_0 through OP_16."""
     i = 0
     while i < len(script):
         opcode = script[i]
@@ -223,7 +216,6 @@ def _check_der_signature(sig: bytes) -> bool:
 
 
 def _check_low_s(sig_without_hashtype: bytes) -> bool:
-    """Check that S value in DER sig is in the lower half of the curve order."""
     if len(sig_without_hashtype) < 6:
         return True
     if sig_without_hashtype[0] != 0x30:
@@ -239,13 +231,6 @@ def _check_low_s(sig_without_hashtype: bytes) -> bool:
 
 
 def _check_pubkey_encoding(pubkey: bytes) -> bool:
-    """
-    Validate public key encoding (Bitcoin Core CheckPubKeyEncoding).
-
-    Valid formats:
-    - Compressed: 33 bytes, prefix 0x02 or 0x03
-    - Uncompressed: 65 bytes, prefix 0x04
-    """
     if len(pubkey) == 33 and pubkey[0] in (0x02, 0x03):
         return True
     if len(pubkey) == 65 and pubkey[0] == 0x04:
@@ -254,15 +239,10 @@ def _check_pubkey_encoding(pubkey: bytes) -> bool:
 
 
 def _check_compressed_pubkey(pubkey: bytes) -> bool:
-    """Validate that a public key is compressed (33 bytes, prefix 0x02/0x03)."""
     return len(pubkey) == 33 and pubkey[0] in (0x02, 0x03)
 
 
 def _get_witness_version_and_program(script_pubkey: bytes) -> Optional[Tuple[int, bytes]]:
-    """
-    If script_pubkey is a witness program, return (version, program).
-    Witness programs: OP_n <2..40 bytes>
-    """
     if len(script_pubkey) < 4 or len(script_pubkey) > 42:
         return None
     version_opcode = script_pubkey[0]
@@ -284,7 +264,6 @@ class ScriptInterpreter:
     """Interprets and verifies Bitcoin scripts"""
     
     def __init__(self):
-        """Initialize the script interpreter"""
         pass
     
     def verify(
@@ -391,7 +370,6 @@ class ScriptInterpreter:
             return False
 
     def _is_p2sh(self, script: bytes) -> bool:
-        """OP_HASH160 <20 bytes> OP_EQUAL"""
         return (len(script) == 23
                 and script[0] == 0xa9
                 and script[1] == 0x14
@@ -470,7 +448,6 @@ class ScriptInterpreter:
         scripthash: bytes, witness: List[bytes],
         flags: int, amount: int,
     ) -> bool:
-        """P2WSH: witness = [...stack, witness_script], scripthash = SHA256(witness_script)."""
         if len(witness) < 1:
             return False
         witness_script = witness[-1]
@@ -574,32 +551,7 @@ class ScriptInterpreter:
         default_sighash: Optional[bytes] = None,
         witness_weight: int = 0,
     ) -> List[bytes]:
-        """
-        Execute a Bitcoin script.
-
-        Handles legacy, SegWit v0, and tapscript (BIP 342) execution in a
-        single unified interpreter, mirroring Bitcoin Core's EvalScript().
-
-        Args:
-            script: Script bytes to execute
-            tx: Transaction context
-            input_index: Index of input being verified
-            script_pubkey: Script pubkey for signature hash calculation
-            flags: Script verification flags
-            initial_stack: Pre-populated stack (for P2SH / witness evaluation)
-            is_witness_v0: True when executing inside a SegWit v0 context
-            witness_amount: Input amount (needed for BIP 143 sighash)
-            sig_version: Script context (BASE, WITNESS_V0, TAPSCRIPT)
-            input_amounts: All input amounts (tapscript sighash)
-            input_script_pubkeys: All input scriptPubKeys (tapscript sighash)
-            annex: Witness annex (BIP 341)
-            leaf_hash: Tapleaf hash (tapscript sighash)
-            default_sighash: Pre-computed sighash for type 0x00 (tapscript)
-            witness_weight: Witness serialization weight (for sigops budget)
-
-        Returns:
-            Stack after execution
-        """
+        """Execute a Bitcoin script."""
         is_tapscript = sig_version == SigVersion.TAPSCRIPT
 
         # Tapscript OP_SUCCESS pre-check: scan for OP_SUCCESS opcodes before
@@ -662,7 +614,7 @@ class ScriptInterpreter:
             if opcode in (0x65, 0x66):
                 raise ValueError(f"Invalid opcode 0x{opcode:02x}")
 
-            # ── Data push (always consume bytes; only push when executing) ──
+            # Data push (always consume bytes; only push when executing)
             push_data = None
             if 1 <= opcode <= 75:
                 n = opcode
@@ -732,7 +684,7 @@ class ScriptInterpreter:
             if opcode in _DISABLED:
                 raise ValueError(f"Disabled opcode 0x{opcode:02x}")
 
-            # ── Flow control (always processed for nesting) ─────────────
+            # Flow control (always processed for nesting)
             if opcode == 0x63:  # OP_IF
                 val = False
                 if executing:
@@ -771,11 +723,9 @@ class ScriptInterpreter:
             if not executing:
                 continue
 
-            # ════════════════════════════════════════════════════════════
-            #  From here on, the opcode is being executed.
-            # ════════════════════════════════════════════════════════════
+            # From here on, the opcode is being executed.
 
-            # ── Constants ───────────────────────────────────────────────
+            # Constants
             if opcode == 0x00:  # OP_0 / OP_FALSE
                 stack.append(b'')
                 continue
@@ -786,7 +736,7 @@ class ScriptInterpreter:
                 stack.append(bytes([opcode - 0x50]))
                 continue
 
-            # ── Flow control ────────────────────────────────────────────
+            # Flow control
             if opcode == 0x61:  # OP_NOP
                 continue
             if opcode == 0x69:  # OP_VERIFY
@@ -798,11 +748,11 @@ class ScriptInterpreter:
             if opcode == 0x6a:  # OP_RETURN
                 raise ValueError("OP_RETURN encountered")
 
-            # ── Reserved (fail when executed) ───────────────────────────
+            # Reserved (fail when executed)
             if opcode in (0x50, 0x62, 0x89, 0x8a):
                 raise ValueError(f"Reserved opcode 0x{opcode:02x}")
 
-            # ── Stack manipulation ──────────────────────────────────────
+            # --- Stack manipulation ---
             if opcode == 0x6b:  # OP_TOALTSTACK
                 if not stack:
                     raise ValueError("OP_TOALTSTACK: stack underflow")
@@ -909,14 +859,14 @@ class ScriptInterpreter:
                 stack.insert(-2, stack[-1])
                 continue
 
-            # ── Splice ──────────────────────────────────────────────────
+            # Splice
             if opcode == 0x82:  # OP_SIZE (does not pop)
                 if not stack:
                     raise ValueError("OP_SIZE: stack underflow")
                 stack.append(self._encode_script_num(len(stack[-1])))
                 continue
 
-            # ── Bitwise logic ───────────────────────────────────────────
+            # Bitwise logic
             if opcode == 0x87:  # OP_EQUAL
                 if len(stack) < 2:
                     raise ValueError("OP_EQUAL: stack underflow")
@@ -930,7 +880,7 @@ class ScriptInterpreter:
                     raise ValueError("OP_EQUALVERIFY failed")
                 continue
 
-            # ── Arithmetic (unary) ──────────────────────────────────────
+            # Arithmetic (unary)
             if opcode == 0x8b:  # OP_1ADD
                 if not stack:
                     raise ValueError("OP_1ADD: stack underflow")
@@ -962,7 +912,7 @@ class ScriptInterpreter:
                 stack.append(self._encode_script_num(int(self._read_signed_num(stack.pop()) != 0)))
                 continue
 
-            # ── Arithmetic (binary) ─────────────────────────────────────
+            # Arithmetic (binary)
             if opcode in (0x93, 0x94, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e,
                           0x9f, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4):
                 if len(stack) < 2:
@@ -1011,7 +961,7 @@ class ScriptInterpreter:
                 stack.append(self._encode_script_num(int(mn <= x < mx)))
                 continue
 
-            # ── Crypto ──────────────────────────────────────────────────
+            # Crypto
             if opcode == 0xa6:  # OP_RIPEMD160
                 if not stack:
                     raise ValueError("OP_RIPEMD160: stack underflow")
@@ -1047,7 +997,7 @@ class ScriptInterpreter:
                 codesep_pos = i  # position after the opcode
                 continue
 
-            # ── Signature verification ──────────────────────────────────
+            # Signature verification #
             if opcode == 0xac:  # OP_CHECKSIG
                 if len(stack) < 2:
                     raise ValueError("OP_CHECKSIG: stack underflow")
@@ -1307,7 +1257,7 @@ class ScriptInterpreter:
                     raise ValueError("OP_CHECKMULTISIGVERIFY failed")
                 continue
 
-            # ── Timelocks (BIP 65 / BIP 112) ────────────────────────────
+            # Timelocks (BIP 65 / BIP 112)
             if opcode == 0xb1:  # OP_CHECKLOCKTIMEVERIFY
                 if not stack:
                     raise ValueError("OP_CHECKLOCKTIMEVERIFY: stack empty")
@@ -1355,7 +1305,7 @@ class ScriptInterpreter:
                     raise ValueError("OP_CHECKSEQUENCEVERIFY: unsatisfied")
                 continue
 
-            # ── Reserved NOPs ───────────────────────────────────────────
+            # Reserved NOPs
             if opcode in (0xb0, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9):
                 if flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS:
                     raise ValueError(
@@ -1373,7 +1323,6 @@ class ScriptInterpreter:
     
     @staticmethod
     def _cast_to_bool(data: bytes) -> bool:
-        """Bitcoin CastToBool: false iff all-zero bytes or negative zero (0x80)."""
         for idx in range(len(data)):
             if data[idx] != 0:
                 if idx == len(data) - 1 and data[idx] == 0x80:
@@ -1382,33 +1331,24 @@ class ScriptInterpreter:
         return False
 
     def _hash160(self, data: bytes) -> bytes:
-        """Compute HASH160 (RIPEMD160(SHA256(data)))"""
         sha256_hash = hashlib.sha256(data).digest()
         return hashlib.new('ripemd160', sha256_hash).digest()
     
     def _hash256(self, data: bytes) -> bytes:
-        """Compute double SHA256"""
         return hashlib.sha256(hashlib.sha256(data).digest()).digest()
     
     def _read_num(self, data: bytes) -> int:
-        """Read script number from stack (empty = 0, else minimal little-endian)."""
         if not data:
             return 0
         return int.from_bytes(data, 'little')
 
     def _read_signed_num(self, data: bytes, max_len: int = 4) -> int:
-        """
-        Decode a CScriptNum: signed little-endian with the MSB of the
-        last byte used as a sign bit.  Enforces minimal encoding.
-
-        Bitcoin Core: ``CScriptNum(stacktop(-1), fRequireMinimal, max_len)``
-        """
         if not data:
             return 0
         if len(data) > max_len:
             raise ValueError(f"CScriptNum overflow ({len(data)} > {max_len})")
 
-        # Minimal encoding check (Bitcoin Core CScriptNum constructor)
+        # Minimal encoding check
         if data[-1] & 0x7f == 0:
             if len(data) <= 1 or not (data[-2] & 0x80):
                 raise ValueError("Non-minimal CScriptNum encoding")
@@ -1422,7 +1362,6 @@ class ScriptInterpreter:
         return result
 
     def _encode_varint(self, value: int) -> bytes:
-        """Encode variable-length integer for script serialization."""
         if value < 0xfd:
             return bytes([value])
         elif value <= 0xffff:
@@ -1434,13 +1373,6 @@ class ScriptInterpreter:
 
     @staticmethod
     def _find_and_delete(script: bytes, sig: bytes) -> bytes:
-        """
-        Remove all occurrences of *sig* (with its push opcode) from *script*.
-
-        Ref: Bitcoin Core FindAndDelete() in script.h.
-        This is used in legacy (pre-SegWit) sighash computation to strip the
-        signature being verified from the script code.
-        """
         # Build the serialized push of the signature
         sig_len = len(sig)
         if sig_len < 0x4C:
@@ -1465,21 +1397,7 @@ class ScriptInterpreter:
         script_code: bytes,
         sighash_type: int
     ) -> bytes:
-        """
-        Calculate Bitcoin legacy SignatureHash for ECDSA verification.
-
-        Follows en.bitcoin.it/wiki/OP_CHECKSIG.
-        Supports SIGHASH_ALL, SIGHASH_NONE, SIGHASH_SINGLE, SIGHASH_ANYONECANPAY.
-
-        Args:
-            transaction: The transaction being signed
-            input_index: Index of the input being verified
-            script_code: Script code (scriptPubKey for P2PKH)
-            sighash_type: SIGHASH type (last byte of signature)
-
-        Returns:
-            32-byte hash for signature verification
-        """
+        """Calculate Bitcoin legacy SignatureHash for ECDSA verification."""
         base_type = sighash_type & 0x1f
         anyone_can_pay = (sighash_type & 0x80) != 0
 
@@ -1535,17 +1453,7 @@ class ScriptInterpreter:
         return hashlib.sha256(hashlib.sha256(bytes(data)).digest()).digest()
     
     def _verify_ecdsa_signature(self, message_hash: bytes, der_sig: bytes, pubkey: bytes) -> bool:
-        """
-        Verify ECDSA signature using secp256k1 (Rust sync module or Python coincurve).
-
-        Args:
-            message_hash: 32-byte double-SHA256 of signed data
-            der_sig: DER-encoded signature (without SIGHASH byte)
-            pubkey: Public key (compressed 33 or uncompressed 65 bytes)
-
-        Returns:
-            True if signature is valid, False otherwise
-        """
+        """Verify ECDSA signature using secp256k1 (Rust sync module or Python coincurve)."""
         if len(message_hash) != 32 or len(der_sig) < 8:
             return False
         if len(pubkey) not in (33, 65):
@@ -1639,16 +1547,7 @@ class ScriptInterpreter:
     def _verify_schnorr_signature(
         self, message_hash: bytes, signature: bytes, pubkey_x: bytes
     ) -> bool:
-        """
-        Verify a BIP 340 Schnorr signature.
-
-        Args:
-            message_hash: 32-byte sighash
-            signature: 64-byte Schnorr signature
-            pubkey_x: 32-byte x-only public key
-
-        Reference: BIP 340
-        """
+        """Verify a BIP 340 Schnorr signature."""
         if len(signature) != 64 or len(pubkey_x) != 32:
             return False
 
@@ -1726,11 +1625,7 @@ class ScriptInterpreter:
         input_script_pubkeys: Optional[List[bytes]] = None,
         annex: Optional[bytes] = None,
     ) -> bool:
-        """
-        Key-path spend: witness is a single Schnorr signature (64 or 65 bytes).
-
-        Reference: BIP 341 key path spending
-        """
+        """Key-path spend: witness is a single Schnorr signature (64 or 65 bytes)."""
         sighash_type = 0x00
         sig = sig_element
         if len(sig) == 65:
@@ -1761,14 +1656,7 @@ class ScriptInterpreter:
         annex: Optional[bytes] = None,
         flags: int = SCRIPT_VERIFY_NONE,
     ) -> bool:
-        """
-        Script-path spend: witness = [...script_inputs, tapscript, control_block].
-
-        Validates the control block Merkle proof against the output key,
-        then executes the tapscript under BIP 342 rules.
-
-        Reference: BIP 341 script path spending
-        """
+        """Script-path spend: witness = [...script_inputs, tapscript, control_block]."""
         if len(witness) < 2:
             return False
 
@@ -1860,10 +1748,6 @@ class ScriptInterpreter:
     def _taproot_tweak_pubkey(
         self, internal_key: bytes, tweak: bytes
     ) -> Optional[Tuple[bytes, int]]:
-        """
-        Compute tweaked x-only pubkey: lift internal_key to a point, add
-        tweak*G, return (x_bytes, parity).
-        """
         try:
             from coincurve import PublicKeyXOnly
             pk = PublicKeyXOnly(internal_key)
@@ -1886,7 +1770,6 @@ class ScriptInterpreter:
         return None
 
     def _ser_script_size(self, script: bytes) -> bytes:
-        """CompactSize-encode the length of a script."""
         n = len(script)
         if n < 0xFD:
             return struct.pack('<B', n)
@@ -1909,15 +1792,7 @@ class ScriptInterpreter:
         ext_flag: int = 0,
         tap_leaf_hash: Optional[bytes] = None,
     ) -> bytes:
-        """
-        Compute the signature hash for a Taproot spend (BIP 341 §4).
-
-        Uses tagged hash "TapSighash" and commits to all inputs' amounts
-        and scriptPubKeys (unlike BIP 143 which only commits to the
-        current input's amount).
-
-        Reference: BIP 341 §4 (Signature validation rules)
-        """
+        """Compute the signature hash for a Taproot spend (BIP 341 §4)."""
         # Determine hash type components
         anyone_can_pay = (sighash_type & 0x80) != 0
         base_type = sighash_type & 0x03  # 0=default/all, 1=all, 2=none, 3=single
@@ -2036,15 +1911,7 @@ class ScriptInterpreter:
         annex: Optional[bytes] = None,
         leaf_hash: Optional[bytes] = None,
     ) -> bool:
-        """
-        Execute a tapscript (BIP 342).
-
-        Differences from legacy script:
-        - OP_CHECKSIG uses Schnorr (not ECDSA)
-        - OP_CHECKMULTISIG is disabled, replaced by OP_CHECKSIGADD
-        - Signature validation failure is immediate script failure (not push 0)
-        - Unknown leaf versions are treated as OP_SUCCESS
-        """
+        """Execute a tapscript (BIP 342)."""
         stack: List[bytes] = list(witness_inputs)
         op_count = 0
         max_ops = 201
@@ -2226,7 +2093,6 @@ class ScriptInterpreter:
         return bool(top)
 
     def _encode_script_num(self, n: int) -> bytes:
-        """Encode an integer as a Bitcoin script number (minimal CScriptNum)."""
         if n == 0:
             return b''
         negative = n < 0

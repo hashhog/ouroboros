@@ -32,7 +32,6 @@ class SyncProgress:
     total_known: bool = True  # False in header phase until we know actual chain tip
     
     def __str__(self) -> str:
-        """Human-readable progress string"""
         if self.total_height == 0:
             return "Syncing... (unknown total)"
         
@@ -61,13 +60,6 @@ class SyncManager:
     """Manages initial blockchain synchronization"""
     
     def __init__(self, data_dir: str, network: str = "mainnet"):
-        """
-        Initialize sync manager.
-        
-        Args:
-            data_dir: Directory for blockchain data
-            network: Network name (mainnet, testnet, regtest, signet)
-        """
         if sync is None:
             raise ImportError(
                 "Rust sync module not available. "
@@ -86,22 +78,14 @@ class SyncManager:
         self._sync_error: Optional[Exception] = None
         self._last_progress: Optional[SyncProgress] = None
         
-    def perform_initial_sync(self, 
+    def perform_initial_sync(self,
                             progress_callback: Optional[Callable[[SyncProgress], None]] = None,
                             cancel_check: Optional[Callable[[], bool]] = None,
                             progress_interval: float = 5.0,
                             limit: Optional[int] = None) -> bool:
-        """
-        Run initial blockchain sync.
-        
-        Args:
-            progress_callback: Called periodically with progress info
-            cancel_check: Called periodically, return True to cancel
-            progress_interval: Seconds between progress reports (default: 5.0)
-            limit: If set, sync only the first N blocks (for quick validation)
-            
-        Returns:
-            True if completed, False if cancelled or error occurred
+        """Run initial blockchain sync; returns True on completion, False if cancelled or on error.
+
+        *progress_callback* receives :class:`SyncProgress` updates every *progress_interval* seconds.
         """
         if self._is_running:
             logger.warning("Sync already in progress")
@@ -226,12 +210,7 @@ class SyncManager:
             self._sync_thread = None
     
     def is_synced(self) -> bool:
-        """
-        Check if blockchain is fully synced.
-        
-        Returns:
-            True if synced, False otherwise
-        """
+        """Return True when the blockchain has caught up to the network tip."""
         try:
             return self.fast_sync.is_synced()
         except Exception as e:
@@ -239,15 +218,7 @@ class SyncManager:
             return False
     
     def get_progress(self) -> Optional[SyncProgress]:
-        """
-        Get current sync progress.
-        
-        Uses SyncProgressReporter to read from shared cache, avoiding "Already borrowed"
-        when the sync thread holds FastSync.
-        
-        Returns:
-            SyncProgress object or None if unavailable
-        """
+        """Return the latest :class:`SyncProgress` from the shared cache, or None if unavailable."""
         try:
             rust_progress = self._progress_reporter.get_progress()
             if rust_progress is None:
@@ -277,13 +248,7 @@ class SyncManager:
             return self._last_progress
     
     def cancel_sync(self) -> None:
-        """
-        Cancel ongoing sync operation.
-
-        This is a graceful cancellation - the sync will stop at the next
-        safe point and save its progress. Uses a separate canceller handle
-        to avoid "Already borrowed" when the sync thread holds FastSync.
-        """
+        """Request graceful cancellation of the ongoing sync (stops at the next safe checkpoint)."""
         if not self._is_running:
             logger.warning("No sync in progress")
             return
@@ -295,15 +260,7 @@ class SyncManager:
             logger.error(f"Error cancelling sync: {e}")
     
     def wait_for_sync(self, timeout: Optional[float] = None) -> bool:
-        """
-        Wait for sync to complete.
-        
-        Args:
-            timeout: Maximum seconds to wait (None = wait indefinitely)
-            
-        Returns:
-            True if sync completed, False if timeout or error
-        """
+        """Block until sync completes (or *timeout* seconds elapse); returns True on success."""
         if not self._is_running or self._sync_thread is None:
             return self.is_synced()
         

@@ -41,7 +41,7 @@ from typing import List, Optional, Set, Tuple
 logger = logging.getLogger(__name__)
 
 
-# ── GF(2^32) arithmetic ────────────────────────────────────────────
+# GF(2^32) arithmetic
 
 # Irreducible polynomial for GF(2^32): x^32 + x^7 + x^3 + x^2 + 1
 # Represented as the low-order 32 bits (the x^32 term is implicit).
@@ -73,12 +73,7 @@ def gf_sq(a: int) -> int:
 
 
 def gf_inv(a: int) -> int:
-    """
-    Multiplicative inverse in GF(2^32) using the extended Euclidean
-    algorithm over polynomials.
-
-    Returns 0 when a == 0 (no inverse exists).
-    """
+    """Multiplicative inverse in GF(2^32) via repeated squaring; returns 0 when *a* == 0."""
     if a == 0:
         return 0
     # Use exponentiation: a^(2^32 - 2) = a^(-1) in GF(2^32).
@@ -104,19 +99,10 @@ def gf_pow(base: int, exp: int) -> int:
     return result
 
 
-# ── Berlekamp–Massey algorithm ─────────────────────────────────────
+# Berlekamp-Massey algorithm
 
 def berlekamp_massey(syndromes: List[int]) -> Optional[List[int]]:
-    """
-    Run the Berlekamp–Massey algorithm over GF(2^32) to find the
-    shortest linear-feedback shift register (LFSR) that generates
-    the given syndrome sequence.
-
-    Returns:
-        Coefficients of the error-locator polynomial Λ(x) = 1 + Λ_1*x + …
-        (list of length <= len(syndromes)//2 + 1, where index 0 is the
-        constant term 1).  Returns ``None`` if decoding fails.
-    """
+    """Berlekamp–Massey over GF(2^32): returns the error-locator polynomial Λ(x), or None on failure."""
     n = len(syndromes)
     # Current connection polynomial (LFSR taps)
     C = [0] * (n + 1)
@@ -156,10 +142,9 @@ def berlekamp_massey(syndromes: List[int]) -> Optional[List[int]]:
     return poly
 
 
-# ── Polynomial arithmetic over GF(2^32) ──────────────────────────
+# --- Polynomial arithmetic over GF(2^32) ---
 
 def _poly_mul(a: List[int], b: List[int]) -> List[int]:
-    """Multiply two polynomials over GF(2^32)."""
     if not a or not b:
         return []
     result = [0] * (len(a) + len(b) - 1)
@@ -174,7 +159,6 @@ def _poly_mul(a: List[int], b: List[int]) -> List[int]:
 
 
 def _poly_mod(a: List[int], b: List[int]) -> List[int]:
-    """Compute a mod b for polynomials over GF(2^32)."""
     a = list(a)
     db = len(b) - 1
     inv_lead = gf_inv(b[db])
@@ -192,7 +176,6 @@ def _poly_mod(a: List[int], b: List[int]) -> List[int]:
 
 
 def _poly_divmod(a: List[int], b: List[int]) -> Tuple[List[int], List[int]]:
-    """Divide polynomial a by b, returning (quotient, remainder)."""
     a = list(a)
     db = len(b) - 1
     if db < 0 or (len(b) == 1 and b[0] == 0):
@@ -213,7 +196,6 @@ def _poly_divmod(a: List[int], b: List[int]) -> Tuple[List[int], List[int]]:
 
 
 def _poly_gcd(a: List[int], b: List[int]) -> List[int]:
-    """Compute GCD of two polynomials over GF(2^32)."""
     while b and not (len(b) == 1 and b[0] == 0):
         a, b = b, _poly_mod(a, b)
     # Normalize: make leading coefficient 1
@@ -224,7 +206,6 @@ def _poly_gcd(a: List[int], b: List[int]) -> List[int]:
 
 
 def _poly_powmod(base: List[int], exp: int, mod: List[int]) -> List[int]:
-    """Compute base^exp mod modpoly over GF(2^32)."""
     result = [1]  # polynomial 1
     base = _poly_mod(base, mod)
     while exp > 0:
@@ -235,24 +216,9 @@ def _poly_powmod(base: List[int], exp: int, mod: List[int]) -> List[int]:
     return result
 
 
-# ── Root finding via Cantor–Zassenhaus and square-free splitting ──
+# Root finding via Cantor-Zassenhaus and square-free splitting
 
 def _solve_quadratic_trace(d: int) -> Optional[int]:
-    """
-    Solve t^2 + t + d = 0 in GF(2^32).
-
-    For even-degree extension fields like GF(2^32), the half-trace
-    method does not apply directly.  We use a randomized algorithm:
-
-    Pick random c != 0, compute:
-        z = 0, w = c
-        for i in range(m-1):
-            z = z^2 + w^2 * d
-            w = w^2 + c
-        if w != 0 then t = z/w is a solution.
-
-    This succeeds with probability ~1/2 per attempt.
-    """
     import random as _rng
     rng = _rng.Random(0xBEEF)  # deterministic for reproducibility
     for _ in range(200):
@@ -270,7 +236,6 @@ def _solve_quadratic_trace(d: int) -> Optional[int]:
 
 
 def _find_roots_linear(poly: List[int]) -> Optional[List[int]]:
-    """Solve poly[0] + poly[1]*x = 0 → x = poly[0]/poly[1]."""
     if len(poly) != 2 or poly[1] == 0:
         return None
     root = gf_mul(poly[0], gf_inv(poly[1]))
@@ -280,7 +245,6 @@ def _find_roots_linear(poly: List[int]) -> Optional[List[int]]:
 
 
 def _find_roots_quadratic(poly: List[int]) -> Optional[List[int]]:
-    """Solve a degree-2 polynomial a + bx + cx^2 = 0 over GF(2^32)."""
     if len(poly) != 3 or poly[2] == 0:
         return None
     inv_a = gf_inv(poly[2])
@@ -309,24 +273,7 @@ def _find_roots_quadratic(poly: List[int]) -> Optional[List[int]]:
 
 
 def _factor_poly(poly: List[int]) -> Optional[List[int]]:
-    """
-    Find all roots of a polynomial over GF(2^32) using
-    randomized factorization.
-
-    For GF(2^m), the standard Cantor–Zassenhaus trace-based approach
-    can fail when roots are "trace-compatible".  Instead we use a
-    two-pronged strategy:
-
-    1. **Trace-based splitting** (gcd with trace polynomial) — works
-       well when roots have differing traces.
-    2. **Multiplicative-order splitting** — compute r(x)^((2^32-1)/d)
-       mod f for small divisors d of 2^32-1, then gcd(f, result - 1).
-       This splits by the d-th root of unity and works regardless
-       of trace values.
-
-    Returns:
-        List of roots, or None if factorization fails.
-    """
+    """Find all roots of a polynomial over GF(2^32) using randomized factorization."""
     import random as _random
 
     degree = len(poly) - 1
@@ -433,13 +380,7 @@ def _factor_poly(poly: List[int]) -> Optional[List[int]]:
 
 
 def find_roots(poly: List[int]) -> Optional[List[int]]:
-    """
-    Find the roots of the error-locator polynomial and return the
-    corresponding set-difference elements (inverses of roots).
-
-    Uses Cantor–Zassenhaus polynomial factorization, which is
-    efficient for GF(2^32) — O(n^2 * 32) for degree-n polynomials.
-    """
+    """Return set-difference elements (inverse of roots) via Cantor–Zassenhaus; None on failure."""
     degree = len(poly) - 1
     if degree == 0:
         return []
@@ -462,7 +403,7 @@ def find_roots(poly: List[int]) -> Optional[List[int]]:
     return elements
 
 
-# ── Minisketch data structure ──────────────────────────────────────
+# Minisketch data structure #
 
 @dataclass
 class Minisketch:
@@ -493,18 +434,10 @@ class Minisketch:
         if not self.syndromes:
             self.syndromes = [0] * self.capacity
 
-    # ── Mutation ──────────────────────────────────────────────────
+    # Mutation
 
     def add(self, element: int) -> None:
-        """
-        Add (or remove, since XOR is self-inverse) an element from
-        the sketch.
-
-        Updates odd power sums S_1, S_3, S_5, …, S_{2c-1}.
-
-        Args:
-            element: a non-zero element in GF(2^32) (a 32-bit short txid)
-        """
+        """Add (or remove) a non-zero GF(2^32) element; updates odd power sums S_1…S_{2c-1}."""
         if element == 0:
             raise ValueError("Cannot add zero element to sketch")
         element &= FIELD_MASK
@@ -521,13 +454,10 @@ class Minisketch:
             if e != 0:
                 self.add(e)
 
-    # ── Merge (XOR) ──────────────────────────────────────────────
+    # Merge (XOR)
 
     def merge(self, other: 'Minisketch') -> 'Minisketch':
-        """
-        XOR two sketches to produce the sketch of the symmetric
-        difference.  Returns a **new** Minisketch.
-        """
+        """XOR *other* into this sketch and return a new Minisketch encoding the symmetric difference."""
         if self.capacity != other.capacity:
             raise ValueError(
                 f"Cannot merge sketches with different capacities "
@@ -550,12 +480,6 @@ class Minisketch:
             self.syndromes[i] ^= other.syndromes[i]
 
     def _expand_syndromes(self) -> List[int]:
-        """
-        Expand odd power sums into a full sequence of 2*capacity
-        syndromes: S_1, S_2, S_3, …, S_{2c}.
-
-        Uses the identity S_{2k} = S_k² (valid in characteristic 2).
-        """
         n = self.capacity
         full = [0] * (2 * n)
         # Place odd syndromes: S_{2i+1} at index 2*i
@@ -568,16 +492,10 @@ class Minisketch:
             full[2 * k - 1] = gf_sq(full[k - 1])
         return full
 
-    # ── Decode ───────────────────────────────────────────────────
+    # Decode
 
     def decode(self) -> Optional[Set[int]]:
-        """
-        Decode the sketch into the set of elements it encodes.
-
-        Returns:
-            The set of field elements, or ``None`` if decoding fails
-            (i.e. more differences exist than the sketch capacity).
-        """
+        """Decode the sketch into its elements; returns None if the difference exceeds capacity."""
         # All-zero syndromes → empty difference
         if all(s == 0 for s in self.syndromes):
             return set()
@@ -608,15 +526,10 @@ class Minisketch:
 
         return set(elements)
 
-    # ── Serialization ────────────────────────────────────────────
+    # Serialization
 
     def serialize(self) -> bytes:
-        """
-        Serialize the sketch to bytes.
-
-        Each syndrome is stored as a 4-byte little-endian uint32.
-        Total size: capacity × 4 bytes.
-        """
+        """Serialize to bytes: each syndrome as a 4-byte little-endian uint32 (capacity × 4 bytes total)."""
         data = bytearray()
         for s in self.syndromes:
             data.extend(struct.pack('<I', s & FIELD_MASK))
@@ -624,16 +537,7 @@ class Minisketch:
 
     @classmethod
     def deserialize(cls, data: bytes, capacity: int) -> 'Minisketch':
-        """
-        Deserialize a sketch from bytes.
-
-        Args:
-            data: raw sketch bytes (must be exactly capacity × 4)
-            capacity: number of syndromes
-
-        Returns:
-            Minisketch instance
-        """
+        """Deserialize a sketch from *capacity × 4* bytes (each syndrome as a 4-byte little-endian uint32)."""
         expected = capacity * 4
         if len(data) < expected:
             raise ValueError(
@@ -646,24 +550,10 @@ class Minisketch:
         return cls(capacity=capacity, syndromes=syndromes)
 
 
-# ── Short transaction ID helpers ─────────────────────────────────
+# Short transaction ID helpers
 
 def compute_short_txid(txid: bytes, salt1: int, salt2: int) -> int:
-    """
-    Map a 32-byte transaction ID to a 32-bit short ID for sketch
-    reconciliation.
-
-    The mapping uses SipHash-2-4 keyed by a salt derived from both
-    peers' salts (combined via XOR, as specified in BIP 330).
-
-    Args:
-        txid: 32-byte transaction hash
-        salt1: our 64-bit salt (from sendtxrcncl)
-        salt2: peer's 64-bit salt (from sendtxrcncl)
-
-    Returns:
-        32-bit short txid (non-zero; zero is remapped to 1)
-    """
+    """Map a 32-byte txid to a 32-bit short ID via SipHash-2-4 (BIP 330 XOR-salt key); 0 → 1."""
     # Combine salts
     combined_salt = salt1 ^ salt2
     # Build 16-byte SipHash key from the combined salt
@@ -676,7 +566,7 @@ def compute_short_txid(txid: bytes, salt1: int, salt2: int) -> int:
     return short_id if short_id != 0 else 1
 
 
-# ── Reconciliation set manager ───────────────────────────────────
+# Reconciliation set manager
 
 @dataclass
 class ReconciliationSet:
@@ -753,19 +643,7 @@ def estimate_sketch_capacity(
     remote_size: int,
     q: float = 0.1,
 ) -> int:
-    """
-    Estimate the appropriate sketch capacity for a reconciliation round.
-
-    BIP 330 suggests capacity = |local_size - remote_size| + q * min(local, remote) + 1
-
-    Args:
-        local_size: our reconciliation set size
-        remote_size: peer's reconciliation set size (from reqtxrcncl)
-        q: estimated fraction of symmetric difference vs. set overlap
-
-    Returns:
-        Sketch capacity (clamped to [1, 2^15])
-    """
+    """BIP 330 capacity estimate: ``|diff| + q*min(local, remote) + 1``, clamped to [1, 2^15]."""
     abs_diff = abs(local_size - remote_size)
     min_size = min(local_size, remote_size)
     capacity = int(abs_diff + q * min_size) + 1

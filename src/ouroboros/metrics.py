@@ -94,7 +94,7 @@ def init_metrics(port: int = 9332) -> bool:
     return True
 
 
-# ── convenience helpers (safe to call even when metrics are disabled) ──
+# convenience helpers (safe to call even when metrics are disabled)
 
 
 def update_chain_metrics(height: int, difficulty: float, peers: int) -> None:

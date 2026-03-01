@@ -13,22 +13,22 @@ from ouroboros.script import (
 
 COINBASE_MATURITY = 100
 
-# ── Block limits ──────────────────────────────────────────────────────
+# Block limits
 MAX_BLOCK_WEIGHT = 4_000_000
 MAX_BLOCK_SIGOPS_COST = 80_000
 MAX_TX_SIGOPS_COST = 16_000
 WITNESS_SCALE_FACTOR = 4
 
-# ── Difficulty / PoW constants ────────────────────────────────────────
+# Difficulty / PoW constants #
 DIFFICULTY_ADJUSTMENT_INTERVAL = 2016
-POW_TARGET_TIMESPAN = 14 * 24 * 60 * 60          # 2 weeks in seconds
-POW_TARGET_SPACING = 10 * 60                       # 10 minutes
+POW_TARGET_TIMESPAN = 14 * 24 * 60 * 60
+POW_TARGET_SPACING = 10 * 60
 POW_LIMIT_MAINNET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
 POW_LIMIT_BITS_MAINNET = 0x1d00ffff
 MAX_TIMEWARP = 600  # BIP94: max seconds a diff-adjustment block can precede prev
 MAX_MONEY = 21_000_000 * 100_000_000  # 2,100,000,000,000,000 satoshis
 
-# ── Signet (BIP 325) ────────────────────────────────────────────────
+# --- Signet (BIP 325) ---
 SIGNET_HEADER = bytes([0xEC, 0xC7, 0xDA, 0xA2])
 
 # Default signet challenge: 1-of-2 multisig (Bitcoin Core kernel/chainparams.cpp)
@@ -38,7 +38,7 @@ DEFAULT_SIGNET_CHALLENGE = bytes.fromhex(
     "2ae"
 )
 
-# Script verification flags for signet block validation (Bitcoin Core)
+# Script verification flags for signet block validation
 SIGNET_SCRIPT_FLAGS = (
     SCRIPT_VERIFY_P2SH
     | SCRIPT_VERIFY_WITNESS
@@ -48,12 +48,6 @@ SIGNET_SCRIPT_FLAGS = (
 
 
 def _bits_to_target(bits: int) -> int:
-    """
-    Decode difficulty target from compact bits (nBits) format.
-
-    Ref: bitcoin/src/pow.cpp, node.py _calculate_block_work
-    Format: target = mantissa * 256^(exponent-3)
-    """
     mantissa = bits & 0x007FFFFF
     exponent = (bits >> 24) & 0xFF
 
@@ -66,48 +60,38 @@ def _bits_to_target(bits: int) -> int:
 
 
 def _count_legacy_sigops(script: bytes) -> int:
-    """
-    Count legacy signature operations in a script (pre-execution).
-
-    OP_CHECKSIG/OP_CHECKSIGVERIFY count as 1.
-    OP_CHECKMULTISIG/OP_CHECKMULTISIGVERIFY count as 20 (upper bound).
-    Data pushes are skipped to avoid counting opcodes inside push data.
-    """
+    """Count legacy signature operations in a script (pre-execution)."""
     count = 0
     i = 0
     while i < len(script):
         op = script[i]
-        if op in (0xAC, 0xAD):  # OP_CHECKSIG, OP_CHECKSIGVERIFY
+        if op in (0xAC, 0xAD):
             count += 1
-        elif op in (0xAE, 0xAF):  # OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY
+        elif op in (0xAE, 0xAF):
             count += 20
-        elif 1 <= op <= 0x4B:  # Direct data push (1-75 bytes)
+        elif 1 <= op <= 0x4B:
             i += op
-        elif op == 0x4C:  # OP_PUSHDATA1
+        elif op == 0x4C:
             if i + 1 < len(script):
                 i += 1 + script[i + 1]
             else:
                 i += 1
-        elif op == 0x4D:  # OP_PUSHDATA2
+        elif op == 0x4D:
             if i + 2 < len(script):
                 i += 2 + int.from_bytes(script[i + 1 : i + 3], "little")
             else:
                 i += 2
-        elif op == 0x4E:  # OP_PUSHDATA4
+        elif op == 0x4E:
             if i + 4 < len(script):
                 i += 4 + int.from_bytes(script[i + 1 : i + 5], "little")
             else:
                 i += 4
         i += 1
+    # logger.debug(f'sigops: {count}')
     return count
 
 
 def _target_to_bits(target: int) -> int:
-    """
-    Encode a 256-bit target as compact nBits format.
-
-    Ref: Bitcoin Core arith_uint256::GetCompact()
-    """
     if target == 0:
         return 0
     # Convert to bytes, big-endian, strip leading zeros
@@ -126,7 +110,6 @@ def _target_to_bits(target: int) -> int:
 
 
 def _is_p2sh(script: bytes) -> bool:
-    """OP_HASH160 <20 bytes> OP_EQUAL"""
     return (
         len(script) == 23
         and script[0] == 0xA9
@@ -136,10 +119,6 @@ def _is_p2sh(script: bytes) -> bool:
 
 
 def _read_compact_size(data: bytes, offset: int = 0) -> tuple[int, int]:
-    """Read a Bitcoin compact-size uint.
-
-    Returns ``(value, bytes_consumed)``.
-    """
     if offset >= len(data):
         return 0, 0
     first = data[offset]
@@ -153,12 +132,7 @@ def _read_compact_size(data: bytes, offset: int = 0) -> tuple[int, int]:
 
 
 def _get_last_push(script_sig: bytes) -> bytes | None:
-    """
-    Extract the last data-push item from a push-only scriptSig.
-
-    Used for P2SH sigops counting: the last push is the serialized redeem
-    script.  Returns None if parsing fails.
-    """
+    """Extract the last data-push item from a push-only scriptSig."""
     last_push = None
     i = 0
     n = len(script_sig)
@@ -214,10 +188,6 @@ def _get_last_push(script_sig: bytes) -> bytes | None:
 
 
 def _get_witness_version_and_program(script: bytes):
-    """
-    If *script* is a witness program, return (version, program).
-    Witness programs: OP_n <2..40 bytes>
-    """
     if len(script) < 4 or len(script) > 42:
         return None
     version_op = script[0]
@@ -236,11 +206,6 @@ def _get_witness_version_and_program(script: bytes):
 
 
 def _count_witness_sigops(prev_script_pubkey: bytes, witness: list | None) -> int:
-    """
-    Count witness signature operations for a single input.
-
-    Ref: Bitcoin Core CountWitnessSigOps() in consensus/tx_verify.cpp.
-    """
     wp = _get_witness_version_and_program(prev_script_pubkey)
     if wp is None:
         return 0
@@ -260,11 +225,6 @@ def _count_witness_sigops(prev_script_pubkey: bytes, witness: list | None) -> in
 
 
 def _get_p2sh_sigops(script_sig: bytes, prev_script_pubkey: bytes) -> int:
-    """
-    Count sigops inside a P2SH redeem script.
-
-    Ref: Bitcoin Core GetP2SHSigOpCount() in consensus/tx_verify.cpp.
-    """
     if not _is_p2sh(prev_script_pubkey):
         return 0
     redeem_script = _get_last_push(script_sig)
@@ -277,27 +237,12 @@ class BlockValidator:
     """Validates new blocks"""
 
     def __init__(self, db: BlockchainDatabase, network: str = "mainnet"):
-        """
-        Initialize block validator.
-
-        Args:
-            db: Blockchain database for block and UTXO lookups
-            network: Network name (mainnet, testnet, testnet4, regtest, signet)
-        """
         self.db = db
         self.network = network
         self.tx_validator = TransactionValidator(db)
     
     def validate_block(self, block: Block) -> Tuple[bool, str]:
-        """
-        Validate a new block completely.
-        
-        Args:
-            block: Block to validate
-            
-        Returns:
-            (is_valid, error_message)
-        """
+        """Fully validate *block* (header, merkle root, weight, scripts); returns ``(ok, error_message)``."""
         # 1. Get previous block
         prev_block = self.db.get_block(block.prev_blockhash)
         if not prev_block:
@@ -382,12 +327,7 @@ class BlockValidator:
         return True, ""
     
     def apply_block(self, block: Block) -> None:
-        """
-        Apply block to database (update UTXO set).
-        
-        Args:
-            block: Block to apply
-        """
+        """Apply *block*'s UTXO effects to the database (spend inputs, create outputs)."""
         spent = []
         created = []
         
@@ -421,18 +361,7 @@ class BlockValidator:
         block_mtp: int = 0,
         height: int = 0,
     ) -> bool:
-        """
-        Validate block header.
-
-        Args:
-            block: Block to validate
-            prev_block: Previous block
-            block_mtp: Median time past of previous 11 blocks
-            height: Expected block height
-
-        Returns:
-            True if header is valid
-        """
+        """Validate block header."""
         # Block timestamp must exceed the median-time-past of previous 11 blocks
         if block_mtp > 0 and block.timestamp <= block_mtp:
             return False
@@ -479,16 +408,7 @@ class BlockValidator:
     def _get_expected_bits(
         self, height: int, prev_block: Block, block: Block
     ) -> int | None:
-        """
-        Calculate expected nBits for a block at *height*.
-
-        Ports Bitcoin Core GetNextWorkRequired() + CalculateNextWorkRequired()
-        from pow.cpp.
-
-        Returns:
-            Expected compact nBits value, or None if we cannot determine it
-            (e.g. missing ancestor blocks).
-        """
+        """Calculate expected nBits for a block at *height*."""
         # Regtest: no retargeting
         if self.network == "regtest":
             return POW_LIMIT_BITS_MAINNET
@@ -514,7 +434,6 @@ class BlockValidator:
                 return prev_block.bits
             return prev_block.bits
 
-        # ── Retarget boundary ────────────────────────────────────────────
         first_height = height - DIFFICULTY_ADJUSTMENT_INTERVAL
         first_block = self.db.get_block_by_height(first_height)
         if first_block is None:
@@ -551,30 +470,17 @@ class BlockValidator:
         return _target_to_bits(new_target)
 
     def _verify_merkle_root(self, block: Block) -> bool:
-        """
-        Verify block's merkle root and detect merkle malleation (CVE-2012-2459).
-
-        Bitcoin's merkle tree duplicates the last element when the count is
-        odd.  An attacker can exploit this to create two distinct transaction
-        lists that yield the same root.  We detect this by checking for
-        duplicate hashes at every level of the tree when a duplication occurs.
-        """
         txids = [tx.get_txid() for tx in block.transactions]
         root, mutated = self._calculate_merkle_root_checked(txids)
         if mutated:
             return False
-        return root == block.merkle_root
+        valid = root == block.merkle_root
+        return valid
 
     def _calculate_merkle_root_checked(
         self, txids: List[bytes]
     ) -> tuple:
-        """
-        Calculate merkle root and detect malleation.
-
-        Returns:
-            (merkle_root, mutated) — mutated is True if the tree has
-            duplicate trailing hashes at any level (CVE-2012-2459).
-        """
+        """Calculate merkle root and detect malleation."""
         if not txids:
             return bytes(32), False
 
@@ -613,22 +519,12 @@ class BlockValidator:
         return level[0], mutated
 
     def _calculate_merkle_root(self, txids: List[bytes]) -> bytes:
-        """Calculate merkle root (without malleation check)."""
         root, _ = self._calculate_merkle_root_checked(txids)
         return root
 
-    # ── Block weight / sigops ─────────────────────────────────────────
+    # Block weight / sigops
     def _validate_block_limits(self, block: Block) -> Tuple[bool, str]:
-        """
-        Validate block weight and sigops cost limits.
-
-        Counts three categories of sigops (matching Bitcoin Core):
-        1. Legacy sigops in scriptPubKey and scriptSig  × WITNESS_SCALE_FACTOR
-        2. P2SH sigops (inside redeemed script)         × WITNESS_SCALE_FACTOR
-        3. Witness sigops (P2WPKH=1, P2WSH=counted)     × 1
-
-        Ref: Bitcoin Core GetTransactionSigOpCost() in consensus/tx_verify.cpp.
-        """
+        """Validate block weight and sigops cost limits."""
         total_weight = 0
         total_sigops_cost = 0
 
@@ -687,7 +583,7 @@ class BlockValidator:
 
         return True, ""
 
-    # ── Witness commitment (SegWit) ───────────────────────────────────
+    # Witness commitment (SegWit)
     # Activation heights per network
     _SEGWIT_ACTIVATION = {
         "mainnet": 481_824,
@@ -701,14 +597,6 @@ class BlockValidator:
     _WITNESS_COMMITMENT_MAGIC = bytes.fromhex("aa21a9ed")
 
     def _find_witness_commitment(self, coinbase_tx: Transaction) -> bytes | None:
-        """
-        Find the witness commitment hash in the coinbase's outputs.
-
-        Scans outputs last-to-first for an OP_RETURN output whose scriptPubKey
-        starts with ``6a24aa21a9ed`` (OP_RETURN OP_PUSH36 <magic>).
-
-        Returns the 32-byte commitment hash, or None.
-        """
         for out in reversed(coinbase_tx.outputs):
             spk = out.script_pubkey
             if (
@@ -721,12 +609,6 @@ class BlockValidator:
         return None
 
     def _calculate_witness_merkle_root(self, block: Block) -> bytes:
-        """
-        Compute witness merkle root.
-
-        Same algorithm as the regular merkle tree, but using wtxids for every
-        transaction except the coinbase, which is replaced with 32 zero-bytes.
-        """
         wtxids: List[bytes] = [bytes(32)]  # coinbase → null hash
         for tx in block.transactions[1:]:
             wtxids.append(tx.get_wtxid())
@@ -735,11 +617,7 @@ class BlockValidator:
     def _validate_witness_commitment(
         self, block: Block, height: int
     ) -> Tuple[bool, str]:
-        """
-        Validate the SegWit witness commitment in the coinbase.
-
-        Ref: Bitcoin Core CheckWitnessMalleation() in validation.cpp.
-        """
+        """Validate the SegWit witness commitment in the coinbase."""
         activation = self._SEGWIT_ACTIVATION.get(self.network, 481_824)
         if height < activation:
             return True, ""
@@ -768,16 +646,7 @@ class BlockValidator:
         return True, ""
 
     def _validate_coinbase(self, tx: Transaction, height: int) -> bool:
-        """
-        Validate coinbase transaction.
-        
-        Args:
-            tx: Coinbase transaction
-            height: Block height
-            
-        Returns:
-            True if coinbase is valid
-        """
+        """Validate coinbase transaction."""
         # Check it's actually a coinbase
         if not tx.is_coinbase:
             return False
@@ -827,17 +696,6 @@ class BlockValidator:
         height: int,
         total_fees: int
     ) -> bool:
-        """
-        Verify coinbase amount is correct.
-        
-        Args:
-            coinbase_tx: Coinbase transaction
-            height: Block height
-            total_fees: Total fees from all transactions in block
-            
-        Returns:
-            True if coinbase amount is valid
-        """
         block_subsidy = self._calculate_block_subsidy(height)
         expected_amount = block_subsidy + total_fees
         
@@ -847,41 +705,17 @@ class BlockValidator:
         return total_output <= expected_amount
     
     def _calculate_block_subsidy(self, height: int) -> int:
-        """
-        Calculate block subsidy (50 BTC halving every 210000 blocks).
-        
-        Args:
-            height: Block height
-            
-        Returns:
-            Block subsidy in satoshis
-        """
         halvings = height // 210000
         if halvings >= 64:
             return 0
         return 50 * 100_000_000 >> halvings
     
-    # ── Signet block solution (BIP 325) ─────────────────────────────
+    # Signet block solution (BIP 325)
 
     def _validate_signet_solution(
         self, block: Block, height: int
     ) -> Tuple[bool, str]:
-        """
-        Validate the signet block signature (BIP 325).
-
-        Only applies when ``self.network == "signet"``.  Signet blocks
-        must contain a valid signature in the coinbase's witness commitment
-        that satisfies the signet challenge script.
-
-        Algorithm (following Bitcoin Core signet.cpp):
-        1. Find the witness commitment output in the coinbase.
-        2. Extract the signet commitment (data after SIGNET_HEADER).
-        3. Parse scriptSig and witness from the commitment.
-        4. Build virtual *to_spend* and *to_sign* transactions.
-        5. Verify *to_sign* is a valid spend of *to_spend*.
-
-        Ref: BIP 325, Bitcoin Core ``CheckSignetBlockSolution()``.
-        """
+        """Validate the signet block signature (BIP 325)."""
         if self.network != "signet":
             return True, ""
 
@@ -967,12 +801,7 @@ class BlockValidator:
 
     @staticmethod
     def _extract_signet_commitment(commitment_script: bytes) -> bytes | None:
-        """Extract signet data from the witness commitment scriptPubKey.
-
-        Scans push opcodes in the script for data starting with
-        ``SIGNET_HEADER``.  Returns the bytes *after* the header, or
-        None if not found.
-        """
+        """Extract signet data from the witness commitment scriptPubKey."""
         # The commitment script starts with OP_RETURN (0x6a), then various
         # push opcodes.  Walk through the pushes looking for SIGNET_HEADER.
         i = 1  # skip OP_RETURN
@@ -1017,15 +846,7 @@ class BlockValidator:
     def _parse_signet_solution(
         solution: bytes,
     ) -> tuple[bytes, list[bytes]]:
-        """Parse scriptSig and witness stack from a signet solution.
-
-        Format: ``<scriptSig_len><scriptSig><witness_stack>``
-
-        The witness stack is encoded as a Bitcoin serialized witness:
-        ``<item_count><len1><item1>...``
-
-        Returns ``(script_sig, witness_list)``.
-        """
+        """Parse scriptSig and witness stack from a signet solution."""
         if not solution:
             return b"", []
 
@@ -1053,14 +874,7 @@ class BlockValidator:
         return script_sig, witness
 
     def _compute_signet_merkle_root(self, block: Block) -> bytes:
-        """Compute the modified merkle root for signet signing.
-
-        The actual coinbase scriptPubKey containing the signet commitment
-        is replaced with one that has only SIGNET_HEADER (no solution data).
-        This avoids a circular dependency (the signature is over a hash
-        that includes the merkle root, but the merkle root includes the
-        coinbase that contains the signature).
-        """
+        """Compute the modified merkle root for signet signing."""
         coinbase = block.transactions[0]
 
         # Build the modified coinbase witness commitment output:
@@ -1107,11 +921,6 @@ class BlockValidator:
     def _encode_signet_block_data(
         block: Block, modified_merkle: bytes
     ) -> bytes:
-        """Encode block header fields for the to_spend scriptSig.
-
-        Returns 72 bytes: nVersion (4) + hashPrevBlock (32) +
-        signet_merkle_root (32) + nTime (4).
-        """
         data = bytearray()
         data.extend(struct.pack("<i", block.version))        # 4 bytes
         data.extend(block.prev_blockhash)                     # 32 bytes
@@ -1123,11 +932,7 @@ class BlockValidator:
     def _build_signet_to_spend(
         block_data: bytes, challenge: bytes
     ) -> Transaction:
-        """Build the virtual *to_spend* transaction for signet.
-
-        vin[0]: prevout = (0x00..00, 0xFFFFFFFF), scriptSig = OP_0 <block_data>
-        vout[0]: scriptPubKey = challenge, value = 0
-        """
+        """Build the virtual *to_spend* transaction for signet."""
         # scriptSig: OP_0 PUSH72 <block_data>
         sig_script = bytes([0x00, len(block_data)]) + block_data
 
@@ -1158,11 +963,6 @@ class BlockValidator:
         solution_script_sig: bytes,
         solution_witness: list[bytes],
     ) -> Transaction:
-        """Build the virtual *to_sign* transaction for signet.
-
-        vin[0]: prevout = (to_spend.txid, 0), scriptSig / witness from solution
-        vout[0]: OP_RETURN, value = 0
-        """
         inp = TxIn(
             prev_txid=to_spend.get_txid(),
             prev_vout=0,
@@ -1185,15 +985,6 @@ class BlockValidator:
         return tx
 
     def _calculate_tx_fee(self, tx: Transaction) -> int:
-        """
-        Calculate transaction fee.
-        
-        Args:
-            tx: Transaction to calculate fee for
-            
-        Returns:
-            Fee in satoshis
-        """
         total_input = 0
         for tx_in in tx.inputs:
             utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
@@ -1211,12 +1002,6 @@ class TransactionValidator:
     """Validates transactions for mempool and new blocks"""
     
     def __init__(self, db: BlockchainDatabase):
-        """
-        Initialize transaction validator.
-        
-        Args:
-            db: Blockchain database for UTXO lookups
-        """
         self.db = db
         self.script_interpreter = ScriptInterpreter()
         
@@ -1224,18 +1009,7 @@ class TransactionValidator:
         self, tx: Transaction, height: int, block_mtp: int = 0,
         block_hash: bytes | None = None,
     ) -> Tuple[bool, str]:
-        """
-        Validate transaction.
-
-        Args:
-            tx: Transaction to validate
-            height: Block height
-            block_mtp: Block median-time-past (for BIP 68 time-based locks)
-            block_hash: Block hash (internal byte order) for flag exceptions
-
-        Returns:
-            (is_valid, error_message)
-        """
+        """Validate *tx* at *height* (structure, inputs, locktime, scripts); returns ``(ok, error_message)``."""
         flags = get_flags_for_height(height, block_hash)
 
         # 1. Check structure
@@ -1243,7 +1017,6 @@ class TransactionValidator:
             return False, "Invalid structure"
 
         # 2. IsFinalTx — complete locktime validation
-        #    Ref: Bitcoin Core IsFinalTx() in consensus/tx_verify.cpp
         if not self._is_final_tx(tx, height, block_mtp):
             return False, "Transaction is not final (locktime not satisfied)"
 
@@ -1293,18 +1066,6 @@ class TransactionValidator:
     
     @staticmethod
     def _is_final_tx(tx: Transaction, block_height: int, block_mtp: int) -> bool:
-        """
-        Check if a transaction is final for inclusion in a block.
-
-        Ref: Bitcoin Core IsFinalTx() in consensus/tx_verify.cpp.
-
-        A transaction is final if:
-        - locktime == 0, OR
-        - All inputs have sequence == 0xFFFFFFFF, OR
-        - locktime < block_height (height-based, locktime < 500M), OR
-        - locktime < block_time (time-based, locktime >= 500M, using MTP
-          per BIP 113).
-        """
         LOCKTIME_THRESHOLD = 500_000_000
 
         if tx.locktime == 0:
@@ -1371,7 +1132,6 @@ class TransactionValidator:
         input_amounts: List[int] = None,
         input_script_pubkeys: List[bytes] = None,
     ) -> bool:
-        """Verify signature for one input with appropriate flags."""
         return self.script_interpreter.verify(
             tx_in.script_sig,
             bytes(utxo['script_pubkey']),
@@ -1383,7 +1143,7 @@ class TransactionValidator:
             input_script_pubkeys=input_script_pubkeys,
         )
     
-    # ── BIP 68 constants ──────────────────────────────────────────────
+    # BIP 68 constants
     SEQUENCE_DISABLE = 1 << 31       # 0x80000000
     SEQUENCE_TYPE    = 1 << 22       # 0x00400000  (time-based if set)
     SEQUENCE_MASK    = 0x0000ffff
@@ -1432,15 +1192,6 @@ class TransactionValidator:
         return True
 
     def _calculate_min_fee(self, tx: Transaction) -> int:
-        """
-        Calculate minimum relay fee (1 sat/vbyte).
-        
-        Args:
-            tx: Transaction to calculate fee for
-            
-        Returns:
-            Minimum fee in satoshis
-        """
         # Get transaction size in bytes
         tx_size = len(tx.serialize())
         
