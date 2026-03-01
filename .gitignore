@@ -109,6 +109,10 @@ dmypy.json
 **/*.rs.bk
 *.pdb
 
+# Task runner logs
+.parity-task-logs/
+scripts/task-runner/node_modules/
+
 # OS
 .DS_Store
 Thumbs.db

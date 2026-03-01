@@ -20,8 +20,14 @@ from ouroboros.p2p_messages import (
     GetDataMessage,
     GetHeadersMessage,
     HeadersMessage,
+    BlockHeader,
     BlockMessage,
+    CmpctBlockMessage,
+    TxMessage,
+    INV_TYPE_TX,
     INV_TYPE_BLOCK,
+    MSG_WITNESS_TX,
+    MSG_WTX,
 )
 from ouroboros.peer import Peer
 
@@ -60,6 +66,9 @@ class BlockSync:
         
         # Track requested blocks (hash -> request_time)
         self.requested_blocks: Dict[bytes, float] = {}
+
+        # Track requested transactions (hash -> request_time)
+        self._requested_txs: Dict[bytes, float] = {}
         
         # Track received blocks (hash -> Block)
         self.received_blocks: Dict[bytes, Block] = {}
@@ -217,34 +226,66 @@ class BlockSync:
             await asyncio.sleep(10)
     
     async def handle_inv(self, msg: NetworkMessage, peer: Peer):
-        """Handle inventory announcement"""
+        """Handle inventory announcement (blocks + transactions)."""
         try:
             inv = InvMessage.from_payload(msg.payload)
-            
-            # Request blocks we don't have
-            to_request = []
+
+            blocks_to_request = []
+            txs_to_request = []
+
+            # Expire stale tx requests (>60 s)
+            now = time.time()
+            stale = [h for h, t in self._requested_txs.items() if now - t > 60]
+            for h in stale:
+                self._requested_txs.pop(h, None)
+
             for inv_type, inv_hash in inv.inventory:
                 if inv_type == INV_TYPE_BLOCK:
-                    # Check if we already have this block
                     existing_block = self.db.get_block(inv_hash)
                     if not existing_block:
-                        # Check if we've already requested it
                         if inv_hash not in self.requested_blocks:
-                            to_request.append((inv_type, inv_hash))
-                            self.requested_blocks[inv_hash] = time.time()
-            
-            if to_request:
-                # Send getdata
-                getdata = GetDataMessage(inventory=to_request)
-                getdata_msg = getdata.to_network_message(self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet")
-                
+                            blocks_to_request.append((inv_type, inv_hash))
+                            self.requested_blocks[inv_hash] = now
+
+                elif inv_type in (INV_TYPE_TX, MSG_WITNESS_TX, MSG_WTX):
+                    # Request transactions we don't already have
+                    if (
+                        self.mempool
+                        and not self.mempool.get_transaction(inv_hash)
+                        and inv_hash not in self._requested_txs
+                    ):
+                        txs_to_request.append((MSG_WITNESS_TX, inv_hash))
+                        self._requested_txs[inv_hash] = now
+
+            network = (
+                self.peer_manager.network
+                if hasattr(self.peer_manager, "network")
+                else "mainnet"
+            )
+
+            if blocks_to_request:
+                getdata = GetDataMessage(inventory=blocks_to_request)
                 try:
-                    await peer.send_message(getdata_msg)
-                    logger.info(f"Requested {len(to_request)} blocks from {peer.host}:{peer.port}")
+                    await peer.send_message(getdata.to_network_message(network))
+                    logger.info(
+                        f"Requested {len(blocks_to_request)} blocks from "
+                        f"{peer.host}:{peer.port}"
+                    )
                 except Exception as e:
-                    logger.error(f"Failed to send getdata to {peer.host}:{peer.port}: {e}")
+                    logger.error(f"Failed to send getdata: {e}")
                     peer.adjust_score(-5)
-        
+
+            if txs_to_request:
+                getdata = GetDataMessage(inventory=txs_to_request)
+                try:
+                    await peer.send_message(getdata.to_network_message(network))
+                    logger.debug(
+                        f"Requested {len(txs_to_request)} txs from "
+                        f"{peer.host}:{peer.port}"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to request txs: {e}")
+
         except Exception as e:
             logger.error(f"Error handling inv from {peer.host}:{peer.port}: {e}")
             peer.adjust_score(-2)
@@ -331,10 +372,8 @@ class BlockSync:
                 # Process orphans that may now have their parent
                 await self._process_orphans(block_hash)
                 
-                # Broadcast to other peers
-                inv = InvMessage(inventory=[(INV_TYPE_BLOCK, block_hash)])
-                if hasattr(self.peer_manager, 'broadcast'):
-                    await self.peer_manager.broadcast(inv.to_network_message())
+                # Announce new block to peers based on their preferences
+                await self._announce_block(block, block_hash, exclude_peer=peer)
             else:
                 logger.warning(f"✗ Invalid block: {error}")
                 peer.adjust_score(-10)  # Penalize for invalid block
@@ -385,6 +424,47 @@ class BlockSync:
             logger.error(f"Error handling headers from {peer.host}:{peer.port}: {e}")
             peer.adjust_score(-2)
     
+    async def _announce_block(
+        self, block: Block, block_hash: bytes, exclude_peer: Peer | None = None,
+    ) -> None:
+        """Announce a validated block to peers based on their preferences.
+
+        - ``wants_cmpctblock``: send a BIP 152 ``cmpctblock`` message.
+        - ``wants_headers``: send a ``headers`` message with the single header.
+        - Otherwise: send a traditional ``inv`` message.
+        """
+        if not hasattr(self.peer_manager, 'get_all_ready_peers'):
+            return
+        network = getattr(self.peer_manager, 'network', 'mainnet')
+
+        for p in self.peer_manager.get_all_ready_peers():
+            if p is exclude_peer:
+                continue
+            try:
+                if p.wants_cmpctblock:
+                    import os
+                    from ouroboros.compact_blocks import CompactBlock
+                    nonce = int.from_bytes(os.urandom(8), 'little')
+                    cb = CompactBlock.from_block(block, nonce)
+                    msg = CmpctBlockMessage(payload_bytes=cb.serialize())
+                    await p.send_message(msg.to_network_message(network))
+                elif p.wants_headers:
+                    hdr = BlockHeader(
+                        version=block.version,
+                        prev_blockhash=block.prev_blockhash,
+                        merkle_root=block.merkle_root,
+                        timestamp=block.timestamp,
+                        bits=block.bits,
+                        nonce=block.nonce,
+                    )
+                    msg = HeadersMessage(headers=[hdr])
+                    await p.send_message(msg.to_network_message(network))
+                else:
+                    inv = InvMessage(inventory=[(INV_TYPE_BLOCK, block_hash)])
+                    await p.send_message(inv.to_network_message(network))
+            except Exception as e:
+                logger.debug(f"Failed to announce block to {p.host}:{p.port}: {e}")
+
     async def _process_orphans(self, applied_block_hash: bytes) -> None:
         """
         Process orphan blocks that may now have their parent in our chain.
@@ -419,11 +499,7 @@ class BlockSync:
                 block_height = block.height if hasattr(block, 'height') and block.height else 0
                 logger.info(f"✓ Connected orphan block {block_height}: {block_hash.hex()[:16]}...")
                 
-                if hasattr(self.peer_manager, 'broadcast'):
-                    inv = InvMessage(inventory=[(INV_TYPE_BLOCK, block_hash)])
-                    network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
-                    await self.peer_manager.broadcast(inv.to_network_message(network))
-                
+                await self._announce_block(block, block_hash)
                 await self._process_orphans(block_hash)
 
     async def _catch_up(self, peer: Peer, our_height: int):
