@@ -73,24 +73,7 @@ class PeerManager:
         proxy: Optional[str] = None,
         onion: Optional[str] = None,
     ):
-        """
-        Initialize peer manager.
-
-        Args:
-            network: Network name (mainnet, testnet, regtest)
-            max_peers: Maximum number of full-relay outbound peers
-            max_block_relay_only: Maximum number of block-relay-only outbound
-                                  peers (default 2, matching Bitcoin Core)
-            data_dir: Data directory for persisting bans
-            transport_version: Default P2P transport version for new peers
-                               (1 = plaintext v1, 2 = BIP 324 encrypted)
-            listen: Whether to accept inbound connections
-            proxy: SOCKS5 proxy ``host:port`` for all outbound connections
-                   (equivalent to Bitcoin Core ``-proxy=``).
-            onion: SOCKS5 proxy ``host:port`` used *only* for .onion
-                   connections.  Falls back to *proxy* if not set
-                   (equivalent to Bitcoin Core ``-onion=``).
-        """
+        """Initialize peer manager."""
         self.network = network
         self.max_peers = max_peers
         self.max_block_relay_only = max_block_relay_only
@@ -231,19 +214,10 @@ class PeerManager:
 
         logger.info("PeerManager stopped")
 
-    # ── Inbound eviction logic ────────────────────────────────────────
+    # Inbound eviction logic
 
     @staticmethod
     def _netgroup(host: str) -> str:
-        """Return the netgroup for an address.
-
-        For IPv4, this is the first two octets (e.g. ``"192.168"``).
-        For ``.onion`` addresses, all Tor peers share the ``"onion"``
-        netgroup (matching Bitcoin Core behaviour).
-        Non-IPv4, non-onion addresses are bucketed by their full host.
-
-        Reference: Bitcoin Core ``GetGroup()`` in ``netaddress.cpp``.
-        """
         if is_onion_host(host):
             return "onion"
         parts = host.split(".")
@@ -254,25 +228,11 @@ class PeerManager:
                 return f"{parts[0]}.{parts[1]}"
             except ValueError:
                 pass
+        # TODO: handle IPv6 addresses (they share a /48 netgroup in Bitcoin Core)
         return host  # non-IPv4 — use entire host as its own group
 
     def _select_eviction_candidate(self) -> Optional[str]:
-        """Select the worst inbound peer for eviction.
-
-        Mirrors Bitcoin Core ``SelectNodeToEvict()`` (``net.cpp``):
-
-        1. Start with all inbound peers as candidates.
-        2. Protect the 4 peers with lowest latency.
-        3. Protect the 4 peers with highest score (proxy for upload volume).
-        4. Protect the 4 peers with most recent block relay activity.
-        5. Protect up to 4 peers from unique /16 netgroups.
-        6. Protect the 4 most recently connected peers.
-        7. From remaining candidates, evict the one connected longest.
-        8. If no candidates remain, return ``None``.
-
-        Returns:
-            Address string of the peer to evict, or ``None``.
-        """
+        """Select the worst inbound peer for eviction."""
         # Build candidate list: [(addr, peer), ...]
         candidates = [
             (addr, peer) for addr, peer in self.inbound_peers.items()
@@ -333,11 +293,6 @@ class PeerManager:
         return candidates[0][0]
 
     async def _evict_inbound_peer(self) -> bool:
-        """Try to evict the worst inbound peer to make room.
-
-        Returns:
-            ``True`` if a peer was evicted, ``False`` otherwise.
-        """
         victim_addr = self._select_eviction_candidate()
         if victim_addr is None:
             return False
@@ -349,10 +304,9 @@ class PeerManager:
             return True
         return False
 
-    # ── Inbound connection handling ──────────────────────────────────
+    # Inbound connection handling
 
     async def _start_listening(self, port: int):
-        """Start the TCP server for inbound connections."""
         try:
             self._server = await asyncio.start_server(
                 self._handle_inbound_connection,
@@ -433,8 +387,8 @@ class PeerManager:
             logger.warning(f"No DNS seeds configured for {self.network}")
             return
         
-        port = 8333 if self.network == "mainnet" else 18333
-        
+        port = 8333 if self.network == "mainnet" else 18333  # XXX: not sure this handles testnet4 correctly
+
         # Resolve DNS seeds in parallel
         tasks = [self._resolve_dns_seed(seed, port) for seed in seeds]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -451,16 +405,7 @@ class PeerManager:
         logger.info(f"Total known peers: {len(self.known_addrs)}")
     
     async def _resolve_dns_seed(self, seed: str, port: int) -> int:
-        """
-        Resolve DNS seed and add addresses to known_addrs.
-        
-        Args:
-            seed: DNS seed hostname
-            port: Port number
-            
-        Returns:
-            Number of addresses discovered
-        """
+        """Resolve DNS seed and add addresses to known_addrs."""
         try:
             # Use asyncio to resolve DNS (non-blocking)
             loop = asyncio.get_event_loop()
@@ -487,17 +432,11 @@ class PeerManager:
             return 0
     
     def _proxy_for_host(self, host: str) -> Optional[str]:
-        """Return the SOCKS5 proxy address to use for *host*, or ``None``.
-
-        * ``.onion`` hosts use ``self.onion`` if set, otherwise ``self.proxy``.
-        * Other hosts use ``self.proxy`` (if set).
-        """
         if is_onion_host(host):
             return self.onion or self.proxy
         return self.proxy
 
     def _all_outbound_addrs(self) -> Set[str]:
-        """Return the set of addresses used by any outbound connection."""
         return set(self.peers.keys()) | set(self.block_relay_peers.keys())
 
     async def connect_to_peers(self, start_height: int = 0):
@@ -559,18 +498,7 @@ class PeerManager:
                     logger.debug(f"Removed {addr} from known addresses after {self.retry_counts[addr]} failures")
 
     async def _connect_block_relay_peers(self, start_height: int = 0):
-        """Connect block-relay-only outbound peers up to max_block_relay_only.
-
-        Block-relay-only peers:
-        - Version message with relay=False
-        - No sendcmpct, feefilter, wtxidrelay, or sendaddrv2
-        - No addr/addrv2 handler registration (no address gossip)
-        - No getaddr request
-        - No compact block negotiation
-
-        These connections provide an independent path for block propagation
-        that is resistant to transaction-graph-based eclipse attacks.
-        """
+        """Connect block-relay-only outbound peers up to max_block_relay_only."""
         while len(self.block_relay_peers) < self.max_block_relay_only and self.known_addrs:
             available = (
                 self.known_addrs
@@ -623,15 +551,6 @@ class PeerManager:
                     )
     
     def _should_retry(self, addr: str) -> bool:
-        """
-        Check if we should retry connecting to an address (exponential backoff).
-        
-        Args:
-            addr: Peer address
-            
-        Returns:
-            True if we should retry, False otherwise
-        """
         retry_count = self.retry_counts.get(addr, 0)
         if retry_count == 0:
             return True
@@ -709,13 +628,9 @@ class PeerManager:
                 logger.error(f"Error in maintain_connections: {e}")
                 await asyncio.sleep(30)
     
-    # ── BIP 133 Fee Filter ─────────────────────────────────────────
+    # BIP 133 Fee Filter
 
     async def _broadcast_feefilter(self) -> None:
-        """Send updated feefilter to full-relay peers based on mempool min fee rate.
-
-        Block-relay-only peers never receive feefilter messages.
-        """
         if self._mempool is None:
             return
         try:
@@ -736,7 +651,7 @@ class PeerManager:
             except Exception:
                 pass
 
-    # ── BIP 152 Compact Blocks ───────────────────────────────────────
+    # BIP 152 Compact Blocks #
 
     def set_mempool(self, mempool) -> None:
         """Provide the mempool for compact block reconstruction."""
@@ -844,7 +759,7 @@ class PeerManager:
         peer.register_handler("notfound", on_notfound)
         peer.register_handler("mempool", on_mempool)
 
-    # ── Address gossip (addr / addrv2 / getaddr) ─────────────────────
+    # Address gossip (addr / addrv2 / getaddr)
 
     def _register_addr_handlers(self, peer: Peer, addr: str) -> None:
         """Wire up addr/addrv2/getaddr handlers on a peer."""
@@ -934,7 +849,6 @@ class PeerManager:
         peer.register_handler("getaddr", on_getaddr)
 
     async def _send_getaddr(self, peer: Peer) -> None:
-        """Send ``getaddr`` to a newly-connected outbound peer."""
         try:
             msg = GetAddrMessage().to_network_message(self.network)
             await peer.send_message(msg)
@@ -943,10 +857,6 @@ class PeerManager:
             logger.debug(f"Failed to send getaddr to {peer.host}:{peer.port}: {e}")
 
     def _relay_addr(self, msg: NetworkMessage, exclude: str = "") -> None:
-        """Relay an addr message to 1-2 random full-relay peers (excluding sender).
-
-        Block-relay-only peers never participate in address gossip.
-        """
         all_items = list(self.peers.items()) + list(self.inbound_peers.items())
         candidates = [
             p for a, p in all_items
@@ -960,7 +870,6 @@ class PeerManager:
                 pass
 
     def _rate_limit_addr_relay(self, addr: str, count: int) -> bool:
-        """Return True if this addr relay is within the daily limit (1000/day)."""
         now = time.time()
         day_start = self._addr_relay_day.get(addr, 0)
         if now - day_start > 86400:
@@ -971,7 +880,6 @@ class PeerManager:
 
     @staticmethod
     def _netaddr_to_host(net_addr) -> Optional[str]:
-        """Extract IPv4 string from a NetworkAddress, or None."""
         ip_bytes = net_addr.ip
         # IPv4-mapped IPv6: ::ffff:a.b.c.d
         if ip_bytes[:12] == b"\x00" * 10 + b"\xff\xff":
@@ -983,13 +891,6 @@ class PeerManager:
 
     @staticmethod
     def _addr_bytes_to_host(net_id: int, addr_bytes: bytes) -> Optional[str]:
-        """Convert addrv2 raw bytes to a host string.
-
-        Supported network IDs (BIP 155):
-            1 — IPv4  (4 bytes)
-            2 — IPv6  (16 bytes, currently skipped)
-            4 — Tor v3 (32-byte ed25519 public key → ``<base32>.onion``)
-        """
         if net_id == 1 and len(addr_bytes) == 4:
             return ".".join(str(b) for b in addr_bytes)
         if net_id == 2 and len(addr_bytes) == 16:
@@ -1009,12 +910,9 @@ class PeerManager:
             return onion_host
         return None
 
-    # ── BIP 330 Erlay Reconciliation ───────────────────────────────────
+    # --- BIP 330 Erlay Reconciliation ---
 
     async def _negotiate_erlay(self, peer: Peer, addr: str) -> None:
-        """Send ``sendtxrcncl`` to a newly-connected peer to negotiate
-        Erlay support.  Both sides must exchange this message for Erlay
-        to be active on the connection."""
         if not peer.relay_txs:
             # Block-relay-only peers don't participate in tx reconciliation
             return
@@ -1255,12 +1153,7 @@ class PeerManager:
         peer.register_handler("reconcildiff", on_reconcildiff)
 
     async def _reconciliation_loop(self) -> None:
-        """Periodically reconcile transaction sets with Erlay peers.
-
-        Runs every ``_reconciliation_interval`` seconds, initiating a
-        reconciliation round with each Erlay-capable peer that has
-        pending unannounced transactions.
-        """
+        """Periodically reconcile transaction sets with Erlay peers."""
         try:
             while self.running:
                 await asyncio.sleep(self._reconciliation_interval)
@@ -1333,7 +1226,6 @@ class PeerManager:
         return list(self._erlay_peers.keys())
 
     async def _flood_pending_invs(self, peer: Peer, addr: str) -> None:
-        """Fallback: send all pending reconciliation txs as INVs."""
         recon = self._erlay_peers.get(addr)
         if recon is None or recon.set_size == 0:
             return
@@ -1448,7 +1340,6 @@ class PeerManager:
         self.ban_manager.ban(addr)
 
     def _on_peer_banned(self, ip: str) -> None:
-        """Callback from BanManager — disconnect and forget the peer."""
         # Full-relay outbound
         matching = [a for a in list(self.peers) if a.startswith(ip)]
         for addr in matching:

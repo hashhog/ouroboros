@@ -19,7 +19,7 @@ from ouroboros.node import BitcoinNode
 
 
 class TestBitsToDifficulty(unittest.TestCase):
-    """Test _bits_to_difficulty matches Bitcoin Core"""
+    """Test _bits_to_difficulty against known difficulty values."""
 
     def setUp(self):
         """Set up test fixtures"""

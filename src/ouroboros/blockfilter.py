@@ -27,7 +27,6 @@ Filter header (for chaining):
 
 Reference:
     https://github.com/bitcoin/bips/blob/master/bip-0158.mediawiki
-    Bitcoin Core: src/blockfilter.cpp
 """
 
 from __future__ import annotations
@@ -57,7 +56,6 @@ OP_RETURN = 0x6A             # OP_RETURN opcode
 # ---------------------------------------------------------------------------
 
 def _encode_compact_size(n: int) -> bytes:
-    """Encode an integer as a Bitcoin CompactSize (varint)."""
     if n < 0xFD:
         return struct.pack('<B', n)
     elif n <= 0xFFFF:
@@ -69,7 +67,6 @@ def _encode_compact_size(n: int) -> bytes:
 
 
 def _decode_compact_size(data: bytes, offset: int = 0) -> tuple[int, int]:
-    """Decode a CompactSize varint, returning (value, bytes_consumed)."""
     first = data[offset]
     if first < 0xFD:
         return first, 1
@@ -151,14 +148,6 @@ class _BitReader:
 # ---------------------------------------------------------------------------
 
 def _golomb_rice_encode(deltas: List[int], p: int) -> bytes:
-    """
-    Golomb-Rice encode a list of non-negative integer deltas.
-
-    For each delta *d*:
-        q = d >> p            (quotient)
-        r = d & ((1 << p) - 1)  (remainder)
-        Write q ones followed by a zero (unary), then r in P bits.
-    """
     w = _BitWriter()
     for d in deltas:
         q = d >> p
@@ -173,11 +162,6 @@ def _golomb_rice_encode(deltas: List[int], p: int) -> bytes:
 
 
 def _golomb_rice_decode(data: bytes, n: int, p: int) -> List[int]:
-    """
-    Decode *n* Golomb-Rice coded deltas from *data*.
-
-    Returns list of decoded delta values.
-    """
     reader = _BitReader(data)
     deltas: List[int] = []
     for _ in range(n):
@@ -196,13 +180,6 @@ def _golomb_rice_decode(data: bytes, n: int, p: int) -> List[int]:
 # ---------------------------------------------------------------------------
 
 def _block_filter_siphash_key(block_hash: bytes) -> bytes:
-    """
-    Derive the 16-byte SipHash key for block filter construction.
-
-    Per BIP 158 the key is the first 16 bytes of the block hash in
-    *internal* byte order (little-endian / wire order).  In this codebase
-    ``Block.hash`` is stored in display (big-endian) order, so we reverse.
-    """
     # block_hash is in display order (big-endian), reverse to LE
     return block_hash[::-1][:16]
 
@@ -212,15 +189,6 @@ def _block_filter_siphash_key(block_hash: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 def _hash_to_range(key: bytes, item: bytes, f: int) -> int:
-    """
-    Map *item* to the range ``[0, f)`` using SipHash-2-4.
-
-    ``f`` is typically ``N * M`` where N = number of items.
-
-    Per BIP 158 the mapping is:
-        ``(SipHash(key, item) * f) >> 64``
-    which produces a uniform value in [0, f).
-    """
     h = _siphash_2_4(key, item)
     # Fast-range reduction: (h * f) >> 64
     return (h * f) >> 64
@@ -232,18 +200,7 @@ def construct_gcs_filter(
     p: int = GCS_P,
     m: int = GCS_M,
 ) -> bytes:
-    """
-    Build a GCS (Golomb-coded set) filter from a set of byte-string items.
-
-    Args:
-        items: List of byte strings (scriptPubKeys) to include in the filter.
-        key: 16-byte SipHash key.
-        p: Golomb-Rice coding parameter (default: 19 per BIP 158).
-        m: False-positive rate parameter (default: 784931 per BIP 158).
-
-    Returns:
-        Serialized filter bytes: ``CompactSize(N) || GCS-encoded data``.
-    """
+    """Build a GCS filter from a list of byte-string items (BIP 158)."""
     n = len(items)
     if n == 0:
         return _encode_compact_size(0)
@@ -274,12 +231,7 @@ def gcs_match(
     p: int = GCS_P,
     m: int = GCS_M,
 ) -> bool:
-    """
-    Check whether *target* is (probably) in the GCS filter.
-
-    Returns True if the target matches (with possible false positive),
-    False if definitely not in the set.
-    """
+    """Check whether *target* is probably in the GCS filter (may false-positive)."""
     offset = 0
     n, sz = _decode_compact_size(filter_bytes, offset)
     offset += sz
@@ -311,11 +263,7 @@ def gcs_match_any(
     p: int = GCS_P,
     m: int = GCS_M,
 ) -> bool:
-    """
-    Check whether *any* of the *targets* match the GCS filter.
-
-    Uses a sorted intersection approach for efficiency.
-    """
+    """Check whether any of *targets* matches the GCS filter (sorted intersection)."""
     if not targets:
         return False
 
@@ -354,7 +302,6 @@ def gcs_match_any(
 # ---------------------------------------------------------------------------
 
 def _is_op_return(script: bytes) -> bool:
-    """Return True if the script starts with OP_RETURN."""
     return len(script) > 0 and script[0] == OP_RETURN
 
 
@@ -402,16 +349,9 @@ def build_basic_filter(
     block: "Block",
     db: Optional["BlockchainDatabase"] = None,
 ) -> bytes:
-    """
-    Build a BIP 158 basic block filter for *block*.
+    """Build a BIP 158 basic block filter for *block*.
 
-    Args:
-        block: A fully-parsed Block (with transactions).
-        db: Optional blockchain database for looking up spent prevout
-            scriptPubKeys.  If None, only output scripts are included.
-
-    Returns:
-        The serialized GCS filter bytes (CompactSize(N) || encoded data).
+    Pass *db* to also include scripts from spent prevouts.
     """
     scripts = collect_block_scripts(block, db)
 
@@ -429,12 +369,11 @@ def build_basic_filter(
 # ---------------------------------------------------------------------------
 
 def _dsha256(data: bytes) -> bytes:
-    """Double SHA-256."""
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
 
 
 def compute_filter_hash(filter_bytes: bytes) -> bytes:
-    """Hash a filter for header chain computation: dSHA256(filter_bytes)."""
+    """dSHA256 of the filter bytes, used for filter header chaining."""
     return _dsha256(filter_bytes)
 
 
@@ -485,18 +424,7 @@ class BlockFilterIndex:
         db: Optional["BlockchainDatabase"] = None,
         prev_header: Optional[bytes] = None,
     ) -> tuple[bytes, bytes]:
-        """
-        Build, store, and return the filter and filter header for *block*.
-
-        Args:
-            block: Block to index.
-            db: Optional database for prevout lookups.
-            prev_header: Previous filter header; if None, uses the
-                internally tracked tip header.
-
-        Returns:
-            ``(filter_bytes, filter_header)``
-        """
+        """Build, store, and return ``(filter_bytes, filter_header)`` for *block*."""
         filt = build_basic_filter(block, db)
 
         if prev_header is None:

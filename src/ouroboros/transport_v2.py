@@ -26,7 +26,7 @@ from typing import Optional, Tuple
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
-# ── constants ────────────────────────────────────────────────────────
+# constants
 
 NETWORK_MAGIC_V2 = b""  # v2 has no network magic; first 64 bytes are ESwift keys
 REKEY_INTERVAL = 224     # re-key after this many messages (BIP 324)
@@ -42,14 +42,14 @@ class PacketType(IntEnum):
     DECOY = 128
 
 
-# ── tagged hash (BIP 340-style) ──────────────────────────────────────
+# tagged hash (BIP 340-style)
 
 def _tagged_hash(tag: str, data: bytes) -> bytes:
     tag_hash = hashlib.sha256(tag.encode()).digest()
     return hashlib.sha256(tag_hash + tag_hash + data).digest()
 
 
-# ── HKDF-SHA256 (extract + expand, single-info) ─────────────────────
+# --- HKDF-SHA256 (extract + expand, single-info) ---
 
 def _hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, length: int = 32) -> bytes:
     prk = hmac.new(salt, ikm, hashlib.sha256).digest()
@@ -64,7 +64,7 @@ def _hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, length: int = 32) -> byte
     return okm[:length]
 
 
-# ── ChaCha20-Poly1305 cipher for a single direction ─────────────────
+# ChaCha20-Poly1305 cipher for a single direction
 
 @dataclass
 class CipherState:
@@ -97,12 +97,11 @@ class CipherState:
         return pt
 
     def _rekey(self) -> None:
-        """Derive a new key from the current key (forward secrecy)."""
         self.key = _tagged_hash("bip324_rekey", self.key)
         self.nonce_counter = 0
 
 
-# ── v2 Handshake & Session ───────────────────────────────────────────
+# v2 Handshake & Session #
 
 @dataclass
 class V2Handshake:
@@ -198,7 +197,7 @@ class V2Transport:
             recv_cipher=CipherState(key=recv_key),
         )
 
-    # ── packet format ─────────────────────────────────────────────
+    # packet format
 
     def encrypt_message(self, payload: bytes, *, decoy: bool = False) -> bytes:
         """

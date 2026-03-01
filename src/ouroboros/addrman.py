@@ -46,14 +46,14 @@ class AddressManager:
 
     def __init__(self, data_dir: Optional[str] = None):
         self._new: Dict[str, AddrInfo] = {}     # addr -> AddrInfo
-        self._tried: Dict[str, AddrInfo] = {}   # addr -> AddrInfo
+        self._tried: Dict[str, AddrInfo] = dict()   # addr -> AddrInfo
         self._data_dir = data_dir
         self._filepath: Optional[str] = None
         if data_dir:
             self._filepath = os.path.join(data_dir, "peers.json")
             self._load()
 
-    # ── Public API ────────────────────────────────────────────────────
+    # Public API #
 
     def add(
         self,
@@ -63,11 +63,7 @@ class AddressManager:
         timestamp: float = 0.0,
         source: str = "",
     ) -> bool:
-        """
-        Add an address to the *new* table.
-
-        Returns True if the address was actually inserted (or updated).
-        """
+        """Add an address to the *new* table; returns True if inserted/updated."""
         addr = f"{host}:{port}"
 
         # Already in tried — just update last_seen
@@ -142,12 +138,7 @@ class AddressManager:
         return all_addrs[:count]
 
     def select_for_connection(self, exclude: Set[str] | None = None) -> Optional[str]:
-        """
-        Pick an address from the *new* table for an outbound connection.
-
-        Prefers addresses with fewer past attempts and more recent
-        ``last_seen`` timestamps.
-        """
+        """Pick a candidate from the *new* table, weighting by recency and low attempt count."""
         exclude = exclude or set()
         candidates = [
             (addr, info) for addr, info in self._new.items()
@@ -181,7 +172,7 @@ class AddressManager:
         """Total number of known addresses."""
         return len(self._new) + len(self._tried)
 
-    # ── Persistence ───────────────────────────────────────────────────
+    # Persistence
 
     def save(self) -> None:
         """Persist address tables to disk."""
@@ -205,7 +196,6 @@ class AddressManager:
             logger.warning(f"Failed to save address manager: {e}")
 
     def _load(self) -> None:
-        """Load address tables from disk."""
         if not self._filepath or not os.path.exists(self._filepath):
             return
         try:

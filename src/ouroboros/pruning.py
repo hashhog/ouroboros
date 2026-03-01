@@ -7,7 +7,7 @@ module implements a ``BlockPruner`` that deletes block bodies from the
 RocksDB ``BLOCKS_CF`` column family while preserving the block index
 (height → hash mapping), headers, and UTXO set.
 
-Pruning modes (following Bitcoin Core):
+Pruning modes:
 - ``target_size_mb``: prune block data when total exceeds this
 - ``keep_blocks``: always keep at least the last N blocks
 
@@ -38,7 +38,7 @@ class BlockPruner:
     survive pruning but the raw ``blk*.dat`` data is removed.
     """
 
-    MIN_KEEP_BLOCKS = 288  # ~2 days of blocks (Bitcoin Core minimum)
+    MIN_KEEP_BLOCKS = 288  # ~2 days of blocks
     MIN_TARGET_MB = 550     # Bitcoin Core -prune minimum
 
     def __init__(
@@ -47,15 +47,6 @@ class BlockPruner:
         target_size_mb: int = 550,
         keep_blocks: int = 288,
     ):
-        """
-        Args:
-            db: A ``PyBlockchainDB`` (Rust-backed) or compatible object
-                that exposes ``prune_blocks_range``, ``get_prune_height``,
-                ``has_block_data``, ``estimate_blocks_size``, and
-                ``get_best_block``.
-            target_size_mb: Prune when total block data exceeds this (MB).
-            keep_blocks: Always keep at least this many recent blocks.
-        """
         self.db = db
         self.target_size = target_size_mb * 1_000_000
         self.keep_blocks = max(keep_blocks, self.MIN_KEEP_BLOCKS)
@@ -70,11 +61,7 @@ class BlockPruner:
         return not self.db.has_block_data(height)
 
     def prune_blocks(self, current_height: int) -> int:
-        """
-        Prune old blocks up to ``current_height - keep_blocks``.
-
-        Returns the number of block bodies removed.
-        """
+        """Prune old blocks up to ``current_height - keep_blocks``; returns the number of bodies removed."""
         if current_height <= self.keep_blocks:
             return 0
 
@@ -93,12 +80,7 @@ class BlockPruner:
         return removed
 
     def prune_to_target(self, current_height: int) -> int:
-        """
-        Prune oldest blocks until total block storage is below
-        ``target_size``.
-
-        Returns the number of block bodies removed.
-        """
+        """Prune oldest blocks until storage is below ``target_size``; returns the number of bodies removed."""
         current_size = self.db.estimate_blocks_size()
         if current_size <= self.target_size:
             return 0

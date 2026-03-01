@@ -42,14 +42,7 @@ class BitcoinNode:
     """Main Bitcoin full node"""
     
     def __init__(self, data_dir: str = "~/.ouroboros", network: str = "mainnet", config: dict = None):
-        """
-        Initialize Bitcoin node.
-        
-        Args:
-            data_dir: Data directory path (can be overridden by config file)
-            network: Network name (mainnet, testnet, regtest) (can be overridden by config file)
-            config: Additional configuration dictionary (overrides config file)
-        """
+        """Initialize Bitcoin node."""
         # Load configuration file (--config or datadir/ouroboros.conf)
         config_path = config.get('config_path') or config.get('config_file') if config else None
         data_dir_for_config = config.get('datadir', data_dir) if config else data_dir
@@ -100,13 +93,7 @@ class BitcoinNode:
         self._shutdown_event: Optional[asyncio.Event] = None
     
     async def start(self, rpc_port: int = 8332, p2p_port: int = 8333):
-        """
-        Start the Bitcoin node.
-        
-        Args:
-            rpc_port: RPC server port (can be overridden by config)
-            p2p_port: P2P network port (can be overridden by config)
-        """
+        """Start the Bitcoin node (config file values override the port defaults)."""
         # Use config values if available, otherwise use parameters
         rpc_port = self.config.get('rpc_port', rpc_port)
         p2p_port = self.config.get('p2p_port', p2p_port)
@@ -308,7 +295,6 @@ class BitcoinNode:
             logger.error(f"Error stopping node: {e}", exc_info=True)
     
     async def _main_loop(self):
-        """Main node loop"""
         while self.running:
             try:
                 # Check for shutdown event
@@ -414,12 +400,6 @@ class BitcoinNode:
         ))
 
     def _check_synced(self) -> bool:
-        """
-        Check if blockchain is synced.
-        
-        Returns:
-            True if synced, False otherwise
-        """
         if not self.db:
             return False
         
@@ -555,32 +535,11 @@ class BitcoinNode:
         logger.info("Transaction and getdata handlers registered")
     
     def is_synced(self) -> bool:
-        """
-        Check if node is synced.
-        
-        Returns:
-            True if synced, False otherwise
-        """
+        """Return True when the node has completed initial block synchronisation."""
         return self.synced
     
     def _bits_to_difficulty(self, bits: int) -> float:
-        """
-        Convert compact target (bits) to difficulty.
-
-        Uses Bitcoin Core GetDifficulty formula from rpc/blockchain.cpp:
-        - nShift = (nBits >> 24) & 0xff
-        - dDiff = 0x0000ffff / (nBits & 0x00ffffff)
-        - while nShift < 29: dDiff *= 256; nShift += 1
-        - while nShift > 29: dDiff /= 256; nShift -= 1
-
-        Difficulty 1 corresponds to bits 0x1d00ffff.
-
-        Args:
-            bits: Compact target (32-bit integer)
-
-        Returns:
-            Difficulty value
-        """
+        """Convert compact target (bits) to difficulty."""
         n_shift = (bits >> 24) & 0xFF
         mantissa = bits & 0x00FFFFFF
 
@@ -599,12 +558,7 @@ class BitcoinNode:
         return d_diff
     
     def get_current_difficulty(self) -> float:
-        """
-        Get current difficulty from best block.
-        
-        Returns:
-            Current difficulty
-        """
+        """Return the proof-of-work difficulty of the current chain tip."""
         if not self.db:
             return 1.0
         
@@ -625,26 +579,7 @@ class BitcoinNode:
             return 1.0
     
     def get_median_time(self, height: Optional[int] = None) -> int:
-        """
-        Get median time of last 11 blocks.
-        
-        The median time is the median timestamp of the last 11 blocks (or fewer
-        if not enough blocks exist). This is used in Bitcoin to prevent timestamp
-        manipulation attacks.
-        
-        Implementation:
-        1. If height is None, get best block height
-        2. Get blocks from max(0, height-10) to height (11 blocks total)
-        3. Extract timestamps from each block
-        4. Sort timestamps
-        5. Return median (middle value, index 5 for 11 blocks)
-        
-        Args:
-            height: Block height (None for current best block)
-            
-        Returns:
-            Median timestamp (Unix epoch seconds)
-        """
+        """Median timestamp of the 11 blocks ending at *height* (or the chain tip when None)."""
         import time
         
         if not self.db:
@@ -683,18 +618,7 @@ class BitcoinNode:
             return int(time.time())  # Fallback when DB empty or error
     
     def _calculate_block_work(self, bits: int) -> int:
-        """
-        Calculate proof-of-work for a block.
-        
-        Formula: work = (2^256) / (target + 1)
-        Where target is decoded from bits.
-        
-        Args:
-            bits: Compact target (32-bit integer)
-            
-        Returns:
-            Work value as integer (can be very large)
-        """
+        """Calculate proof-of-work for a block."""
         # Extract target from bits (same as difficulty calculation)
         mantissa = bits & 0x007fffff
         exponent = (bits >> 24) & 0xff
@@ -716,17 +640,7 @@ class BitcoinNode:
         return work
     
     def _calculate_chainwork_at_height(self, height: int) -> int:
-        """
-        Calculate cumulative chainwork up to height.
-        
-        This recursively calculates chainwork from genesis, caching results.
-        
-        Args:
-            height: Block height
-            
-        Returns:
-            Cumulative chainwork at this height
-        """
+        """Calculate cumulative chainwork up to height."""
         if not self.db:
             return 0
         
@@ -784,12 +698,7 @@ class BitcoinNode:
             return 0
     
     def get_chainwork(self) -> str:
-        """
-        Get chain work (hex).
-        
-        Returns:
-            Chain work as hex string
-        """
+        """Return cumulative chain work at the tip as a hex string."""
         if not self.db:
             return "0x0"
         
@@ -802,15 +711,7 @@ class BitcoinNode:
             return "0x0"
     
     def get_confirmations(self, height: int) -> int:
-        """
-        Get confirmations for block at height.
-        
-        Args:
-            height: Block height
-            
-        Returns:
-            Number of confirmations
-        """
+        """Return the number of confirmations for a block at *height*."""
         if not self.db:
             return 0
         
@@ -821,27 +722,11 @@ class BitcoinNode:
             return 0
     
     def get_difficulty(self, bits: int) -> float:
-        """
-        Get difficulty from bits.
-        
-        Args:
-            bits: Compact difficulty target
-            
-        Returns:
-            Difficulty value
-        """
+        """Convert compact *bits* target to difficulty."""
         return self._bits_to_difficulty(bits)
     
     def get_chainwork_at_height(self, height: int) -> str:
-        """
-        Get chain work at height.
-        
-        Args:
-            height: Block height
-            
-        Returns:
-            Chain work as hex string
-        """
+        """Return cumulative chain work up to *height* as a hex string."""
         if not self.db:
             return "0x0"
         
@@ -853,9 +738,5 @@ class BitcoinNode:
             return "0x0"
     
     async def run(self) -> None:
-        """
-        Run the Bitcoin node (start and keep running).
-        
-        This is a convenience method that starts the node and waits for shutdown.
-        """
+        """Start the node and block until shutdown (convenience wrapper for ``start()``)."""
         await self.start()

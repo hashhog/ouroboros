@@ -31,17 +31,15 @@ from typing import Dict, List, Optional, Tuple
 
 from ouroboros.database import Transaction, TxIn, TxOut
 
-# ── BIP 174 magic ────────────────────────────────────────────────────
+# BIP 174 magic
 
 PSBT_MAGIC = b"psbt\xff"
-
-# ── Global key types ─────────────────────────────────────────────────
 
 PSBT_GLOBAL_UNSIGNED_TX = 0x00
 PSBT_GLOBAL_XPUB = 0x01
 PSBT_GLOBAL_VERSION = 0xFB
 
-# ── Per-input key types ──────────────────────────────────────────────
+# Per-input key types
 
 PSBT_IN_NON_WITNESS_UTXO = 0x00
 PSBT_IN_WITNESS_UTXO = 0x01
@@ -53,14 +51,14 @@ PSBT_IN_BIP32_DERIVATION = 0x06
 PSBT_IN_FINAL_SCRIPTSIG = 0x07
 PSBT_IN_FINAL_SCRIPTWITNESS = 0x08
 
-# ── Per-output key types ─────────────────────────────────────────────
+# Per-output key types
 
 PSBT_OUT_REDEEM_SCRIPT = 0x00
 PSBT_OUT_WITNESS_SCRIPT = 0x01
 PSBT_OUT_BIP32_DERIVATION = 0x02
 
 
-# ── compact-size encoding / decoding ─────────────────────────────────
+# compact-size encoding / decoding #
 
 def _write_compact_size(n: int) -> bytes:
     if n < 0xFD:
@@ -86,10 +84,9 @@ def _read_compact_size(f: io.BytesIO) -> int:
     return struct.unpack("<Q", f.read(8))[0]
 
 
-# ── key-value pair I/O ───────────────────────────────────────────────
+# key-value pair I/O
 
 def _read_kv_pairs(f: io.BytesIO) -> Dict[bytes, bytes]:
-    """Read key-value pairs until the 0x00 separator."""
     pairs: Dict[bytes, bytes] = {}
     while True:
         key_len_byte = f.read(1)
@@ -115,10 +112,9 @@ def _write_kv_pairs(pairs: Dict[bytes, bytes]) -> bytes:
     return bytes(out)
 
 
-# ── Helper: serialise unsigned tx (no witness, no scriptSig) ─────────
+# Helper: serialise unsigned tx (no witness, no scriptSig)
 
 def _serialize_unsigned_tx(tx: Transaction) -> bytes:
-    """Serialise the unsigned transaction (BIP 174 global field)."""
     data = bytearray()
     data += tx.version.to_bytes(4, "little", signed=True)
     data += _write_compact_size(len(tx.inputs))
@@ -137,7 +133,6 @@ def _serialize_unsigned_tx(tx: Transaction) -> bytes:
 
 
 def _deserialize_tx(raw: bytes) -> Transaction:
-    """Minimal tx deserialiser (non-witness only, for PSBT global)."""
     f = io.BytesIO(raw)
     version = struct.unpack("<i", f.read(4))[0]
     n_in = _read_compact_size(f)
@@ -162,7 +157,7 @@ def _deserialize_tx(raw: bytes) -> Transaction:
                        inputs=inputs, outputs=outputs)
 
 
-# ── PSBTInput / PSBTOutput ───────────────────────────────────────────
+# PSBTInput / PSBTOutput
 
 @dataclass
 class PSBTInput:
@@ -271,7 +266,7 @@ class PSBTOutput:
         return out
 
 
-# ── PSBT ─────────────────────────────────────────────────────────────
+# --- PSBT ---
 
 @dataclass
 class PSBT:
@@ -287,7 +282,7 @@ class PSBT:
     global_xpubs: Dict[bytes, bytes] = field(default_factory=dict)
     unknown_global: Dict[bytes, bytes] = field(default_factory=dict)
 
-    # ── constructors ──────────────────────────────────────────────
+    # constructors
 
     @classmethod
     def from_transaction(cls, tx: Transaction) -> "PSBT":
@@ -303,7 +298,7 @@ class PSBT:
             outputs=[PSBTOutput() for _ in unsigned.outputs],
         )
 
-    # ── binary serialisation (BIP 174) ────────────────────────────
+    # binary serialisation (BIP 174)
 
     def serialize(self) -> bytes:
         out = bytearray(PSBT_MAGIC)
@@ -363,7 +358,7 @@ class PSBT:
         return cls(tx=tx, inputs=inputs, outputs=outputs,
                    global_xpubs=global_xpubs, unknown_global=unknown_global)
 
-    # ── combine ───────────────────────────────────────────────────
+    # combine
 
     def combine(self, other: "PSBT") -> "PSBT":
         """
@@ -406,16 +401,10 @@ class PSBT:
         self.unknown_global.update(other.unknown_global)
         return self
 
-    # ── finalize ──────────────────────────────────────────────────
+    # finalize
 
     def finalize(self) -> "PSBT":
-        """
-        Finalise each input (``finalizepsbt``).
-
-        For P2WPKH inputs: builds final_script_witness from the single
-        partial signature.  For P2PKH/bare: builds final_script_sig.
-        Clears non-final fields after finalisation.
-        """
+        """Finalise each input: builds final_script_witness (P2WPKH) or final_script_sig (P2PKH) and clears non-final fields."""
         for i, psbt_in in enumerate(self.inputs):
             if psbt_in.final_script_sig is not None or psbt_in.final_script_witness is not None:
                 continue  # already finalised
@@ -432,7 +421,6 @@ class PSBT:
 
     @staticmethod
     def _finalize_p2wpkh(psbt_in: PSBTInput) -> None:
-        """Finalise a P2WPKH input."""
         if len(psbt_in.partial_sigs) != 1:
             return
         pubkey, sig = next(iter(psbt_in.partial_sigs.items()))
@@ -452,7 +440,6 @@ class PSBT:
 
     @staticmethod
     def _finalize_p2pkh(psbt_in: PSBTInput) -> None:
-        """Finalise a P2PKH input."""
         if len(psbt_in.partial_sigs) != 1:
             return
         pubkey, sig = next(iter(psbt_in.partial_sigs.items()))
@@ -468,14 +455,10 @@ class PSBT:
         psbt_in.witness_script = None
         psbt_in.sighash_type = None
 
-    # ── extract ───────────────────────────────────────────────────
+    # extract
 
     def extract_transaction(self) -> Transaction:
-        """
-        Extract the fully-signed transaction from a finalised PSBT.
-
-        Raises ``ValueError`` if any input is not finalised.
-        """
+        """Extract the fully-signed transaction from a finalised PSBT; raises ValueError if any input is not finalised."""
         tx = copy.deepcopy(self.tx)
         has_witness = False
 
@@ -498,12 +481,10 @@ class PSBT:
         tx.txid = hashlib.sha256(hashlib.sha256(tx.serialize()).digest()).digest()
         return tx
 
-    # ── decode (human-readable) ───────────────────────────────────
+    # decode (human-readable)
 
     def decode(self) -> Dict:
-        """
-        Return a human-readable dictionary representation (``decodepsbt``).
-        """
+        """Return a human-readable dictionary representation (``decodepsbt``)."""
         result: Dict = {
             "tx": {
                 "txid": self.tx.txid.hex(),

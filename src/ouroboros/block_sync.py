@@ -45,19 +45,7 @@ class BlockSync:
         mempool=None,  # Optional mempool for re-adding txs after reorg
         fee_estimator=None,  # Optional FeeEstimator to feed confirmed-block fee data
     ):
-        """
-        Initialize block synchronizer.
-        
-        Args:
-            db: Blockchain database
-            validator: Block validator
-            peer_manager: Peer manager instance (must have get_all_ready_peers,
-                         get_best_peer, broadcast methods)
-            mempool: Optional mempool to re-validate and re-add transactions
-                     from disconnected blocks after reorg
-            fee_estimator: Optional FeeEstimator to record fee rates from
-                          confirmed blocks
-        """
+        """Initialize block synchronizer."""
         self.db = db
         self.validator = validator
         self.peer_manager = peer_manager
@@ -65,6 +53,7 @@ class BlockSync:
         self.fee_estimator = fee_estimator
         
         # Track requested blocks (hash -> request_time)
+        # FIXME: race condition if called from multiple threads?
         self.requested_blocks: Dict[bytes, float] = {}
 
         # Track requested transactions (hash -> request_time)
@@ -132,7 +121,6 @@ class BlockSync:
             await self._unregister_handlers(peer)
     
     async def _register_handlers(self):
-        """Register message handlers for all ready peers"""
         # Get all ready peers (assuming peer_manager has this method)
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             peers = self.peer_manager.get_all_ready_peers()
@@ -160,25 +148,21 @@ class BlockSync:
             }
     
     async def _unregister_handlers(self, peer: Peer):
-        """Unregister message handlers for a peer"""
         # Note: Peer class doesn't have unregister_handler, so we just remove from tracking
         if peer in self._peer_handlers:
             del self._peer_handlers[peer]
     
     def _make_inv_handler(self, peer: Peer):
-        """Create inv message handler for a specific peer"""
         async def handler(msg: NetworkMessage):
             await self.handle_inv(msg, peer)
         return handler
     
     def _make_block_handler(self, peer: Peer):
-        """Create block message handler for a specific peer"""
         async def handler(msg: NetworkMessage):
             await self.handle_block(msg, peer)
         return handler
     
     def _make_headers_handler(self, peer: Peer):
-        """Create headers message handler for a specific peer"""
         async def handler(msg: NetworkMessage):
             await self.handle_headers(msg, peer)
         return handler
@@ -229,6 +213,7 @@ class BlockSync:
         """Handle inventory announcement (blocks + transactions)."""
         try:
             inv = InvMessage.from_payload(msg.payload)
+            # logger.debug(f'inv from {peer.host}:{peer.port}, {len(inv.inventory)} items')
 
             blocks_to_request = []
             txs_to_request = []
@@ -386,7 +371,6 @@ class BlockSync:
             peer.adjust_score(-5)
     
     def _header_to_block_hash(self, header) -> bytes:
-        """Compute block hash from header (display format)."""
         header_bytes = header.serialize()
         block_hash_raw = hashlib.sha256(hashlib.sha256(header_bytes).digest()).digest()
         return block_hash_raw[::-1]
@@ -427,12 +411,7 @@ class BlockSync:
     async def _announce_block(
         self, block: Block, block_hash: bytes, exclude_peer: Peer | None = None,
     ) -> None:
-        """Announce a validated block to peers based on their preferences.
-
-        - ``wants_cmpctblock``: send a BIP 152 ``cmpctblock`` message.
-        - ``wants_headers``: send a ``headers`` message with the single header.
-        - Otherwise: send a traditional ``inv`` message.
-        """
+        """Announce a validated block to peers based on their preferences."""
         if not hasattr(self.peer_manager, 'get_all_ready_peers'):
             return
         network = getattr(self.peer_manager, 'network', 'mainnet')
@@ -466,12 +445,7 @@ class BlockSync:
                 logger.debug(f"Failed to announce block to {p.host}:{p.port}: {e}")
 
     async def _process_orphans(self, applied_block_hash: bytes) -> None:
-        """
-        Process orphan blocks that may now have their parent in our chain.
-        Recursively processes orphans as we connect blocks.
-        
-        Ref: bitcoin/src/net_processing.cpp ProcessOrphanTx
-        """
+        """Process orphan blocks that may now have their parent in our chain."""
         to_process = [
             (h, b) for h, b in self.orphan_blocks.items()
             if b.prev_blockhash == applied_block_hash
@@ -503,7 +477,6 @@ class BlockSync:
                 await self._process_orphans(block_hash)
 
     async def _catch_up(self, peer: Peer, our_height: int):
-        """Request blocks to catch up"""
         try:
             # Build locator
             locator = self._build_locator(our_height)
@@ -530,15 +503,7 @@ class BlockSync:
             peer.adjust_score(-2)
     
     def _build_locator(self, height: int) -> List[bytes]:
-        """
-        Build block locator (exponential spacing).
-        
-        Args:
-            height: Current block height
-            
-        Returns:
-            List of block hashes for locator
-        """
+        """Build block locator (exponential spacing)."""
         locator = []
         step = 1
         current_height = height
@@ -571,7 +536,6 @@ class BlockSync:
         return locator
     
     def _get_peer_with_highest_block(self) -> Optional[Peer]:
-        """Get peer with highest block height"""
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             peers = self.peer_manager.get_all_ready_peers()
         else:
@@ -627,17 +591,6 @@ class BlockSync:
                     logger.error(f"Failed to re-request block: {e}")
     
     async def _find_transaction_in_blocks(self, txid: bytes, max_height: int, min_height: int = 0) -> Optional['Transaction']:
-        """
-        Find a transaction by txid by searching through blocks.
-        
-        Args:
-            txid: Transaction ID to find
-            max_height: Maximum height to search (inclusive)
-            min_height: Minimum height to search (inclusive)
-            
-        Returns:
-            Transaction if found, None otherwise
-        """
         # Search backwards from max_height to min_height
         for height in range(max_height, min_height - 1, -1):
             try:
@@ -656,21 +609,7 @@ class BlockSync:
         return None
     
     async def _restore_utxos_from_block(self, block: Block, max_search_height: int) -> List[Tuple[bytes, int, int, bytes]]:
-        """
-        Restore UTXOs that were spent in this block.
-        
-        For each non-coinbase transaction input, we need to:
-        1. Find the transaction that created the UTXO (prev_txid)
-        2. Get the output data from that transaction
-        3. Return UTXO data: (txid, vout, value, script_pubkey)
-        
-        Args:
-            block: Block being disconnected
-            max_search_height: Maximum block height to search for transactions
-            
-        Returns:
-            List of (txid, vout, value, script_pubkey) tuples for UTXOs to restore
-        """
+        """Restore UTXOs that were spent in this block."""
         utxos_to_restore = []
         
         for tx in block.transactions:
@@ -708,23 +647,7 @@ class BlockSync:
         return utxos_to_restore
     
     async def _handle_reorg(self, new_block: Block, new_chain_tip: bytes):
-        """
-        Handle chain reorganization.
-        
-        Implementation:
-        1. Find common ancestor between current chain and new chain
-        2. Disconnect blocks from current chain back to common ancestor
-        3. Connect blocks from new chain
-        4. Update UTXO set for each disconnected/connected block
-        5. Re-validate orphan transactions from mempool
-        
-        Args:
-            new_block: New block that caused the reorg
-            new_chain_tip: Hash of the new chain tip
-            
-        Returns:
-            True if reorg was handled successfully, False otherwise
-        """
+        """Handle chain reorganization."""
         logger.warning(f"Handling chain reorganization to new tip: {new_chain_tip.hex()[:16]}...")
         
         try:

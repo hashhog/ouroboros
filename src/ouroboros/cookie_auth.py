@@ -1,5 +1,5 @@
 """
-Cookie-based RPC authentication compatible with Bitcoin Core.
+Cookie-based RPC authentication.
 
 At startup the node writes ``{data_dir}/.cookie`` containing
 ``__cookie__:<random_hex>``.  RPC clients read this file to authenticate.
@@ -19,11 +19,7 @@ COOKIE_USER = "__cookie__"
 
 
 def generate_cookie(data_dir: str) -> Tuple[str, str]:
-    """
-    Create a fresh ``.cookie`` file in *data_dir*.
-
-    Returns ``(username, password)``.
-    """
+    """Write a fresh ``.cookie`` file and return ``(username, password)``."""
     password = secrets.token_hex(32)
     cookie_path = Path(data_dir) / COOKIE_FILENAME
     cookie_path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,11 +33,7 @@ def generate_cookie(data_dir: str) -> Tuple[str, str]:
 
 
 def read_cookie(data_dir: str) -> Tuple[str, str]:
-    """
-    Read credentials from an existing ``.cookie`` file.
-
-    Raises ``FileNotFoundError`` if the cookie file does not exist.
-    """
+    """Read credentials from the ``.cookie`` file; raises FileNotFoundError if missing."""
     cookie_path = Path(data_dir) / COOKIE_FILENAME
     if not cookie_path.exists():
         raise FileNotFoundError(f"Cookie file not found: {cookie_path}")

@@ -287,7 +287,7 @@ impl BlockValidator {
         let inner = block.inner();
         let block_hash = *block.block_hash().as_byte_array();
 
-        // ── Phase 1: Write HEAD_BLOCKS marker ───────────────────────
+        // Phase 1: Write HEAD_BLOCKS marker
         // Record old tip so crash recovery knows where to roll back to.
         let (old_tip_hash, old_tip_height) = if height == 0 {
             ([0u8; 32], 0u32)
@@ -301,7 +301,7 @@ impl BlockValidator {
             height,
         )?;
 
-        // ── UTXO mutations + transaction index ────────────────────
+        // UTXO mutations + transaction index
         for (tx_pos, tx) in inner.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
 
@@ -351,7 +351,7 @@ impl BlockValidator {
         let metadata = BlockMetadata::new(height, chainwork, timestamp);
         self.db.store_block_metadata(height, &block_hash, &metadata)?;
 
-        // ── Phase 2: Update chain tip + delete marker ───────────────
+        // Phase 2: Update chain tip + delete marker
         self.db.update_best_block(&block_hash, height)?;
         self.db.delete_head_blocks()?;
 

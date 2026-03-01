@@ -71,7 +71,6 @@ def _sha256(data: bytes) -> bytes:
 
 
 def _tagged_hash(tag: str, data: bytes) -> bytes:
-    """BIP 340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data)."""
     tag_hash = _sha256(tag.encode())
     return _sha256(tag_hash + tag_hash + data)
 
@@ -105,12 +104,7 @@ def _polymod(c: int, val: int) -> int:
 
 
 def descriptor_checksum(desc: str) -> str:
-    """
-    Compute the 8-character descriptor checksum per BIP 380.
-
-    *desc* must be the descriptor string **without** any existing ``#…``
-    suffix.
-    """
+    """BIP 380 descriptor checksum for *desc* (must not include an existing ``#…`` suffix)."""
     c = 1
     cls = 0
     clscount = 0
@@ -222,11 +216,7 @@ class ExtendedPubKey:
 
     @classmethod
     def deserialize(cls, encoded: str) -> "ExtendedPubKey":
-        """Deserialise an xpub / tpub / xprv / tprv string.
-
-        If an *xprv* is given the private key is used to compute the
-        public key so that we always store the public half.
-        """
+        """Deserialise an xpub/tpub/xprv/tprv string; xprv keys are converted to their public half."""
         raw = base58.b58decode_check(encoded)
         if len(raw) != 78:
             raise ValueError("Invalid extended key length")
@@ -448,7 +438,6 @@ class Descriptor:
 
 
 def _pubkey_to_p2wpkh(pub: bytes, network: str) -> str:
-    """Compressed pubkey → bech32 P2WPKH address."""
     h160 = _hash160(pub)
     hrp = "bc" if network == "mainnet" else "tb"
     bits5 = bech32.convertbits(h160, 8, 5)
@@ -456,14 +445,12 @@ def _pubkey_to_p2wpkh(pub: bytes, network: str) -> str:
 
 
 def _pubkey_to_p2pkh(pub: bytes, network: str) -> str:
-    """Compressed pubkey → legacy P2PKH address."""
     h160 = _hash160(pub)
     version = b"\x00" if network == "mainnet" else b"\x6f"
     return base58.b58encode_check(version + h160).decode()
 
 
 def _pubkey_to_p2sh_p2wpkh(pub: bytes, network: str) -> str:
-    """Compressed pubkey → P2SH-wrapped P2WPKH address."""
     h160 = _hash160(pub)
     redeem_script = b"\x00\x14" + h160
     script_hash = _hash160(redeem_script)
@@ -472,7 +459,6 @@ def _pubkey_to_p2sh_p2wpkh(pub: bytes, network: str) -> str:
 
 
 def _taproot_tweak_pubkey(pub: bytes) -> bytes:
-    """Apply the BIP 341 key-path-only tweak and return the 32-byte x-only output key."""
     x_only = pub[1:]  # drop 02/03 prefix
     tweak = _tagged_hash("TapTweak", x_only)
     # Compute P + t*G
@@ -482,7 +468,6 @@ def _taproot_tweak_pubkey(pub: bytes) -> bytes:
 
 
 def _pubkey_to_p2tr(pub: bytes, network: str) -> str:
-    """Compressed pubkey → bech32m P2TR address."""
     from ouroboros.address import _bech32m_encode
     tweaked_x = _taproot_tweak_pubkey(pub)
     hrp = "bc" if network == "mainnet" else "tb"
@@ -490,7 +475,6 @@ def _pubkey_to_p2tr(pub: bytes, network: str) -> str:
 
 
 def _make_multisig_script(threshold: int, pubkeys: List[bytes]) -> bytes:
-    """Build a bare M-of-N multisig redeemScript."""
     if threshold < 1 or threshold > len(pubkeys):
         raise ValueError(
             f"Invalid multisig threshold: {threshold} of {len(pubkeys)}"
@@ -508,14 +492,12 @@ def _make_multisig_script(threshold: int, pubkeys: List[bytes]) -> bytes:
 
 
 def _script_to_p2sh(script: bytes, network: str) -> str:
-    """Script → P2SH address."""
     script_hash = _hash160(script)
     version = b"\x05" if network == "mainnet" else b"\xc4"
     return base58.b58encode_check(version + script_hash).decode()
 
 
 def _script_to_p2wsh(script: bytes, network: str) -> str:
-    """Script → P2WSH (bech32) address."""
     witness_program = _sha256(script)
     hrp = "bc" if network == "mainnet" else "tb"
     bits5 = bech32.convertbits(witness_program, 8, 5)
@@ -527,7 +509,6 @@ def _script_to_p2wsh(script: bytes, network: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _find_matching_paren(s: str, start: int = 0) -> int:
-    """Find the index of the closing ')' that matches the '(' at *start*."""
     if s[start] != "(":
         raise ValueError(f"Expected '(' at position {start}")
     depth = 0
@@ -641,7 +622,6 @@ def parse_descriptor(desc_str: str) -> Descriptor:
 def _parse_multi_inner(
     inner: str, dtype: str, canonical: str
 ) -> Descriptor:
-    """Parse the inside of a ``multi(M, KEY, KEY, ...)`` expression."""
     # Split by commas, but be careful about brackets in origins
     parts = _split_top_level_commas(inner)
     if len(parts) < 2:
@@ -663,7 +643,6 @@ def _parse_multi_inner(
 
 
 def _split_top_level_commas(s: str) -> List[str]:
-    """Split a string by commas, ignoring commas inside brackets/parens."""
     parts: List[str] = []
     depth = 0
     current: List[str] = []

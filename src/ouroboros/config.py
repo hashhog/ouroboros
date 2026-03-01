@@ -19,7 +19,6 @@ CHAIN_SECTIONS = ('main', 'mainnet', 'test', 'testnet', 'testnet3', 'testnet4', 
 
 
 def _ports_for_network(network: str) -> tuple:
-    """Return (rpc_port, p2p_port) for network."""
     if network == 'testnet':
         return '18332', '18333'
     if network == 'regtest':
@@ -35,15 +34,7 @@ class NodeConfig:
         config_path: Optional[str] = None,
         data_dir: Optional[str] = None,
     ):
-        """
-        Initialize configuration.
-        
-        Args:
-            config_path: Path to config file. If None, uses data_dir/ouroboros.conf
-                        or ~/.ouroboros/ouroboros.conf.
-            data_dir: Data directory (for resolving config_path when config_path is None).
-                      OROBOROS_DATADIR env var overrides this.
-        """
+        """Initialize configuration."""
         # Resolve data_dir: env overrides parameter
         data_dir = os.environ.get('OUROBOROS_DATADIR') or data_dir or str(Path.home() / ".ouroboros")
         data_dir = str(Path(data_dir).expanduser())
@@ -103,7 +94,6 @@ class NodeConfig:
                 logger.warning(f"Error reading config file {self.config_path}: {e}")
 
     def _get_without_env(self, key: str) -> Optional[str]:
-        """Get value from config file only (no env). Used during init."""
         for sec in ('DEFAULT',) + CHAIN_SECTIONS:
             try:
                 if self.config.has_section(sec) and self.config.has_option(sec, key):
@@ -166,16 +156,7 @@ class NodeConfig:
         return self.defaults.get(key)
     
     def getint(self, key: str, section: Optional[str] = None) -> int:
-        """
-        Get config value as integer.
-        
-        Args:
-            key: Config key
-            section: Config section
-            
-        Returns:
-            Integer value or default
-        """
+        """Get a config value as an integer."""
         value = self.get(key, section)
         if value is None:
             default = self.defaults.get(key, '0')
@@ -189,16 +170,7 @@ class NodeConfig:
             return 0
     
     def getboolean(self, key: str, section: Optional[str] = None) -> bool:
-        """
-        Get config value as boolean.
-        
-        Args:
-            key: Config key
-            section: Config section
-            
-        Returns:
-            Boolean value or default
-        """
+        """Get a config value as a boolean."""
         value = self.get(key, section)
         if value is None:
             default = self.defaults.get(key, '0')
@@ -206,12 +178,7 @@ class NodeConfig:
         return value.lower() in ('1', 'true', 'yes', 'on')
     
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert config to dictionary.
-        
-        Returns:
-            Dictionary with all configuration values
-        """
+        """Return all config values as a dictionary."""
         return {
             'network': self.get('network'),
             'datadir': self.get('datadir'),

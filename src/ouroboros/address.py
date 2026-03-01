@@ -21,7 +21,7 @@ _P2WPKH_PREFIX = bytes([0x00, 0x14])
 # P2WSH: OP_0 <32-byte hash>
 _P2WSH_PREFIX = bytes([0x00, 0x20])
 
-# ── bech32m (BIP 350) ────────────────────────────────────────────────
+# bech32m (BIP 350)
 # The only difference from bech32 is the checksum constant:
 #   bech32  → polymod == 1
 #   bech32m → polymod == 0x2bc830a3
@@ -29,10 +29,6 @@ _BECH32M_CONST = 0x2bc830a3
 
 
 def _decode_base58check(address: str) -> Tuple[int, bytes]:
-    """
-    Decode base58check address.
-    Returns (version_byte, payload).
-    """
     import base58
     decoded = base58.b58decode_check(address)
     if len(decoded) < 2:
@@ -43,7 +39,6 @@ def _decode_base58check(address: str) -> Tuple[int, bytes]:
 
 
 def _bech32m_polymod(values: list) -> int:
-    """Internal polymod used by bech32 / bech32m (BIP 173 / BIP 350)."""
     GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
     chk = 1
     for v in values:
@@ -59,7 +54,6 @@ def _bech32m_hrp_expand(hrp: str) -> list:
 
 
 def _bech32m_verify_checksum(hrp: str, data: list) -> str:
-    """Return 'bech32' or 'bech32m' if checksum is valid, else ''."""
     const = _bech32m_polymod(_bech32m_hrp_expand(hrp) + data)
     if const == 1:
         return "bech32"
@@ -79,10 +73,7 @@ _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
 
 def _bech32m_decode(address: str) -> Tuple[Optional[str], Optional[int], Optional[list]]:
-    """
-    Decode a bech32 or bech32m address.
-    Returns (hrp, witness_version, data_5bit) or (None, None, None).
-    """
+    """Decode a bech32 or bech32m address."""
     if any(ord(c) < 33 or ord(c) > 126 for c in address):
         return None, None, None
     lower = address.lower()
@@ -112,7 +103,6 @@ def _bech32m_decode(address: str) -> Tuple[Optional[str], Optional[int], Optiona
 
 
 def _bech32m_encode(hrp: str, witness_version: int, witness_program: bytes) -> str:
-    """Encode a witness program as a bech32 or bech32m address."""
     import bech32 as _b32
     spec = "bech32" if witness_version == 0 else "bech32m"
     data_5bit = _b32.convertbits(witness_program, 8, 5)
@@ -124,11 +114,6 @@ def _bech32m_encode(hrp: str, witness_version: int, witness_program: bytes) -> s
 
 
 def _decode_bech32(address: str) -> Tuple[int, bytes]:
-    """
-    Decode bech32/bech32m segwit address.
-    Returns (witness_version, witness_program).
-    Handles both v0 (bech32) and v1+ (bech32m / Taproot).
-    """
     import bech32
     hrp, witness_version, data_5bit = _bech32m_decode(address)
     if hrp is None or data_5bit is None or witness_version is None:
@@ -142,18 +127,9 @@ def _decode_bech32(address: str) -> Tuple[int, bytes]:
 
 
 def address_to_script_pubkey(address: str, network: str = "mainnet") -> bytes:
-    """
-    Decode Bitcoin address and return script_pubkey.
+    """Decode a Bitcoin address and return the scriptPubKey bytes.
 
-    Args:
-        address: Bitcoin address (P2PKH 1..., P2SH 3..., P2WPKH bc1/tb1...)
-        network: "mainnet" or "testnet" (for bech32 HRP validation)
-
-    Returns:
-        script_pubkey as bytes
-
-    Raises:
-        ValueError: If address is invalid
+    Raises ValueError for invalid or unsupported addresses.
     """
     address = address.strip()
     if not address:
