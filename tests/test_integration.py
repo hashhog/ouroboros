@@ -15,6 +15,7 @@ from ouroboros.wallet import (
     WalletKey, Wallet, HDKey,
     encrypt_wallet_data, decrypt_wallet_data,
     select_coins, select_coins_bnb, select_coins_knapsack, select_coins_srd,
+    _selection_waste, DEFAULT_LONG_TERM_FEE_RATE,
 )
 from ouroboros.fee_estimator import FeeEstimator, BlockFeeData
 from ouroboros.address import address_to_script_pubkey
@@ -1950,3 +1951,71 @@ class TestCoinSelection:
         assert selected is not None
         total = sum(u["value"] for u in selected)
         assert total >= 100_000 + fee
+
+    # ── Waste metric ─────────────────────────────────────────────
+
+    def test_waste_metric_no_change_zero(self):
+        """Exact BnB match: change_cost is 0."""
+        sel = [_utxo(50_000)]
+        waste = _selection_waste(sel, fee_rate=10.0, long_term_fee_rate=10.0, has_change=False)
+        # timing_cost = 68 * (10 - 10) = 0;  change_cost = 0
+        assert waste == 0.0
+
+    def test_waste_metric_with_change(self):
+        """With change output: change_cost = 99 * fee_rate."""
+        sel = [_utxo(50_000)]
+        waste = _selection_waste(sel, fee_rate=20.0, long_term_fee_rate=10.0, has_change=True)
+        # timing_cost = 68 * (20 - 10) = 680
+        # change_cost = 99 * 20 = 1980
+        # total = 2660
+        assert waste == pytest.approx(2660.0)
+
+    def test_waste_metric_negative_timing(self):
+        """fee_rate < long_term → negative timing cost favours more inputs."""
+        sel = [_utxo(10_000), _utxo(10_000)]
+        waste = _selection_waste(sel, fee_rate=1.0, long_term_fee_rate=10.0, has_change=True)
+        # timing_cost = 2 * 68 * (1 - 10) = -1224
+        # change_cost = 99 * 1 = 99
+        # total = -1125
+        assert waste == pytest.approx(-1125.0)
+
+    def test_select_coins_high_fee_prefers_bnb(self):
+        """At high fee rates, BnB exact match (no change) should be preferred."""
+        # Craft UTXOs so BnB can find an exact match.
+        # BnB target = amount + non_input_fee(1, fee_rate)
+        #            = 50_000 + int((11 + 31) * 50.0) + 1 = 50_000 + 2101 = 52_101
+        # Effective value = utxo_value - int(68 * 50.0) = utxo_value - 3400
+        # For exact match: utxo_value - 3400 == 52_101 → utxo_value = 55_501
+        utxos = [_utxo(55_501), _utxo(30_000), _utxo(30_000)]
+        _, _, algo = select_coins(utxos, 50_000, fee_rate=50.0, long_term_fee_rate=10.0)
+        assert algo == "bnb"
+
+    def test_select_coins_low_fee_may_prefer_fewer_inputs(self):
+        """At low fee rates (below long-term), consolidation is cheap."""
+        # With fee_rate=1.0 < long_term=10.0, timing_cost is negative
+        # so more inputs are actually cheaper (consolidation is rewarded).
+        utxos = [_utxo(100_000), _utxo(50_000), _utxo(30_000)]
+        selected, _, algo = select_coins(utxos, 45_000, fee_rate=1.0, long_term_fee_rate=10.0)
+        assert selected is not None
+        total = sum(u["value"] for u in selected)
+        assert total >= 45_000
+
+    def test_select_coins_long_term_fee_rate_default(self):
+        """Default long_term_fee_rate is 10 sat/vB."""
+        assert DEFAULT_LONG_TERM_FEE_RATE == 10.0
+        # Confirm select_coins works without explicit long_term_fee_rate
+        utxos = [_utxo(100_000)]
+        selected, fee, algo = select_coins(utxos, 50_000, fee_rate=1.0)
+        assert selected is not None
+
+    def test_select_coins_waste_picks_best(self):
+        """When multiple algos succeed, the lowest-waste result wins."""
+        # Use fee_rate == long_term_fee_rate so timing cost is 0.
+        # Then waste is purely change_cost: BnB (no change) → waste = 0.
+        # BnB target = 50_000 + int(42 * 5) + 1 = 50_211
+        # eff_value = utxo - 340 → need utxo = 50_551
+        utxos = [_utxo(50_551), _utxo(25_000), _utxo(26_000)]
+        _, _, algo = select_coins(utxos, 50_000, fee_rate=5.0, long_term_fee_rate=5.0)
+        # With timing cost = 0, BnB waste = 0 (no change) vs.
+        # knapsack/srd waste = 99 * 5 = 495. BnB must win.
+        assert algo == "bnb"

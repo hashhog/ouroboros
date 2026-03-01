@@ -291,12 +291,17 @@ impl PyBlockchainDB {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 format!("Failed to open database: {}", e)
             ))?;
-        
+
+        // Check for and recover from a crash during the previous apply_block()
+        if let Err(e) = db.recover_from_crash() {
+            log::error!("Crash recovery failed: {} — continuing anyway", e);
+        }
+
         Ok(Self {
             db: Arc::new(db),
         })
     }
-    
+
     /// Get block by hash
     fn get_block(&self, block_hash: &[u8]) -> PyResult<Option<PyBlock>> {
         if block_hash.len() != 32 {
@@ -483,6 +488,63 @@ impl PyBlockchainDB {
                 format!("Database error: {}", e)
             )
         })
+    }
+
+    /// Check for and recover from a mid-apply crash (two-phase commit).
+    ///
+    /// If a HEAD_BLOCKS marker exists in META_CF, the previous process
+    /// crashed during apply_block(). This method rolls back the partial
+    /// apply by disconnecting the incomplete block and restoring the UTXO
+    /// set to the previous chain tip.
+    ///
+    /// Should be called once at startup before any new blocks are applied.
+    ///
+    /// Returns True if a recovery was performed, False if the database was clean.
+    fn recover_from_crash(&self) -> PyResult<bool> {
+        self.db.recover_from_crash().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Crash recovery failed: {}", e)
+            )
+        })
+    }
+
+    /// Look up a confirmed transaction's block location by txid.
+    ///
+    /// Returns a dict with keys: block_hash (bytes), height (int),
+    /// tx_position (int), or None if the transaction is not indexed.
+    fn get_tx_index(&self, txid: &[u8]) -> PyResult<Option<(Vec<u8>, u32, u32)>> {
+        if txid.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Transaction ID must be 32 bytes"
+            ));
+        }
+        let mut txid_bytes = [0u8; 32];
+        txid_bytes.copy_from_slice(txid);
+        self.db.get_tx_index(&txid_bytes).map(|opt| {
+            opt.map(|(block_hash, height, tx_pos)| {
+                (block_hash.to_vec(), height, tx_pos)
+            })
+        }).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
+
+    /// Disconnect the block at the given height — reverse all UTXO changes.
+    ///
+    /// Removes outputs created by the block from the UTXO set and restores
+    /// spent inputs from undo data in SPENT_CF. Updates the chain tip to
+    /// the previous block.
+    ///
+    /// Returns the hash of the disconnected block.
+    fn disconnect_block(&self, height: u32) -> PyResult<Vec<u8>> {
+        match self.db.disconnect_block_at_height(height) {
+            Ok(hash) => Ok(hash.to_vec()),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to disconnect block at height {}: {}", height, e)
+            )),
+        }
     }
 
     /// Context manager support for transactions
@@ -756,6 +818,11 @@ impl FastSync {
                 format!("Failed to open database: {}", e)
             ))?,
         );
+
+        // Check for and recover from a crash during the previous apply_block()
+        if let Err(e) = db.recover_from_crash() {
+            log::error!("Crash recovery failed: {} — continuing anyway", e);
+        }
 
         // Create validator components
         let header_validator = Arc::new(HeaderValidator::new(Arc::clone(&db), network_enum));
