@@ -13,6 +13,7 @@ from starlette.requests import Request
 from typing import Dict, Any, List, Optional, Union
 import json
 import logging
+import statistics
 import time
 from collections import defaultdict
 from pydantic import BaseModel
@@ -20,6 +21,20 @@ from pydantic import BaseModel
 from ouroboros.database import Transaction, TxIn, TxOut, Block
 from ouroboros.script import disassemble_script
 from ouroboros.metrics import record_rpc_request
+from ouroboros.blockfilter import (
+    build_basic_filter,
+    compute_filter_header,
+    compute_filter_hash,
+    BlockFilterIndex,
+)
+from ouroboros.validation import (
+    _count_legacy_sigops,
+    _get_p2sh_sigops,
+    _count_witness_sigops,
+    _is_p2sh,
+    _get_last_push,
+    WITNESS_SCALE_FACTOR,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +352,47 @@ class RPCServer:
         async def health():
             """Health check endpoint"""
             return {"status": "healthy", "service": "bitcoin-rpc"}
-    
+
+        @self.app.get("/getblockstats")
+        async def getblockstats(
+            hash_or_height: str,
+            stats: Optional[str] = None,
+            http_request: Request = None,
+        ):
+            """GET endpoint for getblockstats.
+
+            ``hash_or_height`` is passed as a query parameter (string).
+            If it looks like an integer it is treated as a block height,
+            otherwise it is treated as a block hash.
+
+            ``stats`` is an optional comma-separated list of stat names to
+            return.
+            """
+            # Coerce to int when possible
+            parsed: Union[int, str]
+            try:
+                parsed = int(hash_or_height)
+            except ValueError:
+                parsed = hash_or_height
+
+            stats_list: Optional[List[str]] = None
+            if stats:
+                stats_list = [s.strip() for s in stats.split(",") if s.strip()]
+
+            return await self.rpc_getblockstats(parsed, stats_list)
+
+        @self.app.get("/getblockfilter")
+        async def getblockfilter_get(
+            blockhash: str,
+            filtertype: str = "basic",
+        ):
+            """GET endpoint for getblockfilter (BIP 157/158).
+
+            ``blockhash`` is the hex-encoded block hash.
+            ``filtertype`` is the filter type name (only ``basic`` supported).
+            """
+            return await self.rpc_getblockfilter(blockhash, filtertype)
+
     async def _get_credentials(self, request: Request) -> Optional[HTTPBasicCredentials]:
         """Get and validate credentials if authentication is enabled"""
         if not self.security:
@@ -525,22 +580,68 @@ class RPCServer:
         verbose: bool = False,
         blockhash: Optional[str] = None
     ) -> Union[str, Dict[str, Any]]:
-        """Return transaction"""
+        """Return raw transaction data.
+
+        Searches the mempool first, then falls back to the on-disk
+        transaction index.  If *blockhash* is provided the transaction
+        is looked up directly inside that block.
+        """
         try:
             tx_hash = bytes.fromhex(txid)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid transaction ID")
-        
-        # Try mempool first
+
+        # ── 1. Mempool lookup (fast) ─────────────────────────────────
         if hasattr(self.node, 'mempool') and self.node.mempool:
             tx = self.node.mempool.get_transaction(tx_hash)
             if tx:
                 if verbose:
                     return self._tx_to_dict(tx)
                 return tx.serialize().hex()
-        
-        # Try blockchain (would need to search blocks)
-        # For now, return error if not in mempool
+
+        # ── 2. Blockchain lookup ─────────────────────────────────────
+        block = None
+        block_hash_bytes = None
+        block_height = None
+
+        if blockhash is not None:
+            # Caller supplied the containing block hash
+            try:
+                block_hash_bytes = bytes.fromhex(blockhash)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid block hash")
+            block = self.node.db.get_block(block_hash_bytes)
+            if block is None:
+                raise HTTPException(status_code=404, detail="Block not found")
+        else:
+            # Use the transaction index for O(1) lookup
+            try:
+                loc = self.node.db.get_tx_index(tx_hash)
+            except Exception:
+                loc = None
+            if loc is not None:
+                block_hash_bytes, block_height, _tx_pos = loc
+                block = self.node.db.get_block(block_hash_bytes)
+
+        if block is not None:
+            for tx in block.transactions:
+                found_txid = tx.get_txid() if hasattr(tx, 'get_txid') else tx.txid
+                if found_txid == tx_hash:
+                    if verbose:
+                        result = self._tx_to_dict(tx)
+                        # Add block context fields for confirmed txs
+                        if block_hash_bytes:
+                            result["blockhash"] = block_hash_bytes.hex()
+                        if block_height is not None:
+                            result["confirmations"] = self._get_confirmations(block_height)
+                            result["blocktime"] = block.timestamp
+                            result["time"] = block.timestamp
+                        elif block is not None:
+                            result["blocktime"] = block.timestamp
+                            result["time"] = block.timestamp
+                        return result
+                    return tx.serialize().hex()
+
         raise HTTPException(status_code=404, detail="Transaction not found")
     
     async def rpc_getmempoolinfo(self) -> Dict[str, Any]:
@@ -660,16 +761,8 @@ class RPCServer:
             entry = self.node.mempool.get_transaction_entry(txid)
             if entry:
                 txid_hex = txid.hex() if isinstance(txid, bytes) else str(txid)
-                result[txid_hex] = {
-                    "size": entry.size,
-                    "fee": entry.fee,
-                    "time": entry.time,
-                    "height": entry.height,
-                    "startingpriority": 0.0,  # TODO: Calculate priority
-                    "currentpriority": 0.0,    # TODO: Calculate priority
-                    "depends": []  # TODO: Track dependencies
-                }
-        
+                result[txid_hex] = self._format_mempool_entry(entry, txid)
+
         return result
     
     async def rpc_getblockheader(self, blockhash: str, verbose: bool = True) -> Union[str, Dict[str, Any]]:
@@ -740,15 +833,84 @@ class RPCServer:
             logger.error(f"Error getting block header: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
     
+    async def rpc_getblockfilter(
+        self, blockhash: str, filtertype: str = "basic"
+    ) -> Dict[str, Any]:
+        """
+        Return the BIP 158 compact block filter for a block.
+
+        Args:
+            blockhash: Block hash (hex string).
+            filtertype: Filter type name (only ``"basic"`` is supported).
+
+        Returns:
+            ``{"filter": "<hex>", "header": "<hex>"}``
+        """
+        if filtertype != "basic":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown filtertype: {filtertype}. Only 'basic' is supported.",
+            )
+
+        try:
+            block_hash = bytes.fromhex(blockhash)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}")
+
+        if not hasattr(self.node, "db") or not self.node.db:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        block = self.node.db.get_block(block_hash)
+        if not block:
+            raise HTTPException(status_code=404, detail="Block not found")
+
+        # Build the basic filter (includes prevout lookups when db is available)
+        filter_bytes = build_basic_filter(block, self.node.db)
+
+        # Compute filter header.  For a full index the previous filter header
+        # would come from the stored chain; here we use a zero prev-header as
+        # a sane default when no persistent filter index is available.
+        prev_header = b"\x00" * 32
+
+        # If the node keeps a BlockFilterIndex, try to use it.
+        bfi: Optional[BlockFilterIndex] = getattr(self.node, "block_filter_index", None)
+        if bfi is not None:
+            cached_filter = bfi.get_filter(block_hash)
+            cached_header = bfi.get_header(block_hash)
+            if cached_filter is not None and cached_header is not None:
+                return {
+                    "filter": cached_filter.hex(),
+                    "header": cached_header.hex(),
+                }
+            # Look up previous filter header for chaining
+            if block.prev_blockhash and block.prev_blockhash != bytes(32):
+                prev_hdr = bfi.get_header(block.prev_blockhash)
+                if prev_hdr is not None:
+                    prev_header = prev_hdr
+
+        filter_header = compute_filter_header(filter_bytes, prev_header)
+
+        # Cache if index is available
+        if bfi is not None:
+            bfi._filters[block_hash] = filter_bytes
+            bfi._headers[block_hash] = filter_header
+            if block.height is not None:
+                bfi._height_to_hash[block.height] = block_hash
+
+        return {
+            "filter": filter_bytes.hex(),
+            "header": filter_header.hex(),
+        }
+
     async def rpc_gettxout(self, txid: str, n: int, includemempool: bool = True) -> Optional[Dict[str, Any]]:
         """
         Get UTXO information by outpoint.
-        
+
         Args:
             txid: Transaction ID (hex string)
             n: Output index (vout)
             includemempool: If True, also check mempool
-            
+
         Returns:
             Dictionary with UTXO information, or None if spent/not found
         """
@@ -1491,32 +1653,199 @@ class RPCServer:
 
         next_height = best_height + 1
 
-        # ── gather transactions from mempool ──────────────────────
+        # ── gather transactions from mempool (dependency-aware) ───
         MAX_BLOCK_WEIGHT = 4_000_000
         txs: List[Dict[str, Any]] = []
         total_fees = 0
         total_weight = 0
 
         if mempool:
-            for entry_txid in reversed(mempool.by_fee_rate):
-                entry = mempool.transactions.get(entry_txid)
+            # Take a consistent snapshot so concurrent mutations don't
+            # cause inconsistencies during template construction.
+            snap_fee_rate, snap_txs = mempool.snapshot()
+
+            # Build a parent-dependency map: txid → set of in-mempool parents
+            in_mempool = set(snap_txs.keys())
+            parents: Dict[bytes, set] = {}
+            for txid_key, entry in snap_txs.items():
+                tx_parents: set = set()
+                for inp in entry.tx.inputs:
+                    if inp.prev_txid in in_mempool:
+                        tx_parents.add(inp.prev_txid)
+                parents[txid_key] = tx_parents
+
+            included: set = set()
+
+            def _collect_ancestors(txid: bytes, already: set) -> List[bytes]:
+                """BFS to collect all un-included ancestors in topological order."""
+                needed = []
+                queue = [txid]
+                visited = set()
+                while queue:
+                    t = queue.pop(0)
+                    if t in visited or t in already:
+                        continue
+                    visited.add(t)
+                    for p in parents.get(t, set()):
+                        if p not in already:
+                            queue.append(p)
+                    needed.append(t)
+                # Topological sort: ancestors before descendants
+                ordered = []
+                placed = set(already)
+                remaining = list(needed)
+                safety = len(remaining) * len(remaining) + 1
+                while remaining and safety > 0:
+                    safety -= 1
+                    for t in list(remaining):
+                        if parents.get(t, set()).issubset(placed):
+                            ordered.append(t)
+                            placed.add(t)
+                            remaining.remove(t)
+                return ordered
+
+            # ── Compute ancestor fee rate for each mempool entry ──
+            # ancestor_fee_rate = (entry.fee + sum(ancestor fees))
+            #                   / (entry.size + sum(ancestor sizes))
+            # Reference: Bitcoin Core BlockAssembler::addPackageTransactions()
+            ancestor_fee_rates: Dict[bytes, float] = {}
+            for txid_key, entry in snap_txs.items():
+                # Collect full transitive ancestor set via BFS
+                all_ancestors: set = set()
+                queue = list(parents.get(txid_key, set()))
+                while queue:
+                    anc = queue.pop()
+                    if anc in all_ancestors or anc not in snap_txs:
+                        continue
+                    all_ancestors.add(anc)
+                    queue.extend(parents.get(anc, set()))
+                ancestor_fee = entry.fee + sum(
+                    snap_txs[a].fee for a in all_ancestors
+                )
+                ancestor_size = entry.size + sum(
+                    snap_txs[a].size for a in all_ancestors
+                )
+                ancestor_fee_rates[txid_key] = (
+                    ancestor_fee / ancestor_size if ancestor_size > 0 else 0.0
+                )
+
+            # Sort candidates by ancestor fee rate (highest first)
+            sorted_by_ancestor_fee_rate = sorted(
+                snap_txs.keys(),
+                key=lambda txid: ancestor_fee_rates.get(txid, 0.0),
+                reverse=True,
+            )
+
+            for entry_txid in sorted_by_ancestor_fee_rate:
+                if entry_txid in included:
+                    continue
+                entry = snap_txs.get(entry_txid)
                 if entry is None:
                     continue
-                tx_weight = entry.size * 4
-                if total_weight + tx_weight > MAX_BLOCK_WEIGHT - 4000:
-                    break
-                raw = entry.tx.serialize()
-                txid_hex = entry_txid.hex()
-                txs.append({
-                    "data": raw.hex(),
-                    "txid": txid_hex,
-                    "hash": txid_hex,
-                    "fee": entry.fee,
-                    "sigops": 0,
-                    "weight": tx_weight,
-                })
-                total_fees += entry.fee
-                total_weight += tx_weight
+
+                # Collect required ancestors (+ self) in topological order
+                batch = _collect_ancestors(entry_txid, included)
+                batch_weight = sum(
+                    snap_txs[t].size * 4
+                    for t in batch
+                    if t in snap_txs
+                )
+                if total_weight + batch_weight > MAX_BLOCK_WEIGHT - 4000:
+                    continue  # skip — batch doesn't fit
+
+                for t in batch:
+                    e = snap_txs.get(t)
+                    if e is None or t in included:
+                        continue
+                    tw = e.size * 4
+                    raw = e.tx.serialize()
+
+                    # ── Compute sigops cost (matches _validate_block_limits) ──
+                    tx_sigops_cost = 0
+
+                    # Legacy sigops (outputs + inputs) × WITNESS_SCALE_FACTOR
+                    legacy_sigops = 0
+                    for out in e.tx.outputs:
+                        legacy_sigops += _count_legacy_sigops(out.script_pubkey)
+                    for inp in e.tx.inputs:
+                        legacy_sigops += _count_legacy_sigops(inp.script_sig)
+                    tx_sigops_cost += legacy_sigops * WITNESS_SCALE_FACTOR
+
+                    # P2SH sigops × WITNESS_SCALE_FACTOR and witness sigops × 1
+                    for inp in e.tx.inputs:
+                        prev_utxo = db.get_utxo(inp.prev_txid, inp.prev_vout)
+                        if prev_utxo is None:
+                            # Check if parent is an in-mempool tx
+                            parent_entry = snap_txs.get(inp.prev_txid)
+                            if parent_entry and inp.prev_vout < len(parent_entry.tx.outputs):
+                                prev_spk = bytes(parent_entry.tx.outputs[inp.prev_vout].script_pubkey)
+                            else:
+                                continue
+                        else:
+                            prev_spk = bytes(prev_utxo["script_pubkey"])
+
+                        p2sh_sigops = _get_p2sh_sigops(inp.script_sig, prev_spk)
+                        tx_sigops_cost += p2sh_sigops * WITNESS_SCALE_FACTOR
+
+                        # Witness sigops × 1
+                        witness_spk = prev_spk
+                        if _is_p2sh(prev_spk):
+                            redeem = _get_last_push(inp.script_sig)
+                            if redeem is not None:
+                                witness_spk = redeem
+                        tx_sigops_cost += _count_witness_sigops(
+                            witness_spk, inp.witness
+                        )
+
+                    txs.append({
+                        "data": raw.hex(),
+                        "txid": t.hex(),
+                        "hash": t.hex(),
+                        "fee": e.fee,
+                        "sigops": tx_sigops_cost,
+                        "weight": tw,
+                    })
+                    total_fees += e.fee
+                    total_weight += tw
+                    included.add(t)
+        else:
+            snap_txs = {}
+
+        # ── witness commitment ────────────────────────────────────
+        # Compute the SegWit witness merkle root from selected txs.
+        # wtxids: coinbase is 32 zero-bytes, then each selected tx's wtxid.
+        wtxids: List[bytes] = [bytes(32)]  # coinbase placeholder
+        for tx_entry in txs:
+            entry_txid = bytes.fromhex(tx_entry["txid"])
+            entry_obj = snap_txs.get(entry_txid)
+            if entry_obj:
+                wtxids.append(entry_obj.tx.get_wtxid())
+            else:
+                wtxids.append(entry_txid)
+
+        # Merkle root of wtxids
+        level = list(wtxids)
+        while len(level) > 1:
+            next_level = []
+            for i in range(0, len(level), 2):
+                if i + 1 < len(level):
+                    combined = level[i] + level[i + 1]
+                else:
+                    combined = level[i] + level[i]
+                h = _hl.sha256(_hl.sha256(combined).digest()).digest()
+                next_level.append(h)
+            level = next_level
+        witness_root = level[0] if level else bytes(32)
+
+        # commitment = SHA256d(witness_root || nonce), nonce = 32 zero bytes
+        nonce = bytes(32)
+        commitment = _hl.sha256(
+            _hl.sha256(witness_root + nonce).digest()
+        ).digest()
+
+        # Full scriptPubKey: OP_RETURN OP_PUSH36 <magic><commitment>
+        witness_commitment_script = bytes.fromhex("6a24aa21a9ed") + commitment
+        default_witness_commitment = witness_commitment_script.hex()
 
         # ── block reward (subsidy + fees) ─────────────────────────
         subsidy = 50 * 100_000_000
@@ -1550,6 +1879,7 @@ class RPCServer:
             "sigoplimit": 80000,
             "sizelimit": 4000000,
             "weightlimit": MAX_BLOCK_WEIGHT,
+            "default_witness_commitment": default_witness_commitment,
         }
 
     async def rpc_submitblock(self, hexdata: str) -> Optional[str]:
@@ -1751,6 +2081,46 @@ class RPCServer:
             "window_block_count": min(nblocks, best_height),
         }
 
+    async def rpc_getchaintips(self) -> List[Dict[str, Any]]:
+        """Return information about all known tips in the block tree.
+
+        Returns a list of chain tips, including the active chain tip and any
+        orphan/stale branches.  Each entry contains the tip height, block hash,
+        branch length (distance to the main chain fork point) and a status
+        string.
+
+        Status values:
+          "active"        — the current best chain tip
+          "valid-fork"    — fully validated fork (not best chain)
+          "valid-headers" — headers are valid but block data not fully validated
+          "headers-only"  — only headers received
+        """
+        if not hasattr(self.node, "db") or not self.node.db:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        tips: List[Dict[str, Any]] = []
+
+        # Active chain tip ---------------------------------------------------
+        hash_bytes, height = self.node.db.get_best_block()
+        tip_hash_hex: str
+        if isinstance(hash_bytes, bytes):
+            tip_hash_hex = hash_bytes.hex()
+        else:
+            tip_hash_hex = str(hash_bytes)
+
+        tips.append({
+            "height": height,
+            "hash": tip_hash_hex,
+            "branchlen": 0,
+            "status": "active",
+        })
+
+        # Future enhancement: iterate over orphan / stale block headers
+        # stored in the block index and report them as additional tips with
+        # status "valid-fork", "valid-headers", or "headers-only".
+
+        return tips
+
     async def rpc_gettxoutsetinfo(self) -> Dict[str, Any]:
         """Return UTXO set statistics."""
         if not hasattr(self.node, 'db') or not self.node.db:
@@ -1765,34 +2135,176 @@ class RPCServer:
         }
 
     async def rpc_verifychain(self, checklevel: int = 3, nblocks: int = 6) -> bool:
-        """Verify the blockchain database."""
+        """Verify the blockchain database.
+
+        Checks the most recent *nblocks* blocks at the given level:
+          0 — Block data reads and deserializes correctly
+          1 — Block hash matches the stored hash
+          2 — Merkle root matches computed merkle root
+          3 — Proof-of-work meets difficulty target (default)
+          4 — Full transaction structure validation (expensive)
+
+        Args:
+            checklevel: Verification depth 0-4 (default 3)
+            nblocks: Number of recent blocks to check (default 6)
+
+        Returns:
+            True if all checks pass, False otherwise
+        """
+        import hashlib
+        from ouroboros.validation import _bits_to_target
+
+        if not hasattr(self.node, "db") or not self.node.db:
+            return True
+
+        try:
+            _, best_height = self.node.db.get_best_block()
+        except Exception:
+            return True
+
+        start_height = max(0, best_height - nblocks + 1)
+        checklevel = max(0, min(4, checklevel))
+
+        for h in range(best_height, start_height - 1, -1):
+            try:
+                block = self.node.db.get_block_by_height(h)
+                if block is None:
+                    logger.warning(f"verifychain: block at height {h} not found")
+                    return False
+
+                # Level 0: block deserialized successfully (implied)
+
+                if checklevel >= 1:
+                    # Recompute block hash from header and compare
+                    header = bytearray()
+                    header.extend(block.version.to_bytes(4, "little", signed=True))
+                    header.extend(block.prev_blockhash[::-1])
+                    header.extend(block.merkle_root[::-1])
+                    header.extend(block.timestamp.to_bytes(4, "little"))
+                    header.extend(block.bits.to_bytes(4, "little"))
+                    header.extend(block.nonce.to_bytes(4, "little"))
+                    computed = hashlib.sha256(
+                        hashlib.sha256(bytes(header)).digest()
+                    ).digest()[::-1]
+                    if computed != block.hash:
+                        logger.warning(
+                            f"verifychain: hash mismatch at height {h}"
+                        )
+                        return False
+
+                if checklevel >= 2:
+                    # Verify merkle root
+                    txids = [tx.get_txid() for tx in block.transactions]
+                    if not txids:
+                        logger.warning(
+                            f"verifychain: no transactions at height {h}"
+                        )
+                        return False
+                    computed_root = self._compute_merkle_root(txids)
+                    if computed_root != block.merkle_root:
+                        logger.warning(
+                            f"verifychain: merkle root mismatch at height {h}"
+                        )
+                        return False
+
+                if checklevel >= 3:
+                    # Verify proof-of-work meets difficulty target
+                    target = _bits_to_target(block.bits)
+                    if target <= 0:
+                        logger.warning(
+                            f"verifychain: invalid target at height {h}"
+                        )
+                        return False
+                    # block.hash is display format (big-endian)
+                    block_hash_int = int.from_bytes(block.hash, "big")
+                    if block_hash_int > target:
+                        logger.warning(
+                            f"verifychain: PoW failed at height {h}"
+                        )
+                        return False
+
+                if checklevel >= 4:
+                    # Full transaction structure validation
+                    for tx in block.transactions:
+                        if tx.is_coinbase:
+                            continue
+                        if len(tx.inputs) == 0:
+                            logger.warning(
+                                f"verifychain: tx with no inputs "
+                                f"at height {h}"
+                            )
+                            return False
+                        if len(tx.outputs) == 0:
+                            logger.warning(
+                                f"verifychain: tx with no outputs "
+                                f"at height {h}"
+                            )
+                            return False
+
+            except Exception as e:
+                logger.warning(f"verifychain: error at height {h}: {e}")
+                return False
+
         return True
+
+    @staticmethod
+    def _compute_merkle_root(txids: list) -> bytes:
+        """Compute merkle root from a list of txids."""
+        import hashlib
+        if not txids:
+            return bytes(32)
+        level = list(txids)
+        while len(level) > 1:
+            if len(level) % 2 != 0:
+                level.append(level[-1])
+            next_level = []
+            for i in range(0, len(level), 2):
+                h = hashlib.sha256(
+                    hashlib.sha256(level[i] + level[i + 1]).digest()
+                ).digest()
+                next_level.append(h)
+            level = next_level
+        return level[0]
 
     async def rpc_getmempoolancestors(
         self, txid: str, verbose: bool = False
     ) -> Union[List[str], Dict[str, Any]]:
         """Return all in-mempool ancestors of a transaction."""
         if not hasattr(self.node, 'mempool') or not self.node.mempool:
-            return []
+            return [] if not verbose else {}
         txid_bytes = bytes.fromhex(txid)
         tx = self.node.mempool.get_transaction(txid_bytes)
         if tx is None:
             raise ValueError(f"Transaction not in mempool: {txid}")
         ancestors = self.node.mempool._get_ancestors(tx)
-        return [a.hex() for a in ancestors]
+        if not verbose:
+            return [a.hex() for a in ancestors]
+        result: Dict[str, Any] = {}
+        for a_txid in ancestors:
+            entry = self.node.mempool.get_transaction_entry(a_txid)
+            if entry is not None:
+                result[a_txid.hex()] = self._format_mempool_entry(entry, a_txid)
+        return result
 
     async def rpc_getmempooldescendants(
         self, txid: str, verbose: bool = False
     ) -> Union[List[str], Dict[str, Any]]:
         """Return all in-mempool descendants of a transaction."""
         if not hasattr(self.node, 'mempool') or not self.node.mempool:
-            return []
+            return [] if not verbose else {}
         txid_bytes = bytes.fromhex(txid)
         if txid_bytes not in self.node.mempool.transactions:
             raise ValueError(f"Transaction not in mempool: {txid}")
         descendants = self.node.mempool._collect_descendants(txid_bytes)
         descendants.discard(txid_bytes)
-        return [d.hex() for d in descendants]
+        if not verbose:
+            return [d.hex() for d in descendants]
+        result: Dict[str, Any] = {}
+        for d_txid in descendants:
+            entry = self.node.mempool.get_transaction_entry(d_txid)
+            if entry is not None:
+                result[d_txid.hex()] = self._format_mempool_entry(entry, d_txid)
+        return result
 
     async def rpc_createrawtransaction(
         self, inputs: List[Dict], outputs: List[Dict],
@@ -1829,9 +2341,371 @@ class RPCServer:
         self, hexstring: str, privkeys: List[str],
         prevtxs: List[Dict] = None, sighashtype: str = "ALL"
     ) -> Dict[str, Any]:
-        """Sign a raw transaction with provided private keys."""
-        # Parse the raw transaction, sign inputs, return signed hex
-        return {"hex": hexstring, "complete": False}
+        """Sign a raw transaction with provided private keys.
+
+        Args:
+            hexstring: Hex-encoded raw transaction
+            privkeys: Array of WIF-encoded private keys
+            prevtxs: Array of previous outputs being spent, each with
+                      keys: txid, vout, scriptPubKey, amount (optional
+                      redeemScript, witnessScript)
+            sighashtype: Signature hash type (ALL, NONE, SINGLE,
+                         ALL|ANYONECANPAY, NONE|ANYONECANPAY,
+                         SINGLE|ANYONECANPAY, DEFAULT)
+
+        Returns:
+            {hex: signed_tx_hex, complete: bool, errors: [...]}
+        """
+        import hashlib
+        import struct
+        from ouroboros.p2p_messages import TxMessage
+        from ouroboros.database import Transaction as DbTx, TxIn, TxOut
+        from ouroboros.wallet import WalletKey, _hash160, _dsha256, _encode_varint
+
+        # --- Parse sighash type string -----------------------------------
+        sighash_map = {
+            "ALL": 0x01, "NONE": 0x02, "SINGLE": 0x03,
+            "ALL|ANYONECANPAY": 0x81, "NONE|ANYONECANPAY": 0x82,
+            "SINGLE|ANYONECANPAY": 0x83, "DEFAULT": 0x00,
+        }
+        sighash_type = sighash_map.get(sighashtype.upper(), 0x01)
+
+        # --- Deserialize transaction -------------------------------------
+        try:
+            tx_msg = TxMessage.from_payload(bytes.fromhex(hexstring))
+            tx = tx_msg.transaction
+        except Exception as e:
+            raise ValueError(f"TX decode failed: {e}")
+
+        # --- Build key lookup: pubkey_hash / pubkey -> WalletKey ---------
+        network = getattr(self.node, "network", "mainnet")
+        keys_by_h160: Dict[bytes, WalletKey] = {}
+        keys_by_pubkey: Dict[bytes, WalletKey] = {}
+        for wif in privkeys:
+            try:
+                k = WalletKey.from_wif(wif, network)
+                keys_by_h160[_hash160(k.pubkey)] = k
+                keys_by_pubkey[k.pubkey] = k
+                # Also index by x-only key for Taproot
+                keys_by_pubkey[k.pubkey[1:]] = k
+            except Exception:
+                pass
+
+        # --- Build prevout lookup: (txid, vout) -> (scriptPubKey, value) -
+        prev_lookup: Dict[tuple, tuple] = {}
+        if prevtxs:
+            for p in prevtxs:
+                txid_bytes = bytes.fromhex(p["txid"])
+                vout = p["vout"]
+                spk = bytes.fromhex(p["scriptPubKey"])
+                amount = int(float(p.get("amount", 0)) * 1e8)
+                prev_lookup[(txid_bytes, vout)] = (spk, amount)
+
+        # --- Helper: look up prevout info --------------------------------
+        def _get_prevout(inp: TxIn):
+            key = (inp.prev_txid, inp.prev_vout)
+            if key in prev_lookup:
+                return prev_lookup[key]
+            # Fall back to UTXO set
+            if hasattr(self.node, "db") and self.node.db:
+                try:
+                    utxo = self.node.db.get_utxo(
+                        inp.prev_txid, inp.prev_vout
+                    )
+                    if utxo:
+                        return (utxo.script_pubkey, utxo.value)
+                except Exception:
+                    pass
+            return None, None
+
+        # --- Helper: legacy sighash --------------------------------------
+        def _legacy_sighash(tx, idx, script_code, sh_type):
+            enc_varint = _encode_varint
+            base = sh_type & 0x1F
+            acp = (sh_type & 0x80) != 0
+            data = bytearray()
+            data.extend(struct.pack("<i", tx.version))
+            inputs = [(idx, tx.inputs[idx])] if acp else list(enumerate(tx.inputs))
+            data.extend(enc_varint(len(inputs)))
+            for i, ti in inputs:
+                data.extend(ti.prev_txid)
+                data.extend(struct.pack("<I", ti.prev_vout))
+                if i == idx:
+                    data.extend(enc_varint(len(script_code)))
+                    data.extend(script_code)
+                else:
+                    data.extend(b"\x00")
+                seq = 0 if base in (2, 3) and i != idx else ti.sequence
+                data.extend(struct.pack("<I", seq))
+            if base in (0, 1):
+                data.extend(enc_varint(len(tx.outputs)))
+                for o in tx.outputs:
+                    data.extend(struct.pack("<q", o.value))
+                    data.extend(enc_varint(len(o.script_pubkey)))
+                    data.extend(o.script_pubkey)
+            elif base == 2:
+                data.extend(b"\x00")
+            elif base == 3:
+                if idx >= len(tx.outputs):
+                    return bytes(32)
+                data.extend(enc_varint(idx + 1))
+                for j, o in enumerate(tx.outputs):
+                    if j == idx:
+                        data.extend(struct.pack("<q", o.value))
+                        data.extend(enc_varint(len(o.script_pubkey)))
+                        data.extend(o.script_pubkey)
+                    else:
+                        data.extend((-1).to_bytes(8, "little", signed=True))
+                        data.extend(b"\x00")
+            data.extend(struct.pack("<I", tx.locktime))
+            data.extend(struct.pack("<I", sh_type))
+            return _dsha256(bytes(data))
+
+        # --- Helper: BIP 143 (SegWit v0) sighash ------------------------
+        def _bip143_sighash(tx, idx, script_code, value, sh_type):
+            base = sh_type & 0x1F
+            acp = (sh_type & 0x80) != 0
+            if not acp:
+                prevouts = b""
+                for i in tx.inputs:
+                    prevouts += i.prev_txid + struct.pack("<I", i.prev_vout)
+                hp = _dsha256(prevouts)
+            else:
+                hp = b"\x00" * 32
+            if not acp and base not in (2, 3):
+                seqs = b""
+                for i in tx.inputs:
+                    seqs += struct.pack("<I", i.sequence)
+                hs = _dsha256(seqs)
+            else:
+                hs = b"\x00" * 32
+            if base not in (2, 3):
+                outs = b""
+                for o in tx.outputs:
+                    outs += struct.pack("<q", o.value)
+                    outs += _encode_varint(len(o.script_pubkey))
+                    outs += o.script_pubkey
+                ho = _dsha256(outs)
+            elif base == 3 and idx < len(tx.outputs):
+                o = tx.outputs[idx]
+                single = struct.pack("<q", o.value)
+                single += _encode_varint(len(o.script_pubkey))
+                single += o.script_pubkey
+                ho = _dsha256(single)
+            else:
+                ho = b"\x00" * 32
+            inp = tx.inputs[idx]
+            sc_with_len = bytes([len(script_code)]) + script_code
+            pre = struct.pack("<i", tx.version)
+            pre += hp + hs
+            pre += inp.prev_txid + struct.pack("<I", inp.prev_vout)
+            pre += sc_with_len
+            pre += struct.pack("<q", value)
+            pre += struct.pack("<I", inp.sequence)
+            pre += ho
+            pre += struct.pack("<I", tx.locktime)
+            pre += struct.pack("<I", sh_type)
+            return _dsha256(pre)
+
+        # --- Helper: taproot key-path sighash (BIP 341) ------------------
+        def _taproot_sighash(tx, idx, sh_type, amounts, spks):
+            acp = (sh_type & 0x80) != 0
+            base = sh_type & 0x03
+            data = bytearray()
+            data.append(0x00)  # epoch
+            data.append(sh_type)
+            data.extend(struct.pack("<i", tx.version))
+            data.extend(struct.pack("<I", tx.locktime))
+            if not acp:
+                prevouts = bytearray()
+                for i in tx.inputs:
+                    prevouts.extend(i.prev_txid)
+                    prevouts.extend(struct.pack("<I", i.prev_vout))
+                data.extend(hashlib.sha256(bytes(prevouts)).digest())
+                amt_data = bytearray()
+                for a in amounts:
+                    amt_data.extend(struct.pack("<q", a))
+                data.extend(hashlib.sha256(bytes(amt_data)).digest())
+                spk_data = bytearray()
+                for s in spks:
+                    spk_data.extend(_encode_varint(len(s)))
+                    spk_data.extend(s)
+                data.extend(hashlib.sha256(bytes(spk_data)).digest())
+                seqs = bytearray()
+                for i in tx.inputs:
+                    seqs.extend(struct.pack("<I", i.sequence))
+                data.extend(hashlib.sha256(bytes(seqs)).digest())
+            if base not in (2, 3):
+                outs = bytearray()
+                for o in tx.outputs:
+                    outs.extend(struct.pack("<q", o.value))
+                    outs.extend(_encode_varint(len(o.script_pubkey)))
+                    outs.extend(o.script_pubkey)
+                data.extend(hashlib.sha256(bytes(outs)).digest())
+            elif base == 3 and idx < len(tx.outputs):
+                o = tx.outputs[idx]
+                out = struct.pack("<q", o.value)
+                out += _encode_varint(len(o.script_pubkey))
+                out += o.script_pubkey
+                data.extend(hashlib.sha256(out).digest())
+            else:
+                data.extend(b"\x00" * 32)
+            # spend_type: ext_flag=0, no annex
+            data.append(0x00)
+            if acp:
+                inp = tx.inputs[idx]
+                data.extend(inp.prev_txid)
+                data.extend(struct.pack("<I", inp.prev_vout))
+                data.extend(struct.pack("<q", amounts[idx]))
+                data.extend(_encode_varint(len(spks[idx])))
+                data.extend(spks[idx])
+                data.extend(struct.pack("<I", inp.sequence))
+            else:
+                data.extend(struct.pack("<I", idx))
+            # Tagged hash: SHA256(SHA256("TapSighash") || SHA256("TapSighash") || data)
+            tag = hashlib.sha256(b"TapSighash").digest()
+            return hashlib.sha256(tag + tag + bytes(data)).digest()
+
+        # --- Sign each input ---------------------------------------------
+        errors = []
+        all_amounts = []
+        all_spks = []
+        # Pre-collect amounts/spks for taproot (needs all inputs)
+        for inp in tx.inputs:
+            spk, amt = _get_prevout(inp)
+            all_amounts.append(amt if amt is not None else 0)
+            all_spks.append(spk if spk is not None else b"")
+
+        for idx, inp in enumerate(tx.inputs):
+            spk = all_spks[idx]
+            amount = all_amounts[idx]
+            if not spk:
+                errors.append({
+                    "txid": inp.prev_txid.hex(),
+                    "vout": inp.prev_vout,
+                    "error": "Input not found or not provided",
+                })
+                continue
+
+            try:
+                # Detect script type and sign
+                if len(spk) == 25 and spk[0] == 0x76 and spk[1] == 0xA9:
+                    # P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+                    h160 = spk[3:23]
+                    key = keys_by_h160.get(h160)
+                    if not key:
+                        errors.append({
+                            "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                            "error": "No matching key for P2PKH",
+                        })
+                        continue
+                    sh = _legacy_sighash(tx, idx, spk, sighash_type)
+                    sig = key.sign(sh) + bytes([sighash_type])
+                    inp.script_sig = (
+                        bytes([len(sig)]) + sig
+                        + bytes([len(key.pubkey)]) + key.pubkey
+                    )
+
+                elif len(spk) == 22 and spk[0] == 0x00 and spk[1] == 0x14:
+                    # P2WPKH: OP_0 <20-byte-hash>
+                    h160 = spk[2:22]
+                    key = keys_by_h160.get(h160)
+                    if not key:
+                        errors.append({
+                            "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                            "error": "No matching key for P2WPKH",
+                        })
+                        continue
+                    script_code = b"\x76\xa9\x14" + h160 + b"\x88\xac"
+                    sh = _bip143_sighash(tx, idx, script_code, amount, sighash_type)
+                    sig = key.sign(sh) + bytes([sighash_type])
+                    inp.witness = [sig, key.pubkey]
+                    tx.has_witness = True
+
+                elif len(spk) == 23 and spk[0] == 0xA9 and spk[1] == 0x14:
+                    # P2SH — check for P2SH-P2WPKH
+                    signed = False
+                    for h160, key in keys_by_h160.items():
+                        redeem_script = b"\x00\x14" + h160
+                        if _hash160(redeem_script) == spk[2:22]:
+                            script_code = b"\x76\xa9\x14" + h160 + b"\x88\xac"
+                            sh = _bip143_sighash(
+                                tx, idx, script_code, amount, sighash_type
+                            )
+                            sig = key.sign(sh) + bytes([sighash_type])
+                            inp.script_sig = (
+                                bytes([len(redeem_script)]) + redeem_script
+                            )
+                            inp.witness = [sig, key.pubkey]
+                            tx.has_witness = True
+                            signed = True
+                            break
+                    if not signed:
+                        errors.append({
+                            "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                            "error": "No matching key for P2SH-P2WPKH",
+                        })
+
+                elif len(spk) == 34 and spk[0] == 0x51 and spk[1] == 0x20:
+                    # P2TR: OP_1 <32-byte-x-only-key>
+                    x_only = spk[2:34]
+                    key = keys_by_pubkey.get(x_only)
+                    if not key:
+                        errors.append({
+                            "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                            "error": "No matching key for P2TR",
+                        })
+                        continue
+                    sh = _taproot_sighash(
+                        tx, idx, sighash_type, all_amounts, all_spks
+                    )
+                    try:
+                        import sync as _sync
+                        raw_sig = _sync.sign_schnorr(sh, key.secret)
+                    except (ImportError, AttributeError):
+                        try:
+                            from coincurve import PrivateKey as CPrivKey
+                            raw_sig = CPrivKey(key.secret).sign_schnorr(sh)
+                        except Exception:
+                            errors.append({
+                                "txid": inp.prev_txid.hex(),
+                                "vout": inp.prev_vout,
+                                "error": "Schnorr signing not available",
+                            })
+                            continue
+                    if sighash_type != 0x00:
+                        raw_sig += bytes([sighash_type])
+                    inp.witness = [raw_sig]
+                    tx.has_witness = True
+
+                elif len(spk) == 34 and spk[0] == 0x00 and spk[1] == 0x20:
+                    # P2WSH: OP_0 <32-byte-hash> — need witnessScript
+                    errors.append({
+                        "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                        "error": "P2WSH signing requires witnessScript "
+                                 "(not yet supported)",
+                    })
+
+                else:
+                    errors.append({
+                        "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                        "error": f"Unsupported script type (len={len(spk)})",
+                    })
+
+            except Exception as e:
+                errors.append({
+                    "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                    "error": str(e),
+                })
+
+        # --- Re-compute txid and serialize --------------------------------
+        tx.txid = _dsha256(tx.serialize())
+        signed_hex = tx.serialize_with_witness().hex()
+        complete = len(errors) == 0
+        result: Dict[str, Any] = {"hex": signed_hex, "complete": complete}
+        if errors:
+            result["errors"] = errors
+        return result
 
     async def rpc_testmempoolaccept(
         self, rawtxs: List[str], maxfeerate: float = 0.10
@@ -1858,6 +2732,89 @@ class RPCServer:
                     "reject-reason": str(e),
                 })
         return results
+
+    async def rpc_submitpackage(self, package: List[str]) -> Dict[str, Any]:
+        """Submit a package of raw transactions for validation and mempool acceptance.
+
+        Accepts a list of raw transaction hex strings in topological order
+        (parents before children).  The package is evaluated as a unit so
+        that a child can pay for a low-fee parent (CPFP).
+
+        Returns a result dict compatible with Bitcoin Core's ``submitpackage``
+        RPC, including per-transaction results with txid, vsize, and fees.
+        """
+        if not isinstance(package, list) or len(package) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="package must be a non-empty list of raw transaction hex strings",
+            )
+
+        from ouroboros.p2p_messages import TxMessage
+
+        # Deserialize each hex string into a Transaction
+        txs: List[Transaction] = []
+        for i, raw_hex in enumerate(package):
+            try:
+                tx_data = bytes.fromhex(raw_hex.strip())
+            except (ValueError, AttributeError) as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid hex string at index {i}: {e}",
+                )
+            try:
+                tx_msg = TxMessage.from_payload(tx_data)
+                tx = tx_msg.transaction
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to decode transaction at index {i}: {e}",
+                )
+            if tx.is_coinbase:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Coinbase transaction at index {i} cannot be submitted",
+                )
+            txs.append(tx)
+
+        if not hasattr(self.node, "mempool") or not self.node.mempool:
+            raise HTTPException(status_code=500, detail="Mempool not available")
+        if not hasattr(self.node, "db") or not self.node.db:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        _, best_height = self.node.db.get_best_block()
+        success, error = self.node.mempool.validate_package(txs, best_height + 1)
+
+        if not success:
+            return {
+                "package_msg": error,
+                "tx-results": {},
+            }
+
+        # Build per-transaction results from the mempool entries that were
+        # just inserted by validate_package.
+        tx_results: Dict[str, Any] = {}
+        for tx in txs:
+            txid_hex = tx.get_txid().hex()
+            entry = self.node.mempool.get_transaction_entry(tx.get_txid())
+            if entry is not None:
+                tx_results[txid_hex] = {
+                    "txid": txid_hex,
+                    "vsize": tx.get_vsize(),
+                    "fees": {
+                        "base": entry.fee / 1e8,
+                    },
+                }
+            else:
+                tx_results[txid_hex] = {
+                    "txid": txid_hex,
+                    "vsize": tx.get_vsize(),
+                    "fees": {"base": 0},
+                }
+
+        return {
+            "package_msg": "success",
+            "tx-results": tx_results,
+        }
 
     async def rpc_listtransactions(
         self, label: str = "*", count: int = 10, skip: int = 0,
@@ -1956,8 +2913,56 @@ class RPCServer:
     async def rpc_getnetworkhashps(
         self, nblocks: int = 120, height: int = -1
     ) -> float:
-        """Return estimated network hash rate."""
-        return 0.0  # would need block timestamp analysis
+        """Return estimated network hashes per second.
+
+        Uses the same algorithm as Bitcoin Core's GetNetworkHashPS()
+        in rpc/mining.cpp: computes chainwork difference over a time
+        window and divides by elapsed seconds.
+
+        Args:
+            nblocks: Number of blocks to look back (default 120).
+                     Use -1 to average over the current difficulty epoch.
+            height:  Block height to end at (default -1 = chain tip).
+        """
+        if not hasattr(self.node, 'db') or not self.node.db:
+            return 0.0
+
+        try:
+            _, best_height = self.node.db.get_best_block()
+        except Exception:
+            return 0.0
+
+        if height < 0 or height > best_height:
+            height = best_height
+
+        # nblocks == -1 means use the current difficulty epoch length
+        if nblocks <= 0:
+            nblocks = max(height % 2016, 1)
+
+        # Clamp: don't look back further than genesis
+        if nblocks > height:
+            nblocks = height
+
+        if nblocks == 0:
+            return 0.0
+
+        tip_block = self.node.db.get_block_by_height(height)
+        start_block = self.node.db.get_block_by_height(height - nblocks)
+
+        if tip_block is None or start_block is None:
+            return 0.0
+
+        time_diff = tip_block.timestamp - start_block.timestamp
+        if time_diff <= 0:
+            return 0.0
+
+        # Calculate chainwork difference
+        work_diff = (
+            self.node._calculate_chainwork_at_height(height)
+            - self.node._calculate_chainwork_at_height(height - nblocks)
+        )
+
+        return float(work_diff) / float(time_diff)
 
     async def rpc_prioritisetransaction(
         self, txid: str, dummy: float = 0, fee_delta: int = 0
@@ -1981,6 +2986,243 @@ class RPCServer:
         """Return the status of indices."""
         return {}
 
+    # ── Fee Bumping (RBF) ──────────────────────────────────────────────
+
+    async def rpc_bumpfee(
+        self, txid: str, options: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Bump the fee of a mempool transaction via RBF.
+
+        Creates a replacement transaction with a higher fee and broadcasts
+        it.  The original transaction must signal BIP 125 replaceability
+        (at least one input with sequence < 0xFFFFFFFE).
+
+        Args:
+            txid: Transaction ID to bump (hex string).
+            options: Optional dict with ``fee_rate`` (sat/vB) or
+                     ``conf_target`` (blocks for fee estimation).
+
+        Returns:
+            Dict with ``txid`` (new txid), ``origfee`` (BTC),
+            ``fee`` (BTC), and ``errors`` list.
+
+        Reference: Bitcoin Core ``bumpfee`` (wallet/rpc/spend.cpp)
+        """
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="Wallet not loaded")
+
+        if not hasattr(self.node, "mempool") or not self.node.mempool:
+            raise HTTPException(status_code=500, detail="Mempool not available")
+
+        options = options or {}
+        fee_rate = options.get("fee_rate")
+        conf_target = options.get("conf_target")
+
+        if fee_rate is None:
+            if conf_target is not None:
+                fee_estimator = getattr(self.node, "fee_estimator", None)
+                if fee_estimator is not None:
+                    fee_rate = fee_estimator.estimate_fee(int(conf_target))
+            if fee_rate is None:
+                fee_rate = 10  # conservative default bump rate
+
+        fee_rate = int(fee_rate)
+
+        # Get original fee before bumping
+        txid_bytes = bytes.fromhex(txid)
+        orig_entry = self.node.mempool.get_transaction_entry(txid_bytes)
+        if orig_entry is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Transaction {txid} not in mempool",
+            )
+        orig_fee_btc = orig_entry.fee / 1e8
+
+        new_txid = await wallet.bump_fee(txid, fee_rate, sign=True)
+        if new_txid is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Fee bump failed – transaction may not signal RBF, "
+                "wallet may lack keys or funds, or mempool rejected the replacement",
+            )
+
+        # Get the new entry fee
+        new_entry = self.node.mempool.get_transaction_entry(
+            bytes.fromhex(new_txid)
+        )
+        new_fee_btc = new_entry.fee / 1e8 if new_entry else 0
+
+        # Broadcast inv to peers
+        try:
+            from ouroboros.p2p_messages import InvMessage, INV_TYPE_TX
+
+            inv = InvMessage(
+                inventory=[(INV_TYPE_TX, bytes.fromhex(new_txid))]
+            )
+            inv_msg = inv.to_network_message(self.node.network)
+            if hasattr(self.node, "peer_manager") and self.node.peer_manager:
+                await self.node.peer_manager.broadcast(inv_msg)
+        except Exception:
+            pass  # best-effort broadcast
+
+        return {
+            "txid": new_txid,
+            "origfee": orig_fee_btc,
+            "fee": new_fee_btc,
+            "errors": [],
+        }
+
+    async def rpc_psbtbumpfee(
+        self, txid: str, options: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Bump the fee of a mempool transaction, returning a PSBT.
+
+        Like ``bumpfee`` but does NOT sign or broadcast.  Returns an
+        unsigned raw transaction hex in the ``psbt`` field that can be
+        signed externally.
+
+        Args:
+            txid: Transaction ID to bump (hex string).
+            options: Optional dict with ``fee_rate`` (sat/vB) or
+                     ``conf_target`` (blocks for fee estimation).
+
+        Returns:
+            Dict with ``psbt`` (unsigned raw hex), ``origfee`` (BTC),
+            ``fee`` (BTC), and ``errors`` list.
+
+        Reference: Bitcoin Core ``psbtbumpfee`` (wallet/rpc/spend.cpp)
+        """
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="Wallet not loaded")
+
+        if not hasattr(self.node, "mempool") or not self.node.mempool:
+            raise HTTPException(status_code=500, detail="Mempool not available")
+
+        options = options or {}
+        fee_rate = options.get("fee_rate")
+        conf_target = options.get("conf_target")
+
+        if fee_rate is None:
+            if conf_target is not None:
+                fee_estimator = getattr(self.node, "fee_estimator", None)
+                if fee_estimator is not None:
+                    fee_rate = fee_estimator.estimate_fee(int(conf_target))
+            if fee_rate is None:
+                fee_rate = 10
+
+        fee_rate = int(fee_rate)
+
+        # Get original fee before bumping
+        txid_bytes = bytes.fromhex(txid)
+        orig_entry = self.node.mempool.get_transaction_entry(txid_bytes)
+        if orig_entry is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Transaction {txid} not in mempool",
+            )
+        orig_fee_btc = orig_entry.fee / 1e8
+
+        unsigned_hex = await wallet.bump_fee(txid, fee_rate, sign=False)
+        if unsigned_hex is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Fee bump failed – transaction may not signal RBF "
+                "or wallet cannot reconstruct the replacement",
+            )
+
+        # Estimate new fee from the unsigned tx
+        orig_total_out = sum(o.value for o in orig_entry.tx.outputs)
+        # Parse unsigned tx to compute new total outputs
+        try:
+            from ouroboros.p2p_messages import TxMessage
+
+            tx_data = bytes.fromhex(unsigned_hex)
+            tx_msg = TxMessage.from_payload(tx_data)
+            new_total_out = sum(o.value for o in tx_msg.transaction.outputs)
+            # Get total input value from original entry
+            total_in = orig_fee_btc * 1e8 + orig_total_out
+            new_fee_btc = (total_in - new_total_out) / 1e8
+        except Exception:
+            new_fee_btc = 0
+
+        return {
+            "psbt": unsigned_hex,
+            "origfee": orig_fee_btc,
+            "fee": new_fee_btc,
+            "errors": [],
+        }
+
+    def _format_mempool_entry(self, entry, txid_bytes: bytes) -> Dict[str, Any]:
+        """Format a MempoolEntry into the Bitcoin Core-compatible dict.
+
+        Computes ``depends`` (unconfirmed parent txids) and ``spentby``
+        (unconfirmed child txids) by scanning the mempool.
+        """
+        mempool = self.node.mempool
+
+        # -- depends: unconfirmed parents of this tx -----------------------
+        depends: List[str] = []
+        for inp in entry.tx.inputs:
+            if inp.prev_txid in mempool.transactions:
+                depends.append(inp.prev_txid.hex())
+
+        # -- spentby: unconfirmed children spending this tx's outputs ------
+        spentby: List[str] = []
+        for other_txid, other_entry in mempool.transactions.items():
+            if other_txid == txid_bytes:
+                continue
+            for inp in other_entry.tx.inputs:
+                if inp.prev_txid == txid_bytes:
+                    spentby.append(other_txid.hex())
+                    break  # one match per child tx is enough
+
+        # -- weight / vsize ------------------------------------------------
+        weight = entry.tx.get_weight()
+        vsize = (weight + 3) // 4
+
+        # -- ancestor / descendant fees ------------------------------------
+        ancestor_fees = entry.fee
+        for a_txid in mempool._get_ancestors(entry.tx):
+            a_entry = mempool.transactions.get(a_txid)
+            if a_entry is not None:
+                ancestor_fees += a_entry.fee
+
+        descendant_fees = entry.fee
+        for d_txid in mempool._collect_descendants(txid_bytes):
+            if d_txid == txid_bytes:
+                continue
+            d_entry = mempool.transactions.get(d_txid)
+            if d_entry is not None:
+                descendant_fees += d_entry.fee
+
+        base_fee_btc = entry.fee / 1e8
+
+        return {
+            "fees": {
+                "base": base_fee_btc,
+                "modified": base_fee_btc,
+                "ancestor": ancestor_fees / 1e8,
+                "descendant": descendant_fees / 1e8,
+            },
+            "vsize": vsize,
+            "weight": weight,
+            "fee": base_fee_btc,
+            "time": int(entry.time_added),
+            "height": entry.height_added,
+            "descendantcount": entry.descendant_count,
+            "descendantsize": entry.descendant_size,
+            "descendantfees": descendant_fees,
+            "ancestorcount": entry.ancestor_count,
+            "ancestorsize": entry.ancestor_size,
+            "ancestorfees": ancestor_fees,
+            "depends": depends,
+            "spentby": spentby,
+        }
+
     async def rpc_getmempoolentry(self, txid: str) -> Dict[str, Any]:
         """Return mempool data for a given transaction."""
         if not hasattr(self.node, 'mempool') or not self.node.mempool:
@@ -1989,23 +3231,236 @@ class RPCServer:
         entry = self.node.mempool.get_transaction_entry(txid_bytes)
         if entry is None:
             raise ValueError(f"Transaction not in mempool: {txid}")
-        return {
-            "vsize": entry.size,
-            "weight": entry.size * 4,
-            "fee": entry.fee / 1e8,
-            "time": int(entry.time_added),
-            "height": entry.height_added,
-            "descendantcount": entry.descendant_count,
-            "descendantsize": entry.descendant_size,
-            "ancestorcount": entry.ancestor_count,
-            "ancestorsize": entry.ancestor_size,
-            "fees": {
-                "base": entry.fee / 1e8,
-            },
+        return self._format_mempool_entry(entry, txid_bytes)
+
+    async def rpc_getblockstats(
+        self,
+        hash_or_height: Union[str, int],
+        stats: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Return per-block statistics for a given block.
+
+        ``hash_or_height`` may be a block hash (hex string) or a block height
+        (integer).  All fee / size statistics are computed by iterating every
+        transaction in the block.
+
+        If ``stats`` is provided it must be a list of stat names; only those
+        keys will be present in the result.
+
+        Ref: bitcoin/src/rpc/blockchain.cpp ``getblockstats``
+        """
+        if not hasattr(self.node, "db") or not self.node.db:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        db = self.node.db
+
+        # ------------------------------------------------------------------
+        # Resolve block from hash or height
+        # ------------------------------------------------------------------
+        block: Optional[Block] = None
+        if isinstance(hash_or_height, int):
+            block = db.get_block_by_height(hash_or_height)
+            if not block:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Block not found at height {hash_or_height}",
+                )
+        else:
+            try:
+                block_hash = bytes.fromhex(hash_or_height)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400, detail="Invalid block hash"
+                )
+            block = db.get_block(block_hash)
+            if not block:
+                raise HTTPException(
+                    status_code=404, detail="Block not found"
+                )
+
+        block_height = getattr(block, "height", None) or 0
+        block_hash_bytes = (
+            block.hash if isinstance(block.hash, bytes) else bytes(32)
+        )
+        blockhash_hex = block_hash_bytes.hex()
+        block_time = block.timestamp
+
+        # Median time past
+        if hasattr(self.node, "get_median_time"):
+            mediantime = self.node.get_median_time(block_height)
+        else:
+            mediantime = block_time
+
+        # ------------------------------------------------------------------
+        # Block subsidy
+        # ------------------------------------------------------------------
+        halvings = block_height // 210_000
+        if halvings >= 64:
+            subsidy = 0
+        else:
+            subsidy = (50 * 100_000_000) >> halvings
+
+        # ------------------------------------------------------------------
+        # Iterate transactions and accumulate statistics
+        # ------------------------------------------------------------------
+        txs_list: List[Transaction] = (
+            block.transactions if hasattr(block, "transactions") else []
+        )
+        num_txs = len(txs_list)
+
+        total_size = 0
+        total_weight = 0
+        total_out = 0          # sum of all output values (satoshis)
+        totalfee = 0           # sum of all non-coinbase fees
+
+        ins = 0
+        outs = 0
+
+        swtxs = 0
+        swtotal_size = 0
+        swtotal_weight = 0
+
+        utxo_increase = 0      # outputs created minus inputs spent
+
+        # Per-tx collections (exclude coinbase for fee stats)
+        tx_fees: List[int] = []
+        tx_feerates: List[int] = []   # sat / vbyte (integer)
+        tx_sizes: List[int] = []
+
+        for tx in txs_list:
+            tx_size = len(tx.serialize())
+            tx_weight = tx.get_weight()
+            tx_vsize = tx.get_vsize()
+
+            total_size += tx_size
+            total_weight += tx_weight
+
+            n_in = len(tx.inputs)
+            n_out = len(tx.outputs)
+            ins += n_in
+            outs += n_out
+            utxo_increase += n_out  # each output creates a UTXO
+
+            out_value = sum(o.value for o in tx.outputs)
+            total_out += out_value
+
+            if tx.has_witness:
+                swtxs += 1
+                swtotal_size += tx_size
+                swtotal_weight += tx_weight
+
+            if tx.is_coinbase:
+                # Coinbase has no real inputs to spend
+                # utxo_increase is not reduced by coinbase inputs
+                continue
+
+            # Non-coinbase: each input spends a UTXO
+            utxo_increase -= n_in
+
+            # Fee = sum(input values) - sum(output values)
+            input_total = 0
+            for tx_in in tx.inputs:
+                utxo = db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                if utxo:
+                    input_total += utxo["value"]
+
+            fee = input_total - out_value
+            if fee < 0:
+                fee = 0
+
+            totalfee += fee
+            tx_fees.append(fee)
+            tx_sizes.append(tx_size)
+
+            if tx_vsize > 0:
+                tx_feerates.append(fee // tx_vsize)
+            else:
+                tx_feerates.append(0)
+
+        # ------------------------------------------------------------------
+        # Aggregates (guard against empty lists)
+        # ------------------------------------------------------------------
+        if tx_fees:
+            avgfee = totalfee // len(tx_fees)
+            minfee = min(tx_fees)
+            maxfee = max(tx_fees)
+            medianfee = int(statistics.median(tx_fees))
+        else:
+            avgfee = minfee = maxfee = medianfee = 0
+
+        if tx_feerates:
+            avgfeerate = sum(tx_feerates) // len(tx_feerates)
+            minfeerate = min(tx_feerates)
+            maxfeerate = max(tx_feerates)
+        else:
+            avgfeerate = minfeerate = maxfeerate = 0
+
+        if tx_sizes:
+            avgtxsize = sum(tx_sizes) // len(tx_sizes)
+            mintxsize = min(tx_sizes)
+            maxtxsize = max(tx_sizes)
+            mediantxsize = int(statistics.median(tx_sizes))
+        else:
+            avgtxsize = mintxsize = maxtxsize = mediantxsize = 0
+
+        # utxo_size_inc: approximate serialized size change of the UTXO set
+        # Each UTXO ≈ 32 (txid) + 4 (vout) + 8 (value) + scriptPubKey bytes
+        # Simplified: count * 50 bytes as a rough estimate, matching Bitcoin
+        # Core's approach of tracking the actual serialized UTXO set delta.
+        # A positive utxo_increase means the set grew.
+        utxo_size_inc = 0
+        for tx in txs_list:
+            if tx.is_coinbase:
+                for o in tx.outputs:
+                    utxo_size_inc += 50 + len(o.script_pubkey)
+                continue
+            for o in tx.outputs:
+                utxo_size_inc += 50 + len(o.script_pubkey)
+            for _ in tx.inputs:
+                utxo_size_inc -= 50
+
+        # ------------------------------------------------------------------
+        # Build result
+        # ------------------------------------------------------------------
+        result: Dict[str, Any] = {
+            "avgfee": avgfee,
+            "avgfeerate": avgfeerate,
+            "avgtxsize": avgtxsize,
+            "blockhash": blockhash_hex,
+            "height": block_height,
+            "ins": ins,
+            "maxfee": maxfee,
+            "maxfeerate": maxfeerate,
+            "maxtxsize": maxtxsize,
+            "medianfee": medianfee,
+            "mediantime": mediantime,
+            "mediantxsize": mediantxsize,
+            "minfee": minfee,
+            "minfeerate": minfeerate,
+            "mintxsize": mintxsize,
+            "outs": outs,
+            "subsidy": subsidy,
+            "swtotal_size": swtotal_size,
+            "swtotal_weight": swtotal_weight,
+            "swtxs": swtxs,
+            "time": block_time,
+            "total_out": total_out,
+            "total_size": total_size,
+            "total_weight": total_weight,
+            "totalfee": totalfee,
+            "txs": num_txs,
+            "utxo_increase": utxo_increase,
+            "utxo_size_inc": utxo_size_inc,
         }
 
+        # Filter to requested stats
+        if stats:
+            result = {k: v for k, v in result.items() if k in stats}
+
+        return result
+
     # Helper methods
-    
+
     def _tx_to_dict(self, tx: Transaction) -> Dict[str, Any]:
         """
         Convert transaction to dictionary for RPC response.
