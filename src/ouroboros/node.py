@@ -6,6 +6,7 @@ database, validation, mempool, peer management, block synchronization, and RPC s
 """
 
 import asyncio
+import os
 import signal
 import logging
 from typing import Optional
@@ -134,18 +135,24 @@ class BitcoinNode:
             # Initialize validators
             logger.info("Initializing validators...")
             self.tx_validator = TransactionValidator(self.db)
-            self.validator = BlockValidator(self.db)
+            self.validator = BlockValidator(self.db, network=self.network)
             
             # Initialize mempool
             logger.info("Initializing mempool...")
             self.mempool = Mempool(self.tx_validator)
-            
+
+            # Reload persisted mempool (if available)
+            mempool_path = os.path.join(self.data_dir, "mempool.dat")
+            _, chain_height = self.db.get_best_block()
+            self.mempool.load_from_file(mempool_path, chain_height)
+
             # Initialize fee estimator
             self.fee_estimator = FeeEstimator()
             
             # Initialize wallet
             self.wallet = Wallet(self.data_dir, self.network)
             self.wallet.set_database(self.db)
+            self.wallet.set_mempool(self.mempool)
             
             # Initialize block pruner (optional — enabled when prune=<MB> is set)
             prune_target = self.config.get('prune')
@@ -177,13 +184,18 @@ class BitcoinNode:
             logger.info(f"Initializing peer manager (current height: {best_height})...")
             max_peers = self.config.get('max_connections', 8)
             p2p_transport = 2 if self.config.get('v2transport') else 1
+            listen_enabled = self.config.get('listen', True)
+            # Treat explicit "0" or False as disabled
+            if str(listen_enabled).lower() in ("0", "false", "no"):
+                listen_enabled = False
             self.peer_manager = PeerManager(
                 self.network,
                 max_peers=max_peers,
                 data_dir=self.data_dir,
                 transport_version=p2p_transport,
+                listen=bool(listen_enabled),
             )
-            await self.peer_manager.start(best_height)
+            await self.peer_manager.start(best_height, p2p_port=p2p_port)
             peer_count = len(self.peer_manager.get_all_ready_peers()) if self.peer_manager else 0
             logger.info(f"Peer manager started ({peer_count} peers)")
             
@@ -281,6 +293,11 @@ class BitcoinNode:
             if self.zmq_publisher:
                 logger.info("Stopping ZMQ publisher...")
                 await self.zmq_publisher.stop()
+
+            # Persist mempool to disk
+            if self.mempool:
+                mempool_path = os.path.join(self.data_dir, "mempool.dat")
+                self.mempool.dump_to_file(mempool_path)
 
             # Remove cookie file on clean shutdown
             delete_cookie(self.data_dir)
@@ -426,28 +443,66 @@ class BitcoinNode:
         if not self.peer_manager:
             return
 
-        async def handle_tx(msg):
-            """Handle incoming transaction"""
-            if not self.mempool:
-                return
-            try:
-                from ouroboros.p2p_messages import TxMessage
+        def _make_tx_handler(sender_peer):
+            """Create a per-peer tx handler that relays accepted txs."""
+            async def handler(msg):
+                if not self.mempool:
+                    return
+                try:
+                    from ouroboros.p2p_messages import (
+                        TxMessage, InvMessage, MSG_WITNESS_TX,
+                    )
 
-                tx_msg = TxMessage.from_payload(msg.payload)
-                tx = tx_msg.transaction
+                    tx_msg = TxMessage.from_payload(msg.payload)
+                    tx = tx_msg.transaction
 
-                _, height = self.db.get_best_block()
-                success, error = self.mempool.add_transaction(tx, height)
+                    _, height = self.db.get_best_block()
+                    success, error = self.mempool.add_transaction(tx, height)
 
-                if success:
-                    logger.info(f"Added transaction {tx.get_txid().hex()[:16]}... to mempool")
-                    if self.zmq_publisher:
-                        self.zmq_publisher.notify_transaction(tx)
-                else:
-                    logger.debug(f"Rejected transaction: {error}")
+                    if error == "orphan":
+                        txid = tx.get_txid()
+                        logger.debug(
+                            f"Stored orphan tx {txid.hex()[:16]}... "
+                            f"(missing parents)"
+                        )
+                    elif success:
+                        txid = tx.get_txid()
+                        logger.info(
+                            f"Added transaction {txid.hex()[:16]}... to mempool"
+                        )
+                        if self.zmq_publisher:
+                            self.zmq_publisher.notify_transaction(tx)
 
-            except Exception as e:
-                logger.error(f"Error handling transaction: {e}", exc_info=True)
+                        # Relay INV to all peers except the sender
+                        if hasattr(self, "peer_manager") and self.peer_manager:
+                            inv = InvMessage(
+                                inventory=[(MSG_WITNESS_TX, txid)]
+                            )
+                            inv_msg = inv.to_network_message(self.network)
+                            # Convert mempool fee rate (sat/vB) to sat/kB for
+                            # comparison against BIP 133 feefilter values.
+                            entry = self.mempool.transactions.get(txid)
+                            tx_feerate_per_kb = int(
+                                entry.fee_rate * 1000
+                            ) if entry else 0
+                            for p in self.peer_manager.get_all_ready_peers():
+                                if p is not sender_peer:
+                                    # Skip peers whose feefilter exceeds
+                                    # this tx's fee rate (BIP 133)
+                                    if p.peer_feefilter > tx_feerate_per_kb:
+                                        continue
+                                    try:
+                                        await p.send_message(inv_msg)
+                                    except Exception:
+                                        pass
+                    else:
+                        logger.debug(f"Rejected transaction: {error}")
+
+                except Exception as e:
+                    logger.error(
+                        f"Error handling transaction: {e}", exc_info=True
+                    )
+            return handler
 
         def _make_getdata_handler(peer):
             """Handle getdata: respond with tx from mempool or block from db"""
@@ -487,8 +542,15 @@ class BitcoinNode:
             peers = self.peer_manager.get_all_ready_peers()
             for peer in peers:
                 if hasattr(peer, 'register_handler'):
-                    peer.register_handler("tx", handle_tx)
+                    peer.register_handler("tx", _make_tx_handler(peer))
                     peer.register_handler("getdata", _make_getdata_handler(peer))
+
+        # Register callback for future inbound peers so they get handlers too
+        async def _on_inbound_peer(peer):
+            peer.register_handler("tx", _make_tx_handler(peer))
+            peer.register_handler("getdata", _make_getdata_handler(peer))
+
+        self.peer_manager.set_inbound_peer_handler(_on_inbound_peer)
 
         logger.info("Transaction and getdata handlers registered")
     

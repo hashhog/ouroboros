@@ -312,7 +312,8 @@ def sync(ctx, reset, limit):
 @click.pass_context
 @click.option("--rpc-port", default=8332, type=int, help="RPC server port")
 @click.option("--p2p-port", default=8333, type=int, help="P2P network port")
-def start(ctx, rpc_port, p2p_port):
+@click.option("--listen/--nolisten", default=True, help="Accept inbound P2P connections")
+def start(ctx, rpc_port, p2p_port, listen):
     """Start the Bitcoin node"""
     global _node, _cancelled
     _cancelled = False
@@ -351,6 +352,7 @@ def start(ctx, rpc_port, p2p_port):
             "network": network,
             "rpc_port": rpc_port,
             "p2p_port": p2p_port,
+            "listen": listen,
             "config_path": config_path,
         }
         
