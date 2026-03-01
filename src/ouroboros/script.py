@@ -16,10 +16,18 @@ Taproot support (BIP 340/341/342):
 
 import hashlib
 import struct
+from enum import IntEnum
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
 from ouroboros.database import Transaction, TxIn
+
+
+class SigVersion(IntEnum):
+    """Script signature verification context (matches Bitcoin Core)."""
+    BASE = 0          # Legacy pre-SegWit
+    WITNESS_V0 = 1    # SegWit v0 (BIP 141/143)
+    TAPSCRIPT = 2     # Tapscript (BIP 342)
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +53,8 @@ SCRIPT_VERIFY_NULLFAIL = (1 << 14)
 SCRIPT_VERIFY_WITNESS_PUBKEYTYPE = (1 << 15)
 SCRIPT_VERIFY_CONST_SCRIPTCODE = (1 << 16)
 SCRIPT_VERIFY_TAPROOT = (1 << 17)        # BIP 341
+SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION = (1 << 18)
+SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS = (1 << 19)
 
 # Maximum push data size in bytes
 MAX_SCRIPT_ELEMENT_SIZE = 520
@@ -62,14 +72,36 @@ BIP68_ACTIVATION_HEIGHT = 419328
 SEGWIT_ACTIVATION_HEIGHT = 481824
 TAPROOT_ACTIVATION_HEIGHT = 709632
 
+# Historical blocks that violate rules applied retroactively.
+# Ref: Bitcoin Core chainparams.cpp script_flag_exceptions.
+# Keys are block hashes in internal byte order (little-endian).
+_SCRIPT_FLAG_EXCEPTIONS: dict[bytes, int] = {
+    # BIP16 exception (mainnet height ~170,060)
+    bytes.fromhex(
+        "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+    )[::-1]: SCRIPT_VERIFY_NONE,
+    # Taproot exception (mainnet height 709,632)
+    bytes.fromhex(
+        "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"
+    )[::-1]: SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS,
+}
+
 # secp256k1 curve order / 2, for low-S enforcement
 SECP256K1_ORDER_HALF = (
     0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140 // 2
 )
 
 
-def get_flags_for_height(height: int) -> int:
-    """Return the script verification flags appropriate for *height*."""
+def get_flags_for_height(height: int, block_hash: bytes | None = None) -> int:
+    """Return the script verification flags appropriate for *height*.
+
+    If *block_hash* (internal byte order) is provided, check for historical
+    exceptions matching Bitcoin Core's script_flag_exceptions.
+    """
+    # Check for historical exception blocks first
+    if block_hash is not None and block_hash in _SCRIPT_FLAG_EXCEPTIONS:
+        return _SCRIPT_FLAG_EXCEPTIONS[block_hash]
+
     flags = SCRIPT_VERIFY_NONE
     if height >= BIP16_ACTIVATION_HEIGHT:
         flags |= SCRIPT_VERIFY_P2SH
@@ -83,9 +115,13 @@ def get_flags_for_height(height: int) -> int:
         flags |= (SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_NULLDUMMY
                    | SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_CLEANSTACK
                    | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
-                   | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE)
+                   | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
+                   | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS
+                   | SCRIPT_VERIFY_CONST_SCRIPTCODE)
     if height >= TAPROOT_ACTIVATION_HEIGHT:
-        flags |= SCRIPT_VERIFY_TAPROOT
+        flags |= (SCRIPT_VERIFY_TAPROOT
+                   | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
+                   | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
     return flags
 
 
@@ -200,6 +236,26 @@ def _check_low_s(sig_without_hashtype: bytes) -> bool:
     s_bytes = sig_without_hashtype[s_start:s_start + len_s]
     s_val = int.from_bytes(s_bytes, 'big')
     return s_val <= SECP256K1_ORDER_HALF
+
+
+def _check_pubkey_encoding(pubkey: bytes) -> bool:
+    """
+    Validate public key encoding (Bitcoin Core CheckPubKeyEncoding).
+
+    Valid formats:
+    - Compressed: 33 bytes, prefix 0x02 or 0x03
+    - Uncompressed: 65 bytes, prefix 0x04
+    """
+    if len(pubkey) == 33 and pubkey[0] in (0x02, 0x03):
+        return True
+    if len(pubkey) == 65 and pubkey[0] == 0x04:
+        return True
+    return False
+
+
+def _check_compressed_pubkey(pubkey: bytes) -> bool:
+    """Validate that a public key is compressed (33 bytes, prefix 0x02/0x03)."""
+    return len(pubkey) == 33 and pubkey[0] in (0x02, 0x03)
 
 
 def _get_witness_version_and_program(script_pubkey: bytes) -> Optional[Tuple[int, bytes]]:
@@ -369,7 +425,7 @@ class ScriptInterpreter:
                 spk = bytes([0x51, 0x20]) + program
                 return self.verify_taproot(
                     tx, input_index, witness, spk,
-                    input_amounts, input_script_pubkeys)
+                    input_amounts, input_script_pubkeys, flags)
             return True  # unknown witness version succeeds
         elif flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM:
             return False
@@ -385,6 +441,9 @@ class ScriptInterpreter:
             return False
         sig, pubkey = witness[0], witness[1]
         if self._hash160(pubkey) != keyhash:
+            return False
+        # WITNESS_PUBKEYTYPE: pubkeys in v0 witness must be compressed
+        if (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
             return False
         # Build implicit P2PKH script: OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY OP_CHECKSIG
         script_code = (
@@ -506,9 +565,20 @@ class ScriptInterpreter:
         initial_stack: Optional[List[bytes]] = None,
         is_witness_v0: bool = False,
         witness_amount: int = 0,
+        sig_version: "SigVersion" = SigVersion.BASE,
+        # Tapscript-specific parameters (only used when sig_version == TAPSCRIPT)
+        input_amounts: Optional[List[int]] = None,
+        input_script_pubkeys: Optional[List[bytes]] = None,
+        annex: Optional[bytes] = None,
+        leaf_hash: Optional[bytes] = None,
+        default_sighash: Optional[bytes] = None,
+        witness_weight: int = 0,
     ) -> List[bytes]:
         """
         Execute a Bitcoin script.
+
+        Handles legacy, SegWit v0, and tapscript (BIP 342) execution in a
+        single unified interpreter, mirroring Bitcoin Core's EvalScript().
 
         Args:
             script: Script bytes to execute
@@ -519,14 +589,60 @@ class ScriptInterpreter:
             initial_stack: Pre-populated stack (for P2SH / witness evaluation)
             is_witness_v0: True when executing inside a SegWit v0 context
             witness_amount: Input amount (needed for BIP 143 sighash)
+            sig_version: Script context (BASE, WITNESS_V0, TAPSCRIPT)
+            input_amounts: All input amounts (tapscript sighash)
+            input_script_pubkeys: All input scriptPubKeys (tapscript sighash)
+            annex: Witness annex (BIP 341)
+            leaf_hash: Tapleaf hash (tapscript sighash)
+            default_sighash: Pre-computed sighash for type 0x00 (tapscript)
+            witness_weight: Witness serialization weight (for sigops budget)
 
         Returns:
             Stack after execution
         """
+        is_tapscript = sig_version == SigVersion.TAPSCRIPT
+
+        # Tapscript OP_SUCCESS pre-check: scan for OP_SUCCESS opcodes before
+        # executing anything.  If any is found, the script succeeds
+        # unconditionally (BIP 342).
+        if is_tapscript:
+            j = 0
+            while j < len(script):
+                op = script[j]
+                j += 1
+                # skip push data
+                if 1 <= op <= 75:
+                    j += op
+                elif op == 0x4C:  # OP_PUSHDATA1
+                    dlen = script[j] if j < len(script) else 0
+                    j += 1 + dlen
+                elif op == 0x4D:  # OP_PUSHDATA2
+                    if j + 2 <= len(script):
+                        dlen = int.from_bytes(script[j:j + 2], "little")
+                        j += 2 + dlen
+                    else:
+                        j += 2
+                elif op == 0x4E:  # OP_PUSHDATA4
+                    if j + 4 <= len(script):
+                        dlen = int.from_bytes(script[j:j + 4], "little")
+                        j += 4 + dlen
+                    else:
+                        j += 4
+                elif op in _TAPSCRIPT_OP_SUCCESS:
+                    if flags & SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS:
+                        raise ValueError(
+                            f"DISCOURAGE_OP_SUCCESS: OP_SUCCESS opcode 0x{op:02x}"
+                        )
+                    return [b"\x01"]  # immediate success
+
         stack: List[bytes] = list(initial_stack) if initial_stack else []
         altstack: List[bytes] = []
         exec_stack: List[bool] = []
         op_count = 0
+        codesep_pos = -1  # updated by OP_CODESEPARATOR
+
+        # Tapscript sigops budget (BIP 342): 50 + 50 * witness_weight
+        sigops_budget = 50 + witness_weight if is_tapscript else 0
 
         _DISABLED = frozenset([
             0x7e, 0x7f, 0x80, 0x81,  # CAT, SUBSTR, LEFT, RIGHT
@@ -579,15 +695,38 @@ class ScriptInterpreter:
                 if executing:
                     if len(push_data) > MAX_SCRIPT_ELEMENT_SIZE:
                         raise ValueError(f"Push data exceeds {MAX_SCRIPT_ELEMENT_SIZE} bytes")
+                    # MINIMALDATA: reject non-minimal push encodings
+                    if flags & SCRIPT_VERIFY_MINIMALDATA:
+                        n = len(push_data)
+                        if n == 0:
+                            # Empty data should use OP_0 (0x00), not a push
+                            if opcode != 0x00:
+                                raise ValueError("MINIMALDATA: empty push should use OP_0")
+                        elif n == 1 and 1 <= push_data[0] <= 16:
+                            # Single byte 1-16 should use OP_1..OP_16
+                            raise ValueError("MINIMALDATA: should use OP_n")
+                        elif n == 1 and push_data[0] == 0x81:
+                            # -1 should use OP_1NEGATE
+                            raise ValueError("MINIMALDATA: should use OP_1NEGATE")
+                        elif n <= 75 and opcode > 75:
+                            # Data fits in direct push but used OP_PUSHDATA1/2/4
+                            raise ValueError("MINIMALDATA: non-minimal push encoding")
+                        elif n <= 0xFF and opcode == 0x4d:
+                            # Fits in OP_PUSHDATA1 but used OP_PUSHDATA2
+                            raise ValueError("MINIMALDATA: non-minimal push encoding")
+                        elif n <= 0xFFFF and opcode == 0x4e:
+                            # Fits in OP_PUSHDATA2 but used OP_PUSHDATA4
+                            raise ValueError("MINIMALDATA: non-minimal push encoding")
                     stack.append(push_data)
                     if len(stack) + len(altstack) > MAX_STACK_SIZE:
                         raise ValueError("Stack size exceeded")
                 continue
 
             # Op count (opcodes > OP_16 only, regardless of exec state)
+            # Tapscript removes the 201 op-count limit (BIP 342).
             if opcode > 0x60:
                 op_count += 1
-                if op_count > 201:
+                if not is_tapscript and op_count > 201:
                     raise ValueError("Too many operations")
 
             if opcode in _DISABLED:
@@ -599,7 +738,11 @@ class ScriptInterpreter:
                 if executing:
                     if not stack:
                         raise ValueError("OP_IF: stack underflow")
-                    val = self._cast_to_bool(stack.pop())
+                    top = stack.pop()
+                    # Tapscript: MINIMALIF is consensus (BIP 342)
+                    if is_tapscript and top not in (b"", b"\x01"):
+                        raise ValueError("MINIMALIF: non-minimal OP_IF input in tapscript")
+                    val = self._cast_to_bool(top)
                 exec_stack.append(val)
                 continue
             if opcode == 0x64:  # OP_NOTIF
@@ -607,7 +750,11 @@ class ScriptInterpreter:
                 if executing:
                     if not stack:
                         raise ValueError("OP_NOTIF: stack underflow")
-                    val = not self._cast_to_bool(stack.pop())
+                    top = stack.pop()
+                    # Tapscript: MINIMALIF is consensus (BIP 342)
+                    if is_tapscript and top not in (b"", b"\x01"):
+                        raise ValueError("MINIMALIF: non-minimal OP_NOTIF input in tapscript")
+                    val = not self._cast_to_bool(top)
                 exec_stack.append(val)
                 continue
             if opcode == 0x67:  # OP_ELSE
@@ -893,6 +1040,11 @@ class ScriptInterpreter:
 
             # OP_CODESEPARATOR (0xab)
             if opcode == 0xab:
+                # CONST_SCRIPTCODE: reject OP_CODESEPARATOR in non-segwit
+                # scripts (pre-SegWit context).
+                if (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE) and sig_version == SigVersion.BASE:
+                    raise ValueError("CONST_SCRIPTCODE: OP_CODESEPARATOR in non-witness script")
+                codesep_pos = i  # position after the opcode
                 continue
 
             # ── Signature verification ──────────────────────────────────
@@ -901,6 +1053,47 @@ class ScriptInterpreter:
                     raise ValueError("OP_CHECKSIG: stack underflow")
                 pubkey = stack.pop()
                 sig = stack.pop()
+
+                if is_tapscript:
+                    # BIP 342 Schnorr CHECKSIG
+                    if not sig:
+                        stack.append(b"")
+                        continue
+                    if len(pubkey) != 32:
+                        # Unknown pubkey type in tapscript — succeed for
+                        # forward compatibility (len > 0 only)
+                        if len(pubkey) == 0:
+                            raise ValueError("OP_CHECKSIG: empty pubkey in tapscript")
+                        stack.append(b"\x01")
+                        continue
+                    sighash_type = 0x00
+                    raw_sig = sig
+                    if len(sig) == 65:
+                        sighash_type = sig[-1]
+                        raw_sig = sig[:-1]
+                        if sighash_type == 0x00:
+                            raise ValueError("OP_CHECKSIG: explicit 0x00 sighash in tapscript")
+                    elif len(sig) != 64:
+                        raise ValueError("OP_CHECKSIG: invalid Schnorr sig length")
+                    if sighash_type != 0x00:
+                        sh = self._compute_taproot_sighash(
+                            tx, input_index, sighash_type,
+                            input_amounts=input_amounts,
+                            input_script_pubkeys=input_script_pubkeys,
+                            annex=annex, ext_flag=1,
+                            tap_leaf_hash=leaf_hash,
+                        )
+                    else:
+                        sh = default_sighash
+                    if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
+                        raise ValueError("OP_CHECKSIG: Schnorr verification failed")
+                    sigops_budget -= 50
+                    if sigops_budget < 0:
+                        raise ValueError("Tapscript sigops budget exceeded")
+                    stack.append(b"\x01")
+                    continue
+
+                # Legacy / SegWit v0 ECDSA CHECKSIG
                 if not sig:
                     stack.append(b'\x00')
                     continue
@@ -914,14 +1107,21 @@ class ScriptInterpreter:
                 der_sig = sig[:-1]
                 if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
                     raise ValueError("Non-low-S signature")
+                if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
+                    raise ValueError("STRICTENC: invalid pubkey encoding")
+                if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
+                    raise ValueError("WITNESS_PUBKEYTYPE: uncompressed pubkey in witness v0")
                 sighash_type = sig[-1]
                 try:
                     if is_witness_v0:
                         msg = self._compute_segwit_v0_sighash(
                             tx, input_index, script_pubkey, witness_amount, sighash_type)
                     else:
+                        # FindAndDelete: remove the signature from script
+                        # code before hashing (legacy consensus rule).
+                        cleaned = self._find_and_delete(script_pubkey, sig)
                         msg = self._calculate_signature_hash(
-                            tx, input_index, script_pubkey, sighash_type)
+                            tx, input_index, cleaned, sighash_type)
                     ok = self._verify_ecdsa_signature(msg, der_sig, pubkey)
                     if not ok and (flags & SCRIPT_VERIFY_NULLFAIL):
                         raise ValueError("NULLFAIL: signature verification failed with non-empty sig")
@@ -937,6 +1137,36 @@ class ScriptInterpreter:
                     raise ValueError("OP_CHECKSIGVERIFY: stack underflow")
                 pubkey = stack.pop()
                 sig = stack.pop()
+
+                if is_tapscript:
+                    if not sig or len(pubkey) == 0:
+                        raise ValueError("OP_CHECKSIGVERIFY failed in tapscript")
+                    if len(pubkey) != 32:
+                        # Unknown pubkey type — succeed for forward compat
+                        continue
+                    sighash_type = 0x00
+                    raw_sig = sig
+                    if len(sig) == 65:
+                        sighash_type = sig[-1]
+                        raw_sig = sig[:-1]
+                        if sighash_type == 0x00:
+                            raise ValueError("Explicit 0x00 sighash in tapscript")
+                    elif len(sig) != 64:
+                        raise ValueError("Invalid Schnorr sig length")
+                    sh = default_sighash if sighash_type == 0x00 else self._compute_taproot_sighash(
+                        tx, input_index, sighash_type,
+                        input_amounts=input_amounts,
+                        input_script_pubkeys=input_script_pubkeys,
+                        annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
+                    )
+                    if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
+                        raise ValueError("OP_CHECKSIGVERIFY: Schnorr failed")
+                    sigops_budget -= 50
+                    if sigops_budget < 0:
+                        raise ValueError("Tapscript sigops budget exceeded")
+                    continue
+
+                # Legacy / SegWit v0 ECDSA CHECKSIGVERIFY
                 if not sig or len(pubkey) < 1:
                     raise ValueError("OP_CHECKSIGVERIFY failed")
                 if (flags & SCRIPT_VERIFY_DERSIG) and not _check_der_signature(sig):
@@ -944,14 +1174,19 @@ class ScriptInterpreter:
                 der_sig = sig[:-1]
                 if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
                     raise ValueError("Non-low-S signature")
+                if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
+                    raise ValueError("STRICTENC: invalid pubkey encoding")
+                if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
+                    raise ValueError("WITNESS_PUBKEYTYPE: uncompressed pubkey in witness v0")
                 sighash_type = sig[-1]
                 try:
                     if is_witness_v0:
                         msg = self._compute_segwit_v0_sighash(
                             tx, input_index, script_pubkey, witness_amount, sighash_type)
                     else:
+                        cleaned = self._find_and_delete(script_pubkey, sig)
                         msg = self._calculate_signature_hash(
-                            tx, input_index, script_pubkey, sighash_type)
+                            tx, input_index, cleaned, sighash_type)
                     if not self._verify_ecdsa_signature(msg, der_sig, pubkey):
                         raise ValueError("OP_CHECKSIGVERIFY failed")
                 except ValueError:
@@ -960,7 +1195,50 @@ class ScriptInterpreter:
                     raise ValueError("OP_CHECKSIGVERIFY failed")
                 continue
 
+            # OP_CHECKSIGADD (0xba) — BIP 342, tapscript only
+            if opcode == 0xba:
+                if not is_tapscript:
+                    raise ValueError("OP_CHECKSIGADD outside tapscript")
+                if len(stack) < 3:
+                    raise ValueError("OP_CHECKSIGADD: stack underflow")
+                pubkey = stack.pop()
+                n = self._read_num(stack.pop())
+                sig = stack.pop()
+                if not sig:
+                    stack.append(self._encode_script_num(n))
+                    continue
+                if len(pubkey) == 0:
+                    raise ValueError("OP_CHECKSIGADD: empty pubkey")
+                if len(pubkey) != 32:
+                    # Unknown pubkey type — succeed for forward compat
+                    stack.append(self._encode_script_num(n + 1))
+                    continue
+                sighash_type = 0x00
+                raw_sig = sig
+                if len(sig) == 65:
+                    sighash_type = sig[-1]
+                    raw_sig = sig[:-1]
+                    if sighash_type == 0x00:
+                        raise ValueError("Explicit 0x00 sighash in tapscript")
+                elif len(sig) != 64:
+                    raise ValueError("Invalid Schnorr sig length")
+                sh = default_sighash if sighash_type == 0x00 else self._compute_taproot_sighash(
+                    tx, input_index, sighash_type,
+                    input_amounts=input_amounts,
+                    input_script_pubkeys=input_script_pubkeys,
+                    annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
+                )
+                if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
+                    raise ValueError("OP_CHECKSIGADD: Schnorr failed")
+                sigops_budget -= 50
+                if sigops_budget < 0:
+                    raise ValueError("Tapscript sigops budget exceeded")
+                stack.append(self._encode_script_num(n + 1))
+                continue
+
             if opcode == 0xae:  # OP_CHECKMULTISIG
+                if is_tapscript:
+                    raise ValueError("OP_CHECKMULTISIG disabled in tapscript")
                 if len(stack) < 1:
                     raise ValueError("OP_CHECKMULTISIG: stack underflow")
                 n = self._read_num(stack.pop())
@@ -997,6 +1275,8 @@ class ScriptInterpreter:
                 continue
 
             if opcode == 0xaf:  # OP_CHECKMULTISIGVERIFY
+                if is_tapscript:
+                    raise ValueError("OP_CHECKMULTISIGVERIFY disabled in tapscript")
                 if not stack:
                     raise ValueError("OP_CHECKMULTISIGVERIFY: stack underflow")
                 n = self._read_num(stack.pop())
@@ -1077,6 +1357,11 @@ class ScriptInterpreter:
 
             # ── Reserved NOPs ───────────────────────────────────────────
             if opcode in (0xb0, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9):
+                if flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS:
+                    raise ValueError(
+                        f"DISCOURAGE_UPGRADABLE_NOPS: OP_NOP{opcode - 0xaf} "
+                        f"(0x{opcode:02x})"
+                    )
                 continue
 
             raise ValueError(f"Unknown opcode 0x{opcode:02x}")
@@ -1146,6 +1431,32 @@ class ScriptInterpreter:
             return b'\xfe' + value.to_bytes(4, 'little')
         else:
             return b'\xff' + value.to_bytes(8, 'little')
+
+    @staticmethod
+    def _find_and_delete(script: bytes, sig: bytes) -> bytes:
+        """
+        Remove all occurrences of *sig* (with its push opcode) from *script*.
+
+        Ref: Bitcoin Core FindAndDelete() in script.h.
+        This is used in legacy (pre-SegWit) sighash computation to strip the
+        signature being verified from the script code.
+        """
+        # Build the serialized push of the signature
+        sig_len = len(sig)
+        if sig_len < 0x4C:
+            needle = bytes([sig_len]) + sig
+        elif sig_len <= 0xFF:
+            needle = bytes([0x4C, sig_len]) + sig
+        elif sig_len <= 0xFFFF:
+            needle = b"\x4d" + sig_len.to_bytes(2, "little") + sig
+        else:
+            needle = b"\x4e" + sig_len.to_bytes(4, "little") + sig
+
+        # Remove all occurrences
+        result = script
+        while needle in result:
+            result = result.replace(needle, b"", 1)
+        return result
 
     def _calculate_signature_hash(
         self,
@@ -1277,6 +1588,13 @@ class ScriptInterpreter:
 
         script_code = script_pubkey
 
+        # FindAndDelete: remove all signatures from script_code before hashing
+        # (only for legacy, not witness v0).
+        if not is_witness_v0:
+            for sig in sigs:
+                if sig:
+                    script_code = self._find_and_delete(script_code, sig)
+
         sig_idx = 0
         key_idx = 0
         matched = 0
@@ -1293,6 +1611,10 @@ class ScriptInterpreter:
                 return False
             der_sig = sig[:-1]
             if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
+                return False
+            if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
+                return False
+            if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
                 return False
 
             sighash_type = sig[-1]
@@ -1355,6 +1677,7 @@ class ScriptInterpreter:
         script_pubkey: bytes,
         input_amounts: Optional[List[int]] = None,
         input_script_pubkeys: Optional[List[bytes]] = None,
+        flags: int = SCRIPT_VERIFY_NONE,
     ) -> bool:
         """
         Verify a Taproot (witness v1) spend.
@@ -1388,7 +1711,7 @@ class ScriptInterpreter:
         if len(effective_witness) >= 2:
             return self._verify_taproot_scriptpath(
                 tx, input_index, effective_witness, output_pubkey,
-                input_amounts, input_script_pubkeys, annex,
+                input_amounts, input_script_pubkeys, annex, flags,
             )
 
         return False
@@ -1436,6 +1759,7 @@ class ScriptInterpreter:
         input_amounts: Optional[List[int]] = None,
         input_script_pubkeys: Optional[List[bytes]] = None,
         annex: Optional[bytes] = None,
+        flags: int = SCRIPT_VERIFY_NONE,
     ) -> bool:
         """
         Script-path spend: witness = [...script_inputs, tapscript, control_block].
@@ -1488,7 +1812,7 @@ class ScriptInterpreter:
         if (control_block[0] & 1) != tweaked_parity:
             return False
 
-        # Execute the tapscript (BIP 342)
+        # Execute the tapscript (BIP 342) via the unified interpreter
         if leaf_version == 0xc0:
             sighash = self._compute_taproot_sighash(
                 tx, input_index, 0x00,
@@ -1498,12 +1822,40 @@ class ScriptInterpreter:
                 ext_flag=1,
                 tap_leaf_hash=leaf_hash,
             )
-            return self._execute_tapscript(
-                tap_script, script_inputs, tx, input_index, sighash,
-                input_amounts, input_script_pubkeys, annex, leaf_hash,
-            )
+            # Compute witness weight for sigops budget
+            w_weight = sum(len(item) for item in witness)
+            try:
+                result_stack = self._execute_script(
+                    tap_script,
+                    tx,
+                    input_index,
+                    tap_script,  # script_pubkey (not used for tapscript sighash)
+                    flags=flags,
+                    initial_stack=list(script_inputs),
+                    sig_version=SigVersion.TAPSCRIPT,
+                    input_amounts=input_amounts,
+                    input_script_pubkeys=input_script_pubkeys,
+                    annex=annex,
+                    leaf_hash=leaf_hash,
+                    default_sighash=sighash,
+                    witness_weight=w_weight,
+                )
+            except (ValueError, Exception):
+                return False
+            if not result_stack:
+                return False
+            top = result_stack[-1]
+            return len(top) > 0 and any(b != 0 for b in top)
 
-        return False
+        # DISCOURAGE_UPGRADABLE_TAPROOT_VERSION: reject unknown leaf versions
+        # when this policy flag is set (for relay/mempool).
+        if flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION:
+            return False
+
+        # BIP 341: unknown leaf versions succeed unconditionally in consensus.
+        # This ensures forward compatibility — future soft-forks can define new
+        # leaf versions without old nodes rejecting blocks that use them.
+        return True
 
     def _taproot_tweak_pubkey(
         self, internal_key: bytes, tweak: bytes

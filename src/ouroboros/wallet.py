@@ -7,6 +7,11 @@ as WIF in a JSON wallet file under {data_dir}/wallets/{name}.json.
 BIP 32 hierarchical deterministic (HD) derivation and BIP 44/84
 derivation paths are supported when the wallet is initialised from
 a seed via ``Wallet.init_hd()``.
+
+Output descriptor support (BIP 380–386) allows importing descriptors
+such as ``wpkh(xpub.../0/*)``, ``pkh(...)``, ``tr(...)``, ``sh(wpkh(...))``,
+``multi(M, ...)``, and ``wsh(multi(...))``.  Addresses are derived from
+descriptors with range support via ``importdescriptors``.
 """
 
 import hashlib
@@ -125,6 +130,10 @@ COST_OF_CHANGE_VBYTES = INPUT_VBYTES + OUTPUT_VBYTES  # 99 vB
 
 # BnB search limit (matches Bitcoin Core)
 BNB_MAX_TRIES = 100_000
+
+# Default long-term fee rate (sat/vB) used by the waste metric.
+# This represents the fee rate at which we'd ideally consolidate UTXOs.
+DEFAULT_LONG_TERM_FEE_RATE = 10.0
 
 
 def _estimate_fee(n_inputs: int, n_outputs: int, fee_rate: float) -> int:
@@ -306,22 +315,59 @@ def _non_input_fee(n_outputs: int, fee_rate: float) -> int:
     return int((OVERHEAD_VBYTES + n_outputs * OUTPUT_VBYTES) * fee_rate) + 1
 
 
+def _selection_waste(
+    selected: List[Dict],
+    fee_rate: float,
+    long_term_fee_rate: float,
+    has_change: bool,
+) -> float:
+    """
+    Compute the *waste metric* for a coin-selection result.
+
+    Mirrors Bitcoin Core's ``GetSelectionWaste()`` in
+    ``wallet/coinselection.cpp``.
+
+    waste = total_input_weight × (fee_rate − long_term_fee_rate)
+          + change_cost
+
+    * ``total_input_weight`` — sum of ``INPUT_VBYTES`` per selected UTXO.
+    * ``change_cost`` — 0 when BnB finds an exact match (no change output),
+      otherwise ``COST_OF_CHANGE_VBYTES × fee_rate`` (cost to create **and
+      later spend** the change output).
+    * When ``fee_rate < long_term_fee_rate`` the first term is negative,
+      favouring solutions that consolidate more inputs while fees are cheap.
+    """
+    total_input_weight = len(selected) * INPUT_VBYTES
+    timing_cost = total_input_weight * (fee_rate - long_term_fee_rate)
+    change_cost = 0.0 if not has_change else COST_OF_CHANGE_VBYTES * fee_rate
+    return timing_cost + change_cost
+
+
 def select_coins(
     utxos: List[Dict],
     target_amount: int,
     fee_rate: float,
+    *,
+    long_term_fee_rate: float = DEFAULT_LONG_TERM_FEE_RATE,
 ) -> Tuple[List[Dict], int, str]:
     """
-    Three-tier coin selection matching Bitcoin Core's strategy.
+    Three-tier coin selection matching Bitcoin Core's strategy with
+    waste-metric optimisation.
 
-    1. Branch-and-Bound — try for an exact match (no change)
-    2. Knapsack — randomised approximation
-    3. Single Random Draw — last-resort shuffle-and-grab
+    Runs **all three** algorithms, computes the waste metric for each
+    successful result, and returns the one with the lowest waste.
+
+    Algorithms:
+        1. Branch-and-Bound — exact match (no change output)
+        2. Knapsack — randomised approximation
+        3. Single Random Draw — last-resort shuffle-and-grab
 
     Args:
         utxos: Available UTXOs (each must have ``"value": int``).
         target_amount: Destination amount in satoshis.
         fee_rate: Fee rate in sat/vB.
+        long_term_fee_rate: Long-term fee rate in sat/vB (default 10).
+            Used by the waste metric to evaluate input-weight timing cost.
 
     Returns:
         (selected_utxos, estimated_fee, algorithm_used)
@@ -329,13 +375,17 @@ def select_coins(
     Raises:
         ValueError: Insufficient funds across all strategies.
     """
+    # Collect (result, fee, algo_name, has_change) for every algorithm
+    # that returns a valid selection.
+    candidates: List[Tuple[List[Dict], int, str, bool]] = []
+
     # BnB: target = amount + (overhead + 1 output fee).
     # BnB internally subtracts per-input cost from each UTXO's effective value.
     bnb_target = target_amount + _non_input_fee(1, fee_rate)
     result = select_coins_bnb(utxos, bnb_target, fee_rate)
     if result is not None:
         fee = _estimate_fee(len(result), 1, fee_rate)
-        return result, fee, "bnb"
+        candidates.append((result, fee, "bnb", False))
 
     # Knapsack / SRD: target = amount + (overhead + 2 output fees).
     # Input fees are handled inside each algorithm via effective values.
@@ -344,17 +394,25 @@ def select_coins(
     result = select_coins_knapsack(utxos, change_target, fee_rate)
     if result is not None:
         fee = _estimate_fee(len(result), 2, fee_rate)
-        return result, fee, "knapsack"
+        candidates.append((result, fee, "knapsack", True))
 
     result = select_coins_srd(utxos, change_target, fee_rate)
     if result is not None:
         fee = _estimate_fee(len(result), 2, fee_rate)
-        return result, fee, "srd"
+        candidates.append((result, fee, "srd", True))
 
-    raise ValueError(
-        f"Insufficient funds: cannot cover {target_amount} sat + fees "
-        f"at {fee_rate} sat/vB"
+    if not candidates:
+        raise ValueError(
+            f"Insufficient funds: cannot cover {target_amount} sat + fees "
+            f"at {fee_rate} sat/vB"
+        )
+
+    # Pick the candidate with the lowest waste.
+    best = min(
+        candidates,
+        key=lambda c: _selection_waste(c[0], fee_rate, long_term_fee_rate, c[3]),
     )
+    return best[0], best[1], best[2]
 
 
 class HDKey:
@@ -553,6 +611,8 @@ class WalletKey:
 
     def get_p2tr_address(self) -> str:
         """Taproot bech32m P2TR address (key-path only, no scripts)."""
+        from ouroboros.address import _bech32m_encode
+
         x_only = self.pubkey[1:]  # drop the 0x02/0x03 prefix
         # Tweak with empty merkle root for key-path-only spending
         tweak = hashlib.sha256(
@@ -570,8 +630,7 @@ class WalletKey:
             tweaked_x = x_only
 
         hrp = "bc" if self.network == "mainnet" else "tb"
-        converted = bech32.convertbits(tweaked_x, 8, 5)
-        return bech32.bech32m_encode(hrp, [1] + converted)
+        return _bech32m_encode(hrp, 1, tweaked_x)
 
     def get_script_pubkey(self) -> bytes:
         """P2WPKH scriptPubKey: OP_0 <20-byte-hash>."""
@@ -608,12 +667,14 @@ class Wallet:
     """
     Bitcoin wallet with key management, coin selection, and transaction signing.
 
-    Wallet file (JSON):
-    {
-        "version": 1,
-        "network": "mainnet",
-        "keys": [{"wif": "...", "label": "...", "created": 123}]
-    }
+    Wallet file (JSON)::
+
+        {
+            "version": 1,
+            "network": "mainnet",
+            "keys": [{"wif": "...", "label": "...", "created": 123}],
+            "descriptors": [{"desc": "wpkh(xpub.../0/*)#checksum", ...}]
+        }
     """
 
     # Default BIP 84 derivation base for native SegWit
@@ -630,7 +691,9 @@ class Wallet:
         self.name = name
         self.wallet_path = self.data_dir / "wallets" / f"{name}.json"
         self.keys: List[Dict] = []
+        self.descriptors: List = []  # List[DescriptorEntry]
         self.db = None  # set via set_database()
+        self.mempool = None  # set via set_mempool()
         self._hd_seed: Optional[bytes] = None
         self._hd_next_index: int = 0
         self._hd_base_path: str = self.HD_BASE_PATH
@@ -667,12 +730,15 @@ class Wallet:
     # ── persistence ───────────────────────────────────────────────────
 
     def _load_or_create(self) -> None:
+        from ouroboros.descriptors import DescriptorEntry
+
         if self.wallet_path.exists():
             with open(self.wallet_path) as f:
                 data = json.load(f)
             if data.get("encrypted"):
                 self._encrypted_blob = bytes.fromhex(data["ciphertext"])
                 self.keys = []
+                self.descriptors = []
                 logger.info(
                     f"Loaded encrypted wallet '{self.name}' — "
                     "call unlock(passphrase) to decrypt"
@@ -680,13 +746,19 @@ class Wallet:
                 return
             self._encrypted_blob = None
             self.keys = data.get("keys", [])
+            # Load descriptors
+            self.descriptors = [
+                DescriptorEntry.from_dict(d)
+                for d in data.get("descriptors", [])
+            ]
             hd = data.get("hd")
             if hd:
                 self._hd_seed = bytes.fromhex(hd["seed_hex"])
                 self._hd_next_index = hd.get("next_index", 0)
                 self._hd_base_path = hd.get("base_path", self.HD_BASE_PATH)
             logger.info(
-                f"Loaded wallet '{self.name}' with {len(self.keys)} keys"
+                f"Loaded wallet '{self.name}' with {len(self.keys)} keys, "
+                f"{len(self.descriptors)} descriptors"
                 + (" (HD)" if self._hd_seed else "")
             )
         else:
@@ -699,6 +771,8 @@ class Wallet:
         inner: Dict = {
             "keys": self.keys,
         }
+        if self.descriptors:
+            inner["descriptors"] = [d.to_dict() for d in self.descriptors]
         if self._hd_seed is not None:
             inner["hd"] = {
                 "seed_hex": self._hd_seed.hex(),
@@ -750,11 +824,17 @@ class Wallet:
 
     def unlock(self, passphrase: str) -> None:
         """Decrypt an encrypted wallet that was loaded from disk."""
+        from ouroboros.descriptors import DescriptorEntry
+
         if self._encrypted_blob is None:
             raise ValueError("Wallet is not encrypted")
         plaintext = decrypt_wallet_data(self._encrypted_blob, passphrase)
         data = json.loads(plaintext.decode("utf-8"))
         self.keys = data.get("keys", [])
+        self.descriptors = [
+            DescriptorEntry.from_dict(d)
+            for d in data.get("descriptors", [])
+        ]
         hd = data.get("hd")
         if hd:
             self._hd_seed = bytes.fromhex(hd["seed_hex"])
@@ -771,6 +851,7 @@ class Wallet:
         self._save()
         self._encrypted_blob = self._read_encrypted_blob()
         self.keys = []
+        self.descriptors = []
         self._hd_seed = None
         self._hd_next_index = 0
         self._passphrase = None
@@ -796,6 +877,9 @@ class Wallet:
 
     def set_database(self, db) -> None:
         self.db = db
+
+    def set_mempool(self, mempool) -> None:
+        self.mempool = mempool
 
     # --- key / address operations ---------------------------------------------
 
@@ -843,6 +927,19 @@ class Wallet:
                 balance=balance,
                 label=kd.get("label"),
             ))
+        # Include addresses from active descriptors
+        for entry in self.descriptors:
+            if not entry.active:
+                continue
+            end = max(entry.next_index, entry.range_start + 1)
+            for i in range(entry.range_start, end):
+                addr = entry.descriptor.derive_address(i, self.network)
+                balance = self.db.get_balance(addr, self.network) if self.db else 0
+                result.append(AddressInfo(
+                    address=addr,
+                    balance=balance,
+                    label=entry.label or None,
+                ))
         return result
 
     async def get_transactions(
@@ -899,21 +996,495 @@ class Wallet:
         else:
             return key.get_p2wpkh_address()
 
-    async def bump_fee(self, txid: str, new_fee_rate: int) -> Optional[str]:
+    async def bump_fee(
+        self, txid: str, new_fee_rate: int, *, sign: bool = True
+    ) -> Optional[str]:
         """
         Create an RBF fee-bumped version of a mempool transaction.
 
-        Returns new raw transaction hex or None if the tx can't be bumped.
-        """
-        from ouroboros.address import address_to_script_pubkey
-        from ouroboros.database import Transaction as DbTx, TxIn, TxOut
+        Finds the original transaction in the mempool, verifies it signals
+        RBF (any input with sequence < 0xFFFFFFFE), then builds a
+        replacement with a higher fee by reducing the change output or
+        adding a new input when the change is insufficient.
 
-        if self.db is None:
+        Args:
+            txid: Hex transaction ID of the original transaction.
+            new_fee_rate: Target fee rate in sat/vB.
+            sign: If True (default), sign and submit to mempool.
+                  If False, return unsigned raw hex (for PSBT workflow).
+
+        Returns:
+            New transaction hex (signed and broadcast when *sign=True*,
+            unsigned otherwise), or None on failure.
+        """
+        from ouroboros.database import Transaction, TxIn, TxOut
+
+        if self.db is None or self.mempool is None:
+            logger.warning("bump_fee: database or mempool not available")
             return None
-        # This would require access to the mempool to find the original tx
-        # and rebuild it with higher fee. Placeholder for future implementation.
-        logger.warning("Fee bumping not yet fully implemented")
-        return None
+
+        # ── 1. Look up the original tx in mempool ────────────────────
+        txid_bytes = bytes.fromhex(txid)
+        entry = self.mempool.get_transaction_entry(txid_bytes)
+        if entry is None:
+            logger.warning("bump_fee: transaction %s not in mempool", txid)
+            return None
+        orig_tx = entry.tx
+        orig_fee = entry.fee
+
+        # ── 2. Verify RBF signal ─────────────────────────────────────
+        rbf_signaled = any(inp.sequence < 0xFFFFFFFE for inp in orig_tx.inputs)
+        if not rbf_signaled:
+            logger.warning(
+                "bump_fee: transaction %s does not signal RBF "
+                "(no input with sequence < 0xFFFFFFFE)",
+                txid,
+            )
+            return None
+
+        # ── 3. Gather input values and wallet keys ───────────────────
+        # Build a lookup of wallet script_pubkeys → WalletKey
+        wallet_spk_map: Dict[bytes, "WalletKey"] = {}
+        for kd in self.keys:
+            k = self._get_wallet_key(kd)
+            wallet_spk_map[k.get_script_pubkey()] = k
+
+        input_values: List[int] = []
+        input_keys: List[Optional["WalletKey"]] = []
+        for inp in orig_tx.inputs:
+            # Try UTXO set first (confirmed), then check mempool outputs
+            utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
+            if utxo is not None:
+                input_values.append(utxo["value"])
+                spk = utxo.get("script_pubkey", b"")
+                if isinstance(spk, str):
+                    spk = bytes.fromhex(spk)
+                input_keys.append(wallet_spk_map.get(spk))
+            else:
+                # Parent might be in mempool
+                parent_tx = self.mempool.get_transaction(inp.prev_txid)
+                if parent_tx is not None and inp.prev_vout < len(parent_tx.outputs):
+                    out = parent_tx.outputs[inp.prev_vout]
+                    input_values.append(out.value)
+                    input_keys.append(wallet_spk_map.get(out.script_pubkey))
+                else:
+                    logger.warning(
+                        "bump_fee: cannot find value for input %s:%d",
+                        inp.prev_txid.hex(),
+                        inp.prev_vout,
+                    )
+                    return None
+
+        total_input_value = sum(input_values)
+
+        # ── 4. Calculate target fee ──────────────────────────────────
+        # Start with the same outputs; adjust change later.
+        new_outputs = [
+            TxOut(value=out.value, script_pubkey=out.script_pubkey)
+            for out in orig_tx.outputs
+        ]
+        new_inputs = [
+            TxIn(
+                prev_txid=inp.prev_txid,
+                prev_vout=inp.prev_vout,
+                script_sig=b"",
+                sequence=0xFFFFFFFD,  # signal RBF
+            )
+            for inp in orig_tx.inputs
+        ]
+
+        # Estimate vsize with current input/output counts
+        est_vsize = (
+            OVERHEAD_VBYTES
+            + len(new_inputs) * INPUT_VBYTES
+            + len(new_outputs) * OUTPUT_VBYTES
+        )
+        target_fee = max(int(new_fee_rate * est_vsize), orig_fee + 1)
+
+        total_output_value = sum(o.value for o in new_outputs)
+        fee_increase_needed = target_fee - (total_input_value - total_output_value)
+
+        # ── 5. Identify and reduce the change output ─────────────────
+        # The change output is the one paying to a wallet address.
+        change_idx: Optional[int] = None
+        for i, out in enumerate(new_outputs):
+            if out.script_pubkey in wallet_spk_map:
+                change_idx = i
+                break
+
+        if fee_increase_needed > 0:
+            if change_idx is not None:
+                available_change = new_outputs[change_idx].value
+                if available_change - fee_increase_needed > 546:
+                    # Reduce change to cover increased fee
+                    new_outputs[change_idx] = TxOut(
+                        value=available_change - fee_increase_needed,
+                        script_pubkey=new_outputs[change_idx].script_pubkey,
+                    )
+                elif available_change - fee_increase_needed >= 0:
+                    # Change would become dust – remove it entirely
+                    new_outputs.pop(change_idx)
+                    # Recalculate since we removed an output
+                    est_vsize = (
+                        OVERHEAD_VBYTES
+                        + len(new_inputs) * INPUT_VBYTES
+                        + len(new_outputs) * OUTPUT_VBYTES
+                    )
+                    target_fee = max(
+                        int(new_fee_rate * est_vsize), orig_fee + 1
+                    )
+                else:
+                    # Need to add a new input to cover the fee
+                    if not self._add_input_for_fee(
+                        new_inputs,
+                        new_outputs,
+                        input_values,
+                        input_keys,
+                        wallet_spk_map,
+                        new_fee_rate,
+                        target_fee,
+                        total_input_value,
+                        orig_fee,
+                    ):
+                        logger.warning(
+                            "bump_fee: insufficient funds to bump fee"
+                        )
+                        return None
+            else:
+                # No change output exists; must add a new input
+                if not self._add_input_for_fee(
+                    new_inputs,
+                    new_outputs,
+                    input_values,
+                    input_keys,
+                    wallet_spk_map,
+                    new_fee_rate,
+                    target_fee,
+                    total_input_value,
+                    orig_fee,
+                ):
+                    logger.warning(
+                        "bump_fee: insufficient funds to bump fee"
+                    )
+                    return None
+
+        # ── 6. Build the new transaction ─────────────────────────────
+        new_tx = Transaction(
+            txid=b"\x00" * 32,
+            version=orig_tx.version,
+            locktime=orig_tx.locktime,
+            inputs=new_inputs,
+            outputs=new_outputs,
+            has_witness=True,
+        )
+
+        if sign:
+            # ── 7. Sign all inputs ───────────────────────────────────
+            for i, inp in enumerate(new_inputs):
+                if i < len(input_keys) and input_keys[i] is not None:
+                    key = input_keys[i]
+                    sighash = self._bip143_sighash(
+                        new_tx, i, key.pubkey, input_values[i]
+                    )
+                    sig = key.sign(sighash) + b"\x01"  # SIGHASH_ALL
+                    new_tx.inputs[i].witness = [sig, key.pubkey]
+                else:
+                    logger.warning(
+                        "bump_fee: cannot sign input %d – key not in wallet", i
+                    )
+                    return None
+
+            # Compute real txid
+            new_tx.txid = _dsha256(new_tx.serialize())
+
+            # ── 8. Submit via mempool.try_replace() ──────────────────
+            _, best_height = self.db.get_best_block()
+            success, error = self.mempool.try_replace(new_tx, best_height)
+            if not success:
+                logger.warning("bump_fee: mempool rejected replacement: %s", error)
+                return None
+
+            new_txid = new_tx.txid.hex()
+            logger.info(
+                "bump_fee: replaced %s with %s (fee_rate=%d sat/vB)",
+                txid,
+                new_txid,
+                new_fee_rate,
+            )
+            return new_txid
+        else:
+            # Return unsigned raw hex for PSBT workflow
+            return new_tx.serialize_with_witness().hex()
+
+    def _add_input_for_fee(
+        self,
+        new_inputs: list,
+        new_outputs: list,
+        input_values: list,
+        input_keys: list,
+        wallet_spk_map: Dict[bytes, "WalletKey"],
+        new_fee_rate: int,
+        target_fee: int,
+        total_input_value: int,
+        orig_fee: int,
+    ) -> bool:
+        """
+        Add a new wallet UTXO to cover the fee increase when the change
+        output is insufficient.  May also add a new change output.
+
+        Returns True on success, False if no suitable UTXO is found.
+        """
+        from ouroboros.database import TxIn, TxOut
+
+        # Collect UTXOs not already used by the transaction
+        used_outpoints = {
+            (inp.prev_txid, inp.prev_vout) for inp in new_inputs
+        }
+        available = [
+            u
+            for u in self._collect_utxos()
+            if (
+                (bytes.fromhex(u["txid"]) if isinstance(u["txid"], str) else u["txid"]),
+                u["vout"],
+            )
+            not in used_outpoints
+        ]
+        if not available:
+            return False
+
+        # Sort descending by value for a greedy pick
+        available.sort(key=lambda u: u["value"], reverse=True)
+
+        total_output_value = sum(o.value for o in new_outputs)
+        needed = target_fee - (total_input_value - total_output_value)
+
+        for utxo in available:
+            utxo_txid = (
+                bytes.fromhex(utxo["txid"])
+                if isinstance(utxo["txid"], str)
+                else utxo["txid"]
+            )
+            new_inputs.append(
+                TxIn(
+                    prev_txid=utxo_txid,
+                    prev_vout=utxo["vout"],
+                    script_sig=b"",
+                    sequence=0xFFFFFFFD,
+                )
+            )
+            input_values.append(utxo["value"])
+            key = utxo.get("_key")
+            input_keys.append(key)
+
+            total_input_value += utxo["value"]
+
+            # Recalculate fee with new input (and possibly new change output)
+            est_vsize = (
+                OVERHEAD_VBYTES
+                + len(new_inputs) * INPUT_VBYTES
+                + (len(new_outputs) + 1) * OUTPUT_VBYTES  # +1 for potential change
+            )
+            target_fee = max(int(new_fee_rate * est_vsize), orig_fee + 1)
+            change = total_input_value - total_output_value - target_fee
+
+            if change > 546:
+                # Add change output
+                change_key = self._get_wallet_key(self.keys[0])
+                new_outputs.append(
+                    TxOut(
+                        value=change,
+                        script_pubkey=change_key.get_script_pubkey(),
+                    )
+                )
+                return True
+            elif change >= 0:
+                # No change needed (dust absorbed into fee)
+                return True
+            # else: keep trying with another UTXO (rare)
+
+        return False
+
+    # --- descriptor operations ---------------------------------------------------
+
+    def importdescriptors(
+        self, requests: List[Dict]
+    ) -> List[Dict]:
+        """
+        Import one or more output descriptors into the wallet.
+
+        Each element of *requests* is a dict matching the Bitcoin Core
+        ``importdescriptors`` RPC format::
+
+            {
+                "desc": "wpkh(xpub.../0/*)#checksum",
+                "active": true,            # optional, default true
+                "range": [0, 1000],         # optional, default [0, 1000]
+                "next_index": 0,            # optional, default 0
+                "timestamp": "now"|int,     # optional
+                "internal": false,          # optional
+                "label": ""                 # optional
+            }
+
+        Returns a list of result dicts, one per request, each containing
+        ``{"success": true}`` or ``{"success": false, "error": {...}}``.
+        """
+        from ouroboros.descriptors import (
+            DescriptorEntry,
+            add_checksum,
+            parse_descriptor,
+            verify_checksum,
+        )
+
+        results: List[Dict] = []
+
+        for req in requests:
+            try:
+                desc_str = req.get("desc", "")
+                if not desc_str:
+                    raise ValueError("Missing 'desc' field")
+
+                # Validate / add checksum
+                if "#" in desc_str:
+                    if not verify_checksum(desc_str):
+                        raise ValueError(f"Invalid checksum in: {desc_str}")
+                else:
+                    desc_str = add_checksum(desc_str)
+
+                descriptor = parse_descriptor(desc_str)
+
+                # Resolve timestamp
+                ts = req.get("timestamp", "now")
+                if ts == "now":
+                    ts = int(time.time())
+                elif isinstance(ts, str):
+                    ts = int(ts)
+
+                # Range
+                rng = req.get("range", [0, 1000])
+                if isinstance(rng, int):
+                    rng = [0, rng]
+
+                entry = DescriptorEntry(
+                    descriptor=descriptor,
+                    desc_string=desc_str,
+                    timestamp=ts,
+                    active=req.get("active", True),
+                    range_start=rng[0],
+                    range_end=rng[1],
+                    next_index=req.get("next_index", 0),
+                    internal=req.get("internal", False),
+                    label=req.get("label", ""),
+                )
+
+                # Replace existing descriptor with same desc string, or append
+                replaced = False
+                for i, existing in enumerate(self.descriptors):
+                    if existing.desc_string == desc_str:
+                        self.descriptors[i] = entry
+                        replaced = True
+                        break
+                if not replaced:
+                    self.descriptors.append(entry)
+
+                results.append({"success": True})
+                logger.info(
+                    "Imported descriptor: %s (range %d–%d)",
+                    descriptor.descriptor_type,
+                    rng[0],
+                    rng[1],
+                )
+
+            except Exception as exc:
+                results.append({
+                    "success": False,
+                    "error": {
+                        "code": -5,
+                        "message": str(exc),
+                    },
+                })
+                logger.warning("Failed to import descriptor: %s", exc)
+
+        self._save()
+        return results
+
+    def listdescriptors(self) -> List[Dict]:
+        """Return all imported descriptors in JSON-serialisable form."""
+        return [d.to_dict() for d in self.descriptors]
+
+    def deriveaddresses(
+        self, desc_str: str, range_param: Optional[List[int]] = None
+    ) -> List[str]:
+        """
+        Derive addresses from a descriptor string.
+
+        *range_param* is ``[start, end]`` (inclusive on both ends, matching
+        Bitcoin Core's ``deriveaddresses`` RPC).  If the descriptor is not a
+        range descriptor, *range_param* must be ``None``.
+        """
+        from ouroboros.descriptors import parse_descriptor, add_checksum
+
+        if "#" not in desc_str:
+            desc_str = add_checksum(desc_str)
+
+        descriptor = parse_descriptor(desc_str)
+
+        if descriptor.is_range:
+            if range_param is None:
+                range_param = [0, 0]
+            start = range_param[0]
+            end = range_param[1]
+            return [
+                descriptor.derive_address(i, self.network)
+                for i in range(start, end + 1)  # inclusive end
+            ]
+        else:
+            if range_param is not None:
+                raise ValueError(
+                    "Range should not be specified for un-ranged descriptors"
+                )
+            return [descriptor.derive_address(0, self.network)]
+
+    def get_descriptor_addresses(self) -> List[str]:
+        """Return all addresses derived from active descriptors up to next_index."""
+        addrs: List[str] = []
+        for entry in self.descriptors:
+            if not entry.active:
+                continue
+            desc = entry.descriptor
+            end = max(entry.next_index, entry.range_start + 1)
+            for i in range(entry.range_start, end):
+                addrs.append(desc.derive_address(i, self.network))
+        return addrs
+
+    def generate_descriptor_address(
+        self, desc_index: int = 0, label: str | None = None
+    ) -> str:
+        """
+        Generate the next address from a descriptor and advance its index.
+
+        *desc_index* selects which imported descriptor to use (default: first
+        active external descriptor).
+        """
+        # Find the target descriptor
+        active_external = [
+            d for d in self.descriptors
+            if d.active and not d.internal
+        ]
+        if not active_external:
+            raise ValueError("No active external descriptors in wallet")
+        if desc_index >= len(active_external):
+            raise ValueError(
+                f"Descriptor index {desc_index} out of range "
+                f"(have {len(active_external)} active external descriptors)"
+            )
+
+        entry = active_external[desc_index]
+        idx = entry.next_index
+        addr = entry.descriptor.derive_address(idx, self.network)
+        entry.next_index = idx + 1
+        self._save()
+        logger.info("Generated descriptor address %s (index %d)", addr, idx)
+        return addr
 
     def backup(self, backup_path: str) -> str:
         """Create a backup of the wallet file."""
@@ -952,21 +1523,31 @@ class Wallet:
     # --- coin selection --------------------------------------------------------
 
     def _select_coins(
-        self, amount: int, fee_rate: float
+        self,
+        amount: int,
+        fee_rate: float,
+        long_term_fee_rate: float = DEFAULT_LONG_TERM_FEE_RATE,
     ) -> Tuple[List[Dict], int]:
         """
         Select UTXOs to fund a transaction.
 
-        Uses Bitcoin Core's three-tier strategy:
-        1. Branch-and-Bound (exact match, avoids change)
-        2. Knapsack (randomised approximation)
-        3. Single Random Draw (greedy fallback)
+        Runs all three coin-selection algorithms (Branch-and-Bound,
+        Knapsack, Single Random Draw) and picks the result with the
+        lowest *waste metric*.
+
+        Args:
+            amount: Destination amount in satoshis.
+            fee_rate: Current fee rate in sat/vB.
+            long_term_fee_rate: Long-term fee rate in sat/vB (default 10).
 
         Returns (selected_utxos, estimated_fee).
         Raises ValueError on insufficient funds.
         """
         all_utxos = self._collect_utxos()
-        selected, est_fee, _algo = select_coins(all_utxos, amount, fee_rate)
+        selected, est_fee, _algo = select_coins(
+            all_utxos, amount, fee_rate,
+            long_term_fee_rate=long_term_fee_rate,
+        )
         return selected, est_fee
 
     # --- BIP 143 sighash -------------------------------------------------------

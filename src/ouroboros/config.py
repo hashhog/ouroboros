@@ -81,6 +81,13 @@ class NodeConfig:
             'maxconnections': '125',
             'debug': '0',
             'logtimestamps': '1',
+            # SOCKS5 proxy for all outbound P2P connections (host:port)
+            'proxy': None,
+            # SOCKS5 proxy specifically for .onion connections (host:port).
+            # Falls back to 'proxy' when not set.
+            'onion': None,
+            # Whether to accept inbound P2P connections (1/0)
+            'listen': '1',
         }
         
         if self.config_path.exists():
@@ -217,4 +224,7 @@ class NodeConfig:
             'max_connections': self.getint('maxconnections'),
             'debug': self.getboolean('debug'),
             'log_timestamps': self.getboolean('logtimestamps'),
+            'proxy': self.get('proxy'),
+            'onion': self.get('onion'),
+            'listen': self.getboolean('listen'),
         }
