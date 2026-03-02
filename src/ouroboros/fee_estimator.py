@@ -1,24 +1,101 @@
 """
-Fee estimation based on recent block fee rate statistics.
+Fee estimation using exponential-decay fee rate buckets.
 
-Tracks fee rates from the most recent N confirmed blocks and returns
-percentile-based estimates for target confirmation windows.
+Modelled on Bitcoin Core's ``CBlockPolicyEstimator`` (``policy/fees.cpp``).
 
-Bitcoin Core uses exponential-decay fee rate buckets (CBlockPolicyEstimator
-in policy/fees.cpp). This is a simpler percentile approach that observes
-which fee rates actually made it into blocks and uses that distribution
-to recommend rates for a given confirmation target.
+The estimator maintains ~40 fee-rate *buckets* on a logarithmic scale
+(1 – 10 000 sat/vB).  For every confirmed transaction whose fee we know
+(because it was in our mempool), the bucket corresponding to its fee rate
+is updated:
+
+* ``confirmed[bucket][target]`` is incremented when the tx confirmed
+  within *target* blocks.
+* ``total[bucket][target]`` is incremented for every target from 1 up to
+  the actual number of blocks the tx waited – reflecting that it was
+  *unconfirmed* for those shorter windows.
+
+All counters are subjected to an exponential decay (factor 0.998 per
+block), so recent data naturally outweighs stale observations.
+
+To produce an estimate for a given confirmation target *T* the estimator
+finds the lowest bucket where
+``confirmed[bucket][T] / total[bucket][T] >= SUCCESS_THRESHOLD`` (85 %).
+
+A simple percentile-based fallback (the original implementation) is used
+when the bucket data is still sparse (< ``MIN_BUCKET_OBSERVATIONS``
+total observations).
+
+Reference
+---------
+Bitcoin Core ``policy/fees.cpp`` — ``CBlockPolicyEstimator::processBlock``
+and ``CBlockPolicyEstimator::estimateSmartFee``.
 """
 
+import bisect
 import logging
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-MAX_BLOCK_HISTORY = 144
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
+MAX_BLOCK_HISTORY = 144  # blocks kept for the simple (fallback) estimator
+
+#: Fee-rate bucket boundaries in sat/vB (logarithmic scale, ~40 values).
+#: The first element is the lower bound of the first bucket; the last is the
+#: upper bound of the last bucket.  ``_bucket_index`` maps any fee rate to
+#: the appropriate bucket.
+FEE_RATE_BUCKETS: List[float] = [
+    1, 2, 3, 5, 7,
+    10, 15, 20, 30, 50,
+    75, 100, 150, 200, 300,
+    500, 750, 1000, 1500, 2000,
+    3000, 5000, 7500, 10000,
+]
+
+NUM_BUCKETS = len(FEE_RATE_BUCKETS)
+
+#: Maximum confirmation target tracked in the bucket arrays.
+MAX_CONF_TARGET = 25
+
+#: Per-block exponential decay factor applied to all counters.
+DECAY_FACTOR = 0.998
+
+#: Minimum total observations across all buckets before the bucket estimator
+#: is preferred over the simple fallback.
+MIN_BUCKET_OBSERVATIONS = 100
+
+#: Required success probability (confirmed / total) for a bucket to be
+#: considered "good enough" for a given target.
+SUCCESS_THRESHOLD = 0.85
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _bucket_index(fee_rate: float) -> int:
+    """Return the index into ``FEE_RATE_BUCKETS`` for *fee_rate* (sat/vB).
+
+    Uses binary search so that ``FEE_RATE_BUCKETS[idx]`` is the largest
+    bucket boundary that is ≤ *fee_rate*.  Rates below the lowest bucket
+    are clamped to index 0; rates above the highest are clamped to the
+    last index.
+    """
+    if fee_rate <= FEE_RATE_BUCKETS[0]:
+        return 0
+    idx = bisect.bisect_right(FEE_RATE_BUCKETS, fee_rate) - 1
+    return min(idx, NUM_BUCKETS - 1)
+
+
+# ---------------------------------------------------------------------------
+# Legacy data structure (kept for fallback)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BlockFeeData:
@@ -29,71 +106,254 @@ class BlockFeeData:
     min_fee_rate: float
 
 
-class FeeEstimator:
-    """
-    Estimates required fee rates based on observed fee rates in recent
-    confirmed blocks.
+# ---------------------------------------------------------------------------
+# Main estimator
+# ---------------------------------------------------------------------------
 
-    Fee data comes from mempool entries: when a block confirms a transaction
-    that was in our mempool, we know its exact fee and vsize.
+class FeeEstimator:
+    """Exponential-decay fee-rate-bucket estimator with percentile fallback.
+
+    Public API
+    ----------
+    * ``process_block(block, height, mempool)`` — feed confirmed block data.
+    * ``estimate_fee(conf_target)`` — fee rate in sat/vB (or ``None``).
+    * ``estimate_fee_per_kb(conf_target)`` — fee rate in BTC/kB (or ``None``).
+    * ``get_fee_summary()`` — diagnostic dict.
     """
 
     def __init__(self, max_history: int = MAX_BLOCK_HISTORY):
+        # ── Bucket-based estimator state ──────────────────────────────
+        # confirmed[bucket][target] – how many txs in this bucket confirmed
+        #   within exactly *target* blocks (after decay).
+        # total[bucket][target] – how many txs in this bucket were tracked
+        #   for this target window (confirmed OR still unconfirmed, after
+        #   decay).
+        self.confirmed: List[List[float]] = [
+            [0.0] * (MAX_CONF_TARGET + 1) for _ in range(NUM_BUCKETS)
+        ]
+        self.total: List[List[float]] = [
+            [0.0] * (MAX_CONF_TARGET + 1) for _ in range(NUM_BUCKETS)
+        ]
+        # Running count of total observations fed into the bucket arrays
+        # (before decay), used to decide whether we have enough data.
+        self._total_observations: int = 0
+
+        # ── Simple fallback estimator state ───────────────────────────
         self.max_history = max_history
         self.block_history: deque[BlockFeeData] = deque(maxlen=max_history)
 
-    def process_block(self, block, height: int, mempool=None) -> None:
-        """
-        Record fee rate data from a newly confirmed block.
+    # ------------------------------------------------------------------
+    # Block processing
+    # ------------------------------------------------------------------
 
-        For each non-coinbase transaction that was in our mempool, record
-        its fee rate. Transactions we never saw in our mempool are skipped
-        (we don't know their fee).
+    def process_block(self, block, height: int, mempool=None) -> None:
+        """Record fee-rate data from a newly confirmed block.
+
+        For every non-coinbase transaction that was in our mempool we know
+        its fee, vsize and the height at which we first saw it.  We compute
+        how many blocks the tx waited (``height - entry.height_added``) and
+        update the bucket counters.
+
+        The method also feeds the simple (fallback) estimator.
 
         Args:
-            block: Block object with .transactions list
-            height: Block height
-            mempool: Mempool instance to look up fee data
+            block: Block object with a ``.transactions`` list.
+            height: Height of the confirmed block.
+            mempool: ``Mempool`` instance — used to look up fee / size /
+                entry-height for confirmed transactions.
         """
+        # 1) Apply per-block exponential decay to ALL existing counters
+        #    *before* recording the new observations (mirrors Bitcoin Core).
+        self._apply_decay()
+
         fee_rates: List[float] = []
 
         for tx in block.transactions:
             if tx.is_coinbase:
                 continue
 
-            if mempool is not None:
-                entry = mempool.get_transaction_entry(tx.get_txid())
-                if entry is not None and entry.fee > 0:
-                    vsize = entry.size if entry.size > 0 else 1
-                    fee_rates.append(entry.fee / vsize)
+            if mempool is None:
+                continue
 
-        if not fee_rates:
-            return
+            entry = mempool.get_transaction_entry(tx.get_txid())
+            if entry is None or entry.fee <= 0:
+                continue
 
-        fee_rates.sort()
-        median = fee_rates[len(fee_rates) // 2]
-        self.block_history.append(BlockFeeData(
-            height=height,
-            fee_rates=fee_rates,
-            median_fee_rate=median,
-            min_fee_rate=fee_rates[0],
-        ))
-        logger.debug(
-            f"Fee estimator: block {height} had {len(fee_rates)} txs "
-            f"with median fee rate {median:.1f} sat/vB"
-        )
+            vsize = entry.size if entry.size > 0 else 1
+            fee_rate = entry.fee / vsize
+            fee_rates.append(fee_rate)
+
+            # Determine how many blocks the tx waited.
+            entry_height = getattr(entry, "height_added", 0)
+            if entry_height > 0 and height >= entry_height:
+                blocks_to_confirm = height - entry_height + 1  # 1-based
+            else:
+                blocks_to_confirm = 1  # conservative default
+
+            self._record_confirmation(fee_rate, blocks_to_confirm)
+
+        # ── Feed the simple fallback estimator ────────────────────────
+        if fee_rates:
+            fee_rates.sort()
+            median = fee_rates[len(fee_rates) // 2]
+            self.block_history.append(BlockFeeData(
+                height=height,
+                fee_rates=fee_rates,
+                median_fee_rate=median,
+                min_fee_rate=fee_rates[0],
+            ))
+            logger.debug(
+                f"Fee estimator: block {height} had {len(fee_rates)} txs "
+                f"with median fee rate {median:.1f} sat/vB"
+            )
+
+    # ------------------------------------------------------------------
+    # Estimation
+    # ------------------------------------------------------------------
 
     def estimate_fee(self, conf_target: int = 6) -> Optional[float]:
+        """Estimate fee rate in sat/vB for confirmation within *conf_target* blocks.
+
+        If the bucket estimator has accumulated enough data it is used;
+        otherwise the simple percentile fallback kicks in.
+
+        Returns ``None`` when there is truly not enough information.
         """
-        Estimate fee rate (sat/vB) for confirmation within conf_target blocks.
+        conf_target = max(1, min(conf_target, MAX_CONF_TARGET))
 
-        Strategy mirrors Bitcoin Core's buckets at a coarse level:
-        - conf_target 1-2:  90th percentile (high priority)
-        - conf_target 3-6:  50th percentile (normal)
-        - conf_target 7-25: 25th percentile (low priority)
-        - conf_target 25+:  10th percentile (economy)
+        # Try bucket-based estimation first.
+        if self._total_observations >= MIN_BUCKET_OBSERVATIONS:
+            bucket_estimate = self._estimate_from_buckets(conf_target)
+            if bucket_estimate is not None:
+                return bucket_estimate
 
-        Returns None if insufficient data (< 3 blocks observed).
+        # Fallback to simple percentile method.
+        return self._estimate_simple(conf_target)
+
+    def estimate_fee_per_kb(self, conf_target: int = 6) -> Optional[float]:
+        """Return fee estimate in BTC/kB (Bitcoin Core RPC format)."""
+        rate = self.estimate_fee(conf_target)
+        if rate is None:
+            return None
+        # sat/vB → BTC/kB:  rate * 1000 / 1e8
+        return rate * 1000 / 1e8
+
+    def get_fee_summary(self) -> Dict:
+        """Return summary statistics for diagnostics."""
+        summary: Dict = {
+            "blocks_tracked": len(self.block_history),
+            "bucket_observations": self._total_observations,
+        }
+
+        if self.block_history:
+            medians = [b.median_fee_rate for b in self.block_history]
+            summary.update({
+                "oldest_height": self.block_history[0].height,
+                "newest_height": self.block_history[-1].height,
+                "median_fee_rate": sorted(medians)[len(medians) // 2],
+                "min_fee_rate": min(
+                    b.min_fee_rate for b in self.block_history
+                ),
+            })
+
+        # Per-bucket snapshot (confirmed / total for a few representative
+        # targets) — useful for debugging.
+        bucket_snapshot: List[Dict] = []
+        for i, boundary in enumerate(FEE_RATE_BUCKETS):
+            row: Dict = {"bucket_sat_vb": boundary}
+            for t in (1, 3, 6, 12, 25):
+                total = self.total[i][t]
+                conf = self.confirmed[i][t]
+                if total > 0:
+                    row[f"target_{t}"] = round(conf / total, 3)
+                else:
+                    row[f"target_{t}"] = None
+            bucket_snapshot.append(row)
+        summary["buckets"] = bucket_snapshot
+
+        return summary
+
+    # ------------------------------------------------------------------
+    # Internal: bucket estimator
+    # ------------------------------------------------------------------
+
+    def _apply_decay(self) -> None:
+        """Multiply every counter by ``DECAY_FACTOR``."""
+        for i in range(NUM_BUCKETS):
+            for t in range(MAX_CONF_TARGET + 1):
+                self.confirmed[i][t] *= DECAY_FACTOR
+                self.total[i][t] *= DECAY_FACTOR
+
+    def _record_confirmation(self, fee_rate: float, blocks_to_confirm: int) -> None:
+        """Update bucket counters for a single confirmed transaction.
+
+        * The tx confirmed in *blocks_to_confirm* blocks, so for every
+          target T from *blocks_to_confirm* up to ``MAX_CONF_TARGET`` the
+          tx is a *success* (it confirmed within T blocks) — we increment
+          both ``confirmed`` and ``total``.
+        * For targets T from 1 to *blocks_to_confirm - 1* the tx was still
+          unconfirmed (it had *not yet* confirmed within that shorter
+          window) — we only increment ``total``.
+        """
+        bucket = _bucket_index(fee_rate)
+        self._total_observations += 1
+
+        # Clamp to the range we track.
+        btc = min(blocks_to_confirm, MAX_CONF_TARGET)
+
+        # Targets where the tx was still unconfirmed (failed to confirm
+        # within that window).
+        for t in range(1, btc):
+            self.total[bucket][t] += 1.0
+
+        # Targets where the tx *did* confirm within the window (success).
+        for t in range(btc, MAX_CONF_TARGET + 1):
+            self.confirmed[bucket][t] += 1.0
+            self.total[bucket][t] += 1.0
+
+    def _estimate_from_buckets(self, conf_target: int) -> Optional[float]:
+        """Find the lowest fee-rate bucket meeting the success threshold.
+
+        Scans buckets from low to high.  Returns the bucket boundary
+        (sat/vB) of the first bucket whose success probability for
+        *conf_target* meets ``SUCCESS_THRESHOLD``.
+
+        To avoid noise from buckets with very few observations, a bucket
+        needs at least 2.0 (decayed) total observations to be considered.
+
+        Returns ``None`` if no bucket qualifies.
+        """
+        for i in range(NUM_BUCKETS):
+            total = self.total[i][conf_target]
+            if total < 2.0:
+                continue
+            prob = self.confirmed[i][conf_target] / total
+            if prob >= SUCCESS_THRESHOLD:
+                return max(float(FEE_RATE_BUCKETS[i]), 1.0)
+
+        # If no bucket passes, recommend the highest bucket as a
+        # conservative estimate – but only if we have *some* data there.
+        for i in range(NUM_BUCKETS - 1, -1, -1):
+            total = self.total[i][conf_target]
+            if total >= 2.0:
+                return max(float(FEE_RATE_BUCKETS[i]), 1.0)
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Internal: simple percentile fallback
+    # ------------------------------------------------------------------
+
+    def _estimate_simple(self, conf_target: int) -> Optional[float]:
+        """Original percentile-based estimator (fallback).
+
+        Strategy:
+        - conf_target  1-2:   90th percentile (high priority)
+        - conf_target  3-6:   50th percentile (normal)
+        - conf_target  7-25:  25th percentile (low priority)
+        - conf_target 25+:    10th percentile (economy)
+
+        Returns ``None`` if fewer than 3 blocks have been observed.
         """
         if len(self.block_history) < 3:
             return None
@@ -120,24 +380,3 @@ class FeeEstimator:
 
         idx = min(int(len(all_rates) * percentile), len(all_rates) - 1)
         return max(all_rates[idx], 1.0)
-
-    def estimate_fee_per_kb(self, conf_target: int = 6) -> Optional[float]:
-        """Return fee estimate in BTC/kB (Bitcoin Core RPC format)."""
-        rate = self.estimate_fee(conf_target)
-        if rate is None:
-            return None
-        return rate * 1000 / 1e8
-
-    def get_fee_summary(self) -> Dict:
-        """Return summary statistics for diagnostics."""
-        if not self.block_history:
-            return {"blocks_tracked": 0}
-
-        medians = [b.median_fee_rate for b in self.block_history]
-        return {
-            "blocks_tracked": len(self.block_history),
-            "oldest_height": self.block_history[0].height,
-            "newest_height": self.block_history[-1].height,
-            "median_fee_rate": sorted(medians)[len(medians) // 2],
-            "min_fee_rate": min(b.min_fee_rate for b in self.block_history),
-        }
