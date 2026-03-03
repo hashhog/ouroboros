@@ -30,6 +30,7 @@ class SyncProgress:
     eta_seconds: int
     phase: str = "header"  # "header" or "block"
     total_known: bool = True  # False in header phase until we know actual chain tip
+    peer_count: int = 0
     
     def __str__(self) -> str:
         if self.total_height == 0:
@@ -233,6 +234,7 @@ class SyncManager:
                 eta_seconds=rust_progress.eta_seconds,
                 phase=getattr(rust_progress, "phase", "header"),
                 total_known=getattr(rust_progress, "total_known", True),
+                peer_count=getattr(rust_progress, "peer_count", 0),
             )
 
             # When total_known is False we intentionally use 0% (CLI shows "Requesting...").

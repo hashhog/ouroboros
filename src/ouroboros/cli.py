@@ -16,7 +16,6 @@ from rich.progress import (
     SpinnerColumn,
     BarColumn,
     TextColumn,
-    TaskID,
 )
 from rich.table import Table
 from rich.panel import Panel
@@ -109,6 +108,10 @@ def cli(ctx, data_dir, config_file, network, debug, log_json):
     # Ensure data directory exists
     Path(data_dir).mkdir(parents=True, exist_ok=True)
 
+    # Wire --debug through to Rust logging (OUROBOROS_VERBOSE=1 sets sync=debug)
+    if debug:
+        os.environ["OUROBOROS_VERBOSE"] = "1"
+
     configure_logging(
         debug=debug,
         json_format=log_json,
@@ -161,108 +164,93 @@ def sync(ctx, reset, limit):
         else:
             data_path.mkdir(parents=True, exist_ok=True)
     
-    limit_info = f"\nBlock limit: [cyan]{limit}[/cyan]" if limit else ""
-    console.print(Panel.fit(
-        f"[bold]Blockchain Synchronization[/bold]\n"
-        f"Network: [cyan]{network}[/cyan]\n"
-        f"Data directory: [cyan]{data_dir}[/cyan]"
-        f"{limit_info}",
-        border_style="blue"
-    ))
-    
+    limit_info = f" (limit: {limit} blocks)" if limit else ""
+    console.print(
+        f"[bold]ouroboros sync[/bold] — [cyan]{network}[/cyan]{limit_info}\n"
+        f"[dim]Data: {data_dir}[/dim]"
+    )
+
     # Create SyncManager
     try:
         _sync_manager = SyncManager(data_dir, network)
     except Exception as e:
         console.print(f"[red]Error initializing sync manager: {e}[/red]")
         sys.exit(1)
-    
+
     # Check if already synced
     if _sync_manager.is_synced():
-        console.print("[green]✓ Blockchain is already synchronized[/green]")
+        console.print("[green]✓ Already synced[/green]")
         return
-    
+
     # Progress tracking
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TextColumn("[cyan]• {task.fields[blocks]}[/cyan]"),
-        TextColumn("[yellow]{task.fields[speed_str]}[/yellow]"),
+        TextColumn("{task.fields[info]}"),
         console=console,
         redirect_stderr=True,
     ) as progress:
-        # TODO: Peer count and desync warnings - expose from Rust BlockProgressCache when available
         task = progress.add_task(
-            "[cyan]Phase: Header sync • Starting...[/cyan]",
+            "[cyan]Connecting...[/cyan]",
             total=100.0,
-            blocks="0",
-            speed_str="",
+            info="",
         )
-        
+
         _last_phase: Optional[str] = None
+        _total_blocks_downloaded = 0
+
+        def format_eta(seconds: int) -> str:
+            if seconds >= 999 * 3600:
+                return ""
+            if seconds < 60:
+                return f"{seconds}s"
+            if seconds < 3600:
+                return f"{seconds // 60}m {seconds % 60}s"
+            return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
 
         def progress_callback(prog: SyncProgress):
-            """Update progress bar with sync status."""
-            nonlocal _last_phase
+            nonlocal _last_phase, _total_blocks_downloaded
             global _cancelled
             if _cancelled:
                 return
 
-            # Reset progress bar when transitioning from header to block phase
             if prog.phase == "block" and _last_phase == "header":
                 progress.update(task, completed=0)
             _last_phase = prog.phase
+            _total_blocks_downloaded = prog.current_height
 
-            # Block count display: "X blocks / chain_height" during block phase, "X headers" during header
-            if prog.phase == "block":
-                blocks_str = (
-                    f"{prog.current_height:,} blocks / {prog.total_height:,}"
-                    if prog.total_height > 0
-                    else f"{prog.current_height:,} blocks"
-                )
-                speed_str = f"• {prog.blocks_per_second:.1f} blocks/s"
+            peers_str = f"[dim]{prog.peer_count} peers[/dim]" if prog.peer_count > 0 else ""
+
+            if prog.phase == "header":
+                if not prog.total_known:
+                    desc = "[cyan]Headers[/cyan]"
+                    info = f"[dim]connecting...[/dim]  {peers_str}"
+                else:
+                    desc = "[cyan]Headers[/cyan]"
+                    info = f"[cyan]{prog.current_height:,}[/cyan] / {prog.total_height:,}  {peers_str}"
             else:
-                blocks_str = f"{prog.current_height:,} headers"
-                speed_str = ""
+                eta = format_eta(prog.eta_seconds)
+                eta_str = f"  [dim]ETA {eta}[/dim]" if eta else ""
+                desc = "[cyan]Blocks[/cyan]"
+                info = (
+                    f"[cyan]{prog.current_height:,}[/cyan] / {prog.total_height:,}"
+                    f"  [yellow]{prog.blocks_per_second:.1f} blk/s[/yellow]"
+                    f"{eta_str}  {peers_str}"
+                )
 
-            # Update progress
             progress.update(
                 task,
                 completed=prog.progress_percent,
-                blocks=blocks_str,
-                speed_str=speed_str,
+                description=desc,
+                info=info,
             )
 
-            # Description with phase label (blocks/speed in columns to avoid duplication)
-            if prog.phase == "header":
-                if not prog.total_known:
-                    desc = "[cyan]Phase: Header sync • Requesting current block height...[/cyan]"
-                else:
-                    desc = f"[cyan]Phase: Header sync • {prog.current_height:,} headers[/cyan]"
-            else:
-                # Block phase: phase label + ETA
-                if prog.eta_seconds >= 999 * 3600:
-                    eta_str = "—"
-                elif prog.eta_seconds < 60:
-                    eta_str = f"{prog.eta_seconds}s"
-                elif prog.eta_seconds < 3600:
-                    eta_str = f"{prog.eta_seconds // 60}m {prog.eta_seconds % 60}s"
-                else:
-                    hours = prog.eta_seconds // 3600
-                    minutes = (prog.eta_seconds % 3600) // 60
-                    eta_str = f"{hours}h {minutes}m"
-                desc = f"[cyan]Phase: Block sync • ETA: {eta_str}[/cyan]"
-
-            progress.update(task, description=desc)
-        
         def cancel_check() -> bool:
-            """Check if sync should be cancelled."""
             return _cancelled
 
         def format_duration(secs: float) -> str:
-            """Format duration for display."""
             if secs < 60:
                 return f"{secs:.1f}s"
             if secs < 3600:
@@ -277,7 +265,7 @@ def sync(ctx, reset, limit):
             success = _sync_manager.perform_initial_sync(
                 progress_callback=progress_callback,
                 cancel_check=cancel_check,
-                progress_interval=1.0,  # Update every second for better UX
+                progress_interval=1.0,
                 limit=limit,
             )
 
@@ -286,25 +274,30 @@ def sync(ctx, reset, limit):
                 duration_secs = time.time() - sync_start_time
                 final_progress = _sync_manager.get_progress() or _sync_manager.last_progress
                 final_height = final_progress.current_height if final_progress else 0
+                avg_speed = final_height / duration_secs if duration_secs > 0 else 0
                 console.print(
-                    "\n[green]✓ Blockchain synchronization completed[/green] "
-                    f"• Height: [cyan]{final_height:,}[/cyan] "
-                    f"• Duration: [cyan]{format_duration(duration_secs)}[/cyan]"
+                    f"\n[green]✓ Synced to {final_height:,}[/green]"
+                    f" in [cyan]{format_duration(duration_secs)}[/cyan]"
+                    f" [dim](avg {avg_speed:.1f} blk/s)[/dim]"
                 )
             elif _cancelled:
-                console.print("\n[yellow]Synchronization cancelled by user[/yellow]")
+                duration_secs = time.time() - sync_start_time
+                console.print(
+                    f"\n[yellow]Sync cancelled at height {_total_blocks_downloaded:,}[/yellow]"
+                    f" after [cyan]{format_duration(duration_secs)}[/cyan]"
+                )
             else:
                 error = _sync_manager.last_error
-                console.print(f"\n[red]✗ Synchronization failed: {error}[/red]")
+                console.print(f"\n[red]✗ Sync failed: {error}[/red]")
                 sys.exit(1)
-        
+
         except KeyboardInterrupt:
             _cancelled = True
             _sync_manager.cancel_sync()
-            console.print("\n[yellow]Synchronization interrupted[/yellow]")
+            console.print("\n[yellow]Sync interrupted[/yellow]")
             sys.exit(1)
         except Exception as e:
-            console.print(f"\n[red]✗ Error during synchronization: {e}[/red]")
+            console.print(f"\n[red]✗ Sync error: {e}[/red]")
             sys.exit(1)
 
 
