@@ -206,6 +206,8 @@ pub struct BlockProgressCache {
     /// When header sync receives a short batch, it sets this to the discovered tip (0-indexed).
     /// Used for accurate progress % when chain is shorter than estimated_tip.
     pub header_sync_tip: Option<u32>,
+    /// Number of connected peers (updated during sync for CLI display)
+    pub peer_count: u32,
 }
 
 impl Default for BlockProgressCache {
@@ -217,6 +219,7 @@ impl Default for BlockProgressCache {
             blocks_per_second: 0.0,
             eta_seconds: 0.0,
             header_sync_tip: None,
+            peer_count: 0,
         }
     }
 }
@@ -1316,12 +1319,19 @@ impl BlockSync {
             None => return,
         };
 
+        // Get connected peer count
+        let peer_count = {
+            let pm = self.peer_manager.lock().await;
+            pm.connected_peers_count().await as u32
+        };
+
         // Update cache for get_sync_progress (called from sync Python code)
         {
             let mut cache = self.progress_cache.lock().unwrap();
             cache.blocks_downloaded = blocks_downloaded;
             cache.blocks_per_second = speed;
             cache.eta_seconds = eta;
+            cache.peer_count = peer_count;
         }
 
         if let Some(ref callback) = self.progress_callback {
