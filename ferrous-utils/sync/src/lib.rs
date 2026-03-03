@@ -730,6 +730,7 @@ impl SyncProgressReporter {
             eta_seconds: eta_capped,
             phase: phase.to_string(),
             total_known,
+            peer_count: cache.peer_count,
         })
     }
 }
@@ -772,6 +773,9 @@ pub struct SyncProgress {
     /// When false (header phase, tip unknown): CLI should show "Requesting current block height..." instead of %
     #[pyo3(get)]
     pub total_known: bool,
+    /// Number of connected peers
+    #[pyo3(get)]
+    pub peer_count: u32,
 }
 
 /// Fast sync orchestrator for Bitcoin blockchain
@@ -1066,6 +1070,10 @@ impl FastSync {
         const MAX_ETA_SECS: u64 = 999 * 3600;
         let eta_capped = eta_seconds.min(MAX_ETA_SECS as f64) as u64;
 
+        let peer_count = self.progress_cache.lock()
+            .map(|c| c.peer_count)
+            .unwrap_or(0);
+
         Ok(SyncProgress {
             current_height,
             total_height,
@@ -1074,6 +1082,7 @@ impl FastSync {
             eta_seconds: eta_capped,
             phase: phase.to_string(),
             total_known,
+            peer_count,
         })
     }
 

@@ -307,6 +307,17 @@ impl HeaderSync {
                 callback(downloaded, estimated_total, percentage.min(100.0));
             }
 
+            // Update peer count in progress cache for CLI display
+            if let Some(ref cache) = self.progress_cache {
+                let count = {
+                    let pm = self.peer_manager.lock().await;
+                    pm.connected_peers_count().await as u32
+                };
+                if let Ok(mut c) = cache.lock() {
+                    c.peer_count = count;
+                }
+            }
+
             // If we got fewer than BATCH_SIZE headers, we're at chain tip
             // current_height = save_start + len is the next height; tip = current_height - 1
             if headers.len() < BATCH_SIZE as usize {
