@@ -53,6 +53,10 @@ pub enum ScriptError {
     /// BIP141: Script evaluated to false
     #[error("Script evaluated to false")]
     EvalFalse,
+
+    /// BIP16: P2SH scriptSig must contain only push operations
+    #[error("scriptSig must be push-only for P2SH")]
+    SigPushOnly,
 }
 
 /// Result type for script operations
@@ -321,6 +325,172 @@ pub fn cast_to_bool(data: &[u8]) -> bool {
         }
     }
     false
+}
+
+// ============================================================================
+// Push-only script validation (BIP16)
+// ============================================================================
+
+/// Opcode constants for push-only validation
+/// Reference: Bitcoin Core script/script.h
+const OP_0: u8 = 0x00;
+const OP_PUSHDATA1: u8 = 0x4c;  // 76 - next byte is length
+const OP_PUSHDATA2: u8 = 0x4d;  // 77 - next 2 bytes are length (LE)
+const OP_PUSHDATA4: u8 = 0x4e;  // 78 - next 4 bytes are length (LE)
+const OP_1NEGATE: u8 = 0x4f;    // 79
+const OP_RESERVED: u8 = 0x50;   // 80
+const OP_1: u8 = 0x51;          // 81
+const OP_16_CONST: u8 = 0x60;   // 96
+
+/// Check if a script contains only push operations.
+///
+/// A script is "push-only" if every instruction is either:
+/// - OP_0 (0x00) - push empty array
+/// - Direct push (0x01-0x4b) - push 1-75 bytes
+/// - OP_PUSHDATA1 (0x4c) - push up to 255 bytes
+/// - OP_PUSHDATA2 (0x4d) - push up to 65535 bytes
+/// - OP_PUSHDATA4 (0x4e) - push up to 4GB bytes
+/// - OP_1NEGATE (0x4f) - push -1
+/// - OP_RESERVED (0x50) - technically a push opcode (returns failure but counted as push)
+/// - OP_1..OP_16 (0x51-0x60) - push small integers 1-16
+///
+/// This is consensus-critical for P2SH: the scriptSig must be push-only
+/// before the redeem script is evaluated.
+///
+/// Reference: Bitcoin Core script/script.cpp CScript::IsPushOnly()
+///
+/// # Arguments
+/// * `script` - The raw script bytes to check
+///
+/// # Returns
+/// `true` if the script contains only push operations, `false` otherwise
+pub fn is_push_only(script: &[u8]) -> bool {
+    let mut pc = 0;
+    let len = script.len();
+
+    while pc < len {
+        let opcode = script[pc];
+        pc += 1;
+
+        // Check if this is a push opcode (opcode <= OP_16)
+        // Bitcoin Core: "IsPushOnly() *does* consider OP_RESERVED to be a push-type opcode"
+        if opcode > OP_16_CONST {
+            return false;
+        }
+
+        // Handle data pushes - need to skip over the data
+        if opcode == OP_0 {
+            // OP_0: push empty array, no data bytes
+            continue;
+        } else if opcode <= 0x4b {
+            // Direct push: opcode is the number of bytes to push (1-75)
+            let data_len = opcode as usize;
+            if pc + data_len > len {
+                // Script truncated, not a valid push-only script
+                return false;
+            }
+            pc += data_len;
+        } else if opcode == OP_PUSHDATA1 {
+            // OP_PUSHDATA1: next byte is length
+            if pc >= len {
+                return false;
+            }
+            let data_len = script[pc] as usize;
+            pc += 1;
+            if pc + data_len > len {
+                return false;
+            }
+            pc += data_len;
+        } else if opcode == OP_PUSHDATA2 {
+            // OP_PUSHDATA2: next 2 bytes are length (little-endian)
+            if pc + 2 > len {
+                return false;
+            }
+            let data_len = u16::from_le_bytes([script[pc], script[pc + 1]]) as usize;
+            pc += 2;
+            if pc + data_len > len {
+                return false;
+            }
+            pc += data_len;
+        } else if opcode == OP_PUSHDATA4 {
+            // OP_PUSHDATA4: next 4 bytes are length (little-endian)
+            if pc + 4 > len {
+                return false;
+            }
+            let data_len = u32::from_le_bytes([
+                script[pc],
+                script[pc + 1],
+                script[pc + 2],
+                script[pc + 3],
+            ]) as usize;
+            pc += 4;
+            if pc + data_len > len {
+                return false;
+            }
+            pc += data_len;
+        }
+        // OP_1NEGATE (0x4f), OP_RESERVED (0x50), OP_1..OP_16 (0x51-0x60)
+        // These are all push opcodes with no additional data bytes
+    }
+
+    true
+}
+
+/// Check if a scriptPubKey is a P2SH output.
+///
+/// P2SH pattern: OP_HASH160 <20 bytes> OP_EQUAL
+/// - Byte 0: OP_HASH160 (0xa9)
+/// - Byte 1: OP_PUSHBYTES_20 (0x14)
+/// - Bytes 2-21: 20-byte script hash
+/// - Byte 22: OP_EQUAL (0x87)
+///
+/// Reference: Bitcoin Core script/script.cpp CScript::IsPayToScriptHash()
+pub fn is_p2sh(script: &[u8]) -> bool {
+    script.len() == 23
+        && script[0] == 0xa9  // OP_HASH160
+        && script[1] == 0x14  // Push 20 bytes
+        && script[22] == 0x87 // OP_EQUAL
+}
+
+/// Verify P2SH push-only constraint on scriptSig.
+///
+/// When spending a P2SH output, the scriptSig MUST contain only push operations.
+/// This is a consensus rule since BIP16 activation and is enforced unconditionally
+/// when `SCRIPT_VERIFY_P2SH` is set and the scriptPubKey is P2SH.
+///
+/// This check is separate from `SCRIPT_VERIFY_SIGPUSHONLY` which applies to ALL
+/// scriptSigs. The P2SH push-only rule is consensus-critical and unconditional.
+///
+/// Reference: Bitcoin Core interpreter.cpp VerifyScript() lines 2054-2056
+///
+/// # Arguments
+/// * `script_sig` - The scriptSig bytes to validate
+/// * `script_pubkey` - The scriptPubKey being spent (to check if P2SH)
+/// * `flags` - Script verification flags (P2SH must be set)
+///
+/// # Returns
+/// `Ok(())` if valid, `Err(ScriptError::SigPushOnly)` if scriptSig is not push-only
+pub fn verify_p2sh_push_only(
+    script_sig: &[u8],
+    script_pubkey: &[u8],
+    flags: ScriptVerifyFlags,
+) -> Result<()> {
+    // Only check if P2SH flag is set
+    if !flags.contains(ScriptVerifyFlags::P2SH) {
+        return Ok(());
+    }
+
+    // Only check if the scriptPubKey is P2SH
+    if !is_p2sh(script_pubkey) {
+        return Ok(());
+    }
+
+    // scriptSig must be push-only for P2SH
+    if !is_push_only(script_sig) {
+        return Err(ScriptError::SigPushOnly);
+    }
+
+    Ok(())
 }
 
 /// Signature version for script execution context.
@@ -2368,5 +2538,272 @@ mod tests {
 
         // CHECKSIG leaves result, then 42 is pushed - 2 elements fails cleanstack
         assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    // =========================================================================
+    // P2SH Push-Only Tests (BIP16)
+    // =========================================================================
+
+    #[test]
+    fn test_is_push_only_empty_script() {
+        // Empty script is push-only (vacuously true)
+        assert!(is_push_only(&[]));
+    }
+
+    #[test]
+    fn test_is_push_only_op_0() {
+        // OP_0 (0x00) is a push opcode
+        assert!(is_push_only(&[0x00]));
+    }
+
+    #[test]
+    fn test_is_push_only_small_integers() {
+        // OP_1..OP_16 (0x51-0x60) are push opcodes
+        for opcode in 0x51..=0x60 {
+            assert!(is_push_only(&[opcode]), "OP_{} should be push-only", opcode - 0x50);
+        }
+    }
+
+    #[test]
+    fn test_is_push_only_op_1negate() {
+        // OP_1NEGATE (0x4f) is a push opcode
+        assert!(is_push_only(&[0x4f]));
+    }
+
+    #[test]
+    fn test_is_push_only_op_reserved() {
+        // OP_RESERVED (0x50) is considered a push opcode by Bitcoin Core
+        // even though it causes script failure when executed
+        assert!(is_push_only(&[0x50]));
+    }
+
+    #[test]
+    fn test_is_push_only_direct_push() {
+        // Direct push: opcode 0x01-0x4b specifies length
+        // Push 5 bytes: [0x05, byte1, byte2, byte3, byte4, byte5]
+        let script = vec![0x05, 0x01, 0x02, 0x03, 0x04, 0x05];
+        assert!(is_push_only(&script));
+
+        // Push 75 bytes (max direct push)
+        let mut script_75 = vec![0x4b]; // push 75 bytes
+        script_75.extend_from_slice(&[0u8; 75]);
+        assert!(is_push_only(&script_75));
+    }
+
+    #[test]
+    fn test_is_push_only_pushdata1() {
+        // OP_PUSHDATA1 (0x4c): next byte is length
+        // Push 100 bytes
+        let mut script = vec![0x4c, 100]; // OP_PUSHDATA1, length=100
+        script.extend_from_slice(&[0u8; 100]);
+        assert!(is_push_only(&script));
+    }
+
+    #[test]
+    fn test_is_push_only_pushdata2() {
+        // OP_PUSHDATA2 (0x4d): next 2 bytes are length (little-endian)
+        // Push 300 bytes
+        let mut script = vec![0x4d, 0x2c, 0x01]; // OP_PUSHDATA2, length=300 (0x012c)
+        script.extend_from_slice(&[0u8; 300]);
+        assert!(is_push_only(&script));
+    }
+
+    #[test]
+    fn test_is_push_only_pushdata4() {
+        // OP_PUSHDATA4 (0x4e): next 4 bytes are length (little-endian)
+        // Push 100 bytes using PUSHDATA4
+        let mut script = vec![0x4e, 0x64, 0x00, 0x00, 0x00]; // OP_PUSHDATA4, length=100
+        script.extend_from_slice(&[0u8; 100]);
+        assert!(is_push_only(&script));
+    }
+
+    #[test]
+    fn test_is_push_only_multiple_pushes() {
+        // Multiple push operations
+        let script = vec![
+            0x00,             // OP_0
+            0x51,             // OP_1
+            0x03, 0xaa, 0xbb, 0xcc,  // push 3 bytes
+            0x4f,             // OP_1NEGATE
+            0x60,             // OP_16
+        ];
+        assert!(is_push_only(&script));
+    }
+
+    #[test]
+    fn test_is_push_only_fails_op_dup() {
+        // OP_DUP (0x76) is NOT a push opcode
+        assert!(!is_push_only(&[0x76]));
+    }
+
+    #[test]
+    fn test_is_push_only_fails_op_hash160() {
+        // OP_HASH160 (0xa9) is NOT a push opcode
+        assert!(!is_push_only(&[0xa9]));
+    }
+
+    #[test]
+    fn test_is_push_only_fails_op_checksig() {
+        // OP_CHECKSIG (0xac) is NOT a push opcode
+        assert!(!is_push_only(&[0xac]));
+    }
+
+    #[test]
+    fn test_is_push_only_fails_op_equal() {
+        // OP_EQUAL (0x87) is NOT a push opcode
+        assert!(!is_push_only(&[0x87]));
+    }
+
+    #[test]
+    fn test_is_push_only_fails_with_computation_in_middle() {
+        // Script: push 1, OP_DUP, push 2
+        // Even with valid pushes, a single non-push opcode fails
+        let script = vec![0x51, 0x76, 0x52]; // OP_1, OP_DUP, OP_2
+        assert!(!is_push_only(&script));
+    }
+
+    #[test]
+    fn test_is_push_only_fails_truncated_direct_push() {
+        // Direct push claims 5 bytes but only 3 are present
+        let script = vec![0x05, 0x01, 0x02, 0x03];
+        assert!(!is_push_only(&script));
+    }
+
+    #[test]
+    fn test_is_push_only_fails_truncated_pushdata1() {
+        // OP_PUSHDATA1 claims 100 bytes but only 10 are present
+        let mut script = vec![0x4c, 100];
+        script.extend_from_slice(&[0u8; 10]);
+        assert!(!is_push_only(&script));
+    }
+
+    #[test]
+    fn test_is_push_only_fails_truncated_pushdata2() {
+        // OP_PUSHDATA2 with insufficient length bytes
+        let script = vec![0x4d, 0x01]; // missing second length byte
+        assert!(!is_push_only(&script));
+    }
+
+    #[test]
+    fn test_is_p2sh_valid() {
+        // Valid P2SH script: OP_HASH160 <20 bytes> OP_EQUAL
+        let mut script = vec![0xa9, 0x14]; // OP_HASH160, push 20 bytes
+        script.extend_from_slice(&[0u8; 20]); // 20-byte hash
+        script.push(0x87); // OP_EQUAL
+        assert!(is_p2sh(&script));
+    }
+
+    #[test]
+    fn test_is_p2sh_wrong_length() {
+        // Wrong length (24 bytes instead of 23)
+        let mut script = vec![0xa9, 0x15]; // OP_HASH160, push 21 bytes
+        script.extend_from_slice(&[0u8; 21]); // 21-byte hash
+        script.push(0x87); // OP_EQUAL
+        assert!(!is_p2sh(&script));
+    }
+
+    #[test]
+    fn test_is_p2sh_wrong_op() {
+        // Wrong opcode at start
+        let mut script = vec![0xaa, 0x14]; // OP_HASH256 instead of OP_HASH160
+        script.extend_from_slice(&[0u8; 20]);
+        script.push(0x87);
+        assert!(!is_p2sh(&script));
+    }
+
+    #[test]
+    fn test_verify_p2sh_push_only_passes_for_push_only_script() {
+        // P2SH scriptPubKey
+        let mut script_pubkey = vec![0xa9, 0x14];
+        script_pubkey.extend_from_slice(&[0u8; 20]);
+        script_pubkey.push(0x87);
+
+        // Push-only scriptSig: <sig> <pubkey>
+        let script_sig = vec![
+            0x47, // push 71 bytes (typical signature)
+        ];
+        let mut sig = vec![0x47];
+        sig.extend_from_slice(&[0x30; 71]); // 71 bytes of dummy sig
+        sig.push(0x21); // push 33 bytes
+        sig.extend_from_slice(&[0x02; 33]); // 33 bytes of pubkey
+
+        let flags = ScriptVerifyFlags::P2SH;
+        let result = verify_p2sh_push_only(&sig, &script_pubkey, flags);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_p2sh_push_only_fails_for_non_push_script() {
+        // P2SH scriptPubKey
+        let mut script_pubkey = vec![0xa9, 0x14];
+        script_pubkey.extend_from_slice(&[0u8; 20]);
+        script_pubkey.push(0x87);
+
+        // Non-push-only scriptSig: contains OP_DUP (0x76)
+        let script_sig = vec![0x51, 0x76]; // OP_1, OP_DUP
+
+        let flags = ScriptVerifyFlags::P2SH;
+        let result = verify_p2sh_push_only(&script_sig, &script_pubkey, flags);
+        assert!(matches!(result, Err(ScriptError::SigPushOnly)));
+    }
+
+    #[test]
+    fn test_verify_p2sh_push_only_allows_non_push_for_non_p2sh() {
+        // Non-P2SH scriptPubKey (P2PKH)
+        let script_pubkey = vec![
+            0x76, 0xa9, 0x14, // OP_DUP, OP_HASH160, push 20
+        ];
+        let mut spk = script_pubkey.clone();
+        spk.extend_from_slice(&[0u8; 20]);
+        spk.extend_from_slice(&[0x88, 0xac]); // OP_EQUALVERIFY, OP_CHECKSIG
+
+        // Non-push-only scriptSig
+        let script_sig = vec![0x51, 0x76]; // OP_1, OP_DUP
+
+        let flags = ScriptVerifyFlags::P2SH;
+        // Should pass because scriptPubKey is not P2SH
+        let result = verify_p2sh_push_only(&script_sig, &spk, flags);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_p2sh_push_only_skips_without_p2sh_flag() {
+        // P2SH scriptPubKey
+        let mut script_pubkey = vec![0xa9, 0x14];
+        script_pubkey.extend_from_slice(&[0u8; 20]);
+        script_pubkey.push(0x87);
+
+        // Non-push-only scriptSig
+        let script_sig = vec![0x51, 0x76]; // OP_1, OP_DUP
+
+        // Without P2SH flag, the check is skipped
+        let flags = ScriptVerifyFlags::NONE;
+        let result = verify_p2sh_push_only(&script_sig, &script_pubkey, flags);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_p2sh_scriptsig_with_op_checksig_fails() {
+        // A P2SH scriptSig containing OP_CHECKSIG must fail
+        // This is a consensus-critical test case
+        let mut script_pubkey = vec![0xa9, 0x14];
+        script_pubkey.extend_from_slice(&[0u8; 20]);
+        script_pubkey.push(0x87);
+
+        // scriptSig with OP_CHECKSIG (0xac) embedded
+        let script_sig = vec![
+            0x03, 0xaa, 0xbb, 0xcc, // push 3 bytes
+            0xac,                   // OP_CHECKSIG - NOT allowed!
+        ];
+
+        let flags = ScriptVerifyFlags::P2SH;
+        let result = verify_p2sh_push_only(&script_sig, &script_pubkey, flags);
+        assert!(matches!(result, Err(ScriptError::SigPushOnly)));
+    }
+
+    #[test]
+    fn test_sig_push_only_error_message() {
+        let err = ScriptError::SigPushOnly;
+        assert_eq!(err.to_string(), "scriptSig must be push-only for P2SH");
     }
 }
