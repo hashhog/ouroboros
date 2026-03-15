@@ -21,6 +21,7 @@ the node logic, RPC server, and mempool.
 - [x] BIP146 NULLFAIL enforcement
 - [x] BIP141 WITNESS_PUBKEYTYPE (compressed keys in witness v0)
 - [x] BIP141 witness cleanstack (exactly one true element after execution)
+- [x] Legacy sighash (FindAndDelete, OP_CODESEPARATOR, all sighash types)
 - [x] Script interpreter with stack operations
 - [ ] Full signature verification (secp256k1)
 - [ ] Mempool transaction relay
