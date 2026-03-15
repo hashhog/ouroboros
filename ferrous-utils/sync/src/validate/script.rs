@@ -57,6 +57,14 @@ pub enum ScriptError {
     /// BIP16: P2SH scriptSig must contain only push operations
     #[error("scriptSig must be push-only for P2SH")]
     SigPushOnly,
+
+    /// BIP141/Tapscript: OP_IF/OP_NOTIF argument must be empty or exactly 0x01
+    #[error("OP_IF/OP_NOTIF argument must be empty or 0x01 (MINIMALIF)")]
+    MinimalIf,
+
+    /// Unbalanced conditional (OP_ENDIF without matching OP_IF/OP_NOTIF)
+    #[error("Unbalanced conditional")]
+    UnbalancedConditional,
 }
 
 /// Result type for script operations
@@ -537,6 +545,51 @@ pub fn check_pubkey_encoding(
     Ok(())
 }
 
+/// Check MINIMALIF constraint on OP_IF/OP_NOTIF argument.
+///
+/// Reference: Bitcoin Core interpreter.cpp lines 611-627
+///
+/// For witness v0 with MINIMALIF flag, and unconditionally for tapscript:
+/// The argument to OP_IF/OP_NOTIF must be either:
+/// - Empty vector (false)
+/// - Exactly `[0x01]` (true)
+///
+/// Any other value (including `[0x00]`, `[0x02]`, multi-byte values) is rejected.
+///
+/// # Arguments
+/// * `value` - The stack element being used as the IF condition
+/// * `flags` - Script verification flags
+/// * `sigversion` - Signature version context
+///
+/// # Returns
+/// `Ok(())` if valid, `Err(ScriptError::MinimalIf)` if value is not minimal
+pub fn check_minimalif(
+    value: &[u8],
+    flags: ScriptVerifyFlags,
+    sigversion: SigVersion,
+) -> Result<()> {
+    // Tapscript: MINIMALIF is unconditionally enforced as a consensus rule
+    // Reference: Bitcoin Core interpreter.cpp lines 614-619
+    if sigversion == SigVersion::Tapscript {
+        if value.len() > 1 || (value.len() == 1 && value[0] != 1) {
+            return Err(ScriptError::MinimalIf);
+        }
+    }
+
+    // Witness v0: MINIMALIF is enforced when the flag is set
+    // Reference: Bitcoin Core interpreter.cpp lines 621-627
+    if sigversion == SigVersion::WitnessV0 && flags.contains(ScriptVerifyFlags::MINIMALIF) {
+        if value.len() > 1 {
+            return Err(ScriptError::MinimalIf);
+        }
+        if value.len() == 1 && value[0] != 1 {
+            return Err(ScriptError::MinimalIf);
+        }
+    }
+
+    Ok(())
+}
+
 /// Bitcoin script types
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptType {
@@ -639,19 +692,76 @@ impl ScriptInterpreter {
             return Err(ScriptError::ScriptTooLarge);
         }
 
-        // Parse and execute the script
+        // Parse and execute the script with control flow
         let instructions = script.instructions().collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| ScriptError::ExecutionError("Invalid script".to_string()))?;
 
+        // Control flow state: stack of booleans indicating whether we're executing
+        // Each entry corresponds to an IF/NOTIF. True means we're in the executing branch.
+        let mut exec_stack: Vec<bool> = Vec::new();
+
         for instruction in instructions {
+            // Check if we should execute this instruction
+            let executing = exec_stack.iter().all(|&b| b);
+
             match instruction {
                 Instruction::PushBytes(bytes) => {
-                    stack.push(bytes.as_bytes().to_vec());
+                    if executing {
+                        stack.push(bytes.as_bytes().to_vec());
+                    }
                 }
                 Instruction::Op(opcode) => {
-                    Self::execute_opcode_with_context(opcode, stack, flags, sigversion)?;
+                    // Handle control flow opcodes specially
+                    match opcode {
+                        OP_IF | OP_NOTIF => {
+                            if executing {
+                                if stack.is_empty() {
+                                    return Err(ScriptError::StackUnderflow);
+                                }
+                                let value = stack.pop()?;
+
+                                // MINIMALIF check for witness scripts
+                                check_minimalif(&value, flags, sigversion)?;
+
+                                let condition = cast_to_bool(&value);
+                                let take_branch = if opcode == OP_IF { condition } else { !condition };
+                                exec_stack.push(take_branch);
+                            } else {
+                                // Not executing, but still need to track nesting
+                                exec_stack.push(false);
+                            }
+                        }
+                        OP_ELSE => {
+                            if exec_stack.is_empty() {
+                                return Err(ScriptError::UnbalancedConditional);
+                            }
+                            // Flip the execution state if the parent is executing
+                            let parent_executing = exec_stack.len() <= 1 ||
+                                exec_stack[..exec_stack.len()-1].iter().all(|&b| b);
+                            if parent_executing {
+                                let last = exec_stack.last_mut().unwrap();
+                                *last = !*last;
+                            }
+                        }
+                        OP_ENDIF => {
+                            if exec_stack.is_empty() {
+                                return Err(ScriptError::UnbalancedConditional);
+                            }
+                            exec_stack.pop();
+                        }
+                        _ => {
+                            if executing {
+                                Self::execute_opcode_with_context(opcode, stack, flags, sigversion)?;
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        // Check for unbalanced conditionals
+        if !exec_stack.is_empty() {
+            return Err(ScriptError::UnbalancedConditional);
         }
 
         // Witness cleanstack: stack must have exactly one element
@@ -685,21 +795,76 @@ impl ScriptInterpreter {
             return Err(ScriptError::ScriptTooLarge);
         }
 
-        // For now, implement a basic interpreter
-        // This is a simplified version - full Bitcoin Script implementation is very complex
-
+        // Parse the script
         let instructions = script.instructions().collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| ScriptError::ExecutionError("Invalid script".to_string()))?;
 
+        // Control flow state: stack of booleans indicating whether we're executing
+        // Each entry corresponds to an IF/NOTIF. True means we're in the executing branch.
+        let mut exec_stack: Vec<bool> = Vec::new();
+
         for instruction in instructions {
+            // Check if we should execute this instruction
+            let executing = exec_stack.iter().all(|&b| b);
+
             match instruction {
                 Instruction::PushBytes(bytes) => {
-                    stack.push(bytes.as_bytes().to_vec());
+                    if executing {
+                        stack.push(bytes.as_bytes().to_vec());
+                    }
                 }
                 Instruction::Op(opcode) => {
-                    Self::execute_opcode_with_context(opcode, stack, flags, sigversion)?;
+                    // Handle control flow opcodes specially
+                    match opcode {
+                        OP_IF | OP_NOTIF => {
+                            if executing {
+                                if stack.is_empty() {
+                                    return Err(ScriptError::StackUnderflow);
+                                }
+                                let value = stack.pop()?;
+
+                                // MINIMALIF check (only for witness contexts)
+                                check_minimalif(&value, flags, sigversion)?;
+
+                                let condition = cast_to_bool(&value);
+                                let take_branch = if opcode == OP_IF { condition } else { !condition };
+                                exec_stack.push(take_branch);
+                            } else {
+                                // Not executing, but still need to track nesting
+                                exec_stack.push(false);
+                            }
+                        }
+                        OP_ELSE => {
+                            if exec_stack.is_empty() {
+                                return Err(ScriptError::UnbalancedConditional);
+                            }
+                            // Flip the execution state if the parent is executing
+                            let parent_executing = exec_stack.len() <= 1 ||
+                                exec_stack[..exec_stack.len()-1].iter().all(|&b| b);
+                            if parent_executing {
+                                let last = exec_stack.last_mut().unwrap();
+                                *last = !*last;
+                            }
+                        }
+                        OP_ENDIF => {
+                            if exec_stack.is_empty() {
+                                return Err(ScriptError::UnbalancedConditional);
+                            }
+                            exec_stack.pop();
+                        }
+                        _ => {
+                            if executing {
+                                Self::execute_opcode_with_context(opcode, stack, flags, sigversion)?;
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        // Check for unbalanced conditionals
+        if !exec_stack.is_empty() {
+            return Err(ScriptError::UnbalancedConditional);
         }
 
         // Script succeeds if stack is not empty and top element is truthy
@@ -2805,5 +2970,287 @@ mod tests {
     fn test_sig_push_only_error_message() {
         let err = ScriptError::SigPushOnly;
         assert_eq!(err.to_string(), "scriptSig must be push-only for P2SH");
+    }
+
+    // =========================================================================
+    // MINIMALIF tests
+    // =========================================================================
+
+    #[test]
+    fn test_minimalif_helper_accepts_empty_vector() {
+        // Empty vector is always valid (false condition)
+        let value: Vec<u8> = vec![];
+        assert!(check_minimalif(&value, ScriptVerifyFlags::MINIMALIF, SigVersion::WitnessV0).is_ok());
+        assert!(check_minimalif(&value, ScriptVerifyFlags::NONE, SigVersion::Tapscript).is_ok());
+    }
+
+    #[test]
+    fn test_minimalif_helper_accepts_0x01() {
+        // [0x01] is the only valid true value
+        let value = vec![0x01];
+        assert!(check_minimalif(&value, ScriptVerifyFlags::MINIMALIF, SigVersion::WitnessV0).is_ok());
+        assert!(check_minimalif(&value, ScriptVerifyFlags::NONE, SigVersion::Tapscript).is_ok());
+    }
+
+    #[test]
+    fn test_minimalif_helper_rejects_0x02_witness_v0() {
+        // [0x02] is truthy but not minimal
+        let value = vec![0x02];
+        let result = check_minimalif(&value, ScriptVerifyFlags::MINIMALIF, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn test_minimalif_helper_rejects_0x02_tapscript() {
+        // [0x02] rejected unconditionally in tapscript
+        let value = vec![0x02];
+        let result = check_minimalif(&value, ScriptVerifyFlags::NONE, SigVersion::Tapscript);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn test_minimalif_helper_rejects_0x00_single_byte() {
+        // [0x00] is not minimal - should use empty vector for false
+        let value = vec![0x00];
+        // Witness v0 with MINIMALIF flag
+        let result = check_minimalif(&value, ScriptVerifyFlags::MINIMALIF, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+        // Tapscript (unconditional)
+        let result = check_minimalif(&value, ScriptVerifyFlags::NONE, SigVersion::Tapscript);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn test_minimalif_helper_rejects_multi_byte() {
+        // Multi-byte values are never minimal
+        let value = vec![0x01, 0x00];
+        let result = check_minimalif(&value, ScriptVerifyFlags::MINIMALIF, SigVersion::WitnessV0);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+        let result = check_minimalif(&value, ScriptVerifyFlags::NONE, SigVersion::Tapscript);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn test_minimalif_not_enforced_legacy() {
+        // MINIMALIF is NOT enforced for legacy scripts, even with flag set
+        let value = vec![0x02];
+        // Legacy context - should pass
+        assert!(check_minimalif(&value, ScriptVerifyFlags::MINIMALIF, SigVersion::Base).is_ok());
+    }
+
+    #[test]
+    fn test_minimalif_not_enforced_witness_v0_without_flag() {
+        // Witness v0 without MINIMALIF flag - should pass
+        let value = vec![0x02];
+        assert!(check_minimalif(&value, ScriptVerifyFlags::NONE, SigVersion::WitnessV0).is_ok());
+    }
+
+    #[test]
+    fn test_op_if_with_0x01_passes_witness_v0() {
+        // Script: <0x01> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+        // Should take the IF branch and leave 1 on stack
+        let script = Builder::new()
+            .push_slice(&[0x01])
+            .push_opcode(OP_IF)
+            .push_int(1)
+            .push_opcode(OP_ELSE)
+            .push_int(0)
+            .push_opcode(OP_ENDIF)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::MINIMALIF;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_op_if_with_empty_takes_else_branch() {
+        // Script: <empty> OP_IF OP_0 OP_ELSE OP_1 OP_ENDIF
+        // Should take the ELSE branch and leave 1 on stack
+        let script = Builder::new()
+            .push_slice(&[])  // empty = false
+            .push_opcode(OP_IF)
+            .push_int(0)
+            .push_opcode(OP_ELSE)
+            .push_int(1)
+            .push_opcode(OP_ENDIF)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::MINIMALIF;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_op_if_with_0x02_fails_minimalif_witness_v0() {
+        // Script: <0x02> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+        // [0x02] is truthy but not minimal - should fail
+        let script = Builder::new()
+            .push_slice(&[0x02])
+            .push_opcode(OP_IF)
+            .push_int(1)
+            .push_opcode(OP_ELSE)
+            .push_int(0)
+            .push_opcode(OP_ENDIF)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::MINIMALIF;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn test_op_if_with_0x02_fails_tapscript() {
+        // Tapscript unconditionally enforces MINIMALIF
+        let script = Builder::new()
+            .push_slice(&[0x02])
+            .push_opcode(OP_IF)
+            .push_int(1)
+            .push_opcode(OP_ELSE)
+            .push_int(0)
+            .push_opcode(OP_ENDIF)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;  // No flags needed for tapscript
+        let result = ScriptInterpreter::evaluate_tapscript(&script, &mut stack, flags);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn test_op_notif_with_empty_takes_if_branch() {
+        // Script: <empty> OP_NOTIF OP_1 OP_ELSE OP_0 OP_ENDIF
+        // empty = false, NOTIF inverts, so we take the IF branch
+        let script = Builder::new()
+            .push_slice(&[])  // empty = false
+            .push_opcode(OP_NOTIF)
+            .push_int(1)
+            .push_opcode(OP_ELSE)
+            .push_int(0)
+            .push_opcode(OP_ENDIF)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::MINIMALIF;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_op_notif_with_0x01_takes_else_branch() {
+        // Script: <0x01> OP_NOTIF OP_0 OP_ELSE OP_1 OP_ENDIF
+        // 0x01 = true, NOTIF inverts to false, so we take the ELSE branch
+        let script = Builder::new()
+            .push_slice(&[0x01])
+            .push_opcode(OP_NOTIF)
+            .push_int(0)
+            .push_opcode(OP_ELSE)
+            .push_int(1)
+            .push_opcode(OP_ENDIF)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::MINIMALIF;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_op_notif_with_0x02_fails_minimalif() {
+        // Script: <0x02> OP_NOTIF OP_0 OP_ELSE OP_1 OP_ENDIF
+        // [0x02] is not minimal
+        let script = Builder::new()
+            .push_slice(&[0x02])
+            .push_opcode(OP_NOTIF)
+            .push_int(0)
+            .push_opcode(OP_ELSE)
+            .push_int(1)
+            .push_opcode(OP_ENDIF)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::MINIMALIF;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+        assert!(matches!(result, Err(ScriptError::MinimalIf)));
+    }
+
+    #[test]
+    fn test_nested_if_with_minimalif() {
+        // Nested IF with valid minimal arguments
+        // Script: <0x01> OP_IF <0x01> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF OP_ELSE OP_0 OP_ENDIF
+        let script = Builder::new()
+            .push_slice(&[0x01])
+            .push_opcode(OP_IF)
+            .push_slice(&[0x01])
+            .push_opcode(OP_IF)
+            .push_int(1)
+            .push_opcode(OP_ELSE)
+            .push_int(0)
+            .push_opcode(OP_ENDIF)
+            .push_opcode(OP_ELSE)
+            .push_int(0)
+            .push_opcode(OP_ENDIF)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::MINIMALIF;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_unbalanced_if_fails() {
+        // Script: <0x01> OP_IF OP_1 (missing ENDIF)
+        let script = Builder::new()
+            .push_slice(&[0x01])
+            .push_opcode(OP_IF)
+            .push_int(1)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::MINIMALIF;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+        assert!(matches!(result, Err(ScriptError::UnbalancedConditional)));
+    }
+
+    #[test]
+    fn test_unbalanced_else_fails() {
+        // Script: OP_ELSE (without IF)
+        let script = Builder::new()
+            .push_opcode(OP_ELSE)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+        assert!(matches!(result, Err(ScriptError::UnbalancedConditional)));
+    }
+
+    #[test]
+    fn test_unbalanced_endif_fails() {
+        // Script: OP_ENDIF (without IF)
+        let script = Builder::new()
+            .push_opcode(OP_ENDIF)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+        assert!(matches!(result, Err(ScriptError::UnbalancedConditional)));
+    }
+
+    #[test]
+    fn test_minimalif_error_message() {
+        let err = ScriptError::MinimalIf;
+        assert_eq!(err.to_string(), "OP_IF/OP_NOTIF argument must be empty or 0x01 (MINIMALIF)");
+    }
+
+    #[test]
+    fn test_unbalanced_conditional_error_message() {
+        let err = ScriptError::UnbalancedConditional;
+        assert_eq!(err.to_string(), "Unbalanced conditional");
     }
 }
