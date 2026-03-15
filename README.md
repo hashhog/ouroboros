@@ -16,6 +16,7 @@ the node logic, RPC server, and mempool.
 - [x] Proof of work validation
 - [x] BIP66 (DERSIG) strict signature encoding
 - [x] BIP65/112 (CLTV/CSV) time locks
+- [x] BIP16 P2SH push-only scriptSig enforcement
 - [x] BIP141 SegWit support (P2WPKH, P2WSH)
 - [x] BIP146 NULLFAIL enforcement
 - [x] BIP141 WITNESS_PUBKEYTYPE (compressed keys in witness v0)
