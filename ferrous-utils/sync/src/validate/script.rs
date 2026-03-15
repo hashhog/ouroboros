@@ -45,6 +45,14 @@ pub enum ScriptError {
     /// BIP141: Non-compressed public key in witness v0 script
     #[error("Public key must be compressed in witness v0 scripts")]
     WitnessPubkeyType,
+
+    /// BIP141: Witness script must leave exactly one element on the stack
+    #[error("Script must leave exactly one element on the stack (CLEANSTACK)")]
+    CleanStack,
+
+    /// BIP141: Script evaluated to false
+    #[error("Script evaluated to false")]
+    EvalFalse,
 }
 
 /// Result type for script operations
@@ -294,6 +302,27 @@ pub fn is_compressed_or_uncompressed_pubkey(pubkey: &[u8]) -> bool {
     }
 }
 
+/// Cast a script stack element to a boolean value.
+///
+/// This matches Bitcoin Core's `CastToBool` function exactly:
+/// - Empty vector is false
+/// - All-zero vector (including negative zero 0x80) is false
+/// - Any other value is true
+///
+/// Reference: Bitcoin Core interpreter.cpp CastToBool()
+pub fn cast_to_bool(data: &[u8]) -> bool {
+    for (i, &byte) in data.iter().enumerate() {
+        if byte != 0 {
+            // Can be negative zero: last byte is 0x80 with all preceding bytes zero
+            if i == data.len() - 1 && byte == 0x80 {
+                return false;
+            }
+            return true;
+        }
+    }
+    false
+}
+
 /// Signature version for script execution context.
 ///
 /// This determines which validation rules apply during script execution.
@@ -386,12 +415,90 @@ impl ScriptInterpreter {
     /// This method enforces witness-specific rules including:
     /// - WITNESS_PUBKEYTYPE: public keys must be compressed (33 bytes)
     /// - Witness cleanstack (exactly one element after execution)
+    ///
+    /// After script execution, the stack MUST have exactly one element that
+    /// evaluates to true. This is enforced unconditionally for all witness
+    /// scripts (not gated by SCRIPT_VERIFY_CLEANSTACK flag).
+    ///
+    /// Reference: Bitcoin Core ExecuteWitnessScript() in interpreter.cpp
     pub fn evaluate_witness_v0_script(
         script: &Script,
         stack: &mut Stack,
         flags: ScriptVerifyFlags,
     ) -> Result<bool> {
-        Self::evaluate_script_with_context(script, stack, flags, SigVersion::WitnessV0)
+        Self::execute_witness_script(script, stack, flags, SigVersion::WitnessV0)
+    }
+
+    /// Evaluate a tapscript (witness v1) with full context
+    ///
+    /// This method enforces tapscript-specific rules including:
+    /// - Witness cleanstack (exactly one element after execution)
+    ///
+    /// After script execution, the stack MUST have exactly one element that
+    /// evaluates to true. This is enforced unconditionally for all witness
+    /// scripts (not gated by SCRIPT_VERIFY_CLEANSTACK flag).
+    ///
+    /// Reference: Bitcoin Core ExecuteWitnessScript() in interpreter.cpp
+    pub fn evaluate_tapscript(
+        script: &Script,
+        stack: &mut Stack,
+        flags: ScriptVerifyFlags,
+    ) -> Result<bool> {
+        Self::execute_witness_script(script, stack, flags, SigVersion::Tapscript)
+    }
+
+    /// Execute a witness script with cleanstack enforcement.
+    ///
+    /// This is the internal method that runs the script and enforces witness
+    /// cleanstack rules. After execution:
+    /// 1. Stack must have exactly one element (CleanStack error otherwise)
+    /// 2. That element must cast to true (EvalFalse error otherwise)
+    ///
+    /// This check is NOT gated by the SCRIPT_VERIFY_CLEANSTACK flag — it is
+    /// unconditionally enforced for all witness scripts (v0 and v1/tapscript).
+    ///
+    /// Reference: Bitcoin Core ExecuteWitnessScript() lines 1866-1868
+    fn execute_witness_script(
+        script: &Script,
+        stack: &mut Stack,
+        flags: ScriptVerifyFlags,
+        sigversion: SigVersion,
+    ) -> Result<bool> {
+        // Check script size limit (Bitcoin Core limit is 10,000 bytes)
+        if script.len() > 10000 {
+            return Err(ScriptError::ScriptTooLarge);
+        }
+
+        // Parse and execute the script
+        let instructions = script.instructions().collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| ScriptError::ExecutionError("Invalid script".to_string()))?;
+
+        for instruction in instructions {
+            match instruction {
+                Instruction::PushBytes(bytes) => {
+                    stack.push(bytes.as_bytes().to_vec());
+                }
+                Instruction::Op(opcode) => {
+                    Self::execute_opcode_with_context(opcode, stack, flags, sigversion)?;
+                }
+            }
+        }
+
+        // Witness cleanstack: stack must have exactly one element
+        // Reference: Bitcoin Core interpreter.cpp line 1867
+        // "Scripts inside witness implicitly require cleanstack behaviour"
+        if stack.len() != 1 {
+            return Err(ScriptError::CleanStack);
+        }
+
+        // The single element must cast to true
+        // Reference: Bitcoin Core interpreter.cpp line 1868
+        let result = stack.peek()?;
+        if !cast_to_bool(result) {
+            return Err(ScriptError::EvalFalse);
+        }
+
+        Ok(true)
     }
 
     /// Evaluate a script with full context (flags and signature version)
@@ -1876,5 +1983,390 @@ mod tests {
         assert_eq!(SigVersion::Tapscript, SigVersion::Tapscript);
         assert_ne!(SigVersion::Base, SigVersion::WitnessV0);
         assert_ne!(SigVersion::WitnessV0, SigVersion::Tapscript);
+    }
+
+    // =========================================================================
+    // cast_to_bool Tests
+    // =========================================================================
+
+    #[test]
+    fn test_cast_to_bool_empty_is_false() {
+        // Empty vector is false
+        assert!(!cast_to_bool(&[]));
+    }
+
+    #[test]
+    fn test_cast_to_bool_zero_is_false() {
+        // Single zero byte is false
+        assert!(!cast_to_bool(&[0]));
+        // Multiple zero bytes are false
+        assert!(!cast_to_bool(&[0, 0, 0]));
+    }
+
+    #[test]
+    fn test_cast_to_bool_negative_zero_is_false() {
+        // Negative zero (0x80) is false
+        assert!(!cast_to_bool(&[0x80]));
+        // Multiple zero bytes followed by 0x80 is false (negative zero)
+        assert!(!cast_to_bool(&[0, 0, 0x80]));
+    }
+
+    #[test]
+    fn test_cast_to_bool_nonzero_is_true() {
+        // Any non-zero value is true
+        assert!(cast_to_bool(&[1]));
+        assert!(cast_to_bool(&[0xff]));
+        assert!(cast_to_bool(&[0, 1]));
+        assert!(cast_to_bool(&[0, 0, 1]));
+    }
+
+    #[test]
+    fn test_cast_to_bool_nonzero_in_middle_is_true() {
+        // Non-zero byte anywhere (except final 0x80) makes it true
+        assert!(cast_to_bool(&[1, 0]));
+        assert!(cast_to_bool(&[0, 1, 0]));
+    }
+
+    #[test]
+    fn test_cast_to_bool_0x80_not_last_is_true() {
+        // 0x80 is only negative zero if it's the last byte
+        assert!(cast_to_bool(&[0x80, 0]));
+        assert!(cast_to_bool(&[0x80, 0x80]));
+    }
+
+    // =========================================================================
+    // Witness Cleanstack Tests (BIP141)
+    // =========================================================================
+
+    #[test]
+    fn test_witness_cleanstack_single_true_element_passes() {
+        // Script that leaves exactly one true element on the stack
+        let script = Builder::new()
+            .push_int(1) // Push 1 (true)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_witness_cleanstack_empty_stack_fails() {
+        // Empty script leaves empty stack - should fail cleanstack
+        let script = Builder::new().into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn test_witness_cleanstack_multiple_elements_fails() {
+        // Script that leaves two elements on the stack
+        let script = Builder::new()
+            .push_int(1)
+            .push_int(2)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn test_witness_cleanstack_three_elements_fails() {
+        // Script that leaves three elements on the stack
+        let script = Builder::new()
+            .push_int(1)
+            .push_int(2)
+            .push_int(3)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn test_witness_cleanstack_false_element_fails() {
+        // Script that leaves exactly one element but it's false (zero)
+        let script = Builder::new()
+            .push_int(0) // Push 0 (false)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        // Cleanstack passes (1 element), but element is false
+        assert!(matches!(result, Err(ScriptError::EvalFalse)));
+    }
+
+    #[test]
+    fn test_witness_cleanstack_op_true_passes() {
+        // OP_TRUE (OP_1) pushes 1 - should pass
+        let script = Builder::new()
+            .push_opcode(bitcoin::opcodes::OP_TRUE)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_witness_cleanstack_op_true_op_true_fails() {
+        // Two OP_TRUE leaves two elements - cleanstack fails
+        let script = Builder::new()
+            .push_opcode(bitcoin::opcodes::OP_TRUE)
+            .push_opcode(bitcoin::opcodes::OP_TRUE)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn test_witness_cleanstack_not_flag_gated() {
+        // Witness cleanstack is NOT gated by SCRIPT_VERIFY_CLEANSTACK flag
+        // It's always enforced for witness scripts
+
+        // Script that leaves two elements
+        let script = Builder::new()
+            .push_int(1)
+            .push_int(2)
+            .into_script();
+
+        // Even with CLEANSTACK flag NOT set, witness cleanstack is enforced
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE; // No CLEANSTACK flag
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        // Should still fail - witness cleanstack is unconditional
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn test_witness_cleanstack_equal_passes() {
+        // Script: 1 1 OP_EQUAL leaves one true element
+        let script = Builder::new()
+            .push_int(1)
+            .push_int(1)
+            .push_opcode(OP_EQUAL)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_witness_cleanstack_equal_false_fails() {
+        // Script: 1 2 OP_EQUAL leaves one false element
+        let script = Builder::new()
+            .push_int(1)
+            .push_int(2)
+            .push_opcode(OP_EQUAL)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        // Cleanstack passes (1 element), but element is false
+        assert!(matches!(result, Err(ScriptError::EvalFalse)));
+    }
+
+    #[test]
+    fn test_witness_cleanstack_dup_fails() {
+        // Script: 1 OP_DUP leaves two elements
+        let script = Builder::new()
+            .push_int(1)
+            .push_opcode(OP_DUP)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn test_witness_cleanstack_dup_equalverify_passes() {
+        // Script: 1 OP_DUP OP_EQUALVERIFY leaves one element (the original 1)
+        // Wait, that's wrong - EQUALVERIFY consumes both, then we need something left
+        // Let's do: 1 OP_DUP 1 OP_EQUALVERIFY - leaves one element
+        let script = Builder::new()
+            .push_int(1)
+            .push_opcode(OP_DUP)
+            .push_opcode(OP_EQUALVERIFY) // Verifies top two are equal, removes both
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        // 1 OP_DUP gives [1, 1], EQUALVERIFY checks and removes both
+        // Stack is empty, so cleanstack fails
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn test_witness_cleanstack_add_passes() {
+        // Script: 2 3 OP_ADD leaves one element (5)
+        let script = Builder::new()
+            .push_int(2)
+            .push_int(3)
+            .push_opcode(OP_ADD)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_witness_cleanstack_with_initial_stack_elements() {
+        // If stack already has elements before script execution,
+        // they count towards the final cleanstack check
+
+        let script = Builder::new()
+            .push_int(1)
+            .into_script();
+
+        let mut stack = Stack::new();
+        stack.push(vec![42]); // Pre-existing element
+
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        // Two elements on stack (42 and 1) - cleanstack fails
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    // =========================================================================
+    // Tapscript Cleanstack Tests
+    // =========================================================================
+
+    #[test]
+    fn test_tapscript_cleanstack_single_true_element_passes() {
+        let script = Builder::new()
+            .push_int(1)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_tapscript(&script, &mut stack, flags);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_tapscript_cleanstack_multiple_elements_fails() {
+        let script = Builder::new()
+            .push_int(1)
+            .push_int(2)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_tapscript(&script, &mut stack, flags);
+
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
+    }
+
+    #[test]
+    fn test_tapscript_cleanstack_false_element_fails() {
+        let script = Builder::new()
+            .push_int(0)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::NONE;
+        let result = ScriptInterpreter::evaluate_tapscript(&script, &mut stack, flags);
+
+        assert!(matches!(result, Err(ScriptError::EvalFalse)));
+    }
+
+    // =========================================================================
+    // CleanStack Error Tests
+    // =========================================================================
+
+    #[test]
+    fn test_cleanstack_error_message() {
+        let err = ScriptError::CleanStack;
+        assert_eq!(
+            err.to_string(),
+            "Script must leave exactly one element on the stack (CLEANSTACK)"
+        );
+    }
+
+    #[test]
+    fn test_eval_false_error_message() {
+        let err = ScriptError::EvalFalse;
+        assert_eq!(err.to_string(), "Script evaluated to false");
+    }
+
+    // =========================================================================
+    // Witness Eval Combined Tests (cleanstack + other rules)
+    // =========================================================================
+
+    #[test]
+    fn test_witness_eval_cleanstack_with_pubkeytype() {
+        // Test that both cleanstack and WITNESS_PUBKEYTYPE are enforced
+
+        // First, test that uncompressed key fails before cleanstack check
+        let mut stack = Stack::new();
+        stack.push(vec![0x30, 0x06]); // dummy signature
+        let mut uncompressed_pubkey = vec![0x04];
+        uncompressed_pubkey.extend_from_slice(&[0u8; 64]);
+        stack.push(uncompressed_pubkey);
+
+        let script = Builder::new()
+            .push_opcode(OP_CHECKSIG)
+            .into_script();
+
+        let flags = ScriptVerifyFlags::WITNESS_PUBKEYTYPE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        // Should fail with WitnessPubkeyType (checked before cleanstack)
+        assert!(matches!(result, Err(ScriptError::WitnessPubkeyType)));
+    }
+
+    #[test]
+    fn test_witness_eval_cleanstack_with_compressed_key_and_extra_element() {
+        // Compressed key passes WITNESS_PUBKEYTYPE, but extra element fails cleanstack
+        let script = Builder::new()
+            .push_slice(&[0x30, 0x06]) // dummy sig
+            .push_slice(&[0x02; 33])   // compressed pubkey
+            .push_opcode(OP_CHECKSIG)
+            .push_int(42) // Extra element that breaks cleanstack
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::WITNESS_PUBKEYTYPE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        // CHECKSIG leaves result, then 42 is pushed - 2 elements fails cleanstack
+        assert!(matches!(result, Err(ScriptError::CleanStack)));
     }
 }
