@@ -6,7 +6,7 @@ use common::{TransactionWrapper, crypto};
 use thiserror::Error;
 
 /// Script validation error types
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum ScriptError {
     #[error("Script execution failed: {0}")]
     ExecutionError(String),
@@ -37,10 +37,181 @@ pub enum ScriptError {
 
     #[error("Invalid witness program")]
     InvalidWitnessProgram,
+
+    /// BIP146: Failed signature check with non-empty signature (NULLFAIL)
+    #[error("Signature must be empty when verification fails (NULLFAIL)")]
+    NullFail,
+
+    /// BIP141: Non-compressed public key in witness v0 script
+    #[error("Public key must be compressed in witness v0 scripts")]
+    WitnessPubkeyType,
 }
 
 /// Result type for script operations
 pub type Result<T> = std::result::Result<T, ScriptError>;
+
+// ============================================================================
+// Script verification flags (mirrors Bitcoin Core's interpreter.h)
+// ============================================================================
+
+bitflags::bitflags! {
+    /// Script verification flags controlling consensus and policy rules.
+    ///
+    /// These flags mirror Bitcoin Core's `script_verify_flags` in `script/interpreter.h`.
+    /// Flags are applied cumulatively based on block height in `GetBlockScriptFlags()`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    pub struct ScriptVerifyFlags: u32 {
+        /// No flags
+        const NONE = 0;
+
+        /// BIP16: Evaluate P2SH subscripts
+        const P2SH = 1 << 0;
+
+        /// Passing a non-strict-DER signature or pubkey fails
+        const STRICTENC = 1 << 1;
+
+        /// BIP66: Require strict DER signatures
+        const DERSIG = 1 << 2;
+
+        /// BIP62 rule 5: Require S values <= order/2
+        const LOW_S = 1 << 3;
+
+        /// BIP147: Require dummy element in CHECKMULTISIG to be null
+        const NULLDUMMY = 1 << 4;
+
+        /// BIP62 rule 2: scriptSig must be push-only
+        const SIGPUSHONLY = 1 << 5;
+
+        /// BIP62 rules 3/4: Require minimal encodings
+        const MINIMALDATA = 1 << 6;
+
+        /// Discourage upgradable NOPs (OP_NOP1-10)
+        const DISCOURAGE_UPGRADABLE_NOPS = 1 << 7;
+
+        /// BIP62 rule 6: Require exactly one stack element after execution
+        const CLEANSTACK = 1 << 8;
+
+        /// BIP65: Enable OP_CHECKLOCKTIMEVERIFY
+        const CHECKLOCKTIMEVERIFY = 1 << 9;
+
+        /// BIP112: Enable OP_CHECKSEQUENCEVERIFY
+        const CHECKSEQUENCEVERIFY = 1 << 10;
+
+        /// BIP141: Enable SegWit (witness programs)
+        const WITNESS = 1 << 11;
+
+        /// Discourage upgradable witness programs
+        const DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM = 1 << 12;
+
+        /// BIP141: Require minimal IF/NOTIF arguments (empty or 0x01)
+        const MINIMALIF = 1 << 13;
+
+        /// BIP146: Require signature to be empty if CHECKSIG/MULTISIG fails
+        const NULLFAIL = 1 << 14;
+
+        /// BIP141: Only compressed keys in P2WPKH/P2WSH
+        const WITNESS_PUBKEYTYPE = 1 << 15;
+
+        /// Making OP_CODESEPARATOR and FindAndDelete fail
+        const CONST_SCRIPTCODE = 1 << 16;
+
+        /// BIP341: Enable Taproot (version 1 witness programs)
+        const TAPROOT = 1 << 17;
+
+        /// Discourage upgradable Taproot versions
+        const DISCOURAGE_UPGRADABLE_TAPROOT_VERSION = 1 << 18;
+
+        /// Discourage OP_SUCCESS opcodes
+        const DISCOURAGE_OP_SUCCESS = 1 << 19;
+
+        /// Discourage upgradable pubkey types in Tapscript
+        const DISCOURAGE_UPGRADABLE_PUBKEYTYPE = 1 << 20;
+    }
+}
+
+/// SegWit activation heights per network
+pub mod activation_heights {
+    use bitcoin::Network;
+
+    /// Returns the SegWit (BIP141) activation height for the given network.
+    /// NULLFAIL (BIP146) is consensus-mandatory at the same height as SegWit.
+    pub fn segwit_height(network: Network) -> u32 {
+        match network {
+            Network::Bitcoin => 481824,     // mainnet
+            Network::Testnet => 834624,     // testnet3
+            Network::Testnet4 => 0,         // active from genesis
+            Network::Signet => 0,           // active from genesis
+            Network::Regtest => 0,          // active from genesis
+            _ => 0,                         // conservative default
+        }
+    }
+
+    /// Returns the script verification flags for a given block height on the network.
+    /// This mirrors Bitcoin Core's GetBlockScriptFlags() in validation.cpp.
+    pub fn get_script_flags_for_height(height: u32, network: Network) -> super::ScriptVerifyFlags {
+        use super::ScriptVerifyFlags;
+
+        let mut flags = ScriptVerifyFlags::NONE;
+
+        // BIP16 (P2SH) - activated at height 173805 on mainnet
+        let bip16_height = match network {
+            Network::Bitcoin => 173805,
+            _ => 0, // active from genesis on testnets
+        };
+        if height >= bip16_height {
+            flags |= ScriptVerifyFlags::P2SH;
+        }
+
+        // BIP66 (DERSIG) - activated at height 363725 on mainnet
+        let bip66_height = match network {
+            Network::Bitcoin => 363725,
+            _ => 0,
+        };
+        if height >= bip66_height {
+            flags |= ScriptVerifyFlags::DERSIG;
+        }
+
+        // BIP65 (CLTV) - activated at height 388381 on mainnet
+        let bip65_height = match network {
+            Network::Bitcoin => 388381,
+            _ => 0,
+        };
+        if height >= bip65_height {
+            flags |= ScriptVerifyFlags::CHECKLOCKTIMEVERIFY;
+        }
+
+        // BIP68/112 (CSV) - activated at height 419328 on mainnet
+        let csv_height = match network {
+            Network::Bitcoin => 419328,
+            _ => 0,
+        };
+        if height >= csv_height {
+            flags |= ScriptVerifyFlags::CHECKSEQUENCEVERIFY;
+        }
+
+        // SegWit (BIP141/143/147/146) - activated at height 481824 on mainnet
+        // CRITICAL: NULLFAIL is consensus-mandatory at SegWit activation, NOT policy-only
+        let segwit_height = segwit_height(network);
+        if height >= segwit_height {
+            flags |= ScriptVerifyFlags::WITNESS
+                | ScriptVerifyFlags::NULLDUMMY
+                | ScriptVerifyFlags::NULLFAIL  // BIP146: consensus-mandatory
+                | ScriptVerifyFlags::WITNESS_PUBKEYTYPE;
+        }
+
+        // Taproot (BIP341/342) - activated at height 709632 on mainnet
+        let taproot_height = match network {
+            Network::Bitcoin => 709632,
+            Network::Signet => 0,
+            _ => 0,
+        };
+        if height >= taproot_height {
+            flags |= ScriptVerifyFlags::TAPROOT;
+        }
+
+        flags
+    }
+}
 
 /// Script execution stack
 #[derive(Debug, Clone)]
@@ -93,6 +264,80 @@ impl Stack {
     }
 }
 
+// ============================================================================
+// Public key encoding validation (BIP141)
+// ============================================================================
+
+/// Check if a public key is compressed (33 bytes, starting with 0x02 or 0x03).
+///
+/// Reference: Bitcoin Core interpreter.cpp IsCompressedPubKey()
+pub fn is_compressed_pubkey(pubkey: &[u8]) -> bool {
+    // Compressed public key: 33 bytes, first byte is 0x02 or 0x03
+    pubkey.len() == 33 && (pubkey[0] == 0x02 || pubkey[0] == 0x03)
+}
+
+/// Check if a public key is either compressed (33 bytes) or uncompressed (65 bytes).
+///
+/// Reference: Bitcoin Core interpreter.cpp IsCompressedOrUncompressedPubKey()
+pub fn is_compressed_or_uncompressed_pubkey(pubkey: &[u8]) -> bool {
+    if pubkey.len() < 33 {
+        return false;
+    }
+    if pubkey[0] == 0x04 {
+        // Uncompressed key: 65 bytes, starts with 0x04
+        pubkey.len() == 65
+    } else if pubkey[0] == 0x02 || pubkey[0] == 0x03 {
+        // Compressed key: 33 bytes, starts with 0x02 or 0x03
+        pubkey.len() == 33
+    } else {
+        false
+    }
+}
+
+/// Signature version for script execution context.
+///
+/// This determines which validation rules apply during script execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigVersion {
+    /// Legacy (pre-SegWit) scripts
+    Base,
+    /// SegWit v0 (P2WPKH, P2WSH)
+    WitnessV0,
+    /// Tapscript (SegWit v1)
+    Tapscript,
+}
+
+/// Check public key encoding based on flags and signature version.
+///
+/// Reference: Bitcoin Core interpreter.cpp CheckPubKeyEncoding()
+///
+/// - STRICTENC: Requires valid compressed or uncompressed key format
+/// - WITNESS_PUBKEYTYPE: Requires compressed key for witness v0 scripts
+pub fn check_pubkey_encoding(
+    pubkey: &[u8],
+    flags: ScriptVerifyFlags,
+    sigversion: SigVersion,
+) -> Result<()> {
+    // STRICTENC: require valid public key format
+    if flags.contains(ScriptVerifyFlags::STRICTENC)
+        && !is_compressed_or_uncompressed_pubkey(pubkey)
+    {
+        return Err(ScriptError::ExecutionError(
+            "Non-canonical public key".to_string(),
+        ));
+    }
+
+    // BIP141 WITNESS_PUBKEYTYPE: only compressed keys in witness v0
+    if flags.contains(ScriptVerifyFlags::WITNESS_PUBKEYTYPE)
+        && sigversion == SigVersion::WitnessV0
+        && !is_compressed_pubkey(pubkey)
+    {
+        return Err(ScriptError::WitnessPubkeyType);
+    }
+
+    Ok(())
+}
+
 /// Bitcoin script types
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScriptType {
@@ -118,8 +363,46 @@ pub struct ScriptInterpreter;
 impl ScriptInterpreter {
     /// Evaluate a script
     ///
-    /// Executes the script and returns whether it evaluates to true
+    /// Executes the script and returns whether it evaluates to true.
+    /// This is the legacy method that doesn't take verification flags.
     pub fn evaluate_script(script: &Script, stack: &mut Stack) -> Result<bool> {
+        Self::evaluate_script_with_flags(script, stack, ScriptVerifyFlags::NONE)
+    }
+
+    /// Evaluate a script with verification flags
+    ///
+    /// Executes the script and returns whether it evaluates to true.
+    /// The `flags` parameter controls which consensus rules are enforced.
+    pub fn evaluate_script_with_flags(
+        script: &Script,
+        stack: &mut Stack,
+        flags: ScriptVerifyFlags,
+    ) -> Result<bool> {
+        Self::evaluate_script_with_context(script, stack, flags, SigVersion::Base)
+    }
+
+    /// Evaluate a witness v0 script with full context
+    ///
+    /// This method enforces witness-specific rules including:
+    /// - WITNESS_PUBKEYTYPE: public keys must be compressed (33 bytes)
+    /// - Witness cleanstack (exactly one element after execution)
+    pub fn evaluate_witness_v0_script(
+        script: &Script,
+        stack: &mut Stack,
+        flags: ScriptVerifyFlags,
+    ) -> Result<bool> {
+        Self::evaluate_script_with_context(script, stack, flags, SigVersion::WitnessV0)
+    }
+
+    /// Evaluate a script with full context (flags and signature version)
+    ///
+    /// This is the core evaluation method that supports all script contexts.
+    pub fn evaluate_script_with_context(
+        script: &Script,
+        stack: &mut Stack,
+        flags: ScriptVerifyFlags,
+        sigversion: SigVersion,
+    ) -> Result<bool> {
         // Check script size limit (Bitcoin Core limit is 10,000 bytes)
         if script.len() > 10000 {
             return Err(ScriptError::ScriptTooLarge);
@@ -137,7 +420,7 @@ impl ScriptInterpreter {
                     stack.push(bytes.as_bytes().to_vec());
                 }
                 Instruction::Op(opcode) => {
-                    Self::execute_opcode(opcode, stack)?;
+                    Self::execute_opcode_with_context(opcode, stack, flags, sigversion)?;
                 }
             }
         }
@@ -151,8 +434,30 @@ impl ScriptInterpreter {
         Ok(!top.is_empty() && top[0] != 0)
     }
 
-    /// Execute a single opcode
+    /// Execute a single opcode (legacy, no flags)
     fn execute_opcode(opcode: bitcoin::opcodes::Opcode, stack: &mut Stack) -> Result<()> {
+        Self::execute_opcode_with_context(opcode, stack, ScriptVerifyFlags::NONE, SigVersion::Base)
+    }
+
+    /// Execute a single opcode with verification flags (legacy context)
+    fn execute_opcode_with_flags(
+        opcode: bitcoin::opcodes::Opcode,
+        stack: &mut Stack,
+        flags: ScriptVerifyFlags,
+    ) -> Result<()> {
+        Self::execute_opcode_with_context(opcode, stack, flags, SigVersion::Base)
+    }
+
+    /// Execute a single opcode with full context (flags and signature version)
+    ///
+    /// This method enforces all context-dependent validation rules including
+    /// WITNESS_PUBKEYTYPE for witness v0 scripts.
+    fn execute_opcode_with_context(
+        opcode: bitcoin::opcodes::Opcode,
+        stack: &mut Stack,
+        flags: ScriptVerifyFlags,
+        sigversion: SigVersion,
+    ) -> Result<()> {
         // Handle push operations for small integers
         let opcode_byte = opcode.to_u8();
         if opcode_byte >= 0x51 && opcode_byte <= 0x60 {
@@ -199,15 +504,30 @@ impl ScriptInterpreter {
                 return Err(ScriptError::ValidationFailed);
             }
             OP_CHECKSIG | OP_CHECKSIGVERIFY => {
-                // Signature verification - this is a placeholder
+                // Signature verification
                 // In a full implementation, this would need access to the transaction
                 // and input index to create the proper sighash
                 let pubkey = stack.pop()?;
                 let sig = stack.pop()?;
 
+                // BIP141: WITNESS_PUBKEYTYPE enforcement
+                // In witness v0 scripts, public keys must be compressed (33 bytes, 0x02/0x03 prefix).
+                // This check happens BEFORE signature verification.
+                // Reference: Bitcoin Core interpreter.cpp CheckPubKeyEncoding()
+                check_pubkey_encoding(&pubkey, flags, sigversion)?;
+
                 // For now, just check that both are non-empty
                 // Real implementation would verify the signature cryptographically
                 let valid = !pubkey.is_empty() && !sig.is_empty();
+
+                // BIP146: NULLFAIL enforcement
+                // If NULLFAIL flag is set and signature check fails, the signature
+                // MUST be an empty byte vector, otherwise the script fails.
+                // Reference: Bitcoin Core interpreter.cpp line 341-342
+                if !valid && flags.contains(ScriptVerifyFlags::NULLFAIL) && !sig.is_empty() {
+                    return Err(ScriptError::NullFail);
+                }
+
                 stack.push(if valid { vec![1] } else { vec![0] });
 
                 if opcode == OP_CHECKSIGVERIFY && !valid {
@@ -215,9 +535,97 @@ impl ScriptInterpreter {
                 }
             }
             OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
-                // Simplified multisig verification
-                // This is complex - for now just return true
-                stack.push(vec![1]);
+                // CHECKMULTISIG: ([sig ...] num_of_signatures [pubkey ...] num_of_pubkeys -- bool)
+                // Reference: Bitcoin Core interpreter.cpp lines 1105-1215
+
+                // Get number of public keys
+                let n_keys_count = {
+                    let n_keys_bytes = stack.pop()?;
+                    Self::decode_num(&n_keys_bytes)? as i32
+                };
+
+                if n_keys_count < 0 || n_keys_count > 20 {
+                    return Err(ScriptError::ExecutionError(
+                        "Invalid pubkey count in CHECKMULTISIG".to_string(),
+                    ));
+                }
+
+                // Collect public keys
+                let mut pubkeys = Vec::new();
+                for _ in 0..n_keys_count {
+                    let pubkey = stack.pop()?;
+                    // BIP141: WITNESS_PUBKEYTYPE enforcement for all pubkeys
+                    // In witness v0 scripts, ALL public keys must be compressed.
+                    // Reference: Bitcoin Core interpreter.cpp CheckPubKeyEncoding()
+                    check_pubkey_encoding(&pubkey, flags, sigversion)?;
+                    pubkeys.push(pubkey);
+                }
+
+                // Get number of signatures
+                let n_sigs_count = {
+                    let n_sigs_bytes = stack.pop()?;
+                    Self::decode_num(&n_sigs_bytes)? as i32
+                };
+
+                if n_sigs_count < 0 || n_sigs_count > n_keys_count {
+                    return Err(ScriptError::ExecutionError(
+                        "Invalid signature count in CHECKMULTISIG".to_string(),
+                    ));
+                }
+
+                // Collect signatures
+                let mut signatures = Vec::new();
+                for _ in 0..n_sigs_count {
+                    signatures.push(stack.pop()?);
+                }
+
+                // Pop the dummy element (CHECKMULTISIG bug)
+                let dummy = stack.pop()?;
+                if flags.contains(ScriptVerifyFlags::NULLDUMMY) && !dummy.is_empty() {
+                    return Err(ScriptError::ExecutionError(
+                        "NULLDUMMY: dummy element must be empty".to_string(),
+                    ));
+                }
+
+                // Simplified verification: for now, check all signatures are non-empty
+                // and we have enough valid pubkeys.
+                // Real implementation would verify each signature against pubkeys.
+                let mut valid = true;
+                let mut keys_remaining = n_keys_count;
+                let mut sigs_checked = 0;
+
+                for sig in &signatures {
+                    if sig.is_empty() {
+                        // Empty signature never matches
+                        valid = false;
+                        break;
+                    }
+                    sigs_checked += 1;
+                    keys_remaining -= 1;
+
+                    // If more signatures remain than keys, fail
+                    if (n_sigs_count - sigs_checked) > keys_remaining {
+                        valid = false;
+                        break;
+                    }
+                }
+
+                // BIP146: NULLFAIL enforcement for CHECKMULTISIG
+                // If the operation failed, ALL signatures must be empty vectors.
+                // Reference: Bitcoin Core interpreter.cpp lines 1183-1191
+                if !valid && flags.contains(ScriptVerifyFlags::NULLFAIL) {
+                    for sig in &signatures {
+                        if !sig.is_empty() {
+                            return Err(ScriptError::NullFail);
+                        }
+                    }
+                }
+
+                stack.push(if valid { vec![1] } else { vec![0] });
+
+                if opcode == OP_CHECKMULTISIGVERIFY && !valid {
+                    return Err(ScriptError::ValidationFailed);
+                }
             }
             OP_RIPEMD160 => {
                 let data = stack.pop()?;
@@ -1032,5 +1440,441 @@ mod tests {
 
         let result = ScriptInterpreter::evaluate_script(&script, &mut stack);
         assert!(result.unwrap());
+    }
+
+    // =========================================================================
+    // NULLFAIL (BIP146) Tests
+    // =========================================================================
+
+    #[test]
+    fn test_nullfail_checksig_with_empty_sig_passes() {
+        // When NULLFAIL is enabled and signature check fails with empty sig,
+        // it should NOT error - just push false
+        let mut stack = Stack::new();
+        stack.push(vec![]); // empty signature (passes NULLFAIL)
+        stack.push(vec![0x02; 33]); // valid-looking pubkey
+
+        let result = ScriptInterpreter::execute_opcode_with_flags(
+            OP_CHECKSIG,
+            &mut stack,
+            ScriptVerifyFlags::NULLFAIL,
+        );
+
+        // Should succeed (no NULLFAIL error), but push false
+        assert!(result.is_ok());
+        assert_eq!(stack.pop().unwrap(), vec![0]); // false
+    }
+
+    #[test]
+    fn test_nullfail_checksig_with_nonempty_sig_fails() {
+        // When NULLFAIL is enabled and signature check fails with non-empty sig,
+        // it MUST return NullFail error
+        let mut stack = Stack::new();
+        stack.push(vec![0x30, 0x06]); // non-empty (invalid) signature
+        stack.push(vec![]); // empty pubkey (causes check to fail)
+
+        let result = ScriptInterpreter::execute_opcode_with_flags(
+            OP_CHECKSIG,
+            &mut stack,
+            ScriptVerifyFlags::NULLFAIL,
+        );
+
+        // Should fail with NULLFAIL error
+        assert!(matches!(result, Err(ScriptError::NullFail)));
+    }
+
+    #[test]
+    fn test_nullfail_disabled_allows_nonempty_failed_sig() {
+        // When NULLFAIL is NOT enabled, a failing signature with non-empty sig
+        // should just push false, not error
+        let mut stack = Stack::new();
+        stack.push(vec![0x30, 0x06]); // non-empty (invalid) signature
+        stack.push(vec![]); // empty pubkey (causes check to fail)
+
+        let result = ScriptInterpreter::execute_opcode_with_flags(
+            OP_CHECKSIG,
+            &mut stack,
+            ScriptVerifyFlags::NONE, // NULLFAIL not enabled
+        );
+
+        // Should succeed, pushing false
+        assert!(result.is_ok());
+        assert_eq!(stack.pop().unwrap(), vec![0]); // false
+    }
+
+    #[test]
+    fn test_nullfail_checksigverify_with_nonempty_sig_fails() {
+        // CHECKSIGVERIFY with NULLFAIL and non-empty failing sig
+        let mut stack = Stack::new();
+        stack.push(vec![0x30, 0x06]); // non-empty (invalid) signature
+        stack.push(vec![]); // empty pubkey (causes check to fail)
+
+        let result = ScriptInterpreter::execute_opcode_with_flags(
+            OP_CHECKSIGVERIFY,
+            &mut stack,
+            ScriptVerifyFlags::NULLFAIL,
+        );
+
+        // NULLFAIL error takes precedence
+        assert!(matches!(result, Err(ScriptError::NullFail)));
+    }
+
+    #[test]
+    fn test_script_verify_flags_constants() {
+        // Test that flag constants have correct values
+        assert_eq!(ScriptVerifyFlags::NONE.bits(), 0);
+        assert_eq!(ScriptVerifyFlags::P2SH.bits(), 1 << 0);
+        assert_eq!(ScriptVerifyFlags::NULLFAIL.bits(), 1 << 14);
+        assert_eq!(ScriptVerifyFlags::WITNESS.bits(), 1 << 11);
+        assert_eq!(ScriptVerifyFlags::TAPROOT.bits(), 1 << 17);
+    }
+
+    #[test]
+    fn test_script_verify_flags_combined() {
+        // Test combining multiple flags
+        let flags = ScriptVerifyFlags::P2SH
+            | ScriptVerifyFlags::WITNESS
+            | ScriptVerifyFlags::NULLFAIL;
+
+        assert!(flags.contains(ScriptVerifyFlags::P2SH));
+        assert!(flags.contains(ScriptVerifyFlags::WITNESS));
+        assert!(flags.contains(ScriptVerifyFlags::NULLFAIL));
+        assert!(!flags.contains(ScriptVerifyFlags::TAPROOT));
+    }
+
+    #[test]
+    fn test_segwit_activation_heights() {
+        use bitcoin::Network;
+
+        // Test activation heights
+        assert_eq!(activation_heights::segwit_height(Network::Bitcoin), 481824);
+        assert_eq!(activation_heights::segwit_height(Network::Testnet), 834624);
+        assert_eq!(activation_heights::segwit_height(Network::Testnet4), 0);
+        assert_eq!(activation_heights::segwit_height(Network::Regtest), 0);
+    }
+
+    #[test]
+    fn test_get_script_flags_for_height_mainnet() {
+        use bitcoin::Network;
+
+        // Before any softforks
+        let flags = activation_heights::get_script_flags_for_height(0, Network::Bitcoin);
+        assert_eq!(flags, ScriptVerifyFlags::NONE);
+
+        // At P2SH activation (173805)
+        let flags = activation_heights::get_script_flags_for_height(173805, Network::Bitcoin);
+        assert!(flags.contains(ScriptVerifyFlags::P2SH));
+        assert!(!flags.contains(ScriptVerifyFlags::NULLFAIL));
+
+        // At SegWit activation (481824) - NULLFAIL must be enabled
+        let flags = activation_heights::get_script_flags_for_height(481824, Network::Bitcoin);
+        assert!(flags.contains(ScriptVerifyFlags::P2SH));
+        assert!(flags.contains(ScriptVerifyFlags::WITNESS));
+        assert!(flags.contains(ScriptVerifyFlags::NULLFAIL));
+        assert!(flags.contains(ScriptVerifyFlags::NULLDUMMY));
+        assert!(flags.contains(ScriptVerifyFlags::WITNESS_PUBKEYTYPE));
+
+        // After Taproot activation (709632)
+        let flags = activation_heights::get_script_flags_for_height(709632, Network::Bitcoin);
+        assert!(flags.contains(ScriptVerifyFlags::NULLFAIL));
+        assert!(flags.contains(ScriptVerifyFlags::TAPROOT));
+    }
+
+    #[test]
+    fn test_get_script_flags_for_height_regtest() {
+        use bitcoin::Network;
+
+        // Regtest has all flags from genesis
+        let flags = activation_heights::get_script_flags_for_height(0, Network::Regtest);
+        assert!(flags.contains(ScriptVerifyFlags::P2SH));
+        assert!(flags.contains(ScriptVerifyFlags::DERSIG));
+        assert!(flags.contains(ScriptVerifyFlags::CHECKLOCKTIMEVERIFY));
+        assert!(flags.contains(ScriptVerifyFlags::CHECKSEQUENCEVERIFY));
+        assert!(flags.contains(ScriptVerifyFlags::WITNESS));
+        assert!(flags.contains(ScriptVerifyFlags::NULLFAIL));
+    }
+
+    #[test]
+    fn test_nullfail_error_type() {
+        // Verify NullFail error is properly constructed
+        let err = ScriptError::NullFail;
+        assert_eq!(
+            err.to_string(),
+            "Signature must be empty when verification fails (NULLFAIL)"
+        );
+    }
+
+    // =========================================================================
+    // WITNESS_PUBKEYTYPE (BIP141) Tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_compressed_pubkey_valid() {
+        // Valid compressed pubkey: 33 bytes, starts with 0x02
+        let compressed_02 = [0x02; 33];
+        assert!(is_compressed_pubkey(&compressed_02));
+
+        // Valid compressed pubkey: 33 bytes, starts with 0x03
+        let compressed_03 = [0x03; 33];
+        assert!(is_compressed_pubkey(&compressed_03));
+    }
+
+    #[test]
+    fn test_is_compressed_pubkey_invalid_uncompressed() {
+        // Uncompressed pubkey: 65 bytes, starts with 0x04
+        let mut uncompressed = vec![0x04];
+        uncompressed.extend_from_slice(&[0u8; 64]);
+        assert!(!is_compressed_pubkey(&uncompressed));
+    }
+
+    #[test]
+    fn test_is_compressed_pubkey_invalid_length() {
+        // Too short
+        let too_short = [0x02; 32];
+        assert!(!is_compressed_pubkey(&too_short));
+
+        // Too long
+        let too_long = [0x02; 34];
+        assert!(!is_compressed_pubkey(&too_long));
+    }
+
+    #[test]
+    fn test_is_compressed_pubkey_invalid_prefix() {
+        // Wrong prefix (0x04 with 33 bytes)
+        let wrong_prefix = [0x04; 33];
+        assert!(!is_compressed_pubkey(&wrong_prefix));
+
+        // Wrong prefix (0x01 with 33 bytes)
+        let wrong_prefix_01 = [0x01; 33];
+        assert!(!is_compressed_pubkey(&wrong_prefix_01));
+    }
+
+    #[test]
+    fn test_is_compressed_or_uncompressed_pubkey() {
+        // Compressed 0x02
+        let compressed_02 = [0x02; 33];
+        assert!(is_compressed_or_uncompressed_pubkey(&compressed_02));
+
+        // Compressed 0x03
+        let compressed_03 = [0x03; 33];
+        assert!(is_compressed_or_uncompressed_pubkey(&compressed_03));
+
+        // Uncompressed 0x04
+        let mut uncompressed = vec![0x04];
+        uncompressed.extend_from_slice(&[0u8; 64]);
+        assert!(is_compressed_or_uncompressed_pubkey(&uncompressed));
+
+        // Invalid: 0x04 with wrong length
+        let mut invalid = vec![0x04];
+        invalid.extend_from_slice(&[0u8; 32]);
+        assert!(!is_compressed_or_uncompressed_pubkey(&invalid));
+    }
+
+    #[test]
+    fn test_witness_pubkeytype_compressed_key_passes() {
+        // A witness v0 CHECKSIG with compressed pubkey should pass
+        let mut stack = Stack::new();
+        stack.push(vec![0x30, 0x06]); // dummy signature
+        stack.push([0x02; 33].to_vec()); // compressed pubkey
+
+        let flags = ScriptVerifyFlags::WITNESS_PUBKEYTYPE;
+        let result = ScriptInterpreter::execute_opcode_with_context(
+            OP_CHECKSIG,
+            &mut stack,
+            flags,
+            SigVersion::WitnessV0,
+        );
+
+        // Should succeed (pubkey check passes)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_witness_pubkeytype_uncompressed_key_fails() {
+        // A witness v0 CHECKSIG with uncompressed pubkey should fail
+        let mut stack = Stack::new();
+        stack.push(vec![0x30, 0x06]); // dummy signature
+        let mut uncompressed_pubkey = vec![0x04];
+        uncompressed_pubkey.extend_from_slice(&[0u8; 64]);
+        stack.push(uncompressed_pubkey);
+
+        let flags = ScriptVerifyFlags::WITNESS_PUBKEYTYPE;
+        let result = ScriptInterpreter::execute_opcode_with_context(
+            OP_CHECKSIG,
+            &mut stack,
+            flags,
+            SigVersion::WitnessV0,
+        );
+
+        // Should fail with WitnessPubkeyType error
+        assert!(matches!(result, Err(ScriptError::WitnessPubkeyType)));
+    }
+
+    #[test]
+    fn test_witness_pubkeytype_legacy_allows_uncompressed() {
+        // A legacy (non-witness) CHECKSIG with uncompressed pubkey should pass
+        let mut stack = Stack::new();
+        stack.push(vec![0x30, 0x06]); // dummy signature
+        let mut uncompressed_pubkey = vec![0x04];
+        uncompressed_pubkey.extend_from_slice(&[0u8; 64]);
+        stack.push(uncompressed_pubkey);
+
+        let flags = ScriptVerifyFlags::WITNESS_PUBKEYTYPE;
+        let result = ScriptInterpreter::execute_opcode_with_context(
+            OP_CHECKSIG,
+            &mut stack,
+            flags,
+            SigVersion::Base, // Legacy context
+        );
+
+        // Should succeed (WITNESS_PUBKEYTYPE only applies to witness v0)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_witness_pubkeytype_flag_disabled_allows_uncompressed() {
+        // When WITNESS_PUBKEYTYPE flag is not set, uncompressed keys are allowed
+        let mut stack = Stack::new();
+        stack.push(vec![0x30, 0x06]); // dummy signature
+        let mut uncompressed_pubkey = vec![0x04];
+        uncompressed_pubkey.extend_from_slice(&[0u8; 64]);
+        stack.push(uncompressed_pubkey);
+
+        let flags = ScriptVerifyFlags::NONE; // No WITNESS_PUBKEYTYPE
+        let result = ScriptInterpreter::execute_opcode_with_context(
+            OP_CHECKSIG,
+            &mut stack,
+            flags,
+            SigVersion::WitnessV0,
+        );
+
+        // Should succeed (flag not enabled)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_witness_pubkeytype_checkmultisig_compressed_passes() {
+        // CHECKMULTISIG in witness v0 with all compressed pubkeys should pass
+        let mut stack = Stack::new();
+        stack.push(vec![]); // dummy element for CHECKMULTISIG bug
+        stack.push(vec![0x30, 0x06]); // signature 1
+        stack.push(vec![1]); // 1 signature required
+        stack.push([0x02; 33].to_vec()); // compressed pubkey 1
+        stack.push([0x03; 33].to_vec()); // compressed pubkey 2
+        stack.push(vec![2]); // 2 pubkeys total
+
+        let flags = ScriptVerifyFlags::WITNESS_PUBKEYTYPE;
+        let result = ScriptInterpreter::execute_opcode_with_context(
+            OP_CHECKMULTISIG,
+            &mut stack,
+            flags,
+            SigVersion::WitnessV0,
+        );
+
+        // Should succeed
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_witness_pubkeytype_checkmultisig_uncompressed_fails() {
+        // CHECKMULTISIG in witness v0 with uncompressed pubkey should fail
+        let mut stack = Stack::new();
+        stack.push(vec![]); // dummy element for CHECKMULTISIG bug
+        stack.push(vec![0x30, 0x06]); // signature 1
+        stack.push(vec![1]); // 1 signature required
+        stack.push([0x02; 33].to_vec()); // compressed pubkey 1
+        let mut uncompressed_pubkey = vec![0x04];
+        uncompressed_pubkey.extend_from_slice(&[0u8; 64]);
+        stack.push(uncompressed_pubkey); // uncompressed pubkey 2
+        stack.push(vec![2]); // 2 pubkeys total
+
+        let flags = ScriptVerifyFlags::WITNESS_PUBKEYTYPE;
+        let result = ScriptInterpreter::execute_opcode_with_context(
+            OP_CHECKMULTISIG,
+            &mut stack,
+            flags,
+            SigVersion::WitnessV0,
+        );
+
+        // Should fail with WitnessPubkeyType error
+        assert!(matches!(result, Err(ScriptError::WitnessPubkeyType)));
+    }
+
+    #[test]
+    fn test_witness_pubkeytype_error_message() {
+        let err = ScriptError::WitnessPubkeyType;
+        assert_eq!(
+            err.to_string(),
+            "Public key must be compressed in witness v0 scripts"
+        );
+    }
+
+    #[test]
+    fn test_check_pubkey_encoding_witness_v0() {
+        // Compressed key in witness v0 with flag should pass
+        let compressed = [0x02; 33];
+        let result = check_pubkey_encoding(
+            &compressed,
+            ScriptVerifyFlags::WITNESS_PUBKEYTYPE,
+            SigVersion::WitnessV0,
+        );
+        assert!(result.is_ok());
+
+        // Uncompressed key in witness v0 with flag should fail
+        let mut uncompressed = vec![0x04];
+        uncompressed.extend_from_slice(&[0u8; 64]);
+        let result = check_pubkey_encoding(
+            &uncompressed,
+            ScriptVerifyFlags::WITNESS_PUBKEYTYPE,
+            SigVersion::WitnessV0,
+        );
+        assert!(matches!(result, Err(ScriptError::WitnessPubkeyType)));
+    }
+
+    #[test]
+    fn test_evaluate_witness_v0_script_with_compressed_key() {
+        // Test full script evaluation in witness v0 context with compressed key
+        let script = Builder::new()
+            .push_slice(&[0x30, 0x06]) // dummy sig
+            .push_slice(&[0x02; 33])   // compressed pubkey
+            .push_opcode(OP_CHECKSIG)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::WITNESS_PUBKEYTYPE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        // Should succeed (compressed key passes)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_evaluate_witness_v0_script_with_uncompressed_key_fails() {
+        // Test full script evaluation in witness v0 context with uncompressed key
+        // Build the uncompressed key as a fixed-size array
+        let mut uncompressed = [0u8; 65];
+        uncompressed[0] = 0x04;
+
+        let script = Builder::new()
+            .push_slice([0x30, 0x06]) // dummy sig
+            .push_slice(uncompressed) // uncompressed pubkey
+            .push_opcode(OP_CHECKSIG)
+            .into_script();
+
+        let mut stack = Stack::new();
+        let flags = ScriptVerifyFlags::WITNESS_PUBKEYTYPE;
+        let result = ScriptInterpreter::evaluate_witness_v0_script(&script, &mut stack, flags);
+
+        // Should fail with WitnessPubkeyType error
+        assert!(matches!(result, Err(ScriptError::WitnessPubkeyType)));
+    }
+
+    #[test]
+    fn test_sigversion_equality() {
+        assert_eq!(SigVersion::Base, SigVersion::Base);
+        assert_eq!(SigVersion::WitnessV0, SigVersion::WitnessV0);
+        assert_eq!(SigVersion::Tapscript, SigVersion::Tapscript);
+        assert_ne!(SigVersion::Base, SigVersion::WitnessV0);
+        assert_ne!(SigVersion::WitnessV0, SigVersion::Tapscript);
     }
 }
