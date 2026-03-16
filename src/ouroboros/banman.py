@@ -17,17 +17,28 @@ from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Misbehavior score table #
+# ---------------------------------------------------------------------------
+# Misbehavior score table
+# Reference: Bitcoin Core net_processing.cpp Misbehaving() calls
+# ---------------------------------------------------------------------------
 
-SCORE_INVALID_BLOCK_HEADER = 100
-SCORE_INVALID_BLOCK = 100
-SCORE_INVALID_TX_HIGH = 10
+# Instant bans (score >= 100)
+SCORE_INVALID_BLOCK = 100        # Invalid block (consensus failure)
+SCORE_INVALID_HEADERS = 20       # Invalid headers (e.g., bad PoW, doesn't connect)
+SCORE_INVALID_TX = 10            # Invalid transaction
+
+# Other violations
+SCORE_UNREQUESTED_DATA = 20      # Unrequested block/tx data
+SCORE_ORPHAN_TX = 1              # Orphan transaction (low score, not misbehavior)
+SCORE_HEADERS_NOT_CONNECT = 10   # Headers don't connect to our chain
+SCORE_INVALID_MESSAGE = 10       # Malformed P2P message
+SCORE_ADDR_SPAM = 5              # Excessive addr relay
+
+# Legacy aliases
+SCORE_INVALID_BLOCK_HEADER = SCORE_INVALID_HEADERS
+SCORE_INVALID_TX_HIGH = SCORE_INVALID_TX
 SCORE_INVALID_TX_LOW = 1
-SCORE_ORPHAN_TX = 1
-SCORE_UNSOLICITED_BLOCK = 20
-SCORE_HEADERS_NOT_CONNECT = 10
-SCORE_INVALID_MESSAGE = 10
-SCORE_ADDR_SPAM = 5
+SCORE_UNSOLICITED_BLOCK = SCORE_UNREQUESTED_DATA
 
 
 @dataclass
@@ -61,8 +72,11 @@ class BanManager:
 
     # Public API
 
-    def record_misbehavior(self, ip: str, score: int, reason: str) -> None:
-        """Add *score* points for *ip*.  Ban if threshold is reached."""
+    def record_misbehavior(self, ip: str, score: int, reason: str) -> bool:
+        """Add *score* points for *ip*.  Ban if threshold is reached.
+
+        Returns True if the peer was banned as a result of this call.
+        """
         rec = self.scores.setdefault(ip, MisbehaviorRecord())
         rec.score += score
         rec.events.append(reason)
@@ -75,17 +89,71 @@ class BanManager:
 
         if rec.score >= self.ban_threshold:
             self.ban(ip)
+            return True
+        return False
 
-    def ban(self, ip: str) -> None:
-        """Immediately ban *ip* for ``ban_duration`` seconds."""
-        self.banned[ip] = time.time() + self.ban_duration
+    def misbehaving(self, peer_id: str, score: int, reason: str) -> bool:
+        """Record misbehavior for a peer (Bitcoin Core API compatibility).
+
+        This is an alias for record_misbehavior() that matches the naming
+        convention used in Bitcoin Core's net_processing.cpp.
+
+        Args:
+            peer_id: Peer identifier (IP address or IP:port)
+            score: Misbehavior score to add
+            reason: Human-readable reason for the misbehavior
+
+        Returns:
+            True if the peer was banned as a result
+        """
+        return self.record_misbehavior(peer_id, score, reason)
+
+    def ban(self, ip: str, duration: Optional[int] = None) -> None:
+        """Immediately ban *ip* for *duration* seconds (default: ban_duration)."""
+        ban_time = duration if duration is not None else self.ban_duration
+        self.banned[ip] = time.time() + ban_time
         self.scores.pop(ip, None)
-        logger.warning("Banned %s for %d s", ip, self.ban_duration)
+        logger.warning("Banned %s for %d s", ip, ban_time)
 
         if self._data_dir:
             self._save_bans()
         if self._on_ban:
             self._on_ban(ip)
+
+    def setban(
+        self,
+        ip: str,
+        command: str = "add",
+        bantime: int = 0,
+        absolute: bool = False,
+    ) -> bool:
+        """Set or remove a ban (Bitcoin Core RPC compatibility).
+
+        Args:
+            ip: IP address or subnet to ban
+            command: "add" to ban, "remove" to unban
+            bantime: Ban duration in seconds (0 = use default 24h)
+            absolute: If True, bantime is an absolute UNIX timestamp
+
+        Returns:
+            True if operation succeeded
+        """
+        if command == "add":
+            if bantime == 0:
+                duration = self.ban_duration
+            elif absolute:
+                # bantime is an absolute timestamp
+                duration = max(0, int(bantime - time.time()))
+            else:
+                duration = bantime
+            self.ban(ip, duration=duration)
+            return True
+        elif command == "remove":
+            self.unban(ip)
+            return True
+        else:
+            logger.warning("Unknown setban command: %s", command)
+            return False
 
     def is_banned(self, ip: str) -> bool:
         """Return True if *ip* is currently banned."""
@@ -119,6 +187,31 @@ class BanManager:
         now = time.time()
         self.banned = {ip: t for ip, t in self.banned.items() if t > now}
         return dict(self.banned)
+
+    def list_banned_detailed(self) -> List[Dict[str, any]]:
+        """Return detailed ban info for each banned IP (for listbanned RPC).
+
+        Returns a list of dicts with:
+            - address: The banned IP/subnet
+            - ban_created: UNIX timestamp when ban was created
+            - banned_until: UNIX timestamp when ban expires
+            - ban_duration: Duration in seconds
+        """
+        now = time.time()
+        result = []
+        for ip, ban_until in list(self.banned.items()):
+            if ban_until <= now:
+                continue
+            # We don't store ban_created, so estimate it from ban_until
+            # This is an approximation; ideally we'd store creation time
+            duration = int(ban_until - now)
+            result.append({
+                "address": ip,
+                "ban_created": int(ban_until - self.ban_duration),
+                "banned_until": int(ban_until),
+                "ban_duration": duration,
+            })
+        return result
 
     def sweep_expired(self) -> int:
         """Remove expired bans and return how many were removed."""
