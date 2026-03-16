@@ -36,6 +36,13 @@ from ouroboros.validation import (
     WITNESS_SCALE_FACTOR,
 )
 
+# BIP9 versionbits support
+try:
+    from sync import get_all_deployments_info
+    HAS_VERSIONBITS = True
+except ImportError:
+    HAS_VERSIONBITS = False
+
 logger = logging.getLogger(__name__)
 
 # Rate limiting
@@ -444,6 +451,9 @@ class RPCServer:
         pruner = getattr(self.node, "pruner", None)
         pruned = pruner is not None and pruner.prune_height > 0
 
+        # Get softfork info from BIP9 versionbits
+        softforks = self._get_softforks_info(best_height, network)
+
         info: Dict[str, Any] = {
             "chain": network,
             "blocks": best_height,
@@ -454,7 +464,7 @@ class RPCServer:
             "verificationprogress": 1.0 if self._is_synced() else 0.0,
             "chainwork": self.node.get_chainwork(),
             "pruned": pruned,
-            "softforks": {},
+            "softforks": softforks,
         }
 
         if pruner is not None:
@@ -642,57 +652,219 @@ class RPCServer:
             "minrelaytxfee": 0.00001,  # 1 sat/vbyte
         }
     
+    # Default maxfeerate: 0.10 BTC/kvB (100,000 sat/kvB = 100 sat/vB)
+    DEFAULT_MAX_RAW_TX_FEE_RATE = 0.10  # BTC/kvB
+
     async def rpc_sendrawtransaction(
         self,
         hexstring: str,
         maxfeerate: Optional[float] = None
     ) -> str:
         """
-        Broadcast a raw transaction to the network.
+        Submit a raw transaction (serialized, hex-encoded) to the network.
 
-        Accepts hex-encoded raw transaction, deserializes, adds to mempool,
-        and broadcasts inv to peers. Peers that want the tx will send getdata;
-        we respond with the full tx via the getdata handler.
+        The transaction will be validated against consensus and policy rules,
+        then added to the mempool and relayed to peers via INV messages.
+
+        Reference: Bitcoin Core rpc/mempool.cpp sendrawtransaction
+
+        Args:
+            hexstring: Hex-encoded raw transaction
+            maxfeerate: Reject if fee rate exceeds this (BTC/kvB). Default: 0.10.
+                        Set to 0 to accept any fee rate.
+
+        Returns:
+            The transaction hash (txid) in hex
+
+        Raises:
+            HTTPException: On validation failure with detailed reject reason
         """
+        # 1. Deserialize the hex-encoded raw transaction
         try:
             tx_data = bytes.fromhex(hexstring.strip())
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid hex string: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"TX decode failed: {e}"
+            )
 
         try:
-            from ouroboros.p2p_messages import TxMessage, InvMessage, INV_TYPE_TX
+            from ouroboros.p2p_messages import TxMessage
         except ImportError:
-            raise HTTPException(status_code=500, detail="P2P messages not available")
+            raise HTTPException(
+                status_code=500,
+                detail="P2P messages not available"
+            )
 
         try:
             tx_msg = TxMessage.from_payload(tx_data)
             tx = tx_msg.transaction
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid transaction: {e}")
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"TX decode failed. Make sure the tx has at least one input. {e}"
+            )
 
-        # Reject coinbase
+        txid = tx.get_txid()
+        txid_hex = txid.hex()
+
+        # Reject coinbase transactions
         if tx.is_coinbase:
-            raise HTTPException(status_code=400, detail="Coinbase transactions cannot be broadcast")
+            raise HTTPException(
+                status_code=400,
+                detail="coinbase"
+            )
 
         if not hasattr(self.node, 'mempool') or not self.node.mempool:
-            raise HTTPException(status_code=500, detail="Mempool not available")
+            raise HTTPException(
+                status_code=500,
+                detail="Mempool not available"
+            )
 
+        # 2. Check if already in mempool — return txid if so
+        if self.node.mempool.has_transaction(txid):
+            return txid_hex
+
+        # 3. Check if already confirmed — return txid if so
+        if hasattr(self.node, 'db') and self.node.db:
+            try:
+                loc = self.node.db.get_tx_index(txid)
+                if loc is not None:
+                    # Transaction is already confirmed on-chain
+                    return txid_hex
+            except Exception:
+                pass
+
+        # 4. Check maxfeerate parameter (safety check against absurd fees)
+        # Default: 0.10 BTC/kvB = 100,000 sat/kvB = 100 sat/vB
+        if maxfeerate is None:
+            maxfeerate = self.DEFAULT_MAX_RAW_TX_FEE_RATE
+
+        # Calculate transaction fee and vsize
         _, best_height = self.node.db.get_best_block()
+
+        # Calculate total input value from UTXOs
+        total_input = 0
+        for tx_in in tx.inputs:
+            # Check mempool first for unconfirmed parent outputs
+            parent_entry = self.node.mempool.transactions.get(tx_in.prev_txid)
+            if parent_entry and tx_in.prev_vout < len(parent_entry.tx.outputs):
+                total_input += parent_entry.tx.outputs[tx_in.prev_vout].value
+            else:
+                utxo = self.node.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                if utxo:
+                    total_input += utxo['value']
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="missing-inputs"
+                    )
+
+        total_output = sum(out.value for out in tx.outputs)
+        fee = total_input - total_output
+
+        if fee < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="bad-txns-in-belowout"
+            )
+
+        # Calculate fee rate in BTC/kvB
+        vsize = tx.get_vsize()
+        fee_rate_btc_kvb = (fee / 1e8) / (vsize / 1000.0)  # fee in BTC / vsize in kvB
+
+        # Reject if fee rate exceeds maxfeerate (unless maxfeerate is 0)
+        if maxfeerate > 0 and fee_rate_btc_kvb > maxfeerate:
+            raise HTTPException(
+                status_code=400,
+                detail=f"max-fee-exceeded: fee rate {fee_rate_btc_kvb:.8f} BTC/kvB "
+                       f"exceeds maxfeerate {maxfeerate:.8f} BTC/kvB"
+            )
+
+        # 5. Submit to mempool — runs all policy and consensus checks
         success, error = self.node.mempool.add_transaction(tx, best_height)
 
         if not success:
-            if error == "Already in mempool":
-                return tx.txid.hex()
-            raise HTTPException(status_code=400, detail=error)
+            # Map common errors to Bitcoin Core-style reject reasons
+            reject_reason = self._map_mempool_error_to_reject_reason(error)
+            raise HTTPException(
+                status_code=400,
+                detail=reject_reason
+            )
 
-        # Broadcast inv to peers
-        txid = tx.txid
-        inv = InvMessage(inventory=[(INV_TYPE_TX, txid)])
-        inv_msg = inv.to_network_message(self.node.network)
+        # 6. Relay INV to all connected peers via trickle queue (privacy)
+        # Use privacy-preserving relay via INV messages
+        wtxid = tx.get_wtxid() if hasattr(tx, 'get_wtxid') else txid
+
         if hasattr(self.node, 'peer_manager') and self.node.peer_manager:
-            await self.node.peer_manager.broadcast(inv_msg)
+            # Use trickle queue for privacy-preserving relay
+            self.node.peer_manager.queue_tx_for_relay(txid, wtxid)
 
-        return txid.hex()
+        logger.info(
+            f"sendrawtransaction: accepted {txid_hex[:16]}... "
+            f"(fee={fee} sat, rate={fee_rate_btc_kvb:.8f} BTC/kvB)"
+        )
+
+        # 7. Return the txid on success
+        return txid_hex
+
+    def _map_mempool_error_to_reject_reason(self, error: str) -> str:
+        """Map internal mempool error messages to Bitcoin Core-style reject reasons.
+
+        Reference: Bitcoin Core validation.cpp TxValidationResult
+        """
+        error_lower = error.lower()
+
+        # Already in mempool (shouldn't reach here, but handle gracefully)
+        if "already in mempool" in error_lower:
+            return "txn-already-in-mempool"
+
+        # Missing inputs (orphan)
+        if "orphan" in error_lower:
+            return "missing-inputs"
+
+        # UTXO not found
+        if "utxo not found" in error_lower:
+            return "missing-inputs"
+
+        # Double spend / conflict
+        if "conflict" in error_lower or "double" in error_lower:
+            return "txn-mempool-conflict"
+
+        # Fee too low
+        if "fee" in error_lower and ("low" in error_lower or "minimum" in error_lower or "below" in error_lower):
+            return "insufficient-fee"
+
+        # Non-standard
+        if "non-standard" in error_lower or "standardness" in error_lower:
+            return "non-standard"
+
+        # Script failure
+        if "script" in error_lower:
+            return "script-failed"
+
+        # Ancestor/descendant limits
+        if "ancestor" in error_lower or "descendant" in error_lower:
+            return "too-long-mempool-chain"
+
+        # Size/weight limits
+        if "size" in error_lower or "weight" in error_lower:
+            return "tx-size"
+
+        # TRUC (v3) policy
+        if "truc" in error_lower or "v3" in error_lower:
+            return "truc-policy"
+
+        # Dust output
+        if "dust" in error_lower:
+            return "dust"
+
+        # Negative fee
+        if "negative" in error_lower:
+            return "bad-txns-in-belowout"
+
+        # Default: return original error
+        return error
     
     async def rpc_getnetworkinfo(self) -> Dict[str, Any]:
         """Return network information"""
@@ -1575,6 +1747,17 @@ class RPCServer:
         Selects mempool transactions by fee rate (greedy), builds a
         coinbase, computes the merkle root, and returns the template
         for external miners.
+
+        Locktime enforcement:
+        - Transactions with nLockTime > next_height (or > MTP for time-based)
+          are excluded from the template.
+
+        Coinbase requirements (for miners using this template):
+        - Coinbase nSequence: 0xFFFFFFFF (SEQUENCE_FINAL)
+        - Coinbase nLockTime: 0
+        - Witness commitment: OP_RETURN <0xaa21a9ed><32-byte-commitment>
+          in the last output, where commitment = SHA256d(witness_root || nonce)
+          and nonce is 32 zero bytes (coinbase witness item).
         """
         import time as _time
         import hashlib as _hl
@@ -1591,6 +1774,33 @@ class RPCServer:
             raise HTTPException(status_code=500, detail="Cannot read tip block")
 
         next_height = best_height + 1
+
+        # Get MTP for time-based locktime checks (BIP 113)
+        block_mtp = db.get_median_time_past(best_height) or 0
+
+        # Try to use Rust is_final_tx for locktime checking
+        try:
+            from sync import is_final_tx as rust_is_final_tx
+            use_rust_final = True
+        except ImportError:
+            use_rust_final = False
+
+        def _is_tx_final(tx) -> bool:
+            """Check if transaction is final for inclusion in next block."""
+            sequences = [inp.sequence for inp in tx.inputs]
+            if use_rust_final:
+                return rust_is_final_tx(tx.locktime, sequences, next_height, block_mtp)
+            else:
+                # Python fallback
+                LOCKTIME_THRESHOLD = 500_000_000
+                if tx.locktime == 0:
+                    return True
+                if all(seq == 0xFFFFFFFF for seq in sequences):
+                    return True
+                if tx.locktime < LOCKTIME_THRESHOLD:
+                    return tx.locktime < next_height
+                else:
+                    return tx.locktime < block_mtp
 
         # gather transactions from mempool (dependency-aware)
         MAX_BLOCK_WEIGHT = 4_000_000
@@ -1681,8 +1891,23 @@ class RPCServer:
                 if entry is None:
                     continue
 
+                # Skip non-final transactions (locktime not yet satisfied)
+                if not _is_tx_final(entry.tx):
+                    continue
+
                 # Collect required ancestors (+ self) in topological order
                 batch = _collect_ancestors(entry_txid, included)
+
+                # Skip if any ancestor is not final
+                batch_valid = True
+                for t in batch:
+                    anc_entry = snap_txs.get(t)
+                    if anc_entry and not _is_tx_final(anc_entry.tx):
+                        batch_valid = False
+                        break
+                if not batch_valid:
+                    continue
+
                 batch_weight = sum(
                     snap_txs[t].size * 4
                     for t in batch
@@ -1801,11 +2026,24 @@ class RPCServer:
             target_int = mantissa << (8 * (n_shift - 3))
         target_hex = f"{target_int:064x}"
 
+        # Coinbase requirements:
+        # - nSequence: 0xFFFFFFFF (SEQUENCE_FINAL)
+        # - nLockTime: 0
+        # - witness: single 32-byte zero nonce
+        coinbase_aux = {
+            "flags": "",  # extra nonce space in coinbase scriptSig
+        }
+
         return {
             "version": best_block.version,
             "previousblockhash": best_hash.hex(),
             "transactions": txs,
+            "coinbaseaux": coinbase_aux,
             "coinbasevalue": coinbase_value,
+            "coinbasetxn": {
+                "locktime": 0,
+                "sequence": 0xFFFFFFFF,
+            },
             "target": target_hex,
             "bits": f"{bits:08x}",
             "curtime": int(_time.time()),
@@ -1967,6 +2205,63 @@ class RPCServer:
         pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
         if pm and hasattr(pm, 'disconnect_peer'):
             await pm.disconnect_peer(address or nodeid)
+
+    async def rpc_setban(
+        self,
+        subnet: str,
+        command: str,
+        bantime: int = 0,
+        absolute: bool = False,
+    ) -> None:
+        """Add or remove an IP/subnet from the ban list.
+
+        Args:
+            subnet: IP address or subnet to ban (e.g., "192.168.0.1" or "192.168.0.0/24")
+            command: "add" to ban, "remove" to unban
+            bantime: Ban duration in seconds (0 = default 24 hours)
+            absolute: If True, bantime is an absolute UNIX timestamp
+
+        Raises:
+            ValueError: If command is invalid
+        """
+        pm = getattr(self.node, 'peer_manager', None)
+        if not pm or not hasattr(pm, 'ban_manager'):
+            raise ValueError("Peer manager not available")
+
+        bm = pm.ban_manager
+        if command not in ("add", "remove"):
+            raise ValueError(f"Invalid command: {command}")
+
+        success = bm.setban(subnet, command, bantime, absolute)
+        if not success:
+            raise ValueError(f"setban failed for {subnet}")
+
+    async def rpc_listbanned(self) -> List[Dict[str, Any]]:
+        """Return list of all banned IPs/subnets.
+
+        Returns:
+            List of dicts with address, ban_created, banned_until, ban_duration
+        """
+        pm = getattr(self.node, 'peer_manager', None)
+        if not pm or not hasattr(pm, 'ban_manager'):
+            return []
+
+        bm = pm.ban_manager
+        return bm.list_banned_detailed()
+
+    async def rpc_clearbanned(self) -> None:
+        """Clear all banned IPs/subnets."""
+        pm = getattr(self.node, 'peer_manager', None)
+        if not pm or not hasattr(pm, 'ban_manager'):
+            return
+
+        bm = pm.ban_manager
+        # Clear all bans
+        bm.banned.clear()
+        bm.scores.clear()
+        if bm._data_dir:
+            bm._save_bans()
+        logger.info("Cleared all bans")
 
     async def rpc_getnettotals(self) -> Dict[str, Any]:
         """Return network traffic statistics."""
@@ -3492,7 +3787,59 @@ class RPCServer:
         if hasattr(self.node, 'sync_manager'):
             return self.node.sync_manager.is_synced()
         return True  # Assume synced if can't check
-    
+
+    def _get_softforks_info(self, height: int, network: str) -> Dict[str, Any]:
+        """Get BIP9 softfork deployment info for getblockchaininfo.
+
+        Returns a dict mapping deployment names to their state info.
+        """
+        if not HAS_VERSIONBITS:
+            return {}
+
+        # For a full implementation, we'd query block versions/MTPs from DB
+        # For now, return static info based on known activation heights
+        softforks = {}
+
+        try:
+            # Get deployment info from Rust
+            # We need to pass block versions and MTPs for the BIP9 state machine
+            # For now, use empty lists which will return ALWAYS_ACTIVE deployments correctly
+            deployments = get_all_deployments_info(height, network, [], [])
+
+            for dep in deployments:
+                sf_info: Dict[str, Any] = {
+                    "type": "bip9",
+                    "bip9": {
+                        "status": dep.state,
+                        "bit": dep.bit,
+                        "start_time": dep.start_time,
+                        "timeout": dep.timeout,
+                        "since": dep.since,
+                        "min_activation_height": dep.min_activation_height,
+                    },
+                    "active": dep.state == "active",
+                }
+
+                # Add statistics if available (for STARTED/LOCKED_IN states)
+                if dep.period is not None:
+                    sf_info["bip9"]["statistics"] = {
+                        "period": dep.period,
+                        "threshold": dep.threshold,
+                        "elapsed": dep.elapsed,
+                        "count": dep.count,
+                        "possible": dep.possible,
+                    }
+
+                # Add activation height if known and active
+                if dep.state == "active" and dep.min_activation_height > 0:
+                    sf_info["height"] = dep.min_activation_height
+
+                softforks[dep.name] = sf_info
+        except Exception as e:
+            logger.debug(f"Could not get softfork info: {e}")
+
+        return softforks
+
     def _get_confirmations(self, height: Optional[int]) -> int:
         if height is None:
             return 0
