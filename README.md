@@ -33,6 +33,7 @@ the node logic, RPC server, and mempool.
 - [x] Eclipse attack mitigations (bucketed addrman, /16 diversity, anchors, feelers)
 - [x] Stale tip detection and peer eviction (ConsiderEviction, extra outbound connection)
 - [x] sendrawtransaction RPC with maxfeerate, confirmed/mempool checks, detailed errors
+- [x] getrawtransaction RPC with txindex support, verbose output, and in_active_chain
 - [ ] Full signature verification (secp256k1)
 - [ ] Wallet functionality
 
