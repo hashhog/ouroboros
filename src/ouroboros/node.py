@@ -34,6 +34,7 @@ from ouroboros.metrics import (
     update_mempool_metrics,
     NODE_INFO,
 )
+from ouroboros.snapshot import SnapshotManager, read_snapshot_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,9 @@ class BitcoinNode:
         # ZMQ publisher
         self.zmq_publisher: Optional[ZMQPublisher] = None
 
+        # Snapshot manager for assumeUTXO
+        self.snapshot_manager: Optional[SnapshotManager] = None
+
         # State
         self.running = False
         self.synced = False
@@ -118,7 +122,15 @@ class BitcoinNode:
             logger.info(f"Initializing database at {self.data_dir}")
             self.db = BlockchainDatabase(self.data_dir)
             logger.info("Database initialized")
-            
+
+            # Initialize snapshot manager for assumeUTXO
+            self.snapshot_manager = SnapshotManager(self.db, self.network, self.data_dir)
+
+            # Check for assumeutxo option and load snapshot if specified
+            assumeutxo_path = self.config.get('assumeutxo')
+            if assumeutxo_path:
+                await self._load_snapshot_if_needed(assumeutxo_path)
+
             # Initialize validators
             logger.info("Initializing validators...")
             self.tx_validator = TransactionValidator(self.db)
@@ -201,14 +213,18 @@ class BitcoinNode:
             if not (rpc_username and rpc_password):
                 rpc_username, rpc_password = generate_cookie(self.data_dir)
 
-            # Start RPC server
+            # Start RPC server (with optional REST interface)
+            rest_enabled = str(self.config.get('rest', '0')).lower() in ('1', 'true', 'yes', 'on')
             logger.info(f"RPC server listening on 127.0.0.1:{rpc_port}")
+            if rest_enabled:
+                logger.info("REST interface enabled at /rest/*")
             self.rpc_server = RPCServer(
                 self,
                 port=rpc_port,
                 username=rpc_username,
                 password=rpc_password,
-                rate_limit=True
+                rate_limit=True,
+                enable_rest=rest_enabled,
             )
             self._rpc_task = asyncio.create_task(self.rpc_server.start())
 
@@ -361,6 +377,62 @@ class BitcoinNode:
         except Exception as e:
             logger.error(f"Error in periodic tasks: {e}", exc_info=True)
     
+    async def _load_snapshot_if_needed(self, snapshot_path: str) -> None:
+        """Load a UTXO snapshot if specified via -assumeutxo option.
+
+        This enables fast startup by loading a pre-validated UTXO set,
+        then starting background validation from genesis.
+
+        Args:
+            snapshot_path: Path to the snapshot file
+        """
+        if not os.path.exists(snapshot_path):
+            logger.error(f"[assumeutxo] Snapshot file not found: {snapshot_path}")
+            return
+
+        try:
+            # Check if we already have a snapshot chainstate
+            if self.snapshot_manager.has_snapshot_chainstate():
+                existing_hash = self.snapshot_manager.read_snapshot_base_blockhash()
+                if existing_hash:
+                    logger.info(
+                        f"[assumeutxo] Snapshot chainstate already exists at "
+                        f"height {self.snapshot_manager.snapshot_height or 'unknown'}"
+                    )
+                    # Resume background validation if not completed
+                    if not self.snapshot_manager.background_validated:
+                        self.snapshot_manager.start_background_validation()
+                    return
+
+            # Read snapshot metadata first to validate
+            metadata = read_snapshot_metadata(snapshot_path, self.network)
+            logger.info(
+                f"[assumeutxo] Loading snapshot with {metadata.coins_count:,} coins "
+                f"at block {metadata.base_blockhash_hex()[:16]}..."
+            )
+
+            # Load the snapshot
+            def progress_callback(loaded: int, total: int):
+                pct = (loaded / total) * 100
+                logger.info(f"[assumeutxo] Loading snapshot: {loaded:,}/{total:,} ({pct:.1f}%)")
+
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.snapshot_manager.load_snapshot(snapshot_path, progress_callback),
+            )
+
+            logger.info(
+                f"[assumeutxo] Snapshot loaded. Node ready to serve at height "
+                f"{self.snapshot_manager.snapshot_height}"
+            )
+
+            # Start background validation from genesis
+            self.snapshot_manager.start_background_validation()
+
+        except Exception as e:
+            logger.error(f"[assumeutxo] Failed to load snapshot: {e}")
+            raise
+
     def _print_startup_status(self, rpc_port: int, p2p_port: int) -> None:
         """Print a clear status block to the terminal when node starts."""
         console = Console()
