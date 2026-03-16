@@ -79,6 +79,8 @@ class NodeConfig:
             'onion': None,
             # Whether to accept inbound P2P connections (1/0)
             'listen': '1',
+            # Enable REST interface (1/0)
+            'rest': '0',
         }
         
         if self.config_path.exists():
@@ -195,3 +197,128 @@ class NodeConfig:
             'onion': self.get('onion'),
             'listen': self.getboolean('listen'),
         }
+
+
+# =============================================================================
+# Chain Parameters
+# =============================================================================
+
+class ChainParams:
+    """
+    Chain parameters for a Bitcoin network.
+
+    Wraps the Rust chainparams module to provide access to:
+    - Checkpoints: known-good (height, block_hash) pairs
+    - Minimum chain work: anti-DoS threshold for header sync
+    - Network-specific consensus parameters
+    """
+
+    def __init__(self, network: str = "mainnet"):
+        """
+        Initialize chain parameters for a network.
+
+        Args:
+            network: One of "mainnet", "testnet", "testnet4", "regtest", "signet"
+        """
+        self.network = network.lower()
+        self._sync_module = None
+        try:
+            import sync
+            self._sync_module = sync
+        except ImportError:
+            pass
+
+    def get_checkpoints(self) -> list:
+        """
+        Get all checkpoints for this network.
+
+        Returns:
+            List of checkpoint objects with height and hash attributes.
+            Empty list if Rust module is not available.
+        """
+        if self._sync_module is None:
+            return []
+        return self._sync_module.get_network_checkpoints(self.network)
+
+    def get_last_checkpoint(self) -> Optional[Any]:
+        """
+        Get the last checkpoint for this network.
+
+        Returns:
+            Checkpoint object with height and hash, or None if no checkpoints.
+        """
+        if self._sync_module is None:
+            return None
+        return self._sync_module.get_last_network_checkpoint(self.network)
+
+    def get_last_checkpoint_height(self) -> Optional[int]:
+        """
+        Get the height of the last checkpoint.
+
+        Returns:
+            Height as int, or None if no checkpoints.
+        """
+        cp = self.get_last_checkpoint()
+        return cp.height if cp else None
+
+    def is_below_checkpoint(self, height: int) -> bool:
+        """
+        Check if a height is at or below the last checkpoint.
+
+        Used to determine if script validation can be skipped during IBD.
+
+        Args:
+            height: Block height to check
+
+        Returns:
+            True if height is at or below the last checkpoint
+        """
+        if self._sync_module is None:
+            return False
+        return self._sync_module.check_is_below_checkpoint(self.network, height)
+
+    def verify_checkpoint(self, height: int, block_hash: bytes) -> Optional[bool]:
+        """
+        Verify a block hash matches the checkpoint at a given height.
+
+        Args:
+            height: Block height
+            block_hash: 32-byte block hash (internal byte order)
+
+        Returns:
+            True if checkpoint exists and matches,
+            False if checkpoint exists but doesn't match,
+            None if no checkpoint at this height
+        """
+        if self._sync_module is None:
+            return None
+        return self._sync_module.verify_block_checkpoint(self.network, height, block_hash)
+
+    def can_skip_script_validation(self, height: int, block_hash: bytes) -> bool:
+        """
+        Check if script validation can be skipped for a block during IBD.
+
+        Blocks at or below the last checkpoint can skip script validation
+        (only PoW and merkle root need to be verified).
+
+        Args:
+            height: Block height
+            block_hash: 32-byte block hash (internal byte order)
+
+        Returns:
+            True if scripts can be skipped
+        """
+        if self._sync_module is None:
+            return False
+        return self._sync_module.can_skip_scripts_for_block(self.network, height, block_hash)
+
+    def get_minimum_chain_work(self) -> Optional[str]:
+        """
+        Get the minimum chain work for this network.
+
+        Returns:
+            Hex string representing the minimum chain work, or None if unavailable.
+        """
+        if self._sync_module is None:
+            return None
+        return self._sync_module.get_minimum_chain_work(self.network)
