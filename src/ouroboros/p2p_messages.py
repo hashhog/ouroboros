@@ -1430,3 +1430,165 @@ class ReconcilDiffMessage:
             ask_shortids.append(sid)
             offset += 4
         return cls(success=success, ask_shortids=ask_shortids)
+
+
+# BIP 331 Package Relay messages (draft)
+# https://github.com/bitcoin/bips/blob/master/bip-0331.mediawiki
+
+# Package relay inventory type
+MSG_PKGTXNS = 6  # Package transactions
+
+
+@dataclass
+class SendPackagesMessage:
+    """
+    ``sendpackages`` (BIP 331) — negotiate package relay support.
+
+    Sent after the version handshake.  If both peers send this message,
+    package relay is enabled for the connection.
+
+    Fields:
+        version: package relay protocol version (currently 1)
+        max_count: maximum number of transactions in a package this peer accepts
+        max_weight: maximum total weight of a package this peer accepts
+    """
+    version: int = 1
+    max_count: int = 25
+    max_weight: int = 404_000
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = struct.pack('<I', self.version)
+        payload += struct.pack('<I', self.max_count)
+        payload += struct.pack('<I', self.max_weight)
+        return NetworkMessage(
+            command="sendpackages", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'SendPackagesMessage':
+        if len(payload) < 12:
+            raise ValueError("sendpackages payload too short")
+        version = struct.unpack('<I', payload[:4])[0]
+        max_count = struct.unpack('<I', payload[4:8])[0]
+        max_weight = struct.unpack('<I', payload[8:12])[0]
+        return cls(version=version, max_count=max_count, max_weight=max_weight)
+
+
+@dataclass
+class GetPkgTxnsMessage:
+    """
+    ``getpkgtxns`` (BIP 331) — request a package by announcing the child's wtxid.
+
+    When a peer announces a transaction via inv with type MSG_PKGTXNS,
+    the receiving peer sends this message to request the package.
+
+    Fields:
+        child_wtxid: witness transaction ID of the child transaction
+    """
+    child_wtxid: bytes
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        if len(self.child_wtxid) != 32:
+            raise ValueError(f"Invalid wtxid length: {len(self.child_wtxid)}")
+        return NetworkMessage(
+            command="getpkgtxns", payload=self.child_wtxid, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'GetPkgTxnsMessage':
+        if len(payload) != 32:
+            raise ValueError(f"getpkgtxns payload must be 32 bytes, got {len(payload)}")
+        return cls(child_wtxid=payload)
+
+
+@dataclass
+class PkgTxnsMessage:
+    """
+    ``pkgtxns`` (BIP 331) — deliver a package of transactions.
+
+    Sent in response to getpkgtxns.  Contains the full package in
+    topological order (parents first, child last).
+
+    Fields:
+        transactions: list of serialized transactions (as raw bytes)
+    """
+    transactions: List[bytes] = field(default_factory=list)
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = encode_varint(len(self.transactions))
+        for tx_bytes in self.transactions:
+            payload += encode_varint(len(tx_bytes))
+            payload += tx_bytes
+        return NetworkMessage(
+            command="pkgtxns", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'PkgTxnsMessage':
+        offset = 0
+        tx_count, consumed = decode_varint(payload, offset)
+        offset += consumed
+
+        if tx_count > 25:
+            raise ValueError(f"pkgtxns contains too many transactions: {tx_count}")
+
+        transactions = []
+        for _ in range(tx_count):
+            tx_len, consumed = decode_varint(payload, offset)
+            offset += consumed
+            if offset + tx_len > len(payload):
+                raise ValueError("pkgtxns payload truncated")
+            tx_bytes = payload[offset:offset + tx_len]
+            offset += tx_len
+            transactions.append(tx_bytes)
+
+        return cls(transactions=transactions)
+
+
+@dataclass
+class AncPkgInfoMessage:
+    """
+    ``ancpkginfo`` (BIP 331) — announce package info for ancestor package relay.
+
+    When a peer receives a transaction that is in the orphan pool and the
+    parent is in reconsiderable rejects (low fee), they can request the
+    ancestor package info to understand the full package fee rate.
+
+    Fields:
+        child_wtxid: witness txid of the child transaction
+        parent_wtxids: list of witness txids of parent transactions
+    """
+    child_wtxid: bytes
+    parent_wtxids: List[bytes] = field(default_factory=list)
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        if len(self.child_wtxid) != 32:
+            raise ValueError(f"Invalid child wtxid length: {len(self.child_wtxid)}")
+        payload = self.child_wtxid
+        payload += encode_varint(len(self.parent_wtxids))
+        for parent_wtxid in self.parent_wtxids:
+            if len(parent_wtxid) != 32:
+                raise ValueError(f"Invalid parent wtxid length: {len(parent_wtxid)}")
+            payload += parent_wtxid
+        return NetworkMessage(
+            command="ancpkginfo", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> 'AncPkgInfoMessage':
+        if len(payload) < 33:
+            raise ValueError("ancpkginfo payload too short")
+        offset = 0
+        child_wtxid = payload[offset:offset + 32]
+        offset += 32
+
+        parent_count, consumed = decode_varint(payload, offset)
+        offset += consumed
+
+        if parent_count > 24:  # max 24 parents + 1 child = 25 package limit
+            raise ValueError(f"ancpkginfo contains too many parents: {parent_count}")
+
+        parent_wtxids = []
+        for _ in range(parent_count):
+            if offset + 32 > len(payload):
+                raise ValueError("ancpkginfo payload truncated")
+            parent_wtxids.append(payload[offset:offset + 32])
+            offset += 32
+
+        return cls(child_wtxid=child_wtxid, parent_wtxids=parent_wtxids)
