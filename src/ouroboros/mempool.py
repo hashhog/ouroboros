@@ -1358,19 +1358,82 @@ class Mempool:
 
     # --- Package Validation / CPFP ---
 
+    @staticmethod
+    def is_child_with_parents(txs: List[Transaction]) -> bool:
+        """
+        Check if the package has child-with-parents topology.
+
+        For a valid child-with-parents package:
+        - The package must have at least 2 transactions
+        - The last transaction is the "child"
+        - All other transactions must be direct parents of the child
+          (i.e., the child must spend at least one output from each parent)
+
+        Reference: Bitcoin Core policy/packages.cpp IsChildWithParents()
+        """
+        if len(txs) < 2:
+            return False
+
+        # The child is the last transaction
+        child = txs[-1]
+
+        # Collect all txids that the child spends from
+        child_parent_txids: Set[bytes] = set()
+        for inp in child.inputs:
+            child_parent_txids.add(inp.prev_txid)
+
+        # Every transaction except the child must be a parent of the child
+        for tx in txs[:-1]:
+            txid = tx.get_txid()
+            if txid not in child_parent_txids:
+                return False
+
+        return True
+
+    @staticmethod
+    def is_child_with_parents_tree(txs: List[Transaction]) -> bool:
+        """
+        Check if the package is a child-with-parents tree (no inter-parent deps).
+
+        For a valid child-with-parents tree:
+        - Must satisfy is_child_with_parents()
+        - Parents cannot depend on each other (no parent spends from another parent)
+
+        Reference: Bitcoin Core policy/packages.cpp IsChildWithParentsTree()
+        """
+        if not Mempool.is_child_with_parents(txs):
+            return False
+
+        # Collect all parent txids (all except the last one)
+        parent_txids: Set[bytes] = {tx.get_txid() for tx in txs[:-1]}
+
+        # Check that no parent spends from another parent
+        for tx in txs[:-1]:
+            for inp in tx.inputs:
+                if inp.prev_txid in parent_txids:
+                    # This parent depends on another parent — not a tree
+                    return False
+
+        return True
+
     def validate_package(
         self, txs: List[Transaction], height: int
     ) -> Tuple[bool, str]:
         """
         Validate and accept a package of transactions (CPFP support).
 
-        Transactions must be topologically sorted (parents before children).
+        Supports two topologies:
+        1. A single transaction
+        2. A child-with-parents package (1 child paying for N parents)
+
         The package is evaluated as a unit: individual transactions are allowed
         to fall below the minimum relay fee as long as the *package* fee rate
         meets the mempool minimum.
 
+        Reference: Bitcoin Core validation.cpp AcceptPackage()
+
         Args:
-            txs: List of transactions in topological order
+            txs: List of transactions in topological order (parents before child)
             height: Current block height
 
         Returns:
@@ -1429,6 +1492,16 @@ class Mempool:
                         "Package not in topological order: "
                         f"tx at position {i} spends output of tx at position {parent_pos}"
                     )
+
+        # Check child-with-parents topology for multi-tx packages
+        # Reference: Bitcoin Core validation.cpp AcceptPackage()
+        if len(txs) > 1:
+            if not self.is_child_with_parents(txs):
+                return False, "package-not-child-with-parents"
+            if not self.is_child_with_parents_tree(txs):
+                return False, (
+                    "package topology disallowed: parents depend on each other"
+                )
 
         # Ephemeral dust check for v3 transactions
         # Any v3 tx in the package that has dust outputs must have every
