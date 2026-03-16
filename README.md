@@ -37,6 +37,9 @@ the node logic, RPC server, and mempool.
 - [x] getrawtransaction RPC with txindex support, verbose output, and in_active_chain
 - [x] Bitcoin Core-compatible RPCs (getblockchaininfo, getmempoolinfo, getpeerinfo, etc.)
 - [x] JSON-RPC batch request support (array of calls in single HTTP request)
+- [x] Package relay and CPFP (child-pays-for-parent) package acceptance
+- [x] submitpackage RPC for package submission (child-with-parents topology)
+- [x] BIP331 P2P messages (sendpackages, getpkgtxns, pkgtxns, ancpkginfo)
 - [ ] Full signature verification (secp256k1)
 - [ ] Wallet functionality
 
