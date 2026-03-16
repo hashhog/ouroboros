@@ -1847,12 +1847,30 @@ class RPCServer:
         address_type: str = "bech32",
     ) -> str:
         """
-        Generate a new address.
+        Generate a new address from the wallet's key pool.
+
+        Args:
+            label: Optional label for the address
+            address_type: Type of address to generate:
+                - "bech32" (default): Native SegWit P2WPKH (bc1q...)
+                - "p2sh-segwit": P2SH-wrapped SegWit (3...)
+                - "bech32m": Taproot P2TR (bc1p...)
+                - "legacy": P2PKH (1...)
+
+        Returns:
+            The newly generated address string
+
+        Reference: Bitcoin Core wallet/rpc/addresses.cpp getnewaddress
         """
         wallet = getattr(self.node, "wallet", None)
         if wallet is None:
             raise HTTPException(status_code=500, detail="Wallet not loaded")
-        return await wallet.generate_new_address(label)
+        if wallet.is_locked:
+            raise HTTPException(
+                status_code=500,
+                detail="Wallet is locked; unlock with walletpassphrase first"
+            )
+        return await wallet.generate_new_address(label, address_type=address_type)
 
     async def rpc_sendtoaddress(
         self,
@@ -2047,13 +2065,20 @@ class RPCServer:
     async def rpc_getwalletinfo(self) -> Dict[str, Any]:
         """
         Return wallet state info.
+
+        Reference: Bitcoin Core wallet/rpc/wallet.cpp getwalletinfo
         """
         wallet = getattr(self.node, "wallet", None)
         if wallet is None:
             raise HTTPException(status_code=500, detail="Wallet not loaded")
 
         balance = await wallet.get_balance()
-        addresses = await wallet.get_addresses()
+
+        # Use key pool size if available, otherwise count addresses
+        keypool_size = wallet.get_keypool_size()
+        if keypool_size == 0:
+            addresses = await wallet.get_addresses()
+            keypool_size = len(addresses)
 
         info: Dict[str, Any] = {
             "walletname": wallet.name,
@@ -2062,7 +2087,7 @@ class RPCServer:
             "unconfirmed_balance": 0.0,
             "immature_balance": 0.0,
             "txcount": 0,
-            "keypoolsize": len(addresses),
+            "keypoolsize": keypool_size,
             "paytxfee": 0.0,
             "hd": wallet.is_hd,
             "encrypted": wallet.is_encrypted,
@@ -2076,6 +2101,51 @@ class RPCServer:
                 info["hd_master_xpub"] = master.serialize_xpub()
 
         return info
+
+    async def rpc_keypoolrefill(self, newsize: int = 1000) -> None:
+        """
+        Refill the key pool.
+
+        Args:
+            newsize: Target key pool size (default 1000)
+
+        Reference: Bitcoin Core wallet/rpc/wallet.cpp keypoolrefill
+        """
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="Wallet not loaded")
+        if wallet.is_locked:
+            raise HTTPException(
+                status_code=500,
+                detail="Wallet is locked; unlock with walletpassphrase first"
+            )
+
+        generated = wallet.keypoolrefill(newsize)
+        logger.info(f"Key pool refilled with {generated} new keys")
+        return None
+
+    async def rpc_getrawchangeaddress(self, address_type: str = "bech32") -> str:
+        """
+        Generate a new change address for receiving change.
+
+        Args:
+            address_type: Type of address to generate (bech32, p2sh-segwit, legacy, bech32m)
+
+        Returns:
+            A new change address from the internal (change) key pool
+
+        Reference: Bitcoin Core wallet/rpc/addresses.cpp getrawchangeaddress
+        """
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="Wallet not loaded")
+        if wallet.is_locked:
+            raise HTTPException(
+                status_code=500,
+                detail="Wallet is locked; unlock with walletpassphrase first"
+            )
+
+        return await wallet.get_change_address(address_type=address_type)
 
     # PSBT RPCs (BIP 174)
 
@@ -2757,7 +2827,14 @@ class RPCServer:
         """
         Prune block data up to the given height.
 
-        Returns the height of the last block pruned.
+        Instructs the node to delete old block files (blk*.dat and rev*.dat)
+        up to the specified height.  Block headers and metadata are preserved.
+
+        The actual prune height may be less than requested to maintain the
+        minimum reorg safety margin (288 blocks).
+
+        Returns:
+            The height of the last block that was pruned.
         """
         pruner = getattr(self.node, "pruner", None)
         if pruner is None:
@@ -2771,18 +2848,11 @@ class RPCServer:
             )
 
         _, best_height = self.node.db.get_best_block()
-        max_height = best_height - pruner.keep_blocks
-        target = min(height, max_height)
-        if target < 0:
-            target = 0
 
-        from_height = pruner.prune_height
-        if from_height > target:
-            return from_height
-
-        removed = self.node.db.prune_blocks_range(from_height, target)
-        logger.info(f"RPC pruneblockchain: pruned {removed} blocks up to height {target}")
-        return target
+        # Use the file-based pruner
+        actual_height = pruner.prune_to_height(height, best_height)
+        logger.info(f"RPC pruneblockchain: pruned up to height {actual_height}")
+        return actual_height
 
     # --- Additional RPC methods ---
 
@@ -4772,6 +4842,504 @@ class RPCServer:
             logger.debug(f"Error getting next block hash for height {height}: {e}")
             return None
     
+    # --- PSBT RPCs (BIP174/BIP370) --------------------------------------------
+
+    async def rpc_createpsbt(
+        self,
+        inputs: List[Dict[str, Any]],
+        outputs: List[Dict[str, Any]],
+        locktime: int = 0,
+        replaceable: bool = True,
+    ) -> str:
+        """
+        Create a Partially Signed Bitcoin Transaction (PSBT).
+
+        Args:
+            inputs: Array of input objects with txid, vout, and optional sequence
+            outputs: Array of output objects with address:amount pairs
+            locktime: Transaction locktime (default 0)
+            replaceable: Enable RBF (default True)
+
+        Returns:
+            Base64-encoded PSBT string
+        """
+        from ouroboros.psbt import createpsbt
+        return createpsbt(inputs, outputs, locktime, replaceable)
+
+    async def rpc_decodepsbt(self, psbt: str) -> Dict[str, Any]:
+        """
+        Decode a PSBT to human-readable format.
+
+        Args:
+            psbt: Base64-encoded PSBT
+
+        Returns:
+            Decoded PSBT as dictionary
+        """
+        from ouroboros.psbt import decodepsbt
+        return decodepsbt(psbt)
+
+    async def rpc_analyzepsbt(self, psbt: str) -> Dict[str, Any]:
+        """
+        Analyze a PSBT and determine the next action needed.
+
+        Args:
+            psbt: Base64-encoded PSBT
+
+        Returns:
+            Analysis including inputs status, next role, estimated fees
+        """
+        from ouroboros.psbt import analyzepsbt
+        return analyzepsbt(psbt)
+
+    async def rpc_combinepsbt(self, psbts: List[str]) -> str:
+        """
+        Combine multiple PSBTs for the same transaction.
+
+        Args:
+            psbts: Array of base64-encoded PSBTs
+
+        Returns:
+            Combined base64-encoded PSBT
+        """
+        from ouroboros.psbt import combinepsbt
+        return combinepsbt(psbts)
+
+    async def rpc_finalizepsbt(
+        self, psbt: str, extract: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Finalize a PSBT and optionally extract the signed transaction.
+
+        Args:
+            psbt: Base64-encoded PSBT
+            extract: If True and complete, return hex transaction
+
+        Returns:
+            {psbt: base64, complete: bool, hex: raw_tx (if complete and extract)}
+        """
+        from ouroboros.psbt import finalizepsbt
+        return finalizepsbt(psbt, extract)
+
+    async def rpc_utxoupdatepsbt(
+        self, psbt: str, descriptors: List[Any] = None
+    ) -> str:
+        """
+        Update a PSBT with UTXO information from the UTXO set.
+
+        Args:
+            psbt: Base64-encoded PSBT
+            descriptors: Optional output descriptors (not yet implemented)
+
+        Returns:
+            Updated base64-encoded PSBT
+        """
+        from ouroboros.psbt import PSBT
+
+        psbt_obj = PSBT.from_base64(psbt)
+
+        # Look up UTXOs from our database
+        if psbt_obj.tx is not None and hasattr(self.node, 'db') and self.node.db:
+            for i, tx_in in enumerate(psbt_obj.tx.inputs):
+                if psbt_obj.inputs[i].witness_utxo is not None:
+                    continue  # Already has UTXO info
+
+                try:
+                    utxo = self.node.db.get_utxo(
+                        tx_in.prev_txid, tx_in.prev_vout
+                    )
+                    if utxo:
+                        psbt_obj.inputs[i].witness_utxo = (
+                            utxo.value, utxo.script_pubkey
+                        )
+                except Exception:
+                    pass
+
+        return psbt_obj.to_base64()
+
+    async def rpc_joinpsbts(self, psbts: List[str]) -> str:
+        """
+        Join multiple PSBTs into a single PSBT.
+
+        Unlike combinepsbt which merges signatures for the same transaction,
+        joinpsbts creates a new transaction combining inputs/outputs from
+        multiple PSBTs.
+
+        Args:
+            psbts: Array of base64-encoded PSBTs
+
+        Returns:
+            Joined base64-encoded PSBT
+        """
+        from ouroboros.psbt import joinpsbts
+        return joinpsbts(psbts)
+
+    async def rpc_walletprocesspsbt(
+        self,
+        psbt: str,
+        sign: bool = True,
+        sighashtype: str = "ALL",
+        bip32derivs: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Update a PSBT with wallet information and optionally sign inputs.
+
+        Args:
+            psbt: Base64-encoded PSBT
+            sign: Whether to sign inputs the wallet has keys for
+            sighashtype: Signature hash type (ALL, NONE, SINGLE, etc.)
+            bip32derivs: Include BIP32 derivation paths
+
+        Returns:
+            {psbt: base64, complete: bool}
+        """
+        import hashlib
+        import struct
+        from ouroboros.psbt import PSBT, SIGHASH_ALL
+        from ouroboros.wallet import WalletKey, _hash160, _dsha256
+
+        # Parse sighash type
+        sighash_map = {
+            "ALL": 0x01, "NONE": 0x02, "SINGLE": 0x03,
+            "ALL|ANYONECANPAY": 0x81, "NONE|ANYONECANPAY": 0x82,
+            "SINGLE|ANYONECANPAY": 0x83, "DEFAULT": 0x00,
+        }
+        sighash_type = sighash_map.get(sighashtype.upper(), 0x01)
+
+        psbt_obj = PSBT.from_base64(psbt)
+
+        if psbt_obj.tx is None:
+            raise ValueError("PSBT has no transaction")
+
+        # Get wallet if available
+        wallet = getattr(self.node, 'wallet', None)
+        if wallet is None:
+            return {"psbt": psbt_obj.to_base64(), "complete": False}
+
+        # Build key lookup from wallet
+        network = getattr(self.node, 'network', 'mainnet')
+        keys_by_h160: Dict[bytes, WalletKey] = {}
+        keys_by_pubkey: Dict[bytes, WalletKey] = {}
+
+        # Get all wallet keys
+        for key_info in wallet.keys:
+            try:
+                k = WalletKey.from_wif(key_info['wif'], network)
+                keys_by_h160[_hash160(k.pubkey)] = k
+                keys_by_pubkey[k.pubkey] = k
+                keys_by_pubkey[k.pubkey[1:]] = k  # x-only for Taproot
+            except Exception:
+                pass
+
+        # Also include HD-derived keys if available
+        if hasattr(wallet, '_key_pool') and wallet._key_pool:
+            try:
+                for wk in wallet._key_pool.get_all_keys():
+                    keys_by_h160[_hash160(wk.pubkey)] = wk
+                    keys_by_pubkey[wk.pubkey] = wk
+                    keys_by_pubkey[wk.pubkey[1:]] = wk
+            except Exception:
+                pass
+
+        # Helper functions for signing
+        def _encode_varint(n: int) -> bytes:
+            if n < 0xFD:
+                return bytes([n])
+            elif n <= 0xFFFF:
+                return b'\xfd' + struct.pack('<H', n)
+            elif n <= 0xFFFFFFFF:
+                return b'\xfe' + struct.pack('<I', n)
+            else:
+                return b'\xff' + struct.pack('<Q', n)
+
+        def _bip143_sighash(tx, idx, script_code, value, sh_type):
+            base = sh_type & 0x1F
+            acp = (sh_type & 0x80) != 0
+            if not acp:
+                prevouts = b""
+                for i in tx.inputs:
+                    prevouts += i.prev_txid + struct.pack("<I", i.prev_vout)
+                hp = _dsha256(prevouts)
+            else:
+                hp = b"\x00" * 32
+            if not acp and base not in (2, 3):
+                seqs = b""
+                for i in tx.inputs:
+                    seqs += struct.pack("<I", i.sequence)
+                hs = _dsha256(seqs)
+            else:
+                hs = b"\x00" * 32
+            if base not in (2, 3):
+                outs = b""
+                for o in tx.outputs:
+                    outs += struct.pack("<q", o.value)
+                    outs += _encode_varint(len(o.script_pubkey))
+                    outs += o.script_pubkey
+                ho = _dsha256(outs)
+            elif base == 3 and idx < len(tx.outputs):
+                o = tx.outputs[idx]
+                single = struct.pack("<q", o.value)
+                single += _encode_varint(len(o.script_pubkey))
+                single += o.script_pubkey
+                ho = _dsha256(single)
+            else:
+                ho = b"\x00" * 32
+            inp = tx.inputs[idx]
+            sc_with_len = bytes([len(script_code)]) + script_code
+            pre = struct.pack("<i", tx.version)
+            pre += hp + hs
+            pre += inp.prev_txid + struct.pack("<I", inp.prev_vout)
+            pre += sc_with_len
+            pre += struct.pack("<q", value)
+            pre += struct.pack("<I", inp.sequence)
+            pre += ho
+            pre += struct.pack("<I", tx.locktime)
+            pre += struct.pack("<I", sh_type)
+            return _dsha256(pre)
+
+        def _taproot_sighash(tx, idx, sh_type, amounts, spks):
+            acp = (sh_type & 0x80) != 0
+            base = sh_type & 0x03
+            data = bytearray()
+            data.append(0x00)  # epoch
+            data.append(sh_type if sh_type != 0 else 0x00)
+            data.extend(struct.pack("<i", tx.version))
+            data.extend(struct.pack("<I", tx.locktime))
+            if not acp:
+                prevouts = bytearray()
+                for i in tx.inputs:
+                    prevouts.extend(i.prev_txid)
+                    prevouts.extend(struct.pack("<I", i.prev_vout))
+                data.extend(hashlib.sha256(bytes(prevouts)).digest())
+                amt_data = bytearray()
+                for a in amounts:
+                    amt_data.extend(struct.pack("<q", a))
+                data.extend(hashlib.sha256(bytes(amt_data)).digest())
+                spk_data = bytearray()
+                for s in spks:
+                    spk_data.extend(_encode_varint(len(s)))
+                    spk_data.extend(s)
+                data.extend(hashlib.sha256(bytes(spk_data)).digest())
+                seqs = bytearray()
+                for i in tx.inputs:
+                    seqs.extend(struct.pack("<I", i.sequence))
+                data.extend(hashlib.sha256(bytes(seqs)).digest())
+            if base not in (2, 3):
+                outs = bytearray()
+                for o in tx.outputs:
+                    outs.extend(struct.pack("<q", o.value))
+                    outs.extend(_encode_varint(len(o.script_pubkey)))
+                    outs.extend(o.script_pubkey)
+                data.extend(hashlib.sha256(bytes(outs)).digest())
+            elif base == 3 and idx < len(tx.outputs):
+                o = tx.outputs[idx]
+                out = struct.pack("<q", o.value)
+                out += _encode_varint(len(o.script_pubkey))
+                out += o.script_pubkey
+                data.extend(hashlib.sha256(out).digest())
+            else:
+                data.extend(b"\x00" * 32)
+            data.append(0x00)  # spend_type: no annex
+            if acp:
+                inp = tx.inputs[idx]
+                data.extend(inp.prev_txid)
+                data.extend(struct.pack("<I", inp.prev_vout))
+                data.extend(struct.pack("<q", amounts[idx]))
+                data.extend(_encode_varint(len(spks[idx])))
+                data.extend(spks[idx])
+                data.extend(struct.pack("<I", inp.sequence))
+            else:
+                data.extend(struct.pack("<I", idx))
+            tag = hashlib.sha256(b"TapSighash").digest()
+            return hashlib.sha256(tag + tag + bytes(data)).digest()
+
+        # First pass: update UTXO info and add derivation paths
+        tx = psbt_obj.tx
+        all_amounts = []
+        all_spks = []
+
+        for idx, psbt_in in enumerate(psbt_obj.inputs):
+            if psbt_in.is_finalized():
+                all_amounts.append(0)
+                all_spks.append(b"")
+                continue
+
+            # Get UTXO info
+            amount = 0
+            spk = b""
+
+            if psbt_in.witness_utxo is not None:
+                amount, spk = psbt_in.witness_utxo
+            elif psbt_in.non_witness_utxo is not None:
+                # Parse the prev tx to get the output
+                try:
+                    from ouroboros.psbt import _deserialize_tx
+                    prev_tx = _deserialize_tx(psbt_in.non_witness_utxo)
+                    tx_in = tx.inputs[idx]
+                    out = prev_tx.outputs[tx_in.prev_vout]
+                    amount = out.value
+                    spk = out.script_pubkey
+                except Exception:
+                    pass
+            else:
+                # Try to look up from database
+                tx_in = tx.inputs[idx]
+                if hasattr(self.node, 'db') and self.node.db:
+                    try:
+                        utxo = self.node.db.get_utxo(
+                            tx_in.prev_txid, tx_in.prev_vout
+                        )
+                        if utxo:
+                            amount = utxo.value
+                            spk = utxo.script_pubkey
+                            psbt_in.witness_utxo = (amount, spk)
+                    except Exception:
+                        pass
+
+            all_amounts.append(amount)
+            all_spks.append(spk)
+
+        # Second pass: sign inputs
+        if sign:
+            for idx, psbt_in in enumerate(psbt_obj.inputs):
+                if psbt_in.is_finalized():
+                    continue
+
+                spk = all_spks[idx]
+                amount = all_amounts[idx]
+
+                if not spk:
+                    continue
+
+                try:
+                    # P2WPKH: OP_0 <20-byte-hash>
+                    if len(spk) == 22 and spk[0] == 0x00 and spk[1] == 0x14:
+                        h160 = spk[2:22]
+                        key = keys_by_h160.get(h160)
+                        if key:
+                            script_code = b"\x76\xa9\x14" + h160 + b"\x88\xac"
+                            sh = _bip143_sighash(
+                                tx, idx, script_code, amount, sighash_type
+                            )
+                            sig = key.sign(sh) + bytes([sighash_type])
+                            psbt_in.partial_sigs[key.pubkey] = sig
+                            psbt_in.sighash_type = sighash_type
+
+                    # P2TR: OP_1 <32-byte-x-only>
+                    elif len(spk) == 34 and spk[0] == 0x51 and spk[1] == 0x20:
+                        x_only = spk[2:34]
+                        key = keys_by_pubkey.get(x_only)
+                        if key:
+                            sh = _taproot_sighash(
+                                tx, idx, sighash_type, all_amounts, all_spks
+                            )
+                            try:
+                                import sync as _sync
+                                raw_sig = _sync.sign_schnorr(sh, key.secret)
+                            except (ImportError, AttributeError):
+                                try:
+                                    from coincurve import PrivateKey as CPrivKey
+                                    raw_sig = CPrivKey(key.secret).sign_schnorr(sh)
+                                except Exception:
+                                    continue
+                            if sighash_type != 0x00:
+                                raw_sig += bytes([sighash_type])
+                            psbt_in.tap_key_sig = raw_sig
+
+                    # P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+                    elif len(spk) == 25 and spk[0] == 0x76 and spk[1] == 0xA9:
+                        h160 = spk[3:23]
+                        key = keys_by_h160.get(h160)
+                        if key:
+                            # Legacy sighash
+                            def _legacy_sighash(tx, idx, script_code, sh_type):
+                                base = sh_type & 0x1F
+                                acp = (sh_type & 0x80) != 0
+                                data = bytearray()
+                                data.extend(struct.pack("<i", tx.version))
+                                inputs = [(idx, tx.inputs[idx])] if acp else list(enumerate(tx.inputs))
+                                data.extend(_encode_varint(len(inputs)))
+                                for i, ti in inputs:
+                                    data.extend(ti.prev_txid)
+                                    data.extend(struct.pack("<I", ti.prev_vout))
+                                    if i == idx:
+                                        data.extend(_encode_varint(len(script_code)))
+                                        data.extend(script_code)
+                                    else:
+                                        data.extend(b"\x00")
+                                    seq = 0 if base in (2, 3) and i != idx else ti.sequence
+                                    data.extend(struct.pack("<I", seq))
+                                if base in (0, 1):
+                                    data.extend(_encode_varint(len(tx.outputs)))
+                                    for o in tx.outputs:
+                                        data.extend(struct.pack("<q", o.value))
+                                        data.extend(_encode_varint(len(o.script_pubkey)))
+                                        data.extend(o.script_pubkey)
+                                elif base == 2:
+                                    data.extend(b"\x00")
+                                elif base == 3:
+                                    if idx >= len(tx.outputs):
+                                        return bytes(32)
+                                    data.extend(_encode_varint(idx + 1))
+                                    for j, o in enumerate(tx.outputs):
+                                        if j == idx:
+                                            data.extend(struct.pack("<q", o.value))
+                                            data.extend(_encode_varint(len(o.script_pubkey)))
+                                            data.extend(o.script_pubkey)
+                                        else:
+                                            data.extend((-1).to_bytes(8, "little", signed=True))
+                                            data.extend(b"\x00")
+                                data.extend(struct.pack("<I", tx.locktime))
+                                data.extend(struct.pack("<I", sh_type))
+                                return _dsha256(bytes(data))
+
+                            sh = _legacy_sighash(tx, idx, spk, sighash_type)
+                            sig = key.sign(sh) + bytes([sighash_type])
+                            psbt_in.partial_sigs[key.pubkey] = sig
+                            psbt_in.sighash_type = sighash_type
+
+                except Exception:
+                    pass
+
+        # Check if complete
+        complete = all(inp.is_finalized() or bool(inp.partial_sigs) or inp.tap_key_sig
+                      for inp in psbt_obj.inputs)
+
+        return {"psbt": psbt_obj.to_base64(), "complete": complete}
+
+    async def rpc_converttopsbt(
+        self, hexstring: str, permitsigdata: bool = False
+    ) -> str:
+        """
+        Convert a network-serialized transaction to a PSBT.
+
+        Args:
+            hexstring: Hex-encoded raw transaction
+            permitsigdata: Allow transaction with signature data
+
+        Returns:
+            Base64-encoded PSBT
+        """
+        from ouroboros.psbt import PSBT
+        from ouroboros.p2p_messages import TxMessage
+
+        try:
+            tx_msg = TxMessage.from_payload(bytes.fromhex(hexstring))
+            tx = tx_msg.transaction
+        except Exception as e:
+            raise ValueError(f"TX decode failed: {e}")
+
+        # Check for existing signatures unless permitted
+        if not permitsigdata:
+            for inp in tx.inputs:
+                if inp.script_sig or (hasattr(inp, 'witness') and inp.witness):
+                    raise ValueError(
+                        "Transaction has signatures; use permitsigdata=true to strip"
+                    )
+
+        psbt = PSBT.from_transaction(tx)
+        return psbt.to_base64()
+
     def get_app(self) -> FastAPI:
         """Get the FastAPI application"""
         return self.app
