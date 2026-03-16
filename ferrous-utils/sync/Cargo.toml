@@ -19,12 +19,16 @@ bitcoin_hashes = "0.18"
 secp256k1 = "0.31"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
+bitflags = "2.4"
 num_cpus = "1.16"
 primitive-types = { version = "0.13", features = ["serde"] }
 rand = "0.8"
+siphasher = "1.0"
+hex = "0.4"
 
 [dev-dependencies]
 tempdir = "0.3"
+tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 hex = "0.4"
