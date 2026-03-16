@@ -5,6 +5,7 @@ This module implements a Bitcoin-compatible JSON-RPC server for the node,
 supporting standard Bitcoin RPC methods.
 """
 
+import asyncio
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -223,7 +224,7 @@ def _parse_partial_merkle_tree(data: bytes) -> tuple:
 
 class RPCServer:
     """Bitcoin JSON-RPC server"""
-    
+
     def __init__(
         self,
         node: Any,
@@ -231,18 +232,30 @@ class RPCServer:
         username: Optional[str] = None,
         password: Optional[str] = None,
         rate_limit: bool = True,
-        max_batch_size: int = 1000
+        max_batch_size: int = 1000,
+        enable_rest: bool = False,
     ):
-        """Initialize RPC server."""
+        """Initialize RPC server.
+
+        Args:
+            node: Bitcoin node instance
+            port: Port to listen on
+            username: RPC username (None for no auth)
+            password: RPC password
+            rate_limit: Enable rate limiting
+            max_batch_size: Maximum batch request size
+            enable_rest: Enable REST interface (no auth required)
+        """
         self.node = node
         self.port = port
         self.username = username
         self.password = password
         self.rate_limit_enabled = rate_limit
         self.max_batch_size = max_batch_size
-        
+        self.enable_rest = enable_rest
+
         self.app = FastAPI(title="Bitcoin Hybrid Node RPC")
-        
+
         # Add CORS middleware
         self.app.add_middleware(
             CORSMiddleware,
@@ -251,14 +264,18 @@ class RPCServer:
             allow_methods=["*"],
             allow_headers=["*"],
         )
-        
+
         # Setup security if credentials provided
         self.security = None
         if username and password:
             self.security = HTTPBasic()
-        
+
         # Register RPC methods
         self._register_methods()
+
+        # Register REST interface if enabled
+        if enable_rest:
+            self._register_rest_interface()
     
     async def _execute_single_rpc(self, req_data: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a single RPC call and return the response as a dict.
@@ -464,6 +481,14 @@ class RPCServer:
             ``filtertype`` is the filter type name (only ``basic`` supported).
             """
             return await self.rpc_getblockfilter(blockhash, filtertype)
+
+    def _register_rest_interface(self):
+        """Register REST interface endpoints (no authentication required)."""
+        from ouroboros.rest import RESTInterface
+
+        rest_interface = RESTInterface(self.node)
+        self.app.include_router(rest_interface.router)
+        logger.info("REST interface enabled at /rest/*")
 
     async def _get_credentials(self, request: Request) -> Optional[HTTPBasicCredentials]:
         if not self.security:
@@ -5339,6 +5364,328 @@ class RPCServer:
 
         psbt = PSBT.from_transaction(tx)
         return psbt.to_base64()
+
+    # -------------------------------------------------------------------------
+    # Descriptor RPCs (BIP 380-386)
+    # -------------------------------------------------------------------------
+
+    async def rpc_getdescriptorinfo(self, descriptor: str) -> Dict[str, Any]:
+        """
+        Analyze a descriptor string and return information about it.
+
+        Args:
+            descriptor: The descriptor string to analyze (with or without checksum)
+
+        Returns:
+            Object containing:
+            - descriptor: The descriptor with checksum added
+            - checksum: The 8-character checksum
+            - isrange: Whether the descriptor uses wildcards for range derivation
+            - issolvable: Whether we have the keys to spend outputs
+            - hasprivatekeys: Whether private keys are present
+
+        Reference: Bitcoin Core rpc/misc.cpp getdescriptorinfo
+        """
+        from ouroboros.descriptors import getdescriptorinfo
+
+        try:
+            return getdescriptorinfo(descriptor)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    async def rpc_deriveaddresses(
+        self, descriptor: str, range_param: Union[int, List[int], None] = None
+    ) -> List[str]:
+        """
+        Derive addresses from a descriptor.
+
+        Args:
+            descriptor: The output descriptor string
+            range_param: For ranged descriptors: [start, end] or just end (start=0)
+
+        Returns:
+            List of derived addresses
+
+        Reference: Bitcoin Core rpc/misc.cpp deriveaddresses
+        """
+        from ouroboros.descriptors import add_checksum, parse_descriptor
+
+        try:
+            # Add checksum if missing
+            if "#" not in descriptor:
+                descriptor = add_checksum(descriptor)
+
+            desc = parse_descriptor(descriptor)
+
+            # Handle range parameter
+            if desc.is_range:
+                if range_param is None:
+                    raise ValueError("Range must be specified for ranged descriptors")
+                if isinstance(range_param, int):
+                    start, end = 0, range_param
+                elif isinstance(range_param, list):
+                    if len(range_param) == 1:
+                        start, end = 0, range_param[0]
+                    elif len(range_param) >= 2:
+                        start, end = range_param[0], range_param[1]
+                    else:
+                        raise ValueError("Invalid range format")
+                else:
+                    raise ValueError("Invalid range format")
+
+                return [
+                    desc.derive_address(i, self.node.network)
+                    for i in range(start, end + 1)  # inclusive end
+                ]
+            else:
+                if range_param is not None:
+                    raise ValueError("Range should not be specified for non-ranged descriptors")
+                return [desc.derive_address(0, self.node.network)]
+
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    async def rpc_importdescriptors(self, requests: List[Dict]) -> List[Dict]:
+        """
+        Import output descriptors into the wallet.
+
+        Args:
+            requests: List of import requests, each containing:
+                - desc: The descriptor string (required)
+                - active: Set this descriptor as active for address generation (default: true)
+                - range: [start, end] for ranged descriptors (default: [0, 1000])
+                - next_index: Next index to derive (default: 0)
+                - timestamp: Import time (default: "now")
+                - internal: Mark as change descriptor (default: false)
+                - label: Optional label
+
+        Returns:
+            List of results, one per request, containing success status
+
+        Reference: Bitcoin Core wallet/rpcwallet.cpp importdescriptors
+        """
+        if not hasattr(self.node, "wallet") or self.node.wallet is None:
+            raise HTTPException(status_code=500, detail="Wallet not available")
+
+        return self.node.wallet.importdescriptors(requests)
+
+    async def rpc_listdescriptors(self, private: bool = False) -> Dict[str, Any]:
+        """
+        List all imported descriptors in the wallet.
+
+        Args:
+            private: Include private keys (xprv) in output (default: false)
+
+        Returns:
+            Object with wallet_name and descriptors array
+
+        Reference: Bitcoin Core wallet/rpcwallet.cpp listdescriptors
+        """
+        if not hasattr(self.node, "wallet") or self.node.wallet is None:
+            raise HTTPException(status_code=500, detail="Wallet not available")
+
+        descriptors = self.node.wallet.listdescriptors()
+        return {
+            "wallet_name": getattr(self.node.wallet, "name", "default"),
+            "descriptors": descriptors,
+        }
+
+    # ==========================================================================
+    # assumeUTXO (BIP305) RPC methods
+    # ==========================================================================
+
+    async def rpc_loadtxoutset(self, path: str) -> Dict[str, Any]:
+        """
+        Load a UTXO snapshot to enable fast startup (BIP305 assumeUTXO).
+
+        This loads a serialized UTXO set from a snapshot file, validates it
+        against hardcoded assumeUTXO parameters, and activates it as the
+        current chainstate. Background validation from genesis begins
+        automatically.
+
+        Args:
+            path: Path to the snapshot file (created by dumptxoutset)
+
+        Returns:
+            Object with snapshot loading results:
+            - coins_loaded: Number of UTXOs loaded
+            - base_hash: Block hash of the snapshot
+            - base_height: Block height of the snapshot
+            - path: Path to the loaded snapshot
+
+        Raises:
+            Error if the snapshot is invalid or for a different network
+
+        Reference: Bitcoin Core rpc/blockchain.cpp loadtxoutset
+        """
+        import os
+        from ouroboros.snapshot import read_snapshot_metadata
+
+        if not os.path.exists(path):
+            raise HTTPException(status_code=400, detail=f"File not found: {path}")
+
+        if not hasattr(self.node, 'snapshot_manager') or self.node.snapshot_manager is None:
+            raise HTTPException(status_code=500, detail="Snapshot manager not initialized")
+
+        sm = self.node.snapshot_manager
+
+        # Check if snapshot is already loaded
+        if sm.snapshot_loaded:
+            raise HTTPException(
+                status_code=400,
+                detail="Snapshot already loaded. Restart node to load a different snapshot."
+            )
+
+        try:
+            # Read metadata to validate before loading
+            network = getattr(self.node, 'network', 'mainnet')
+            metadata = read_snapshot_metadata(path, network)
+
+            # Load the snapshot
+            def progress_callback(loaded: int, total: int):
+                pass  # Could emit progress via ZMQ or websockets
+
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: sm.load_snapshot(path, progress_callback),
+            )
+
+            # Start background validation
+            sm.start_background_validation()
+
+            return {
+                "coins_loaded": metadata.coins_count,
+                "base_hash": metadata.base_blockhash_hex(),
+                "base_height": sm.snapshot_height,
+                "path": path,
+            }
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load snapshot: {e}")
+
+    async def rpc_dumptxoutset(self, path: str) -> Dict[str, Any]:
+        """
+        Dump the current UTXO set to a file for use with loadtxoutset.
+
+        This serializes the entire UTXO set to a file that can be used
+        for fast startup on another node using the -assumeutxo option
+        or the loadtxoutset RPC.
+
+        Args:
+            path: Path to write the snapshot file
+
+        Returns:
+            Object with dump results:
+            - coins_written: Number of UTXOs written
+            - base_hash: Block hash of the snapshot
+            - base_height: Block height at time of dump
+            - path: Path to the created snapshot
+
+        Note:
+            The node should be stopped or in a stable state when creating
+            snapshots to ensure consistency.
+
+        Reference: Bitcoin Core rpc/blockchain.cpp dumptxoutset
+        """
+        import os
+
+        if not hasattr(self.node, 'db') or self.node.db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        if not hasattr(self.node, 'snapshot_manager') or self.node.snapshot_manager is None:
+            raise HTTPException(status_code=500, detail="Snapshot manager not initialized")
+
+        sm = self.node.snapshot_manager
+
+        # Check if path exists and warn
+        if os.path.exists(path):
+            raise HTTPException(
+                status_code=400,
+                detail=f"File already exists: {path}. Remove it first."
+            )
+
+        try:
+            # Get current best block info
+            best_hash, best_height = self.node.db.get_best_block()
+
+            def progress_callback(written: int, total: int):
+                pass  # Could emit progress via ZMQ or websockets
+
+            coins_written = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: sm.dump_snapshot(path, progress_callback),
+            )
+
+            return {
+                "coins_written": coins_written,
+                "base_hash": best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash),
+                "base_height": best_height,
+                "path": path,
+            }
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to dump snapshot: {e}")
+
+    async def rpc_getchainstates(self) -> Dict[str, Any]:
+        """
+        Return information about all active chainstates (BIP305 assumeUTXO support).
+
+        When using assumeUTXO, there may be two active chainstates:
+        1. The snapshot chainstate (serving queries)
+        2. The background validation chainstate (validating from genesis)
+
+        Returns:
+            Object with chainstate information:
+            - headers: Number of validated headers
+            - chainstates: Array of chainstate info objects
+
+        Reference: Bitcoin Core rpc/blockchain.cpp getchainstates
+        """
+        if not hasattr(self.node, 'db') or self.node.db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        best_hash, best_height = self.node.db.get_best_block()
+
+        chainstates = []
+
+        # Main chainstate
+        main_chainstate = {
+            "id": 0,
+            "validated_height": best_height,
+            "validated_hash": best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash),
+            "validated": True,
+            "active": True,
+        }
+
+        # Check if using assumeUTXO
+        if hasattr(self.node, 'snapshot_manager') and self.node.snapshot_manager:
+            sm = self.node.snapshot_manager
+            status = sm.get_status()
+
+            if status["snapshot_loaded"]:
+                # The main chainstate is the snapshot chainstate
+                main_chainstate["snapshot_blockhash"] = status["snapshot_hash"]
+                main_chainstate["snapshot_height"] = status["snapshot_height"]
+                main_chainstate["from_snapshot"] = True
+
+                # Add background validation chainstate if in progress
+                if status["background_validating"]:
+                    bg_chainstate = {
+                        "id": 1,
+                        "validated_height": status["background_validation_height"],
+                        "validated_hash": None,  # Would need to track this
+                        "validated": False,
+                        "active": False,
+                        "background_validation": True,
+                    }
+                    chainstates.append(bg_chainstate)
+
+        chainstates.insert(0, main_chainstate)
+
+        return {
+            "headers": best_height,  # Simplified; would need header count
+            "chainstates": chainstates,
+        }
 
     def get_app(self) -> FastAPI:
         """Get the FastAPI application"""
