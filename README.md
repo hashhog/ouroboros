@@ -32,6 +32,7 @@ the node logic, RPC server, and mempool.
 - [x] Transaction trickling (privacy-preserving relay with Poisson delays)
 - [x] Eclipse attack mitigations (bucketed addrman, /16 diversity, anchors, feelers)
 - [x] Stale tip detection and peer eviction (ConsiderEviction, extra outbound connection)
+- [x] sendrawtransaction RPC with maxfeerate, confirmed/mempool checks, detailed errors
 - [ ] Full signature verification (secp256k1)
 - [ ] Wallet functionality
 
