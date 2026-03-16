@@ -2,7 +2,9 @@
 Peer-to-peer networking module.
 
 This module implements peer discovery, connection management, and peer scoring
-for the Bitcoin P2P network.
+for the Bitcoin P2P network. Includes transaction trickling for privacy-preserving
+relay (randomized delays prevent network observers from mapping transactions to
+originating IP addresses).
 """
 
 import asyncio
@@ -11,7 +13,8 @@ import socket
 import random
 import time
 import logging
-from typing import List, Dict, Set, Optional
+from dataclasses import dataclass, field
+from typing import List, Dict, Set, Optional, Tuple
 from collections import defaultdict
 
 from ouroboros.peer import Peer, PeerState, RelayType, is_onion_host
@@ -20,7 +23,7 @@ from ouroboros.p2p_messages import (
     GetBlockTxnMessage, BlockTxnMessage,
     AddrMessage, AddrV2Message, GetAddrMessage,
     SendTxRcnclMessage, ReqTxRcnclMessage, SketchMessage,
-    ReconcilDiffMessage, InvMessage, INV_TYPE_TX,
+    ReconcilDiffMessage, InvMessage, INV_TYPE_TX, MSG_WTX,
 )
 from ouroboros.minisketch import (
     Minisketch, ReconciliationSet, estimate_sketch_capacity,
@@ -36,6 +39,185 @@ from ouroboros.banman import (
 from ouroboros.addrman import AddressManager
 
 logger = logging.getLogger(__name__)
+
+
+# Transaction trickling constants (Bitcoin Core net_processing.cpp)
+# Average delay between trickled inventory transmissions
+INBOUND_INVENTORY_BROADCAST_INTERVAL = 5.0   # seconds (inbound peers)
+OUTBOUND_INVENTORY_BROADCAST_INTERVAL = 2.0  # seconds (outbound peers)
+
+# Maximum rate of inventory items per second (limits low-fee tx floods)
+INVENTORY_BROADCAST_PER_SECOND = 14
+
+# Target number of tx inventory items per transmission
+INVENTORY_BROADCAST_TARGET = int(
+    INVENTORY_BROADCAST_PER_SECOND * INBOUND_INVENTORY_BROADCAST_INTERVAL
+)  # 70 items
+
+# Maximum inventory items per transmission
+INVENTORY_BROADCAST_MAX = 1000
+
+
+@dataclass
+class TrickleEntry:
+    """Entry in the per-peer trickle queue."""
+    txid: bytes               # 32-byte txid
+    wtxid: bytes              # 32-byte wtxid (may be same as txid for legacy)
+    added_time: float = field(default_factory=time.time)
+
+
+class TrickleQueue:
+    """Per-peer transaction inventory queue with Poisson-delayed sending.
+
+    Instead of immediately announcing new transactions to all peers, we queue
+    INV messages and send them on a randomized schedule. This prevents network
+    observers from mapping transactions to their originating IP addresses.
+
+    Bitcoin Core reference: net_processing.cpp
+    - INBOUND_INVENTORY_BROADCAST_INTERVAL = 5s
+    - OUTBOUND_INVENTORY_BROADCAST_INTERVAL = 2s
+    - Uses Poisson distribution via rand_exp_duration()
+    - Batches up to INVENTORY_BROADCAST_MAX per message
+    - Prefers wtxid for BIP339 peers
+    """
+
+    def __init__(self, is_inbound: bool = False, wtxid_relay: bool = False):
+        """Initialize trickle queue.
+
+        Args:
+            is_inbound: True if this is an inbound peer (uses 5s interval)
+            wtxid_relay: True if peer supports BIP339 wtxid relay
+        """
+        self.is_inbound = is_inbound
+        self.wtxid_relay = wtxid_relay
+
+        # Set of wtxids pending announcement (like m_tx_inventory_to_send)
+        self.pending_wtxids: Set[bytes] = set()
+
+        # Map wtxid -> txid for peers that don't support wtxid relay
+        self.wtxid_to_txid: Dict[bytes, bytes] = {}
+
+        # Bloom filter to track already-announced txs (like m_tx_inventory_known_filter)
+        # For simplicity, use a set here; Bitcoin Core uses CRollingBloomFilter
+        self.known_filter: Set[bytes] = set()
+
+        # Next scheduled send time
+        self.next_send_time: float = 0.0
+
+        # Average interval for Poisson delay
+        self.avg_interval = (
+            INBOUND_INVENTORY_BROADCAST_INTERVAL if is_inbound
+            else OUTBOUND_INVENTORY_BROADCAST_INTERVAL
+        )
+
+    def add_tx(self, txid: bytes, wtxid: bytes) -> bool:
+        """Queue a transaction for trickled announcement.
+
+        Args:
+            txid: 32-byte transaction id
+            wtxid: 32-byte witness transaction id
+
+        Returns:
+            True if added, False if already known/pending
+        """
+        # Check if already known to this peer
+        inv_hash = wtxid if self.wtxid_relay else txid
+        if inv_hash in self.known_filter:
+            return False
+
+        if wtxid in self.pending_wtxids:
+            return False
+
+        self.pending_wtxids.add(wtxid)
+        self.wtxid_to_txid[wtxid] = txid
+        return True
+
+    def mark_known(self, txid: bytes, wtxid: bytes) -> None:
+        """Mark a transaction as known to this peer (received from them)."""
+        inv_hash = wtxid if self.wtxid_relay else txid
+        self.known_filter.add(inv_hash)
+        # Remove from pending if queued
+        self.pending_wtxids.discard(wtxid)
+        self.wtxid_to_txid.pop(wtxid, None)
+
+    def should_send(self, current_time: float) -> bool:
+        """Check if it's time to send trickled INVs."""
+        return current_time >= self.next_send_time and len(self.pending_wtxids) > 0
+
+    def schedule_next_send(self, current_time: float) -> None:
+        """Schedule the next send using Poisson-distributed delay.
+
+        Uses random.expovariate() which produces exponentially distributed
+        random values, implementing Poisson process timing.
+        """
+        # Poisson delay: exponential distribution with rate = 1/avg_interval
+        delay = random.expovariate(1.0 / self.avg_interval)
+        self.next_send_time = current_time + delay
+
+    def get_invs_to_send(
+        self,
+        max_count: int = INVENTORY_BROADCAST_MAX,
+    ) -> List[Tuple[int, bytes]]:
+        """Get INV items ready to send and remove them from the queue.
+
+        Args:
+            max_count: Maximum number of items to return
+
+        Returns:
+            List of (inv_type, hash) tuples for InvMessage
+        """
+        # Adaptively scale the broadcast limit based on queue size
+        # (Bitcoin Core: INVENTORY_BROADCAST_TARGET + (size/1000)*5)
+        broadcast_max = min(
+            INVENTORY_BROADCAST_TARGET + (len(self.pending_wtxids) // 1000) * 5,
+            max_count,
+        )
+        broadcast_max = min(broadcast_max, INVENTORY_BROADCAST_MAX)
+
+        # Randomize order for privacy
+        pending_list = list(self.pending_wtxids)
+        random.shuffle(pending_list)
+
+        inv_items: List[Tuple[int, bytes]] = []
+        to_remove: List[bytes] = []
+
+        for wtxid in pending_list[:broadcast_max]:
+            txid = self.wtxid_to_txid.get(wtxid, wtxid)
+
+            # Choose INV type based on peer's wtxid relay preference
+            if self.wtxid_relay:
+                inv_type = MSG_WTX  # BIP339: type 5 (wtxid)
+                inv_hash = wtxid
+            else:
+                inv_type = INV_TYPE_TX  # type 1 (txid)
+                inv_hash = txid
+
+            # Skip if already known
+            if inv_hash in self.known_filter:
+                to_remove.append(wtxid)
+                continue
+
+            inv_items.append((inv_type, inv_hash))
+            self.known_filter.add(inv_hash)
+            to_remove.append(wtxid)
+
+        # Remove sent items from pending set
+        for wtxid in to_remove:
+            self.pending_wtxids.discard(wtxid)
+            self.wtxid_to_txid.pop(wtxid, None)
+
+        return inv_items
+
+    @property
+    def pending_count(self) -> int:
+        """Number of transactions pending announcement."""
+        return len(self.pending_wtxids)
+
+    def clear(self) -> None:
+        """Clear all pending announcements."""
+        self.pending_wtxids.clear()
+        self.wtxid_to_txid.clear()
+
 
 # DNS seeds for mainnet
 DNS_SEEDS_MAINNET = [
@@ -130,6 +312,12 @@ class PeerManager:
         self._erlay_pending_recon: Dict[str, bool] = {}  # addr -> recon in progress
         self._reconciliation_task: Optional[asyncio.Task] = None
         self._reconciliation_interval: float = 2.0  # seconds between rounds
+
+        # Transaction trickling state (privacy-preserving relay)
+        # Per-peer trickle queues: addr -> TrickleQueue
+        self._trickle_queues: Dict[str, TrickleQueue] = {}
+        self._trickle_task: Optional[asyncio.Task] = None
+        self._trickle_interval: float = 1.0  # check interval in seconds
     
     async def start(self, start_height: int = 0, p2p_port: int = 0):
         """
@@ -170,6 +358,9 @@ class PeerManager:
             self._reconciliation_task = asyncio.create_task(
                 self._reconciliation_loop()
             )
+
+        # Start transaction trickle loop
+        self._trickle_task = asyncio.create_task(self._trickle_loop())
     
     async def stop(self):
         """Stop peer manager and disconnect all peers"""
@@ -198,6 +389,14 @@ class PeerManager:
             self._reconciliation_task.cancel()
             try:
                 await self._reconciliation_task
+            except asyncio.CancelledError:
+                pass
+
+        # Cancel trickle task
+        if self._trickle_task:
+            self._trickle_task.cancel()
+            try:
+                await self._trickle_task
             except asyncio.CancelledError:
                 pass
 
@@ -361,6 +560,10 @@ class PeerManager:
             if self.erlay_enabled:
                 self._register_erlay_handlers(peer, addr)
                 asyncio.ensure_future(self._negotiate_erlay(peer, addr))
+            # Initialize trickle queue for inbound peer (5s avg delay)
+            self._trickle_queues[addr] = TrickleQueue(
+                is_inbound=True, wtxid_relay=peer.wtxid_relay
+            )
 
             # Notify node so it can register tx/getdata handlers
             if self._on_inbound_peer:
@@ -491,6 +694,10 @@ class PeerManager:
                 if self.erlay_enabled:
                     self._register_erlay_handlers(peer, addr)
                     asyncio.ensure_future(self._negotiate_erlay(peer, addr))
+                # Initialize trickle queue for outbound peer (2s avg delay)
+                self._trickle_queues[addr] = TrickleQueue(
+                    is_inbound=False, wtxid_relay=peer.wtxid_relay
+                )
                 logger.info(f"Connected to full-relay peer {addr} ({len(self.peers)}/{self.max_peers})")
             else:
                 # Failed to connect
@@ -580,6 +787,7 @@ class PeerManager:
                 ]
                 for addr in disconnected:
                     del self.peers[addr]
+                    self._trickle_queues.pop(addr, None)  # cleanup trickle queue
                     logger.info(f"Removed disconnected full-relay peer {addr}")
 
                 # Remove disconnected block-relay-only outbound peers
@@ -598,6 +806,7 @@ class PeerManager:
                 ]
                 for addr in disconnected_in:
                     del self.inbound_peers[addr]
+                    self._trickle_queues.pop(addr, None)  # cleanup trickle queue
                     logger.info(f"Removed disconnected inbound peer {addr}")
 
                 # Refill full-relay outbound slots
@@ -1416,6 +1625,177 @@ class PeerManager:
             self.known_addrs.add(addr)
             logger.debug(f"Added peer address: {addr}")
     
+    # --- Transaction Trickling (Privacy-Preserving Relay) ---
+
+    async def _trickle_loop(self) -> None:
+        """Background loop that sends queued INVs on Poisson-distributed schedule.
+
+        For each peer with a trickle queue, checks if it's time to send INVs
+        and dispatches them. Randomized timing prevents network observers from
+        correlating transaction broadcasts with originating nodes.
+        """
+        try:
+            while self.running:
+                await asyncio.sleep(self._trickle_interval)
+                if not self.running:
+                    break
+
+                current_time = time.time()
+
+                # Process each peer's trickle queue
+                for addr, queue in list(self._trickle_queues.items()):
+                    if queue.pending_count == 0:
+                        continue
+
+                    # Check if it's time to send
+                    if not queue.should_send(current_time):
+                        continue
+
+                    peer = self.get_peer_by_addr(addr)
+                    if peer is None or not peer.is_connected():
+                        # Peer disconnected — clean up
+                        self._trickle_queues.pop(addr, None)
+                        continue
+
+                    # Skip block-relay-only peers (no tx relay)
+                    if not peer.relay_txs:
+                        queue.clear()
+                        continue
+
+                    try:
+                        # Get INVs to send
+                        inv_items = queue.get_invs_to_send()
+                        if inv_items:
+                            # Send INV message
+                            inv_msg = InvMessage(inv_items)
+                            await peer.send_message(
+                                inv_msg.to_network_message(self.network)
+                            )
+                            logger.debug(
+                                f"Trickled {len(inv_items)} tx INVs to {addr}"
+                            )
+
+                        # Schedule next send with Poisson delay
+                        queue.schedule_next_send(current_time)
+
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to send trickled INVs to {addr}: {e}"
+                        )
+
+        except asyncio.CancelledError:
+            logger.debug("Trickle loop cancelled")
+        except Exception as e:
+            logger.error(f"Error in trickle loop: {e}")
+
+    def queue_tx_for_relay(
+        self,
+        txid: bytes,
+        wtxid: bytes,
+        exclude_addr: str = "",
+    ) -> int:
+        """Queue a transaction for trickled announcement to all eligible peers.
+
+        Instead of immediately broadcasting INVs, the transaction is added to
+        each peer's trickle queue and announced on a randomized schedule.
+
+        For Erlay-enabled peers, transactions are added to the reconciliation
+        set instead of the trickle queue (handled separately).
+
+        Args:
+            txid: 32-byte transaction hash
+            wtxid: 32-byte witness transaction hash
+            exclude_addr: Peer address to exclude (sender of the tx)
+
+        Returns:
+            Number of peers the transaction was queued for
+        """
+        queued_count = 0
+
+        # Get all full-relay peers (outbound + inbound)
+        all_relay_peers = list(self.peers.items()) + list(self.inbound_peers.items())
+
+        for addr, peer in all_relay_peers:
+            if addr == exclude_addr:
+                continue
+            if not peer.is_connected() or not peer.relay_txs:
+                continue
+
+            # For Erlay peers, add to reconciliation set instead
+            if self.is_erlay_peer(addr):
+                self.erlay_add_tx_to_reconcile(txid, exclude_addr=exclude_addr)
+                continue
+
+            # Get or create trickle queue
+            queue = self._trickle_queues.get(addr)
+            if queue is None:
+                queue = TrickleQueue(
+                    is_inbound=peer.inbound,
+                    wtxid_relay=peer.wtxid_relay,
+                )
+                self._trickle_queues[addr] = queue
+
+            # Add to trickle queue
+            if queue.add_tx(txid, wtxid):
+                queued_count += 1
+
+        if queued_count > 0:
+            logger.debug(
+                f"Queued tx {txid.hex()[:16]}... for trickled relay to "
+                f"{queued_count} peers"
+            )
+
+        return queued_count
+
+    def mark_tx_known_by_peer(
+        self,
+        addr: str,
+        txid: bytes,
+        wtxid: bytes,
+    ) -> None:
+        """Mark a transaction as known by a peer (e.g., received from them).
+
+        Prevents us from announcing the transaction back to the peer.
+
+        Args:
+            addr: Peer address
+            txid: 32-byte transaction hash
+            wtxid: 32-byte witness transaction hash
+        """
+        queue = self._trickle_queues.get(addr)
+        if queue is not None:
+            queue.mark_known(txid, wtxid)
+
+    def update_peer_wtxid_relay(self, addr: str, wtxid_relay: bool) -> None:
+        """Update a peer's wtxid relay preference.
+
+        Called when wtxidrelay message is received during handshake.
+
+        Args:
+            addr: Peer address
+            wtxid_relay: True if peer supports BIP339 wtxid relay
+        """
+        queue = self._trickle_queues.get(addr)
+        if queue is not None:
+            queue.wtxid_relay = wtxid_relay
+
+    def get_trickle_stats(self) -> Dict:
+        """Get transaction trickling statistics.
+
+        Returns:
+            Dictionary with trickle queue stats
+        """
+        total_pending = sum(q.pending_count for q in self._trickle_queues.values())
+        inbound_queues = sum(1 for q in self._trickle_queues.values() if q.is_inbound)
+        outbound_queues = len(self._trickle_queues) - inbound_queues
+
+        return {
+            "trickle_queues": len(self._trickle_queues),
+            "inbound_queues": inbound_queues,
+            "outbound_queues": outbound_queues,
+            "total_pending": total_pending,
+        }
+
     def get_peer_count(self) -> int:
         """Get total number of connected peers (outbound + block-relay-only + inbound)"""
         return len(self.peers) + len(self.block_relay_peers) + len(self.inbound_peers)
@@ -1445,6 +1825,8 @@ class PeerManager:
             1 for p in ready_peers if is_onion_host(p.host)
         )
 
+        trickle_stats = self.get_trickle_stats()
+
         return {
             "connected": len(self.peers) + len(self.block_relay_peers) + len(self.inbound_peers),
             "outbound": len(self.peers),
@@ -1460,6 +1842,7 @@ class PeerManager:
             "proxy": self.proxy,
             "onion_proxy": self.onion,
             "onion_peers": onion_peers,
+            "trickle_pending": trickle_stats["total_pending"],
         }
 
 
