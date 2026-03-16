@@ -24,6 +24,11 @@ the node logic, RPC server, and mempool.
 - [x] BIP141 MINIMALIF (OP_IF/OP_NOTIF must use minimal boolean encoding)
 - [x] Legacy sighash (FindAndDelete, OP_CODESEPARATOR, all sighash types)
 - [x] Script interpreter with stack operations and control flow (IF/ELSE/ENDIF)
+- [x] Mempool with ancestor/descendant limits (25 txs, 101KB)
+- [x] TRUC (v3 transaction) policy and ephemeral dust
+- [x] BIP125 Replace-By-Fee (RBF)
+- [x] Pre-handshake peer filtering (reject old protocol versions, timeout)
+- [x] BIP339 WTXIDRELAY and BIP155 SENDADDRV2 negotiation
 - [ ] Full signature verification (secp256k1)
 - [ ] Mempool transaction relay
 - [ ] Wallet functionality
