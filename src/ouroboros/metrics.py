@@ -36,6 +36,10 @@ BLOCKS_RECEIVED: Optional["Counter"] = None
 TX_RECEIVED: Optional["Counter"] = None
 PEER_DISCONNECTS: Optional["Counter"] = None
 
+# Stale tip detection metrics
+STALE_TIP_DETECTED: Optional["Counter"] = None
+PEER_EVICTIONS: Optional["Counter"] = None
+
 RPC_REQUESTS: Optional["Counter"] = None
 RPC_DURATION: Optional["Histogram"] = None
 
@@ -54,6 +58,7 @@ def init_metrics(port: int = 9332) -> bool:
     global BLOCK_HEIGHT, CHAIN_DIFFICULTY, PEERS_CONNECTED
     global MEMPOOL_SIZE, MEMPOOL_TX_COUNT
     global BLOCKS_RECEIVED, TX_RECEIVED, PEER_DISCONNECTS
+    global STALE_TIP_DETECTED, PEER_EVICTIONS
     global RPC_REQUESTS, RPC_DURATION, NODE_INFO
     global _initialised
 
@@ -74,6 +79,13 @@ def init_metrics(port: int = 9332) -> bool:
     BLOCKS_RECEIVED = Counter("ouroboros_blocks_received_total", "Blocks received")
     TX_RECEIVED = Counter("ouroboros_tx_received_total", "Transactions received")
     PEER_DISCONNECTS = Counter("ouroboros_peer_disconnects_total", "Peer disconnections")
+
+    STALE_TIP_DETECTED = Counter(
+        "ouroboros_stale_tip_detected_total", "Stale tip detection events"
+    )
+    PEER_EVICTIONS = Counter(
+        "ouroboros_peer_evictions_total", "Peer eviction events", ["reason"]
+    )
 
     RPC_REQUESTS = Counter(
         "ouroboros_rpc_requests_total", "RPC requests", ["method"]
@@ -133,3 +145,19 @@ def record_tx_received() -> None:
 def record_peer_disconnect() -> None:
     if PEER_DISCONNECTS is not None:
         PEER_DISCONNECTS.inc()
+
+
+def record_stale_tip_detected() -> None:
+    """Record a stale tip detection event."""
+    if STALE_TIP_DETECTED is not None:
+        STALE_TIP_DETECTED.inc()
+
+
+def record_peer_evicted(reason: str) -> None:
+    """Record a peer eviction event.
+
+    Args:
+        reason: Why peer was evicted (chain_sync_timeout, extra_outbound)
+    """
+    if PEER_EVICTIONS is not None:
+        PEER_EVICTIONS.labels(reason=reason).inc()
