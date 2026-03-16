@@ -31,6 +31,7 @@ the node logic, RPC server, and mempool.
 - [x] BIP339 WTXIDRELAY and BIP155 SENDADDRV2 negotiation
 - [x] Transaction trickling (privacy-preserving relay with Poisson delays)
 - [x] Eclipse attack mitigations (bucketed addrman, /16 diversity, anchors, feelers)
+- [x] Stale tip detection and peer eviction (ConsiderEviction, extra outbound connection)
 - [ ] Full signature verification (secp256k1)
 - [ ] Wallet functionality
 
