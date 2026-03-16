@@ -2,18 +2,32 @@
 Output descriptor parsing, validation, and address derivation.
 
 Implements the Bitcoin output descriptor language (BIP 380–386):
-  - ``wpkh(KEY)``       — BIP 84 native SegWit P2WPKH
+  - ``pk(KEY)``         — bare P2PK (pay-to-pubkey)
   - ``pkh(KEY)``        — BIP 44 legacy P2PKH
+  - ``wpkh(KEY)``       — BIP 84 native SegWit P2WPKH
   - ``tr(KEY)``         — BIP 86 taproot (key-path only)
+  - ``tr(KEY, TREE)``   — BIP 386 taproot with script paths (including miniscript)
   - ``sh(wpkh(KEY))``   — BIP 49 P2SH-wrapped SegWit
-  - ``multi(M, KEY, ...)``  — bare multisig
+  - ``multi(M, KEY, ...)``      — bare multisig (wrapped in P2SH)
+  - ``sortedmulti(M, KEY, ...)`` — sorted multisig (keys sorted lexicographically)
   - ``wsh(multi(...))`` — P2WSH multisig
+  - ``wsh(sortedmulti(...))`` — P2WSH sorted multisig
+  - ``wsh(MINISCRIPT)`` — P2WSH with miniscript
+  - ``sh(multi(...))``  — P2SH multisig
+  - ``sh(wsh(multi(...)))`` — P2SH-P2WSH multisig
+  - ``combo(KEY)``      — expands to P2PK, P2PKH, P2WPKH, P2SH-P2WPKH
+  - ``addr(ADDRESS)``   — raw address (watch-only)
+  - ``raw(HEX)``        — raw scriptPubKey hex
 
 KEY may be:
   - A hex-encoded compressed public key (66 hex chars)
   - An xpub/tpub extended public key, optionally with a derivation suffix
   - An xprv/tprv extended private key (treated identically but flagged)
   - An origin prefix ``[fingerprint/path]`` before any key
+
+MINISCRIPT:
+  - Miniscript expressions can be used inside wsh() and in tr() script paths
+  - Examples: wsh(and_v(pk(KEY),older(1000))), tr(KEY,pk(KEY2))
 
 Range descriptors use ``*`` as a wildcard index:
   ``wpkh(xpub.../0/*)`` derives addresses at index 0, 1, 2, …
@@ -24,7 +38,9 @@ computed per the algorithm in BIP 380.
 Reference:
   - BIP 380  https://github.com/bitcoin/bips/blob/master/bip-0380.mediawiki
   - BIP 381  https://github.com/bitcoin/bips/blob/master/bip-0381.mediawiki
+  - BIP 383  https://github.com/bitcoin/bips/blob/master/bip-0383.mediawiki
   - BIP 386  https://github.com/bitcoin/bips/blob/master/bip-0386.mediawiki
+  - BIP 379  https://github.com/bitcoin/bips/blob/master/bip-0379.mediawiki (Miniscript)
 """
 
 from __future__ import annotations
@@ -34,7 +50,10 @@ import hmac
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
+
+if TYPE_CHECKING:
+    from ouroboros.miniscript import MiniscriptNode
 
 import base58
 import bech32
@@ -363,73 +382,346 @@ def _parse_key_expression(raw: str) -> KeyExpression:
 @dataclass
 class Descriptor:
     """Parsed output descriptor."""
-    descriptor_type: str          # "wpkh", "pkh", "tr", "sh-wpkh", "multi", "wsh-multi"
+    descriptor_type: str          # "pk", "pkh", "wpkh", "tr", "sh-wpkh", "multi",
+                                  # "sortedmulti", "wsh-multi", "wsh-sortedmulti",
+                                  # "wsh-miniscript", "tr-script", "sh-multi",
+                                  # "sh-wsh-multi", "combo", "addr", "raw"
     keys: List[KeyExpression] = field(default_factory=list)
     multisig_threshold: int = 0   # M in multi(M, ...)
     is_range: bool = False
     raw: str = ""                 # original canonical string (no checksum)
+    sorted_multi: bool = False    # True for sortedmulti() descriptors
+    # For addr() and raw() descriptors
+    address: str = ""             # address string for addr() descriptors
+    script_hex: str = ""          # raw script hex for raw() descriptors
+    # For miniscript descriptors
+    miniscript_expr: str = ""     # miniscript expression string
+    miniscript_node: Optional["MiniscriptNode"] = None  # parsed miniscript
+    # For tr() with script paths
+    tap_tree: Optional[List] = None  # Taproot script tree
 
     # -- address / script derivation --------------------------------------
 
     def derive_address(self, index: int = 0, network: str = "mainnet") -> str:
-        """Derive the address at *index* (relevant for range descriptors)."""
-        if self.descriptor_type == "wpkh":
+        """Derive the address at *index* (relevant for range descriptors).
+
+        For combo() descriptors, returns a list of addresses.
+        """
+        dtype = self.descriptor_type
+
+        if dtype == "pk":
+            # P2PK has no standard address; wrap in P2SH
             pub = self.keys[0].derive_pubkey(index)
-            return _pubkey_to_p2wpkh(pub, network)
-        elif self.descriptor_type == "pkh":
+            script = _make_p2pk_script(pub)
+            return _script_to_p2sh(script, network)
+
+        if dtype == "pkh":
             pub = self.keys[0].derive_pubkey(index)
             return _pubkey_to_p2pkh(pub, network)
-        elif self.descriptor_type == "tr":
+
+        if dtype == "wpkh":
+            pub = self.keys[0].derive_pubkey(index)
+            return _pubkey_to_p2wpkh(pub, network)
+
+        if dtype == "tr":
             pub = self.keys[0].derive_pubkey(index)
             return _pubkey_to_p2tr(pub, network)
-        elif self.descriptor_type == "sh-wpkh":
+
+        if dtype == "sh-wpkh":
             pub = self.keys[0].derive_pubkey(index)
             return _pubkey_to_p2sh_p2wpkh(pub, network)
-        elif self.descriptor_type == "multi":
+
+        if dtype in ("multi", "sortedmulti"):
             pubs = [k.derive_pubkey(index) for k in self.keys]
-            script = _make_multisig_script(self.multisig_threshold, pubs)
+            script = _make_multisig_script(
+                self.multisig_threshold, pubs, self.sorted_multi
+            )
             # Bare multisig — address is P2SH of the script
             return _script_to_p2sh(script, network)
-        elif self.descriptor_type == "wsh-multi":
+
+        if dtype in ("wsh-multi", "wsh-sortedmulti"):
             pubs = [k.derive_pubkey(index) for k in self.keys]
-            script = _make_multisig_script(self.multisig_threshold, pubs)
+            script = _make_multisig_script(
+                self.multisig_threshold, pubs, self.sorted_multi
+            )
             return _script_to_p2wsh(script, network)
-        else:
-            raise ValueError(f"Unknown descriptor type: {self.descriptor_type}")
+
+        if dtype in ("sh-multi", "sh-sortedmulti"):
+            pubs = [k.derive_pubkey(index) for k in self.keys]
+            script = _make_multisig_script(
+                self.multisig_threshold, pubs, self.sorted_multi
+            )
+            return _script_to_p2sh(script, network)
+
+        if dtype in ("sh-wsh-multi", "sh-wsh-sortedmulti"):
+            pubs = [k.derive_pubkey(index) for k in self.keys]
+            script = _make_multisig_script(
+                self.multisig_threshold, pubs, self.sorted_multi
+            )
+            # P2SH wrapping P2WSH
+            witness_program = b"\x00\x20" + _sha256(script)
+            return _script_to_p2sh(witness_program, network)
+
+        if dtype == "wsh-miniscript":
+            script = self._compile_miniscript(index)
+            return _script_to_p2wsh(script, network)
+
+        if dtype == "tr-script":
+            pub = self.keys[0].derive_pubkey(index)
+            tweaked = self._taproot_tweak_with_tree(pub, index)
+            hrp = "bc" if network == "mainnet" else "tb"
+            from ouroboros.address import _bech32m_encode
+            return _bech32m_encode(hrp, 1, tweaked)
+
+        if dtype == "addr":
+            # addr() always returns the stored address
+            return self.address
+
+        if dtype == "raw":
+            # raw() returns P2SH of the script
+            script = bytes.fromhex(self.script_hex)
+            return _script_to_p2sh(script, network)
+
+        raise ValueError(f"Unknown descriptor type: {dtype}")
 
     def derive_script_pubkey(self, index: int = 0) -> bytes:
         """Derive the scriptPubKey at *index*."""
-        if self.descriptor_type == "wpkh":
+        dtype = self.descriptor_type
+
+        if dtype == "pk":
             pub = self.keys[0].derive_pubkey(index)
-            return b"\x00\x14" + _hash160(pub)
-        elif self.descriptor_type == "pkh":
+            return _make_p2pk_script(pub)
+
+        if dtype == "pkh":
             pub = self.keys[0].derive_pubkey(index)
             h = _hash160(pub)
             return b"\x76\xa9\x14" + h + b"\x88\xac"
-        elif self.descriptor_type == "tr":
+
+        if dtype == "wpkh":
+            pub = self.keys[0].derive_pubkey(index)
+            return b"\x00\x14" + _hash160(pub)
+
+        if dtype == "tr":
             pub = self.keys[0].derive_pubkey(index)
             tweaked = _taproot_tweak_pubkey(pub)
             return b"\x51\x20" + tweaked
-        elif self.descriptor_type == "sh-wpkh":
+
+        if dtype == "sh-wpkh":
             pub = self.keys[0].derive_pubkey(index)
             redeem = b"\x00\x14" + _hash160(pub)
             return b"\xa9\x14" + _hash160(redeem) + b"\x87"
-        elif self.descriptor_type == "multi":
+
+        if dtype in ("multi", "sortedmulti"):
             pubs = [k.derive_pubkey(index) for k in self.keys]
-            script = _make_multisig_script(self.multisig_threshold, pubs)
+            script = _make_multisig_script(
+                self.multisig_threshold, pubs, self.sorted_multi
+            )
             return b"\xa9\x14" + _hash160(script) + b"\x87"
-        elif self.descriptor_type == "wsh-multi":
+
+        if dtype in ("wsh-multi", "wsh-sortedmulti"):
             pubs = [k.derive_pubkey(index) for k in self.keys]
-            script = _make_multisig_script(self.multisig_threshold, pubs)
+            script = _make_multisig_script(
+                self.multisig_threshold, pubs, self.sorted_multi
+            )
             return b"\x00\x20" + _sha256(script)
-        else:
-            raise ValueError(f"Unknown descriptor type: {self.descriptor_type}")
+
+        if dtype in ("sh-multi", "sh-sortedmulti"):
+            pubs = [k.derive_pubkey(index) for k in self.keys]
+            script = _make_multisig_script(
+                self.multisig_threshold, pubs, self.sorted_multi
+            )
+            return b"\xa9\x14" + _hash160(script) + b"\x87"
+
+        if dtype in ("sh-wsh-multi", "sh-wsh-sortedmulti"):
+            pubs = [k.derive_pubkey(index) for k in self.keys]
+            script = _make_multisig_script(
+                self.multisig_threshold, pubs, self.sorted_multi
+            )
+            witness_program = b"\x00\x20" + _sha256(script)
+            return b"\xa9\x14" + _hash160(witness_program) + b"\x87"
+
+        if dtype == "wsh-miniscript":
+            # Compile miniscript to get witness script
+            script = self._compile_miniscript(index)
+            return b"\x00\x20" + _sha256(script)
+
+        if dtype == "tr-script":
+            # Taproot with script paths
+            pub = self.keys[0].derive_pubkey(index)
+            tweaked = self._taproot_tweak_with_tree(pub, index)
+            return b"\x51\x20" + tweaked
+
+        if dtype == "addr":
+            # addr() — decode address to scriptPubKey
+            return _decode_address(self.address)
+
+        if dtype == "raw":
+            return bytes.fromhex(self.script_hex)
+
+        raise ValueError(f"Unknown descriptor type: {dtype}")
+
+    def derive_all_scripts(self, index: int = 0) -> List[bytes]:
+        """For combo() descriptors, return all scriptPubKeys; otherwise a single-element list."""
+        if self.descriptor_type != "combo":
+            return [self.derive_script_pubkey(index)]
+
+        # combo(KEY) expands to: P2PK, P2PKH, and if compressed: P2WPKH, P2SH-P2WPKH
+        pub = self.keys[0].derive_pubkey(index)
+        scripts: List[bytes] = []
+        # P2PK
+        scripts.append(_make_p2pk_script(pub))
+        # P2PKH
+        h = _hash160(pub)
+        scripts.append(b"\x76\xa9\x14" + h + b"\x88\xac")
+        # Compressed keys get segwit variants
+        if pub[0] in (0x02, 0x03):
+            # P2WPKH
+            scripts.append(b"\x00\x14" + _hash160(pub))
+            # P2SH-P2WPKH
+            redeem = b"\x00\x14" + _hash160(pub)
+            scripts.append(b"\xa9\x14" + _hash160(redeem) + b"\x87")
+        return scripts
+
+    def derive_all_addresses(self, index: int = 0, network: str = "mainnet") -> List[str]:
+        """For combo() descriptors, return all addresses; otherwise a single-element list."""
+        if self.descriptor_type != "combo":
+            return [self.derive_address(index, network)]
+
+        # combo(KEY) expands to: P2PK (as P2SH), P2PKH, and if compressed: P2WPKH, P2SH-P2WPKH
+        pub = self.keys[0].derive_pubkey(index)
+        addresses: List[str] = []
+        # P2PK has no standard address; wrap in P2SH
+        script = _make_p2pk_script(pub)
+        addresses.append(_script_to_p2sh(script, network))
+        # P2PKH
+        addresses.append(_pubkey_to_p2pkh(pub, network))
+        # Compressed keys get segwit variants
+        if pub[0] in (0x02, 0x03):
+            # P2WPKH
+            addresses.append(_pubkey_to_p2wpkh(pub, network))
+            # P2SH-P2WPKH
+            addresses.append(_pubkey_to_p2sh_p2wpkh(pub, network))
+        return addresses
 
     def derive_addresses(
         self, start: int = 0, count: int = 20, network: str = "mainnet"
     ) -> List[str]:
         """Derive a range of addresses."""
         return [self.derive_address(i, network) for i in range(start, start + count)]
+
+    def _compile_miniscript(self, index: int = 0) -> bytes:
+        """Compile miniscript expression to witness script."""
+        from ouroboros.miniscript import (
+            MiniscriptContext,
+            compile_miniscript,
+            parse_miniscript,
+        )
+
+        # Create key parser that resolves keys from our key expressions
+        def key_parser(key_str: str) -> bytes:
+            # Try to find matching key expression
+            for key_expr in self.keys:
+                if key_expr.hex_pubkey is not None:
+                    if key_str.strip() == key_expr.hex_pubkey.hex():
+                        return key_expr.hex_pubkey
+                elif key_expr.ext_key_str:
+                    # Check if it's an xpub reference
+                    if key_str.strip().startswith(key_expr.ext_key_str[:10]):
+                        return key_expr.derive_pubkey(index)
+            # Try hex decode
+            return bytes.fromhex(key_str.strip())
+
+        ctx = MiniscriptContext.P2WSH
+        if self.miniscript_node is not None:
+            return compile_miniscript(self.miniscript_node, ctx)
+
+        node = parse_miniscript(self.miniscript_expr, ctx, key_parser)
+        return compile_miniscript(node, ctx)
+
+    def _taproot_tweak_with_tree(self, pub: bytes, index: int = 0) -> bytes:
+        """Compute taproot output key with script tree."""
+        from ouroboros.miniscript import MiniscriptContext, compile_miniscript, parse_miniscript
+
+        x_only = pub[1:] if len(pub) == 33 else pub  # Get x-only pubkey
+
+        if self.tap_tree is None:
+            # Key-path only
+            tweak = _tagged_hash("TapTweak", x_only)
+        else:
+            # Compute merkle root from tap tree
+            merkle_root = self._compute_tap_tree_merkle(index)
+            tweak = _tagged_hash("TapTweak", x_only + merkle_root)
+
+        # Compute P + t*G
+        pk = PublicKey(pub)
+        tweaked = pk.add(tweak)
+        return tweaked.format(compressed=True)[1:]
+
+    def _compute_tap_tree_merkle(self, index: int = 0) -> bytes:
+        """Compute merkle root of taproot script tree."""
+        from ouroboros.miniscript import MiniscriptContext, compile_miniscript, parse_miniscript
+
+        def leaf_hash(script: bytes, leaf_version: int = 0xc0) -> bytes:
+            return _tagged_hash("TapLeaf", bytes([leaf_version]) + _compact_size(len(script)) + script)
+
+        def branch_hash(left: bytes, right: bytes) -> bytes:
+            # Sort lexicographically
+            if left > right:
+                left, right = right, left
+            return _tagged_hash("TapBranch", left + right)
+
+        def compute_tree(tree) -> bytes:
+            if isinstance(tree, str):
+                # It's a miniscript expression - compile it
+                def key_parser(key_str: str) -> bytes:
+                    for key_expr in self.keys:
+                        if key_expr.hex_pubkey is not None:
+                            if key_str.strip() == key_expr.hex_pubkey.hex():
+                                return key_expr.hex_pubkey
+                    return bytes.fromhex(key_str.strip())
+                node = parse_miniscript(tree, MiniscriptContext.TAPSCRIPT, key_parser)
+                script = compile_miniscript(node, MiniscriptContext.TAPSCRIPT)
+                return leaf_hash(script)
+            elif isinstance(tree, tuple) and len(tree) == 2:
+                # It's a branch (left, right)
+                left = compute_tree(tree[0])
+                right = compute_tree(tree[1])
+                return branch_hash(left, right)
+            elif isinstance(tree, list) and len(tree) == 1:
+                return compute_tree(tree[0])
+            elif isinstance(tree, list) and len(tree) == 2:
+                left = compute_tree(tree[0])
+                right = compute_tree(tree[1])
+                return branch_hash(left, right)
+            else:
+                raise ValueError(f"Invalid tap tree structure: {tree}")
+
+        return compute_tree(self.tap_tree)
+
+    def get_miniscript_satisfaction_size(self, index: int = 0) -> Optional[int]:
+        """Get the witness size needed to satisfy this miniscript descriptor."""
+        if self.descriptor_type not in ("wsh-miniscript", "tr-script"):
+            return None
+
+        from ouroboros.miniscript import (
+            MiniscriptContext,
+            analyze_satisfaction,
+            parse_miniscript,
+        )
+
+        ctx = (
+            MiniscriptContext.TAPSCRIPT
+            if self.descriptor_type == "tr-script"
+            else MiniscriptContext.P2WSH
+        )
+
+        if self.miniscript_node is not None:
+            info = analyze_satisfaction(self.miniscript_node)
+        else:
+            node = parse_miniscript(self.miniscript_expr, ctx)
+            info = analyze_satisfaction(node)
+
+        return info.sat_size
 
 
 # ---------------------------------------------------------------------------
@@ -474,13 +766,18 @@ def _pubkey_to_p2tr(pub: bytes, network: str) -> str:
     return _bech32m_encode(hrp, 1, tweaked_x)
 
 
-def _make_multisig_script(threshold: int, pubkeys: List[bytes]) -> bytes:
+def _make_multisig_script(
+    threshold: int, pubkeys: List[bytes], sorted_keys: bool = False
+) -> bytes:
     if threshold < 1 or threshold > len(pubkeys):
         raise ValueError(
             f"Invalid multisig threshold: {threshold} of {len(pubkeys)}"
         )
     if len(pubkeys) > 20:
         raise ValueError(f"Too many multisig keys: {len(pubkeys)} (max 20)")
+    # For sortedmulti, sort keys lexicographically
+    if sorted_keys:
+        pubkeys = sorted(pubkeys)
     # OP_M <key1> <key2> ... OP_N OP_CHECKMULTISIG
     op_m = 0x50 + threshold  # OP_1 = 0x51, OP_2 = 0x52, ...
     op_n = 0x50 + len(pubkeys)
@@ -489,6 +786,83 @@ def _make_multisig_script(threshold: int, pubkeys: List[bytes]) -> bytes:
         script += bytes([len(pk)]) + pk
     script += bytes([op_n, 0xAE])  # OP_CHECKMULTISIG
     return script
+
+
+def _make_p2pk_script(pub: bytes) -> bytes:
+    """Create a P2PK scriptPubKey: <pubkey> OP_CHECKSIG."""
+    return bytes([len(pub)]) + pub + bytes([0xAC])  # 0xAC = OP_CHECKSIG
+
+
+def _compact_size(n: int) -> bytes:
+    """Encode an integer as a Bitcoin compact size."""
+    if n < 0xfd:
+        return bytes([n])
+    elif n <= 0xffff:
+        return b"\xfd" + n.to_bytes(2, "little")
+    elif n <= 0xffffffff:
+        return b"\xfe" + n.to_bytes(4, "little")
+    else:
+        return b"\xff" + n.to_bytes(8, "little")
+
+
+def _decode_address(addr: str, network: str = "mainnet") -> bytes:
+    """Decode a Bitcoin address and return its scriptPubKey.
+
+    Supports: P2PKH (1.../m...), P2SH (3.../2...), P2WPKH (bc1q.../tb1q...),
+    P2WSH (bc1q... 32-byte), P2TR (bc1p.../tb1p...).
+    """
+    # Bech32/Bech32m addresses
+    if addr.lower().startswith(("bc1", "tb1")):
+        hrp = "bc" if network == "mainnet" else "tb"
+        try:
+            # Try bech32 first
+            decoded = bech32.bech32_decode(addr)
+            if decoded[0] is not None:
+                _, data = decoded
+                if data is None or len(data) < 1:
+                    raise ValueError(f"Invalid bech32 address: {addr}")
+                witver = data[0]
+                witprog = bytes(bech32.convertbits(data[1:], 5, 8, False))
+                if witver == 0:
+                    if len(witprog) == 20:
+                        # P2WPKH
+                        return b"\x00\x14" + witprog
+                    elif len(witprog) == 32:
+                        # P2WSH
+                        return b"\x00\x20" + witprog
+        except Exception:
+            pass
+        # Try bech32m for taproot
+        try:
+            from ouroboros.address import _bech32m_decode
+            witver, witprog = _bech32m_decode(hrp, addr)
+            if witver == 1 and len(witprog) == 32:
+                # P2TR
+                return b"\x51\x20" + witprog
+        except Exception:
+            pass
+        raise ValueError(f"Invalid bech32/bech32m address: {addr}")
+
+    # Base58Check addresses (P2PKH, P2SH)
+    try:
+        decoded = base58.b58decode_check(addr)
+    except Exception:
+        raise ValueError(f"Invalid base58 address: {addr}")
+
+    if len(decoded) != 21:
+        raise ValueError(f"Invalid address length: {addr}")
+
+    version = decoded[0]
+    h160 = decoded[1:]
+
+    # P2PKH mainnet (0x00), testnet (0x6f)
+    if version == 0x00 or version == 0x6F:
+        return b"\x76\xa9\x14" + h160 + b"\x88\xac"
+    # P2SH mainnet (0x05), testnet (0xc4)
+    if version == 0x05 or version == 0xC4:
+        return b"\xa9\x14" + h160 + b"\x87"
+
+    raise ValueError(f"Unknown address version: {version}")
 
 
 def _script_to_p2sh(script: bytes, network: str) -> str:
@@ -531,12 +905,20 @@ def parse_descriptor(desc_str: str) -> Descriptor:
 
     Supported forms::
 
-        wpkh(KEY)
-        pkh(KEY)
-        tr(KEY)
-        sh(wpkh(KEY))
-        multi(M, KEY, KEY, ...)
-        wsh(multi(M, KEY, KEY, ...))
+        pk(KEY)                    — bare P2PK
+        pkh(KEY)                   — P2PKH
+        wpkh(KEY)                  — P2WPKH
+        tr(KEY)                    — P2TR (key-path only)
+        sh(wpkh(KEY))              — P2SH-P2WPKH
+        multi(M, KEY, ...)         — bare multisig (wrapped in P2SH)
+        sortedmulti(M, KEY, ...)   — sorted multisig
+        wsh(multi(M, KEY, ...))    — P2WSH multisig
+        wsh(sortedmulti(...))      — P2WSH sorted multisig
+        sh(multi(M, KEY, ...))     — P2SH multisig
+        sh(wsh(multi(...)))        — P2SH-P2WSH multisig
+        combo(KEY)                 — P2PK, P2PKH, P2WPKH, P2SH-P2WPKH
+        addr(ADDRESS)              — raw address (watch-only)
+        raw(HEX)                   — raw scriptPubKey hex
 
     Raises ``ValueError`` on any parse or validation error.
     """
@@ -549,6 +931,60 @@ def parse_descriptor(desc_str: str) -> Descriptor:
         s = s.split("#")[0]
 
     canonical = s  # save the body for Descriptor.raw
+
+    # -- addr(ADDRESS) -----------------------------------------------------
+    if s.startswith("addr("):
+        paren_close = _find_matching_paren(s, 4)
+        addr_str = s[5:paren_close].strip()
+        # Validate address by attempting to decode it
+        _decode_address(addr_str)
+        return Descriptor(
+            descriptor_type="addr",
+            address=addr_str,
+            is_range=False,
+            raw=canonical,
+        )
+
+    # -- raw(HEX) ----------------------------------------------------------
+    if s.startswith("raw("):
+        paren_close = _find_matching_paren(s, 3)
+        hex_str = s[4:paren_close].strip()
+        # Validate hex
+        try:
+            bytes.fromhex(hex_str)
+        except ValueError:
+            raise ValueError(f"Invalid hex in raw(): {hex_str}")
+        return Descriptor(
+            descriptor_type="raw",
+            script_hex=hex_str,
+            is_range=False,
+            raw=canonical,
+        )
+
+    # -- combo(KEY) --------------------------------------------------------
+    if s.startswith("combo("):
+        paren_close = _find_matching_paren(s, 5)
+        key_str = s[6:paren_close]
+        key = _parse_key_expression(key_str)
+        return Descriptor(
+            descriptor_type="combo",
+            keys=[key],
+            is_range=key.is_range,
+            raw=canonical,
+        )
+
+    # -- sh(wsh(multi(M, KEY, ...))) or sh(wsh(sortedmulti(...))) ---------
+    if s.startswith("sh(wsh(multi(") or s.startswith("sh(wsh(sortedmulti("):
+        sorted_multi = "sortedmulti" in s
+        if sorted_multi:
+            inner_start = s.index("sortedmulti(") + 12
+            inner_end = _find_matching_paren(s, s.index("sortedmulti(") + 11)
+        else:
+            inner_start = s.index("multi(") + 6
+            inner_end = _find_matching_paren(s, s.index("multi(") + 5)
+        inner = s[inner_start:inner_end]
+        dtype = "sh-wsh-sortedmulti" if sorted_multi else "sh-wsh-multi"
+        return _parse_multi_inner(inner, dtype, canonical, sorted_multi)
 
     # -- sh(wpkh(KEY)) -----------------------------------------------------
     if s.startswith("sh(wpkh("):
@@ -563,21 +999,47 @@ def parse_descriptor(desc_str: str) -> Descriptor:
             raw=canonical,
         )
 
-    # -- wsh(multi(M, KEY, ...)) ------------------------------------------
-    if s.startswith("wsh(multi("):
-        inner_start = s.index("multi(") + 6
-        inner_end = _find_matching_paren(s, s.index("multi(") + 5)
+    # -- sh(multi(M, KEY, ...)) or sh(sortedmulti(...)) --------------------
+    if s.startswith("sh(multi(") or s.startswith("sh(sortedmulti("):
+        sorted_multi = "sortedmulti" in s
+        if sorted_multi:
+            inner_start = s.index("sortedmulti(") + 12
+            inner_end = _find_matching_paren(s, s.index("sortedmulti(") + 11)
+        else:
+            inner_start = s.index("multi(") + 6
+            inner_end = _find_matching_paren(s, s.index("multi(") + 5)
         inner = s[inner_start:inner_end]
-        return _parse_multi_inner(inner, "wsh-multi", canonical)
+        dtype = "sh-sortedmulti" if sorted_multi else "sh-multi"
+        return _parse_multi_inner(inner, dtype, canonical, sorted_multi)
 
-    # -- wpkh(KEY) --------------------------------------------------------
-    if s.startswith("wpkh("):
-        paren_open = 4
-        paren_close = _find_matching_paren(s, paren_open)
-        key_str = s[paren_open + 1:paren_close]
+    # -- wsh(multi(M, KEY, ...)) or wsh(sortedmulti(...)) ------------------
+    if s.startswith("wsh(multi(") or s.startswith("wsh(sortedmulti("):
+        sorted_multi = "sortedmulti" in s
+        if sorted_multi:
+            inner_start = s.index("sortedmulti(") + 12
+            inner_end = _find_matching_paren(s, s.index("sortedmulti(") + 11)
+        else:
+            inner_start = s.index("multi(") + 6
+            inner_end = _find_matching_paren(s, s.index("multi(") + 5)
+        inner = s[inner_start:inner_end]
+        dtype = "wsh-sortedmulti" if sorted_multi else "wsh-multi"
+        return _parse_multi_inner(inner, dtype, canonical, sorted_multi)
+
+    # -- wsh(MINISCRIPT) ---------------------------------------------------
+    if s.startswith("wsh("):
+        paren_close = _find_matching_paren(s, 3)
+        inner = s[4:paren_close]
+        # Check if it's a known non-miniscript construct
+        if not inner.startswith(("multi(", "sortedmulti(")):
+            return _parse_wsh_miniscript(inner, canonical)
+
+    # -- pk(KEY) -----------------------------------------------------------
+    if s.startswith("pk("):
+        paren_close = _find_matching_paren(s, 2)
+        key_str = s[3:paren_close]
         key = _parse_key_expression(key_str)
         return Descriptor(
-            descriptor_type="wpkh",
+            descriptor_type="pk",
             keys=[key],
             is_range=key.is_range,
             raw=canonical,
@@ -585,9 +1047,8 @@ def parse_descriptor(desc_str: str) -> Descriptor:
 
     # -- pkh(KEY) ---------------------------------------------------------
     if s.startswith("pkh("):
-        paren_open = 3
-        paren_close = _find_matching_paren(s, paren_open)
-        key_str = s[paren_open + 1:paren_close]
+        paren_close = _find_matching_paren(s, 3)
+        key_str = s[4:paren_close]
         key = _parse_key_expression(key_str)
         return Descriptor(
             descriptor_type="pkh",
@@ -596,32 +1057,68 @@ def parse_descriptor(desc_str: str) -> Descriptor:
             raw=canonical,
         )
 
-    # -- tr(KEY) ----------------------------------------------------------
-    if s.startswith("tr("):
-        paren_open = 2
-        paren_close = _find_matching_paren(s, paren_open)
-        key_str = s[paren_open + 1:paren_close]
+    # -- wpkh(KEY) --------------------------------------------------------
+    if s.startswith("wpkh("):
+        paren_close = _find_matching_paren(s, 4)
+        key_str = s[5:paren_close]
         key = _parse_key_expression(key_str)
         return Descriptor(
-            descriptor_type="tr",
+            descriptor_type="wpkh",
             keys=[key],
             is_range=key.is_range,
             raw=canonical,
         )
 
+    # -- tr(KEY) or tr(KEY, TREE) ------------------------------------------
+    if s.startswith("tr("):
+        paren_close = _find_matching_paren(s, 2)
+        inner = s[3:paren_close]
+        # Check if there's a script tree (comma-separated)
+        parts = _split_top_level_commas(inner)
+        if len(parts) == 1:
+            # Key-path only: tr(KEY)
+            key = _parse_key_expression(parts[0])
+            return Descriptor(
+                descriptor_type="tr",
+                keys=[key],
+                is_range=key.is_range,
+                raw=canonical,
+            )
+        elif len(parts) >= 2:
+            # Script path: tr(KEY, TREE)
+            key = _parse_key_expression(parts[0])
+            tree_str = ",".join(parts[1:])
+            tap_tree, extra_keys = _parse_tap_tree(tree_str)
+            all_keys = [key] + extra_keys
+            return Descriptor(
+                descriptor_type="tr-script",
+                keys=all_keys,
+                is_range=key.is_range or any(k.is_range for k in extra_keys),
+                raw=canonical,
+                tap_tree=tap_tree,
+            )
+        else:
+            raise ValueError(f"Invalid tr() descriptor: {s}")
+
+    # -- sortedmulti(M, KEY, KEY, ...) ------------------------------------
+    if s.startswith("sortedmulti("):
+        paren_close = _find_matching_paren(s, 11)
+        inner = s[12:paren_close]
+        return _parse_multi_inner(inner, "sortedmulti", canonical, sorted_multi=True)
+
     # -- multi(M, KEY, KEY, ...) ------------------------------------------
     if s.startswith("multi("):
-        paren_open = 5
-        paren_close = _find_matching_paren(s, paren_open)
-        inner = s[paren_open + 1:paren_close]
-        return _parse_multi_inner(inner, "multi", canonical)
+        paren_close = _find_matching_paren(s, 5)
+        inner = s[6:paren_close]
+        return _parse_multi_inner(inner, "multi", canonical, sorted_multi=False)
 
     raise ValueError(f"Unsupported descriptor: {desc_str}")
 
 
 def _parse_multi_inner(
-    inner: str, dtype: str, canonical: str
+    inner: str, dtype: str, canonical: str, sorted_multi: bool = False
 ) -> Descriptor:
+    """Parse the inner content of a multi() or sortedmulti() descriptor."""
     # Split by commas, but be careful about brackets in origins
     parts = _split_top_level_commas(inner)
     if len(parts) < 2:
@@ -639,6 +1136,7 @@ def _parse_multi_inner(
         multisig_threshold=threshold,
         is_range=is_range,
         raw=canonical,
+        sorted_multi=sorted_multi,
     )
 
 
@@ -647,10 +1145,10 @@ def _split_top_level_commas(s: str) -> List[str]:
     depth = 0
     current: List[str] = []
     for ch in s:
-        if ch in "([":
+        if ch in "([{":
             depth += 1
             current.append(ch)
-        elif ch in ")]":
+        elif ch in ")]}":
             depth -= 1
             current.append(ch)
         elif ch == "," and depth == 0:
@@ -661,6 +1159,164 @@ def _split_top_level_commas(s: str) -> List[str]:
     if current:
         parts.append("".join(current))
     return parts
+
+
+def _parse_wsh_miniscript(miniscript_expr: str, canonical: str) -> "Descriptor":
+    """Parse a wsh(MINISCRIPT) descriptor."""
+    from ouroboros.miniscript import MiniscriptContext, parse_miniscript
+
+    # Extract keys from the miniscript expression
+    keys = _extract_keys_from_miniscript(miniscript_expr)
+
+    # Create key parser
+    def key_parser(key_str: str) -> bytes:
+        key_str = key_str.strip()
+        # Try to parse as a key expression
+        try:
+            expr = _parse_key_expression(key_str)
+            return expr.derive_pubkey(0)
+        except ValueError:
+            # Fall back to hex decode
+            return bytes.fromhex(key_str)
+
+    # Parse and validate the miniscript
+    node = parse_miniscript(miniscript_expr, MiniscriptContext.P2WSH, key_parser)
+
+    return Descriptor(
+        descriptor_type="wsh-miniscript",
+        keys=keys,
+        is_range=any(k.is_range for k in keys),
+        raw=canonical,
+        miniscript_expr=miniscript_expr,
+        miniscript_node=node,
+    )
+
+
+def _extract_keys_from_miniscript(expr: str) -> List["KeyExpression"]:
+    """Extract all key expressions from a miniscript string."""
+    import re
+
+    keys = []
+    # Find all pk(), pkh(), pk_k(), pk_h() arguments
+    for pattern in [
+        r'pk\(([^)]+)\)',
+        r'pkh\(([^)]+)\)',
+        r'pk_k\(([^)]+)\)',
+        r'pk_h\(([^)]+)\)',
+    ]:
+        for match in re.finditer(pattern, expr):
+            key_str = match.group(1).strip()
+            try:
+                key = _parse_key_expression(key_str)
+                keys.append(key)
+            except ValueError:
+                pass  # Skip invalid keys
+
+    # Find all multi() and multi_a() keys
+    multi_pattern = r'multi(?:_a)?\((\d+)([^)]+)\)'
+    for match in re.finditer(multi_pattern, expr):
+        keys_str = match.group(2)
+        for key_str in keys_str.split(",")[1:]:  # Skip threshold
+            key_str = key_str.strip()
+            if key_str:
+                try:
+                    key = _parse_key_expression(key_str)
+                    keys.append(key)
+                except ValueError:
+                    pass
+
+    return keys
+
+
+def _parse_tap_tree(tree_str: str) -> Tuple[Union[str, List], List["KeyExpression"]]:
+    """
+    Parse a taproot script tree expression.
+
+    Tree format:
+      - Single script: "pk(KEY)" or any miniscript
+      - Binary tree: "{left,right}" where left/right are scripts or subtrees
+
+    Returns:
+        Tuple of (parsed tree structure, list of keys found)
+    """
+    tree_str = tree_str.strip()
+    all_keys: List[KeyExpression] = []
+
+    def parse_node(s: str) -> Union[str, List]:
+        s = s.strip()
+        if s.startswith("{"):
+            # It's a branch node
+            if not s.endswith("}"):
+                raise ValueError(f"Invalid tree node: {s}")
+            inner = s[1:-1]
+            parts = _split_top_level_commas(inner)
+            if len(parts) != 2:
+                raise ValueError(f"Branch must have exactly 2 children: {s}")
+            left = parse_node(parts[0])
+            right = parse_node(parts[1])
+            return [left, right]
+        else:
+            # It's a leaf (miniscript expression)
+            # Extract keys
+            keys = _extract_keys_from_miniscript(s)
+            all_keys.extend(keys)
+            return s
+
+    tree = parse_node(tree_str)
+    return tree, all_keys
+
+
+# ---------------------------------------------------------------------------
+# getdescriptorinfo: analyze and add checksum to descriptor
+# ---------------------------------------------------------------------------
+
+
+def getdescriptorinfo(desc_str: str) -> Dict:
+    """
+    Analyze a descriptor string and return information about it.
+
+    This is equivalent to Bitcoin Core's ``getdescriptorinfo`` RPC.
+
+    Args:
+        desc_str: Descriptor string (with or without checksum)
+
+    Returns:
+        Dict containing:
+        - descriptor: The descriptor with checksum added
+        - checksum: The 8-character checksum
+        - isrange: Whether the descriptor uses wildcards
+        - issolvable: Whether we can sign for this descriptor
+        - hasprivatekeys: Whether private keys are present
+
+    Reference: Bitcoin Core rpc/misc.cpp getdescriptorinfo
+    """
+    # Strip existing checksum for parsing
+    if "#" in desc_str:
+        body = desc_str.split("#")[0]
+    else:
+        body = desc_str
+
+    # Parse to validate and extract info
+    descriptor = parse_descriptor(body)
+
+    # Compute checksum
+    checksum = descriptor_checksum(body)
+    canonical = f"{body}#{checksum}"
+
+    # Check if any keys are private
+    has_private = any(k.is_private for k in descriptor.keys)
+
+    # Check if solvable (we have key material)
+    # addr() and raw() are not solvable (no signing info)
+    is_solvable = descriptor.descriptor_type not in ("addr", "raw")
+
+    return {
+        "descriptor": canonical,
+        "checksum": checksum,
+        "isrange": descriptor.is_range,
+        "issolvable": is_solvable,
+        "hasprivatekeys": has_private,
+    }
 
 
 # ---------------------------------------------------------------------------
