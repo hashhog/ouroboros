@@ -362,9 +362,10 @@ class BlockSync:
             else:
                 logger.warning(f"✗ Invalid block: {error}")
                 peer.adjust_score(-10)  # Penalize for invalid block
-                if hasattr(self.peer_manager, 'ban_peer'):
+                # Record misbehavior - invalid block = 100 points (instant ban)
+                if hasattr(self.peer_manager, 'misbehaving'):
                     addr = f"{peer.host}:{peer.port}"
-                    self.peer_manager.ban_peer(addr, duration=3600)
+                    self.peer_manager.misbehaving(addr, 100, f"invalid block: {error}")
         
         except Exception as e:
             logger.error(f"Error handling block from {peer.host}:{peer.port}: {e}", exc_info=True)
@@ -407,6 +408,10 @@ class BlockSync:
         except Exception as e:
             logger.error(f"Error handling headers from {peer.host}:{peer.port}: {e}")
             peer.adjust_score(-2)
+            # Record misbehavior for malformed headers
+            if hasattr(self.peer_manager, 'misbehaving'):
+                addr = f"{peer.host}:{peer.port}"
+                self.peer_manager.misbehaving(addr, 20, f"invalid headers: {e}")
     
     async def _announce_block(
         self, block: Block, block_hash: bytes, exclude_peer: Peer | None = None,
