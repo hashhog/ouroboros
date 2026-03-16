@@ -163,6 +163,13 @@ class PeerState(Enum):
     READY = 4
 
 
+# Minimum protocol version for segwit support (BIP 144)
+MIN_PEER_VERSION = 70015
+
+# Handshake timeout in seconds
+HANDSHAKE_TIMEOUT = 60.0
+
+
 class RelayType(Enum):
     """Peer relay type — determines what messages we exchange."""
     FULL_RELAY = "full_relay"
@@ -233,6 +240,19 @@ class Peer:
         self._retry_count = 0
         self._max_retries = 3
         self._retry_delay = 5.0  # seconds
+
+        # Handshake state tracking (Phase 16)
+        # The handshake is complete only after both VERSION and VERACK are exchanged
+        self.handshake_complete: bool = False
+        self._version_received: bool = False
+        self._verack_received: bool = False
+        self._version_sent: bool = False
+        self._verack_sent: bool = False
+
+        # BIP 339: peer supports wtxid relay
+        self.wtxid_relay: bool = False
+        # BIP 155: peer supports addrv2
+        self.addrv2: bool = False
     
     async def connect(self, start_height: int = 0, retry: bool = True) -> bool:
         """Connect to the peer, complete the version handshake, and start background tasks."""
@@ -357,11 +377,26 @@ class Peer:
             return False
 
     async def _inbound_handshake(self, start_height: int):
-        """Perform version handshake as the responder (inbound)."""
+        """Perform version handshake as the responder (inbound).
+
+        Message sequence (matching Bitcoin Core net_processing.cpp):
+        1. Receive VERSION from peer
+        2. Validate peer version (must be >= MIN_PEER_VERSION for segwit)
+        3. Send our VERSION
+        4. Send WTXIDRELAY (BIP 339) if version >= 70016
+        5. Send SENDADDRV2 (BIP 155) if version >= 70016
+        6. Send VERACK
+        7. Receive VERACK -> handshake complete
+        """
         self.state = PeerState.HANDSHAKING
 
-        # 1. Receive version from remote peer
-        msg = await self.receive_message(timeout=30.0)
+        from ouroboros.p2p_messages import (
+            SendHeadersMessage, SendCmpctMessage,
+            FeeFilterMessage, WtxidRelayMessage, SendAddrV2Message,
+        )
+
+        # 1. Receive version from remote peer with handshake timeout
+        msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
         if msg.command != "version":
             raise Exception(f"Expected version, got {msg.command}")
 
@@ -370,6 +405,14 @@ class Peer:
         self.services = version.services
         self.user_agent = version.user_agent
         self.start_height = version.start_height
+        self._version_received = True
+
+        # Reject peers with version < MIN_PEER_VERSION (no segwit support)
+        if self.version < MIN_PEER_VERSION:
+            raise Exception(
+                f"Inbound peer {self.host}:{self.port} version {self.version} < {MIN_PEER_VERSION} "
+                "(segwit required)"
+            )
 
         # Validate peer service flags
         if not (self.services & NODE_NETWORK):
@@ -391,45 +434,68 @@ class Peer:
         if self.transport_version >= 2:
             our_services |= NODE_P2P_V2
         version_msg = VersionMessage(
-            version=70015,
+            version=70016,
             services=our_services,
             timestamp=int(time.time()),
             addr_recv=addr_recv,
             addr_from=addr_from,
             nonce=self._generate_nonce(),
-            user_agent='/bitcoin-hybrid:0.1.0/',
+            user_agent='/ouroboros:0.1.0/',
             start_height=start_height,
-            relay=True,
+            relay=self.relay_txs,
         )
         await self.send_message(version_msg.to_network_message(self.network))
+        self._version_sent = True
 
-        # 3. Send verack
+        # Calculate greatest common version for feature negotiation
+        greatest_common_version = min(70016, self.version)
+
+        # 3. BIP 339: Send WTXIDRELAY before VERACK if version >= 70016
+        if greatest_common_version >= 70016 and self.relay_txs:
+            try:
+                await self.send_message(
+                    WtxidRelayMessage().to_network_message(self.network))
+            except Exception as e:
+                logger.debug(f"Failed to send wtxidrelay: {e}")
+
+        # 4. BIP 155: Send SENDADDRV2 before VERACK if version >= 70016
+        if greatest_common_version >= 70016:
+            try:
+                await self.send_message(
+                    SendAddrV2Message().to_network_message(self.network))
+            except Exception as e:
+                logger.debug(f"Failed to send sendaddrv2: {e}")
+
+        # 5. Send verack
         verack = NetworkMessage(
             command="verack", payload=b"", magic=get_magic(self.network)
         )
         await self.send_message(verack)
+        self._verack_sent = True
 
-        # 4. Receive verack
-        msg = await self.receive_message(timeout=30.0)
+        # 6. Receive verack with handshake timeout
+        msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
         if msg.command != "verack":
             raise Exception(f"Expected verack, got {msg.command}")
+        self._verack_received = True
 
-        # Post-handshake feature negotiation
-        from ouroboros.p2p_messages import (
-            SendHeadersMessage, SendCmpctMessage,
-            FeeFilterMessage, WtxidRelayMessage, SendAddrV2Message,
-        )
+        # Handshake is now complete
+        self.handshake_complete = True
+
+        # Post-handshake feature negotiation (sent AFTER verack exchange)
         try:
             await self.send_message(
                 SendHeadersMessage().to_network_message(self.network))
-            await self.send_message(
-                SendCmpctMessage(announce=False, version=2).to_network_message(self.network))
-            await self.send_message(
-                FeeFilterMessage(feerate=1000).to_network_message(self.network))
-            await self.send_message(
-                WtxidRelayMessage().to_network_message(self.network))
-            await self.send_message(
-                SendAddrV2Message().to_network_message(self.network))
+            if self.relay_txs:
+                await self.send_message(
+                    SendCmpctMessage(announce=False, version=2).to_network_message(self.network))
+                await self.send_message(
+                    FeeFilterMessage(feerate=1000).to_network_message(self.network))
+            else:
+                logger.debug(
+                    f"Block-relay-only inbound peer {self.host}:{self.port} — "
+                    "skipping sendcmpct/feefilter"
+                )
         except Exception as feat_err:
             logger.debug(f"Feature negotiation error (non-fatal): {feat_err}")
 
@@ -456,14 +522,28 @@ class Peer:
         )
 
     async def _handshake(self, start_height: int):
-        """Perform version handshake"""
+        """Perform version handshake (outbound connection).
+
+        Message sequence (matching Bitcoin Core net_processing.cpp):
+        1. Send VERSION
+        2. Receive VERSION
+        3. Validate peer version (must be >= MIN_PEER_VERSION for segwit)
+        4. Send WTXIDRELAY (BIP 339) if version >= 70016
+        5. Send SENDADDRV2 (BIP 155) if version >= 70016
+        6. Send VERACK
+        7. Receive VERACK -> handshake complete
+        """
         self.state = PeerState.HANDSHAKING
-        
+
+        from ouroboros.p2p_messages import (
+            SendHeadersMessage, SendCmpctMessage,
+            FeeFilterMessage, WtxidRelayMessage, SendAddrV2Message,
+        )
+
         # Create network addresses
-        # For simplicity, we'll use IPv4-mapped IPv6 addresses
         addr_recv = self._create_network_address(self.host, self.port)
         addr_from = self._create_network_address("0.0.0.0", 8333)
-        
+
         # Send version message
         # Block-relay-only connections set relay=False (BIP 37) to signal
         # that we do not want transaction relay on this connection.
@@ -471,21 +551,22 @@ class Peer:
         if self.transport_version >= 2:
             our_services |= NODE_P2P_V2
         version_msg = VersionMessage(
-            version=70015,
+            version=70016,
             services=our_services,
             timestamp=int(time.time()),
             addr_recv=addr_recv,
             addr_from=addr_from,
             nonce=self._generate_nonce(),
-            user_agent="/bitcoin-hybrid:0.1.0/",
+            user_agent="/ouroboros:0.1.0/",
             start_height=start_height,
             relay=self.relay_txs,
         )
 
         await self.send_message(version_msg.to_network_message(self.network))
+        self._version_sent = True
 
-        # Receive version message
-        msg = await self.receive_message(timeout=30.0)
+        # Receive version message with handshake timeout
+        msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
         if msg.command != "version":
             raise Exception(f"Expected version, got {msg.command}")
 
@@ -494,6 +575,14 @@ class Peer:
         self.services = version.services
         self.user_agent = version.user_agent
         self.start_height = version.start_height
+        self._version_received = True
+
+        # Reject peers with version < MIN_PEER_VERSION (no segwit support)
+        if self.version < MIN_PEER_VERSION:
+            raise Exception(
+                f"Peer {self.host}:{self.port} version {self.version} < {MIN_PEER_VERSION} "
+                "(segwit required)"
+            )
 
         # Validate peer service flags
         if not (self.services & NODE_NETWORK):
@@ -507,22 +596,42 @@ class Peer:
                 "will not relay witness data"
             )
 
+        # Calculate greatest common version for feature negotiation
+        greatest_common_version = min(70016, self.version)
+
+        # BIP 339: Send WTXIDRELAY before VERACK if version >= 70016
+        # (must be sent during handshake, not after)
+        if greatest_common_version >= 70016 and self.relay_txs:
+            try:
+                await self.send_message(
+                    WtxidRelayMessage().to_network_message(self.network))
+            except Exception as e:
+                logger.debug(f"Failed to send wtxidrelay: {e}")
+
+        # BIP 155: Send SENDADDRV2 before VERACK if version >= 70016
+        if greatest_common_version >= 70016:
+            try:
+                await self.send_message(
+                    SendAddrV2Message().to_network_message(self.network))
+            except Exception as e:
+                logger.debug(f"Failed to send sendaddrv2: {e}")
+
         # Send verack
         verack = NetworkMessage(command="verack", payload=b"", magic=get_magic(self.network))
         await self.send_message(verack)
+        self._verack_sent = True
 
-        # Receive verack
-        msg = await self.receive_message(timeout=30.0)
+        # Receive verack with handshake timeout
+        msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
         if msg.command != "verack":
             raise Exception(f"Expected verack, got {msg.command}")
+        self._verack_received = True
+
+        # Handshake is now complete
+        self.handshake_complete = True
 
         # Post-handshake feature negotiation messages
-        # Block-relay-only peers: only send sendheaders.
-        # Skip sendcmpct, feefilter, wtxidrelay, and sendaddrv2.
-        from ouroboros.p2p_messages import (
-            SendHeadersMessage, SendCmpctMessage,
-            FeeFilterMessage, WtxidRelayMessage, SendAddrV2Message,
-        )
+        # These are sent AFTER verack exchange
         try:
             # sendheaders is always sent — we want header announcements
             # even on block-relay-only connections
@@ -535,14 +644,10 @@ class Peer:
                     SendCmpctMessage(announce=False, version=2).to_network_message(self.network))
                 await self.send_message(
                     FeeFilterMessage(feerate=1000).to_network_message(self.network))
-                await self.send_message(
-                    WtxidRelayMessage().to_network_message(self.network))
-                await self.send_message(
-                    SendAddrV2Message().to_network_message(self.network))
             else:
                 logger.debug(
                     f"Block-relay-only peer {self.host}:{self.port} — "
-                    "skipping sendcmpct/feefilter/wtxidrelay/sendaddrv2"
+                    "skipping sendcmpct/feefilter"
                 )
         except Exception as feat_err:
             logger.debug(f"Feature negotiation error (non-fatal): {feat_err}")
@@ -673,13 +778,63 @@ class Peer:
             # The payload is the original v1 serialised NetworkMessage
             return NetworkMessage.deserialize(payload, network=self.network)
     
+    def _is_handshake_message(self, command: str) -> bool:
+        """Check if message is allowed during handshake (before handshake_complete)."""
+        # Bitcoin Core net_processing.cpp: only version/verack/wtxidrelay/sendaddrv2
+        # are allowed before handshake completes
+        return command in ("version", "verack", "wtxidrelay", "sendaddrv2")
+
     async def listen(self):
-        """Message receive loop: dispatches to registered handlers until disconnected."""
+        """Message receive loop: dispatches to registered handlers until disconnected.
+
+        Pre-handshake filtering: If handshake_complete is False, only accept
+        VERSION, VERACK, WTXIDRELAY, and SENDADDRV2 messages. All other messages
+        are dropped/ignored per Bitcoin Core's net_processing.cpp behavior.
+        """
         try:
             while self.state == PeerState.READY:
                 try:
                     msg = await self.receive_message(timeout=60.0)
-                    
+
+                    # Pre-handshake message filtering (Phase 16)
+                    # Should not normally happen since listen() starts after
+                    # handshake, but included for safety and protocol correctness
+                    if not self.handshake_complete:
+                        if not self._is_handshake_message(msg.command):
+                            logger.warning(
+                                f"Dropping non-handshake message '{msg.command}' "
+                                f"before handshake complete from {self.host}:{self.port}"
+                            )
+                            self.adjust_score(-10)
+                            continue
+
+                    # Handle feature negotiation messages (BIP 339, BIP 155)
+                    # These can arrive after VERACK but we still track them
+                    if msg.command == "wtxidrelay":
+                        if self.handshake_complete:
+                            # Per BIP 339, wtxidrelay must be sent before VERACK
+                            # If received after, Bitcoin Core disconnects
+                            logger.warning(
+                                f"wtxidrelay received after verack from "
+                                f"{self.host}:{self.port}, ignoring"
+                            )
+                        else:
+                            self.wtxid_relay = True
+                            logger.debug(f"Peer {self.host}:{self.port} supports wtxid relay")
+                        continue
+
+                    if msg.command == "sendaddrv2":
+                        if self.handshake_complete:
+                            # Per BIP 155, sendaddrv2 must be sent before VERACK
+                            logger.warning(
+                                f"sendaddrv2 received after verack from "
+                                f"{self.host}:{self.port}, ignoring"
+                            )
+                        else:
+                            self.addrv2 = True
+                            logger.debug(f"Peer {self.host}:{self.port} supports addrv2")
+                        continue
+
                     # Handle ping/pong automatically
                     if msg.command == "ping":
                         ping = PingMessage.from_payload(msg.payload)
@@ -687,7 +842,7 @@ class Peer:
                         pong_msg = pong.to_network_message(self.network)
                         await self.send_message(pong_msg)
                         continue
-                    
+
                     if msg.command == "pong":
                         pong = PongMessage.from_payload(msg.payload)
                         if self.last_ping > 0:
@@ -697,7 +852,7 @@ class Peer:
                                 f"latency: {self.latency:.3f}s"
                             )
                         continue
-                    
+
                     # Dispatch to handler
                     if msg.command in self.message_handlers:
                         try:
@@ -711,12 +866,12 @@ class Peer:
                         logger.debug(
                             f"No handler for {msg.command} from {self.host}:{self.port}"
                         )
-                        
+
                 except asyncio.TimeoutError:
                     # Timeout is normal, just continue listening
                     logger.debug(f"Receive timeout from {self.host}:{self.port}")
                     continue
-                    
+
                 except Exception as e:
                     logger.error(
                         f"Error receiving message from {self.host}:{self.port}: {e}"
@@ -726,7 +881,7 @@ class Peer:
                     if self.score <= 0:
                         await self.disconnect()
                         break
-                        
+
         except asyncio.CancelledError:
             logger.info(f"Peer {self.host}:{self.port} listener cancelled")
         except Exception as e:
