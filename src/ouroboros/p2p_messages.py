@@ -963,52 +963,195 @@ class SendAddrV2Message:
 
 
 @dataclass
+class AddrV2Entry:
+    """
+    Single address entry in an addrv2 message (BIP155).
+
+    Attributes:
+        time: Unix timestamp when last seen
+        services: Service flags (NODE_NETWORK, NODE_WITNESS, etc.)
+        network_id: BIP155 network ID (1=IPv4, 2=IPv6, 4=TorV3, 5=I2P, 6=CJDNS)
+        addr: Raw address bytes (variable length based on network_id)
+        port: Port number
+    """
+    time: int
+    services: int
+    network_id: int
+    addr: bytes
+    port: int
+
+    def is_valid(self) -> bool:
+        """Check if this address entry is valid per BIP155 rules."""
+        # Check network ID is known
+        if self.network_id not in BIP155_ADDR_SIZES:
+            return False
+
+        # TorV2 is deprecated and should be ignored
+        if self.network_id == BIP155_NET_TORV2:
+            return False
+
+        # Check address length matches network ID
+        expected_len = BIP155_ADDR_SIZES[self.network_id]
+        if len(self.addr) != expected_len:
+            return False
+
+        # CJDNS addresses must start with 0xFC
+        if self.network_id == BIP155_NET_CJDNS:
+            if len(self.addr) < 1 or self.addr[0] != 0xFC:
+                return False
+
+        return True
+
+    def to_string(self) -> str:
+        """Convert address to human-readable string."""
+        if self.network_id == BIP155_NET_IPV4:
+            return f"{self.addr[0]}.{self.addr[1]}.{self.addr[2]}.{self.addr[3]}:{self.port}"
+        elif self.network_id == BIP155_NET_IPV6:
+            # Format as IPv6
+            groups = [f"{self.addr[i]:02x}{self.addr[i+1]:02x}" for i in range(0, 16, 2)]
+            return f"[{':'.join(groups)}]:{self.port}"
+        elif self.network_id == BIP155_NET_TORV3:
+            # TorV3: base32 encode with checksum
+            import base64
+            import hashlib
+            # Compute checksum: SHA3-256(".onion checksum" || pubkey || version)[:2]
+            checksum_prefix = b".onion checksum"
+            version = bytes([3])
+            h = hashlib.sha3_256(checksum_prefix + self.addr + version).digest()[:2]
+            onion_bytes = self.addr + h + version
+            # Base32 encode (lowercase, no padding)
+            b32 = base64.b32encode(onion_bytes).decode('ascii').lower().rstrip('=')
+            return f"{b32}.onion:{self.port}"
+        elif self.network_id == BIP155_NET_I2P:
+            # I2P: base32 encode (no padding)
+            import base64
+            b32 = base64.b32encode(self.addr).decode('ascii').lower().rstrip('=')
+            return f"{b32}.b32.i2p:{self.port}"
+        elif self.network_id == BIP155_NET_CJDNS:
+            # CJDNS: IPv6 format
+            groups = [f"{self.addr[i]:02x}{self.addr[i+1]:02x}" for i in range(0, 16, 2)]
+            return f"[{':'.join(groups)}]:{self.port}"
+        else:
+            return f"unknown({self.network_id}):{self.port}"
+
+
+@dataclass
 class AddrV2Message:
     """
     ``addrv2`` (BIP 155) — extended address message supporting IPv6,
     Tor v3, I2P, and CJDNS addresses.
+
+    Reference: Bitcoin Core protocol.h, netaddress.cpp
+
+    Message format per entry:
+    - time (4 bytes, uint32_t): last-seen timestamp
+    - services (CompactSize): service flags
+    - network_id (1 byte): BIP155 network type
+    - addr_len (CompactSize): address byte length
+    - addr (variable): raw address bytes
+    - port (2 bytes, big-endian): port number
     """
-    addresses: List[dict] = field(default_factory=list)
+    addresses: List[AddrV2Entry] = field(default_factory=list)
 
     def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
-        data = encode_varint(len(self.addresses))
-        for addr in self.addresses:
-            data += struct.pack('<I', addr.get('time', int(time.time())))
-            data += encode_varint(addr.get('services', 0))
-            net_id = addr.get('network_id', 1)  # 1=IPv4, 2=IPv6
-            data += struct.pack('B', net_id)
-            addr_bytes = addr.get('addr', b'\x00' * 4)
-            data += encode_varint(len(addr_bytes))
-            data += addr_bytes
-            data += struct.pack('>H', addr.get('port', 8333))
+        """Serialize addrv2 message."""
+        # Limit to MAX_ADDRV2_ADDRESSES
+        addrs = self.addresses[:MAX_ADDRV2_ADDRESSES]
+
+        data = encode_varint(len(addrs))
+        for entry in addrs:
+            data += struct.pack('<I', entry.time)
+            data += encode_varint(entry.services)
+            data += struct.pack('B', entry.network_id)
+            data += encode_varint(len(entry.addr))
+            data += entry.addr
+            data += struct.pack('>H', entry.port)
         return NetworkMessage(
             command="addrv2", payload=data, magic=get_magic(network))
 
     @classmethod
     def from_payload(cls, payload: bytes) -> 'AddrV2Message':
+        """Deserialize addrv2 message from payload."""
         offset = 0
         count, consumed = decode_varint(payload, offset)
         offset += consumed
+
+        # Enforce limit
+        if count > MAX_ADDRV2_ADDRESSES:
+            raise ValueError(f"addrv2 contains {count} addresses, max is {MAX_ADDRV2_ADDRESSES}")
+
         addresses = []
         for _ in range(count):
+            # Time (4 bytes)
             if offset + 4 > len(payload):
-                break
+                raise ValueError("addrv2 truncated: missing time field")
             ts = struct.unpack('<I', payload[offset:offset+4])[0]
             offset += 4
+
+            # Services (CompactSize)
             services, consumed = decode_varint(payload, offset)
             offset += consumed
-            net_id = payload[offset]; offset += 1
+
+            # Network ID (1 byte)
+            if offset >= len(payload):
+                raise ValueError("addrv2 truncated: missing network_id")
+            net_id = payload[offset]
+            offset += 1
+
+            # Address length (CompactSize)
             addr_len, consumed = decode_varint(payload, offset)
             offset += consumed
+
+            # Validate address length
+            if addr_len > MAX_ADDRV2_ADDR_SIZE:
+                raise ValueError(f"addrv2 address too long: {addr_len} > {MAX_ADDRV2_ADDR_SIZE}")
+
+            # Address bytes
+            if offset + addr_len > len(payload):
+                raise ValueError("addrv2 truncated: missing address bytes")
             addr_bytes = payload[offset:offset + addr_len]
             offset += addr_len
+
+            # Port (2 bytes, big-endian)
+            if offset + 2 > len(payload):
+                raise ValueError("addrv2 truncated: missing port")
             port = struct.unpack('>H', payload[offset:offset+2])[0]
             offset += 2
-            addresses.append({
-                'time': ts, 'services': services,
-                'network_id': net_id, 'addr': addr_bytes, 'port': port,
-            })
+
+            entry = AddrV2Entry(
+                time=ts,
+                services=services,
+                network_id=net_id,
+                addr=addr_bytes,
+                port=port,
+            )
+
+            # Validate entry per BIP155 rules
+            # Skip invalid entries (unknown network, wrong length, deprecated TorV2)
+            if entry.is_valid():
+                addresses.append(entry)
+            # else: silently drop invalid entries (Bitcoin Core behavior)
+
         return cls(addresses=addresses)
+
+    @classmethod
+    def from_dict_list(cls, addr_list: List[dict]) -> 'AddrV2Message':
+        """Create AddrV2Message from a list of address dictionaries.
+
+        For backwards compatibility with existing code that uses dict format.
+        """
+        entries = []
+        for d in addr_list:
+            entry = AddrV2Entry(
+                time=d.get('time', int(time.time())),
+                services=d.get('services', 0),
+                network_id=d.get('network_id', BIP155_NET_IPV4),
+                addr=d.get('addr', b'\x00' * 4),
+                port=d.get('port', 8333),
+            )
+            if entry.is_valid():
+                entries.append(entry)
+        return cls(addresses=entries)
 
 
 @dataclass
@@ -1114,6 +1257,32 @@ class GetBlocksMessage:
             hashes.append(payload[offset:offset+32]); offset += 32
         hash_stop = payload[offset:offset+32]
         return cls(version=version, locator_hashes=hashes, hash_stop=hash_stop)
+
+
+# BIP155 Network IDs (for addrv2 message)
+# Reference: Bitcoin Core netaddress.h BIP155Network enum
+BIP155_NET_IPV4 = 1     # IPv4 (4 bytes)
+BIP155_NET_IPV6 = 2     # IPv6 (16 bytes)
+BIP155_NET_TORV2 = 3    # TorV2 - DEPRECATED (10 bytes)
+BIP155_NET_TORV3 = 4    # TorV3 (32 bytes, ed25519 pubkey)
+BIP155_NET_I2P = 5      # I2P (32 bytes, destination hash)
+BIP155_NET_CJDNS = 6    # CJDNS (16 bytes, starts with 0xFC)
+
+# BIP155 address sizes per network ID
+BIP155_ADDR_SIZES = {
+    BIP155_NET_IPV4: 4,
+    BIP155_NET_IPV6: 16,
+    BIP155_NET_TORV2: 10,  # deprecated but still need to parse
+    BIP155_NET_TORV3: 32,
+    BIP155_NET_I2P: 32,
+    BIP155_NET_CJDNS: 16,
+}
+
+# Maximum addresses per addrv2 message
+MAX_ADDRV2_ADDRESSES = 1000
+
+# Maximum address size per BIP155
+MAX_ADDRV2_ADDR_SIZE = 512
 
 
 # BIP 330 Erlay Transaction Reconciliation messages
