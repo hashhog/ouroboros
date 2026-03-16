@@ -29,8 +29,8 @@ the node logic, RPC server, and mempool.
 - [x] BIP125 Replace-By-Fee (RBF)
 - [x] Pre-handshake peer filtering (reject old protocol versions, timeout)
 - [x] BIP339 WTXIDRELAY and BIP155 SENDADDRV2 negotiation
+- [x] Transaction trickling (privacy-preserving relay with Poisson delays)
 - [ ] Full signature verification (secp256k1)
-- [ ] Mempool transaction relay
 - [ ] Wallet functionality
 
 ## Quick start
