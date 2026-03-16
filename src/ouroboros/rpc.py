@@ -230,7 +230,8 @@ class RPCServer:
         port: int = 8332,
         username: Optional[str] = None,
         password: Optional[str] = None,
-        rate_limit: bool = True
+        rate_limit: bool = True,
+        max_batch_size: int = 1000
     ):
         """Initialize RPC server."""
         self.node = node
@@ -238,6 +239,7 @@ class RPCServer:
         self.username = username
         self.password = password
         self.rate_limit_enabled = rate_limit
+        self.max_batch_size = max_batch_size
         
         self.app = FastAPI(title="Bitcoin Hybrid Node RPC")
         
@@ -258,81 +260,165 @@ class RPCServer:
         # Register RPC methods
         self._register_methods()
     
+    async def _execute_single_rpc(self, req_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a single RPC call and return the response as a dict.
+
+        This is used by both single request and batch request handlers.
+        Errors are caught and returned as JSON-RPC error responses.
+        """
+        req_id = req_data.get("id")
+        method = req_data.get("method")
+        params = req_data.get("params", [])
+
+        t0 = time.monotonic()
+        try:
+            # Validate request structure
+            if not method or not isinstance(method, str):
+                return {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Invalid Request: missing method"},
+                    "id": req_id
+                }
+
+            # Get method handler
+            method_name = f"rpc_{method}"
+            handler = getattr(self, method_name, None)
+
+            if not handler:
+                return {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32601, "message": f"Method not found: {method}"},
+                    "id": req_id
+                }
+
+            # Call method with params
+            if isinstance(params, list):
+                result = await handler(*params)
+            elif isinstance(params, dict):
+                result = await handler(**params)
+            else:
+                result = await handler()
+
+            return {"jsonrpc": "2.0", "result": result, "id": req_id}
+
+        except HTTPException as e:
+            return {
+                "jsonrpc": "2.0",
+                "error": {"code": -32603, "message": e.detail},
+                "id": req_id
+            }
+        except Exception as e:
+            logger.error(f"RPC error in {method}: {e}", exc_info=True)
+            return {
+                "jsonrpc": "2.0",
+                "error": {"code": -32603, "message": str(e)},
+                "id": req_id
+            }
+        finally:
+            if method:
+                record_rpc_request(method, time.monotonic() - t0)
+
     def _register_methods(self):
         """Register all RPC methods"""
         @self.app.post("/")
-        async def handle_rpc(
-            request: JSONRPCRequest,
-            http_request: Request
-        ) -> JSONRPCResponse:
-            """Handle JSON-RPC requests"""
+        async def handle_rpc(http_request: Request):
+            """Handle JSON-RPC requests (single or batch)"""
             # Authentication
             if self.security:
                 try:
                     credentials = await self._get_credentials(http_request)
                 except HTTPException:
-                    return JSONRPCResponse(
-                        error={
-                            "code": -32000,
-                            "message": "Authentication required"
-                        },
-                        id=request.id
+                    return JSONResponse(
+                        content={
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32000, "message": "Authentication required"},
+                            "id": None
+                        }
                     )
-            
+
             # Rate limiting
             if self.rate_limit_enabled:
                 client_ip = self._get_client_ip_from_request(http_request)
                 if not self._check_rate_limit(client_ip):
-                    return JSONRPCResponse(
-                        error={
-                            "code": -32000,
-                            "message": "Rate limit exceeded"
-                        },
-                        id=request.id
+                    return JSONResponse(
+                        content={
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32000, "message": "Rate limit exceeded"},
+                            "id": None
+                        }
                     )
-            
-            t0 = time.monotonic()
+
+            # Parse raw body to detect batch vs single request
             try:
-                # Get method handler
-                method_name = f"rpc_{request.method}"
-                method = getattr(self, method_name, None)
-                
-                if not method:
-                    return JSONRPCResponse(
-                        error={
-                            "code": -32601,
-                            "message": f"Method not found: {request.method}"
-                        },
-                        id=request.id
+                body = await http_request.body()
+                request_data = json.loads(body)
+            except json.JSONDecodeError as e:
+                return JSONResponse(
+                    content={
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32700, "message": f"Parse error: {e}"},
+                        "id": None
+                    }
+                )
+
+            # Handle batch request (array)
+            if isinstance(request_data, list):
+                # Empty batch is an error (JSON-RPC 2.0 spec)
+                if len(request_data) == 0:
+                    return JSONResponse(
+                        content={
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32600, "message": "Invalid Request: empty batch"},
+                            "id": None
+                        }
                     )
-                
-                # Call method with params
-                if isinstance(request.params, list):
-                    result = await method(*request.params)
-                else:
-                    result = await method(**request.params)
-                
-                return JSONRPCResponse(result=result, id=request.id)
-                
-            except HTTPException as e:
-                return JSONRPCResponse(
-                    error={
-                        "code": -32603,
-                        "message": e.detail
-                    },
-                    id=request.id
+
+                # Check batch size limit
+                if len(request_data) > self.max_batch_size:
+                    return JSONResponse(
+                        content={
+                            "jsonrpc": "2.0",
+                            "error": {
+                                "code": -32600,
+                                "message": f"Invalid Request: batch size {len(request_data)} exceeds maximum {self.max_batch_size}"
+                            },
+                            "id": None
+                        }
+                    )
+
+                # Execute each request, collecting responses
+                responses = []
+                for req in request_data:
+                    if not isinstance(req, dict):
+                        responses.append({
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32600, "message": "Invalid Request: not an object"},
+                            "id": None
+                        })
+                    else:
+                        response = await self._execute_single_rpc(req)
+                        # Only include response if not a notification (id is present)
+                        # JSON-RPC 2.0: notifications have id=null or missing id
+                        if "id" in req:
+                            responses.append(response)
+
+                # Return array of responses
+                return JSONResponse(content=responses)
+
+            # Handle single request (object)
+            elif isinstance(request_data, dict):
+                response = await self._execute_single_rpc(request_data)
+                return JSONResponse(content=response)
+
+            # Invalid request type
+            else:
+                return JSONResponse(
+                    content={
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32600, "message": "Invalid Request: expected object or array"},
+                        "id": None
+                    }
                 )
-            except Exception as e:
-                logger.error(f"RPC error in {request.method}: {e}", exc_info=True)
-                return JSONRPCResponse(
-                    error={
-                        "code": -32603,
-                        "message": str(e)
-                    },
-                    id=request.id
-                )
-            finally:
-                record_rpc_request(request.method, time.monotonic() - t0)
         
         @self.app.get("/health")
         async def health():
