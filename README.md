@@ -40,6 +40,8 @@ the node logic, RPC server, and mempool.
 - [x] Package relay and CPFP (child-pays-for-parent) package acceptance
 - [x] submitpackage RPC for package submission (child-with-parents topology)
 - [x] BIP331 P2P messages (sendpackages, getpkgtxns, pkgtxns, ancpkginfo)
+- [x] PSBT (BIP174/BIP370) creation, signing, combining, and finalization
+- [x] Taproot PSBT fields (key path sigs, script path, internal key)
 - [ ] Full signature verification (secp256k1)
 - [ ] Wallet functionality
 
@@ -66,6 +68,7 @@ ouroboros/
 │   ├── rpc.py              # JSON-RPC server (FastAPI)
 │   ├── mempool.py          # Transaction mempool
 │   ├── node.py             # Node orchestration
+│   ├── psbt.py             # PSBT (BIP174/BIP370) support
 │   └── validation.py       # Transaction/block validation
 └── pyproject.toml
 ```
