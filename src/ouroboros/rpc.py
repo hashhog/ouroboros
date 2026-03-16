@@ -563,72 +563,177 @@ class RPCServer:
     async def rpc_getrawtransaction(
         self,
         txid: str,
-        verbose: bool = False,
+        verbose: Union[bool, int] = 0,
         blockhash: Optional[str] = None
     ) -> Union[str, Dict[str, Any]]:
         """Return raw transaction data.
 
-        Searches the mempool first, then falls back to the on-disk
-        transaction index.  If *blockhash* is provided the transaction
-        is looked up directly inside that block.
+        By default, this call only returns a transaction if it is in the
+        mempool. If -txindex is enabled and no blockhash argument is passed,
+        it will return the transaction if it is in the mempool or any block.
+        If a blockhash argument is passed, it will return the transaction if
+        the specified block is available and the transaction is in that block.
+
+        Args:
+            txid: The transaction id (hex string)
+            verbose: 0 for hex-encoded data, 1 for JSON object, 2 for JSON
+                     object with fee and prevout (bool True = 1, False = 0)
+            blockhash: The block in which to look for the transaction
+
+        Returns:
+            If verbose is 0: hex-encoded raw transaction string
+            If verbose is 1 or 2: JSON object with transaction details
+
+        Reference: Bitcoin Core rpc/rawtransaction.cpp getrawtransaction
         """
+        # Parse txid
         try:
             tx_hash = bytes.fromhex(txid)
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid transaction ID")
+            raise HTTPException(status_code=400, detail="Invalid transaction id")
 
-        # 1. Mempool lookup (fast)
-        if hasattr(self.node, 'mempool') and self.node.mempool:
-            tx = self.node.mempool.get_transaction(tx_hash)
-            if tx:
-                if verbose:
-                    return self._tx_to_dict(tx)
-                return tx.serialize().hex()
+        if len(tx_hash) != 32:
+            raise HTTPException(status_code=400, detail="Invalid transaction id")
 
-        # 2. Blockchain lookup
-        block = None
+        # Parse verbosity - support both bool and int
+        if isinstance(verbose, bool):
+            verbosity = 1 if verbose else 0
+        else:
+            verbosity = int(verbose)
+
+        # Parse blockhash if provided
         block_hash_bytes = None
-        block_height = None
+        explicit_blockhash = blockhash is not None
 
-        if blockhash is not None:
-            # Caller supplied the containing block hash
+        if explicit_blockhash:
             try:
                 block_hash_bytes = bytes.fromhex(blockhash)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid block hash")
-            block = self.node.db.get_block(block_hash_bytes)
-            if block is None:
-                raise HTTPException(status_code=404, detail="Block not found")
-        else:
-            # Use the transaction index for O(1) lookup
-            try:
-                loc = self.node.db.get_tx_index(tx_hash)
-            except Exception:
-                loc = None
-            if loc is not None:
-                block_hash_bytes, block_height, _tx_pos = loc
+            if len(block_hash_bytes) != 32:
+                raise HTTPException(status_code=400, detail="Invalid block hash")
+
+        # Check database availability
+        if not hasattr(self.node, 'db') or not self.node.db:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        # Check if txindex is enabled (we assume it is if get_tx_index exists)
+        has_txindex = hasattr(self.node.db, 'get_tx_index')
+
+        # 1. Check mempool first (unless explicit blockhash provided)
+        tx = None
+        in_mempool = False
+
+        if not explicit_blockhash and hasattr(self.node, 'mempool') and self.node.mempool:
+            tx = self.node.mempool.get_transaction(tx_hash)
+            if tx:
+                in_mempool = True
+
+        # 2. Blockchain lookup if not in mempool
+        block = None
+        block_height = None
+        in_active_chain = None
+
+        if not in_mempool:
+            if explicit_blockhash:
+                # Caller supplied the containing block hash
                 block = self.node.db.get_block(block_hash_bytes)
+                if block is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Block hash not found"
+                    )
+                # Check if block has data
+                block_height = block.height if hasattr(block, 'height') else None
+                # Check if block is in active chain
+                if block_height is not None:
+                    try:
+                        active_hash = self.node.db.get_block_hash_by_height(block_height)
+                        if active_hash is not None:
+                            in_active_chain = (active_hash == block_hash_bytes)
+                        else:
+                            in_active_chain = False
+                    except Exception:
+                        in_active_chain = None
+            else:
+                # Use the transaction index for O(1) lookup
+                if has_txindex:
+                    try:
+                        loc = self.node.db.get_tx_index(tx_hash)
+                    except Exception:
+                        loc = None
+                    if loc is not None:
+                        block_hash_bytes, block_height, _tx_pos = loc
+                        block = self.node.db.get_block(block_hash_bytes)
 
-        if block is not None:
-            for tx in block.transactions:
-                found_txid = tx.get_txid() if hasattr(tx, 'get_txid') else tx.txid
-                if found_txid == tx_hash:
-                    if verbose:
-                        result = self._tx_to_dict(tx)
-                        # Add block context fields for confirmed txs
-                        if block_hash_bytes:
-                            result["blockhash"] = block_hash_bytes.hex()
-                        if block_height is not None:
-                            result["confirmations"] = self._get_confirmations(block_height)
-                            result["blocktime"] = block.timestamp
-                            result["time"] = block.timestamp
-                        elif block is not None:
-                            result["blocktime"] = block.timestamp
-                            result["time"] = block.timestamp
-                        return result
-                    return tx.serialize().hex()
+            # Search for the transaction in the block
+            if block is not None:
+                for block_tx in block.transactions:
+                    found_txid = block_tx.get_txid() if hasattr(block_tx, 'get_txid') else block_tx.txid
+                    if found_txid == tx_hash:
+                        tx = block_tx
+                        break
 
-        raise HTTPException(status_code=404, detail="Transaction not found")
+        # 3. Handle not found
+        if tx is None:
+            if explicit_blockhash:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No such transaction found in the provided block. "
+                           "Use gettransaction for wallet transactions."
+                )
+            elif not has_txindex:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No such mempool transaction. Use -txindex or provide "
+                           "a block hash to enable blockchain transaction queries. "
+                           "Use gettransaction for wallet transactions."
+                )
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No such mempool or blockchain transaction. "
+                           "Use gettransaction for wallet transactions."
+                )
+
+        # 4. Return result based on verbosity
+        if verbosity == 0:
+            return tx.serialize().hex()
+
+        # Verbose output (verbosity >= 1)
+        result = self._tx_to_dict(tx)
+
+        # Add hex-encoded raw transaction
+        result["hex"] = tx.serialize().hex()
+
+        # Add in_active_chain if explicit blockhash was provided
+        if explicit_blockhash and in_active_chain is not None:
+            result["in_active_chain"] = in_active_chain
+
+        # Add block context fields for confirmed transactions
+        if not in_mempool and block is not None:
+            if block_hash_bytes:
+                result["blockhash"] = block_hash_bytes.hex()
+            if block_height is not None:
+                result["confirmations"] = self._get_confirmations(block_height)
+            else:
+                # Try to get height from block
+                bh = block.height if hasattr(block, 'height') else None
+                if bh is not None:
+                    result["confirmations"] = self._get_confirmations(bh)
+                else:
+                    result["confirmations"] = 0
+            result["blocktime"] = block.timestamp
+            result["time"] = block.timestamp
+        else:
+            # Mempool transaction - no confirmations
+            pass
+
+        # TODO: verbosity == 2 would include fee and prevout information
+        # This requires looking up the spent outputs for each input
+        # which needs undo data or UTXO lookups
+
+        return result
     
     async def rpc_getmempoolinfo(self) -> Dict[str, Any]:
         """Return mempool information"""
