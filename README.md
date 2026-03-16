@@ -26,7 +26,7 @@ the node logic, RPC server, and mempool.
 - [x] Script interpreter with stack operations and control flow (IF/ELSE/ENDIF)
 - [x] Mempool with ancestor/descendant limits (25 txs, 101KB)
 - [x] TRUC (v3 transaction) policy and ephemeral dust
-- [x] BIP125 Replace-By-Fee (RBF)
+- [x] BIP125 Replace-By-Fee (RBF) with full RBF support (mempoolfullrbf)
 - [x] Pre-handshake peer filtering (reject old protocol versions, timeout)
 - [x] BIP339 WTXIDRELAY and BIP155 SENDADDRV2 negotiation
 - [x] BIP155 addrv2 message format (Tor v3, I2P, CJDNS addresses)
