@@ -434,41 +434,133 @@ class RPCServer:
     # RPC Methods
     
     async def rpc_getblockchaininfo(self) -> Dict[str, Any]:
-        """Return blockchain information"""
+        """Return blockchain information.
+
+        Reference: Bitcoin Core rpc/blockchain.cpp getblockchaininfo
+
+        Returns an object containing various state info regarding blockchain processing:
+        - chain: current network name
+        - blocks: height of the most-work fully-validated chain
+        - headers: current number of headers we have validated
+        - bestblockhash: hash of the currently best block
+        - bits: compact representation of the block difficulty target
+        - target: the difficulty target
+        - difficulty: the current difficulty
+        - time: block time of the tip
+        - mediantime: median block time
+        - verificationprogress: estimate of verification progress [0..1]
+        - initialblockdownload: whether node is in IBD mode
+        - chainwork: total amount of work in active chain (hex)
+        - size_on_disk: estimated size of block and undo files on disk
+        - pruned: if blocks are subject to pruning
+        - softforks: status of softfork deployments
+        """
         if not hasattr(self.node, 'db'):
             raise HTTPException(status_code=500, detail="Database not available")
-        
+
         db = self.node.db if hasattr(self.node, 'db') else None
         if not db:
             raise HTTPException(status_code=500, detail="Database not initialized")
-        
+
         best_hash, best_height = db.get_best_block()
-        
+
         network = getattr(self.node, 'network', 'mainnet')
         if hasattr(self.node, 'config'):
             network = self.node.config.get('network', network)
-        
+
         pruner = getattr(self.node, "pruner", None)
         pruned = pruner is not None and pruner.prune_height > 0
 
         # Get softfork info from BIP9 versionbits
         softforks = self._get_softforks_info(best_height, network)
 
+        # Get tip block for bits, target, and time
+        tip_block = db.get_block(best_hash) if isinstance(best_hash, bytes) else None
+        bits = tip_block.bits if tip_block else 0x1d00ffff
+        block_time = tip_block.timestamp if tip_block else 0
+
+        # Calculate target from bits (compact format)
+        mantissa = bits & 0x007FFFFF
+        exponent = (bits >> 24) & 0xFF
+        if exponent <= 3:
+            target_int = mantissa >> (8 * (3 - exponent))
+        else:
+            target_int = mantissa << (8 * (exponent - 3))
+        target_hex = f"{target_int:064x}"
+
+        # Get header count (may differ from blocks during sync)
+        headers_count = best_height
+        if hasattr(self.node, 'sync_manager') and self.node.sync_manager:
+            sm = self.node.sync_manager
+            if hasattr(sm, 'header_height'):
+                headers_count = max(sm.header_height, best_height)
+
+        # Estimate size on disk (block files + undo files)
+        size_on_disk = 0
+        if hasattr(db, 'get_disk_usage'):
+            size_on_disk = db.get_disk_usage()
+        elif hasattr(db, 'data_dir'):
+            import os
+            data_dir = db.data_dir
+            if data_dir and os.path.isdir(data_dir):
+                for dirpath, _, filenames in os.walk(data_dir):
+                    for f in filenames:
+                        if f.endswith('.dat') or f.endswith('.ldb') or f.endswith('.log'):
+                            try:
+                                size_on_disk += os.path.getsize(os.path.join(dirpath, f))
+                            except OSError:
+                                pass
+
+        # Initial block download detection
+        # IBD if: sync progress < 99.9% OR last block time > 24 hours ago
+        is_ibd = not self._is_synced()
+        if not is_ibd and block_time > 0:
+            import time as _time
+            # If tip block is older than 24 hours, we're likely still syncing
+            if (_time.time() - block_time) > 24 * 60 * 60:
+                is_ibd = True
+
+        # Verification progress estimate
+        # Use actual sync progress if available, otherwise estimate from time
+        verification_progress = 1.0
+        if is_ibd:
+            # Estimate based on block times (rough approximation)
+            if block_time > 0:
+                import time as _time
+                # Genesis time for mainnet: 2009-01-03 18:15:05 UTC
+                genesis_time = 1231006505
+                current_time = int(_time.time())
+                if current_time > genesis_time:
+                    verification_progress = min(1.0, max(0.0,
+                        (block_time - genesis_time) / (current_time - genesis_time)
+                    ))
+
         info: Dict[str, Any] = {
             "chain": network,
             "blocks": best_height,
-            "headers": best_height,
+            "headers": headers_count,
             "bestblockhash": best_hash.hex() if isinstance(best_hash, bytes) else best_hash,
+            "bits": f"{bits:08x}",
+            "target": target_hex,
             "difficulty": self.node.get_current_difficulty(),
+            "time": block_time,
             "mediantime": self.node.get_median_time(),
-            "verificationprogress": 1.0 if self._is_synced() else 0.0,
+            "verificationprogress": verification_progress,
+            "initialblockdownload": is_ibd,
             "chainwork": self.node.get_chainwork(),
+            "size_on_disk": size_on_disk,
             "pruned": pruned,
             "softforks": softforks,
         }
 
         if pruner is not None:
             info.update(pruner.get_prune_info())
+
+        # Add warnings if available
+        warnings = []
+        if hasattr(self.node, 'get_warnings'):
+            warnings = self.node.get_warnings()
+        info["warnings"] = warnings
 
         return info
     
@@ -509,56 +601,188 @@ class RPCServer:
         blockhash: str,
         verbosity: int = 1
     ) -> Union[str, Dict[str, Any]]:
-        """Return block information"""
+        """Return block information.
+
+        Reference: Bitcoin Core rpc/blockchain.cpp getblock
+
+        Args:
+            blockhash: The block hash (hex string)
+            verbosity: 0 for hex-encoded data, 1 for JSON object, 2 for JSON
+                       object with transaction data, 3 for JSON object with
+                       transaction data including prevout information
+
+        Returns:
+            If verbosity = 0: hex-encoded serialized block data
+            If verbosity = 1: JSON object with block info and transaction IDs
+            If verbosity = 2: JSON object with full transaction details
+            If verbosity = 3: JSON object with transaction details and prevout info
+        """
         try:
             block_hash = bytes.fromhex(blockhash)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid block hash")
-        
+
         if not hasattr(self.node, 'db'):
             raise HTTPException(status_code=500, detail="Database not available")
-        
+
         block = self.node.db.get_block(block_hash)
         if not block:
             raise HTTPException(status_code=404, detail="Block not found")
-        
+
         if verbosity == 0:
             # Return serialized block (hex)
             try:
                 return block.serialize().hex()
             except:
                 raise HTTPException(status_code=500, detail="Block serialization not implemented")
-        
-        elif verbosity == 1:
-            block_height = getattr(block, 'height', None)
-            return {
-                "hash": blockhash,
-                "confirmations": self._get_confirmations(block_height) if block_height else 0,
-                "height": block_height if block_height else 0,
-                "version": block.version,
-                "merkleroot": block.merkle_root.hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
-                "time": block.timestamp,
-                "mediantime": self.node.get_median_time(block_height) if block_height is not None else block.timestamp,
-                "nonce": block.nonce,
-                "bits": hex(block.bits),
-                "difficulty": self.node.get_difficulty(block.bits),
-                "chainwork": self.node.get_chainwork_at_height(block_height) if block_height is not None else "0x0",
-                "nTx": len(block.transactions) if hasattr(block, 'transactions') else 0,
-                "previousblockhash": block.prev_blockhash.hex() if isinstance(block.prev_blockhash, bytes) else str(block.prev_blockhash),
-                "nextblockhash": self._get_next_block_hash(block_height) if block_height is not None else None,
-                "tx": [
-                    tx.get_txid().hex() if hasattr(tx, 'get_txid') else str(tx.txid)
-                    for tx in block.transactions
-                ] if hasattr(block, 'transactions') else [],
-            }
-        else:  # verbosity == 2
-            # Include full transaction data
-            block_data = await self.rpc_getblock(blockhash, 1)
-            if hasattr(block, 'transactions'):
-                block_data["tx"] = [
-                    self._tx_to_dict(tx) for tx in block.transactions
-                ]
-            return block_data
+
+        # Common fields for verbosity >= 1
+        block_height = getattr(block, 'height', None)
+
+        # Get confirmations (-1 if not on main chain)
+        confirmations = -1
+        best_hash, best_height = self.node.db.get_best_block()
+        if block_height is not None:
+            active_hash = self.node.db.get_block_hash_by_height(block_height)
+            if active_hash == block_hash:
+                confirmations = max(0, best_height - block_height + 1)
+
+        # Calculate block sizes and weight
+        block_data_bytes = block.serialize()
+        size = len(block_data_bytes)
+
+        # Stripped size: size without witness data
+        # For non-SegWit blocks, strippedsize == size
+        strippedsize = size
+        weight = size * 4  # Default: no witness discount
+
+        if hasattr(block, 'transactions') and block.transactions:
+            # Calculate stripped size and weight accurately
+            total_base_size = 0
+            total_witness_size = 0
+
+            for tx in block.transactions:
+                if hasattr(tx, 'get_base_size') and hasattr(tx, 'get_witness_size'):
+                    total_base_size += tx.get_base_size()
+                    total_witness_size += tx.get_witness_size()
+                elif hasattr(tx, 'has_witness') and tx.has_witness:
+                    # Estimate: serialize with and without witness
+                    full_size = len(tx.serialize())
+                    # Witness flag is 2 bytes, then witness data
+                    # Rough estimate: assume witness is 50% of SegWit tx
+                    total_base_size += full_size // 2
+                    total_witness_size += full_size - (full_size // 2)
+                else:
+                    tx_size = len(tx.serialize())
+                    total_base_size += tx_size
+
+            # Block header is 80 bytes (no witness)
+            strippedsize = 80 + total_base_size + 1  # +1 for tx count varint (approx)
+
+            # Weight = base_size * 4 + witness_size
+            # For block: (header + tx_base) * 4 + witness
+            weight = strippedsize * 4 + total_witness_size
+
+        # Calculate target from bits
+        bits = block.bits
+        mantissa = bits & 0x007FFFFF
+        exponent = (bits >> 24) & 0xFF
+        if exponent <= 3:
+            target_int = mantissa >> (8 * (3 - exponent))
+        else:
+            target_int = mantissa << (8 * (exponent - 3))
+        target_hex = f"{target_int:064x}"
+
+        # Number of transactions
+        n_tx = len(block.transactions) if hasattr(block, 'transactions') and block.transactions else 0
+
+        # Build result
+        result: Dict[str, Any] = {
+            "hash": blockhash,
+            "confirmations": confirmations,
+            "size": size,
+            "strippedsize": strippedsize,
+            "weight": weight,
+            "height": block_height if block_height else 0,
+            "version": block.version,
+            "versionHex": f"{block.version:08x}",
+            "merkleroot": block.merkle_root.hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
+            "time": block.timestamp,
+            "mediantime": self.node.get_median_time(block_height) if block_height is not None else block.timestamp,
+            "nonce": block.nonce,
+            "bits": f"{block.bits:08x}",
+            "target": target_hex,
+            "difficulty": self.node.get_difficulty(block.bits),
+            "chainwork": self.node.get_chainwork_at_height(block_height) if block_height is not None else "0" * 64,
+            "nTx": n_tx,
+        }
+
+        # Previous block hash (not present for genesis)
+        if block.prev_blockhash and block.prev_blockhash != bytes(32):
+            result["previousblockhash"] = block.prev_blockhash.hex()
+
+        # Next block hash (not present for tip)
+        if block_height is not None:
+            next_hash = self._get_next_block_hash(block_height)
+            if next_hash:
+                result["nextblockhash"] = next_hash
+
+        if verbosity == 1:
+            # Transaction IDs only
+            result["tx"] = [
+                tx.get_txid().hex() if hasattr(tx, 'get_txid') else str(tx.txid)
+                for tx in block.transactions
+            ] if hasattr(block, 'transactions') and block.transactions else []
+        elif verbosity >= 2:
+            # Full transaction details
+            if hasattr(block, 'transactions') and block.transactions:
+                tx_list = []
+                for tx in block.transactions:
+                    tx_dict = self._tx_to_dict(tx)
+
+                    # Calculate fee for non-coinbase transactions
+                    if not tx.is_coinbase:
+                        fee = 0
+                        input_total = 0
+                        for tx_in in tx.inputs:
+                            utxo = self.node.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                            if utxo:
+                                input_total += utxo['value']
+                        output_total = sum(o.value for o in tx.outputs)
+                        fee = max(0, input_total - output_total)
+                        tx_dict["fee"] = fee / 1e8  # BTC
+
+                    if verbosity >= 3:
+                        # Include prevout information for each input
+                        vin_with_prevout = []
+                        for i, tx_in in enumerate(tx.inputs):
+                            vin_dict = self._vin_to_dict(tx_in, i, tx)
+
+                            if not tx.is_coinbase:
+                                # Add prevout info
+                                utxo = self.node.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                                if utxo:
+                                    vin_dict["prevout"] = {
+                                        "generated": False,  # TODO: check if coinbase output
+                                        "height": utxo.get('height', 0),
+                                        "value": utxo['value'] / 1e8,
+                                        "scriptPubKey": {
+                                            "asm": disassemble_script(utxo['script_pubkey']),
+                                            "hex": utxo['script_pubkey'].hex() if isinstance(utxo['script_pubkey'], bytes) else str(utxo['script_pubkey']),
+                                            "type": self._get_script_type(utxo['script_pubkey']),
+                                        }
+                                    }
+                            vin_with_prevout.append(vin_dict)
+
+                        tx_dict["vin"] = vin_with_prevout
+
+                    tx_list.append(tx_dict)
+
+                result["tx"] = tx_list
+            else:
+                result["tx"] = []
+
+        return result
     
     async def rpc_getrawtransaction(
         self,
@@ -736,25 +960,98 @@ class RPCServer:
         return result
     
     async def rpc_getmempoolinfo(self) -> Dict[str, Any]:
-        """Return mempool information"""
+        """Return mempool information.
+
+        Reference: Bitcoin Core rpc/mempool.cpp getmempoolinfo
+
+        Returns an object containing details on the active state of the TX memory pool:
+        - loaded: True if the initial load attempt of the persisted mempool finished
+        - size: Current tx count
+        - bytes: Sum of all virtual transaction sizes (BIP 141)
+        - usage: Total memory usage for the mempool
+        - total_fee: Total fees for the mempool in BTC
+        - maxmempool: Maximum memory usage for the mempool
+        - mempoolminfee: Minimum fee rate in BTC/kvB for tx to be accepted
+        - minrelaytxfee: Current minimum relay fee for transactions
+        - incrementalrelayfee: Minimum fee rate increment for mempool limiting/RBF
+        - unbroadcastcount: Number of transactions that haven't passed initial broadcast
+        - fullrbf: True if mempool accepts RBF without signaling
+        """
         if not hasattr(self.node, 'mempool') or not self.node.mempool:
             return {
+                "loaded": True,
                 "size": 0,
                 "bytes": 0,
                 "usage": 0,
+                "total_fee": 0.0,
                 "maxmempool": 300_000_000,
-                "mempoolminfee": 0.0,
+                "mempoolminfee": 0.00001,
                 "minrelaytxfee": 0.00001,
+                "incrementalrelayfee": 0.00001,
+                "unbroadcastcount": 0,
+                "fullrbf": True,
             }
-        
-        info = self.node.mempool.get_mempool_info()
+
+        mempool = self.node.mempool
+        info = mempool.get_mempool_info()
+
+        # Calculate total fees from all mempool entries
+        total_fee_sat = 0
+        for txid, entry in mempool.transactions.items():
+            total_fee_sat += entry.fee
+
+        # Get unbroadcast count if tracked
+        unbroadcast_count = 0
+        if hasattr(mempool, 'unbroadcast_txids'):
+            unbroadcast_count = len(mempool.unbroadcast_txids)
+        elif hasattr(mempool, 'get_unbroadcast_count'):
+            unbroadcast_count = mempool.get_unbroadcast_count()
+
+        # Memory usage estimate (more accurate than just bytes)
+        # Each entry has overhead for hash tables, ancestor/descendant tracking, etc.
+        usage = info['bytes']
+        if hasattr(mempool, 'get_memory_usage'):
+            usage = mempool.get_memory_usage()
+        else:
+            # Estimate: tx bytes + ~200 bytes overhead per tx for indexing
+            usage = info['bytes'] + (info['size'] * 200)
+
+        # Check if mempool is loaded (finished initial load from disk)
+        loaded = True
+        if hasattr(mempool, 'is_loaded'):
+            loaded = mempool.is_loaded()
+
+        # Full RBF setting
+        full_rbf = True
+        if hasattr(mempool, 'full_rbf'):
+            full_rbf = mempool.full_rbf
+        elif hasattr(mempool, 'require_standard'):
+            # If require_standard is False, we likely accept full RBF
+            full_rbf = True
+
+        # Min fee rate calculation (mempoolminfee)
+        # This is max(minrelaytxfee, dynamic_min_fee_for_mempool_acceptance)
+        min_fee_rate = info.get('min_fee_rate', 1000)  # sat/kvB
+        mempoolminfee_btc = min_fee_rate / 1e8  # BTC/kvB
+
+        # Min relay tx fee (static policy setting)
+        minrelaytxfee_btc = 0.00001  # 1 sat/vB = 0.00001 BTC/kvB
+
+        # Incremental relay fee for RBF (typically same as minrelaytxfee)
+        incrementalfee_btc = 0.00001
+
         return {
+            "loaded": loaded,
             "size": info['size'],
             "bytes": info['bytes'],
-            "usage": info['bytes'],
-            "maxmempool": info['max_size'],
-            "mempoolminfee": info['min_fee_rate'] / 1e8 if info['min_fee_rate'] > 0 else 0.0,
-            "minrelaytxfee": 0.00001,  # 1 sat/vbyte
+            "usage": usage,
+            "total_fee": total_fee_sat / 1e8,  # BTC
+            "maxmempool": info.get('max_size', 300_000_000),
+            "mempoolminfee": mempoolminfee_btc,
+            "minrelaytxfee": minrelaytxfee_btc,
+            "incrementalrelayfee": incrementalfee_btc,
+            "unbroadcastcount": unbroadcast_count,
+            "fullrbf": full_rbf,
         }
     
     # Default maxfeerate: 0.10 BTC/kvB (100,000 sat/kvB = 100 sat/vB)
@@ -972,21 +1269,144 @@ class RPCServer:
         return error
     
     async def rpc_getnetworkinfo(self) -> Dict[str, Any]:
-        """Return network information"""
+        """Return network information.
+
+        Reference: Bitcoin Core rpc/net.cpp getnetworkinfo
+
+        Returns an object containing various state info regarding P2P networking:
+        - version: the server version
+        - subversion: the server subversion string
+        - protocolversion: the protocol version
+        - localservices: the services we offer to the network (hex)
+        - localservicesnames: the services we offer, in human-readable form
+        - localrelay: true if transaction relay is requested from peers
+        - timeoffset: the time offset
+        - connections: the total number of connections
+        - connections_in: the number of inbound connections
+        - connections_out: the number of outbound connections
+        - networkactive: whether p2p networking is enabled
+        - networks: information per network
+        - relayfee: minimum relay fee rate for transactions
+        - incrementalfee: minimum fee rate increment for mempool limiting or RBF
+        - localaddresses: list of local addresses
+        - warnings: any network and blockchain warnings
+        """
         peers = []
-        if hasattr(self.node, 'peer_manager'):
-            if hasattr(self.node.peer_manager, 'get_all_ready_peers'):
-                peers = self.node.peer_manager.get_all_ready_peers()
-            elif hasattr(self.node.peer_manager, 'peers'):
-                peers = list(self.node.peer_manager.peers.values()) if isinstance(self.node.peer_manager.peers, dict) else []
-        
+        connections_in = 0
+        connections_out = 0
+        pm = getattr(self.node, 'peer_manager', None)
+
+        if pm:
+            if hasattr(pm, 'get_all_ready_peers'):
+                peers = pm.get_all_ready_peers()
+            elif hasattr(pm, 'peers'):
+                peers = list(pm.peers.values()) if isinstance(pm.peers, dict) else list(pm.peers)
+
+            # Count inbound vs outbound
+            for peer in peers:
+                if getattr(peer, 'inbound', False):
+                    connections_in += 1
+                else:
+                    connections_out += 1
+
+        total_connections = len(peers)
+
+        # Local services we offer
+        local_services = 0x0409  # NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED
+        if hasattr(self.node, 'local_services'):
+            local_services = self.node.local_services
+        elif pm and hasattr(pm, 'local_services'):
+            local_services = pm.local_services
+
+        local_services_hex = f"{local_services:016x}"
+
+        # Service names
+        service_names = []
+        if local_services & 1:
+            service_names.append("NETWORK")
+        if local_services & 2:
+            service_names.append("GETUTXO")
+        if local_services & 4:
+            service_names.append("BLOOM")
+        if local_services & 8:
+            service_names.append("WITNESS")
+        if local_services & 64:
+            service_names.append("COMPACT_FILTERS")
+        if local_services & 1024:
+            service_names.append("NETWORK_LIMITED")
+        if local_services & 2048:
+            service_names.append("P2P_V2")
+
+        # Network active status
+        network_active = True
+        if pm and hasattr(pm, 'network_active'):
+            network_active = pm.network_active
+
+        # Time offset (median of connected peers)
+        time_offset = 0
+        if pm and hasattr(pm, 'get_time_offset'):
+            time_offset = pm.get_time_offset()
+
+        # Networks info
+        networks = []
+        for net_name in ["ipv4", "ipv6", "onion", "i2p", "cjdns"]:
+            net_info = {
+                "name": net_name,
+                "limited": False,
+                "reachable": net_name in ["ipv4", "ipv6"],  # Default reachability
+                "proxy": "",
+                "proxy_randomize_credentials": False,
+            }
+            # Check if we have specific network config
+            if hasattr(self.node, 'network_config'):
+                nc = self.node.network_config.get(net_name, {})
+                net_info["limited"] = nc.get("limited", False)
+                net_info["reachable"] = nc.get("reachable", net_name in ["ipv4", "ipv6"])
+                net_info["proxy"] = nc.get("proxy", "")
+                net_info["proxy_randomize_credentials"] = nc.get("proxy_randomize_credentials", False)
+            networks.append(net_info)
+
+        # Local addresses
+        local_addresses = []
+        if pm and hasattr(pm, 'local_addresses'):
+            for addr_info in pm.local_addresses:
+                local_addresses.append({
+                    "address": addr_info.get("address", ""),
+                    "port": addr_info.get("port", 8333),
+                    "score": addr_info.get("score", 0),
+                })
+
+        # Relay fee (minimum fee for tx to be relayed)
+        relay_fee = 0.00001  # 1 sat/vB in BTC/kvB
+        if hasattr(self.node, 'mempool') and self.node.mempool:
+            if hasattr(self.node.mempool, 'min_relay_fee'):
+                relay_fee = self.node.mempool.min_relay_fee / 1e8
+
+        # Incremental fee for RBF
+        incremental_fee = 0.00001
+
+        # Warnings
+        warnings = []
+        if hasattr(self.node, 'get_warnings'):
+            warnings = self.node.get_warnings()
+
         return {
-            "version": 240000,
-            "subversion": "/bitcoin-hybrid:0.1.0/",
-            "protocolversion": 70015,
-            "connections": len(peers),
-            "networkactive": True,
-            "relayfee": 0.00001,
+            "version": 250000,  # Ouroboros version
+            "subversion": "/Ouroboros:0.25.0/",
+            "protocolversion": 70016,
+            "localservices": local_services_hex,
+            "localservicesnames": service_names,
+            "localrelay": True,
+            "timeoffset": time_offset,
+            "networkactive": network_active,
+            "connections": total_connections,
+            "connections_in": connections_in,
+            "connections_out": connections_out,
+            "networks": networks,
+            "relayfee": relay_fee,
+            "incrementalfee": incremental_fee,
+            "localaddresses": local_addresses,
+            "warnings": warnings,
         }
     
     async def rpc_getrawmempool(self, verbose: bool = False) -> Union[List[str], Dict[str, Dict[str, Any]]]:
@@ -1021,25 +1441,44 @@ class RPCServer:
     async def rpc_getblockheader(self, blockhash: str, verbose: bool = True) -> Union[str, Dict[str, Any]]:
         """
         Get block header information.
-        
+
+        Reference: Bitcoin Core rpc/blockchain.cpp getblockheader
+
         Args:
             blockhash: Block hash (hex string)
             verbose: If True, return JSON object; if False, return hex-encoded header
-            
+
         Returns:
-            If verbose=True: Dictionary with header fields
+            If verbose=True: Dictionary with header fields:
+                - hash: the block hash (same as provided)
+                - confirmations: number of confirmations, or -1 if not on main chain
+                - height: the block height or index
+                - version: the block version
+                - versionHex: the block version formatted in hexadecimal
+                - merkleroot: the merkle root
+                - time: the block time (UNIX timestamp)
+                - mediantime: the median block time (UNIX timestamp)
+                - nonce: the nonce
+                - bits: compact representation of the block difficulty target
+                - target: the difficulty target
+                - difficulty: the difficulty
+                - chainwork: expected hashes to produce the current chain
+                - nTx: number of transactions in the block
+                - previousblockhash: hash of the previous block (if available)
+                - nextblockhash: hash of the next block (if available)
+
             If verbose=False: Hex-encoded block header (80 bytes)
         """
         try:
             block_hash = bytes.fromhex(blockhash)
             if not hasattr(self.node, 'db') or not self.node.db:
                 raise HTTPException(status_code=500, detail="Database not available")
-            
+
             block = self.node.db.get_block(block_hash)
-            
+
             if not block:
                 raise HTTPException(status_code=404, detail="Block not found")
-            
+
             if not verbose:
                 # Return hex-encoded header (80 bytes)
                 # Serialize block header
@@ -1051,17 +1490,35 @@ class RPCServer:
                 header_data.extend(block.bits.to_bytes(4, 'little'))
                 header_data.extend(block.nonce.to_bytes(4, 'little'))
                 return header_data.hex()
-            
+
             # Return verbose JSON
             block_height = block.height if hasattr(block, 'height') and block.height is not None else None
-            
+
             # Get confirmations
-            confirmations = 0
+            # -1 if block is not on the main chain
+            confirmations = -1
+            best_hash, best_height = self.node.db.get_best_block()
             if block_height is not None:
-                best_hash, best_height = self.node.db.get_best_block()
-                confirmations = max(0, best_height - block_height + 1) if best_height >= block_height else 0
-            
-            return {
+                # Check if this block is on the active chain
+                active_hash = self.node.db.get_block_hash_by_height(block_height)
+                if active_hash == block_hash:
+                    confirmations = max(0, best_height - block_height + 1)
+                # else confirmations stays -1
+
+            # Calculate target from bits
+            bits = block.bits
+            mantissa = bits & 0x007FFFFF
+            exponent = (bits >> 24) & 0xFF
+            if exponent <= 3:
+                target_int = mantissa >> (8 * (3 - exponent))
+            else:
+                target_int = mantissa << (8 * (exponent - 3))
+            target_hex = f"{target_int:064x}"
+
+            # Number of transactions
+            n_tx = len(block.transactions) if hasattr(block, 'transactions') and block.transactions else 0
+
+            result: Dict[str, Any] = {
                 "hash": blockhash,
                 "confirmations": confirmations,
                 "height": block_height if block_height is not None else 0,
@@ -1072,12 +1529,24 @@ class RPCServer:
                 "mediantime": self.node.get_median_time(block_height) if block_height is not None else block.timestamp,
                 "nonce": block.nonce,
                 "bits": f"{block.bits:08x}",
+                "target": target_hex,
                 "difficulty": self.node.get_difficulty(block.bits),
-                "chainwork": self.node.get_chainwork_at_height(block_height) if block_height is not None else "0x0",
-                "previousblockhash": block.prev_blockhash.hex() if block.prev_blockhash != bytes(32) else None,
-                "nextblockhash": self._get_next_block_hash(block_height) if block_height is not None else None
+                "chainwork": self.node.get_chainwork_at_height(block_height) if block_height is not None else "0" * 64,
+                "nTx": n_tx,
             }
-        
+
+            # Previous block hash (not present for genesis)
+            if block.prev_blockhash and block.prev_blockhash != bytes(32):
+                result["previousblockhash"] = block.prev_blockhash.hex()
+
+            # Next block hash (not present for tip)
+            if block_height is not None:
+                next_hash = self._get_next_block_hash(block_height)
+                if next_hash:
+                    result["nextblockhash"] = next_hash
+
+            return result
+
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}")
         except HTTPException:
@@ -2258,28 +2727,156 @@ class RPCServer:
         return 0
 
     async def rpc_getpeerinfo(self) -> List[Dict[str, Any]]:
-        """Return information about connected peers."""
+        """Return information about connected peers.
+
+        Reference: Bitcoin Core rpc/net.cpp getpeerinfo
+
+        Returns data about each connected network peer as a JSON array of objects.
+        Each peer object includes:
+        - id: Peer index
+        - addr: IP address and port
+        - services: Services offered (hex)
+        - servicesnames: Human-readable service names
+        - lastsend: UNIX timestamp of last send
+        - lastrecv: UNIX timestamp of last receive
+        - bytessent: Total bytes sent
+        - bytesrecv: Total bytes received
+        - conntime: Connection time (UNIX timestamp)
+        - version: Protocol version
+        - subver: User agent string
+        - inbound: True if inbound connection
+        - connection_type: Type of connection
+        - synced_headers: Last header we have in common
+        - synced_blocks: Last block we have in common
+        """
+        import time as _time
+
         peers = []
         pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
         if pm is None:
             return []
+
         peer_list = getattr(pm, 'peers', [])
         if isinstance(peer_list, dict):
             peer_list = list(peer_list.values())
+
         for i, peer in enumerate(peer_list):
-            info = {
-                "id": i,
-                "addr": getattr(peer, 'address', ''),
-                "services": hex(getattr(peer, 'services', 0)),
+            # Get peer ID (use internal ID if available)
+            peer_id = getattr(peer, 'id', i)
+
+            # Get address
+            addr = getattr(peer, 'address', '')
+            if not addr and hasattr(peer, 'host') and hasattr(peer, 'port'):
+                addr = f"{peer.host}:{peer.port}"
+
+            # Services
+            services = getattr(peer, 'services', 0)
+            services_hex = f"{services:016x}"
+
+            # Service names (Bitcoin Core style)
+            service_names = []
+            if services & 1:    # NODE_NETWORK
+                service_names.append("NETWORK")
+            if services & 2:    # NODE_GETUTXO
+                service_names.append("GETUTXO")
+            if services & 4:    # NODE_BLOOM
+                service_names.append("BLOOM")
+            if services & 8:    # NODE_WITNESS
+                service_names.append("WITNESS")
+            if services & 16:   # NODE_XTHIN
+                service_names.append("XTHIN")
+            if services & 64:   # NODE_COMPACT_FILTERS
+                service_names.append("COMPACT_FILTERS")
+            if services & 1024: # NODE_NETWORK_LIMITED
+                service_names.append("NETWORK_LIMITED")
+            if services & 2048: # NODE_P2P_V2
+                service_names.append("P2P_V2")
+
+            # Timestamps
+            now = int(_time.time())
+            lastsend = getattr(peer, 'last_send', 0)
+            lastrecv = getattr(peer, 'last_recv', 0)
+            conntime = getattr(peer, 'connected_time', now)
+
+            # Bytes sent/received
+            bytessent = getattr(peer, 'bytes_sent', 0)
+            bytesrecv = getattr(peer, 'bytes_recv', 0)
+
+            # Connection type
+            inbound = getattr(peer, 'inbound', False)
+            connection_type = "inbound" if inbound else "outbound-full-relay"
+            if hasattr(peer, 'connection_type'):
+                connection_type = peer.connection_type
+            elif hasattr(peer, 'is_feeler') and peer.is_feeler:
+                connection_type = "feeler"
+            elif hasattr(peer, 'is_block_relay_only') and peer.is_block_relay_only:
+                connection_type = "block-relay-only"
+
+            # Ping times
+            pingtime = getattr(peer, 'ping_time', None)
+            minping = getattr(peer, 'min_ping_time', None)
+            pingwait = getattr(peer, 'ping_wait', None)
+
+            # Block relay info
+            bip152_hb_to = getattr(peer, 'bip152_highbandwidth_to', False)
+            bip152_hb_from = getattr(peer, 'bip152_highbandwidth_from', False)
+
+            # Min fee filter
+            minfeefilter = getattr(peer, 'fee_filter', 0)
+
+            info: Dict[str, Any] = {
+                "id": peer_id,
+                "addr": addr,
+                "services": services_hex,
+                "servicesnames": service_names,
+                "relaytxes": getattr(peer, 'relay_txes', True),
+                "lastsend": lastsend,
+                "lastrecv": lastrecv,
+                "last_transaction": getattr(peer, 'last_tx_time', 0),
+                "last_block": getattr(peer, 'last_block_time', 0),
+                "bytessent": bytessent,
+                "bytesrecv": bytesrecv,
+                "conntime": conntime,
+                "timeoffset": getattr(peer, 'time_offset', 0),
                 "version": getattr(peer, 'version', 0),
                 "subver": getattr(peer, 'user_agent', ''),
+                "inbound": inbound,
+                "bip152_hb_to": bip152_hb_to,
+                "bip152_hb_from": bip152_hb_from,
                 "startingheight": getattr(peer, 'start_height', 0),
+                "presynced_headers": getattr(peer, 'presynced_headers', -1),
                 "synced_headers": getattr(peer, 'synced_headers', -1),
                 "synced_blocks": getattr(peer, 'synced_blocks', -1),
-                "inbound": getattr(peer, 'inbound', False),
-                "banscore": getattr(peer, 'ban_score', 0),
+                "inflight": getattr(peer, 'inflight_blocks', []),
+                "addr_relay_enabled": getattr(peer, 'addr_relay_enabled', True),
+                "addr_processed": getattr(peer, 'addr_processed', 0),
+                "addr_rate_limited": getattr(peer, 'addr_rate_limited', 0),
+                "permissions": getattr(peer, 'permissions', []),
+                "minfeefilter": minfeefilter / 1e8 if minfeefilter > 0 else 0.0,
+                "connection_type": connection_type,
             }
+
+            # Optional ping fields
+            if pingtime is not None:
+                info["pingtime"] = pingtime
+            if minping is not None:
+                info["minping"] = minping
+            if pingwait is not None and pingwait > 0:
+                info["pingwait"] = pingwait
+
+            # Bytes per message type (if tracked)
+            if hasattr(peer, 'bytes_sent_per_msg'):
+                info["bytessent_per_msg"] = peer.bytes_sent_per_msg
+            if hasattr(peer, 'bytes_recv_per_msg'):
+                info["bytesrecv_per_msg"] = peer.bytes_recv_per_msg
+
+            # Ban score (legacy)
+            banscore = getattr(peer, 'ban_score', 0)
+            if banscore > 0:
+                info["banscore"] = banscore
+
             peers.append(info)
+
         return peers
 
     async def rpc_getconnectioncount(self) -> int:
@@ -2417,40 +3014,153 @@ class RPCServer:
     async def rpc_getchaintips(self) -> List[Dict[str, Any]]:
         """Return information about all known tips in the block tree.
 
+        Reference: Bitcoin Core rpc/blockchain.cpp getchaintips
+
         Returns a list of chain tips, including the active chain tip and any
-        orphan/stale branches.  Each entry contains the tip height, block hash,
-        branch length (distance to the main chain fork point) and a status
-        string.
+        orphan/stale branches. Each entry contains:
+        - height: height of the chain tip
+        - hash: block hash of the tip
+        - branchlen: zero for main chain, otherwise length of branch connecting
+                     the tip to the main chain
+        - status: status of the chain
 
         Status values:
-          "active"        — the current best chain tip
-          "valid-fork"    — fully validated fork (not best chain)
-          "valid-headers" — headers are valid but block data not fully validated
-          "headers-only"  — only headers received
+          "active"        — the current best chain tip (most work)
+          "valid-fork"    — fully validated fork, not part of active chain
+          "valid-headers" — all blocks available but not fully validated
+          "headers-only"  — only headers received, block data unavailable
+          "invalid"       — branch contains at least one invalid block
         """
         if not hasattr(self.node, "db") or not self.node.db:
             raise HTTPException(status_code=500, detail="Database not available")
 
+        db = self.node.db
         tips: List[Dict[str, Any]] = []
 
         # Active chain tip ---------------------------------------------------
-        hash_bytes, height = self.node.db.get_best_block()
+        best_hash, best_height = db.get_best_block()
         tip_hash_hex: str
-        if isinstance(hash_bytes, bytes):
-            tip_hash_hex = hash_bytes.hex()
+        if isinstance(best_hash, bytes):
+            tip_hash_hex = best_hash.hex()
         else:
-            tip_hash_hex = str(hash_bytes)
+            tip_hash_hex = str(best_hash)
 
         tips.append({
-            "height": height,
+            "height": best_height,
             "hash": tip_hash_hex,
             "branchlen": 0,
             "status": "active",
         })
 
-        # Future enhancement: iterate over orphan / stale block headers
-        # stored in the block index and report them as additional tips with
-        # status "valid-fork", "valid-headers", or "headers-only".
+        # Collect orphan/stale tips from block index -------------------------
+        # A tip is a block with no known children in the block index.
+        # We identify tips by finding blocks that are not referenced as
+        # prev_blockhash by any other block.
+
+        # Get all known block hashes
+        all_blocks: Dict[bytes, Any] = {}
+        parent_refs: set = set()  # blocks that are someone's parent
+
+        # If the database has a block index, iterate it
+        if hasattr(db, 'get_all_block_hashes'):
+            for block_hash in db.get_all_block_hashes():
+                block = db.get_block(block_hash)
+                if block:
+                    all_blocks[block_hash] = block
+                    if block.prev_blockhash and block.prev_blockhash != bytes(32):
+                        parent_refs.add(block.prev_blockhash)
+
+        elif hasattr(db, 'block_index'):
+            # Direct access to block index
+            for block_hash, block_info in db.block_index.items():
+                block = db.get_block(block_hash)
+                if block:
+                    all_blocks[block_hash] = block
+                    if block.prev_blockhash and block.prev_blockhash != bytes(32):
+                        parent_refs.add(block.prev_blockhash)
+
+        # Blocks that are tips (not referenced as parent by anyone)
+        for block_hash, block in all_blocks.items():
+            if block_hash == best_hash:
+                continue  # Already added as active tip
+
+            if block_hash not in parent_refs:
+                # This is a tip
+                block_height = getattr(block, 'height', 0) or 0
+
+                # Determine status
+                status = "headers-only"
+                branchlen = 0
+
+                # Check if block has full data
+                has_data = hasattr(block, 'transactions') and block.transactions
+
+                # Check if block is marked invalid
+                is_invalid = getattr(block, 'is_invalid', False)
+                if hasattr(db, 'is_block_invalid'):
+                    is_invalid = db.is_block_invalid(block_hash)
+
+                if is_invalid:
+                    status = "invalid"
+                elif has_data:
+                    # Check if fully validated
+                    is_validated = getattr(block, 'is_validated', True)
+                    if hasattr(db, 'is_block_validated'):
+                        is_validated = db.is_block_validated(block_hash)
+
+                    if is_validated:
+                        status = "valid-fork"
+                    else:
+                        status = "valid-headers"
+                else:
+                    status = "headers-only"
+
+                # Calculate branch length by walking back to find fork point
+                # Fork point is where this branch meets the active chain
+                fork_height = 0
+                current = block
+                visited = set()
+                while current and current.prev_blockhash != bytes(32):
+                    if current.prev_blockhash in visited:
+                        break
+                    visited.add(current.prev_blockhash)
+
+                    # Check if prev is on active chain
+                    prev_hash = current.prev_blockhash
+                    prev_height = None
+
+                    # Try to get height from active chain
+                    if hasattr(db, 'get_block_height'):
+                        prev_height = db.get_block_height(prev_hash)
+                    elif prev_hash in all_blocks:
+                        prev_height = getattr(all_blocks[prev_hash], 'height', None)
+
+                    if prev_height is not None:
+                        # Check if this hash is in active chain at this height
+                        active_hash = db.get_block_hash_by_height(prev_height)
+                        if active_hash == prev_hash:
+                            fork_height = prev_height
+                            break
+
+                    # Move to parent
+                    if prev_hash in all_blocks:
+                        current = all_blocks[prev_hash]
+                    else:
+                        current = db.get_block(prev_hash)
+                        if current:
+                            all_blocks[prev_hash] = current
+
+                branchlen = max(0, block_height - fork_height)
+
+                tips.append({
+                    "height": block_height,
+                    "hash": block_hash.hex() if isinstance(block_hash, bytes) else str(block_hash),
+                    "branchlen": branchlen,
+                    "status": status,
+                })
+
+        # Sort by height descending (Bitcoin Core behavior)
+        tips.sort(key=lambda x: (-x["height"], x["hash"]))
 
         return tips
 
