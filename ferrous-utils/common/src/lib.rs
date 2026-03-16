@@ -16,6 +16,11 @@ pub use crypto::{
     verify_ecdsa_signature, verify_ecdsa_signature_der,
 };
 
+// Re-export siphash for compact blocks
+pub use crypto::siphash::{
+    compute_siphash_key, siphash_2_4, PresaltedSipHasher, SipHasher,
+};
+
 // Re-export serialization functions
 pub use serialize::{
     decode_varint, deserialize_from_slice, encode_varint, serialize_to_vec, BitcoinDeserialize,
