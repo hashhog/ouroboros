@@ -477,6 +477,13 @@ class BitcoinNode:
                                         pass
                     else:
                         logger.debug(f"Rejected transaction: {error}")
+                        # Record misbehavior for invalid transactions
+                        # Invalid tx = 10 points (requires 10 violations to ban)
+                        if hasattr(self, "peer_manager") and self.peer_manager:
+                            addr = f"{sender_peer.host}:{sender_peer.port}"
+                            self.peer_manager.misbehaving(
+                                addr, 10, f"invalid tx: {error}"
+                            )
 
                 except Exception as e:
                     logger.error(
