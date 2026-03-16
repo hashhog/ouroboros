@@ -2,6 +2,7 @@
 
 pub mod chain_params;
 pub mod chainwork;
+pub mod versionbits;
 
 use std::env;
 pub mod storage;
@@ -50,11 +51,1869 @@ fn verify_ecdsa(der_sig: Vec<u8>, pubkey: Vec<u8>, msg_hash: Vec<u8>) -> PyResul
     }
 }
 
+// Re-export script verification types for use by Python
+use crate::validate::script::{ScriptVerifyFlags, activation_heights};
+use crate::validate::sequence_lock;
+use crate::validate::difficulty::{self, BlockIndexInfo};
+use crate::chain_params::get_consensus_params;
+use crate::versionbits::{VersionBitsCache, DeploymentPos, BlockIndexProvider};
+
+/// Get script verification flags for a given block height and network.
+///
+/// This mirrors Bitcoin Core's GetBlockScriptFlags() and determines which
+/// consensus rules are active at a given height.
+///
+/// Networks: "mainnet"/"bitcoin", "testnet"/"testnet3", "testnet4", "regtest", "signet"
+#[pyfunction]
+fn get_script_flags_for_height(height: u32, network: String) -> PyResult<u32> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+    Ok(activation_heights::get_script_flags_for_height(height, network_enum).bits())
+}
+
+/// Get SegWit activation height for a network.
+/// NULLFAIL (BIP146) is consensus-mandatory at this height.
+#[pyfunction]
+fn segwit_activation_height(network: String) -> PyResult<u32> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+    Ok(activation_heights::segwit_height(network_enum))
+}
+
+/// Get BIP68 (CSV) activation height for a network.
+#[pyfunction]
+fn bip68_activation_height(network: String) -> PyResult<u32> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+    Ok(sequence_lock::csv_activation_height(network_enum))
+}
+
+/// Check if BIP68 sequence locks are active at a given height for a network.
+#[pyfunction]
+fn is_bip68_active(height: u32, network: String) -> PyResult<bool> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+    Ok(sequence_lock::is_bip68_active(height, network_enum))
+}
+
+/// Calculate sequence locks for a transaction.
+///
+/// # Arguments
+/// * `tx_version` - Transaction version (BIP68 only applies to version >= 2)
+/// * `inputs` - List of tuples: (sequence, prev_height, prev_median_time)
+/// * `enforce_bip68` - Whether BIP68 is active
+///
+/// # Returns
+/// Tuple (min_height, min_time) representing sequence lock requirements.
+/// Values of -1 mean "no lock of this type required".
+#[pyfunction]
+fn calculate_sequence_locks(
+    tx_version: i32,
+    inputs: Vec<(u32, u32, i64)>,
+) -> PyResult<(i32, i64)> {
+    let input_infos: Vec<sequence_lock::InputLockInfo> = inputs
+        .into_iter()
+        .map(|(seq, height, mtp)| sequence_lock::InputLockInfo {
+            sequence: seq,
+            prev_height: height,
+            prev_median_time: mtp,
+        })
+        .collect();
+
+    let lock = sequence_lock::calculate_sequence_locks(tx_version, &input_infos, true);
+    Ok((lock.min_height, lock.min_time))
+}
+
+/// Check if sequence locks are satisfied for inclusion in a block.
+///
+/// # Arguments
+/// * `tx_version` - Transaction version
+/// * `inputs` - List of tuples: (sequence, prev_height, prev_median_time)
+/// * `block_height` - Height of the block where the tx would be included
+/// * `block_median_time` - Median time past of the previous block
+/// * `enforce_bip68` - Whether BIP68 is active
+///
+/// # Returns
+/// True if sequence locks are satisfied.
+#[pyfunction]
+fn check_sequence_locks(
+    tx_version: i32,
+    inputs: Vec<(u32, u32, i64)>,
+    block_height: u32,
+    block_median_time: i64,
+    enforce_bip68: bool,
+) -> PyResult<bool> {
+    let input_infos: Vec<sequence_lock::InputLockInfo> = inputs
+        .into_iter()
+        .map(|(seq, height, mtp)| sequence_lock::InputLockInfo {
+            sequence: seq,
+            prev_height: height,
+            prev_median_time: mtp,
+        })
+        .collect();
+
+    Ok(sequence_lock::check_sequence_locks(
+        tx_version,
+        &input_infos,
+        block_height,
+        block_median_time,
+        enforce_bip68,
+    ))
+}
+
+/// Check if a transaction is final for inclusion in a block.
+///
+/// A transaction is final if:
+/// - nLockTime == 0, OR
+/// - nLockTime < threshold (block height or MTP depending on type), OR
+/// - All inputs have nSequence == 0xFFFFFFFF
+///
+/// Reference: Bitcoin Core IsFinalTx() in consensus/tx_verify.cpp
+///
+/// # Arguments
+/// * `locktime` - Transaction nLockTime
+/// * `sequences` - List of nSequence values for each input
+/// * `block_height` - Height of the block where the tx would be included
+/// * `block_mtp` - Median time past of the previous block (BIP 113)
+///
+/// # Returns
+/// True if the transaction is final.
+#[pyfunction]
+fn is_final_tx(
+    locktime: u32,
+    sequences: Vec<u32>,
+    block_height: u32,
+    block_mtp: i64,
+) -> PyResult<bool> {
+    Ok(sequence_lock::is_final_tx(
+        locktime,
+        &sequences,
+        block_height,
+        block_mtp,
+    ))
+}
+
+/// Get the locktime threshold constant.
+///
+/// Values below this are block heights, values at or above are Unix timestamps.
+#[pyfunction]
+fn locktime_threshold() -> u32 {
+    sequence_lock::LOCKTIME_THRESHOLD
+}
+
+/// Get the COINBASE_MATURITY constant (100 blocks).
+///
+/// Coinbase transaction outputs cannot be spent until they have at least
+/// this many confirmations.
+///
+/// Reference: Bitcoin Core consensus/consensus.h
+#[pyfunction]
+fn coinbase_maturity_constant() -> u32 {
+    crate::validate::COINBASE_MATURITY
+}
+
+/// Check if spending a coinbase output is allowed at the given height.
+///
+/// Coinbase outputs require COINBASE_MATURITY (100) confirmations before
+/// they can be spent.
+///
+/// # Arguments
+/// * `is_coinbase` - Whether the UTXO being spent is from a coinbase transaction
+/// * `utxo_height` - The height at which the UTXO was created
+/// * `spending_height` - The height of the block where the spending tx will be included
+///
+/// # Returns
+/// * None if the coinbase maturity requirement is satisfied (spend allowed)
+/// * String error message if premature spend ("bad-txns-premature-spend-of-coinbase")
+///
+/// Reference: Bitcoin Core consensus/tx_verify.cpp line 179
+#[pyfunction]
+fn check_coinbase_maturity(
+    is_coinbase: bool,
+    utxo_height: u32,
+    spending_height: u32,
+) -> Option<String> {
+    match crate::validate::check_coinbase_maturity(is_coinbase, utxo_height, spending_height) {
+        Ok(()) => None,
+        Err((depth, _required)) => Some(format!(
+            "bad-txns-premature-spend-of-coinbase: tried to spend coinbase at depth {}",
+            depth
+        )),
+    }
+}
+
+/// Calculate the next work required (difficulty) for a block.
+///
+/// This implements Bitcoin's difficulty adjustment algorithm including:
+/// - Mainnet: standard 2016-block retarget with timespan clamping
+/// - Testnet3: 20-minute rule and walk-back to last non-min-diff block
+/// - Testnet4/BIP94: similar to testnet3 with time warp fix
+/// - Regtest: always returns pow_limit (no retargeting)
+///
+/// # Arguments
+/// * `last_height` - Height of the previous block (tip)
+/// * `last_bits` - nBits of the previous block
+/// * `last_timestamp` - Timestamp of the previous block
+/// * `new_block_time` - Timestamp of the new block
+/// * `network` - Network name ("mainnet", "testnet", "testnet4", "regtest", "signet")
+/// * `ancestors` - List of (height, bits, timestamp) tuples for ancestor blocks
+///
+/// # Returns
+/// The expected nBits value for the next block
+#[pyfunction]
+fn get_next_work_required(
+    last_height: u32,
+    last_bits: u32,
+    last_timestamp: u32,
+    new_block_time: u32,
+    network: String,
+    ancestors: Vec<(u32, u32, u32)>,
+) -> PyResult<u32> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    let last_block = BlockIndexInfo {
+        height: last_height,
+        bits: last_bits,
+        timestamp: last_timestamp,
+    };
+
+    // Build ancestor lookup from the provided list
+    let ancestor_map: std::collections::HashMap<u32, BlockIndexInfo> = ancestors
+        .into_iter()
+        .map(|(h, b, t)| (h, BlockIndexInfo { height: h, bits: b, timestamp: t }))
+        .collect();
+
+    let result = difficulty::get_next_work_required(
+        &last_block,
+        new_block_time,
+        network_enum,
+        |height| ancestor_map.get(&height).cloned(),
+    );
+
+    Ok(result)
+}
+
+/// Calculate difficulty at a retarget boundary.
+///
+/// This is the core calculation: new_target = old_target * (actual_time / target_time)
+/// with clamping to [target_time/4, target_time*4].
+///
+/// # Arguments
+/// * `last_bits` - nBits of the last block in the period
+/// * `first_timestamp` - Timestamp of the first block in the period
+/// * `last_timestamp` - Timestamp of the last block in the period
+/// * `network` - Network name
+///
+/// # Returns
+/// New difficulty in compact "bits" format
+#[pyfunction]
+fn calculate_next_difficulty(
+    last_bits: u32,
+    first_timestamp: u32,
+    last_timestamp: u32,
+    network: String,
+) -> PyResult<u32> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    let params = get_consensus_params(network_enum);
+
+    let last_block = BlockIndexInfo {
+        height: 2015, // Dummy, not used in calculation
+        bits: last_bits,
+        timestamp: last_timestamp,
+    };
+
+    let new_bits = difficulty::calculate_next_work_required(&last_block, first_timestamp, &params);
+    Ok(new_bits)
+}
+
+/// Get the PoW limit (minimum difficulty) bits for a network.
+#[pyfunction]
+fn pow_limit_bits(network: String) -> PyResult<u32> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    let params = get_consensus_params(network_enum);
+    Ok(params.pow_limit_bits)
+}
+
+/// Check if a difficulty transition is permitted.
+///
+/// Validates that the difficulty change between two consecutive blocks
+/// follows consensus rules (within 4x at adjustment boundaries, unchanged otherwise).
+#[pyfunction]
+fn check_difficulty_transition(
+    height: u32,
+    old_bits: u32,
+    new_bits: u32,
+    network: String,
+) -> PyResult<bool> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    Ok(difficulty::permitted_difficulty_transition(height, old_bits, new_bits, network_enum))
+}
+
+/// Get the difficulty adjustment interval (2016 blocks).
+#[pyfunction]
+fn difficulty_adjustment_interval() -> u32 {
+    difficulty::DIFFICULTY_ADJUSTMENT_INTERVAL
+}
+
+/// Get the target timespan for difficulty adjustment (2 weeks in seconds).
+#[pyfunction]
+fn target_timespan() -> i64 {
+    difficulty::TARGET_TIMESPAN
+}
+
+/// Get the target block spacing (10 minutes in seconds).
+#[pyfunction]
+fn target_spacing() -> i64 {
+    difficulty::TARGET_SPACING
+}
+
+/// Python wrapper for ScriptVerifyFlags
+/// Provides constants and helper methods for script verification flags.
+#[pyclass]
+#[derive(Clone)]
+pub struct PyScriptVerifyFlags {
+    flags: u32,
+}
+
+#[pymethods]
+impl PyScriptVerifyFlags {
+    #[new]
+    fn new(flags: u32) -> Self {
+        Self { flags }
+    }
+
+    /// Get the raw flags value
+    #[getter]
+    fn value(&self) -> u32 {
+        self.flags
+    }
+
+    /// Check if NULLFAIL flag is set
+    fn has_nullfail(&self) -> bool {
+        self.flags & ScriptVerifyFlags::NULLFAIL.bits() != 0
+    }
+
+    /// Check if WITNESS flag is set
+    fn has_witness(&self) -> bool {
+        self.flags & ScriptVerifyFlags::WITNESS.bits() != 0
+    }
+
+    /// Check if P2SH flag is set
+    fn has_p2sh(&self) -> bool {
+        self.flags & ScriptVerifyFlags::P2SH.bits() != 0
+    }
+
+    // Script verification flag constants
+    #[classattr]
+    const NONE: u32 = 0;
+    #[classattr]
+    const P2SH: u32 = 1 << 0;
+    #[classattr]
+    const STRICTENC: u32 = 1 << 1;
+    #[classattr]
+    const DERSIG: u32 = 1 << 2;
+    #[classattr]
+    const LOW_S: u32 = 1 << 3;
+    #[classattr]
+    const NULLDUMMY: u32 = 1 << 4;
+    #[classattr]
+    const SIGPUSHONLY: u32 = 1 << 5;
+    #[classattr]
+    const MINIMALDATA: u32 = 1 << 6;
+    #[classattr]
+    const DISCOURAGE_UPGRADABLE_NOPS: u32 = 1 << 7;
+    #[classattr]
+    const CLEANSTACK: u32 = 1 << 8;
+    #[classattr]
+    const CHECKLOCKTIMEVERIFY: u32 = 1 << 9;
+    #[classattr]
+    const CHECKSEQUENCEVERIFY: u32 = 1 << 10;
+    #[classattr]
+    const WITNESS: u32 = 1 << 11;
+    #[classattr]
+    const DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM: u32 = 1 << 12;
+    #[classattr]
+    const MINIMALIF: u32 = 1 << 13;
+    #[classattr]
+    const NULLFAIL: u32 = 1 << 14;
+    #[classattr]
+    const WITNESS_PUBKEYTYPE: u32 = 1 << 15;
+    #[classattr]
+    const CONST_SCRIPTCODE: u32 = 1 << 16;
+    #[classattr]
+    const TAPROOT: u32 = 1 << 17;
+}
+
+/// Get BIP9 deployment state for a deployment at a given height.
+///
+/// # Arguments
+/// * `deployment` - Deployment name ("taproot", "testdummy")
+/// * `height` - Block height to query
+/// * `network` - Network name
+/// * `block_versions` - List of (height, version) tuples for blocks in the chain
+/// * `block_mtps` - List of (height, mtp) tuples for median time past values
+///
+/// # Returns
+/// State name: "defined", "started", "locked_in", "active", or "failed"
+#[pyfunction]
+fn get_deployment_state(
+    deployment: String,
+    height: u32,
+    network: String,
+    block_versions: Vec<(u32, i32)>,
+    block_mtps: Vec<(u32, i64)>,
+) -> PyResult<String> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    // Map deployment name to position
+    let dep_pos = match deployment.to_lowercase().as_str() {
+        "taproot" => DeploymentPos::Taproot,
+        "testdummy" => DeploymentPos::TestDummy,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Unknown deployment: {}", deployment),
+            ));
+        }
+    };
+
+    // Create provider from the provided data
+    let provider = PyBlockIndexProvider {
+        versions: block_versions.into_iter().collect(),
+        mtps: block_mtps.into_iter().collect(),
+        height,
+    };
+
+    let mut cache = VersionBitsCache::new(network_enum);
+    let state = cache.get_state(dep_pos, height, &provider)
+        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            format!("Deployment {} not found for network {}", deployment, network),
+        ))?;
+
+    Ok(state.name().to_string())
+}
+
+/// Get all BIP9 deployment info for a network (for getblockchaininfo RPC).
+///
+/// # Arguments
+/// * `height` - Current chain height
+/// * `network` - Network name
+/// * `block_versions` - List of (height, version) tuples
+/// * `block_mtps` - List of (height, mtp) tuples
+///
+/// # Returns
+/// List of deployment info dictionaries
+#[pyfunction]
+fn get_all_deployments_info(
+    height: u32,
+    network: String,
+    block_versions: Vec<(u32, i32)>,
+    block_mtps: Vec<(u32, i64)>,
+) -> PyResult<Vec<PyDeploymentInfo>> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    let provider = PyBlockIndexProvider {
+        versions: block_versions.into_iter().collect(),
+        mtps: block_mtps.into_iter().collect(),
+        height,
+    };
+
+    let mut cache = VersionBitsCache::new(network_enum);
+    let infos = cache.get_all_deployment_info(height, &provider);
+
+    Ok(infos.into_iter().map(|info| PyDeploymentInfo {
+        name: info.name,
+        bit: info.bit,
+        state: info.state.name().to_string(),
+        since: info.since,
+        start_time: info.start_time,
+        timeout: info.timeout,
+        min_activation_height: info.min_activation_height,
+        period: info.stats.as_ref().map(|s| s.period),
+        threshold: info.stats.as_ref().map(|s| s.threshold),
+        elapsed: info.stats.as_ref().map(|s| s.elapsed),
+        count: info.stats.as_ref().map(|s| s.count),
+        possible: info.stats.as_ref().map(|s| s.possible),
+    }).collect())
+}
+
+/// Check if a deployment is active at a given height.
+#[pyfunction]
+fn is_deployment_active(
+    deployment: String,
+    height: u32,
+    network: String,
+    block_versions: Vec<(u32, i32)>,
+    block_mtps: Vec<(u32, i64)>,
+) -> PyResult<bool> {
+    let state = get_deployment_state(deployment, height, network, block_versions, block_mtps)?;
+    Ok(state == "active")
+}
+
+/// Get the versionbits constants.
+#[pyfunction]
+fn versionbits_top_bits() -> i32 {
+    versionbits::VERSIONBITS_TOP_BITS
+}
+
+/// Get the versionbits top mask.
+#[pyfunction]
+fn versionbits_top_mask() -> i32 {
+    versionbits::VERSIONBITS_TOP_MASK
+}
+
+/// Check if a block version signals for a deployment.
+///
+/// # Arguments
+/// * `version` - Block version
+/// * `bit` - Deployment bit (0-28)
+///
+/// # Returns
+/// True if the version signals for the deployment
+#[pyfunction]
+fn check_version_signal(version: i32, bit: u8) -> bool {
+    // Top 3 bits must be 001 (version bits signaling active)
+    if (version & versionbits::VERSIONBITS_TOP_MASK) != versionbits::VERSIONBITS_TOP_BITS {
+        return false;
+    }
+    // Check the specific bit
+    let mask = 1i32 << bit;
+    (version & mask) != 0
+}
+
+/// Python wrapper for deployment info
+#[pyclass]
+#[derive(Clone)]
+pub struct PyDeploymentInfo {
+    #[pyo3(get)]
+    pub name: String,
+    #[pyo3(get)]
+    pub bit: u8,
+    #[pyo3(get)]
+    pub state: String,
+    #[pyo3(get)]
+    pub since: u32,
+    #[pyo3(get)]
+    pub start_time: i64,
+    #[pyo3(get)]
+    pub timeout: i64,
+    #[pyo3(get)]
+    pub min_activation_height: u32,
+    // Statistics (only present for STARTED/LOCKED_IN states)
+    #[pyo3(get)]
+    pub period: Option<u32>,
+    #[pyo3(get)]
+    pub threshold: Option<u32>,
+    #[pyo3(get)]
+    pub elapsed: Option<u32>,
+    #[pyo3(get)]
+    pub count: Option<u32>,
+    #[pyo3(get)]
+    pub possible: Option<bool>,
+}
+
+/// Internal provider for versionbits calculations from Python data
+struct PyBlockIndexProvider {
+    versions: std::collections::HashMap<u32, i32>,
+    mtps: std::collections::HashMap<u32, i64>,
+    height: u32,
+}
+
+impl BlockIndexProvider for PyBlockIndexProvider {
+    fn get_median_time_past(&self, height: u32) -> Option<i64> {
+        self.mtps.get(&height).copied()
+    }
+
+    fn get_block_version(&self, height: u32) -> Option<i32> {
+        self.versions.get(&height).copied()
+    }
+
+    fn get_chain_height(&self) -> u32 {
+        self.height
+    }
+}
+
+/// Python wrapper for BIP68 sequence lock constants.
+/// Provides constants for interpreting sequence numbers per BIP68.
+#[pyclass]
+#[derive(Clone)]
+pub struct PySequenceLockConstants;
+
+#[pymethods]
+impl PySequenceLockConstants {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    /// If bit 31 is set, sequence is NOT treated as a relative lock-time
+    #[classattr]
+    const DISABLE_FLAG: u32 = sequence_lock::SEQUENCE_LOCKTIME_DISABLE_FLAG;
+
+    /// If bit 22 is set, lock is time-based; otherwise block-height-based
+    #[classattr]
+    const TYPE_FLAG: u32 = sequence_lock::SEQUENCE_LOCKTIME_TYPE_FLAG;
+
+    /// Mask for lower 16 bits containing the lock value
+    #[classattr]
+    const MASK: u32 = sequence_lock::SEQUENCE_LOCKTIME_MASK;
+
+    /// Time-based locks use 512-second granularity (2^9)
+    #[classattr]
+    const GRANULARITY: u32 = sequence_lock::SEQUENCE_LOCKTIME_GRANULARITY;
+
+    /// Sequence value 0xFFFFFFFF means the input is final (no lock)
+    #[classattr]
+    const FINAL: u32 = sequence_lock::SEQUENCE_FINAL;
+}
+
+// =============================================================================
+// Headers Presync Anti-DoS (PRESYNC/REDOWNLOAD)
+// =============================================================================
+
+use crate::validate::headers_presync::{
+    HeadersSyncState, HeadersSyncPhase, HeadersSyncResult as RustHeadersSyncResult,
+    MAX_HEADERS_PER_MESSAGE,
+};
+use crate::chain_params::{
+    minimum_chain_work, headers_presync_commitment_period, headers_redownload_buffer_size,
+    get_checkpoints, get_last_checkpoint, get_checkpoint_at_height, verify_checkpoint,
+    is_below_last_checkpoint, Checkpoint,
+};
+
+/// Get minimum chain work for a network (anti-DoS threshold).
+///
+/// Returns the value as a hex string (big-endian, no 0x prefix).
+#[pyfunction]
+fn get_minimum_chain_work(network: String) -> PyResult<String> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    let work = minimum_chain_work(network_enum);
+    // Convert to hex string
+    let bytes = work.to_big_endian();
+    Ok(hex::encode(bytes))
+}
+
+/// Get headers presync commitment period for a network.
+#[pyfunction]
+fn get_headers_commitment_period(network: String) -> PyResult<u32> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    Ok(headers_presync_commitment_period(network_enum))
+}
+
+/// Get headers redownload buffer size for a network.
+#[pyfunction]
+fn get_headers_redownload_buffer_size(network: String) -> PyResult<u32> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    Ok(headers_redownload_buffer_size(network_enum))
+}
+
+/// Get max headers per P2P message.
+#[pyfunction]
+fn max_headers_per_message() -> usize {
+    MAX_HEADERS_PER_MESSAGE
+}
+
+// =============================================================================
+// Checkpoint Functions
+// =============================================================================
+
+/// Python wrapper for Checkpoint
+#[pyclass]
+#[derive(Clone)]
+pub struct PyCheckpoint {
+    #[pyo3(get)]
+    pub height: u32,
+    #[pyo3(get)]
+    pub hash: Vec<u8>,
+}
+
+impl From<Checkpoint> for PyCheckpoint {
+    fn from(cp: Checkpoint) -> Self {
+        Self {
+            height: cp.height,
+            hash: cp.hash.to_vec(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyCheckpoint {
+    /// Get the hash as a hex string (big-endian display format).
+    fn hash_hex(&self) -> String {
+        // Convert from internal (little-endian) to display (big-endian)
+        let mut display = self.hash.clone();
+        display.reverse();
+        hex::encode(display)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Checkpoint(height={}, hash={})", self.height, self.hash_hex())
+    }
+}
+
+/// Get all checkpoints for a network.
+///
+/// Returns a list of Checkpoint objects (height, hash) representing known-good blocks.
+#[pyfunction]
+fn get_network_checkpoints(network: String) -> PyResult<Vec<PyCheckpoint>> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    Ok(get_checkpoints(network_enum)
+        .into_iter()
+        .map(PyCheckpoint::from)
+        .collect())
+}
+
+/// Get the last checkpoint for a network.
+///
+/// Returns None if no checkpoints are defined.
+#[pyfunction]
+fn get_last_network_checkpoint(network: String) -> PyResult<Option<PyCheckpoint>> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    Ok(get_last_checkpoint(network_enum).map(PyCheckpoint::from))
+}
+
+/// Check if a height is at or below the last checkpoint.
+///
+/// Used to determine if script validation can be skipped during IBD.
+#[pyfunction]
+fn check_is_below_checkpoint(network: String, height: u32) -> PyResult<bool> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    Ok(is_below_last_checkpoint(network_enum, height))
+}
+
+/// Verify a block hash matches the checkpoint at a given height.
+///
+/// Returns:
+/// - True if checkpoint exists and hash matches
+/// - False if checkpoint exists and hash does NOT match
+/// - None if no checkpoint at that height
+#[pyfunction]
+fn verify_block_checkpoint(network: String, height: u32, block_hash: Vec<u8>) -> PyResult<Option<bool>> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    if block_hash.len() != 32 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Block hash must be 32 bytes",
+        ));
+    }
+
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&block_hash);
+
+    Ok(verify_checkpoint(network_enum, height, &hash))
+}
+
+/// Check if script validation can be skipped for a block during IBD.
+///
+/// Blocks at or below the last checkpoint can skip script validation
+/// (only PoW and merkle root need to be verified).
+#[pyfunction]
+fn can_skip_scripts_for_block(network: String, height: u32, block_hash: Vec<u8>) -> PyResult<bool> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    if block_hash.len() != 32 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Block hash must be 32 bytes",
+        ));
+    }
+
+    // Must be below last checkpoint
+    if !is_below_last_checkpoint(network_enum, height) {
+        return Ok(false);
+    }
+
+    // If at a checkpoint height, verify hash matches
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&block_hash);
+    if let Some(matches) = verify_checkpoint(network_enum, height, &hash) {
+        if !matches {
+            return Ok(false); // Checkpoint mismatch
+        }
+    }
+
+    Ok(true)
+}
+
+/// Python wrapper for HeadersSyncPhase enum
+#[pyclass]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PyHeadersSyncPhase {
+    Presync,
+    Redownload,
+    Final,
+}
+
+impl From<HeadersSyncPhase> for PyHeadersSyncPhase {
+    fn from(phase: HeadersSyncPhase) -> Self {
+        match phase {
+            HeadersSyncPhase::Presync => PyHeadersSyncPhase::Presync,
+            HeadersSyncPhase::Redownload => PyHeadersSyncPhase::Redownload,
+            HeadersSyncPhase::Final => PyHeadersSyncPhase::Final,
+        }
+    }
+}
+
+/// Python wrapper for HeadersSyncResult
+#[pyclass]
+#[derive(Clone)]
+pub struct PyHeadersSyncResult {
+    #[pyo3(get)]
+    pub success: bool,
+    #[pyo3(get)]
+    pub request_more: bool,
+    #[pyo3(get)]
+    pub headers_to_store: Vec<Vec<u8>>,
+    #[pyo3(get)]
+    pub error: Option<String>,
+}
+
+impl From<RustHeadersSyncResult> for PyHeadersSyncResult {
+    fn from(result: RustHeadersSyncResult) -> Self {
+        Self {
+            success: result.success,
+            request_more: result.request_more,
+            headers_to_store: result.headers_to_store
+                .iter()
+                .map(|h| {
+                    use bitcoin::consensus::Encodable;
+                    let mut buf = Vec::new();
+                    h.consensus_encode(&mut buf).unwrap();
+                    buf
+                })
+                .collect(),
+            error: result.error,
+        }
+    }
+}
+
+/// Python wrapper for HeadersSyncState
+///
+/// Provides anti-DoS protection during header synchronization.
+/// Implements PRESYNC/REDOWNLOAD phases per Bitcoin Core's HeadersSyncState.
+#[pyclass]
+pub struct PyHeadersSyncState {
+    inner: HeadersSyncState,
+}
+
+#[pymethods]
+impl PyHeadersSyncState {
+    /// Create a new header sync state.
+    ///
+    /// # Arguments
+    /// * `network` - Network name ("mainnet", "testnet", etc.)
+    /// * `chain_start_hash` - 32-byte hash of the block we're syncing from
+    /// * `chain_start_time` - Median time past of chain_start
+    #[new]
+    fn new(network: String, chain_start_hash: Vec<u8>, chain_start_time: u32) -> PyResult<Self> {
+        if chain_start_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "chain_start_hash must be 32 bytes",
+            ));
+        }
+
+        let network_enum = match network.to_lowercase().as_str() {
+            "mainnet" | "bitcoin" => Network::Bitcoin,
+            "testnet" | "testnet3" => Network::Testnet,
+            "testnet4" => Network::Testnet4,
+            "regtest" => Network::Regtest,
+            "signet" => Network::Signet,
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid network: {}", network),
+                ));
+            }
+        };
+
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&chain_start_hash);
+
+        Ok(Self {
+            inner: HeadersSyncState::new(network_enum, hash, chain_start_time),
+        })
+    }
+
+    /// Get current sync phase.
+    fn phase(&self) -> PyHeadersSyncPhase {
+        self.inner.phase().into()
+    }
+
+    /// Get cumulative work seen during presync (as hex string).
+    fn presync_work(&self) -> String {
+        let work = self.inner.presync_work();
+        let bytes = work.to_big_endian();
+        hex::encode(bytes)
+    }
+
+    /// Get presync height.
+    fn presync_height(&self) -> u32 {
+        self.inner.presync_height()
+    }
+
+    /// Get number of commitments stored.
+    fn commitment_count(&self) -> usize {
+        self.inner.commitment_count()
+    }
+
+    /// Process headers received from peer.
+    ///
+    /// # Arguments
+    /// * `headers` - List of serialized headers (80 bytes each)
+    /// * `full_message` - True if this is a complete 2000-header message
+    ///
+    /// # Returns
+    /// PyHeadersSyncResult with success, request_more, headers_to_store, error
+    fn process_headers(&mut self, headers: Vec<Vec<u8>>, full_message: bool) -> PyResult<PyHeadersSyncResult> {
+        use bitcoin::consensus::Decodable;
+
+        // Deserialize headers
+        let mut parsed: Vec<bitcoin::blockdata::block::Header> = Vec::with_capacity(headers.len());
+        for (i, header_bytes) in headers.iter().enumerate() {
+            if header_bytes.len() != 80 {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Header {} has invalid length: {} (expected 80)", i, header_bytes.len()),
+                ));
+            }
+
+            let mut cursor = std::io::Cursor::new(header_bytes);
+            let header = bitcoin::blockdata::block::Header::consensus_decode(&mut cursor)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Failed to deserialize header {}: {}", i, e),
+                ))?;
+            parsed.push(header);
+        }
+
+        let result = self.inner.process_headers(&parsed, full_message);
+        Ok(result.into())
+    }
+
+    /// Build locator for next headers request.
+    ///
+    /// Returns list of 32-byte block hashes.
+    fn next_headers_request_locator(&self) -> Vec<Vec<u8>> {
+        self.inner.next_headers_request_locator()
+            .into_iter()
+            .map(|h| h.to_vec())
+            .collect()
+    }
+
+    /// Finalize and clean up state.
+    fn finalize(&mut self) {
+        self.inner.finalize();
+    }
+}
+
+// ============================================================================
+// PyBlockStore: Flat file block storage (blk*.dat/rev*.dat format)
+// ============================================================================
+
+use crate::storage::blockstore::{BlockStore, BlockFileInfo, BlockPosition};
+use crate::storage::undo::BlockUndo;
+use bitcoin::consensus::{Decodable, Encodable};
+
+/// Python wrapper for flat file block storage (blk*.dat/rev*.dat format).
+///
+/// This provides Bitcoin Core compatible block storage in flat files, with
+/// automatic file rollover at 128MB and a RocksDB index for block positions.
+#[pyclass]
+pub struct PyBlockStore {
+    store: Arc<std::sync::RwLock<BlockStore>>,
+}
+
+#[pymethods]
+impl PyBlockStore {
+    /// Create a new block store.
+    ///
+    /// Args:
+    ///     data_dir: Base data directory (blocks stored in data_dir/blocks/)
+    ///     network: Network name ("mainnet", "testnet", "testnet4", "regtest", "signet")
+    #[new]
+    fn new(data_dir: String, network: String) -> PyResult<Self> {
+        let network_enum = match network.to_lowercase().as_str() {
+            "mainnet" | "bitcoin" => Network::Bitcoin,
+            "testnet" | "testnet3" => Network::Testnet,
+            "testnet4" => Network::Testnet4,
+            "regtest" => Network::Regtest,
+            "signet" => Network::Signet,
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid network: {}", network),
+                ));
+            }
+        };
+
+        let store = BlockStore::new(&data_dir, network_enum).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to open block store: {}",
+                e
+            ))
+        })?;
+
+        Ok(Self {
+            store: Arc::new(std::sync::RwLock::new(store)),
+        })
+    }
+
+    /// Write a block to disk.
+    ///
+    /// Args:
+    ///     block_data: Serialized block data (Bitcoin consensus encoding)
+    ///     height: Block height
+    ///
+    /// Returns:
+    ///     Tuple of (file_num, data_pos) indicating where block was stored.
+    fn write_block(&self, block_data: Vec<u8>, height: u32) -> PyResult<(i32, u32)> {
+        let block = bitcoin::Block::consensus_decode(&mut std::io::Cursor::new(&block_data))
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Invalid block data: {}",
+                    e
+                ))
+            })?;
+
+        let store = self.store.write().unwrap();
+        let pos = store.write_block(&block, height).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to write block: {}",
+                e
+            ))
+        })?;
+
+        Ok((pos.file, pos.data_pos))
+    }
+
+    /// Read a block from disk by hash.
+    ///
+    /// Args:
+    ///     block_hash: 32-byte block hash
+    ///
+    /// Returns:
+    ///     Serialized block data, or None if not found.
+    fn read_block(&self, block_hash: &[u8]) -> PyResult<Option<Vec<u8>>> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes",
+            ));
+        }
+
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+        let block_hash = bitcoin::BlockHash::from_byte_array(hash_bytes);
+
+        let store = self.store.read().unwrap();
+        match store.read_block(&block_hash) {
+            Ok(Some(block)) => {
+                let mut data = Vec::new();
+                block.consensus_encode(&mut data).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Failed to serialize block: {}",
+                        e
+                    ))
+                })?;
+                Ok(Some(data))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to read block: {}",
+                e
+            ))),
+        }
+    }
+
+    /// Read a block from disk by file position.
+    ///
+    /// Args:
+    ///     file_num: Block file number
+    ///     data_pos: Position in block file (after header)
+    ///
+    /// Returns:
+    ///     Serialized block data, or None if not found.
+    fn read_block_at(&self, file_num: i32, data_pos: u32) -> PyResult<Option<Vec<u8>>> {
+        let store = self.store.read().unwrap();
+        match store.read_block_at(file_num, data_pos) {
+            Ok(Some(block)) => {
+                let mut data = Vec::new();
+                block.consensus_encode(&mut data).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Failed to serialize block: {}",
+                        e
+                    ))
+                })?;
+                Ok(Some(data))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to read block: {}",
+                e
+            ))),
+        }
+    }
+
+    /// Check if a block exists in the store.
+    fn has_block(&self, block_hash: &[u8]) -> PyResult<bool> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes",
+            ));
+        }
+
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+        let block_hash = bitcoin::BlockHash::from_byte_array(hash_bytes);
+
+        let store = self.store.read().unwrap();
+        store.has_block(&block_hash).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to check block: {}",
+                e
+            ))
+        })
+    }
+
+    /// Get block position (file_num, data_pos, undo_pos) for a block hash.
+    fn get_block_pos(&self, block_hash: &[u8]) -> PyResult<Option<(i32, u32, u32)>> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes",
+            ));
+        }
+
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+        let block_hash = bitcoin::BlockHash::from_byte_array(hash_bytes);
+
+        let store = self.store.read().unwrap();
+        match store.get_block_pos(&block_hash) {
+            Ok(Some(pos)) => Ok(Some((pos.file, pos.data_pos, pos.undo_pos))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to get block position: {}",
+                e
+            ))),
+        }
+    }
+
+    /// Get current block file number.
+    fn current_file(&self) -> i32 {
+        let store = self.store.read().unwrap();
+        store.current_file()
+    }
+
+    /// Get current position in block file.
+    fn current_pos(&self) -> u32 {
+        let store = self.store.read().unwrap();
+        store.current_pos()
+    }
+
+    /// Get file info for a block file.
+    ///
+    /// Returns: Tuple of (num_blocks, size, undo_size, height_first, height_last, time_first, time_last)
+    fn get_file_info(&self, file_num: i32) -> Option<(u32, u32, u32, u32, u32, u64, u64)> {
+        let store = self.store.read().unwrap();
+        store.get_file_info(file_num).map(|info| {
+            (
+                info.num_blocks,
+                info.size,
+                info.undo_size,
+                info.height_first,
+                info.height_last,
+                info.time_first,
+                info.time_last,
+            )
+        })
+    }
+
+    /// Flush all pending writes to disk.
+    fn flush(&self) -> PyResult<()> {
+        let store = self.store.read().unwrap();
+        store.flush().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to flush: {}", e))
+        })
+    }
+
+    /// Get the blocks directory path.
+    fn blocks_dir(&self) -> String {
+        let store = self.store.read().unwrap();
+        store.blocks_dir().to_string_lossy().to_string()
+    }
+
+    // =========================================================================
+    // Pruning Methods
+    // =========================================================================
+
+    /// Get the maximum block file number currently in use.
+    fn max_blockfile_num(&self) -> i32 {
+        let store = self.store.read().unwrap();
+        store.max_blockfile_num()
+    }
+
+    /// Calculate total disk usage of all block and undo files.
+    fn calculate_current_usage(&self) -> u64 {
+        let store = self.store.read().unwrap();
+        store.calculate_current_usage()
+    }
+
+    /// Find block files eligible for pruning.
+    ///
+    /// Args:
+    ///     last_block_can_prune: Highest block height that can be pruned
+    ///     min_block_to_prune: Lowest block height that can be pruned (usually 0)
+    ///     target_bytes: Target disk usage in bytes (0 = no target, prune all eligible)
+    ///
+    /// Returns:
+    ///     List of file numbers that can be pruned.
+    fn find_files_to_prune(
+        &self,
+        last_block_can_prune: u32,
+        min_block_to_prune: u32,
+        target_bytes: u64,
+    ) -> Vec<i32> {
+        let store = self.store.read().unwrap();
+        store.find_files_to_prune(last_block_can_prune, min_block_to_prune, target_bytes)
+    }
+
+    /// Prune block files to meet a target size.
+    ///
+    /// Args:
+    ///     current_height: Current best block height
+    ///     target_bytes: Target disk usage (minimum 550MB)
+    ///
+    /// Returns:
+    ///     Tuple of (files_pruned, bytes_freed).
+    fn prune_to_target(&self, current_height: u32, target_bytes: u64) -> PyResult<(usize, u64)> {
+        let store = self.store.read().unwrap();
+        store.prune_to_target(current_height, target_bytes).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Prune error: {}", e))
+        })
+    }
+
+    /// Prune block files up to a specific height (for pruneblockchain RPC).
+    ///
+    /// Args:
+    ///     target_height: Prune all files with blocks fully below this height
+    ///     current_height: Current best block height (for safety check)
+    ///
+    /// Returns:
+    ///     Tuple of (files_pruned, bytes_freed, actual_prune_height).
+    fn prune_to_height(
+        &self,
+        target_height: u32,
+        current_height: u32,
+    ) -> PyResult<(usize, u64, u32)> {
+        let store = self.store.read().unwrap();
+        store.prune_to_height(target_height, current_height).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Prune error: {}", e))
+        })
+    }
+
+    /// Get the lowest height that still has block data available.
+    fn get_prune_height(&self) -> u32 {
+        let store = self.store.read().unwrap();
+        store.get_prune_height()
+    }
+
+    /// Check if block data is available for a given height.
+    fn has_block_data_at_height(&self, height: u32) -> bool {
+        let store = self.store.read().unwrap();
+        store.has_block_data_at_height(height)
+    }
+
+    /// Get pruning statistics.
+    ///
+    /// Returns:
+    ///     Tuple of (total_files, pruned_files, data_bytes, undo_bytes, prune_height).
+    fn get_prune_stats(&self) -> (usize, usize, u64, u64, u32) {
+        let store = self.store.read().unwrap();
+        let stats = store.get_prune_stats();
+        (
+            stats.total_files,
+            stats.pruned_files,
+            stats.data_bytes,
+            stats.undo_bytes,
+            stats.prune_height,
+        )
+    }
+
+    /// Get minimum blocks to keep for reorg safety (288 blocks).
+    #[staticmethod]
+    fn min_blocks_to_keep() -> u32 {
+        BlockStore::MIN_BLOCKS_TO_KEEP
+    }
+
+    /// Get minimum prune target in bytes (550 MB).
+    #[staticmethod]
+    fn min_prune_target() -> u64 {
+        BlockStore::MIN_DISK_SPACE_FOR_BLOCK_FILES
+    }
+}
+
+// =============================================================================
+// UTXO Cache Statistics for Python
+// =============================================================================
+
+use crate::storage::coins::{CacheStats, DEFAULT_DBCACHE_BYTES};
+
+/// Python wrapper for UTXO cache statistics.
+///
+/// Provides read-only access to cache performance metrics.
+#[pyclass]
+#[derive(Clone)]
+pub struct PyUtxoCacheStats {
+    /// Total number of entries in the cache (including tombstones).
+    #[pyo3(get)]
+    pub entries: usize,
+    /// Number of unspent entries.
+    #[pyo3(get)]
+    pub unspent: usize,
+    /// Number of spent entries (tombstones).
+    #[pyo3(get)]
+    pub spent: usize,
+    /// Number of dirty entries (modified since last flush).
+    #[pyo3(get)]
+    pub dirty: usize,
+    /// Number of fresh entries (created in cache, not from DB).
+    #[pyo3(get)]
+    pub fresh: usize,
+    /// Approximate memory usage in bytes.
+    #[pyo3(get)]
+    pub memory_bytes: usize,
+    /// Number of cache hits.
+    #[pyo3(get)]
+    pub hits: u64,
+    /// Number of cache misses.
+    #[pyo3(get)]
+    pub misses: u64,
+    /// Number of flushes performed.
+    #[pyo3(get)]
+    pub flushes: u64,
+    /// Total entries written in all flushes.
+    #[pyo3(get)]
+    pub entries_flushed: u64,
+}
+
+impl From<CacheStats> for PyUtxoCacheStats {
+    fn from(stats: CacheStats) -> Self {
+        Self {
+            entries: stats.entries,
+            unspent: stats.unspent,
+            spent: stats.spent,
+            dirty: stats.dirty,
+            fresh: stats.fresh,
+            memory_bytes: stats.memory_bytes,
+            hits: stats.hits,
+            misses: stats.misses,
+            flushes: stats.flushes,
+            entries_flushed: stats.entries_flushed,
+        }
+    }
+}
+
+#[pymethods]
+impl PyUtxoCacheStats {
+    /// Memory usage as a human-readable string (e.g., "450 MB").
+    fn memory_human(&self) -> String {
+        let bytes = self.memory_bytes as f64;
+        if bytes >= 1_073_741_824.0 {
+            format!("{:.2} GB", bytes / 1_073_741_824.0)
+        } else if bytes >= 1_048_576.0 {
+            format!("{:.2} MB", bytes / 1_048_576.0)
+        } else if bytes >= 1024.0 {
+            format!("{:.2} KB", bytes / 1024.0)
+        } else {
+            format!("{} B", self.memory_bytes)
+        }
+    }
+
+    /// Cache hit rate as a percentage (0.0-100.0).
+    fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            (self.hits as f64 / total as f64) * 100.0
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "UtxoCacheStats(entries={}, unspent={}, dirty={}, memory={}, hit_rate={:.1}%)",
+            self.entries,
+            self.unspent,
+            self.dirty,
+            self.memory_human(),
+            self.hit_rate()
+        )
+    }
+}
+
+/// Get the default UTXO cache size in bytes (450 MB).
+#[pyfunction]
+fn utxo_cache_default_size() -> usize {
+    DEFAULT_DBCACHE_BYTES
+}
+
+// =============================================================================
+// Transaction Index (TxIndex)
+// =============================================================================
+
+use crate::storage::txindex::{TxIndex, DiskTxPos};
+
+/// Python wrapper for transaction disk position.
+#[pyclass]
+#[derive(Clone)]
+pub struct PyDiskTxPos {
+    /// Block file number (blk?????.dat).
+    #[pyo3(get)]
+    pub file_number: i32,
+    /// Position of block data within file (after 8-byte header).
+    #[pyo3(get)]
+    pub block_offset: u32,
+    /// Offset of transaction within block (after tx count varint).
+    #[pyo3(get)]
+    pub tx_offset: u32,
+}
+
+#[pymethods]
+impl PyDiskTxPos {
+    #[new]
+    fn new(file_number: i32, block_offset: u32, tx_offset: u32) -> Self {
+        Self { file_number, block_offset, tx_offset }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DiskTxPos(file={}, block_offset={}, tx_offset={})",
+            self.file_number, self.block_offset, self.tx_offset
+        )
+    }
+}
+
+impl From<DiskTxPos> for PyDiskTxPos {
+    fn from(pos: DiskTxPos) -> Self {
+        Self {
+            file_number: pos.file_number,
+            block_offset: pos.block_offset,
+            tx_offset: pos.tx_offset,
+        }
+    }
+}
+
+impl From<PyDiskTxPos> for DiskTxPos {
+    fn from(pos: PyDiskTxPos) -> Self {
+        Self::new(pos.file_number, pos.block_offset, pos.tx_offset)
+    }
+}
+
+/// Python wrapper for transaction index.
+///
+/// Provides O(1) lookup of confirmed transactions by txid, storing the
+/// file position where each transaction is located.
+#[pyclass]
+pub struct PyTxIndex {
+    inner: TxIndex,
+}
+
+#[pymethods]
+impl PyTxIndex {
+    /// Open or create a transaction index.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Directory for the index database
+    /// * `enabled` - Whether the index is enabled (default: true)
+    #[new]
+    #[pyo3(signature = (path, enabled=true))]
+    fn new(path: String, enabled: bool) -> PyResult<Self> {
+        let inner = TxIndex::open(&path, enabled)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to open TxIndex: {}", e)
+            ))?;
+        Ok(Self { inner })
+    }
+
+    /// Check if the index is enabled.
+    fn is_enabled(&self) -> bool {
+        self.inner.is_enabled()
+    }
+
+    /// Write a transaction position to the index.
+    ///
+    /// # Arguments
+    ///
+    /// * `txid` - Transaction ID as 32-byte array
+    /// * `file_number` - Block file number
+    /// * `block_offset` - Position of block data within file
+    /// * `tx_offset` - Offset of transaction within block
+    fn write_tx(
+        &self,
+        txid: Vec<u8>,
+        file_number: i32,
+        block_offset: u32,
+        tx_offset: u32,
+    ) -> PyResult<()> {
+        if txid.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "txid must be 32 bytes"
+            ));
+        }
+        let mut txid_arr = [0u8; 32];
+        txid_arr.copy_from_slice(&txid);
+        let txid = bitcoin::Txid::from_byte_array(txid_arr);
+        let pos = DiskTxPos::new(file_number, block_offset, tx_offset);
+
+        self.inner.write_tx(&txid, &pos)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to write tx: {}", e)
+            ))
+    }
+
+    /// Write multiple transaction positions in a batch.
+    ///
+    /// # Arguments
+    ///
+    /// * `txs` - List of (txid, file_number, block_offset, tx_offset) tuples
+    fn write_txs(&self, txs: Vec<(Vec<u8>, i32, u32, u32)>) -> PyResult<()> {
+        let txs: Result<Vec<(bitcoin::Txid, DiskTxPos)>, _> = txs
+            .into_iter()
+            .map(|(txid, file_num, block_off, tx_off)| {
+                if txid.len() != 32 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "txid must be 32 bytes"
+                    ));
+                }
+                let mut txid_arr = [0u8; 32];
+                txid_arr.copy_from_slice(&txid);
+                Ok((
+                    bitcoin::Txid::from_byte_array(txid_arr),
+                    DiskTxPos::new(file_num, block_off, tx_off),
+                ))
+            })
+            .collect();
+
+        self.inner.write_txs(&txs?)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to write txs: {}", e)
+            ))
+    }
+
+    /// Read a transaction position from the index.
+    ///
+    /// # Arguments
+    ///
+    /// * `txid` - Transaction ID as 32-byte array
+    ///
+    /// # Returns
+    ///
+    /// DiskTxPos if found, None otherwise.
+    fn read_tx(&self, txid: Vec<u8>) -> PyResult<Option<PyDiskTxPos>> {
+        if txid.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "txid must be 32 bytes"
+            ));
+        }
+        let mut txid_arr = [0u8; 32];
+        txid_arr.copy_from_slice(&txid);
+        let txid = bitcoin::Txid::from_byte_array(txid_arr);
+
+        self.inner.read_tx(&txid)
+            .map(|opt| opt.map(PyDiskTxPos::from))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to read tx: {}", e)
+            ))
+    }
+
+    /// Delete a transaction from the index.
+    fn delete_tx(&self, txid: Vec<u8>) -> PyResult<()> {
+        if txid.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "txid must be 32 bytes"
+            ));
+        }
+        let mut txid_arr = [0u8; 32];
+        txid_arr.copy_from_slice(&txid);
+        let txid = bitcoin::Txid::from_byte_array(txid_arr);
+
+        self.inner.delete_tx(&txid)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to delete tx: {}", e)
+            ))
+    }
+
+    /// Delete multiple transactions in a batch.
+    fn delete_txs(&self, txids: Vec<Vec<u8>>) -> PyResult<()> {
+        let txids: Result<Vec<bitcoin::Txid>, _> = txids
+            .into_iter()
+            .map(|txid| {
+                if txid.len() != 32 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "txid must be 32 bytes"
+                    ));
+                }
+                let mut txid_arr = [0u8; 32];
+                txid_arr.copy_from_slice(&txid);
+                Ok(bitcoin::Txid::from_byte_array(txid_arr))
+            })
+            .collect();
+
+        self.inner.delete_txs(&txids?)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to delete txs: {}", e)
+            ))
+    }
+
+    /// Check if a transaction exists in the index.
+    fn has_tx(&self, txid: Vec<u8>) -> PyResult<bool> {
+        if txid.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "txid must be 32 bytes"
+            ));
+        }
+        let mut txid_arr = [0u8; 32];
+        txid_arr.copy_from_slice(&txid);
+        let txid = bitcoin::Txid::from_byte_array(txid_arr);
+
+        self.inner.has_tx(&txid)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to check tx: {}", e)
+            ))
+    }
+
+    /// Flush pending writes.
+    fn flush(&self) -> PyResult<()> {
+        self.inner.flush()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to flush: {}", e)
+            ))
+    }
+}
+
 /// Fast sync module for Bitcoin blockchain synchronization
 #[pymodule]
 fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_logging();
     m.add_function(pyo3::wrap_pyfunction!(verify_ecdsa, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(get_script_flags_for_height, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(segwit_activation_height, m)?)?;
+    // BIP68 sequence lock functions
+    m.add_function(pyo3::wrap_pyfunction!(bip68_activation_height, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(is_bip68_active, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(calculate_sequence_locks, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(check_sequence_locks, m)?)?;
+    // Transaction finality (locktime) functions
+    m.add_function(pyo3::wrap_pyfunction!(is_final_tx, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(locktime_threshold, m)?)?;
+    // Coinbase maturity functions
+    m.add_function(pyo3::wrap_pyfunction!(check_coinbase_maturity, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(coinbase_maturity_constant, m)?)?;
+    // Difficulty adjustment functions
+    m.add_function(pyo3::wrap_pyfunction!(get_next_work_required, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(calculate_next_difficulty, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(pow_limit_bits, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(check_difficulty_transition, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(difficulty_adjustment_interval, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(target_timespan, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(target_spacing, m)?)?;
     m.add_class::<PyUTXO>()?;
     m.add_class::<SyncEngine>()?;
     m.add_class::<FastSync>()?;
@@ -62,8 +1921,40 @@ fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SyncProgressReporter>()?;
     m.add_class::<SyncProgress>()?;
     m.add_class::<PyBlockchainDB>()?;
+    m.add_class::<PyBlockStore>()?;
     m.add_class::<PyBlock>()?;
     m.add_class::<PyTransaction>()?;
+    m.add_class::<PyScriptVerifyFlags>()?;
+    m.add_class::<PySequenceLockConstants>()?;
+    // BIP9 versionbits functions
+    m.add_function(pyo3::wrap_pyfunction!(get_deployment_state, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(get_all_deployments_info, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(is_deployment_active, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(versionbits_top_bits, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(versionbits_top_mask, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(check_version_signal, m)?)?;
+    m.add_class::<PyDeploymentInfo>()?;
+    // Headers presync anti-DoS functions
+    m.add_function(pyo3::wrap_pyfunction!(get_minimum_chain_work, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(get_headers_commitment_period, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(get_headers_redownload_buffer_size, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(max_headers_per_message, m)?)?;
+    m.add_class::<PyHeadersSyncPhase>()?;
+    m.add_class::<PyHeadersSyncResult>()?;
+    m.add_class::<PyHeadersSyncState>()?;
+    // Checkpoint functions
+    m.add_class::<PyCheckpoint>()?;
+    m.add_function(pyo3::wrap_pyfunction!(get_network_checkpoints, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(get_last_network_checkpoint, m)?)?;
+    // UTXO cache statistics
+    m.add_class::<PyUtxoCacheStats>()?;
+    m.add_function(pyo3::wrap_pyfunction!(utxo_cache_default_size, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(check_is_below_checkpoint, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(verify_block_checkpoint, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(can_skip_scripts_for_block, m)?)?;
+    // Transaction index
+    m.add_class::<PyTxIndex>()?;
+    m.add_class::<PyDiskTxPos>()?;
     Ok(())
 }
 
@@ -531,11 +2422,63 @@ impl PyBlockchainDB {
         })
     }
 
+    /// Build and store undo data for a block.
+    ///
+    /// This should be called after the UTXO set has been updated during
+    /// connect_block. It reads spent UTXOs from SPENT_CF and stores
+    /// structured undo data in UNDO_CF.
+    ///
+    /// # Arguments
+    /// * `block_hash` - Hash of the block being connected
+    /// * `height` - Block height
+    /// * `prev_block_hash` - Hash of the previous block
+    fn store_block_undo(&self, block_hash: &[u8], height: u32, prev_block_hash: &[u8]) -> PyResult<()> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+        if prev_block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Previous block hash must be 32 bytes"
+            ));
+        }
+
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+        let mut prev_hash_bytes = [0u8; 32];
+        prev_hash_bytes.copy_from_slice(prev_block_hash);
+
+        // Get the block
+        let block = self.db.get_block(&hash_bytes).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to get block: {}", e)
+            )
+        })?.ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Block not found")
+        })?;
+
+        self.db.build_and_store_undo_data(&block, height, &prev_hash_bytes).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to store undo data: {}", e)
+            )
+        })
+    }
+
+    /// Check if undo data exists for a block at the given height.
+    fn has_block_undo(&self, height: u32) -> PyResult<bool> {
+        self.db.has_block_undo(height).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
+
     /// Disconnect the block at the given height — reverse all UTXO changes.
     ///
     /// Removes outputs created by the block from the UTXO set and restores
-    /// spent inputs from undo data in SPENT_CF. Updates the chain tip to
-    /// the previous block.
+    /// spent inputs from undo data in UNDO_CF (or SPENT_CF for backward
+    /// compatibility). Updates the chain tip to the previous block.
     ///
     /// Returns the hash of the disconnected block.
     fn disconnect_block(&self, height: u32) -> PyResult<Vec<u8>> {
