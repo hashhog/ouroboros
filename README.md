@@ -34,6 +34,7 @@ the node logic, RPC server, and mempool.
 - [x] Stale tip detection and peer eviction (ConsiderEviction, extra outbound connection)
 - [x] sendrawtransaction RPC with maxfeerate, confirmed/mempool checks, detailed errors
 - [x] getrawtransaction RPC with txindex support, verbose output, and in_active_chain
+- [x] Bitcoin Core-compatible RPCs (getblockchaininfo, getmempoolinfo, getpeerinfo, etc.)
 - [ ] Full signature verification (secp256k1)
 - [ ] Wallet functionality
 
@@ -57,6 +58,10 @@ ouroboros status
 ouroboros/
 ├── ferrous-utils/sync/     # Rust: block sync, validation, PyO3 bindings
 ├── src/ouroboros/          # Python: CLI, RPC, mempool, node logic
+│   ├── rpc.py              # JSON-RPC server (FastAPI)
+│   ├── mempool.py          # Transaction mempool
+│   ├── node.py             # Node orchestration
+│   └── validation.py       # Transaction/block validation
 └── pyproject.toml
 ```
 
