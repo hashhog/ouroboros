@@ -26,7 +26,13 @@ from ouroboros.minisketch import (
     Minisketch, ReconciliationSet, estimate_sketch_capacity,
     compute_short_txid,
 )
-from ouroboros.banman import BanManager
+from ouroboros.banman import (
+    BanManager,
+    SCORE_INVALID_BLOCK,
+    SCORE_INVALID_HEADERS,
+    SCORE_INVALID_TX,
+    SCORE_UNREQUESTED_DATA,
+)
 from ouroboros.addrman import AddressManager
 
 logger = logging.getLogger(__name__)
@@ -1360,9 +1366,35 @@ class PeerManager:
                 asyncio.ensure_future(peer.disconnect())
         self.known_addrs.discard(ip)
 
-    def record_misbehavior(self, addr: str, score: int, reason: str) -> None:
-        """Record misbehavior for a peer; auto-bans at threshold."""
-        self.ban_manager.record_misbehavior(addr, score, reason)
+    def record_misbehavior(self, addr: str, score: int, reason: str) -> bool:
+        """Record misbehavior for a peer; auto-bans at threshold.
+
+        Returns True if the peer was banned.
+        """
+        return self.ban_manager.record_misbehavior(addr, score, reason)
+
+    def misbehaving(self, peer_id: str, score: int, reason: str) -> bool:
+        """Record misbehavior for a peer (Bitcoin Core API compatibility).
+
+        This method adds misbehavior points to a peer. When the cumulative
+        score reaches the ban threshold (default 100), the peer is automatically
+        disconnected and banned for the ban duration (default 24 hours).
+
+        Common scores (from Bitcoin Core net_processing.cpp):
+            - Invalid block: 100 (instant ban)
+            - Invalid headers: 20
+            - Invalid tx: 10
+            - Unrequested data: 20
+
+        Args:
+            peer_id: Peer identifier (IP address or IP:port)
+            score: Misbehavior score to add
+            reason: Human-readable reason
+
+        Returns:
+            True if the peer was banned as a result
+        """
+        return self.ban_manager.misbehaving(peer_id, score, reason)
 
     def unban_peer(self, addr: str):
         """
