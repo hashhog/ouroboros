@@ -42,6 +42,13 @@ the node logic, RPC server, and mempool.
 - [x] BIP331 P2P messages (sendpackages, getpkgtxns, pkgtxns, ancpkginfo)
 - [x] PSBT (BIP174/BIP370) creation, signing, combining, and finalization
 - [x] Taproot PSBT fields (key path sigs, script path, internal key)
+- [x] Output descriptors (BIP380-386): pk, pkh, wpkh, tr, sh, wsh, multi, sortedmulti, combo, addr, raw
+- [x] Descriptor RPCs: getdescriptorinfo, deriveaddresses, importdescriptors, listdescriptors
+- [x] Miniscript (BIP379): parsing, type checking, compilation to Script, witness size analysis
+- [x] Miniscript fragments: pk, pkh, older, after, sha256, hash256, ripemd160, hash160
+- [x] Miniscript combinators: and_v, and_b, or_b, or_c, or_d, or_i, andor, thresh, multi, multi_a
+- [x] Miniscript wrappers: a:, s:, c:, d:, v:, j:, n:, t:, l:, u:
+- [x] Miniscript in descriptors: wsh(miniscript), tr(KEY, TREE)
 - [ ] Full signature verification (secp256k1)
 - [ ] Wallet functionality
 
@@ -69,6 +76,8 @@ ouroboros/
 │   ├── mempool.py          # Transaction mempool
 │   ├── node.py             # Node orchestration
 │   ├── psbt.py             # PSBT (BIP174/BIP370) support
+│   ├── descriptors.py      # Output descriptors (BIP380-386)
+│   ├── miniscript.py       # Miniscript (BIP379) support
 │   └── validation.py       # Transaction/block validation
 └── pyproject.toml
 ```
