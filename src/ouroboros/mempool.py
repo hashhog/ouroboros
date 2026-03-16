@@ -109,6 +109,9 @@ class MempoolEntry:
     ancestor_size: int = 0
     descendant_count: int = 1
     descendant_size: int = 0
+    # Parent/child txid links for efficient graph traversal
+    parents: Set[bytes] = field(default_factory=set)
+    children: Set[bytes] = field(default_factory=set)
 
 
 # Orphan transaction pool
@@ -199,17 +202,31 @@ class OrphanPool:
 
 class Mempool:
     """Unconfirmed transaction pool"""
-    
+
     def __init__(
         self,
         validator: TransactionValidator,
         max_size: int = 300_000_000,  # 300 MB
         require_standard: bool = True,
+        full_rbf: bool = True,  # BIP125 Full RBF (mempoolfullrbf), default True since v28
+        on_tx_removed: Optional[callable] = None,  # callback: (txid, reason) -> None
     ):
-        """Initialize mempool."""
+        """Initialize mempool.
+
+        Args:
+            validator: Transaction validator instance
+            max_size: Maximum mempool size in bytes (default 300MB)
+            require_standard: Enforce standardness rules (default True)
+            full_rbf: Enable full RBF - allow replacing any unconfirmed tx
+                      regardless of BIP125 signaling (default True since v28)
+            on_tx_removed: Optional callback invoked when tx is removed from mempool
+                           Called with (txid: bytes, reason: str)
+        """
         self.validator = validator
         self.max_size = max_size
         self.require_standard = require_standard
+        self.full_rbf = full_rbf
+        self._on_tx_removed = on_tx_removed
         
         self.transactions: Dict[bytes, MempoolEntry] = {}  # txid -> entry
         self.spent_outputs: Set[OutPoint] = set()
@@ -315,22 +332,36 @@ class Mempool:
                     # The only way to add another child is via replacement
                     return self.try_replace(tx, height)
 
-        # Ancestor/descendant limits
+        # Ancestor/descendant limits (Bitcoin Core: CalculateMemPoolAncestors)
         ancestors = self._get_ancestors(tx)
+        tx_size = len(tx.serialize())
+
+        # Check ancestor count limit
         if len(ancestors) + 1 > MAX_ANCESTOR_COUNT:
             return False, (
                 f"Too many ancestors: {len(ancestors) + 1} > {MAX_ANCESTOR_COUNT}")
-        ancestor_size = sum(self.transactions[a].size for a in ancestors if a in self.transactions)  # TODO: this could be cached
-        tx_size = len(tx.serialize())
-        if (ancestor_size + tx_size) // 1000 > MAX_ANCESTOR_SIZE_KVB:
-            return False, "Ancestor size limit exceeded"
 
+        # Check ancestor size limit (101KB)
+        ancestor_size = sum(self.transactions[a].size for a in ancestors if a in self.transactions)
+        if ancestor_size + tx_size > MAX_ANCESTOR_SIZE_KVB * 1000:
+            return False, (
+                f"Ancestor size limit exceeded: {ancestor_size + tx_size} > "
+                f"{MAX_ANCESTOR_SIZE_KVB * 1000}")
+
+        # Check descendant limits for each ancestor
         for a_txid in ancestors:
             if a_txid in self.transactions:
                 entry = self.transactions[a_txid]
+                # Descendant count limit
                 if entry.descendant_count + 1 > MAX_DESCENDANT_COUNT:
                     return False, (
-                        f"Too many descendants for ancestor {a_txid.hex()[:16]}...")
+                        f"Too many descendants for ancestor {a_txid.hex()[:16]}...: "
+                        f"{entry.descendant_count + 1} > {MAX_DESCENDANT_COUNT}")
+                # Descendant size limit (101KB)
+                if entry.descendant_size + tx_size > MAX_DESCENDANT_SIZE_KVB * 1000:
+                    return False, (
+                        f"Descendant size limit exceeded for {a_txid.hex()[:16]}...: "
+                        f"{entry.descendant_size + tx_size} > {MAX_DESCENDANT_SIZE_KVB * 1000}")
         
         # Check mempool size
         if self.current_size + tx_size > self.max_size:
@@ -359,6 +390,12 @@ class Mempool:
         if fee < min_relay:
             return False, "Below minimum relay fee: %d < %d" % (fee, min_relay)
         
+        # Compute direct parents (mempool txs this tx spends from)
+        direct_parents: Set[bytes] = set()
+        for tx_in in tx.inputs:
+            if tx_in.prev_txid in self.transactions:
+                direct_parents.add(tx_in.prev_txid)
+
         # Add to mempool
         entry = MempoolEntry(
             tx=tx,
@@ -369,15 +406,22 @@ class Mempool:
             height_added=height,
             ancestor_count=len(ancestors) + 1,
             ancestor_size=ancestor_size + tx_size,
+            parents=direct_parents,
+            children=set(),
         )
-        
+
         self.transactions[txid] = entry
         self.current_size += tx_size
-        
+
         # Track spent outputs
         for tx_in in tx.inputs:
             outpoint: OutPoint = (tx_in.prev_txid, tx_in.prev_vout)
             self.spent_outputs.add(outpoint)
+
+        # Update parent entries to add this txid as a child
+        for parent_txid in direct_parents:
+            if parent_txid in self.transactions:
+                self.transactions[parent_txid].children.add(txid)
 
         # Update ancestor descendant counts
         for a_txid in ancestors:
@@ -399,21 +443,31 @@ class Mempool:
         return True, ""
 
     def _get_ancestors(self, tx: Transaction) -> Set[bytes]:
+        """Get all ancestors (transitive parents) of a transaction.
+
+        Uses parent links stored on MempoolEntry for efficient traversal.
+        For a tx not yet in the mempool, computes direct parents from inputs.
+        """
         result: Set[bytes] = set()
-        queue = []
+        queue: List[bytes] = []
+
+        # Find direct parents from inputs
         for inp in tx.inputs:
             if inp.prev_txid in self.transactions:
                 queue.append(inp.prev_txid)
                 result.add(inp.prev_txid)
+
+        # BFS through parent links
         while queue:
-            parent = queue.pop()
-            entry = self.transactions.get(parent)
-            if entry is None:
+            parent_txid = queue.pop()
+            parent_entry = self.transactions.get(parent_txid)
+            if parent_entry is None:
                 continue
-            for inp in entry.tx.inputs:
-                if inp.prev_txid in self.transactions and inp.prev_txid not in result:
-                    result.add(inp.prev_txid)
-                    queue.append(inp.prev_txid)
+            # Use stored parent links for efficient traversal
+            for grandparent_txid in parent_entry.parents:
+                if grandparent_txid not in result and grandparent_txid in self.transactions:
+                    result.add(grandparent_txid)
+                    queue.append(grandparent_txid)
         return result
 
     # --- TRUC (v3) helpers ---
@@ -455,13 +509,11 @@ class Mempool:
         return True, ""
 
     def _get_v3_children(self, parent_txid: bytes) -> List[bytes]:
-        children: List[bytes] = []
-        for child_txid, child_entry in self.transactions.items():
-            for inp in child_entry.tx.inputs:
-                if inp.prev_txid == parent_txid:
-                    children.append(child_txid)
-                    break
-        return children
+        """Get direct children of a transaction in the mempool."""
+        parent_entry = self.transactions.get(parent_txid)
+        if parent_entry is None:
+            return []
+        return list(parent_entry.children)
 
     def _recalculate_ancestors(self, txid: bytes) -> None:
         entry = self.transactions.get(txid)
@@ -474,25 +526,28 @@ class Mempool:
             + entry.size
         )
 
-    def _update_descendants_after_removal(self, removed_txid: bytes) -> None:
-        """After removing *removed_txid*, fix ancestor/descendant counts."""
-        removed_entry_size = 0
-        # We need the removed entry's info, but it's already deleted.
-        # Instead, find descendants by scanning the mempool for any tx
-        # that has removed_txid in its ancestor chain.  Since we already
-        # deleted the entry, _get_ancestors won't include it, but its
-        # former descendants still reference it as a parent input — they
-        # now have fewer ancestors.
+    def _update_descendants_after_removal(
+        self, removed_txid: bytes, former_children: Optional[Set[bytes]] = None
+    ) -> None:
+        """After removing *removed_txid*, fix ancestor/descendant counts.
 
-        # Find direct children (txs that spent an output of removed_txid)
-        children: Set[bytes] = set()
-        for child_txid, child_entry in self.transactions.items():
-            for inp in child_entry.tx.inputs:
-                if inp.prev_txid == removed_txid:
-                    children.add(child_txid)
-                    break
+        Args:
+            removed_txid: The txid that was just removed.
+            former_children: The children set of the removed entry (if available).
+        """
+        # Find direct children of removed tx. Use former_children if provided,
+        # otherwise scan transactions (slower fallback for compatibility).
+        if former_children is not None:
+            children = former_children
+        else:
+            children = set()
+            for child_txid, child_entry in self.transactions.items():
+                for inp in child_entry.tx.inputs:
+                    if inp.prev_txid == removed_txid:
+                        children.add(child_txid)
+                        break
 
-        # Collect all descendants of removed tx (via children)
+        # Collect all descendants of removed tx (via children) using children links
         all_desc: Set[bytes] = set()
         queue = list(children)
         while queue:
@@ -500,33 +555,30 @@ class Mempool:
             if t in all_desc:
                 continue
             all_desc.add(t)
-            for child_txid, child_entry in self.transactions.items():
-                if child_txid in all_desc:
-                    continue
-                for inp in child_entry.tx.inputs:
-                    if inp.prev_txid == t:
+            # Use children links for efficient traversal
+            entry = self.transactions.get(t)
+            if entry:
+                for child_txid in entry.children:
+                    if child_txid not in all_desc and child_txid in self.transactions:
                         queue.append(child_txid)
-                        break
 
         # Recalculate ancestor counts for all affected descendants
         for desc_txid in all_desc:
             self._recalculate_ancestors(desc_txid)
+            # Also update the parents set (remove removed_txid if present)
+            desc_entry = self.transactions.get(desc_txid)
+            if desc_entry:
+                desc_entry.parents.discard(removed_txid)
 
-        # Decrement descendant counts for ancestors of the removed tx.
-        # Since the removed tx is gone, we find its former ancestors by
-        # looking at ancestors of its direct children (minus the children
-        # themselves).  A simpler approach: for each remaining tx, if
-        # removed_txid was in its descendant set, decrement.
-        # But we don't track that directly.  Instead, walk up from each
-        # child to recalculate descendant counts for all ancestors.
+        # Rebuild descendant counts for ancestors of the direct children.
+        # These ancestors lost removed_txid (and possibly its descendants) from
+        # their descendant sets.
         affected_ancestors: Set[bytes] = set()
         for child_txid in children:
-            affected_ancestors |= self._get_ancestors(
-                self.transactions[child_txid].tx
-            )
-        # Also include ancestors that aren't parents of children
-        # (they lost the removed tx as a descendant)
-        # Rebuild descendant counts for affected ancestors
+            child_entry = self.transactions.get(child_txid)
+            if child_entry:
+                affected_ancestors |= self._get_ancestors(child_entry.tx)
+
         for anc_txid in affected_ancestors:
             if anc_txid in self.transactions:
                 descs = self._collect_descendants(anc_txid)
@@ -589,7 +641,12 @@ class Mempool:
 
         return len(expired)
 
-    def remove_transaction(self, txid: bytes, _skip_recount: bool = False):
+    def remove_transaction(
+        self,
+        txid: bytes,
+        _skip_recount: bool = False,
+        _reason: str = "unknown",
+    ):
         """
         Remove transaction from mempool.
 
@@ -598,21 +655,39 @@ class Mempool:
             _skip_recount: Internal flag — skip ancestor/descendant
                 recalculation (used during batch removals that do a
                 single recalculation pass afterward).
+            _reason: Reason for removal (for notification callback)
         """
         with self._lock:
-            self._remove_transaction_inner(txid, _skip_recount)
+            self._remove_transaction_inner(txid, _skip_recount, _reason)
 
-    def _remove_transaction_inner(self, txid: bytes, _skip_recount: bool = False):
+    def _remove_transaction_inner(
+        self, txid: bytes, _skip_recount: bool = False, _reason: str = "unknown"
+    ):
         if txid not in self.transactions:
             return
 
         entry = self.transactions[txid]
         self.current_size -= entry.size
 
+        # Save children for recounting (before we modify links)
+        former_children = set(entry.children)
+
         # Remove spent outputs
         for tx_in in entry.tx.inputs:
             outpoint: OutPoint = (tx_in.prev_txid, tx_in.prev_vout)
             self.spent_outputs.discard(outpoint)
+
+        # Update parent/child links: remove this txid from parents' children sets
+        for parent_txid in entry.parents:
+            parent_entry = self.transactions.get(parent_txid)
+            if parent_entry:
+                parent_entry.children.discard(txid)
+
+        # Update parent/child links: remove this txid from children's parents sets
+        for child_txid in entry.children:
+            child_entry = self.transactions.get(child_txid)
+            if child_entry:
+                child_entry.parents.discard(txid)
 
         # Remove from sorted list
         if txid in self.by_fee_rate:
@@ -621,8 +696,15 @@ class Mempool:
         del self.transactions[txid]
         logger.debug(f"Removed transaction {txid.hex()[:16]}... from mempool")
 
+        # Emit notification callback
+        if self._on_tx_removed is not None:
+            try:
+                self._on_tx_removed(txid, _reason)
+            except Exception as e:
+                logger.warning(f"on_tx_removed callback error: {e}")
+
         if not _skip_recount:
-            self._update_descendants_after_removal(txid)
+            self._update_descendants_after_removal(txid, former_children)
     
     def remove_block_transactions(self, block):
         """
@@ -746,19 +828,59 @@ class Mempool:
         return conflicts
 
     def _collect_descendants(self, txid: bytes) -> Set[bytes]:
+        """Get all descendants (transitive children) of a transaction.
+
+        Uses children links stored on MempoolEntry for efficient traversal.
+        """
         result: Set[bytes] = {txid}
-        queue = [txid]
+        queue: List[bytes] = [txid]
         while queue:
-            parent = queue.pop()
-            for child_txid, child_entry in self.transactions.items():
-                if child_txid in result:
-                    continue
-                for inp in child_entry.tx.inputs:
-                    if inp.prev_txid == parent:
-                        result.add(child_txid)
-                        queue.append(child_txid)
-                        break
+            parent_txid = queue.pop()
+            parent_entry = self.transactions.get(parent_txid)
+            if parent_entry is None:
+                continue
+            # Use stored children links for efficient traversal
+            for child_txid in parent_entry.children:
+                if child_txid not in result and child_txid in self.transactions:
+                    result.add(child_txid)
+                    queue.append(child_txid)
         return result
+
+    def signals_rbf(self, tx: Transaction) -> bool:
+        """Check if a transaction signals opt-in RBF per BIP125.
+
+        A transaction signals RBF if any input has nSequence < 0xFFFFFFFE.
+        (SEQUENCE_FINAL - 1 = 0xFFFFFFFE, any value below that signals RBF)
+
+        Reference: bitcoin/src/util/rbf.cpp SignalsOptInRBF()
+        """
+        return any(inp.sequence < 0xFFFFFFFE for inp in tx.inputs)
+
+    def is_rbf_opt_in(self, txid: bytes) -> bool:
+        """Check if a mempool transaction is replaceable.
+
+        A tx is replaceable if:
+        1. The transaction itself signals RBF (any input sequence < 0xFFFFFFFE), OR
+        2. Any of its unconfirmed ancestors signal RBF
+
+        Reference: bitcoin/src/policy/rbf.cpp IsRBFOptIn()
+        """
+        entry = self.transactions.get(txid)
+        if entry is None:
+            return False
+
+        # Check if this tx signals
+        if self.signals_rbf(entry.tx):
+            return True
+
+        # Check if any ancestor signals
+        ancestors = self._get_ancestors(entry.tx)
+        for anc_txid in ancestors:
+            anc_entry = self.transactions.get(anc_txid)
+            if anc_entry and self.signals_rbf(anc_entry.tx):
+                return True
+
+        return False
 
     def try_replace(
         self, new_tx: Transaction, height: int
@@ -768,12 +890,14 @@ class Mempool:
 
         Rules (following bitcoin/src/policy/rbf.cpp):
         1. Every directly-conflicting tx must signal replaceability
-           (at least one input with sequence < 0xfffffffe).
+           (at least one input with sequence < 0xfffffffe) UNLESS
+           full_rbf is enabled (mempoolfullrbf=1).
         2. The new tx may not spend any *new* unconfirmed inputs that
            the original transactions did not already spend.
         3. Total evictions (conflicts + descendants) <= 100.
         4. New tx fee must strictly exceed the sum of all evicted fees.
-        5. New tx fee must also cover the incremental relay cost.
+        5. New tx fee must also cover the incremental relay cost
+           (incrementalrelayfee * new_tx_vsize).
 
         Returns (success, error_message).  On success the conflicts
         (and their descendants) are removed and the new tx is added.
@@ -829,10 +953,12 @@ class Mempool:
                         )
 
         # Rule 1: all direct conflicts must signal replaceability
-        for c_txid in conflicts:
-            c_entry = self.transactions[c_txid]
-            if not any(inp.sequence < 0xFFFFFFFE for inp in c_entry.tx.inputs):
-                return False, "Conflicting tx does not signal replaceability"
+        # UNLESS full_rbf (mempoolfullrbf) is enabled
+        if not self.full_rbf:
+            for c_txid in conflicts:
+                c_entry = self.transactions[c_txid]
+                if not self.is_rbf_opt_in(c_txid):
+                    return False, "Conflicting tx does not signal replaceability (BIP125)"
 
         # Gather full eviction set (conflicts + descendants)
         to_evict: Set[bytes] = set()
@@ -880,18 +1006,30 @@ class Mempool:
             )
 
         # Rule 5: covers incremental relay cost
-        if new_fee < old_fees + self.INCREMENTAL_RELAY_FEE:
-            return False, "Replacement does not cover incremental relay fee"
+        # The additional fee must cover incrementalrelayfee * new_tx_size
+        # Reference: bitcoin/src/policy/rbf.cpp PaysForRBF()
+        incremental_fee_needed = (new_size * self.INCREMENTAL_RELAY_FEE) // 1000
+        additional_fee = new_fee - old_fees
+        if additional_fee < incremental_fee_needed:
+            return False, (
+                f"Replacement does not cover incremental relay fee: "
+                f"additional {additional_fee} < required {incremental_fee_needed}"
+            )
 
         # All checks passed — evict and add (skip per-removal recount)
         evicted_ids = set(to_evict)
         for txid in to_evict:
-            self.remove_transaction(txid, _skip_recount=True)
+            self.remove_transaction(txid, _skip_recount=True, _reason="replaced")
 
         new_fee_rate = new_fee / new_size if new_size > 0 else 0
         new_txid = new_tx.get_txid()
 
-        # Compute ancestors for the replacement tx
+        # Compute direct parents and ancestors for the replacement tx
+        direct_parents: Set[bytes] = set()
+        for inp in new_tx.inputs:
+            if inp.prev_txid in self.transactions:
+                direct_parents.add(inp.prev_txid)
+
         ancestors = self._get_ancestors(new_tx)
         ancestor_size = sum(
             self.transactions[a].size for a in ancestors if a in self.transactions
@@ -901,12 +1039,19 @@ class Mempool:
             size=new_size, time_added=time.time(), height_added=height,
             ancestor_count=len(ancestors) + 1,
             ancestor_size=ancestor_size + new_size,
+            parents=direct_parents,
+            children=set(),
         )
         self.transactions[new_txid] = entry
         self.current_size += new_size
         for inp in new_tx.inputs:
             self.spent_outputs.add((inp.prev_txid, inp.prev_vout))
         self._insert_sorted_by_fee_rate(new_txid, new_fee_rate)
+
+        # Update parent entries to add this txid as a child
+        for parent_txid in direct_parents:
+            if parent_txid in self.transactions:
+                self.transactions[parent_txid].children.add(new_txid)
 
         # Update ancestor descendant counts for the new tx's ancestors
         for a_txid in ancestors:
@@ -1120,14 +1265,96 @@ class Mempool:
     def get_transaction_entry(self, txid: bytes) -> Optional[MempoolEntry]:
         """
         Get mempool entry for a transaction.
-        
+
         Args:
             txid: Transaction ID
-            
+
         Returns:
             MempoolEntry or None if not found
         """
         return self.transactions.get(txid)
+
+    # --- BIP 152 Compact Block Support ---
+
+    def build_short_txid_map(
+        self, siphash_key: bytes
+    ) -> Dict[int, Transaction]:
+        """
+        Build a map of short txid -> transaction for compact block reconstruction.
+
+        This is called when we receive a cmpctblock message and need to match
+        the 6-byte short txids against our mempool. Bitcoin Core iterates over
+        txns_randomized for optimal cache behavior; we iterate over the dict.
+
+        Args:
+            siphash_key: 16-byte SipHash key derived from block header + nonce
+
+        Returns:
+            Dict mapping 48-bit short txid -> Transaction.
+            If two transactions collide to the same short id, the later one wins
+            (Bitcoin Core handles this by nulling the entry on collision).
+        """
+        from ouroboros.compact_blocks import short_txid
+
+        result: Dict[int, Transaction] = {}
+        for entry in self.transactions.values():
+            tx = entry.tx
+            wtxid = tx.get_wtxid()
+            sid = short_txid(siphash_key, wtxid)
+            # On collision, we could null out the entry like Bitcoin Core,
+            # but for simplicity we just overwrite (caller handles missing txs)
+            result[sid] = tx
+        return result
+
+    def match_compact_block(
+        self, short_ids: List[int], siphash_key: bytes
+    ) -> Tuple[List[Optional[Transaction]], List[int]]:
+        """
+        Match a list of short txids against the mempool.
+
+        Used during compact block reconstruction to find which transactions
+        we already have in our mempool.
+
+        Args:
+            short_ids: List of 48-bit short txids from the cmpctblock
+            siphash_key: 16-byte SipHash key
+
+        Returns:
+            (matched_txs, missing_indices) where:
+            - matched_txs[i] is the Transaction for short_ids[i], or None if missing
+            - missing_indices lists the indices of short_ids we couldn't find
+        """
+        from ouroboros.compact_blocks import short_txid
+
+        # Build wtxid -> tx lookup, then compute short ids
+        wtxid_to_tx: Dict[int, Transaction] = {}
+        collisions: Set[int] = set()
+
+        for entry in self.transactions.values():
+            tx = entry.tx
+            wtxid = tx.get_wtxid()
+            sid = short_txid(siphash_key, wtxid)
+            if sid in wtxid_to_tx:
+                # Collision - mark both as unavailable
+                collisions.add(sid)
+            else:
+                wtxid_to_tx[sid] = tx
+
+        # Remove collisions (like Bitcoin Core's duplicate detection)
+        for sid in collisions:
+            wtxid_to_tx.pop(sid, None)
+
+        # Match each short id
+        matched: List[Optional[Transaction]] = []
+        missing: List[int] = []
+
+        for i, sid in enumerate(short_ids):
+            tx = wtxid_to_tx.get(sid)
+            matched.append(tx)
+            if tx is None:
+                missing.append(i)
+
+        return matched, missing
 
     # --- Package Validation / CPFP ---
 
@@ -1307,6 +1534,12 @@ class Mempool:
             txid = tx.get_txid()
             tx_size = len(tx.serialize())
 
+            # Compute direct parents (mempool txs this tx spends from)
+            direct_parents: Set[bytes] = set()
+            for inp in tx.inputs:
+                if inp.prev_txid in self.transactions:
+                    direct_parents.add(inp.prev_txid)
+
             # Compute fee for this individual transaction
             tx_input = 0
             for inp in tx.inputs:
@@ -1337,6 +1570,8 @@ class Mempool:
                 height_added=height,
                 ancestor_count=len(ancestors) + 1,
                 ancestor_size=ancestor_size + tx_size,
+                parents=direct_parents,
+                children=set(),
             )
             self.transactions[txid] = entry
             self.current_size += tx_size
@@ -1345,6 +1580,11 @@ class Mempool:
                 self.spent_outputs.add((inp.prev_txid, inp.prev_vout))
 
             self._insert_sorted_by_fee_rate(txid, fee_rate)
+
+            # Update parent entries to add this txid as a child
+            for parent_txid in direct_parents:
+                if parent_txid in self.transactions:
+                    self.transactions[parent_txid].children.add(txid)
 
             # Update ancestor descendant counts
             for a_txid in ancestors:
