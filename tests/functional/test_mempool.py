@@ -8,7 +8,8 @@ ancestor/descendant limits, as well as TRUC (v3 transaction) policy.
 import pytest
 from ouroboros.mempool import (
     Mempool, _is_standard_tx, _get_dust_threshold, _has_ephemeral_dust,
-    MAX_ANCESTOR_COUNT, MAX_STANDARD_TX_WEIGHT,
+    MAX_ANCESTOR_COUNT, MAX_DESCENDANT_COUNT, MAX_ANCESTOR_SIZE_KVB,
+    MAX_DESCENDANT_SIZE_KVB, MAX_STANDARD_TX_WEIGHT,
     TX_V3_MAX_VSIZE, TX_V3_ANCESTOR_LIMIT, TX_V3_DESCENDANT_LIMIT,
 )
 from ouroboros.database import Transaction, TxIn, TxOut
@@ -94,6 +95,272 @@ class TestAncestorLimits:
 
     def test_max_standard_tx_weight(self):
         assert MAX_STANDARD_TX_WEIGHT == 400_000
+
+
+# ── Ancestor/Descendant Limit Policy Tests ─────────────────────────
+
+
+class TestAncestorDescendantLimits:
+    """Tests for ancestor/descendant count and size limits (BIP 125 limits)."""
+
+    def _make_chain_tx(self, txid_byte, parent_txid, parent_vout, output_value):
+        """Helper to build a tx spending a specific parent output."""
+        return Transaction(
+            txid=bytes([txid_byte]) * 32,
+            version=2,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=parent_txid,
+                    prev_vout=parent_vout,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                )
+            ],
+            outputs=[TxOut(value=output_value, script_pubkey=b"\x51")],
+        )
+
+    def test_ancestor_count_limit(self):
+        """Reject transaction exceeding MAX_ANCESTOR_COUNT (25)."""
+        # Build a chain of 25 transactions (the maximum allowed)
+        utxos = {(b"\x00" * 32, 0): {"value": 1_000_000}}
+        pool = _truc_pool(utxos)
+
+        prev_txid = b"\x00" * 32
+        prev_value = 1_000_000
+
+        # Add 25 transactions (forming a chain of 25)
+        for i in range(25):
+            tx = self._make_chain_tx(i + 1, prev_txid, 0, prev_value - 1000)
+            ok, err = pool.add_transaction(tx, height=100)
+            if i < 25:  # First 25 should succeed
+                assert ok, f"Transaction {i+1} should be accepted: {err}"
+            prev_txid = bytes([i + 1]) * 32
+            prev_value -= 1000
+            pool.validator.db.add(prev_txid, 0, prev_value)
+
+        # 26th transaction should be rejected (ancestor count = 26 > 25)
+        tx_26 = self._make_chain_tx(26, prev_txid, 0, prev_value - 1000)
+        ok, err = pool.add_transaction(tx_26, height=100)
+        assert not ok, "26th transaction should be rejected (ancestor limit)"
+        assert "ancestor" in err.lower()
+
+    def test_descendant_count_limit(self):
+        """Reject transaction when an ancestor would exceed MAX_DESCENDANT_COUNT."""
+        # Add a root tx then try to add 26 children spending the same parent
+        utxos = {(b"\x00" * 32, 0): {"value": 10_000_000}}
+        pool = _truc_pool(utxos)
+
+        # Root transaction with many outputs
+        root_outputs = [TxOut(value=100_000, script_pubkey=b"\x51") for _ in range(30)]
+        root = Transaction(
+            txid=b"\xAA" * 32,
+            version=2,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                )
+            ],
+            outputs=root_outputs,
+        )
+        ok, err = pool.add_transaction(root, height=100)
+        assert ok, f"Root should be accepted: {err}"
+
+        # Register outputs
+        for i in range(30):
+            pool.validator.db.add(b"\xAA" * 32, i, 100_000)
+
+        # Add 24 children (each spending different output of root)
+        # Root has 1 descendant (itself), adding 24 children = 25 descendants total
+        for i in range(24):
+            child = self._make_chain_tx(i + 1, b"\xAA" * 32, i, 90_000)
+            ok, err = pool.add_transaction(child, height=100)
+            assert ok, f"Child {i+1} should be accepted: {err}"
+
+        # 25th child should also succeed (exactly at the limit)
+        child_25 = self._make_chain_tx(25, b"\xAA" * 32, 24, 90_000)
+        ok, err = pool.add_transaction(child_25, height=100)
+        # Actually this may exceed if root counts itself. Let's check the actual behavior.
+        # Descendant count for root = 1 (itself) + 24 children = 25. Adding one more = 26.
+        # So child_25 should be rejected.
+        assert not ok, "25th child should be rejected (descendant limit for root)"
+        assert "descendant" in err.lower()
+
+    def test_ancestor_size_limit(self):
+        """Reject transaction when ancestor size exceeds 101KB."""
+        # Create large transactions that together exceed 101KB
+        # Each ~20KB tx needs ~20 sat/vB = 400,000 sats fee minimum
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000_000}}
+        pool = _truc_pool(utxos)
+
+        prev_txid = b"\x00" * 32
+        prev_value = 100_000_000
+
+        # Create transactions with ~20KB each (large script_sig)
+        # 5 such transactions = 100KB, 6th would exceed 101KB limit
+        large_script = b"\x00" * 20_000  # ~20KB
+        fee_per_tx = 500_000  # More than enough for ~20KB tx
+
+        for i in range(5):
+            tx = Transaction(
+                txid=bytes([i + 1]) * 32,
+                version=2,
+                locktime=0,
+                inputs=[
+                    TxIn(
+                        prev_txid=prev_txid,
+                        prev_vout=0,
+                        script_sig=large_script,
+                        sequence=0xFFFFFFFD,
+                    )
+                ],
+                outputs=[TxOut(value=prev_value - fee_per_tx, script_pubkey=b"\x51")],
+            )
+            ok, err = pool.add_transaction(tx, height=100)
+            assert ok, f"Transaction {i+1} should be accepted: {err}"
+            prev_txid = bytes([i + 1]) * 32
+            prev_value -= fee_per_tx
+            pool.validator.db.add(prev_txid, 0, prev_value)
+
+        # 6th large tx should exceed 101KB ancestor size limit
+        tx_6 = Transaction(
+            txid=bytes([6]) * 32,
+            version=2,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=prev_txid,
+                    prev_vout=0,
+                    script_sig=large_script,
+                    sequence=0xFFFFFFFD,
+                )
+            ],
+            outputs=[TxOut(value=prev_value - fee_per_tx, script_pubkey=b"\x51")],
+        )
+        ok, err = pool.add_transaction(tx_6, height=100)
+        assert not ok, "6th large tx should be rejected (ancestor size limit)"
+        assert "ancestor" in err.lower() and "size" in err.lower()
+
+    def test_descendant_size_limit(self):
+        """Reject transaction when descendant size for an ancestor exceeds 101KB."""
+        # Each ~20KB tx needs ~20 sat/vB = 400,000 sats fee minimum
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000_000}}
+        pool = _truc_pool(utxos)
+
+        # Create a root with many outputs (total value = 100M - 10K fee)
+        output_value = 10_000_000  # 10M per output
+        root_outputs = [TxOut(value=output_value, script_pubkey=b"\x51") for _ in range(8)]
+        root = Transaction(
+            txid=b"\xAA" * 32,
+            version=2,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                )
+            ],
+            outputs=root_outputs,
+        )
+        ok, err = pool.add_transaction(root, height=100)
+        assert ok, f"Root should be accepted: {err}"
+
+        for i in range(8):
+            pool.validator.db.add(b"\xAA" * 32, i, output_value)
+
+        # Add children with ~20KB each until we exceed 101KB
+        large_script = b"\x00" * 20_000
+        fee_per_child = 500_000  # More than enough for ~20KB tx
+        for i in range(5):
+            child = Transaction(
+                txid=bytes([i + 1]) * 32,
+                version=2,
+                locktime=0,
+                inputs=[
+                    TxIn(
+                        prev_txid=b"\xAA" * 32,
+                        prev_vout=i,
+                        script_sig=large_script,
+                        sequence=0xFFFFFFFD,
+                    )
+                ],
+                outputs=[TxOut(value=output_value - fee_per_child, script_pubkey=b"\x51")],
+            )
+            ok, err = pool.add_transaction(child, height=100)
+            # All 5 should succeed (root ~200 bytes + 5*20KB ~= 100KB < 101KB)
+            assert ok, f"Child {i+1} should be accepted: {err}"
+
+        # The 6th child should be rejected (root + 6*20KB > 101KB)
+        # root (~200 bytes) + 6*20KB = ~120KB > 101KB
+        child_6 = Transaction(
+            txid=bytes([6]) * 32,
+            version=2,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\xAA" * 32,
+                    prev_vout=5,
+                    script_sig=large_script,
+                    sequence=0xFFFFFFFD,
+                )
+            ],
+            outputs=[TxOut(value=output_value - fee_per_child, script_pubkey=b"\x51")],
+        )
+        ok, err = pool.add_transaction(child_6, height=100)
+        assert not ok, "6th large child should be rejected (descendant size limit)"
+        assert "descendant" in err.lower() and "size" in err.lower()
+
+    def test_parent_child_links_updated_on_add(self):
+        """Verify parent/child links are set correctly when adding transactions."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # Add parent
+        parent = self._make_chain_tx(0xAA, b"\x00" * 32, 0, 90_000)
+        ok, _ = pool.add_transaction(parent, height=100)
+        assert ok
+        pool.validator.db.add(b"\xAA" * 32, 0, 90_000)
+
+        # Add child
+        child = self._make_chain_tx(0xBB, b"\xAA" * 32, 0, 80_000)
+        ok, _ = pool.add_transaction(child, height=100)
+        assert ok
+
+        # Check links
+        parent_entry = pool.transactions[b"\xAA" * 32]
+        child_entry = pool.transactions[b"\xBB" * 32]
+
+        assert b"\xBB" * 32 in parent_entry.children
+        assert b"\xAA" * 32 in child_entry.parents
+
+    def test_parent_child_links_updated_on_remove(self):
+        """Verify parent/child links are cleaned up when removing transactions."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # Add parent and child
+        parent = self._make_chain_tx(0xAA, b"\x00" * 32, 0, 90_000)
+        ok, _ = pool.add_transaction(parent, height=100)
+        assert ok
+        pool.validator.db.add(b"\xAA" * 32, 0, 90_000)
+
+        child = self._make_chain_tx(0xBB, b"\xAA" * 32, 0, 80_000)
+        ok, _ = pool.add_transaction(child, height=100)
+        assert ok
+
+        # Remove parent
+        pool.remove_transaction(b"\xAA" * 32)
+
+        # Child should no longer have parent in its parents set
+        child_entry = pool.transactions.get(b"\xBB" * 32)
+        assert child_entry is not None
+        assert b"\xAA" * 32 not in child_entry.parents
 
 
 # ── TRUC (v3 Transaction) Policy Tests ──────────────────────────────
@@ -544,3 +811,374 @@ class TestEphemeralDust:
         tx = _make_tx(version=3, output_value=50_000)
         ok, reason = _is_standard_tx(tx)
         assert ok, f"v3 without dust should be standard: {reason}"
+
+
+# ── BIP 125 Replace-By-Fee (RBF) Tests ──────────────────────────────
+
+
+def _rbf_tx(
+    txid_byte,
+    inputs,
+    outputs_values,
+    version=2,
+    sequence=0xFFFFFFFD,  # BIP125 signaling sequence (< 0xFFFFFFFE)
+    script_sig_size=72,
+):
+    """Build a Transaction for RBF tests.
+
+    *txid_byte*: single byte to fill the 32-byte txid.
+    *inputs*: list of (prev_txid_bytes, prev_vout).
+    *outputs_values*: list of output satoshi values.
+    *sequence*: input sequence number (< 0xFFFFFFFE signals RBF).
+    """
+    txid = bytes([txid_byte]) * 32
+    return Transaction(
+        txid=txid,
+        version=version,
+        locktime=0,
+        inputs=[
+            TxIn(
+                prev_txid=pt,
+                prev_vout=pv,
+                script_sig=b"\x00" * script_sig_size,
+                sequence=sequence,
+            )
+            for pt, pv in inputs
+        ],
+        outputs=[
+            TxOut(value=v, script_pubkey=b"\x51")
+            for v in outputs_values
+        ],
+    )
+
+
+def _rbf_pool(utxo_values, full_rbf=True, on_tx_removed=None):
+    """Create a Mempool for RBF tests."""
+    return Mempool(
+        validator=_StubValidator(utxo_values),
+        require_standard=False,
+        full_rbf=full_rbf,
+        on_tx_removed=on_tx_removed,
+    )
+
+
+class TestRBF:
+    """BIP 125 Replace-By-Fee tests."""
+
+    def test_signals_rbf_with_low_sequence(self):
+        """A transaction with sequence < 0xFFFFFFFE signals RBF."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _rbf_pool(utxos)
+
+        # Sequence 0xFFFFFFFD signals RBF
+        tx = _rbf_tx(0xAA, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFD)
+        assert pool.signals_rbf(tx)
+
+        # Sequence 0 also signals RBF
+        tx2 = _rbf_tx(0xBB, [(b"\x00" * 32, 0)], [90_000], sequence=0)
+        assert pool.signals_rbf(tx2)
+
+    def test_does_not_signal_rbf_with_high_sequence(self):
+        """A transaction with sequence >= 0xFFFFFFFE does NOT signal RBF."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _rbf_pool(utxos)
+
+        # Sequence 0xFFFFFFFE (SEQUENCE_FINAL - 1) does NOT signal
+        tx = _rbf_tx(0xAA, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFE)
+        assert not pool.signals_rbf(tx)
+
+        # Sequence 0xFFFFFFFF (SEQUENCE_FINAL) does NOT signal
+        tx2 = _rbf_tx(0xBB, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFF)
+        assert not pool.signals_rbf(tx2)
+
+    def test_basic_rbf_replacement(self):
+        """Basic RBF: higher fee tx replaces lower fee tx."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _rbf_pool(utxos)
+
+        # Original tx: spends 100k, outputs 90k (fee = 10k)
+        original = _rbf_tx(0xAA, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFD)
+        ok, err = pool.add_transaction(original, height=100)
+        assert ok, f"Original should be accepted: {err}"
+        assert b"\xAA" * 32 in pool.transactions
+
+        # Replacement tx: spends same input, outputs 80k (fee = 20k)
+        replacement = _rbf_tx(0xBB, [(b"\x00" * 32, 0)], [80_000], sequence=0xFFFFFFFD)
+        ok, err = pool.add_transaction(replacement, height=100)
+        assert ok, f"Replacement should be accepted: {err}"
+
+        # Original should be evicted, replacement should be in mempool
+        assert b"\xAA" * 32 not in pool.transactions
+        assert b"\xBB" * 32 in pool.transactions
+
+    def test_rbf_requires_higher_fee(self):
+        """RBF: replacement must pay strictly higher fee."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _rbf_pool(utxos)
+
+        # Original: fee = 10k
+        original = _rbf_tx(0xAA, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFD)
+        ok, _ = pool.add_transaction(original, height=100)
+        assert ok
+
+        # Replacement with same fee should be rejected
+        same_fee = _rbf_tx(0xBB, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFD)
+        ok, err = pool.add_transaction(same_fee, height=100)
+        assert not ok
+        assert "fee" in err.lower() or "exceed" in err.lower()
+
+        # Replacement with lower fee should be rejected
+        lower_fee = _rbf_tx(0xCC, [(b"\x00" * 32, 0)], [95_000], sequence=0xFFFFFFFD)
+        ok, err = pool.add_transaction(lower_fee, height=100)
+        assert not ok
+        assert "fee" in err.lower() or "exceed" in err.lower()
+
+    def test_rbf_requires_incremental_relay_fee(self):
+        """RBF: additional fee must cover incrementalrelayfee * new_tx_size."""
+        utxos = {(b"\x00" * 32, 0): {"value": 1_000_000}}
+        pool = _rbf_pool(utxos)
+
+        # Original: outputs 990k (fee = 10k)
+        original = _rbf_tx(0xAA, [(b"\x00" * 32, 0)], [990_000], sequence=0xFFFFFFFD)
+        ok, _ = pool.add_transaction(original, height=100)
+        assert ok
+
+        original_size = len(original.serialize())
+
+        # Replacement that barely exceeds old fee but doesn't cover incremental relay
+        # Fee = 10001 (only 1 sat more than original)
+        # Required additional fee = size * 1000 / 1000 = size sats
+        barely_higher = _rbf_tx(
+            0xBB, [(b"\x00" * 32, 0)], [990_000 - 1], sequence=0xFFFFFFFD
+        )
+        ok, err = pool.add_transaction(barely_higher, height=100)
+        assert not ok
+        assert "incremental" in err.lower()
+
+        # Replacement with sufficient additional fee
+        # Additional fee needed ~= tx_size * 1 sat/vB
+        replacement_size = len(original.serialize())  # roughly same size
+        sufficient_fee = 10_000 + replacement_size + 100  # extra margin
+        sufficient = _rbf_tx(
+            0xCC, [(b"\x00" * 32, 0)], [1_000_000 - sufficient_fee], sequence=0xFFFFFFFD
+        )
+        ok, err = pool.add_transaction(sufficient, height=100)
+        assert ok, f"Sufficient fee replacement should succeed: {err}"
+
+    def test_rbf_evicts_descendants(self):
+        """RBF: replacing a tx also evicts all its descendants."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _rbf_pool(utxos)
+
+        # Parent tx
+        parent = _rbf_tx(0xAA, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFD)
+        ok, _ = pool.add_transaction(parent, height=100)
+        assert ok
+
+        # Register parent's output for child
+        pool.validator.db.add(b"\xAA" * 32, 0, 90_000)
+
+        # Child tx spending parent
+        child = _rbf_tx(0xBB, [(b"\xAA" * 32, 0)], [80_000], sequence=0xFFFFFFFD)
+        ok, _ = pool.add_transaction(child, height=100)
+        assert ok
+        assert b"\xAA" * 32 in pool.transactions
+        assert b"\xBB" * 32 in pool.transactions
+
+        # Replace parent with higher fee tx
+        replacement = _rbf_tx(0xCC, [(b"\x00" * 32, 0)], [70_000], sequence=0xFFFFFFFD)
+        ok, err = pool.add_transaction(replacement, height=100)
+        assert ok, f"Replacement should succeed: {err}"
+
+        # Both parent and child should be evicted
+        assert b"\xAA" * 32 not in pool.transactions
+        assert b"\xBB" * 32 not in pool.transactions
+        assert b"\xCC" * 32 in pool.transactions
+
+    def test_rbf_max_evictions_limit(self):
+        """RBF: cannot evict more than 100 transactions.
+
+        Note: We can't easily test with 100+ direct children because of the
+        descendant count limit (25). Instead, we directly test the limit constant
+        and use a smaller chain that would trip the limit if it were lower.
+        """
+        from ouroboros.mempool import Mempool
+
+        # Verify the constant is set to 100
+        assert Mempool.MAX_REPLACEMENT_EVICTIONS == 100
+
+        # Test that we can evict up to 24 txs (parent + 23 children, under descendant limit)
+        utxos = {(b"\x00" * 32, 0): {"value": 10_000_000}}
+        pool = _rbf_pool(utxos)
+
+        # Create parent with many outputs
+        parent_outputs = [TxOut(value=200_000, script_pubkey=b"\x51") for _ in range(24)]
+        parent = Transaction(
+            txid=b"\xAA" * 32,
+            version=2,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                )
+            ],
+            outputs=parent_outputs,
+        )
+        ok, err = pool.add_transaction(parent, height=100)
+        assert ok, f"Parent should be accepted: {err}"
+
+        # Register parent outputs
+        for i in range(24):
+            pool.validator.db.add(b"\xAA" * 32, i, 200_000)
+
+        # Create 23 children (each spending one output)
+        # This is within the descendant limit of 25
+        for i in range(23):
+            child = _rbf_tx(i + 1, [(b"\xAA" * 32, i)], [190_000], sequence=0xFFFFFFFD)
+            ok, err = pool.add_transaction(child, height=100)
+            assert ok, f"Child {i} should be accepted: {err}"
+
+        # Total txs = 1 (parent) + 23 (children) = 24 < 100
+        # Replacement should succeed (fee must exceed sum of evicted fees)
+        # Parent fee: 10M - 24*200k = 10M - 4.8M = 5.2M
+        # Each child fee: 200k - 190k = 10k; 23 children = 230k
+        # Total evicted fees ~= 5.2M + 230k = 5.43M
+        # Replacement needs to pay more than 5.43M + incremental relay fee
+        replacement = _rbf_tx(0xFF, [(b"\x00" * 32, 0)], [4_000_000], sequence=0xFFFFFFFD)
+        # Fee = 10M - 4M = 6M > 5.43M
+        ok, err = pool.add_transaction(replacement, height=100)
+        assert ok, f"Replacement should succeed when evicting 24 txs: {err}"
+
+        # Verify parent and children were evicted
+        assert b"\xAA" * 32 not in pool.transactions
+        assert b"\xFF" * 32 in pool.transactions
+
+    def test_rbf_cannot_introduce_new_unconfirmed_inputs(self):
+        """RBF: replacement cannot spend new unconfirmed inputs."""
+        utxos = {
+            (b"\x00" * 32, 0): {"value": 100_000},
+            (b"\x00" * 32, 1): {"value": 100_000},
+        }
+        pool = _rbf_pool(utxos)
+
+        # Add an unrelated tx to mempool (will be a "new unconfirmed input")
+        unrelated = _rbf_tx(0xDD, [(b"\x00" * 32, 1)], [90_000], sequence=0xFFFFFFFD)
+        ok, _ = pool.add_transaction(unrelated, height=100)
+        assert ok
+        pool.validator.db.add(b"\xDD" * 32, 0, 90_000)
+
+        # Original tx
+        original = _rbf_tx(0xAA, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFD)
+        ok, _ = pool.add_transaction(original, height=100)
+        assert ok
+
+        # Replacement that tries to also spend the unrelated mempool tx output
+        # This introduces a new unconfirmed input
+        replacement = Transaction(
+            txid=b"\xBB" * 32,
+            version=2,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+                TxIn(
+                    prev_txid=b"\xDD" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[TxOut(value=160_000, script_pubkey=b"\x51")],
+        )
+        ok, err = pool.add_transaction(replacement, height=100)
+        assert not ok
+        assert "unconfirmed input" in err.lower()
+
+    def test_full_rbf_allows_replacing_non_signaling_tx(self):
+        """Full RBF: allows replacing tx that doesn't signal BIP125."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _rbf_pool(utxos, full_rbf=True)
+
+        # Original does NOT signal RBF (sequence = 0xFFFFFFFF)
+        original = _rbf_tx(0xAA, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFF)
+        assert not pool.signals_rbf(original)
+        ok, _ = pool.add_transaction(original, height=100)
+        assert ok
+
+        # With full_rbf=True, replacement should still work
+        replacement = _rbf_tx(0xBB, [(b"\x00" * 32, 0)], [80_000], sequence=0xFFFFFFFD)
+        ok, err = pool.add_transaction(replacement, height=100)
+        assert ok, f"Full RBF should allow replacement: {err}"
+        assert b"\xBB" * 32 in pool.transactions
+
+    def test_opt_in_rbf_rejects_non_signaling_tx(self):
+        """Opt-in RBF: rejects replacing tx that doesn't signal BIP125."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _rbf_pool(utxos, full_rbf=False)  # Opt-in only
+
+        # Original does NOT signal RBF
+        original = _rbf_tx(0xAA, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFF)
+        assert not pool.signals_rbf(original)
+        ok, _ = pool.add_transaction(original, height=100)
+        assert ok
+
+        # With full_rbf=False, replacement should be rejected
+        replacement = _rbf_tx(0xBB, [(b"\x00" * 32, 0)], [80_000], sequence=0xFFFFFFFD)
+        ok, err = pool.add_transaction(replacement, height=100)
+        assert not ok
+        assert "signal" in err.lower() or "bip125" in err.lower()
+
+    def test_rbf_notification_callback(self):
+        """RBF: on_tx_removed callback is invoked for replaced transactions."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        removed_txs = []
+
+        def on_removed(txid, reason):
+            removed_txs.append((txid, reason))
+
+        pool = _rbf_pool(utxos, on_tx_removed=on_removed)
+
+        # Add original
+        original = _rbf_tx(0xAA, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFD)
+        ok, _ = pool.add_transaction(original, height=100)
+        assert ok
+
+        # Replace it
+        replacement = _rbf_tx(0xBB, [(b"\x00" * 32, 0)], [80_000], sequence=0xFFFFFFFD)
+        ok, _ = pool.add_transaction(replacement, height=100)
+        assert ok
+
+        # Check callback was invoked
+        assert len(removed_txs) == 1
+        assert removed_txs[0][0] == b"\xAA" * 32
+        assert removed_txs[0][1] == "replaced"
+
+    def test_is_rbf_opt_in_inherits_from_ancestor(self):
+        """is_rbf_opt_in returns True if any ancestor signals RBF."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _rbf_pool(utxos, full_rbf=False)
+
+        # Parent signals RBF
+        parent = _rbf_tx(0xAA, [(b"\x00" * 32, 0)], [90_000], sequence=0xFFFFFFFD)
+        ok, _ = pool.add_transaction(parent, height=100)
+        assert ok
+        pool.validator.db.add(b"\xAA" * 32, 0, 90_000)
+
+        # Child does NOT signal RBF (high sequence)
+        child = _rbf_tx(0xBB, [(b"\xAA" * 32, 0)], [80_000], sequence=0xFFFFFFFF)
+        assert not pool.signals_rbf(child)
+        ok, _ = pool.add_transaction(child, height=100)
+        assert ok
+
+        # Child should be replaceable because parent signals
+        assert pool.is_rbf_opt_in(b"\xBB" * 32)
+
+        # Parent is also replaceable (it signals directly)
+        assert pool.is_rbf_opt_in(b"\xAA" * 32)
