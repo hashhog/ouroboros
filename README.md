@@ -49,6 +49,7 @@ the node logic, RPC server, and mempool.
 - [x] Miniscript combinators: and_v, and_b, or_b, or_c, or_d, or_i, andor, thresh, multi, multi_a
 - [x] Miniscript wrappers: a:, s:, c:, d:, v:, j:, n:, t:, l:, u:
 - [x] Miniscript in descriptors: wsh(miniscript), tr(KEY, TREE)
+- [x] REST interface for block explorers (block, tx, headers, utxos, mempool, chaininfo)
 - [ ] Full signature verification (secp256k1)
 - [ ] Wallet functionality
 
@@ -73,6 +74,7 @@ ouroboros/
 ├── ferrous-utils/sync/     # Rust: block sync, validation, PyO3 bindings
 ├── src/ouroboros/          # Python: CLI, RPC, mempool, node logic
 │   ├── rpc.py              # JSON-RPC server (FastAPI)
+│   ├── rest.py             # REST interface for block explorers
 │   ├── mempool.py          # Transaction mempool
 │   ├── node.py             # Node orchestration
 │   ├── psbt.py             # PSBT (BIP174/BIP370) support
