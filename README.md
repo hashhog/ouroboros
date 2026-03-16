@@ -30,6 +30,7 @@ the node logic, RPC server, and mempool.
 - [x] Pre-handshake peer filtering (reject old protocol versions, timeout)
 - [x] BIP339 WTXIDRELAY and BIP155 SENDADDRV2 negotiation
 - [x] Transaction trickling (privacy-preserving relay with Poisson delays)
+- [x] Eclipse attack mitigations (bucketed addrman, /16 diversity, anchors, feelers)
 - [ ] Full signature verification (secp256k1)
 - [ ] Wallet functionality
 
