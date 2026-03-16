@@ -51,13 +51,42 @@ MAX_TRIED_COLLISIONS = 10  # max pending collision entries
 REPLACEMENT_HOURS = 4  # recent success protects from eviction
 
 
+# BIP155 Network IDs
+NET_IPV4 = 1
+NET_IPV6 = 2
+NET_TORV2 = 3  # deprecated
+NET_TORV3 = 4
+NET_I2P = 5
+NET_CJDNS = 6
+
+
 @dataclass
 class AddrInfo:
-    """Metadata for a single peer address."""
+    """Metadata for a single peer address.
+
+    Supports BIP155 variable-length addresses (Tor v3, I2P, CJDNS).
+
+    Attributes:
+        host: Human-readable address string (IPv4/IPv6 or .onion/.b32.i2p)
+        port: Port number
+        services: Service flags (NODE_NETWORK, NODE_WITNESS, etc.)
+        network_id: BIP155 network type (1=IPv4, 2=IPv6, 4=TorV3, 5=I2P, 6=CJDNS)
+        addr_bytes: Raw address bytes (variable length per BIP155)
+        last_seen: Epoch timestamp when last seen
+        last_attempt: Epoch timestamp of last connection attempt
+        last_success: Epoch timestamp of last successful connection
+        attempts: Total connection attempts
+        failures: Connection failures in MIN_FAIL window
+        source: Address key of peer who told us about this address
+        source_group: /16 network group of source
+        ref_count: Number of new buckets containing this addr
+    """
 
     host: str
     port: int
     services: int = 0
+    network_id: int = NET_IPV4   # BIP155 network type
+    addr_bytes: bytes = b""      # raw address bytes (variable length)
     last_seen: float = 0.0       # epoch - most recent addr timestamp
     last_attempt: float = 0.0    # epoch - when we last tried to connect
     last_success: float = 0.0    # epoch - when we last connected successfully
@@ -71,34 +100,90 @@ class AddrInfo:
         """Unique key for this address."""
         return f"{self.host}:{self.port}"
 
+    def is_onion(self) -> bool:
+        """Return True if this is a Tor .onion address."""
+        return self.network_id == NET_TORV3 or self.host.endswith(".onion")
 
-def get_network_group(host: str) -> str:
-    """Get /16 network group for an IP address.
+    def is_i2p(self) -> bool:
+        """Return True if this is an I2P address."""
+        return self.network_id == NET_I2P or self.host.endswith(".b32.i2p")
 
-    For IPv4: returns first two octets (a.b)
-    For IPv6: returns /32 prefix (simplified)
-    For onion: returns "onion"
+    def is_cjdns(self) -> bool:
+        """Return True if this is a CJDNS address."""
+        return self.network_id == NET_CJDNS
+
+    def is_ipv4(self) -> bool:
+        """Return True if this is an IPv4 address."""
+        return self.network_id == NET_IPV4
+
+    def is_ipv6(self) -> bool:
+        """Return True if this is an IPv6 address."""
+        return self.network_id == NET_IPV6
+
+    def is_addrv1_compatible(self) -> bool:
+        """Return True if this address can be sent via legacy addr message.
+
+        Only IPv4 and IPv6 addresses are compatible with the legacy addr
+        message format. Tor v3, I2P, and CJDNS require addrv2 (BIP155).
+        """
+        return self.network_id in (NET_IPV4, NET_IPV6)
+
+
+def get_network_group(host: str, network_id: int = NET_IPV4) -> str:
+    """Get network group for an address (for bucket diversification).
+
+    For IPv4: returns first two octets (a.b) - /16 group
+    For IPv6: returns /32 prefix (first 4 hex groups)
+    For TorV3: returns first 4 bytes of pubkey (hex)
+    For I2P: returns first 4 bytes of destination hash (hex)
+    For CJDNS: returns "cjdns" (all CJDNS in same group)
+    For .onion hostname: returns "onion"
+    For .b32.i2p hostname: returns "i2p"
+
+    Reference: Bitcoin Core addrman.cpp GetGroup()
     """
+    # Handle .onion addresses
     if host.endswith(".onion"):
         return "onion"
 
-    parts = host.split(".")
-    if len(parts) == 4:
-        try:
-            # IPv4 - return /16 group
-            int(parts[0])
-            int(parts[1])
-            return f"{parts[0]}.{parts[1]}"
-        except ValueError:
-            pass
+    # Handle I2P addresses
+    if host.endswith(".b32.i2p"):
+        return "i2p"
 
-    # IPv6 or hostname - use full address as group
-    # (In production, would parse IPv6 properly)
-    if ":" in host:
-        # IPv6 - use /32 prefix (first 4 hex groups)
-        groups = host.split(":")
-        return ":".join(groups[:2]) if len(groups) >= 2 else host
+    # IPv4
+    if network_id == NET_IPV4:
+        parts = host.split(".")
+        if len(parts) == 4:
+            try:
+                int(parts[0])
+                int(parts[1])
+                return f"{parts[0]}.{parts[1]}"
+            except ValueError:
+                pass
+        return host
 
+    # IPv6
+    if network_id == NET_IPV6:
+        if ":" in host:
+            # Remove brackets if present
+            h = host.strip("[]")
+            groups = h.split(":")
+            return ":".join(groups[:2]) if len(groups) >= 2 else host
+        return host
+
+    # TorV3 - group by first 4 bytes of pubkey
+    if network_id == NET_TORV3:
+        return "onion"
+
+    # I2P - group by first 4 bytes of destination hash
+    if network_id == NET_I2P:
+        return "i2p"
+
+    # CJDNS - all in same group
+    if network_id == NET_CJDNS:
+        return "cjdns"
+
+    # Default: use host as group
     return host
 
 
@@ -164,7 +249,7 @@ class AddressManager:
         bucket = hash(key, addr_group, source_group) % 64
                  then hash(key, source_group, bucket) % 256
         """
-        addr_group = get_network_group(addr.host)
+        addr_group = get_network_group(addr.host, addr.network_id)
         hash1 = _hash_for_bucket(
             self._key, addr_group, source_group
         )
@@ -179,7 +264,7 @@ class AddressManager:
         bucket = hash(key, addr_group, hash(key, addr_key) % 8) % 64
         """
         addr_key = addr.get_key()
-        addr_group = get_network_group(addr.host)
+        addr_group = get_network_group(addr.host, addr.network_id)
         hash1 = _hash_for_bucket(self._key, addr_key)
         hash2 = _hash_for_bucket(
             self._key, addr_group, hash1 % TRIED_BUCKETS_PER_GROUP
@@ -251,10 +336,22 @@ class AddressManager:
         services: int = 0,
         timestamp: float = 0.0,
         source: str = "",
+        network_id: int = NET_IPV4,
+        addr_bytes: bytes = b"",
     ) -> bool:
         """Add an address to the new table.
 
-        Returns True if inserted (new address), False if updated existing.
+        Args:
+            host: Human-readable address string
+            port: Port number
+            services: Service flags
+            timestamp: Last-seen timestamp
+            source: Address key of peer who told us
+            network_id: BIP155 network ID (1=IPv4, 2=IPv6, 4=TorV3, etc.)
+            addr_bytes: Raw address bytes (for BIP155 addresses)
+
+        Returns:
+            True if inserted (new address), False if updated existing.
         """
         addr_key = f"{host}:{port}"
         source_group = get_network_group(source.split(":")[0] if source else "")
@@ -280,6 +377,8 @@ class AddressManager:
             host=host,
             port=port,
             services=services,
+            network_id=network_id,
+            addr_bytes=addr_bytes,
             last_seen=timestamp or time.time(),
             source=source,
             source_group=source_group,
@@ -302,6 +401,33 @@ class AddressManager:
         info.ref_count = 1
 
         return True
+
+    def add_from_addrv2(
+        self,
+        entry,  # AddrV2Entry from p2p_messages
+        source: str = "",
+    ) -> bool:
+        """Add an address from an AddrV2Entry (BIP155).
+
+        Args:
+            entry: AddrV2Entry object with network_id, addr, port, services, time
+            source: Address key of peer who sent us this address
+
+        Returns:
+            True if inserted (new address), False if updated existing.
+        """
+        # Convert AddrV2Entry to host string
+        host = entry.to_string().rsplit(":", 1)[0]  # Remove port from string
+
+        return self.add(
+            host=host,
+            port=entry.port,
+            services=entry.services,
+            timestamp=float(entry.time),
+            source=source,
+            network_id=entry.network_id,
+            addr_bytes=entry.addr,
+        )
 
     def _remove_from_new(
         self, addr_key: str, bucket: int, position: int
@@ -712,10 +838,11 @@ class AddressManager:
 
     @staticmethod
     def _info_to_dict(info: AddrInfo) -> dict:
-        return {
+        d = {
             "host": info.host,
             "port": info.port,
             "services": info.services,
+            "network_id": info.network_id,
             "last_seen": info.last_seen,
             "last_attempt": info.last_attempt,
             "last_success": info.last_success,
@@ -725,13 +852,23 @@ class AddressManager:
             "source_group": info.source_group,
             "ref_count": info.ref_count,
         }
+        # Store addr_bytes as hex for JSON serialization
+        if info.addr_bytes:
+            d["addr_bytes"] = info.addr_bytes.hex()
+        return d
 
     @staticmethod
     def _dict_to_info(d: dict) -> AddrInfo:
+        # Decode addr_bytes from hex if present
+        addr_bytes = b""
+        if "addr_bytes" in d and d["addr_bytes"]:
+            addr_bytes = bytes.fromhex(d["addr_bytes"])
         return AddrInfo(
             host=d["host"],
             port=d["port"],
             services=d.get("services", 0),
+            network_id=d.get("network_id", NET_IPV4),
+            addr_bytes=addr_bytes,
             last_seen=d.get("last_seen", 0),
             last_attempt=d.get("last_attempt", 0),
             last_success=d.get("last_success", 0),
