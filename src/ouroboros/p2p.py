@@ -2,18 +2,26 @@
 Peer-to-peer networking module.
 
 This module implements peer discovery, connection management, and peer scoring
-for the Bitcoin P2P network. Includes transaction trickling for privacy-preserving
-relay (randomized delays prevent network observers from mapping transactions to
-originating IP addresses).
+for the Bitcoin P2P network. Includes eclipse attack mitigations:
+
+  - Connection diversification: outbound connections span multiple /16 network groups
+  - Anchor connections: persist 2 block-relay-only connections across restarts
+  - Feeler connections: periodically probe new addresses to verify them
+  - Reserved inbound slots: keep 2 slots for connections from new networks
+
+Reference: Bitcoin Core net.cpp, net_processing.cpp
 """
 
 import asyncio
 import base64
+import json
+import os
 import socket
 import random
 import time
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Dict, Set, Optional, Tuple
 from collections import defaultdict
 
@@ -36,7 +44,7 @@ from ouroboros.banman import (
     SCORE_INVALID_TX,
     SCORE_UNREQUESTED_DATA,
 )
-from ouroboros.addrman import AddressManager
+from ouroboros.addrman import AddressManager, get_network_group
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +254,16 @@ MAX_INBOUND = 117  # Bitcoin Core default max inbound connections
 # new blocks to us.
 MAX_BLOCK_RELAY_ONLY_CONNECTIONS = 2
 
+# Eclipse attack mitigation constants (Bitcoin Core net.h)
+MAX_BLOCK_RELAY_ONLY_ANCHORS = 2  # persistent anchor connections across restarts
+FEELER_INTERVAL = 120.0  # seconds between feeler connections (2 minutes)
+FEELER_SLEEP_WINDOW = 1.0  # jitter window for feeler timing
+MAX_FEELER_CONNECTIONS = 1  # only one feeler at a time
+
+# Reserved inbound slots for connections from new /16 groups
+# This ensures diverse inbound connections and resists eclipse attacks
+RESERVED_INBOUND_SLOTS_FOR_NEW_GROUPS = 2
+
 
 class PeerManager:
     """Manages peer connections and discovery"""
@@ -318,6 +336,25 @@ class PeerManager:
         self._trickle_queues: Dict[str, TrickleQueue] = {}
         self._trickle_task: Optional[asyncio.Task] = None
         self._trickle_interval: float = 1.0  # check interval in seconds
+
+        # Eclipse attack mitigation state
+        # Anchor connections: persistent block-relay-only peers across restarts
+        self._anchors: List[str] = []  # list of anchor addresses
+        self._anchors_filepath: Optional[str] = None
+        if data_dir:
+            self._anchors_filepath = os.path.join(data_dir, "anchors.dat")
+            self._load_anchors()
+
+        # Feeler connections: probe new addresses periodically
+        self._feeler_task: Optional[asyncio.Task] = None
+        self._feeler_peer: Optional[Peer] = None
+        self._next_feeler_time: float = 0.0
+
+        # Track outbound /16 groups for connection diversification
+        self._outbound_netgroups: Set[str] = set()
+
+        # Track inbound /16 groups for reserved slot enforcement
+        self._inbound_netgroups: Dict[str, int] = {}  # group -> count
     
     async def start(self, start_height: int = 0, p2p_port: int = 0):
         """
@@ -342,6 +379,9 @@ class PeerManager:
         # Discover peers from DNS seeds
         await self.discover_peers()
 
+        # Connect to anchor peers first (eclipse protection)
+        await self._connect_anchor_peers(start_height)
+
         # Connect to full-relay outbound peers
         await self.connect_to_peers(start_height)
 
@@ -361,6 +401,9 @@ class PeerManager:
 
         # Start transaction trickle loop
         self._trickle_task = asyncio.create_task(self._trickle_loop())
+
+        # Start feeler connection loop (eclipse protection)
+        self._feeler_task = asyncio.create_task(self._feeler_loop())
     
     async def stop(self):
         """Stop peer manager and disconnect all peers"""
@@ -400,6 +443,22 @@ class PeerManager:
             except asyncio.CancelledError:
                 pass
 
+        # Cancel feeler task
+        if self._feeler_task:
+            self._feeler_task.cancel()
+            try:
+                await self._feeler_task
+            except asyncio.CancelledError:
+                pass
+
+        # Disconnect feeler peer if active
+        if self._feeler_peer and self._feeler_peer.is_connected():
+            await self._feeler_peer.disconnect()
+            self._feeler_peer = None
+
+        # Save anchor connections before shutting down
+        self._save_anchors()
+
         # Disconnect all peers (full-relay + block-relay-only + inbound)
         all_peers = (
             list(self.peers.values())
@@ -423,18 +482,8 @@ class PeerManager:
 
     @staticmethod
     def _netgroup(host: str) -> str:
-        if is_onion_host(host):
-            return "onion"
-        parts = host.split(".")
-        if len(parts) == 4:
-            try:
-                int(parts[0])
-                int(parts[1])
-                return f"{parts[0]}.{parts[1]}"
-            except ValueError:
-                pass
-        # TODO: handle IPv6 addresses (they share a /48 netgroup in Bitcoin Core)
-        return host  # non-IPv4 — use entire host as its own group
+        """Get /16 network group for connection diversity."""
+        return get_network_group(host)
 
     def _select_eviction_candidate(self) -> Optional[str]:
         """Select the worst inbound peer for eviction."""
@@ -541,14 +590,24 @@ class PeerManager:
             writer.close()
             return
 
+        # Eclipse protection: reserved slots for new network groups
+        peer_group = self._netgroup(host)
+        is_new_group = peer_group not in self._inbound_netgroups
+
+        # Calculate effective limit (reserve slots for new groups)
+        effective_limit = MAX_INBOUND
+        if not is_new_group:
+            # Not a new group - reduce limit by reserved slots
+            effective_limit = MAX_INBOUND - RESERVED_INBOUND_SLOTS_FOR_NEW_GROUPS
+
         # Check inbound limit — try to evict the worst peer first
-        if len(self.inbound_peers) >= MAX_INBOUND:
+        if len(self.inbound_peers) >= effective_limit:
             if not await self._evict_inbound_peer():
                 logger.debug(f"Rejected inbound peer {addr}: max inbound reached, no eviction candidate")
                 writer.close()
                 return
 
-        logger.info(f"New inbound connection from {addr}")
+        logger.info(f"New inbound connection from {addr} (netgroup={peer_group})")
 
         peer = Peer(host, port, self.network, inbound=True)
         if await peer.accept_inbound(reader, writer, self._start_height):
@@ -565,6 +624,9 @@ class PeerManager:
                 is_inbound=True, wtxid_relay=peer.wtxid_relay
             )
 
+            # Track inbound netgroup for eclipse protection
+            self._inbound_netgroups[peer_group] = self._inbound_netgroups.get(peer_group, 0) + 1
+
             # Notify node so it can register tx/getdata handlers
             if self._on_inbound_peer:
                 try:
@@ -574,14 +636,169 @@ class PeerManager:
 
             logger.info(
                 f"Inbound peer {addr} ready "
-                f"({len(self.inbound_peers)} inbound)"
+                f"({len(self.inbound_peers)} inbound, {len(self._inbound_netgroups)} groups)"
             )
 
     def set_inbound_peer_handler(self, handler) -> None:
         """Register an async callback invoked when an inbound peer completes
         its handshake.  ``handler(peer: Peer) -> None``."""
         self._on_inbound_peer = handler
-    
+
+    # Eclipse protection: anchor connections
+
+    def _load_anchors(self) -> None:
+        """Load anchor addresses from disk."""
+        if not self._anchors_filepath or not os.path.exists(self._anchors_filepath):
+            return
+        try:
+            with open(self._anchors_filepath) as f:
+                data = json.load(f)
+            self._anchors = data.get("anchors", [])[:MAX_BLOCK_RELAY_ONLY_ANCHORS]
+            logger.info(f"Loaded {len(self._anchors)} anchor connections")
+        except Exception as e:
+            logger.warning(f"Failed to load anchors: {e}")
+
+    def _save_anchors(self) -> None:
+        """Save current block-relay-only peers as anchors for next restart."""
+        if not self._anchors_filepath:
+            return
+        try:
+            # Use current block-relay-only peers as anchors
+            anchors = list(self.block_relay_peers.keys())[:MAX_BLOCK_RELAY_ONLY_ANCHORS]
+            data = {"anchors": anchors, "saved_at": time.time()}
+            tmp = self._anchors_filepath + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self._anchors_filepath)
+            logger.debug(f"Saved {len(anchors)} anchor connections")
+        except Exception as e:
+            logger.warning(f"Failed to save anchors: {e}")
+
+    async def _connect_anchor_peers(self, start_height: int) -> None:
+        """Connect to anchor peers from previous session.
+
+        Anchor connections are block-relay-only peers that persist across
+        restarts, providing continuity against eclipse attacks.
+        """
+        if not self._anchors:
+            return
+
+        logger.info(f"Connecting to {len(self._anchors)} anchor peers...")
+        for addr in self._anchors:
+            if len(self.block_relay_peers) >= self.max_block_relay_only:
+                break
+            if addr in self._all_outbound_addrs():
+                continue
+            if self.ban_manager.is_banned(addr):
+                continue
+
+            try:
+                host, port = addr.split(":")
+                port = int(port)
+            except ValueError:
+                continue
+
+            peer_proxy = self._proxy_for_host(host)
+            if is_onion_host(host) and not peer_proxy:
+                continue
+
+            peer = Peer(
+                host, port, self.network,
+                transport_version=self.transport_version,
+                relay_txs=False,  # block-relay-only
+                proxy=peer_proxy,
+            )
+
+            if await peer.connect(start_height, retry=False):
+                self.block_relay_peers[addr] = peer
+                self.addrman.mark_good(host, port)
+                group = self._netgroup(host)
+                self._outbound_netgroups.add(group)
+                self._register_compact_handlers(peer, addr)
+                logger.info(f"Connected to anchor peer {addr}")
+            else:
+                self.addrman.mark_attempt(host, port)
+
+    # Eclipse protection: feeler connections
+
+    async def _feeler_loop(self) -> None:
+        """Background loop that makes feeler connections to verify new addresses.
+
+        Feelers are short-lived connections that probe addresses from the new
+        table to verify they're real and reachable. This helps detect bad
+        addresses before they're moved to the tried table.
+        """
+        try:
+            # Initial delay with jitter
+            self._next_feeler_time = time.time() + random.expovariate(1.0 / FEELER_INTERVAL)
+
+            while self.running:
+                await asyncio.sleep(1.0)
+                if not self.running:
+                    break
+
+                now = time.time()
+                if now < self._next_feeler_time:
+                    continue
+
+                # Schedule next feeler with exponential random interval
+                self._next_feeler_time = now + random.expovariate(1.0 / FEELER_INTERVAL)
+                self._next_feeler_time += random.uniform(0, FEELER_SLEEP_WINDOW)
+
+                # Make feeler connection
+                await self._make_feeler_connection()
+
+        except asyncio.CancelledError:
+            logger.debug("Feeler loop cancelled")
+        except Exception as e:
+            logger.error(f"Error in feeler loop: {e}")
+
+    async def _make_feeler_connection(self) -> None:
+        """Make a single feeler connection to probe a new address."""
+        # Don't make multiple feelers simultaneously
+        if self._feeler_peer and self._feeler_peer.is_connected():
+            return
+
+        # Select address from new table for probing
+        exclude = self._all_outbound_addrs() | set(self.inbound_peers.keys())
+        addr = self.addrman.select_for_feeler(exclude=exclude)
+        if not addr:
+            return
+
+        try:
+            host, port = addr.split(":")
+            port = int(port)
+        except ValueError:
+            return
+
+        peer_proxy = self._proxy_for_host(host)
+        if is_onion_host(host) and not peer_proxy:
+            return
+
+        logger.debug(f"Making feeler connection to {addr}")
+
+        peer = Peer(
+            host, port, self.network,
+            transport_version=self.transport_version,
+            relay_txs=False,  # feelers don't relay
+            proxy=peer_proxy,
+        )
+
+        self._feeler_peer = peer
+        self.addrman.mark_attempt(host, port)
+
+        if await peer.connect(self._start_height, retry=False):
+            # Successful - mark as good and disconnect
+            self.addrman.mark_good(host, port)
+            logger.debug(f"Feeler to {addr} succeeded, moving to tried table")
+            await peer.disconnect()
+        else:
+            # Failed - mark as failed
+            self.addrman.mark_failed(host, port)
+            logger.debug(f"Feeler to {addr} failed")
+
+        self._feeler_peer = None
+
     async def discover_peers(self):
         """Discover peers from DNS seeds"""
         logger.info("Discovering peers from DNS seeds...")
@@ -648,21 +865,48 @@ class PeerManager:
     def _all_outbound_addrs(self) -> Set[str]:
         return set(self.peers.keys()) | set(self.block_relay_peers.keys())
 
+    def _update_outbound_netgroups(self) -> None:
+        """Rebuild the set of outbound network groups from current peers."""
+        self._outbound_netgroups = set()
+        for peer in self.peers.values():
+            self._outbound_netgroups.add(self._netgroup(peer.host))
+        for peer in self.block_relay_peers.values():
+            self._outbound_netgroups.add(self._netgroup(peer.host))
+
     async def connect_to_peers(self, start_height: int = 0):
-        """Connect to full-relay peers up to max_peers."""
-        while len(self.peers) < self.max_peers and self.known_addrs:
-            # Get available addresses (not already connected, not banned)
-            available = (
-                self.known_addrs
-                - self._all_outbound_addrs()
-                - {a for a in self.known_addrs if self.ban_manager.is_banned(a)}
+        """Connect to full-relay peers up to max_peers.
+
+        Enforces /16 network group diversification to resist eclipse attacks.
+        Each outbound connection must be from a unique network group.
+        """
+        attempts = 0
+        max_attempts = len(self.known_addrs) + 100  # prevent infinite loop
+
+        while len(self.peers) < self.max_peers and attempts < max_attempts:
+            attempts += 1
+
+            # Use address manager with network group exclusion for diversity
+            exclude = self._all_outbound_addrs() | set(self.inbound_peers.keys())
+            addr = self.addrman.select_for_connection(
+                exclude=exclude,
+                exclude_groups=self._outbound_netgroups,
             )
 
-            if not available:
-                break
-
-            # Pick random peer
-            addr = random.choice(list(available))
+            # Fall back to known_addrs if addrman is empty
+            if not addr:
+                available = (
+                    self.known_addrs
+                    - self._all_outbound_addrs()
+                    - {a for a in self.known_addrs if self.ban_manager.is_banned(a)}
+                )
+                # Filter by network group
+                available = {
+                    a for a in available
+                    if self._netgroup(a.split(":")[0]) not in self._outbound_netgroups
+                }
+                if not available:
+                    break
+                addr = random.choice(list(available))
 
             # Check exponential backoff
             if not self._should_retry(addr):
@@ -670,6 +914,12 @@ class PeerManager:
 
             # Try to connect (full-relay: relay_txs=True)
             host, port = addr.split(':')
+            port = int(port)
+
+            # Eclipse protection: enforce /16 network group diversity
+            group = self._netgroup(host)
+            if group in self._outbound_netgroups:
+                continue  # skip duplicate network group
 
             # Determine proxy — .onion peers require a SOCKS5 proxy
             peer_proxy = self._proxy_for_host(host)
@@ -677,14 +927,15 @@ class PeerManager:
                 logger.debug(f"Skipping .onion peer {addr}: no proxy configured")
                 continue
 
-            peer = Peer(host, int(port), self.network,
+            peer = Peer(host, port, self.network,
                         transport_version=self.transport_version, relay_txs=True,
                         proxy=peer_proxy)
 
             if await peer.connect(start_height, retry=False):
                 self.peers[addr] = peer
                 self.retry_counts[addr] = 0  # Reset retry count on success
-                self.addrman.mark_good(host, int(port))
+                self.addrman.mark_good(host, port)
+                self._outbound_netgroups.add(group)  # track for diversity
                 self._register_compact_handlers(peer, addr)
                 self._register_addr_handlers(peer, addr)
                 asyncio.ensure_future(self.negotiate_compact_blocks(peer))
@@ -698,12 +949,15 @@ class PeerManager:
                 self._trickle_queues[addr] = TrickleQueue(
                     is_inbound=False, wtxid_relay=peer.wtxid_relay
                 )
-                logger.info(f"Connected to full-relay peer {addr} ({len(self.peers)}/{self.max_peers})")
+                logger.info(
+                    f"Connected to full-relay peer {addr} "
+                    f"({len(self.peers)}/{self.max_peers}, group={group})"
+                )
             else:
                 # Failed to connect
                 self.retry_counts[addr] += 1
                 self.last_retry_time[addr] = time.time()
-                self.addrman.mark_attempt(host, int(port))
+                self.addrman.mark_attempt(host, port)
 
                 # Remove from known if too many failures
                 if self.retry_counts[addr] >= 3:
@@ -711,23 +965,48 @@ class PeerManager:
                     logger.debug(f"Removed {addr} from known addresses after {self.retry_counts[addr]} failures")
 
     async def _connect_block_relay_peers(self, start_height: int = 0):
-        """Connect block-relay-only outbound peers up to max_block_relay_only."""
-        while len(self.block_relay_peers) < self.max_block_relay_only and self.known_addrs:
-            available = (
-                self.known_addrs
-                - self._all_outbound_addrs()
-                - {a for a in self.known_addrs if self.ban_manager.is_banned(a)}
+        """Connect block-relay-only outbound peers up to max_block_relay_only.
+
+        Enforces /16 network group diversification for eclipse resistance.
+        """
+        attempts = 0
+        max_attempts = len(self.known_addrs) + 100
+
+        while len(self.block_relay_peers) < self.max_block_relay_only and attempts < max_attempts:
+            attempts += 1
+
+            # Use address manager with network group exclusion
+            exclude = self._all_outbound_addrs() | set(self.inbound_peers.keys())
+            addr = self.addrman.select_for_connection(
+                exclude=exclude,
+                exclude_groups=self._outbound_netgroups,
             )
 
-            if not available:
-                break
-
-            addr = random.choice(list(available))
+            # Fall back to known_addrs
+            if not addr:
+                available = (
+                    self.known_addrs
+                    - self._all_outbound_addrs()
+                    - {a for a in self.known_addrs if self.ban_manager.is_banned(a)}
+                )
+                available = {
+                    a for a in available
+                    if self._netgroup(a.split(":")[0]) not in self._outbound_netgroups
+                }
+                if not available:
+                    break
+                addr = random.choice(list(available))
 
             if not self._should_retry(addr):
                 continue
 
             host, port = addr.split(':')
+            port = int(port)
+
+            # Eclipse protection: enforce network group diversity
+            group = self._netgroup(host)
+            if group in self._outbound_netgroups:
+                continue
 
             # Determine proxy — .onion peers require a SOCKS5 proxy
             peer_proxy = self._proxy_for_host(host)
@@ -735,14 +1014,15 @@ class PeerManager:
                 logger.debug(f"Skipping .onion block-relay peer {addr}: no proxy configured")
                 continue
 
-            peer = Peer(host, int(port), self.network,
+            peer = Peer(host, port, self.network,
                         transport_version=self.transport_version, relay_txs=False,
                         proxy=peer_proxy)
 
             if await peer.connect(start_height, retry=False):
                 self.block_relay_peers[addr] = peer
                 self.retry_counts[addr] = 0
-                self.addrman.mark_good(host, int(port))
+                self.addrman.mark_good(host, port)
+                self._outbound_netgroups.add(group)  # track for diversity
                 # Register only the compact-block *receive* handlers (for
                 # unsolicited cmpctblock messages) but do NOT send sendcmpct
                 # and do NOT register addr handlers or request addresses.
@@ -750,12 +1030,12 @@ class PeerManager:
                 # Explicitly skip: negotiate_compact_blocks, _register_addr_handlers, _send_getaddr
                 logger.info(
                     f"Connected to block-relay-only peer {addr} "
-                    f"({len(self.block_relay_peers)}/{self.max_block_relay_only})"
+                    f"({len(self.block_relay_peers)}/{self.max_block_relay_only}, group={group})"
                 )
             else:
                 self.retry_counts[addr] += 1
                 self.last_retry_time[addr] = time.time()
-                self.addrman.mark_attempt(host, int(port))
+                self.addrman.mark_attempt(host, port)
                 if self.retry_counts[addr] >= 3:
                     self.known_addrs.discard(addr)
                     logger.debug(
@@ -777,7 +1057,7 @@ class PeerManager:
         return elapsed >= backoff_time
     
     async def maintain_connections(self, start_height: int):
-        """Maintain peer connections"""
+        """Maintain peer connections and eclipse protections."""
         while self.running:
             try:
                 # Remove disconnected full-relay outbound peers
@@ -786,8 +1066,11 @@ class PeerManager:
                     if not p.is_connected()
                 ]
                 for addr in disconnected:
-                    del self.peers[addr]
+                    peer = self.peers.pop(addr)
                     self._trickle_queues.pop(addr, None)  # cleanup trickle queue
+                    # Update outbound netgroups tracking
+                    group = self._netgroup(peer.host)
+                    self._update_outbound_netgroups()
                     logger.info(f"Removed disconnected full-relay peer {addr}")
 
                 # Remove disconnected block-relay-only outbound peers
@@ -796,7 +1079,9 @@ class PeerManager:
                     if not p.is_connected()
                 ]
                 for addr in disconnected_bro:
-                    del self.block_relay_peers[addr]
+                    peer = self.block_relay_peers.pop(addr)
+                    # Update outbound netgroups tracking
+                    self._update_outbound_netgroups()
                     logger.info(f"Removed disconnected block-relay-only peer {addr}")
 
                 # Remove disconnected inbound peers
@@ -805,8 +1090,14 @@ class PeerManager:
                     if not p.is_connected()
                 ]
                 for addr in disconnected_in:
-                    del self.inbound_peers[addr]
+                    peer = self.inbound_peers.pop(addr)
                     self._trickle_queues.pop(addr, None)  # cleanup trickle queue
+                    # Update inbound netgroups tracking
+                    group = self._netgroup(peer.host)
+                    if group in self._inbound_netgroups:
+                        self._inbound_netgroups[group] -= 1
+                        if self._inbound_netgroups[group] <= 0:
+                            del self._inbound_netgroups[group]
                     logger.info(f"Removed disconnected inbound peer {addr}")
 
                 # Refill full-relay outbound slots
@@ -1843,6 +2134,12 @@ class PeerManager:
             "onion_proxy": self.onion,
             "onion_peers": onion_peers,
             "trickle_pending": trickle_stats["total_pending"],
+            # Eclipse protection stats
+            "outbound_netgroups": len(self._outbound_netgroups),
+            "inbound_netgroups": len(self._inbound_netgroups),
+            "anchors": len(self._anchors),
+            "addrman_new": self.addrman.new_count(),
+            "addrman_tried": self.addrman.tried_count(),
         }
 
 
