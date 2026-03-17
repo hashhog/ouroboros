@@ -13,7 +13,7 @@ from typing import Dict, Set, Optional, List, Tuple, Callable
 from collections import defaultdict
 
 from ouroboros.database import BlockchainDatabase, Block
-from ouroboros.validation import BlockValidator
+from ouroboros.validation import BlockValidator, SIG_CACHE
 from ouroboros.p2p_messages import (
     NetworkMessage,
     InvMessage,
@@ -654,7 +654,10 @@ class BlockSync:
     async def _handle_reorg(self, new_block: Block, new_chain_tip: bytes):
         """Handle chain reorganization."""
         logger.warning(f"Handling chain reorganization to new tip: {new_chain_tip.hex()[:16]}...")
-        
+
+        # Clear signature cache on reorg to prevent stale entries from invalidated chain
+        SIG_CACHE.clear()
+
         try:
             # Get current best block
             current_hash, current_height = self.db.get_best_block()
