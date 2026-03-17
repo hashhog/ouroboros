@@ -52,6 +52,7 @@ the node logic, RPC server, and mempool.
 - [x] REST interface for block explorers (block, tx, headers, utxos, mempool, chaininfo)
 - [x] decoderawtransaction and decodescript RPCs
 - [x] getbalance and signrawtransactionwithwallet RPCs
+- [x] Signature verification cache (LRU, cleared on reorg)
 - [ ] Full signature verification (secp256k1)
 - [ ] Wallet functionality
 
@@ -82,6 +83,7 @@ ouroboros/
 │   ├── psbt.py             # PSBT (BIP174/BIP370) support
 │   ├── descriptors.py      # Output descriptors (BIP380-386)
 │   ├── miniscript.py       # Miniscript (BIP379) support
+│   ├── sig_cache.py        # Signature verification cache
 │   └── validation.py       # Transaction/block validation
 └── pyproject.toml
 ```
