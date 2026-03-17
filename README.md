@@ -50,6 +50,8 @@ the node logic, RPC server, and mempool.
 - [x] Miniscript wrappers: a:, s:, c:, d:, v:, j:, n:, t:, l:, u:
 - [x] Miniscript in descriptors: wsh(miniscript), tr(KEY, TREE)
 - [x] REST interface for block explorers (block, tx, headers, utxos, mempool, chaininfo)
+- [x] decoderawtransaction and decodescript RPCs
+- [x] getbalance and signrawtransactionwithwallet RPCs
 - [ ] Full signature verification (secp256k1)
 - [ ] Wallet functionality
 
