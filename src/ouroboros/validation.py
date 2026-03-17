@@ -10,6 +10,10 @@ from ouroboros.script import (
     SCRIPT_VERIFY_NONE, SCRIPT_VERIFY_WITNESS,
     SCRIPT_VERIFY_P2SH, SCRIPT_VERIFY_DERSIG, SCRIPT_VERIFY_NULLDUMMY,
 )
+from ouroboros.sig_cache import SigCache
+
+# Global signature cache instance (50,000 entries ~ Bitcoin Core default)
+SIG_CACHE = SigCache(max_entries=50_000)
 
 COINBASE_MATURITY = 100
 
@@ -239,7 +243,7 @@ class BlockValidator:
     def __init__(self, db: BlockchainDatabase, network: str = "mainnet"):
         self.db = db
         self.network = network
-        self.tx_validator = TransactionValidator(db)
+        self.tx_validator = TransactionValidator(db, network)
     
     def validate_block(self, block: Block) -> Tuple[bool, str]:
         """Fully validate *block* (header, merkle root, weight, scripts); returns ``(ok, error_message)``."""
@@ -1000,17 +1004,18 @@ class BlockValidator:
 
 class TransactionValidator:
     """Validates transactions for mempool and new blocks"""
-    
-    def __init__(self, db: BlockchainDatabase):
+
+    def __init__(self, db: BlockchainDatabase, network: str = "mainnet"):
         self.db = db
+        self.network = network
         self.script_interpreter = ScriptInterpreter()
-        
+
     def validate_transaction(
         self, tx: Transaction, height: int, block_mtp: int = 0,
         block_hash: bytes | None = None,
     ) -> Tuple[bool, str]:
         """Validate *tx* at *height* (structure, inputs, locktime, scripts); returns ``(ok, error_message)``."""
-        flags = get_flags_for_height(height, block_hash)
+        flags = get_flags_for_height(height, block_hash, self.network)
 
         # 1. Check structure
         if not self._check_structure(tx):
@@ -1132,7 +1137,16 @@ class TransactionValidator:
         input_amounts: List[int] = None,
         input_script_pubkeys: List[bytes] = None,
     ) -> bool:
-        return self.script_interpreter.verify(
+        # Build cache key: (txid_hex, input_index, flags)
+        txid_hex = tx.get_txid().hex()
+        cache_key = (txid_hex, input_index, flags)
+
+        # Check cache first - only successful verifications are cached
+        if SIG_CACHE.lookup(cache_key):
+            return True
+
+        # Cache miss - perform verification
+        result = self.script_interpreter.verify(
             tx_in.script_sig,
             bytes(utxo['script_pubkey']),
             tx,
@@ -1142,6 +1156,12 @@ class TransactionValidator:
             input_amounts=input_amounts,
             input_script_pubkeys=input_script_pubkeys,
         )
+
+        # Cache successful verifications only
+        if result:
+            SIG_CACHE.insert(cache_key)
+
+        return result
     
     # BIP 68 constants
     SEQUENCE_DISABLE = 1 << 31       # 0x80000000
@@ -1149,7 +1169,8 @@ class TransactionValidator:
     SEQUENCE_MASK    = 0x0000ffff
 
     def check_sequence_locks(
-        self, tx: Transaction, block_height: int, block_mtp: int
+        self, tx: Transaction, block_height: int, block_mtp: int,
+        network: str = "mainnet"
     ) -> bool:
         """
         BIP 68: verify relative lock-time constraints on every input.
@@ -1158,7 +1179,63 @@ class TransactionValidator:
         For each input whose disable flag is NOT set:
           - height-based: UTXO must be buried by at least (sequence & MASK) blocks
           - time-based:   MTP must exceed UTXO's MTP by (sequence & MASK) * 512 s
+
+        Uses Rust implementation via PyO3 for performance and consistency.
         """
+        # BIP68 only applies to version 2+ transactions
+        if tx.version < 2:
+            return True
+
+        # Check if BIP68 is active at this height
+        try:
+            from sync import is_bip68_active, check_sequence_locks as rust_check_sequence_locks
+            enforce_bip68 = is_bip68_active(block_height, network)
+        except ImportError:
+            # Fall back to Python implementation if Rust module unavailable
+            enforce_bip68 = block_height >= 419328  # mainnet CSV height
+
+        if not enforce_bip68:
+            return True
+
+        # Build input info for Rust: list of (sequence, prev_height, prev_median_time)
+        input_infos = []
+        for inp in tx.inputs:
+            utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
+            if utxo is None:
+                return False
+
+            utxo_height = utxo.get('height')
+            if utxo_height is None:
+                # No height metadata — treat as disabled (skip this input)
+                # This matches assumevalid-era UTXO handling
+                input_infos.append((inp.sequence | self.SEQUENCE_DISABLE, 0, 0))
+                continue
+
+            # Get the median time past of the block before the UTXO's confirmation
+            # (coin time is MTP of block at height-1)
+            utxo_mtp = self.db.get_median_time_past(utxo_height)
+            if utxo_mtp is None:
+                utxo_mtp = 0  # Fallback
+
+            input_infos.append((inp.sequence, utxo_height, utxo_mtp))
+
+        # Use Rust implementation if available
+        try:
+            return rust_check_sequence_locks(
+                tx.version,
+                input_infos,
+                block_height,
+                block_mtp,
+                enforce_bip68,
+            )
+        except (ImportError, NameError):
+            # Fall back to Python implementation
+            return self._check_sequence_locks_py(tx, block_height, block_mtp)
+
+    def _check_sequence_locks_py(
+        self, tx: Transaction, block_height: int, block_mtp: int
+    ) -> bool:
+        """Pure-Python fallback for BIP 68 sequence lock checking."""
         if tx.version < 2:
             return True
 
