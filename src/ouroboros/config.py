@@ -19,11 +19,84 @@ CHAIN_SECTIONS = ('main', 'mainnet', 'test', 'testnet', 'testnet3', 'testnet4', 
 
 
 def _ports_for_network(network: str) -> tuple:
-    if network == 'testnet':
+    """Return (rpc_port, p2p_port) for a given network."""
+    if network in ('testnet', 'testnet3'):
         return '18332', '18333'
+    if network == 'testnet4':
+        return '48332', '48333'
     if network == 'regtest':
         return '18443', '18444'
+    if network == 'signet':
+        return '38332', '38333'
     return '8332', '8333'
+
+
+# =============================================================================
+# Regtest-specific configuration
+# =============================================================================
+
+class RegtestConfig:
+    """
+    Configuration specific to regtest mode.
+
+    Regtest (regression test) mode is a local-only chain for automated testing:
+    - No DNS seeds or peer discovery
+    - Minimum difficulty (blocks found instantly)
+    - All soft forks active from genesis
+    - Mock time support for time-dependent tests
+    """
+
+    # Genesis block parameters (matches Bitcoin Core CRegTestParams)
+    GENESIS_TIME = 1296688602  # Same as testnet3
+    GENESIS_NONCE = 2
+    GENESIS_BITS = 0x207fffff  # Minimum difficulty
+    GENESIS_HASH = bytes.fromhex(
+        "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+    )[::-1]  # Internal byte order
+
+    # Network parameters
+    NETWORK_MAGIC = bytes([0xfa, 0xbf, 0xb5, 0xda])
+    DEFAULT_P2P_PORT = 18444
+    DEFAULT_RPC_PORT = 18443
+
+    # Consensus parameters
+    SUBSIDY_HALVING_INTERVAL = 150  # Much shorter for testing
+    POW_NO_RETARGETING = True  # No difficulty adjustment
+    POW_ALLOW_MIN_DIFFICULTY = True
+
+    # All soft forks active from genesis/height 1
+    BIP34_HEIGHT = 1
+    BIP65_HEIGHT = 1
+    BIP66_HEIGHT = 1
+    CSV_HEIGHT = 1
+    SEGWIT_HEIGHT = 0  # Active from genesis
+    TAPROOT_ALWAYS_ACTIVE = True
+
+    # No minimum chain work (testing)
+    MIN_CHAIN_WORK = 0
+
+    # No checkpoints
+    CHECKPOINTS = []
+
+    # No DNS seeds
+    DNS_SEEDS = []
+
+    @classmethod
+    def is_regtest(cls, network: str) -> bool:
+        """Check if the given network is regtest."""
+        return network.lower() == 'regtest'
+
+    @classmethod
+    def get_pow_limit(cls) -> int:
+        """
+        Get the PoW limit (maximum target) for regtest.
+
+        Returns the target corresponding to nBits=0x207fffff.
+        This is the easiest possible difficulty.
+        """
+        # 0x207fffff decodes to: 0x7fffff << (8 * (0x20 - 3))
+        # = 0x7fffff << (8 * 29) = 0x7fffff << 232
+        return 0x7fffff << (8 * (0x20 - 3))
 
 
 class NodeConfig:
@@ -81,6 +154,20 @@ class NodeConfig:
             'listen': '1',
             # Enable REST interface (1/0)
             'rest': '0',
+            # ZMQ notification endpoints (per-topic, Bitcoin Core style)
+            # Each option specifies the endpoint for that topic.
+            # Multiple topics can share the same endpoint.
+            'zmqpubhashblock': None,
+            'zmqpubhashtx': None,
+            'zmqpubrawblock': None,
+            'zmqpubrawtx': None,
+            'zmqpubsequence': None,
+            # I2P SAM bridge for I2P connections (host:port)
+            'i2psam': None,
+            # Tor control port for hidden service creation (host:port)
+            'torcontrol': None,
+            # Tor control password (for HASHEDPASSWORD auth)
+            'torpassword': None,
         }
         
         if self.config_path.exists():
@@ -196,6 +283,9 @@ class NodeConfig:
             'proxy': self.get('proxy'),
             'onion': self.get('onion'),
             'listen': self.getboolean('listen'),
+            'i2psam': self.get('i2psam'),
+            'torcontrol': self.get('torcontrol'),
+            'torpassword': self.get('torpassword'),
         }
 
 
@@ -322,3 +412,67 @@ class ChainParams:
         if self._sync_module is None:
             return None
         return self._sync_module.get_minimum_chain_work(self.network)
+
+    def is_regtest(self) -> bool:
+        """Check if this is regtest network."""
+        return self.network == "regtest"
+
+    def all_forks_active_from_genesis(self) -> bool:
+        """
+        Check if all soft forks are active from genesis.
+
+        Returns True for regtest, testnet4, and signet.
+        """
+        return self.network in ("regtest", "testnet4", "signet")
+
+
+# =============================================================================
+# Mock Time Support (for regtest)
+# =============================================================================
+
+import time as _time
+
+# Global mock time state
+_mock_time: Optional[int] = None
+
+
+def get_mock_time() -> Optional[int]:
+    """
+    Get the current mock time, if set.
+
+    Returns:
+        Mock time as Unix timestamp, or None if not mocked.
+    """
+    return _mock_time
+
+
+def set_mock_time(timestamp: Optional[int]) -> None:
+    """
+    Set the mock time for testing.
+
+    This affects all time-dependent operations in the node when in regtest mode.
+    Pass None to disable mock time and use real time.
+
+    Args:
+        timestamp: Unix timestamp to use, or None to use real time.
+    """
+    global _mock_time
+    _mock_time = timestamp
+
+
+def get_time() -> int:
+    """
+    Get the current time, respecting mock time if set.
+
+    Returns:
+        Current time as Unix timestamp.
+    """
+    if _mock_time is not None:
+        return _mock_time
+    return int(_time.time())
+
+
+def clear_mock_time() -> None:
+    """Clear mock time and use real time."""
+    global _mock_time
+    _mock_time = None

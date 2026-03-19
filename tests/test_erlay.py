@@ -729,5 +729,185 @@ class TestMinisketchRandomized(unittest.TestCase):
             self.assertEqual(result, {a, b})
 
 
+# ── Rust Minisketch (PyO3 bindings) ─────────────────────────────────
+
+
+def _import_rust_minisketch():
+    """Try to import the Rust Minisketch implementation."""
+    try:
+        import sync
+        return sync.PyMinisketch, sync
+    except ImportError:
+        return None, None
+
+
+class TestRustMinisketch(unittest.TestCase):
+    """Test the Rust Minisketch implementation via PyO3 bindings."""
+
+    def test_rust_minisketch_available(self):
+        """Verify Rust Minisketch is importable."""
+        PyMinisketch, _ = _import_rust_minisketch()
+        if PyMinisketch is None:
+            self.skipTest("Rust sync module not available")
+        sketch = PyMinisketch(10)
+        self.assertEqual(sketch.capacity, 10)
+
+    def test_rust_empty_sketch(self):
+        """Empty Rust sketch decodes to empty set."""
+        PyMinisketch, _ = _import_rust_minisketch()
+        if PyMinisketch is None:
+            self.skipTest("Rust sync module not available")
+
+        sketch = PyMinisketch(5)
+        result = sketch.decode()
+        self.assertIsNotNone(result)
+        self.assertEqual(result, [])
+
+    def test_rust_single_element(self):
+        """Rust sketch with one element decodes correctly."""
+        PyMinisketch, _ = _import_rust_minisketch()
+        if PyMinisketch is None:
+            self.skipTest("Rust sync module not available")
+
+        sketch = PyMinisketch(5)
+        sketch.add(42)
+        result = sketch.decode()
+        self.assertIsNotNone(result)
+        self.assertEqual(set(result), {42})
+
+    def test_rust_multiple_elements(self):
+        """Rust sketch with multiple elements decodes correctly."""
+        PyMinisketch, _ = _import_rust_minisketch()
+        if PyMinisketch is None:
+            self.skipTest("Rust sync module not available")
+
+        sketch = PyMinisketch(10)
+        elements = [100, 200, 300]
+        for e in elements:
+            sketch.add(e)
+        result = sketch.decode()
+        self.assertIsNotNone(result)
+        self.assertEqual(set(result), set(elements))
+
+    def test_rust_merge(self):
+        """Rust sketch merge produces symmetric difference."""
+        PyMinisketch, _ = _import_rust_minisketch()
+        if PyMinisketch is None:
+            self.skipTest("Rust sync module not available")
+
+        sketch1 = PyMinisketch(10)
+        sketch2 = PyMinisketch(10)
+
+        # Set 1: {10, 20, 30}
+        for e in [10, 20, 30]:
+            sketch1.add(e)
+        # Set 2: {20, 30, 40}
+        for e in [20, 30, 40]:
+            sketch2.add(e)
+
+        diff = sketch1.merge_new(sketch2)
+        result = diff.decode()
+        self.assertIsNotNone(result)
+        self.assertEqual(set(result), {10, 40})
+
+    def test_rust_serialization_roundtrip(self):
+        """Rust sketch survives serialize/deserialize."""
+        PyMinisketch, _ = _import_rust_minisketch()
+        if PyMinisketch is None:
+            self.skipTest("Rust sync module not available")
+
+        sketch = PyMinisketch(5)
+        sketch.add(123)
+        sketch.add(456)
+
+        data = sketch.serialize()
+        self.assertEqual(len(data), 5 * 4)  # 5 syndromes * 4 bytes each
+
+        restored = PyMinisketch.from_bytes(data, 5)
+        self.assertEqual(sketch.syndromes(), restored.syndromes())
+
+    def test_rust_xor_cancellation(self):
+        """Adding and removing same element cancels out."""
+        PyMinisketch, _ = _import_rust_minisketch()
+        if PyMinisketch is None:
+            self.skipTest("Rust sync module not available")
+
+        sketch = PyMinisketch(5)
+        sketch.add(999)
+        sketch.add(999)
+
+        result = sketch.decode()
+        self.assertIsNotNone(result)
+        self.assertEqual(result, [])
+
+    def test_rust_compute_short_txid(self):
+        """Rust short txid computation works."""
+        _, sync_module = _import_rust_minisketch()
+        if sync_module is None:
+            self.skipTest("Rust sync module not available")
+
+        wtxid = b'\xAA' * 32
+        sid = sync_module.minisketch_compute_short_txid(wtxid, 123, 456)
+        self.assertIsInstance(sid, int)
+        self.assertGreater(sid, 0)
+        self.assertLessEqual(sid, FIELD_MASK)
+
+        # Same inputs produce same output
+        sid2 = sync_module.minisketch_compute_short_txid(wtxid, 123, 456)
+        self.assertEqual(sid, sid2)
+
+    def test_rust_compute_salt(self):
+        """Rust salt computation works."""
+        _, sync_module = _import_rust_minisketch()
+        if sync_module is None:
+            self.skipTest("Rust sync module not available")
+
+        k0, k1 = sync_module.minisketch_compute_salt(0x1234, 0x5678)
+        self.assertIsInstance(k0, int)
+        self.assertIsInstance(k1, int)
+
+        # Order shouldn't matter (salts combined in ascending order)
+        k0_rev, k1_rev = sync_module.minisketch_compute_salt(0x5678, 0x1234)
+        self.assertEqual(k0, k0_rev)
+        self.assertEqual(k1, k1_rev)
+
+    def test_rust_estimate_capacity(self):
+        """Rust capacity estimation works."""
+        _, sync_module = _import_rust_minisketch()
+        if sync_module is None:
+            self.skipTest("Rust sync module not available")
+
+        cap = sync_module.minisketch_estimate_capacity(100, 100, 0.1)
+        self.assertGreaterEqual(cap, 1)
+        self.assertLessEqual(cap, 1 << 15)
+
+    def test_rust_python_interop(self):
+        """Rust and Python sketches can be merged via serialization."""
+        RustMinisketch, _ = _import_rust_minisketch()
+        if RustMinisketch is None:
+            self.skipTest("Rust sync module not available")
+
+        # Create Python sketch
+        py_sketch = Minisketch(capacity=5)
+        py_sketch.add(10)
+        py_sketch.add(20)
+
+        # Create Rust sketch with different elements
+        rust_sketch = RustMinisketch(5)
+        rust_sketch.add(20)
+        rust_sketch.add(30)
+
+        # Serialize Python sketch and load into Rust
+        py_data = py_sketch.serialize()
+        rust_from_py = RustMinisketch.from_bytes(py_data, 5)
+
+        # Merge in Rust
+        diff = rust_from_py.merge_new(rust_sketch)
+        result = diff.decode()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(set(result), {10, 30})
+
+
 if __name__ == "__main__":
     unittest.main()

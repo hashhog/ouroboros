@@ -100,6 +100,18 @@ pub const META_CF: &str = "meta";
 /// Populated during `apply_block()`, removed during `disconnect_block()`.
 pub const TX_INDEX_CF: &str = "tx_index";
 
+/// Column family name for undo data (block height -> BlockUndo)
+///
+/// **Key**: `height` (4 bytes, u32 little-endian)
+/// **Value**: `[serialized BlockUndo][32-byte checksum]`
+///
+/// Stores the UTXOs consumed by each block's transactions. Used during
+/// chain reorganizations to restore spent UTXOs when disconnecting blocks.
+///
+/// The checksum is SHA256d(prev_block_hash || block_undo_data) to verify
+/// the undo data matches the expected chain position.
+pub const UNDO_CF: &str = "undo";
+
 /// Metadata keys
 pub mod meta_keys {
     /// Key for best block hash in META_CF
@@ -349,6 +361,7 @@ pub fn get_column_families() -> Vec<String> {
         SPENT_CF.to_string(),
         META_CF.to_string(),
         TX_INDEX_CF.to_string(),
+        UNDO_CF.to_string(),
     ]
 }
 
@@ -433,13 +446,14 @@ mod tests {
     #[test]
     fn test_column_families() {
         let cfs = get_column_families();
-        assert_eq!(cfs.len(), 6);
+        assert_eq!(cfs.len(), 7);
         assert!(cfs.contains(&BLOCKS_CF.to_string()));
         assert!(cfs.contains(&BLOCK_INDEX_CF.to_string()));
         assert!(cfs.contains(&CHAINSTATE_CF.to_string()));
         assert!(cfs.contains(&SPENT_CF.to_string()));
         assert!(cfs.contains(&META_CF.to_string()));
         assert!(cfs.contains(&TX_INDEX_CF.to_string()));
+        assert!(cfs.contains(&UNDO_CF.to_string()));
     }
 
     #[test]

@@ -13,7 +13,7 @@ from typing import Dict, Set, Optional, List, Tuple, Callable
 from collections import defaultdict
 
 from ouroboros.database import BlockchainDatabase, Block
-from ouroboros.validation import BlockValidator
+from ouroboros.validation import BlockValidator, SIG_CACHE
 from ouroboros.p2p_messages import (
     NetworkMessage,
     InvMessage,
@@ -333,10 +333,17 @@ class BlockSync:
                         peer.adjust_score(-10)
                         return
                 else:
-                    # Normal block - apply to database
-                    self.validator.apply_block(block)
-                
+                    # Normal block — store via Rust API (atomic block + UTXO update)
+                    new_height = current_height + 1
+                    if hasattr(self.db._db, 'connect_block_from_bytes'):
+                        self.db._db.connect_block_from_bytes(msg.payload, new_height)
+                    else:
+                        self.validator.apply_block(block)
+
                 block_height = block.height if hasattr(block, 'height') and block.height else 0
+                if block_height == 0:
+                    # Height wasn't set in wire format; infer from chain tip
+                    _, block_height = self.db.get_best_block()
                 
                 # Feed fee estimator before removing txs from mempool
                 if self.fee_estimator is not None and block_height > 0:
@@ -374,7 +381,7 @@ class BlockSync:
     def _header_to_block_hash(self, header) -> bytes:
         header_bytes = header.serialize()
         block_hash_raw = hashlib.sha256(hashlib.sha256(header_bytes).digest()).digest()
-        return block_hash_raw[::-1]
+        return block_hash_raw  # internal byte order — matches DB and wire
 
     async def handle_headers(self, msg: NetworkMessage, peer: Peer):
         """Handle headers message"""
@@ -389,7 +396,7 @@ class BlockSync:
             # Request blocks for headers we don't have
             to_request = []
             for header in headers_msg.headers:
-                block_hash = self._header_to_block_hash(header)
+                block_hash = self._header_to_block_hash(header)  # internal byte order
                 if not self.db.get_block(block_hash) and block_hash not in self.requested_blocks:
                     to_request.append((INV_TYPE_BLOCK, block_hash))
                     self.requested_blocks[block_hash] = time.time()
@@ -654,7 +661,10 @@ class BlockSync:
     async def _handle_reorg(self, new_block: Block, new_chain_tip: bytes):
         """Handle chain reorganization."""
         logger.warning(f"Handling chain reorganization to new tip: {new_chain_tip.hex()[:16]}...")
-        
+
+        # Clear signature cache on reorg to prevent stale entries from invalidated chain
+        SIG_CACHE.clear()
+
         try:
             # Get current best block
             current_hash, current_height = self.db.get_best_block()

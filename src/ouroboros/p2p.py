@@ -26,6 +26,14 @@ from typing import List, Dict, Set, Optional, Tuple
 from collections import defaultdict
 
 from ouroboros.peer import Peer, PeerState, RelayType, is_onion_host
+from ouroboros.tor import (
+    TorController,
+    I2PSession,
+    socks5_connect_isolated,
+    is_i2p_host,
+    is_anonymous_network,
+    i2p_destination_to_address,
+)
 from ouroboros.p2p_messages import (
     NetworkMessage, SendCmpctMessage, CmpctBlockMessage,
     GetBlockTxnMessage, BlockTxnMessage,
@@ -47,6 +55,87 @@ from ouroboros.banman import (
 from ouroboros.addrman import AddressManager, get_network_group
 
 logger = logging.getLogger(__name__)
+
+
+# BIP 133 Fee Filter constants (Bitcoin Core net_processing.cpp)
+# Average delay between feefilter broadcasts
+AVG_FEEFILTER_BROADCAST_INTERVAL = 600.0  # 10 minutes
+# Maximum delay after significant change
+MAX_FEEFILTER_CHANGE_DELAY = 300.0  # 5 minutes
+# Fee filter spacing for bucketing (1.1x between buckets)
+FEE_FILTER_SPACING = 1.1
+# Maximum fee rate for filter
+MAX_FILTER_FEERATE = 1e7
+# Minimum relay fee rate (sat/kvB)
+MIN_RELAY_FEE_RATE = 1000
+
+
+class FeeFilterRounder:
+    """Quantize fee rates for privacy before broadcasting.
+
+    Creates discrete fee buckets spaced at 1.1x intervals and rounds
+    incoming fees to these buckets with randomization to prevent
+    fee-rate fingerprinting.
+
+    Reference: Bitcoin Core policy/fees/block_policy_estimator.cpp
+    """
+
+    def __init__(self, min_incremental_fee: int = MIN_RELAY_FEE_RATE):
+        """Initialize fee filter rounder.
+
+        Args:
+            min_incremental_fee: Minimum fee rate in sat/kvB
+        """
+        self._fee_set = self._make_fee_set(min_incremental_fee)
+
+    def _make_fee_set(self, min_incremental_fee: int) -> list:
+        """Build the set of fee bucket boundaries.
+
+        Creates buckets from min_fee_limit to MAX_FILTER_FEERATE
+        with FEE_FILTER_SPACING (1.1x) between each.
+        """
+        fee_set = [0]
+        min_fee_limit = max(1, min_incremental_fee // 2)
+        bucket_boundary = float(min_fee_limit)
+        while bucket_boundary <= MAX_FILTER_FEERATE:
+            fee_set.append(bucket_boundary)
+            bucket_boundary *= FEE_FILTER_SPACING
+        return sorted(fee_set)
+
+    def round(self, current_min_fee: int) -> int:
+        """Quantize a minimum fee for privacy before broadcast.
+
+        Uses randomization: 2/3 of the time rounds down to the previous
+        bucket, 1/3 of the time uses the current or higher bucket.
+        This adds noise to prevent fee-rate fingerprinting.
+
+        Args:
+            current_min_fee: Current minimum fee rate in sat/kvB
+
+        Returns:
+            Rounded fee rate in sat/kvB
+        """
+        if current_min_fee <= 0:
+            return 0
+
+        # Find lower_bound (first element >= current_min_fee)
+        idx = 0
+        for i, fee in enumerate(self._fee_set):
+            if fee >= current_min_fee:
+                idx = i
+                break
+        else:
+            # current_min_fee exceeds all buckets
+            idx = len(self._fee_set)
+
+        # Randomization: 2/3 chance to round down to previous bucket
+        if idx == len(self._fee_set) or (idx > 0 and random.randint(0, 2) != 0):
+            idx -= 1
+
+        if idx < 0:
+            return 0
+
+        return int(self._fee_set[idx])
 
 
 # Transaction trickling constants (Bitcoin Core net_processing.cpp)
@@ -71,7 +160,16 @@ class TrickleEntry:
     """Entry in the per-peer trickle queue."""
     txid: bytes               # 32-byte txid
     wtxid: bytes              # 32-byte wtxid (may be same as txid for legacy)
+    fee: int = 0              # Transaction fee in satoshis
+    vsize: int = 0            # Virtual size in vbytes
     added_time: float = field(default_factory=time.time)
+
+    @property
+    def fee_rate_kvb(self) -> int:
+        """Fee rate in sat/kvB (sat per 1000 virtual bytes)."""
+        if self.vsize <= 0:
+            return 0
+        return (self.fee * 1000) // self.vsize
 
 
 class TrickleQueue:
@@ -105,6 +203,9 @@ class TrickleQueue:
         # Map wtxid -> txid for peers that don't support wtxid relay
         self.wtxid_to_txid: Dict[bytes, bytes] = {}
 
+        # Map wtxid -> TrickleEntry for fee information (BIP133 feefilter)
+        self.wtxid_to_entry: Dict[bytes, TrickleEntry] = {}
+
         # Bloom filter to track already-announced txs (like m_tx_inventory_known_filter)
         # For simplicity, use a set here; Bitcoin Core uses CRollingBloomFilter
         self.known_filter: Set[bytes] = set()
@@ -118,12 +219,20 @@ class TrickleQueue:
             else OUTBOUND_INVENTORY_BROADCAST_INTERVAL
         )
 
-    def add_tx(self, txid: bytes, wtxid: bytes) -> bool:
+    def add_tx(
+        self,
+        txid: bytes,
+        wtxid: bytes,
+        fee: int = 0,
+        vsize: int = 0,
+    ) -> bool:
         """Queue a transaction for trickled announcement.
 
         Args:
             txid: 32-byte transaction id
             wtxid: 32-byte witness transaction id
+            fee: Transaction fee in satoshis (for BIP133 feefilter)
+            vsize: Virtual size in vbytes (for BIP133 feefilter)
 
         Returns:
             True if added, False if already known/pending
@@ -138,6 +247,9 @@ class TrickleQueue:
 
         self.pending_wtxids.add(wtxid)
         self.wtxid_to_txid[wtxid] = txid
+        self.wtxid_to_entry[wtxid] = TrickleEntry(
+            txid=txid, wtxid=wtxid, fee=fee, vsize=vsize
+        )
         return True
 
     def mark_known(self, txid: bytes, wtxid: bytes) -> None:
@@ -147,6 +259,7 @@ class TrickleQueue:
         # Remove from pending if queued
         self.pending_wtxids.discard(wtxid)
         self.wtxid_to_txid.pop(wtxid, None)
+        self.wtxid_to_entry.pop(wtxid, None)
 
     def should_send(self, current_time: float) -> bool:
         """Check if it's time to send trickled INVs."""
@@ -165,11 +278,16 @@ class TrickleQueue:
     def get_invs_to_send(
         self,
         max_count: int = INVENTORY_BROADCAST_MAX,
+        feefilter: int = 0,
     ) -> List[Tuple[int, bytes]]:
         """Get INV items ready to send and remove them from the queue.
 
+        BIP133: Transactions with fee rate below the peer's feefilter
+        are skipped (not announced to that peer).
+
         Args:
             max_count: Maximum number of items to return
+            feefilter: Peer's minimum fee rate in sat/kvB (BIP133)
 
         Returns:
             List of (inv_type, hash) tuples for InvMessage
@@ -191,6 +309,16 @@ class TrickleQueue:
 
         for wtxid in pending_list[:broadcast_max]:
             txid = self.wtxid_to_txid.get(wtxid, wtxid)
+            entry = self.wtxid_to_entry.get(wtxid)
+
+            # BIP133: Skip transactions below peer's feefilter threshold
+            # Only filter INV announcements, not responses to GETDATA
+            # Only filter if we have valid fee info (vsize > 0)
+            if feefilter > 0 and entry is not None and entry.vsize > 0:
+                if entry.fee_rate_kvb < feefilter:
+                    # Don't announce to this peer, but keep in queue
+                    # (may be announced later if feefilter drops)
+                    continue
 
             # Choose INV type based on peer's wtxid relay preference
             if self.wtxid_relay:
@@ -213,6 +341,7 @@ class TrickleQueue:
         for wtxid in to_remove:
             self.pending_wtxids.discard(wtxid)
             self.wtxid_to_txid.pop(wtxid, None)
+            self.wtxid_to_entry.pop(wtxid, None)
 
         return inv_items
 
@@ -225,6 +354,7 @@ class TrickleQueue:
         """Clear all pending announcements."""
         self.pending_wtxids.clear()
         self.wtxid_to_txid.clear()
+        self.wtxid_to_entry.clear()
 
 
 # DNS seeds for mainnet
@@ -278,6 +408,9 @@ class PeerManager:
         listen: bool = True,
         proxy: Optional[str] = None,
         onion: Optional[str] = None,
+        i2psam: Optional[str] = None,
+        torcontrol: Optional[str] = None,
+        torpassword: Optional[str] = None,
     ):
         """Initialize peer manager."""
         self.network = network
@@ -287,6 +420,9 @@ class PeerManager:
         self._listen_enabled = listen
         self.proxy = proxy    # global SOCKS5 proxy for all outbound
         self.onion = onion    # SOCKS5 proxy specifically for .onion peers
+        self.i2psam = i2psam  # I2P SAM bridge (host:port)
+        self.torcontrol = torcontrol  # Tor control port (host:port)
+        self.torpassword = torpassword  # Tor control password
 
         self.peers: Dict[str, Peer] = {}  # addr -> Peer (full-relay outbound)
         self.block_relay_peers: Dict[str, Peer] = {}  # addr -> Peer (block-relay-only outbound)
@@ -355,7 +491,17 @@ class PeerManager:
 
         # Track inbound /16 groups for reserved slot enforcement
         self._inbound_netgroups: Dict[str, int] = {}  # group -> count
-    
+
+        # Tor hidden service support
+        self._tor_controller: Optional[TorController] = None
+        self._tor_onion_address: Optional[str] = None
+        self._data_dir = data_dir
+
+        # I2P SAM session
+        self._i2p_session: Optional[I2PSession] = None
+        self._i2p_address: Optional[str] = None
+        self._i2p_accept_task: Optional[asyncio.Task] = None
+
     async def start(self, start_height: int = 0, p2p_port: int = 0):
         """
         Start peer manager.
@@ -375,6 +521,14 @@ class PeerManager:
         # Start listening for inbound connections
         if self._listen_enabled and p2p_port:
             await self._start_listening(p2p_port)
+
+            # Start Tor hidden service for inbound .onion connections
+            if self.torcontrol:
+                await self._start_tor_hidden_service(p2p_port)
+
+            # Start I2P SAM session for inbound/outbound I2P connections
+            if self.i2psam:
+                await self._start_i2p_session(p2p_port)
 
         # Discover peers from DNS seeds
         await self.discover_peers()
@@ -455,6 +609,27 @@ class PeerManager:
         if self._feeler_peer and self._feeler_peer.is_connected():
             await self._feeler_peer.disconnect()
             self._feeler_peer = None
+
+        # Cancel I2P accept task
+        if self._i2p_accept_task:
+            self._i2p_accept_task.cancel()
+            try:
+                await self._i2p_accept_task
+            except asyncio.CancelledError:
+                pass
+
+        # Stop Tor hidden service
+        if self._tor_controller:
+            await self._tor_controller.remove_hidden_service()
+            await self._tor_controller.disconnect()
+            self._tor_controller = None
+            self._tor_onion_address = None
+
+        # Stop I2P session
+        if self._i2p_session:
+            await self._i2p_session.disconnect()
+            self._i2p_session = None
+            self._i2p_address = None
 
         # Save anchor connections before shutting down
         self._save_anchors()
@@ -799,6 +974,187 @@ class PeerManager:
 
         self._feeler_peer = None
 
+    # --- Tor Hidden Service Support ---
+
+    async def _start_tor_hidden_service(self, p2p_port: int) -> None:
+        """Start Tor hidden service for accepting inbound .onion connections.
+
+        Creates an ephemeral hidden service via Tor control protocol that
+        forwards incoming connections to our P2P port.
+        """
+        if not self.torcontrol:
+            return
+
+        try:
+            # Parse control address
+            parts = self.torcontrol.rsplit(":", 1)
+            if len(parts) == 2:
+                control_host, control_port = parts[0], int(parts[1])
+            else:
+                control_host, control_port = self.torcontrol, 9051
+
+            self._tor_controller = TorController(
+                control_host=control_host,
+                control_port=control_port,
+                password=self.torpassword,
+                data_dir=self._data_dir,
+            )
+
+            if await self._tor_controller.connect():
+                self._tor_onion_address = await self._tor_controller.create_hidden_service(
+                    target_port=p2p_port
+                )
+                if self._tor_onion_address:
+                    logger.info(f"Tor hidden service ready: {self._tor_onion_address}:{p2p_port}")
+                else:
+                    logger.warning("Failed to create Tor hidden service")
+            else:
+                logger.warning("Failed to connect to Tor control port")
+                self._tor_controller = None
+
+        except Exception as e:
+            logger.error(f"Error starting Tor hidden service: {e}")
+            self._tor_controller = None
+
+    # --- I2P SAM Support ---
+
+    async def _start_i2p_session(self, p2p_port: int) -> None:
+        """Start I2P SAM session for anonymous P2P connections.
+
+        Creates a streaming session that can both make outbound connections
+        and accept inbound connections via I2P.
+        """
+        if not self.i2psam:
+            return
+
+        try:
+            # Parse SAM address
+            parts = self.i2psam.rsplit(":", 1)
+            if len(parts) == 2:
+                sam_host, sam_port = parts[0], int(parts[1])
+            else:
+                sam_host, sam_port = self.i2psam, 7656
+
+            self._i2p_session = I2PSession(
+                sam_host=sam_host,
+                sam_port=sam_port,
+                data_dir=self._data_dir,
+                persistent=True,
+            )
+
+            if await self._i2p_session.connect():
+                self._i2p_address = self._i2p_session.address
+                logger.info(f"I2P session ready: {self._i2p_address}")
+
+                # Start accepting inbound I2P connections
+                self._i2p_accept_task = asyncio.create_task(
+                    self._i2p_accept_loop(p2p_port)
+                )
+            else:
+                logger.warning("Failed to connect to I2P SAM bridge")
+                self._i2p_session = None
+
+        except Exception as e:
+            logger.error(f"Error starting I2P session: {e}")
+            self._i2p_session = None
+
+    async def _i2p_accept_loop(self, p2p_port: int) -> None:
+        """Background loop accepting incoming I2P connections."""
+        try:
+            while self.running and self._i2p_session:
+                try:
+                    result = await self._i2p_session.stream_accept(timeout=60.0)
+                    if result is None:
+                        continue
+
+                    reader, writer, peer_dest = result
+                    # Convert destination to .b32.i2p address for identification
+                    peer_addr = i2p_destination_to_address(
+                        __import__('base64').b64decode(
+                            peer_dest.replace("-", "+").replace("~", "/")
+                        )
+                    ) if peer_dest != "unknown" else "unknown.b32.i2p"
+
+                    addr = f"{peer_addr}:{p2p_port}"
+                    logger.info(f"Accepted I2P connection from {addr}")
+
+                    # Handle like a normal inbound connection
+                    await self._handle_i2p_inbound(reader, writer, peer_addr, p2p_port)
+
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.warning(f"I2P accept error: {e}")
+                    await asyncio.sleep(1.0)
+
+        except asyncio.CancelledError:
+            logger.debug("I2P accept loop cancelled")
+        except Exception as e:
+            logger.error(f"I2P accept loop error: {e}")
+
+    async def _handle_i2p_inbound(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        host: str,
+        port: int,
+    ) -> None:
+        """Handle an incoming I2P connection."""
+        addr = f"{host}:{port}"
+
+        # Check inbound limit
+        if len(self.inbound_peers) >= MAX_INBOUND:
+            if not await self._evict_inbound_peer():
+                logger.debug(f"Rejected I2P peer {addr}: max inbound reached")
+                writer.close()
+                return
+
+        peer = Peer(host, port, self.network, inbound=True)
+        if await peer.accept_inbound(reader, writer, self._start_height):
+            self.inbound_peers[addr] = peer
+            self._register_compact_handlers(peer, addr)
+            self._register_addr_handlers(peer, addr)
+            asyncio.ensure_future(self.negotiate_compact_blocks(peer))
+
+            if self.erlay_enabled:
+                self._register_erlay_handlers(peer, addr)
+                asyncio.ensure_future(self._negotiate_erlay(peer, addr))
+
+            self._trickle_queues[addr] = TrickleQueue(
+                is_inbound=True, wtxid_relay=peer.wtxid_relay
+            )
+
+            # Track I2P as its own network group
+            peer_group = "i2p"
+            self._inbound_netgroups[peer_group] = self._inbound_netgroups.get(peer_group, 0) + 1
+
+            if self._on_inbound_peer:
+                try:
+                    await self._on_inbound_peer(peer)
+                except Exception as e:
+                    logger.error(f"Error in inbound peer callback: {e}")
+
+            logger.info(f"I2P peer {addr} ready ({len(self.inbound_peers)} inbound)")
+
+    async def _connect_via_i2p(
+        self,
+        host: str,
+        port: int,
+    ) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+        """Connect to an I2P peer via SAM session."""
+        if not self._i2p_session or not self._i2p_session.is_connected:
+            return None
+
+        try:
+            reader, writer = await self._i2p_session.stream_connect(
+                dest_address=host,
+                timeout=180.0,
+            )
+            return reader, writer
+        except Exception as e:
+            logger.debug(f"I2P connect to {host} failed: {e}")
+            return None
+
     async def discover_peers(self):
         """Discover peers from DNS seeds"""
         logger.info("Discovering peers from DNS seeds...")
@@ -858,9 +1214,30 @@ class PeerManager:
             return 0
     
     def _proxy_for_host(self, host: str) -> Optional[str]:
+        """Get SOCKS5 proxy for a host, if any.
+
+        - .onion addresses use the onion proxy (or global proxy)
+        - .i2p addresses return None (use I2P SAM instead)
+        - Other addresses use the global proxy
+        """
         if is_onion_host(host):
             return self.onion or self.proxy
+        if is_i2p_host(host):
+            return None  # I2P uses SAM, not SOCKS5
         return self.proxy
+
+    def _can_connect_to(self, host: str) -> bool:
+        """Check if we can connect to a host.
+
+        For .onion: need a SOCKS5 proxy
+        For .i2p: need an I2P SAM session
+        For clearnet: always possible (direct or via proxy)
+        """
+        if is_onion_host(host):
+            return bool(self.onion or self.proxy)
+        if is_i2p_host(host):
+            return self._i2p_session is not None and self._i2p_session.is_connected
+        return True
 
     def _all_outbound_addrs(self) -> Set[str]:
         return set(self.peers.keys()) | set(self.block_relay_peers.keys())
@@ -1136,26 +1513,138 @@ class PeerManager:
     
     # BIP 133 Fee Filter
 
-    async def _broadcast_feefilter(self) -> None:
+    def _init_feefilter_rounder(self) -> None:
+        """Initialize the fee filter rounder (lazy initialization)."""
+        if not hasattr(self, '_fee_filter_rounder'):
+            self._fee_filter_rounder = FeeFilterRounder()
+
+    def _get_current_feefilter(self) -> int:
+        """Get the current fee filter rate from the mempool.
+
+        Returns the minimum fee rate for transaction relay in sat/kvB.
+        During IBD or if mempool is unavailable, returns MAX_MONEY to
+        suppress all transaction announcements.
+        """
+        MAX_MONEY = 21_000_000 * 100_000_000  # 21 million BTC in satoshis
+
         if self._mempool is None:
-            return
+            return MIN_RELAY_FEE_RATE
+
+        # Check if we're in initial block download (IBD)
+        # During IBD, set filter to MAX_MONEY to suppress tx announcements
+        if hasattr(self, '_in_ibd') and self._in_ibd:
+            return MAX_MONEY
+
         try:
-            stats = self._mempool.get_stats()
-            # min_fee_rate from mempool is in sat/vB; feefilter is sat/kB
-            min_rate = stats.get("min_fee_rate", 0)
-            feerate = max(int(min_rate * 1000), 1000)  # floor at 1000 sat/kB
+            # Use get_mempool_info() which returns min_fee_rate in sat/vB
+            info = self._mempool.get_mempool_info()
+            min_rate_satvb = info.get("min_fee_rate", 0)
+            # Convert sat/vB to sat/kvB
+            return max(int(min_rate_satvb * 1000), MIN_RELAY_FEE_RATE)
         except Exception:
-            return
+            return MIN_RELAY_FEE_RATE
+
+    async def _broadcast_feefilter(self) -> None:
+        """Send feefilter messages to peers with hysteresis.
+
+        Implements BIP 133 with Bitcoin Core's timing and privacy behavior:
+        - Exponentially distributed broadcast intervals (~10 min average)
+        - Hysteresis: only expedite update if fee changed significantly
+          (dropped below 75% or rose above 133% of last sent)
+        - Random noise via FeeFilterRounder to prevent fingerprinting
+        """
+        self._init_feefilter_rounder()
+
+        current_filter = self._get_current_feefilter()
+        current_time = time.time()
 
         from ouroboros.p2p_messages import FeeFilterMessage
-        msg = FeeFilterMessage(feerate=feerate).to_network_message(self.network)
+
         for p in self.get_all_ready_peers():
+            # Skip block-relay-only peers (they don't relay transactions)
             if not p.relay_txs:
-                continue  # skip block-relay-only peers
-            try:
-                await p.send_message(msg)
-            except Exception:
-                pass
+                continue
+
+            await self._maybe_send_feefilter(p, current_filter, current_time)
+
+    async def _maybe_send_feefilter(
+        self,
+        peer: Peer,
+        current_filter: int,
+        current_time: float,
+    ) -> None:
+        """Send feefilter to a peer if conditions are met.
+
+        Implements Bitcoin Core's MaybeSendFeefilter() logic:
+        1. If scheduled time has passed, round and send if changed
+        2. If fee changed significantly (3/4 to 4/3) and >5min until
+           next scheduled send, expedite to within 5 minutes
+
+        Args:
+            peer: The peer to potentially send feefilter to
+            current_filter: Current mempool minimum fee in sat/kvB
+            current_time: Current timestamp
+        """
+        from ouroboros.p2p_messages import FeeFilterMessage
+
+        # Check if it's time for scheduled broadcast
+        if current_time > peer.next_feefilter_time:
+            # Round with noise for privacy
+            filter_to_send = self._fee_filter_rounder.round(current_filter)
+            # Ensure minimum relay fee floor
+            filter_to_send = max(filter_to_send, MIN_RELAY_FEE_RATE)
+
+            # Only send if value changed
+            if filter_to_send != peer.feefilter_sent:
+                try:
+                    msg = FeeFilterMessage(feerate=filter_to_send).to_network_message(
+                        self.network
+                    )
+                    await peer.send_message(msg)
+                    peer.feefilter_sent = filter_to_send
+                    logger.debug(
+                        f"Sent feefilter {filter_to_send} sat/kvB to "
+                        f"{peer.host}:{peer.port}"
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to send feefilter to {peer.host}:{peer.port}: {e}")
+
+            # Schedule next broadcast with exponential distribution
+            # Average interval is AVG_FEEFILTER_BROADCAST_INTERVAL (10 min)
+            delay = random.expovariate(1.0 / AVG_FEEFILTER_BROADCAST_INTERVAL)
+            peer.next_feefilter_time = current_time + delay
+
+        # Check hysteresis: if fee changed substantially and next broadcast
+        # is more than MAX_FEEFILTER_CHANGE_DELAY away, expedite it
+        elif (
+            current_time + MAX_FEEFILTER_CHANGE_DELAY < peer.next_feefilter_time
+            and peer.feefilter_sent > 0
+        ):
+            # Hysteresis thresholds: 3/4 (75%) and 4/3 (133%)
+            # current_filter < 3/4 * sent  OR  current_filter > 4/3 * sent
+            if (
+                current_filter < (3 * peer.feefilter_sent) // 4
+                or current_filter > (4 * peer.feefilter_sent) // 3
+            ):
+                # Expedite: schedule within MAX_FEEFILTER_CHANGE_DELAY
+                peer.next_feefilter_time = current_time + random.uniform(
+                    0, MAX_FEEFILTER_CHANGE_DELAY
+                )
+                logger.debug(
+                    f"Expedited feefilter for {peer.host}:{peer.port} "
+                    f"(current={current_filter}, sent={peer.feefilter_sent})"
+                )
+
+    def set_ibd_state(self, in_ibd: bool) -> None:
+        """Set the initial block download state.
+
+        During IBD, feefilter is set to MAX_MONEY to suppress all
+        transaction relay.
+
+        Args:
+            in_ibd: True if currently in initial block download
+        """
+        self._in_ibd = in_ibd
 
     # BIP 152 Compact Blocks #
 
@@ -1397,6 +1886,14 @@ class PeerManager:
 
     @staticmethod
     def _addr_bytes_to_host(net_id: int, addr_bytes: bytes) -> Optional[str]:
+        """Convert BIP155 address bytes to human-readable host string.
+
+        Supports:
+        - net_id=1: IPv4 (4 bytes)
+        - net_id=2: IPv6 (16 bytes) - currently skipped
+        - net_id=4: Tor v3 (32 bytes ed25519 pubkey)
+        - net_id=5: I2P (32 bytes SHA256 hash of destination)
+        """
         if net_id == 1 and len(addr_bytes) == 4:
             return ".".join(str(b) for b in addr_bytes)
         if net_id == 2 and len(addr_bytes) == 16:
@@ -1414,6 +1911,11 @@ class PeerManager:
             onion_body = addr_bytes + checksum + version_byte
             onion_host = base64.b32encode(onion_body).decode("ascii").lower() + ".onion"
             return onion_host
+        if net_id == 5 and len(addr_bytes) == 32:
+            # I2P: 32-byte SHA256 hash of destination → base32 .b32.i2p address
+            # The address is the base32 encoding of the hash (without padding)
+            i2p_host = base64.b32encode(addr_bytes).decode("ascii").lower().rstrip("=") + ".b32.i2p"
+            return i2p_host
         return None
 
     # --- BIP 330 Erlay Reconciliation ---
@@ -1954,8 +2456,10 @@ class PeerManager:
                         continue
 
                     try:
-                        # Get INVs to send
-                        inv_items = queue.get_invs_to_send()
+                        # Get INVs to send, filtering by peer's feefilter (BIP133)
+                        inv_items = queue.get_invs_to_send(
+                            feefilter=peer.peer_feefilter
+                        )
                         if inv_items:
                             # Send INV message
                             inv_msg = InvMessage(inv_items)
@@ -1983,6 +2487,8 @@ class PeerManager:
         self,
         txid: bytes,
         wtxid: bytes,
+        fee: int = 0,
+        vsize: int = 0,
         exclude_addr: str = "",
     ) -> int:
         """Queue a transaction for trickled announcement to all eligible peers.
@@ -1990,12 +2496,17 @@ class PeerManager:
         Instead of immediately broadcasting INVs, the transaction is added to
         each peer's trickle queue and announced on a randomized schedule.
 
+        BIP133: Fee information is stored so that transactions can be filtered
+        based on each peer's feefilter at announcement time.
+
         For Erlay-enabled peers, transactions are added to the reconciliation
         set instead of the trickle queue (handled separately).
 
         Args:
             txid: 32-byte transaction hash
             wtxid: 32-byte witness transaction hash
+            fee: Transaction fee in satoshis (for BIP133 feefilter)
+            vsize: Virtual size in vbytes (for BIP133 feefilter)
             exclude_addr: Peer address to exclude (sender of the tx)
 
         Returns:
@@ -2026,14 +2537,14 @@ class PeerManager:
                 )
                 self._trickle_queues[addr] = queue
 
-            # Add to trickle queue
-            if queue.add_tx(txid, wtxid):
+            # Add to trickle queue with fee info for BIP133 filtering
+            if queue.add_tx(txid, wtxid, fee=fee, vsize=vsize):
                 queued_count += 1
 
         if queued_count > 0:
             logger.debug(
                 f"Queued tx {txid.hex()[:16]}... for trickled relay to "
-                f"{queued_count} peers"
+                f"{queued_count} peers (fee={fee}, vsize={vsize})"
             )
 
         return queued_count
@@ -2115,6 +2626,9 @@ class PeerManager:
         onion_peers = sum(
             1 for p in ready_peers if is_onion_host(p.host)
         )
+        i2p_peers = sum(
+            1 for p in ready_peers if is_i2p_host(p.host)
+        )
 
         trickle_stats = self.get_trickle_stats()
 
@@ -2133,6 +2647,11 @@ class PeerManager:
             "proxy": self.proxy,
             "onion_proxy": self.onion,
             "onion_peers": onion_peers,
+            "i2p_sam": self.i2psam,
+            "i2p_address": self._i2p_address,
+            "i2p_peers": i2p_peers,
+            "tor_control": self.torcontrol,
+            "tor_onion_address": self._tor_onion_address,
             "trickle_pending": trickle_stats["total_pending"],
             # Eclipse protection stats
             "outbound_netgroups": len(self._outbound_netgroups),

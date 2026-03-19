@@ -226,8 +226,13 @@ class Peer:
         self.wants_headers: bool = False      # BIP 130: prefer headers announcements
         self.wants_cmpctblock: bool = False    # BIP 152: announce via cmpctblock
 
-        # BIP 133: peer's minimum fee rate for tx relay (sat/kB)
+        # BIP 133: peer's minimum fee rate for tx relay (sat/kvB)
+        # peer_feefilter: received from peer, used to filter our INV announcements
+        # feefilter_sent: what we last sent to this peer
+        # next_feefilter_time: when to send the next feefilter update
         self.peer_feefilter: int = 0
+        self.feefilter_sent: int = 0
+        self.next_feefilter_time: float = 0.0
 
         # BIP 330: Erlay reconciliation support
         self.erlay_enabled: bool = False       # Set to True when sendtxrcncl exchanged
@@ -473,10 +478,23 @@ class Peer:
         await self.send_message(verack)
         self._verack_sent = True
 
-        # 6. Receive verack with handshake timeout
-        msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
-        if msg.command != "verack":
+        # 6. Receive verack with handshake timeout.
+        # The remote peer may send wtxidrelay / sendaddrv2 before its verack.
+        for _attempt in range(10):
+            msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
+            if msg.command == "verack":
+                break
+            if msg.command == "wtxidrelay":
+                self.wtxid_relay = True
+                logger.debug(f"Received wtxidrelay from {self.host}:{self.port} during inbound handshake")
+                continue
+            if msg.command == "sendaddrv2":
+                self.addrv2 = True
+                logger.debug(f"Received sendaddrv2 from {self.host}:{self.port} during inbound handshake")
+                continue
             raise Exception(f"Expected verack, got {msg.command}")
+        else:
+            raise Exception("Did not receive verack within expected message count")
         self._verack_received = True
 
         # Handshake is now complete
@@ -621,10 +639,24 @@ class Peer:
         await self.send_message(verack)
         self._verack_sent = True
 
-        # Receive verack with handshake timeout
-        msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
-        if msg.command != "verack":
+        # Receive verack with handshake timeout.
+        # The remote peer may send wtxidrelay / sendaddrv2 before its verack
+        # (this is standard Bitcoin Core behaviour), so consume those first.
+        for _attempt in range(10):  # safety bound
+            msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
+            if msg.command == "verack":
+                break
+            if msg.command == "wtxidrelay":
+                self.wtxid_relay = True
+                logger.debug(f"Received wtxidrelay from {self.host}:{self.port} during handshake")
+                continue
+            if msg.command == "sendaddrv2":
+                self.addrv2 = True
+                logger.debug(f"Received sendaddrv2 from {self.host}:{self.port} during handshake")
+                continue
             raise Exception(f"Expected verack, got {msg.command}")
+        else:
+            raise Exception("Did not receive verack within expected message count")
         self._verack_received = True
 
         # Handshake is now complete
