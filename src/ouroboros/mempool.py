@@ -35,16 +35,727 @@ MEMPOOL_EXPIRY_HOURS = 336  # 14 days
 TX_MAX_STANDARD_VERSION = 3
 
 # TRUC (v3 transaction) policy constants (Bitcoin Core policy/truc_policy.cpp)
-TX_V3_MAX_VSIZE = 10_000  # max vsize for a v3 child of an unconfirmed v3 parent
-TX_V3_ANCESTOR_LIMIT = 2  # v3 tx may have at most 1 unconfirmed ancestor (self + 1)
-TX_V3_DESCENDANT_LIMIT = 2  # v3 tx may have at most 1 unconfirmed descendant (self + 1)
+TRUC_VERSION = 3  # nVersion == 3 marks a TRUC transaction
+TRUC_MAX_VSIZE = 10_000  # max vsize for any TRUC transaction
+TRUC_CHILD_MAX_VSIZE = 1_000  # max vsize for a v3 child spending unconfirmed v3 parent
+TRUC_ANCESTOR_LIMIT = 2  # v3 tx may have at most 1 unconfirmed ancestor (self + 1)
+TRUC_DESCENDANT_LIMIT = 2  # v3 tx may have at most 1 unconfirmed descendant (self + 1)
 
 # Package validation limits (BIP 331)
 MAX_PACKAGE_COUNT = 25
 MAX_PACKAGE_WEIGHT = 404_000  # weight units
 
+# Cluster mempool limits (Bitcoin Core cluster_linearize.h / txgraph.h)
+MAX_CLUSTER_COUNT = 100  # Maximum transactions per cluster
+
+# Ephemeral dust policy constants (Bitcoin Core policy/policy.h)
+MAX_DUST_OUTPUTS_PER_TX = 1  # Maximum number of dust outputs per transaction
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Cluster Mempool Implementation
+#
+# A cluster is a connected component in the mempool dependency graph. Transactions
+# are connected if one spends from another (parent-child relationship). The cluster
+# mempool groups related transactions and uses linearization to determine optimal
+# eviction and mining order.
+#
+# Reference: Bitcoin Core cluster_linearize.h, txgraph.h
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class Chunk:
+    """A chunk is a group of transactions that are mined together.
+
+    In a linearization, a chunk is an indivisible unit at its combined feerate.
+    When mining, we select chunks in decreasing feerate order.
+    When evicting, we remove the lowest-feerate chunk.
+    """
+
+    txids: Set[bytes]
+    total_fee: int
+    total_size: int
+
+    @property
+    def fee_rate(self) -> float:
+        """Fee rate of this chunk in sat/vB."""
+        return self.total_fee / self.total_size if self.total_size > 0 else 0.0
+
+    def __lt__(self, other: "Chunk") -> bool:
+        """Compare chunks by fee rate for sorting."""
+        return self.fee_rate < other.fee_rate
+
+
+@dataclass
+class Cluster:
+    """A cluster is a connected component of transactions in the mempool.
+
+    Transactions are connected if one spends from another (parent-child).
+    Each cluster maintains its own linearization, which determines the order
+    transactions should be mined in and which transactions to evict first.
+
+    Reference: Bitcoin Core txgraph.h - TxGraph
+    """
+
+    txids: Set[bytes]
+    # Cached linearization (list of txids in mining order)
+    _linearization: Optional[List[bytes]] = field(default=None, repr=False)
+    # Cached chunks (groups of txs with combined feerate)
+    _chunks: Optional[List[Chunk]] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        if not isinstance(self.txids, set):
+            self.txids = set(self.txids)
+
+    def invalidate_cache(self) -> None:
+        """Invalidate cached linearization and chunks."""
+        self._linearization = None
+        self._chunks = None
+
+    def contains(self, txid: bytes) -> bool:
+        """Check if txid is in this cluster."""
+        return txid in self.txids
+
+    def size(self) -> int:
+        """Number of transactions in this cluster."""
+        return len(self.txids)
+
+
+class ClusterLinearizer:
+    """Linearizes a cluster of transactions for optimal mining order.
+
+    The linearization algorithm produces a topologically valid ordering where
+    each prefix has a fee rate >= the next prefix. This is done using the
+    ancestor-set-based approach:
+
+    1. Repeatedly find the transaction with highest ancestor feerate
+    2. Output that transaction and all its ancestors as a "chunk"
+    3. Remove them and repeat until empty
+
+    The result is a list of txids in mining order, where earlier transactions
+    should be mined before later ones.
+
+    Reference: Bitcoin Core cluster_linearize.h - Linearize()
+    """
+
+    def __init__(
+        self,
+        transactions: Dict[bytes, "MempoolEntry"],
+    ):
+        """Initialize linearizer with mempool transactions.
+
+        Args:
+            transactions: Dict mapping txid -> MempoolEntry for all txs in cluster
+        """
+        self.transactions = transactions
+
+    def _get_ancestor_set_feerate(self, txid: bytes, remaining: Set[bytes]) -> float:
+        """Compute the ancestor set feerate for a transaction.
+
+        The ancestor set is the transaction plus all its ancestors (within remaining).
+        The ancestor set feerate is the total fee divided by total size.
+        """
+        entry = self.transactions.get(txid)
+        if entry is None:
+            return 0.0
+
+        # Collect ancestors within remaining set
+        ancestors = {txid}
+        queue = [txid]
+        while queue:
+            current = queue.pop()
+            current_entry = self.transactions.get(current)
+            if current_entry is None:
+                continue
+            for parent_txid in current_entry.parents:
+                if parent_txid in remaining and parent_txid not in ancestors:
+                    ancestors.add(parent_txid)
+                    queue.append(parent_txid)
+
+        # Compute combined feerate
+        total_fee = 0
+        total_size = 0
+        for anc_txid in ancestors:
+            anc_entry = self.transactions.get(anc_txid)
+            if anc_entry:
+                total_fee += anc_entry.fee
+                total_size += anc_entry.size
+
+        return total_fee / total_size if total_size > 0 else 0.0
+
+    def _get_ancestor_set(self, txid: bytes, remaining: Set[bytes]) -> Set[bytes]:
+        """Get the ancestor set for a transaction within remaining."""
+        entry = self.transactions.get(txid)
+        if entry is None:
+            return set()
+
+        ancestors = {txid}
+        queue = [txid]
+        while queue:
+            current = queue.pop()
+            current_entry = self.transactions.get(current)
+            if current_entry is None:
+                continue
+            for parent_txid in current_entry.parents:
+                if parent_txid in remaining and parent_txid not in ancestors:
+                    ancestors.add(parent_txid)
+                    queue.append(parent_txid)
+
+        return ancestors
+
+    def linearize(self, cluster_txids: Set[bytes]) -> Tuple[List[bytes], List[Chunk]]:
+        """Linearize a cluster of transactions.
+
+        Returns:
+            (linearization, chunks) where:
+            - linearization: List of txids in mining order (parents before children)
+            - chunks: List of Chunks representing indivisible mining units
+        """
+        remaining = set(cluster_txids)
+        linearization: List[bytes] = []
+        chunks: List[Chunk] = []
+
+        while remaining:
+            # Find transaction with highest ancestor set feerate
+            best_txid = None
+            best_feerate = -1.0
+
+            for txid in remaining:
+                feerate = self._get_ancestor_set_feerate(txid, remaining)
+                if feerate > best_feerate:
+                    best_feerate = feerate
+                    best_txid = txid
+
+            if best_txid is None:
+                # Should not happen, but handle gracefully
+                break
+
+            # Get the ancestor set for this transaction
+            ancestor_set = self._get_ancestor_set(best_txid, remaining)
+
+            # Topologically sort the ancestor set (parents before children)
+            sorted_ancestors = self._topo_sort(ancestor_set)
+
+            # Add to linearization
+            linearization.extend(sorted_ancestors)
+
+            # Create a chunk for this ancestor set
+            total_fee = 0
+            total_size = 0
+            for txid in ancestor_set:
+                entry = self.transactions.get(txid)
+                if entry:
+                    total_fee += entry.fee
+                    total_size += entry.size
+
+            chunk = Chunk(
+                txids=ancestor_set,
+                total_fee=total_fee,
+                total_size=total_size,
+            )
+
+            # Merge with previous chunk if this chunk has higher feerate
+            # (this implements the chunking rule from Bitcoin Core)
+            while chunks and chunk.fee_rate > chunks[-1].fee_rate:
+                prev_chunk = chunks.pop()
+                chunk = Chunk(
+                    txids=chunk.txids | prev_chunk.txids,
+                    total_fee=chunk.total_fee + prev_chunk.total_fee,
+                    total_size=chunk.total_size + prev_chunk.total_size,
+                )
+
+            chunks.append(chunk)
+
+            # Remove from remaining
+            remaining -= ancestor_set
+
+        return linearization, chunks
+
+    def _topo_sort(self, txids: Set[bytes]) -> List[bytes]:
+        """Topologically sort transactions (parents before children)."""
+        # Build in-degree count for each tx (counting only edges within txids)
+        in_degree: Dict[bytes, int] = {txid: 0 for txid in txids}
+
+        for txid in txids:
+            entry = self.transactions.get(txid)
+            if entry:
+                for parent_txid in entry.parents:
+                    if parent_txid in txids:
+                        in_degree[txid] += 1
+
+        # Start with nodes that have no dependencies
+        queue = [txid for txid, degree in in_degree.items() if degree == 0]
+        result: List[bytes] = []
+
+        while queue:
+            # Pick one with no remaining dependencies
+            txid = queue.pop(0)
+            result.append(txid)
+
+            # Decrease in-degree for children
+            entry = self.transactions.get(txid)
+            if entry:
+                for child_txid in entry.children:
+                    if child_txid in in_degree:
+                        in_degree[child_txid] -= 1
+                        if in_degree[child_txid] == 0:
+                            queue.append(child_txid)
+
+        return result
+
+
+class ClusterManager:
+    """Manages clusters of transactions in the mempool.
+
+    This class tracks which transactions belong to which cluster, and provides
+    methods for:
+    - Finding the cluster a transaction belongs to
+    - Merging clusters when a new transaction connects them
+    - Splitting clusters when a transaction is removed
+    - Getting chunks for eviction and mining
+
+    Reference: Bitcoin Core txgraph.cpp
+    """
+
+    def __init__(self, transactions: Dict[bytes, "MempoolEntry"]):
+        """Initialize cluster manager.
+
+        Args:
+            transactions: Reference to mempool's transactions dict
+        """
+        self.transactions = transactions
+        # txid -> cluster_id (arbitrary identifier)
+        self._tx_to_cluster: Dict[bytes, int] = {}
+        # cluster_id -> Cluster
+        self._clusters: Dict[int, Cluster] = {}
+        # Next cluster ID to assign
+        self._next_cluster_id = 0
+
+    def _new_cluster_id(self) -> int:
+        """Generate a new unique cluster ID."""
+        cid = self._next_cluster_id
+        self._next_cluster_id += 1
+        return cid
+
+    def _find_connected_component(self, start_txid: bytes) -> Set[bytes]:
+        """Find all transactions connected to start_txid via parent-child links."""
+        if start_txid not in self.transactions:
+            return set()
+
+        visited: Set[bytes] = set()
+        queue = [start_txid]
+
+        while queue:
+            txid = queue.pop()
+            if txid in visited:
+                continue
+            if txid not in self.transactions:
+                continue
+
+            visited.add(txid)
+            entry = self.transactions[txid]
+
+            # Add parents and children
+            for parent_txid in entry.parents:
+                if parent_txid not in visited and parent_txid in self.transactions:
+                    queue.append(parent_txid)
+            for child_txid in entry.children:
+                if child_txid not in visited and child_txid in self.transactions:
+                    queue.append(child_txid)
+
+        return visited
+
+    def add_transaction(self, txid: bytes) -> Optional[int]:
+        """Add a transaction to the cluster structure.
+
+        This finds the connected component the tx belongs to and either:
+        - Creates a new singleton cluster if no connections
+        - Adds to existing cluster if one neighbor
+        - Merges clusters if multiple neighbors from different clusters
+
+        Returns the cluster ID the transaction was added to, or None if tx not found.
+        """
+        if txid not in self.transactions:
+            return None
+
+        entry = self.transactions[txid]
+
+        # Find which clusters our parents and children belong to
+        neighbor_cluster_ids: Set[int] = set()
+        for parent_txid in entry.parents:
+            if parent_txid in self._tx_to_cluster:
+                neighbor_cluster_ids.add(self._tx_to_cluster[parent_txid])
+        for child_txid in entry.children:
+            if child_txid in self._tx_to_cluster:
+                neighbor_cluster_ids.add(self._tx_to_cluster[child_txid])
+
+        if not neighbor_cluster_ids:
+            # No neighbors - create singleton cluster
+            cluster_id = self._new_cluster_id()
+            cluster = Cluster(txids={txid})
+            self._clusters[cluster_id] = cluster
+            self._tx_to_cluster[txid] = cluster_id
+            return cluster_id
+
+        elif len(neighbor_cluster_ids) == 1:
+            # One neighbor cluster - add to it
+            cluster_id = next(iter(neighbor_cluster_ids))
+            cluster = self._clusters[cluster_id]
+            cluster.txids.add(txid)
+            cluster.invalidate_cache()
+            self._tx_to_cluster[txid] = cluster_id
+            return cluster_id
+
+        else:
+            # Multiple neighbor clusters - merge them all
+            cluster_ids = list(neighbor_cluster_ids)
+            merged_id = cluster_ids[0]
+            merged_cluster = self._clusters[merged_id]
+
+            # Add the new transaction
+            merged_cluster.txids.add(txid)
+            self._tx_to_cluster[txid] = merged_id
+
+            # Merge other clusters into the first
+            for cid in cluster_ids[1:]:
+                other_cluster = self._clusters.pop(cid)
+                for other_txid in other_cluster.txids:
+                    merged_cluster.txids.add(other_txid)
+                    self._tx_to_cluster[other_txid] = merged_id
+
+            merged_cluster.invalidate_cache()
+            return merged_id
+
+    def remove_transaction(self, txid: bytes) -> None:
+        """Remove a transaction from the cluster structure.
+
+        This may cause the cluster to split into multiple clusters if the
+        removed transaction was connecting different parts.
+        """
+        if txid not in self._tx_to_cluster:
+            return
+
+        old_cluster_id = self._tx_to_cluster.pop(txid)
+        old_cluster = self._clusters.get(old_cluster_id)
+
+        if old_cluster is None:
+            return
+
+        old_cluster.txids.discard(txid)
+
+        if not old_cluster.txids:
+            # Cluster is now empty
+            del self._clusters[old_cluster_id]
+            return
+
+        # Check if cluster needs to split
+        # Find connected components among remaining transactions
+        remaining = set(old_cluster.txids)
+        components: List[Set[bytes]] = []
+
+        while remaining:
+            start = next(iter(remaining))
+            component = self._find_connected_component_within(start, remaining)
+            components.append(component)
+            remaining -= component
+
+        if len(components) == 1:
+            # No split needed, just invalidate cache
+            old_cluster.invalidate_cache()
+        else:
+            # Split into multiple clusters
+            # Reuse old cluster for first component
+            old_cluster.txids = components[0]
+            old_cluster.invalidate_cache()
+
+            # Create new clusters for other components
+            for comp in components[1:]:
+                new_cluster_id = self._new_cluster_id()
+                new_cluster = Cluster(txids=comp)
+                self._clusters[new_cluster_id] = new_cluster
+                for comp_txid in comp:
+                    self._tx_to_cluster[comp_txid] = new_cluster_id
+
+    def _find_connected_component_within(
+        self, start_txid: bytes, within: Set[bytes]
+    ) -> Set[bytes]:
+        """Find connected component starting from start_txid, only considering txids in 'within'."""
+        if start_txid not in within:
+            return set()
+
+        visited: Set[bytes] = set()
+        queue = [start_txid]
+
+        while queue:
+            txid = queue.pop()
+            if txid in visited or txid not in within:
+                continue
+
+            entry = self.transactions.get(txid)
+            if entry is None:
+                continue
+
+            visited.add(txid)
+
+            # Add parents and children that are in 'within'
+            for parent_txid in entry.parents:
+                if parent_txid in within and parent_txid not in visited:
+                    queue.append(parent_txid)
+            for child_txid in entry.children:
+                if child_txid in within and child_txid not in visited:
+                    queue.append(child_txid)
+
+        return visited
+
+    def get_cluster(self, txid: bytes) -> Optional[Cluster]:
+        """Get the cluster containing a transaction."""
+        cluster_id = self._tx_to_cluster.get(txid)
+        if cluster_id is None:
+            return None
+        return self._clusters.get(cluster_id)
+
+    def get_cluster_id(self, txid: bytes) -> Optional[int]:
+        """Get the cluster ID for a transaction."""
+        return self._tx_to_cluster.get(txid)
+
+    def get_all_clusters(self) -> List[Cluster]:
+        """Get all clusters."""
+        return list(self._clusters.values())
+
+    def get_chunks(self, cluster: Cluster) -> List[Chunk]:
+        """Get chunks for a cluster (cached)."""
+        if cluster._chunks is not None:
+            return cluster._chunks
+
+        # Linearize and get chunks
+        linearizer = ClusterLinearizer(self.transactions)
+        _, chunks = linearizer.linearize(cluster.txids)
+        cluster._chunks = chunks
+        return chunks
+
+    def get_linearization(self, cluster: Cluster) -> List[bytes]:
+        """Get linearization for a cluster (cached)."""
+        if cluster._linearization is not None:
+            return cluster._linearization
+
+        # Linearize
+        linearizer = ClusterLinearizer(self.transactions)
+        linearization, chunks = linearizer.linearize(cluster.txids)
+        cluster._linearization = linearization
+        cluster._chunks = chunks
+        return linearization
+
+    def get_worst_chunk(self) -> Optional[Tuple[Chunk, int]]:
+        """Get the lowest-feerate chunk across all clusters.
+
+        Returns (chunk, cluster_id) or None if empty.
+        """
+        worst_chunk: Optional[Chunk] = None
+        worst_cluster_id: Optional[int] = None
+
+        for cluster_id, cluster in self._clusters.items():
+            chunks = self.get_chunks(cluster)
+            if chunks:
+                # Last chunk has lowest feerate (chunks are high-to-low)
+                last_chunk = chunks[-1]
+                if worst_chunk is None or last_chunk.fee_rate < worst_chunk.fee_rate:
+                    worst_chunk = last_chunk
+                    worst_cluster_id = cluster_id
+
+        if worst_chunk is None or worst_cluster_id is None:
+            return None
+        return worst_chunk, worst_cluster_id
+
+    def get_mining_chunks(self) -> List[Tuple[Chunk, int]]:
+        """Get all chunks across all clusters, sorted by feerate (highest first).
+
+        Returns list of (chunk, cluster_id) tuples.
+        """
+        all_chunks: List[Tuple[Chunk, int]] = []
+
+        for cluster_id, cluster in self._clusters.items():
+            chunks = self.get_chunks(cluster)
+            for chunk in chunks:
+                all_chunks.append((chunk, cluster_id))
+
+        # Sort by feerate, highest first
+        all_chunks.sort(key=lambda x: x[0].fee_rate, reverse=True)
+        return all_chunks
+
+    def check_cluster_limit(self, txid: bytes) -> Tuple[bool, str]:
+        """Check if adding a transaction would exceed cluster size limit.
+
+        Returns (ok, error_message).
+        """
+        if txid not in self.transactions:
+            return True, ""
+
+        entry = self.transactions[txid]
+
+        # Find which clusters our parents and children belong to
+        neighbor_cluster_ids: Set[int] = set()
+        for parent_txid in entry.parents:
+            if parent_txid in self._tx_to_cluster:
+                neighbor_cluster_ids.add(self._tx_to_cluster[parent_txid])
+        for child_txid in entry.children:
+            if child_txid in self._tx_to_cluster:
+                neighbor_cluster_ids.add(self._tx_to_cluster[child_txid])
+
+        if not neighbor_cluster_ids:
+            # New singleton cluster - always OK
+            return True, ""
+
+        # Calculate total size of merged cluster
+        total_size = 1  # The new transaction
+        for cid in neighbor_cluster_ids:
+            cluster = self._clusters.get(cid)
+            if cluster:
+                total_size += cluster.size()
+
+        if total_size > MAX_CLUSTER_COUNT:
+            return False, (
+                f"Transaction would create cluster of size {total_size} "
+                f"exceeding limit {MAX_CLUSTER_COUNT}"
+            )
+
+        return True, ""
+
+    def rebuild(self) -> None:
+        """Rebuild all cluster data from scratch.
+
+        Call this after bulk modifications to the mempool.
+        """
+        self._tx_to_cluster.clear()
+        self._clusters.clear()
+        self._next_cluster_id = 0
+
+        # Find all connected components
+        remaining = set(self.transactions.keys())
+
+        while remaining:
+            start = next(iter(remaining))
+            component = self._find_connected_component(start)
+            component &= remaining  # Only consider remaining txs
+
+            if component:
+                cluster_id = self._new_cluster_id()
+                cluster = Cluster(txids=component)
+                self._clusters[cluster_id] = cluster
+                for txid in component:
+                    self._tx_to_cluster[txid] = cluster_id
+                remaining -= component
+            else:
+                remaining.discard(start)
+
+
+# P2A (Pay-to-Anchor) constants
+# P2A script: OP_1 OP_PUSHBYTES_2 0x4e73 (4 bytes total)
+# This is a witness v1 program with a 2-byte program, anyone-can-spend
+P2A_SCRIPT = bytes([0x51, 0x02, 0x4e, 0x73])
+P2A_PROGRAM = bytes([0x4e, 0x73])  # The witness program bytes
+
+
+def is_pay_to_anchor(script_pubkey: bytes) -> bool:
+    """Check if a scriptPubKey is a Pay-to-Anchor (P2A) output.
+
+    P2A pattern: OP_1 OP_PUSHBYTES_2 0x4e73 (4 bytes total)
+    - Byte 0: OP_1 (0x51) - witness version 1
+    - Byte 1: OP_PUSHBYTES_2 (0x02)
+    - Bytes 2-3: 0x4e73 - the anchor program
+
+    P2A outputs are designed for CPFP fee bumping in Lightning and other
+    protocols. They are anyone-can-spend via witness v1 semantics with an
+    empty witness.
+
+    Reference: Bitcoin Core script/script.cpp CScript::IsPayToAnchor()
+    """
+    return (
+        len(script_pubkey) == 4
+        and script_pubkey[0] == 0x51  # OP_1 (witness v1)
+        and script_pubkey[1] == 0x02  # push 2 bytes
+        and script_pubkey[2] == 0x4e  # 'N'
+        and script_pubkey[3] == 0x73  # 's'
+    )
+
+
+def is_pay_to_anchor_program(version: int, program: bytes) -> bool:
+    """Check if a witness program is P2A given version and program bytes."""
+    return (
+        version == 1
+        and len(program) == 2
+        and program[0] == 0x4e
+        and program[1] == 0x73
+    )
+
+
+def _is_standard_output_type(script_pubkey: bytes) -> bool:
+    """Check if a scriptPubKey is a standard output type.
+
+    Standard types:
+    - P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG (25 bytes)
+    - P2SH: OP_HASH160 <20 bytes> OP_EQUAL (23 bytes)
+    - P2WPKH: OP_0 <20 bytes> (22 bytes)
+    - P2WSH: OP_0 <32 bytes> (34 bytes)
+    - P2TR: OP_1 <32 bytes> (34 bytes)
+    - P2A: OP_1 <2 bytes> (4 bytes)
+    - OP_RETURN: OP_RETURN ... (any length)
+    - Bare multisig (rare but standard)
+
+    Reference: Bitcoin Core script/solver.cpp Solver()
+    """
+    if not script_pubkey:
+        return False
+
+    # OP_RETURN is standard (unspendable)
+    if script_pubkey[0] == 0x6a:
+        return True
+
+    # P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    if (len(script_pubkey) == 25 and script_pubkey[0] == 0x76 and
+            script_pubkey[1] == 0xa9 and script_pubkey[2] == 0x14 and
+            script_pubkey[23] == 0x88 and script_pubkey[24] == 0xac):
+        return True
+
+    # P2SH: OP_HASH160 <20> OP_EQUAL
+    if (len(script_pubkey) == 23 and script_pubkey[0] == 0xa9 and
+            script_pubkey[1] == 0x14 and script_pubkey[22] == 0x87):
+        return True
+
+    # P2WPKH: OP_0 <20>
+    if len(script_pubkey) == 22 and script_pubkey[0] == 0x00 and script_pubkey[1] == 0x14:
+        return True
+
+    # P2WSH: OP_0 <32>
+    if len(script_pubkey) == 34 and script_pubkey[0] == 0x00 and script_pubkey[1] == 0x20:
+        return True
+
+    # P2TR: OP_1 <32>
+    if len(script_pubkey) == 34 and script_pubkey[0] == 0x51 and script_pubkey[1] == 0x20:
+        return True
+
+    # P2A: OP_1 <2>
+    if is_pay_to_anchor(script_pubkey):
+        return True
+
+    # Bare multisig: OP_m ... OP_n OP_CHECKMULTISIG
+    # This is rare but standard. Check for OP_CHECKMULTISIG at end.
+    if len(script_pubkey) >= 3 and script_pubkey[-1] == 0xae:
+        return True
+
+    return False
+
 
 def _get_dust_threshold(script_pubkey: bytes) -> int:
+    """Get the dust threshold for a given scriptPubKey.
+
+    P2A outputs are exempt from dust (return 0).
+    Reference: Bitcoin Core policy/policy.cpp GetDustThreshold()
+    """
+    # P2A outputs are exempt from dust threshold (anyone-can-spend anchors)
+    if is_pay_to_anchor(script_pubkey):
+        return 0
+
     # P2PKH/P2SH cost: 34 + 148 = 182 bytes
     # P2WPKH cost: 31 + 68 = 99 bytes (roughly)
     # P2WSH cost: 43 + 68 = 111 bytes
@@ -61,14 +772,73 @@ def _get_dust_threshold(script_pubkey: bytes) -> int:
 
 
 def _has_ephemeral_dust(tx: Transaction) -> List[int]:
+    """Return indices of outputs that are dust (below threshold).
+
+    Exemptions (never considered dust):
+    - OP_RETURN outputs (unspendable)
+    - P2A (Pay-to-Anchor) outputs (allowed at 0 value for CPFP)
+    """
     dust_indices: List[int] = []
     for idx, out in enumerate(tx.outputs):
-        if out.script_pubkey and out.script_pubkey[0] == 0x6a:
-            continue  # OP_RETURN is never dust
+        if not out.script_pubkey:
+            continue
+        # OP_RETURN is never dust (unspendable)
+        if out.script_pubkey[0] == 0x6a:
+            continue
+        # P2A outputs are exempt from dust (threshold is 0)
+        # The _get_dust_threshold function handles this, but we can
+        # short-circuit here for clarity
+        if is_pay_to_anchor(out.script_pubkey):
+            continue
         threshold = _get_dust_threshold(out.script_pubkey)
         if out.value < threshold:
             dust_indices.append(idx)
     return dust_indices
+
+
+def _check_ephemeral_dust(
+    tx: Transaction, fee: int
+) -> Tuple[bool, str]:
+    """Check ephemeral dust policy for a transaction with dust outputs.
+
+    Called when a transaction has dust outputs. Validates:
+    1. At most MAX_DUST_OUTPUTS_PER_TX (1) dust output
+    2. Transaction must have 0 fee (child provides fees via CPFP)
+    3. Dust output must be P2A or a standard output type
+
+    Reference: Bitcoin Core policy/ephemeral_policy.cpp PreCheckEphemeralTx()
+
+    Args:
+        tx: Transaction with dust outputs
+        fee: Transaction fee in satoshis
+
+    Returns:
+        (ok, error_message)
+    """
+    dust_indices = _has_ephemeral_dust(tx)
+
+    if not dust_indices:
+        return True, ""
+
+    # Rule 1: At most 1 dust output per transaction
+    if len(dust_indices) > MAX_DUST_OUTPUTS_PER_TX:
+        return False, (
+            f"tx with dust must have at most {MAX_DUST_OUTPUTS_PER_TX} "
+            f"dust output(s), has {len(dust_indices)}"
+        )
+
+    # Rule 2: Transaction with dust must have 0 fee
+    # "We never want to give incentives to mine this transaction alone"
+    if fee != 0:
+        return False, "tx with dust output must be 0-fee"
+
+    # Rule 3: Dust output must be P2A or standard type
+    for idx in dust_indices:
+        out = tx.outputs[idx]
+        if not _is_standard_output_type(out.script_pubkey):
+            return False, f"dust output at index {idx} is not a standard type"
+
+    return True, ""
 
 
 def _is_standard_tx(tx: Transaction) -> Tuple[bool, str]:
@@ -112,6 +882,11 @@ class MempoolEntry:
     # Parent/child txid links for efficient graph traversal
     parents: Set[bytes] = field(default_factory=set)
     children: Set[bytes] = field(default_factory=set)
+    # Ephemeral dust tracking: if this tx has ephemeral dust, track the
+    # child that spends it. If child is evicted, this parent must be too.
+    # Reference: Bitcoin Core policy/ephemeral_policy.cpp
+    has_ephemeral_dust: bool = False
+    ephemeral_child: Optional[bytes] = None  # txid of child spending our dust
 
 
 # Orphan transaction pool
@@ -210,6 +985,7 @@ class Mempool:
         require_standard: bool = True,
         full_rbf: bool = True,  # BIP125 Full RBF (mempoolfullrbf), default True since v28
         on_tx_removed: Optional[callable] = None,  # callback: (txid, reason) -> None
+        on_tx_added: Optional[callable] = None,  # callback: (txid, tx, mempool_seq) -> None
     ):
         """Initialize mempool.
 
@@ -220,22 +996,30 @@ class Mempool:
             full_rbf: Enable full RBF - allow replacing any unconfirmed tx
                       regardless of BIP125 signaling (default True since v28)
             on_tx_removed: Optional callback invoked when tx is removed from mempool
-                           Called with (txid: bytes, reason: str)
+                           Called with (txid: bytes, reason: str, mempool_seq: int)
+            on_tx_added: Optional callback invoked when tx is added to mempool
+                         Called with (txid: bytes, tx: Transaction, mempool_seq: int)
         """
         self.validator = validator
         self.max_size = max_size
         self.require_standard = require_standard
         self.full_rbf = full_rbf
         self._on_tx_removed = on_tx_removed
-        
+        self._on_tx_added = on_tx_added
+
         self.transactions: Dict[bytes, MempoolEntry] = {}  # txid -> entry
         self.spent_outputs: Set[OutPoint] = set()
-        
+
         # Sorted by fee rate (for mining)
         self.by_fee_rate: List[bytes] = []  # txids sorted by fee rate (lowest first)
-        
+
         # Tracking
         self.current_size = 0  # bytes
+
+        # Monotonically increasing mempool sequence number for ZMQ notifications
+        # Incremented on every add or remove, providing a total ordering of events
+        # Reference: Bitcoin Core txmempool.h m_sequence_number
+        self._mempool_sequence: int = 0
 
         # Reentrant lock for snapshot isolation (e.g. getblocktemplate).
         # RLock because _resolve_orphans -> add_transaction recurses.
@@ -243,6 +1027,25 @@ class Mempool:
 
         # Orphan transaction pool
         self.orphan_pool = OrphanPool()
+
+        # Cluster mempool manager
+        self._cluster_manager = ClusterManager(self.transactions)
+
+    @property
+    def total_size(self) -> int:
+        """Alias for current_size (total bytes in mempool)."""
+        return self.current_size
+
+    @property
+    def mempool_sequence(self) -> int:
+        """Current mempool sequence number."""
+        return self._mempool_sequence
+
+    def _next_sequence(self) -> int:
+        """Get the next mempool sequence number and increment."""
+        seq = self._mempool_sequence
+        self._mempool_sequence += 1
+        return seq
     
     def snapshot(self) -> Tuple[List[bytes], Dict[bytes, "MempoolEntry"]]:
         """Take a consistent snapshot of the mempool for template construction.
@@ -314,23 +1117,14 @@ class Mempool:
             return self.try_replace(tx, height)
 
         # TRUC (v3 transaction) policy checks — must come before general
-        # ancestor/descendant limits.
-        if tx.version == 3:
-            truc_ok, truc_err = self._check_v3_policy(tx)
-            if not truc_ok:
-                return False, truc_err
-
-        # For any existing v3 parent in the mempool: enforce that the
-        # v3 parent gets at most one unconfirmed child.  If it already
-        # has a child, redirect to replacement.
-        for tx_in in tx.inputs:
-            parent_entry = self.transactions.get(tx_in.prev_txid)
-            if parent_entry is not None and parent_entry.tx.version == 3:
-                # Check if this v3 parent already has an unconfirmed child
-                existing_children = self._get_v3_children(tx_in.prev_txid)
-                if existing_children:
-                    # The only way to add another child is via replacement
-                    return self.try_replace(tx, height)
+        # ancestor/descendant limits. This handles both v3 and non-v3 txs
+        # (non-v3 txs are checked for spending from v3 parents).
+        truc_ok, truc_err, sibling_txid = self._check_truc_policy(tx)
+        if not truc_ok:
+            if sibling_txid is not None:
+                # Sibling eviction: try to replace the existing child
+                return self._try_sibling_eviction(tx, sibling_txid, height)
+            return False, truc_err
 
         # Ancestor/descendant limits (Bitcoin Core: CalculateMemPoolAncestors)
         ancestors = self._get_ancestors(tx)
@@ -362,7 +1156,12 @@ class Mempool:
                     return False, (
                         f"Descendant size limit exceeded for {a_txid.hex()[:16]}...: "
                         f"{entry.descendant_size + tx_size} > {MAX_DESCENDANT_SIZE_KVB * 1000}")
-        
+
+        # Check cluster size limit
+        cluster_ok, cluster_err = self._check_cluster_limit(tx)
+        if not cluster_ok:
+            return False, cluster_err
+
         # Check mempool size
         if self.current_size + tx_size > self.max_size:
             self._evict_low_fee_txs(tx_size)
@@ -428,14 +1227,27 @@ class Mempool:
             if a_txid in self.transactions:
                 self.transactions[a_txid].descendant_count += 1
                 self.transactions[a_txid].descendant_size += tx_size
-        
+
         # Insert sorted by fee rate
         self._insert_sorted_by_fee_rate(txid, fee_rate)
-        
+
+        # Update cluster manager
+        self._cluster_manager.add_transaction(txid)
+
+        # Get sequence number for this add event
+        seq = self._next_sequence()
+
         logger.info(
             f"Added transaction {txid.hex()[:16]}... to mempool "
-            f"(fee: {fee}, rate: {fee_rate:.2f} sat/vbyte)"
+            f"(fee: {fee}, rate: {fee_rate:.2f} sat/vbyte, seq: {seq})"
         )
+
+        # Emit notification callback for ZMQ sequence topic
+        if self._on_tx_added is not None:
+            try:
+                self._on_tx_added(txid, tx, seq)
+            except Exception as e:
+                logger.warning(f"on_tx_added callback error: {e}")
 
         # Try to resolve orphans that were waiting on this transaction
         self._resolve_orphans(txid, height)
@@ -470,41 +1282,285 @@ class Mempool:
                     queue.append(grandparent_txid)
         return result
 
-    # --- TRUC (v3) helpers ---
+    def _check_cluster_limit(self, tx: Transaction) -> Tuple[bool, str]:
+        """Check if adding a transaction would exceed cluster size limit.
 
-    def _check_v3_policy(self, tx: Transaction) -> Tuple[bool, str]:
-        """Enforce TRUC policy for a v3 transaction being added."""
-        ancestors = self._get_ancestors(tx)
+        The cluster limit (MAX_CLUSTER_COUNT = 100) prevents clusters from
+        growing too large, which would make linearization expensive.
 
-        # Rule 1: at most 1 unconfirmed ancestor
-        if len(ancestors) + 1 > TX_V3_ANCESTOR_LIMIT:
+        Reference: Bitcoin Core txgraph.h - max_cluster_count
+        """
+        # Find all clusters that would be merged by this transaction
+        neighbor_cluster_ids: Set[int] = set()
+        for inp in tx.inputs:
+            cid = self._cluster_manager.get_cluster_id(inp.prev_txid)
+            if cid is not None:
+                neighbor_cluster_ids.add(cid)
+
+        # Also check children (txs spending from us) - but the tx isn't
+        # in mempool yet so it won't have children yet. Skip this for now.
+
+        if not neighbor_cluster_ids:
+            # New singleton cluster - always OK
+            return True, ""
+
+        # Calculate total size of merged cluster
+        total_size = 1  # The new transaction
+        for cid in neighbor_cluster_ids:
+            cluster = self._cluster_manager._clusters.get(cid)
+            if cluster:
+                total_size += cluster.size()
+
+        if total_size > MAX_CLUSTER_COUNT:
             return False, (
-                f"TRUC (v3) tx exceeds unconfirmed ancestor limit: "
-                f"{len(ancestors) + 1} > {TX_V3_ANCESTOR_LIMIT}"
+                f"Transaction would create cluster of size {total_size} "
+                f"exceeding limit {MAX_CLUSTER_COUNT}"
             )
 
-        # Rules 2 & 3: per-parent checks
+        return True, ""
+
+    # --- TRUC (v3) helpers ---
+
+    def _is_truc(self, tx: Transaction) -> bool:
+        """Check if a transaction is a TRUC (v3) transaction."""
+        return tx.version == TRUC_VERSION
+
+    def _check_truc_policy(
+        self, tx: Transaction
+    ) -> Tuple[bool, str, Optional[bytes]]:
+        """Enforce TRUC policy for a transaction being added.
+
+        This implements Bitcoin Core's SingleTRUCChecks (policy/truc_policy.cpp).
+
+        Returns:
+            (ok, error_message, sibling_txid)
+            - ok: True if the transaction passes all TRUC checks
+            - error_message: Error description if ok is False
+            - sibling_txid: If a v3 parent already has a child, returns that
+                           child's txid for potential sibling eviction. None otherwise.
+        """
+        tx_vsize = tx.get_vsize() if hasattr(tx, 'get_vsize') else len(tx.serialize())
+
+        # Check v3/non-v3 inheritance rules first (applies to both v3 and non-v3)
         for inp in tx.inputs:
             parent_entry = self.transactions.get(inp.prev_txid)
             if parent_entry is None:
-                continue  # parent is confirmed
+                continue  # parent is confirmed, no inheritance check needed
 
-            # Rule 2: v3 parent must not already have an unconfirmed child
-            if parent_entry.tx.version == 3:
-                existing_children = self._get_v3_children(inp.prev_txid)
-                if existing_children:
+            parent_is_v3 = self._is_truc(parent_entry.tx)
+            tx_is_v3 = self._is_truc(tx)
+
+            if tx_is_v3 and not parent_is_v3:
+                # v3 tx cannot spend from non-v3 unconfirmed parent
+                return False, (
+                    f"version=3 tx cannot spend from non-version=3 tx "
+                    f"{inp.prev_txid.hex()[:16]}..."
+                ), None
+
+            if not tx_is_v3 and parent_is_v3:
+                # non-v3 tx cannot spend from v3 unconfirmed parent
+                return False, (
+                    f"non-version=3 tx cannot spend from version=3 tx "
+                    f"{inp.prev_txid.hex()[:16]}..."
+                ), None
+
+        # Remaining checks only apply to v3 transactions
+        if not self._is_truc(tx):
+            return True, "", None
+
+        # TRUC_MAX_VSIZE check (10,000 vbytes for any v3 tx)
+        if tx_vsize > TRUC_MAX_VSIZE:
+            return False, (
+                f"version=3 tx is too big: {tx_vsize} > {TRUC_MAX_VSIZE} virtual bytes"
+            ), None
+
+        ancestors = self._get_ancestors(tx)
+
+        # Ancestor limit check
+        if len(ancestors) + 1 > TRUC_ANCESTOR_LIMIT:
+            return False, (
+                f"TRUC (v3) tx would have too many ancestors: "
+                f"{len(ancestors) + 1} > {TRUC_ANCESTOR_LIMIT}"
+            ), None
+
+        # If there are mempool parents, additional checks apply
+        if not ancestors:
+            return True, "", None
+
+        # With an unconfirmed parent, check the parent's ancestor count too
+        for inp in tx.inputs:
+            parent_entry = self.transactions.get(inp.prev_txid)
+            if parent_entry is None:
+                continue
+
+            # Check that the parent doesn't already have too many ancestors
+            if parent_entry.ancestor_count + 1 > TRUC_ANCESTOR_LIMIT:
+                return False, (
+                    f"TRUC (v3) tx would have too many ancestors"
+                ), None
+
+            # Child vsize limit: v3 child of unconfirmed parent must be <= 1000 vbytes
+            if tx_vsize > TRUC_CHILD_MAX_VSIZE:
+                return False, (
+                    f"version=3 child tx is too big: {tx_vsize} > "
+                    f"{TRUC_CHILD_MAX_VSIZE} virtual bytes"
+                ), None
+
+            # Descendant limit: v3 parent can have at most 1 child
+            existing_children = list(parent_entry.children)
+            if existing_children:
+                # Return sibling info for potential sibling eviction
+                # Only consider sibling eviction if there's exactly 1 child
+                # and that child has exactly 2 ancestors (parent + grandparent or
+                # just parent being the only unconfirmed ancestor)
+                if len(existing_children) == 1:
+                    sibling_txid = existing_children[0]
+                    sibling_entry = self.transactions.get(sibling_txid)
+                    if sibling_entry and sibling_entry.ancestor_count == 2:
+                        return False, (
+                            f"tx would exceed descendant count limit"
+                        ), sibling_txid
+                # Otherwise just reject without sibling eviction option
+                return False, (
+                    f"tx would exceed descendant count limit"
+                ), None
+
+        return True, "", None
+
+    def _check_package_truc_policy(
+        self, txs: List[Transaction]
+    ) -> Tuple[bool, str]:
+        """Check TRUC policy for a package of transactions.
+
+        This implements Bitcoin Core's PackageTRUCChecks (policy/truc_policy.cpp).
+
+        For each transaction in the package:
+        - If TRUC: verify parents (in mempool or package) are also TRUC
+        - If non-TRUC: verify no TRUC parents (in mempool or package)
+        - Check ancestor/descendant limits considering both mempool and package
+        - Check child vsize limits
+
+        Args:
+            txs: List of transactions in topological order
+
+        Returns:
+            (ok, error_message)
+        """
+        # Build lookup for package txids and their versions
+        package_txids = {tx.get_txid(): tx for tx in txs}
+
+        for tx in txs:
+            txid = tx.get_txid()
+            tx_is_v3 = self._is_truc(tx)
+            tx_vsize = tx.get_vsize() if hasattr(tx, 'get_vsize') else len(tx.serialize())
+
+            # Collect in-mempool and in-package parents (use sets to avoid
+            # double-counting when multiple inputs spend from the same parent)
+            mempool_parents: Set[bytes] = set()
+            package_parents: Set[bytes] = set()
+
+            for inp in tx.inputs:
+                if inp.prev_txid in self.transactions:
+                    mempool_parents.add(inp.prev_txid)
+                elif inp.prev_txid in package_txids:
+                    package_parents.add(inp.prev_txid)
+
+            # Check v3/non-v3 inheritance
+            if tx_is_v3:
+                # v3 tx max vsize check
+                if tx_vsize > TRUC_MAX_VSIZE:
                     return False, (
-                        f"TRUC (v3) parent {inp.prev_txid.hex()[:16]}... "
-                        f"already has an unconfirmed child"
+                        f"version=3 tx {txid.hex()[:16]}... is too big: "
+                        f"{tx_vsize} > {TRUC_MAX_VSIZE} virtual bytes"
                     )
 
-                # Rule 3: child vsize limit when parent is v3
-                tx_vsize = tx.get_vsize() if hasattr(tx, 'get_vsize') else len(tx.serialize())
-                if tx_vsize > TX_V3_MAX_VSIZE:
+                # Check ancestor limit
+                total_ancestors = len(mempool_parents) + len(package_parents)
+                if total_ancestors + 1 > TRUC_ANCESTOR_LIMIT:
                     return False, (
-                        f"TRUC (v3) child vsize {tx_vsize} exceeds "
-                        f"{TX_V3_MAX_VSIZE} limit for v3 parent"
+                        f"tx {txid.hex()[:16]}... would have too many ancestors"
                     )
+
+                # Check that mempool parent doesn't already have too many ancestors
+                for mp_txid in mempool_parents:
+                    mp_entry = self.transactions.get(mp_txid)
+                    if mp_entry:
+                        if mp_entry.ancestor_count + len(package_parents) + 1 > TRUC_ANCESTOR_LIMIT:
+                            return False, (
+                                f"tx {txid.hex()[:16]}... would have too many ancestors"
+                            )
+
+                # If has unconfirmed parent, check child-specific rules
+                has_parent = len(mempool_parents) + len(package_parents) > 0
+                if has_parent:
+                    # Child vsize limit
+                    if tx_vsize > TRUC_CHILD_MAX_VSIZE:
+                        return False, (
+                            f"version=3 child tx {txid.hex()[:16]}... is too big: "
+                            f"{tx_vsize} > {TRUC_CHILD_MAX_VSIZE} virtual bytes"
+                        )
+
+                    # Find the parent (exactly 1 should exist per TRUC rules)
+                    parent_txid = next(iter(mempool_parents)) if mempool_parents else next(iter(package_parents))
+
+                    # Check parent is also v3
+                    if parent_txid in self.transactions:
+                        parent_tx = self.transactions[parent_txid].tx
+                    else:
+                        parent_tx = package_txids.get(parent_txid)
+
+                    if parent_tx and not self._is_truc(parent_tx):
+                        return False, (
+                            f"version=3 tx {txid.hex()[:16]}... cannot spend from "
+                            f"non-version=3 tx {parent_txid.hex()[:16]}..."
+                        )
+
+                    # Check that no other tx in package also spends from this parent
+                    for other_tx in txs:
+                        if other_tx.get_txid() == txid:
+                            continue
+                        for inp in other_tx.inputs:
+                            if inp.prev_txid == parent_txid:
+                                return False, (
+                                    f"tx {parent_txid.hex()[:16]}... would exceed "
+                                    f"descendant count limit"
+                                )
+
+                    # Check that this tx doesn't have any children in the package
+                    for other_tx in txs:
+                        for inp in other_tx.inputs:
+                            if inp.prev_txid == txid:
+                                return False, (
+                                    f"tx {other_tx.get_txid().hex()[:16]}... would "
+                                    f"have too many ancestors"
+                                )
+
+                    # Check that mempool parent doesn't already have a child
+                    if mempool_parents:
+                        mp_txid = next(iter(mempool_parents))
+                        mp_entry = self.transactions.get(mp_txid)
+                        if mp_entry and mp_entry.children:
+                            return False, (
+                                f"tx {mp_txid.hex()[:16]}... would exceed "
+                                f"descendant count limit"
+                            )
+
+            else:
+                # Non-v3 tx cannot have v3 parents
+                for mp_txid in mempool_parents:
+                    mp_entry = self.transactions.get(mp_txid)
+                    if mp_entry and self._is_truc(mp_entry.tx):
+                        return False, (
+                            f"non-version=3 tx {txid.hex()[:16]}... cannot spend from "
+                            f"version=3 tx {mp_txid.hex()[:16]}..."
+                        )
+                for pp_txid in package_parents:
+                    pp_tx = package_txids.get(pp_txid)
+                    if pp_tx and self._is_truc(pp_tx):
+                        return False, (
+                            f"non-version=3 tx {txid.hex()[:16]}... cannot spend from "
+                            f"version=3 tx {pp_txid.hex()[:16]}..."
+                        )
 
         return True, ""
 
@@ -514,6 +1570,81 @@ class Mempool:
         if parent_entry is None:
             return []
         return list(parent_entry.children)
+
+    def _try_sibling_eviction(
+        self, new_tx: Transaction, sibling_txid: bytes, height: int
+    ) -> Tuple[bool, str]:
+        """Attempt TRUC sibling eviction.
+
+        When a TRUC parent already has one child, a new child can replace
+        the existing sibling if it pays a higher fee rate. This is a special
+        form of RBF specific to TRUC transactions.
+
+        Reference: Bitcoin Core policy/truc_policy.cpp (sibling eviction logic)
+        """
+        sibling_entry = self.transactions.get(sibling_txid)
+        if sibling_entry is None:
+            return False, "Sibling transaction not found"
+
+        # Calculate new tx fee
+        new_size = len(new_tx.serialize())
+        total_input = 0
+        for inp in new_tx.inputs:
+            utxo = self.validator.db.get_utxo(inp.prev_txid, inp.prev_vout)
+            if utxo:
+                total_input += utxo['value']
+            else:
+                # Check mempool parent output
+                parent_entry = self.transactions.get(inp.prev_txid)
+                if parent_entry and inp.prev_vout < len(parent_entry.tx.outputs):
+                    total_input += parent_entry.tx.outputs[inp.prev_vout].value
+                else:
+                    return False, f"UTXO not found: {inp.prev_txid.hex()[:16]}...:{inp.prev_vout}"
+
+        total_output = sum(out.value for out in new_tx.outputs)
+        new_fee = total_input - total_output
+
+        if new_fee < 0:
+            return False, "Negative fee"
+
+        # Sibling eviction requires:
+        # 1. New fee > sibling fee (strictly higher)
+        # 2. New fee covers incremental relay fee for new tx size
+        sibling_fee = sibling_entry.fee
+
+        if new_fee <= sibling_fee:
+            return False, (
+                f"Sibling eviction requires higher fee: {new_fee} <= {sibling_fee}"
+            )
+
+        # Check incremental relay fee
+        incremental_fee_needed = (new_size * self.INCREMENTAL_RELAY_FEE) // 1000
+        additional_fee = new_fee - sibling_fee
+        if additional_fee < incremental_fee_needed:
+            return False, (
+                f"Sibling eviction does not cover incremental relay fee: "
+                f"additional {additional_fee} < required {incremental_fee_needed}"
+            )
+
+        # All checks passed - evict sibling and add new tx
+        logger.info(
+            f"TRUC sibling eviction: replacing {sibling_txid.hex()[:16]}... "
+            f"with {new_tx.get_txid().hex()[:16]}..."
+        )
+
+        # Remove sibling
+        self.remove_transaction(sibling_txid, _skip_recount=True, _reason="sibling-evicted")
+
+        # Now add the new transaction (it should pass all checks)
+        # We need to be careful to avoid infinite recursion - the sibling
+        # is already removed so the parent no longer has a child.
+        ok, err = self._add_transaction_inner(new_tx, height)
+        if not ok:
+            # This shouldn't happen if our checks are correct
+            logger.warning(f"Failed to add tx after sibling eviction: {err}")
+            return False, f"Failed after sibling eviction: {err}"
+
+        return True, ""
 
     def _recalculate_ancestors(self, txid: bytes) -> None:
         entry = self.transactions.get(txid)
@@ -672,6 +1803,16 @@ class Mempool:
         # Save children for recounting (before we modify links)
         former_children = set(entry.children)
 
+        # Ephemeral dust policy: if this tx is the child that spends an
+        # ephemeral dust parent's output, the parent must also be evicted.
+        # Reference: Bitcoin Core policy/ephemeral_policy.cpp
+        ephemeral_parents_to_evict: List[bytes] = []
+        for parent_txid in entry.parents:
+            parent_entry = self.transactions.get(parent_txid)
+            if parent_entry and parent_entry.has_ephemeral_dust:
+                if parent_entry.ephemeral_child == txid:
+                    ephemeral_parents_to_evict.append(parent_txid)
+
         # Remove spent outputs
         for tx_in in entry.tx.inputs:
             outpoint: OutPoint = (tx_in.prev_txid, tx_in.prev_vout)
@@ -682,6 +1823,9 @@ class Mempool:
             parent_entry = self.transactions.get(parent_txid)
             if parent_entry:
                 parent_entry.children.discard(txid)
+                # Clear ephemeral child tracking
+                if parent_entry.ephemeral_child == txid:
+                    parent_entry.ephemeral_child = None
 
         # Update parent/child links: remove this txid from children's parents sets
         for child_txid in entry.children:
@@ -694,17 +1838,39 @@ class Mempool:
             self.by_fee_rate.remove(txid)
 
         del self.transactions[txid]
-        logger.debug(f"Removed transaction {txid.hex()[:16]}... from mempool")
 
-        # Emit notification callback
+        # Update cluster manager
+        self._cluster_manager.remove_transaction(txid)
+
+        # Get sequence number for this remove event
+        seq = self._next_sequence()
+
+        logger.debug(f"Removed transaction {txid.hex()[:16]}... from mempool (seq: {seq})")
+
+        # Emit notification callback with sequence number
         if self._on_tx_removed is not None:
             try:
-                self._on_tx_removed(txid, _reason)
+                self._on_tx_removed(txid, _reason, seq)
             except Exception as e:
                 logger.warning(f"on_tx_removed callback error: {e}")
 
         if not _skip_recount:
             self._update_descendants_after_removal(txid, former_children)
+
+        # Evict ephemeral dust parents (after this tx is fully removed)
+        # This must happen after the main removal to avoid modifying entry.parents
+        # while iterating over it.
+        for parent_txid in ephemeral_parents_to_evict:
+            if parent_txid in self.transactions:
+                logger.info(
+                    f"Evicting ephemeral dust parent {parent_txid.hex()[:16]}... "
+                    f"because child {txid.hex()[:16]}... was evicted"
+                )
+                self._remove_transaction_inner(
+                    parent_txid,
+                    _skip_recount=_skip_recount,
+                    _reason="ephemeral-child-evicted"
+                )
     
     def remove_block_transactions(self, block):
         """
@@ -809,12 +1975,205 @@ class Mempool:
             'max_fee_rate': max(fee_rates),
             'avg_fee_rate': sum(fee_rates) / len(fee_rates),
             'orphan_count': self.orphan_pool.size(),
+            'cluster_count': len(self._cluster_manager._clusters),
         }
-    
+
+    # ── Cluster Mempool Mining Interface ─────────────────────────────────
+
+    def get_mining_chunks(self) -> List[Tuple[Chunk, List[bytes]]]:
+        """Get chunks for block template construction, sorted by feerate.
+
+        Returns a list of (chunk, txids) tuples, where txids are in
+        topological order (parents before children) within each chunk.
+        Chunks are sorted by fee rate, highest first.
+
+        Reference: Bitcoin Core txgraph.h - GetBlockBuilder()
+        """
+        with self._lock:
+            result: List[Tuple[Chunk, List[bytes]]] = []
+
+            for chunk, _cluster_id in self._cluster_manager.get_mining_chunks():
+                # Get topologically sorted txids within chunk
+                linearizer = ClusterLinearizer(self.transactions)
+                sorted_txids = linearizer._topo_sort(chunk.txids)
+                result.append((chunk, sorted_txids))
+
+            return result
+
+    def get_block_template_txs(
+        self, max_weight: int = 4_000_000
+    ) -> Tuple[List[Transaction], int]:
+        """Select transactions for a block template using cluster linearization.
+
+        Selects chunks in decreasing feerate order until the weight limit
+        is reached. Returns transactions in mining order (topologically
+        sorted within each chunk, chunks sorted by fee rate).
+
+        Args:
+            max_weight: Maximum block weight (default 4M = 1M vbytes)
+
+        Returns:
+            (transactions, total_fee) - list of transactions to include and
+            their total fee
+        """
+        with self._lock:
+            selected_txs: List[Transaction] = []
+            total_fee = 0
+            total_weight = 0
+
+            for chunk, txids in self.get_mining_chunks():
+                # Approximate weight as 4 * size (conservative)
+                chunk_weight = chunk.total_size * 4
+
+                if total_weight + chunk_weight > max_weight:
+                    # Can't fit this chunk, skip it
+                    # In a more sophisticated impl, we could try smaller chunks
+                    continue
+
+                # Add all transactions in this chunk
+                for txid in txids:
+                    entry = self.transactions.get(txid)
+                    if entry:
+                        selected_txs.append(entry.tx)
+
+                total_fee += chunk.total_fee
+                total_weight += chunk_weight
+
+            return selected_txs, total_fee
+
+    def get_cluster_info(self, txid: bytes) -> Optional[Dict]:
+        """Get cluster information for a transaction.
+
+        Returns dict with cluster_id, cluster_size, linearization position,
+        and chunk info for the transaction.
+        """
+        with self._lock:
+            cluster = self._cluster_manager.get_cluster(txid)
+            if cluster is None:
+                return None
+
+            cluster_id = self._cluster_manager.get_cluster_id(txid)
+            linearization = self._cluster_manager.get_linearization(cluster)
+            chunks = self._cluster_manager.get_chunks(cluster)
+
+            # Find which chunk this tx is in and its position
+            chunk_index = None
+            chunk_fee_rate = None
+            for i, chunk in enumerate(chunks):
+                if txid in chunk.txids:
+                    chunk_index = i
+                    chunk_fee_rate = chunk.fee_rate
+                    break
+
+            lin_position = linearization.index(txid) if txid in linearization else None
+
+            return {
+                'cluster_id': cluster_id,
+                'cluster_size': cluster.size(),
+                'linearization_position': lin_position,
+                'chunk_index': chunk_index,
+                'chunk_fee_rate': chunk_fee_rate,
+                'num_chunks': len(chunks),
+            }
+
     # BIP 125 Replace-By-Fee #
 
     INCREMENTAL_RELAY_FEE = 1000  # sat/kvB
     MAX_REPLACEMENT_EVICTIONS = 100
+
+    def _check_cluster_rbf(
+        self, new_tx: Transaction, to_evict: Set[bytes], new_fee: int
+    ) -> Tuple[bool, str]:
+        """Check if replacement improves the cluster linearization.
+
+        For cluster mempool, we require that the new linearization be strictly
+        better than the old one. This is checked by comparing feerate diagrams.
+
+        The feerate diagram is a cumulative plot of (size, fee) for each chunk
+        in order. A diagram A is better than B if A is always above B.
+
+        Reference: Bitcoin Core txgraph.h - GetMainStagingDiagrams()
+        """
+        # Find clusters affected by the eviction
+        affected_cluster_ids: Set[int] = set()
+        for txid in to_evict:
+            cid = self._cluster_manager.get_cluster_id(txid)
+            if cid is not None:
+                affected_cluster_ids.add(cid)
+
+        if not affected_cluster_ids:
+            # No clusters affected - OK
+            return True, ""
+
+        # Get old feerate diagrams for affected clusters
+        old_diagrams: List[List[Tuple[int, int]]] = []  # List of [(size, fee), ...]
+        for cid in affected_cluster_ids:
+            cluster = self._cluster_manager._clusters.get(cid)
+            if cluster:
+                chunks = self._cluster_manager.get_chunks(cluster)
+                diagram = []
+                cumul_size = 0
+                cumul_fee = 0
+                for chunk in chunks:
+                    cumul_size += chunk.total_size
+                    cumul_fee += chunk.total_fee
+                    diagram.append((cumul_size, cumul_fee))
+                old_diagrams.append(diagram)
+
+        # Compute what the new diagram would look like after replacement
+        # This is approximate: we simulate adding the new tx after eviction
+        new_size = len(new_tx.serialize())
+
+        # Calculate total old fee/size from affected clusters
+        old_total_fee = 0
+        old_total_size = 0
+        for cid in affected_cluster_ids:
+            cluster = self._cluster_manager._clusters.get(cid)
+            if cluster:
+                for txid in cluster.txids:
+                    entry = self.transactions.get(txid)
+                    if entry:
+                        old_total_fee += entry.fee
+                        old_total_size += entry.size
+
+        # Calculate new total after eviction + addition
+        evicted_fee = sum(self.transactions[t].fee for t in to_evict if t in self.transactions)
+        evicted_size = sum(self.transactions[t].size for t in to_evict if t in self.transactions)
+
+        new_total_fee = old_total_fee - evicted_fee + new_fee
+        new_total_size = old_total_size - evicted_size + new_size
+
+        # Simple check: the new fee rate must be >= old fee rate
+        # This is a simplified version of the full diagram comparison
+        old_rate = old_total_fee / old_total_size if old_total_size > 0 else 0
+        new_rate = new_total_fee / new_total_size if new_total_size > 0 else 0
+
+        if new_rate < old_rate:
+            return False, (
+                f"Replacement would worsen cluster feerate: "
+                f"{new_rate:.2f} < {old_rate:.2f} sat/vB"
+            )
+
+        # Additional check: the new tx's feerate should be at least as good as
+        # the worst chunk it would displace
+        new_tx_rate = new_fee / new_size if new_size > 0 else 0
+        for cid in affected_cluster_ids:
+            cluster = self._cluster_manager._clusters.get(cid)
+            if cluster:
+                chunks = self._cluster_manager.get_chunks(cluster)
+                if chunks:
+                    # Check against chunks containing evicted txs
+                    for chunk in chunks:
+                        if chunk.txids & to_evict:
+                            # This chunk contains evicted txs
+                            # New tx should have at least this feerate
+                            if new_tx_rate < chunk.fee_rate * 0.99:  # 1% tolerance
+                                return False, (
+                                    f"Replacement tx feerate {new_tx_rate:.2f} is worse "
+                                    f"than chunk feerate {chunk.fee_rate:.2f}"
+                                )
+
+        return True, ""
 
     def _find_conflicts(self, tx: Transaction) -> Set[bytes]:
         conflicts: Set[bytes] = set()
@@ -860,8 +2219,10 @@ class Mempool:
         """Check if a mempool transaction is replaceable.
 
         A tx is replaceable if:
-        1. The transaction itself signals RBF (any input sequence < 0xFFFFFFFE), OR
-        2. Any of its unconfirmed ancestors signal RBF
+        1. The transaction is a TRUC (v3) transaction (always replaceable), OR
+        2. The transaction itself signals RBF (any input sequence < 0xFFFFFFFE), OR
+        3. Any of its unconfirmed ancestors signal RBF, OR
+        4. Any of its unconfirmed ancestors is a TRUC (v3) transaction
 
         Reference: bitcoin/src/policy/rbf.cpp IsRBFOptIn()
         """
@@ -869,16 +2230,23 @@ class Mempool:
         if entry is None:
             return False
 
+        # TRUC (v3) transactions are always replaceable
+        if self._is_truc(entry.tx):
+            return True
+
         # Check if this tx signals
         if self.signals_rbf(entry.tx):
             return True
 
-        # Check if any ancestor signals
+        # Check if any ancestor signals or is TRUC
         ancestors = self._get_ancestors(entry.tx)
         for anc_txid in ancestors:
             anc_entry = self.transactions.get(anc_txid)
-            if anc_entry and self.signals_rbf(anc_entry.tx):
-                return True
+            if anc_entry:
+                if self.signals_rbf(anc_entry.tx):
+                    return True
+                if self._is_truc(anc_entry.tx):
+                    return True
 
         return False
 
@@ -1016,6 +2384,13 @@ class Mempool:
                 f"additional {additional_fee} < required {incremental_fee_needed}"
             )
 
+        # Rule 6 (cluster mempool): new linearization must be strictly better
+        # The new tx must improve the feerate diagram of the affected cluster(s).
+        # Reference: Bitcoin Core txgraph.h - GetMainStagingDiagrams()
+        cluster_ok, cluster_err = self._check_cluster_rbf(new_tx, to_evict, new_fee)
+        if not cluster_ok:
+            return False, cluster_err
+
         # All checks passed — evict and add (skip per-removal recount)
         evicted_ids = set(to_evict)
         for txid in to_evict:
@@ -1085,22 +2460,48 @@ class Mempool:
         self.by_fee_rate.insert(left, txid)
     
     def _evict_low_fee_txs(self, needed_space: int):
+        """Evict lowest-feerate chunks until we have enough space.
+
+        Uses cluster mempool chunk-based eviction: we evict whole chunks
+        (groups of transactions that would be mined together) rather than
+        individual transactions. This maintains linearization invariants.
+
+        Reference: Bitcoin Core txgraph.h - GetWorstMainChunk()
+        """
         freed = 0
         evicted_count = 0
-        
-        # Evict from lowest fee rate (start of list)
-        while self.by_fee_rate and freed < needed_space:
-            txid = self.by_fee_rate[0]  # Lowest fee rate
-            entry = self.transactions[txid]
-            size = entry.size
-            self.remove_transaction(txid)
-            freed += size
-            evicted_count += 1
-        
+
+        # Evict entire chunks (lowest feerate first)
+        while self.transactions and freed < needed_space:
+            worst = self._cluster_manager.get_worst_chunk()
+            if worst is None:
+                break
+
+            chunk, _cluster_id = worst
+            chunk_size = chunk.total_size
+
+            # Evict all transactions in this chunk
+            # Must remove in reverse topological order (children before parents)
+            # to avoid orphaning transactions
+            chunk_txids = list(chunk.txids)
+            # Sort by descendant count (highest first = children first)
+            chunk_txids.sort(
+                key=lambda t: self.transactions[t].descendant_count
+                if t in self.transactions else 0,
+                reverse=True
+            )
+
+            for txid in chunk_txids:
+                if txid in self.transactions:
+                    self.remove_transaction(txid, _reason="evicted")
+                    evicted_count += 1
+
+            freed += chunk_size
+
         if evicted_count > 0:
             logger.info(
-                f"Evicted {evicted_count} transactions to free {freed} bytes "
-                f"(needed: {needed_space})"
+                f"Evicted {evicted_count} transactions (chunk-based) to free "
+                f"{freed} bytes (needed: {needed_space})"
             )
     
     def clear(self) -> None:
@@ -1110,6 +2511,7 @@ class Mempool:
             self.transactions.clear()
             self.spent_outputs.clear()
             self.by_fee_rate.clear()
+            self._cluster_manager.rebuild()  # Clear cluster data
             self.current_size = 0
             logger.info(f"Cleared mempool ({count} transactions removed)")
 
@@ -1503,52 +2905,15 @@ class Mempool:
                     "package topology disallowed: parents depend on each other"
                 )
 
-        # Ephemeral dust check for v3 transactions
-        # Any v3 tx in the package that has dust outputs must have every
-        # such output spent by another transaction within the same package.
-        # Reference: Bitcoin Core policy/ephemeral_policy.cpp
-        for tx in txs:
-            if tx.version != 3:
-                continue
-            dust_indices = _has_ephemeral_dust(tx)
-            if not dust_indices:
-                continue
-            txid = tx.get_txid()
-            for dust_vout in dust_indices:
-                dust_outpoint: OutPoint = (txid, dust_vout)
-                if dust_outpoint not in package_spent:
-                    return False, (
-                        f"v3 tx {txid.hex()[:16]}... has unspent ephemeral "
-                        f"dust output at index {dust_vout}"
-                    )
-
-        # Validate each transaction (consensus checks only)
-        for tx in txs:
-            txid = tx.get_txid()
-            if txid in self.transactions:
-                return False, f"Transaction {txid.hex()[:16]}... already in mempool"
-
-        # Check conflicts with existing mempool (any double-spend)
-        for tx in txs:
-            for inp in tx.inputs:
-                op = (inp.prev_txid, inp.prev_vout)
-                if op in self.spent_outputs:
-                    return False, (
-                        f"Package conflicts with mempool: "
-                        f"{inp.prev_txid.hex()[:16]}...:{inp.prev_vout} already spent"
-                    )
-
-        # Compute package fee rate.
+        # Compute per-transaction fees BEFORE ephemeral dust checks
+        # We need individual fees to enforce the 0-fee requirement for dust parents.
         # Build a temporary UTXO view that includes outputs created by
-        # earlier transactions in the package so child fees can be computed.
+        # earlier transactions in the package.
         package_outputs: Dict[OutPoint, int] = {}  # (txid, vout) → value
-        total_fees = 0
-        total_size = 0
+        tx_fees: Dict[bytes, int] = {}  # txid → fee
 
         for tx in txs:
             txid = tx.get_txid()
-            tx_size = len(tx.serialize())
-
             # Sum inputs — from chain UTXO set, mempool, or package
             total_input = 0
             for inp in tx.inputs:
@@ -1556,7 +2921,6 @@ class Mempool:
                 if op in package_outputs:
                     total_input += package_outputs[op]
                 else:
-                    # Check mempool parent output
                     parent_entry = self.transactions.get(inp.prev_txid)
                     if parent_entry and inp.prev_vout < len(parent_entry.tx.outputs):
                         total_input += parent_entry.tx.outputs[inp.prev_vout].value
@@ -1574,13 +2938,65 @@ class Mempool:
             fee = total_input - total_output
             if fee < 0:
                 return False, f"Negative fee in package tx {txid.hex()[:16]}..."
+            tx_fees[txid] = fee
 
-            total_fees += fee
-            total_size += tx_size
-
-            # Register this tx's outputs for children in the package
+            # Register outputs for children in the package
             for vout, out in enumerate(tx.outputs):
                 package_outputs[(txid, vout)] = out.value
+
+        # Ephemeral dust policy checks (Bitcoin Core policy/ephemeral_policy.cpp)
+        # For any tx with dust outputs:
+        # 1. At most 1 dust output per transaction
+        # 2. Dust tx must have 0 fee (child provides all fees via CPFP)
+        # 3. Dust output must be P2A or standard type
+        # 4. All dust outputs must be spent by child in same package
+        for tx in txs:
+            dust_indices = _has_ephemeral_dust(tx)
+            if not dust_indices:
+                continue
+
+            txid = tx.get_txid()
+            fee = tx_fees.get(txid, 0)
+
+            # Check ephemeral dust policy (max 1 dust, 0-fee, standard type)
+            ok, err = _check_ephemeral_dust(tx, fee)
+            if not ok:
+                return False, f"ephemeral dust policy: {err}"
+
+            # All dust outputs must be spent by a child in the package
+            for dust_vout in dust_indices:
+                dust_outpoint: OutPoint = (txid, dust_vout)
+                if dust_outpoint not in package_spent:
+                    return False, (
+                        f"tx {txid.hex()[:16]}... has unspent ephemeral "
+                        f"dust output at index {dust_vout}"
+                    )
+
+        # TRUC (v3) policy checks for packages
+        # Reference: Bitcoin Core policy/truc_policy.cpp PackageTRUCChecks()
+        truc_ok, truc_err = self._check_package_truc_policy(txs)
+        if not truc_ok:
+            return False, truc_err
+
+        # Validate each transaction (consensus checks only)
+        for tx in txs:
+            txid = tx.get_txid()
+            if txid in self.transactions:
+                return False, f"Transaction {txid.hex()[:16]}... already in mempool"
+
+        # Check conflicts with existing mempool (any double-spend)
+        for tx in txs:
+            for inp in tx.inputs:
+                op = (inp.prev_txid, inp.prev_vout)
+                if op in self.spent_outputs:
+                    return False, (
+                        f"Package conflicts with mempool: "
+                        f"{inp.prev_txid.hex()[:16]}...:{inp.prev_vout} already spent"
+                    )
+
+        # Calculate total fees and size using pre-computed per-tx fees
+        total_fees = sum(tx_fees.values())
+        total_size = sum(len(tx.serialize()) for tx in txs)
 
         # Package fee rate check (CPFP: package rate must meet minimum)
         package_fee_rate = total_fees / total_size if total_size > 0 else 0
@@ -1600,9 +3016,11 @@ class Mempool:
                 return False, f"Package tx {tx.get_txid().hex()[:16]}... invalid: {error}"
 
         # All checks passed — add transactions in topological order.
-        # Re-compute per-tx fee info and skip the per-tx minimum fee check
+        # Use pre-computed per-tx fees; skip per-tx minimum fee check
         # (package rate already validated above).
         added_txids: List[bytes] = []
+        ephemeral_parents: Set[bytes] = set()  # Track parents with ephemeral dust
+
         for tx in txs:
             txid = tx.get_txid()
             tx_size = len(tx.serialize())
@@ -1613,20 +3031,13 @@ class Mempool:
                 if inp.prev_txid in self.transactions:
                     direct_parents.add(inp.prev_txid)
 
-            # Compute fee for this individual transaction
-            tx_input = 0
-            for inp in tx.inputs:
-                op = (inp.prev_txid, inp.prev_vout)
-                parent_entry = self.transactions.get(inp.prev_txid)
-                if parent_entry and inp.prev_vout < len(parent_entry.tx.outputs):
-                    tx_input += parent_entry.tx.outputs[inp.prev_vout].value
-                else:
-                    utxo = self.validator.db.get_utxo(inp.prev_txid, inp.prev_vout)
-                    if utxo:
-                        tx_input += utxo['value']
-            tx_output = sum(out.value for out in tx.outputs)
-            fee = tx_input - tx_output
+            # Use pre-computed fee from earlier validation
+            fee = tx_fees.get(txid, 0)
             fee_rate = fee / tx_size if tx_size > 0 else 0
+
+            # Track if this is an ephemeral dust parent
+            if _has_ephemeral_dust(tx):
+                ephemeral_parents.add(txid)
 
             ancestors = self._get_ancestors(tx)
             ancestor_size = sum(
@@ -1634,6 +3045,7 @@ class Mempool:
                 for a in ancestors if a in self.transactions
             )
 
+            has_dust = txid in ephemeral_parents
             entry = MempoolEntry(
                 tx=tx,
                 fee=fee,
@@ -1645,6 +3057,7 @@ class Mempool:
                 ancestor_size=ancestor_size + tx_size,
                 parents=direct_parents,
                 children=set(),
+                has_ephemeral_dust=has_dust,
             )
             self.transactions[txid] = entry
             self.current_size += tx_size
@@ -1655,9 +3068,14 @@ class Mempool:
             self._insert_sorted_by_fee_rate(txid, fee_rate)
 
             # Update parent entries to add this txid as a child
+            # Also track ephemeral dust relationships
             for parent_txid in direct_parents:
                 if parent_txid in self.transactions:
-                    self.transactions[parent_txid].children.add(txid)
+                    parent_entry = self.transactions[parent_txid]
+                    parent_entry.children.add(txid)
+                    # If parent has ephemeral dust, mark this child as spending it
+                    if parent_entry.has_ephemeral_dust:
+                        parent_entry.ephemeral_child = txid
 
             # Update ancestor descendant counts
             for a_txid in ancestors:

@@ -32,6 +32,13 @@ PEERS_CONNECTED: Optional["Gauge"] = None
 MEMPOOL_SIZE: Optional["Gauge"] = None
 MEMPOOL_TX_COUNT: Optional["Gauge"] = None
 
+# UTXO cache metrics
+UTXO_CACHE_SIZE: Optional["Gauge"] = None
+UTXO_CACHE_MEMORY: Optional["Gauge"] = None
+UTXO_CACHE_DIRTY: Optional["Gauge"] = None
+UTXO_CACHE_HIT_RATE: Optional["Gauge"] = None
+UTXO_CACHE_FLUSHES: Optional["Counter"] = None
+
 BLOCKS_RECEIVED: Optional["Counter"] = None
 TX_RECEIVED: Optional["Counter"] = None
 PEER_DISCONNECTS: Optional["Counter"] = None
@@ -57,6 +64,8 @@ def init_metrics(port: int = 9332) -> bool:
     """
     global BLOCK_HEIGHT, CHAIN_DIFFICULTY, PEERS_CONNECTED
     global MEMPOOL_SIZE, MEMPOOL_TX_COUNT
+    global UTXO_CACHE_SIZE, UTXO_CACHE_MEMORY, UTXO_CACHE_DIRTY
+    global UTXO_CACHE_HIT_RATE, UTXO_CACHE_FLUSHES
     global BLOCKS_RECEIVED, TX_RECEIVED, PEER_DISCONNECTS
     global STALE_TIP_DETECTED, PEER_EVICTIONS
     global RPC_REQUESTS, RPC_DURATION, NODE_INFO
@@ -75,6 +84,21 @@ def init_metrics(port: int = 9332) -> bool:
 
     MEMPOOL_SIZE = Gauge("ouroboros_mempool_size", "Mempool size in bytes")
     MEMPOOL_TX_COUNT = Gauge("ouroboros_mempool_tx_count", "Mempool transaction count")
+
+    # UTXO cache metrics
+    UTXO_CACHE_SIZE = Gauge("ouroboros_utxo_cache_size", "UTXO cache entry count")
+    UTXO_CACHE_MEMORY = Gauge(
+        "ouroboros_utxo_cache_memory_bytes", "UTXO cache memory usage in bytes"
+    )
+    UTXO_CACHE_DIRTY = Gauge(
+        "ouroboros_utxo_cache_dirty", "Number of dirty entries in UTXO cache"
+    )
+    UTXO_CACHE_HIT_RATE = Gauge(
+        "ouroboros_utxo_cache_hit_rate", "UTXO cache hit rate (0.0-1.0)"
+    )
+    UTXO_CACHE_FLUSHES = Counter(
+        "ouroboros_utxo_cache_flushes_total", "Total number of UTXO cache flushes"
+    )
 
     BLOCKS_RECEIVED = Counter("ouroboros_blocks_received_total", "Blocks received")
     TX_RECEIVED = Counter("ouroboros_tx_received_total", "Transactions received")
@@ -161,3 +185,32 @@ def record_peer_evicted(reason: str) -> None:
     """
     if PEER_EVICTIONS is not None:
         PEER_EVICTIONS.labels(reason=reason).inc()
+
+
+def update_utxo_cache_metrics(
+    entries: int, memory_bytes: int, dirty: int, hit_rate: float, flushes: int
+) -> None:
+    """Update UTXO cache metrics.
+
+    Args:
+        entries: Total cache entry count
+        memory_bytes: Approximate memory usage in bytes
+        dirty: Number of dirty entries (modified since last flush)
+        hit_rate: Cache hit rate (0.0-1.0)
+        flushes: Total flush count (for incrementing counter)
+    """
+    if UTXO_CACHE_SIZE is not None:
+        UTXO_CACHE_SIZE.set(entries)
+    if UTXO_CACHE_MEMORY is not None:
+        UTXO_CACHE_MEMORY.set(memory_bytes)
+    if UTXO_CACHE_DIRTY is not None:
+        UTXO_CACHE_DIRTY.set(dirty)
+    if UTXO_CACHE_HIT_RATE is not None:
+        UTXO_CACHE_HIT_RATE.set(hit_rate)
+    # Note: flushes counter is not incremented here as it tracks lifetime total
+
+
+def record_utxo_cache_flush() -> None:
+    """Record a UTXO cache flush event."""
+    if UTXO_CACHE_FLUSHES is not None:
+        UTXO_CACHE_FLUSHES.inc()

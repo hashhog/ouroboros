@@ -131,13 +131,18 @@ class CompactBlock:
         Returns ``(txs, missing_indices)``.  If all short IDs matched,
         *missing_indices* is empty; otherwise *txs* is None and
         *missing_indices* lists slots the caller should fetch via ``getblocktxn``.
+
+        Uses the mempool's match_compact_block method which handles short ID
+        collisions by marking both colliding transactions as unavailable
+        (following Bitcoin Core behavior).
         """
         key = self.siphash_key()
 
         total_tx_count = len(self.short_ids) + len(self.prefilled_txs)
         txs: List[Optional['Transaction']] = [None] * total_tx_count
 
-        # Place pre-filled transactions
+        # Place pre-filled transactions using differential encoding
+        # The index in PrefilledTransaction is relative to the last placed tx
         offset = 0
         for pf in self.prefilled_txs:
             abs_idx = pf.index + offset
@@ -146,22 +151,16 @@ class CompactBlock:
             txs[abs_idx] = pf.tx
             offset = abs_idx + 1
 
-        # Build short_id → mempool tx lookup
-        mempool_by_short: Dict[int, 'Transaction'] = {}
-        for entry in mempool.transactions.values():
-            tx = entry.tx
-            wtxid = tx.get_wtxid()
-            sid = short_txid(key, wtxid)
-            mempool_by_short[sid] = tx
+        # Use mempool's matching function (handles collisions properly)
+        matched_txs, _ = mempool.match_compact_block(self.short_ids, key)
 
-        # Fill remaining slots from mempool
-        sid_iter = iter(self.short_ids)
+        # Fill remaining slots from matched mempool transactions
+        sid_iter = iter(matched_txs)
         missing: List[int] = []
         for i in range(total_tx_count):
             if txs[i] is not None:
                 continue
-            sid = next(sid_iter)
-            matched = mempool_by_short.get(sid)
+            matched = next(sid_iter)
             if matched is not None:
                 txs[i] = matched
             else:

@@ -14,7 +14,10 @@ pub mod headers_presync;
 // Re-export functions for convenience
 pub use header::{HeaderValidator, HeaderValidationError};
 pub use pow::*;
-pub use transaction::*;
+pub use transaction::{
+    TransactionValidator, TransactionValidationError, Result,
+    check_coinbase_maturity, COINBASE_MATURITY,
+};
 pub use script::{ScriptInterpreter, ScriptError, ScriptType, Stack, identify_script_type, verify_signature_in_script, verify_witness};
 pub use block::{BlockValidator, BlockValidationError};
 pub use sighash::{

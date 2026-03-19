@@ -413,9 +413,9 @@ class BlockValidator:
         self, height: int, prev_block: Block, block: Block
     ) -> int | None:
         """Calculate expected nBits for a block at *height*."""
-        # Regtest: no retargeting
+        # Regtest: no retargeting — always use regtest min-difficulty (0x207fffff)
         if self.network == "regtest":
-            return POW_LIMIT_BITS_MAINNET
+            return 0x207fffff
 
         # Non-retarget block
         if height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0:

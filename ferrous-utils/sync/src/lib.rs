@@ -18,6 +18,18 @@ use tokio::sync::Mutex;
 
 use common::{OutPointWrapper, UTXO, BlockWrapper, BlockHeaderWrapper, BlockMetadata};
 use common::verify_ecdsa_signature_der;
+// Hardware-accelerated crypto
+use common::crypto::sha256::{
+    sha256 as hw_sha256, double_sha256 as hw_double_sha256,
+    detect_implementation as sha256_detect_impl, implementation_string as sha256_impl_string,
+};
+use common::crypto::secp::{
+    verify_ecdsa_compact as secp_verify_ecdsa_compact,
+    verify_ecdsa_der as secp_verify_ecdsa_der,
+    verify_schnorr as secp_verify_schnorr,
+    batch_verify_schnorr as secp_batch_verify_schnorr,
+    SchnorrVerifyItem,
+};
 use crate::storage::db::{BlockchainDB, DbError};
 use crate::validate::header::HeaderValidator;
 use crate::validate::block::BlockValidator;
@@ -43,6 +55,91 @@ fn init_logging() {
 #[pyfunction]
 fn verify_ecdsa(der_sig: Vec<u8>, pubkey: Vec<u8>, msg_hash: Vec<u8>) -> PyResult<bool> {
     match verify_ecdsa_signature_der(&der_sig, &pubkey, &msg_hash) {
+        Ok(valid) => Ok(valid),
+        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "ECDSA verification error: {}",
+            e
+        ))),
+    }
+}
+
+// ============================================================================
+// Hardware-accelerated cryptographic functions
+// ============================================================================
+
+/// Get the detected SHA256 implementation (hardware-accelerated or software).
+/// Returns one of: "sha256:x86_shani", "sha256:arm_sha2", "sha256:software"
+#[pyfunction]
+fn crypto_sha256_implementation() -> String {
+    sha256_impl_string()
+}
+
+/// Compute SHA256 hash using hardware acceleration when available.
+/// Uses SHA-NI on x86 (Intel/AMD) or SHA2 extensions on ARM (Apple Silicon).
+#[pyfunction]
+fn crypto_sha256(data: Vec<u8>) -> Vec<u8> {
+    hw_sha256(&data).to_vec()
+}
+
+/// Compute double SHA256 (SHA256(SHA256(data))) using hardware acceleration.
+/// This is Bitcoin's primary hash function for block headers, merkle trees, etc.
+#[pyfunction]
+fn crypto_double_sha256(data: Vec<u8>) -> Vec<u8> {
+    hw_double_sha256(&data).to_vec()
+}
+
+/// Verify Schnorr signature (BIP340, used in Taproot).
+///
+/// Args:
+///     sig: 64-byte Schnorr signature
+///     pubkey: 32-byte x-only public key
+///     msg_hash: 32-byte message hash
+///
+/// Returns:
+///     True if signature is valid, False otherwise
+#[pyfunction]
+fn crypto_verify_schnorr(sig: Vec<u8>, pubkey: Vec<u8>, msg_hash: Vec<u8>) -> PyResult<bool> {
+    match secp_verify_schnorr(&sig, &pubkey, &msg_hash) {
+        Ok(valid) => Ok(valid),
+        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Schnorr verification error: {}",
+            e
+        ))),
+    }
+}
+
+/// Batch verify multiple Schnorr signatures.
+/// More efficient than verifying individually when processing Taproot transactions.
+///
+/// Args:
+///     items: List of (sig, pubkey, msg_hash) tuples
+///
+/// Returns:
+///     True if ALL signatures are valid, False if ANY is invalid
+#[pyfunction]
+fn crypto_batch_verify_schnorr(items: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>) -> PyResult<bool> {
+    let verify_items: Vec<SchnorrVerifyItem> = items
+        .iter()
+        .map(|(sig, pubkey, msg)| SchnorrVerifyItem {
+            sig,
+            pubkey,
+            msg_hash: msg,
+        })
+        .collect();
+
+    match secp_batch_verify_schnorr(&verify_items) {
+        Ok(valid) => Ok(valid),
+        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "Batch Schnorr verification error: {}",
+            e
+        ))),
+    }
+}
+
+/// Verify ECDSA signature with compact 64-byte format (for use with global context).
+#[pyfunction]
+fn crypto_verify_ecdsa_compact(sig: Vec<u8>, pubkey: Vec<u8>, msg_hash: Vec<u8>) -> PyResult<bool> {
+    match secp_verify_ecdsa_compact(&sig, &pubkey, &msg_hash) {
         Ok(valid) => Ok(valid),
         Err(e) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
             "ECDSA verification error: {}",
@@ -1888,11 +1985,347 @@ impl PyTxIndex {
     }
 }
 
+// =============================================================================
+// Minisketch (BIP 330 Erlay)
+// =============================================================================
+
+use common::minisketch::{
+    Minisketch as RustMinisketch,
+    compute_short_txid as rust_compute_short_txid,
+    compute_reconciliation_salt as rust_compute_reconciliation_salt,
+    estimate_sketch_capacity as rust_estimate_sketch_capacity,
+};
+
+/// Python wrapper for Minisketch (BIP 330 set reconciliation).
+#[pyclass]
+#[derive(Clone)]
+pub struct PyMinisketch {
+    inner: RustMinisketch,
+}
+
+#[pymethods]
+impl PyMinisketch {
+    /// Create a new sketch with the given capacity.
+    #[new]
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: RustMinisketch::new(capacity),
+        }
+    }
+
+    /// Create a sketch from serialized bytes.
+    #[staticmethod]
+    fn from_bytes(data: Vec<u8>, capacity: usize) -> PyResult<Self> {
+        RustMinisketch::deserialize(&data, capacity)
+            .map(|inner| Self { inner })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))
+    }
+
+    /// Get the capacity of this sketch.
+    #[getter]
+    fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    /// Add a non-zero element to the sketch.
+    fn add(&mut self, element: u32) -> PyResult<()> {
+        if element == 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Cannot add zero element to sketch"
+            ));
+        }
+        self.inner.add(element);
+        Ok(())
+    }
+
+    /// Merge another sketch into this one (XOR).
+    fn merge(&mut self, other: &PyMinisketch) -> PyResult<()> {
+        if self.inner.capacity() != other.inner.capacity() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Cannot merge sketches with different capacities"
+            ));
+        }
+        self.inner.merge(&other.inner);
+        Ok(())
+    }
+
+    /// Merge two sketches, returning a new sketch encoding the symmetric difference.
+    fn merge_new(&self, other: &PyMinisketch) -> PyResult<PyMinisketch> {
+        if self.inner.capacity() != other.inner.capacity() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Cannot merge sketches with different capacities"
+            ));
+        }
+        Ok(PyMinisketch {
+            inner: self.inner.merge_new(&other.inner),
+        })
+    }
+
+    /// Decode the sketch into its elements.
+    /// Returns None if the difference exceeds capacity.
+    fn decode(&self) -> Option<Vec<u32>> {
+        self.inner.decode().map(|set| set.into_iter().collect())
+    }
+
+    /// Serialize to bytes.
+    fn serialize(&self) -> Vec<u8> {
+        self.inner.serialize()
+    }
+
+    /// Get the syndromes as a list.
+    fn syndromes(&self) -> Vec<u32> {
+        self.inner.syndromes().to_vec()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Minisketch(capacity={})", self.inner.capacity())
+    }
+}
+
+/// Compute a 32-bit short txid from a wtxid using SipHash.
+#[pyfunction]
+fn minisketch_compute_short_txid(wtxid: Vec<u8>, k0: u64, k1: u64) -> PyResult<u32> {
+    if wtxid.len() != 32 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "wtxid must be 32 bytes"
+        ));
+    }
+    let mut wtxid_arr = [0u8; 32];
+    wtxid_arr.copy_from_slice(&wtxid);
+    Ok(rust_compute_short_txid(&wtxid_arr, k0, k1))
+}
+
+/// Compute the reconciliation salt from two peer salts per BIP 330.
+#[pyfunction]
+fn minisketch_compute_salt(salt1: u64, salt2: u64) -> (u64, u64) {
+    rust_compute_reconciliation_salt(salt1, salt2)
+}
+
+/// Estimate sketch capacity based on set sizes per BIP 330.
+#[pyfunction]
+fn minisketch_estimate_capacity(local_size: usize, remote_size: usize, q: f64) -> usize {
+    rust_estimate_sketch_capacity(local_size, remote_size, q)
+}
+
+// =============================================================================
+// BIP305 assumeUTXO Snapshot Functions
+// =============================================================================
+
+use crate::storage::snapshot::{
+    self as snapshot_mod, AssumeutxoData, SnapshotMetadata,
+    get_assumeutxo_data as rust_get_assumeutxo_data,
+    get_assumeutxo_by_hash as rust_get_assumeutxo_by_hash,
+    get_available_snapshot_heights as rust_get_available_heights,
+};
+
+/// Python wrapper for assumeUTXO data
+#[pyclass]
+#[derive(Clone)]
+pub struct PyAssumeutxoData {
+    #[pyo3(get)]
+    pub height: u32,
+    #[pyo3(get)]
+    pub block_hash: Vec<u8>,
+    #[pyo3(get)]
+    pub hash_serialized: Vec<u8>,
+    #[pyo3(get)]
+    pub chain_tx_count: u64,
+}
+
+impl From<AssumeutxoData> for PyAssumeutxoData {
+    fn from(data: AssumeutxoData) -> Self {
+        Self {
+            height: data.height,
+            block_hash: data.block_hash.to_vec(),
+            hash_serialized: data.hash_serialized.to_vec(),
+            chain_tx_count: data.chain_tx_count,
+        }
+    }
+}
+
+#[pymethods]
+impl PyAssumeutxoData {
+    /// Get block hash as hex string (big-endian display format)
+    fn block_hash_hex(&self) -> String {
+        let mut display = self.block_hash.clone();
+        display.reverse();
+        hex::encode(display)
+    }
+
+    /// Get hash_serialized as hex string
+    fn hash_serialized_hex(&self) -> String {
+        let mut display = self.hash_serialized.clone();
+        display.reverse();
+        hex::encode(display)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AssumeutxoData(height={}, block_hash={}, chain_tx_count={})",
+            self.height,
+            self.block_hash_hex(),
+            self.chain_tx_count
+        )
+    }
+}
+
+/// Python wrapper for snapshot metadata
+#[pyclass]
+#[derive(Clone)]
+pub struct PySnapshotMetadata {
+    #[pyo3(get)]
+    pub version: u16,
+    #[pyo3(get)]
+    pub network: String,
+    #[pyo3(get)]
+    pub base_blockhash: Vec<u8>,
+    #[pyo3(get)]
+    pub coins_count: u64,
+}
+
+#[pymethods]
+impl PySnapshotMetadata {
+    /// Get base block hash as hex string (big-endian display format)
+    fn base_blockhash_hex(&self) -> String {
+        let mut display = self.base_blockhash.clone();
+        display.reverse();
+        hex::encode(display)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SnapshotMetadata(version={}, network={}, base_blockhash={}, coins_count={})",
+            self.version,
+            self.network,
+            self.base_blockhash_hex(),
+            self.coins_count
+        )
+    }
+}
+
+/// Get assumeUTXO data for a network and height.
+///
+/// Returns None if no assumeUTXO data exists for the given height.
+#[pyfunction]
+fn get_assumeutxo_data(network: String, height: u32) -> PyResult<Option<PyAssumeutxoData>> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    Ok(rust_get_assumeutxo_data(network_enum, height).map(Into::into))
+}
+
+/// Get assumeUTXO data for a network by block hash.
+///
+/// Returns None if no assumeUTXO data exists for the given block hash.
+#[pyfunction]
+fn get_assumeutxo_by_blockhash(network: String, block_hash: Vec<u8>) -> PyResult<Option<PyAssumeutxoData>> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    if block_hash.len() != 32 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Block hash must be 32 bytes",
+        ));
+    }
+
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(&block_hash);
+
+    Ok(rust_get_assumeutxo_by_hash(network_enum, &hash_arr).map(Into::into))
+}
+
+/// Get all available snapshot heights for a network.
+#[pyfunction]
+fn get_available_snapshot_heights(network: String) -> PyResult<Vec<u32>> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    Ok(rust_get_available_heights(network_enum))
+}
+
+/// Get the snapshot magic bytes (b"utxo\xff")
+#[pyfunction]
+fn snapshot_magic_bytes() -> Vec<u8> {
+    snapshot_mod::SNAPSHOT_MAGIC.to_vec()
+}
+
+/// Get the current snapshot format version
+#[pyfunction]
+fn snapshot_format_version() -> u16 {
+    snapshot_mod::SNAPSHOT_VERSION
+}
+
+/// Read snapshot metadata from a file.
+///
+/// Returns the metadata if the file is a valid snapshot for the given network.
+#[pyfunction]
+fn read_snapshot_metadata(path: String, network: String) -> PyResult<PySnapshotMetadata> {
+    let network_enum = match network.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Network::Bitcoin,
+        "testnet" | "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        "signet" => Network::Signet,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid network: {}", network),
+            ));
+        }
+    };
+
+    let metadata = SnapshotMetadata::from_file(&path, network_enum)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{}", e)))?;
+
+    Ok(PySnapshotMetadata {
+        version: metadata.version,
+        network: format!("{:?}", metadata.network),
+        base_blockhash: metadata.base_blockhash.to_vec(),
+        coins_count: metadata.coins_count,
+    })
+}
+
 /// Fast sync module for Bitcoin blockchain synchronization
 #[pymodule]
 fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_logging();
     m.add_function(pyo3::wrap_pyfunction!(verify_ecdsa, m)?)?;
+    // Hardware-accelerated crypto functions
+    m.add_function(pyo3::wrap_pyfunction!(crypto_sha256_implementation, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(crypto_sha256, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(crypto_double_sha256, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(crypto_verify_schnorr, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(crypto_batch_verify_schnorr, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(crypto_verify_ecdsa_compact, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(get_script_flags_for_height, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(segwit_activation_height, m)?)?;
     // BIP68 sequence lock functions
@@ -1955,6 +2388,20 @@ fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Transaction index
     m.add_class::<PyTxIndex>()?;
     m.add_class::<PyDiskTxPos>()?;
+    // BIP 330 Minisketch (Erlay)
+    m.add_class::<PyMinisketch>()?;
+    m.add_function(pyo3::wrap_pyfunction!(minisketch_compute_short_txid, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(minisketch_compute_salt, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(minisketch_estimate_capacity, m)?)?;
+    // BIP305 assumeUTXO snapshot functions
+    m.add_class::<PyAssumeutxoData>()?;
+    m.add_class::<PySnapshotMetadata>()?;
+    m.add_function(pyo3::wrap_pyfunction!(get_assumeutxo_data, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(get_assumeutxo_by_blockhash, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(get_available_snapshot_heights, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(snapshot_magic_bytes, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(snapshot_format_version, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(read_snapshot_metadata, m)?)?;
     Ok(())
 }
 
@@ -2258,7 +2705,99 @@ impl PyBlockchainDB {
             "store_block requires BlockWrapper reconstruction - use Rust API directly"
         ))
     }
-    
+
+    /// Accept a fully-serialised block (Bitcoin wire format) and connect it
+    /// to the active chain.  This performs the same work as
+    /// `BlockValidator::apply_block()`:
+    ///
+    /// 1. Deserialize block bytes into a `BlockWrapper`.
+    /// 2. Store the block body in BLOCKS_CF.
+    /// 3. Update UTXO set (spend inputs, create outputs).
+    /// 4. Store transaction index entries.
+    /// 5. Store block metadata (height, chainwork, timestamp) in BLOCK_INDEX_CF.
+    /// 6. Update the chain tip.
+    ///
+    /// This is used by `generatetoaddress` (regtest mining) where the block
+    /// is constructed in Python and needs to be persisted via the Rust DB.
+    fn connect_block_from_bytes(&self, block_bytes: Vec<u8>, height: u32) -> PyResult<Vec<u8>> {
+        use common::BitcoinDeserialize;
+
+        // Deserialize
+        let (block, _) = BlockWrapper::bitcoin_deserialize(&block_bytes).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Failed to deserialize block: {}", e)
+            )
+        })?;
+
+        let block_hash = *block.block_hash().as_byte_array();
+        let inner = block.inner();
+
+        // HEAD_BLOCKS marker (crash-safety)
+        let (old_tip_hash, old_tip_height) = if height == 0 {
+            ([0u8; 32], 0u32)
+        } else {
+            self.db.get_best_block().unwrap_or(([0u8; 32], 0))
+        };
+        self.db.write_head_blocks(&old_tip_hash, old_tip_height, &block_hash, height)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+        // UTXO mutations + tx index
+        for (tx_pos, tx) in inner.txdata.iter().enumerate() {
+            let txid = tx.compute_txid();
+
+            if !tx.is_coinbase() {
+                for input in &tx.input {
+                    let outpoint = OutPointWrapper::new(input.previous_output);
+                    self.db.spend_utxo(outpoint.inner(), txid.as_byte_array())
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+                }
+            }
+
+            for (vout, output) in tx.output.iter().enumerate() {
+                let outpoint = OutPointWrapper::from_txid_vout(txid, vout as u32);
+                let utxo = UTXO::new(
+                    outpoint.clone(),
+                    output.value.to_sat(),
+                    output.script_pubkey.clone(),
+                    Some(height),
+                    tx.is_coinbase(),
+                );
+                self.db.add_utxo(outpoint.inner(), &utxo)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+            }
+
+            self.db.store_tx_index(txid.as_byte_array(), &block_hash, height, tx_pos as u32)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+        }
+
+        // Store block body + metadata
+        self.db.store_block(&block)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+        let timestamp = inner.header.time;
+        let bits = inner.header.bits.to_consensus();
+        let prev_chainwork = if height == 0 {
+            [0u8; 32]
+        } else {
+            self.db.get_block_metadata(height - 1)
+                .ok()
+                .and_then(|opt| opt.map(|m| m.chainwork))
+                .unwrap_or([0u8; 32])
+        };
+        let chainwork = crate::chainwork::compute_chainwork(&prev_chainwork, bits);
+        let metadata = BlockMetadata::new(height, chainwork, timestamp);
+        self.db.store_block_metadata(height, &block_hash, &metadata)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+        // Update chain tip + delete marker
+        self.db.update_best_block(&block_hash, height)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+        self.db.delete_head_blocks()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+        Ok(block_hash.to_vec())
+    }
+
     /// Update UTXO set atomically
     fn update_utxo_set(
         &self,
@@ -2488,6 +3027,99 @@ impl PyBlockchainDB {
                 format!("Failed to disconnect block at height {}: {}", height, e)
             )),
         }
+    }
+
+    // ========== Block Invalidation Methods ==========
+
+    /// Invalidate a block and all its descendants.
+    ///
+    /// Marks the block as BLOCK_FAILED_VALID and all its descendants as
+    /// BLOCK_FAILED_CHILD. If the block is in the active chain, disconnects
+    /// blocks back to the invalid block's parent.
+    ///
+    /// # Arguments
+    /// * `block_hash` - Hash of the block to invalidate (32 bytes)
+    ///
+    /// # Returns
+    /// The height of the new chain tip after invalidation.
+    ///
+    /// # Reference
+    /// Bitcoin Core: validation.cpp `InvalidateBlock()`
+    fn invalidate_block(&self, block_hash: &[u8]) -> PyResult<u32> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+
+        self.db.invalidate_block(&hash_bytes).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to invalidate block: {}", e)
+            )
+        })
+    }
+
+    /// Reconsider a previously-invalidated block.
+    ///
+    /// Removes the invalid flag from the block and its descendants/ancestors,
+    /// allowing them to be considered for chain selection again.
+    ///
+    /// # Arguments
+    /// * `block_hash` - Hash of the block to reconsider (32 bytes)
+    ///
+    /// # Returns
+    /// The height of the chain tip after reconsideration (may change if the
+    /// reconsidered chain is now best).
+    ///
+    /// # Reference
+    /// Bitcoin Core: rpc/blockchain.cpp `ReconsiderBlock()`
+    fn reconsider_block(&self, block_hash: &[u8]) -> PyResult<u32> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+
+        self.db.reconsider_block(&hash_bytes).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to reconsider block: {}", e)
+            )
+        })
+    }
+
+    /// Check if a block at a given height is marked as invalid.
+    ///
+    /// Returns True if the block has BLOCK_FAILED_VALID or BLOCK_FAILED_CHILD
+    /// flags set, False otherwise.
+    fn is_block_invalid(&self, height: u32) -> PyResult<bool> {
+        self.db.is_block_invalid(height).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
+
+    /// Get list of all invalid blocks.
+    ///
+    /// Returns a list of (height, hash) tuples for all blocks marked as invalid.
+    fn get_invalid_blocks(&self) -> PyResult<Vec<(u32, Vec<u8>)>> {
+        self.db.get_invalid_blocks()
+            .map(|blocks| {
+                blocks.into_iter()
+                    .map(|(height, hash)| (height, hash.to_vec()))
+                    .collect()
+            })
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Database error: {}", e)
+                )
+            })
     }
 
     /// Context manager support for transactions

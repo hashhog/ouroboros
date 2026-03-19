@@ -10,7 +10,8 @@ from ouroboros.mempool import (
     Mempool, _is_standard_tx, _get_dust_threshold, _has_ephemeral_dust,
     MAX_ANCESTOR_COUNT, MAX_DESCENDANT_COUNT, MAX_ANCESTOR_SIZE_KVB,
     MAX_DESCENDANT_SIZE_KVB, MAX_STANDARD_TX_WEIGHT,
-    TX_V3_MAX_VSIZE, TX_V3_ANCESTOR_LIMIT, TX_V3_DESCENDANT_LIMIT,
+    TRUC_VERSION, TRUC_MAX_VSIZE, TRUC_CHILD_MAX_VSIZE,
+    TRUC_ANCESTOR_LIMIT, TRUC_DESCENDANT_LIMIT,
 )
 from ouroboros.database import Transaction, TxIn, TxOut
 
@@ -432,8 +433,13 @@ def _truc_pool(utxo_values):
 class TestTRUCPolicy:
     """TRUC (Topologically Restricted Until Confirmation) v3 transaction policy."""
 
-    def test_v3_max_vsize_constant(self):
-        assert TX_V3_MAX_VSIZE == 10_000
+    def test_truc_constants(self):
+        """Verify TRUC policy constants match Bitcoin Core."""
+        assert TRUC_VERSION == 3
+        assert TRUC_MAX_VSIZE == 10_000
+        assert TRUC_CHILD_MAX_VSIZE == 1_000
+        assert TRUC_ANCESTOR_LIMIT == 2
+        assert TRUC_DESCENDANT_LIMIT == 2
 
     # ── Test 1: v3 tx with 2 unconfirmed ancestors → reject ──────
 
@@ -484,11 +490,11 @@ class TestTRUCPolicy:
         assert not ok, "Child with 2 unconfirmed ancestors should be rejected"
         assert "ancestor" in err.lower() or "truc" in err.lower()
 
-    # ── Test 2: v3 child > 10,000 vB of v3 parent → reject ──────
+    # ── Test 2: v3 child > 1,000 vB of v3 parent → reject ──────
 
     def test_v3_reject_oversized_child(self):
-        """A v3 child of an unconfirmed v3 parent that exceeds 10,000 vB
-        must be rejected.
+        """A v3 child of an unconfirmed v3 parent that exceeds 1,000 vB
+        must be rejected (TRUC_CHILD_MAX_VSIZE = 1000).
         """
         utxos = {(b"\x00" * 32, 0): {"value": 200_000}}
         pool = _truc_pool(utxos)
@@ -506,7 +512,7 @@ class TestTRUCPolicy:
         # Register parent's output
         pool.validator.db.add(b"\xAA" * 32, 0, 190_000)
 
-        # Child: v3, very large script_sig to push vsize > 10,000 vB
+        # Child: v3, large script_sig to push vsize > 1,000 vB
         # We use a large script_sig to make the serialized size big enough.
         oversized_child = Transaction(
             txid=b"\xBB" * 32,
@@ -516,18 +522,18 @@ class TestTRUCPolicy:
                 TxIn(
                     prev_txid=b"\xAA" * 32,
                     prev_vout=0,
-                    script_sig=b"\x00" * 12_000,  # large enough to exceed 10k vB
+                    script_sig=b"\x00" * 1_100,  # > 1000 vB
                     sequence=0xFFFFFFFD,
                 )
             ],
             outputs=[TxOut(value=180_000, script_pubkey=b"\x51")],
         )
-        # Sanity: confirm the tx is indeed > 10k bytes
-        assert len(oversized_child.serialize()) > TX_V3_MAX_VSIZE
+        # Sanity: confirm the tx is indeed > 1000 bytes
+        assert len(oversized_child.serialize()) > TRUC_CHILD_MAX_VSIZE
 
         ok, err = pool.add_transaction(oversized_child, height=100)
         assert not ok, "Oversized v3 child should be rejected"
-        assert "vsize" in err.lower() or "truc" in err.lower()
+        assert "big" in err.lower() or "vsize" in err.lower() or "1000" in err
 
     # ── Test 3: second child of v3 parent → reject ───────────────
 
@@ -618,7 +624,7 @@ class TestTRUCPolicy:
     # ── Additional: v3 child within vsize limit is accepted ──────
 
     def test_v3_child_within_vsize_accepted(self):
-        """A v3 child of a v3 parent with vsize ≤ 10,000 should be accepted."""
+        """A v3 child of a v3 parent with vsize ≤ 1,000 should be accepted."""
         utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
         pool = _truc_pool(utxos)
 
@@ -633,14 +639,14 @@ class TestTRUCPolicy:
 
         pool.validator.db.add(b"\xAA" * 32, 0, 90_000)
 
-        # Small child, well within 10k vsize
+        # Small child, well within 1000 vsize
         child = _truc_tx(
             0xBB,
             inputs=[(b"\xAA" * 32, 0)],
             outputs_values=[80_000],
             version=3,
         )
-        assert len(child.serialize()) < TX_V3_MAX_VSIZE
+        assert len(child.serialize()) < TRUC_CHILD_MAX_VSIZE
         ok, err = pool.add_transaction(child, height=100)
         assert ok, f"Small v3 child should be accepted: {err}"
 
@@ -1182,3 +1188,845 @@ class TestRBF:
 
         # Parent is also replaceable (it signals directly)
         assert pool.is_rbf_opt_in(b"\xAA" * 32)
+
+
+# ── TRUC v3/Non-v3 Inheritance Tests ────────────────────────────────
+
+
+class TestTRUCInheritance:
+    """Tests for TRUC v3/non-v3 inheritance rules."""
+
+    def test_v3_cannot_spend_non_v3_unconfirmed(self):
+        """A v3 transaction cannot spend from a non-v3 unconfirmed parent."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # Non-v3 parent
+        parent = _truc_tx(
+            0xAA,
+            inputs=[(b"\x00" * 32, 0)],
+            outputs_values=[90_000],
+            version=2,  # non-v3
+        )
+        ok, err = pool.add_transaction(parent, height=100)
+        assert ok, f"Non-v3 parent should be accepted: {err}"
+
+        pool.validator.db.add(b"\xAA" * 32, 0, 90_000)
+
+        # v3 child trying to spend from non-v3 parent
+        child = _truc_tx(
+            0xBB,
+            inputs=[(b"\xAA" * 32, 0)],
+            outputs_values=[80_000],
+            version=3,  # v3
+        )
+        ok, err = pool.add_transaction(child, height=100)
+        assert not ok, "v3 child should not be able to spend from non-v3 parent"
+        assert "version=3" in err.lower() or "non-version=3" in err.lower()
+
+    def test_non_v3_cannot_spend_v3_unconfirmed(self):
+        """A non-v3 transaction cannot spend from a v3 unconfirmed parent."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # v3 parent
+        parent = _truc_tx(
+            0xAA,
+            inputs=[(b"\x00" * 32, 0)],
+            outputs_values=[90_000],
+            version=3,  # v3
+        )
+        ok, err = pool.add_transaction(parent, height=100)
+        assert ok, f"v3 parent should be accepted: {err}"
+
+        pool.validator.db.add(b"\xAA" * 32, 0, 90_000)
+
+        # non-v3 child trying to spend from v3 parent
+        child = _truc_tx(
+            0xBB,
+            inputs=[(b"\xAA" * 32, 0)],
+            outputs_values=[80_000],
+            version=2,  # non-v3
+        )
+        ok, err = pool.add_transaction(child, height=100)
+        assert not ok, "non-v3 child should not be able to spend from v3 parent"
+        assert "version=3" in err.lower() or "non-version=3" in err.lower()
+
+    def test_v3_can_spend_confirmed_non_v3(self):
+        """A v3 transaction CAN spend from a confirmed non-v3 output."""
+        # The UTXO is confirmed (in the chain DB), so no inheritance check
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # v3 tx spending confirmed UTXO (regardless of what version created it)
+        tx = _truc_tx(
+            0xAA,
+            inputs=[(b"\x00" * 32, 0)],
+            outputs_values=[90_000],
+            version=3,
+        )
+        ok, err = pool.add_transaction(tx, height=100)
+        assert ok, f"v3 tx spending confirmed output should be accepted: {err}"
+
+
+# ── TRUC Always-Replaceable Tests ───────────────────────────────────
+
+
+class TestTRUCAlwaysReplaceable:
+    """Tests that TRUC (v3) transactions are always RBF-replaceable."""
+
+    def test_v3_tx_always_replaceable(self):
+        """A v3 transaction is always replaceable, regardless of sequence."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # v3 tx with high sequence (would NOT signal RBF for non-v3)
+        tx = _truc_tx(
+            0xAA,
+            inputs=[(b"\x00" * 32, 0)],
+            outputs_values=[90_000],
+            version=3,
+            sequence=0xFFFFFFFF,  # Does NOT signal BIP125 RBF
+        )
+        assert not pool.signals_rbf(tx)  # Sequence-based signaling is False
+        ok, _ = pool.add_transaction(tx, height=100)
+        assert ok
+
+        # But is_rbf_opt_in should return True because it's v3
+        assert pool.is_rbf_opt_in(b"\xAA" * 32)
+
+    def test_v3_child_inherits_replaceability_from_v3_parent(self):
+        """A non-signaling child of a v3 parent is replaceable."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # v3 parent (always replaceable)
+        parent = _truc_tx(
+            0xAA,
+            inputs=[(b"\x00" * 32, 0)],
+            outputs_values=[90_000],
+            version=3,
+            sequence=0xFFFFFFFF,
+        )
+        ok, _ = pool.add_transaction(parent, height=100)
+        assert ok
+        pool.validator.db.add(b"\xAA" * 32, 0, 90_000)
+
+        # v3 child (also always replaceable)
+        child = _truc_tx(
+            0xBB,
+            inputs=[(b"\xAA" * 32, 0)],
+            outputs_values=[80_000],
+            version=3,
+            sequence=0xFFFFFFFF,
+        )
+        ok, _ = pool.add_transaction(child, height=100)
+        assert ok
+
+        # Both should be replaceable
+        assert pool.is_rbf_opt_in(b"\xAA" * 32)
+        assert pool.is_rbf_opt_in(b"\xBB" * 32)
+
+
+# ── TRUC Sibling Eviction Tests ─────────────────────────────────────
+
+
+class TestTRUCSiblingEviction:
+    """Tests for TRUC sibling eviction feature."""
+
+    def test_sibling_eviction_higher_fee(self):
+        """A new child can evict existing sibling if it pays higher fee."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # v3 parent with two outputs
+        parent = Transaction(
+            txid=b"\xAA" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=40_000, script_pubkey=b"\x51"),
+                TxOut(value=40_000, script_pubkey=b"\x51"),
+            ],
+        )
+        ok, err = pool.add_transaction(parent, height=100)
+        assert ok, f"Parent should be accepted: {err}"
+
+        pool.validator.db.add(b"\xAA" * 32, 0, 40_000)
+        pool.validator.db.add(b"\xAA" * 32, 1, 40_000)
+
+        # First child: fee = 40000 - 30000 = 10000
+        child1 = _truc_tx(
+            0xBB,
+            inputs=[(b"\xAA" * 32, 0)],
+            outputs_values=[30_000],
+            version=3,
+        )
+        ok, err = pool.add_transaction(child1, height=100)
+        assert ok, f"First child should be accepted: {err}"
+        assert b"\xBB" * 32 in pool.transactions
+
+        # Second child with higher fee: fee = 40000 - 20000 = 20000
+        # This should evict child1
+        child2 = _truc_tx(
+            0xCC,
+            inputs=[(b"\xAA" * 32, 1)],
+            outputs_values=[20_000],
+            version=3,
+        )
+        ok, err = pool.add_transaction(child2, height=100)
+        assert ok, f"Second child should evict first: {err}"
+
+        # First child should be evicted, second should be in mempool
+        assert b"\xBB" * 32 not in pool.transactions
+        assert b"\xCC" * 32 in pool.transactions
+
+    def test_sibling_eviction_lower_fee_rejected(self):
+        """A new child with lower fee cannot evict existing sibling."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # v3 parent with two outputs
+        parent = Transaction(
+            txid=b"\xAA" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=40_000, script_pubkey=b"\x51"),
+                TxOut(value=40_000, script_pubkey=b"\x51"),
+            ],
+        )
+        ok, _ = pool.add_transaction(parent, height=100)
+        assert ok
+
+        pool.validator.db.add(b"\xAA" * 32, 0, 40_000)
+        pool.validator.db.add(b"\xAA" * 32, 1, 40_000)
+
+        # First child: high fee = 40000 - 10000 = 30000
+        child1 = _truc_tx(
+            0xBB,
+            inputs=[(b"\xAA" * 32, 0)],
+            outputs_values=[10_000],
+            version=3,
+        )
+        ok, _ = pool.add_transaction(child1, height=100)
+        assert ok
+        assert b"\xBB" * 32 in pool.transactions
+
+        # Second child with lower fee: fee = 40000 - 35000 = 5000
+        # This should be rejected
+        child2 = _truc_tx(
+            0xCC,
+            inputs=[(b"\xAA" * 32, 1)],
+            outputs_values=[35_000],
+            version=3,
+        )
+        ok, err = pool.add_transaction(child2, height=100)
+        assert not ok, "Lower-fee sibling should be rejected"
+
+        # First child should still be in mempool
+        assert b"\xBB" * 32 in pool.transactions
+        assert b"\xCC" * 32 not in pool.transactions
+
+
+# ── TRUC Package Validation Tests ───────────────────────────────────
+
+
+class TestTRUCPackagePolicy:
+    """Tests for TRUC policy in package validation."""
+
+    def test_package_v3_parent_non_v3_child_rejected(self):
+        """A package with v3 parent and non-v3 child should be rejected."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # v3 parent
+        parent = _truc_tx(
+            0xAA,
+            inputs=[(b"\x00" * 32, 0)],
+            outputs_values=[90_000],
+            version=3,
+        )
+
+        # non-v3 child
+        child = _truc_tx(
+            0xBB,
+            inputs=[(b"\xAA" * 32, 0)],
+            outputs_values=[80_000],
+            version=2,
+        )
+
+        ok, err = pool.validate_package([parent, child], height=100)
+        assert not ok, "Package with v3 parent and non-v3 child should be rejected"
+        assert "version=3" in err.lower() or "non-version=3" in err.lower()
+
+    def test_package_non_v3_parent_v3_child_rejected(self):
+        """A package with non-v3 parent and v3 child should be rejected."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # non-v3 parent
+        parent = _truc_tx(
+            0xAA,
+            inputs=[(b"\x00" * 32, 0)],
+            outputs_values=[90_000],
+            version=2,
+        )
+
+        # v3 child
+        child = _truc_tx(
+            0xBB,
+            inputs=[(b"\xAA" * 32, 0)],
+            outputs_values=[80_000],
+            version=3,
+        )
+
+        ok, err = pool.validate_package([parent, child], height=100)
+        assert not ok, "Package with non-v3 parent and v3 child should be rejected"
+        assert "version=3" in err.lower() or "non-version=3" in err.lower()
+
+    def test_package_v3_parent_v3_child_accepted(self):
+        """A package with v3 parent and v3 child should be accepted."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # v3 parent
+        parent = _truc_tx(
+            0xAA,
+            inputs=[(b"\x00" * 32, 0)],
+            outputs_values=[90_000],
+            version=3,
+        )
+
+        # v3 child (small enough)
+        child = _truc_tx(
+            0xBB,
+            inputs=[(b"\xAA" * 32, 0)],
+            outputs_values=[80_000],
+            version=3,
+        )
+
+        ok, err = pool.validate_package([parent, child], height=100)
+        assert ok, f"Package with v3 parent and v3 child should be accepted: {err}"
+
+    def test_package_v3_oversized_child_rejected(self):
+        """A package with v3 child exceeding 1000 vB should be rejected."""
+        utxos = {(b"\x00" * 32, 0): {"value": 200_000}}
+        pool = _truc_pool(utxos)
+
+        # v3 parent
+        parent = _truc_tx(
+            0xAA,
+            inputs=[(b"\x00" * 32, 0)],
+            outputs_values=[190_000],
+            version=3,
+        )
+
+        # v3 child > 1000 vB
+        oversized_child = Transaction(
+            txid=b"\xBB" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\xAA" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 1_100,
+                    sequence=0xFFFFFFFD,
+                )
+            ],
+            outputs=[TxOut(value=180_000, script_pubkey=b"\x51")],
+        )
+
+        ok, err = pool.validate_package([parent, oversized_child], height=100)
+        assert not ok, "Package with oversized v3 child should be rejected"
+        assert "big" in err.lower() or "1000" in err
+
+    def test_package_v3_two_children_rejected(self):
+        """A package where both the parent and child are v3 but the package
+        structure violates TRUC rules (multiple children in topology) should
+        be rejected.
+
+        Note: Our package validation requires child-with-parents topology,
+        so we can't directly test multiple children in a package. Instead,
+        we test the scenario where a v3 parent in the mempool already has
+        a child, and we try to add another child via package.
+        """
+        utxos = {(b"\x00" * 32, 0): {"value": 200_000}}
+        pool = _truc_pool(utxos)
+
+        # v3 parent with two outputs - add to mempool directly
+        parent = Transaction(
+            txid=b"\xAA" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=90_000, script_pubkey=b"\x51"),
+                TxOut(value=90_000, script_pubkey=b"\x51"),
+            ],
+        )
+        ok, err = pool.add_transaction(parent, height=100)
+        assert ok, f"Parent should be accepted: {err}"
+
+        pool.validator.db.add(b"\xAA" * 32, 0, 90_000)
+        pool.validator.db.add(b"\xAA" * 32, 1, 90_000)
+
+        # First child - add to mempool directly
+        child1 = _truc_tx(
+            0xBB,
+            inputs=[(b"\xAA" * 32, 0)],
+            outputs_values=[80_000],
+            version=3,
+        )
+        ok, err = pool.add_transaction(child1, height=100)
+        assert ok, f"First child should be accepted: {err}"
+
+        # Try to add second child as a single-tx "package"
+        child2 = _truc_tx(
+            0xCC,
+            inputs=[(b"\xAA" * 32, 1)],
+            outputs_values=[80_000],
+            version=3,
+        )
+
+        # This should fail because the v3 parent already has a child
+        ok, err = pool.validate_package([child2], height=100)
+        assert not ok, "Second child of v3 parent should be rejected"
+        assert "descendant" in err.lower()
+
+
+# ── Ephemeral Dust Policy Tests (Extended) ──────────────────────────────
+
+
+class TestEphemeralDustPolicy:
+    """Extended tests for ephemeral dust policy (Bitcoin Core ephemeral_policy.cpp).
+
+    Key requirements:
+    1. Transactions with dust must have 0 fee (parent is CPFP'd by child)
+    2. At most 1 dust output per transaction
+    3. Dust output must be P2A or standard type
+    4. All dust outputs must be spent by child in same package
+    5. If child is evicted, parent must be evicted too
+    """
+
+    # ── Test: Zero-fee requirement for dust parent ──────────────────
+
+    def test_ephemeral_dust_parent_must_be_zero_fee(self):
+        """Parent with dust output must have 0 fee (PreCheckEphemeralTx)."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # Parent with dust output AND non-zero fee — should be rejected
+        # Fee = 100k - 90k - 0 = 10k (non-zero)
+        parent = Transaction(
+            txid=b"\xAA" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=90_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),  # P2WPKH
+                TxOut(value=0, script_pubkey=b"\x00\x14" + b"\x00" * 20),  # dust
+            ],
+        )
+
+        # Child spends both outputs
+        child = Transaction(
+            txid=b"\xBB" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\xAA" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+                TxIn(
+                    prev_txid=b"\xAA" * 32,
+                    prev_vout=1,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=80_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+            ],
+        )
+
+        ok, err = pool.validate_package([parent, child], height=100)
+        assert not ok, "Parent with dust and non-zero fee should be rejected"
+        assert "0-fee" in err.lower() or "zero" in err.lower()
+
+    def test_ephemeral_dust_parent_zero_fee_accepted(self):
+        """Parent with dust output and exactly 0 fee should be accepted in package."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # Parent with dust output and 0 fee
+        # Total outputs = 100k (equal to input), fee = 0
+        parent = Transaction(
+            txid=b"\xAA" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=100_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),  # P2WPKH
+                TxOut(value=0, script_pubkey=b"\x00\x14" + b"\x00" * 20),  # dust
+            ],
+        )
+
+        # Child spends both outputs and pays the fee
+        child = Transaction(
+            txid=b"\xBB" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\xAA" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+                TxIn(
+                    prev_txid=b"\xAA" * 32,
+                    prev_vout=1,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=90_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+            ],
+        )
+
+        ok, err = pool.validate_package([parent, child], height=100)
+        assert ok, f"Zero-fee parent with dust should be accepted: {err}"
+
+    # ── Test: At most 1 dust output per transaction ──────────────────
+
+    def test_ephemeral_dust_max_one_output(self):
+        """Transaction cannot have more than 1 dust output."""
+        from ouroboros.mempool import _check_ephemeral_dust, MAX_DUST_OUTPUTS_PER_TX
+
+        assert MAX_DUST_OUTPUTS_PER_TX == 1
+
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # Parent with TWO dust outputs — should be rejected
+        parent = Transaction(
+            txid=b"\xAA" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=100_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+                TxOut(value=0, script_pubkey=b"\x00\x14" + b"\x00" * 20),  # dust 1
+                TxOut(value=0, script_pubkey=b"\x00\x14" + b"\x00" * 20),  # dust 2
+            ],
+        )
+
+        # Child spends all outputs
+        child = Transaction(
+            txid=b"\xBB" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(prev_txid=b"\xAA" * 32, prev_vout=0, script_sig=b"\x00" * 72, sequence=0xFFFFFFFD),
+                TxIn(prev_txid=b"\xAA" * 32, prev_vout=1, script_sig=b"\x00" * 72, sequence=0xFFFFFFFD),
+                TxIn(prev_txid=b"\xAA" * 32, prev_vout=2, script_sig=b"\x00" * 72, sequence=0xFFFFFFFD),
+            ],
+            outputs=[
+                TxOut(value=90_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+            ],
+        )
+
+        ok, err = pool.validate_package([parent, child], height=100)
+        assert not ok, "Parent with 2 dust outputs should be rejected"
+        assert "at most 1" in err.lower() or "has 2" in err
+
+    # ── Test: Child eviction triggers parent eviction ────────────────
+
+    def test_ephemeral_parent_evicted_when_child_evicted(self):
+        """When child spending ephemeral dust is evicted, parent must be evicted too."""
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        removed_txs = []
+
+        def on_removed(txid, reason):
+            removed_txs.append((txid, reason))
+
+        pool = Mempool(
+            validator=_StubValidator(utxos),
+            require_standard=False,
+            on_tx_removed=on_removed,
+        )
+
+        # Zero-fee parent with dust
+        parent = Transaction(
+            txid=b"\xAA" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=100_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+                TxOut(value=0, script_pubkey=b"\x00\x14" + b"\x00" * 20),  # dust
+            ],
+        )
+
+        # Child spends both outputs
+        child = Transaction(
+            txid=b"\xBB" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(prev_txid=b"\xAA" * 32, prev_vout=0, script_sig=b"\x00" * 72, sequence=0xFFFFFFFD),
+                TxIn(prev_txid=b"\xAA" * 32, prev_vout=1, script_sig=b"\x00" * 72, sequence=0xFFFFFFFD),
+            ],
+            outputs=[
+                TxOut(value=90_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+            ],
+        )
+
+        ok, err = pool.validate_package([parent, child], height=100)
+        assert ok, f"Package should be accepted: {err}"
+
+        # Both should be in mempool
+        assert b"\xAA" * 32 in pool.transactions
+        assert b"\xBB" * 32 in pool.transactions
+
+        # Verify parent has ephemeral_child tracking set
+        parent_entry = pool.transactions[b"\xAA" * 32]
+        assert parent_entry.has_ephemeral_dust
+        assert parent_entry.ephemeral_child == b"\xBB" * 32
+
+        # Now evict the child
+        pool.remove_transaction(b"\xBB" * 32, _reason="test-eviction")
+
+        # Both should be evicted
+        assert b"\xBB" * 32 not in pool.transactions
+        assert b"\xAA" * 32 not in pool.transactions
+
+        # Check callbacks
+        child_removed = any(txid == b"\xBB" * 32 for txid, _ in removed_txs)
+        parent_removed = any(
+            txid == b"\xAA" * 32 and "ephemeral" in reason
+            for txid, reason in removed_txs
+        )
+        assert child_removed, "Child should have been removed"
+        assert parent_removed, "Parent should have been removed due to ephemeral dust policy"
+
+    # ── Test: P2A dust output is acceptable ──────────────────────────
+
+    def test_ephemeral_p2a_dust_accepted(self):
+        """P2A (Pay-to-Anchor) zero-value output is acceptable as ephemeral dust."""
+        from ouroboros.mempool import P2A_SCRIPT, is_pay_to_anchor
+
+        assert is_pay_to_anchor(P2A_SCRIPT)
+
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # Parent with P2A dust output (value=0, P2A script)
+        parent = Transaction(
+            txid=b"\xAA" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=100_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+                TxOut(value=0, script_pubkey=P2A_SCRIPT),  # P2A anchor
+            ],
+        )
+
+        # Child spends both outputs
+        child = Transaction(
+            txid=b"\xBB" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(prev_txid=b"\xAA" * 32, prev_vout=0, script_sig=b"\x00" * 72, sequence=0xFFFFFFFD),
+                TxIn(prev_txid=b"\xAA" * 32, prev_vout=1, script_sig=b"\x00" * 72, sequence=0xFFFFFFFD),
+            ],
+            outputs=[
+                TxOut(value=90_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+            ],
+        )
+
+        ok, err = pool.validate_package([parent, child], height=100)
+        # P2A is exempt from dust threshold, so the parent doesn't "have dust"
+        # from the perspective of _has_ephemeral_dust(), which short-circuits for P2A.
+        # This means the 0-fee check doesn't apply to P2A. The package should succeed.
+        assert ok, f"P2A dust in package should be accepted: {err}"
+
+    # ── Test: Non-standard dust type is rejected ─────────────────────
+
+    def test_ephemeral_nonstandard_dust_rejected(self):
+        """Dust output that is not P2A or standard type should be rejected."""
+        from ouroboros.mempool import _is_standard_output_type
+
+        # A clearly non-standard script (random bytes)
+        nonstandard_script = b"\x00\x00\xFF\xFF\xAB\xCD"
+        assert not _is_standard_output_type(nonstandard_script)
+
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        # Parent with non-standard dust output
+        parent = Transaction(
+            txid=b"\xAA" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=100_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+                TxOut(value=0, script_pubkey=nonstandard_script),  # non-standard dust
+            ],
+        )
+
+        # Child spends both
+        child = Transaction(
+            txid=b"\xBB" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(prev_txid=b"\xAA" * 32, prev_vout=0, script_sig=b"\x00" * 72, sequence=0xFFFFFFFD),
+                TxIn(prev_txid=b"\xAA" * 32, prev_vout=1, script_sig=b"\x00" * 72, sequence=0xFFFFFFFD),
+            ],
+            outputs=[
+                TxOut(value=90_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+            ],
+        )
+
+        ok, err = pool.validate_package([parent, child], height=100)
+        assert not ok, "Non-standard dust type should be rejected"
+        assert "standard" in err.lower()
+
+    # ── Test: Multiple standard dust types work ──────────────────────
+
+    def test_ephemeral_standard_dust_types(self):
+        """Standard output types (P2PKH, P2SH, P2WPKH, P2WSH, P2TR) work as dust."""
+        from ouroboros.mempool import _is_standard_output_type
+
+        # P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+        p2pkh = b"\x76\xa9\x14" + b"\x00" * 20 + b"\x88\xac"
+        assert _is_standard_output_type(p2pkh)
+
+        # P2SH: OP_HASH160 <20> OP_EQUAL
+        p2sh = b"\xa9\x14" + b"\x00" * 20 + b"\x87"
+        assert _is_standard_output_type(p2sh)
+
+        # P2WPKH: OP_0 <20>
+        p2wpkh = b"\x00\x14" + b"\x00" * 20
+        assert _is_standard_output_type(p2wpkh)
+
+        # P2WSH: OP_0 <32>
+        p2wsh = b"\x00\x20" + b"\x00" * 32
+        assert _is_standard_output_type(p2wsh)
+
+        # P2TR: OP_1 <32>
+        p2tr = b"\x51\x20" + b"\x00" * 32
+        assert _is_standard_output_type(p2tr)
+
+        # Test with P2TR dust in a package
+        utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
+        pool = _truc_pool(utxos)
+
+        parent = Transaction(
+            txid=b"\xAA" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=b"\x00" * 32,
+                    prev_vout=0,
+                    script_sig=b"\x00" * 72,
+                    sequence=0xFFFFFFFD,
+                ),
+            ],
+            outputs=[
+                TxOut(value=100_000, script_pubkey=p2wpkh),
+                TxOut(value=0, script_pubkey=p2tr),  # P2TR dust
+            ],
+        )
+
+        child = Transaction(
+            txid=b"\xBB" * 32,
+            version=3,
+            locktime=0,
+            inputs=[
+                TxIn(prev_txid=b"\xAA" * 32, prev_vout=0, script_sig=b"\x00" * 72, sequence=0xFFFFFFFD),
+                TxIn(prev_txid=b"\xAA" * 32, prev_vout=1, script_sig=b"\x00" * 72, sequence=0xFFFFFFFD),
+            ],
+            outputs=[
+                TxOut(value=90_000, script_pubkey=p2wpkh),
+            ],
+        )
+
+        ok, err = pool.validate_package([parent, child], height=100)
+        assert ok, f"P2TR dust should be accepted: {err}"

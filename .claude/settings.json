@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rebar3 compile)",
+      "Bash(pkill -9 -f \"beam.smp\")",
+      "Bash(pgrep -f \"beam.smp\")",
+      "WebFetch(domain:mempool.space)",
+      "Bash(kill -9 2024237)",
+      "Bash(kill -9 2024667)",
+      "Bash(killall -9 beam.smp epmd)",
+      "Bash(kill -9 2025082)",
+      "Bash(pgrep -f \"beam\")",
+      "Read(//home/max/.beamchain/**)",
+      "Read(//home/max/**)",
+      "Bash(BEAMCHAIN_NETWORK=testnet4 erl -pa _build/default/lib/*/ebin -eval 'application:ensure_all_started\\(beamchain\\).' -noshell)",
+      "Bash(pkill -f \"beam.smp\")",
+      "Bash(pkill -9 -f \"beam.smp.*beamchain\")",
+      "Bash(ls /tmp/beamchain_sync1*.log)",
+      "Bash(pkill -f \"BEAMCHAIN_NETWORK=testnet4\")",
+      "Bash(pkill -f beamchain)",
+      "Bash(pgrep -f beamchain)",
+      "Bash(ls /home/max/.beamchain/testnet4/chaindata/*.sst)",
+      "Bash(erl -pa _build/default/lib/*/ebin -noshell -eval ':*)",
+      "Bash(BEAMCHAIN_NETWORK=testnet4 erl -pa _build/default/lib/*/ebin -kernel logger_level info -kernel logger '[{handler,default,logger_std_h,#{config => #{file => \"\"/tmp/beamchain_sync17.log\"\"}}}]' -eval 'application:ensure_all_started\\(beamchain\\), timer:sleep\\(infinity\\).' -noshell)",
+      "Read(//home/max/hashhog/ouroboros/**)",
+      "Bash(tr -d '\\(\\)')"
+    ],
+    "additionalDirectories": [
+      "/home/max/hashhog/beamchain/src",
+      "/home/max/.beamchain/testnet4",
+      "/home/max/.beamchain/testnet4/chaindata",
+      "/home/max/.beamchain/chaindata"
+    ]
+  }
+}

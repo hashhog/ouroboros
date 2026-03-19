@@ -10,6 +10,10 @@ use thiserror::Error;
 use crate::storage::{BlockchainDB, DbError};
 use common::TransactionWrapper;
 
+/// Coinbase transaction outputs can only be spent after this number of new blocks.
+/// Reference: Bitcoin Core consensus/consensus.h
+pub const COINBASE_MATURITY: u32 = 100;
+
 /// Transaction validation error types
 #[derive(Error, Debug)]
 pub enum TransactionValidationError {
@@ -60,6 +64,9 @@ pub enum TransactionValidationError {
 
     #[error("Transaction is not final")]
     NotFinal,
+
+    #[error("Premature spend of coinbase at depth {depth}")]
+    PrematureCoinbaseSpend { depth: i64 },
 }
 
 /// Result type for transaction validation
@@ -183,6 +190,30 @@ impl TransactionValidator {
     ///
     /// Returns the total input amount in satoshis.
     pub fn validate_transaction_inputs(&self, tx: &Transaction) -> Result<u64> {
+        // Call the height-aware version with height=0 to skip coinbase maturity check.
+        // This maintains backward compatibility with existing callers.
+        self.validate_transaction_inputs_at_height(tx, 0)
+    }
+
+    /// Validate transaction inputs at a specific spending height.
+    ///
+    /// Checks all inputs exist in UTXO set, verifies no double spends,
+    /// verifies all signatures, and enforces coinbase maturity.
+    ///
+    /// # Arguments
+    /// * `tx` - The transaction to validate
+    /// * `spending_height` - The height of the block where this tx will be included.
+    ///                       If 0, coinbase maturity check is skipped.
+    ///
+    /// # Returns
+    /// The total input amount in satoshis.
+    ///
+    /// # Errors
+    /// Returns `PrematureCoinbaseSpend` if any input spends a coinbase output
+    /// that has fewer than COINBASE_MATURITY (100) confirmations.
+    ///
+    /// Reference: Bitcoin Core consensus/tx_verify.cpp CheckTxInputs()
+    pub fn validate_transaction_inputs_at_height(&self, tx: &Transaction, spending_height: u32) -> Result<u64> {
         let mut total_input = 0u64;
         let mut seen_outpoints = HashSet::new();
 
@@ -201,6 +232,18 @@ impl TransactionValidator {
                         format!("{}:{}", outpoint.txid, outpoint.vout)
                     )
                 })?;
+
+            // Coinbase maturity check:
+            // If the UTXO is from a coinbase transaction, it cannot be spent until
+            // it has at least COINBASE_MATURITY (100) confirmations.
+            // Reference: Bitcoin Core consensus/tx_verify.cpp line 179
+            if spending_height > 0 && utxo.is_coinbase {
+                let utxo_height = utxo.height.unwrap_or(0);
+                let depth = spending_height as i64 - utxo_height as i64;
+                if depth < COINBASE_MATURITY as i64 {
+                    return Err(TransactionValidationError::PrematureCoinbaseSpend { depth });
+                }
+            }
 
             // Check if UTXO is already spent (double spend check)
             // This is simplified - in production, we'd track spending in the current block
@@ -346,11 +389,13 @@ impl TransactionValidator {
         }
     }
 
-    /// Get signature operation count
+    /// Get signature operation count (legacy method, no witness discount)
     ///
     /// Counts the number of signature operations in the transaction.
     /// This is a simplified version - full implementation would count
     /// OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY.
+    ///
+    /// **Deprecated**: Use `get_sigop_cost()` instead for proper BIP141 witness discount.
     pub fn get_sigop_count(&self, tx: &Transaction) -> usize {
         let mut count = 0;
 
@@ -366,6 +411,57 @@ impl TransactionValidator {
         }
 
         count
+    }
+
+    /// Get signature operation cost with BIP141 witness discount.
+    ///
+    /// Implements proper sigop cost calculation:
+    /// - Legacy sigops cost WITNESS_SCALE_FACTOR (4) weight units each
+    /// - P2SH redeem script sigops cost WITNESS_SCALE_FACTOR (4) weight units each
+    /// - Witness sigops cost 1 weight unit each (discounted)
+    ///
+    /// This matches Bitcoin Core's `GetTransactionSigOpCost()`.
+    ///
+    /// # Arguments
+    /// * `tx` - The transaction to count sigops for
+    /// * `verify_p2sh` - Whether to count P2SH redeem script sigops
+    /// * `verify_witness` - Whether to count witness script sigops
+    pub fn get_sigop_cost(&self, tx: &Transaction, verify_p2sh: bool, verify_witness: bool) -> i64 {
+        super::sigop::get_transaction_sigop_cost(tx, &self.db, verify_p2sh, verify_witness)
+    }
+}
+
+/// Check if spending a coinbase output is allowed at the given height.
+///
+/// Coinbase outputs require COINBASE_MATURITY (100) confirmations before
+/// they can be spent. This function returns true if the maturity requirement
+/// is satisfied.
+///
+/// # Arguments
+/// * `is_coinbase` - Whether the UTXO being spent is from a coinbase transaction
+/// * `utxo_height` - The height at which the UTXO was created
+/// * `spending_height` - The height of the block where the spending tx will be included
+///
+/// # Returns
+/// * `Ok(())` if the coinbase maturity requirement is satisfied
+/// * `Err((depth, required))` if the coinbase is not mature enough, with the current
+///   depth and required depth
+///
+/// Reference: Bitcoin Core consensus/tx_verify.cpp line 179
+pub fn check_coinbase_maturity(
+    is_coinbase: bool,
+    utxo_height: u32,
+    spending_height: u32,
+) -> std::result::Result<(), (i64, u32)> {
+    if !is_coinbase {
+        return Ok(());
+    }
+
+    let depth = spending_height as i64 - utxo_height as i64;
+    if depth < COINBASE_MATURITY as i64 {
+        Err((depth, COINBASE_MATURITY))
+    } else {
+        Ok(())
     }
 }
 
@@ -588,6 +684,71 @@ mod tests {
         };
 
         assert_eq!(validator.get_sigop_count(&tx), 1);
+    }
+
+    #[test]
+    fn test_coinbase_maturity_constant() {
+        // Verify COINBASE_MATURITY matches Bitcoin Core
+        assert_eq!(COINBASE_MATURITY, 100);
+    }
+
+    #[test]
+    fn test_check_coinbase_maturity_non_coinbase() {
+        // Non-coinbase UTXOs should always pass
+        assert!(check_coinbase_maturity(false, 0, 1).is_ok());
+        assert!(check_coinbase_maturity(false, 100, 100).is_ok());
+        assert!(check_coinbase_maturity(false, 200, 100).is_ok());
+    }
+
+    #[test]
+    fn test_check_coinbase_maturity_immature() {
+        // Coinbase at height 100, spending at height 150 (depth = 50)
+        let result = check_coinbase_maturity(true, 100, 150);
+        assert!(result.is_err());
+        let (depth, required) = result.unwrap_err();
+        assert_eq!(depth, 50);
+        assert_eq!(required, 100);
+
+        // Coinbase at height 100, spending at height 199 (depth = 99)
+        let result = check_coinbase_maturity(true, 100, 199);
+        assert!(result.is_err());
+        let (depth, _) = result.unwrap_err();
+        assert_eq!(depth, 99);
+
+        // Coinbase at height 100, spending at height 101 (depth = 1)
+        let result = check_coinbase_maturity(true, 100, 101);
+        assert!(result.is_err());
+        let (depth, _) = result.unwrap_err();
+        assert_eq!(depth, 1);
+    }
+
+    #[test]
+    fn test_check_coinbase_maturity_mature() {
+        // Coinbase at height 100, spending at height 200 (depth = 100) - exactly at maturity
+        assert!(check_coinbase_maturity(true, 100, 200).is_ok());
+
+        // Coinbase at height 100, spending at height 201 (depth = 101) - beyond maturity
+        assert!(check_coinbase_maturity(true, 100, 201).is_ok());
+
+        // Coinbase at height 0, spending at height 100 (depth = 100)
+        assert!(check_coinbase_maturity(true, 0, 100).is_ok());
+
+        // Coinbase at height 0, spending at height 1000 (depth = 1000)
+        assert!(check_coinbase_maturity(true, 0, 1000).is_ok());
+    }
+
+    #[test]
+    fn test_check_coinbase_maturity_edge_cases() {
+        // Spending at same height as coinbase (depth = 0)
+        let result = check_coinbase_maturity(true, 100, 100);
+        assert!(result.is_err());
+        let (depth, _) = result.unwrap_err();
+        assert_eq!(depth, 0);
+
+        // Very large heights
+        assert!(check_coinbase_maturity(true, 800000, 800100).is_ok());
+        let result = check_coinbase_maturity(true, 800000, 800099);
+        assert!(result.is_err());
     }
 }
 

@@ -92,32 +92,98 @@ SECP256K1_ORDER_HALF = (
 )
 
 
-def get_flags_for_height(height: int, block_hash: bytes | None = None) -> int:
-    """Script verification flags for *height*; checks historical exceptions when *block_hash* is given."""
+def get_flags_for_height(
+    height: int,
+    block_hash: bytes | None = None,
+    network: str = "mainnet",
+) -> int:
+    """
+    Script verification flags for *height*; checks historical exceptions when *block_hash* is given.
+
+    This function returns the appropriate script verification flags based on
+    which soft forks are active at the given height. It uses the consensus
+    module to check buried deployment activation heights per network.
+
+    Args:
+        height: Block height
+        block_hash: Optional block hash to check for historical exceptions
+        network: Network name (mainnet, testnet, testnet4, regtest, signet)
+
+    Returns:
+        Combined script verification flags
+    """
     # Check for historical exception blocks first
     if block_hash is not None and block_hash in _SCRIPT_FLAG_EXCEPTIONS:
         return _SCRIPT_FLAG_EXCEPTIONS[block_hash]
 
+    # Import consensus module for deployment checks
+    try:
+        from ouroboros.consensus import is_buried_deployment_active, is_deployment_active
+        use_consensus = True
+    except ImportError:
+        use_consensus = False
+
     flags = SCRIPT_VERIFY_NONE
-    if height >= BIP16_ACTIVATION_HEIGHT:
-        flags |= SCRIPT_VERIFY_P2SH
-    if height >= BIP66_ACTIVATION_HEIGHT:
-        flags |= SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S
-    if height >= BIP65_ACTIVATION_HEIGHT:
-        flags |= SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
-    if height >= BIP68_ACTIVATION_HEIGHT:
-        flags |= SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
-    if height >= SEGWIT_ACTIVATION_HEIGHT:
-        flags |= (SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_NULLDUMMY
-                   | SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_CLEANSTACK
-                   | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
-                   | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
-                   | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS
-                   | SCRIPT_VERIFY_CONST_SCRIPTCODE)
-    if height >= TAPROOT_ACTIVATION_HEIGHT:
-        flags |= (SCRIPT_VERIFY_TAPROOT
-                   | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
-                   | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
+
+    if use_consensus:
+        # Use consensus module for network-aware deployment checks
+        # P2SH (BIP16) - not a buried deployment but always active
+        # (activated via ISM, hardcoded to height 173805 on mainnet)
+        if network.lower() in ("regtest", "testnet4", "signet"):
+            # Active from genesis on these networks
+            flags |= SCRIPT_VERIFY_P2SH
+        elif height >= BIP16_ACTIVATION_HEIGHT:
+            flags |= SCRIPT_VERIFY_P2SH
+
+        # BIP66 - strict DER signatures
+        if is_buried_deployment_active("bip66", height, network):
+            flags |= SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S
+
+        # BIP65 - CHECKLOCKTIMEVERIFY
+        if is_buried_deployment_active("bip65", height, network):
+            flags |= SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
+
+        # CSV (BIP68/112/113) - CHECKSEQUENCEVERIFY
+        if is_buried_deployment_active("csv", height, network):
+            flags |= SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
+
+        # SegWit (BIP141/143/147)
+        if is_buried_deployment_active("segwit", height, network):
+            flags |= (SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_NULLDUMMY
+                       | SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_CLEANSTACK
+                       | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
+                       | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
+                       | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS
+                       | SCRIPT_VERIFY_CONST_SCRIPTCODE)
+
+        # Taproot (BIP340/341/342)
+        if is_deployment_active("taproot", height, network):
+            flags |= (SCRIPT_VERIFY_TAPROOT
+                       | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
+                       | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
+
+    else:
+        # Fallback to hardcoded mainnet heights
+        if height >= BIP16_ACTIVATION_HEIGHT:
+            flags |= SCRIPT_VERIFY_P2SH
+        if height >= BIP66_ACTIVATION_HEIGHT:
+            flags |= SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S
+        if height >= BIP65_ACTIVATION_HEIGHT:
+            flags |= SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
+        if height >= BIP68_ACTIVATION_HEIGHT:
+            flags |= SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
+        if height >= SEGWIT_ACTIVATION_HEIGHT:
+            flags |= (SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_NULLDUMMY
+                       | SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_CLEANSTACK
+                       | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
+                       | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
+                       | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS
+                       | SCRIPT_VERIFY_CONST_SCRIPTCODE)
+        if height >= TAPROOT_ACTIVATION_HEIGHT:
+            flags |= (SCRIPT_VERIFY_TAPROOT
+                       | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
+                       | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
+
     return flags
 
 
@@ -1398,11 +1464,49 @@ class ScriptInterpreter:
         sighash_type: int
     ) -> bytes:
         """Calculate Bitcoin legacy SignatureHash for ECDSA verification."""
+        # Strip OP_CODESEPARATOR (0xab) from script_code (FindAndDelete)
+        # Must be opcode-aware: only remove standalone 0xab, not data push content
+        cleaned = bytearray()
+        pos = 0
+        while pos < len(script_code):
+            op = script_code[pos]
+            if op == 0xab:  # OP_CODESEPARATOR - skip it
+                pos += 1
+                continue
+            if op <= 0x4e:  # Data push opcodes
+                if op == 0:
+                    cleaned.append(op); pos += 1
+                elif op <= 75:
+                    length = op
+                    cleaned.extend(script_code[pos:pos + 1 + length])
+                    pos += 1 + length
+                elif op == 0x4c:  # OP_PUSHDATA1
+                    if pos + 1 < len(script_code):
+                        length = script_code[pos + 1]
+                        cleaned.extend(script_code[pos:pos + 2 + length])
+                        pos += 2 + length
+                    else:
+                        cleaned.append(op); pos += 1
+                elif op == 0x4d:  # OP_PUSHDATA2
+                    if pos + 2 < len(script_code):
+                        length = int.from_bytes(script_code[pos+1:pos+3], 'little')
+                        cleaned.extend(script_code[pos:pos + 3 + length])
+                        pos += 3 + length
+                    else:
+                        cleaned.append(op); pos += 1
+                elif op == 0x4e:  # OP_PUSHDATA4
+                    if pos + 4 < len(script_code):
+                        length = int.from_bytes(script_code[pos+1:pos+5], 'little')
+                        cleaned.extend(script_code[pos:pos + 5 + length])
+                        pos += 5 + length
+                    else:
+                        cleaned.append(op); pos += 1
+            else:
+                cleaned.append(op); pos += 1
+        script_code = bytes(cleaned)
+
         base_type = sighash_type & 0x1f
         anyone_can_pay = (sighash_type & 0x80) != 0
-
-        if base_type not in (0x01, 0, 0x02, 0x03):
-            base_type = 0x01
 
         data = bytearray()
         data.extend(transaction.version.to_bytes(4, 'little'))
@@ -1426,29 +1530,30 @@ class ScriptInterpreter:
             seq = 0 if base_type in (0x02, 0x03) and i != input_index else tx_in.sequence
             data.extend(seq.to_bytes(4, 'little'))
 
-        if base_type == 0x01 or base_type == 0:  # SIGHASH_ALL
-            data.extend(self._encode_varint(len(transaction.outputs)))
-            for tx_out in transaction.outputs:
-                data.extend(tx_out.value.to_bytes(8, 'little'))
-                data.extend(self._encode_varint(len(tx_out.script_pubkey)))
-                data.extend(tx_out.script_pubkey)
-        elif base_type == 0x02:  # SIGHASH_NONE
+        if base_type == 0x02:  # SIGHASH_NONE
             data.extend(b'\x00')  # Zero outputs
         elif base_type == 0x03:  # SIGHASH_SINGLE
             if input_index >= len(transaction.outputs):
-                return bytes(32)
+                return b'\x01' + b'\x00' * 31
             data.extend(self._encode_varint(input_index + 1))
-            for j, tx_out in enumerate(transaction.outputs):
+            for j in range(input_index + 1):
                 if j == input_index:
+                    tx_out = transaction.outputs[j]
                     data.extend(tx_out.value.to_bytes(8, 'little'))
                     data.extend(self._encode_varint(len(tx_out.script_pubkey)))
                     data.extend(tx_out.script_pubkey)
                 else:
                     data.extend((-1).to_bytes(8, 'little', signed=True))
                     data.extend(b'\x00')
+        else:  # SIGHASH_ALL (0x01) or any unknown type — default behavior
+            data.extend(self._encode_varint(len(transaction.outputs)))
+            for tx_out in transaction.outputs:
+                data.extend(tx_out.value.to_bytes(8, 'little'))
+                data.extend(self._encode_varint(len(tx_out.script_pubkey)))
+                data.extend(tx_out.script_pubkey)
 
         data.extend(transaction.locktime.to_bytes(4, 'little'))
-        data.extend(sighash_type.to_bytes(4, 'little'))
+        data.extend((sighash_type & 0xFFFFFFFF).to_bytes(4, 'little'))
 
         return hashlib.sha256(hashlib.sha256(bytes(data)).digest()).digest()
     

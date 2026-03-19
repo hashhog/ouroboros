@@ -1,0 +1,45 @@
+# Bitcoin Node Configuration File
+# Copy this file to ~/.ouroboros/ouroboros.conf and modify as needed
+
+[network]
+# Network: mainnet, testnet, or regtest
+network=mainnet
+
+[datadir]
+# Data directory (default: ~/.ouroboros)
+# Use absolute path or path relative to home directory
+datadir=~/.ouroboros
+
+[rpc]
+# RPC server port (default: 8332)
+rpcport=8332
+
+# RPC username (optional, for authentication)
+#rpcuser=myuser
+
+# RPC password (optional, for authentication)
+#rpcpassword=mypassword
+
+# Allowed RPC IPs (comma-separated, default: 127.0.0.1)
+# Use 0.0.0.0/0 to allow all IPs (not recommended)
+rpcallowip=127.0.0.1
+
+# RPC bind address (default: 127.0.0.1)
+# Use 0.0.0.0 to bind to all interfaces
+rpcbind=127.0.0.1
+
+[p2p]
+# P2P network port (default: 8333)
+p2pport=8333
+
+# Maximum connections (default: 125)
+maxconnections=125
+
+[logging]
+# Debug level (0-4, default: 0)
+# 0 = Error, 1 = Warning, 2 = Info, 3 = Debug, 4 = Trace
+debug=0
+
+# Log timestamps (default: 1)
+# 1 = enabled, 0 = disabled
+logtimestamps=1
