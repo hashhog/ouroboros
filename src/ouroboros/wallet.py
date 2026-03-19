@@ -23,7 +23,7 @@ import random
 import struct
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import base58
 import bech32
@@ -366,6 +366,190 @@ def select_coins(
     return best[0], best[1], best[2]
 
 
+class KeyPool:
+    """
+    BIP32/BIP84 HD key pool with pre-generated keys for receive and change paths.
+
+    Maintains separate pools for:
+      - Receive (external): m/84'/coin'/0'/0/index
+      - Change (internal):  m/84'/coin'/0'/1/index
+
+    Pre-generates keys (default 1000) and auto-refills when pool drops below threshold.
+
+    Reference: Bitcoin Core wallet/scriptpubkeyman.cpp TopUp(), GetNewDestination()
+    """
+
+    DEFAULT_POOL_SIZE = 1000
+    REFILL_THRESHOLD = 100
+
+    def __init__(
+        self,
+        seed: bytes,
+        network: str = "mainnet",
+        pool_size: int = DEFAULT_POOL_SIZE,
+    ):
+        self.seed = seed
+        self.network = network
+        self.pool_size = pool_size
+
+        # BIP84 coin type: 0 for mainnet, 1 for testnet/regtest
+        self.coin_type = 0 if network == "mainnet" else 1
+
+        # Key pools: list of (index, WalletKey) tuples
+        self._receive_pool: List[Tuple[int, "WalletKey"]] = []
+        self._change_pool: List[Tuple[int, "WalletKey"]] = []
+
+        # Indices for next key derivation
+        self._next_receive_index: int = 0
+        self._next_change_index: int = 0
+
+        # Track used indices for address lookup
+        self._used_receive_indices: set = set()
+        self._used_change_indices: set = set()
+
+        # Master key derived once
+        self._master: Optional["HDKey"] = None
+
+    @property
+    def master(self) -> "HDKey":
+        """Lazily derive the master key."""
+        if self._master is None:
+            self._master = HDKey.from_seed(self.seed, self.network)
+        return self._master
+
+    def _derive_key_at_path(self, is_change: bool, index: int) -> "WalletKey":
+        """Derive a key at the BIP84 path: m/84'/coin'/0'/change/index."""
+        change_flag = 1 if is_change else 0
+        path = f"m/84'/{self.coin_type}'/0'/{change_flag}/{index}"
+        hd_key = self.master.derive_path(path)
+        return hd_key.to_wallet_key()
+
+    def _refill_pool(self, is_change: bool) -> None:
+        """Pre-generate keys to fill the pool up to pool_size."""
+        pool = self._change_pool if is_change else self._receive_pool
+        next_idx = self._next_change_index if is_change else self._next_receive_index
+        used_indices = self._used_change_indices if is_change else self._used_receive_indices
+
+        # Calculate how many keys to generate
+        current_unused = len([k for k in pool if k[0] not in used_indices])
+        needed = self.pool_size - current_unused
+
+        for _ in range(max(0, needed)):
+            key = self._derive_key_at_path(is_change, next_idx)
+            pool.append((next_idx, key))
+            next_idx += 1
+
+        if is_change:
+            self._next_change_index = next_idx
+        else:
+            self._next_receive_index = next_idx
+
+    def get_new_address(
+        self,
+        is_change: bool = False,
+        address_type: str = "bech32",
+    ) -> Tuple[str, int]:
+        """
+        Get the next unused address from the pool.
+
+        Returns (address, index).
+        Refills pool if below threshold.
+        """
+        pool = self._change_pool if is_change else self._receive_pool
+        used_indices = self._used_change_indices if is_change else self._used_receive_indices
+
+        # Refill if needed
+        unused_count = len([k for k in pool if k[0] not in used_indices])
+        if unused_count < self.REFILL_THRESHOLD:
+            self._refill_pool(is_change)
+
+        # Find next unused key
+        for idx, key in pool:
+            if idx not in used_indices:
+                used_indices.add(idx)
+                if address_type == "p2sh-segwit":
+                    addr = key.get_p2sh_p2wpkh_address()
+                elif address_type == "bech32m":
+                    addr = key.get_p2tr_address()
+                elif address_type == "legacy":
+                    addr = key.get_p2pkh_address()
+                else:
+                    addr = key.get_p2wpkh_address()
+                return (addr, idx)
+
+        # Pool exhausted; generate one more
+        self._refill_pool(is_change)
+        return self.get_new_address(is_change, address_type)
+
+    def get_key_at_index(self, index: int, is_change: bool = False) -> "WalletKey":
+        """Get or derive the key at a specific index."""
+        pool = self._change_pool if is_change else self._receive_pool
+
+        # Check if already in pool
+        for idx, key in pool:
+            if idx == index:
+                return key
+
+        # Derive on demand
+        return self._derive_key_at_path(is_change, index)
+
+    def get_all_keys(self, include_change: bool = True) -> List["WalletKey"]:
+        """Return all keys in the pool (used for address scanning)."""
+        keys = [k for _, k in self._receive_pool]
+        if include_change:
+            keys.extend(k for _, k in self._change_pool)
+        return keys
+
+    def top_up(self) -> int:
+        """Ensure both pools are filled; returns total keys generated."""
+        before_receive = len(self._receive_pool)
+        before_change = len(self._change_pool)
+        self._refill_pool(False)
+        self._refill_pool(True)
+        return (len(self._receive_pool) - before_receive) + (len(self._change_pool) - before_change)
+
+    def to_dict(self) -> Dict:
+        """Serialize key pool state for persistence."""
+        return {
+            "seed_hex": self.seed.hex(),
+            "network": self.network,
+            "pool_size": self.pool_size,
+            "coin_type": self.coin_type,
+            "next_receive_index": self._next_receive_index,
+            "next_change_index": self._next_change_index,
+            "used_receive_indices": list(self._used_receive_indices),
+            "used_change_indices": list(self._used_change_indices),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "KeyPool":
+        """Deserialize key pool from persisted state."""
+        pool = cls(
+            seed=bytes.fromhex(data["seed_hex"]),
+            network=data.get("network", "mainnet"),
+            pool_size=data.get("pool_size", cls.DEFAULT_POOL_SIZE),
+        )
+        pool.coin_type = data.get("coin_type", pool.coin_type)
+        pool._next_receive_index = data.get("next_receive_index", 0)
+        pool._next_change_index = data.get("next_change_index", 0)
+        pool._used_receive_indices = set(data.get("used_receive_indices", []))
+        pool._used_change_indices = set(data.get("used_change_indices", []))
+        # Rebuild pools up to the next indices
+        pool._rebuild_pools()
+        return pool
+
+    def _rebuild_pools(self) -> None:
+        """Rebuild key pools from indices (called after deserialize)."""
+        self._receive_pool = []
+        self._change_pool = []
+        for i in range(self._next_receive_index):
+            key = self._derive_key_at_path(False, i)
+            self._receive_pool.append((i, key))
+        for i in range(self._next_change_index):
+            key = self._derive_key_at_path(True, i)
+            self._change_pool.append((i, key))
+
+
 class HDKey:
     """
     BIP 32 extended key (private).
@@ -630,11 +814,33 @@ class Wallet:
         data_dir: str,
         network: str = "mainnet",
         name: str = "default",
+        wallet_dir: Optional[str] = None,
     ):
+        """
+        Initialize a wallet.
+
+        Args:
+            data_dir: Base data directory for the node
+            network: Bitcoin network
+            name: Wallet name
+            wallet_dir: Optional explicit wallet directory path. If not provided,
+                        uses legacy single-file format at ``<datadir>/wallets/<name>.json``.
+                        For multi-wallet support, set to ``<datadir>/wallets/<name>/``
+                        and wallet will be stored at ``wallet.dat`` inside that directory.
+        """
         self.data_dir = Path(data_dir).expanduser()
         self.network = network
         self.name = name
-        self.wallet_path = self.data_dir / "wallets" / f"{name}.json"
+
+        # Wallet path: new directory format or legacy single-file
+        if wallet_dir is not None:
+            self.wallet_dir = Path(wallet_dir)
+            self.wallet_path = self.wallet_dir / "wallet.dat"
+        else:
+            # Legacy format for backwards compatibility
+            self.wallet_dir = None
+            self.wallet_path = self.data_dir / "wallets" / f"{name}.json"
+
         self.keys: List[Dict] = []
         self.descriptors: List = []  # List[DescriptorEntry]
         self.db = None  # set via set_database()
@@ -644,19 +850,41 @@ class Wallet:
         self._hd_base_path: str = self.HD_BASE_PATH
         self._passphrase: Optional[str] = None
         self._encrypted_blob: Optional[bytes] = None
+        self._key_pool: Optional[KeyPool] = None  # BIP84 key pool
+        self._disable_private_keys: bool = False  # watch-only mode
         self._load_or_create()
 
     # HD seed management #
 
-    def init_hd(self, seed: bytes, base_path: Optional[str] = None) -> str:
-        """Initialise the wallet in HD mode from a BIP 32 *seed*; returns the xprv of the master key."""
+    def init_hd(
+        self,
+        seed: bytes,
+        base_path: Optional[str] = None,
+        pool_size: int = KeyPool.DEFAULT_POOL_SIZE,
+    ) -> str:
+        """
+        Initialise the wallet in HD mode from a BIP 32 *seed*.
+
+        Creates a BIP84 key pool with pre-generated keys (default 1000).
+        Returns the xprv of the master key.
+
+        Reference: Bitcoin Core wallet/scriptpubkeyman.cpp SetupDescriptorGeneration()
+        """
         master = HDKey.from_seed(seed, self.network)
         self._hd_seed = seed
         self._hd_next_index = 0
         if base_path is not None:
             self._hd_base_path = base_path
+
+        # Initialize key pool with BIP84 paths
+        self._key_pool = KeyPool(seed, self.network, pool_size)
+        self._key_pool.top_up()
+
         self._save()
-        logger.info(f"Wallet '{self.name}' initialised in HD mode")
+        logger.info(
+            f"Wallet '{self.name}' initialised in HD mode with "
+            f"{pool_size} key pool size"
+        )
         return master.serialize_xprv()
 
     @property
@@ -697,13 +925,25 @@ class Wallet:
                 self._hd_seed = bytes.fromhex(hd["seed_hex"])
                 self._hd_next_index = hd.get("next_index", 0)
                 self._hd_base_path = hd.get("base_path", self.HD_BASE_PATH)
+            # Load key pool if present
+            key_pool_data = data.get("key_pool")
+            if key_pool_data:
+                self._key_pool = KeyPool.from_dict(key_pool_data)
+            elif self._hd_seed is not None:
+                # Create key pool from existing HD seed for backwards compatibility
+                self._key_pool = KeyPool(self._hd_seed, self.network)
+                self._key_pool.top_up()
+            # Load wallet flags
+            self._disable_private_keys = data.get("disable_private_keys", False)
             logger.info(
                 f"Loaded wallet '{self.name}' with {len(self.keys)} keys, "
                 f"{len(self.descriptors)} descriptors"
                 + (" (HD)" if self._hd_seed else "")
+                + (" (watch-only)" if self._disable_private_keys else "")
             )
         else:
             self._encrypted_blob = None
+            # Create parent directory (either wallet_dir or wallets/)
             self.wallet_path.parent.mkdir(parents=True, exist_ok=True)
             self._save()
             logger.info(f"Created new wallet '{self.name}'")
@@ -720,6 +960,10 @@ class Wallet:
                 "next_index": self._hd_next_index,
                 "base_path": self._hd_base_path,
             }
+        if self._key_pool is not None:
+            inner["key_pool"] = self._key_pool.to_dict()
+        if self._disable_private_keys:
+            inner["disable_private_keys"] = True
 
         if self._passphrase is not None:
             plaintext = json.dumps(inner).encode("utf-8")
@@ -777,6 +1021,13 @@ class Wallet:
             self._hd_seed = bytes.fromhex(hd["seed_hex"])
             self._hd_next_index = hd.get("next_index", 0)
             self._hd_base_path = hd.get("base_path", self.HD_BASE_PATH)
+        # Load key pool
+        key_pool_data = data.get("key_pool")
+        if key_pool_data:
+            self._key_pool = KeyPool.from_dict(key_pool_data)
+        elif self._hd_seed is not None:
+            self._key_pool = KeyPool(self._hd_seed, self.network)
+            self._key_pool.top_up()
         self._passphrase = passphrase
         self._encrypted_blob = None
         logger.info(f"Wallet '{self.name}' unlocked")
@@ -791,6 +1042,7 @@ class Wallet:
         self.descriptors = []
         self._hd_seed = None
         self._hd_next_index = 0
+        self._key_pool = None
         self._passphrase = None
         logger.info(f"Wallet '{self.name}' locked")
 
@@ -823,7 +1075,43 @@ class Wallet:
     def _get_wallet_key(self, key_data: Dict) -> WalletKey:
         return WalletKey.from_wif(key_data["wif"], self.network)
 
-    async def generate_new_address(self, label: str | None = None) -> str:
+    async def generate_new_address(
+        self,
+        label: str | None = None,
+        address_type: str = "bech32",
+    ) -> str:
+        """
+        Generate a new receiving address from the key pool.
+
+        Args:
+            label: Optional label for the address
+            address_type: One of "bech32" (P2WPKH), "p2sh-segwit" (P2SH-P2WPKH),
+                          "bech32m" (P2TR), or "legacy" (P2PKH)
+
+        Returns:
+            The new address string
+
+        Reference: Bitcoin Core wallet/scriptpubkeyman.cpp GetNewDestination()
+        """
+        # Use key pool if available (BIP84 HD wallet)
+        if self._key_pool is not None:
+            addr, index = self._key_pool.get_new_address(
+                is_change=False,
+                address_type=address_type,
+            )
+            # Also store in keys list for compatibility
+            key = self._key_pool.get_key_at_index(index, is_change=False)
+            self.keys.append({
+                "wif": key.to_wif(),
+                "label": label or "",
+                "created": int(time.time()),
+                "hd_path": f"m/84'/{self._key_pool.coin_type}'/0'/0/{index}",
+            })
+            self._save()
+            logger.info(f"Generated new address {addr} (pool index {index})")
+            return addr
+
+        # Legacy HD mode (backwards compatibility)
         if self._hd_seed is not None:
             path = f"{self._hd_base_path}/{self._hd_next_index}"
             hd = HDKey.from_seed(self._hd_seed, self.network).derive_path(path)
@@ -838,9 +1126,72 @@ class Wallet:
             "created": int(time.time()),
         })
         self._save()
-        addr = key.get_p2wpkh_address()
+
+        # Return address of requested type
+        if address_type == "p2sh-segwit":
+            addr = key.get_p2sh_p2wpkh_address()
+        elif address_type == "bech32m":
+            addr = key.get_p2tr_address()
+        elif address_type == "legacy":
+            addr = key.get_p2pkh_address()
+        else:
+            addr = key.get_p2wpkh_address()
+
         logger.info(f"Generated new address {addr}")
         return addr
+
+    async def get_change_address(self, address_type: str = "bech32") -> str:
+        """
+        Generate a new change (internal) address from the key pool.
+
+        Change addresses use the BIP84 internal path: m/84'/coin'/0'/1/index
+
+        Reference: Bitcoin Core wallet/scriptpubkeyman.cpp GetReservedDestination()
+        """
+        if self._key_pool is not None:
+            addr, index = self._key_pool.get_new_address(
+                is_change=True,
+                address_type=address_type,
+            )
+            logger.info(f"Generated change address {addr} (pool index {index})")
+            return addr
+
+        # Fallback: use regular address generation
+        return await self.generate_new_address(address_type=address_type)
+
+    def get_keypool_size(self) -> int:
+        """Return the number of unused keys in the pool."""
+        if self._key_pool is None:
+            return 0
+        receive_unused = len([
+            k for k in self._key_pool._receive_pool
+            if k[0] not in self._key_pool._used_receive_indices
+        ])
+        change_unused = len([
+            k for k in self._key_pool._change_pool
+            if k[0] not in self._key_pool._used_change_indices
+        ])
+        return receive_unused + change_unused
+
+    def keypoolrefill(self, new_size: int = KeyPool.DEFAULT_POOL_SIZE) -> int:
+        """
+        Refill the key pool to the specified size.
+
+        Returns the number of new keys generated.
+
+        Reference: Bitcoin Core RPC keypoolrefill
+        """
+        if self._key_pool is None:
+            if self._hd_seed is None:
+                raise ValueError("Wallet is not HD; cannot refill key pool")
+            # Create key pool from seed
+            self._key_pool = KeyPool(self._hd_seed, self.network, new_size)
+
+        self._key_pool.pool_size = new_size
+        generated = self._key_pool.top_up()
+        self._save()
+        logger.info(f"Key pool refilled with {generated} new keys")
+        return generated
 
     async def get_balance(self, address: str | None = None) -> int:
         if self.db is None:
@@ -1500,7 +1851,12 @@ class Wallet:
         amount: int,
         fee_rate: int | None = None,
     ) -> str:
-        """Build, sign, and return a raw transaction hex sending *amount* sats to *to_address* at *fee_rate* sat/vB."""
+        """Build, sign, and return a raw transaction hex sending *amount* sats to *to_address* at *fee_rate* sat/vB.
+
+        Anti-fee-sniping: Sets nLockTime to the current block height to
+        discourage miners from reorganizing old blocks to claim high-fee
+        transactions. Reference: Bitcoin Core wallet/spend.cpp DiscourageFeeSniping().
+        """
         from ouroboros.address import address_to_script_pubkey
         from ouroboros.database import Transaction, TxIn, TxOut
 
@@ -1520,7 +1876,20 @@ class Wallet:
             change_spk = change_key.get_script_pubkey()
             outputs.append(TxOut(value=change, script_pubkey=change_spk))
 
+        # Anti-fee-sniping: set nLockTime to current block height
+        # This makes the transaction invalid for older blocks, discouraging
+        # miners from fee-sniping by reorganizing to claim high-fee txs.
+        # Reference: Bitcoin Core wallet/spend.cpp DiscourageFeeSniping()
+        locktime = 0
+        if self.db is not None:
+            try:
+                _, current_height = self.db.get_best_block()
+                locktime = current_height
+            except Exception:
+                locktime = 0
+
         # Build unsigned inputs
+        # Use sequence 0xFFFFFFFD to signal RBF and enable locktime
         inputs: List[TxIn] = []
         for utxo in selected:
             txid_bytes = bytes.fromhex(utxo["txid"]) if isinstance(utxo["txid"], str) else utxo["txid"]
@@ -1528,13 +1897,13 @@ class Wallet:
                 prev_txid=txid_bytes,
                 prev_vout=utxo["vout"],
                 script_sig=b"",
-                sequence=0xFFFFFFFD,
+                sequence=0xFFFFFFFD,  # RBF signal + enables locktime
             ))
 
         tx = Transaction(
             txid=b"\x00" * 32,
             version=2,
-            locktime=0,
+            locktime=locktime,
             inputs=inputs,
             outputs=outputs,
             has_witness=True,
@@ -1567,3 +1936,378 @@ def _encode_varint(value: int) -> bytes:
         return b"\xfe" + value.to_bytes(4, "little")
     else:
         return b"\xff" + value.to_bytes(8, "little")
+
+
+class WalletManager:
+    """
+    Manages multiple wallets loaded simultaneously.
+
+    Each wallet is stored in its own directory under ``<datadir>/wallets/<name>/``.
+    Wallets can be dynamically created, loaded, and unloaded via RPC.
+
+    Reference: Bitcoin Core wallet/wallet.cpp (LoadWallet, CreateWallet, UnloadWallet)
+    """
+
+    def __init__(self, data_dir: str, network: str = "mainnet"):
+        """
+        Initialize the wallet manager.
+
+        Args:
+            data_dir: Base data directory for the node
+            network: Bitcoin network (mainnet, testnet, regtest, etc.)
+        """
+        self.data_dir = Path(data_dir).expanduser()
+        self.network = network
+        self.wallets_dir = self.data_dir / "wallets"
+        self.wallets_dir.mkdir(parents=True, exist_ok=True)
+
+        # Loaded wallets: name -> Wallet instance
+        self._wallets: Dict[str, Wallet] = {}
+
+        # Default wallet (first loaded wallet)
+        self._default_wallet_name: Optional[str] = None
+
+        # Database and mempool references (shared across wallets)
+        self._db = None
+        self._mempool = None
+
+        # Wallet load callbacks
+        self._load_callbacks: List = []
+
+        logger.info(f"WalletManager initialized at {self.wallets_dir}")
+
+    def set_database(self, db) -> None:
+        """Set the blockchain database for all wallets."""
+        self._db = db
+        for wallet in self._wallets.values():
+            wallet.set_database(db)
+
+    def set_mempool(self, mempool) -> None:
+        """Set the mempool for all wallets."""
+        self._mempool = mempool
+        for wallet in self._wallets.values():
+            wallet.set_mempool(mempool)
+
+    def _wallet_dir(self, name: str) -> Path:
+        """Get the directory path for a wallet."""
+        return self.wallets_dir / name
+
+    def _wallet_file(self, name: str) -> Path:
+        """Get the wallet.dat path for a wallet."""
+        return self._wallet_dir(name) / "wallet.dat"
+
+    def wallet_exists(self, name: str) -> bool:
+        """Check if a wallet exists on disk."""
+        return self._wallet_file(name).exists()
+
+    def is_loaded(self, name: str) -> bool:
+        """Check if a wallet is currently loaded."""
+        return name in self._wallets
+
+    def list_loaded_wallets(self) -> List[str]:
+        """Return list of loaded wallet names."""
+        return list(self._wallets.keys())
+
+    def list_wallet_dir(self) -> List[Dict[str, str]]:
+        """
+        List all wallets in the wallet directory (loaded or not).
+
+        Returns list of dicts with 'name' key.
+        Reference: Bitcoin Core listwalletdir RPC
+        """
+        result = []
+        if not self.wallets_dir.exists():
+            return result
+
+        for entry in self.wallets_dir.iterdir():
+            if entry.is_dir():
+                wallet_file = entry / "wallet.dat"
+                if wallet_file.exists():
+                    result.append({"name": entry.name})
+        return result
+
+    def get_wallet(self, name: Optional[str] = None) -> Optional[Wallet]:
+        """
+        Get a loaded wallet by name.
+
+        If name is None, returns the default wallet (first loaded).
+        Returns None if no matching wallet is loaded.
+        """
+        if name is None:
+            if self._default_wallet_name is None:
+                return None
+            return self._wallets.get(self._default_wallet_name)
+        return self._wallets.get(name)
+
+    def get_default_wallet(self) -> Optional[Wallet]:
+        """Get the default wallet (first loaded wallet)."""
+        return self.get_wallet(None)
+
+    def create_wallet(
+        self,
+        name: str,
+        disable_private_keys: bool = False,
+        blank: bool = False,
+        passphrase: Optional[str] = None,
+        avoid_reuse: bool = False,
+        descriptors: bool = True,
+        load_on_startup: Optional[bool] = None,
+    ) -> Tuple[Optional[Wallet], List[str]]:
+        """
+        Create a new wallet.
+
+        Args:
+            name: Wallet name (cannot be empty)
+            disable_private_keys: Create watch-only wallet
+            blank: Create wallet without keys
+            passphrase: Encryption passphrase (optional)
+            avoid_reuse: Enable coin reuse tracking (not implemented)
+            descriptors: Must be True (legacy wallets not supported)
+            load_on_startup: Add to auto-load list
+
+        Returns:
+            (wallet, warnings) tuple. wallet is None on error.
+
+        Reference: Bitcoin Core wallet/wallet.cpp CreateWallet
+        """
+        warnings: List[str] = []
+
+        # Validate name
+        if not name:
+            raise ValueError("Wallet name cannot be empty")
+
+        # Only descriptor wallets supported
+        if not descriptors:
+            raise ValueError("Legacy wallets are not supported; descriptors must be True")
+
+        # Check if already loaded
+        if name in self._wallets:
+            raise ValueError(f"Wallet '{name}' is already loaded")
+
+        # Check if exists on disk
+        wallet_dir = self._wallet_dir(name)
+        wallet_file = self._wallet_file(name)
+        if wallet_file.exists():
+            raise ValueError(f"Wallet '{name}' already exists")
+
+        # Passphrase validation
+        if passphrase is not None and disable_private_keys:
+            raise ValueError("Cannot encrypt a watch-only wallet")
+        if passphrase == "":
+            warnings.append("Empty passphrase provided; wallet will not be encrypted")
+            passphrase = None
+
+        # Create wallet directory
+        wallet_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create wallet instance with new-style directory path
+        wallet = Wallet(
+            data_dir=str(self.data_dir),
+            network=self.network,
+            name=name,
+            wallet_dir=str(wallet_dir),
+        )
+
+        # Set disable_private_keys flag
+        wallet._disable_private_keys = disable_private_keys
+
+        # Initialize HD seed if not blank and not watch-only
+        if not blank and not disable_private_keys:
+            seed = os.urandom(32)
+            if passphrase:
+                # For encrypted wallets, create blank first then encrypt
+                wallet.encrypt(passphrase)
+                wallet.unlock(passphrase)
+                wallet.init_hd(seed, pool_size=1000)
+                wallet.lock()
+                wallet.unlock(passphrase)  # Keep unlocked for use
+            else:
+                wallet.init_hd(seed, pool_size=1000)
+        elif passphrase and not disable_private_keys:
+            # Blank wallet with passphrase
+            wallet.encrypt(passphrase)
+
+        # Set database and mempool
+        if self._db:
+            wallet.set_database(self._db)
+        if self._mempool:
+            wallet.set_mempool(self._mempool)
+
+        # Add to loaded wallets
+        self._wallets[name] = wallet
+
+        # Set as default if first wallet
+        if self._default_wallet_name is None:
+            self._default_wallet_name = name
+
+        # Save load_on_startup setting
+        if load_on_startup is not None:
+            self._update_load_on_startup(name, load_on_startup)
+
+        logger.info(f"Created wallet '{name}'")
+        return wallet, warnings
+
+    def load_wallet(
+        self,
+        name: str,
+        load_on_startup: Optional[bool] = None,
+    ) -> Tuple[Optional[Wallet], List[str]]:
+        """
+        Load an existing wallet.
+
+        Args:
+            name: Wallet name to load
+            load_on_startup: Update auto-load setting
+
+        Returns:
+            (wallet, warnings) tuple. wallet is None on error.
+
+        Reference: Bitcoin Core wallet/wallet.cpp LoadWallet
+        """
+        warnings: List[str] = []
+
+        # Check if already loaded
+        if name in self._wallets:
+            raise ValueError(f"Wallet '{name}' is already loaded")
+
+        # Check if exists
+        wallet_dir = self._wallet_dir(name)
+        wallet_file = self._wallet_file(name)
+
+        if not wallet_file.exists():
+            # Try legacy path (old single-file wallets)
+            legacy_path = self.wallets_dir / f"{name}.json"
+            if legacy_path.exists():
+                # Migrate to new directory structure
+                wallet_dir.mkdir(parents=True, exist_ok=True)
+                legacy_path.rename(wallet_file)
+                warnings.append(f"Migrated wallet '{name}' to new directory format")
+            else:
+                raise ValueError(f"Wallet '{name}' not found")
+
+        # Load wallet
+        wallet = Wallet(
+            data_dir=str(self.data_dir),
+            network=self.network,
+            name=name,
+            wallet_dir=str(wallet_dir),
+        )
+
+        # Set database and mempool
+        if self._db:
+            wallet.set_database(self._db)
+        if self._mempool:
+            wallet.set_mempool(self._mempool)
+
+        # Add to loaded wallets
+        self._wallets[name] = wallet
+
+        # Set as default if first wallet
+        if self._default_wallet_name is None:
+            self._default_wallet_name = name
+
+        # Update load_on_startup setting
+        if load_on_startup is not None:
+            self._update_load_on_startup(name, load_on_startup)
+
+        logger.info(f"Loaded wallet '{name}'")
+        return wallet, warnings
+
+    def unload_wallet(
+        self,
+        name: str,
+        load_on_startup: Optional[bool] = None,
+    ) -> List[str]:
+        """
+        Unload a wallet from memory.
+
+        Args:
+            name: Wallet name to unload
+            load_on_startup: Update auto-load setting (False to remove from list)
+
+        Returns:
+            List of warnings
+
+        Reference: Bitcoin Core wallet/wallet.cpp UnloadWallet
+        """
+        warnings: List[str] = []
+
+        if name not in self._wallets:
+            raise ValueError(f"Wallet '{name}' is not loaded")
+
+        wallet = self._wallets[name]
+
+        # Save wallet state before unloading
+        wallet._save()
+
+        # Remove from loaded wallets
+        del self._wallets[name]
+
+        # Update default wallet if needed
+        if self._default_wallet_name == name:
+            if self._wallets:
+                self._default_wallet_name = next(iter(self._wallets.keys()))
+            else:
+                self._default_wallet_name = None
+
+        # Update load_on_startup setting
+        if load_on_startup is not None:
+            self._update_load_on_startup(name, load_on_startup)
+
+        logger.info(f"Unloaded wallet '{name}'")
+        return warnings
+
+    def _update_load_on_startup(self, name: str, enabled: bool) -> None:
+        """Update the load_on_startup setting for a wallet."""
+        settings_file = self.wallets_dir / "settings.json"
+        settings: Dict[str, Any] = {}
+
+        if settings_file.exists():
+            try:
+                with open(settings_file) as f:
+                    settings = json.load(f)
+            except Exception:
+                pass
+
+        if "load_on_startup" not in settings:
+            settings["load_on_startup"] = []
+
+        wallets_list = settings["load_on_startup"]
+
+        if enabled:
+            if name not in wallets_list:
+                wallets_list.append(name)
+        else:
+            if name in wallets_list:
+                wallets_list.remove(name)
+
+        with open(settings_file, "w") as f:
+            json.dump(settings, f, indent=2)
+
+    def get_load_on_startup_wallets(self) -> List[str]:
+        """Get list of wallets configured to load on startup."""
+        settings_file = self.wallets_dir / "settings.json"
+        if not settings_file.exists():
+            return []
+
+        try:
+            with open(settings_file) as f:
+                settings = json.load(f)
+            return settings.get("load_on_startup", [])
+        except Exception:
+            return []
+
+    def load_startup_wallets(self) -> None:
+        """Load all wallets configured for startup loading."""
+        wallets_to_load = self.get_load_on_startup_wallets()
+        for name in wallets_to_load:
+            try:
+                self.load_wallet(name)
+            except Exception as e:
+                logger.warning(f"Failed to load wallet '{name}' on startup: {e}")
+
+    def get_wallet_info(self, name: str) -> Dict[str, Any]:
+        """Get wallet information dict for RPC."""
+        if name not in self._wallets:
+            raise ValueError(f"Wallet '{name}' is not loaded")
+        return {"name": name}

@@ -461,6 +461,110 @@ impl UTXO {
     }
 }
 
+/// Block status flags (matching Bitcoin Core's BlockStatus enum)
+///
+/// These flags track the validation status of a block and whether it has been
+/// explicitly marked as invalid via the `invalidateblock` RPC.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BlockStatus(pub u32);
+
+impl BlockStatus {
+    /// Block has valid header, ancestry, timestamps, and nBits (contextual checks)
+    pub const BLOCK_VALID_TREE: u32 = 1;
+    /// Block has been validated: transactions, scripts, duplicate inputs, etc
+    pub const BLOCK_VALID_TRANSACTIONS: u32 = 2;
+    /// Unused flag
+    pub const BLOCK_VALID_CHAIN: u32 = 3;
+    /// Block and all parents have been validated
+    pub const BLOCK_VALID_SCRIPTS: u32 = 4;
+    /// All validity checks passed
+    pub const BLOCK_VALID_MASK: u32 = 0x07;
+
+    /// Block failed a validity check (consensus rule violation)
+    pub const BLOCK_FAILED_VALID: u32 = 32;
+    /// Descendant of a block that failed validation (inherited invalidity)
+    pub const BLOCK_FAILED_CHILD: u32 = 64;
+    /// Mask for any failed flag
+    pub const BLOCK_FAILED_MASK: u32 = Self::BLOCK_FAILED_VALID | Self::BLOCK_FAILED_CHILD;
+
+    /// Block data is stored (we have the full block, not just header)
+    pub const BLOCK_HAVE_DATA: u32 = 8;
+    /// Undo data is stored (we can disconnect this block)
+    pub const BLOCK_HAVE_UNDO: u32 = 16;
+    /// Mask for storage flags
+    pub const BLOCK_HAVE_MASK: u32 = Self::BLOCK_HAVE_DATA | Self::BLOCK_HAVE_UNDO;
+
+    /// Create a new block status with default flags (valid tree)
+    pub fn new() -> Self {
+        Self(Self::BLOCK_VALID_TREE)
+    }
+
+    /// Create from raw u32 value
+    pub fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// Get raw bits
+    pub fn bits(&self) -> u32 {
+        self.0
+    }
+
+    /// Check if block is valid (no failure flags set)
+    pub fn is_valid(&self) -> bool {
+        (self.0 & Self::BLOCK_FAILED_MASK) == 0
+    }
+
+    /// Check if block failed validation directly
+    pub fn is_failed_valid(&self) -> bool {
+        (self.0 & Self::BLOCK_FAILED_VALID) != 0
+    }
+
+    /// Check if block is invalid due to an invalid ancestor
+    pub fn is_failed_child(&self) -> bool {
+        (self.0 & Self::BLOCK_FAILED_CHILD) != 0
+    }
+
+    /// Check if block has any failure flag
+    pub fn is_invalid(&self) -> bool {
+        (self.0 & Self::BLOCK_FAILED_MASK) != 0
+    }
+
+    /// Mark block as failed validation
+    pub fn set_failed_valid(&mut self) {
+        self.0 |= Self::BLOCK_FAILED_VALID;
+    }
+
+    /// Mark block as having an invalid ancestor
+    pub fn set_failed_child(&mut self) {
+        self.0 |= Self::BLOCK_FAILED_CHILD;
+    }
+
+    /// Clear all failure flags
+    pub fn clear_failed(&mut self) {
+        self.0 &= !Self::BLOCK_FAILED_MASK;
+    }
+
+    /// Check if we have the full block data
+    pub fn has_data(&self) -> bool {
+        (self.0 & Self::BLOCK_HAVE_DATA) != 0
+    }
+
+    /// Check if we have undo data
+    pub fn has_undo(&self) -> bool {
+        (self.0 & Self::BLOCK_HAVE_UNDO) != 0
+    }
+
+    /// Set the has-data flag
+    pub fn set_has_data(&mut self) {
+        self.0 |= Self::BLOCK_HAVE_DATA;
+    }
+
+    /// Set the has-undo flag
+    pub fn set_has_undo(&mut self) {
+        self.0 |= Self::BLOCK_HAVE_UNDO;
+    }
+}
+
 /// Block metadata
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlockMetadata {
@@ -470,6 +574,9 @@ pub struct BlockMetadata {
     pub chainwork: [u8; 32],
     /// Block timestamp
     pub timestamp: u32,
+    /// Block status flags (validity, storage, invalidation markers)
+    #[serde(default)]
+    pub status: BlockStatus,
 }
 
 impl BlockMetadata {
@@ -479,25 +586,58 @@ impl BlockMetadata {
             height,
             chainwork,
             timestamp,
+            status: BlockStatus::new(),
         }
     }
 
+    /// Create new block metadata with explicit status
+    pub fn with_status(height: u32, chainwork: [u8; 32], timestamp: u32, status: BlockStatus) -> Self {
+        Self {
+            height,
+            chainwork,
+            timestamp,
+            status,
+        }
+    }
+
+    /// Check if block is valid (not marked as invalid)
+    pub fn is_valid(&self) -> bool {
+        self.status.is_valid()
+    }
+
+    /// Check if block is marked as invalid
+    pub fn is_invalid(&self) -> bool {
+        self.status.is_invalid()
+    }
+
     /// Serialize to bytes
+    ///
+    /// Format: [height: 4 bytes][chainwork: 32 bytes][timestamp: 4 bytes][status: 4 bytes]
+    /// For backwards compatibility, status is optional (defaults to 0 if missing)
     pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
         let mut encoder = Vec::new();
         self.height.consensus_encode(&mut encoder)?;
         self.chainwork.consensus_encode(&mut encoder)?;
         self.timestamp.consensus_encode(&mut encoder)?;
+        self.status.0.consensus_encode(&mut encoder)?;
         Ok(encoder)
     }
 
     /// Deserialize from bytes
+    ///
+    /// For backwards compatibility, status defaults to 0 if not present
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, EncodeError> {
         let mut decoder = &bytes[..];
         let height = u32::consensus_decode(&mut decoder)?;
         let chainwork = <[u8; 32]>::consensus_decode(&mut decoder)?;
         let timestamp = u32::consensus_decode(&mut decoder)?;
-        Ok(Self::new(height, chainwork, timestamp))
+        // Status is optional for backwards compatibility with older data
+        let status = if decoder.is_empty() {
+            BlockStatus::new()
+        } else {
+            BlockStatus(u32::consensus_decode(&mut decoder)?)
+        };
+        Ok(Self::with_status(height, chainwork, timestamp, status))
     }
 }
 
@@ -770,11 +910,93 @@ mod tests {
         assert_eq!(metadata.height, 100);
         assert_eq!(metadata.chainwork, chainwork);
         assert_eq!(metadata.timestamp, 1234567890);
+        assert!(metadata.is_valid());
+        assert!(!metadata.is_invalid());
 
         // Test serialization roundtrip
         let bytes = metadata.to_bytes().unwrap();
         let deserialized = BlockMetadata::from_bytes(&bytes).unwrap();
         assert_eq!(metadata, deserialized);
+    }
+
+    #[test]
+    fn test_block_status_flags() {
+        let mut status = BlockStatus::new();
+        assert!(status.is_valid());
+        assert!(!status.is_invalid());
+        assert!(!status.is_failed_valid());
+        assert!(!status.is_failed_child());
+
+        // Mark as failed valid
+        status.set_failed_valid();
+        assert!(!status.is_valid());
+        assert!(status.is_invalid());
+        assert!(status.is_failed_valid());
+        assert!(!status.is_failed_child());
+
+        // Clear failed flags
+        status.clear_failed();
+        assert!(status.is_valid());
+        assert!(!status.is_invalid());
+
+        // Mark as failed child
+        status.set_failed_child();
+        assert!(!status.is_valid());
+        assert!(status.is_invalid());
+        assert!(!status.is_failed_valid());
+        assert!(status.is_failed_child());
+
+        // Test storage flags
+        let mut status2 = BlockStatus::new();
+        assert!(!status2.has_data());
+        assert!(!status2.has_undo());
+        status2.set_has_data();
+        assert!(status2.has_data());
+        status2.set_has_undo();
+        assert!(status2.has_undo());
+    }
+
+    #[test]
+    fn test_block_metadata_with_status() {
+        let chainwork = [2u8; 32];
+        let mut status = BlockStatus::new();
+        status.set_failed_valid();
+        status.set_has_data();
+
+        let metadata = BlockMetadata::with_status(200, chainwork, 1234567891, status);
+        assert_eq!(metadata.height, 200);
+        assert!(metadata.is_invalid());
+        assert!(metadata.status.has_data());
+
+        // Test serialization roundtrip with status
+        let bytes = metadata.to_bytes().unwrap();
+        let deserialized = BlockMetadata::from_bytes(&bytes).unwrap();
+        assert_eq!(metadata, deserialized);
+        assert!(deserialized.is_invalid());
+        assert!(deserialized.status.has_data());
+    }
+
+    #[test]
+    fn test_block_metadata_backwards_compatibility() {
+        // Simulate old format without status (just height + chainwork + timestamp)
+        // This tests that we can read old data that doesn't have the status field
+        let chainwork = [3u8; 32];
+        let metadata = BlockMetadata::new(300, chainwork, 1234567892);
+
+        // Manually create old-format bytes (without status)
+        use bitcoin::consensus::Encodable;
+        let mut old_format = Vec::new();
+        300u32.consensus_encode(&mut old_format).unwrap();
+        chainwork.consensus_encode(&mut old_format).unwrap();
+        1234567892u32.consensus_encode(&mut old_format).unwrap();
+        // No status field in old format
+
+        // Should deserialize with default status
+        let deserialized = BlockMetadata::from_bytes(&old_format).unwrap();
+        assert_eq!(deserialized.height, 300);
+        assert_eq!(deserialized.chainwork, chainwork);
+        assert_eq!(deserialized.timestamp, 1234567892);
+        assert!(deserialized.is_valid()); // Default status should be valid
     }
 
     #[test]
