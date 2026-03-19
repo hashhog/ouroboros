@@ -1,0 +1,13 @@
+{application, pequod,
+ [{description, "Bitcoin P2P full node in Erlang"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {pequod_app, []}},
+  {applications, [kernel, stdlib, crypto]},
+  {env, [{network, testnet4},
+         {max_in_flight, 32},
+         {in_flight_timeout_secs, 120},
+         {block_receive_timeout_secs, 180},
+         {target_peers, 8},
+         {desync_blacklist_secs, 30},
+         {try_resync, false}]}]}.

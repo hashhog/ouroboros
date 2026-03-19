@@ -695,3 +695,225 @@ class TestCrossVerification:
         wk_addr = wk.get_p2wpkh_address()
 
         assert desc_addr == wk_addr
+
+
+# New descriptor type tests (BIP 380-386 expansion)
+
+
+class TestPkDescriptor:
+    """Tests for pk() bare pay-to-pubkey descriptor."""
+
+    def test_pk_parsing(self):
+        desc = parse_descriptor(f"pk({_TEST_PUBKEY_HEX})")
+        assert desc.descriptor_type == "pk"
+        assert len(desc.keys) == 1
+        assert not desc.is_range
+
+    def test_pk_script_pubkey(self):
+        desc = parse_descriptor(f"pk({_TEST_PUBKEY_HEX})")
+        spk = desc.derive_script_pubkey(0)
+        # <pubkey> OP_CHECKSIG
+        assert spk[-1] == 0xAC  # OP_CHECKSIG
+        assert spk[0] == 33  # push 33 bytes
+        assert len(spk) == 35  # 1 + 33 + 1
+
+    def test_pk_address_is_p2sh(self):
+        # P2PK has no standard address format; we wrap in P2SH
+        desc = parse_descriptor(f"pk({_TEST_PUBKEY_HEX})")
+        addr = desc.derive_address(0, "mainnet")
+        assert addr.startswith("3")
+
+
+class TestSortedMultiDescriptor:
+    """Tests for sortedmulti() descriptor."""
+
+    def test_sortedmulti_parsing(self):
+        pk2 = "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+        desc = parse_descriptor(f"sortedmulti(1,{_TEST_PUBKEY_HEX},{pk2})")
+        assert desc.descriptor_type == "sortedmulti"
+        assert desc.multisig_threshold == 1
+        assert desc.sorted_multi is True
+        assert len(desc.keys) == 2
+
+    def test_sortedmulti_keys_sorted(self):
+        # Keys should be sorted lexicographically in the script
+        pk1 = _TEST_PUBKEY_HEX
+        pk2 = "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+        desc1 = parse_descriptor(f"sortedmulti(1,{pk1},{pk2})")
+        desc2 = parse_descriptor(f"sortedmulti(1,{pk2},{pk1})")
+        # Both should produce the same script regardless of input order
+        assert desc1.derive_script_pubkey(0) == desc2.derive_script_pubkey(0)
+
+    def test_wsh_sortedmulti(self):
+        pk2 = "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+        desc = parse_descriptor(f"wsh(sortedmulti(2,{_TEST_PUBKEY_HEX},{pk2}))")
+        assert desc.descriptor_type == "wsh-sortedmulti"
+        assert desc.sorted_multi is True
+        addr = desc.derive_address(0, "mainnet")
+        assert addr.startswith("bc1q")
+
+
+class TestComboDescriptor:
+    """Tests for combo() descriptor."""
+
+    def test_combo_parsing(self):
+        desc = parse_descriptor(f"combo({_TEST_PUBKEY_HEX})")
+        assert desc.descriptor_type == "combo"
+        assert len(desc.keys) == 1
+
+    def test_combo_derives_all_scripts(self):
+        desc = parse_descriptor(f"combo({_TEST_PUBKEY_HEX})")
+        scripts = desc.derive_all_scripts(0)
+        # P2PK, P2PKH, P2WPKH, P2SH-P2WPKH (4 types for compressed key)
+        assert len(scripts) == 4
+
+    def test_combo_derives_all_addresses(self):
+        desc = parse_descriptor(f"combo({_TEST_PUBKEY_HEX})")
+        addrs = desc.derive_all_addresses(0, "mainnet")
+        assert len(addrs) == 4
+        # P2SH (for P2PK)
+        assert addrs[0].startswith("3")
+        # P2PKH
+        assert addrs[1].startswith("1")
+        # P2WPKH
+        assert addrs[2].startswith("bc1q")
+        # P2SH-P2WPKH
+        assert addrs[3].startswith("3")
+
+    def test_combo_with_xpub(self):
+        desc = parse_descriptor(f"combo({_TEST_XPUB}/0/*)")
+        assert desc.is_range
+        addrs0 = desc.derive_all_addresses(0, "mainnet")
+        addrs1 = desc.derive_all_addresses(1, "mainnet")
+        assert addrs0 != addrs1
+
+
+class TestAddrDescriptor:
+    """Tests for addr() descriptor."""
+
+    def test_addr_p2pkh(self):
+        # Use a known P2PKH address
+        addr = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+        desc = parse_descriptor(f"addr({addr})")
+        assert desc.descriptor_type == "addr"
+        assert desc.address == addr
+        assert not desc.is_range
+
+    def test_addr_p2wpkh(self):
+        # A P2WPKH address
+        addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        desc = parse_descriptor(f"addr({addr})")
+        assert desc.descriptor_type == "addr"
+        assert desc.derive_address(0, "mainnet") == addr
+
+    def test_addr_script_pubkey(self):
+        # P2PKH address
+        addr = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+        desc = parse_descriptor(f"addr({addr})")
+        spk = desc.derive_script_pubkey(0)
+        # P2PKH script structure
+        assert spk[:3] == b"\x76\xa9\x14"
+        assert spk[-2:] == b"\x88\xac"
+
+
+class TestRawDescriptor:
+    """Tests for raw() descriptor."""
+
+    def test_raw_parsing(self):
+        # A simple OP_RETURN script
+        script_hex = "6a0b68656c6c6f20776f726c64"  # OP_RETURN "hello world"
+        desc = parse_descriptor(f"raw({script_hex})")
+        assert desc.descriptor_type == "raw"
+        assert desc.script_hex == script_hex
+
+    def test_raw_script_pubkey(self):
+        script_hex = "76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac"
+        desc = parse_descriptor(f"raw({script_hex})")
+        spk = desc.derive_script_pubkey(0)
+        assert spk == bytes.fromhex(script_hex)
+
+    def test_raw_invalid_hex(self):
+        with pytest.raises(ValueError, match="Invalid hex"):
+            parse_descriptor("raw(not_hex)")
+
+
+class TestShMultiDescriptor:
+    """Tests for sh(multi()) and nested variants."""
+
+    def test_sh_multi(self):
+        pk2 = "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+        desc = parse_descriptor(f"sh(multi(1,{_TEST_PUBKEY_HEX},{pk2}))")
+        assert desc.descriptor_type == "sh-multi"
+        addr = desc.derive_address(0, "mainnet")
+        assert addr.startswith("3")
+
+    def test_sh_sortedmulti(self):
+        pk2 = "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+        desc = parse_descriptor(f"sh(sortedmulti(1,{_TEST_PUBKEY_HEX},{pk2}))")
+        assert desc.descriptor_type == "sh-sortedmulti"
+        assert desc.sorted_multi is True
+
+    def test_sh_wsh_multi(self):
+        pk2 = "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+        desc = parse_descriptor(f"sh(wsh(multi(1,{_TEST_PUBKEY_HEX},{pk2})))")
+        assert desc.descriptor_type == "sh-wsh-multi"
+        addr = desc.derive_address(0, "mainnet")
+        assert addr.startswith("3")
+
+    def test_sh_wsh_sortedmulti(self):
+        pk2 = "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+        desc = parse_descriptor(f"sh(wsh(sortedmulti(2,{_TEST_PUBKEY_HEX},{pk2})))")
+        assert desc.descriptor_type == "sh-wsh-sortedmulti"
+        assert desc.sorted_multi is True
+
+
+class TestGetDescriptorInfo:
+    """Tests for getdescriptorinfo function."""
+
+    def test_basic_wpkh(self):
+        from ouroboros.descriptors import getdescriptorinfo
+
+        desc_str = f"wpkh({_TEST_PUBKEY_HEX})"
+        info = getdescriptorinfo(desc_str)
+        assert "descriptor" in info
+        assert "#" in info["descriptor"]
+        assert len(info["checksum"]) == 8
+        assert info["isrange"] is False
+        assert info["issolvable"] is True
+        assert info["hasprivatekeys"] is False
+
+    def test_ranged_xpub(self):
+        from ouroboros.descriptors import getdescriptorinfo
+
+        desc_str = f"wpkh({_TEST_XPUB}/0/*)"
+        info = getdescriptorinfo(desc_str)
+        assert info["isrange"] is True
+
+    def test_with_xprv(self):
+        from ouroboros.descriptors import getdescriptorinfo
+
+        desc_str = f"wpkh({_TEST_XPRV})"
+        info = getdescriptorinfo(desc_str)
+        assert info["hasprivatekeys"] is True
+
+    def test_addr_not_solvable(self):
+        from ouroboros.descriptors import getdescriptorinfo
+
+        desc_str = "addr(1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2)"
+        info = getdescriptorinfo(desc_str)
+        assert info["issolvable"] is False
+
+    def test_raw_not_solvable(self):
+        from ouroboros.descriptors import getdescriptorinfo
+
+        desc_str = "raw(76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac)"
+        info = getdescriptorinfo(desc_str)
+        assert info["issolvable"] is False
+
+    def test_checksum_deterministic(self):
+        from ouroboros.descriptors import getdescriptorinfo
+
+        desc_str = f"wpkh({_TEST_PUBKEY_HEX})"
+        info1 = getdescriptorinfo(desc_str)
+        info2 = getdescriptorinfo(desc_str)
+        assert info1["checksum"] == info2["checksum"]

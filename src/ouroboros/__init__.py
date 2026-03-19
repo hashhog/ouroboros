@@ -12,6 +12,15 @@ from ouroboros.block_sync import BlockSync
 from ouroboros.rpc import RPCServer
 from ouroboros.validation import BlockValidator, TransactionValidator, ValidationError
 from ouroboros.script import ScriptInterpreter
+from ouroboros.consensus import (
+    DeploymentState,
+    Deployment,
+    BuriedDeployment,
+    get_deployment_state,
+    is_deployment_active,
+    is_buried_deployment_active,
+    get_all_deployments_info,
+)
 from ouroboros.p2p_messages import (
     NetworkMessage,
     VersionMessage,
@@ -81,4 +90,11 @@ __all__ = [
     "SyncEngine",
     "PyUTXO",
     "NodeConfig",
+    "DeploymentState",
+    "Deployment",
+    "BuriedDeployment",
+    "get_deployment_state",
+    "is_deployment_active",
+    "is_buried_deployment_active",
+    "get_all_deployments_info",
 ]

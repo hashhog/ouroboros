@@ -460,6 +460,51 @@ pub fn is_p2sh(script: &[u8]) -> bool {
         && script[22] == 0x87 // OP_EQUAL
 }
 
+/// The P2A (Pay-to-Anchor) witness program bytes: 0x4e73
+/// This is ASCII for "N" (0x4e) and "s" (0x73), chosen because it spells out
+/// part of "aNchor" and is a valid 2-byte witness program.
+pub const P2A_PROGRAM: [u8; 2] = [0x4e, 0x73];
+
+/// Check if a scriptPubKey is a Pay-to-Anchor (P2A) output.
+///
+/// P2A pattern: OP_1 OP_PUSHBYTES_2 0x4e73 (4 bytes total)
+/// - Byte 0: OP_1 (0x51) - witness version 1
+/// - Byte 1: OP_PUSHBYTES_2 (0x02)
+/// - Bytes 2-3: 0x4e73 - the anchor program
+///
+/// P2A is a standardized anyone-can-spend output for anchor outputs in
+/// Lightning and other protocols that need efficient CPFP fee bumping.
+/// It's a witness v1 program with a 2-byte program (invalid for Taproot
+/// which requires 32 bytes, but valid by consensus for future upgrades).
+///
+/// Reference: Bitcoin Core script/script.cpp CScript::IsPayToAnchor()
+pub fn is_pay_to_anchor(script: &[u8]) -> bool {
+    script.len() == 4
+        && script[0] == 0x51  // OP_1 (witness v1)
+        && script[1] == 0x02  // push 2 bytes
+        && script[2] == 0x4e  // 'N'
+        && script[3] == 0x73  // 's'
+}
+
+/// Check if a witness program is P2A given the version and program bytes.
+///
+/// This is useful when you've already parsed out the witness version and program.
+///
+/// Reference: Bitcoin Core script/script.cpp CScript::IsPayToAnchor(int, vector<unsigned char>)
+pub fn is_pay_to_anchor_program(version: u8, program: &[u8]) -> bool {
+    version == 1
+        && program.len() == 2
+        && program[0] == 0x4e
+        && program[1] == 0x73
+}
+
+/// Construct the P2A scriptPubKey.
+///
+/// Returns the 4-byte scriptPubKey: OP_1 OP_PUSHBYTES_2 0x4e73
+pub fn p2a_script() -> [u8; 4] {
+    [0x51, 0x02, 0x4e, 0x73]
+}
+
 /// Verify P2SH push-only constraint on scriptSig.
 ///
 /// When spending a P2SH output, the scriptSig MUST contain only push operations.
@@ -603,6 +648,10 @@ pub enum ScriptType {
     P2WSH,
     /// Pay to Public Key (P2PK)
     P2PK,
+    /// Pay to Taproot (P2TR)
+    P2TR,
+    /// Pay to Anchor (P2A) - anyone-can-spend anchor output for CPFP
+    P2A,
     /// Multisig script
     Multisig,
     /// Non-standard script
@@ -1293,6 +1342,20 @@ pub fn identify_script_type(script: &Script) -> ScriptType {
         && script_bytes[1] == 0x20 // 32 bytes
     {
         return ScriptType::P2WSH;
+    }
+
+    // Check for P2A (Pay-to-Anchor): OP_1 OP_PUSHBYTES_2 0x4e73
+    // Must check BEFORE P2TR since both start with OP_1
+    if is_pay_to_anchor(script_bytes) {
+        return ScriptType::P2A;
+    }
+
+    // Check for P2TR (Pay-to-Taproot): OP_1 <32 bytes>
+    if script_bytes.len() == 34
+        && script_bytes[0] == 0x51 // OP_1 (witness v1)
+        && script_bytes[1] == 0x20 // 32 bytes
+    {
+        return ScriptType::P2TR;
     }
 
     // Check for multisig patterns
@@ -3252,5 +3315,107 @@ mod tests {
     fn test_unbalanced_conditional_error_message() {
         let err = ScriptError::UnbalancedConditional;
         assert_eq!(err.to_string(), "Unbalanced conditional");
+    }
+
+    // =========================================================================
+    // Pay-to-Anchor (P2A) Tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_pay_to_anchor_valid() {
+        // Valid P2A script: OP_1 OP_PUSHBYTES_2 0x4e73
+        let script = [0x51, 0x02, 0x4e, 0x73];
+        assert!(is_pay_to_anchor(&script));
+    }
+
+    #[test]
+    fn test_is_pay_to_anchor_wrong_version() {
+        // Wrong witness version (OP_0 instead of OP_1)
+        let script = [0x00, 0x02, 0x4e, 0x73];
+        assert!(!is_pay_to_anchor(&script));
+    }
+
+    #[test]
+    fn test_is_pay_to_anchor_wrong_length() {
+        // Wrong push length (3 bytes instead of 2)
+        let script = [0x51, 0x03, 0x4e, 0x73, 0x00];
+        assert!(!is_pay_to_anchor(&script));
+    }
+
+    #[test]
+    fn test_is_pay_to_anchor_wrong_program() {
+        // Wrong program bytes
+        let script = [0x51, 0x02, 0x00, 0x00];
+        assert!(!is_pay_to_anchor(&script));
+    }
+
+    #[test]
+    fn test_is_pay_to_anchor_program_valid() {
+        // Valid P2A program
+        let program = [0x4e, 0x73];
+        assert!(is_pay_to_anchor_program(1, &program));
+    }
+
+    #[test]
+    fn test_is_pay_to_anchor_program_wrong_version() {
+        // Wrong version (0 instead of 1)
+        let program = [0x4e, 0x73];
+        assert!(!is_pay_to_anchor_program(0, &program));
+    }
+
+    #[test]
+    fn test_is_pay_to_anchor_program_wrong_bytes() {
+        // Wrong program bytes
+        let program = [0x00, 0x00];
+        assert!(!is_pay_to_anchor_program(1, &program));
+    }
+
+    #[test]
+    fn test_is_pay_to_anchor_program_wrong_length() {
+        // Wrong program length (32 bytes = Taproot, not anchor)
+        let program = [0u8; 32];
+        assert!(!is_pay_to_anchor_program(1, &program));
+    }
+
+    #[test]
+    fn test_p2a_script_construction() {
+        let script = p2a_script();
+        assert_eq!(script, [0x51, 0x02, 0x4e, 0x73]);
+        assert!(is_pay_to_anchor(&script));
+    }
+
+    #[test]
+    fn test_identify_script_type_p2a() {
+        // P2A script
+        let script = bitcoin::blockdata::script::Builder::new()
+            .push_opcode(OP_PUSHNUM_1)
+            .push_slice(&[0x4e, 0x73])
+            .into_script();
+        assert_eq!(identify_script_type(&script), ScriptType::P2A);
+    }
+
+    #[test]
+    fn test_identify_script_type_p2tr() {
+        // P2TR script (32-byte program)
+        let script = bitcoin::blockdata::script::Builder::new()
+            .push_opcode(OP_PUSHNUM_1)
+            .push_slice(&[0u8; 32])
+            .into_script();
+        assert_eq!(identify_script_type(&script), ScriptType::P2TR);
+    }
+
+    #[test]
+    fn test_p2a_not_confused_with_p2tr() {
+        // P2A is 4 bytes total, P2TR is 34 bytes total
+        let p2a = p2a_script();
+        let p2tr = [0x51, 0x20, /* 32 bytes */ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        assert!(is_pay_to_anchor(&p2a));
+        assert!(!is_pay_to_anchor(&p2tr));
+    }
+
+    #[test]
+    fn test_p2a_program_constant() {
+        assert_eq!(P2A_PROGRAM, [0x4e, 0x73]);
     }
 }
