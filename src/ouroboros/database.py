@@ -38,11 +38,11 @@ class Block:
         # Version (4 bytes)
         data.extend(self.version.to_bytes(4, 'little', signed=True))
         
-        # Previous block hash (32 bytes, reverse from display format to wire format)
-        data.extend(self.prev_blockhash[::-1])
-        
-        # Merkle root (32 bytes, reverse from display format to wire format)
-        data.extend(self.merkle_root[::-1])
+        # Previous block hash (32 bytes, already in internal/wire byte order)
+        data.extend(self.prev_blockhash)
+
+        # Merkle root (32 bytes, already in internal/wire byte order)
+        data.extend(self.merkle_root)
         
         # Timestamp (4 bytes)
         data.extend(self.timestamp.to_bytes(4, 'little'))
@@ -80,10 +80,10 @@ class Block:
         version = int.from_bytes(data[offset:offset+4], byteorder='little', signed=True)
         offset += 4
         
-        prev_blockhash = data[offset:offset+32][::-1]  # Reverse for display format (big-endian)
+        prev_blockhash = data[offset:offset+32]  # Internal (little-endian) byte order — matches DB
         offset += 32
-        
-        merkle_root = data[offset:offset+32][::-1]  # Reverse for display format
+
+        merkle_root = data[offset:offset+32]  # Internal (little-endian) byte order
         offset += 32
         
         timestamp = int.from_bytes(data[offset:offset+4], byteorder='little')
@@ -153,7 +153,7 @@ class Block:
         # Calculate block hash
         import hashlib
         block_header = data[0:80]
-        block_hash = hashlib.sha256(hashlib.sha256(block_header).digest()).digest()[::-1]  # Reverse for display
+        block_hash = hashlib.sha256(hashlib.sha256(block_header).digest()).digest()  # Internal byte order — matches DB
         
         return cls(
             version=version,
