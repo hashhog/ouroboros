@@ -24,9 +24,9 @@ from ouroboros.rpc import RPCServer
 from ouroboros.sync_manager import SyncManager
 from ouroboros.config import NodeConfig
 from ouroboros.fee_estimator import FeeEstimator
-from ouroboros.wallet import Wallet
+from ouroboros.wallet import Wallet, WalletManager
 from ouroboros.cookie_auth import generate_cookie, delete_cookie
-from ouroboros.zmq_publisher import ZMQPublisher
+from ouroboros.zmq_notifier import ZMQNotifier
 from ouroboros.pruning import BlockPruner
 from ouroboros.metrics import (
     init_metrics,
@@ -67,10 +67,12 @@ class BitcoinNode:
         
         # Fee estimator
         self.fee_estimator: Optional[FeeEstimator] = None
-        
-        # Wallet
+
+        # Wallet manager (multi-wallet support)
+        self.wallet_manager: Optional[WalletManager] = None
+        # Legacy single wallet reference (for backwards compatibility)
         self.wallet: Optional[Wallet] = None
-        
+
         # Network components
         self.peer_manager: Optional[PeerManager] = None
         self.block_sync: Optional[BlockSync] = None
@@ -84,8 +86,8 @@ class BitcoinNode:
         # Block pruner
         self.pruner: Optional[BlockPruner] = None
 
-        # ZMQ publisher
-        self.zmq_publisher: Optional[ZMQPublisher] = None
+        # ZMQ notifier (replaces the older zmq_publisher)
+        self.zmq_notifier: Optional[ZMQNotifier] = None
 
         # Snapshot manager for assumeUTXO
         self.snapshot_manager: Optional[SnapshotManager] = None
@@ -142,16 +144,40 @@ class BitcoinNode:
 
             # Reload persisted mempool (if available)
             mempool_path = os.path.join(self.data_dir, "mempool.dat")
-            _, chain_height = self.db.get_best_block()
+            try:
+                _, chain_height = self.db.get_best_block()
+            except RuntimeError:
+                # Empty database — initialize genesis block
+                logger.info("Empty database, initializing genesis block...")
+                self._init_genesis_block()
+                _, chain_height = self.db.get_best_block()
             self.mempool.load_from_file(mempool_path, chain_height)
 
             # Initialize fee estimator
             self.fee_estimator = FeeEstimator()
-            
-            # Initialize wallet
-            self.wallet = Wallet(self.data_dir, self.network)
-            self.wallet.set_database(self.db)
-            self.wallet.set_mempool(self.mempool)
+
+            # Initialize wallet manager (multi-wallet support)
+            self.wallet_manager = WalletManager(self.data_dir, self.network)
+            self.wallet_manager.set_database(self.db)
+            self.wallet_manager.set_mempool(self.mempool)
+
+            # Load wallets configured for startup, or create default wallet
+            self.wallet_manager.load_startup_wallets()
+            if not self.wallet_manager.list_loaded_wallets():
+                # Create a default wallet if none configured
+                try:
+                    self.wallet_manager.create_wallet("default")
+                    logger.info("Created default wallet")
+                except ValueError:
+                    # Wallet already exists; try to load it
+                    try:
+                        self.wallet_manager.load_wallet("default")
+                        logger.info("Loaded default wallet")
+                    except Exception as e:
+                        logger.warning(f"Could not load default wallet: {e}")
+
+            # Set legacy wallet reference for backwards compatibility
+            self.wallet = self.wallet_manager.get_default_wallet()
             
             # Initialize block pruner (optional — enabled when prune=<MB> is set)
             prune_target = self.config.get('prune')
@@ -228,17 +254,29 @@ class BitcoinNode:
             )
             self._rpc_task = asyncio.create_task(self.rpc_server.start())
 
-            # ZMQ publisher (optional — enabled when zmq_endpoint or zmqpubhashblock is set)
-            zmq_endpoint = (
-                self.config.get('zmqpubhashblock')
-                or self.config.get('zmq_endpoint')
-            )
-            if zmq_endpoint:
-                self.zmq_publisher = ZMQPublisher(endpoint=zmq_endpoint)
-                await self.zmq_publisher.start()
-                logger.info(f"ZMQ publisher started on {zmq_endpoint}")
+            # ZMQ notifier (optional — per-topic configuration)
+            # Configure endpoints for each ZMQ topic
+            self.zmq_notifier = ZMQNotifier()
+            zmq_topics = [
+                ('hashblock', self.config.get('zmqpubhashblock')),
+                ('hashtx', self.config.get('zmqpubhashtx')),
+                ('rawblock', self.config.get('zmqpubrawblock')),
+                ('rawtx', self.config.get('zmqpubrawtx')),
+                ('sequence', self.config.get('zmqpubsequence')),
+            ]
+            # Also support legacy zmq_endpoint config
+            legacy_endpoint = self.config.get('zmq_endpoint')
+            for topic, endpoint in zmq_topics:
+                if endpoint:
+                    self.zmq_notifier.configure_endpoint(topic, endpoint)
+                elif legacy_endpoint and topic in ('hashblock', 'hashtx', 'rawblock', 'rawtx'):
+                    # Legacy: apply zmq_endpoint to all hash/raw topics
+                    self.zmq_notifier.configure_endpoint(topic, legacy_endpoint)
+
+            if self.zmq_notifier._topic_endpoints:
+                await self.zmq_notifier.start()
                 if self.block_sync:
-                    self.block_sync.set_zmq_publisher(self.zmq_publisher)
+                    self.block_sync.set_zmq_notifier(self.zmq_notifier)
 
             # Prometheus metrics (best-effort; disabled if prometheus_client not installed)
             metrics_port = int(self.config.get('metrics_port', 9332))
@@ -292,10 +330,10 @@ class BitcoinNode:
                 except asyncio.CancelledError:
                     pass
             
-            # Stop ZMQ publisher
-            if self.zmq_publisher:
-                logger.info("Stopping ZMQ publisher...")
-                await self.zmq_publisher.stop()
+            # Stop ZMQ notifier
+            if self.zmq_notifier:
+                logger.info("Stopping ZMQ notifier...")
+                await self.zmq_notifier.stop()
 
             # Persist mempool to disk
             if self.mempool:
@@ -470,6 +508,90 @@ class BitcoinNode:
             title="[bold]Ouroboros Node Status[/bold]",
             border_style="green",
         ))
+
+    def _init_genesis_block(self):
+        """Initialize the chain tip to the genesis block for the current network.
+
+        When the database is empty (fresh datadir), we set the best-block
+        pointer to the well-known genesis hash at height 0 so the node can
+        start without requiring a prior ``ouroboros sync`` run.
+
+        If the Rust extension exposes ``connect_block_from_bytes`` (full
+        block storage including UTXO set), we use that.  Otherwise we fall
+        back to ``update_best_block`` which only sets the chain-tip pointer
+        — enough for RPC / mining to work on regtest.
+        """
+        import struct
+
+        # Genesis block hashes (internal / little-endian byte order)
+        GENESIS_HASHES = {
+            'regtest':  bytes.fromhex(
+                '06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f'),
+            'testnet':  bytes.fromhex(
+                '43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000'),
+            'testnet3': bytes.fromhex(
+                '43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000'),
+            'testnet4': bytes.fromhex(
+                '43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000'),
+            'signet':   bytes.fromhex(
+                'f61eee3b63a380a477a063af32b2bbc9f7990f1f2c4225e973988181080000'),
+            'mainnet':  bytes.fromhex(
+                '6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000'),
+        }
+
+        genesis_hash = GENESIS_HASHES.get(self.network)
+        if genesis_hash is None:
+            logger.warning(f"Unknown network '{self.network}', cannot init genesis")
+            return
+
+        # --- Try full connect_block_from_bytes first (stores block + UTXO) ---
+        if hasattr(self.db._db, 'connect_block_from_bytes'):
+            prev_block = b'\x00' * 32
+            # Merkle root in display (big-endian) order; reverse to internal
+            # (little-endian) for the raw 80-byte header serialisation.
+            merkle_root = bytes.fromhex(
+                '4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b'
+            )[::-1]
+            if self.network == 'regtest':
+                ts, bits, nonce = 1296688602, 0x207fffff, 2
+            elif self.network in ('testnet', 'testnet3'):
+                ts, bits, nonce = 1296688602, 0x1d00ffff, 414098458
+            elif self.network == 'testnet4':
+                ts, bits, nonce = 1296688602, 0x1d00ffff, 393743547
+            elif self.network == 'signet':
+                ts, bits, nonce = 1598918400, 0x1e0377ae, 52613770
+            else:
+                ts, bits, nonce = 1231006505, 0x1d00ffff, 2083236893
+
+            header = struct.pack('<i', 1) + prev_block + merkle_root
+            header += struct.pack('<III', ts, bits, nonce)
+
+            coinbase_tx = bytes.fromhex(
+                '01000000'
+                '01'
+                '0000000000000000000000000000000000000000000000000000000000000000'
+                'ffffffff'
+                '4d'
+                '04ffff001d0104455468652054696d65732030332f4a616e2f323030'
+                '39204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73'
+                'ffffffff'
+                '01'
+                '00f2052a01000000'
+                '43'
+                '4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac'
+                '00000000'
+            )
+            block_bytes = header + b'\x01' + coinbase_tx
+            try:
+                self.db._db.connect_block_from_bytes(block_bytes, 0)
+                logger.info("Genesis block stored (full connect)")
+                return
+            except Exception as e:
+                logger.warning(f"connect_block_from_bytes failed: {e}, falling back")
+
+        # --- Fallback: just set the chain-tip pointer ---
+        self.db._db.update_best_block(genesis_hash, 0)
+        logger.info("Genesis block tip set (lightweight init)")
 
     def _check_synced(self) -> bool:
         if not self.db:

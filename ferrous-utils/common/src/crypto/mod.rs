@@ -1,5 +1,8 @@
 // Bitcoin cryptographic operations
 
+pub mod bip324;
+pub mod secp;
+pub mod sha256;
 pub mod siphash;
 
 use bitcoin_hashes::{hash160::Hash as Hash160Hash, sha256d::Hash as Sha256dHash};

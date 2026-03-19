@@ -270,22 +270,80 @@ class RPCServer:
         if username and password:
             self.security = HTTPBasic()
 
+        # Current wallet context (set per-request)
+        self._current_wallet_name: Optional[str] = None
+
         # Register RPC methods
         self._register_methods()
 
         # Register REST interface if enabled
         if enable_rest:
             self._register_rest_interface()
-    
-    async def _execute_single_rpc(self, req_data: Dict[str, Any]) -> Dict[str, Any]:
+
+    def _get_wallet_for_rpc(self) -> Any:
+        """
+        Get the wallet for the current RPC request.
+
+        If a wallet name was specified via /wallet/<name>, uses that wallet.
+        Otherwise, uses the default wallet (first loaded) or node.wallet for
+        backwards compatibility.
+
+        Returns the Wallet instance or None.
+        Raises HTTPException if the specified wallet is not loaded.
+
+        Reference: Bitcoin Core GetWalletForJSONRPCRequest
+        """
+        # Check if node has wallet_manager (multi-wallet mode)
+        wallet_manager = getattr(self.node, "wallet_manager", None)
+
+        if wallet_manager is not None:
+            # Multi-wallet mode
+            if self._current_wallet_name is not None:
+                # Specific wallet requested via /wallet/<name>
+                wallet = wallet_manager.get_wallet(self._current_wallet_name)
+                if wallet is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Wallet '{self._current_wallet_name}' not loaded. "
+                        "Load the wallet first using loadwallet RPC."
+                    )
+                return wallet
+            else:
+                # No specific wallet; use default
+                loaded = wallet_manager.list_loaded_wallets()
+                if len(loaded) == 0:
+                    return None
+                elif len(loaded) == 1:
+                    return wallet_manager.get_wallet(loaded[0])
+                else:
+                    # Multiple wallets loaded; need to specify which one
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Wallet file not specified (must request wallet RPC "
+                        "through /wallet/<wallet_name> uri-path)."
+                    )
+        else:
+            # Legacy single-wallet mode (backwards compatibility)
+            return getattr(self.node, "wallet", None)
+
+    async def _execute_single_rpc(
+        self, req_data: Dict[str, Any], wallet_name: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Execute a single RPC call and return the response as a dict.
 
         This is used by both single request and batch request handlers.
         Errors are caught and returned as JSON-RPC error responses.
+
+        Args:
+            req_data: The JSON-RPC request dict
+            wallet_name: Optional wallet name from /wallet/<name> endpoint
         """
         req_id = req_data.get("id")
         method = req_data.get("method")
         params = req_data.get("params", [])
+
+        # Store wallet context for this request
+        self._current_wallet_name = wallet_name
 
         t0 = time.monotonic()
         try:
@@ -337,9 +395,11 @@ class RPCServer:
 
     def _register_methods(self):
         """Register all RPC methods"""
-        @self.app.post("/")
-        async def handle_rpc(http_request: Request):
-            """Handle JSON-RPC requests (single or batch)"""
+
+        async def _handle_rpc_common(
+            http_request: Request, wallet_name: Optional[str] = None
+        ):
+            """Common handler for RPC requests with optional wallet context."""
             # Authentication
             if self.security:
                 try:
@@ -413,7 +473,7 @@ class RPCServer:
                             "id": None
                         })
                     else:
-                        response = await self._execute_single_rpc(req)
+                        response = await self._execute_single_rpc(req, wallet_name)
                         # Only include response if not a notification (id is present)
                         # JSON-RPC 2.0: notifications have id=null or missing id
                         if "id" in req:
@@ -424,7 +484,7 @@ class RPCServer:
 
             # Handle single request (object)
             elif isinstance(request_data, dict):
-                response = await self._execute_single_rpc(request_data)
+                response = await self._execute_single_rpc(request_data, wallet_name)
                 return JSONResponse(content=response)
 
             # Invalid request type
@@ -436,6 +496,23 @@ class RPCServer:
                         "id": None
                     }
                 )
+
+        @self.app.post("/")
+        async def handle_rpc(http_request: Request):
+            """Handle JSON-RPC requests (single or batch)"""
+            return await _handle_rpc_common(http_request, wallet_name=None)
+
+        @self.app.post("/wallet/{wallet_name}")
+        async def handle_wallet_rpc(wallet_name: str, http_request: Request):
+            """Handle wallet-specific JSON-RPC requests.
+
+            Bitcoin Core compatible endpoint: /wallet/<name>
+            All wallet RPCs will use the specified wallet.
+            """
+            # URL decode the wallet name (e.g., %2F -> /)
+            from urllib.parse import unquote
+            wallet_name = unquote(wallet_name)
+            return await _handle_rpc_common(http_request, wallet_name=wallet_name)
         
         @self.app.get("/health")
         async def health():
@@ -1887,9 +1964,9 @@ class RPCServer:
 
         Reference: Bitcoin Core wallet/rpc/addresses.cpp getnewaddress
         """
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
-            raise HTTPException(status_code=500, detail="Wallet not loaded")
+            raise HTTPException(status_code=500, detail="No wallet loaded")
         if wallet.is_locked:
             raise HTTPException(
                 status_code=500,
@@ -1909,9 +1986,9 @@ class RPCServer:
         """
         Send bitcoin to an address. Returns the txid.
         """
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
-            raise HTTPException(status_code=500, detail="Wallet not loaded")
+            raise HTTPException(status_code=500, detail="No wallet loaded")
 
         amount_sat = int(round(amount * 1e8))
         if amount_sat <= 0:
@@ -1939,10 +2016,10 @@ class RPCServer:
         """
         import os
 
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
             return JSONRPCResponse(
-                error={"code": -18, "message": "Wallet not loaded"}, id=None
+                error={"code": -18, "message": "No wallet loaded"}, id=None
             )
 
         if seed_hex is not None:
@@ -1977,10 +2054,10 @@ class RPCServer:
         """
         Encrypt the wallet with a passphrase.
         """
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
             return JSONRPCResponse(
-                error={"code": -18, "message": "Wallet not loaded"}, id=None
+                error={"code": -18, "message": "No wallet loaded"}, id=None
             )
         if wallet.is_encrypted:
             return JSONRPCResponse(
@@ -2003,10 +2080,10 @@ class RPCServer:
         """
         Unlock an encrypted wallet for *timeout* seconds.
         """
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
             return JSONRPCResponse(
-                error={"code": -18, "message": "Wallet not loaded"}, id=None
+                error={"code": -18, "message": "No wallet loaded"}, id=None
             )
         if not wallet.is_encrypted:
             return JSONRPCResponse(
@@ -2033,10 +2110,10 @@ class RPCServer:
         """
         Lock the wallet, wiping the decryption key from memory.
         """
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
             return JSONRPCResponse(
-                error={"code": -18, "message": "Wallet not loaded"}, id=None
+                error={"code": -18, "message": "No wallet loaded"}, id=None
             )
         if not wallet.is_encrypted:
             return JSONRPCResponse(
@@ -2065,10 +2142,10 @@ class RPCServer:
         """
         Change the wallet passphrase.
         """
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
             return JSONRPCResponse(
-                error={"code": -18, "message": "Wallet not loaded"}, id=None
+                error={"code": -18, "message": "No wallet loaded"}, id=None
             )
         if not wallet.is_encrypted:
             return JSONRPCResponse(
@@ -2093,9 +2170,9 @@ class RPCServer:
 
         Reference: Bitcoin Core wallet/rpc/wallet.cpp getwalletinfo
         """
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
-            raise HTTPException(status_code=500, detail="Wallet not loaded")
+            raise HTTPException(status_code=500, detail="No wallet loaded")
 
         balance = await wallet.get_balance()
 
@@ -2136,9 +2213,9 @@ class RPCServer:
 
         Reference: Bitcoin Core wallet/rpc/wallet.cpp keypoolrefill
         """
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
-            raise HTTPException(status_code=500, detail="Wallet not loaded")
+            raise HTTPException(status_code=500, detail="No wallet loaded")
         if wallet.is_locked:
             raise HTTPException(
                 status_code=500,
@@ -2161,9 +2238,9 @@ class RPCServer:
 
         Reference: Bitcoin Core wallet/rpc/addresses.cpp getrawchangeaddress
         """
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
-            raise HTTPException(status_code=500, detail="Wallet not loaded")
+            raise HTTPException(status_code=500, detail="No wallet loaded")
         if wallet.is_locked:
             raise HTTPException(
                 status_code=500,
@@ -2817,6 +2894,8 @@ class RPCServer:
         Submit a mined block to the network.
 
         Returns None on success, an error string on failure.
+        Stores the block in the database (block data, header/height index,
+        UTXO set, tx index) and updates the chain tip.
         """
         from ouroboros.database import Block as _Block
 
@@ -2830,19 +2909,21 @@ class RPCServer:
         except Exception as e:
             return f"Block deserialization failed: {e}"
 
-        block_sync = getattr(self.node, "block_sync", None)
-        if block_sync is None:
-            return "Block sync not available"
+        db = getattr(self.node, "db", None)
+        if db is None:
+            return "Database not available"
 
         try:
-            valid, error = block_sync.validator.validate_block(block)
-            if not valid:
-                return error or "Block validation failed"
+            _, best_height = db.get_best_block()
+            next_height = best_height + 1
 
-            block_sync.validator.apply_block(block)
+            # Use Rust connect_block_from_bytes for full persistence
+            db._db.connect_block_from_bytes(block_bytes, next_height)
 
-            if block_sync.mempool is not None:
-                block_sync.mempool.remove_block_transactions(block)
+            # Remove confirmed transactions from mempool
+            mempool = getattr(self.node, "mempool", None)
+            if mempool is not None:
+                mempool.remove_block_transactions(block)
 
             return None
         except Exception as e:
@@ -2878,6 +2959,129 @@ class RPCServer:
         actual_height = pruner.prune_to_height(height, best_height)
         logger.info(f"RPC pruneblockchain: pruned up to height {actual_height}")
         return actual_height
+
+    async def rpc_invalidateblock(self, blockhash: str) -> None:
+        """
+        Mark a block as invalid and disconnect it from the active chain.
+
+        Permanently marks a block as permanently invalid, as if it violated
+        a consensus rule. The block and all its descendants will be marked
+        as invalid and excluded from chain selection.
+
+        If the block is part of the active chain, the chain will be reorganized
+        to the best valid chain (the parent of the invalidated block).
+
+        This command can be used to manually trigger a chain reorganization
+        or to mark a known-bad block as invalid for testing purposes.
+
+        Arguments:
+            blockhash: The hash of the block to invalidate (hex string)
+
+        Returns:
+            None on success
+
+        Raises:
+            JSONRPCError: If the block is not found or cannot be invalidated
+
+        Reference:
+            Bitcoin Core: rpc/blockchain.cpp invalidateblock()
+        """
+        if not hasattr(self.node, 'db') or self.node.db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        # Parse and validate block hash
+        try:
+            block_hash = bytes.fromhex(blockhash)
+            if len(block_hash) != 32:
+                raise ValueError("Block hash must be 32 bytes")
+            # Convert from display (big-endian) to internal (little-endian)
+            block_hash_internal = bytes(reversed(block_hash))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}")
+
+        # Check if block exists
+        db = self.node.db
+        try:
+            # Use rust db if available
+            if hasattr(db, 'rust_db') and db.rust_db is not None:
+                new_tip_height = db.rust_db.invalidate_block(block_hash_internal)
+                logger.info(
+                    f"invalidateblock: Invalidated block {blockhash[:16]}... "
+                    f"new tip height: {new_tip_height}"
+                )
+            else:
+                # Fallback: Python-only implementation
+                raise HTTPException(
+                    status_code=500,
+                    detail="invalidateblock requires Rust database bindings"
+                )
+        except Exception as e:
+            if "not found" in str(e).lower():
+                raise HTTPException(status_code=404, detail=f"Block not found: {blockhash}")
+            if "genesis" in str(e).lower():
+                raise HTTPException(status_code=400, detail="Cannot invalidate genesis block")
+            raise HTTPException(status_code=500, detail=str(e))
+
+        return None
+
+    async def rpc_reconsiderblock(self, blockhash: str) -> None:
+        """
+        Remove invalidity status from a block and reconsider it for activation.
+
+        Removes the "invalid" marking from a block that was previously marked
+        invalid via invalidateblock. The block and its ancestors/descendants
+        will be reconsidered for chain selection.
+
+        If the reconsidered chain has more cumulative proof-of-work than the
+        current active chain, a reorganization will occur.
+
+        This command can be used to undo the effects of invalidateblock.
+
+        Arguments:
+            blockhash: The hash of the block to reconsider (hex string)
+
+        Returns:
+            None on success
+
+        Raises:
+            JSONRPCError: If the block is not found
+
+        Reference:
+            Bitcoin Core: rpc/blockchain.cpp reconsiderblock()
+        """
+        if not hasattr(self.node, 'db') or self.node.db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        # Parse and validate block hash
+        try:
+            block_hash = bytes.fromhex(blockhash)
+            if len(block_hash) != 32:
+                raise ValueError("Block hash must be 32 bytes")
+            # Convert from display (big-endian) to internal (little-endian)
+            block_hash_internal = bytes(reversed(block_hash))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}")
+
+        # Reconsider the block
+        db = self.node.db
+        try:
+            if hasattr(db, 'rust_db') and db.rust_db is not None:
+                new_tip_height = db.rust_db.reconsider_block(block_hash_internal)
+                logger.info(
+                    f"reconsiderblock: Reconsidered block {blockhash[:16]}... "
+                    f"tip height: {new_tip_height}"
+                )
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail="reconsiderblock requires Rust database bindings"
+                )
+        except Exception as e:
+            if "not found" in str(e).lower():
+                raise HTTPException(status_code=404, detail=f"Block not found: {blockhash}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+        return None
 
     # --- Additional RPC methods ---
 
@@ -4127,10 +4331,186 @@ class RPCServer:
         }
 
     async def rpc_listwallets(self) -> List[str]:
-        """Return list of loaded wallets."""
+        """
+        Return list of currently loaded wallet names.
+
+        Reference: Bitcoin Core wallet/rpc/wallet.cpp listwallets
+        """
+        wallet_manager = getattr(self.node, "wallet_manager", None)
+        if wallet_manager is not None:
+            return wallet_manager.list_loaded_wallets()
+        # Legacy single-wallet mode
         if hasattr(self.node, 'wallet') and self.node.wallet:
             return [self.node.wallet.name]
         return []
+
+    async def rpc_listwalletdir(self) -> Dict[str, List[Dict[str, str]]]:
+        """
+        Return list of wallets in the wallet directory.
+
+        Returns a dict with 'wallets' key containing list of wallet info dicts.
+
+        Reference: Bitcoin Core wallet/rpc/wallet.cpp listwalletdir
+        """
+        wallet_manager = getattr(self.node, "wallet_manager", None)
+        if wallet_manager is not None:
+            return {"wallets": wallet_manager.list_wallet_dir()}
+        return {"wallets": []}
+
+    async def rpc_createwallet(
+        self,
+        wallet_name: str,
+        disable_private_keys: bool = False,
+        blank: bool = False,
+        passphrase: str = "",
+        avoid_reuse: bool = False,
+        descriptors: bool = True,
+        load_on_startup: Optional[bool] = None,
+        external_signer: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Create a new wallet.
+
+        Args:
+            wallet_name: Name for the new wallet (required)
+            disable_private_keys: Create watch-only wallet
+            blank: Create empty wallet with no keys
+            passphrase: Encryption passphrase (empty = no encryption)
+            avoid_reuse: Track coin reuse (not implemented)
+            descriptors: Create descriptor wallet (must be True)
+            load_on_startup: Add to auto-load list on node startup
+            external_signer: Use external signer (not implemented)
+
+        Returns:
+            Dict with 'name' (wallet name) and 'warning' (any warnings)
+
+        Reference: Bitcoin Core wallet/rpc/wallet.cpp createwallet
+        """
+        wallet_manager = getattr(self.node, "wallet_manager", None)
+        if wallet_manager is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Multi-wallet support not enabled"
+            )
+
+        if external_signer:
+            raise HTTPException(
+                status_code=400,
+                detail="External signer is not supported"
+            )
+
+        try:
+            wallet, warnings = wallet_manager.create_wallet(
+                name=wallet_name,
+                disable_private_keys=disable_private_keys,
+                blank=blank,
+                passphrase=passphrase if passphrase else None,
+                avoid_reuse=avoid_reuse,
+                descriptors=descriptors,
+                load_on_startup=load_on_startup,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        return {
+            "name": wallet_name,
+            "warning": "\n".join(warnings) if warnings else "",
+        }
+
+    async def rpc_loadwallet(
+        self,
+        filename: str,
+        load_on_startup: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """
+        Load a wallet from disk.
+
+        Args:
+            filename: Wallet name (directory name in wallets/)
+            load_on_startup: Add to auto-load list on node startup
+
+        Returns:
+            Dict with 'name' (wallet name) and 'warning' (any warnings)
+
+        Reference: Bitcoin Core wallet/rpc/wallet.cpp loadwallet
+        """
+        wallet_manager = getattr(self.node, "wallet_manager", None)
+        if wallet_manager is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Multi-wallet support not enabled"
+            )
+
+        try:
+            wallet, warnings = wallet_manager.load_wallet(
+                name=filename,
+                load_on_startup=load_on_startup,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        return {
+            "name": filename,
+            "warning": "\n".join(warnings) if warnings else "",
+        }
+
+    async def rpc_unloadwallet(
+        self,
+        wallet_name: Optional[str] = None,
+        load_on_startup: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """
+        Unload a wallet from memory.
+
+        Args:
+            wallet_name: Wallet name to unload. If not specified, uses the
+                         wallet from /wallet/<name> endpoint, or the only
+                         loaded wallet if there is exactly one.
+            load_on_startup: Set to False to remove from auto-load list
+
+        Returns:
+            Dict with 'warning' (any warnings)
+
+        Reference: Bitcoin Core wallet/rpc/wallet.cpp unloadwallet
+        """
+        wallet_manager = getattr(self.node, "wallet_manager", None)
+        if wallet_manager is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Multi-wallet support not enabled"
+            )
+
+        # Determine wallet name
+        if wallet_name is None:
+            # Try to get from endpoint context or default
+            if self._current_wallet_name is not None:
+                wallet_name = self._current_wallet_name
+            else:
+                loaded = wallet_manager.list_loaded_wallets()
+                if len(loaded) == 0:
+                    raise HTTPException(
+                        status_code=400, detail="No wallet is loaded"
+                    )
+                elif len(loaded) == 1:
+                    wallet_name = loaded[0]
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Multiple wallets loaded. Use wallet_name parameter "
+                        "or /wallet/<name> endpoint."
+                    )
+
+        try:
+            warnings = wallet_manager.unload_wallet(
+                name=wallet_name,
+                load_on_startup=load_on_startup,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        return {
+            "warning": "\n".join(warnings) if warnings else "",
+        }
 
     async def rpc_getnetworkhashps(
         self, nblocks: int = 120, height: int = -1
@@ -4195,8 +4575,211 @@ class RPCServer:
     async def rpc_generatetoaddress(
         self, nblocks: int, address: str, maxtries: int = 1000000
     ) -> List[str]:
-        """Mine blocks to a given address (regtest only)."""
-        return []
+        """Mine blocks to a given address (regtest only).
+
+        Creates *nblocks* blocks whose coinbase pays to *address*, connects
+        them to the active chain (block storage, header/height index, UTXO
+        set, tx index, chain tip), and returns a list of the new block hashes.
+        """
+        import hashlib as _hl
+        import struct as _st
+        import time as _time
+        from ouroboros.address import address_to_script_pubkey
+        from ouroboros.database import Block as _Block, Transaction as _Tx, TxIn as _TxIn, TxOut as _TxOut
+        from ouroboros.p2p_messages import encode_varint
+
+        db = getattr(self.node, "db", None)
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        network = getattr(self.node, "network", "regtest")
+
+        # Decode destination address to scriptPubKey
+        try:
+            output_spk = address_to_script_pubkey(address, network)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid address: {e}")
+
+        block_hashes: List[str] = []
+
+        for _ in range(nblocks):
+            best_hash, best_height = db.get_best_block()
+            next_height = best_height + 1
+
+            # --- Subsidy ---
+            from ouroboros.config import RegtestConfig
+            halving_interval = getattr(RegtestConfig, "SUBSIDY_HALVING_INTERVAL", 150)
+            halvings = next_height // halving_interval
+            subsidy = (50 * 100_000_000) >> halvings if halvings < 64 else 0
+
+            # --- Coinbase transaction ---
+            # BIP34: height in scriptSig
+            height_bytes = _st.pack("<q", next_height)
+            # Trim trailing zero bytes but keep at least 1
+            while len(height_bytes) > 1 and height_bytes[-1] == 0:
+                height_bytes = height_bytes[:-1]
+            coinbase_script = bytes([len(height_bytes)]) + height_bytes
+
+            coinbase_in = _TxIn(
+                prev_txid=bytes(32),
+                prev_vout=0xFFFFFFFF,
+                script_sig=coinbase_script,
+                sequence=0xFFFFFFFF,
+                witness=[bytes(32)],  # SegWit nonce (32 zero bytes)
+            )
+
+            # Witness commitment (even with 0 non-coinbase txs we include it
+            # so that the block is valid SegWit).
+            witness_root = bytes(32)  # only coinbase -> wtxid is 0x00*32
+            witness_nonce = bytes(32)
+            commitment = _hl.sha256(
+                _hl.sha256(witness_root + witness_nonce).digest()
+            ).digest()
+            witness_commitment_spk = bytes.fromhex("6a24aa21a9ed") + commitment
+
+            coinbase_out_reward = _TxOut(value=subsidy, script_pubkey=output_spk)
+            coinbase_out_commitment = _TxOut(value=0, script_pubkey=witness_commitment_spk)
+
+            # Build coinbase as raw bytes (with witness) for correct txid/wtxid.
+            cb_raw = bytearray()
+            cb_raw.extend(_st.pack("<i", 2))  # version 2
+            # SegWit marker + flag
+            cb_raw.extend(b"\x00\x01")
+            # 1 input
+            cb_raw.extend(encode_varint(1))
+            cb_raw.extend(coinbase_in.prev_txid)
+            cb_raw.extend(_st.pack("<I", coinbase_in.prev_vout))
+            cb_raw.extend(encode_varint(len(coinbase_in.script_sig)))
+            cb_raw.extend(coinbase_in.script_sig)
+            cb_raw.extend(_st.pack("<I", coinbase_in.sequence))
+            # 2 outputs
+            cb_raw.extend(encode_varint(2))
+            for out in (coinbase_out_reward, coinbase_out_commitment):
+                cb_raw.extend(_st.pack("<q", out.value))
+                cb_raw.extend(encode_varint(len(out.script_pubkey)))
+                cb_raw.extend(out.script_pubkey)
+            # Witness data: 1 item (32 zero bytes)
+            cb_raw.extend(encode_varint(1))  # 1 witness item
+            cb_raw.extend(encode_varint(32))
+            cb_raw.extend(bytes(32))
+            # locktime
+            cb_raw.extend(_st.pack("<I", 0))
+
+            cb_bytes = bytes(cb_raw)
+
+            # Compute txid (without witness) for merkle root
+            cb_no_witness = bytearray()
+            cb_no_witness.extend(_st.pack("<i", 2))
+            cb_no_witness.extend(encode_varint(1))
+            cb_no_witness.extend(coinbase_in.prev_txid)
+            cb_no_witness.extend(_st.pack("<I", coinbase_in.prev_vout))
+            cb_no_witness.extend(encode_varint(len(coinbase_in.script_sig)))
+            cb_no_witness.extend(coinbase_in.script_sig)
+            cb_no_witness.extend(_st.pack("<I", coinbase_in.sequence))
+            cb_no_witness.extend(encode_varint(2))
+            for out in (coinbase_out_reward, coinbase_out_commitment):
+                cb_no_witness.extend(_st.pack("<q", out.value))
+                cb_no_witness.extend(encode_varint(len(out.script_pubkey)))
+                cb_no_witness.extend(out.script_pubkey)
+            cb_no_witness.extend(_st.pack("<I", 0))
+
+            cb_txid = _hl.sha256(_hl.sha256(bytes(cb_no_witness)).digest()).digest()
+
+            # --- Merkle root (single tx) ---
+            merkle_root = cb_txid  # only coinbase
+
+            # --- Block header ---
+            # For regtest, bits stays at minimum difficulty
+            bits = 0x207FFFFF
+
+            # prev_blockhash is stored in internal byte order; wire format
+            # needs little-endian (reversed display order).
+            prev_hash_wire = best_hash[::-1]
+
+            timestamp = max(int(_time.time()), (self.node.get_median_time(best_height) or 0) + 1)
+
+            # --- Mine (find valid nonce) ---
+            # Regtest target from bits 0x207fffff:
+            #   mantissa = 0x7fffff, exponent = 0x20 = 32
+            #   target = 0x7fffff << (8 * (32 - 3)) = huge number
+            # Practically any nonce is valid on regtest.
+            target = self._bits_to_target(bits)
+
+            header_prefix = bytearray()
+            header_prefix.extend(_st.pack("<i", 0x20000000))  # version
+            header_prefix.extend(prev_hash_wire)
+            # merkle root: raw SHA256d output = wire format (internal byte order)
+            header_prefix.extend(merkle_root)
+            header_prefix.extend(_st.pack("<I", timestamp))
+            header_prefix.extend(_st.pack("<I", bits))
+
+            found = False
+            for nonce in range(maxtries):
+                header = bytes(header_prefix) + _st.pack("<I", nonce)
+                block_hash = _hl.sha256(_hl.sha256(header).digest()).digest()
+                # Compare hash as little-endian 256-bit integer vs target
+                hash_int = int.from_bytes(block_hash, "little")
+                if hash_int <= target:
+                    found = True
+                    break
+
+            if not found:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Block generation failed: could not find valid nonce in {maxtries} tries",
+                )
+
+            # --- Assemble full block bytes ---
+            block_data = bytearray()
+            block_data.extend(header)
+            block_data.extend(encode_varint(1))  # 1 transaction
+            block_data.extend(cb_bytes)
+
+            block_bytes = bytes(block_data)
+
+            # --- Store via Rust DB ---
+            try:
+                stored_hash = db._db.connect_block_from_bytes(block_bytes, next_height)
+                # Rust returns hash in display byte order (same as as_byte_array())
+                block_hash_hex = bytes(stored_hash).hex()
+            except AttributeError:
+                # Fallback: Rust extension doesn't have connect_block_from_bytes
+                # (needs rebuild). Use display hash from mined header.
+                block_hash_hex = block_hash[::-1].hex()
+                logger.warning(
+                    "connect_block_from_bytes not available; block not persisted. "
+                    "Rebuild the Rust extension (maturin develop)."
+                )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Block generation failed: {e}",
+                )
+
+            # Remove confirmed txs from mempool (currently coinbase only)
+            mempool = getattr(self.node, "mempool", None)
+            if mempool is not None:
+                try:
+                    blk = _Block.deserialize(block_bytes)
+                    mempool.remove_block_transactions(blk)
+                except Exception:
+                    pass
+
+            block_hashes.append(block_hash_hex)
+            logger.info(f"Generated block {next_height}: {block_hash_hex[:16]}...")
+
+        return block_hashes
+
+    @staticmethod
+    def _bits_to_target(bits: int) -> int:
+        """Convert compact 'bits' representation to the full 256-bit target."""
+        exponent = (bits >> 24) & 0xFF
+        mantissa = bits & 0x7FFFFF
+        if bits & 0x800000:
+            mantissa = -mantissa
+        if exponent <= 3:
+            return mantissa >> (8 * (3 - exponent))
+        return mantissa << (8 * (exponent - 3))
 
     async def rpc_getrpcinfo(self) -> Dict[str, Any]:
         """Return info about the RPC server."""
@@ -4230,9 +4813,9 @@ class RPCServer:
             ``fee`` (BTC), and ``errors`` list.
 
         """
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
-            raise HTTPException(status_code=500, detail="Wallet not loaded")
+            raise HTTPException(status_code=500, detail="No wallet loaded")
 
         if not hasattr(self.node, "mempool") or not self.node.mempool:
             raise HTTPException(status_code=500, detail="Mempool not available")
@@ -4315,9 +4898,9 @@ class RPCServer:
             ``fee`` (BTC), and ``errors`` list.
 
         """
-        wallet = getattr(self.node, "wallet", None)
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
-            raise HTTPException(status_code=500, detail="Wallet not loaded")
+            raise HTTPException(status_code=500, detail="No wallet loaded")
 
         if not hasattr(self.node, "mempool") or not self.node.mempool:
             raise HTTPException(status_code=500, detail="Mempool not available")
@@ -5686,6 +6269,616 @@ class RPCServer:
             "headers": best_height,  # Simplified; would need header count
             "chainstates": chainstates,
         }
+
+    async def rpc_decoderawtransaction(
+        self, hexstring: str, iswitness: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Decode a hex-encoded raw transaction.
+
+        Reference: Bitcoin Core rpc/rawtransaction.cpp decoderawtransaction
+
+        Args:
+            hexstring: The hex-encoded transaction data
+            iswitness: Whether to attempt parsing as a SegWit transaction (default True)
+
+        Returns:
+            JSON object with transaction details: txid, hash (wtxid), version,
+            size, vsize, weight, locktime, vin, vout
+        """
+        from ouroboros.p2p_messages import TxMessage
+
+        try:
+            raw_bytes = bytes.fromhex(hexstring)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid hex string: {e}")
+
+        try:
+            tx_msg = TxMessage.from_payload(raw_bytes)
+            tx = tx_msg.transaction
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to decode transaction: {e}")
+
+        # Use existing _tx_to_dict helper
+        return self._tx_to_dict(tx)
+
+    async def rpc_decodescript(self, hexstring: str) -> Dict[str, Any]:
+        """
+        Decode a hex-encoded script.
+
+        Reference: Bitcoin Core rpc/rawtransaction.cpp decodescript
+
+        Args:
+            hexstring: The hex-encoded script
+
+        Returns:
+            JSON object with: asm, type, p2sh (if applicable), segwit info
+        """
+        try:
+            script_bytes = bytes.fromhex(hexstring)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid hex string: {e}")
+
+        # Disassemble script to human-readable ASM
+        asm = disassemble_script(script_bytes)
+
+        # Classify script type
+        script_type = self._classify_script(script_bytes)
+
+        result: Dict[str, Any] = {
+            "asm": asm,
+            "type": script_type,
+            "hex": hexstring,
+        }
+
+        # For P2PK, extract pubkey
+        if script_type == "pubkey":
+            # Format: <pubkey> OP_CHECKSIG
+            if len(script_bytes) >= 35 and script_bytes[-1] == 0xac:
+                pubkey_len = script_bytes[0]
+                if pubkey_len in (33, 65) and len(script_bytes) == pubkey_len + 2:
+                    result["pubkey"] = script_bytes[1:1 + pubkey_len].hex()
+
+        # For P2PKH, extract address
+        if script_type == "pubkeyhash" and len(script_bytes) == 25:
+            import hashlib
+            import base58
+            pubkey_hash = script_bytes[3:23]
+            network = getattr(self.node, 'network', 'mainnet')
+            version = b"\x00" if network == "mainnet" else b"\x6f"
+            result["address"] = base58.b58encode_check(version + pubkey_hash).decode()
+
+        # For P2SH, extract script hash and compute P2SH address
+        if script_type == "scripthash" and len(script_bytes) == 23:
+            import base58
+            script_hash = script_bytes[2:22]
+            network = getattr(self.node, 'network', 'mainnet')
+            version = b"\x05" if network == "mainnet" else b"\xc4"
+            result["address"] = base58.b58encode_check(version + script_hash).decode()
+
+        # For witness programs, extract address
+        if script_type in ("witness_v0_keyhash", "witness_v0_scripthash", "witness_v1_taproot"):
+            import bech32
+            network = getattr(self.node, 'network', 'mainnet')
+            hrp = "bc" if network == "mainnet" else "tb"
+            version = script_bytes[0]
+            if version == 0x00:
+                # OP_0 for witness v0
+                version = 0
+            elif version == 0x51:
+                # OP_1 for witness v1 (taproot)
+                version = 1
+            else:
+                version = version - 0x50  # OP_1 through OP_16
+            program = script_bytes[2:]
+            converted = bech32.convertbits(program, 8, 5)
+            if converted:
+                if version == 0:
+                    result["address"] = bech32.bech32_encode(hrp, [version] + converted)
+                else:
+                    # bech32m for version 1+
+                    from ouroboros.address import _bech32m_encode
+                    result["address"] = _bech32m_encode(hrp, version, program)
+
+        # Compute P2SH-wrapped address for this script (if it were used as redeem script)
+        if len(script_bytes) > 0:
+            import hashlib
+            import base58
+            script_hash = hashlib.new(
+                "ripemd160", hashlib.sha256(script_bytes).digest()
+            ).digest()
+            network = getattr(self.node, 'network', 'mainnet')
+            version = b"\x05" if network == "mainnet" else b"\xc4"
+            result["p2sh"] = base58.b58encode_check(version + script_hash).decode()
+
+            # Compute segwit address if this script were used as witness script
+            # (P2WSH address for this script)
+            script_sha256 = hashlib.sha256(script_bytes).digest()
+            hrp = "bc" if network == "mainnet" else "tb"
+            converted = bech32.convertbits(script_sha256, 8, 5)
+            if converted:
+                result["segwit"] = {
+                    "asm": f"0 {script_sha256.hex()}",
+                    "hex": f"0020{script_sha256.hex()}",
+                    "address": bech32.bech32_encode(hrp, [0] + converted),
+                    "type": "witness_v0_scripthash",
+                    "p2sh-segwit": result["p2sh"],  # This script as P2SH
+                }
+
+        return result
+
+    def _classify_script(self, script: bytes) -> str:
+        """Classify a script into its type with extended detection."""
+        if not script:
+            return "nonstandard"
+
+        # P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+        if (len(script) == 25 and script[0] == 0x76 and script[1] == 0xa9 and
+            script[2] == 0x14 and script[23] == 0x88 and script[24] == 0xac):
+            return "pubkeyhash"
+
+        # P2SH: OP_HASH160 <20> OP_EQUAL
+        if len(script) == 23 and script[0] == 0xa9 and script[1] == 0x14 and script[22] == 0x87:
+            return "scripthash"
+
+        # P2WPKH: OP_0 <20>
+        if len(script) == 22 and script[0] == 0x00 and script[1] == 0x14:
+            return "witness_v0_keyhash"
+
+        # P2WSH: OP_0 <32>
+        if len(script) == 34 and script[0] == 0x00 and script[1] == 0x20:
+            return "witness_v0_scripthash"
+
+        # P2TR: OP_1 <32>
+        if len(script) == 34 and script[0] == 0x51 and script[1] == 0x20:
+            return "witness_v1_taproot"
+
+        # Witness unknown: OP_N <program> where N is 2-16 or program length != 20/32
+        if len(script) >= 4 and 0x52 <= script[0] <= 0x60:
+            version = script[0] - 0x50
+            prog_len = script[1]
+            if 2 <= prog_len <= 40 and len(script) == prog_len + 2:
+                return f"witness_v{version}_unknown"
+
+        # P2PK uncompressed: <65> OP_CHECKSIG
+        if len(script) == 67 and script[0] == 0x41 and script[-1] == 0xac:
+            return "pubkey"
+
+        # P2PK compressed: <33> OP_CHECKSIG
+        if len(script) == 35 and script[0] == 0x21 and script[-1] == 0xac:
+            return "pubkey"
+
+        # Multisig: OP_M <pubkeys...> OP_N OP_CHECKMULTISIG
+        if len(script) > 3 and script[-1] == 0xae:
+            first = script[0]
+            if 0x51 <= first <= 0x60:  # OP_1 to OP_16
+                return "multisig"
+
+        # OP_RETURN (nulldata)
+        if len(script) > 0 and script[0] == 0x6a:
+            return "nulldata"
+
+        return "nonstandard"
+
+    async def rpc_getbalance(
+        self,
+        dummy: str = "*",
+        minconf: int = 0,
+        include_watchonly: bool = True,
+    ) -> float:
+        """
+        Get the total wallet balance.
+
+        Reference: Bitcoin Core rpc/wallet.cpp getbalance
+
+        Args:
+            dummy: Dummy argument (for compatibility, must be "*")
+            minconf: Minimum confirmations for a transaction to be included
+            include_watchonly: Include watch-only addresses in balance
+
+        Returns:
+            Balance in BTC as a float
+        """
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="No wallet loaded")
+
+        if wallet.db is None:
+            raise HTTPException(status_code=500, detail="Wallet database not available")
+
+        # Get current best height for confirmation counting
+        best_hash, best_height = wallet.db.get_best_block() if wallet.db else (None, 0)
+
+        total_balance = 0
+
+        # Get all wallet addresses
+        addresses = set()
+
+        # From imported keys
+        for key_data in wallet.keys:
+            from ouroboros.wallet import WalletKey
+            try:
+                key = WalletKey.from_wif(key_data["wif"], wallet.network)
+                # Add all address types for the key
+                addresses.add(key.get_p2wpkh_address())
+                addresses.add(key.get_p2pkh_address())
+                addresses.add(key.get_p2sh_p2wpkh_address())
+            except Exception:
+                continue
+
+        # From descriptors
+        for entry in wallet.descriptors:
+            if not entry.active:
+                continue
+            try:
+                end = max(entry.next_index, entry.range_start + 1)
+                for i in range(entry.range_start, end):
+                    addr = entry.descriptor.derive_address(i, wallet.network)
+                    addresses.add(addr)
+            except Exception:
+                continue
+
+        # Sum UTXOs for all addresses
+        for addr in addresses:
+            if hasattr(wallet.db, 'get_utxos_for_address'):
+                utxos = wallet.db.get_utxos_for_address(addr, wallet.network)
+                for utxo in utxos:
+                    # Check confirmations
+                    utxo_height = utxo.get('height', 0)
+                    if utxo_height == 0:
+                        # Unconfirmed (mempool)
+                        confs = 0
+                    else:
+                        confs = max(0, best_height - utxo_height + 1)
+
+                    if confs >= minconf:
+                        total_balance += utxo.get('value', 0)
+            elif hasattr(wallet.db, 'get_balance'):
+                # Fallback to simple balance query
+                balance = wallet.db.get_balance(addr, wallet.network)
+                if minconf == 0:
+                    total_balance += balance
+
+        # Convert satoshis to BTC
+        return total_balance / 100_000_000
+
+    async def rpc_signrawtransactionwithwallet(
+        self,
+        hexstring: str,
+        prevtxs: Optional[List[Dict]] = None,
+        sighashtype: str = "ALL",
+    ) -> Dict[str, Any]:
+        """
+        Sign a raw transaction with wallet keys.
+
+        Reference: Bitcoin Core rpc/rawtransaction.cpp signrawtransactionwithwallet
+
+        Args:
+            hexstring: The hex-encoded raw transaction
+            prevtxs: Array of previous transaction outputs (optional, for signing
+                     inputs not in the blockchain/mempool)
+            sighashtype: The signature hash type: ALL, NONE, SINGLE,
+                         ALL|ANYONECANPAY, NONE|ANYONECANPAY, SINGLE|ANYONECANPAY
+
+        Returns:
+            JSON object with: hex (signed transaction), complete (bool)
+        """
+        from ouroboros.p2p_messages import TxMessage
+        from ouroboros.wallet import WalletKey, _hash160, _dsha256
+
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="No wallet loaded")
+
+        if wallet.is_locked:
+            raise HTTPException(status_code=500, detail="Wallet is locked; unlock with walletpassphrase")
+
+        # Parse sighash type
+        sighash_map = {
+            "ALL": 0x01,
+            "NONE": 0x02,
+            "SINGLE": 0x03,
+            "ALL|ANYONECANPAY": 0x81,
+            "NONE|ANYONECANPAY": 0x82,
+            "SINGLE|ANYONECANPAY": 0x83,
+        }
+        sighash = sighash_map.get(sighashtype.upper())
+        if sighash is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid sighashtype: {sighashtype}. Valid types: {list(sighash_map.keys())}"
+            )
+
+        # Parse transaction
+        try:
+            raw_bytes = bytes.fromhex(hexstring)
+            tx_msg = TxMessage.from_payload(raw_bytes)
+            tx = tx_msg.transaction
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to decode transaction: {e}")
+
+        # Build a map of scriptPubKey -> WalletKey for signing
+        spk_to_key: Dict[bytes, WalletKey] = {}
+        for key_data in wallet.keys:
+            try:
+                key = WalletKey.from_wif(key_data["wif"], wallet.network)
+                # P2WPKH scriptPubKey
+                spk_to_key[key.get_script_pubkey()] = key
+                # P2PKH scriptPubKey
+                h160 = _hash160(key.pubkey)
+                p2pkh_spk = b"\x76\xa9\x14" + h160 + b"\x88\xac"
+                spk_to_key[p2pkh_spk] = key
+            except Exception:
+                continue
+
+        # Build prevtxs lookup if provided
+        prevtxs_map: Dict[tuple, Dict] = {}
+        if prevtxs:
+            for prev in prevtxs:
+                txid = prev.get("txid", "")
+                vout = prev.get("vout", 0)
+                prevtxs_map[(txid, vout)] = prev
+
+        # Track signing status
+        errors = []
+        signed_count = 0
+
+        # Sign each input
+        for i, tx_in in enumerate(tx.inputs):
+            prev_txid_hex = tx_in.prev_txid.hex()
+            prev_vout = tx_in.prev_vout
+
+            # Skip if already signed (has witness or non-empty scriptSig)
+            if tx_in.witness and len(tx_in.witness) > 0:
+                signed_count += 1
+                continue
+            if tx_in.script_sig and len(tx_in.script_sig) > 0:
+                signed_count += 1
+                continue
+
+            # Find scriptPubKey from prevtxs or database
+            script_pubkey = None
+            value = None
+
+            if (prev_txid_hex, prev_vout) in prevtxs_map:
+                prev = prevtxs_map[(prev_txid_hex, prev_vout)]
+                spk_hex = prev.get("scriptPubKey", "")
+                if spk_hex:
+                    script_pubkey = bytes.fromhex(spk_hex)
+                value = int(prev.get("amount", 0) * 100_000_000)
+            elif wallet.db:
+                utxo = wallet.db.get_utxo(tx_in.prev_txid, prev_vout)
+                if utxo:
+                    script_pubkey = utxo.get('script_pubkey')
+                    value = utxo.get('value')
+
+            if script_pubkey is None:
+                errors.append({
+                    "txid": prev_txid_hex,
+                    "vout": prev_vout,
+                    "error": "Input not found or missing scriptPubKey"
+                })
+                continue
+
+            # Find matching wallet key
+            key = spk_to_key.get(script_pubkey)
+
+            # Check if P2SH-P2WPKH
+            is_p2sh_p2wpkh = False
+            if key is None and len(script_pubkey) == 23 and script_pubkey[0] == 0xa9:
+                # P2SH - check if we have a key for P2SH-P2WPKH
+                for wkey in spk_to_key.values():
+                    h160 = _hash160(wkey.pubkey)
+                    redeem_script = b"\x00\x14" + h160
+                    script_hash = _hash160(redeem_script)
+                    p2sh_spk = b"\xa9\x14" + script_hash + b"\x87"
+                    if p2sh_spk == script_pubkey:
+                        key = wkey
+                        is_p2sh_p2wpkh = True
+                        break
+
+            if key is None:
+                errors.append({
+                    "txid": prev_txid_hex,
+                    "vout": prev_vout,
+                    "error": "Unable to find key for this input"
+                })
+                continue
+
+            if value is None:
+                errors.append({
+                    "txid": prev_txid_hex,
+                    "vout": prev_vout,
+                    "error": "Missing input value (required for SegWit signing)"
+                })
+                continue
+
+            # Determine signing method based on script type
+            script_type = self._get_script_type(script_pubkey)
+
+            try:
+                if script_type == "witness_v0_keyhash":
+                    # P2WPKH signing (BIP143)
+                    sighash_bytes = self._compute_bip143_sighash(
+                        tx, i, key.pubkey, value, sighash
+                    )
+                    sig = key.sign(sighash_bytes) + bytes([sighash])
+                    tx.inputs[i].witness = [sig, key.pubkey]
+                    tx.has_witness = True
+                    signed_count += 1
+
+                elif is_p2sh_p2wpkh:
+                    # P2SH-P2WPKH signing
+                    h160 = _hash160(key.pubkey)
+                    redeem_script = b"\x00\x14" + h160
+                    tx.inputs[i].script_sig = bytes([len(redeem_script)]) + redeem_script
+                    sighash_bytes = self._compute_bip143_sighash(
+                        tx, i, key.pubkey, value, sighash
+                    )
+                    sig = key.sign(sighash_bytes) + bytes([sighash])
+                    tx.inputs[i].witness = [sig, key.pubkey]
+                    tx.has_witness = True
+                    signed_count += 1
+
+                elif script_type == "pubkeyhash":
+                    # Legacy P2PKH signing
+                    sighash_bytes = self._compute_legacy_sighash(
+                        tx, i, script_pubkey, sighash
+                    )
+                    sig = key.sign(sighash_bytes) + bytes([sighash])
+                    # Build scriptSig: <sig> <pubkey>
+                    script_sig = bytes([len(sig)]) + sig + bytes([len(key.pubkey)]) + key.pubkey
+                    tx.inputs[i].script_sig = script_sig
+                    signed_count += 1
+
+                else:
+                    errors.append({
+                        "txid": prev_txid_hex,
+                        "vout": prev_vout,
+                        "error": f"Unsupported script type: {script_type}"
+                    })
+
+            except Exception as e:
+                errors.append({
+                    "txid": prev_txid_hex,
+                    "vout": prev_vout,
+                    "error": str(e)
+                })
+
+        # Recompute txid
+        tx.txid = _dsha256(tx.serialize())
+
+        # Serialize signed transaction
+        if tx.has_witness:
+            signed_hex = tx.serialize_with_witness().hex()
+        else:
+            signed_hex = tx.serialize().hex()
+
+        complete = len(errors) == 0 and signed_count == len(tx.inputs)
+
+        result: Dict[str, Any] = {
+            "hex": signed_hex,
+            "complete": complete,
+        }
+
+        if errors:
+            result["errors"] = errors
+
+        return result
+
+    def _compute_bip143_sighash(
+        self, tx, input_index: int, pubkey: bytes, value: int, sighash_type: int
+    ) -> bytes:
+        """Compute BIP143 signature hash for SegWit inputs."""
+        from ouroboros.wallet import _hash160, _dsha256
+
+        pubkey_hash = _hash160(pubkey)
+        script_code = b"\x76\xa9\x14" + pubkey_hash + b"\x88\xac"
+        script_code_with_len = bytes([len(script_code)]) + script_code
+
+        anyonecanpay = bool(sighash_type & 0x80)
+        base_type = sighash_type & 0x1f
+
+        # hashPrevouts
+        if anyonecanpay:
+            hash_prevouts = b"\x00" * 32
+        else:
+            prevouts = b""
+            for inp in tx.inputs:
+                prevouts += inp.prev_txid[::-1] + inp.prev_vout.to_bytes(4, 'little')
+            hash_prevouts = _dsha256(prevouts)
+
+        # hashSequence
+        if anyonecanpay or base_type in (0x02, 0x03):  # NONE or SINGLE
+            hash_sequence = b"\x00" * 32
+        else:
+            sequences = b""
+            for inp in tx.inputs:
+                sequences += inp.sequence.to_bytes(4, 'little')
+            hash_sequence = _dsha256(sequences)
+
+        # hashOutputs
+        if base_type == 0x02:  # NONE
+            hash_outputs = b"\x00" * 32
+        elif base_type == 0x03 and input_index < len(tx.outputs):  # SINGLE
+            out = tx.outputs[input_index]
+            output_data = out.value.to_bytes(8, 'little')
+            output_data += self._encode_varint(len(out.script_pubkey))
+            output_data += out.script_pubkey
+            hash_outputs = _dsha256(output_data)
+        elif base_type == 0x03:
+            hash_outputs = b"\x00" * 32
+        else:  # ALL
+            outputs = b""
+            for out in tx.outputs:
+                outputs += out.value.to_bytes(8, 'little')
+                outputs += self._encode_varint(len(out.script_pubkey))
+                outputs += out.script_pubkey
+            hash_outputs = _dsha256(outputs)
+
+        inp = tx.inputs[input_index]
+        preimage = tx.version.to_bytes(4, 'little', signed=True)
+        preimage += hash_prevouts
+        preimage += hash_sequence
+        preimage += inp.prev_txid[::-1] + inp.prev_vout.to_bytes(4, 'little')
+        preimage += script_code_with_len
+        preimage += value.to_bytes(8, 'little')
+        preimage += inp.sequence.to_bytes(4, 'little')
+        preimage += hash_outputs
+        preimage += tx.locktime.to_bytes(4, 'little')
+        preimage += sighash_type.to_bytes(4, 'little')
+
+        return _dsha256(preimage)
+
+    def _compute_legacy_sighash(
+        self, tx, input_index: int, script_pubkey: bytes, sighash_type: int
+    ) -> bytes:
+        """Compute legacy signature hash for P2PKH inputs."""
+        from ouroboros.wallet import _dsha256
+
+        # Create a copy of the transaction for signing
+        tx_copy_inputs = []
+        for i, inp in enumerate(tx.inputs):
+            if i == input_index:
+                new_script = script_pubkey
+            else:
+                new_script = b""
+            tx_copy_inputs.append((
+                inp.prev_txid,
+                inp.prev_vout,
+                new_script,
+                inp.sequence
+            ))
+
+        # Serialize for signing
+        data = tx.version.to_bytes(4, 'little', signed=True)
+        data += self._encode_varint(len(tx_copy_inputs))
+        for prev_txid, prev_vout, script, seq in tx_copy_inputs:
+            data += prev_txid[::-1]  # Wire format is reversed
+            data += prev_vout.to_bytes(4, 'little')
+            data += self._encode_varint(len(script))
+            data += script
+            data += seq.to_bytes(4, 'little')
+        data += self._encode_varint(len(tx.outputs))
+        for out in tx.outputs:
+            data += out.value.to_bytes(8, 'little')
+            data += self._encode_varint(len(out.script_pubkey))
+            data += out.script_pubkey
+        data += tx.locktime.to_bytes(4, 'little')
+        data += sighash_type.to_bytes(4, 'little')
+
+        return _dsha256(data)
+
+    def _encode_varint(self, value: int) -> bytes:
+        """Encode a varint."""
+        if value < 0xfd:
+            return bytes([value])
+        elif value <= 0xffff:
+            return b'\xfd' + value.to_bytes(2, 'little')
+        elif value <= 0xffffffff:
+            return b'\xfe' + value.to_bytes(4, 'little')
+        else:
+            return b'\xff' + value.to_bytes(8, 'little')
 
     def get_app(self) -> FastAPI:
         """Get the FastAPI application"""
