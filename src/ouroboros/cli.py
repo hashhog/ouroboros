@@ -323,10 +323,12 @@ def start(ctx, rpc_port, p2p_port, listen):
         border_style="green"
     ))
     
-    # Check if synced
+    # Check if synced (release SyncManager before node opens DB to avoid RocksDB lock conflict)
     try:
         sync_manager = SyncManager(data_dir, network)
-        if not sync_manager.is_synced():
+        is_synced = sync_manager.is_synced()
+        del sync_manager  # Release RocksDB lock before node opens it
+        if not is_synced:
             console.print(
                 "[yellow]⚠ Blockchain not fully synced — run 'ouroboros sync' first[/yellow]"
             )

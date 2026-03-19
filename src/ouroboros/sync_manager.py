@@ -4,6 +4,11 @@ Python sync manager that wraps Rust FastSync.
 This module provides a high-level Python interface for blockchain synchronization
 with progress reporting, error recovery, and graceful cancellation.
 
+Checkpoint Optimization:
+- During IBD, blocks at or below the last checkpoint can skip script validation
+- Only PoW and merkle root are verified for these blocks
+- This significantly speeds up initial sync
+
 Stale Tip Detection (Bitcoin Core net_processing.cpp TipMayBeStale/ConsiderEviction):
 - If the chain tip hasn't updated for 30 minutes AND the tip's timestamp is > 24 hours old,
   the tip is considered stale.
@@ -70,14 +75,14 @@ class SyncProgress:
 
 class SyncManager:
     """Manages initial blockchain synchronization"""
-    
+
     def __init__(self, data_dir: str, network: str = "mainnet"):
         if sync is None:
             raise ImportError(
                 "Rust sync module not available. "
                 "Install with: maturin develop"
             )
-        
+
         self.fast_sync = sync.FastSync(data_dir, network)
         # Progress reporter reads from shared cache without borrowing FastSync.
         self._progress_reporter = self.fast_sync.get_progress_reporter()
@@ -89,6 +94,43 @@ class SyncManager:
         self._is_running = False
         self._sync_error: Optional[Exception] = None
         self._last_progress: Optional[SyncProgress] = None
+
+        # Checkpoint info for IBD optimization
+        self._last_checkpoint_height: Optional[int] = None
+        self._init_checkpoint_info()
+
+    def _init_checkpoint_info(self) -> None:
+        """Initialize checkpoint information for IBD optimization."""
+        try:
+            last_cp = sync.get_last_network_checkpoint(self.network)
+            if last_cp is not None:
+                self._last_checkpoint_height = last_cp.height
+                logger.debug(f"Last checkpoint at height {self._last_checkpoint_height}")
+        except Exception as e:
+            logger.debug(f"Could not get checkpoint info: {e}")
+
+    def get_last_checkpoint_height(self) -> Optional[int]:
+        """Get the height of the last checkpoint for this network."""
+        return self._last_checkpoint_height
+
+    def is_below_checkpoint(self, height: int) -> bool:
+        """Check if a height is at or below the last checkpoint."""
+        try:
+            return sync.check_is_below_checkpoint(self.network, height)
+        except Exception:
+            return False
+
+    def can_skip_script_validation(self, height: int, block_hash: bytes) -> bool:
+        """
+        Check if script validation can be skipped for a block during IBD.
+
+        Blocks at or below the last checkpoint can skip script validation
+        (only PoW and merkle root need to be verified).
+        """
+        try:
+            return sync.can_skip_scripts_for_block(self.network, height, block_hash)
+        except Exception:
+            return False
         
     def perform_initial_sync(self,
                             progress_callback: Optional[Callable[[SyncProgress], None]] = None,

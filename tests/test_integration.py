@@ -1340,7 +1340,10 @@ class TestHDKey:
         # Reload wallet and verify HD state persisted
         w2 = Wallet(temp_data_dir, "mainnet")
         assert w2.is_hd
-        assert w2._hd_next_index == 2
+        # With key pool, addresses are tracked via used indices
+        assert w2._key_pool is not None
+        assert 0 in w2._key_pool._used_receive_indices
+        assert 1 in w2._key_pool._used_receive_indices
         addrs = await w2.get_addresses()
         assert len(addrs) == 2
         assert addrs[0].address == a0

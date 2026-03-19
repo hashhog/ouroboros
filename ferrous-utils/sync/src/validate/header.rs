@@ -6,7 +6,12 @@ use bitcoin::{blockdata::block::Header, Network};
 use thiserror::Error;
 
 use crate::storage::{BlockchainDB, DbError};
+use crate::chain_params::{
+    get_checkpoints, get_last_checkpoint, verify_checkpoint, is_below_last_checkpoint,
+    minimum_chain_work, Checkpoint,
+};
 use common::BlockHeaderWrapper;
+use primitive_types::U256;
 
 use super::pow::{bits_to_target, calculate_next_difficulty, validate_pow};
 
@@ -39,6 +44,15 @@ pub enum HeaderValidationError {
 
     #[error("Invalid header chain: {0}")]
     InvalidChain(String),
+
+    #[error("Checkpoint validation failed at height {0}: block hash does not match")]
+    CheckpointMismatch(u32),
+
+    #[error("Chain branches before last checkpoint at height {0}")]
+    ForkBeforeCheckpoint(u32),
+
+    #[error("Chain has insufficient work: {0} < minimum {1}")]
+    InsufficientChainWork(String, String),
 }
 
 /// Result type for header validation
@@ -277,6 +291,103 @@ impl HeaderValidator {
         }
 
         Ok(())
+    }
+
+    // =========================================================================
+    // Checkpoint validation
+    // =========================================================================
+
+    /// Validate a header against checkpoints.
+    ///
+    /// This checks:
+    /// 1. If a checkpoint exists at this height, the hash must match
+    /// 2. The chain must not fork before the last checkpoint
+    ///
+    /// Returns Ok(true) if the header is at a checkpoint height (can skip script validation),
+    /// Ok(false) if validation passed but not at a checkpoint.
+    pub fn validate_checkpoint(
+        &self,
+        height: u32,
+        block_hash: &[u8; 32],
+    ) -> Result<bool> {
+        // Check if there's a checkpoint at this exact height
+        if let Some(matches) = verify_checkpoint(self.network, height, block_hash) {
+            if !matches {
+                return Err(HeaderValidationError::CheckpointMismatch(height));
+            }
+            return Ok(true); // At checkpoint, hash matches
+        }
+
+        Ok(false) // Not at a checkpoint height
+    }
+
+    /// Check if a fork point is valid with respect to checkpoints.
+    ///
+    /// A fork is invalid if it branches off before the last checkpoint.
+    /// This prevents attackers from creating long alternative chains that
+    /// could waste validation resources.
+    pub fn validate_fork_point(&self, fork_height: u32) -> Result<()> {
+        if let Some(last_cp) = get_last_checkpoint(self.network) {
+            if fork_height < last_cp.height {
+                return Err(HeaderValidationError::ForkBeforeCheckpoint(last_cp.height));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if a height is at or below the last checkpoint.
+    ///
+    /// Used to determine if script validation can be skipped during IBD.
+    /// Blocks at or below the last checkpoint only need PoW and merkle root validation.
+    pub fn is_below_checkpoint(&self, height: u32) -> bool {
+        is_below_last_checkpoint(self.network, height)
+    }
+
+    /// Get all checkpoints for this network.
+    pub fn get_checkpoints(&self) -> Vec<Checkpoint> {
+        get_checkpoints(self.network)
+    }
+
+    /// Get the last checkpoint height, or None if no checkpoints exist.
+    pub fn last_checkpoint_height(&self) -> Option<u32> {
+        get_last_checkpoint(self.network).map(|cp| cp.height)
+    }
+
+    /// Validate that a chain has sufficient cumulative work.
+    ///
+    /// Rejects headers from chains with less work than nMinimumChainWork.
+    /// This prevents DoS attacks where an attacker sends headers from
+    /// a low-work chain.
+    pub fn validate_minimum_chain_work(&self, chain_work: U256) -> Result<()> {
+        let min_work = minimum_chain_work(self.network);
+        if chain_work < min_work {
+            return Err(HeaderValidationError::InsufficientChainWork(
+                format!("{:x}", chain_work),
+                format!("{:x}", min_work),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check if script validation can be skipped for a block.
+    ///
+    /// During IBD, blocks at or below the last checkpoint can skip script validation
+    /// because they have been validated by the wider network and are protected by PoW.
+    /// Only PoW and merkle root need to be verified.
+    pub fn can_skip_script_validation(&self, height: u32, block_hash: &[u8; 32]) -> bool {
+        // Must be at or below last checkpoint
+        if !self.is_below_checkpoint(height) {
+            return false;
+        }
+
+        // If at a checkpoint height, verify hash matches
+        if let Some(matches) = verify_checkpoint(self.network, height, block_hash) {
+            if !matches {
+                return false; // Checkpoint mismatch - must do full validation
+            }
+        }
+
+        true
     }
 }
 

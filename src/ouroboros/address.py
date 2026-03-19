@@ -2,7 +2,8 @@
 Bitcoin address decoding and script_pubkey derivation.
 
 Supports P2PKH (1...), P2SH (3...), P2WPKH/P2WSH (bc1q.../tb1q...),
-and P2TR (bc1p.../tb1p... — Taproot, BIP 350 bech32m).
+P2TR (bc1p.../tb1p... — Taproot, BIP 350 bech32m), and
+P2A (Pay-to-Anchor — bc1pfeessrawgf... for CPFP anchors).
 """
 
 from typing import Tuple, Optional, List, Union
@@ -20,6 +21,12 @@ _P2WPKH_PREFIX = bytes([0x00, 0x14])
 
 # P2WSH: OP_0 <32-byte hash>
 _P2WSH_PREFIX = bytes([0x00, 0x20])
+
+# P2A (Pay-to-Anchor): OP_1 OP_PUSHBYTES_2 0x4e73
+# This is a witness v1 program with a 2-byte program (0x4e73 = "Ns")
+# P2A is anyone-can-spend and used for CPFP fee bumping in Lightning
+_P2A_SCRIPT = bytes([0x51, 0x02, 0x4e, 0x73])
+_P2A_PROGRAM = bytes([0x4e, 0x73])
 
 # bech32m (BIP 350)
 # The only difference from bech32 is the checksum constant:
@@ -168,3 +175,60 @@ def address_to_script_pubkey(address: str, network: str = "mainnet") -> bytes:
         return _P2SH_PREFIX + payload + _P2SH_SUFFIX
 
     raise ValueError(f"Unsupported address version: {version}")
+
+
+# =============================================================================
+# Pay-to-Anchor (P2A) utilities
+# =============================================================================
+
+def anchor_to_address(network: str = "mainnet") -> str:
+    """Return the P2A (Pay-to-Anchor) address for the given network.
+
+    P2A is a standardized anyone-can-spend output for anchor outputs in
+    Lightning and other protocols that need efficient CPFP fee bumping.
+
+    The P2A script is: OP_1 OP_PUSHBYTES_2 0x4e73 (4 bytes)
+    This is a witness v1 program with a 2-byte program (not Taproot).
+
+    Returns:
+        The bech32m-encoded P2A address for the network.
+
+    Examples:
+        mainnet: bc1pfeessrawgf...
+        testnet: tb1pfeessrawgf...
+        regtest: bcrt1pfeessrawgf...
+
+    Reference: Bitcoin Core script/script.cpp, policy/policy.cpp
+    """
+    if network == "mainnet":
+        hrp = "bc"
+    elif network in ("testnet", "testnet3", "testnet4", "signet"):
+        hrp = "tb"
+    elif network == "regtest":
+        hrp = "bcrt"
+    else:
+        raise ValueError(f"Unknown network: {network}")
+
+    # Witness version 1, program = 0x4e73
+    return _bech32m_encode(hrp, 1, _P2A_PROGRAM)
+
+
+def p2a_script() -> bytes:
+    """Return the P2A (Pay-to-Anchor) scriptPubKey.
+
+    Returns the 4-byte scriptPubKey: OP_1 OP_PUSHBYTES_2 0x4e73
+    """
+    return _P2A_SCRIPT
+
+
+def is_pay_to_anchor(script_pubkey: bytes) -> bool:
+    """Check if a scriptPubKey is a Pay-to-Anchor (P2A) output.
+
+    P2A pattern: OP_1 OP_PUSHBYTES_2 0x4e73 (4 bytes total)
+    """
+    return script_pubkey == _P2A_SCRIPT
+
+
+def is_pay_to_anchor_program(version: int, program: bytes) -> bool:
+    """Check if a witness program is P2A given version and program bytes."""
+    return version == 1 and program == _P2A_PROGRAM

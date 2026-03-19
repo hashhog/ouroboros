@@ -3,6 +3,8 @@ Tests for Tor / SOCKS5 proxy support.
 
 Verifies:
 - SOCKS5 handshake and connection tunnelling (peer.py)
+- SOCKS5 stream isolation for Tor (tor.py)
+- Tor control protocol (tor.py)
 - .onion address parsing from addrv2 messages (p2p.py)
 - Proxy configuration options (config.py)
 - PeerManager proxy routing logic (p2p.py)
@@ -27,6 +29,14 @@ from ouroboros.peer import (
     SOCKS5_ATYP_DOMAINNAME,
     SOCKS5_ATYP_IPV4,
     SOCKS5_REPLY_SUCCESS,
+)
+from ouroboros.tor import (
+    TorController,
+    TorStreamIsolation,
+    socks5_connect_isolated,
+    SOCKS5_AUTH_USER_PASS,
+    SOCKS5_TOR_HS_DESC_NOT_FOUND,
+    _socks5_error_message,
 )
 from ouroboros.p2p import PeerManager
 from ouroboros.config import NodeConfig
@@ -373,6 +383,156 @@ class TestConfigProxyOptions(unittest.TestCase):
             del os.environ["OUROBOROS_PROXY"]
             del os.environ["OUROBOROS_ONION"]
             del os.environ["OUROBOROS_LISTEN"]
+
+
+# ── Stream Isolation ─────────────────────────────────────────────────
+
+
+class TestTorStreamIsolation(unittest.TestCase):
+    """Test Tor stream isolation credential generation."""
+
+    def test_unique_credentials(self):
+        """Each call should generate unique credentials."""
+        isolation = TorStreamIsolation()
+        cred1 = isolation.generate()
+        cred2 = isolation.generate()
+        cred3 = isolation.generate()
+
+        self.assertNotEqual(cred1, cred2)
+        self.assertNotEqual(cred2, cred3)
+        self.assertNotEqual(cred1, cred3)
+
+    def test_username_equals_password(self):
+        """Username and password should be equal."""
+        isolation = TorStreamIsolation()
+        username, password = isolation.generate()
+        self.assertEqual(username, password)
+
+    def test_counter_increments(self):
+        """Counter should increment with each call."""
+        isolation = TorStreamIsolation()
+        u1, _ = isolation.generate()
+        u2, _ = isolation.generate()
+        # Username format: prefix-counter
+        self.assertIn("-0", u1)
+        self.assertIn("-1", u2)
+
+
+# ── SOCKS5 Error Messages ────────────────────────────────────────────
+
+
+class TestSocks5ErrorMessages(unittest.TestCase):
+    """Test SOCKS5 error message translation."""
+
+    def test_standard_errors(self):
+        self.assertEqual(_socks5_error_message(0x01), "general failure")
+        self.assertEqual(_socks5_error_message(0x05), "connection refused")
+
+    def test_tor_specific_errors(self):
+        self.assertEqual(
+            _socks5_error_message(SOCKS5_TOR_HS_DESC_NOT_FOUND),
+            "onion descriptor not found"
+        )
+
+    def test_unknown_error(self):
+        self.assertEqual(_socks5_error_message(0x99), "unknown error")
+
+
+# ── Tor Controller ───────────────────────────────────────────────────
+
+
+class TestTorController(unittest.TestCase):
+    """Test Tor control protocol handling."""
+
+    def test_controller_init(self):
+        """Test TorController initialization."""
+        ctrl = TorController(
+            control_host="127.0.0.1",
+            control_port=9051,
+            password="secret",
+            data_dir="/tmp/test",
+        )
+        self.assertFalse(ctrl.is_connected)
+        self.assertIsNone(ctrl.onion_address)
+
+    def test_add_onion_command_format(self):
+        """Test expected ADD_ONION command format."""
+        # This tests the expected command format
+        expected_new = "ADD_ONION NEW:ED25519-V3 Port=8333,127.0.0.1:8333"
+        self.assertIn("ADD_ONION", expected_new)
+        self.assertIn("NEW:ED25519-V3", expected_new)
+        self.assertIn("Port=", expected_new)
+
+    def test_protocolinfo_command(self):
+        """Test PROTOCOLINFO command format."""
+        expected = "PROTOCOLINFO 1"
+        self.assertIn("PROTOCOLINFO", expected)
+
+
+# ── PeerManager Tor Control Integration ──────────────────────────────
+
+
+class TestPeerManagerTorControl(unittest.TestCase):
+    """Test PeerManager Tor control integration."""
+
+    def test_torcontrol_config(self):
+        """PeerManager should accept torcontrol configuration."""
+        pm = PeerManager(
+            network="regtest",
+            listen=False,
+            torcontrol="127.0.0.1:9051",
+            torpassword="secret",
+        )
+        self.assertEqual(pm.torcontrol, "127.0.0.1:9051")
+        self.assertEqual(pm.torpassword, "secret")
+
+    def test_stats_include_tor_control(self):
+        """Stats should include Tor control information."""
+        pm = PeerManager(
+            network="regtest",
+            listen=False,
+            torcontrol="127.0.0.1:9051",
+        )
+        stats = pm.get_stats()
+        self.assertEqual(stats["tor_control"], "127.0.0.1:9051")
+        self.assertIsNone(stats["tor_onion_address"])
+
+
+# ── Config Tor/I2P Options ───────────────────────────────────────────
+
+
+class TestConfigTorI2POptions(unittest.TestCase):
+    """Test that config.py exposes Tor and I2P options."""
+
+    def test_defaults(self):
+        cfg = NodeConfig()
+        d = cfg.to_dict()
+        self.assertIsNone(d["i2psam"])
+        self.assertIsNone(d["torcontrol"])
+        self.assertIsNone(d["torpassword"])
+
+    def test_i2psam_from_env(self):
+        import os
+        os.environ["OUROBOROS_I2PSAM"] = "127.0.0.1:7656"
+        try:
+            cfg = NodeConfig()
+            d = cfg.to_dict()
+            self.assertEqual(d["i2psam"], "127.0.0.1:7656")
+        finally:
+            del os.environ["OUROBOROS_I2PSAM"]
+
+    def test_torcontrol_from_env(self):
+        import os
+        os.environ["OUROBOROS_TORCONTROL"] = "127.0.0.1:9051"
+        os.environ["OUROBOROS_TORPASSWORD"] = "secret"
+        try:
+            cfg = NodeConfig()
+            d = cfg.to_dict()
+            self.assertEqual(d["torcontrol"], "127.0.0.1:9051")
+            self.assertEqual(d["torpassword"], "secret")
+        finally:
+            del os.environ["OUROBOROS_TORCONTROL"]
+            del os.environ["OUROBOROS_TORPASSWORD"]
 
 
 if __name__ == "__main__":

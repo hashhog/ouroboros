@@ -1,10 +1,90 @@
 // Benchmarks for Bitcoin cryptographic operations
+//
+// Tests hardware-accelerated SHA256 (SHA-NI / ARM SHA2) and secp256k1 operations
 
 use common::crypto::{
     bits_to_target, compute_merkle_root, double_sha256, hash160, target_to_bits,
     verify_ecdsa_signature,
 };
+use common::crypto::secp::{
+    batch_verify_schnorr, verify_ecdsa_compact, verify_ecdsa_der, verify_schnorr,
+    SchnorrVerifyItem,
+};
+use common::crypto::sha256::{
+    detect_implementation, double_sha256 as hw_double_sha256, implementation_string,
+    sha256 as hw_sha256, Sha256,
+};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+
+fn bench_sha256_hardware(c: &mut Criterion) {
+    println!(
+        "SHA256 implementation detected: {}",
+        implementation_string()
+    );
+
+    let data_64 = [0u8; 64];
+    let data_256 = [0u8; 256];
+    let data_1024 = [0u8; 1024];
+
+    c.bench_function("sha256_hw_64b", |b| {
+        b.iter(|| hw_sha256(black_box(&data_64)))
+    });
+
+    c.bench_function("sha256_hw_256b", |b| {
+        b.iter(|| hw_sha256(black_box(&data_256)))
+    });
+
+    c.bench_function("sha256_hw_1kb", |b| {
+        b.iter(|| hw_sha256(black_box(&data_1024)))
+    });
+
+    // Benchmark incremental updates
+    c.bench_function("sha256_hw_incremental_1kb", |b| {
+        b.iter(|| {
+            let mut hasher = Sha256::new();
+            for chunk in data_1024.chunks(64) {
+                hasher.update(black_box(chunk));
+            }
+            hasher.finalize()
+        })
+    });
+}
+
+fn bench_double_sha256_hardware(c: &mut Criterion) {
+    let data_64 = [0u8; 64];
+    let data_256 = [0u8; 256];
+
+    c.bench_function("double_sha256_hw_64b", |b| {
+        b.iter(|| hw_double_sha256(black_box(&data_64)))
+    });
+
+    c.bench_function("double_sha256_hw_256b", |b| {
+        b.iter(|| hw_double_sha256(black_box(&data_256)))
+    });
+
+    // Compare old vs new implementation
+    c.bench_function("double_sha256_old_64b", |b| {
+        b.iter(|| double_sha256(black_box(&data_64)))
+    });
+}
+
+fn bench_sha256_comparison(c: &mut Criterion) {
+    // Compare hardware-accelerated vs library (bitcoin_hashes) implementation
+    let mut group = c.benchmark_group("sha256_comparison");
+
+    for size in [64, 256, 1024, 4096].iter() {
+        let data = vec![0u8; *size];
+
+        group.bench_with_input(BenchmarkId::new("hw", size), &data, |b, data| {
+            b.iter(|| hw_sha256(black_box(data)))
+        });
+
+        group.bench_with_input(BenchmarkId::new("lib_double", size), &data, |b, data| {
+            b.iter(|| double_sha256(black_box(data)))
+        });
+    }
+    group.finish();
+}
 
 fn bench_verify_ecdsa_signature(c: &mut Criterion) {
     // Use dummy data for benchmarking (will fail verification, but tests the function)
@@ -17,7 +97,7 @@ fn bench_verify_ecdsa_signature(c: &mut Criterion) {
     ]; // Valid pubkey format (33 bytes)
     let msg_hash = [0u8; 32]; // Message hash
 
-    c.bench_function("verify_ecdsa_signature", |b| {
+    c.bench_function("verify_ecdsa_signature_old", |b| {
         b.iter(|| {
             let _ = verify_ecdsa_signature(
                 black_box(&sig_bytes),
@@ -26,6 +106,65 @@ fn bench_verify_ecdsa_signature(c: &mut Criterion) {
             );
         });
     });
+
+    c.bench_function("verify_ecdsa_compact_new", |b| {
+        b.iter(|| {
+            let _ = verify_ecdsa_compact(
+                black_box(&sig_bytes),
+                black_box(&pubkey_bytes),
+                black_box(&msg_hash),
+            );
+        });
+    });
+}
+
+fn bench_schnorr_verification(c: &mut Criterion) {
+    // BIP340 test vector #0
+    let pubkey =
+        hex::decode("F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9")
+            .unwrap();
+    let msg = hex::decode("0000000000000000000000000000000000000000000000000000000000000000")
+        .unwrap();
+    let sig = hex::decode("E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0")
+        .unwrap();
+
+    c.bench_function("verify_schnorr_single", |b| {
+        b.iter(|| {
+            let _ = verify_schnorr(black_box(&sig), black_box(&pubkey), black_box(&msg));
+        });
+    });
+}
+
+fn bench_batch_schnorr(c: &mut Criterion) {
+    // BIP340 test vector #0
+    let pubkey =
+        hex::decode("F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9")
+            .unwrap();
+    let msg = hex::decode("0000000000000000000000000000000000000000000000000000000000000000")
+        .unwrap();
+    let sig = hex::decode("E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0")
+        .unwrap();
+
+    let mut group = c.benchmark_group("batch_schnorr");
+
+    for batch_size in [1, 4, 16, 64].iter() {
+        let items: Vec<SchnorrVerifyItem> = (0..*batch_size)
+            .map(|_| SchnorrVerifyItem {
+                sig: &sig,
+                pubkey: &pubkey,
+                msg_hash: &msg,
+            })
+            .collect();
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch_size),
+            &items,
+            |b, items| {
+                b.iter(|| batch_verify_schnorr(black_box(items)));
+            },
+        );
+    }
+    group.finish();
 }
 
 fn bench_double_sha256(c: &mut Criterion) {
@@ -132,7 +271,12 @@ fn bench_target_to_bits(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_sha256_hardware,
+    bench_double_sha256_hardware,
+    bench_sha256_comparison,
     bench_verify_ecdsa_signature,
+    bench_schnorr_verification,
+    bench_batch_schnorr,
     bench_double_sha256,
     bench_hash160,
     bench_compute_merkle_root,

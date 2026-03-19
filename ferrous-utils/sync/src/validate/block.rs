@@ -81,6 +81,8 @@ pub struct BlockValidator {
     /// Blocks at or below this height skip script/input validation (assumevalid).
     /// 0 = validate everything. u32::MAX = skip scripts for entire chain.
     assumevalid_height: u32,
+    /// Network for determining activation heights
+    network: Network,
 }
 
 impl BlockValidator {
@@ -107,6 +109,7 @@ impl BlockValidator {
             header_validator,
             tx_validator,
             assumevalid_height,
+            network,
         }
     }
 
@@ -154,8 +157,6 @@ impl BlockValidator {
         self.check_duplicate_transactions(inner)?;
 
         // 7. Per-transaction validation
-        let mut total_sigops = 0usize;
-
         if full_validation {
             self.tx_validator.check_coinbase(coinbase_tx, height)
                 .map_err(BlockValidationError::TransactionValidation)?;
@@ -164,21 +165,48 @@ impl BlockValidator {
                 let tx_wrapper = TransactionWrapper::new(tx.clone());
                 self.tx_validator.validate_transaction(&tx_wrapper, height, true)
                     .map_err(BlockValidationError::TransactionValidation)?;
-                total_sigops += self.tx_validator.get_sigop_count(tx);
-            }
-        } else {
-            for tx in inner.txdata.iter().skip(1) {
-                total_sigops += self.tx_validator.get_sigop_count(tx);
             }
         }
 
-        // 8. Sigops limit (always)
-        const MAX_SIGOPS: usize = 80_000;
-        if total_sigops > MAX_SIGOPS {
+        // 8. Sigop cost limit with BIP141 witness discount (always enforced)
+        //
+        // Reference: Bitcoin Core validation.cpp ConnectBlock()
+        //
+        // Legacy/P2SH sigops cost 4 weight units each (WITNESS_SCALE_FACTOR).
+        // Witness sigops cost 1 weight unit each (discounted).
+        // Total block sigop cost must not exceed MAX_BLOCK_SIGOPS_COST (80,000).
+        let (verify_p2sh, verify_witness) = self.get_sigop_flags(height);
+        let total_sigop_cost = super::sigop::get_block_sigop_cost(
+            &inner.txdata,
+            &self.db,
+            verify_p2sh,
+            verify_witness,
+        );
+        if total_sigop_cost > super::sigop::MAX_BLOCK_SIGOPS_COST {
             return Err(BlockValidationError::TooManySigops);
         }
 
         Ok(())
+    }
+
+    /// Get sigop verification flags based on block height and network.
+    ///
+    /// Returns (verify_p2sh, verify_witness) based on activation heights.
+    fn get_sigop_flags(&self, height: u32) -> (bool, bool) {
+        use super::script::activation_heights;
+
+        // P2SH activation height
+        let p2sh_height = match self.network {
+            Network::Bitcoin => 173805,
+            _ => 0, // active from genesis on testnets
+        };
+        let verify_p2sh = height >= p2sh_height;
+
+        // SegWit activation height
+        let segwit_height = activation_heights::segwit_height(self.network);
+        let verify_witness = height >= segwit_height;
+
+        (verify_p2sh, verify_witness)
     }
 
     /// Validate block header
