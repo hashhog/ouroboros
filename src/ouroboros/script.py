@@ -620,6 +620,10 @@ class ScriptInterpreter:
         """Execute a Bitcoin script."""
         is_tapscript = sig_version == SigVersion.TAPSCRIPT
 
+        # Script size limit (10,000 bytes) — applies to all non-tapscript scripts
+        if not is_tapscript and len(script) > MAX_SCRIPT_SIZE:
+            raise ValueError("Script too long")
+
         # Tapscript OP_SUCCESS pre-check: scan for OP_SUCCESS opcodes before
         # executing anything.  If any is found, the script succeeds
         # unconditionally (BIP 342).
@@ -710,9 +714,10 @@ class ScriptInterpreter:
                 push_data = script[i:i + n]; i += n
 
             if push_data is not None:
+                # PUSH_SIZE check applies even in non-executed branches
+                if len(push_data) > MAX_SCRIPT_ELEMENT_SIZE:
+                    raise ValueError(f"Push data exceeds {MAX_SCRIPT_ELEMENT_SIZE} bytes")
                 if executing:
-                    if len(push_data) > MAX_SCRIPT_ELEMENT_SIZE:
-                        raise ValueError(f"Push data exceeds {MAX_SCRIPT_ELEMENT_SIZE} bytes")
                     # MINIMALDATA: reject non-minimal push encodings
                     if flags & SCRIPT_VERIFY_MINIMALDATA:
                         n = len(push_data)
@@ -794,12 +799,18 @@ class ScriptInterpreter:
             # Constants
             if opcode == 0x00:  # OP_0 / OP_FALSE
                 stack.append(b'')
+                if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                    raise ValueError("Stack size exceeded")
                 continue
             if opcode == 0x4f:  # OP_1NEGATE
                 stack.append(b'\x81')
+                if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                    raise ValueError("Stack size exceeded")
                 continue
             if 0x51 <= opcode <= 0x60:  # OP_1 .. OP_16
                 stack.append(bytes([opcode - 0x50]))
+                if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                    raise ValueError("Stack size exceeded")
                 continue
 
             # Flow control
@@ -838,16 +849,22 @@ class ScriptInterpreter:
                 if len(stack) < 2:
                     raise ValueError("OP_2DUP: stack underflow")
                 stack.extend(stack[-2:])
+                if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                    raise ValueError("Stack size exceeded")
                 continue
             if opcode == 0x6f:  # OP_3DUP
                 if len(stack) < 3:
                     raise ValueError("OP_3DUP: stack underflow")
                 stack.extend(stack[-3:])
+                if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                    raise ValueError("Stack size exceeded")
                 continue
             if opcode == 0x70:  # OP_2OVER
                 if len(stack) < 4:
                     raise ValueError("OP_2OVER: stack underflow")
                 stack.extend(stack[-4:-2])
+                if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                    raise ValueError("Stack size exceeded")
                 continue
             if opcode == 0x71:  # OP_2ROT
                 if len(stack) < 6:
@@ -866,9 +883,13 @@ class ScriptInterpreter:
                     raise ValueError("OP_IFDUP: stack underflow")
                 if self._cast_to_bool(stack[-1]):
                     stack.append(stack[-1])
+                    if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                        raise ValueError("Stack size exceeded")
                 continue
             if opcode == 0x74:  # OP_DEPTH
                 stack.append(self._encode_script_num(len(stack)))
+                if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                    raise ValueError("Stack size exceeded")
                 continue
             if opcode == 0x75:  # OP_DROP
                 if not stack:
@@ -879,6 +900,8 @@ class ScriptInterpreter:
                 if not stack:
                     raise ValueError("OP_DUP: stack underflow")
                 stack.append(stack[-1])
+                if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                    raise ValueError("Stack size exceeded")
                 continue
             if opcode == 0x77:  # OP_NIP
                 if len(stack) < 2:
@@ -889,6 +912,8 @@ class ScriptInterpreter:
                 if len(stack) < 2:
                     raise ValueError("OP_OVER: stack underflow")
                 stack.append(stack[-2])
+                if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                    raise ValueError("Stack size exceeded")
                 continue
             if opcode == 0x79:  # OP_PICK
                 if not stack:
@@ -923,6 +948,8 @@ class ScriptInterpreter:
                 if len(stack) < 2:
                     raise ValueError("OP_TUCK: stack underflow")
                 stack.insert(-2, stack[-1])
+                if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                    raise ValueError("Stack size exceeded")
                 continue
 
             # Splice
@@ -1110,6 +1137,22 @@ class ScriptInterpreter:
                     continue
 
                 # Legacy / SegWit v0 ECDSA CHECKSIG
+                # Check signature encoding BEFORE checking for empty sig/pubkey
+                # (Bitcoin Core checks DERSIG/STRICTENC first)
+                if sig:
+                    if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
+                        raise ValueError("Non-DER signature")
+                    der_sig_check = sig[:-1]
+                    if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig_check):
+                        raise ValueError("Non-low-S signature")
+                    if (flags & SCRIPT_VERIFY_STRICTENC):
+                        ht = sig[-1] & 0x1f
+                        if ht < 1 or ht > 3:
+                            raise ValueError("STRICTENC: undefined hashtype")
+                if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
+                    raise ValueError("STRICTENC: invalid pubkey encoding")
+                if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
+                    raise ValueError("WITNESS_PUBKEYTYPE: uncompressed pubkey in witness v0")
                 if not sig:
                     stack.append(b'\x00')
                     continue
@@ -1118,19 +1161,7 @@ class ScriptInterpreter:
                         raise ValueError("NULLFAIL: non-empty sig for empty pubkey")
                     stack.append(b'\x00')
                     continue
-                if (flags & SCRIPT_VERIFY_DERSIG) and not _check_der_signature(sig):
-                    raise ValueError("Non-DER signature")
                 der_sig = sig[:-1]
-                if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
-                    raise ValueError("Non-low-S signature")
-                if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
-                    raise ValueError("STRICTENC: invalid pubkey encoding")
-                if (flags & SCRIPT_VERIFY_STRICTENC) and len(sig) > 0:
-                    ht = sig[-1] & 0x1f
-                    if ht < 1 or ht > 3:
-                        raise ValueError("STRICTENC: undefined hashtype")
-                if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
-                    raise ValueError("WITNESS_PUBKEYTYPE: uncompressed pubkey in witness v0")
                 sighash_type = sig[-1]
                 try:
                     if is_witness_v0:
@@ -1187,17 +1218,22 @@ class ScriptInterpreter:
                     continue
 
                 # Legacy / SegWit v0 ECDSA CHECKSIGVERIFY
-                if not sig or len(pubkey) < 1:
-                    raise ValueError("OP_CHECKSIGVERIFY failed")
-                if (flags & SCRIPT_VERIFY_DERSIG) and not _check_der_signature(sig):
-                    raise ValueError("Non-DER signature")
-                der_sig = sig[:-1]
-                if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
-                    raise ValueError("Non-low-S signature")
+                # Check encoding first (Bitcoin Core order)
+                if sig:
+                    if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
+                        raise ValueError("Non-DER signature")
+                    if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(sig[:-1]):
+                        raise ValueError("Non-low-S signature")
+                    if (flags & SCRIPT_VERIFY_STRICTENC):
+                        ht = sig[-1] & 0x1f
+                        if ht < 1 or ht > 3:
+                            raise ValueError("STRICTENC: undefined hashtype")
                 if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
                     raise ValueError("STRICTENC: invalid pubkey encoding")
                 if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
                     raise ValueError("WITNESS_PUBKEYTYPE: uncompressed pubkey in witness v0")
+                if not sig or len(pubkey) < 1:
+                    raise ValueError("OP_CHECKSIGVERIFY failed")
                 sighash_type = sig[-1]
                 try:
                     if is_witness_v0:
@@ -1568,7 +1604,7 @@ class ScriptInterpreter:
         return hashlib.sha256(hashlib.sha256(bytes(data)).digest()).digest()
     
     @staticmethod
-    def _lax_der_to_compact(der_sig: bytes):
+    def _lax_der_to_compact(der_sig: bytes, normalize_s: bool = True):
         """Parse a lax DER signature into 64-byte compact R||S format."""
         try:
             if len(der_sig) < 6:
@@ -1581,23 +1617,44 @@ class ScriptInterpreter:
             if pos >= len(der_sig) or der_sig[pos] != 0x02:
                 return None
             pos += 1
-            r_len = der_sig[pos]; pos += 1
+            # R length — handle multi-byte length
+            if der_sig[pos] & 0x80:
+                num_len_bytes = der_sig[pos] & 0x7f
+                pos += 1
+                if pos + num_len_bytes > len(der_sig):
+                    return None
+                r_len = int.from_bytes(der_sig[pos:pos + num_len_bytes], 'big')
+                pos += num_len_bytes
+            else:
+                r_len = der_sig[pos]; pos += 1
             if pos + r_len > len(der_sig):
                 return None
             r_bytes = der_sig[pos:pos + r_len]; pos += r_len
             if pos >= len(der_sig) or der_sig[pos] != 0x02:
                 return None
             pos += 1
-            s_len = der_sig[pos]; pos += 1
+            # S length — handle multi-byte length
+            if pos >= len(der_sig):
+                return None
+            if der_sig[pos] & 0x80:
+                num_len_bytes = der_sig[pos] & 0x7f
+                pos += 1
+                if pos + num_len_bytes > len(der_sig):
+                    return None
+                s_len = int.from_bytes(der_sig[pos:pos + num_len_bytes], 'big')
+                pos += num_len_bytes
+            else:
+                s_len = der_sig[pos]; pos += 1
             if pos + s_len > len(der_sig):
                 return None
             s_bytes = der_sig[pos:pos + s_len]
             r_int = int.from_bytes(r_bytes, 'big') if r_bytes else 0
             s_int = int.from_bytes(s_bytes, 'big') if s_bytes else 0
-            # Normalize to low-S
-            order = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-            if s_int > order // 2:
-                s_int = order - s_int
+            # Only normalize to low-S when requested (i.e. LOW_S flag is set)
+            if normalize_s:
+                order = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+                if s_int > order // 2:
+                    s_int = order - s_int
             return r_int.to_bytes(32, 'big') + s_int.to_bytes(32, 'big')
         except Exception:
             return None
@@ -1609,29 +1666,50 @@ class ScriptInterpreter:
         if len(pubkey) not in (33, 65):
             return False
 
+        # Try strict DER first (fast path via Rust sync or coincurve)
         try:
             import sync
-            return sync.verify_ecdsa(der_sig, pubkey, message_hash)
+            if sync.verify_ecdsa(der_sig, pubkey, message_hash):
+                return True
+            # Strict DER failed — fall through to lax parsing below
         except (ImportError, AttributeError, ValueError):
+            pass
+        else:
+            # sync is available but returned False — try lax parsing via coincurve
             pass
 
         try:
             from coincurve import PublicKey
             pk = PublicKey(pubkey)
             try:
-                return pk.verify(der_sig, message_hash, hasher=None)
+                if pk.verify(der_sig, message_hash, hasher=None):
+                    return True
             except Exception:
-                # Strict DER failed — try lax parsing
-                compact = self._lax_der_to_compact(der_sig)
-                if compact is not None:
-                    try:
-                        from coincurve.ecdsa import deserialize_compact, cdata_to_der
-                        raw_sig = deserialize_compact(compact)
-                        canonical_der = cdata_to_der(raw_sig)
-                        return pk.verify(canonical_der, message_hash, hasher=None)
-                    except Exception:
-                        pass
-                return False
+                pass
+            # Strict DER failed or returned False — try lax parsing
+            # First try without S normalization (preserves original S)
+            compact = self._lax_der_to_compact(der_sig, normalize_s=False)
+            if compact is not None:
+                try:
+                    from coincurve.ecdsa import deserialize_compact, cdata_to_der
+                    raw_sig = deserialize_compact(compact)
+                    canonical_der = cdata_to_der(raw_sig)
+                    if pk.verify(canonical_der, message_hash, hasher=None):
+                        return True
+                except Exception:
+                    pass
+            # Try again with S normalization (for high-S sigs)
+            compact_norm = self._lax_der_to_compact(der_sig, normalize_s=True)
+            if compact_norm is not None and compact_norm != compact:
+                try:
+                    from coincurve.ecdsa import deserialize_compact, cdata_to_der
+                    raw_sig2 = deserialize_compact(compact_norm)
+                    canonical_der2 = cdata_to_der(raw_sig2)
+                    if pk.verify(canonical_der2, message_hash, hasher=None):
+                        return True
+                except Exception:
+                    pass
+            return False
         except ImportError:
             pass
 
@@ -1676,15 +1754,19 @@ class ScriptInterpreter:
                 key_idx += 1
                 continue
 
-            if (flags & SCRIPT_VERIFY_DERSIG) and not _check_der_signature(sig):
-                return False
+            if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
+                raise ValueError("Non-DER signature")
             der_sig = sig[:-1]
             if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
-                return False
+                raise ValueError("Non-low-S signature")
             if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
-                return False
+                raise ValueError("STRICTENC: invalid pubkey encoding")
+            if (flags & SCRIPT_VERIFY_STRICTENC) and len(sig) > 0:
+                ht = sig[-1] & 0x1f
+                if ht < 1 or ht > 3:
+                    raise ValueError("STRICTENC: undefined hashtype")
             if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
-                return False
+                raise ValueError("WITNESS_PUBKEYTYPE: uncompressed pubkey in witness v0")
 
             sighash_type = sig[-1]
             if is_witness_v0:
@@ -1698,6 +1780,12 @@ class ScriptInterpreter:
                 matched += 1
 
             key_idx += 1
+
+            # Early exit: if remaining keys < remaining sigs needed, give up
+            sigs_remaining = k - matched
+            keys_remaining = len(pubkeys) - key_idx
+            if sigs_remaining > keys_remaining:
+                break
 
         return matched == k
 
