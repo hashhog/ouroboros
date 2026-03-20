@@ -22,11 +22,9 @@ sync.SyncEngine = type("SyncEngine", (), {})
 sync.PyBlockchainDB = type("PyBlockchainDB", (), {})
 sys.modules["sync"] = sync
 
+import hashlib
 import json
-import struct
 from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Optional
 
 from ouroboros.database import Transaction, TxIn, TxOut
 from ouroboros.script import (
@@ -260,25 +258,99 @@ def parse_flags(s: str) -> int:
     return flags
 
 
-def make_dummy_tx(script_sig: bytes, script_pubkey: bytes) -> Transaction:
-    """Create a minimal spending transaction for script verification."""
-    tx_in = TxIn(
+def _encode_varint(value: int) -> bytes:
+    """Encode an integer as a Bitcoin protocol compact-size varint."""
+    if value < 0xfd:
+        return bytes([value])
+    elif value <= 0xffff:
+        return b'\xfd' + value.to_bytes(2, 'little')
+    elif value <= 0xffffffff:
+        return b'\xfe' + value.to_bytes(4, 'little')
+    else:
+        return b'\xff' + value.to_bytes(8, 'little')
+
+
+def _serialize_tx(tx: Transaction) -> bytes:
+    """Serialize a transaction to raw bytes (no witness)."""
+    data = bytearray()
+    data.extend(tx.version.to_bytes(4, 'little'))
+    data.extend(_encode_varint(len(tx.inputs)))
+    for inp in tx.inputs:
+        data.extend(inp.prev_txid)
+        data.extend(inp.prev_vout.to_bytes(4, 'little'))
+        data.extend(_encode_varint(len(inp.script_sig)))
+        data.extend(inp.script_sig)
+        data.extend(inp.sequence.to_bytes(4, 'little'))
+    data.extend(_encode_varint(len(tx.outputs)))
+    for out in tx.outputs:
+        data.extend(out.value.to_bytes(8, 'little'))
+        data.extend(_encode_varint(len(out.script_pubkey)))
+        data.extend(out.script_pubkey)
+    data.extend(tx.locktime.to_bytes(4, 'little'))
+    return bytes(data)
+
+
+def _double_sha256(data: bytes) -> bytes:
+    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+
+
+def make_crediting_spending_tx(
+    script_sig: bytes, script_pubkey: bytes
+) -> Transaction:
+    """
+    Build crediting + spending transactions matching Bitcoin Core's test framework
+    (BuildCreditingTransaction / BuildSpendingTransaction in script_tests.cpp).
+
+    Crediting tx: version 1, locktime 0, single input (null prevout with
+    vout=0xFFFFFFFF, scriptSig = OP_0 OP_0, sequence 0xFFFFFFFF), single output
+    (scriptPubKey = test's scriptPubKey, value = 0).
+
+    Spending tx: version 1, locktime 0, single input (prevout = hash(crediting_tx):0,
+    scriptSig = test's scriptSig, sequence 0xFFFFFFFF), single output (empty
+    scriptPubKey, value = 0).
+    """
+    # --- crediting transaction ---
+    # scriptSig for crediting tx: CScriptNum(0) CScriptNum(0) -> OP_0 OP_0
+    credit_script_sig = bytes([0x00, 0x00])
+    credit_in = TxIn(
         prev_txid=b"\x00" * 32,
+        prev_vout=0xFFFFFFFF,
+        script_sig=credit_script_sig,
+        sequence=0xFFFFFFFF,
+        witness=None,
+    )
+    credit_out = TxOut(value=0, script_pubkey=script_pubkey)
+    credit_tx = Transaction(
+        txid=b"\x00" * 32,  # placeholder
+        version=1,
+        locktime=0,
+        inputs=[credit_in],
+        outputs=[credit_out],
+        has_witness=False,
+    )
+    # Compute the real txid of the crediting tx
+    credit_txid = _double_sha256(_serialize_tx(credit_tx))
+
+    # --- spending transaction ---
+    spend_in = TxIn(
+        prev_txid=credit_txid,
         prev_vout=0,
         script_sig=script_sig,
         sequence=0xFFFFFFFF,
         witness=None,
     )
-    tx_out = TxOut(value=0, script_pubkey=b"")
-    tx = Transaction(
-        txid=b"\x00" * 32,
+    spend_out = TxOut(value=0, script_pubkey=b"")
+    spend_tx = Transaction(
+        txid=b"\x00" * 32,  # placeholder
         version=1,
         locktime=0,
-        inputs=[tx_in],
-        outputs=[tx_out],
+        inputs=[spend_in],
+        outputs=[spend_out],
         has_witness=False,
     )
-    return tx
+    # Compute txid of spending tx (for completeness)
+    spend_tx.txid = _double_sha256(_serialize_tx(spend_tx))
+    return spend_tx
 
 
 def test_script_vectors():
@@ -335,7 +407,7 @@ def test_script_vectors():
             continue
 
         flags = parse_flags(flags_str)
-        tx = make_dummy_tx(script_sig, script_pubkey)
+        tx = make_crediting_spending_tx(script_sig, script_pubkey)
 
         try:
             got_ok = interp.verify(script_sig, script_pubkey, tx, 0, flags=flags)
@@ -361,7 +433,7 @@ def test_script_vectors():
     )
 
     if failed > 0:
-        print("NOTE: some failures expected due to dummy tx (no real sig verification)")
+        print("NOTE: some failures may remain for witness/taproot tests (skipped above)")
 
 
 if __name__ == "__main__":
