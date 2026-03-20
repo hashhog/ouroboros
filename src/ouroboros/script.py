@@ -1125,6 +1125,10 @@ class ScriptInterpreter:
                     raise ValueError("Non-low-S signature")
                 if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
                     raise ValueError("STRICTENC: invalid pubkey encoding")
+                if (flags & SCRIPT_VERIFY_STRICTENC) and len(sig) > 0:
+                    ht = sig[-1] & 0x1f
+                    if ht < 1 or ht > 3:
+                        raise ValueError("STRICTENC: undefined hashtype")
                 if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
                     raise ValueError("WITNESS_PUBKEYTYPE: uncompressed pubkey in witness v0")
                 sighash_type = sig[-1]
@@ -1421,7 +1425,7 @@ class ScriptInterpreter:
             raise ValueError(f"CScriptNum overflow ({len(data)} > {max_len})")
 
         # Minimal encoding check
-        if require_minimal and data[-1] & 0x7f == 0:
+        if require_minimal and len(data) > 0 and (data[-1] & 0x7f) == 0:
             if len(data) <= 1 or not (data[-2] & 0x80):
                 raise ValueError("Non-minimal CScriptNum encoding")
 
@@ -1563,9 +1567,44 @@ class ScriptInterpreter:
 
         return hashlib.sha256(hashlib.sha256(bytes(data)).digest()).digest()
     
+    @staticmethod
+    def _lax_der_to_compact(der_sig: bytes):
+        """Parse a lax DER signature into 64-byte compact R||S format."""
+        try:
+            if len(der_sig) < 6:
+                return None
+            pos = 1  # skip SEQUENCE tag
+            if der_sig[pos] & 0x80:
+                pos += (der_sig[pos] & 0x7f) + 1
+            else:
+                pos += 1
+            if pos >= len(der_sig) or der_sig[pos] != 0x02:
+                return None
+            pos += 1
+            r_len = der_sig[pos]; pos += 1
+            if pos + r_len > len(der_sig):
+                return None
+            r_bytes = der_sig[pos:pos + r_len]; pos += r_len
+            if pos >= len(der_sig) or der_sig[pos] != 0x02:
+                return None
+            pos += 1
+            s_len = der_sig[pos]; pos += 1
+            if pos + s_len > len(der_sig):
+                return None
+            s_bytes = der_sig[pos:pos + s_len]
+            r_int = int.from_bytes(r_bytes, 'big') if r_bytes else 0
+            s_int = int.from_bytes(s_bytes, 'big') if s_bytes else 0
+            # Normalize to low-S
+            order = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+            if s_int > order // 2:
+                s_int = order - s_int
+            return r_int.to_bytes(32, 'big') + s_int.to_bytes(32, 'big')
+        except Exception:
+            return None
+
     def _verify_ecdsa_signature(self, message_hash: bytes, der_sig: bytes, pubkey: bytes) -> bool:
         """Verify ECDSA signature using secp256k1 (Rust sync module or Python coincurve)."""
-        if len(message_hash) != 32 or len(der_sig) < 8:
+        if len(message_hash) != 32 or len(der_sig) < 1:
             return False
         if len(pubkey) not in (33, 65):
             return False
@@ -1579,13 +1618,22 @@ class ScriptInterpreter:
         try:
             from coincurve import PublicKey
             pk = PublicKey(pubkey)
-            # message_hash is already the sighash digest; pass hasher=None
-            # so coincurve does not hash it again.
-            return pk.verify(der_sig, message_hash, hasher=None)
+            try:
+                return pk.verify(der_sig, message_hash, hasher=None)
+            except Exception:
+                # Strict DER failed — try lax parsing
+                compact = self._lax_der_to_compact(der_sig)
+                if compact is not None:
+                    try:
+                        from coincurve.ecdsa import deserialize_compact, cdata_to_der
+                        raw_sig = deserialize_compact(compact)
+                        canonical_der = cdata_to_der(raw_sig)
+                        return pk.verify(canonical_der, message_hash, hasher=None)
+                    except Exception:
+                        pass
+                return False
         except ImportError:
             pass
-        except Exception:
-            return False
 
         return False
 
