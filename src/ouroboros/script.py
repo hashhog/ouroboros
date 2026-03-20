@@ -1579,7 +1579,9 @@ class ScriptInterpreter:
         try:
             from coincurve import PublicKey
             pk = PublicKey(pubkey)
-            return pk.verify(der_sig, message_hash)
+            # message_hash is already the sighash digest; pass hasher=None
+            # so coincurve does not hash it again.
+            return pk.verify(der_sig, message_hash, hasher=None)
         except ImportError:
             pass
         except Exception:
