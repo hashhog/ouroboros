@@ -54,7 +54,7 @@ from ouroboros.script import (
     SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS,
 )
 
-VECTOR_PATH = Path("/home/max/hashhog/ouroboros/bitcoin/src/test/data/script_tests.json")
+VECTOR_PATH = Path("/home/max/hashhog/bitcoin/src/test/data/script_tests.json")
 
 # ---------------------------------------------------------------------------
 # Opcode name -> byte value mapping
