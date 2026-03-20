@@ -893,7 +893,7 @@ class ScriptInterpreter:
             if opcode == 0x79:  # OP_PICK
                 if not stack:
                     raise ValueError("OP_PICK: stack underflow")
-                n = self._read_signed_num(stack.pop())
+                n = self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
                 if n < 0 or n >= len(stack):
                     raise ValueError("OP_PICK: index out of range")
                 stack.append(stack[-(n + 1)])
@@ -901,7 +901,7 @@ class ScriptInterpreter:
             if opcode == 0x7a:  # OP_ROLL
                 if not stack:
                     raise ValueError("OP_ROLL: stack underflow")
-                n = self._read_signed_num(stack.pop())
+                n = self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
                 if n < 0 or n >= len(stack):
                     raise ValueError("OP_ROLL: index out of range")
                 val = stack[-(n + 1)]
@@ -950,32 +950,32 @@ class ScriptInterpreter:
             if opcode == 0x8b:  # OP_1ADD
                 if not stack:
                     raise ValueError("OP_1ADD: stack underflow")
-                stack.append(self._encode_script_num(self._read_signed_num(stack.pop()) + 1))
+                stack.append(self._encode_script_num(self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA)) + 1))
                 continue
             if opcode == 0x8c:  # OP_1SUB
                 if not stack:
                     raise ValueError("OP_1SUB: stack underflow")
-                stack.append(self._encode_script_num(self._read_signed_num(stack.pop()) - 1))
+                stack.append(self._encode_script_num(self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA)) - 1))
                 continue
             if opcode == 0x8f:  # OP_NEGATE
                 if not stack:
                     raise ValueError("OP_NEGATE: stack underflow")
-                stack.append(self._encode_script_num(-self._read_signed_num(stack.pop())))
+                stack.append(self._encode_script_num(-self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))))
                 continue
             if opcode == 0x90:  # OP_ABS
                 if not stack:
                     raise ValueError("OP_ABS: stack underflow")
-                stack.append(self._encode_script_num(abs(self._read_signed_num(stack.pop()))))
+                stack.append(self._encode_script_num(abs(self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA)))))
                 continue
             if opcode == 0x91:  # OP_NOT
                 if not stack:
                     raise ValueError("OP_NOT: stack underflow")
-                stack.append(self._encode_script_num(int(self._read_signed_num(stack.pop()) == 0)))
+                stack.append(self._encode_script_num(int(self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA)) == 0)))
                 continue
             if opcode == 0x92:  # OP_0NOTEQUAL
                 if not stack:
                     raise ValueError("OP_0NOTEQUAL: stack underflow")
-                stack.append(self._encode_script_num(int(self._read_signed_num(stack.pop()) != 0)))
+                stack.append(self._encode_script_num(int(self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA)) != 0)))
                 continue
 
             # Arithmetic (binary)
@@ -983,8 +983,8 @@ class ScriptInterpreter:
                           0x9f, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4):
                 if len(stack) < 2:
                     raise ValueError(f"Arithmetic opcode 0x{opcode:02x}: stack underflow")
-                bn_b = self._read_signed_num(stack.pop())
-                bn_a = self._read_signed_num(stack.pop())
+                bn_b = self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
+                bn_a = self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
                 if opcode == 0x93:    # OP_ADD
                     r = bn_a + bn_b
                 elif opcode == 0x94:  # OP_SUB
@@ -1021,9 +1021,9 @@ class ScriptInterpreter:
             if opcode == 0xa5:  # OP_WITHIN  (ternary: x min max)
                 if len(stack) < 3:
                     raise ValueError("OP_WITHIN: stack underflow")
-                mx = self._read_signed_num(stack.pop())
-                mn = self._read_signed_num(stack.pop())
-                x = self._read_signed_num(stack.pop())
+                mx = self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
+                mn = self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
+                x = self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
                 stack.append(self._encode_script_num(int(mn <= x < mx)))
                 continue
 
@@ -1257,7 +1257,7 @@ class ScriptInterpreter:
                     raise ValueError("OP_CHECKMULTISIG disabled in tapscript")
                 if len(stack) < 1:
                     raise ValueError("OP_CHECKMULTISIG: stack underflow")
-                n = self._read_num(stack.pop())
+                n = self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
                 if n < 0 or n > MAX_PUBKEYS_PER_MULTISIG:
                     raise ValueError("OP_CHECKMULTISIG n out of range")
                 op_count += n
@@ -1268,7 +1268,7 @@ class ScriptInterpreter:
                 pubkeys = [stack.pop() for _ in range(n)]
                 if not stack:
                     raise ValueError("OP_CHECKMULTISIG: stack underflow")
-                k = self._read_num(stack.pop())
+                k = self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
                 if k < 0 or k > n:
                     raise ValueError("OP_CHECKMULTISIG k out of range")
                 if len(stack) < k:
@@ -1295,7 +1295,7 @@ class ScriptInterpreter:
                     raise ValueError("OP_CHECKMULTISIGVERIFY disabled in tapscript")
                 if not stack:
                     raise ValueError("OP_CHECKMULTISIGVERIFY: stack underflow")
-                n = self._read_num(stack.pop())
+                n = self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
                 if n < 0 or n > MAX_PUBKEYS_PER_MULTISIG:
                     raise ValueError("OP_CHECKMULTISIGVERIFY n out of range")
                 op_count += n
@@ -1306,7 +1306,7 @@ class ScriptInterpreter:
                 pubkeys = [stack.pop() for _ in range(n)]
                 if not stack:
                     raise ValueError("OP_CHECKMULTISIGVERIFY: stack underflow")
-                k = self._read_num(stack.pop())
+                k = self._read_signed_num(stack.pop(), require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
                 if k < 0 or k > n:
                     raise ValueError("OP_CHECKMULTISIGVERIFY k out of range")
                 if len(stack) < k:
@@ -1325,9 +1325,12 @@ class ScriptInterpreter:
 
             # Timelocks (BIP 65 / BIP 112)
             if opcode == 0xb1:  # OP_CHECKLOCKTIMEVERIFY
+                if not (flags & SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY):
+                    # Treat as NOP2 when CLTV flag is not set
+                    continue
                 if not stack:
                     raise ValueError("OP_CHECKLOCKTIMEVERIFY: stack empty")
-                lock_value = self._read_signed_num(stack[-1], max_len=5)
+                lock_value = self._read_signed_num(stack[-1], max_len=5, require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
                 if lock_value < 0:
                     raise ValueError("OP_CHECKLOCKTIMEVERIFY: negative locktime")
                 LOCKTIME_THRESHOLD = 500_000_000
@@ -1344,9 +1347,12 @@ class ScriptInterpreter:
                 continue
 
             if opcode == 0xb2:  # OP_CHECKSEQUENCEVERIFY
+                if not (flags & SCRIPT_VERIFY_CHECKSEQUENCEVERIFY):
+                    # Treat as NOP3 when CSV flag is not set
+                    continue
                 if not stack:
                     raise ValueError("OP_CHECKSEQUENCEVERIFY: stack empty")
-                lock_value = self._read_signed_num(stack[-1], max_len=5)
+                lock_value = self._read_signed_num(stack[-1], max_len=5, require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA))
                 if lock_value < 0:
                     raise ValueError("OP_CHECKSEQUENCEVERIFY: negative sequence")
                 SEQ_DISABLE = 1 << 31
@@ -1408,14 +1414,14 @@ class ScriptInterpreter:
             return 0
         return int.from_bytes(data, 'little')
 
-    def _read_signed_num(self, data: bytes, max_len: int = 4) -> int:
+    def _read_signed_num(self, data: bytes, max_len: int = 4, require_minimal: bool = False) -> int:
         if not data:
             return 0
         if len(data) > max_len:
             raise ValueError(f"CScriptNum overflow ({len(data)} > {max_len})")
 
         # Minimal encoding check
-        if data[-1] & 0x7f == 0:
+        if require_minimal and data[-1] & 0x7f == 0:
             if len(data) <= 1 or not (data[-2] & 0x80):
                 raise ValueError("Non-minimal CScriptNum encoding")
 
