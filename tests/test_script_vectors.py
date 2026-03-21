@@ -26,6 +26,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import coincurve._libsecp256k1 as _secp256k1_lib
+
 from ouroboros.database import Transaction, TxIn, TxOut
 from ouroboros.script import (
     ScriptInterpreter,
@@ -150,6 +152,122 @@ def push_data(data: bytes) -> bytes:
         return bytes([0x4d, length & 0xff, (length >> 8) & 0xff]) + data
     return bytes([0x4e, length & 0xff, (length >> 8) & 0xff,
                   (length >> 16) & 0xff, (length >> 24) & 0xff]) + data
+
+
+# ---------------------------------------------------------------------------
+# Taproot helpers for resolving #SCRIPT#, #CONTROLBLOCK#, #TAPROOTOUTPUT#
+# ---------------------------------------------------------------------------
+
+# BIP-340 internal key: generator point x-only (secp256k1 G)
+_TAPROOT_INTERNAL_KEY = bytes.fromhex(
+    "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+)
+
+
+def _tagged_hash(tag: str, data: bytes) -> bytes:
+    """BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data)."""
+    tag_hash = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(tag_hash + tag_hash + data).digest()
+
+
+def _compact_size(n: int) -> bytes:
+    """Encode integer as Bitcoin compact size."""
+    if n < 0xfd:
+        return bytes([n])
+    elif n <= 0xffff:
+        return b"\xfd" + n.to_bytes(2, "little")
+    elif n <= 0xffffffff:
+        return b"\xfe" + n.to_bytes(4, "little")
+    else:
+        return b"\xff" + n.to_bytes(8, "little")
+
+
+def _compute_taproot_output(script_bytes: bytes):
+    """
+    Compute the tweaked output key and parity for a single-leaf taproot tree.
+
+    Returns (output_key_x_only_32bytes, parity_int).
+    """
+    ffi = _secp256k1_lib.ffi
+    lib = _secp256k1_lib.lib
+    ctx = lib.secp256k1_context_static
+
+    # Tapleaf hash: tagged_hash("TapLeaf", 0xc0 || compact_size(len) || script)
+    leaf_version = 0xc0
+    leaf_data = bytes([leaf_version]) + _compact_size(len(script_bytes)) + script_bytes
+    tapleaf_hash = _tagged_hash("TapLeaf", leaf_data)
+
+    # Merkle root = tapleaf hash (single leaf)
+    merkle_root = tapleaf_hash
+
+    # Tweak: tagged_hash("TapTweak", internal_key || merkle_root)
+    tweak = _tagged_hash("TapTweak", _TAPROOT_INTERNAL_KEY + merkle_root)
+
+    # Parse internal key as xonly pubkey
+    xonly_pk = ffi.new("secp256k1_xonly_pubkey *")
+    ret = lib.secp256k1_xonly_pubkey_parse(ctx, xonly_pk, _TAPROOT_INTERNAL_KEY)
+    assert ret == 1, "failed to parse internal key"
+
+    # Tweak-add: output_pk = internal_key + tweak * G
+    output_pk = ffi.new("secp256k1_pubkey *")
+    ret = lib.secp256k1_xonly_pubkey_tweak_add(ctx, output_pk, xonly_pk, tweak)
+    assert ret == 1, "tweak_add failed"
+
+    # Extract xonly and parity from output key
+    out_xonly = ffi.new("secp256k1_xonly_pubkey *")
+    parity = ffi.new("int *")
+    ret = lib.secp256k1_xonly_pubkey_from_pubkey(ctx, out_xonly, parity, output_pk)
+    assert ret == 1, "from_pubkey failed"
+
+    out_bytes = ffi.new("unsigned char[32]")
+    ret = lib.secp256k1_xonly_pubkey_serialize(ctx, out_bytes, out_xonly)
+    assert ret == 1, "serialize failed"
+
+    return bytes(ffi.buffer(out_bytes, 32)), parity[0]
+
+
+def _compute_control_block(script_bytes: bytes) -> bytes:
+    """
+    Compute the control block for a single-leaf taproot script path spend.
+
+    Control block = (leaf_version | output_key_parity) || internal_key_x_only
+    (33 bytes for single-leaf, no merkle path needed)
+    """
+    _, parity = _compute_taproot_output(script_bytes)
+    leaf_version = 0xc0
+    first_byte = leaf_version | parity
+    return bytes([first_byte]) + _TAPROOT_INTERNAL_KEY
+
+
+def _resolve_taproot_witness(wit_array: list) -> tuple:
+    """
+    Resolve #SCRIPT#, #CONTROLBLOCK# placeholders in witness array.
+
+    Returns (resolved_witness_stack, script_bytes_for_taproot_output).
+    """
+    # Find the #SCRIPT# entry to extract the ASM and compile it
+    script_bytes = None
+    for item in wit_array[:-1]:  # last element is amount
+        if isinstance(item, str) and item.startswith("#SCRIPT#"):
+            asm_part = item[len("#SCRIPT#"):].strip()
+            script_bytes = parse_script_asm(asm_part)
+            break
+
+    if script_bytes is None:
+        raise ValueError("No #SCRIPT# placeholder found in witness")
+
+    # Now resolve each witness element
+    resolved = []
+    for item in wit_array[:-1]:
+        if isinstance(item, str) and item.startswith("#SCRIPT#"):
+            resolved.append(script_bytes)
+        elif isinstance(item, str) and item == "#CONTROLBLOCK#":
+            resolved.append(_compute_control_block(script_bytes))
+        else:
+            # Regular hex witness item
+            resolved.append(bytes.fromhex(item))
+
+    return resolved, script_bytes
 
 
 def parse_script_asm(asm: str) -> bytes:
@@ -387,15 +505,22 @@ def test_script_vectors():
             # Witness format: [[wit_hex1, wit_hex2, ..., amount_btc], scriptSig, scriptPubKey, flags, result]
             # The last element of entry[0] is the amount in BTC (float), rest are hex witness items
             wit_array = entry[0]
-            # Skip taproot placeholder vectors (#SCRIPT#, #CONTROLBLOCK#, etc.)
+            # Check for taproot placeholder vectors (#SCRIPT#, #CONTROLBLOCK#, etc.)
             has_placeholder = any(
                 isinstance(x, str) and x.startswith('#') for x in wit_array[:-1]
             )
-            if has_placeholder:
-                skipped += 1
-                continue
             witness_amount = round(float(wit_array[-1]) * 1e8)
-            witness_stack = [bytes.fromhex(h) for h in wit_array[:-1]]
+            if has_placeholder:
+                try:
+                    witness_stack, tap_script = _resolve_taproot_witness(wit_array)
+                except Exception as e:
+                    parse_errors += 1
+                    if parse_errors <= 20:
+                        print(f"test {i}: taproot witness resolve error: {e}")
+                    continue
+            else:
+                witness_stack = [bytes.fromhex(h) for h in wit_array[:-1]]
+                tap_script = None
             script_sig_asm = entry[1]
             script_pubkey_asm = entry[2]
             flags_str = entry[3]
@@ -410,6 +535,14 @@ def test_script_vectors():
             flags_str = entry[2]
             expected = entry[3]
             comment = entry[4] if len(entry) >= 5 else ""
+            tap_script = None
+
+        # Resolve #TAPROOTOUTPUT# in scriptPubKey if present
+        if "#TAPROOTOUTPUT#" in script_pubkey_asm and tap_script is not None:
+            output_key, _ = _compute_taproot_output(tap_script)
+            script_pubkey_asm = script_pubkey_asm.replace(
+                "#TAPROOTOUTPUT#", "0x" + output_key.hex()
+            )
 
         try:
             script_sig = parse_script_asm(script_sig_asm)
