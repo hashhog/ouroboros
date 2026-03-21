@@ -532,7 +532,7 @@ class BitcoinNode:
             'testnet3': bytes.fromhex(
                 '43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000'),
             'testnet4': bytes.fromhex(
-                '43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000'),
+                '43f08bdab050e35b567c864b91f47f50ae725ae2de53bcfbbaf284da00000000'),
             'signet':   bytes.fromhex(
                 'f61eee3b63a380a477a063af32b2bbc9f7990f1f2c4225e973988181080000'),
             'mainnet':  bytes.fromhex(
@@ -557,7 +557,7 @@ class BitcoinNode:
             elif self.network in ('testnet', 'testnet3'):
                 ts, bits, nonce = 1296688602, 0x1d00ffff, 414098458
             elif self.network == 'testnet4':
-                ts, bits, nonce = 1296688602, 0x1d00ffff, 393743547
+                ts, bits, nonce = 1714777860, 0x1d00ffff, 393743547
             elif self.network == 'signet':
                 ts, bits, nonce = 1598918400, 0x1e0377ae, 52613770
             else:

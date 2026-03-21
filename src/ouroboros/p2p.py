@@ -367,12 +367,18 @@ DNS_SEEDS_MAINNET = [
     "seed.btc.petertodd.org",
 ]
 
-# DNS seeds for testnet
+# DNS seeds for testnet3
 DNS_SEEDS_TESTNET = [
     "testnet-seed.bitcoin.jonasschnelli.ch",
     "seed.tbtc.petertodd.org",
     "seed.testnet.bitcoin.sprovoost.nl",
     "testnet-seed.bluematt.me",
+]
+
+# DNS seeds for testnet4 (BIP-94)
+DNS_SEEDS_TESTNET4 = [
+    "seed.testnet4.bitcoin.sprovoost.nl",
+    "seed.testnet4.wiz.biz",
 ]
 
 
@@ -1161,15 +1167,20 @@ class PeerManager:
         
         seeds = (
             DNS_SEEDS_MAINNET if self.network == "mainnet"
-            else DNS_SEEDS_TESTNET if self.network == "testnet"
+            else DNS_SEEDS_TESTNET4 if self.network == "testnet4"
+            else DNS_SEEDS_TESTNET if self.network in ("testnet", "testnet3")
             else []
         )
-        
+
         if not seeds:
             logger.warning(f"No DNS seeds configured for {self.network}")
             return
-        
-        port = 8333 if self.network == "mainnet" else 18333  # XXX: not sure this handles testnet4 correctly
+
+        port = (
+            8333 if self.network == "mainnet"
+            else 48333 if self.network == "testnet4"
+            else 18333
+        )
 
         # Resolve DNS seeds in parallel
         tasks = [self._resolve_dns_seed(seed, port) for seed in seeds]

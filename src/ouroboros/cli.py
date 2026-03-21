@@ -302,11 +302,12 @@ def sync(ctx, reset, limit):
 
 
 @cli.command()
-@click.pass_context
 @click.option("--rpc-port", default=8332, type=int, help="RPC server port")
 @click.option("--p2p-port", default=8333, type=int, help="P2P network port")
 @click.option("--listen/--nolisten", default=True, help="Accept inbound P2P connections")
-def start(ctx, rpc_port, p2p_port, listen):
+@click.option("--force", is_flag=True, default=False, help="Skip sync check prompt")
+@click.pass_context
+def start(ctx, rpc_port, p2p_port, listen, force):
     """Start the Bitcoin node"""
     global _node, _cancelled
     _cancelled = False
@@ -332,11 +333,11 @@ def start(ctx, rpc_port, p2p_port, listen):
             console.print(
                 "[yellow]⚠ Blockchain not fully synced — run 'ouroboros sync' first[/yellow]"
             )
-            if not click.confirm("Continue anyway?", default=False):
+            if not force and not click.confirm("Continue anyway?", default=False):
                 return
     except Exception as e:
         console.print(f"[yellow]⚠ Could not check sync status: {e}[/yellow]")
-        if not click.confirm("Continue anyway?", default=False):
+        if not force and not click.confirm("Continue anyway?", default=False):
             return
     
     # Create and start node
