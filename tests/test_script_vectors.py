@@ -7,7 +7,7 @@ verifies each test case against the ouroboros script interpreter.
 Formats:
   [scriptSig_asm, scriptPubKey_asm, flags, expected_result]              (4 fields)
   [scriptSig_asm, scriptPubKey_asm, flags, expected_result, comment]     (5 fields)
-  [[witness...], amount, scriptSig_asm, scriptPubKey_asm, flags, result] (6+ fields, skipped)
+  [[wit_hex..., amount_btc], scriptSig_asm, scriptPubKey_asm, flags, result]  (witness)
 
 Single-element arrays are comments and are skipped.
 """
@@ -295,7 +295,8 @@ def _double_sha256(data: bytes) -> bytes:
 
 
 def make_crediting_spending_tx(
-    script_sig: bytes, script_pubkey: bytes
+    script_sig: bytes, script_pubkey: bytes,
+    amount: int = 0, witness: list = None,
 ) -> Transaction:
     """
     Build crediting + spending transactions matching Bitcoin Core's test framework
@@ -303,11 +304,11 @@ def make_crediting_spending_tx(
 
     Crediting tx: version 1, locktime 0, single input (null prevout with
     vout=0xFFFFFFFF, scriptSig = OP_0 OP_0, sequence 0xFFFFFFFF), single output
-    (scriptPubKey = test's scriptPubKey, value = 0).
+    (scriptPubKey = test's scriptPubKey, value = amount).
 
     Spending tx: version 1, locktime 0, single input (prevout = hash(crediting_tx):0,
     scriptSig = test's scriptSig, sequence 0xFFFFFFFF), single output (empty
-    scriptPubKey, value = 0).
+    scriptPubKey, value = amount), witness = provided witness stack.
     """
     # --- crediting transaction ---
     # scriptSig for crediting tx: CScriptNum(0) CScriptNum(0) -> OP_0 OP_0
@@ -319,7 +320,7 @@ def make_crediting_spending_tx(
         sequence=0xFFFFFFFF,
         witness=None,
     )
-    credit_out = TxOut(value=0, script_pubkey=script_pubkey)
+    credit_out = TxOut(value=amount, script_pubkey=script_pubkey)
     credit_tx = Transaction(
         txid=b"\x00" * 32,  # placeholder
         version=1,
@@ -332,21 +333,22 @@ def make_crediting_spending_tx(
     credit_txid = _double_sha256(_serialize_tx(credit_tx))
 
     # --- spending transaction ---
+    has_wit = witness is not None and len(witness) > 0
     spend_in = TxIn(
         prev_txid=credit_txid,
         prev_vout=0,
         script_sig=script_sig,
         sequence=0xFFFFFFFF,
-        witness=None,
+        witness=witness if has_wit else None,
     )
-    spend_out = TxOut(value=0, script_pubkey=b"")
+    spend_out = TxOut(value=amount, script_pubkey=b"")
     spend_tx = Transaction(
         txid=b"\x00" * 32,  # placeholder
         version=1,
         locktime=0,
         inputs=[spend_in],
         outputs=[spend_out],
-        has_witness=False,
+        has_witness=has_wit,
     )
     # Compute txid of spending tx (for completeness)
     spend_tx.txid = _double_sha256(_serialize_tx(spend_tx))
@@ -375,20 +377,39 @@ def test_script_vectors():
             skipped += 1
             continue
 
-        # Skip witness tests (first element is an array)
+        # Parse witness vectors (first element is an array)
+        witness_stack = None
+        witness_amount = 0
         if isinstance(entry[0], list):
+            if len(entry) < 5:
+                skipped += 1
+                continue
+            # Witness format: [[wit_hex1, wit_hex2, ..., amount_btc], scriptSig, scriptPubKey, flags, result]
+            # The last element of entry[0] is the amount in BTC (float), rest are hex witness items
+            wit_array = entry[0]
+            # Skip taproot placeholder vectors (#SCRIPT#, #CONTROLBLOCK#, etc.)
+            has_placeholder = any(
+                isinstance(x, str) and x.startswith('#') for x in wit_array[:-1]
+            )
+            if has_placeholder:
+                skipped += 1
+                continue
+            witness_amount = round(float(wit_array[-1]) * 1e8)
+            witness_stack = [bytes.fromhex(h) for h in wit_array[:-1]]
+            script_sig_asm = entry[1]
+            script_pubkey_asm = entry[2]
+            flags_str = entry[3]
+            expected = entry[4]
+            comment = entry[5] if len(entry) >= 6 else ""
+        elif len(entry) < 4:
             skipped += 1
             continue
-
-        if len(entry) < 4:
-            skipped += 1
-            continue
-
-        script_sig_asm = entry[0]
-        script_pubkey_asm = entry[1]
-        flags_str = entry[2]
-        expected = entry[3]
-        comment = entry[4] if len(entry) >= 5 else ""
+        else:
+            script_sig_asm = entry[0]
+            script_pubkey_asm = entry[1]
+            flags_str = entry[2]
+            expected = entry[3]
+            comment = entry[4] if len(entry) >= 5 else ""
 
         try:
             script_sig = parse_script_asm(script_sig_asm)
@@ -407,10 +428,16 @@ def test_script_vectors():
             continue
 
         flags = parse_flags(flags_str)
-        tx = make_crediting_spending_tx(script_sig, script_pubkey)
+        tx = make_crediting_spending_tx(
+            script_sig, script_pubkey,
+            amount=witness_amount, witness=witness_stack,
+        )
 
         try:
-            got_ok = interp.verify(script_sig, script_pubkey, tx, 0, flags=flags)
+            got_ok = interp.verify(
+                script_sig, script_pubkey, tx, 0,
+                flags=flags, amount=witness_amount,
+            )
         except Exception:
             got_ok = False
 
@@ -433,7 +460,7 @@ def test_script_vectors():
     )
 
     if failed > 0:
-        print("NOTE: some failures may remain for witness/taproot tests (skipped above)")
+        print("NOTE: some failures may remain for taproot placeholder tests (skipped above)")
 
 
 if __name__ == "__main__":
