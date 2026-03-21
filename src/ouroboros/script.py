@@ -424,7 +424,16 @@ class ScriptInterpreter:
                     return False
                 if (flags & SCRIPT_VERIFY_CLEANSTACK) and len(redeem_stack) != 1:
                     return False
+                # WITNESS_UNEXPECTED in P2SH non-witness path
+                if (flags & SCRIPT_VERIFY_WITNESS) and witness:
+                    return False
                 return True
+
+            # WITNESS_UNEXPECTED: if WITNESS flag is set and we did NOT
+            # enter a witness program above, the tx must not carry witness data.
+            if flags & SCRIPT_VERIFY_WITNESS:
+                if witness:
+                    return False  # unexpected witness data
 
             # Step 6: Clean stack
             if (flags & SCRIPT_VERIFY_CLEANSTACK) and len(stack) != 1:
@@ -762,9 +771,9 @@ class ScriptInterpreter:
                     if not stack:
                         raise ValueError("OP_IF: stack underflow")
                     top = stack.pop()
-                    # Tapscript: MINIMALIF is consensus (BIP 342)
-                    if is_tapscript and top not in (b"", b"\x01"):
-                        raise ValueError("MINIMALIF: non-minimal OP_IF input in tapscript")
+                    # MINIMALIF: enforce in tapscript (consensus) or segwit v0 (policy)
+                    if (is_tapscript or (is_witness_v0 and (flags & SCRIPT_VERIFY_MINIMALIF))) and top not in (b"", b"\x01"):
+                        raise ValueError("MINIMALIF: non-minimal OP_IF input")
                     val = self._cast_to_bool(top)
                 exec_stack.append(val)
                 continue
@@ -774,9 +783,9 @@ class ScriptInterpreter:
                     if not stack:
                         raise ValueError("OP_NOTIF: stack underflow")
                     top = stack.pop()
-                    # Tapscript: MINIMALIF is consensus (BIP 342)
-                    if is_tapscript and top not in (b"", b"\x01"):
-                        raise ValueError("MINIMALIF: non-minimal OP_NOTIF input in tapscript")
+                    # MINIMALIF: enforce in tapscript (consensus) or segwit v0 (policy)
+                    if (is_tapscript or (is_witness_v0 and (flags & SCRIPT_VERIFY_MINIMALIF))) and top not in (b"", b"\x01"):
+                        raise ValueError("MINIMALIF: non-minimal OP_NOTIF input")
                     val = not self._cast_to_bool(top)
                 exec_stack.append(val)
                 continue
