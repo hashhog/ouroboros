@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 # Bitcoin P2P magic bytes for different networks
 MAGIC_MAINNET = 0xD9B4BEF9
 MAGIC_TESTNET = 0x0709110B
+MAGIC_TESTNET4 = 0x283F161C
 MAGIC_REGTEST = 0xDAB5BFFA
 MAGIC_SIGNET = 0x40CF030A
 
@@ -48,6 +49,8 @@ def get_magic(network: str) -> int:
     network_map = {
         "mainnet": MAGIC_MAINNET,
         "testnet": MAGIC_TESTNET,
+        "testnet3": MAGIC_TESTNET,
+        "testnet4": MAGIC_TESTNET4,
         "regtest": MAGIC_REGTEST,
         "signet": MAGIC_SIGNET,
     }
