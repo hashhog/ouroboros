@@ -608,7 +608,18 @@ class RPCServer:
     
     async def start(self):
         """Start RPC server"""
+        import socket
         import uvicorn
+
+        # Pre-check: is the port already in use?
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            if sock.connect_ex(("127.0.0.1", self.port)) == 0:
+                logger.error(
+                    f"RPC port {self.port} is already in use — "
+                    "is another node running?  Skipping RPC server."
+                )
+                return
+
         config = uvicorn.Config(
             self.app,
             host="127.0.0.1",
@@ -617,7 +628,21 @@ class RPCServer:
         )
         server = uvicorn.Server(config)
         logger.info(f"Starting RPC server on 127.0.0.1:{self.port}")
-        await server.serve()
+        try:
+            await server.serve()
+        except SystemExit as e:
+            # uvicorn calls sys.exit(1) when it fails to bind.
+            # Catch it so it doesn't tear down the entire event loop.
+            logger.error(
+                f"RPC server failed to start (exit code {e.code}). "
+                f"Port {self.port} may be in use.  "
+                "Node continues running without RPC."
+            )
+        except OSError as e:
+            logger.error(
+                f"RPC server OS error: {e}.  "
+                "Node continues running without RPC."
+            )
     
     # RPC Methods
     

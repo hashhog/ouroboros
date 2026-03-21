@@ -252,7 +252,18 @@ class BitcoinNode:
                 rate_limit=True,
                 enable_rest=rest_enabled,
             )
-            self._rpc_task = asyncio.create_task(self.rpc_server.start())
+            async def _safe_rpc_start():
+                try:
+                    await self.rpc_server.start()
+                except SystemExit as e:
+                    logger.error(
+                        f"RPC server exited with code {e.code}. "
+                        "Node continues without RPC."
+                    )
+                except Exception as e:
+                    logger.error(f"RPC server error: {e}. Node continues without RPC.")
+
+            self._rpc_task = asyncio.create_task(_safe_rpc_start())
 
             # ZMQ notifier (optional — per-topic configuration)
             # Configure endpoints for each ZMQ topic
@@ -547,40 +558,65 @@ class BitcoinNode:
         # --- Try full connect_block_from_bytes first (stores block + UTXO) ---
         if hasattr(self.db._db, 'connect_block_from_bytes'):
             prev_block = b'\x00' * 32
-            # Merkle root in display (big-endian) order; reverse to internal
-            # (little-endian) for the raw 80-byte header serialisation.
-            merkle_root = bytes.fromhex(
-                '4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b'
-            )[::-1]
-            if self.network == 'regtest':
-                ts, bits, nonce = 1296688602, 0x207fffff, 2
-            elif self.network in ('testnet', 'testnet3'):
-                ts, bits, nonce = 1296688602, 0x1d00ffff, 414098458
-            elif self.network == 'testnet4':
+
+            if self.network == 'testnet4':
+                # Testnet4 (BIP 94) uses a different coinbase message and
+                # a 33-byte null pubkey instead of the Satoshi pubkey.
+                merkle_root = bytes.fromhex(
+                    '7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e'
+                )[::-1]
                 ts, bits, nonce = 1714777860, 0x1d00ffff, 393743547
-            elif self.network == 'signet':
-                ts, bits, nonce = 1598918400, 0x1e0377ae, 52613770
+                coinbase_tx = bytes.fromhex(
+                    '01000000'                                          # version
+                    '01'                                                # 1 input
+                    '0000000000000000000000000000000000000000000000000000000000000000'
+                    'ffffffff'                                          # prevout
+                    '55'                                                # scriptSig len (85)
+                    '04ffff001d0104'                                    # nBits push + CScriptNum(4)
+                    '4c4c'                                              # OP_PUSHDATA1 + 76
+                    '30332f4d61792f323032342030303030303030303030303030'
+                    '303030303030303165626435386332343439373062336161'
+                    '396437383362623030313031316662653865613865393865303065'
+                    'ffffffff'                                          # sequence
+                    '01'                                                # 1 output
+                    '00f2052a01000000'                                  # 50 BTC
+                    '23'                                                # scriptPubKey len (35)
+                    '21' '000000000000000000000000000000000000000000000000000000000000000000'
+                    'ac'                                                # OP_CHECKSIG
+                    '00000000'                                          # locktime
+                )
             else:
-                ts, bits, nonce = 1231006505, 0x1d00ffff, 2083236893
+                # Mainnet, testnet3, regtest, signet all share the original
+                # Satoshi coinbase (different header params).
+                merkle_root = bytes.fromhex(
+                    '4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b'
+                )[::-1]
+                if self.network == 'regtest':
+                    ts, bits, nonce = 1296688602, 0x207fffff, 2
+                elif self.network in ('testnet', 'testnet3'):
+                    ts, bits, nonce = 1296688602, 0x1d00ffff, 414098458
+                elif self.network == 'signet':
+                    ts, bits, nonce = 1598918400, 0x1e0377ae, 52613770
+                else:
+                    ts, bits, nonce = 1231006505, 0x1d00ffff, 2083236893
+                coinbase_tx = bytes.fromhex(
+                    '01000000'
+                    '01'
+                    '0000000000000000000000000000000000000000000000000000000000000000'
+                    'ffffffff'
+                    '4d'
+                    '04ffff001d0104455468652054696d65732030332f4a616e2f323030'
+                    '39204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73'
+                    'ffffffff'
+                    '01'
+                    '00f2052a01000000'
+                    '43'
+                    '4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac'
+                    '00000000'
+                )
 
             header = struct.pack('<i', 1) + prev_block + merkle_root
             header += struct.pack('<III', ts, bits, nonce)
-
-            coinbase_tx = bytes.fromhex(
-                '01000000'
-                '01'
-                '0000000000000000000000000000000000000000000000000000000000000000'
-                'ffffffff'
-                '4d'
-                '04ffff001d0104455468652054696d65732030332f4a616e2f323030'
-                '39204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73'
-                'ffffffff'
-                '01'
-                '00f2052a01000000'
-                '43'
-                '4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac'
-                '00000000'
-            )
             block_bytes = header + b'\x01' + coinbase_tx
             try:
                 self.db._db.connect_block_from_bytes(block_bytes, 0)

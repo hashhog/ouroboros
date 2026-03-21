@@ -325,6 +325,9 @@ def start(ctx, rpc_port, p2p_port, listen, force):
     ))
     
     # Check if synced (release SyncManager before node opens DB to avoid RocksDB lock conflict)
+    # Auto-skip interactive prompt when --force is set, stdin is not a TTY,
+    # or network is not mainnet (testnet/regtest users always want to proceed)
+    skip_prompt = force or not sys.stdin.isatty() or network != "mainnet"
     try:
         sync_manager = SyncManager(data_dir, network)
         is_synced = sync_manager.is_synced()
@@ -333,11 +336,11 @@ def start(ctx, rpc_port, p2p_port, listen, force):
             console.print(
                 "[yellow]⚠ Blockchain not fully synced — run 'ouroboros sync' first[/yellow]"
             )
-            if not force and not click.confirm("Continue anyway?", default=False):
+            if not skip_prompt and not click.confirm("Continue anyway?", default=False):
                 return
     except Exception as e:
         console.print(f"[yellow]⚠ Could not check sync status: {e}[/yellow]")
-        if not force and not click.confirm("Continue anyway?", default=False):
+        if not skip_prompt and not click.confirm("Continue anyway?", default=False):
             return
     
     # Create and start node
