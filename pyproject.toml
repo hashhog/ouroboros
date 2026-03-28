@@ -45,6 +45,8 @@ dependencies = [
     "bech32>=1.2.0",
     # ECDSA verification fallback (when sync module unavailable)
     "coincurve>=19.0.0",
+    # BIP-324 v2 transport (ChaCha20-Poly1305)
+    "cryptography>=41.0.0",
     # Prometheus metrics (optional at runtime but included for convenience)
     "prometheus-client>=0.19.0",
 ]
