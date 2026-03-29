@@ -233,10 +233,13 @@ class BitcoinNode:
                 transport_version=p2p_transport,
                 listen=bool(listen_enabled),
             )
-            await self.peer_manager.start(best_height, p2p_port=p2p_port)
+            try:
+                await self.peer_manager.start(best_height, p2p_port=p2p_port)
+            except Exception as e:
+                logger.warning(f"Peer manager start error (node continues): {e}")
             peer_count = len(self.peer_manager.get_all_ready_peers()) if self.peer_manager else 0
             logger.info(f"Peer manager started ({peer_count} peers)")
-            
+
             # Initialize block sync
             logger.info("Initializing block synchronization...")
             self.block_sync = BlockSync(
@@ -244,7 +247,10 @@ class BitcoinNode:
                 mempool=self.mempool,
                 fee_estimator=self.fee_estimator,
             )
-            await self.block_sync.start()
+            try:
+                await self.block_sync.start()
+            except Exception as e:
+                logger.warning(f"Block sync start error (node continues): {e}")
             
             # Start RPC server (with optional REST interface)
             rest_enabled = str(self.config.get('rest', '0')).lower() in ('1', 'true', 'yes', 'on')
@@ -309,10 +315,13 @@ class BitcoinNode:
             self.running = True
             logger.info("Bitcoin node started successfully")
 
-            # Print status block to terminal
-            self._print_startup_status(rpc_port, p2p_port)
+            # Print status block to terminal (best-effort; never fatal)
+            try:
+                self._print_startup_status(rpc_port, p2p_port)
+            except Exception as e:
+                logger.warning(f"Could not print startup status: {e}")
 
-            # Main loop (will exit when shutdown event is set)
+            # Main loop — runs indefinitely until shutdown signal
             await self._main_loop()
             
         except Exception as e:
@@ -367,23 +376,40 @@ class BitcoinNode:
             logger.error(f"Error stopping node: {e}", exc_info=True)
     
     async def _main_loop(self):
+        """Run indefinitely until an explicit shutdown signal is received.
+
+        The node MUST stay alive even when there are zero connected peers
+        (matching Bitcoin Core behaviour).  Only SIGINT, SIGTERM, or an
+        RPC ``stop`` command should cause the loop to exit.
+        """
         while self.running:
             try:
                 # Check for shutdown event
                 if self._shutdown_event and self._shutdown_event.is_set():
                     logger.info("Shutdown event received, exiting main loop")
                     break
-                
+
                 # Periodic tasks
-                await self._periodic_tasks()
-                
+                try:
+                    await self._periodic_tasks()
+                except Exception as e:
+                    logger.error(f"Error in periodic tasks: {e}", exc_info=True)
+
                 # Sleep, but check shutdown event more frequently
                 for _ in range(60):  # Check every second for 60 seconds
                     if self._shutdown_event and self._shutdown_event.is_set():
                         break
                     await asyncio.sleep(1)
-                
+
             except asyncio.CancelledError:
+                break
+            except SystemExit:
+                # Never let a stray sys.exit() (e.g. from uvicorn) tear
+                # down the node — only explicit shutdown signals should
+                # stop us.
+                logger.warning("Caught SystemExit in main loop, ignoring")
+            except KeyboardInterrupt:
+                logger.info("KeyboardInterrupt in main loop, shutting down")
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
@@ -500,12 +526,10 @@ class BitcoinNode:
             best_height = 0
             hash_truncated = "—"
 
-        # Check sync status via SyncManager for accuracy
-        try:
-            sync_mgr = SyncManager(self.data_dir, self.network)
-            is_synced = sync_mgr.is_synced()
-        except Exception:
-            is_synced = self.synced
+        # Use the already-computed sync flag; do NOT create a SyncManager
+        # here — its constructor opens a second RocksDB handle on the same
+        # data directory, which can corrupt state or crash via lock conflict.
+        is_synced = self.synced
 
         lines = [
             f"Network: [cyan]{self.network}[/cyan]",
