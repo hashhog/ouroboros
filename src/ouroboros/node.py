@@ -97,6 +97,8 @@ class BitcoinNode:
         self.synced = False
         self._rpc_task: Optional[asyncio.Task] = None
         self._shutdown_event: Optional[asyncio.Event] = None
+        self._rpc_username: Optional[str] = None
+        self._rpc_password: Optional[str] = None
     
     async def start(self, rpc_port: int = 8332, p2p_port: int = 8333):
         """Start the Bitcoin node (config file values override the port defaults)."""
@@ -124,6 +126,17 @@ class BitcoinNode:
             logger.info(f"Initializing database at {self.data_dir}")
             self.db = BlockchainDatabase(self.data_dir)
             logger.info("Database initialized")
+
+            # RPC authentication: explicit config > cookie file
+            # Write the cookie file early (before the RPC server binds) so
+            # that external tools polling with curl can read it as soon as
+            # the port opens — matching Bitcoin Core's init order.
+            rpc_username = self.config.get('rpc_username')
+            rpc_password = self.config.get('rpc_password')
+            if not (rpc_username and rpc_password):
+                rpc_username, rpc_password = generate_cookie(self.data_dir)
+            self._rpc_username = rpc_username
+            self._rpc_password = rpc_password
 
             # Initialize snapshot manager for assumeUTXO
             self.snapshot_manager = SnapshotManager(self.db, self.network, self.data_dir)
@@ -233,12 +246,6 @@ class BitcoinNode:
             )
             await self.block_sync.start()
             
-            # RPC authentication: explicit config > cookie file
-            rpc_username = self.config.get('rpc_username')
-            rpc_password = self.config.get('rpc_password')
-            if not (rpc_username and rpc_password):
-                rpc_username, rpc_password = generate_cookie(self.data_dir)
-
             # Start RPC server (with optional REST interface)
             rest_enabled = str(self.config.get('rest', '0')).lower() in ('1', 'true', 'yes', 'on')
             logger.info(f"RPC server listening on 127.0.0.1:{rpc_port}")
@@ -247,8 +254,8 @@ class BitcoinNode:
             self.rpc_server = RPCServer(
                 self,
                 port=rpc_port,
-                username=rpc_username,
-                password=rpc_password,
+                username=self._rpc_username,
+                password=self._rpc_password,
                 rate_limit=True,
                 enable_rest=rest_enabled,
             )
@@ -976,4 +983,9 @@ class BitcoinNode:
     
     async def run(self) -> None:
         """Start the node and block until shutdown (convenience wrapper for ``start()``)."""
-        await self.start()
+        try:
+            await self.start()
+        finally:
+            # Ensure clean shutdown (cookie deletion, DB flush, etc.) even
+            # when start() returns normally after _main_loop exits.
+            await self.stop()
