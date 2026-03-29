@@ -320,7 +320,7 @@ class RESTInterface:
             target_int = mantissa << (8 * (exponent - 3))
 
         result: Dict[str, Any] = {
-            "hash": block_hash.hex() if isinstance(block_hash, bytes) else str(block_hash),
+            "hash": block_hash[::-1].hex() if isinstance(block_hash, bytes) else str(block_hash),
             "confirmations": confirmations,
             "size": size,
             "strippedsize": strippedsize,
@@ -328,7 +328,7 @@ class RESTInterface:
             "height": block_height if block_height is not None else 0,
             "version": block.version,
             "versionHex": f"{block.version:08x}",
-            "merkleroot": block.merkle_root.hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
+            "merkleroot": block.merkle_root[::-1].hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
             "time": block.timestamp,
             "mediantime": self.node.get_median_time(block_height) if block_height is not None else block.timestamp,
             "nonce": block.nonce,
@@ -340,14 +340,14 @@ class RESTInterface:
 
         # Previous block hash
         if block.prev_blockhash and block.prev_blockhash != bytes(32):
-            result["previousblockhash"] = block.prev_blockhash.hex()
+            result["previousblockhash"] = block.prev_blockhash[::-1].hex()
 
         # Next block hash
         if block_height is not None:
             next_block = db.get_block_by_height(block_height + 1)
             if next_block:
                 next_hash = next_block.hash if hasattr(next_block, 'hash') else next_block.get_hash()
-                result["nextblockhash"] = next_hash.hex() if isinstance(next_hash, bytes) else str(next_hash)
+                result["nextblockhash"] = next_hash[::-1].hex() if isinstance(next_hash, bytes) else str(next_hash)
 
         # Transactions
         if include_tx_details:
@@ -588,7 +588,7 @@ class RESTInterface:
                     "height": h_height,
                     "version": h.version,
                     "versionHex": f"{h.version:08x}",
-                    "merkleroot": h.merkle_root.hex() if isinstance(h.merkle_root, bytes) else str(h.merkle_root),
+                    "merkleroot": h.merkle_root[::-1].hex() if isinstance(h.merkle_root, bytes) else str(h.merkle_root),
                     "time": h.timestamp,
                     "mediantime": self.node.get_median_time(h_height) if h_height is not None else h.timestamp,
                     "nonce": h.nonce,
@@ -596,7 +596,7 @@ class RESTInterface:
                     "difficulty": self.node.get_difficulty(h.bits),
                     "chainwork": self.node.get_chainwork_at_height(h_height) if h_height is not None else "0" * 64,
                     "nTx": len(h.transactions) if hasattr(h, 'transactions') and h.transactions else 0,
-                    "previousblockhash": h.prev_blockhash.hex() if h.prev_blockhash and h.prev_blockhash != bytes(32) else None,
+                    "previousblockhash": h.prev_blockhash[::-1].hex() if h.prev_blockhash and h.prev_blockhash != bytes(32) else None,
                 })
 
             return JSONResponse(content=json_headers)
