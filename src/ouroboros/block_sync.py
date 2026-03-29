@@ -7,6 +7,7 @@ handling new block announcements, validation, and chain reorganization.
 
 import asyncio
 import hashlib
+import random
 import time
 import logging
 from typing import Dict, Set, Optional, List, Tuple, Callable
@@ -56,6 +57,9 @@ class BlockSync:
         # FIXME: race condition if called from multiple threads?
         self.requested_blocks: Dict[bytes, float] = {}
 
+        # Track which peer each block was last requested from (hash -> Peer)
+        self._block_request_peer: Dict[bytes, Peer] = {}
+
         # Track requested transactions (hash -> request_time)
         self._requested_txs: Dict[bytes, float] = {}
         
@@ -65,7 +69,7 @@ class BlockSync:
         # Orphan blocks: hash -> Block (blocks whose parent is not in our chain)
         # Ref: bitcoin/src/net_processing.cpp orphan_work_set, ProcessOrphanTx
         self.orphan_blocks: Dict[bytes, Block] = {}
-        self._max_orphans = 100
+        self._max_orphans = 200
         
         # Track pending headers requests
         self.pending_headers: Dict[bytes, float] = {}  # locator_hash -> request_time
@@ -81,6 +85,15 @@ class BlockSync:
         
         # Message handlers per peer (peer -> handler_dict)
         self._peer_handlers: Dict[Peer, Dict[str, Callable]] = defaultdict(dict)
+
+        # Headers-first sync: validated header chain waiting for block download.
+        # List of (block_hash, header) in chain order (oldest first).
+        self._validated_headers: List[Tuple[bytes, 'BlockHeader']] = []
+        # Max blocks to have in-flight at once during headers-first sync.
+        # Keep moderate to avoid exceeding orphan pool when blocks arrive
+        # out of order (each out-of-order block becomes an orphan until
+        # its predecessor connects).
+        self._max_blocks_in_flight: int = 64
     
     def set_zmq_publisher(self, publisher) -> None:
         """Attach a ZMQPublisher for real-time block/tx notifications."""
@@ -167,13 +180,42 @@ class BlockSync:
             await self.handle_headers(msg, peer)
         return handler
     
+    def _register_new_peers(self):
+        """Register handlers for any newly connected peers."""
+        if hasattr(self.peer_manager, 'get_all_ready_peers'):
+            peers = self.peer_manager.get_all_ready_peers()
+        else:
+            peers = getattr(self.peer_manager, 'peers', [])
+            if isinstance(peers, dict):
+                peers = list(peers.values())
+        new_count = 0
+        for peer in peers:
+            if not isinstance(peer, Peer):
+                continue
+            if peer in self._peer_handlers:
+                continue
+            peer.register_handler("inv", self._make_inv_handler(peer))
+            peer.register_handler("block", self._make_block_handler(peer))
+            peer.register_handler("headers", self._make_headers_handler(peer))
+            self._peer_handlers[peer] = {
+                "inv": self._make_inv_handler(peer),
+                "block": self._make_block_handler(peer),
+                "headers": self._make_headers_handler(peer),
+            }
+            new_count += 1
+        if new_count:
+            logger.info(f"Registered block_sync handlers for {new_count} new peers (total: {len(self._peer_handlers)})")
+
     async def sync_loop(self):
         """Main synchronization loop"""
         while self.running:
             try:
+                # Register handlers for any new peers
+                self._register_new_peers()
+
                 # Check if we're behind
                 best_hash, best_height = self.db.get_best_block()
-                
+
                 # Detect reorgs
                 if self.last_best_hash and self.last_best_hash != best_hash:
                     # Check if this is a reorg
@@ -192,21 +234,28 @@ class BlockSync:
                 
                 self.last_best_hash = best_hash
                 
-                # Get peer with highest block
-                best_peer = self._get_peer_with_highest_block()
-                if best_peer and hasattr(best_peer, 'start_height'):
-                    if best_peer.start_height > best_height:
+                # Get a peer that's ahead of us (rotate to avoid getting stuck)
+                sync_peer = self._get_sync_peer(best_height)
+                if sync_peer and hasattr(sync_peer, 'start_height'):
+                    if sync_peer.start_height > best_height:
                         logger.info(
-                            f"Behind by {best_peer.start_height - best_height} blocks"
+                            f"Behind by {sync_peer.start_height - best_height} blocks"
                         )
-                        await self._catch_up(best_peer, best_height)
+                        await self._catch_up(sync_peer, best_height)
                 
                 # Handle timeouts
                 await self._handle_timeouts()
-                
+
+                # Advance headers-first download window (in case blocks
+                # connected between sync_loop iterations).
+                await self._request_next_blocks()
+
+                # Prune validated headers that have been downloaded and connected.
+                self._prune_validated_headers()
+
             except Exception as e:
                 logger.error(f"Error in sync loop: {e}", exc_info=True)
-            
+
             await asyncio.sleep(10)
     
     async def handle_inv(self, msg: NetworkMessage, peer: Peer):
@@ -224,13 +273,12 @@ class BlockSync:
             for h in stale:
                 self._requested_txs.pop(h, None)
 
+            has_new_blocks = False
             for inv_type, inv_hash in inv.inventory:
                 if inv_type == INV_TYPE_BLOCK:
                     existing_block = self.db.get_block(inv_hash)
                     if not existing_block:
-                        if inv_hash not in self.requested_blocks:
-                            blocks_to_request.append((inv_type, inv_hash))
-                            self.requested_blocks[inv_hash] = now
+                        has_new_blocks = True
 
                 elif inv_type in (INV_TYPE_TX, MSG_WITNESS_TX, MSG_WTX):
                     # Request transactions we don't already have
@@ -248,17 +296,29 @@ class BlockSync:
                 else "mainnet"
             )
 
-            if blocks_to_request:
-                getdata = GetDataMessage(inventory=blocks_to_request)
-                try:
-                    await peer.send_message(getdata.to_network_message(network))
-                    logger.info(
-                        f"Requested {len(blocks_to_request)} blocks from "
-                        f"{peer.host}:{peer.port}"
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send getdata: {e}")
-                    peer.adjust_score(-5)
+            if has_new_blocks:
+                # Headers-first: request headers instead of blocks directly.
+                # This ensures we only download blocks whose headers validate
+                # and connect to our chain, preventing orphan pool flooding.
+                # (Mirrors Bitcoin Core net_processing.cpp: block inv triggers
+                # getheaders, blocks are only requested after header validation.)
+                best_hash, best_height = self.db.get_best_block()
+                locator = self._build_locator(best_height)
+                if locator:
+                    try:
+                        getheaders = GetHeadersMessage(
+                            version=70015,
+                            locator_hashes=locator,
+                            hash_stop=b'\x00' * 32,
+                        )
+                        await peer.send_message(getheaders.to_network_message(network))
+                        logger.info(
+                            f"Block inv from {peer.host}:{peer.port} — "
+                            f"requesting headers (headers-first sync)"
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send getheaders: {e}")
+                        peer.adjust_score(-5)
 
             if txs_to_request:
                 getdata = GetDataMessage(inventory=txs_to_request)
@@ -288,6 +348,7 @@ class BlockSync:
             # Remove from requested blocks
             if block_hash in self.requested_blocks:
                 del self.requested_blocks[block_hash]
+            self._block_request_peer.pop(block_hash, None)
             
             # Orphan check: parent not in our chain
             prev_block = self.db.get_block(block.prev_blockhash)
@@ -300,16 +361,23 @@ class BlockSync:
                     return
                 self.orphan_blocks[block_hash] = block
                 logger.info(f"Stored orphan block {block_hash.hex()[:16]}... (parent unknown)")
-                # Request parent via getdata
-                if block.prev_blockhash not in self.requested_blocks:
-                    self.requested_blocks[block.prev_blockhash] = time.time()
+                # Headers-first: request headers to find the connecting chain
+                # instead of chasing individual parents (which causes orphan
+                # cascades when blocks arrive out of order).
+                network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
+                best_hash, best_height = self.db.get_best_block()
+                locator = self._build_locator(best_height)
+                if locator:
                     try:
-                        getdata = GetDataMessage(inventory=[(INV_TYPE_BLOCK, block.prev_blockhash)])
-                        network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
-                        await peer.send_message(getdata.to_network_message(network))
-                        logger.debug(f"Requested orphan parent {block.prev_blockhash.hex()[:16]}...")
+                        getheaders = GetHeadersMessage(
+                            version=70015,
+                            locator_hashes=locator,
+                            hash_stop=b'\x00' * 32,
+                        )
+                        await peer.send_message(getheaders.to_network_message(network))
+                        logger.debug(f"Orphan received — requesting headers from {peer.host}:{peer.port}")
                     except Exception as e:
-                        logger.debug(f"Failed to request orphan parent: {e}")
+                        logger.debug(f"Failed to request headers for orphan: {e}")
                 return
             
             # Validate block
@@ -363,7 +431,10 @@ class BlockSync:
 
                 # Process orphans that may now have their parent
                 await self._process_orphans(block_hash)
-                
+
+                # Advance headers-first download window now that a block connected.
+                await self._request_next_blocks()
+
                 # Announce new block to peers based on their preferences
                 await self._announce_block(block, block_hash, exclude_peer=peer)
             else:
@@ -384,42 +455,170 @@ class BlockSync:
         return block_hash_raw  # internal byte order — matches DB and wire
 
     async def handle_headers(self, msg: NetworkMessage, peer: Peer):
-        """Handle headers message"""
+        """Handle headers message — headers-first sync.
+
+        Validates that received headers form a chain connecting to our
+        current tip (or to the end of already-validated headers), then
+        queues them for block download in a limited window.  This mirrors
+        Bitcoin Core's approach in net_processing.cpp where block data is
+        only requested after headers have been validated and connected.
+        """
         try:
             headers_msg = HeadersMessage.from_payload(msg.payload)
-            
+
             if not headers_msg.headers:
                 return
-            
+
             logger.info(f"Received {len(headers_msg.headers)} headers from {peer.host}:{peer.port}")
-            
-            # Request blocks for headers we don't have
-            to_request = []
+
+            # Determine expected prev_hash: either last validated header or our DB tip.
+            if self._validated_headers:
+                expected_prev = self._validated_headers[-1][0]  # hash of last queued header
+            else:
+                best_hash, _ = self.db.get_best_block()
+                expected_prev = best_hash
+
+            accepted = 0
             for header in headers_msg.headers:
-                block_hash = self._header_to_block_hash(header)  # internal byte order
-                if not self.db.get_block(block_hash) and block_hash not in self.requested_blocks:
-                    to_request.append((INV_TYPE_BLOCK, block_hash))
-                    self.requested_blocks[block_hash] = time.time()
-            
-            if to_request:
+                block_hash = self._header_to_block_hash(header)
+
+                # Skip headers we already have in the DB.
+                if self.db.get_block(block_hash):
+                    expected_prev = block_hash
+                    continue
+
+                # Skip duplicates already in our validated queue.
+                known_hashes = {h for h, _ in self._validated_headers}
+                if block_hash in known_hashes:
+                    expected_prev = block_hash
+                    continue
+
+                # Validate chain continuity: header must extend expected_prev.
+                header_prev = header.prev_blockhash if hasattr(header, 'prev_blockhash') else None
+                if header_prev != expected_prev:
+                    logger.warning(
+                        f"Header {block_hash.hex()[:16]}... does not connect "
+                        f"(expected prev {expected_prev.hex()[:16]}..., "
+                        f"got {header_prev.hex()[:16] if header_prev else 'None'}...) — "
+                        f"dropping remaining {len(headers_msg.headers) - accepted} headers"
+                    )
+                    break
+
+                self._validated_headers.append((block_hash, header))
+                expected_prev = block_hash
+                accepted += 1
+
+            if accepted:
+                logger.info(
+                    f"Validated {accepted} new headers (queue: {len(self._validated_headers)})"
+                )
+                # Kick off block downloads for the next window.
+                await self._request_next_blocks()
+
+            # If we received a full batch (2000 headers), ask for more.
+            if len(headers_msg.headers) >= 2000 and self._validated_headers:
+                network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
+                last_hash = self._validated_headers[-1][0]
+                getheaders = GetHeadersMessage(
+                    version=70015,
+                    locator_hashes=[last_hash],
+                    hash_stop=b'\x00' * 32,
+                )
                 try:
-                    getdata = GetDataMessage(inventory=to_request)
-                    network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
-                    getdata_msg = getdata.to_network_message(network)
-                    await peer.send_message(getdata_msg)
-                    logger.info(f"Requested {len(to_request)} blocks for headers from {peer.host}:{peer.port}")
+                    await peer.send_message(getheaders.to_network_message(network))
+                    logger.info(f"Requesting more headers after {last_hash.hex()[:16]}...")
                 except Exception as e:
-                    logger.error(f"Failed to send getdata for headers: {e}")
-                    peer.adjust_score(-2)
-        
+                    logger.error(f"Failed to request continuation headers: {e}")
+
         except Exception as e:
             logger.error(f"Error handling headers from {peer.host}:{peer.port}: {e}")
             peer.adjust_score(-2)
-            # Record misbehavior for malformed headers
             if hasattr(self.peer_manager, 'misbehaving'):
                 addr = f"{peer.host}:{peer.port}"
                 self.peer_manager.misbehaving(addr, 20, f"invalid headers: {e}")
-    
+
+    async def _request_next_blocks(self):
+        """Request blocks from the validated header queue up to the in-flight limit.
+
+        Anchored to the connected tip: only requests blocks that are within
+        _max_blocks_in_flight of the last block we've actually stored in the
+        DB.  This ensures blocks arrive roughly in order and can chain
+        sequentially, avoiding orphan cascades.
+        """
+        if not self._validated_headers:
+            return
+
+        network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
+
+        # Find where our connected tip sits in the header queue.
+        # After pruning, index 0 is the first header not yet in the DB
+        # (or already in DB if pruning hasn't run yet).
+        tip_idx = -1
+        for i, (bh, _) in enumerate(self._validated_headers):
+            if self.db.get_block(bh):
+                tip_idx = i
+            else:
+                break  # Headers are in order; first missing = end of connected chain.
+
+        # Request blocks starting just after the connected tip, up to window size.
+        start = tip_idx + 1
+        in_flight = len(self.requested_blocks)
+        available = max(0, self._max_blocks_in_flight - in_flight)
+        if available == 0:
+            return
+
+        to_request: List[Tuple[int, bytes]] = []
+        for i in range(start, min(start + available, len(self._validated_headers))):
+            block_hash, _ = self._validated_headers[i]
+            if block_hash not in self.requested_blocks and not self.db.get_block(block_hash):
+                to_request.append((INV_TYPE_BLOCK, block_hash))
+                self.requested_blocks[block_hash] = time.time()
+
+        if not to_request:
+            return
+
+        # Distribute across connected peers round-robin.
+        if hasattr(self.peer_manager, 'get_all_ready_peers'):
+            candidates = [p for p in self.peer_manager.get_all_ready_peers()
+                          if isinstance(p, Peer) and p.is_connected()]
+        else:
+            candidates = []
+        if not candidates:
+            return
+
+        per_peer: dict[Peer, list] = {c: [] for c in candidates}
+        for i, item in enumerate(to_request):
+            target = candidates[i % len(candidates)]
+            per_peer[target].append(item)
+
+        for target_peer, items in per_peer.items():
+            if not items:
+                continue
+            try:
+                getdata = GetDataMessage(inventory=items)
+                await target_peer.send_message(getdata.to_network_message(network))
+                for _, bh in items:
+                    self._block_request_peer[bh] = target_peer
+            except Exception as e:
+                logger.error(f"Failed to send getdata to {target_peer.host}:{target_peer.port}: {e}")
+                target_peer.adjust_score(-2)
+
+        logger.info(f"Requested {len(to_request)} blocks (tip+{start}, in-flight: {in_flight}+{len(to_request)}/{self._max_blocks_in_flight})")
+
+    def _prune_validated_headers(self):
+        """Remove validated headers that have already been connected to the chain."""
+        if not self._validated_headers:
+            return
+        # Find how many leading headers are now in the DB.
+        prune_count = 0
+        for block_hash, _ in self._validated_headers:
+            if self.db.get_block(block_hash):
+                prune_count += 1
+            else:
+                break
+        if prune_count > 0:
+            self._validated_headers = self._validated_headers[prune_count:]
+
     async def _announce_block(
         self, block: Block, block_hash: bytes, exclude_peer: Peer | None = None,
     ) -> None:
@@ -547,6 +746,23 @@ class BlockSync:
         
         return locator
     
+    def _get_sync_peer(self, our_height: int) -> Optional[Peer]:
+        """Pick a random peer that's ahead of us for header requests."""
+        if hasattr(self.peer_manager, 'get_all_ready_peers'):
+            peers = self.peer_manager.get_all_ready_peers()
+        else:
+            peers = getattr(self.peer_manager, 'peers', [])
+            if isinstance(peers, dict):
+                peers = list(peers.values())
+        candidates = [
+            p for p in peers
+            if isinstance(p, Peer) and hasattr(p, 'start_height')
+            and p.start_height > our_height and p.is_connected()
+        ]
+        if not candidates:
+            return None
+        return random.choice(candidates)
+
     def _get_peer_with_highest_block(self) -> Optional[Peer]:
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             peers = self.peer_manager.get_all_ready_peers()
@@ -568,39 +784,83 @@ class BlockSync:
         return max(valid_peers, key=lambda p: p.start_height)
     
     async def _handle_timeouts(self):
-        """Re-request blocks that timed out"""
+        """Re-request blocks that timed out, rotating to a different peer each time."""
         now = time.time()
-        timeout = 30.0
-        
+        timeout = 60.0
+
         timed_out = [
             block_hash for block_hash, request_time in self.requested_blocks.items()
             if now - request_time > timeout
         ]
-        
+
+        if not timed_out:
+            return
+
+        # Get all connected peers once for the whole batch
+        if hasattr(self.peer_manager, 'get_all_ready_peers'):
+            all_peers = [p for p in self.peer_manager.get_all_ready_peers()
+                         if isinstance(p, Peer)]
+        else:
+            raw = getattr(self.peer_manager, 'peers', [])
+            if isinstance(raw, dict):
+                raw = list(raw.values())
+            all_peers = [p for p in raw if isinstance(p, Peer)]
+
+        # Penalize each failed peer only ONCE per cycle (not per block)
+        failed_peers = set()
         for block_hash in timed_out:
-            logger.warning(f"Block request timed out: {block_hash.hex()[:16]}...")
-            del self.requested_blocks[block_hash]
-            
-            # Re-request from different peer
-            if hasattr(self.peer_manager, 'get_best_peer'):
-                peer = self.peer_manager.get_best_peer()
-            else:
-                # Fallback
-                peers = getattr(self.peer_manager, 'peers', [])
-                if isinstance(peers, dict):
-                    peers = list(peers.values())
-                peer = peers[0] if peers else None
-            
-            if peer and isinstance(peer, Peer):
-                try:
-                    getdata = GetDataMessage(inventory=[(INV_TYPE_BLOCK, block_hash)])
-                    network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
-                    getdata_msg = getdata.to_network_message(network)
-                    await peer.send_message(getdata_msg)
-                    self.requested_blocks[block_hash] = now
-                    logger.info(f"Re-requested block from {peer.host}:{peer.port}")
-                except Exception as e:
-                    logger.error(f"Failed to re-request block: {e}")
+            failed_peer = self._block_request_peer.get(block_hash)
+            if failed_peer is not None:
+                failed_peers.add(failed_peer)
+        for peer in failed_peers:
+            peer.adjust_score(-1)
+
+        connected_peers = [p for p in all_peers if p.is_connected()]
+
+        # If no peers available, clear all in-flight requests so they re-queue on reconnect
+        if not connected_peers:
+            logger.warning(
+                f"{len(timed_out)} block requests timed out with 0 available peers, "
+                f"clearing in-flight requests for re-queue"
+            )
+            for block_hash in timed_out:
+                del self.requested_blocks[block_hash]
+                self._block_request_peer.pop(block_hash, None)
+            return
+
+        logger.warning(
+            f"{len(timed_out)} block requests timed out "
+            f"(failed peers: {len(failed_peers)}, available peers: {len(connected_peers)})"
+        )
+
+        # Batch re-requests: round-robin across available peers, preferring non-failed ones
+        preferred = [p for p in connected_peers if p not in failed_peers]
+        if not preferred:
+            preferred = connected_peers
+
+        # Group re-requests by target peer for batched getdata messages
+        peer_batches: dict = {}
+        for i, block_hash in enumerate(timed_out):
+            peer = preferred[i % len(preferred)]
+            peer_batches.setdefault(peer, []).append(block_hash)
+
+        network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
+
+        for peer, block_hashes in peer_batches.items():
+            try:
+                inventory = [(INV_TYPE_BLOCK, bh) for bh in block_hashes]
+                getdata = GetDataMessage(inventory=inventory)
+                getdata_msg = getdata.to_network_message(network)
+                await peer.send_message(getdata_msg)
+                for bh in block_hashes:
+                    self.requested_blocks[bh] = now
+                    self._block_request_peer[bh] = peer
+                logger.info(f"Re-requested {len(block_hashes)} blocks from {peer.host}:{peer.port}")
+            except Exception as e:
+                logger.error(f"Failed to re-request {len(block_hashes)} blocks from {peer.host}:{peer.port}: {e}")
+                for bh in block_hashes:
+                    del self.requested_blocks[bh]
+                    self._block_request_peer.pop(bh, None)
     
     async def _find_transaction_in_blocks(self, txid: bytes, max_height: int, min_height: int = 0) -> Optional['Transaction']:
         # Search backwards from max_height to min_height
