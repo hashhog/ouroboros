@@ -632,7 +632,7 @@ class BlockValidator:
         if has_witness and commitment is None:
             return False, "Block has witness data but no witness commitment"
 
-        if commitment is not None:
+        if commitment is not None and has_witness:
             # Coinbase must have exactly one 32-byte witness item (the nonce)
             coinbase_input = block.transactions[0].inputs[0]
             witness = coinbase_input.witness or []
