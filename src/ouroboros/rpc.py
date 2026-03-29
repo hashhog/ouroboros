@@ -3125,8 +3125,15 @@ class RPCServer:
     async def rpc_stop(self) -> str:
         """Stop the node."""
         import asyncio
-        asyncio.get_event_loop().call_later(0.5, self.node.stop
-                                            if hasattr(self.node, 'stop') else lambda: None)
+
+        def _trigger_shutdown():
+            # Set the shutdown event so _main_loop exits cleanly.
+            if hasattr(self.node, '_shutdown_event') and self.node._shutdown_event:
+                self.node._shutdown_event.set()
+            elif hasattr(self.node, 'stop'):
+                asyncio.ensure_future(self.node.stop())
+
+        asyncio.get_event_loop().call_later(0.5, _trigger_shutdown)
         return "Ouroboros server stopping"
 
     async def rpc_uptime(self) -> int:
