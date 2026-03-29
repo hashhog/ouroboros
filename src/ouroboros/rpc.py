@@ -752,7 +752,7 @@ class RPCServer:
             "chain": network,
             "blocks": best_height,
             "headers": headers_count,
-            "bestblockhash": best_hash.hex() if isinstance(best_hash, bytes) else best_hash,
+            "bestblockhash": best_hash[::-1].hex() if isinstance(best_hash, bytes) else best_hash,
             "bits": f"{bits:08x}",
             "target": target_hex,
             "difficulty": self.node.get_current_difficulty(),
@@ -792,7 +792,7 @@ class RPCServer:
         
         hash_bytes, _ = self.node.db.get_best_block()
         if isinstance(hash_bytes, bytes):
-            return hash_bytes.hex()
+            return hash_bytes[::-1].hex()
         return str(hash_bytes)
     
     async def rpc_getblockhash(self, height: int) -> str:
@@ -806,7 +806,7 @@ class RPCServer:
         
         block_hash = block.hash if hasattr(block, 'hash') else block.get_txid() if hasattr(block, 'get_txid') else None
         if isinstance(block_hash, bytes):
-            return block_hash.hex()
+            return block_hash[::-1].hex()
         raise HTTPException(status_code=500, detail="Could not get block hash")
     
     async def rpc_getblock(
@@ -919,7 +919,7 @@ class RPCServer:
             "height": block_height if block_height else 0,
             "version": block.version,
             "versionHex": f"{block.version:08x}",
-            "merkleroot": block.merkle_root.hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
+            "merkleroot": block.merkle_root[::-1].hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
             "time": block.timestamp,
             "mediantime": self.node.get_median_time(block_height) if block_height is not None else block.timestamp,
             "nonce": block.nonce,
@@ -932,7 +932,7 @@ class RPCServer:
 
         # Previous block hash (not present for genesis)
         if block.prev_blockhash and block.prev_blockhash != bytes(32):
-            result["previousblockhash"] = block.prev_blockhash.hex()
+            result["previousblockhash"] = block.prev_blockhash[::-1].hex()
 
         # Next block hash (not present for tip)
         if block_height is not None:
@@ -1737,7 +1737,7 @@ class RPCServer:
                 "height": block_height if block_height is not None else 0,
                 "version": block.version,
                 "versionHex": f"{block.version:08x}",
-                "merkleroot": block.merkle_root.hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
+                "merkleroot": block.merkle_root[::-1].hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
                 "time": block.timestamp,
                 "mediantime": self.node.get_median_time(block_height) if block_height is not None else block.timestamp,
                 "nonce": block.nonce,
@@ -1750,7 +1750,7 @@ class RPCServer:
 
             # Previous block hash (not present for genesis)
             if block.prev_blockhash and block.prev_blockhash != bytes(32):
-                result["previousblockhash"] = block.prev_blockhash.hex()
+                result["previousblockhash"] = block.prev_blockhash[::-1].hex()
 
             # Next block hash (not present for tip)
             if block_height is not None:
