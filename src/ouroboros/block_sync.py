@@ -234,10 +234,14 @@ class BlockSync:
                 
                 self.last_best_hash = best_hash
                 
-                # Get a peer that's ahead of us (rotate to avoid getting stuck)
+                # Get a peer that's ahead of us (rotate to avoid getting stuck).
+                # Skip if we already have a header queue in progress — the
+                # handle_headers continuation handles fetching the rest.
+                # Sending another getheaders from the DB tip while headers
+                # are already streaming just produces duplicate responses.
                 sync_peer = self._get_sync_peer(best_height)
                 if sync_peer and hasattr(sync_peer, 'start_height'):
-                    if sync_peer.start_height > best_height:
+                    if sync_peer.start_height > best_height and not self._validated_headers:
                         logger.info(
                             f"Behind by {sync_peer.start_height - best_height} blocks"
                         )
@@ -515,20 +519,25 @@ class BlockSync:
                 # Kick off block downloads for the next window.
                 await self._request_next_blocks()
 
-            # If we received a full batch (2000 headers), ask for more.
-            if len(headers_msg.headers) >= 2000 and self._validated_headers:
-                network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
-                last_hash = self._validated_headers[-1][0]
-                getheaders = GetHeadersMessage(
-                    version=70015,
-                    locator_hashes=[last_hash],
-                    hash_stop=b'\x00' * 32,
-                )
-                try:
-                    await peer.send_message(getheaders.to_network_message(network))
-                    logger.info(f"Requesting more headers after {last_hash.hex()[:16]}...")
-                except Exception as e:
-                    logger.error(f"Failed to request continuation headers: {e}")
+                # If we received a full batch (2000 headers), ask for more.
+                # Only send continuation when we actually accepted new headers;
+                # otherwise duplicate responses (from sync_loop's periodic
+                # getheaders) each spawn their own continuation, creating an
+                # exponential flood of redundant requests that drowns out the
+                # one legitimate continuation.
+                if len(headers_msg.headers) >= 2000:
+                    network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
+                    last_hash = self._validated_headers[-1][0]
+                    getheaders = GetHeadersMessage(
+                        version=70015,
+                        locator_hashes=[last_hash],
+                        hash_stop=b'\x00' * 32,
+                    )
+                    try:
+                        await peer.send_message(getheaders.to_network_message(network))
+                        logger.info(f"Requesting more headers after {last_hash.hex()[:16]}...")
+                    except Exception as e:
+                        logger.error(f"Failed to request continuation headers: {e}")
 
         except Exception as e:
             logger.error(f"Error handling headers from {peer.host}:{peer.port}: {e}")
