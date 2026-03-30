@@ -34,6 +34,13 @@ from ouroboros.transport_v2 import V2Handshake, V2Transport
 logger = logging.getLogger(__name__)
 
 
+class V2TransportError(Exception):
+    """Raised when a peer appears to use BIP 324 v2 encrypted transport
+    but we attempted to parse its message as v1 plaintext.  The caller
+    should disconnect gracefully without penalising the peer's score."""
+    pass
+
+
 # SOCKS5 constants (RFC 1928)
 
 SOCKS5_VERSION = 0x05
@@ -742,11 +749,22 @@ class Peer:
             self.reader.readexactly(24),
             timeout=timeout
         )
-        
+
         # Parse header
         magic, command_bytes, length, checksum = struct.unpack('<I12sI4s', header)
-        command = command_bytes.rstrip(b'\x00').decode('ascii')
-        
+        try:
+            command = command_bytes.rstrip(b'\x00').decode('ascii')
+        except UnicodeDecodeError:
+            # Peer sent non-ASCII bytes in the command field — likely a v2
+            # (BIP 324) encrypted transport message that we cannot parse as
+            # v1 plaintext.  Bitcoin Core simply disconnects without banning
+            # (see net.cpp).  Raise a dedicated exception so the listener
+            # can disconnect gracefully without applying a score penalty.
+            raise V2TransportError(
+                f"Peer {self.host}:{self.port} appears to use v2 transport, "
+                f"disconnecting gracefully"
+            )
+
         # Verify magic bytes
         expected_magic = get_magic(self.network)
         if magic != expected_magic:
@@ -903,6 +921,14 @@ class Peer:
                     # Timeout is normal, just continue listening
                     logger.debug(f"Receive timeout from {self.host}:{self.port}")
                     continue
+
+                except V2TransportError as e:
+                    # Peer speaks v2 transport but we parsed as v1 —
+                    # disconnect gracefully without score penalty (same
+                    # behaviour as Bitcoin Core, see net.cpp).
+                    logger.info(str(e))
+                    await self.disconnect()
+                    break
 
                 except Exception as e:
                     logger.error(
