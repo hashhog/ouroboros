@@ -1266,11 +1266,20 @@ class PeerManager:
 
         Enforces /16 network group diversification to resist eclipse attacks.
         Each outbound connection must be from a unique network group.
+
+        During the initial call (few peers), limits attempts to avoid
+        blocking startup.  maintain_connections() fills remaining slots.
         """
         attempts = 0
-        max_attempts = len(self.known_addrs) + 100  # prevent infinite loop
+        # Limit attempts so we don't block startup.  Stop early once we
+        # have 8 peers (Bitcoin Core's default outbound count) — the
+        # maintain_connections loop will fill remaining slots in the
+        # background without blocking the sync startup.
+        min_peers = 8
+        max_attempts = min(len(self.known_addrs) + 10, 40)
 
-        while len(self.peers) < self.max_peers and attempts < max_attempts:
+        while len(self.peers) < self.max_peers and attempts < max_attempts and \
+              len(self.peers) < min_peers:
             attempts += 1
 
             # Use address manager with network group exclusion for diversity
@@ -1319,7 +1328,7 @@ class PeerManager:
                         transport_version=self.transport_version, relay_txs=True,
                         proxy=peer_proxy)
 
-            if await peer.connect(start_height, retry=True):
+            if await peer.connect(start_height, retry=False):
                 self.peers[addr] = peer
                 self.retry_counts[addr] = 0  # Reset retry count on success
                 self.addrman.mark_good(host, port)
@@ -1447,7 +1456,7 @@ class PeerManager:
                         transport_version=self.transport_version, relay_txs=False,
                         proxy=peer_proxy)
 
-            if await peer.connect(start_height, retry=True):
+            if await peer.connect(start_height, retry=False):
                 self.block_relay_peers[addr] = peer
                 self.retry_counts[addr] = 0
                 self.addrman.mark_good(host, port)
