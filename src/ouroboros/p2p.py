@@ -1352,6 +1352,47 @@ class PeerManager:
                     self.known_addrs.discard(addr)
                     logger.debug(f"Removed {addr} from known addresses after {self.retry_counts[addr]} failures")
 
+    async def connect_to_node(self, host: str, port: int) -> bool:
+        """Connect to a specific peer by host and port (for addnode RPC).
+
+        Returns True on success, False on failure.
+        """
+        addr = f"{host}:{port}"
+        if addr in self.peers or addr in self.block_relay_peers:
+            logger.info(f"Already connected to {addr}")
+            return True
+        if self.ban_manager.is_banned(addr) or self.ban_manager.is_banned(host):
+            logger.warning(f"Cannot connect to banned peer {addr}")
+            return False
+
+        peer_proxy = self._proxy_for_host(host)
+        peer = Peer(host, port, self.network,
+                     transport_version=self.transport_version, relay_txs=True,
+                     proxy=peer_proxy)
+
+        if await peer.connect(self._start_height, retry=False):
+            self.peers[addr] = peer
+            self.retry_counts[addr] = 0
+            self.addrman.mark_good(host, port)
+            group = self._netgroup(host)
+            self._outbound_netgroups.add(group)
+            self._register_compact_handlers(peer, addr)
+            self._register_addr_handlers(peer, addr)
+            asyncio.ensure_future(self.negotiate_compact_blocks(peer))
+            asyncio.ensure_future(self._send_getaddr(peer))
+            if self.erlay_enabled:
+                self._register_erlay_handlers(peer, addr)
+                asyncio.ensure_future(self._negotiate_erlay(peer, addr))
+            self._trickle_queues[addr] = TrickleQueue(
+                is_inbound=False, wtxid_relay=peer.wtxid_relay
+            )
+            logger.info(f"Connected to manually added peer {addr}")
+            return True
+        else:
+            self.addrman.mark_attempt(host, port)
+            logger.warning(f"Failed to connect to {addr}")
+            return False
+
     async def _connect_block_relay_peers(self, start_height: int = 0):
         """Connect block-relay-only outbound peers up to max_block_relay_only.
 
