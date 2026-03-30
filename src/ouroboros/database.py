@@ -599,4 +599,5 @@ class BlockchainDatabase:
             nonce=py_block.nonce,
             transactions=transactions,
             hash=bytes(py_block.hash() if callable(getattr(py_block, "hash", None)) else py_block.hash),
+            height=getattr(py_block, 'height', None),
         )

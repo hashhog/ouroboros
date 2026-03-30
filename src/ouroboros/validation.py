@@ -245,15 +245,28 @@ class BlockValidator:
         self.network = network
         self.tx_validator = TransactionValidator(db, network)
     
-    def validate_block(self, block: Block) -> Tuple[bool, str]:
-        """Fully validate *block* (header, merkle root, weight, scripts); returns ``(ok, error_message)``."""
+    def validate_block(self, block: Block, known_height: int = 0) -> Tuple[bool, str]:
+        """Fully validate *block* (header, merkle root, weight, scripts); returns ``(ok, error_message)``.
+
+        *known_height*: if >0, use this as the block's height instead of
+        deriving it from the previous block in the DB.  This avoids
+        incorrect height=1 when the DB doesn't store height on Block objects.
+        """
         # 1. Get previous block
         prev_block = self.db.get_block(block.prev_blockhash)
         if not prev_block:
             return False, "Previous block not found"
-        
+
         # Calculate expected height
-        expected_height = (prev_block.height or 0) + 1
+        if known_height > 0:
+            expected_height = known_height
+        else:
+            prev_height = prev_block.height
+            if prev_height is None:
+                # Fall back to the chain tip height (best effort)
+                _, tip_height = self.db.get_best_block()
+                prev_height = tip_height
+            expected_height = (prev_height or 0) + 1
 
         # 2. Compute median-time-past (needed for header validation and BIP 68)
         block_mtp = self.db.get_median_time_past(expected_height - 1) or 0

@@ -488,8 +488,8 @@ class TxMessage:
             if len(payload) < offset + 36:  # 32 + 4 minimum
                 raise ValueError(f"Payload too short for input {i}")
             
-            # prev_txid (32 bytes, reversed for display format)
-            prev_txid = payload[offset:offset+32][::-1]  # Reverse for big-endian
+            # prev_txid (32 bytes, internal byte order — same as wire)
+            prev_txid = payload[offset:offset+32]
             offset += 32
             
             # prev_vout (4 bytes)
