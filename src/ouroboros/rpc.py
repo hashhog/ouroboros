@@ -4821,6 +4821,19 @@ class RPCServer:
             block_hashes.append(block_hash_hex)
             logger.info(f"Generated block {next_height}: {block_hash_hex[:16]}...")
 
+            # Announce new block to all connected peers
+            try:
+                from ouroboros.p2p_messages import InvMessage, INV_TYPE_BLOCK
+
+                inv = InvMessage(
+                    inventory=[(INV_TYPE_BLOCK, block_hash)]
+                )
+                inv_msg = inv.to_network_message(network)
+                if hasattr(self.node, "peer_manager") and self.node.peer_manager:
+                    await self.node.peer_manager.broadcast(inv_msg)
+            except Exception:
+                pass  # best-effort broadcast
+
         return block_hashes
 
     @staticmethod
