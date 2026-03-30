@@ -762,19 +762,21 @@ class BitcoinNode:
                         InvMessage,
                         INV_TYPE_TX,
                         INV_TYPE_BLOCK,
+                        MSG_WITNESS_TX,
+                        MSG_WITNESS_BLOCK,
                     )
 
                     getdata = GetDataMessage.from_payload(msg.payload)
                     network = getattr(peer, 'network', 'mainnet')
 
                     for inv_type, inv_hash in getdata.inventory:
-                        if inv_type == INV_TYPE_TX and self.mempool:
+                        if inv_type in (INV_TYPE_TX, MSG_WITNESS_TX) and self.mempool:
                             tx = self.mempool.get_transaction(inv_hash)
                             if tx:
                                 tx_msg = TxMessage(transaction=tx)
                                 await peer.send_message(tx_msg.to_network_message(network))
                                 logger.debug(f"Sent tx {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
-                        elif inv_type == INV_TYPE_BLOCK:
+                        elif inv_type in (INV_TYPE_BLOCK, MSG_WITNESS_BLOCK):
                             block = self.db.get_block(inv_hash)
                             if block:
                                 from ouroboros.p2p_messages import BlockMessage
@@ -786,21 +788,85 @@ class BitcoinNode:
 
             return handler
 
+        def _make_getheaders_handler(peer):
+            """Handle getheaders: respond with headers from our chain."""
+            async def handler(msg):
+                try:
+                    from ouroboros.p2p_messages import (
+                        GetHeadersMessage,
+                        HeadersMessage,
+                        BlockHeader,
+                    )
+
+                    getheaders = GetHeadersMessage.from_payload(msg.payload)
+                    network = getattr(peer, 'network', 'mainnet')
+
+                    # Find the fork point: walk through the locator hashes
+                    # and find the first one we have in our chain.
+                    start_height = 0
+                    for locator_hash in getheaders.locator_hashes:
+                        block = self.db.get_block(locator_hash)
+                        if block is not None:
+                            start_height = (block.height if block.height else 0) + 1
+                            break
+
+                    # Collect up to 2000 headers starting from start_height.
+                    _, best_height = self.db.get_best_block()
+                    headers = []
+                    for h in range(start_height, min(start_height + 2000, best_height + 1)):
+                        block = self.db.get_block_by_height(h)
+                        if block is None:
+                            break
+                        header = BlockHeader(
+                            version=block.version,
+                            prev_blockhash=block.prev_blockhash,
+                            merkle_root=block.merkle_root,
+                            timestamp=block.timestamp,
+                            bits=block.bits,
+                            nonce=block.nonce,
+                        )
+                        headers.append(header)
+
+                        # Stop if we've reached hash_stop.
+                        if getheaders.hash_stop != b'\x00' * 32:
+                            block_hash = block.hash
+                            if block_hash == getheaders.hash_stop:
+                                break
+
+                    if headers:
+                        headers_msg = HeadersMessage(headers=headers)
+                        await peer.send_message(headers_msg.to_network_message(network))
+                        logger.debug(
+                            f"Sent {len(headers)} headers to "
+                            f"{peer.host}:{peer.port} (from height {start_height})"
+                        )
+                    else:
+                        # Send empty headers message (signals "no new headers").
+                        headers_msg = HeadersMessage(headers=[])
+                        await peer.send_message(headers_msg.to_network_message(network))
+
+                except Exception as e:
+                    logger.error(f"Error handling getheaders from {peer.host}:{peer.port}: {e}")
+
+            return handler
+
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             peers = self.peer_manager.get_all_ready_peers()
             for peer in peers:
                 if hasattr(peer, 'register_handler'):
                     peer.register_handler("tx", _make_tx_handler(peer))
                     peer.register_handler("getdata", _make_getdata_handler(peer))
+                    peer.register_handler("getheaders", _make_getheaders_handler(peer))
 
         # Register callback for future inbound peers so they get handlers too
         async def _on_inbound_peer(peer):
             peer.register_handler("tx", _make_tx_handler(peer))
             peer.register_handler("getdata", _make_getdata_handler(peer))
+            peer.register_handler("getheaders", _make_getheaders_handler(peer))
 
         self.peer_manager.set_inbound_peer_handler(_on_inbound_peer)
 
-        logger.info("Transaction and getdata handlers registered")
+        logger.info("Transaction, getdata, and getheaders handlers registered")
     
     def is_synced(self) -> bool:
         """Return True when the node has completed initial block synchronisation."""

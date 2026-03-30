@@ -283,6 +283,13 @@ class BlockSync:
                     existing_block = self.db.get_block(inv_hash)
                     if not existing_block:
                         has_new_blocks = True
+                        # Directly request the block if not already in-flight.
+                        # This is critical for receiving blocks from mining
+                        # peers promptly (e.g., regtest mesh tests) rather
+                        # than waiting for the full headers-first round-trip.
+                        if inv_hash not in self.requested_blocks:
+                            blocks_to_request.append((INV_TYPE_BLOCK, inv_hash))
+                            self.requested_blocks[inv_hash] = now
 
                 elif inv_type in (INV_TYPE_TX, MSG_WITNESS_TX, MSG_WTX):
                     # Request transactions we don't already have
@@ -301,11 +308,8 @@ class BlockSync:
             )
 
             if has_new_blocks:
-                # Headers-first: request headers instead of blocks directly.
-                # This ensures we only download blocks whose headers validate
-                # and connect to our chain, preventing orphan pool flooding.
-                # (Mirrors Bitcoin Core net_processing.cpp: block inv triggers
-                # getheaders, blocks are only requested after header validation.)
+                # Also send getheaders so we learn the full chain structure
+                # (headers-first approach for longer forks / initial sync).
                 best_hash, best_height = self.db.get_best_block()
                 locator = self._build_locator(best_height)
                 if locator:
@@ -323,6 +327,19 @@ class BlockSync:
                     except Exception as e:
                         logger.error(f"Failed to send getheaders: {e}")
                         peer.adjust_score(-5)
+
+            if blocks_to_request:
+                getdata = GetDataMessage(inventory=blocks_to_request)
+                try:
+                    await peer.send_message(getdata.to_network_message(network))
+                    for _, bh in blocks_to_request:
+                        self._block_request_peer[bh] = peer
+                    logger.info(
+                        f"Requested {len(blocks_to_request)} blocks directly "
+                        f"from {peer.host}:{peer.port} (inv-triggered)"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to request blocks: {e}")
 
             if txs_to_request:
                 getdata = GetDataMessage(inventory=txs_to_request)
