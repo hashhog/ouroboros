@@ -3309,15 +3309,36 @@ class RPCServer:
         pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
         if pm is None:
             raise ValueError("No peer manager available")
-        if command == "add":
-            if hasattr(pm, 'add_peer'):
+
+        # Parse host:port
+        if ':' in node:
+            parts = node.rsplit(':', 1)
+            host = parts[0]
+            try:
+                port = int(parts[1])
+            except ValueError:
+                raise ValueError(f"Invalid port in address: {node}")
+        else:
+            host = node
+            port = getattr(pm, '_default_port', 8333)
+
+        if command in ("add", "onetry"):
+            if hasattr(pm, 'connect_to_node'):
+                ok = await pm.connect_to_node(host, port)
+                if not ok and command == "add":
+                    raise ValueError(f"Failed to connect to {node}")
+            elif hasattr(pm, 'add_peer'):
                 await pm.add_peer(node)
         elif command == "remove":
-            if hasattr(pm, 'remove_peer'):
-                await pm.remove_peer(node)
-        elif command == "onetry":
-            if hasattr(pm, 'connect'):
-                await pm.connect(node)
+            addr = f"{host}:{port}"
+            peers = getattr(pm, 'peers', {})
+            if addr in peers:
+                peer = peers[addr]
+                if hasattr(peer, 'disconnect'):
+                    await peer.disconnect() if asyncio.iscoroutinefunction(peer.disconnect) else peer.disconnect()
+                del peers[addr]
+            else:
+                raise ValueError(f"Node not found: {node}")
 
     async def rpc_disconnectnode(self, address: str = "", nodeid: int = -1) -> None:
         """Disconnect a peer by address or node id."""
