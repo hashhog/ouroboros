@@ -400,18 +400,10 @@ class RPCServer:
             http_request: Request, wallet_name: Optional[str] = None
         ):
             """Common handler for RPC requests with optional wallet context."""
-            # Authentication
+            # Authentication — re-raise so FastAPI returns HTTP 401 with
+            # WWW-Authenticate header, matching Bitcoin Core's httprpc.cpp behaviour.
             if self.security:
-                try:
-                    credentials = await self._get_credentials(http_request)
-                except HTTPException:
-                    return JSONResponse(
-                        content={
-                            "jsonrpc": "2.0",
-                            "error": {"code": -32000, "message": "Authentication required"},
-                            "id": None
-                        }
-                    )
+                await self._get_credentials(http_request)
 
             # Rate limiting
             if self.rate_limit_enabled:
@@ -570,14 +562,23 @@ class RPCServer:
     async def _get_credentials(self, request: Request) -> Optional[HTTPBasicCredentials]:
         if not self.security:
             return None
-        
+
+        _www_auth = {"WWW-Authenticate": 'Basic realm="jsonrpc"'}
         try:
             credentials = await self.security(request)
-            if credentials.username != self.username or credentials.password != self.password:
-                raise HTTPException(status_code=401, detail="Invalid credentials")
-            return credentials
-        except Exception:
-            raise HTTPException(status_code=401, detail="Authentication required")
+        except HTTPException:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required",
+                headers=_www_auth,
+            )
+        if credentials.username != self.username or credentials.password != self.password:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid credentials",
+                headers=_www_auth,
+            )
+        return credentials
     
     def _get_client_ip_from_request(self, request: Request) -> str:
         # Try to get real IP from headers (for proxies)
