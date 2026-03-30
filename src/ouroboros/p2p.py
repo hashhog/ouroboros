@@ -890,7 +890,7 @@ class PeerManager:
                 proxy=peer_proxy,
             )
 
-            if await peer.connect(start_height, retry=False):
+            if await peer.connect(start_height, retry=True):
                 self.block_relay_peers[addr] = peer
                 self.addrman.mark_good(host, port)
                 group = self._netgroup(host)
@@ -1319,7 +1319,7 @@ class PeerManager:
                         transport_version=self.transport_version, relay_txs=True,
                         proxy=peer_proxy)
 
-            if await peer.connect(start_height, retry=False):
+            if await peer.connect(start_height, retry=True):
                 self.peers[addr] = peer
                 self.retry_counts[addr] = 0  # Reset retry count on success
                 self.addrman.mark_good(host, port)
@@ -1447,7 +1447,7 @@ class PeerManager:
                         transport_version=self.transport_version, relay_txs=False,
                         proxy=peer_proxy)
 
-            if await peer.connect(start_height, retry=False):
+            if await peer.connect(start_height, retry=True):
                 self.block_relay_peers[addr] = peer
                 self.retry_counts[addr] = 0
                 self.addrman.mark_good(host, port)
@@ -1528,6 +1528,17 @@ class PeerManager:
                         if self._inbound_netgroups[group] <= 0:
                             del self._inbound_netgroups[group]
                     logger.info(f"Removed disconnected inbound peer {addr}")
+
+                # Re-seed from DNS when we have no peers and no known
+                # addresses — mirrors Bitcoin Core's ThreadDNSAddressSeed
+                # which re-queries seeds when the address manager is empty.
+                total_outbound = len(self.peers) + len(self.block_relay_peers)
+                if total_outbound == 0 and not self.known_addrs:
+                    logger.info(
+                        "No connected peers and address pool is empty, "
+                        "re-seeding from DNS..."
+                    )
+                    await self.discover_peers()
 
                 # Refill full-relay outbound slots
                 if len(self.peers) < self.max_peers:
