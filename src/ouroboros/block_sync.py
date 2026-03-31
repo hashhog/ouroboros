@@ -239,17 +239,12 @@ class BlockSync:
                 
                 self.last_best_hash = best_hash
                 
-                # Get a peer that's ahead of us (rotate to avoid getting stuck).
-                # Skip if we already have a header queue in progress — the
-                # handle_headers continuation handles fetching the rest.
-                # Sending another getheaders from the DB tip while headers
-                # are already streaming just produces duplicate responses.
-                sync_peer = self._get_sync_peer(best_height)
-                if sync_peer and hasattr(sync_peer, 'start_height'):
-                    if sync_peer.start_height > best_height and not self._validated_headers:
-                        logger.info(
-                            f"Behind by {sync_peer.start_height - best_height} blocks"
-                        )
+                # Periodic header sync: send getheaders to discover new blocks.
+                # Don't rely on peer.start_height (stale from connection time).
+                # Skip if we already have a validated header queue in progress.
+                if not self._validated_headers:
+                    sync_peer = self._get_sync_peer(best_height)
+                    if sync_peer:
                         await self._catch_up(sync_peer, best_height)
                 
                 # Handle timeouts
