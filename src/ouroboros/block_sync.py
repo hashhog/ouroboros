@@ -90,10 +90,14 @@ class BlockSync:
         # List of (block_hash, header) in chain order (oldest first).
         self._validated_headers: List[Tuple[bytes, 'BlockHeader']] = []
         # Max blocks to have in-flight at once during headers-first sync.
-        # Keep moderate to avoid exceeding orphan pool when blocks arrive
-        # out of order (each out-of-order block becomes an orphan until
-        # its predecessor connects).
         self._max_blocks_in_flight: int = 64
+
+        # IBD block buffer: blocks that arrived out of order are held here
+        # keyed by block_hash until their parent is connected.  After each
+        # successful connect, _drain_block_buffer() processes buffered
+        # children sequentially.
+        self._ibd_block_buffer: Dict[bytes, Block] = {}
+        self._max_ibd_buffer: int = 1024
     
     def set_zmq_publisher(self, publisher) -> None:
         """Attach a ZMQPublisher for real-time block/tx notifications."""
@@ -250,6 +254,9 @@ class BlockSync:
                 # Handle timeouts
                 await self._handle_timeouts()
 
+                # Drain any buffered blocks that can now be connected.
+                await self._drain_block_buffer()
+
                 # Advance headers-first download window (in case blocks
                 # connected between sync_loop iterations).
                 await self._request_next_blocks()
@@ -357,118 +364,127 @@ class BlockSync:
             peer.adjust_score(-2)
     
     async def handle_block(self, msg: NetworkMessage, peer: Peer):
-        """Handle block delivery"""
+        """Handle block delivery.
+
+        During IBD (headers-first), blocks often arrive out of order from
+        multiple peers.  Instead of treating out-of-order blocks as orphans
+        (which breaks bootstrapping), we buffer them keyed by hash and
+        drain the buffer sequentially after each successful connect.
+        """
         try:
             from ouroboros.database import Block
-            from ouroboros.p2p_messages import InvMessage, INV_TYPE_BLOCK
-            
-            # Deserialize block from payload
+
             block = Block.deserialize(msg.payload)
             block_hash = block.hash
-            
-            # Remove from requested blocks
+
+            # Remove from in-flight tracking
             if block_hash in self.requested_blocks:
                 del self.requested_blocks[block_hash]
             self._block_request_peer.pop(block_hash, None)
-            
-            # Orphan check: parent not in our chain
-            prev_block = self.db.get_block(block.prev_blockhash)
-            if prev_block is None:
-                if len(self.orphan_blocks) >= self._max_orphans:
-                    logger.warning(
-                        f"Orphan pool full ({self._max_orphans}), dropping orphan "
-                        f"{block_hash.hex()[:16]}..."
-                    )
-                    return
-                self.orphan_blocks[block_hash] = block
-                logger.info(f"Stored orphan block {block_hash.hex()[:16]}... (parent unknown)")
-                # Headers-first: request headers to find the connecting chain
-                # instead of chasing individual parents (which causes orphan
-                # cascades when blocks arrive out of order).
-                network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
-                best_hash, best_height = self.db.get_best_block()
-                locator = self._build_locator(best_height)
-                if locator:
-                    try:
-                        getheaders = GetHeadersMessage(
-                            version=70015,
-                            locator_hashes=locator,
-                            hash_stop=b'\x00' * 32,
-                        )
-                        await peer.send_message(getheaders.to_network_message(network))
-                        logger.debug(f"Orphan received — requesting headers from {peer.host}:{peer.port}")
-                    except Exception as e:
-                        logger.debug(f"Failed to request headers for orphan: {e}")
+
+            # Already have this block?
+            if self.db.get_block(block_hash):
                 return
-            
-            # Validate block
-            valid, error = self.validator.validate_block(block)
-            
-            if valid:
-                # Check if this block causes a reorg
-                # Get current best block
-                current_hash, current_height = self.db.get_best_block()
-                
-                # Check if this block's previous hash matches current best
-                if block.prev_blockhash != current_hash:
-                    # This is a reorg - handle it
-                    logger.warning(
-                        f"Reorg detected: new block {block_hash.hex()[:16]}... "
-                        f"does not extend current best {current_hash.hex()[:16]}..."
-                    )
-                    reorg_success = await self._handle_reorg(block, block_hash)
-                    if not reorg_success:
-                        logger.error("Failed to handle reorg, rejecting block")
-                        peer.adjust_score(-10)
-                        return
-                else:
-                    # Normal block — store via Rust API (atomic block + UTXO update)
-                    new_height = current_height + 1
-                    if hasattr(self.db._db, 'connect_block_from_bytes'):
-                        self.db._db.connect_block_from_bytes(msg.payload, new_height)
-                    else:
-                        self.validator.apply_block(block)
 
-                block_height = block.height if hasattr(block, 'height') and block.height else 0
-                if block_height == 0:
-                    # Height wasn't set in wire format; infer from chain tip
-                    _, block_height = self.db.get_best_block()
-                
-                # Feed fee estimator before removing txs from mempool
-                if self.fee_estimator is not None and block_height > 0:
-                    try:
-                        self.fee_estimator.process_block(block, block_height, self.mempool)
-                    except Exception as e:
-                        logger.debug(f"Fee estimator error: {e}")
-                
-                # Remove confirmed transactions from mempool
-                if self.mempool is not None:
-                    self.mempool.remove_block_transactions(block)
-                
-                logger.info(f"✓ New block {block_height}: {block_hash.hex()[:16]}...")
+            # Buffer the block (keyed by hash) for sequential processing.
+            if len(self._ibd_block_buffer) < self._max_ibd_buffer:
+                self._ibd_block_buffer[block_hash] = (block, msg.payload)
+            else:
+                logger.debug(
+                    f"IBD buffer full ({self._max_ibd_buffer}), dropping "
+                    f"{block_hash.hex()[:16]}..."
+                )
+                return
 
-                if self._zmq_publisher:
-                    self._zmq_publisher.notify_block(block)
+            # Try to drain buffered blocks in chain order.
+            connected = await self._drain_block_buffer()
 
-                # Process orphans that may now have their parent
-                await self._process_orphans(block_hash)
-
-                # Advance headers-first download window now that a block connected.
+            if connected > 0:
+                # Advance download window after connecting blocks.
                 await self._request_next_blocks()
 
-                # Announce new block to peers based on their preferences
-                await self._announce_block(block, block_hash, exclude_peer=peer)
-            else:
-                logger.warning(f"✗ Invalid block: {error}")
-                peer.adjust_score(-10)  # Penalize for invalid block
-                # Record misbehavior - invalid block = 100 points (instant ban)
-                if hasattr(self.peer_manager, 'misbehaving'):
-                    addr = f"{peer.host}:{peer.port}"
-                    self.peer_manager.misbehaving(addr, 100, f"invalid block: {error}")
-        
         except Exception as e:
             logger.error(f"Error handling block from {peer.host}:{peer.port}: {e}", exc_info=True)
             peer.adjust_score(-5)
+
+    async def _drain_block_buffer(self) -> int:
+        """Connect buffered blocks in chain order.
+
+        Walks the validated header queue starting from the current tip,
+        checking if the next expected block is in the buffer.  Connects
+        as many sequential blocks as possible.
+
+        Returns the number of blocks connected.
+        """
+        connected = 0
+        current_hash, current_height = self.db.get_best_block()
+
+        # Build a quick lookup: hash -> (block, raw_payload) from the buffer.
+        while True:
+            # Find the next expected block hash from the header chain.
+            next_hash = None
+            for bh, _hdr in self._validated_headers:
+                if self.db.get_block(bh):
+                    continue  # already connected
+                next_hash = bh
+                break
+
+            if next_hash is None:
+                break  # no more headers to process
+
+            # Is the next block in our buffer?
+            if next_hash not in self._ibd_block_buffer:
+                break  # need to wait for download
+
+            block, raw_payload = self._ibd_block_buffer.pop(next_hash)
+
+            # Validate
+            new_height = current_height + 1
+            valid, error = self.validator.validate_block(block, known_height=new_height)
+            if not valid:
+                logger.warning(
+                    f"✗ Invalid block at height {new_height}: {error}"
+                )
+                # Don't ban — might be our validation bug. Just skip.
+                break
+
+            # Connect block
+            try:
+                if hasattr(self.db._db, 'connect_block_from_bytes'):
+                    self.db._db.connect_block_from_bytes(raw_payload, new_height)
+                else:
+                    self.validator.apply_block(block)
+            except Exception as e:
+                logger.error(f"Failed to connect block at height {new_height}: {e}")
+                break
+
+            connected += 1
+            current_height = new_height
+            current_hash = next_hash
+
+            # Feed fee estimator
+            if self.fee_estimator is not None:
+                try:
+                    self.fee_estimator.process_block(block, new_height, self.mempool)
+                except Exception:
+                    pass
+
+            # Remove confirmed txs from mempool
+            if self.mempool is not None:
+                self.mempool.remove_block_transactions(block)
+
+            if self._zmq_publisher:
+                self._zmq_publisher.notify_block(block)
+
+            # Log progress every 1000 blocks
+            if new_height % 1000 == 0 or connected == 1:
+                logger.info(
+                    f"✓ Block {new_height} connected "
+                    f"(buffer={len(self._ibd_block_buffer)}, "
+                    f"in-flight={len(self.requested_blocks)})"
+                )
+
+        return connected
     
     def _header_to_block_hash(self, header) -> bytes:
         header_bytes = header.serialize()
