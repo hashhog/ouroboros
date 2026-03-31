@@ -455,15 +455,18 @@ class BlockValidator:
             if self.network in ("testnet", "testnet3", "testnet4", "signet"):
                 if block.timestamp > prev_block.timestamp + POW_TARGET_SPACING * 2:
                     return POW_LIMIT_BITS_MAINNET
-                # Otherwise walk back to find last non-min-difficulty block
+                # Otherwise walk back to find last non-min-difficulty block.
+                # Track height manually since get_block() may not set it.
+                walk_height = height - 1
                 pindex = prev_block
                 while (
                     pindex
-                    and pindex.height is not None
-                    and pindex.height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0
+                    and walk_height > 0
+                    and walk_height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0
                     and pindex.bits == POW_LIMIT_BITS_MAINNET
                 ):
                     pindex = self.db.get_block(pindex.prev_blockhash)
+                    walk_height -= 1
                 if pindex:
                     return pindex.bits
                 return prev_block.bits
