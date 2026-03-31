@@ -118,28 +118,15 @@ class Block:
             try:
                 tx_msg = TxMessage.from_payload(tx_data)
                 tx = tx_msg.transaction
-                
-                # Calculate transaction size by serializing it back
-                # Transaction.serialize() produces wire-format compatible output,
-                # so the size should match the original wire format
-                tx_serialized = tx.serialize()
-                tx_size = len(tx_serialized)
-                
-                # Validate that we haven't gone past the end of data
-                remaining = len(data) - tx_start_offset
-                if tx_size > remaining:
-                    # If calculated size goes past end, this indicates either:
-                    # 1. Transaction serialization doesn't match wire format exactly
-                    # 2. Corrupted block data
-                    if remaining < 60:  # Minimum transaction size
-                        raise ValueError(
-                            f"Transaction {i} size calculation error: "
-                            f"calculated {tx_size} bytes but only {remaining} bytes remaining"
-                        )
-                    # Use remaining bytes as fallback (this is a workaround)
-                    # Ideally, transaction serialization should match wire format exactly
-                    tx_size = remaining
-                
+
+                # Use the exact byte count consumed by the parser (including
+                # segwit marker, flag, and witness data) so that we advance
+                # past the full wire-format transaction.
+                tx_size = getattr(tx_msg, 'bytes_consumed', None)
+                if tx_size is None:
+                    # Fallback: non-witness serialization (may be wrong for segwit)
+                    tx_size = len(tx.serialize())
+
                 offset = tx_start_offset + tx_size
                 transactions.append(tx)
                 

@@ -595,15 +595,17 @@ class TxMessage:
         )
         
         # Calculate actual txid from transaction
-        # Transaction ID is double SHA256 of the transaction (without witness data)
-        # For now, we'll calculate it from the serialized version without witness
-        # Note: This is a simplified calculation - full txid requires proper serialization
+        # Transaction ID is double SHA256 of the non-witness serialization
         import hashlib
         tx_bytes = transaction.serialize()
         txid = hashlib.sha256(hashlib.sha256(tx_bytes).digest()).digest()
         transaction.txid = txid
-        
-        return cls(transaction=transaction)
+
+        # Store the wire-format byte count so callers (like Block.deserialize)
+        # can advance their offset correctly past witness data.
+        result = cls(transaction=transaction)
+        result.bytes_consumed = offset
+        return result
 
 
 @dataclass

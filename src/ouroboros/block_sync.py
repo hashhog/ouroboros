@@ -28,6 +28,7 @@ from ouroboros.p2p_messages import (
     INV_TYPE_TX,
     INV_TYPE_BLOCK,
     MSG_WITNESS_TX,
+    MSG_WITNESS_BLOCK,
     MSG_WTX,
 )
 from ouroboros.peer import Peer
@@ -295,7 +296,7 @@ class BlockSync:
                         # peers promptly (e.g., regtest mesh tests) rather
                         # than waiting for the full headers-first round-trip.
                         if inv_hash not in self.requested_blocks:
-                            blocks_to_request.append((INV_TYPE_BLOCK, inv_hash))
+                            blocks_to_request.append((MSG_WITNESS_BLOCK, inv_hash))
                             self.requested_blocks[inv_hash] = now
 
                 elif inv_type in (INV_TYPE_TX, MSG_WITNESS_TX, MSG_WTX):
@@ -613,7 +614,7 @@ class BlockSync:
         for i in range(start, min(start + available, len(self._validated_headers))):
             block_hash, _ = self._validated_headers[i]
             if block_hash not in self.requested_blocks and not self.db.get_block(block_hash):
-                to_request.append((INV_TYPE_BLOCK, block_hash))
+                to_request.append((MSG_WITNESS_BLOCK, block_hash))
                 self.requested_blocks[block_hash] = time.time()
 
         if not to_request:
@@ -890,7 +891,7 @@ class BlockSync:
 
         for peer, block_hashes in peer_batches.items():
             try:
-                inventory = [(INV_TYPE_BLOCK, bh) for bh in block_hashes]
+                inventory = [(MSG_WITNESS_BLOCK, bh) for bh in block_hashes]
                 getdata = GetDataMessage(inventory=inventory)
                 getdata_msg = getdata.to_network_message(network)
                 await peer.send_message(getdata_msg)
