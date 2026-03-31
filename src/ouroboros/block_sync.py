@@ -93,6 +93,13 @@ class BlockSync:
         # Max blocks to have in-flight at once during headers-first sync.
         self._max_blocks_in_flight: int = 64
 
+        # Single sync peer for header downloads (Bitcoin Core pattern).
+        # Only one peer is sent getheaders at a time to prevent out-of-order
+        # header batches.  Switches to a different peer after a stall.
+        self._header_sync_peer: Optional[Peer] = None
+        self._header_sync_time: float = 0.0  # When the last getheaders was sent
+        self._header_sync_stall_timeout: float = 30.0  # Switch peer after 30s
+
         # IBD block buffer: blocks that arrived out of order are held here
         # keyed by block_hash until their parent is connected.  After each
         # successful connect, _drain_block_buffer() processes buffered
@@ -239,13 +246,25 @@ class BlockSync:
                 
                 self.last_best_hash = best_hash
                 
-                # Periodic header sync: send getheaders to discover new blocks.
-                # Don't rely on peer.start_height (stale from connection time).
-                # Skip if we already have a validated header queue in progress.
-                if not self._validated_headers:
-                    sync_peer = self._get_sync_peer(best_height)
-                    if sync_peer:
-                        await self._catch_up(sync_peer, best_height)
+                # Single-peer header sync (Bitcoin Core pattern).
+                # Send getheaders to ONE designated peer at a time.
+                # Switch peer if the current one stalls (no headers in 30s).
+                now = time.time()
+                if self._header_sync_peer and not self._header_sync_peer.is_connected():
+                    self._header_sync_peer = None  # Peer disconnected
+
+                if self._header_sync_peer and (now - self._header_sync_time > self._header_sync_stall_timeout):
+                    # Sync peer stalled — switch to a different one
+                    logger.info(f"Header sync peer {self._header_sync_peer.host} stalled, switching")
+                    self._header_sync_peer = None
+
+                if not self._header_sync_peer:
+                    self._header_sync_peer = self._get_sync_peer(best_height)
+                    if self._header_sync_peer:
+                        self._header_sync_time = now
+
+                if self._header_sync_peer:
+                    await self._catch_up(self._header_sync_peer, best_height)
                 
                 # Handle timeouts
                 await self._handle_timeouts()
@@ -311,25 +330,18 @@ class BlockSync:
             )
 
             if has_new_blocks:
-                # Also send getheaders so we learn the full chain structure
-                # (headers-first approach for longer forks / initial sync).
-                best_hash, best_height = self.db.get_best_block()
-                locator = self._build_locator(best_height)
-                if locator:
-                    try:
-                        getheaders = GetHeadersMessage(
-                            version=70015,
-                            locator_hashes=locator,
-                            hash_stop=b'\x00' * 32,
-                        )
-                        await peer.send_message(getheaders.to_network_message(network))
-                        logger.info(
-                            f"Block inv from {peer.host}:{peer.port} — "
-                            f"requesting headers (headers-first sync)"
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to send getheaders: {e}")
-                        peer.adjust_score(-5)
+                # Don't send getheaders here — let the sync_loop's single-peer
+                # approach handle it.  Sending getheaders to the inv peer AND
+                # the sync peer creates overlapping header batches that arrive
+                # out of order and get dropped.  Instead, just designate this
+                # peer as the sync peer if we don't have one.
+                if not self._header_sync_peer or not self._header_sync_peer.is_connected():
+                    self._header_sync_peer = peer
+                    self._header_sync_time = time.time()
+                    logger.info(
+                        f"Block inv from {peer.host}:{peer.port} — "
+                        f"set as header sync peer"
+                    )
 
             if blocks_to_request:
                 getdata = GetDataMessage(inventory=blocks_to_request)
@@ -545,6 +557,9 @@ class BlockSync:
                 logger.info(
                     f"Validated {accepted} new headers (queue: {len(self._validated_headers)})"
                 )
+                # Reset sync peer stall timer on successful headers
+                if peer == self._header_sync_peer:
+                    self._header_sync_time = time.time()
                 # Kick off block downloads for the next window.
                 await self._request_next_blocks()
 
@@ -555,6 +570,10 @@ class BlockSync:
                 # exponential flood of redundant requests that drowns out the
                 # one legitimate continuation.
                 if len(headers_msg.headers) >= 2000:
+                    # Send continuation to the SAME peer (which is the sync
+                    # peer).  This ensures sequential header batches from one
+                    # peer, avoiding out-of-order interleaving.
+                    target = self._header_sync_peer if self._header_sync_peer and self._header_sync_peer.is_connected() else peer
                     network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
                     last_hash = self._validated_headers[-1][0]
                     getheaders = GetHeadersMessage(
@@ -563,8 +582,9 @@ class BlockSync:
                         hash_stop=b'\x00' * 32,
                     )
                     try:
-                        await peer.send_message(getheaders.to_network_message(network))
-                        logger.info(f"Requesting more headers after {last_hash.hex()[:16]}...")
+                        await target.send_message(getheaders.to_network_message(network))
+                        self._header_sync_time = time.time()
+                        logger.info(f"Requesting more headers after {last_hash.hex()[:16]}... from {target.host}")
                     except Exception as e:
                         logger.error(f"Failed to request continuation headers: {e}")
 
