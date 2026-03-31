@@ -1,6 +1,6 @@
 """Block and transaction validation logic."""
 
-from typing import Tuple, List
+from typing import Dict, Tuple, List
 import hashlib
 import time as _time
 from ouroboros.database import BlockchainDatabase, Transaction, TxIn, TxOut, Block
@@ -315,7 +315,11 @@ class BlockValidator:
             if tx.is_coinbase:
                 return False, f"Transaction {i} is an unexpected coinbase"
 
-        # 9. Validate all transactions
+        # 9. Validate all transactions.
+        # Build a temporary view of outputs created by earlier txs in this
+        # block so that intra-block dependencies (tx N spending tx M's
+        # output where M < N) can be resolved.
+        intra_block_utxos: Dict[Tuple[bytes, int], Dict] = {}
         total_fees = 0
         for i, tx in enumerate(block.transactions):
             if i == 0:  # Coinbase
@@ -325,13 +329,27 @@ class BlockValidator:
                 valid, error = self.tx_validator.validate_transaction(
                     tx, expected_height, block_mtp,
                     block_hash=block.hash,
+                    intra_block_utxos=intra_block_utxos,
                 )
                 if not valid:
                     return False, f"Transaction {i} invalid: {error}"
 
-                # Calculate fee
-                fee = self._calculate_tx_fee(tx)
+                # Calculate fee (also using intra-block UTXOs)
+                fee = self._calculate_tx_fee(tx, intra_block_utxos)
                 total_fees += fee
+
+            # Register this tx's outputs in the intra-block view for
+            # subsequent transactions.
+            txid = tx.get_txid()
+            for vout_idx, out in enumerate(tx.outputs):
+                intra_block_utxos[(txid, vout_idx)] = {
+                    'txid': txid,
+                    'vout': vout_idx,
+                    'value': out.value,
+                    'script_pubkey': out.script_pubkey,
+                    'height': expected_height,
+                    'is_coinbase': (i == 0),
+                }
 
         # 8. Verify coinbase amount
         if not self._verify_coinbase_amount(
@@ -1001,10 +1019,12 @@ class BlockValidator:
         )
         return tx
 
-    def _calculate_tx_fee(self, tx: Transaction) -> int:
+    def _calculate_tx_fee(self, tx: Transaction, intra_block_utxos=None) -> int:
         total_input = 0
         for tx_in in tx.inputs:
             utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+            if utxo is None and intra_block_utxos:
+                utxo = intra_block_utxos.get((tx_in.prev_txid, tx_in.prev_vout))
             if utxo:
                 total_input += utxo['value']
         
@@ -1026,6 +1046,7 @@ class TransactionValidator:
     def validate_transaction(
         self, tx: Transaction, height: int, block_mtp: int = 0,
         block_hash: bytes | None = None,
+        intra_block_utxos: dict | None = None,
     ) -> Tuple[bool, str]:
         """Validate *tx* at *height* (structure, inputs, locktime, scripts); returns ``(ok, error_message)``."""
         flags = get_flags_for_height(height, block_hash, self.network)
@@ -1044,6 +1065,8 @@ class TransactionValidator:
         input_script_pubkeys: List[bytes] = []
         for i, tx_in in enumerate(tx.inputs):
             utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+            if utxo is None and intra_block_utxos:
+                utxo = intra_block_utxos.get((tx_in.prev_txid, tx_in.prev_vout))
             if not utxo:
                 return False, f"Input not found: {tx_in.prev_txid.hex()}:{tx_in.prev_vout}"
 
