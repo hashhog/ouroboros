@@ -1062,8 +1062,11 @@ class TransactionValidator:
         if not self._is_final_tx(tx, height, block_mtp):
             return False, "Transaction is not final (locktime not satisfied)"
 
-        # 3. Check inputs exist, verify signatures, check coinbase maturity
+        # 3. Gather ALL input UTXOs first — Taproot sighash (BIP 341)
+        #    needs the complete list of input amounts and scriptPubKeys
+        #    before verifying ANY individual input.
         total_input = 0
+        input_utxos: List[dict] = []
         input_amounts: List[int] = []
         input_script_pubkeys: List[bytes] = []
         for i, tx_in in enumerate(tx.inputs):
@@ -1072,6 +1075,13 @@ class TransactionValidator:
                 utxo = intra_block_utxos.get((tx_in.prev_txid, tx_in.prev_vout))
             if not utxo:
                 return False, f"Input not found: {tx_in.prev_txid.hex()}:{tx_in.prev_vout}"
+            input_utxos.append(utxo)
+            input_amounts.append(utxo['value'])
+            input_script_pubkeys.append(bytes(utxo['script_pubkey']))
+
+        # Now verify each input with the COMPLETE amounts/spk lists
+        for i, tx_in in enumerate(tx.inputs):
+            utxo = input_utxos[i]
 
             # Coinbase maturity: coinbase outputs need COINBASE_MATURITY confirmations
             utxo_height = utxo.get('height')
@@ -1083,9 +1093,6 @@ class TransactionValidator:
                         f"Coinbase maturity not met for input {i}: "
                         f"depth {depth} < {COINBASE_MATURITY}"
                     )
-
-            input_amounts.append(utxo['value'])
-            input_script_pubkeys.append(bytes(utxo['script_pubkey']))
 
             # Verify signatures with proper flags
             if not self._verify_input_signature(
