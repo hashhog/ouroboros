@@ -157,10 +157,13 @@ def get_flags_for_height(
                        | SCRIPT_VERIFY_CONST_SCRIPTCODE)
 
         # Taproot (BIP340/341/342)
+        # NOTE: DISCOURAGE_UPGRADABLE_TAPROOT_VERSION and DISCOURAGE_OP_SUCCESS
+        # are policy flags for mempool/relay only.  Block consensus validation
+        # must NOT include them — unknown leaf versions succeed unconditionally
+        # per BIP 341 to allow future soft-fork upgrades.
+        # Ref: Bitcoin Core validation.cpp line 2262 uses only SCRIPT_VERIFY_TAPROOT.
         if is_deployment_active("taproot", height, network):
-            flags |= (SCRIPT_VERIFY_TAPROOT
-                       | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
-                       | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
+            flags |= SCRIPT_VERIFY_TAPROOT
 
     else:
         # Fallback to hardcoded mainnet heights
@@ -177,12 +180,9 @@ def get_flags_for_height(
                        | SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_CLEANSTACK
                        | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
                        | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
-                       | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS
                        | SCRIPT_VERIFY_CONST_SCRIPTCODE)
         if height >= TAPROOT_ACTIVATION_HEIGHT:
-            flags |= (SCRIPT_VERIFY_TAPROOT
-                       | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
-                       | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
+            flags |= SCRIPT_VERIFY_TAPROOT
 
     return flags
 
