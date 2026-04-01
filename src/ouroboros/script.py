@@ -474,12 +474,11 @@ class ScriptInterpreter:
                 return False
         elif version == 1 and len(program) == 32:
             if flags & SCRIPT_VERIFY_TAPROOT:
-                # Build the expected scriptPubKey: OP_1 <32-byte key>
                 spk = bytes([0x51, 0x20]) + program
                 return self.verify_taproot(
                     tx, input_index, witness, spk,
                     input_amounts, input_script_pubkeys, flags)
-            return True  # unknown witness version succeeds
+            return True
         elif flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM:
             return False
         return True  # unknown witness version succeeds
@@ -1243,6 +1242,7 @@ class ScriptInterpreter:
                     raise ValueError("WITNESS_PUBKEYTYPE: uncompressed pubkey in witness v0")
                 if not sig or len(pubkey) < 1:
                     raise ValueError("OP_CHECKSIGVERIFY failed")
+                der_sig = sig[:-1]
                 sighash_type = sig[-1]
                 try:
                     if is_witness_v0:
