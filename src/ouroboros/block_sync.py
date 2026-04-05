@@ -91,7 +91,7 @@ class BlockSync:
         # List of (block_hash, header) in chain order (oldest first).
         self._validated_headers: List[Tuple[bytes, 'BlockHeader']] = []
         # Max blocks to have in-flight at once during headers-first sync.
-        self._max_blocks_in_flight: int = 64
+        self._max_blocks_in_flight: int = 256
 
         # Single sync peer for header downloads (Bitcoin Core pattern).
         # Only one peer is sent getheaders at a time to prevent out-of-order
@@ -282,7 +282,12 @@ class BlockSync:
             except Exception as e:
                 logger.error(f"Error in sync loop: {e}", exc_info=True)
 
-            await asyncio.sleep(10)
+            # During IBD, tick fast so timeout handling / re-requests don't
+            # wait 10s.  After IBD (header queue drained), slow down.
+            if self._validated_headers:
+                await asyncio.sleep(1)
+            else:
+                await asyncio.sleep(10)
     
     async def handle_inv(self, msg: NetworkMessage, peer: Peer):
         """Handle inventory announcement (blocks + transactions)."""
@@ -427,18 +432,19 @@ class BlockSync:
         connected = 0
         current_hash, current_height = self.db.get_best_block()
 
-        # Build a quick lookup: hash -> (block, raw_payload) from the buffer.
-        while True:
-            # Find the next expected block hash from the header chain.
-            next_hash = None
-            for bh, _hdr in self._validated_headers:
-                if self.db.get_block(bh):
-                    continue  # already connected
-                next_hash = bh
+        # Find the first unconnected header index by scanning once, then
+        # advance linearly.  The old code re-scanned from index 0 and
+        # called db.get_block() for every already-connected header on
+        # each iteration, which was O(n^2).
+        header_idx = 0
+        for i, (bh, _hdr) in enumerate(self._validated_headers):
+            if self.db.get_block(bh):
+                header_idx = i + 1
+            else:
                 break
 
-            if next_hash is None:
-                break  # no more headers to process
+        while header_idx < len(self._validated_headers):
+            next_hash, _ = self._validated_headers[header_idx]
 
             # Is the next block in our buffer?
             if next_hash not in self._ibd_block_buffer:
@@ -469,6 +475,7 @@ class BlockSync:
             connected += 1
             current_height = new_height
             current_hash = next_hash
+            header_idx += 1
 
             # Feed fee estimator
             if self.fee_estimator is not None:
@@ -491,6 +498,10 @@ class BlockSync:
                     f"(buffer={len(self._ibd_block_buffer)}, "
                     f"in-flight={len(self.requested_blocks)})"
                 )
+
+        # Prune connected headers to prevent unbounded growth
+        if connected > 0:
+            self._prune_validated_headers()
 
         return connected
     
@@ -844,7 +855,7 @@ class BlockSync:
     async def _handle_timeouts(self):
         """Re-request blocks that timed out, rotating to a different peer each time."""
         now = time.time()
-        timeout = 60.0
+        timeout = 20.0  # Reduced from 60s for faster IBD peer rotation
 
         timed_out = [
             block_hash for block_hash, request_time in self.requested_blocks.items()

@@ -92,9 +92,9 @@ impl BlockValidator {
         let tx_validator = TransactionValidator::new(Arc::clone(&db));
 
         let default_height = match network {
-            Network::Bitcoin => u32::MAX,
-            Network::Testnet4 => u32::MAX,
-            _ => u32::MAX,
+            Network::Bitcoin => 938_343,   // Bitcoin Core v28 default assumevalid
+            Network::Testnet4 => 123_613,  // Testnet4 assumevalid
+            _ => 0,                        // Validate everything on other networks
         };
         let assumevalid_height = assumevalid_height_from_env().unwrap_or(default_height);
 

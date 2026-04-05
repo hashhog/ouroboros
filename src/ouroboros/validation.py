@@ -2,6 +2,7 @@
 
 from typing import Dict, Tuple, List
 import hashlib
+import logging
 import time as _time
 from ouroboros.database import BlockchainDatabase, Transaction, TxIn, TxOut, Block
 import struct
@@ -11,6 +12,16 @@ from ouroboros.script import (
     SCRIPT_VERIFY_P2SH, SCRIPT_VERIFY_DERSIG, SCRIPT_VERIFY_NULLDUMMY,
 )
 from ouroboros.sig_cache import SigCache
+
+logger = logging.getLogger(__name__)
+
+# Try to import the Rust sync module for assume-valid / checkpoint skipping
+try:
+    import sync as _sync_module
+    _has_sync_module = True
+except ImportError:
+    _sync_module = None
+    _has_sync_module = False
 
 # Global signature cache instance (50,000 entries ~ Bitcoin Core default)
 SIG_CACHE = SigCache(max_entries=50_000)
@@ -295,8 +306,17 @@ class BlockValidator:
             return False, error
 
         # 7. BIP30: reject duplicate txids against unspent outputs
-        #    Two historical exceptions on mainnet at heights 91722 and 91812.
-        if expected_height not in (91722, 91812):
+        #    Two historical exceptions on mainnet at heights 91842 and 91880
+        #    (IsBIP30Repeat in Bitcoin Core's validation.cpp). These blocks
+        #    contain coinbase txids that duplicate earlier blocks' coinbases.
+        #    After BIP34 activation (height 227,931), coinbase txids include the
+        #    block height, making duplicates impossible until height 1,983,702.
+        _BIP34_HEIGHT = 227_931
+        _BIP30_RECHECK_HEIGHT = 1_983_702
+        enforce_bip30 = expected_height not in (91842, 91880)
+        if enforce_bip30 and _BIP34_HEIGHT <= expected_height < _BIP30_RECHECK_HEIGHT:
+            enforce_bip30 = False
+        if enforce_bip30:
             for tx in block.transactions:
                 txid = tx.get_txid()
                 for vout_idx in range(len(tx.outputs)):
@@ -315,6 +335,24 @@ class BlockValidator:
             if tx.is_coinbase:
                 return False, f"Transaction {i} is an unexpected coinbase"
 
+        # Determine if script validation can be skipped (assume-valid).
+        # During IBD, blocks below the last checkpoint have their PoW and
+        # merkle root already verified above — script verification is the
+        # dominant cost and can be safely skipped.
+        skip_scripts = False
+        if _has_sync_module:
+            try:
+                block_hash_bytes = block.hash if isinstance(block.hash, bytes) else bytes.fromhex(block.hash)
+                skip_scripts = _sync_module.can_skip_scripts_for_block(
+                    self.network, expected_height, block_hash_bytes
+                )
+                if skip_scripts and expected_height % 10000 == 0:
+                    logger.info(
+                        f"Assume-valid: skipping script verification at height {expected_height}"
+                    )
+            except Exception:
+                skip_scripts = False
+
         # 9. Validate all transactions.
         # Build a temporary view of outputs created by earlier txs in this
         # block so that intra-block dependencies (tx N spending tx M's
@@ -330,6 +368,7 @@ class BlockValidator:
                     tx, expected_height, block_mtp,
                     block_hash=block.hash,
                     intra_block_utxos=intra_block_utxos,
+                    skip_scripts=skip_scripts,
                 )
                 if not valid:
                     return False, f"Transaction {i} invalid: {error}"
@@ -602,11 +641,11 @@ class BlockValidator:
                         witness_spk, witness_data
                     )
 
-            if tx_sigops_cost > MAX_TX_SIGOPS_COST:
-                return False, (
-                    f"Transaction sigops cost {tx_sigops_cost} exceeds "
-                    f"{MAX_TX_SIGOPS_COST}"
-                )
+            # NOTE: MAX_TX_SIGOPS_COST (16,000) is a mempool policy limit
+            # (MAX_STANDARD_TX_SIGOPS_COST in Bitcoin Core), NOT a consensus
+            # rule.  It must NOT be enforced during block validation — only
+            # the per-block limit (MAX_BLOCK_SIGOPS_COST) is consensus.
+            # Ref: Bitcoin Core policy/policy.h, validation.cpp AcceptToMemoryPool
 
             total_sigops_cost += tx_sigops_cost
 
@@ -1050,8 +1089,14 @@ class TransactionValidator:
         self, tx: Transaction, height: int, block_mtp: int = 0,
         block_hash: bytes | None = None,
         intra_block_utxos: dict | None = None,
+        skip_scripts: bool = False,
     ) -> Tuple[bool, str]:
-        """Validate *tx* at *height* (structure, inputs, locktime, scripts); returns ``(ok, error_message)``."""
+        """Validate *tx* at *height* (structure, inputs, locktime, scripts); returns ``(ok, error_message)``.
+
+        When *skip_scripts* is True (assume-valid during IBD), signature and
+        script verification is skipped.  UTXO existence, amounts, coinbase
+        maturity, locktime, and BIP 68 checks are still enforced.
+        """
         flags = get_flags_for_height(height, block_hash, self.network)
 
         # 1. Check structure
@@ -1094,12 +1139,13 @@ class TransactionValidator:
                         f"depth {depth} < {COINBASE_MATURITY}"
                     )
 
-            # Verify signatures with proper flags
-            if not self._verify_input_signature(
-                tx, tx_in, utxo, i, flags, input_amounts, input_script_pubkeys
-            ):
-                return False, f"Invalid signature for input {i}"
-            
+            # Verify signatures with proper flags (skip during assume-valid IBD)
+            if not skip_scripts:
+                if not self._verify_input_signature(
+                    tx, tx_in, utxo, i, flags, input_amounts, input_script_pubkeys
+                ):
+                    return False, f"Invalid signature for input {i}"
+
             total_input += utxo['value']
         
         # 4. Check amounts (consensus: inputs must cover outputs)

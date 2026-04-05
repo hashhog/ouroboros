@@ -2671,6 +2671,32 @@ impl PyBlockchainDB {
         }
     }
     
+    /// Get the median-time-past for a given height (11-block median timestamp).
+    /// Uses lightweight block metadata instead of deserializing full blocks.
+    fn get_median_time_past(&self, height: u32) -> PyResult<Option<u32>> {
+        let start = if height >= 10 { height - 10 } else { 0 };
+        let mut timestamps = Vec::with_capacity(11);
+        for h in start..=height {
+            match self.db.get_block_metadata(h) {
+                Ok(Some(meta)) => timestamps.push(meta.timestamp),
+                Ok(None) => {
+                    // Fall back to full block if metadata missing
+                    match self.db.get_block_by_height(h) {
+                        Ok(Some(block)) => timestamps.push(block.header().time),
+                        Ok(None) => {}
+                        Err(_) => {}
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        if timestamps.is_empty() {
+            return Ok(None);
+        }
+        timestamps.sort_unstable();
+        Ok(Some(timestamps[timestamps.len() / 2]))
+    }
+
     /// Get UTXO
     fn get_utxo(&self, txid: &[u8], vout: u32) -> PyResult<Option<PyUTXO>> {
         if txid.len() != 32 {
@@ -2796,6 +2822,96 @@ impl PyBlockchainDB {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
         Ok(block_hash.to_vec())
+    }
+
+    /// Import blocks from a framed binary file.
+    ///
+    /// Frame format: [4 bytes height LE] [4 bytes size LE] [size bytes raw block]
+    ///
+    /// Reads all frames from the file, skipping blocks at or below `start_height`.
+    /// Connects each block using `connect_block_from_bytes`.
+    /// Returns the number of blocks imported.
+    fn import_blocks_from_file(
+        &self,
+        path: String,
+        start_height: u32,
+        progress_interval: Option<u32>,
+    ) -> PyResult<u32> {
+        use std::io::Read;
+
+        let interval = progress_interval.unwrap_or(10000);
+
+        let mut file: Box<dyn Read> = if path == "-" {
+            Box::new(std::io::stdin().lock())
+        } else {
+            let f = std::fs::File::open(&path).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Cannot open {}: {}", path, e))
+            })?;
+            Box::new(std::io::BufReader::with_capacity(4 * 1024 * 1024, f))
+        };
+
+        let mut frame_header = [0u8; 8];
+        let mut imported = 0u32;
+        let mut skipped = 0u32;
+        let start = std::time::Instant::now();
+
+        loop {
+            match file.read_exact(&mut frame_header) {
+                Ok(()) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                        format!("Error reading frame header: {}", e)
+                    ));
+                }
+            }
+
+            let frame_height = u32::from_le_bytes([
+                frame_header[0], frame_header[1], frame_header[2], frame_header[3],
+            ]);
+            let frame_size = u32::from_le_bytes([
+                frame_header[4], frame_header[5], frame_header[6], frame_header[7],
+            ]);
+
+            if frame_size == 0 || frame_size > 4 * 1024 * 1024 {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid frame size {} at height {}", frame_size, frame_height)
+                ));
+            }
+
+            let mut block_data = vec![0u8; frame_size as usize];
+            file.read_exact(&mut block_data).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                    format!("Error reading block at height {}: {}", frame_height, e)
+                )
+            })?;
+
+            if frame_height <= start_height {
+                skipped += 1;
+                continue;
+            }
+
+            self.connect_block_from_bytes(block_data, frame_height)?;
+            imported += 1;
+
+            if interval > 0 && imported % interval == 0 {
+                let elapsed = start.elapsed().as_secs_f64();
+                let rate = imported as f64 / elapsed.max(0.001);
+                log::info!(
+                    "import-blocks: height={} imported={} skipped={} rate={:.1} blk/s",
+                    frame_height, imported, skipped, rate,
+                );
+            }
+        }
+
+        let elapsed = start.elapsed().as_secs_f64();
+        let rate = imported as f64 / elapsed.max(0.001);
+        log::info!(
+            "import-blocks complete: imported={} skipped={} elapsed={:.1}s rate={:.1} blk/s",
+            imported, skipped, elapsed, rate,
+        );
+
+        Ok(imported)
     }
 
     /// Update UTXO set atomically
