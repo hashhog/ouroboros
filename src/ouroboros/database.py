@@ -413,7 +413,18 @@ class BlockchainDatabase:
         self._db.update_best_block(block_hash, height)
     
     def get_median_time_past(self, height: int) -> Optional[int]:
-        """Median timestamp of the 11 blocks up to *height* (BIP 68 / BIP 113 MTP)."""
+        """Median timestamp of the 11 blocks up to *height* (BIP 68 / BIP 113 MTP).
+
+        Uses the Rust backend's lightweight metadata lookup when available,
+        falling back to full block deserialization otherwise.
+        """
+        # Fast path: Rust computes MTP from block metadata (no full block deser)
+        if hasattr(self._db, 'get_median_time_past'):
+            result = self._db.get_median_time_past(height)
+            if result is not None:
+                return result
+
+        # Slow fallback: deserialize full blocks
         timestamps = []
         for h in range(max(0, height - 10), height + 1):
             block = self.get_block_by_height(h)

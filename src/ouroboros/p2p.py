@@ -508,6 +508,9 @@ class PeerManager:
         self._i2p_address: Optional[str] = None
         self._i2p_accept_task: Optional[asyncio.Task] = None
 
+        # Persistent --connect peers that should be reconnected when lost
+        self._connect_addrs: List[Tuple[str, int]] = []
+
     async def start(self, start_height: int = 0, p2p_port: int = 0):
         """
         Start peer manager.
@@ -1548,6 +1551,21 @@ class PeerManager:
                         "re-seeding from DNS..."
                     )
                     await self.discover_peers()
+
+                # Reconnect to --connect peers that have dropped
+                for host, port in self._connect_addrs:
+                    addr = f"{host}:{port}"
+                    if addr not in self.peers and addr not in self.block_relay_peers:
+                        # --connect peers are always allowed; unban if needed
+                        if self.ban_manager.is_banned(addr):
+                            self.ban_manager.unban(addr)
+                        if self.ban_manager.is_banned(host):
+                            self.ban_manager.unban(host)
+                        try:
+                            logger.info(f"Reconnecting to --connect peer {addr}")
+                            await self.connect_to_node(host, port)
+                        except Exception as e:
+                            logger.warning(f"Failed to reconnect to {addr}: {e}")
 
                 # Refill full-relay outbound slots
                 if len(self.peers) < self.max_peers:

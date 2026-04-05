@@ -237,6 +237,22 @@ class BitcoinNode:
                 await self.peer_manager.start(best_height, p2p_port=p2p_port)
             except Exception as e:
                 logger.warning(f"Peer manager start error (node continues): {e}")
+            # Connect to explicitly specified peers (--connect flag)
+            connect_peers = self.config.get('connect', [])
+            for addr_str in connect_peers:
+                try:
+                    if ':' in addr_str:
+                        host, port_s = addr_str.rsplit(':', 1)
+                        cport = int(port_s)
+                    else:
+                        host = addr_str
+                        cport = 8333
+                    # Register for automatic reconnection
+                    self.peer_manager._connect_addrs.append((host, cport))
+                    logger.info(f"Connecting to specified peer {host}:{cport}")
+                    await self.peer_manager.connect_to_node(host, cport)
+                except Exception as e:
+                    logger.warning(f"Failed to connect to specified peer {addr_str}: {e}")
             peer_count = len(self.peer_manager.get_all_ready_peers()) if self.peer_manager else 0
             logger.info(f"Peer manager started ({peer_count} peers)")
 

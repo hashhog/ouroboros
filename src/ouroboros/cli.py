@@ -305,9 +305,10 @@ def sync(ctx, reset, limit):
 @click.option("--rpc-port", default=8332, type=int, help="RPC server port")
 @click.option("--p2p-port", default=8333, type=int, help="P2P network port")
 @click.option("--listen/--nolisten", default=True, help="Accept inbound P2P connections")
+@click.option("--connect", multiple=True, help="Connect to specific peer(s) host:port (can repeat)")
 @click.option("--force", is_flag=True, default=False, help="Skip sync check prompt")
 @click.pass_context
-def start(ctx, rpc_port, p2p_port, listen, force):
+def start(ctx, rpc_port, p2p_port, listen, connect, force):
     """Start the Bitcoin node"""
     global _node, _cancelled
     _cancelled = False
@@ -354,6 +355,8 @@ def start(ctx, rpc_port, p2p_port, listen, force):
             "listen": listen,
             "config_path": config_path,
         }
+        if connect:
+            config["connect"] = list(connect)
         
         _node = BitcoinNode(config=config)
 
@@ -444,6 +447,148 @@ def getbalance(ctx, address, network):
     except Exception as e:
         console.print(f"[red]✗ Error getting balance: {e}[/red]")
         sys.exit(1)
+
+
+@cli.command("import-blocks")
+@click.argument("source", default="-", type=click.Path(exists=False))
+@click.pass_context
+def import_blocks(ctx, source):
+    """Import blocks from a framed binary file (or stdin with -)
+
+    Frame format: [4 bytes height LE] [4 bytes size LE] [size bytes raw block]
+    """
+    import struct
+
+    data_dir = ctx.obj["data_dir"]
+    network = ctx.obj["network"]
+
+    console.print(
+        f"[bold]ouroboros import-blocks[/bold] -- [cyan]{network}[/cyan]\n"
+        f"[dim]Data: {data_dir}  Source: {source}[/dim]"
+    )
+
+    if sync is None:
+        console.print("[red]Rust sync module not available. Install with: maturin develop[/red]")
+        sys.exit(1)
+
+    # Open the database
+    try:
+        db = sync.PyBlockchainDB(data_dir)
+    except Exception as e:
+        console.print(f"[red]Failed to open database: {e}[/red]")
+        sys.exit(1)
+
+    # Get current tip height
+    try:
+        _best_hash, tip_height = db.get_best_block()
+    except Exception:
+        tip_height = 0
+
+    console.print(f"Chain tip at height [cyan]{tip_height:,}[/cyan], starting import")
+
+    # Try the fast Rust-native path for file sources (reads the framed
+    # format entirely in Rust, avoiding Python I/O overhead).
+    use_rust_native = source != "-" and hasattr(db, "import_blocks_from_file")
+
+    if use_rust_native:
+        console.print("[dim]Using Rust-native file reader[/dim]")
+        start_time = time.time()
+        try:
+            imported = db.import_blocks_from_file(source, tip_height, 10000)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Import interrupted[/yellow]")
+            return
+        except Exception as e:
+            console.print(f"[red]Error during import: {e}[/red]")
+            sys.exit(1)
+
+        elapsed = time.time() - start_time
+        rate = imported / max(elapsed, 0.001)
+        console.print(
+            f"\n[green]Import complete: {imported:,} blocks imported[/green]\n"
+            f"[dim]Elapsed: {elapsed:.1f}s  Rate: {rate:.1f} blk/s[/dim]"
+        )
+        return
+
+    # Fallback: Python-side stdin reader
+    if source == "-":
+        input_file = sys.stdin.buffer
+    else:
+        try:
+            input_file = open(source, "rb")
+        except IOError as e:
+            console.print(f"[red]Cannot open file: {e}[/red]")
+            sys.exit(1)
+
+    imported = 0
+    skipped = 0
+    start_time = time.time()
+    last_log_time = start_time
+
+    try:
+        while True:
+            # Read frame header: [4 bytes height LE] [4 bytes size LE]
+            frame_header = input_file.read(8)
+            if not frame_header:
+                break
+            if len(frame_header) < 8:
+                console.print(f"[red]Incomplete frame header: got {len(frame_header)} bytes[/red]")
+                break
+
+            frame_height, frame_size = struct.unpack("<II", frame_header)
+
+            if frame_size == 0 or frame_size > 4 * 1024 * 1024:
+                console.print(f"[red]Invalid frame size {frame_size} at height {frame_height}[/red]")
+                break
+
+            # Read block data
+            block_data = input_file.read(frame_size)
+            if len(block_data) < frame_size:
+                console.print(
+                    f"[red]Incomplete block at height {frame_height}: "
+                    f"got {len(block_data)} of {frame_size}[/red]"
+                )
+                break
+
+            # Skip blocks we already have
+            if frame_height <= tip_height:
+                skipped += 1
+                continue
+
+            # Connect block via Rust
+            try:
+                db.connect_block_from_bytes(block_data, frame_height)
+            except Exception as e:
+                console.print(f"[red]Error connecting block at height {frame_height}: {e}[/red]")
+                sys.exit(1)
+
+            imported += 1
+
+            # Log progress periodically
+            now = time.time()
+            if now - last_log_time >= 10 or imported % 10000 == 0:
+                elapsed = now - start_time
+                rate = imported / max(elapsed, 0.001)
+                console.print(
+                    f"[dim]import-blocks: height={frame_height} "
+                    f"imported={imported:,} skipped={skipped:,} "
+                    f"rate={rate:.1f} blk/s[/dim]"
+                )
+                last_log_time = now
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Import interrupted[/yellow]")
+    finally:
+        if source != "-" and hasattr(input_file, "close"):
+            input_file.close()
+
+    elapsed = time.time() - start_time
+    rate = imported / max(elapsed, 0.001)
+    console.print(
+        f"\n[green]Import complete: {imported:,} blocks imported, "
+        f"{skipped:,} skipped[/green]\n"
+        f"[dim]Elapsed: {elapsed:.1f}s  Rate: {rate:.1f} blk/s[/dim]"
+    )
 
 
 def main() -> None:

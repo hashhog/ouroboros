@@ -752,24 +752,35 @@ class Peer:
 
         # Parse header
         magic, command_bytes, length, checksum = struct.unpack('<I12sI4s', header)
+
+        # Verify magic bytes FIRST — if wrong, the stream is desynchronised
+        # (e.g. we read into the middle of a previous payload) or the peer
+        # truly switched to v2.  Either way the connection is unrecoverable.
+        expected_magic = get_magic(self.network)
+        if magic != expected_magic:
+            # Check if this could be a genuine BIP 324 v2 negotiation
+            # (only plausible on the very first message exchange).
+            try:
+                command_bytes.rstrip(b'\x00').decode('ascii')
+            except UnicodeDecodeError:
+                raise V2TransportError(
+                    f"Peer {self.host}:{self.port} appears to use v2 transport, "
+                    f"disconnecting gracefully"
+                )
+            raise Exception(
+                f"Invalid magic bytes from {self.host}:{self.port}: "
+                f"expected {expected_magic:08x}, got {magic:08x} — stream desync"
+            )
+
         try:
             command = command_bytes.rstrip(b'\x00').decode('ascii')
         except UnicodeDecodeError:
-            # Peer sent non-ASCII bytes in the command field — likely a v2
-            # (BIP 324) encrypted transport message that we cannot parse as
-            # v1 plaintext.  Bitcoin Core simply disconnects without banning
-            # (see net.cpp).  Raise a dedicated exception so the listener
-            # can disconnect gracefully without applying a score penalty.
-            raise V2TransportError(
-                f"Peer {self.host}:{self.port} appears to use v2 transport, "
-                f"disconnecting gracefully"
-            )
-
-        # Verify magic bytes
-        expected_magic = get_magic(self.network)
-        if magic != expected_magic:
+            # Magic was correct but command is non-ASCII — this is a stream
+            # framing error, NOT v2 transport.  Raise a normal exception so
+            # the score-based handling can decide whether to disconnect.
             raise Exception(
-                f"Invalid magic bytes: expected {expected_magic:08x}, got {magic:08x}"
+                f"Non-ASCII command bytes from {self.host}:{self.port} "
+                f"(likely stream desync): {command_bytes!r}"
             )
         
         # Read payload
