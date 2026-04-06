@@ -527,6 +527,18 @@ class BlockSync:
 
             logger.info(f"Received {len(headers_msg.headers)} headers from {peer.host}:{peer.port}")
 
+            # Throttle header accumulation: if we already have a huge backlog
+            # of validated headers waiting for block download, skip processing
+            # more until we catch up.  This prevents unbounded memory growth
+            # and keeps the set-dedup cost manageable.
+            _MAX_HEADER_QUEUE = 50_000
+            if len(self._validated_headers) > _MAX_HEADER_QUEUE:
+                logger.debug(
+                    f"Header queue at {len(self._validated_headers)}, "
+                    f"skipping batch until blocks catch up"
+                )
+                return
+
             # Determine expected prev_hash: either last validated header or our DB tip.
             if self._validated_headers:
                 expected_prev = self._validated_headers[-1][0]  # hash of last queued header
@@ -535,6 +547,10 @@ class BlockSync:
                 expected_prev = best_hash
 
             accepted = 0
+            # Build the known-hash set ONCE before the loop instead of
+            # rebuilding it for every header.  With 200K+ queued headers
+            # this was O(n*m) and burned 97% CPU, starving RPC.
+            known_hashes = {h for h, _ in self._validated_headers}
             for header in headers_msg.headers:
                 block_hash = self._header_to_block_hash(header)
 
@@ -544,7 +560,6 @@ class BlockSync:
                     continue
 
                 # Skip duplicates already in our validated queue.
-                known_hashes = {h for h, _ in self._validated_headers}
                 if block_hash in known_hashes:
                     expected_prev = block_hash
                     continue
@@ -561,6 +576,7 @@ class BlockSync:
                     break
 
                 self._validated_headers.append((block_hash, header))
+                known_hashes.add(block_hash)
                 expected_prev = block_hash
                 accepted += 1
 
