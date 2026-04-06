@@ -36,8 +36,8 @@ use common::UTXO;
 use crate::storage::db::{BlockchainDB, DbError, Result};
 use crate::storage::undo::Coin;
 
-/// Default cache size in bytes (450 MB, matching Bitcoin Core's -dbcache default).
-pub const DEFAULT_DBCACHE_BYTES: usize = 450 * 1024 * 1024;
+/// Default cache size in bytes (2 GB for faster IBD on high-memory systems).
+pub const DEFAULT_DBCACHE_BYTES: usize = 2048 * 1024 * 1024;
 
 /// Approximate memory overhead per cache entry (beyond the Coin data itself).
 /// Includes HashMap entry overhead, OutPoint key, flags, etc.
