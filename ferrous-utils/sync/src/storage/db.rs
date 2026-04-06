@@ -50,6 +50,16 @@ pub struct BlockchainDB {
 }
 
 impl BlockchainDB {
+    /// Attempt to repair a corrupted database at the given path.
+    pub fn repair(path: &str) -> Result<()> {
+        let mut opts = Options::default();
+        opts.create_if_missing(false);
+        opts.create_missing_column_families(true);
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+        DB::repair(&opts, path).map_err(DbError::RocksDb)
+    }
+
     /// Open or create a new database at the given path
     pub fn open(path: &str) -> Result<Self> {
         let mut opts = Options::default();

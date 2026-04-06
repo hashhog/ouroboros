@@ -164,6 +164,10 @@ pub struct BlockSync {
     desync_count: Arc<AtomicU64>,
     /// Height -> peer that timed out; avoid re-assigning to same peer (cleared when assigned to different peer)
     avoid_peer_for_height: Arc<Mutex<HashMap<u32, SocketAddr>>>,
+    /// Blocks downloaded but not yet applied (connected).  apply_block must be
+    /// called in sequential order.  This buffer holds out-of-order blocks until
+    /// all predecessors are available.
+    pending_apply: Arc<Mutex<HashMap<u32, BlockWrapper>>>,
 }
 
 /// Rolling window for speed calculation (seconds)
@@ -270,6 +274,7 @@ impl BlockSync {
             progress_cache,
             desync_count: Arc::new(AtomicU64::new(0)),
             avoid_peer_for_height: Arc::new(Mutex::new(HashMap::new())),
+            pending_apply: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -659,14 +664,20 @@ impl BlockSync {
                                 };
                                 if let Some(height) = height_opt {
                                     let block_wrapper = BlockWrapper::from(block);
-                                        if let Err(e) = self.db.store_block(&block_wrapper) {
+                                    // Store block body for later retrieval
+                                    if let Err(e) = self.db.store_block(&block_wrapper) {
                                         log::error!("Failed to store block {}: {}", height, e);
                                     } else {
-                                        let (_best_hash, best_height) = self.db.get_best_block()
-                                            .unwrap_or(([0u8; 32], 0));
-                                        if height > best_height {
-                                            let _ = self.db.update_best_block(&hash_bytes, height);
+                                        // Buffer the raw payload so we can apply (connect) the
+                                        // block in sequential order.  `apply_block` updates the
+                                        // UTXO set, tx-index, chainwork, and height→hash
+                                        // mapping — it MUST be called in chain order.
+                                        {
+                                            let mut buf = self.pending_apply.lock().await;
+                                            buf.insert(height, block_wrapper);
                                         }
+                                        // Drain the sequential prefix of pending blocks.
+                                        self.drain_apply_queue().await;
                                         {
                                             let mut in_flight = self.in_flight.lock().await;
                                             in_flight.remove(&height);
@@ -1063,22 +1074,14 @@ impl BlockSync {
             .map_err(|e| BlockSyncError::Validation(e))?;
         }
 
-        // Store block in database
-        self.db.store_block(&block_wrapper)
-            .map_err(|e| BlockSyncError::Database(e))?;
+        // Apply block: store body + update UTXO set, tx-index, height
+        // mapping, and chain tip in one sequential operation.
+        self.validator.apply_block(&block_wrapper, height)
+            .map_err(|e| BlockSyncError::Validation(e))?;
 
-        // Get block hash for updating best block and removing from hash mapping
+        // Get block hash for removing from hash mapping
         let hash = block_wrapper.block_hash();
         let hash_bytes = *hash.as_byte_array();
-
-        // Update best block if this is the highest block
-        let (_best_hash, best_height) = self.db.get_best_block()
-            .map_err(|e| BlockSyncError::Database(e))?;
-        
-        if height > best_height {
-            self.db.update_best_block(&hash_bytes, height)
-                .map_err(|e| BlockSyncError::Database(e))?;
-        }
 
         // Remove from in_flight and hash mapping
         {
@@ -1313,6 +1316,32 @@ impl BlockSync {
     /// Flow: compute_progress() calculates blocks_per_second (rolling 10s window when available),
     /// updates progress_cache for get_sync_progress() (Python polls ~1s via sync_manager),
     /// and invokes progress_callback if set. Called after each block is stored.
+    /// Apply (connect) queued blocks in sequential chain order.
+    ///
+    /// Blocks are stored out-of-order from parallel peer downloads.  This
+    /// method drains the `pending_apply` buffer, applying each block whose
+    /// predecessor has already been applied.  `apply_block` updates the UTXO
+    /// set, tx-index, chainwork, and the canonical height-to-hash mapping.
+    async fn drain_apply_queue(&self) {
+        let (_best_hash, mut next_height) = self.db.get_best_block()
+            .unwrap_or(([0u8; 32], 0));
+        next_height += 1;
+
+        let mut buf = self.pending_apply.lock().await;
+        while let Some(block) = buf.remove(&next_height) {
+            if let Err(e) = self.validator.apply_block(&block, next_height) {
+                log::error!("Failed to apply block at height {}: {}", next_height, e);
+                // Put the block back so we can retry later
+                buf.insert(next_height, block);
+                break;
+            }
+            if next_height % 1000 == 0 {
+                log::info!("[block-sync] Applied block {}", next_height);
+            }
+            next_height += 1;
+        }
+    }
+
     async fn update_progress(&self) {
         let (blocks_downloaded, speed, eta) = match self.compute_progress().await {
             Some((d, s, e)) => (d, s, e),

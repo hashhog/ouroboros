@@ -2623,6 +2623,15 @@ pub struct PyBlockchainDB {
 
 #[pymethods]
 impl PyBlockchainDB {
+    /// Attempt to repair a corrupted database at the given path.
+    #[staticmethod]
+    fn repair(data_dir: String) -> PyResult<()> {
+        BlockchainDB::repair(&data_dir)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to repair database: {}", e)
+            ))
+    }
+
     #[new]
     fn new(data_dir: String) -> PyResult<Self> {
         let db = BlockchainDB::open(&data_dir)
