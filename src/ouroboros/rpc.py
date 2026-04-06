@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # Rate limiting
 _rate_limit_store: Dict[str, List[float]] = defaultdict(list)
 _rate_limit_window = 60.0  # 1 minute
-_rate_limit_max_requests = 100
+_rate_limit_max_requests = 10000  # raised for IBD feeder throughput
 
 
 class JSONRPCRequest(BaseModel):
