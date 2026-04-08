@@ -1031,6 +1031,10 @@ class Mempool:
         # Cluster mempool manager
         self._cluster_manager = ClusterManager(self.transactions)
 
+    def __len__(self) -> int:
+        """Return the number of transactions in the mempool."""
+        return len(self.transactions)
+
     @property
     def total_size(self) -> int:
         """Alias for current_size (total bytes in mempool)."""
