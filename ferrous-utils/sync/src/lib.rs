@@ -2768,6 +2768,83 @@ impl PyBlockchainDB {
         let block_hash = *block.block_hash().as_byte_array();
         let inner = block.inner();
 
+        // Validate proof-of-work (consensus-critical)
+        // Reference: Bitcoin Core src/pow.cpp CheckProofOfWork() + DeriveTarget()
+        {
+            let n_bits = inner.header.bits.to_consensus();
+            let exponent = (n_bits >> 24) as u32;
+            let mantissa = n_bits & 0x7f_ffff;
+
+            // Reject negative target
+            if n_bits & 0x80_0000 != 0 {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "Invalid nBits: negative target".to_string()
+                ));
+            }
+
+            // Reject zero target
+            if mantissa == 0 {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "Invalid nBits: zero target".to_string()
+                ));
+            }
+
+            // Compute 256-bit target from compact nBits
+            // target = mantissa * 2^(8*(exponent-3))
+            let target: [u8; 32] = {
+                let mut t = [0u8; 32];
+                if exponent <= 3 {
+                    let shifted = mantissa >> (8 * (3 - exponent));
+                    if shifted > 0 {
+                        t[0] = (shifted & 0xff) as u8;
+                        t[1] = ((shifted >> 8) & 0xff) as u8;
+                        t[2] = ((shifted >> 16) & 0xff) as u8;
+                    }
+                } else {
+                    let byte_offset = (exponent - 3) as usize;
+                    if byte_offset + 2 < 32 {
+                        t[byte_offset] = (mantissa & 0xff) as u8;
+                        t[byte_offset + 1] = ((mantissa >> 8) & 0xff) as u8;
+                        t[byte_offset + 2] = ((mantissa >> 16) & 0xff) as u8;
+                    }
+                    // If byte_offset + 2 >= 32, target overflows → reject below
+                }
+                t
+            };
+
+            // Reject overflow (target > 2^256 - 1, effectively all zeros after overflow)
+            let target_is_zero = target.iter().all(|&b| b == 0);
+            if target_is_zero {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "Invalid nBits: target overflow or zero".to_string()
+                ));
+            }
+
+            // block_hash is already in internal byte order (little-endian uint256)
+            // Compare hash <= target as little-endian 256-bit integers
+            // Compare from most significant byte (index 31) down
+            let hash_le = &block_hash;
+            let mut pow_ok = false;
+            for i in (0..32).rev() {
+                if hash_le[i] < target[i] {
+                    pow_ok = true;
+                    break;
+                } else if hash_le[i] > target[i] {
+                    break;
+                }
+                // equal bytes: continue to next
+                if i == 0 {
+                    pow_ok = true; // all bytes equal → hash == target → ok
+                }
+            }
+
+            if !pow_ok {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("high-hash: block hash exceeds PoW target")
+                ));
+            }
+        }
+
         // Verify merkle root matches transactions (consensus-critical)
         {
             use common::crypto::compute_merkle_root;
