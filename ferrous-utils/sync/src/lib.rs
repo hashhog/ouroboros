@@ -2788,6 +2788,32 @@ impl PyBlockchainDB {
             }
         }
 
+        // Validate prevhash links to current chain tip (consensus-critical)
+        let prev_blockhash = *inner.header.prev_blockhash.as_byte_array();
+        if height == 0 {
+            // Genesis block must have all-zero prevhash
+            if prev_blockhash != [0u8; 32] {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "Genesis block prev_hash must be all zeros".to_string()
+                ));
+            }
+        } else {
+            let (tip_hash, _tip_height) = self.db.get_best_block().map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to get current chain tip: {}", e)
+                )
+            })?;
+            if prev_blockhash != tip_hash {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!(
+                        "Block prev_hash {} does not match chain tip {}",
+                        hex::encode(prev_blockhash),
+                        hex::encode(tip_hash),
+                    )
+                ));
+            }
+        }
+
         // Single WriteBatch for all DB mutations in this block
         let mut batch = self.db.create_batch();
 
