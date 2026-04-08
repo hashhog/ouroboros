@@ -2756,6 +2756,7 @@ impl PyBlockchainDB {
     /// is constructed in Python and needs to be persisted via the Rust DB.
     fn connect_block_from_bytes(&self, block_bytes: Vec<u8>, height: u32) -> PyResult<Vec<u8>> {
         use common::BitcoinDeserialize;
+        use crate::storage::schema::{encode_outpoint, CHAINSTATE_CF, SPENT_CF};
 
         // Deserialize
         let (block, _) = BlockWrapper::bitcoin_deserialize(&block_bytes).map_err(|e| {
@@ -2779,17 +2780,59 @@ impl PyBlockchainDB {
         self.db.write_head_blocks_batch(&mut batch, &old_tip_hash, old_tip_height, &block_hash, height)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
-        // UTXO mutations + tx index
+        // --- Phase 1: Collect all input outpoint keys for MultiGet ---
+        let raw_db = self.db.raw_db();
+        let chainstate_cf = raw_db.cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("chainstate CF not found"))?;
+        let spent_cf = raw_db.cf_handle(SPENT_CF)
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("spent CF not found"))?;
+
+        // Collect all input outpoint keys (skip coinbase)
+        let mut input_keys: Vec<[u8; 36]> = Vec::new();
+        let mut input_spending_txids: Vec<[u8; 32]> = Vec::new();
+        for tx in inner.txdata.iter() {
+            if tx.is_coinbase() {
+                continue;
+            }
+            let txid = *tx.compute_txid().as_byte_array();
+            for input in &tx.input {
+                let prev_txid = *input.previous_output.txid.as_byte_array();
+                let key = encode_outpoint(&prev_txid, input.previous_output.vout);
+                input_keys.push(key);
+                input_spending_txids.push(txid);
+            }
+        }
+
+        // MultiGet all spent UTXOs in a single RocksDB call
+        let utxo_values: Vec<_> = if !input_keys.is_empty() {
+            let cf_keys: Vec<_> = input_keys.iter()
+                .map(|k| (&*chainstate_cf, k.as_slice()))
+                .collect();
+            raw_db.multi_get_cf(cf_keys)
+        } else {
+            Vec::new()
+        };
+
+        // --- Phase 2: Process spends using pre-fetched data ---
+        for (idx, (key, spending_txid)) in input_keys.iter().zip(input_spending_txids.iter()).enumerate() {
+            // Delete from chainstate
+            batch.delete_cf(&chainstate_cf, key);
+
+            // Store undo record if UTXO was found
+            match &utxo_values[idx] {
+                Ok(Some(utxo_bytes)) => {
+                    let mut undo_value = Vec::with_capacity(32 + utxo_bytes.len());
+                    undo_value.extend_from_slice(spending_txid);
+                    undo_value.extend_from_slice(utxo_bytes);
+                    batch.put_cf(&spent_cf, key, &undo_value);
+                }
+                _ => {} // UTXO not found — skip undo (early blocks may have missing UTXOs)
+            }
+        }
+
+        // --- Phase 3: Add outputs + tx index ---
         for (tx_pos, tx) in inner.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
-
-            if !tx.is_coinbase() {
-                for input in &tx.input {
-                    let outpoint = OutPointWrapper::new(input.previous_output);
-                    self.db.spend_utxo_batch(&mut batch, outpoint.inner(), txid.as_byte_array())
-                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
-                }
-            }
 
             for (vout, output) in tx.output.iter().enumerate() {
                 let outpoint = OutPointWrapper::from_txid_vout(txid, vout as u32);

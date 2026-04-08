@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # Rate limiting
 _rate_limit_store: Dict[str, List[float]] = defaultdict(list)
 _rate_limit_window = 60.0  # 1 minute
-_rate_limit_max_requests = 10000  # raised for IBD feeder throughput
+_rate_limit_max_requests = 100000  # raised for IBD feeder throughput
 
 
 class JSONRPCRequest(BaseModel):
@@ -595,15 +595,14 @@ class RPCServer:
     def _check_rate_limit(self, client_ip: str) -> bool:
         now = time.time()
         requests = _rate_limit_store[client_ip]
-        
-        # Remove old requests outside window
-        requests[:] = [req_time for req_time in requests if now - req_time < _rate_limit_window]
-        
-        # Check limit
+
+        # Prune stale entries only when the list grows large (amortised O(1))
         if len(requests) >= _rate_limit_max_requests:
-            return False
-        
-        # Add current request
+            cutoff = now - _rate_limit_window
+            requests[:] = [t for t in requests if t > cutoff]
+            if len(requests) >= _rate_limit_max_requests:
+                return False
+
         requests.append(now)
         return True
     
@@ -2923,17 +2922,10 @@ class RPCServer:
         Stores the block in the database (block data, header/height index,
         UTXO set, tx index) and updates the chain tip.
         """
-        from ouroboros.database import Block as _Block
-
         try:
             block_bytes = bytes.fromhex(hexdata)
         except ValueError:
             return "Invalid hex"
-
-        try:
-            block = _Block.deserialize(block_bytes)
-        except Exception as e:
-            return f"Block deserialization failed: {e}"
 
         db = getattr(self.node, "db", None)
         if db is None:
@@ -2944,16 +2936,53 @@ class RPCServer:
             next_height = best_height + 1
 
             # Use Rust connect_block_from_bytes for full persistence
+            # (deserialisation + UTXO updates + block storage all in Rust)
             db._db.connect_block_from_bytes(block_bytes, next_height)
 
-            # Remove confirmed transactions from mempool
+            # Remove confirmed transactions from mempool (lazy — only
+            # deserialise block if the mempool is non-empty)
             mempool = getattr(self.node, "mempool", None)
-            if mempool is not None:
-                mempool.remove_block_transactions(block)
+            if mempool is not None and len(mempool) > 0:
+                try:
+                    from ouroboros.database import Block as _Block
+                    block = _Block.deserialize(block_bytes)
+                    mempool.remove_block_transactions(block)
+                except Exception:
+                    pass  # mempool cleanup is best-effort
 
             return None
         except Exception as e:
             return str(e)
+
+    async def rpc_submitblockbatch(self, hexblocks: list) -> list:
+        """
+        Submit multiple blocks in a single RPC call (IBD fast-path).
+
+        Accepts a JSON array of hex-encoded blocks. Returns a list of
+        results: null for success, or an error string for each block.
+        Blocks are applied sequentially in the order given.
+        """
+        db = getattr(self.node, "db", None)
+        if db is None:
+            return ["Database not available"] * len(hexblocks)
+
+        results = []
+        for hexdata in hexblocks:
+            try:
+                block_bytes = bytes.fromhex(hexdata)
+            except (ValueError, TypeError):
+                results.append("Invalid hex")
+                continue
+
+            try:
+                _, best_height = db.get_best_block()
+                next_height = best_height + 1
+                db._db.connect_block_from_bytes(block_bytes, next_height)
+                results.append(None)
+            except Exception as e:
+                results.append(str(e))
+
+        return results
 
     async def rpc_pruneblockchain(self, height: int) -> int:
         """
