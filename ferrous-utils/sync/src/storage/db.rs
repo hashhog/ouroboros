@@ -452,6 +452,31 @@ impl BlockchainDB {
         Ok(count)
     }
 
+    /// Delete all entries from the chainstate (UTXO set) column family.
+    ///
+    /// Uses RocksDB `delete_range` to mark everything as deleted.  The actual
+    /// disk space is reclaimed lazily by background compaction (no explicit
+    /// compaction is triggered so the call returns quickly).
+    pub fn clear_chainstate(&self) -> Result<()> {
+        let cf = self.db
+            .cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+
+        // Delete the entire key range: [0x00..00] to [0xFF..FF]
+        let start = [0u8; 36];
+        let end = [0xFFu8; 36];
+        self.db.delete_range_cf(cf, &start, &end)?;
+        // delete_range is exclusive on the end key, so delete the max key too
+        self.db.delete_cf(cf, &end)?;
+
+        Ok(())
+    }
+
+    /// Expose the inner Arc<DB> for direct WriteBatch operations (e.g. bulk import).
+    pub fn raw_db(&self) -> &Arc<DB> {
+        &self.db
+    }
+
     // ========== Chain State Methods ==========
 
     /// Get the best block hash and height

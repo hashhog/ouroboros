@@ -449,6 +449,97 @@ def getbalance(ctx, address, network):
         sys.exit(1)
 
 
+@cli.command("import-utxo")
+@click.argument("snapshot_path", type=click.Path(exists=True))
+@click.option(
+    "--batch-size",
+    default=100_000,
+    type=int,
+    help="Number of UTXOs per WriteBatch flush (default 100K)",
+)
+@click.pass_context
+def import_utxo(ctx, snapshot_path, batch_size):
+    """Import a UTXO snapshot in HDOG binary format.
+
+    This loads a pre-generated UTXO set so the node can start syncing near the
+    chain tip instead of doing full IBD.  The existing chainstate is cleared
+    before import.
+
+    SNAPSHOT_PATH is the path to a .hdog file.
+    """
+    import struct
+    import hashlib
+    import sync
+
+    data_dir = ctx.obj["data_dir"]
+    network = ctx.obj["network"]
+
+    console.print(
+        f"[bold]ouroboros import-utxo[/bold] -- [cyan]{network}[/cyan]\n"
+        f"[dim]Data: {data_dir}  Snapshot: {snapshot_path}[/dim]"
+    )
+
+    # Quick header peek for display
+    with open(snapshot_path, "rb") as f:
+        header = f.read(52)
+    if len(header) < 52 or header[:4] != b"HDOG":
+        console.print("[red]Invalid HDOG file (bad magic or too short)[/red]")
+        sys.exit(1)
+
+    version = struct.unpack_from("<I", header, 4)[0]
+    block_hash = header[8:40]
+    block_height = struct.unpack_from("<I", header, 40)[0]
+    utxo_count = struct.unpack_from("<Q", header, 44)[0]
+
+    # Display hash (big-endian)
+    display_hash = block_hash[::-1].hex()
+
+    console.print(
+        f"  Version:    [cyan]{version}[/cyan]\n"
+        f"  Block hash: [cyan]{display_hash}[/cyan]\n"
+        f"  Height:     [cyan]{block_height:,}[/cyan]\n"
+        f"  UTXOs:      [cyan]{utxo_count:,}[/cyan]\n"
+        f"  Batch size: [cyan]{batch_size:,}[/cyan]"
+    )
+
+    # Confirm
+    if sys.stdin.isatty():
+        if not click.confirm(
+            f"This will CLEAR the existing chainstate and load {utxo_count:,} UTXOs. Continue?",
+            default=True,
+        ):
+            console.print("[yellow]Aborted.[/yellow]")
+            return
+
+    # Open DB and delegate to Rust
+    try:
+        db = sync.PyBlockchainDB(data_dir)
+    except Exception as e:
+        console.print(f"[red]Failed to open database: {e}[/red]")
+        sys.exit(1)
+
+    start_time = time.time()
+    try:
+        block_hash_hex, height, loaded = db.import_hdog_snapshot(
+            snapshot_path, batch_size
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Import interrupted[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Import failed: {e}[/red]")
+        sys.exit(1)
+
+    elapsed = time.time() - start_time
+    rate = loaded / max(elapsed, 0.001)
+    console.print(
+        f"\n[green]Import complete[/green]\n"
+        f"  UTXOs loaded: [cyan]{loaded:,}[/cyan]\n"
+        f"  Chain tip:    [cyan]{height:,}[/cyan] ({block_hash_hex[:16]}...)\n"
+        f"  Elapsed:      [cyan]{elapsed:.1f}s[/cyan]  ({rate:,.0f} utxo/s)"
+    )
+
+
 @cli.command("import-blocks")
 @click.argument("source", default="-", type=click.Path(exists=False))
 @click.pass_context
