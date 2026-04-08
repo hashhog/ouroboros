@@ -2768,6 +2768,26 @@ impl PyBlockchainDB {
         let block_hash = *block.block_hash().as_byte_array();
         let inner = block.inner();
 
+        // Verify merkle root matches transactions (consensus-critical)
+        {
+            use common::crypto::compute_merkle_root;
+            let txids: Vec<[u8; 32]> = inner.txdata
+                .iter()
+                .map(|tx| *tx.compute_txid().as_byte_array())
+                .collect();
+            let computed_root = compute_merkle_root(&txids);
+            let header_root = inner.header.merkle_root.as_byte_array();
+            if computed_root != *header_root {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!(
+                        "Invalid merkle root: header={} computed={}",
+                        hex::encode(header_root),
+                        hex::encode(computed_root),
+                    )
+                ));
+            }
+        }
+
         // Single WriteBatch for all DB mutations in this block
         let mut batch = self.db.create_batch();
 
