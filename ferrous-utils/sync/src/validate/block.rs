@@ -315,6 +315,9 @@ impl BlockValidator {
         let inner = block.inner();
         let block_hash = *block.block_hash().as_byte_array();
 
+        // Single WriteBatch for all DB mutations in this block
+        let mut batch = self.db.create_batch();
+
         // Phase 1: Write HEAD_BLOCKS marker
         // Record old tip so crash recovery knows where to roll back to.
         let (old_tip_hash, old_tip_height) = if height == 0 {
@@ -322,7 +325,8 @@ impl BlockValidator {
         } else {
             self.db.get_best_block().unwrap_or(([0u8; 32], 0))
         };
-        self.db.write_head_blocks(
+        self.db.write_head_blocks_batch(
+            &mut batch,
             &old_tip_hash,
             old_tip_height,
             &block_hash,
@@ -336,7 +340,7 @@ impl BlockValidator {
             if !tx.is_coinbase() {
                 for input in &tx.input {
                     let outpoint = OutPointWrapper::new(input.previous_output);
-                    self.db.spend_utxo(outpoint.inner(), &txid.as_byte_array())?;
+                    self.db.spend_utxo_batch(&mut batch, outpoint.inner(), &txid.as_byte_array())?;
                 }
             }
 
@@ -349,11 +353,12 @@ impl BlockValidator {
                     Some(height),
                     tx.is_coinbase(),
                 );
-                self.db.add_utxo(outpoint.inner(), &utxo)?;
+                self.db.add_utxo_batch(&mut batch, outpoint.inner(), &utxo)?;
             }
 
             // Store transaction index: txid → (block_hash, height, position)
-            self.db.store_tx_index(
+            self.db.store_tx_index_batch(
+                &mut batch,
                 txid.as_byte_array(),
                 &block_hash,
                 height,
@@ -362,7 +367,7 @@ impl BlockValidator {
         }
 
         // Store block body + metadata
-        self.db.store_block(block)?;
+        self.db.store_block_batch(&mut batch, block)?;
 
         let timestamp = inner.header.time;
         let bits = inner.header.bits.to_consensus();
@@ -377,11 +382,14 @@ impl BlockValidator {
         };
         let chainwork = compute_chainwork(&prev_chainwork, bits);
         let metadata = BlockMetadata::new(height, chainwork, timestamp);
-        self.db.store_block_metadata(height, &block_hash, &metadata)?;
+        self.db.store_block_metadata_batch(&mut batch, height, &block_hash, &metadata)?;
 
         // Phase 2: Update chain tip + delete marker
-        self.db.update_best_block(&block_hash, height)?;
-        self.db.delete_head_blocks()?;
+        self.db.update_best_block_batch(&mut batch, &block_hash, height)?;
+        self.db.delete_head_blocks_batch(&mut batch)?;
+
+        // Atomically apply all writes for this block
+        self.db.apply_batch(batch)?;
 
         Ok(())
     }
