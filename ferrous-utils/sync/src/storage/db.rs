@@ -1035,6 +1035,146 @@ impl BlockchainDB {
         Ok(())
     }
 
+    // ========== Batch-aware write methods for connect_block ==========
+
+    /// Add a UTXO to the chainstate via WriteBatch (no individual write).
+    pub fn add_utxo_batch(&self, batch: &mut WriteBatch, outpoint: &OutPoint, utxo: &UTXO) -> Result<()> {
+        let txid_bytes = *outpoint.txid.as_byte_array();
+        let key = encode_outpoint(&txid_bytes, outpoint.vout);
+        let value = utxo.bitcoin_serialize()?;
+        let cf = self.db.cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+        batch.put_cf(cf, key, value);
+        Ok(())
+    }
+
+    /// Spend a UTXO via WriteBatch: reads the UTXO from DB, queues delete + undo writes.
+    /// Returns the spent UTXO (or None if it didn't exist).
+    pub fn spend_utxo_batch(
+        &self,
+        batch: &mut WriteBatch,
+        outpoint: &OutPoint,
+        spending_txid: &[u8; 32],
+    ) -> Result<Option<UTXO>> {
+        let txid_bytes = *outpoint.txid.as_byte_array();
+        let key = encode_outpoint(&txid_bytes, outpoint.vout);
+
+        let chainstate_cf = self.db.cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+        let spent_cf = self.db.cf_handle(SPENT_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(SPENT_CF.to_string()))?;
+
+        let utxo = match self.db.get_cf(chainstate_cf, &key)? {
+            Some(data) => {
+                let (utxo, _) = UTXO::bitcoin_deserialize(&data)
+                    .map_err(|e| DbError::InvalidData(format!("Failed to deserialize UTXO: {}", e)))?;
+                Some((utxo, data))
+            }
+            None => None,
+        };
+
+        // Queue delete from chainstate
+        batch.delete_cf(chainstate_cf, &key);
+
+        // Queue undo record
+        if let Some((ref _u, ref utxo_bytes)) = utxo {
+            let mut undo_value = Vec::with_capacity(32 + utxo_bytes.len());
+            undo_value.extend_from_slice(spending_txid);
+            undo_value.extend_from_slice(utxo_bytes);
+            batch.put_cf(spent_cf, &key, &undo_value);
+        }
+
+        Ok(utxo.map(|(u, _)| u))
+    }
+
+    /// Store a transaction index entry via WriteBatch.
+    pub fn store_tx_index_batch(
+        &self,
+        batch: &mut WriteBatch,
+        txid: &[u8; 32],
+        block_hash: &[u8; 32],
+        height: u32,
+        tx_position: u32,
+    ) -> Result<()> {
+        let cf = self.db.cf_handle(TX_INDEX_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(TX_INDEX_CF.to_string()))?;
+        let mut value = Vec::with_capacity(40);
+        value.extend_from_slice(block_hash);
+        value.extend_from_slice(&height.to_le_bytes());
+        value.extend_from_slice(&tx_position.to_le_bytes());
+        batch.put_cf(cf, txid, &value);
+        Ok(())
+    }
+
+    /// Store a block via WriteBatch.
+    pub fn store_block_batch(&self, batch: &mut WriteBatch, block: &BlockWrapper) -> Result<()> {
+        let hash = block.block_hash();
+        let hash_bytes = encode_block_hash(&hash);
+        let block_data = block.bitcoin_serialize()?;
+        let cf = self.db.cf_handle(BLOCKS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
+        batch.put_cf(cf, hash_bytes, block_data);
+        Ok(())
+    }
+
+    /// Store block metadata via WriteBatch.
+    pub fn store_block_metadata_batch(
+        &self,
+        batch: &mut WriteBatch,
+        height: u32,
+        hash: &[u8; 32],
+        metadata: &BlockMetadata,
+    ) -> Result<()> {
+        let cf = self.db.cf_handle(BLOCK_INDEX_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_CF.to_string()))?;
+        let key = encode_height(height);
+        let metadata_bytes = metadata.to_bytes()
+            .map_err(|e| DbError::Serialization(SerializeError::Encode(format!("{}", e))))?;
+        let mut value = Vec::with_capacity(32 + metadata_bytes.len());
+        value.extend_from_slice(hash);
+        value.extend_from_slice(&metadata_bytes);
+        batch.put_cf(cf, key, value);
+        Ok(())
+    }
+
+    /// Update best block hash and height via WriteBatch.
+    pub fn update_best_block_batch(&self, batch: &mut WriteBatch, hash: &[u8; 32], height: u32) -> Result<()> {
+        let cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        batch.put_cf(cf, meta_keys::BEST_BLOCK_HASH, hash);
+        let height_bytes = encode_height(height);
+        batch.put_cf(cf, meta_keys::BEST_HEIGHT, height_bytes);
+        Ok(())
+    }
+
+    /// Write HEAD_BLOCKS marker via WriteBatch.
+    pub fn write_head_blocks_batch(
+        &self,
+        batch: &mut WriteBatch,
+        old_tip_hash: &[u8; 32],
+        old_tip_height: u32,
+        new_block_hash: &[u8; 32],
+        new_height: u32,
+    ) -> Result<()> {
+        let cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        let mut value = Vec::with_capacity(72);
+        value.extend_from_slice(old_tip_hash);
+        value.extend_from_slice(&old_tip_height.to_le_bytes());
+        value.extend_from_slice(new_block_hash);
+        value.extend_from_slice(&new_height.to_le_bytes());
+        batch.put_cf(cf, meta_keys::HEAD_BLOCKS, &value);
+        Ok(())
+    }
+
+    /// Delete HEAD_BLOCKS marker via WriteBatch.
+    pub fn delete_head_blocks_batch(&self, batch: &mut WriteBatch) -> Result<()> {
+        let cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        batch.delete_cf(cf, meta_keys::HEAD_BLOCKS);
+        Ok(())
+    }
+
     // ========== Block Invalidation Methods ==========
 
     /// Update the status flags of a block at a given height.

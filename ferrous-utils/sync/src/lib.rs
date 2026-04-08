@@ -2767,13 +2767,16 @@ impl PyBlockchainDB {
         let block_hash = *block.block_hash().as_byte_array();
         let inner = block.inner();
 
+        // Single WriteBatch for all DB mutations in this block
+        let mut batch = self.db.create_batch();
+
         // HEAD_BLOCKS marker (crash-safety)
         let (old_tip_hash, old_tip_height) = if height == 0 {
             ([0u8; 32], 0u32)
         } else {
             self.db.get_best_block().unwrap_or(([0u8; 32], 0))
         };
-        self.db.write_head_blocks(&old_tip_hash, old_tip_height, &block_hash, height)
+        self.db.write_head_blocks_batch(&mut batch, &old_tip_hash, old_tip_height, &block_hash, height)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
         // UTXO mutations + tx index
@@ -2783,7 +2786,7 @@ impl PyBlockchainDB {
             if !tx.is_coinbase() {
                 for input in &tx.input {
                     let outpoint = OutPointWrapper::new(input.previous_output);
-                    self.db.spend_utxo(outpoint.inner(), txid.as_byte_array())
+                    self.db.spend_utxo_batch(&mut batch, outpoint.inner(), txid.as_byte_array())
                         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
                 }
             }
@@ -2797,16 +2800,16 @@ impl PyBlockchainDB {
                     Some(height),
                     tx.is_coinbase(),
                 );
-                self.db.add_utxo(outpoint.inner(), &utxo)
+                self.db.add_utxo_batch(&mut batch, outpoint.inner(), &utxo)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
             }
 
-            self.db.store_tx_index(txid.as_byte_array(), &block_hash, height, tx_pos as u32)
+            self.db.store_tx_index_batch(&mut batch, txid.as_byte_array(), &block_hash, height, tx_pos as u32)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
         }
 
         // Store block body + metadata
-        self.db.store_block(&block)
+        self.db.store_block_batch(&mut batch, &block)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
         let timestamp = inner.header.time;
@@ -2821,13 +2824,17 @@ impl PyBlockchainDB {
         };
         let chainwork = crate::chainwork::compute_chainwork(&prev_chainwork, bits);
         let metadata = BlockMetadata::new(height, chainwork, timestamp);
-        self.db.store_block_metadata(height, &block_hash, &metadata)
+        self.db.store_block_metadata_batch(&mut batch, height, &block_hash, &metadata)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
         // Update chain tip + delete marker
-        self.db.update_best_block(&block_hash, height)
+        self.db.update_best_block_batch(&mut batch, &block_hash, height)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
-        self.db.delete_head_blocks()
+        self.db.delete_head_blocks_batch(&mut batch)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+        // Atomically apply all writes for this block
+        self.db.apply_batch(batch)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
         Ok(block_hash.to_vec())
