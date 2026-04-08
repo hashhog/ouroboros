@@ -70,13 +70,13 @@ impl BlockchainDB {
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
         opts.set_bloom_locality(10);
-        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB
+        opts.set_write_buffer_size(128 * 1024 * 1024); // 128MB (up from 64MB)
         opts.set_max_write_buffer_number(3);
         opts.set_min_write_buffer_number_to_merge(2);
-        opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB
-        opts.set_max_bytes_for_level_base(256 * 1024 * 1024); // 256MB
+        opts.set_target_file_size_base(128 * 1024 * 1024); // 128MB
+        opts.set_max_bytes_for_level_base(512 * 1024 * 1024); // 512MB
         opts.increase_parallelism(num_cpus::get() as i32);
-        opts.optimize_for_point_lookup(10); // 10MB block cache
+        opts.optimize_for_point_lookup(1024); // 1GB block cache (up from 10MB)
 
         // Create column family descriptors with optimized options
         let cf_opts = create_cf_options();
@@ -1530,8 +1530,8 @@ fn create_cf_options() -> Options {
     opts.set_bloom_locality(10);
     opts.set_memtable_prefix_bloom_ratio(0.1);
 
-    // Optimize for point lookups
-    opts.optimize_for_point_lookup(10);
+    // Optimize for point lookups (256MB block cache per CF)
+    opts.optimize_for_point_lookup(256);
 
     opts
 }
