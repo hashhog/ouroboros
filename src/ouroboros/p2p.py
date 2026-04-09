@@ -464,6 +464,7 @@ class PeerManager:
         self.cmpct_peers: Set[str] = set()
         self._mempool = None
         self._on_compact_block = None
+        self._database = None  # database for block lookups (getblocktxn)
 
         # BIP 330 Erlay reconciliation state
         self.erlay_enabled: bool = True  # whether we support Erlay
@@ -1742,6 +1743,10 @@ class PeerManager:
         """Provide the mempool for compact block reconstruction."""
         self._mempool = mempool
 
+    def set_database(self, database) -> None:
+        """Provide the database for block lookups (getblocktxn responses)."""
+        self._database = database
+
     def set_compact_block_handler(self, handler) -> None:
         """Register a callback for incoming compact blocks.
 
@@ -1798,6 +1803,38 @@ class PeerManager:
             if self._on_compact_block:
                 self._on_compact_block(bt.block_hash, bt.transactions, [])
 
+        async def on_getblocktxn(msg: NetworkMessage):
+            """Handle getblocktxn: respond with requested transactions."""
+            from ouroboros.compact_blocks import (
+                BlockTransactionsRequest, BlockTransactions)
+            try:
+                req = BlockTransactionsRequest.deserialize(msg.payload)
+                logger.debug(
+                    f"Received getblocktxn from {addr}: "
+                    f"{req.block_hash.hex()} ({len(req.indices)} indices)")
+                # Look up the full block in our database
+                if self._database is not None:
+                    block = self._database.get_block(req.block_hash)
+                    if block is not None:
+                        txs = block.transactions
+                        requested_txs = []
+                        for idx in req.indices:
+                            if 0 <= idx < len(txs):
+                                requested_txs.append(txs[idx])
+                        bt_resp = BlockTransactions(
+                            block_hash=req.block_hash,
+                            transactions=requested_txs)
+                        bt_msg = BlockTxnMessage(
+                            payload_bytes=bt_resp.serialize())
+                        await peer.send_message(
+                            bt_msg.to_network_message(self.network))
+                    else:
+                        logger.debug(
+                            f"getblocktxn: block not found "
+                            f"{req.block_hash.hex()}")
+            except Exception as e:
+                logger.warning(f"Error handling getblocktxn from {addr}: {e}")
+
         async def on_sendheaders(msg: NetworkMessage):
             peer.wants_headers = True
             logger.debug(f"Peer {addr} wants headers announcements")
@@ -1837,6 +1874,7 @@ class PeerManager:
         peer.register_handler("sendcmpct", on_sendcmpct)
         peer.register_handler("cmpctblock", on_cmpctblock)
         peer.register_handler("blocktxn", on_blocktxn)
+        peer.register_handler("getblocktxn", on_getblocktxn)
         peer.register_handler("sendheaders", on_sendheaders)
         peer.register_handler("feefilter", on_feefilter)
         peer.register_handler("wtxidrelay", on_wtxidrelay)

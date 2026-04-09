@@ -233,6 +233,9 @@ class BitcoinNode:
                 transport_version=p2p_transport,
                 listen=bool(listen_enabled),
             )
+            # BIP 152: Provide mempool and database for compact block relay
+            self.peer_manager.set_mempool(self.mempool)
+            self.peer_manager.set_database(self.db)
             try:
                 await self.peer_manager.start(best_height, p2p_port=p2p_port)
             except Exception as e:
