@@ -251,6 +251,7 @@ impl BlockStore {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        db_opts.set_max_open_files(512);
 
         let cf_descriptors = vec![
             ColumnFamilyDescriptor::new("default", Options::default()),

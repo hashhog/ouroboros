@@ -74,16 +74,29 @@ def _bits_to_target(bits: int) -> int:
     return mantissa << (8 * (exponent - 3))
 
 
-def _count_legacy_sigops(script: bytes) -> int:
-    """Count legacy signature operations in a script (pre-execution)."""
+def _count_legacy_sigops(script: bytes, accurate: bool = False) -> int:
+    """Count legacy signature operations in a script.
+
+    When *accurate* is False (default), OP_CHECKMULTISIG always counts as 20
+    sigops (matching Bitcoin Core ``GetSigOpCount(false)``).
+
+    When *accurate* is True, OP_CHECKMULTISIG counts the actual number of
+    public keys if preceded by an OP_1..OP_16 push (matching Bitcoin Core
+    ``GetSigOpCount(true)``).  This is used for P2SH redeem scripts.
+    """
     count = 0
     i = 0
+    last_opcode = 0xFF  # OP_INVALIDOPCODE
     while i < len(script):
         op = script[i]
-        if op in (0xAC, 0xAD):
+        if op in (0xAC, 0xAD):  # OP_CHECKSIG, OP_CHECKSIGVERIFY
             count += 1
-        elif op in (0xAE, 0xAF):
-            count += 20
+        elif op in (0xAE, 0xAF):  # OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY
+            if accurate and 0x51 <= last_opcode <= 0x60:
+                # OP_1 (0x51) .. OP_16 (0x60) — decode to 1..16
+                count += last_opcode - 0x50
+            else:
+                count += 20
         elif 1 <= op <= 0x4B:
             i += op
         elif op == 0x4C:
@@ -101,8 +114,8 @@ def _count_legacy_sigops(script: bytes) -> int:
                 i += 4 + int.from_bytes(script[i + 1 : i + 5], "little")
             else:
                 i += 4
+        last_opcode = op
         i += 1
-    # logger.debug(f'sigops: {count}')
     return count
 
 
@@ -245,7 +258,10 @@ def _get_p2sh_sigops(script_sig: bytes, prev_script_pubkey: bytes) -> int:
     redeem_script = _get_last_push(script_sig)
     if redeem_script is None:
         return 0
-    return _count_legacy_sigops(redeem_script)
+    # P2SH redeem scripts use accurate sigop counting (fAccurate=true in
+    # Bitcoin Core), where multisig counts actual keys instead of 20.
+    # Ref: Bitcoin Core script/script.cpp CScript::GetSigOpCount(const CScript&)
+    return _count_legacy_sigops(redeem_script, accurate=True)
 
 
 class BlockValidator:
@@ -1156,7 +1172,7 @@ class TransactionValidator:
             return False, f"Outputs exceed inputs: {total_output} > {total_input}"
 
         # 5. BIP 68 relative lock-time
-        if not self.check_sequence_locks(tx, height, block_mtp):
+        if not self.check_sequence_locks(tx, height, block_mtp, intra_block_utxos=intra_block_utxos):
             return False, "BIP 68 sequence lock not satisfied"
         
         return True, ""
@@ -1262,7 +1278,8 @@ class TransactionValidator:
 
     def check_sequence_locks(
         self, tx: Transaction, block_height: int, block_mtp: int,
-        network: str = "mainnet"
+        network: str = "mainnet",
+        intra_block_utxos: dict | None = None,
     ) -> bool:
         """
         BIP 68: verify relative lock-time constraints on every input.
@@ -1293,6 +1310,8 @@ class TransactionValidator:
         input_infos = []
         for inp in tx.inputs:
             utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
+            if utxo is None and intra_block_utxos:
+                utxo = intra_block_utxos.get((inp.prev_txid, inp.prev_vout))
             if utxo is None:
                 return False
 
@@ -1305,7 +1324,9 @@ class TransactionValidator:
 
             # Get the median time past of the block before the UTXO's confirmation
             # (coin time is MTP of block at height-1)
-            utxo_mtp = self.db.get_median_time_past(utxo_height)
+            # Ref: Bitcoin Core consensus/tx_verify.cpp:74
+            #   nCoinTime = block.GetAncestor(max(nCoinHeight-1, 0))->GetMedianTimePast()
+            utxo_mtp = self.db.get_median_time_past(max(utxo_height - 1, 0))
             if utxo_mtp is None:
                 utxo_mtp = 0  # Fallback
 
@@ -1346,7 +1367,7 @@ class TransactionValidator:
             if inp.sequence & self.SEQUENCE_TYPE:
                 # Time-based: units of 512 seconds
                 required = (inp.sequence & self.SEQUENCE_MASK) * 512
-                utxo_mtp = self.db.get_median_time_past(utxo_height)
+                utxo_mtp = self.db.get_median_time_past(max(utxo_height - 1, 0))
                 if utxo_mtp is None:
                     continue
                 if block_mtp - utxo_mtp < required:
