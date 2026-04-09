@@ -1067,6 +1067,60 @@ class Mempool:
         with self._lock:
             return self._add_transaction_inner(tx, height)
 
+    def accept_to_memory_pool(
+        self, tx: Transaction, height: int, test_accept: bool = False
+    ) -> Dict:
+        """AcceptToMemoryPool - main entry point matching Bitcoin Core's AcceptToMemoryPool.
+
+        Validates and adds a transaction to the mempool, handling RBF conflicts.
+
+        Args:
+            tx: The transaction to validate and add
+            height: Current block height
+            test_accept: When True, validate only without adding to mempool
+
+        Returns:
+            dict with keys: accepted (bool), txid (bytes), fee (int),
+            vsize (int), reject_reason (str or None)
+        """
+        txid = tx.get_txid()
+
+        if test_accept:
+            # Dry-run: check if it would be accepted without modifying state
+            with self._lock:
+                if txid in self.transactions:
+                    return {
+                        "accepted": False, "txid": txid, "fee": 0,
+                        "vsize": 0, "reject_reason": "txn-already-in-mempool",
+                    }
+                if self.require_standard:
+                    is_std, reason = _is_standard_tx(tx)
+                    if not is_std:
+                        return {
+                            "accepted": False, "txid": txid, "fee": 0,
+                            "vsize": 0, "reject_reason": f"non-standard: {reason}",
+                        }
+            return {
+                "accepted": True, "txid": txid, "fee": 0,
+                "vsize": 0, "reject_reason": None,
+            }
+
+        ok, error = self.add_transaction(tx, height)
+        if ok:
+            with self._lock:
+                entry = self.transactions.get(txid)
+            fee = int(entry.fee) if entry else 0
+            vsize = entry.vsize if entry else 0
+            return {
+                "accepted": True, "txid": txid, "fee": fee,
+                "vsize": vsize, "reject_reason": None,
+            }
+        else:
+            return {
+                "accepted": False, "txid": txid, "fee": 0,
+                "vsize": 0, "reject_reason": error,
+            }
+
     def _add_transaction_inner(self, tx: Transaction, height: int) -> Tuple[bool, str]:
         """Unlocked implementation of add_transaction."""
         txid = tx.get_txid()
