@@ -1,0 +1,14 @@
+services:
+  ouroboros:
+    build: .
+    container_name: ouroboros
+    restart: unless-stopped
+    ports:
+      - "48350:48350"
+      - "48340:48340"
+    volumes:
+      - ouroboros-data:/data
+    command: ["--data-dir=/data", "--network=testnet4", "start"]
+
+volumes:
+  ouroboros-data:
