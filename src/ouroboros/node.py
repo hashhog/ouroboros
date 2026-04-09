@@ -168,6 +168,9 @@ class BitcoinNode:
 
             # Initialize fee estimator
             self.fee_estimator = FeeEstimator()
+            fee_est_path = os.path.join(self.data_dir, "fee_estimates.json")
+            if self.fee_estimator.load_from_file(fee_est_path):
+                logger.info("Loaded fee estimation data from %s", fee_est_path)
 
             # Initialize wallet manager (multi-wallet support)
             self.wallet_manager = WalletManager(self.data_dir, self.network)
@@ -380,6 +383,15 @@ class BitcoinNode:
             if self.zmq_notifier:
                 logger.info("Stopping ZMQ notifier...")
                 await self.zmq_notifier.stop()
+
+            # Persist fee estimator state
+            if self.fee_estimator:
+                fee_est_path = os.path.join(self.data_dir, "fee_estimates.json")
+                try:
+                    self.fee_estimator.save_to_file(fee_est_path)
+                    logger.info("Saved fee estimation data to %s", fee_est_path)
+                except Exception as e:
+                    logger.warning("Failed to save fee estimates: %s", e)
 
             # Persist mempool to disk
             if self.mempool:

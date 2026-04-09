@@ -32,8 +32,10 @@ and ``CBlockPolicyEstimator::estimateSmartFee``.
 """
 
 import bisect
+import json
 import logging
 import math
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -328,3 +330,89 @@ class FeeEstimator:
 
         idx = min(int(len(all_rates) * percentile), len(all_rates) - 1)
         return max(all_rates[idx], 1.0)
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save_to_file(self, path: str) -> None:
+        """Persist the bucket estimator state to a JSON file."""
+        state = {
+            "version": 1,
+            "total_observations": self._total_observations,
+            "confirmed": self.confirmed,
+            "total": self.total,
+            "block_history": [
+                {
+                    "height": b.height,
+                    "fee_rates": b.fee_rates,
+                    "median_fee_rate": b.median_fee_rate,
+                    "min_fee_rate": b.min_fee_rate,
+                }
+                for b in self.block_history
+            ],
+        }
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)
+            logger.debug("Fee estimator: saved state to %s", path)
+        except OSError as e:
+            logger.warning("Fee estimator: failed to save state: %s", e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def load_from_file(self, path: str) -> bool:
+        """Load bucket estimator state from a JSON file.
+
+        Returns True if state was loaded successfully.
+        """
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("Fee estimator: failed to load state: %s", e)
+            return False
+
+        if state.get("version") != 1:
+            return False
+
+        try:
+            self._total_observations = state["total_observations"]
+
+            # Restore bucket arrays (validate dimensions)
+            confirmed = state["confirmed"]
+            total = state["total"]
+            if (len(confirmed) == NUM_BUCKETS
+                    and len(total) == NUM_BUCKETS
+                    and all(len(row) == MAX_CONF_TARGET + 1 for row in confirmed)
+                    and all(len(row) == MAX_CONF_TARGET + 1 for row in total)):
+                self.confirmed = confirmed
+                self.total = total
+            else:
+                logger.warning("Fee estimator: dimension mismatch, ignoring")
+                return False
+
+            # Restore block history
+            self.block_history.clear()
+            for entry in state.get("block_history", []):
+                self.block_history.append(BlockFeeData(
+                    height=entry["height"],
+                    fee_rates=entry["fee_rates"],
+                    median_fee_rate=entry["median_fee_rate"],
+                    min_fee_rate=entry["min_fee_rate"],
+                ))
+
+            logger.info(
+                "Fee estimator: loaded state (%d observations, %d blocks)",
+                self._total_observations, len(self.block_history),
+            )
+            return True
+        except (KeyError, TypeError) as e:
+            logger.warning("Fee estimator: corrupt state file: %s", e)
+            return False
