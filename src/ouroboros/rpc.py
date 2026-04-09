@@ -675,6 +675,7 @@ class RPCServer:
         if not db:
             raise HTTPException(status_code=500, detail="Database not initialized")
 
+        # Read cached tip (no FFI)
         best_hash, best_height = db.get_best_block()
 
         network = getattr(self.node, 'network', 'mainnet')
@@ -687,8 +688,9 @@ class RPCServer:
         # Get softfork info from BIP9 versionbits
         softforks = self._get_softforks_info(best_height, network)
 
-        # Get tip block for bits, target, and time
-        tip_block = db.get_block(best_hash) if isinstance(best_hash, bytes) else None
+        # Get tip block for bits, target, and time — runs in thread to
+        # avoid blocking the async event loop on Rust FFI locks during IBD.
+        tip_block = await asyncio.to_thread(db.get_block, best_hash) if isinstance(best_hash, bytes) else None
         bits = tip_block.bits if tip_block else 0x1d00ffff
         block_time = tip_block.timestamp if tip_block else 0
 
@@ -748,6 +750,11 @@ class RPCServer:
                         (block_time - genesis_time) / (current_time - genesis_time)
                     ))
 
+        # Gather remaining values that may touch FFI in a thread
+        difficulty = await asyncio.to_thread(self.node.get_current_difficulty)
+        mediantime = await asyncio.to_thread(self.node.get_median_time)
+        chainwork = await asyncio.to_thread(self.node.get_chainwork)
+
         info: Dict[str, Any] = {
             "chain": network,
             "blocks": best_height,
@@ -755,12 +762,12 @@ class RPCServer:
             "bestblockhash": best_hash[::-1].hex() if isinstance(best_hash, bytes) else best_hash,
             "bits": f"{bits:08x}",
             "target": target_hex,
-            "difficulty": self.node.get_current_difficulty(),
+            "difficulty": difficulty,
             "time": block_time,
-            "mediantime": self.node.get_median_time(),
+            "mediantime": mediantime,
             "verificationprogress": verification_progress,
             "initialblockdownload": is_ibd,
-            "chainwork": self.node.get_chainwork(),
+            "chainwork": chainwork,
             "size_on_disk": size_on_disk,
             "pruned": pruned,
             "softforks": softforks,
@@ -799,8 +806,8 @@ class RPCServer:
         """Return block hash at height"""
         if not hasattr(self.node, 'db'):
             raise HTTPException(status_code=500, detail="Database not available")
-        
-        block = self.node.db.get_block_by_height(height)
+
+        block = await asyncio.to_thread(self.node.db.get_block_by_height, height)
         if not block:
             raise HTTPException(status_code=404, detail="Block not found")
         
@@ -838,7 +845,7 @@ class RPCServer:
         if not hasattr(self.node, 'db'):
             raise HTTPException(status_code=500, detail="Database not available")
 
-        block = self.node.db.get_block(block_hash)
+        block = await asyncio.to_thread(self.node.db.get_block, block_hash)
         if not block:
             raise HTTPException(status_code=404, detail="Block not found")
 
@@ -856,7 +863,7 @@ class RPCServer:
         confirmations = -1
         best_hash, best_height = self.node.db.get_best_block()
         if block_height is not None:
-            active_hash = self.node.db.get_block_hash_by_height(block_height)
+            active_hash = await asyncio.to_thread(self.node.db.get_block_hash_by_height, block_height)
             if active_hash == block_hash:
                 confirmations = max(0, best_height - block_height + 1)
 
@@ -936,7 +943,7 @@ class RPCServer:
 
         # Next block hash (not present for tip)
         if block_height is not None:
-            next_hash = self._get_next_block_hash(block_height)
+            next_hash = await self._get_next_block_hash(block_height)
             if next_hash:
                 result["nextblockhash"] = next_hash
 
@@ -958,7 +965,7 @@ class RPCServer:
                         fee = 0
                         input_total = 0
                         for tx_in in tx.inputs:
-                            utxo = self.node.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                            utxo = await asyncio.to_thread(self.node.db.get_utxo, tx_in.prev_txid, tx_in.prev_vout)
                             if utxo:
                                 input_total += utxo['value']
                         output_total = sum(o.value for o in tx.outputs)
@@ -973,7 +980,7 @@ class RPCServer:
 
                             if not tx.is_coinbase:
                                 # Add prevout info
-                                utxo = self.node.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                                utxo = await asyncio.to_thread(self.node.db.get_utxo, tx_in.prev_txid, tx_in.prev_vout)
                                 if utxo:
                                     vin_dict["prevout"] = {
                                         "generated": False,  # TODO: check if coinbase output
@@ -1074,7 +1081,7 @@ class RPCServer:
         if not in_mempool:
             if explicit_blockhash:
                 # Caller supplied the containing block hash
-                block = self.node.db.get_block(block_hash_bytes)
+                block = await asyncio.to_thread(self.node.db.get_block, block_hash_bytes)
                 if block is None:
                     raise HTTPException(
                         status_code=404,
@@ -1085,7 +1092,7 @@ class RPCServer:
                 # Check if block is in active chain
                 if block_height is not None:
                     try:
-                        active_hash = self.node.db.get_block_hash_by_height(block_height)
+                        active_hash = await asyncio.to_thread(self.node.db.get_block_hash_by_height, block_height)
                         if active_hash is not None:
                             in_active_chain = (active_hash == block_hash_bytes)
                         else:
@@ -1096,12 +1103,12 @@ class RPCServer:
                 # Use the transaction index for O(1) lookup
                 if has_txindex:
                     try:
-                        loc = self.node.db.get_tx_index(tx_hash)
+                        loc = await asyncio.to_thread(self.node.db.get_tx_index, tx_hash)
                     except Exception:
                         loc = None
                     if loc is not None:
                         block_hash_bytes, block_height, _tx_pos = loc
-                        block = self.node.db.get_block(block_hash_bytes)
+                        block = await asyncio.to_thread(self.node.db.get_block, block_hash_bytes)
 
             # Search for the transaction in the block
             if block is not None:
@@ -1343,7 +1350,7 @@ class RPCServer:
         # 3. Check if already confirmed — return txid if so
         if hasattr(self.node, 'db') and self.node.db:
             try:
-                loc = self.node.db.get_tx_index(txid)
+                loc = await asyncio.to_thread(self.node.db.get_tx_index, txid)
                 if loc is not None:
                     # Transaction is already confirmed on-chain
                     return txid_hex
@@ -1366,7 +1373,7 @@ class RPCServer:
             if parent_entry and tx_in.prev_vout < len(parent_entry.tx.outputs):
                 total_input += parent_entry.tx.outputs[tx_in.prev_vout].value
             else:
-                utxo = self.node.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                utxo = await asyncio.to_thread(self.node.db.get_utxo, tx_in.prev_txid, tx_in.prev_vout)
                 if utxo:
                     total_input += utxo['value']
                 else:
@@ -1687,7 +1694,7 @@ class RPCServer:
             if not hasattr(self.node, 'db') or not self.node.db:
                 raise HTTPException(status_code=500, detail="Database not available")
 
-            block = self.node.db.get_block(block_hash)
+            block = await asyncio.to_thread(self.node.db.get_block, block_hash)
 
             if not block:
                 raise HTTPException(status_code=404, detail="Block not found")
@@ -1713,7 +1720,7 @@ class RPCServer:
             best_hash, best_height = self.node.db.get_best_block()
             if block_height is not None:
                 # Check if this block is on the active chain
-                active_hash = self.node.db.get_block_hash_by_height(block_height)
+                active_hash = await asyncio.to_thread(self.node.db.get_block_hash_by_height, block_height)
                 if active_hash == block_hash:
                     confirmations = max(0, best_height - block_height + 1)
                 # else confirmations stays -1
@@ -1754,7 +1761,7 @@ class RPCServer:
 
             # Next block hash (not present for tip)
             if block_height is not None:
-                next_hash = self._get_next_block_hash(block_height)
+                next_hash = await self._get_next_block_hash(block_height)
                 if next_hash:
                     result["nextblockhash"] = next_hash
 
@@ -1795,12 +1802,12 @@ class RPCServer:
         if not hasattr(self.node, "db") or not self.node.db:
             raise HTTPException(status_code=500, detail="Database not available")
 
-        block = self.node.db.get_block(block_hash)
+        block = await asyncio.to_thread(self.node.db.get_block, block_hash)
         if not block:
             raise HTTPException(status_code=404, detail="Block not found")
 
         # Build the basic filter (includes prevout lookups when db is available)
-        filter_bytes = build_basic_filter(block, self.node.db)
+        filter_bytes = await asyncio.to_thread(build_basic_filter, block, self.node.db)
 
         # Compute filter header.  For a full index the previous filter header
         # would come from the stored chain; here we use a zero prev-header as
@@ -1883,7 +1890,7 @@ class RPCServer:
             if not hasattr(self.node, 'db') or not self.node.db:
                 return None
             
-            utxo = self.node.db.get_utxo(txid_bytes, n)
+            utxo = await asyncio.to_thread(self.node.db.get_utxo, txid_bytes, n)
             if not utxo:
                 return None
             
@@ -2515,13 +2522,13 @@ class RPCServer:
         block = None
         if blockhash:
             try:
-                block = db.get_block(bytes.fromhex(blockhash))
+                block = await asyncio.to_thread(db.get_block, bytes.fromhex(blockhash))
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid blockhash")
         else:
             _, best_height = db.get_best_block()
             for h in range(best_height, max(best_height - 100, -1), -1):
-                b = db.get_block_by_height(h)
+                b = await asyncio.to_thread(db.get_block_by_height, h)
                 if b is None:
                     continue
                 block_txids = {tx.get_txid() for tx in b.transactions}
@@ -2565,7 +2572,7 @@ class RPCServer:
         if db is None:
             raise HTTPException(status_code=500, detail="Database not available")
 
-        block = db.get_block(block_hash)
+        block = await asyncio.to_thread(db.get_block, block_hash)
         if block is None:
             raise HTTPException(status_code=400, detail="Block not in chain")
 
@@ -2626,7 +2633,7 @@ class RPCServer:
         mempool = getattr(self.node, "mempool", None)
 
         best_hash, best_height = db.get_best_block()
-        best_block = db.get_block(best_hash)
+        best_block = await asyncio.to_thread(db.get_block, best_hash)
         if best_block is None:
             raise HTTPException(status_code=500, detail="Cannot read tip block")
 
@@ -2792,7 +2799,7 @@ class RPCServer:
 
                     # P2SH sigops × WITNESS_SCALE_FACTOR and witness sigops × 1
                     for inp in e.tx.inputs:
-                        prev_utxo = db.get_utxo(inp.prev_txid, inp.prev_vout)
+                        prev_utxo = await asyncio.to_thread(db.get_utxo, inp.prev_txid, inp.prev_vout)
                         if prev_utxo is None:
                             # Check if parent is an in-mempool tx
                             parent_entry = snap_txs.get(inp.prev_txid)
@@ -2937,7 +2944,8 @@ class RPCServer:
 
             # Use Rust connect_block_from_bytes for full persistence
             # (deserialisation + UTXO updates + block storage all in Rust)
-            db._db.connect_block_from_bytes(block_bytes, next_height)
+            # Run in thread to avoid blocking the event loop during IBD.
+            await asyncio.to_thread(db.connect_block_from_bytes, block_bytes, next_height)
 
             # Remove confirmed transactions from mempool (lazy — only
             # deserialise block if the mempool is non-empty)
@@ -2966,23 +2974,25 @@ class RPCServer:
         if db is None:
             return ["Database not available"] * len(hexblocks)
 
-        results = []
-        for hexdata in hexblocks:
-            try:
-                block_bytes = bytes.fromhex(hexdata)
-            except (ValueError, TypeError):
-                results.append("Invalid hex")
-                continue
+        def _connect_batch():
+            results = []
+            for hexdata in hexblocks:
+                try:
+                    block_bytes = bytes.fromhex(hexdata)
+                except (ValueError, TypeError):
+                    results.append("Invalid hex")
+                    continue
 
-            try:
-                _, best_height = db.get_best_block()
-                next_height = best_height + 1
-                db._db.connect_block_from_bytes(block_bytes, next_height)
-                results.append(None)
-            except Exception as e:
-                results.append(str(e))
+                try:
+                    _, best_height = db.get_best_block()
+                    next_height = best_height + 1
+                    db.connect_block_from_bytes(block_bytes, next_height)
+                    results.append(None)
+                except Exception as e:
+                    results.append(str(e))
+            return results
 
-        return results
+        return await asyncio.to_thread(_connect_batch)
 
     async def rpc_pruneblockchain(self, height: int) -> int:
         """
@@ -3447,7 +3457,7 @@ class RPCServer:
             return 0.0
         try:
             _, best_height = self.node.db.get_best_block()
-            block = self.node.db.get_block_by_height(best_height)
+            block = await asyncio.to_thread(self.node.db.get_block_by_height, best_height)
             if block:
                 bits = block.bits if hasattr(block, 'bits') else 0x1d00ffff
                 # difficulty = max_target / current_target
@@ -3532,7 +3542,7 @@ class RPCServer:
         # If the database has a block index, iterate it
         if hasattr(db, 'get_all_block_hashes'):
             for block_hash in db.get_all_block_hashes():
-                block = db.get_block(block_hash)
+                block = await asyncio.to_thread(db.get_block, block_hash)
                 if block:
                     all_blocks[block_hash] = block
                     if block.prev_blockhash and block.prev_blockhash != bytes(32):
@@ -3541,7 +3551,7 @@ class RPCServer:
         elif hasattr(db, 'block_index'):
             # Direct access to block index
             for block_hash, block_info in db.block_index.items():
-                block = db.get_block(block_hash)
+                block = await asyncio.to_thread(db.get_block, block_hash)
                 if block:
                     all_blocks[block_hash] = block
                     if block.prev_blockhash and block.prev_blockhash != bytes(32):
@@ -3605,7 +3615,7 @@ class RPCServer:
 
                     if prev_height is not None:
                         # Check if this hash is in active chain at this height
-                        active_hash = db.get_block_hash_by_height(prev_height)
+                        active_hash = await asyncio.to_thread(db.get_block_hash_by_height, prev_height)
                         if active_hash == prev_hash:
                             fork_height = prev_height
                             break
@@ -3614,7 +3624,7 @@ class RPCServer:
                     if prev_hash in all_blocks:
                         current = all_blocks[prev_hash]
                     else:
-                        current = db.get_block(prev_hash)
+                        current = await asyncio.to_thread(db.get_block, prev_hash)
                         if current:
                             all_blocks[prev_hash] = current
 
@@ -3637,10 +3647,10 @@ class RPCServer:
         if not hasattr(self.node, 'db') or not self.node.db:
             return {}
         _, best_height = self.node.db.get_best_block()
+        best_block_hash = await asyncio.to_thread(self.node.db.get_block_hash_by_height, best_height)
         return {
             "height": best_height,
-            "bestblock": self.node.db.get_block_hash_by_height(best_height).hex()
-                if self.node.db.get_block_hash_by_height(best_height) else "",
+            "bestblock": best_block_hash.hex() if best_block_hash else "",
             "txouts": 0,  # would need UTXO count
             "disk_size": 0,
         }
@@ -3678,7 +3688,7 @@ class RPCServer:
 
         for h in range(best_height, start_height - 1, -1):
             try:
-                block = self.node.db.get_block_by_height(h)
+                block = await asyncio.to_thread(self.node.db.get_block_by_height, h)
                 if block is None:
                     logger.warning(f"verifychain: block at height {h} not found")
                     return False
@@ -4631,8 +4641,8 @@ class RPCServer:
         if nblocks == 0:
             return 0.0
 
-        tip_block = self.node.db.get_block_by_height(height)
-        start_block = self.node.db.get_block_by_height(height - nblocks)
+        tip_block = await asyncio.to_thread(self.node.db.get_block_by_height, height)
+        start_block = await asyncio.to_thread(self.node.db.get_block_by_height, height - nblocks)
 
         if tip_block is None or start_block is None:
             return 0.0
@@ -4822,7 +4832,7 @@ class RPCServer:
 
             # --- Store via Rust DB ---
             try:
-                stored_hash = db._db.connect_block_from_bytes(block_bytes, next_height)
+                stored_hash = db.connect_block_from_bytes(block_bytes, next_height)
                 # Rust returns hash in display byte order (same as as_byte_array())
                 block_hash_hex = bytes(stored_hash).hex()
             except AttributeError:
@@ -5154,7 +5164,7 @@ class RPCServer:
         # ------------------------------------------------------------------
         block: Optional[Block] = None
         if isinstance(hash_or_height, int):
-            block = db.get_block_by_height(hash_or_height)
+            block = await asyncio.to_thread(db.get_block_by_height, hash_or_height)
             if not block:
                 raise HTTPException(
                     status_code=404,
@@ -5167,7 +5177,7 @@ class RPCServer:
                 raise HTTPException(
                     status_code=400, detail="Invalid block hash"
                 )
-            block = db.get_block(block_hash)
+            block = await asyncio.to_thread(db.get_block, block_hash)
             if not block:
                 raise HTTPException(
                     status_code=404, detail="Block not found"
@@ -5255,7 +5265,7 @@ class RPCServer:
             # Fee = sum(input values) - sum(output values)
             input_total = 0
             for tx_in in tx.inputs:
-                utxo = db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                utxo = await asyncio.to_thread(db.get_utxo, tx_in.prev_txid, tx_in.prev_vout)
                 if utxo:
                     input_total += utxo["value"]
 
@@ -5531,12 +5541,12 @@ class RPCServer:
         
         return 0
     
-    def _get_next_block_hash(self, height: int) -> Optional[str]:
+    async def _get_next_block_hash(self, height: int) -> Optional[str]:
         if not hasattr(self.node, "db") or not self.node.db:
             return None
 
         try:
-            next_hash = self.node.db.get_block_hash_by_height(height + 1)
+            next_hash = await asyncio.to_thread(self.node.db.get_block_hash_by_height, height + 1)
             if next_hash is None:
                 return None  # At tip, no next block
             if isinstance(next_hash, bytes):
@@ -5649,7 +5659,8 @@ class RPCServer:
                     continue  # Already has UTXO info
 
                 try:
-                    utxo = self.node.db.get_utxo(
+                    utxo = await asyncio.to_thread(
+                        self.node.db.get_utxo,
                         tx_in.prev_txid, tx_in.prev_vout
                     )
                     if utxo:
@@ -5890,7 +5901,8 @@ class RPCServer:
                 tx_in = tx.inputs[idx]
                 if hasattr(self.node, 'db') and self.node.db:
                     try:
-                        utxo = self.node.db.get_utxo(
+                        utxo = await asyncio.to_thread(
+                            self.node.db.get_utxo,
                             tx_in.prev_txid, tx_in.prev_vout
                         )
                         if utxo:
@@ -6743,7 +6755,7 @@ class RPCServer:
                     script_pubkey = bytes.fromhex(spk_hex)
                 value = int(prev.get("amount", 0) * 100_000_000)
             elif wallet.db:
-                utxo = wallet.db.get_utxo(tx_in.prev_txid, prev_vout)
+                utxo = await asyncio.to_thread(wallet.db.get_utxo, tx_in.prev_txid, prev_vout)
                 if utxo:
                     script_pubkey = utxo.get('script_pubkey')
                     value = utxo.get('value')
