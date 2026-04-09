@@ -28,9 +28,10 @@ SCORE_INVALID_HEADERS = 20       # Invalid headers (e.g., bad PoW, doesn't conne
 SCORE_INVALID_TX = 10            # Invalid transaction
 
 # Other violations
-SCORE_UNREQUESTED_DATA = 20      # Unrequested block/tx data
+SCORE_UNREQUESTED_DATA = 5       # Unrequested block/tx data
 SCORE_ORPHAN_TX = 1              # Orphan transaction (low score, not misbehavior)
-SCORE_HEADERS_NOT_CONNECT = 10   # Headers don't connect to our chain
+SCORE_HEADERS_NOT_CONNECT = 20   # Headers don't connect to our chain
+SCORE_BLOCK_DOWNLOAD_STALL = 50  # Stalling block download
 SCORE_INVALID_MESSAGE = 10       # Malformed P2P message
 SCORE_ADDR_SPAM = 5              # Excessive addr relay
 

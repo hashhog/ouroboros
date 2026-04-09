@@ -256,6 +256,12 @@ class BlockSync:
                 if self._header_sync_peer and (now - self._header_sync_time > self._header_sync_stall_timeout):
                     # Sync peer stalled — switch to a different one
                     logger.info(f"Header sync peer {self._header_sync_peer.host} stalled, switching")
+                    # Score misbehavior for stalling block downloads (+50)
+                    if self.peer_manager:
+                        from ouroboros.banman import SCORE_BLOCK_DOWNLOAD_STALL
+                        self.peer_manager.misbehaving(
+                            self._header_sync_peer.host, SCORE_BLOCK_DOWNLOAD_STALL,
+                            "block download stalling")
                     self._header_sync_peer = None
 
                 if not self._header_sync_peer:
