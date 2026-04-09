@@ -32,6 +32,11 @@ PEERS_CONNECTED: Optional["Gauge"] = None
 MEMPOOL_SIZE: Optional["Gauge"] = None
 MEMPOOL_TX_COUNT: Optional["Gauge"] = None
 
+# Standard bitcoin_* metrics
+BITCOIN_BLOCKS_TOTAL: Optional["Gauge"] = None
+BITCOIN_PEERS_CONNECTED: Optional["Gauge"] = None
+BITCOIN_MEMPOOL_SIZE: Optional["Gauge"] = None
+
 # UTXO cache metrics
 UTXO_CACHE_SIZE: Optional["Gauge"] = None
 UTXO_CACHE_MEMORY: Optional["Gauge"] = None
@@ -64,6 +69,7 @@ def init_metrics(port: int = 9332) -> bool:
     """
     global BLOCK_HEIGHT, CHAIN_DIFFICULTY, PEERS_CONNECTED
     global MEMPOOL_SIZE, MEMPOOL_TX_COUNT
+    global BITCOIN_BLOCKS_TOTAL, BITCOIN_PEERS_CONNECTED, BITCOIN_MEMPOOL_SIZE
     global UTXO_CACHE_SIZE, UTXO_CACHE_MEMORY, UTXO_CACHE_DIRTY
     global UTXO_CACHE_HIT_RATE, UTXO_CACHE_FLUSHES
     global BLOCKS_RECEIVED, TX_RECEIVED, PEER_DISCONNECTS
@@ -84,6 +90,11 @@ def init_metrics(port: int = 9332) -> bool:
 
     MEMPOOL_SIZE = Gauge("ouroboros_mempool_size", "Mempool size in bytes")
     MEMPOOL_TX_COUNT = Gauge("ouroboros_mempool_tx_count", "Mempool transaction count")
+
+    # Standard bitcoin_* metrics for cross-node monitoring
+    BITCOIN_BLOCKS_TOTAL = Gauge("bitcoin_blocks_total", "Current block height")
+    BITCOIN_PEERS_CONNECTED = Gauge("bitcoin_peers_connected", "Number of connected peers")
+    BITCOIN_MEMPOOL_SIZE = Gauge("bitcoin_mempool_size", "Mempool transaction count")
 
     # UTXO cache metrics
     UTXO_CACHE_SIZE = Gauge("ouroboros_utxo_cache_size", "UTXO cache entry count")
@@ -140,6 +151,10 @@ def update_chain_metrics(height: int, difficulty: float, peers: int) -> None:
         CHAIN_DIFFICULTY.set(difficulty)
     if PEERS_CONNECTED is not None:
         PEERS_CONNECTED.set(peers)
+    if BITCOIN_BLOCKS_TOTAL is not None:
+        BITCOIN_BLOCKS_TOTAL.set(height)
+    if BITCOIN_PEERS_CONNECTED is not None:
+        BITCOIN_PEERS_CONNECTED.set(peers)
 
 
 def update_mempool_metrics(size_bytes: int, tx_count: int) -> None:
@@ -147,6 +162,8 @@ def update_mempool_metrics(size_bytes: int, tx_count: int) -> None:
         MEMPOOL_SIZE.set(size_bytes)
     if MEMPOOL_TX_COUNT is not None:
         MEMPOOL_TX_COUNT.set(tx_count)
+    if BITCOIN_MEMPOOL_SIZE is not None:
+        BITCOIN_MEMPOOL_SIZE.set(tx_count)
 
 
 def record_rpc_request(method: str, duration: float) -> None:

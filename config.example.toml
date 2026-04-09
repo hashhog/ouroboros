@@ -1,0 +1,43 @@
+# Ouroboros - Bitcoin Full Node (Python/Rust)
+# Example configuration file
+# Copy to your data directory and modify as needed.
+# See also share/ouroboros.conf.example for key=value format.
+
+[network]
+# Network: mainnet, testnet, testnet4, regtest, signet
+network = "mainnet"
+
+[storage]
+# Data directory
+datadir = "~/.ouroboros"
+
+[rpc]
+# RPC port (default: 8332 mainnet, 18332 testnet, 48332 testnet4, 18443 regtest)
+rpc_port = 8332
+# RPC authentication
+# rpc_user = ""
+# rpc_password = ""
+# Allowed RPC client IPs
+rpc_allow_ip = "127.0.0.1"
+
+[p2p]
+# P2P port
+p2p_port = 8333
+# Accept inbound P2P connections
+listen = true
+# Maximum peer connections
+maxconnections = 125
+
+[mempool]
+# (Uses Bitcoin Core defaults internally)
+
+[logging]
+# Enable debug logging (false/true)
+debug = false
+# Add timestamps to log messages
+logtimestamps = true
+
+[metrics]
+# Prometheus metrics endpoint (requires prometheus_client package)
+# enabled = true
+# port = 9332
