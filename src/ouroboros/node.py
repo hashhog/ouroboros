@@ -618,7 +618,7 @@ class BitcoinNode:
             return
 
         # --- Try full connect_block_from_bytes first (stores block + UTXO) ---
-        if hasattr(self.db._db, 'connect_block_from_bytes'):
+        if hasattr(self.db, 'connect_block_from_bytes'):
             prev_block = b'\x00' * 32
 
             if self.network == 'testnet4':
@@ -681,14 +681,14 @@ class BitcoinNode:
             header += struct.pack('<III', ts, bits, nonce)
             block_bytes = header + b'\x01' + coinbase_tx
             try:
-                self.db._db.connect_block_from_bytes(block_bytes, 0)
+                self.db.connect_block_from_bytes(block_bytes, 0)
                 logger.info("Genesis block stored (full connect)")
                 return
             except Exception as e:
                 logger.warning(f"connect_block_from_bytes failed: {e}, falling back")
 
         # --- Fallback: just set the chain-tip pointer ---
-        self.db._db.update_best_block(genesis_hash, 0)
+        self.db.update_best_block(genesis_hash, 0)
         logger.info("Genesis block tip set (lightweight init)")
 
     def _check_synced(self) -> bool:

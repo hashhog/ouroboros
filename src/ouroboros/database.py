@@ -307,6 +307,14 @@ class BlockchainDatabase:
     def __init__(self, data_dir: str):
         self._db = sync.PyBlockchainDB(data_dir)
         self._data_dir = data_dir
+        # Cached chain tip — updated after every block connect/disconnect.
+        # RPC reads this instead of calling into Rust FFI, avoiding lock
+        # contention during IBD.
+        self._cached_tip: Optional[Tuple[bytes, int]] = None
+        try:
+            self._cached_tip = self.get_best_block()
+        except Exception:
+            pass
     
     def get_block(self, block_hash: bytes) -> Optional[Block]:
         """Look up a block by its 32-byte hash; returns None if not found."""
@@ -371,7 +379,10 @@ class BlockchainDatabase:
         Raises:
             RuntimeError: If the block is not found or the Rust API fails.
         """
-        return bytes(self._db.disconnect_block(height))
+        result = bytes(self._db.disconnect_block(height))
+        # Invalidate cache — next get_best_block() will re-fetch from Rust
+        self._cached_tip = None
+        return result
 
     def recover_from_crash(self) -> bool:
         """
@@ -403,14 +414,18 @@ class BlockchainDatabase:
 
     def get_best_block(self) -> Tuple[bytes, int]:
         """Return the current chain tip as ``(block_hash, height)``."""
+        if self._cached_tip is not None:
+            return self._cached_tip
         hash_bytes, height = self._db.get_best_block()
-        return (bytes(hash_bytes), height)
+        self._cached_tip = (bytes(hash_bytes), height)
+        return self._cached_tip
 
     def update_best_block(self, block_hash: bytes, height: int) -> None:
         """Update the chain tip pointer (used during reorg)."""
         if len(block_hash) != 32:
             raise ValueError("Block hash must be 32 bytes")
         self._db.update_best_block(block_hash, height)
+        self._cached_tip = (bytes(block_hash), height)
     
     def get_median_time_past(self, height: int) -> Optional[int]:
         """Median timestamp of the 11 blocks up to *height* (BIP 68 / BIP 113 MTP).
@@ -529,6 +544,27 @@ class BlockchainDatabase:
 
         return self._chainwork_cache.get(block_hash, 0)
     
+    def connect_block_from_bytes(self, block_bytes: bytes, height: int) -> bytes:
+        """Connect a block via Rust FFI and update the cached chain tip.
+
+        Wraps ``_db.connect_block_from_bytes`` so that every call site that
+        connects a block through this method automatically keeps the
+        in-memory tip cache consistent.
+
+        Returns the block hash (bytes) as returned by the Rust layer.
+        """
+        result = self._db.connect_block_from_bytes(block_bytes, height)
+        # Invalidate cache so next get_best_block() re-reads from Rust.
+        # We don't know the hash here without parsing, so just invalidate.
+        self._cached_tip = None
+        return result
+
+    def refresh_tip_cache(self) -> Tuple[bytes, int]:
+        """Force-refresh the cached tip from Rust and return it."""
+        hash_bytes, height = self._db.get_best_block()
+        self._cached_tip = (bytes(hash_bytes), height)
+        return self._cached_tip
+
     # Pruning (delegated to Rust)
 
     def prune_blocks_range(self, from_height: int, to_height: int) -> int:

@@ -470,8 +470,8 @@ class BlockSync:
 
             # Connect block
             try:
-                if hasattr(self.db._db, 'connect_block_from_bytes'):
-                    self.db._db.connect_block_from_bytes(raw_payload, new_height)
+                if hasattr(self.db, 'connect_block_from_bytes'):
+                    self.db.connect_block_from_bytes(raw_payload, new_height)
                 else:
                     self.validator.apply_block(block)
             except Exception as e:
