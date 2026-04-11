@@ -1,0 +1,46 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sync"
+version = "0.1.0"
+description = "Rust extension module for the Ouroboros Bitcoin node (block/header/script validation + RocksDB storage via pyo3)"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# Deliberately minimal: this package exposes a single top-level `sync`
+# extension module and nothing else. All Python code lives in the sibling
+# `ouroboros` package, which depends on this extension but is installed
+# separately (via `pip install -e .` at the repo root).
+#
+# Why this file exists at all:
+#   Maturin requires a pyproject.toml next to the Cargo.toml it's building.
+#   Without this file, running `maturin develop --manifest-path
+#   ferrous-utils/sync/Cargo.toml` from the repo root falls back to the root
+#   pyproject.toml (name = "ouroboros") and installs the compiled .so AS the
+#   ouroboros package, clobbering the pure-Python editable install. The only
+#   way to keep `ouroboros` and `sync` as independent distributions is to
+#   give each its own pyproject.toml.
+#
+# Canonical install flow (see ../../setup.sh / ../../scripts/install.sh):
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install --upgrade pip maturin patchelf
+#   (cd ferrous-utils/sync && maturin develop --release)
+#   pip install -e ".[dev]"   # from repo root, installs ouroboros
+
+[tool.maturin]
+# Build an extension module (cdylib) named `sync` importable as `import sync`.
+# Pure-Rust package: no Python source tree, no mixed layout. The compiled
+# .so becomes a top-level module installed alongside the sibling `ouroboros`
+# package (installed separately via the repo-root pyproject.toml).
+bindings = "pyo3"
+module-name = "sync"
+manifest-path = "Cargo.toml"
+strip = true
