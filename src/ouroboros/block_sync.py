@@ -505,6 +505,13 @@ class BlockSync:
                     f"in-flight={len(self.requested_blocks)})"
                 )
 
+            # Yield to the event loop after each block so that RPC handlers,
+            # peer message processing, and other coroutines are not starved
+            # during IBD.  Without this, the while loop holds the event loop
+            # for the entire drain (potentially hundreds of blocks), causing
+            # multi-second RPC latency spikes.
+            await asyncio.sleep(0)
+
         # Prune connected headers to prevent unbounded growth
         if connected > 0:
             self._prune_validated_headers()
