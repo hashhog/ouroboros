@@ -833,7 +833,7 @@ class RPCServer:
           bip9 sub-object: status, bit, start_time, timeout, since,
                            min_activation_height, [statistics]
         """
-        from ouroboros.consensus import BURIED_DEPLOYMENTS, BIP9_DEPLOYMENTS
+        from ouroboros.consensus import BIP9_DEPLOYMENTS, BURIED_DEPLOYMENTS
 
         db = getattr(self.node, 'db', None)
 
@@ -849,8 +849,8 @@ class RPCServer:
             # Validate hex before trying the DB
             try:
                 hash_bytes = bytes.fromhex(blockhash)[::-1]
-            except (ValueError, AttributeError):
-                raise HTTPException(status_code=400, detail="Invalid block hash")
+            except (ValueError, AttributeError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid block hash") from exc
 
             if db is None:
                 raise HTTPException(status_code=500, detail="Database not available")
