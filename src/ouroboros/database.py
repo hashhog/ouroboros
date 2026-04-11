@@ -315,6 +315,11 @@ class BlockchainDatabase:
         # RPC reads this instead of calling into Rust FFI, avoiding lock
         # contention during IBD.
         self._cached_tip: Optional[Tuple[bytes, int]] = None
+        # Lightweight header-field cache for RPC — avoids full-block
+        # deserialisation in getblockchaininfo.  Updated on connect.
+        self._tip_bits: int = 0x1d00ffff
+        self._tip_timestamp: int = 0
+        self._recent_timestamps: list = []  # last 11 block timestamps
         try:
             self._cached_tip = self.get_best_block()
         except Exception:
@@ -561,6 +566,22 @@ class BlockchainDatabase:
         # Invalidate cache so next get_best_block() re-reads from Rust.
         # We don't know the hash here without parsing, so just invalidate.
         self._cached_tip = None
+
+        # Extract header-level fields from the raw block bytes so that
+        # RPC handlers can serve them without a full-block FFI round-trip.
+        # Bitcoin block header: version(4) + prevhash(32) + merkle(32) +
+        #                       timestamp(4) + bits(4) + nonce(4) = 80 bytes
+        if len(block_bytes) >= 80:
+            import struct
+            ts = struct.unpack_from("<I", block_bytes, 68)[0]
+            bits = struct.unpack_from("<I", block_bytes, 72)[0]
+            self._tip_bits = bits
+            self._tip_timestamp = ts
+            self._recent_timestamps.append(ts)
+            # Keep only the last 11 timestamps for median-time calculation
+            if len(self._recent_timestamps) > 11:
+                self._recent_timestamps = self._recent_timestamps[-11:]
+
         return result
 
     def refresh_tip_cache(self) -> Tuple[bytes, int]:
