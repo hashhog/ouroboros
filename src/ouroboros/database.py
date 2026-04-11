@@ -270,12 +270,16 @@ class Transaction:
         return total
 
     def get_weight(self) -> int:
-        """Transaction weight: non-witness bytes × 4 + witness bytes (BIP 141)."""
-        non_witness_bytes = len(self.serialize())
-        if self.has_witness:
-            non_witness_bytes += 2  # marker 0x00 + flag 0x01
-        witness_bytes = self.get_witness_bytes()
-        return (non_witness_bytes * 4) + witness_bytes
+        """Transaction weight per BIP 141: stripped_size * 3 + total_size.
+
+        This matches Bitcoin Core's GetTransactionWeight exactly:
+          GetSerializeSize(TX_NO_WITNESS) * (WITNESS_SCALE_FACTOR - 1)
+          + GetSerializeSize(TX_WITH_WITNESS)
+        For non-SegWit txs, stripped == total so weight == size * 4.
+        """
+        stripped_size = len(self.serialize())
+        total_size = len(self.serialize_with_witness())
+        return stripped_size * 3 + total_size
     
     def get_vsize(self) -> int:
         """Virtual size in bytes: ceil(weight / 4)."""
