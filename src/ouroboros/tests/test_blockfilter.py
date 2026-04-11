@@ -12,10 +12,10 @@ Verifies:
 Reference: https://github.com/bitcoin/bips/blob/master/bip-0158.mediawiki
 """
 
-import unittest
 import hashlib
 import sys
 import types
+import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -32,30 +32,30 @@ if "sync" not in sys.modules:
     _mock_sync.SyncEngine = MagicMock
     sys.modules["sync"] = _mock_sync
 
-from ouroboros.blockfilter import (
-    GCS_P,
-    GCS_M,
+from ouroboros.blockfilter import (  # noqa: E402
     BASIC_FILTER_TYPE,
-    _encode_compact_size,
-    _decode_compact_size,
-    _BitWriter,
+    GCS_M,
+    GCS_P,
+    BlockFilterIndex,
     _BitReader,
-    _golomb_rice_encode,
-    _golomb_rice_decode,
+    _BitWriter,
     _block_filter_siphash_key,
+    _decode_compact_size,
+    _encode_compact_size,
+    _golomb_rice_decode,
+    _golomb_rice_encode,
     _hash_to_range,
+    _is_op_return,
+    build_basic_filter,
+    collect_block_scripts,
+    compute_filter_hash,
+    compute_filter_header,
     construct_gcs_filter,
     gcs_match,
     gcs_match_any,
-    build_basic_filter,
-    compute_filter_hash,
-    compute_filter_header,
-    BlockFilterIndex,
-    collect_block_scripts,
-    _is_op_return,
 )
-from ouroboros.compact_blocks import _siphash_2_4
-from ouroboros.database import Block, Transaction, TxIn, TxOut
+from ouroboros.compact_blocks import _siphash_2_4  # noqa: E402
+from ouroboros.database import Block, Transaction, TxIn, TxOut  # noqa: E402
 
 
 def hex_to_bytes(hex_str: str) -> bytes:

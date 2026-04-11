@@ -22,9 +22,7 @@ import os
 import random
 import secrets
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -146,8 +144,8 @@ def get_network_group(host: str, network_id: int = NET_IPV4) -> str:
     if host.endswith(".onion"):
         return "onion"
 
-    # Handle I2P addresses
-    if host.endswith(".b32.i2p"):
+    # Handle I2P addresses (.b32.i2p base32 destinations and plain .i2p)
+    if host.endswith(".i2p"):
         return "i2p"
 
     # IPv4
@@ -209,34 +207,34 @@ class AddressManager:
     - Network group diversification spreads across /16 ranges
     """
 
-    def __init__(self, data_dir: Optional[str] = None):
+    def __init__(self, data_dir: str | None = None):
         # Secret key for deterministic bucket hashing (anti-manipulation)
         self._key: bytes = secrets.token_bytes(32)
 
         # New table: bucket[i][j] = addr_key or None
         # 256 buckets x 64 entries
-        self._new_buckets: List[List[Optional[str]]] = [
+        self._new_buckets: list[list[str | None]] = [
             [None] * NEW_BUCKET_SIZE for _ in range(NEW_BUCKET_COUNT)
         ]
 
         # Tried table: bucket[i][j] = addr_key or None
         # 64 buckets x 256 entries
-        self._tried_buckets: List[List[Optional[str]]] = [
+        self._tried_buckets: list[list[str | None]] = [
             [None] * TRIED_BUCKET_SIZE for _ in range(TRIED_BUCKET_COUNT)
         ]
 
         # Address info storage: addr_key -> AddrInfo
-        self._addrs: Dict[str, AddrInfo] = {}
+        self._addrs: dict[str, AddrInfo] = {}
 
         # Track which addresses are in which table
-        self._in_new: Set[str] = set()
-        self._in_tried: Set[str] = set()
+        self._in_new: set[str] = set()
+        self._in_tried: set[str] = set()
 
         # Collision handling for tried table
-        self._tried_collisions: Set[str] = set()
+        self._tried_collisions: set[str] = set()
 
         self._data_dir = data_dir
-        self._filepath: Optional[str] = None
+        self._filepath: str | None = None
         if data_dir:
             self._filepath = os.path.join(data_dir, "peers.json")
             self._load()
@@ -547,7 +545,7 @@ class AddressManager:
             info.last_attempt = time.time()
             info.attempts += 1
 
-    def get_addresses(self, count: int = 1000) -> List[AddrInfo]:
+    def get_addresses(self, count: int = 1000) -> list[AddrInfo]:
         """Return up to count addresses sampled from both tables."""
         all_addrs = list(self._addrs.values())
         random.shuffle(all_addrs)
@@ -555,9 +553,9 @@ class AddressManager:
 
     def select_for_connection(
         self,
-        exclude: Optional[Set[str]] = None,
-        exclude_groups: Optional[Set[str]] = None,
-    ) -> Optional[str]:
+        exclude: set[str] | None = None,
+        exclude_groups: set[str] | None = None,
+    ) -> str | None:
         """Select a candidate address for connection.
 
         Args:
@@ -592,9 +590,9 @@ class AddressManager:
 
     def _select_from_tried(
         self,
-        exclude: Set[str],
-        exclude_groups: Set[str],
-    ) -> Optional[str]:
+        exclude: set[str],
+        exclude_groups: set[str],
+    ) -> str | None:
         """Select from tried table with weighted random."""
         candidates = []
         for addr_key in self._in_tried:
@@ -630,9 +628,9 @@ class AddressManager:
 
     def _select_from_new(
         self,
-        exclude: Set[str],
-        exclude_groups: Set[str],
-    ) -> Optional[str]:
+        exclude: set[str],
+        exclude_groups: set[str],
+    ) -> str | None:
         """Select from new table with weighted random."""
         candidates = []
         for addr_key in self._in_new:
@@ -668,8 +666,8 @@ class AddressManager:
 
     def select_for_feeler(
         self,
-        exclude: Optional[Set[str]] = None,
-    ) -> Optional[str]:
+        exclude: set[str] | None = None,
+    ) -> str | None:
         """Select an address from new table for feeler connection.
 
         Feelers probe addresses that haven't been tested to verify they're real.
@@ -701,7 +699,7 @@ class AddressManager:
         top_n = max(1, len(candidates) // 4)
         return random.choice(candidates[:top_n])[0]
 
-    def get_addr_info(self, host: str, port: int) -> Optional[AddrInfo]:
+    def get_addr_info(self, host: str, port: int) -> AddrInfo | None:
         """Get address info for a specific address."""
         return self._addrs.get(f"{host}:{port}")
 
@@ -717,9 +715,9 @@ class AddressManager:
         """Number of addresses in tried table."""
         return len(self._in_tried)
 
-    def get_network_group_counts(self) -> Dict[str, int]:
+    def get_network_group_counts(self) -> dict[str, int]:
         """Get count of addresses per /16 network group."""
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
         for info in self._addrs.values():
             group = get_network_group(info.host)
             counts[group] = counts.get(group, 0) + 1
@@ -774,7 +772,7 @@ class AddressManager:
 
     def _load_v1(self, data: dict) -> None:
         """Load legacy flat format and migrate to bucketed."""
-        for addr, d in data.get("new", {}).items():
+        for _addr, d in data.get("new", {}).items():
             info = self._dict_to_info(d)
             self.add(
                 info.host, info.port,
@@ -782,7 +780,7 @@ class AddressManager:
                 timestamp=info.last_seen,
                 source=info.source,
             )
-        for addr, d in data.get("tried", {}).items():
+        for _addr, d in data.get("tried", {}).items():
             info = self._dict_to_info(d)
             # First add to new, then mark good to move to tried
             self.add(

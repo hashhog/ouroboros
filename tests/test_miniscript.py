@@ -3,19 +3,18 @@ Tests for miniscript parsing, compilation, and satisfaction analysis.
 """
 
 import hashlib
+
 import pytest
 
 from ouroboros.miniscript import (
     Fragment,
     MiniscriptContext,
-    MiniscriptNode,
     MiniscriptType,
     analyze_satisfaction,
     compile_miniscript,
     miniscript_to_str,
     parse_miniscript,
 )
-
 
 # ---------------------------------------------------------------------------
 # Test fixtures

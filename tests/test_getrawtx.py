@@ -4,10 +4,9 @@ Tests for getrawtransaction RPC.
 Reference: Bitcoin Core rpc/rawtransaction.cpp getrawtransaction
 """
 
-import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
 from dataclasses import dataclass
-from typing import Dict, List, Any, Optional, Tuple
+
+import pytest
 
 
 @dataclass
@@ -17,7 +16,7 @@ class MockTxIn:
     prev_vout: int
     script_sig: bytes = b""
     sequence: int = 0xFFFFFFFF
-    witness: List[bytes] = None
+    witness: list[bytes] = None
 
     def __post_init__(self):
         if self.witness is None:
@@ -37,8 +36,8 @@ class MockTransaction:
     def __init__(
         self,
         txid: bytes,
-        inputs: List[MockTxIn],
-        outputs: List[MockTxOut],
+        inputs: list[MockTxIn],
+        outputs: list[MockTxOut],
         version: int = 2,
         locktime: int = 0,
         is_coinbase: bool = False,
@@ -84,7 +83,7 @@ class MockBlock:
         self,
         block_hash: bytes,
         height: int,
-        transactions: List[MockTransaction],
+        transactions: list[MockTransaction],
         timestamp: int = 1600000000,
         version: int = 0x20000000,
         prev_blockhash: bytes = None,
@@ -110,12 +109,12 @@ class MockMempool:
     """Mock mempool for testing."""
 
     def __init__(self):
-        self.transactions: Dict[bytes, MockTransaction] = {}
+        self.transactions: dict[bytes, MockTransaction] = {}
 
     def has_transaction(self, txid: bytes) -> bool:
         return txid in self.transactions
 
-    def get_transaction(self, txid: bytes) -> Optional[MockTransaction]:
+    def get_transaction(self, txid: bytes) -> MockTransaction | None:
         return self.transactions.get(txid)
 
 
@@ -123,21 +122,21 @@ class MockDatabase:
     """Mock database for testing."""
 
     def __init__(self):
-        self.blocks: Dict[bytes, MockBlock] = {}
-        self.tx_index: Dict[bytes, Tuple[bytes, int, int]] = {}
-        self.height_to_hash: Dict[int, bytes] = {}
+        self.blocks: dict[bytes, MockBlock] = {}
+        self.tx_index: dict[bytes, tuple[bytes, int, int]] = {}
+        self.height_to_hash: dict[int, bytes] = {}
         self.best_height = 100
 
-    def get_best_block(self) -> Tuple[bytes, int]:
+    def get_best_block(self) -> tuple[bytes, int]:
         return b"\x00" * 32, self.best_height
 
-    def get_block(self, block_hash: bytes) -> Optional[MockBlock]:
+    def get_block(self, block_hash: bytes) -> MockBlock | None:
         return self.blocks.get(block_hash)
 
-    def get_tx_index(self, txid: bytes) -> Optional[Tuple[bytes, int, int]]:
+    def get_tx_index(self, txid: bytes) -> tuple[bytes, int, int] | None:
         return self.tx_index.get(txid)
 
-    def get_block_hash_by_height(self, height: int) -> Optional[bytes]:
+    def get_block_hash_by_height(self, height: int) -> bytes | None:
         return self.height_to_hash.get(height)
 
 
@@ -361,8 +360,9 @@ class TestGetRawTransactionErrors:
     @pytest.mark.asyncio
     async def test_invalid_txid(self, mock_node):
         """Test error on invalid transaction ID."""
-        from ouroboros.rpc import RPCServer
         from fastapi import HTTPException
+
+        from ouroboros.rpc import RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
@@ -376,8 +376,9 @@ class TestGetRawTransactionErrors:
     @pytest.mark.asyncio
     async def test_invalid_blockhash(self, mock_node, sample_tx):
         """Test error on invalid block hash."""
-        from ouroboros.rpc import RPCServer
         from fastapi import HTTPException
+
+        from ouroboros.rpc import RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
@@ -395,8 +396,9 @@ class TestGetRawTransactionErrors:
     @pytest.mark.asyncio
     async def test_block_not_found(self, mock_node, sample_tx):
         """Test error when block hash not found."""
-        from ouroboros.rpc import RPCServer
         from fastapi import HTTPException
+
+        from ouroboros.rpc import RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
@@ -416,8 +418,9 @@ class TestGetRawTransactionErrors:
     @pytest.mark.asyncio
     async def test_tx_not_in_block(self, mock_node, sample_tx, sample_block):
         """Test error when tx not found in specified block."""
-        from ouroboros.rpc import RPCServer
         from fastapi import HTTPException
+
+        from ouroboros.rpc import RPCServer
 
         # Create block without the sample tx
         empty_block = MockBlock(
@@ -443,8 +446,9 @@ class TestGetRawTransactionErrors:
     @pytest.mark.asyncio
     async def test_tx_not_found_no_txindex(self, mock_node, sample_tx):
         """Test error message when tx not found and no txindex."""
-        from ouroboros.rpc import RPCServer
         from fastapi import HTTPException
+
+        from ouroboros.rpc import RPCServer
 
         # Create a mock database without get_tx_index method
         class MockDatabaseNoTxIndex:
@@ -473,8 +477,9 @@ class TestGetRawTransactionErrors:
     @pytest.mark.asyncio
     async def test_tx_not_found_with_txindex(self, mock_node, sample_tx):
         """Test error message when tx not found but txindex enabled."""
-        from ouroboros.rpc import RPCServer
         from fastapi import HTTPException
+
+        from ouroboros.rpc import RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node

@@ -7,15 +7,14 @@ enabling fast node startup by loading a pre-validated UTXO set.
 Reference: Bitcoin Core's validation.cpp (ActivateSnapshot, PopulateAndValidateSnapshot)
 """
 
-import asyncio
 import hashlib
 import logging
-import os
 import struct
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +67,7 @@ def _hex_to_hash_le(hex_str: str) -> bytes:
     return bytes.fromhex(hex_str)[::-1]
 
 
-def get_assumeutxo_params(network: str) -> List[AssumeutxoData]:
+def get_assumeutxo_params(network: str) -> list[AssumeutxoData]:
     """
     Get hardcoded assumeUTXO parameters for a network.
 
@@ -104,7 +103,7 @@ def get_assumeutxo_params(network: str) -> List[AssumeutxoData]:
     return []
 
 
-def get_assumeutxo_data(network: str, height: int) -> Optional[AssumeutxoData]:
+def get_assumeutxo_data(network: str, height: int) -> AssumeutxoData | None:
     """Get assumeUTXO data for a specific height."""
     for data in get_assumeutxo_params(network):
         if data.height == height:
@@ -112,7 +111,7 @@ def get_assumeutxo_data(network: str, height: int) -> Optional[AssumeutxoData]:
     return None
 
 
-def get_assumeutxo_by_hash(network: str, block_hash: bytes) -> Optional[AssumeutxoData]:
+def get_assumeutxo_by_hash(network: str, block_hash: bytes) -> AssumeutxoData | None:
     """Get assumeUTXO data by block hash."""
     for data in get_assumeutxo_params(network):
         if data.block_hash == block_hash:
@@ -120,7 +119,7 @@ def get_assumeutxo_by_hash(network: str, block_hash: bytes) -> Optional[Assumeut
     return None
 
 
-def get_available_snapshot_heights(network: str) -> List[int]:
+def get_available_snapshot_heights(network: str) -> list[int]:
     """Get all available snapshot heights for a network."""
     return [data.height for data in get_assumeutxo_params(network)]
 
@@ -238,14 +237,14 @@ class SnapshotManager:
 
         # Snapshot state
         self.snapshot_loaded = False
-        self.snapshot_height: Optional[int] = None
-        self.snapshot_hash: Optional[bytes] = None
+        self.snapshot_height: int | None = None
+        self.snapshot_hash: bytes | None = None
 
         # Background validation state
         self.background_validating = False
         self.background_validated = False
         self.background_validation_height = 0
-        self._validation_thread: Optional[threading.Thread] = None
+        self._validation_thread: threading.Thread | None = None
         self._validation_cancel = threading.Event()
 
     def get_snapshot_chainstate_dir(self) -> Path:
@@ -257,7 +256,7 @@ class SnapshotManager:
         snapshot_dir = self.get_snapshot_chainstate_dir()
         return snapshot_dir.exists() and (snapshot_dir / "base_blockhash").exists()
 
-    def read_snapshot_base_blockhash(self) -> Optional[bytes]:
+    def read_snapshot_base_blockhash(self) -> bytes | None:
         """Read the base block hash from an existing snapshot chainstate."""
         blockhash_file = self.get_snapshot_chainstate_dir() / "base_blockhash"
         if blockhash_file.exists():
@@ -273,7 +272,7 @@ class SnapshotManager:
     def load_snapshot(
         self,
         snapshot_path: str,
-        progress_callback: Optional[Callable[[int, int], None]] = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> SnapshotMetadata:
         """
         Load a UTXO snapshot from a file.
@@ -377,7 +376,7 @@ class SnapshotManager:
 
     def start_background_validation(
         self,
-        progress_callback: Optional[Callable[[int, int], None]] = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         """
         Start background validation from genesis.
@@ -469,7 +468,7 @@ class SnapshotManager:
     def dump_snapshot(
         self,
         output_path: str,
-        progress_callback: Optional[Callable[[int, int], None]] = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> int:
         """
         Dump the current UTXO set to a snapshot file.
@@ -498,7 +497,7 @@ class SnapshotManager:
 
             # Group UTXOs by txid for compact serialization
             # This is memory-intensive but matches Bitcoin Core's format
-            utxo_groups: Dict[bytes, List[Tuple[int, dict]]] = {}
+            utxo_groups: dict[bytes, list[tuple[int, dict]]] = {}
 
             for utxo in self.db.iter_utxos():
                 txid = utxo.txid
@@ -542,7 +541,7 @@ class SnapshotManager:
         logger.info(f"[snapshot] Wrote {coins_written:,} coins to {output_path}")
         return coins_written
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(self) -> dict[str, Any]:
         """Get the current snapshot status."""
         return {
             "snapshot_loaded": self.snapshot_loaded,

@@ -22,7 +22,6 @@ import os
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional, Tuple
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
@@ -123,7 +122,7 @@ class V2Handshake:
     _private_key: bytes = field(default_factory=lambda: os.urandom(32))
     _local_eswift: bytes = field(default=b"", repr=False)
     _remote_eswift: bytes = field(default=b"", repr=False)
-    _shared_secret: Optional[bytes] = None
+    _shared_secret: bytes | None = None
 
     def __post_init__(self):
         if not self._local_eswift:
@@ -150,7 +149,7 @@ class V2Handshake:
         keys = sorted([self._local_eswift, self._remote_eswift])
         self._shared_secret = _tagged_hash("bip324_ecdh", keys[0] + keys[1])
 
-    def derive_session_keys(self) -> Tuple[bytes, bytes]:
+    def derive_session_keys(self) -> tuple[bytes, bytes]:
         """
         Derive (send_key, recv_key) from the shared secret.
 
@@ -190,7 +189,7 @@ class V2Transport:
     recv_cipher: CipherState
 
     @classmethod
-    def from_handshake(cls, handshake: V2Handshake) -> "V2Transport":
+    def from_handshake(cls, handshake: V2Handshake) -> V2Transport:
         send_key, recv_key = handshake.derive_session_keys()
         return cls(
             send_cipher=CipherState(key=send_key),
@@ -217,7 +216,7 @@ class V2Transport:
         enc_payload = self.send_cipher.encrypt(inner)
         return enc_length + enc_payload
 
-    def decrypt_message(self, data: bytes) -> Tuple[bytes, bool, int]:
+    def decrypt_message(self, data: bytes) -> tuple[bytes, bool, int]:
         """
         Decrypt a v2 packet.
 

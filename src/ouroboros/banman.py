@@ -11,9 +11,9 @@ Reference: bitcoin/src/banman.cpp, bitcoin/src/net_processing.cpp (Misbehaving()
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ SCORE_UNSOLICITED_BLOCK = SCORE_UNREQUESTED_DATA
 class MisbehaviorRecord:
     """Running misbehavior state for a single IP."""
     score: int = 0
-    events: List[str] = field(default_factory=list)
+    events: list[str] = field(default_factory=list)
     last_event: float = 0.0
 
 
@@ -57,16 +57,16 @@ class BanManager:
         self,
         ban_threshold: int = 100,
         ban_duration: int = 86400,
-        data_dir: Optional[str] = None,
-        on_ban: Optional[Callable[[str], None]] = None,
+        data_dir: str | None = None,
+        on_ban: Callable[[str], None] | None = None,
     ):
         self.ban_threshold = ban_threshold
         self.ban_duration = ban_duration
         self._data_dir = data_dir
         self._on_ban = on_ban
 
-        self.scores: Dict[str, MisbehaviorRecord] = {}
-        self.banned: Dict[str, float] = {}  # ip -> ban_until (epoch)
+        self.scores: dict[str, MisbehaviorRecord] = {}
+        self.banned: dict[str, float] = {}  # ip -> ban_until (epoch)
 
         if data_dir:
             self._load_bans()
@@ -109,7 +109,7 @@ class BanManager:
         """
         return self.record_misbehavior(peer_id, score, reason)
 
-    def ban(self, ip: str, duration: Optional[int] = None) -> None:
+    def ban(self, ip: str, duration: int | None = None) -> None:
         """Immediately ban *ip* for *duration* seconds (default: ban_duration)."""
         ban_time = duration if duration is not None else self.ban_duration
         self.banned[ip] = time.time() + ban_time
@@ -183,13 +183,13 @@ class BanManager:
         rec = self.scores.get(ip)
         return rec.score if rec else 0
 
-    def list_banned(self) -> Dict[str, float]:
+    def list_banned(self) -> dict[str, float]:
         """Return a snapshot of currently-banned IPs and their expiry."""
         now = time.time()
         self.banned = {ip: t for ip, t in self.banned.items() if t > now}
         return dict(self.banned)
 
-    def list_banned_detailed(self) -> List[Dict[str, any]]:
+    def list_banned_detailed(self) -> list[dict[str, any]]:
         """Return detailed ban info for each banned IP (for listbanned RPC).
 
         Returns a list of dicts with:

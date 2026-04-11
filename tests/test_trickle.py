@@ -8,18 +8,15 @@ Tests cover:
 - Integration with PeerManager
 """
 
-import pytest
-import time
 import random
-from unittest.mock import MagicMock, AsyncMock, patch
+import time
 
 from ouroboros.p2p import (
-    TrickleQueue,
-    TrickleEntry,
     INBOUND_INVENTORY_BROADCAST_INTERVAL,
-    OUTBOUND_INVENTORY_BROADCAST_INTERVAL,
-    INVENTORY_BROADCAST_TARGET,
     INVENTORY_BROADCAST_MAX,
+    INVENTORY_BROADCAST_TARGET,
+    OUTBOUND_INVENTORY_BROADCAST_INTERVAL,
+    TrickleQueue,
 )
 from ouroboros.p2p_messages import INV_TYPE_TX, MSG_WTX
 

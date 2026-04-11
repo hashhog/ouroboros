@@ -4,10 +4,11 @@ Tests for package relay and CPFP package acceptance.
 Reference: Bitcoin Core policy/packages.cpp, validation.cpp AcceptPackage()
 """
 
-import pytest
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 # Mock the sync module before importing ouroboros modules
 if "sync" not in sys.modules:
@@ -46,13 +47,13 @@ if "sync" not in sys.modules:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from ouroboros.database import Transaction, TxIn, TxOut
-from ouroboros.mempool import Mempool, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT
+from ouroboros.mempool import MAX_PACKAGE_COUNT, Mempool
 from ouroboros.p2p_messages import (
-    SendPackagesMessage,
+    MSG_PKGTXNS,
+    AncPkgInfoMessage,
     GetPkgTxnsMessage,
     PkgTxnsMessage,
-    AncPkgInfoMessage,
-    MSG_PKGTXNS,
+    SendPackagesMessage,
 )
 
 

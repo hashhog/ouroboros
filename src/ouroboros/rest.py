@@ -10,10 +10,10 @@ Reference: Bitcoin Core rest.cpp
 
 import logging
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import Response, PlainTextResponse, JSONResponse
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 if TYPE_CHECKING:
     from ouroboros.node import BitcoinNode
@@ -34,7 +34,7 @@ class RESTResponseFormat(Enum):
     JSON = "json"
 
 
-def parse_format(path: str) -> Tuple[str, Optional[RESTResponseFormat]]:
+def parse_format(path: str) -> tuple[str, RESTResponseFormat | None]:
     """
     Parse format suffix from path (e.g., 'blockhash.json' -> ('blockhash', JSON)).
 
@@ -252,7 +252,7 @@ class RESTInterface:
         try:
             block_hash = bytes.fromhex(hash_str)
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid hash: {hash_str}")
+            raise HTTPException(status_code=400, detail=f"Invalid hash: {hash_str}") from None
 
         if len(block_hash) != 32:
             raise HTTPException(status_code=400, detail=f"Invalid hash: {hash_str}")
@@ -266,8 +266,8 @@ class RESTInterface:
         # Get serialized block data
         try:
             block_data = block.serialize()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"I/O error reading {hash_str}")
+        except Exception:
+            raise HTTPException(status_code=500, detail=f"I/O error reading {hash_str}") from None
 
         if rf == RESTResponseFormat.BINARY:
             return Response(content=block_data, media_type="application/octet-stream")
@@ -285,7 +285,7 @@ class RESTInterface:
             detail=f"output format not found (available: {available_formats_string()})"
         )
 
-    def _block_to_json(self, block: Any, include_tx_details: bool) -> Dict[str, Any]:
+    def _block_to_json(self, block: Any, include_tx_details: bool) -> dict[str, Any]:
         """Convert block to JSON representation."""
         db = self._get_db()
 
@@ -324,11 +324,11 @@ class RESTInterface:
         mantissa = bits & 0x007FFFFF
         exponent = (bits >> 24) & 0xFF
         if exponent <= 3:
-            target_int = mantissa >> (8 * (3 - exponent))
+            mantissa >> (8 * (3 - exponent))
         else:
-            target_int = mantissa << (8 * (exponent - 3))
+            mantissa << (8 * (exponent - 3))
 
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "hash": block_hash[::-1].hex() if isinstance(block_hash, bytes) else str(block_hash),
             "confirmations": confirmations,
             "size": size,
@@ -375,7 +375,7 @@ class RESTInterface:
 
         return result
 
-    def _tx_to_json(self, tx: Any) -> Dict[str, Any]:
+    def _tx_to_json(self, tx: Any) -> dict[str, Any]:
         """Convert transaction to JSON representation."""
         from ouroboros.script import disassemble_script
 
@@ -388,7 +388,7 @@ class RESTInterface:
         vsize = tx.get_vsize() if hasattr(tx, 'get_vsize') else size
         weight = tx.get_weight() if hasattr(tx, 'get_weight') else size * 4
 
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "txid": txid.hex() if isinstance(txid, bytes) else str(txid),
             "hash": wtxid.hex() if isinstance(wtxid, bytes) else str(wtxid),
             "version": tx.version,
@@ -407,7 +407,7 @@ class RESTInterface:
                     "sequence": tx_in.sequence,
                 })
             else:
-                vin_entry: Dict[str, Any] = {
+                vin_entry: dict[str, Any] = {
                     "txid": tx_in.prev_txid.hex() if isinstance(tx_in.prev_txid, bytes) else str(tx_in.prev_txid),
                     "vout": tx_in.prev_vout,
                     "scriptSig": {
@@ -493,7 +493,7 @@ class RESTInterface:
     async def rest_headers(
         self,
         path: str,
-        count: Optional[int] = Query(default=None),
+        count: int | None = Query(default=None),
     ) -> Response:
         """
         Get block headers.
@@ -536,7 +536,7 @@ class RESTInterface:
             raise HTTPException(
                 status_code=400,
                 detail=f"Header count is invalid or out of acceptable range (1-{MAX_REST_HEADERS_RESULTS}): {raw_count}"
-            )
+            ) from None
 
         if num_headers < 1 or num_headers > MAX_REST_HEADERS_RESULTS:
             raise HTTPException(
@@ -548,7 +548,7 @@ class RESTInterface:
         try:
             block_hash = bytes.fromhex(hash_str)
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid hash: {hash_str}")
+            raise HTTPException(status_code=400, detail=f"Invalid hash: {hash_str}") from None
 
         if len(block_hash) != 32:
             raise HTTPException(status_code=400, detail=f"Invalid hash: {hash_str}")
@@ -560,7 +560,7 @@ class RESTInterface:
         if not block:
             raise HTTPException(status_code=404, detail=f"{hash_str} not found")
 
-        headers: List[Any] = []
+        headers: list[Any] = []
         current_height = getattr(block, 'height', None)
 
         if current_height is not None:
@@ -634,7 +634,7 @@ class RESTInterface:
         try:
             tx_hash = bytes.fromhex(param)
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid hash: {param}")
+            raise HTTPException(status_code=400, detail=f"Invalid hash: {param}") from None
 
         if len(tx_hash) != 32:
             raise HTTPException(status_code=400, detail=f"Invalid hash: {param}")
@@ -721,7 +721,7 @@ class RESTInterface:
             start_idx = 1
 
         # Parse outpoints
-        outpoints: List[Tuple[bytes, int]] = []
+        outpoints: list[tuple[bytes, int]] = []
         for i in range(start_idx, len(parts)):
             part = parts[i]
             if not part:
@@ -739,7 +739,7 @@ class RESTInterface:
                 vout = int(txid_out[1])
                 outpoints.append((txid_bytes, vout))
             except ValueError:
-                raise HTTPException(status_code=400, detail="Parse error")
+                raise HTTPException(status_code=400, detail="Parse error") from None
 
         if not outpoints:
             raise HTTPException(status_code=400, detail="Error: empty request")
@@ -868,7 +868,7 @@ class RESTInterface:
         try:
             block_height = int(param)
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid height: {param}")
+            raise HTTPException(status_code=400, detail=f"Invalid height: {param}") from None
 
         if block_height < 0:
             raise HTTPException(status_code=400, detail=f"Invalid height: {param}")
@@ -929,9 +929,9 @@ class RESTInterface:
         mantissa = bits & 0x007FFFFF
         exponent = (bits >> 24) & 0xFF
         if exponent <= 3:
-            target_int = mantissa >> (8 * (3 - exponent))
+            mantissa >> (8 * (3 - exponent))
         else:
-            target_int = mantissa << (8 * (exponent - 3))
+            mantissa << (8 * (exponent - 3))
 
         return JSONResponse(content={
             "chain": network,

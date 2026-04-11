@@ -8,6 +8,7 @@ Reference: Bitcoin Core consensus/consensus.h, consensus/tx_verify.cpp
 """
 
 import sys
+
 import pytest
 
 # Skip tests if sync module is mocked (not available in test environment)
@@ -122,6 +123,7 @@ class TestCoinbaseMaturityIntegration:
     def test_rust_constant_matches_python(self):
         """Rust and Python constants should match."""
         from sync import coinbase_maturity_constant
+
         from ouroboros.validation import COINBASE_MATURITY
 
         assert coinbase_maturity_constant() == COINBASE_MATURITY

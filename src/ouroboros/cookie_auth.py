@@ -7,10 +7,8 @@ The cookie is deleted on clean shutdown and regenerated on every restart.
 """
 
 import logging
-import os
 import secrets
 from pathlib import Path
-from typing import Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +16,7 @@ COOKIE_FILENAME = ".cookie"
 COOKIE_USER = "__cookie__"
 
 
-def generate_cookie(data_dir: str) -> Tuple[str, str]:
+def generate_cookie(data_dir: str) -> tuple[str, str]:
     """Write a fresh ``.cookie`` file and return ``(username, password)``."""
     password = secrets.token_hex(32)
     cookie_path = Path(data_dir) / COOKIE_FILENAME
@@ -32,7 +30,7 @@ def generate_cookie(data_dir: str) -> Tuple[str, str]:
     return COOKIE_USER, password
 
 
-def read_cookie(data_dir: str) -> Tuple[str, str]:
+def read_cookie(data_dir: str) -> tuple[str, str]:
     """Read credentials from the ``.cookie`` file; raises FileNotFoundError if missing."""
     cookie_path = Path(data_dir) / COOKIE_FILENAME
     if not cookie_path.exists():

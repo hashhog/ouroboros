@@ -5,16 +5,14 @@ Covers coinbase maturity, block subsidy, BIP 113 MTP locktime,
 BIP 68 sequence locks, and basic structural checks.
 """
 
-import pytest
 from unittest.mock import MagicMock, patch
 
+from ouroboros.database import Transaction, TxIn, TxOut
 from ouroboros.validation import (
     BlockValidator,
     TransactionValidator,
-    COINBASE_MATURITY,
     _bits_to_target,
 )
-from ouroboros.database import Transaction, TxIn, TxOut, Block
 
 
 def _make_tx(
@@ -176,7 +174,8 @@ class TestBIP68SequenceLocks:
 
     def setup_method(self):
         self.db = _mock_db(utxo_value=100000, utxo_height=100)
-        self.validator = TransactionValidator(self.db)
+        # Use regtest so BIP68 is active at height 0 (no mainnet activation wait)
+        self.validator = TransactionValidator(self.db, network="regtest")
 
     def test_height_lock_not_satisfied(self):
         inp = _make_txin(sequence=10)

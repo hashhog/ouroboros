@@ -7,29 +7,28 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 import click
 from rich.console import Console
+from rich.panel import Panel
 from rich.progress import (
+    BarColumn,
     Progress,
     SpinnerColumn,
-    BarColumn,
     TextColumn,
 )
 from rich.table import Table
-from rich.panel import Panel
 
-from ouroboros.sync_manager import SyncManager, SyncProgress
-from ouroboros.node import BitcoinNode
 from ouroboros.database import BlockchainDatabase
 from ouroboros.mempool import Mempool
+from ouroboros.node import BitcoinNode
+from ouroboros.sync_manager import SyncManager, SyncProgress
 
 console = Console()
 
 # Global variables for signal handling
-_sync_manager: Optional[SyncManager] = None
-_node: Optional[BitcoinNode] = None
+_sync_manager: SyncManager | None = None
+_node: BitcoinNode | None = None
 _cancelled = False
 _interruption_shown = False
 
@@ -146,10 +145,10 @@ def sync(ctx, reset, limit):
     global _sync_manager, _cancelled, _interruption_shown
     _cancelled = False
     _interruption_shown = False
-    
+
     data_dir = ctx.obj["data_dir"]
     network = ctx.obj["network"]
-    
+
     if reset:
         data_path = Path(data_dir)
         if data_path.exists():
@@ -163,7 +162,7 @@ def sync(ctx, reset, limit):
             console.print("[yellow]Chainstate cleared.[/yellow]")
         else:
             data_path.mkdir(parents=True, exist_ok=True)
-    
+
     limit_info = f" (limit: {limit} blocks)" if limit else ""
     console.print(
         f"[bold]ouroboros sync[/bold] — [cyan]{network}[/cyan]{limit_info}\n"
@@ -198,7 +197,7 @@ def sync(ctx, reset, limit):
             info="",
         )
 
-        _last_phase: Optional[str] = None
+        _last_phase: str | None = None
         _total_blocks_downloaded = 0
 
         def format_eta(seconds: int) -> str:
@@ -312,10 +311,10 @@ def start(ctx, rpc_port, p2p_port, listen, connect, force):
     """Start the Bitcoin node"""
     global _node, _cancelled
     _cancelled = False
-    
+
     data_dir = ctx.obj["data_dir"]
     network = ctx.obj["network"]
-    
+
     console.print(Panel.fit(
         f"[bold]Starting Bitcoin Node[/bold]\n"
         f"Network: [cyan]{network}[/cyan]\n"
@@ -324,7 +323,7 @@ def start(ctx, rpc_port, p2p_port, listen, connect, force):
         f"[dim]Node will display status when ready. Press Ctrl+C to stop.[/dim]",
         border_style="green"
     ))
-    
+
     # Check if synced (release SyncManager before node opens DB to avoid RocksDB lock conflict)
     # Auto-skip interactive prompt when --force is set, stdin is not a TTY,
     # or network is not mainnet (testnet/regtest users always want to proceed)
@@ -343,7 +342,7 @@ def start(ctx, rpc_port, p2p_port, listen, connect, force):
         console.print(f"[yellow]⚠ Could not check sync status: {e}[/yellow]")
         if not skip_prompt and not click.confirm("Continue anyway?", default=False):
             return
-    
+
     # Create and start node
     try:
         config_path = ctx.obj.get("config_path", str(Path(data_dir) / "ouroboros.conf"))
@@ -357,7 +356,7 @@ def start(ctx, rpc_port, p2p_port, listen, connect, force):
         }
         if connect:
             config["connect"] = list(connect)
-        
+
         _node = BitcoinNode(config=config)
 
         # Run node (blocks until Ctrl+C — status panel shown when ready)
@@ -367,7 +366,7 @@ def start(ctx, rpc_port, p2p_port, listen, connect, force):
             console.print("\n[yellow]Shutting down node...[/yellow]")
             asyncio.run(_node.stop())
             console.print("[green]✓ Node stopped gracefully[/green]")
-    
+
     except Exception as e:
         console.print(f"[red]✗ Error starting node: {e}[/red]")
         sys.exit(1)
@@ -379,25 +378,25 @@ def status(ctx):
     """Show node status"""
     data_dir = ctx.obj["data_dir"]
     network = ctx.obj["network"]
-    
+
     table = Table(title="Node Status", show_header=True, header_style="bold magenta")
     table.add_column("Property", style="cyan")
     table.add_column("Value", style="green")
-    
+
     # Network info
     table.add_row("Network", network)
     table.add_row("Data directory", data_dir)
-    
+
     # Sync status
     try:
         sync_manager = SyncManager(data_dir, network)
         is_synced = sync_manager.is_synced()
-        
+
         if is_synced:
             table.add_row("Sync status", "[green]✓ Synced[/green]")
         else:
             table.add_row("Sync status", "[yellow]⚠ Not synced[/yellow]")
-        
+
         progress = sync_manager.get_progress()
         if progress:
             table.add_row("Current height", f"{progress.current_height:,}")
@@ -405,7 +404,7 @@ def status(ctx):
             table.add_row("Progress", f"{progress.progress_percent:.2f}%")
     except Exception as e:
         table.add_row("Sync status", f"[red]Error: {e}[/red]")
-    
+
     # Blockchain info
     try:
         db = BlockchainDatabase(data_dir)
@@ -414,7 +413,7 @@ def status(ctx):
         table.add_row("Best block hash", best_hash.hex()[:16] + "...")
     except Exception as e:
         table.add_row("Blockchain info", f"[red]Error: {e}[/red]")
-    
+
     # Mempool info
     try:
         mempool = Mempool()
@@ -422,7 +421,7 @@ def status(ctx):
         table.add_row("Mempool transactions", f"{tx_count}")
     except Exception as e:
         table.add_row("Mempool info", f"[red]Error: {e}[/red]")
-    
+
     console.print(table)
 
 
@@ -468,7 +467,7 @@ def import_utxo(ctx, snapshot_path, batch_size):
     SNAPSHOT_PATH is the path to a .hdog file.
     """
     import struct
-    import hashlib
+
     import sync
 
     data_dir = ctx.obj["data_dir"]
@@ -607,7 +606,7 @@ def import_blocks(ctx, source):
     else:
         try:
             input_file = open(source, "rb")
-        except IOError as e:
+        except OSError as e:
             console.print(f"[red]Cannot open file: {e}[/red]")
             sys.exit(1)
 

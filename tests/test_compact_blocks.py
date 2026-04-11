@@ -7,25 +7,23 @@ and block reconstruction from mempool.
 
 import hashlib
 import struct
-import pytest
 
 from ouroboros.compact_blocks import (
+    BlockTransactions,
+    BlockTransactionsRequest,
     CompactBlock,
     PrefilledTransaction,
-    BlockTransactionsRequest,
-    BlockTransactions,
+    _siphash_2_4,
     compute_siphash_key,
     short_txid,
-    _siphash_2_4,
-)
-from ouroboros.p2p_messages import (
-    SendCmpctMessage,
-    CmpctBlockMessage,
-    GetBlockTxnMessage,
-    BlockTxnMessage,
 )
 from ouroboros.database import Transaction, TxIn, TxOut
-
+from ouroboros.p2p_messages import (
+    BlockTxnMessage,
+    CmpctBlockMessage,
+    GetBlockTxnMessage,
+    SendCmpctMessage,
+)
 
 # --- SipHash Tests ---
 
@@ -137,14 +135,19 @@ def make_test_tx(value: int = 50000, is_coinbase: bool = False) -> Transaction:
 
     outputs = [TxOut(value=value, script_pubkey=b'\x76\xa9' + bytes(20) + b'\x88\xac')]
 
-    return Transaction(
-        txid=bytes(32),  # Will be computed
+    tx = Transaction(
+        txid=bytes(32),  # placeholder
         version=1,
         locktime=0,
         inputs=inputs,
         outputs=outputs,
         has_witness=not is_coinbase,
     )
+    # Compute the real txid so each transaction is unique in the mempool
+    import hashlib as _hl
+    raw = tx.serialize()
+    tx.txid = _hl.sha256(_hl.sha256(raw).digest()).digest()
+    return tx
 
 
 def test_compact_block_creation():
@@ -265,7 +268,7 @@ def test_sendcmpct_message():
 
     # Parse it back
     msg2 = SendCmpctMessage.from_payload(net_msg.payload)
-    assert msg2.announce == True
+    assert msg2.announce
     assert msg2.version == 2
 
 
@@ -275,7 +278,7 @@ def test_sendcmpct_low_bandwidth():
     net_msg = msg.to_network_message("mainnet")
 
     msg2 = SendCmpctMessage.from_payload(net_msg.payload)
-    assert msg2.announce == False
+    assert not msg2.announce
     assert msg2.version == 1
 
 

@@ -5,16 +5,16 @@ This test verifies that SegWit transactions are handled correctly,
 including weight and vsize calculations.
 """
 
-import unittest
 import sys
+import unittest
 from pathlib import Path
 
 # Add src to path
 src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
-from ouroboros.database import Transaction, TxIn, TxOut
-from ouroboros.p2p_messages import TxMessage
+from ouroboros.database import Transaction, TxIn, TxOut  # noqa: E402
+from ouroboros.p2p_messages import TxMessage  # noqa: E402
 
 
 def hex_to_bytes(hex_str: str) -> bytes:
@@ -23,7 +23,7 @@ def hex_to_bytes(hex_str: str) -> bytes:
 
 class TestSegWit(unittest.TestCase):
     """Test SegWit transaction support"""
-    
+
     def test_transaction_weight_method_exists(self):
         """Test that Transaction has get_weight() method"""
         tx = Transaction(
@@ -37,7 +37,7 @@ class TestSegWit(unittest.TestCase):
         self.assertTrue(callable(getattr(tx, 'get_weight', None)))
         self.assertTrue(hasattr(tx, 'get_vsize'))
         self.assertTrue(callable(getattr(tx, 'get_vsize', None)))
-    
+
     def test_weight_calculation_non_segwit(self):
         """Test weight calculation for non-SegWit transaction"""
         # Create a simple transaction
@@ -60,17 +60,17 @@ class TestSegWit(unittest.TestCase):
                 )
             ]
         )
-        
+
         # Calculate weight
         weight = tx.get_weight()
-        
+
         # For non-SegWit: weight = size * 4
         tx_size = len(tx.serialize())
         expected_weight = tx_size * 4
-        
+
         self.assertEqual(weight, expected_weight)
         self.assertGreater(weight, 0)
-    
+
     def test_vsize_calculation(self):
         """Test vsize calculation"""
         tx = Transaction(
@@ -92,21 +92,21 @@ class TestSegWit(unittest.TestCase):
                 )
             ]
         )
-        
+
         # Calculate vsize
         vsize = tx.get_vsize()
         weight = tx.get_weight()
-        
+
         # vsize = ceil(weight / 4) = (weight + 3) // 4
         expected_vsize = (weight + 3) // 4
-        
+
         self.assertEqual(vsize, expected_vsize)
         self.assertGreater(vsize, 0)
-        
+
         # For non-SegWit transactions, vsize should equal size
         tx_size = len(tx.serialize())
         self.assertEqual(vsize, tx_size)
-    
+
     def test_weight_vsize_relationship(self):
         """Test that weight and vsize have correct relationship"""
         tx = Transaction(
@@ -128,32 +128,33 @@ class TestSegWit(unittest.TestCase):
                 )
             ]
         )
-        
+
         weight = tx.get_weight()
         vsize = tx.get_vsize()
-        
+
         # vsize should be approximately weight / 4 (rounded up)
         # More precisely: vsize = (weight + 3) // 4
         calculated_vsize = (weight + 3) // 4
         self.assertEqual(vsize, calculated_vsize)
-        
+
         # vsize should be <= weight / 4 + 1
         self.assertLessEqual(vsize, (weight // 4) + 1)
         # vsize should be >= weight / 4
         self.assertGreaterEqual(vsize, weight // 4)
-    
+
     def test_rpc_vsize_weight(self):
         """Test that RPC returns correct vsize and weight"""
-        from ouroboros.rpc import RPCServer
-        from ouroboros.node import BitcoinNode
-        import tempfile
         import shutil
-        
+        import tempfile
+
+        from ouroboros.node import BitcoinNode
+        from ouroboros.rpc import RPCServer
+
         temp_dir = tempfile.mkdtemp()
         try:
             node = BitcoinNode(data_dir=temp_dir, network="regtest")
             rpc_server = RPCServer(node, port=18332)
-            
+
             tx = Transaction(
                 txid=bytes(32),
                 version=1,
@@ -173,17 +174,17 @@ class TestSegWit(unittest.TestCase):
                     )
                 ]
             )
-            
+
             tx_dict = rpc_server._tx_to_dict(tx)
-            
+
             # Check that vsize and weight are present
             self.assertIn("vsize", tx_dict)
             self.assertIn("weight", tx_dict)
-            
+
             # Check that they match transaction methods
             self.assertEqual(tx_dict["vsize"], tx.get_vsize())
             self.assertEqual(tx_dict["weight"], tx.get_weight())
-            
+
             # Check that vsize <= size (for non-SegWit, they should be equal)
             self.assertLessEqual(tx_dict["vsize"], tx_dict["size"])
         finally:
@@ -218,7 +219,7 @@ class TestBlockWeightRejection(unittest.TestCase):
     def test_overweight_block_rejected(self):
         """A block whose transactions exceed 4M weight must be rejected."""
         from ouroboros.database import Block
-        from ouroboros.validation import BlockValidator, MAX_BLOCK_WEIGHT
+        from ouroboros.validation import MAX_BLOCK_WEIGHT
 
         # Build a block stuffed with large non-witness transactions
         # so total weight clearly exceeds MAX_BLOCK_WEIGHT.
@@ -262,7 +263,6 @@ class TestBlockWeightRejection(unittest.TestCase):
         # _validate_block_limits should reject this block.
         # We can't instantiate a full BlockValidator without a real DB,
         # so test the core logic directly.
-        from ouroboros.validation import WITNESS_SCALE_FACTOR, MAX_BLOCK_SIGOPS_COST
         weight = sum(tx.get_weight() for tx in block.transactions)
         self.assertGreater(weight, MAX_BLOCK_WEIGHT,
                            "fabricated block must exceed MAX_BLOCK_WEIGHT")

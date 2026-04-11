@@ -12,9 +12,7 @@ Covers:
 
 import os
 import random
-import struct
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from ouroboros.minisketch import (
     FIELD_MASK,
@@ -23,7 +21,6 @@ from ouroboros.minisketch import (
     berlekamp_massey,
     compute_short_txid,
     estimate_sketch_capacity,
-    find_roots,
     gf_inv,
     gf_mul,
     gf_pow,
@@ -35,7 +32,6 @@ from ouroboros.p2p_messages import (
     SendTxRcnclMessage,
     SketchMessage,
 )
-
 
 # ── GF(2^32) Arithmetic ─────────────────────────────────────────────
 
@@ -172,7 +168,7 @@ class TestMinisketch(unittest.TestCase):
         a.add(20)
         b.add(20)
         b.add(30)
-        a_copy_syns = a.syndromes[:]
+        a.syndromes[:]
         a.merge_inplace(b)
         # After merge, a should encode {10, 30}
         result = a.decode()
@@ -636,7 +632,7 @@ class TestEndToEndReconciliation(unittest.TestCase):
 class TestPeerManagerErlay(unittest.TestCase):
     """Test PeerManager Erlay state management."""
 
-    def _make_manager(self) -> 'PeerManager':
+    def _make_manager(self):
         from ouroboros.p2p import PeerManager
         pm = PeerManager(network="regtest", max_peers=4)
         pm.erlay_enabled = True

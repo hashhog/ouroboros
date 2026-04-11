@@ -12,30 +12,29 @@ import struct
 import time
 import unittest
 
+from ouroboros.addrman import (
+    NET_CJDNS,
+    NET_I2P,
+    NET_IPV4,
+    NET_IPV6,
+    NET_TORV3,
+    AddressManager,
+    AddrInfo,
+    get_network_group,
+)
 from ouroboros.p2p_messages import (
-    AddrV2Message,
-    AddrV2Entry,
-    SendAddrV2Message,
-    encode_varint,
-    decode_varint,
+    BIP155_ADDR_SIZES,
+    BIP155_NET_CJDNS,
+    BIP155_NET_I2P,
     BIP155_NET_IPV4,
     BIP155_NET_IPV6,
     BIP155_NET_TORV2,
     BIP155_NET_TORV3,
-    BIP155_NET_I2P,
-    BIP155_NET_CJDNS,
-    BIP155_ADDR_SIZES,
     MAX_ADDRV2_ADDRESSES,
-)
-from ouroboros.addrman import (
-    AddressManager,
-    AddrInfo,
-    get_network_group,
-    NET_IPV4,
-    NET_IPV6,
-    NET_TORV3,
-    NET_I2P,
-    NET_CJDNS,
+    AddrV2Entry,
+    AddrV2Message,
+    SendAddrV2Message,
+    encode_varint,
 )
 
 

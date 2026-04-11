@@ -7,17 +7,14 @@ bump-fee flow.
 """
 
 import asyncio
-import hashlib
 import os
-import struct
 import sys
 import tempfile
 import types
 import unittest
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
 # Ensure the src directory is on the path
 src_dir = Path(__file__).parent.parent.parent
@@ -34,16 +31,11 @@ if "sync" not in sys.modules:
 
 # We import only the pure-Python modules we need, avoiding the Rust
 # extension (`sync`) required by the real BlockchainDatabase.
-from ouroboros.wallet import (
+from ouroboros.wallet import (  # noqa: E402
     Wallet,
     WalletKey,
     _dsha256,
-    _hash160,
-    INPUT_VBYTES,
-    OUTPUT_VBYTES,
-    OVERHEAD_VBYTES,
 )
-
 
 # Lightweight stand-ins for database.py dataclasses
 # We redefine them here so we don't trigger the `import sync` error.
@@ -60,7 +52,7 @@ class TxIn:
     prev_vout: int
     script_sig: bytes
     sequence: int
-    witness: Optional[List[bytes]] = None
+    witness: list[bytes] | None = None
 
 
 @dataclass
@@ -68,8 +60,8 @@ class Transaction:
     txid: bytes
     version: int
     locktime: int
-    inputs: List[TxIn]
-    outputs: List[TxOut]
+    inputs: list[TxIn]
+    outputs: list[TxOut]
     has_witness: bool = False
 
     @property
@@ -177,9 +169,9 @@ class MockMempool:
     """Minimal mempool mock that supports the operations needed by bump_fee."""
 
     def __init__(self):
-        self.transactions: Dict[bytes, MempoolEntry] = {}
+        self.transactions: dict[bytes, MempoolEntry] = {}
 
-    def add_transaction(self, tx: Transaction, height: int) -> Tuple[bool, str]:
+    def add_transaction(self, tx: Transaction, height: int) -> tuple[bool, str]:
         fee = 0  # will be set in tests
         vsize = tx.get_vsize()
         entry = MempoolEntry(
@@ -206,17 +198,17 @@ class MockMempool:
         )
         self.transactions[tx.txid] = entry
 
-    def get_transaction(self, txid: bytes) -> Optional[Transaction]:
+    def get_transaction(self, txid: bytes) -> Transaction | None:
         entry = self.transactions.get(txid)
         return entry.tx if entry else None
 
-    def get_transaction_entry(self, txid: bytes) -> Optional[MempoolEntry]:
+    def get_transaction_entry(self, txid: bytes) -> MempoolEntry | None:
         return self.transactions.get(txid)
 
     def has_transaction(self, txid: bytes) -> bool:
         return txid in self.transactions
 
-    def try_replace(self, new_tx: Transaction, height: int) -> Tuple[bool, str]:
+    def try_replace(self, new_tx: Transaction, height: int) -> tuple[bool, str]:
         """Accept replacement if new tx conflicts with an existing one and has higher fee."""
         # Find conflicts
         conflicts = set()
@@ -255,7 +247,7 @@ class MockMempool:
             del self.transactions[c_txid]
 
         new_vsize = new_tx.get_vsize()
-        new_total_out = sum(o.value for o in new_tx.outputs)
+        sum(o.value for o in new_tx.outputs)
         # We'll compute fee from context in the test; for now trust it
         new_fee = evicted_fee + 1000  # mock: just make it higher
         entry = MempoolEntry(
@@ -274,21 +266,21 @@ class MockDB:
     """Minimal database mock."""
 
     def __init__(self):
-        self.utxos: Dict[Tuple[bytes, int], dict] = {}
+        self.utxos: dict[tuple[bytes, int], dict] = {}
         self.best_height = 100
 
-    def get_utxo(self, txid: bytes, vout: int) -> Optional[dict]:
+    def get_utxo(self, txid: bytes, vout: int) -> dict | None:
         return self.utxos.get((txid, vout))
 
-    def get_best_block(self) -> Tuple[bytes, int]:
+    def get_best_block(self) -> tuple[bytes, int]:
         return (b"\x00" * 32, self.best_height)
 
     def get_balance(self, address: str, network: str) -> int:
         return 0
 
-    def list_unspent_by_address(self, address: str, network: str) -> List[dict]:
+    def list_unspent_by_address(self, address: str, network: str) -> list[dict]:
         result = []
-        for (txid, vout), utxo in self.utxos.items():
+        for (_txid, _vout), utxo in self.utxos.items():
             if utxo.get("_address") == address:
                 result.append(utxo)
         return result
@@ -312,7 +304,7 @@ def make_txid() -> bytes:
 
 def make_funding_tx(
     wallet_key: WalletKey, amount: int = 100_000
-) -> Tuple[Transaction, bytes]:
+) -> tuple[Transaction, bytes]:
     """Create a simple funding transaction that pays to the wallet key."""
     txid = make_txid()
     tx = Transaction(
@@ -369,7 +361,7 @@ class TestBumpFee(unittest.TestCase):
 
     def _create_original_tx(
         self, *, rbf: bool = True, fee: int = 500, amount: int = 50_000
-    ) -> Tuple[Transaction, bytes]:
+    ) -> tuple[Transaction, bytes]:
         """Create an original transaction in the mock mempool.
 
         Returns (original_tx, funding_txid).
@@ -592,14 +584,14 @@ class TestBumpFeeRPC(unittest.TestCase):
         from ouroboros.rpc import RPCServer
 
         self.assertTrue(hasattr(RPCServer, "rpc_bumpfee"))
-        self.assertTrue(callable(getattr(RPCServer, "rpc_bumpfee")))
+        self.assertTrue(callable(RPCServer.rpc_bumpfee))
 
     def test_rpc_psbtbumpfee_method_exists(self):
         """The RPCServer class should have rpc_psbtbumpfee method."""
         from ouroboros.rpc import RPCServer
 
         self.assertTrue(hasattr(RPCServer, "rpc_psbtbumpfee"))
-        self.assertTrue(callable(getattr(RPCServer, "rpc_psbtbumpfee")))
+        self.assertTrue(callable(RPCServer.rpc_psbtbumpfee))
 
 
 if __name__ == "__main__":

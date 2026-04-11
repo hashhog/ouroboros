@@ -11,7 +11,6 @@ https://github.com/bitcoin/bips/blob/master/bip-0009.mediawiki
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 
 class DeploymentState(Enum):
@@ -229,7 +228,7 @@ def is_buried_deployment_active(
 
 def get_buried_deployment_height(
     deployment: str, network: str = "mainnet"
-) -> Optional[int]:
+) -> int | None:
     """
     Get the activation height for a buried deployment.
 
@@ -254,8 +253,8 @@ def get_deployment_state(
     deployment: str,
     height: int,
     network: str = "mainnet",
-    block_versions: Optional[list[tuple[int, int]]] = None,
-    block_mtps: Optional[list[tuple[int, int]]] = None,
+    block_versions: list[tuple[int, int]] | None = None,
+    block_mtps: list[tuple[int, int]] | None = None,
 ) -> DeploymentState:
     """
     Get the BIP9 deployment state at the given height.
@@ -298,17 +297,22 @@ def get_deployment_state(
         return DeploymentState(state_str)
 
     except ImportError:
-        # Fallback: check if deployment is ALWAYS_ACTIVE
+        # Fallback: check if deployment is ALWAYS_ACTIVE or use min_activation_height
         deployments = BIP9_DEPLOYMENTS.get(network_lower, {})
         dep = deployments.get(deployment_lower)
 
         if dep is None:
-            raise ValueError(f"Unknown deployment: {deployment}")
+            raise ValueError(f"Unknown deployment: {deployment}") from None
 
         if dep.start_time == Deployment.ALWAYS_ACTIVE:
             return DeploymentState.ACTIVE
         elif dep.start_time == Deployment.NEVER_ACTIVE:
             return DeploymentState.FAILED
+        elif dep.min_activation_height is not None and height >= dep.min_activation_height:
+            # Without Rust versionbits, use the known activation height as a proxy.
+            # This is correct for all deployments that activated at their
+            # min_activation_height (e.g. taproot via speedy trial at 709632).
+            return DeploymentState.ACTIVE
         else:
             # Without Rust, we can't compute the full state machine
             # Return DEFINED as a safe fallback
@@ -319,8 +323,8 @@ def is_deployment_active(
     deployment: str,
     height: int,
     network: str = "mainnet",
-    block_versions: Optional[list[tuple[int, int]]] = None,
-    block_mtps: Optional[list[tuple[int, int]]] = None,
+    block_versions: list[tuple[int, int]] | None = None,
+    block_mtps: list[tuple[int, int]] | None = None,
 ) -> bool:
     """
     Check if a deployment is active at the given height.
@@ -344,8 +348,8 @@ def is_deployment_active(
 def get_all_deployments_info(
     height: int,
     network: str = "mainnet",
-    block_versions: Optional[list[tuple[int, int]]] = None,
-    block_mtps: Optional[list[tuple[int, int]]] = None,
+    block_versions: list[tuple[int, int]] | None = None,
+    block_mtps: list[tuple[int, int]] | None = None,
 ) -> list[dict]:
     """
     Get info about all deployments at a given height.
@@ -450,8 +454,8 @@ def check_version_signal(version: int, bit: int) -> bool:
 def compute_block_version(
     height: int,
     network: str = "mainnet",
-    block_versions: Optional[list[tuple[int, int]]] = None,
-    block_mtps: Optional[list[tuple[int, int]]] = None,
+    block_versions: list[tuple[int, int]] | None = None,
+    block_mtps: list[tuple[int, int]] | None = None,
 ) -> int:
     """
     Compute the block version to use for a new block at the given height.

@@ -44,10 +44,8 @@ Reference: bitcoin/src/zmq/zmqpublishnotifier.cpp
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import struct
-from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +64,7 @@ def _ensure_zmq():
             raise ImportError(
                 "pyzmq is required for ZMQ notifications. "
                 "Install it with: pip install pyzmq"
-            )
+            ) from None
     return _zmq
 
 
@@ -100,12 +98,12 @@ class ZMQNotifier:
 
     def __init__(self):
         # topic -> endpoint URL
-        self._topic_endpoints: Dict[bytes, str] = {}
+        self._topic_endpoints: dict[bytes, str] = {}
         # endpoint URL -> socket
-        self._sockets: Dict[str, object] = {}
-        self._context: Optional[object] = None
+        self._sockets: dict[str, object] = {}
+        self._context: object | None = None
         # per-topic sequence numbers (uint32)
-        self._sequences: Dict[bytes, int] = {
+        self._sequences: dict[bytes, int] = {
             self.TOPIC_HASH_BLOCK: 0,
             self.TOPIC_HASH_TX: 0,
             self.TOPIC_RAW_BLOCK: 0,
@@ -139,7 +137,7 @@ class ZMQNotifier:
         self._context = zmq.asyncio.Context()
 
         # Group topics by endpoint to share sockets
-        endpoint_topics: Dict[str, list] = {}
+        endpoint_topics: dict[str, list] = {}
         for topic, endpoint in self._topic_endpoints.items():
             endpoint_topics.setdefault(endpoint, []).append(topic)
 
@@ -183,7 +181,7 @@ class ZMQNotifier:
         self._started = False
         logger.info("ZMQ notifier stopped")
 
-    def _get_socket(self, topic: bytes) -> Optional[object]:
+    def _get_socket(self, topic: bytes) -> object | None:
         """Get the socket for a topic, or None if not configured."""
         endpoint = self._topic_endpoints.get(topic)
         if endpoint is None:
@@ -256,7 +254,7 @@ class ZMQNotifier:
     def notify_transaction(
         self,
         tx,
-        mempool_sequence: Optional[int] = None,
+        mempool_sequence: int | None = None,
     ) -> None:
         """
         Publish hashtx, rawtx, and sequence (accept) for a new mempool transaction.
@@ -290,7 +288,7 @@ class ZMQNotifier:
     def notify_transaction_removed(
         self,
         txid: bytes,
-        mempool_sequence: Optional[int] = None,
+        mempool_sequence: int | None = None,
     ) -> None:
         """
         Publish sequence (remove) event for a transaction removed from mempool.
@@ -318,7 +316,7 @@ class ZMQNotifier:
         self,
         hash_bytes: bytes,
         label: int,
-        mempool_sequence: Optional[int] = None,
+        mempool_sequence: int | None = None,
     ) -> None:
         """
         Publish a sequence topic message.

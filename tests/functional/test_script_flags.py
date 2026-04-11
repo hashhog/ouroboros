@@ -5,18 +5,29 @@ Tests that the script verification flag system correctly activates
 rules at the right heights and enforces them properly.
 """
 
-import pytest
 from ouroboros.script import (
-    get_flags_for_height,
-    SCRIPT_VERIFY_P2SH, SCRIPT_VERIFY_DERSIG, SCRIPT_VERIFY_LOW_S,
-    SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY, SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
-    SCRIPT_VERIFY_WITNESS, SCRIPT_VERIFY_NULLDUMMY, SCRIPT_VERIFY_NULLFAIL,
-    SCRIPT_VERIFY_CLEANSTACK, SCRIPT_VERIFY_SIGPUSHONLY, SCRIPT_VERIFY_TAPROOT,
-    BIP16_ACTIVATION_HEIGHT, BIP65_ACTIVATION_HEIGHT, BIP66_ACTIVATION_HEIGHT,
-    BIP68_ACTIVATION_HEIGHT, SEGWIT_ACTIVATION_HEIGHT, TAPROOT_ACTIVATION_HEIGHT,
-    _check_der_signature, _check_low_s, _is_push_only_simple,
+    BIP16_ACTIVATION_HEIGHT,
+    BIP65_ACTIVATION_HEIGHT,
+    BIP66_ACTIVATION_HEIGHT,
+    BIP68_ACTIVATION_HEIGHT,
     MAX_SCRIPT_ELEMENT_SIZE,
+    SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY,
+    SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    SCRIPT_VERIFY_CLEANSTACK,
+    SCRIPT_VERIFY_DERSIG,
+    SCRIPT_VERIFY_LOW_S,
+    SCRIPT_VERIFY_NULLDUMMY,
+    SCRIPT_VERIFY_NULLFAIL,
+    SCRIPT_VERIFY_P2SH,
+    SCRIPT_VERIFY_SIGPUSHONLY,
+    SCRIPT_VERIFY_TAPROOT,
+    SCRIPT_VERIFY_WITNESS,
+    SEGWIT_ACTIVATION_HEIGHT,
+    TAPROOT_ACTIVATION_HEIGHT,
     ScriptInterpreter,
+    _check_der_signature,
+    _is_push_only_simple,
+    get_flags_for_height,
 )
 
 
@@ -106,6 +117,6 @@ class TestPushDataLimit:
         script = bytes([0x4d]) + (521).to_bytes(2, 'little') + b'\x00' * 521
         try:
             interp._execute_script(script, tx, 0, b'')
-            assert False, "Should have raised ValueError"
+            raise AssertionError("Should have raised ValueError")
         except ValueError as e:
             assert "520" in str(e) or "exceeds" in str(e).lower()

@@ -10,14 +10,12 @@ parent's but whose package fee rate is lower than the child's package.
 
 import asyncio
 import hashlib
+import shutil
 import sys
 import tempfile
-import shutil
 import unittest
-from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock
 
 # Mock the Rust extension module before any ouroboros imports
 sys.modules.setdefault("sync", MagicMock())
@@ -26,9 +24,9 @@ sys.modules.setdefault("sync", MagicMock())
 src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
-from ouroboros.database import Transaction, TxIn, TxOut, Block
-from ouroboros.mempool import MempoolEntry
-from ouroboros.rpc import RPCServer
+from ouroboros.database import Transaction, TxIn, TxOut  # noqa: E402
+from ouroboros.mempool import MempoolEntry  # noqa: E402
+from ouroboros.rpc import RPCServer  # noqa: E402
 
 
 def _make_txid(label: str) -> bytes:

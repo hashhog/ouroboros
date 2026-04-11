@@ -7,12 +7,12 @@ ouroboros's _calculate_signature_hash produces the expected results
 for each (raw_transaction, script, input_index, hash_type) tuple.
 """
 
-import json
-import os
-import sys
-import struct
 import hashlib
 import io
+import json
+import os
+import struct
+import sys
 
 # ---------------------------------------------------------------------------
 # Ensure the ouroboros package is importable
@@ -21,14 +21,16 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 # Mock the sync Rust extension module so we can import without building it
-import types as _types
-_sync = _types.ModuleType('sync')
-_sync.PyUTXO = type('PyUTXO', (), {})
-_sync.SyncEngine = type('SyncEngine', (), {})
-sys.modules['sync'] = _sync
+import types as _types  # noqa: E402
 
-from ouroboros.database import Transaction, TxIn, TxOut
-from ouroboros.script import ScriptInterpreter
+if 'sync' not in sys.modules:
+    _sync = _types.ModuleType('sync')
+    _sync.PyUTXO = type('PyUTXO', (), {})
+    _sync.SyncEngine = type('SyncEngine', (), {})
+    sys.modules['sync'] = _sync
+
+from ouroboros.database import Transaction, TxIn, TxOut  # noqa: E402
+from ouroboros.script import ScriptInterpreter  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Compact-size (varint) reader – mirrors _read_compact_size in psbt.py

@@ -32,7 +32,7 @@ import io
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any
 
 from ouroboros.database import Transaction, TxIn, TxOut
 
@@ -167,9 +167,9 @@ def _read_compact_size(f: io.BytesIO) -> int:
 # Key-value pair I/O
 # =============================================================================
 
-def _read_kv_pairs(f: io.BytesIO) -> Dict[bytes, bytes]:
+def _read_kv_pairs(f: io.BytesIO) -> dict[bytes, bytes]:
     """Read key-value pairs until separator (0x00)."""
-    pairs: Dict[bytes, bytes] = {}
+    pairs: dict[bytes, bytes] = {}
     while True:
         key_len_byte = f.read(1)
         if not key_len_byte or key_len_byte == b"\x00":
@@ -185,7 +185,7 @@ def _read_kv_pairs(f: io.BytesIO) -> Dict[bytes, bytes]:
     return pairs
 
 
-def _write_kv_pairs(pairs: Dict[bytes, bytes]) -> bytes:
+def _write_kv_pairs(pairs: dict[bytes, bytes]) -> bytes:
     """Write key-value pairs with separator."""
     out = bytearray()
     for key, val in pairs.items():
@@ -225,7 +225,7 @@ def _deserialize_tx(raw: bytes) -> Transaction:
     f = io.BytesIO(raw)
     version = struct.unpack("<i", f.read(4))[0]
     n_in = _read_compact_size(f)
-    inputs: List[TxIn] = []
+    inputs: list[TxIn] = []
     for _ in range(n_in):
         prev_txid = f.read(32)
         prev_vout = struct.unpack("<I", f.read(4))[0]
@@ -234,7 +234,7 @@ def _deserialize_tx(raw: bytes) -> Transaction:
         sequence = struct.unpack("<I", f.read(4))[0]
         inputs.append(TxIn(prev_txid, prev_vout, script_sig, sequence))
     n_out = _read_compact_size(f)
-    outputs: List[TxOut] = []
+    outputs: list[TxOut] = []
     for _ in range(n_out):
         value = struct.unpack("<q", f.read(8))[0]
         spk_len = _read_compact_size(f)
@@ -296,7 +296,7 @@ def _serialize_tx_with_witness(tx: Transaction) -> bytes:
 class KeyOriginInfo:
     """BIP32 key origin information (fingerprint + derivation path)."""
     fingerprint: bytes  # 4 bytes
-    path: List[int]     # derivation path indices
+    path: list[int]     # derivation path indices
 
     def serialize(self) -> bytes:
         data = bytearray(self.fingerprint)
@@ -305,7 +305,7 @@ class KeyOriginInfo:
         return bytes(data)
 
     @classmethod
-    def deserialize(cls, data: bytes) -> "KeyOriginInfo":
+    def deserialize(cls, data: bytes) -> KeyOriginInfo:
         if len(data) < 4:
             raise ValueError("KeyOriginInfo too short")
         if (len(data) - 4) % 4 != 0:
@@ -335,47 +335,47 @@ class KeyOriginInfo:
 class PSBTInput:
     """Per-input PSBT data (BIP174 / BIP370)."""
     # BIP174 fields
-    non_witness_utxo: Optional[bytes] = None      # Full previous tx
-    witness_utxo: Optional[Tuple[int, bytes]] = None  # (value, scriptPubKey)
-    partial_sigs: Dict[bytes, bytes] = field(default_factory=dict)  # pubkey -> sig
-    sighash_type: Optional[int] = None
-    redeem_script: Optional[bytes] = None
-    witness_script: Optional[bytes] = None
-    bip32_derivations: Dict[bytes, KeyOriginInfo] = field(default_factory=dict)
-    final_script_sig: Optional[bytes] = None
-    final_script_witness: Optional[List[bytes]] = None  # Stack items
+    non_witness_utxo: bytes | None = None      # Full previous tx
+    witness_utxo: tuple[int, bytes] | None = None  # (value, scriptPubKey)
+    partial_sigs: dict[bytes, bytes] = field(default_factory=dict)  # pubkey -> sig
+    sighash_type: int | None = None
+    redeem_script: bytes | None = None
+    witness_script: bytes | None = None
+    bip32_derivations: dict[bytes, KeyOriginInfo] = field(default_factory=dict)
+    final_script_sig: bytes | None = None
+    final_script_witness: list[bytes] | None = None  # Stack items
 
     # BIP174 preimage fields
-    ripemd160_preimages: Dict[bytes, bytes] = field(default_factory=dict)  # hash -> preimage
-    sha256_preimages: Dict[bytes, bytes] = field(default_factory=dict)
-    hash160_preimages: Dict[bytes, bytes] = field(default_factory=dict)
-    hash256_preimages: Dict[bytes, bytes] = field(default_factory=dict)
+    ripemd160_preimages: dict[bytes, bytes] = field(default_factory=dict)  # hash -> preimage
+    sha256_preimages: dict[bytes, bytes] = field(default_factory=dict)
+    hash160_preimages: dict[bytes, bytes] = field(default_factory=dict)
+    hash256_preimages: dict[bytes, bytes] = field(default_factory=dict)
 
     # BIP370 PSBT v2 fields
-    previous_txid: Optional[bytes] = None
-    output_index: Optional[int] = None
-    sequence: Optional[int] = None
-    required_time_locktime: Optional[int] = None
-    required_height_locktime: Optional[int] = None
+    previous_txid: bytes | None = None
+    output_index: int | None = None
+    sequence: int | None = None
+    required_time_locktime: int | None = None
+    required_height_locktime: int | None = None
 
     # Taproot fields (BIP371)
-    tap_key_sig: Optional[bytes] = None
-    tap_script_sigs: Dict[Tuple[bytes, bytes], bytes] = field(default_factory=dict)  # (xonly, leaf_hash) -> sig
-    tap_leaf_scripts: Dict[bytes, Tuple[bytes, int]] = field(default_factory=dict)  # control_block -> (script, leaf_ver)
-    tap_bip32_derivations: Dict[bytes, Tuple[List[bytes], KeyOriginInfo]] = field(default_factory=dict)  # xonly -> (leaf_hashes, origin)
-    tap_internal_key: Optional[bytes] = None  # 32-byte x-only pubkey
-    tap_merkle_root: Optional[bytes] = None   # 32-byte hash
+    tap_key_sig: bytes | None = None
+    tap_script_sigs: dict[tuple[bytes, bytes], bytes] = field(default_factory=dict)  # (xonly, leaf_hash) -> sig
+    tap_leaf_scripts: dict[bytes, tuple[bytes, int]] = field(default_factory=dict)  # control_block -> (script, leaf_ver)
+    tap_bip32_derivations: dict[bytes, tuple[list[bytes], KeyOriginInfo]] = field(default_factory=dict)  # xonly -> (leaf_hashes, origin)
+    tap_internal_key: bytes | None = None  # 32-byte x-only pubkey
+    tap_merkle_root: bytes | None = None   # 32-byte hash
 
     # Unknown fields
-    unknown: Dict[bytes, bytes] = field(default_factory=dict)
+    unknown: dict[bytes, bytes] = field(default_factory=dict)
 
     def is_finalized(self) -> bool:
         """Check if this input has been finalized."""
         return self.final_script_sig is not None or self.final_script_witness is not None
 
-    def to_kv(self) -> Dict[bytes, bytes]:
+    def to_kv(self) -> dict[bytes, bytes]:
         """Convert to key-value pairs for serialization."""
-        kv: Dict[bytes, bytes] = {}
+        kv: dict[bytes, bytes] = {}
 
         if self.non_witness_utxo is not None:
             kv[bytes([PSBTInputType.NON_WITNESS_UTXO])] = self.non_witness_utxo
@@ -464,7 +464,7 @@ class PSBTInput:
         return kv
 
     @classmethod
-    def from_kv(cls, kv: Dict[bytes, bytes]) -> "PSBTInput":
+    def from_kv(cls, kv: dict[bytes, bytes]) -> PSBTInput:
         """Parse from key-value pairs."""
         inp = cls()
         for key, val in kv.items():
@@ -545,7 +545,7 @@ class PSBTInput:
                 inp.unknown[key] = val
         return inp
 
-    def merge(self, other: "PSBTInput") -> None:
+    def merge(self, other: PSBTInput) -> None:
         """Merge another PSBTInput into this one."""
         if self.non_witness_utxo is None and other.non_witness_utxo is not None:
             self.non_witness_utxo = other.non_witness_utxo
@@ -591,25 +591,25 @@ class PSBTInput:
 @dataclass
 class PSBTOutput:
     """Per-output PSBT data (BIP174 / BIP370)."""
-    redeem_script: Optional[bytes] = None
-    witness_script: Optional[bytes] = None
-    bip32_derivations: Dict[bytes, KeyOriginInfo] = field(default_factory=dict)
+    redeem_script: bytes | None = None
+    witness_script: bytes | None = None
+    bip32_derivations: dict[bytes, KeyOriginInfo] = field(default_factory=dict)
 
     # PSBT v2 fields
-    amount: Optional[int] = None
-    script: Optional[bytes] = None
+    amount: int | None = None
+    script: bytes | None = None
 
     # Taproot fields
-    tap_internal_key: Optional[bytes] = None
-    tap_tree: Optional[List[Tuple[int, int, bytes]]] = None  # [(depth, leaf_ver, script), ...]
-    tap_bip32_derivations: Dict[bytes, Tuple[List[bytes], KeyOriginInfo]] = field(default_factory=dict)
+    tap_internal_key: bytes | None = None
+    tap_tree: list[tuple[int, int, bytes]] | None = None  # [(depth, leaf_ver, script), ...]
+    tap_bip32_derivations: dict[bytes, tuple[list[bytes], KeyOriginInfo]] = field(default_factory=dict)
 
     # Unknown fields
-    unknown: Dict[bytes, bytes] = field(default_factory=dict)
+    unknown: dict[bytes, bytes] = field(default_factory=dict)
 
-    def to_kv(self) -> Dict[bytes, bytes]:
+    def to_kv(self) -> dict[bytes, bytes]:
         """Convert to key-value pairs for serialization."""
-        kv: Dict[bytes, bytes] = {}
+        kv: dict[bytes, bytes] = {}
 
         if self.redeem_script is not None:
             kv[bytes([PSBTOutputType.REDEEM_SCRIPT])] = self.redeem_script
@@ -648,7 +648,7 @@ class PSBTOutput:
         return kv
 
     @classmethod
-    def from_kv(cls, kv: Dict[bytes, bytes]) -> "PSBTOutput":
+    def from_kv(cls, kv: dict[bytes, bytes]) -> PSBTOutput:
         """Parse from key-value pairs."""
         out = cls()
         for key, val in kv.items():
@@ -689,7 +689,7 @@ class PSBTOutput:
                 out.unknown[key] = val
         return out
 
-    def merge(self, other: "PSBTOutput") -> None:
+    def merge(self, other: PSBTOutput) -> None:
         """Merge another PSBTOutput into this one."""
         if self.redeem_script is None and other.redeem_script is not None:
             self.redeem_script = other.redeem_script
@@ -718,28 +718,28 @@ class PSBT:
     Holds the unsigned transaction plus per-input / per-output metadata
     required for signing, combining, and finalizing.
     """
-    tx: Optional[Transaction] = None
-    inputs: List[PSBTInput] = field(default_factory=list)
-    outputs: List[PSBTOutput] = field(default_factory=list)
-    global_xpubs: Dict[bytes, KeyOriginInfo] = field(default_factory=dict)  # xpub -> derivation
-    unknown_global: Dict[bytes, bytes] = field(default_factory=dict)
+    tx: Transaction | None = None
+    inputs: list[PSBTInput] = field(default_factory=list)
+    outputs: list[PSBTOutput] = field(default_factory=list)
+    global_xpubs: dict[bytes, KeyOriginInfo] = field(default_factory=dict)  # xpub -> derivation
+    unknown_global: dict[bytes, bytes] = field(default_factory=dict)
 
     # PSBT version (0 = BIP174, 2 = BIP370)
     version: int = PSBT_VERSION_0
 
     # PSBT v2 global fields
-    tx_version: Optional[int] = None
-    fallback_locktime: Optional[int] = None
-    input_count: Optional[int] = None
-    output_count: Optional[int] = None
-    tx_modifiable: Optional[int] = None
+    tx_version: int | None = None
+    fallback_locktime: int | None = None
+    input_count: int | None = None
+    output_count: int | None = None
+    tx_modifiable: int | None = None
 
     # ==========================================================================
     # Constructors
     # ==========================================================================
 
     @classmethod
-    def from_transaction(cls, tx: Transaction, version: int = PSBT_VERSION_0) -> "PSBT":
+    def from_transaction(cls, tx: Transaction, version: int = PSBT_VERSION_0) -> PSBT:
         """Create a PSBT from an unsigned Transaction."""
         unsigned = copy.deepcopy(tx)
         for inp in unsigned.inputs:
@@ -775,11 +775,11 @@ class PSBT:
     @classmethod
     def create(
         cls,
-        inputs: List[Dict[str, Any]],
-        outputs: List[Dict[str, Any]],
+        inputs: list[dict[str, Any]],
+        outputs: list[dict[str, Any]],
         version: int = 2,
         locktime: int = 0,
-    ) -> "PSBT":
+    ) -> PSBT:
         """
         Create a new PSBT from input/output specifications.
 
@@ -844,7 +844,7 @@ class PSBT:
         out = bytearray(PSBT_MAGIC)
 
         # Global map
-        global_kv: Dict[bytes, bytes] = {}
+        global_kv: dict[bytes, bytes] = {}
 
         if self.version == PSBT_VERSION_0:
             # v0: include unsigned tx
@@ -885,7 +885,7 @@ class PSBT:
         return base64.b64encode(self.serialize()).decode("ascii")
 
     @classmethod
-    def deserialize(cls, data: bytes) -> "PSBT":
+    def deserialize(cls, data: bytes) -> PSBT:
         """Deserialize PSBT from binary format."""
         if len(data) > MAX_PSBT_SIZE:
             raise ValueError(f"PSBT too large: {len(data)} > {MAX_PSBT_SIZE}")
@@ -963,12 +963,12 @@ class PSBT:
         return psbt
 
     @classmethod
-    def from_base64(cls, b64_str: str) -> "PSBT":
+    def from_base64(cls, b64_str: str) -> PSBT:
         """Deserialize PSBT from base64 string."""
         try:
             data = base64.b64decode(b64_str)
         except Exception as e:
-            raise ValueError(f"Invalid base64: {e}")
+            raise ValueError(f"Invalid base64: {e}") from None
         return cls.deserialize(data)
 
     def _reconstruct_tx_from_v2(self) -> None:
@@ -1005,7 +1005,7 @@ class PSBT:
     # Combining
     # ==========================================================================
 
-    def combine(self, other: "PSBT") -> "PSBT":
+    def combine(self, other: PSBT) -> PSBT:
         """
         Combine two PSBTs for the same transaction (``combinepsbt``).
 
@@ -1031,7 +1031,7 @@ class PSBT:
     # Finalization
     # ==========================================================================
 
-    def finalize(self) -> "PSBT":
+    def finalize(self) -> PSBT:
         """
         Finalize each input: builds final_script_sig/witness and clears
         non-final fields. Returns self.
@@ -1065,7 +1065,7 @@ class PSBT:
 
         if psbt_in.tap_script_sigs:
             # Script path spend - need control block and script
-            for (xonly, leaf_hash), sig in psbt_in.tap_script_sigs.items():
+            for (_xonly, leaf_hash), sig in psbt_in.tap_script_sigs.items():
                 # Find matching leaf script
                 for control_block, (script, leaf_ver) in psbt_in.tap_leaf_scripts.items():
                     # Verify leaf hash matches
@@ -1156,7 +1156,7 @@ class PSBT:
             m = ws[0] - 0x50 if ws[0] >= 0x51 and ws[0] <= 0x60 else None
             if m is not None and len(psbt_in.partial_sigs) >= m:
                 # Build witness stack: OP_0 <sig1> <sig2> ... <witness_script>
-                witness: List[bytes] = [b""]  # OP_0 for CHECKMULTISIG bug
+                witness: list[bytes] = [b""]  # OP_0 for CHECKMULTISIG bug
 
                 # Add signatures in pubkey order
                 for pubkey in sorted(psbt_in.partial_sigs.keys()):
@@ -1266,9 +1266,9 @@ class PSBT:
     # Decoding (human-readable)
     # ==========================================================================
 
-    def decode(self) -> Dict[str, Any]:
+    def decode(self) -> dict[str, Any]:
         """Return a human-readable dictionary representation (``decodepsbt``)."""
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "version": self.version,
         }
 
@@ -1310,8 +1310,8 @@ class PSBT:
 
         # Inputs
         result["inputs"] = []
-        for i, psbt_in in enumerate(self.inputs):
-            info: Dict[str, Any] = {}
+        for _i, psbt_in in enumerate(self.inputs):
+            info: dict[str, Any] = {}
 
             if psbt_in.witness_utxo is not None:
                 val, spk = psbt_in.witness_utxo
@@ -1337,6 +1337,7 @@ class PSBT:
                     0x83: "SINGLE|ANYONECANPAY", 0: "DEFAULT",
                 }
                 info["sighash"] = sighash_names.get(psbt_in.sighash_type, str(psbt_in.sighash_type))
+                info["sighash_type"] = psbt_in.sighash_type
 
             if psbt_in.redeem_script is not None:
                 info["redeem_script"] = {"hex": psbt_in.redeem_script.hex()}
@@ -1414,7 +1415,7 @@ class PSBT:
 
         return result
 
-    def _compute_fee(self) -> Optional[int]:
+    def _compute_fee(self) -> int | None:
         """Compute transaction fee from UTXO information."""
         if self.tx is None:
             return None
@@ -1438,7 +1439,7 @@ class PSBT:
 
     def add_input(
         self,
-        txid: Union[str, bytes],
+        txid: str | bytes,
         vout: int,
         sequence: int = 0xFFFFFFFD,
     ) -> int:
@@ -1469,7 +1470,7 @@ class PSBT:
 
     def add_output(
         self,
-        script_pubkey: Union[str, bytes],
+        script_pubkey: str | bytes,
         amount: int,
     ) -> int:
         """Add a new output to the PSBT. Returns the output index."""
@@ -1528,8 +1529,8 @@ class PSBT:
 # =============================================================================
 
 def createpsbt(
-    inputs: List[Dict[str, Any]],
-    outputs: List[Dict[str, Any]],
+    inputs: list[dict[str, Any]],
+    outputs: list[dict[str, Any]],
     locktime: int = 0,
     replaceable: bool = True,
 ) -> str:
@@ -1545,7 +1546,6 @@ def createpsbt(
     Returns:
         Base64-encoded PSBT
     """
-    from ouroboros.address import address_to_script_pubkey
 
     # Normalize outputs format
     normalized_outputs = []
@@ -1589,7 +1589,7 @@ def createpsbt(
     return psbt.to_base64()
 
 
-def combinepsbt(psbts: List[str]) -> str:
+def combinepsbt(psbts: list[str]) -> str:
     """
     Combine multiple PSBTs (``combinepsbt`` RPC).
 
@@ -1610,7 +1610,7 @@ def combinepsbt(psbts: List[str]) -> str:
     return combined.to_base64()
 
 
-def finalizepsbt(psbt_b64: str, extract: bool = True) -> Dict[str, Any]:
+def finalizepsbt(psbt_b64: str, extract: bool = True) -> dict[str, Any]:
     """
     Finalize a PSBT (``finalizepsbt`` RPC).
 
@@ -1625,7 +1625,7 @@ def finalizepsbt(psbt_b64: str, extract: bool = True) -> Dict[str, Any]:
     psbt.finalize()
 
     complete = psbt.is_finalized()
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "psbt": psbt.to_base64(),
         "complete": complete,
     }
@@ -1637,7 +1637,7 @@ def finalizepsbt(psbt_b64: str, extract: bool = True) -> Dict[str, Any]:
     return result
 
 
-def decodepsbt(psbt_b64: str) -> Dict[str, Any]:
+def decodepsbt(psbt_b64: str) -> dict[str, Any]:
     """
     Decode a PSBT to human-readable format (``decodepsbt`` RPC).
 
@@ -1651,7 +1651,7 @@ def decodepsbt(psbt_b64: str) -> Dict[str, Any]:
     return psbt.decode()
 
 
-def analyzepsbt(psbt_b64: str) -> Dict[str, Any]:
+def analyzepsbt(psbt_b64: str) -> dict[str, Any]:
     """
     Analyze a PSBT (``analyzepsbt`` RPC).
 
@@ -1668,8 +1668,8 @@ def analyzepsbt(psbt_b64: str) -> Dict[str, Any]:
     all_signed = True
     all_finalized = True
 
-    for i, psbt_in in enumerate(psbt.inputs):
-        inp_info: Dict[str, Any] = {}
+    for _i, psbt_in in enumerate(psbt.inputs):
+        inp_info: dict[str, Any] = {}
 
         has_utxo = psbt_in.witness_utxo is not None or psbt_in.non_witness_utxo is not None
         inp_info["has_utxo"] = has_utxo
@@ -1696,7 +1696,7 @@ def analyzepsbt(psbt_b64: str) -> Dict[str, Any]:
     else:
         next_role = "updater"
 
-    result: Dict[str, Any] = {
+    result: dict[str, Any] = {
         "inputs": inputs_analysis,
         "next": next_role,
     }
@@ -1717,7 +1717,7 @@ def analyzepsbt(psbt_b64: str) -> Dict[str, Any]:
     return result
 
 
-def utxoupdatepsbt(psbt_b64: str, utxos: List[Dict[str, Any]]) -> str:
+def utxoupdatepsbt(psbt_b64: str, utxos: list[dict[str, Any]]) -> str:
     """
     Update PSBT with UTXO information (``utxoupdatepsbt`` RPC).
 
@@ -1756,13 +1756,13 @@ def utxoupdatepsbt(psbt_b64: str, utxos: List[Dict[str, Any]]) -> str:
 
 def _construct_miniscript_witness(
     witness_script: bytes,
-    partial_sigs: Dict[bytes, bytes],
-    sha256_preimages: Dict[bytes, bytes],
-    hash256_preimages: Dict[bytes, bytes],
-    ripemd160_preimages: Dict[bytes, bytes],
-    hash160_preimages: Dict[bytes, bytes],
-    ctx: "MiniscriptContext",
-) -> Optional[List[bytes]]:
+    partial_sigs: dict[bytes, bytes],
+    sha256_preimages: dict[bytes, bytes],
+    hash256_preimages: dict[bytes, bytes],
+    ripemd160_preimages: dict[bytes, bytes],
+    hash160_preimages: dict[bytes, bytes],
+    ctx: MiniscriptContext,
+) -> list[bytes] | None:
     """
     Construct a witness stack for a miniscript.
 
@@ -1783,7 +1783,6 @@ def _construct_miniscript_witness(
         List of witness elements (excluding the witness script itself),
         or None if satisfaction is not possible.
     """
-    from ouroboros.miniscript import Fragment, MiniscriptContext
 
     # We need to analyze the witness_script structure and build witness
     # For now, implement basic satisfaction for common patterns
@@ -1833,7 +1832,7 @@ def _construct_miniscript_witness(
     return None
 
 
-def joinpsbts(psbts: List[str]) -> str:
+def joinpsbts(psbts: list[str]) -> str:
     """
     Join multiple PSBTs into a single PSBT with all inputs and outputs.
 
@@ -1850,10 +1849,10 @@ def joinpsbts(psbts: List[str]) -> str:
     if not psbts:
         raise ValueError("No PSBTs provided")
 
-    all_inputs: List[TxIn] = []
-    all_outputs: List[TxOut] = []
-    all_psbt_inputs: List[PSBTInput] = []
-    all_psbt_outputs: List[PSBTOutput] = []
+    all_inputs: list[TxIn] = []
+    all_outputs: list[TxOut] = []
+    all_psbt_inputs: list[PSBTInput] = []
+    all_psbt_outputs: list[PSBTOutput] = []
 
     for psbt_b64 in psbts:
         psbt = PSBT.from_base64(psbt_b64)

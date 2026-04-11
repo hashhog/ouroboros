@@ -9,21 +9,18 @@ Tests cover:
 - Feefilter message serialization/deserialization
 """
 
-import pytest
 import random
-import time
-from unittest.mock import MagicMock, AsyncMock, patch
 
 from ouroboros.p2p import (
-    FeeFilterRounder,
-    TrickleQueue,
-    TrickleEntry,
     AVG_FEEFILTER_BROADCAST_INTERVAL,
-    MAX_FEEFILTER_CHANGE_DELAY,
     FEE_FILTER_SPACING,
+    MAX_FEEFILTER_CHANGE_DELAY,
     MIN_RELAY_FEE_RATE,
+    FeeFilterRounder,
+    TrickleEntry,
+    TrickleQueue,
 )
-from ouroboros.p2p_messages import FeeFilterMessage, INV_TYPE_TX
+from ouroboros.p2p_messages import FeeFilterMessage
 
 
 class TestFeeFilterMessage:
@@ -112,7 +109,7 @@ class TestFeeFilterRounder:
                 results.add(rounder.round(fee))
 
         # All results should be in the bucket set
-        bucket_set = set(int(b) for b in rounder._fee_set)
+        bucket_set = {int(b) for b in rounder._fee_set}
         for r in results:
             assert r in bucket_set or r == 0, f"{r} not in buckets"
 

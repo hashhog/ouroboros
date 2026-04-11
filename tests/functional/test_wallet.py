@@ -4,8 +4,8 @@ Functional test: wallet operations.
 Tests address generation, balance queries, and wallet info.
 """
 
-import asyncio
 import pytest
+
 from tests.functional.framework import BitcoinTestFramework
 
 

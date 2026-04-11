@@ -4,17 +4,14 @@ Unit tests for wallet HD key derivation and key pool management.
 Tests BIP32/BIP84 key derivation, key pool pre-generation, and address types.
 """
 
-import hashlib
 import os
 import tempfile
-import pytest
 
 from ouroboros.wallet import (
     HDKey,
     KeyPool,
     Wallet,
     WalletKey,
-    _hash160,
 )
 
 
@@ -356,7 +353,7 @@ class TestWalletHD:
             wallet1.init_hd(seed, pool_size=5)
 
             import asyncio
-            addr1 = asyncio.get_event_loop().run_until_complete(
+            asyncio.get_event_loop().run_until_complete(
                 wallet1.generate_new_address()
             )
 

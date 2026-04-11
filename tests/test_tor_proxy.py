@@ -17,30 +17,24 @@ import struct
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from ouroboros.config import NodeConfig
+from ouroboros.p2p import PeerManager
 from ouroboros.peer import (
+    SOCKS5_ATYP_IPV4,
+    SOCKS5_AUTH_NONE,
+    SOCKS5_REPLY_SUCCESS,
+    SOCKS5_VERSION,
     Peer,
-    PeerState,
     is_onion_host,
     parse_proxy_addr,
     socks5_connect,
-    SOCKS5_VERSION,
-    SOCKS5_AUTH_NONE,
-    SOCKS5_CMD_CONNECT,
-    SOCKS5_ATYP_DOMAINNAME,
-    SOCKS5_ATYP_IPV4,
-    SOCKS5_REPLY_SUCCESS,
 )
 from ouroboros.tor import (
+    SOCKS5_TOR_HS_DESC_NOT_FOUND,
     TorController,
     TorStreamIsolation,
-    socks5_connect_isolated,
-    SOCKS5_AUTH_USER_PASS,
-    SOCKS5_TOR_HS_DESC_NOT_FOUND,
     _socks5_error_message,
 )
-from ouroboros.p2p import PeerManager
-from ouroboros.config import NodeConfig
-
 
 # ── Helper utilities ─────────────────────────────────────────────────
 
@@ -123,7 +117,7 @@ class TestSocks5Connect(unittest.TestCase):
         """Full SOCKS5 handshake with a mock proxy that responds correctly."""
         greeting = _make_socks5_greeting_response()
         connect_resp = _make_socks5_connect_response()
-        mock_data = greeting + connect_resp
+        greeting + connect_resp
 
         mock_reader = AsyncMock()
         mock_reader.readexactly = AsyncMock(side_effect=[

@@ -6,21 +6,21 @@ sorting, double spend detection, size management, ancestor/descendant
 limits, and standardness checks.
 """
 
-from typing import Dict, List, Set, Optional, Tuple
-from dataclasses import dataclass, field
+import logging
 import os
 import random
 import struct
 import threading
 import time
-import logging
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 from ouroboros.database import Transaction
 from ouroboros.validation import TransactionValidator
 
 logger = logging.getLogger(__name__)
 
-OutPoint = Tuple[bytes, int]
+OutPoint = tuple[bytes, int]
 
 # Policy constants
 MAX_STANDARD_TX_WEIGHT = 400_000
@@ -40,6 +40,8 @@ TRUC_MAX_VSIZE = 10_000  # max vsize for any TRUC transaction
 TRUC_CHILD_MAX_VSIZE = 1_000  # max vsize for a v3 child spending unconfirmed v3 parent
 TRUC_ANCESTOR_LIMIT = 2  # v3 tx may have at most 1 unconfirmed ancestor (self + 1)
 TRUC_DESCENDANT_LIMIT = 2  # v3 tx may have at most 1 unconfirmed descendant (self + 1)
+TX_V3_ANCESTOR_LIMIT = TRUC_ANCESTOR_LIMIT  # alias used in RBF checks
+TX_V3_MAX_VSIZE = TRUC_MAX_VSIZE  # alias used in RBF checks
 
 # Package validation limits (BIP 331)
 MAX_PACKAGE_COUNT = 25
@@ -73,7 +75,7 @@ class Chunk:
     When evicting, we remove the lowest-feerate chunk.
     """
 
-    txids: Set[bytes]
+    txids: set[bytes]
     total_fee: int
     total_size: int
 
@@ -98,11 +100,11 @@ class Cluster:
     Reference: Bitcoin Core txgraph.h - TxGraph
     """
 
-    txids: Set[bytes]
+    txids: set[bytes]
     # Cached linearization (list of txids in mining order)
-    _linearization: Optional[List[bytes]] = field(default=None, repr=False)
+    _linearization: list[bytes] | None = field(default=None, repr=False)
     # Cached chunks (groups of txs with combined feerate)
-    _chunks: Optional[List[Chunk]] = field(default=None, repr=False)
+    _chunks: list[Chunk] | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if not isinstance(self.txids, set):
@@ -141,7 +143,7 @@ class ClusterLinearizer:
 
     def __init__(
         self,
-        transactions: Dict[bytes, "MempoolEntry"],
+        transactions: dict[bytes, "MempoolEntry"],
     ):
         """Initialize linearizer with mempool transactions.
 
@@ -150,7 +152,7 @@ class ClusterLinearizer:
         """
         self.transactions = transactions
 
-    def _get_ancestor_set_feerate(self, txid: bytes, remaining: Set[bytes]) -> float:
+    def _get_ancestor_set_feerate(self, txid: bytes, remaining: set[bytes]) -> float:
         """Compute the ancestor set feerate for a transaction.
 
         The ancestor set is the transaction plus all its ancestors (within remaining).
@@ -184,7 +186,7 @@ class ClusterLinearizer:
 
         return total_fee / total_size if total_size > 0 else 0.0
 
-    def _get_ancestor_set(self, txid: bytes, remaining: Set[bytes]) -> Set[bytes]:
+    def _get_ancestor_set(self, txid: bytes, remaining: set[bytes]) -> set[bytes]:
         """Get the ancestor set for a transaction within remaining."""
         entry = self.transactions.get(txid)
         if entry is None:
@@ -204,7 +206,7 @@ class ClusterLinearizer:
 
         return ancestors
 
-    def linearize(self, cluster_txids: Set[bytes]) -> Tuple[List[bytes], List[Chunk]]:
+    def linearize(self, cluster_txids: set[bytes]) -> tuple[list[bytes], list[Chunk]]:
         """Linearize a cluster of transactions.
 
         Returns:
@@ -213,8 +215,8 @@ class ClusterLinearizer:
             - chunks: List of Chunks representing indivisible mining units
         """
         remaining = set(cluster_txids)
-        linearization: List[bytes] = []
-        chunks: List[Chunk] = []
+        linearization: list[bytes] = []
+        chunks: list[Chunk] = []
 
         while remaining:
             # Find transaction with highest ancestor set feerate
@@ -272,10 +274,10 @@ class ClusterLinearizer:
 
         return linearization, chunks
 
-    def _topo_sort(self, txids: Set[bytes]) -> List[bytes]:
+    def _topo_sort(self, txids: set[bytes]) -> list[bytes]:
         """Topologically sort transactions (parents before children)."""
         # Build in-degree count for each tx (counting only edges within txids)
-        in_degree: Dict[bytes, int] = {txid: 0 for txid in txids}
+        in_degree: dict[bytes, int] = dict.fromkeys(txids, 0)
 
         for txid in txids:
             entry = self.transactions.get(txid)
@@ -286,7 +288,7 @@ class ClusterLinearizer:
 
         # Start with nodes that have no dependencies
         queue = [txid for txid, degree in in_degree.items() if degree == 0]
-        result: List[bytes] = []
+        result: list[bytes] = []
 
         while queue:
             # Pick one with no remaining dependencies
@@ -318,7 +320,7 @@ class ClusterManager:
     Reference: Bitcoin Core txgraph.cpp
     """
 
-    def __init__(self, transactions: Dict[bytes, "MempoolEntry"]):
+    def __init__(self, transactions: dict[bytes, "MempoolEntry"]):
         """Initialize cluster manager.
 
         Args:
@@ -326,9 +328,9 @@ class ClusterManager:
         """
         self.transactions = transactions
         # txid -> cluster_id (arbitrary identifier)
-        self._tx_to_cluster: Dict[bytes, int] = {}
+        self._tx_to_cluster: dict[bytes, int] = {}
         # cluster_id -> Cluster
-        self._clusters: Dict[int, Cluster] = {}
+        self._clusters: dict[int, Cluster] = {}
         # Next cluster ID to assign
         self._next_cluster_id = 0
 
@@ -338,12 +340,12 @@ class ClusterManager:
         self._next_cluster_id += 1
         return cid
 
-    def _find_connected_component(self, start_txid: bytes) -> Set[bytes]:
+    def _find_connected_component(self, start_txid: bytes) -> set[bytes]:
         """Find all transactions connected to start_txid via parent-child links."""
         if start_txid not in self.transactions:
             return set()
 
-        visited: Set[bytes] = set()
+        visited: set[bytes] = set()
         queue = [start_txid]
 
         while queue:
@@ -366,7 +368,7 @@ class ClusterManager:
 
         return visited
 
-    def add_transaction(self, txid: bytes) -> Optional[int]:
+    def add_transaction(self, txid: bytes) -> int | None:
         """Add a transaction to the cluster structure.
 
         This finds the connected component the tx belongs to and either:
@@ -382,7 +384,7 @@ class ClusterManager:
         entry = self.transactions[txid]
 
         # Find which clusters our parents and children belong to
-        neighbor_cluster_ids: Set[int] = set()
+        neighbor_cluster_ids: set[int] = set()
         for parent_txid in entry.parents:
             if parent_txid in self._tx_to_cluster:
                 neighbor_cluster_ids.add(self._tx_to_cluster[parent_txid])
@@ -452,7 +454,7 @@ class ClusterManager:
         # Check if cluster needs to split
         # Find connected components among remaining transactions
         remaining = set(old_cluster.txids)
-        components: List[Set[bytes]] = []
+        components: list[set[bytes]] = []
 
         while remaining:
             start = next(iter(remaining))
@@ -478,13 +480,13 @@ class ClusterManager:
                     self._tx_to_cluster[comp_txid] = new_cluster_id
 
     def _find_connected_component_within(
-        self, start_txid: bytes, within: Set[bytes]
-    ) -> Set[bytes]:
+        self, start_txid: bytes, within: set[bytes]
+    ) -> set[bytes]:
         """Find connected component starting from start_txid, only considering txids in 'within'."""
         if start_txid not in within:
             return set()
 
-        visited: Set[bytes] = set()
+        visited: set[bytes] = set()
         queue = [start_txid]
 
         while queue:
@@ -508,22 +510,22 @@ class ClusterManager:
 
         return visited
 
-    def get_cluster(self, txid: bytes) -> Optional[Cluster]:
+    def get_cluster(self, txid: bytes) -> Cluster | None:
         """Get the cluster containing a transaction."""
         cluster_id = self._tx_to_cluster.get(txid)
         if cluster_id is None:
             return None
         return self._clusters.get(cluster_id)
 
-    def get_cluster_id(self, txid: bytes) -> Optional[int]:
+    def get_cluster_id(self, txid: bytes) -> int | None:
         """Get the cluster ID for a transaction."""
         return self._tx_to_cluster.get(txid)
 
-    def get_all_clusters(self) -> List[Cluster]:
+    def get_all_clusters(self) -> list[Cluster]:
         """Get all clusters."""
         return list(self._clusters.values())
 
-    def get_chunks(self, cluster: Cluster) -> List[Chunk]:
+    def get_chunks(self, cluster: Cluster) -> list[Chunk]:
         """Get chunks for a cluster (cached)."""
         if cluster._chunks is not None:
             return cluster._chunks
@@ -534,7 +536,7 @@ class ClusterManager:
         cluster._chunks = chunks
         return chunks
 
-    def get_linearization(self, cluster: Cluster) -> List[bytes]:
+    def get_linearization(self, cluster: Cluster) -> list[bytes]:
         """Get linearization for a cluster (cached)."""
         if cluster._linearization is not None:
             return cluster._linearization
@@ -546,13 +548,13 @@ class ClusterManager:
         cluster._chunks = chunks
         return linearization
 
-    def get_worst_chunk(self) -> Optional[Tuple[Chunk, int]]:
+    def get_worst_chunk(self) -> tuple[Chunk, int] | None:
         """Get the lowest-feerate chunk across all clusters.
 
         Returns (chunk, cluster_id) or None if empty.
         """
-        worst_chunk: Optional[Chunk] = None
-        worst_cluster_id: Optional[int] = None
+        worst_chunk: Chunk | None = None
+        worst_cluster_id: int | None = None
 
         for cluster_id, cluster in self._clusters.items():
             chunks = self.get_chunks(cluster)
@@ -567,12 +569,12 @@ class ClusterManager:
             return None
         return worst_chunk, worst_cluster_id
 
-    def get_mining_chunks(self) -> List[Tuple[Chunk, int]]:
+    def get_mining_chunks(self) -> list[tuple[Chunk, int]]:
         """Get all chunks across all clusters, sorted by feerate (highest first).
 
         Returns list of (chunk, cluster_id) tuples.
         """
-        all_chunks: List[Tuple[Chunk, int]] = []
+        all_chunks: list[tuple[Chunk, int]] = []
 
         for cluster_id, cluster in self._clusters.items():
             chunks = self.get_chunks(cluster)
@@ -583,7 +585,7 @@ class ClusterManager:
         all_chunks.sort(key=lambda x: x[0].fee_rate, reverse=True)
         return all_chunks
 
-    def check_cluster_limit(self, txid: bytes) -> Tuple[bool, str]:
+    def check_cluster_limit(self, txid: bytes) -> tuple[bool, str]:
         """Check if adding a transaction would exceed cluster size limit.
 
         Returns (ok, error_message).
@@ -594,7 +596,7 @@ class ClusterManager:
         entry = self.transactions[txid]
 
         # Find which clusters our parents and children belong to
-        neighbor_cluster_ids: Set[int] = set()
+        neighbor_cluster_ids: set[int] = set()
         for parent_txid in entry.parents:
             if parent_txid in self._tx_to_cluster:
                 neighbor_cluster_ids.add(self._tx_to_cluster[parent_txid])
@@ -771,14 +773,14 @@ def _get_dust_threshold(script_pubkey: bytes) -> int:
     return (n_size * DUST_RELAY_TX_FEE) // 1000
 
 
-def _has_ephemeral_dust(tx: Transaction) -> List[int]:
+def _has_ephemeral_dust(tx: Transaction) -> list[int]:
     """Return indices of outputs that are dust (below threshold).
 
     Exemptions (never considered dust):
     - OP_RETURN outputs (unspendable)
     - P2A (Pay-to-Anchor) outputs (allowed at 0 value for CPFP)
     """
-    dust_indices: List[int] = []
+    dust_indices: list[int] = []
     for idx, out in enumerate(tx.outputs):
         if not out.script_pubkey:
             continue
@@ -798,7 +800,7 @@ def _has_ephemeral_dust(tx: Transaction) -> List[int]:
 
 def _check_ephemeral_dust(
     tx: Transaction, fee: int
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """Check ephemeral dust policy for a transaction with dust outputs.
 
     Called when a transaction has dust outputs. Validates:
@@ -841,7 +843,7 @@ def _check_ephemeral_dust(
     return True, ""
 
 
-def _is_standard_tx(tx: Transaction) -> Tuple[bool, str]:
+def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
     if tx.version < 1 or tx.version > TX_MAX_STANDARD_VERSION:
         return False, f"Non-standard version: {tx.version}"
 
@@ -880,13 +882,13 @@ class MempoolEntry:
     descendant_count: int = 1
     descendant_size: int = 0
     # Parent/child txid links for efficient graph traversal
-    parents: Set[bytes] = field(default_factory=set)
-    children: Set[bytes] = field(default_factory=set)
+    parents: set[bytes] = field(default_factory=set)
+    children: set[bytes] = field(default_factory=set)
     # Ephemeral dust tracking: if this tx has ephemeral dust, track the
     # child that spends it. If child is evicted, this parent must be too.
     # Reference: Bitcoin Core policy/ephemeral_policy.cpp
     has_ephemeral_dust: bool = False
-    ephemeral_child: Optional[bytes] = None  # txid of child spending our dust
+    ephemeral_child: bytes | None = None  # txid of child spending our dust
 
 
 # Orphan transaction pool
@@ -903,11 +905,11 @@ class OrphanPool:
 
     def __init__(self):
         # orphan txid → (Transaction, expiry_time, set of missing parent txids)
-        self.orphans: Dict[bytes, Tuple[Transaction, float, Set[bytes]]] = {}
+        self.orphans: dict[bytes, tuple[Transaction, float, set[bytes]]] = {}
         # missing parent txid → set of orphan txids waiting on it
-        self.by_parent: Dict[bytes, Set[bytes]] = {}
+        self.by_parent: dict[bytes, set[bytes]] = {}
 
-    def add(self, tx: Transaction, missing_parents: Set[bytes]) -> bool:
+    def add(self, tx: Transaction, missing_parents: set[bytes]) -> bool:
         """Add an orphan transaction.  Returns True if added."""
         txid = tx.get_txid()
         if txid in self.orphans:
@@ -938,7 +940,7 @@ class OrphanPool:
                 if not s:
                     del self.by_parent[parent]
 
-    def get_orphans_for_parent(self, parent_txid: bytes) -> List[Transaction]:
+    def get_orphans_for_parent(self, parent_txid: bytes) -> list[Transaction]:
         """Return orphan txs that are waiting on *parent_txid*."""
         orphan_ids = self.by_parent.get(parent_txid, set())
         result = []
@@ -984,8 +986,8 @@ class Mempool:
         max_size: int = 300_000_000,  # 300 MB
         require_standard: bool = True,
         full_rbf: bool = True,  # BIP125 Full RBF (mempoolfullrbf), default True since v28
-        on_tx_removed: Optional[callable] = None,  # callback: (txid, reason) -> None
-        on_tx_added: Optional[callable] = None,  # callback: (txid, tx, mempool_seq) -> None
+        on_tx_removed: Callable | None = None,  # callback: (txid, reason) -> None
+        on_tx_added: Callable | None = None,  # callback: (txid, tx, mempool_seq) -> None
     ):
         """Initialize mempool.
 
@@ -1007,11 +1009,11 @@ class Mempool:
         self._on_tx_removed = on_tx_removed
         self._on_tx_added = on_tx_added
 
-        self.transactions: Dict[bytes, MempoolEntry] = {}  # txid -> entry
-        self.spent_outputs: Set[OutPoint] = set()
+        self.transactions: dict[bytes, MempoolEntry] = {}  # txid -> entry
+        self.spent_outputs: set[OutPoint] = set()
 
         # Sorted by fee rate (for mining)
-        self.by_fee_rate: List[bytes] = []  # txids sorted by fee rate (lowest first)
+        self.by_fee_rate: list[bytes] = []  # txids sorted by fee rate (lowest first)
 
         # Tracking
         self.current_size = 0  # bytes
@@ -1050,8 +1052,8 @@ class Mempool:
         seq = self._mempool_sequence
         self._mempool_sequence += 1
         return seq
-    
-    def snapshot(self) -> Tuple[List[bytes], Dict[bytes, "MempoolEntry"]]:
+
+    def snapshot(self) -> tuple[list[bytes], dict[bytes, "MempoolEntry"]]:
         """Take a consistent snapshot of the mempool for template construction.
 
         Returns a copy of (by_fee_rate, transactions) under the lock so that
@@ -1062,14 +1064,14 @@ class Mempool:
             txs_copy = dict(self.transactions)
         return fee_rate_copy, txs_copy
 
-    def add_transaction(self, tx: Transaction, height: int) -> Tuple[bool, str]:
+    def add_transaction(self, tx: Transaction, height: int) -> tuple[bool, str]:
         """Validate and add *tx* to the mempool at *height*; returns ``(ok, error_message)``."""
         with self._lock:
             return self._add_transaction_inner(tx, height)
 
     def accept_to_memory_pool(
         self, tx: Transaction, height: int, test_accept: bool = False
-    ) -> Dict:
+    ) -> dict:
         """AcceptToMemoryPool - main entry point matching Bitcoin Core's AcceptToMemoryPool.
 
         Validates and adds a transaction to the mempool, handling RBF conflicts.
@@ -1121,7 +1123,7 @@ class Mempool:
                 "vsize": 0, "reject_reason": error,
             }
 
-    def _add_transaction_inner(self, tx: Transaction, height: int) -> Tuple[bool, str]:
+    def _add_transaction_inner(self, tx: Transaction, height: int) -> tuple[bool, str]:
         """Unlocked implementation of add_transaction."""
         txid = tx.get_txid()
 
@@ -1150,7 +1152,7 @@ class Mempool:
                 )
 
         # Check for missing parent transactions — store as orphan
-        missing_parents: Set[bytes] = set()
+        missing_parents: set[bytes] = set()
         for tx_in in tx.inputs:
             parent_txid = tx_in.prev_txid
             # Parent available if UTXO exists in chain or parent is in mempool
@@ -1165,7 +1167,7 @@ class Mempool:
         valid, error = self.validator.validate_transaction(tx, height)
         if not valid:
             return False, error
-        
+
         # Check for conflicts (double spends) — attempt BIP 125 RBF
         has_conflict = any(
             (tx_in.prev_txid, tx_in.prev_vout) in self.spent_outputs
@@ -1223,7 +1225,7 @@ class Mempool:
         # Check mempool size
         if self.current_size + tx_size > self.max_size:
             self._evict_low_fee_txs(tx_size)
-        
+
         # Calculate fee
         total_input = 0
         for tx_in in tx.inputs:
@@ -1232,23 +1234,23 @@ class Mempool:
                 total_input += utxo['value']
             else:
                 return False, f"UTXO not found: {tx_in.prev_txid.hex()[:16]}...:{tx_in.prev_vout}"
-        
+
         total_output = sum(out.value for out in tx.outputs)
         fee = total_input - total_output
-        
+
         if fee < 0:
             return False, "Negative fee"
-        
+
         fee_rate = fee / tx_size if tx_size > 0 else 0
         # print(f'fee_rate={fee_rate}, target={min_relay}')
 
         # Minimum relay fee
         min_relay = (tx_size * DEFAULT_MIN_RELAY_TX_FEE) // 1000
         if fee < min_relay:
-            return False, "Below minimum relay fee: %d < %d" % (fee, min_relay)
-        
+            return False, f"Below minimum relay fee: {fee} < {min_relay}"
+
         # Compute direct parents (mempool txs this tx spends from)
-        direct_parents: Set[bytes] = set()
+        direct_parents: set[bytes] = set()
         for tx_in in tx.inputs:
             if tx_in.prev_txid in self.transactions:
                 direct_parents.add(tx_in.prev_txid)
@@ -1312,14 +1314,14 @@ class Mempool:
 
         return True, ""
 
-    def _get_ancestors(self, tx: Transaction) -> Set[bytes]:
+    def _get_ancestors(self, tx: Transaction) -> set[bytes]:
         """Get all ancestors (transitive parents) of a transaction.
 
         Uses parent links stored on MempoolEntry for efficient traversal.
         For a tx not yet in the mempool, computes direct parents from inputs.
         """
-        result: Set[bytes] = set()
-        queue: List[bytes] = []
+        result: set[bytes] = set()
+        queue: list[bytes] = []
 
         # Find direct parents from inputs
         for inp in tx.inputs:
@@ -1340,7 +1342,7 @@ class Mempool:
                     queue.append(grandparent_txid)
         return result
 
-    def _check_cluster_limit(self, tx: Transaction) -> Tuple[bool, str]:
+    def _check_cluster_limit(self, tx: Transaction) -> tuple[bool, str]:
         """Check if adding a transaction would exceed cluster size limit.
 
         The cluster limit (MAX_CLUSTER_COUNT = 100) prevents clusters from
@@ -1349,7 +1351,7 @@ class Mempool:
         Reference: Bitcoin Core txgraph.h - max_cluster_count
         """
         # Find all clusters that would be merged by this transaction
-        neighbor_cluster_ids: Set[int] = set()
+        neighbor_cluster_ids: set[int] = set()
         for inp in tx.inputs:
             cid = self._cluster_manager.get_cluster_id(inp.prev_txid)
             if cid is not None:
@@ -1385,7 +1387,7 @@ class Mempool:
 
     def _check_truc_policy(
         self, tx: Transaction
-    ) -> Tuple[bool, str, Optional[bytes]]:
+    ) -> tuple[bool, str, bytes | None]:
         """Enforce TRUC policy for a transaction being added.
 
         This implements Bitcoin Core's SingleTRUCChecks (policy/truc_policy.cpp).
@@ -1454,7 +1456,7 @@ class Mempool:
             # Check that the parent doesn't already have too many ancestors
             if parent_entry.ancestor_count + 1 > TRUC_ANCESTOR_LIMIT:
                 return False, (
-                    f"TRUC (v3) tx would have too many ancestors"
+                    "TRUC (v3) tx would have too many ancestors"
                 ), None
 
             # Child vsize limit: v3 child of unconfirmed parent must be <= 1000 vbytes
@@ -1476,18 +1478,18 @@ class Mempool:
                     sibling_entry = self.transactions.get(sibling_txid)
                     if sibling_entry and sibling_entry.ancestor_count == 2:
                         return False, (
-                            f"tx would exceed descendant count limit"
+                            "tx would exceed descendant count limit"
                         ), sibling_txid
                 # Otherwise just reject without sibling eviction option
                 return False, (
-                    f"tx would exceed descendant count limit"
+                    "tx would exceed descendant count limit"
                 ), None
 
         return True, "", None
 
     def _check_package_truc_policy(
-        self, txs: List[Transaction]
-    ) -> Tuple[bool, str]:
+        self, txs: list[Transaction]
+    ) -> tuple[bool, str]:
         """Check TRUC policy for a package of transactions.
 
         This implements Bitcoin Core's PackageTRUCChecks (policy/truc_policy.cpp).
@@ -1514,8 +1516,8 @@ class Mempool:
 
             # Collect in-mempool and in-package parents (use sets to avoid
             # double-counting when multiple inputs spend from the same parent)
-            mempool_parents: Set[bytes] = set()
-            package_parents: Set[bytes] = set()
+            mempool_parents: set[bytes] = set()
+            package_parents: set[bytes] = set()
 
             for inp in tx.inputs:
                 if inp.prev_txid in self.transactions:
@@ -1622,7 +1624,7 @@ class Mempool:
 
         return True, ""
 
-    def _get_v3_children(self, parent_txid: bytes) -> List[bytes]:
+    def _get_v3_children(self, parent_txid: bytes) -> list[bytes]:
         """Get direct children of a transaction in the mempool."""
         parent_entry = self.transactions.get(parent_txid)
         if parent_entry is None:
@@ -1631,7 +1633,7 @@ class Mempool:
 
     def _try_sibling_eviction(
         self, new_tx: Transaction, sibling_txid: bytes, height: int
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """Attempt TRUC sibling eviction.
 
         When a TRUC parent already has one child, a new child can replace
@@ -1716,7 +1718,7 @@ class Mempool:
         )
 
     def _update_descendants_after_removal(
-        self, removed_txid: bytes, former_children: Optional[Set[bytes]] = None
+        self, removed_txid: bytes, former_children: set[bytes] | None = None
     ) -> None:
         """After removing *removed_txid*, fix ancestor/descendant counts.
 
@@ -1737,7 +1739,7 @@ class Mempool:
                         break
 
         # Collect all descendants of removed tx (via children) using children links
-        all_desc: Set[bytes] = set()
+        all_desc: set[bytes] = set()
         queue = list(children)
         while queue:
             t = queue.pop()
@@ -1762,7 +1764,7 @@ class Mempool:
         # Rebuild descendant counts for ancestors of the direct children.
         # These ancestors lost removed_txid (and possibly its descendants) from
         # their descendant sets.
-        affected_ancestors: Set[bytes] = set()
+        affected_ancestors: set[bytes] = set()
         for child_txid in children:
             child_entry = self.transactions.get(child_txid)
             if child_entry:
@@ -1808,12 +1810,12 @@ class Mempool:
 
         return accepted
 
-    def expire_old_transactions(self, current_time: Optional[float] = None) -> int:
+    def expire_old_transactions(self, current_time: float | None = None) -> int:
         """Remove transactions that have been in the mempool too long."""
         with self._lock:
             return self._expire_old_transactions_inner(current_time)
 
-    def _expire_old_transactions_inner(self, current_time: Optional[float] = None) -> int:
+    def _expire_old_transactions_inner(self, current_time: float | None = None) -> int:
         now = current_time or time.time()
         cutoff = now - (MEMPOOL_EXPIRY_HOURS * 3600)
         expired = [
@@ -1864,7 +1866,7 @@ class Mempool:
         # Ephemeral dust policy: if this tx is the child that spends an
         # ephemeral dust parent's output, the parent must also be evicted.
         # Reference: Bitcoin Core policy/ephemeral_policy.cpp
-        ephemeral_parents_to_evict: List[bytes] = []
+        ephemeral_parents_to_evict: list[bytes] = []
         for parent_txid in entry.parents:
             parent_entry = self.transactions.get(parent_txid)
             if parent_entry and parent_entry.has_ephemeral_dust:
@@ -1929,7 +1931,7 @@ class Mempool:
                     _skip_recount=_skip_recount,
                     _reason="ephemeral-child-evicted"
                 )
-    
+
     def remove_block_transactions(self, block):
         """
         Remove transactions from mempool that are in a block.
@@ -1941,7 +1943,7 @@ class Mempool:
             self._remove_block_transactions_inner(block)
 
     def _remove_block_transactions_inner(self, block):
-        removed_ids: List[bytes] = []
+        removed_ids: list[bytes] = []
         for tx in block.transactions:
             if not tx.is_coinbase:
                 txid = tx.get_txid()
@@ -1968,21 +1970,21 @@ class Mempool:
                 f"Removed {len(removed_ids)} transactions from mempool "
                 f"(included in block)"
             )
-    
-    def get_transaction(self, txid: bytes) -> Optional[Transaction]:
+
+    def get_transaction(self, txid: bytes) -> Transaction | None:
         """
         Get transaction from mempool.
-        
+
         Args:
             txid: Transaction ID
-            
+
         Returns:
             Transaction or None if not found
         """
         entry = self.transactions.get(txid)
         return entry.tx if entry else None
-    
-    def get_all_transactions(self) -> List[Transaction]:
+
+    def get_all_transactions(self) -> list[Transaction]:
         """
         Get all transactions in mempool.
 
@@ -1991,25 +1993,25 @@ class Mempool:
         """
         txs = [entry.tx for entry in self.transactions.values()]
         return txs
-    
-    def get_transactions_by_fee_rate(self, limit: Optional[int] = None) -> List[Transaction]:
+
+    def get_transactions_by_fee_rate(self, limit: int | None = None) -> list[Transaction]:
         """
         Get transactions sorted by fee rate (highest first).
-        
+
         Args:
             limit: Maximum number of transactions to return
-            
+
         Returns:
             List of transactions sorted by fee rate (highest first)
         """
         # by_fee_rate is sorted lowest to highest, so we reverse it
         txids = self.by_fee_rate[-limit:] if limit else self.by_fee_rate
         return [self.transactions[txid].tx for txid in reversed(txids)]
-    
-    def get_mempool_info(self) -> Dict:
+
+    def get_mempool_info(self) -> dict:
         """
         Get mempool statistics.
-        
+
         Returns:
             Dictionary with mempool statistics
         """
@@ -2022,9 +2024,9 @@ class Mempool:
                 'max_fee_rate': 0,
                 'avg_fee_rate': 0,
             }
-        
+
         fee_rates = [entry.fee_rate for entry in self.transactions.values()]
-        
+
         return {
             'size': len(self.transactions),
             'bytes': self.current_size,
@@ -2038,7 +2040,7 @@ class Mempool:
 
     # ── Cluster Mempool Mining Interface ─────────────────────────────────
 
-    def get_mining_chunks(self) -> List[Tuple[Chunk, List[bytes]]]:
+    def get_mining_chunks(self) -> list[tuple[Chunk, list[bytes]]]:
         """Get chunks for block template construction, sorted by feerate.
 
         Returns a list of (chunk, txids) tuples, where txids are in
@@ -2048,7 +2050,7 @@ class Mempool:
         Reference: Bitcoin Core txgraph.h - GetBlockBuilder()
         """
         with self._lock:
-            result: List[Tuple[Chunk, List[bytes]]] = []
+            result: list[tuple[Chunk, list[bytes]]] = []
 
             for chunk, _cluster_id in self._cluster_manager.get_mining_chunks():
                 # Get topologically sorted txids within chunk
@@ -2060,7 +2062,7 @@ class Mempool:
 
     def get_block_template_txs(
         self, max_weight: int = 4_000_000
-    ) -> Tuple[List[Transaction], int]:
+    ) -> tuple[list[Transaction], int]:
         """Select transactions for a block template using cluster linearization.
 
         Selects chunks in decreasing feerate order until the weight limit
@@ -2075,7 +2077,7 @@ class Mempool:
             their total fee
         """
         with self._lock:
-            selected_txs: List[Transaction] = []
+            selected_txs: list[Transaction] = []
             total_fee = 0
             total_weight = 0
 
@@ -2099,7 +2101,7 @@ class Mempool:
 
             return selected_txs, total_fee
 
-    def get_cluster_info(self, txid: bytes) -> Optional[Dict]:
+    def get_cluster_info(self, txid: bytes) -> dict | None:
         """Get cluster information for a transaction.
 
         Returns dict with cluster_id, cluster_size, linearization position,
@@ -2140,8 +2142,8 @@ class Mempool:
     MAX_REPLACEMENT_EVICTIONS = 100
 
     def _check_cluster_rbf(
-        self, new_tx: Transaction, to_evict: Set[bytes], new_fee: int
-    ) -> Tuple[bool, str]:
+        self, new_tx: Transaction, to_evict: set[bytes], new_fee: int
+    ) -> tuple[bool, str]:
         """Check if replacement improves the cluster linearization.
 
         For cluster mempool, we require that the new linearization be strictly
@@ -2153,7 +2155,7 @@ class Mempool:
         Reference: Bitcoin Core txgraph.h - GetMainStagingDiagrams()
         """
         # Find clusters affected by the eviction
-        affected_cluster_ids: Set[int] = set()
+        affected_cluster_ids: set[int] = set()
         for txid in to_evict:
             cid = self._cluster_manager.get_cluster_id(txid)
             if cid is not None:
@@ -2164,7 +2166,7 @@ class Mempool:
             return True, ""
 
         # Get old feerate diagrams for affected clusters
-        old_diagrams: List[List[Tuple[int, int]]] = []  # List of [(size, fee), ...]
+        old_diagrams: list[list[tuple[int, int]]] = []  # List of [(size, fee), ...]
         for cid in affected_cluster_ids:
             cluster = self._cluster_manager._clusters.get(cid)
             if cluster:
@@ -2233,8 +2235,8 @@ class Mempool:
 
         return True, ""
 
-    def _find_conflicts(self, tx: Transaction) -> Set[bytes]:
-        conflicts: Set[bytes] = set()
+    def _find_conflicts(self, tx: Transaction) -> set[bytes]:
+        conflicts: set[bytes] = set()
         for tx_in in tx.inputs:
             op: OutPoint = (tx_in.prev_txid, tx_in.prev_vout)
             if op in self.spent_outputs:
@@ -2244,13 +2246,13 @@ class Mempool:
                             conflicts.add(txid)
         return conflicts
 
-    def _collect_descendants(self, txid: bytes) -> Set[bytes]:
+    def _collect_descendants(self, txid: bytes) -> set[bytes]:
         """Get all descendants (transitive children) of a transaction.
 
         Uses children links stored on MempoolEntry for efficient traversal.
         """
-        result: Set[bytes] = {txid}
-        queue: List[bytes] = [txid]
+        result: set[bytes] = {txid}
+        queue: list[bytes] = [txid]
         while queue:
             parent_txid = queue.pop()
             parent_entry = self.transactions.get(parent_txid)
@@ -2310,7 +2312,7 @@ class Mempool:
 
     def try_replace(
         self, new_tx: Transaction, height: int
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """
         BIP 125 Replace-By-Fee.
 
@@ -2333,7 +2335,7 @@ class Mempool:
 
     def _try_replace_inner(
         self, new_tx: Transaction, height: int
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """Unlocked implementation of try_replace."""
         conflicts = self._find_conflicts(new_tx)
         if not conflicts:
@@ -2345,7 +2347,7 @@ class Mempool:
             # After evicting conflicts we should end up with ≤ 1
             # unconfirmed ancestor.  Pre-check: count unconfirmed
             # parents that are NOT being evicted.
-            remaining_ancestors: Set[bytes] = set()
+            remaining_ancestors: set[bytes] = set()
             for inp in new_tx.inputs:
                 if inp.prev_txid in self.transactions and inp.prev_txid not in conflicts:
                     remaining_ancestors.add(inp.prev_txid)
@@ -2382,12 +2384,12 @@ class Mempool:
         # UNLESS full_rbf (mempoolfullrbf) is enabled
         if not self.full_rbf:
             for c_txid in conflicts:
-                c_entry = self.transactions[c_txid]
+                self.transactions[c_txid]
                 if not self.is_rbf_opt_in(c_txid):
                     return False, "Conflicting tx does not signal replaceability (BIP125)"
 
         # Gather full eviction set (conflicts + descendants)
-        to_evict: Set[bytes] = set()
+        to_evict: set[bytes] = set()
         for c_txid in conflicts:
             to_evict |= self._collect_descendants(c_txid)
 
@@ -2399,7 +2401,7 @@ class Mempool:
             )
 
         # Rule 2: new tx must not introduce new unconfirmed inputs
-        old_unconfirmed: Set[OutPoint] = set()
+        old_unconfirmed: set[OutPoint] = set()
         for txid in to_evict:
             entry = self.transactions[txid]
             for inp in entry.tx.inputs:
@@ -2458,7 +2460,7 @@ class Mempool:
         new_txid = new_tx.get_txid()
 
         # Compute direct parents and ancestors for the replacement tx
-        direct_parents: Set[bytes] = set()
+        direct_parents: set[bytes] = set()
         for inp in new_tx.inputs:
             if inp.prev_txid in self.transactions:
                 direct_parents.add(inp.prev_txid)
@@ -2506,7 +2508,7 @@ class Mempool:
     def _insert_sorted_by_fee_rate(self, txid: bytes, fee_rate: float):
         # Binary search and insert (maintains sorted order: lowest to highest)
         left, right = 0, len(self.by_fee_rate)
-        
+
         while left < right:
             mid = (left + right) // 2
             mid_entry = self.transactions[self.by_fee_rate[mid]]
@@ -2514,9 +2516,9 @@ class Mempool:
                 left = mid + 1
             else:
                 right = mid
-        
+
         self.by_fee_rate.insert(left, txid)
-    
+
     def _evict_low_fee_txs(self, needed_space: int):
         """Evict lowest-feerate chunks until we have enough space.
 
@@ -2561,7 +2563,7 @@ class Mempool:
                 f"Evicted {evicted_count} transactions (chunk-based) to free "
                 f"{freed} bytes (needed: {needed_space})"
             )
-    
+
     def clear(self) -> None:
         """Clear all transactions from the mempool."""
         with self._lock:
@@ -2592,7 +2594,6 @@ class Mempool:
 
         Returns the number of transactions written.
         """
-        from ouroboros.p2p_messages import encode_varint
 
         count = len(self.transactions)
         if count == 0:
@@ -2673,7 +2674,7 @@ class Mempool:
                     meta = f.read(16)  # 8 + 8
                     if len(meta) < 16:
                         break
-                    fee = struct.unpack("<q", meta[:8])[0]
+                    struct.unpack("<q", meta[:8])[0]
                     time_added = struct.unpack("<d", meta[8:16])[0]
 
                     # Deserialize the transaction
@@ -2713,16 +2714,16 @@ class Mempool:
     def has_transaction(self, txid: bytes) -> bool:
         """
         Check if transaction is in mempool.
-        
+
         Args:
             txid: Transaction ID to check
-            
+
         Returns:
             True if transaction is in mempool
         """
         return txid in self.transactions
-    
-    def get_transaction_entry(self, txid: bytes) -> Optional[MempoolEntry]:
+
+    def get_transaction_entry(self, txid: bytes) -> MempoolEntry | None:
         """
         Get mempool entry for a transaction.
 
@@ -2738,7 +2739,7 @@ class Mempool:
 
     def build_short_txid_map(
         self, siphash_key: bytes
-    ) -> Dict[int, Transaction]:
+    ) -> dict[int, Transaction]:
         """
         Build a map of short txid -> transaction for compact block reconstruction.
 
@@ -2756,7 +2757,7 @@ class Mempool:
         """
         from ouroboros.compact_blocks import short_txid
 
-        result: Dict[int, Transaction] = {}
+        result: dict[int, Transaction] = {}
         for entry in self.transactions.values():
             tx = entry.tx
             wtxid = tx.get_wtxid()
@@ -2767,8 +2768,8 @@ class Mempool:
         return result
 
     def match_compact_block(
-        self, short_ids: List[int], siphash_key: bytes
-    ) -> Tuple[List[Optional[Transaction]], List[int]]:
+        self, short_ids: list[int], siphash_key: bytes
+    ) -> tuple[list[Transaction | None], list[int]]:
         """
         Match a list of short txids against the mempool.
 
@@ -2787,8 +2788,8 @@ class Mempool:
         from ouroboros.compact_blocks import short_txid
 
         # Build wtxid -> tx lookup, then compute short ids
-        wtxid_to_tx: Dict[int, Transaction] = {}
-        collisions: Set[int] = set()
+        wtxid_to_tx: dict[int, Transaction] = {}
+        collisions: set[int] = set()
 
         for entry in self.transactions.values():
             tx = entry.tx
@@ -2805,8 +2806,8 @@ class Mempool:
             wtxid_to_tx.pop(sid, None)
 
         # Match each short id
-        matched: List[Optional[Transaction]] = []
-        missing: List[int] = []
+        matched: list[Transaction | None] = []
+        missing: list[int] = []
 
         for i, sid in enumerate(short_ids):
             tx = wtxid_to_tx.get(sid)
@@ -2819,7 +2820,7 @@ class Mempool:
     # --- Package Validation / CPFP ---
 
     @staticmethod
-    def is_child_with_parents(txs: List[Transaction]) -> bool:
+    def is_child_with_parents(txs: list[Transaction]) -> bool:
         """
         Check if the package has child-with-parents topology.
 
@@ -2838,7 +2839,7 @@ class Mempool:
         child = txs[-1]
 
         # Collect all txids that the child spends from
-        child_parent_txids: Set[bytes] = set()
+        child_parent_txids: set[bytes] = set()
         for inp in child.inputs:
             child_parent_txids.add(inp.prev_txid)
 
@@ -2851,7 +2852,7 @@ class Mempool:
         return True
 
     @staticmethod
-    def is_child_with_parents_tree(txs: List[Transaction]) -> bool:
+    def is_child_with_parents_tree(txs: list[Transaction]) -> bool:
         """
         Check if the package is a child-with-parents tree (no inter-parent deps).
 
@@ -2865,7 +2866,7 @@ class Mempool:
             return False
 
         # Collect all parent txids (all except the last one)
-        parent_txids: Set[bytes] = {tx.get_txid() for tx in txs[:-1]}
+        parent_txids: set[bytes] = {tx.get_txid() for tx in txs[:-1]}
 
         # Check that no parent spends from another parent
         for tx in txs[:-1]:
@@ -2877,8 +2878,8 @@ class Mempool:
         return True
 
     def validate_package(
-        self, txs: List[Transaction], height: int
-    ) -> Tuple[bool, str]:
+        self, txs: list[Transaction], height: int
+    ) -> tuple[bool, str]:
         """
         Validate and accept a package of transactions (CPFP support).
 
@@ -2903,8 +2904,8 @@ class Mempool:
             return self._validate_package_inner(txs, height)
 
     def _validate_package_inner(
-        self, txs: List[Transaction], height: int
-    ) -> Tuple[bool, str]:
+        self, txs: list[Transaction], height: int
+    ) -> tuple[bool, str]:
         """Unlocked implementation of validate_package."""
         if not txs:
             return False, "Empty package"
@@ -2915,7 +2916,7 @@ class Mempool:
             )
 
         # Check for duplicates within the package
-        seen_txids: Set[bytes] = set()
+        seen_txids: set[bytes] = set()
         for tx in txs:
             txid = tx.get_txid()
             if txid in seen_txids:
@@ -2930,7 +2931,7 @@ class Mempool:
             )
 
         # Check for double-spends within the package
-        package_spent: Set[OutPoint] = set()
+        package_spent: set[OutPoint] = set()
         for tx in txs:
             for inp in tx.inputs:
                 op: OutPoint = (inp.prev_txid, inp.prev_vout)
@@ -2967,8 +2968,8 @@ class Mempool:
         # We need individual fees to enforce the 0-fee requirement for dust parents.
         # Build a temporary UTXO view that includes outputs created by
         # earlier transactions in the package.
-        package_outputs: Dict[OutPoint, int] = {}  # (txid, vout) → value
-        tx_fees: Dict[bytes, int] = {}  # txid → fee
+        package_outputs: dict[OutPoint, int] = {}  # (txid, vout) → value
+        tx_fees: dict[bytes, int] = {}  # txid → fee
 
         for tx in txs:
             txid = tx.get_txid()
@@ -3076,15 +3077,15 @@ class Mempool:
         # All checks passed — add transactions in topological order.
         # Use pre-computed per-tx fees; skip per-tx minimum fee check
         # (package rate already validated above).
-        added_txids: List[bytes] = []
-        ephemeral_parents: Set[bytes] = set()  # Track parents with ephemeral dust
+        added_txids: list[bytes] = []
+        ephemeral_parents: set[bytes] = set()  # Track parents with ephemeral dust
 
         for tx in txs:
             txid = tx.get_txid()
             tx_size = len(tx.serialize())
 
             # Compute direct parents (mempool txs this tx spends from)
-            direct_parents: Set[bytes] = set()
+            direct_parents: set[bytes] = set()
             for inp in tx.inputs:
                 if inp.prev_txid in self.transactions:
                     direct_parents.add(inp.prev_txid)

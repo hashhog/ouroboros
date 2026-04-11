@@ -5,16 +5,16 @@ Verifies Block.serialize() and Block.deserialize() correctly handle
 Bitcoin wire format: header(80) + tx_count(varint) + [serialized tx for each].
 """
 
-import unittest
 import sys
+import unittest
 from pathlib import Path
 
 # Add src to path
 src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
-from ouroboros.database import Block
-from ouroboros.p2p_messages import BlockMessage
+from ouroboros.database import Block  # noqa: E402
+from ouroboros.p2p_messages import BlockMessage  # noqa: E402
 
 
 def hex_to_bytes(hex_str: str) -> bytes:

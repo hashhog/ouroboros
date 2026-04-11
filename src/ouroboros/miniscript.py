@@ -56,11 +56,9 @@ Reference: Bitcoin Core script/miniscript.h, BIP 379 (proposed)
 from __future__ import annotations
 
 import hashlib
-import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable, Dict, List, Optional, Tuple, Union
-
 
 # ---------------------------------------------------------------------------
 # Fragment types
@@ -176,7 +174,7 @@ class MiniscriptType:
         self._flags = flags
 
     @classmethod
-    def from_str(cls, s: str) -> "MiniscriptType":
+    def from_str(cls, s: str) -> MiniscriptType:
         """Create type from string like 'Bzonudems'."""
         flags = 0
         for ch in s:
@@ -184,11 +182,11 @@ class MiniscriptType:
                 flags |= cls._CHAR_TO_BIT[ch]
         return cls(flags)
 
-    def __or__(self, other: "MiniscriptType") -> "MiniscriptType":
+    def __or__(self, other: MiniscriptType) -> MiniscriptType:
         """Union of properties."""
         return MiniscriptType(self._flags | other._flags)
 
-    def __and__(self, other: "MiniscriptType") -> "MiniscriptType":
+    def __and__(self, other: MiniscriptType) -> MiniscriptType:
         """Intersection of properties."""
         return MiniscriptType(self._flags & other._flags)
 
@@ -212,7 +210,7 @@ class MiniscriptType:
                     return True
         return False
 
-    def when(self, cond: bool) -> "MiniscriptType":
+    def when(self, cond: bool) -> MiniscriptType:
         """Return empty type if cond is False, else self."""
         return MiniscriptType(self._flags if cond else 0)
 
@@ -269,11 +267,11 @@ def _mst(s: str) -> MiniscriptType:
 class MiniscriptNode:
     """A node in a miniscript expression tree."""
     fragment: Fragment
-    subs: List["MiniscriptNode"] = field(default_factory=list)
-    keys: List[bytes] = field(default_factory=list)  # Compressed pubkeys
+    subs: list[MiniscriptNode] = field(default_factory=list)
+    keys: list[bytes] = field(default_factory=list)  # Compressed pubkeys
     data: bytes = b""  # Hash preimages
     k: int = 0  # Threshold or timelock value
-    _type: Optional[MiniscriptType] = field(default=None, repr=False)
+    _type: MiniscriptType | None = field(default=None, repr=False)
     _ctx: MiniscriptContext = MiniscriptContext.P2WSH
 
     def get_type(self) -> MiniscriptType:
@@ -793,7 +791,7 @@ def compile_miniscript(node: MiniscriptNode, ctx: MiniscriptContext = Miniscript
 # ---------------------------------------------------------------------------
 
 
-def parse_miniscript(expr: str, ctx: MiniscriptContext = MiniscriptContext.P2WSH, key_parser: Optional[Callable[[str], bytes]] = None) -> MiniscriptNode:
+def parse_miniscript(expr: str, ctx: MiniscriptContext = MiniscriptContext.P2WSH, key_parser: Callable[[str], bytes] | None = None) -> MiniscriptNode:
     """
     Parse a miniscript expression string into a MiniscriptNode.
 
@@ -1031,7 +1029,7 @@ def _parse_core_expr(expr: str, ctx: MiniscriptContext, key_parser: Callable[[st
     elif name == "thresh":
         args = _split_args(args_str)
         if len(args) < 2:
-            raise ValueError(f"thresh requires at least 2 arguments")
+            raise ValueError("thresh requires at least 2 arguments")
         k = int(args[0].strip())
         subs = [_parse_miniscript_inner(arg, ctx, key_parser) for arg in args[1:]]
         if k < 1 or k > len(subs):
@@ -1043,7 +1041,7 @@ def _parse_core_expr(expr: str, ctx: MiniscriptContext, key_parser: Callable[[st
             raise ValueError("multi() not allowed in Tapscript, use multi_a()")
         args = _split_args(args_str)
         if len(args) < 2:
-            raise ValueError(f"multi requires at least 2 arguments")
+            raise ValueError("multi requires at least 2 arguments")
         k = int(args[0].strip())
         keys = [key_parser(arg) for arg in args[1:]]
         if k < 1 or k > len(keys):
@@ -1057,7 +1055,7 @@ def _parse_core_expr(expr: str, ctx: MiniscriptContext, key_parser: Callable[[st
             raise ValueError("multi_a() only allowed in Tapscript context")
         args = _split_args(args_str)
         if len(args) < 2:
-            raise ValueError(f"multi_a requires at least 2 arguments")
+            raise ValueError("multi_a requires at least 2 arguments")
         k = int(args[0].strip())
         keys = [key_parser(arg) for arg in args[1:]]
         if k < 1 or k > len(keys):
@@ -1083,7 +1081,7 @@ def _find_matching_paren(s: str, start: int) -> int:
     raise ValueError("Unmatched parenthesis")
 
 
-def _split_args(s: str) -> List[str]:
+def _split_args(s: str) -> list[str]:
     """Split arguments at top-level commas."""
     args = []
     depth = 0
@@ -1114,13 +1112,13 @@ def _split_args(s: str) -> List[str]:
 class SatisfactionInfo:
     """Information about satisfying a miniscript."""
     # Witness size in bytes (None if unsatisfiable)
-    sat_size: Optional[int] = None
+    sat_size: int | None = None
     # Dissatisfaction witness size (None if cannot be dissatisfied)
-    dsat_size: Optional[int] = None
+    dsat_size: int | None = None
     # Whether satisfaction requires a signature
     has_sig: bool = False
     # Number of stack elements for satisfaction
-    sat_stack: Optional[int] = None
+    sat_stack: int | None = None
 
 
 def analyze_satisfaction(node: MiniscriptNode) -> SatisfactionInfo:

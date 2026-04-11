@@ -8,8 +8,8 @@ Tests the RPCServer's ability to handle batch requests per JSON-RPC 2.0 spec:
 - Batch size limit is enforced
 """
 
+
 import pytest
-from unittest.mock import MagicMock, AsyncMock
 from fastapi.testclient import TestClient
 
 

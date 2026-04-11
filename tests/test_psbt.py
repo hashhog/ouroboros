@@ -12,28 +12,28 @@ Tests cover:
 """
 
 import base64
+import io
+
 import pytest
 
+from ouroboros.database import Transaction, TxIn, TxOut
 from ouroboros.psbt import (
     PSBT,
-    PSBTInput,
-    PSBTOutput,
-    KeyOriginInfo,
     PSBT_MAGIC,
     PSBT_VERSION_0,
     PSBT_VERSION_2,
-    createpsbt,
-    combinepsbt,
-    finalizepsbt,
-    decodepsbt,
-    analyzepsbt,
-    joinpsbts,
-    _write_compact_size,
+    KeyOriginInfo,
+    PSBTInput,
+    PSBTOutput,
     _read_compact_size,
-    _serialize_unsigned_tx,
+    _write_compact_size,
+    analyzepsbt,
+    combinepsbt,
+    createpsbt,
+    decodepsbt,
+    finalizepsbt,
+    joinpsbts,
 )
-from ouroboros.database import Transaction, TxIn, TxOut
-import io
 
 
 class TestCompactSize:

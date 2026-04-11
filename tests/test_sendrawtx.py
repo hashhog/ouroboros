@@ -4,12 +4,11 @@ Tests for sendrawtransaction RPC.
 Reference: Bitcoin Core rpc/mempool.cpp sendrawtransaction
 """
 
-import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
 from dataclasses import dataclass
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Any
+from unittest.mock import MagicMock, patch
 
-from ouroboros.database import Transaction, TxIn, TxOut
+import pytest
 
 
 @dataclass
@@ -19,7 +18,7 @@ class MockTxIn:
     prev_vout: int
     script_sig: bytes = b""
     sequence: int = 0xFFFFFFFF
-    witness: List[bytes] = None
+    witness: list[bytes] = None
 
     def __post_init__(self):
         if self.witness is None:
@@ -39,8 +38,8 @@ class MockTransaction:
     def __init__(
         self,
         txid: bytes,
-        inputs: List[MockTxIn],
-        outputs: List[MockTxOut],
+        inputs: list[MockTxIn],
+        outputs: list[MockTxOut],
         version: int = 2,
         locktime: int = 0,
         is_coinbase: bool = False,
@@ -79,13 +78,13 @@ class MockMempool:
     """Mock mempool for testing."""
 
     def __init__(self):
-        self.transactions: Dict[bytes, Any] = {}
+        self.transactions: dict[bytes, Any] = {}
         self.add_result = (True, "")
 
     def has_transaction(self, txid: bytes) -> bool:
         return txid in self.transactions
 
-    def add_transaction(self, tx: MockTransaction, height: int) -> Tuple[bool, str]:
+    def add_transaction(self, tx: MockTransaction, height: int) -> tuple[bool, str]:
         if self.add_result[0]:
             self.transactions[tx.get_txid()] = MagicMock(tx=tx)
         return self.add_result
@@ -95,17 +94,17 @@ class MockDatabase:
     """Mock database for testing."""
 
     def __init__(self):
-        self.utxos: Dict[Tuple[bytes, int], Dict[str, Any]] = {}
-        self.tx_index: Dict[bytes, Tuple[bytes, int, int]] = {}
+        self.utxos: dict[tuple[bytes, int], dict[str, Any]] = {}
+        self.tx_index: dict[bytes, tuple[bytes, int, int]] = {}
         self.best_height = 100
 
-    def get_best_block(self) -> Tuple[bytes, int]:
+    def get_best_block(self) -> tuple[bytes, int]:
         return b"\x00" * 32, self.best_height
 
-    def get_utxo(self, txid: bytes, vout: int) -> Optional[Dict[str, Any]]:
+    def get_utxo(self, txid: bytes, vout: int) -> dict[str, Any] | None:
         return self.utxos.get((txid, vout))
 
-    def get_tx_index(self, txid: bytes) -> Optional[Tuple[bytes, int, int]]:
+    def get_tx_index(self, txid: bytes) -> tuple[bytes, int, int] | None:
         return self.tx_index.get(txid)
 
 
@@ -113,7 +112,7 @@ class MockPeerManager:
     """Mock peer manager for testing."""
 
     def __init__(self):
-        self.relayed_txs: List[Tuple[bytes, bytes]] = []
+        self.relayed_txs: list[tuple[bytes, bytes]] = []
 
     def queue_tx_for_relay(self, txid: bytes, wtxid: bytes) -> int:
         self.relayed_txs.append((txid, wtxid))
@@ -260,11 +259,12 @@ class TestSendRawTransactionIntegration:
     @pytest.mark.asyncio
     async def test_sendrawtx_reject_coinbase(self, mock_node):
         """Test that coinbase transactions are rejected."""
-        from ouroboros.rpc import RPCServer
         from fastapi import HTTPException
 
+        from ouroboros.rpc import RPCServer
+
         # Create a coinbase transaction
-        coinbase_tx = MockTransaction(
+        MockTransaction(
             txid=bytes.fromhex("2" * 64),
             inputs=[],
             outputs=[MockTxOut(value=5000000000, script_pubkey=b"\x00" * 25)],
@@ -286,7 +286,6 @@ class TestSendRawTransactionIntegration:
     async def test_sendrawtx_already_in_mempool(self, mock_node, sample_tx):
         """Test that already-in-mempool returns txid without error."""
         from ouroboros.rpc import RPCServer
-        from ouroboros.p2p_messages import TxMessage
 
         # Pre-add to mempool
         mock_node.mempool.transactions[sample_tx.get_txid()] = MagicMock(tx=sample_tx)

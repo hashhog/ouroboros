@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -78,18 +78,23 @@ class BlockPruner:
 
     def __init__(
         self,
-        block_store: Any,
+        block_store: Any = None,
         target_size_mb: int = 550,
         keep_blocks: int = 288,
+        *,
+        db: Any = None,
     ):
         """
         Create a block pruner.
 
         Args:
-            block_store: PyBlockStore instance (from sync module)
+            block_store: PyBlockStore instance (from sync module).
+                         Also accepted as keyword argument ``db`` for compatibility.
             target_size_mb: Target disk usage in MB (minimum 550)
             keep_blocks: Minimum blocks to keep above prune height (minimum 288)
         """
+        if db is not None and block_store is None:
+            block_store = db
         self.block_store = block_store
         self.target_size = max(target_size_mb, self.MIN_TARGET_MB) * 1_000_000
         self.keep_blocks = max(keep_blocks, self.MIN_KEEP_BLOCKS)
@@ -116,7 +121,7 @@ class BlockPruner:
             prune_height=prune_h,
         )
 
-    def prune_blocks(self, current_height: int) -> Tuple[int, int]:
+    def prune_blocks(self, current_height: int) -> tuple[int, int]:
         """
         Prune old blocks to meet the target size.
 
@@ -179,7 +184,7 @@ class BlockPruner:
 
         return final_height
 
-    def prune_to_target(self, current_height: int) -> Tuple[int, int]:
+    def prune_to_target(self, current_height: int) -> tuple[int, int]:
         """
         Prune oldest blocks until storage is below ``target_size``.
 
@@ -193,7 +198,7 @@ class BlockPruner:
         """
         return self.prune_blocks(current_height)
 
-    def get_prune_info(self) -> Dict[str, Any]:
+    def get_prune_info(self) -> dict[str, Any]:
         """Return a summary dict suitable for RPC responses."""
         stats = self.get_stats()
         return {
@@ -246,7 +251,7 @@ class FilePruner:
         """Calculate total disk usage of all block and undo files."""
         return self.block_store.calculate_current_usage()
 
-    def get_file_info(self, file_num: int) -> Optional[Dict[str, Any]]:
+    def get_file_info(self, file_num: int) -> dict[str, Any] | None:
         """
         Get info about a specific block file.
 

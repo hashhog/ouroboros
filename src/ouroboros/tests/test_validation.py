@@ -5,18 +5,18 @@ Verifies BlockValidator._validate_header() including proof-of-work.
 Ref: bitcoin/src/pow.cpp CheckProofOfWork
 """
 
-import unittest
+import shutil
 import sys
 import tempfile
-import shutil
+import unittest
 from pathlib import Path
 
 # Add src to path
 src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
-from ouroboros.database import BlockchainDatabase, Block
-from ouroboros.validation import BlockValidator, _bits_to_target
+from ouroboros.database import Block, BlockchainDatabase  # noqa: E402
+from ouroboros.validation import BlockValidator, _bits_to_target  # noqa: E402
 
 
 def hex_to_bytes(hex_str: str) -> bytes:

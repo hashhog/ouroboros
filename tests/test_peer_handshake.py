@@ -8,18 +8,20 @@ Phase 16: Pre-Handshake Peer Filtering
 - WTXIDRELAY and SENDADDRV2 must be sent before VERACK
 """
 
-import asyncio
 import struct
 import time
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
 
-from ouroboros.peer import (
-    Peer, PeerState, MIN_PEER_VERSION, HANDSHAKE_TIMEOUT,
-)
 from ouroboros.p2p_messages import (
-    NetworkMessage, VersionMessage, get_magic,
-    NODE_NETWORK, NODE_WITNESS,
+    NODE_NETWORK,
+    NODE_WITNESS,
+    VersionMessage,
+)
+from ouroboros.peer import (
+    HANDSHAKE_TIMEOUT,
+    MIN_PEER_VERSION,
+    Peer,
+    PeerState,
 )
 
 
