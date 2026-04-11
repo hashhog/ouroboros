@@ -920,6 +920,19 @@ class RESTInterface:
         if hasattr(self.node, 'config'):
             network = self.node.config.get('network', network)
 
+        # Translate internal network name to Core-canonical RPC chain ID.
+        # Bitcoin Core returns "main" / "test" in chain info responses (not
+        # "mainnet" / "testnet"); ouroboros uses the *-net form internally.
+        # Mirrors rpc.py:_rpc_chain_name — keep the two maps in sync.
+        _REST_CHAIN_NAME_MAP = {
+            "mainnet":  "main",
+            "testnet":  "test",
+            "testnet3": "test",
+            "testnet4": "test",
+            # signet and regtest match Core verbatim
+        }
+        chain_name = _REST_CHAIN_NAME_MAP.get(network, network)
+
         # Get tip block for bits and time
         tip_block = db.get_block(best_hash) if isinstance(best_hash, bytes) else None
         bits = tip_block.bits if tip_block else 0x1d00ffff
@@ -934,7 +947,7 @@ class RESTInterface:
             mantissa << (8 * (exponent - 3))
 
         return JSONResponse(content={
-            "chain": network,
+            "chain": chain_name,
             "blocks": best_height,
             "headers": best_height,
             "bestblockhash": best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash),
