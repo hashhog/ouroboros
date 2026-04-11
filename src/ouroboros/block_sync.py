@@ -458,22 +458,28 @@ class BlockSync:
 
             block, raw_payload = self._ibd_block_buffer.pop(next_hash)
 
-            # Validate
+            # Validate and connect in a thread to avoid blocking the event
+            # loop.  Individual block validations at higher heights can take
+            # seconds (Rust FFI + DB writes).  Running them in a thread lets
+            # the event loop service RPC requests and peer messages meanwhile.
             new_height = current_height + 1
-            valid, error = self.validator.validate_block(block, known_height=new_height)
+            valid, error = await asyncio.to_thread(
+                self.validator.validate_block, block, known_height=new_height
+            )
             if not valid:
                 logger.warning(
                     f"✗ Invalid block at height {new_height}: {error}"
                 )
-                # Don't ban — might be our validation bug. Just skip.
                 break
 
             # Connect block
             try:
                 if hasattr(self.db, 'connect_block_from_bytes'):
-                    self.db.connect_block_from_bytes(raw_payload, new_height)
+                    await asyncio.to_thread(
+                        self.db.connect_block_from_bytes, raw_payload, new_height
+                    )
                 else:
-                    self.validator.apply_block(block)
+                    await asyncio.to_thread(self.validator.apply_block, block)
             except Exception as e:
                 logger.error(f"Failed to connect block at height {new_height}: {e}")
                 break
