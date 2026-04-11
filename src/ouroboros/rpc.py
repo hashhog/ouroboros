@@ -817,6 +817,166 @@ class RPCServer:
 
         return info
 
+    async def rpc_getdeploymentinfo(self, blockhash: str | None = None) -> dict[str, Any]:
+        """Return deployment state info for consensus changes.
+
+        Reference: Bitcoin Core rpc/blockchain.cpp getdeploymentinfo
+
+        Args:
+            blockhash: Optional block hash to query (default: chain tip)
+
+        Returns an object with:
+        - hash: queried block hash
+        - height: queried block height
+        - deployments: dict mapping name -> deployment info
+          Each entry has: type, active, height (if known), bip9 (if bip9 type)
+          bip9 sub-object: status, bit, start_time, timeout, since,
+                           min_activation_height, [statistics]
+        """
+        from ouroboros.consensus import BIP9_DEPLOYMENTS, BURIED_DEPLOYMENTS
+
+        db = getattr(self.node, 'db', None)
+
+        network = getattr(self.node, 'network', 'mainnet')
+        if hasattr(self.node, 'config'):
+            network = self.node.config.get('network', network)
+
+        network_lower = network.lower()
+        if network_lower == "bitcoin":
+            network_lower = "mainnet"
+
+        if blockhash is not None:
+            # Validate hex before trying the DB
+            try:
+                hash_bytes = bytes.fromhex(blockhash)[::-1]
+            except (ValueError, AttributeError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid block hash") from exc
+
+            if db is None:
+                raise HTTPException(status_code=500, detail="Database not available")
+
+            try:
+                block = await asyncio.to_thread(db.get_block, hash_bytes)
+            except Exception:
+                block = None
+
+            if block is None:
+                raise HTTPException(status_code=404, detail="Block not found")
+
+            query_hash = blockhash
+            if hasattr(block, 'height'):
+                query_height = block.height
+            else:
+                # Try to get height from db
+                try:
+                    _, best_height = db.get_best_block()
+                    query_height = best_height
+                except Exception:
+                    query_height = 0
+        elif db is not None:
+            best_hash_bytes, best_height = db.get_best_block()
+            query_height = best_height
+            if isinstance(best_hash_bytes, bytes):
+                query_hash = best_hash_bytes[::-1].hex()
+            else:
+                query_hash = str(best_hash_bytes)
+        else:
+            # No DB, no blockhash — return genesis-level info
+            query_height = 0
+            query_hash = "0" * 64
+
+        deployments: dict[str, Any] = {}
+
+        # --- Buried deployments ---
+        buried_for_net = BURIED_DEPLOYMENTS.get(network_lower, {})
+        for dep_name, buried_dep in buried_for_net.items():
+            active = query_height >= buried_dep.height
+            dep_info: dict[str, Any] = {
+                "type": "buried",
+                "active": active,
+                "height": buried_dep.height,
+                "min_activation_height": buried_dep.height,
+            }
+            deployments[dep_name] = dep_info
+
+        # --- BIP9 deployments (via Rust versionbits) ---
+        if HAS_VERSIONBITS:
+            try:
+                bip9_deps = get_all_deployments_info(query_height, network_lower, [], [])
+                for dep in bip9_deps:
+                    is_active = dep.state == "active"
+                    bip9_obj: dict[str, Any] = {
+                        "status": dep.state,
+                        "bit": dep.bit,
+                        "start_time": dep.start_time,
+                        "timeout": dep.timeout,
+                        "since": dep.since,
+                        "min_activation_height": dep.min_activation_height,
+                    }
+                    if dep.period is not None:
+                        bip9_obj["statistics"] = {
+                            "period": dep.period,
+                            "threshold": dep.threshold,
+                            "elapsed": dep.elapsed,
+                            "count": dep.count,
+                            "possible": dep.possible,
+                        }
+                    dep_entry: dict[str, Any] = {
+                        "type": "bip9",
+                        "active": is_active,
+                        "min_activation_height": dep.min_activation_height,
+                        "bip9": bip9_obj,
+                    }
+                    if is_active and dep.since > 0:
+                        dep_entry["height"] = dep.since
+                    deployments[dep.name] = dep_entry
+            except Exception as e:
+                logger.debug(f"Could not get BIP9 deployment info: {e}")
+                # Fall back to static BIP9 deployment info from consensus module
+                bip9_for_net = BIP9_DEPLOYMENTS.get(network_lower, {})
+                for dep_name, dep_params in bip9_for_net.items():
+                    # Without Rust state machine, report as active if ALWAYS_ACTIVE
+                    is_always_active = dep_params.start_time == -1  # ALWAYS_ACTIVE sentinel
+                    dep_entry = {
+                        "type": "bip9",
+                        "active": is_always_active,
+                        "min_activation_height": dep_params.min_activation_height,
+                        "bip9": {
+                            "status": "active" if is_always_active else "defined",
+                            "bit": dep_params.bit,
+                            "start_time": dep_params.start_time,
+                            "timeout": dep_params.timeout,
+                            "since": 0,
+                            "min_activation_height": dep_params.min_activation_height,
+                        },
+                    }
+                    deployments[dep_name] = dep_entry
+        else:
+            # No Rust versionbits available — use static Python data
+            bip9_for_net = BIP9_DEPLOYMENTS.get(network_lower, {})
+            for dep_name, dep_params in bip9_for_net.items():
+                is_always_active = dep_params.start_time == -1
+                dep_entry = {
+                    "type": "bip9",
+                    "active": is_always_active,
+                    "min_activation_height": dep_params.min_activation_height,
+                    "bip9": {
+                        "status": "active" if is_always_active else "defined",
+                        "bit": dep_params.bit,
+                        "start_time": dep_params.start_time,
+                        "timeout": dep_params.timeout,
+                        "since": 0,
+                        "min_activation_height": dep_params.min_activation_height,
+                    },
+                }
+                deployments[dep_name] = dep_entry
+
+        return {
+            "hash": query_hash,
+            "height": query_height,
+            "deployments": deployments,
+        }
+
     async def rpc_getblockcount(self) -> int:
         """Return block count"""
         if not hasattr(self.node, 'db'):
