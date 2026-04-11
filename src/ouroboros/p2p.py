@@ -15,44 +15,46 @@ Reference: Bitcoin Core net.cpp, net_processing.cpp
 import asyncio
 import base64
 import json
-import os
-import socket
-import random
-import time
 import logging
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List, Dict, Set, Optional, Tuple
+import os
+import random
+import socket
+import time
 from collections import defaultdict
+from dataclasses import dataclass, field
 
-from ouroboros.peer import Peer, PeerState, RelayType, is_onion_host
-from ouroboros.tor import (
-    TorController,
-    I2PSession,
-    socks5_connect_isolated,
-    is_i2p_host,
-    is_anonymous_network,
-    i2p_destination_to_address,
-)
-from ouroboros.p2p_messages import (
-    NetworkMessage, SendCmpctMessage, CmpctBlockMessage,
-    GetBlockTxnMessage, BlockTxnMessage,
-    AddrMessage, AddrV2Message, GetAddrMessage,
-    SendTxRcnclMessage, ReqTxRcnclMessage, SketchMessage,
-    ReconcilDiffMessage, InvMessage, INV_TYPE_TX, MSG_WTX,
-)
-from ouroboros.minisketch import (
-    Minisketch, ReconciliationSet, estimate_sketch_capacity,
-    compute_short_txid,
-)
+from ouroboros.addrman import AddressManager, get_network_group
 from ouroboros.banman import (
     BanManager,
-    SCORE_INVALID_BLOCK,
-    SCORE_INVALID_HEADERS,
-    SCORE_INVALID_TX,
-    SCORE_UNREQUESTED_DATA,
 )
-from ouroboros.addrman import AddressManager, get_network_group
+from ouroboros.minisketch import (
+    Minisketch,
+    ReconciliationSet,
+    estimate_sketch_capacity,
+)
+from ouroboros.p2p_messages import (
+    INV_TYPE_TX,
+    MSG_WTX,
+    AddrMessage,
+    AddrV2Message,
+    BlockTxnMessage,
+    GetAddrMessage,
+    GetBlockTxnMessage,
+    InvMessage,
+    NetworkMessage,
+    ReconcilDiffMessage,
+    ReqTxRcnclMessage,
+    SendCmpctMessage,
+    SendTxRcnclMessage,
+    SketchMessage,
+)
+from ouroboros.peer import Peer, is_onion_host
+from ouroboros.tor import (
+    I2PSession,
+    TorController,
+    i2p_destination_to_address,
+    is_i2p_host,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -198,17 +200,17 @@ class TrickleQueue:
         self.wtxid_relay = wtxid_relay
 
         # Set of wtxids pending announcement (like m_tx_inventory_to_send)
-        self.pending_wtxids: Set[bytes] = set()
+        self.pending_wtxids: set[bytes] = set()
 
         # Map wtxid -> txid for peers that don't support wtxid relay
-        self.wtxid_to_txid: Dict[bytes, bytes] = {}
+        self.wtxid_to_txid: dict[bytes, bytes] = {}
 
         # Map wtxid -> TrickleEntry for fee information (BIP133 feefilter)
-        self.wtxid_to_entry: Dict[bytes, TrickleEntry] = {}
+        self.wtxid_to_entry: dict[bytes, TrickleEntry] = {}
 
         # Bloom filter to track already-announced txs (like m_tx_inventory_known_filter)
         # For simplicity, use a set here; Bitcoin Core uses CRollingBloomFilter
-        self.known_filter: Set[bytes] = set()
+        self.known_filter: set[bytes] = set()
 
         # Next scheduled send time
         self.next_send_time: float = 0.0
@@ -279,7 +281,7 @@ class TrickleQueue:
         self,
         max_count: int = INVENTORY_BROADCAST_MAX,
         feefilter: int = 0,
-    ) -> List[Tuple[int, bytes]]:
+    ) -> list[tuple[int, bytes]]:
         """Get INV items ready to send and remove them from the queue.
 
         BIP133: Transactions with fee rate below the peer's feefilter
@@ -304,8 +306,8 @@ class TrickleQueue:
         pending_list = list(self.pending_wtxids)
         random.shuffle(pending_list)
 
-        inv_items: List[Tuple[int, bytes]] = []
-        to_remove: List[bytes] = []
+        inv_items: list[tuple[int, bytes]] = []
+        to_remove: list[bytes] = []
 
         for wtxid in pending_list[:broadcast_max]:
             txid = self.wtxid_to_txid.get(wtxid, wtxid)
@@ -409,14 +411,14 @@ class PeerManager:
         network: str = "mainnet",
         max_peers: int = 8,
         max_block_relay_only: int = MAX_BLOCK_RELAY_ONLY_CONNECTIONS,
-        data_dir: Optional[str] = None,
+        data_dir: str | None = None,
         transport_version: int = 1,
         listen: bool = True,
-        proxy: Optional[str] = None,
-        onion: Optional[str] = None,
-        i2psam: Optional[str] = None,
-        torcontrol: Optional[str] = None,
-        torpassword: Optional[str] = None,
+        proxy: str | None = None,
+        onion: str | None = None,
+        i2psam: str | None = None,
+        torcontrol: str | None = None,
+        torpassword: str | None = None,
     ):
         """Initialize peer manager."""
         self.network = network
@@ -430,10 +432,10 @@ class PeerManager:
         self.torcontrol = torcontrol  # Tor control port (host:port)
         self.torpassword = torpassword  # Tor control password
 
-        self.peers: Dict[str, Peer] = {}  # addr -> Peer (full-relay outbound)
-        self.block_relay_peers: Dict[str, Peer] = {}  # addr -> Peer (block-relay-only outbound)
-        self.inbound_peers: Dict[str, Peer] = {}  # addr -> Peer (inbound)
-        self.known_addrs: Set[str] = set()
+        self.peers: dict[str, Peer] = {}  # addr -> Peer (full-relay outbound)
+        self.block_relay_peers: dict[str, Peer] = {}  # addr -> Peer (block-relay-only outbound)
+        self.inbound_peers: dict[str, Peer] = {}  # addr -> Peer (inbound)
+        self.known_addrs: set[str] = set()
 
         self.ban_manager = BanManager(
             data_dir=data_dir,
@@ -441,76 +443,76 @@ class PeerManager:
         )
 
         # Connection retry tracking (addr -> retry_count)
-        self.retry_counts: Dict[str, int] = defaultdict(int)
-        self.last_retry_time: Dict[str, float] = {}
+        self.retry_counts: dict[str, int] = defaultdict(int)
+        self.last_retry_time: dict[str, float] = {}
 
         self.running = False
-        self._maintenance_task: Optional[asyncio.Task] = None
-        self._server: Optional[asyncio.AbstractServer] = None
+        self._maintenance_task: asyncio.Task | None = None
+        self._server: asyncio.AbstractServer | None = None
         self._start_height: int = 0
 
         # Callback for registering handlers on newly accepted inbound peers
-        self._on_inbound_peer: Optional[asyncio.coroutines] = None
+        self._on_inbound_peer: asyncio.coroutines | None = None
 
         # Address manager for peer gossip
         self.addrman = AddressManager(data_dir=data_dir)
 
         # Per-peer rate limiting for addr relay (addr -> last relay epoch)
-        self._addr_relay_counts: Dict[str, int] = defaultdict(int)
-        self._addr_relay_day: Dict[str, float] = {}
+        self._addr_relay_counts: dict[str, int] = defaultdict(int)
+        self._addr_relay_day: dict[str, float] = {}
 
         # BIP 152 compact-block state
         self.compact_block_version: int = 2
-        self.cmpct_peers: Set[str] = set()
+        self.cmpct_peers: set[str] = set()
         self._mempool = None
         self._on_compact_block = None
         self._database = None  # database for block lookups (getblocktxn)
 
         # BIP 330 Erlay reconciliation state
         self.erlay_enabled: bool = True  # whether we support Erlay
-        self._erlay_peers: Dict[str, ReconciliationSet] = {}  # addr -> recon set
-        self._erlay_local_salts: Dict[str, int] = {}  # addr -> our salt
-        self._erlay_pending_recon: Dict[str, bool] = {}  # addr -> recon in progress
-        self._reconciliation_task: Optional[asyncio.Task] = None
+        self._erlay_peers: dict[str, ReconciliationSet] = {}  # addr -> recon set
+        self._erlay_local_salts: dict[str, int] = {}  # addr -> our salt
+        self._erlay_pending_recon: dict[str, bool] = {}  # addr -> recon in progress
+        self._reconciliation_task: asyncio.Task | None = None
         self._reconciliation_interval: float = 2.0  # seconds between rounds
 
         # Transaction trickling state (privacy-preserving relay)
         # Per-peer trickle queues: addr -> TrickleQueue
-        self._trickle_queues: Dict[str, TrickleQueue] = {}
-        self._trickle_task: Optional[asyncio.Task] = None
+        self._trickle_queues: dict[str, TrickleQueue] = {}
+        self._trickle_task: asyncio.Task | None = None
         self._trickle_interval: float = 1.0  # check interval in seconds
 
         # Eclipse attack mitigation state
         # Anchor connections: persistent block-relay-only peers across restarts
-        self._anchors: List[str] = []  # list of anchor addresses
-        self._anchors_filepath: Optional[str] = None
+        self._anchors: list[str] = []  # list of anchor addresses
+        self._anchors_filepath: str | None = None
         if data_dir:
             self._anchors_filepath = os.path.join(data_dir, "anchors.dat")
             self._load_anchors()
 
         # Feeler connections: probe new addresses periodically
-        self._feeler_task: Optional[asyncio.Task] = None
-        self._feeler_peer: Optional[Peer] = None
+        self._feeler_task: asyncio.Task | None = None
+        self._feeler_peer: Peer | None = None
         self._next_feeler_time: float = 0.0
 
         # Track outbound /16 groups for connection diversification
-        self._outbound_netgroups: Set[str] = set()
+        self._outbound_netgroups: set[str] = set()
 
         # Track inbound /16 groups for reserved slot enforcement
-        self._inbound_netgroups: Dict[str, int] = {}  # group -> count
+        self._inbound_netgroups: dict[str, int] = {}  # group -> count
 
         # Tor hidden service support
-        self._tor_controller: Optional[TorController] = None
-        self._tor_onion_address: Optional[str] = None
+        self._tor_controller: TorController | None = None
+        self._tor_onion_address: str | None = None
         self._data_dir = data_dir
 
         # I2P SAM session
-        self._i2p_session: Optional[I2PSession] = None
-        self._i2p_address: Optional[str] = None
-        self._i2p_accept_task: Optional[asyncio.Task] = None
+        self._i2p_session: I2PSession | None = None
+        self._i2p_address: str | None = None
+        self._i2p_accept_task: asyncio.Task | None = None
 
         # Persistent --connect peers that should be reconnected when lost
-        self._connect_addrs: List[Tuple[str, int]] = []
+        self._connect_addrs: list[tuple[str, int]] = []
 
     async def start(self, start_height: int = 0, p2p_port: int = 0):
         """
@@ -568,7 +570,7 @@ class PeerManager:
 
         # Start feeler connection loop (eclipse protection)
         self._feeler_task = asyncio.create_task(self._feeler_loop())
-    
+
     async def stop(self):
         """Stop peer manager and disconnect all peers"""
         if not self.running:
@@ -670,7 +672,7 @@ class PeerManager:
         """Get /16 network group for connection diversity."""
         return get_network_group(host)
 
-    def _select_eviction_candidate(self) -> Optional[str]:
+    def _select_eviction_candidate(self) -> str | None:
         """Select the worst inbound peer for eviction."""
         # Build candidate list: [(addr, peer), ...]
         candidates = [
@@ -1150,7 +1152,7 @@ class PeerManager:
         self,
         host: str,
         port: int,
-    ) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
         """Connect to an I2P peer via SAM session."""
         if not self._i2p_session or not self._i2p_session.is_connected:
             return None
@@ -1168,7 +1170,7 @@ class PeerManager:
     async def discover_peers(self):
         """Discover peers from DNS seeds"""
         logger.info("Discovering peers from DNS seeds...")
-        
+
         seeds = (
             DNS_SEEDS_MAINNET if self.network == "mainnet"
             else DNS_SEEDS_TESTNET4 if self.network == "testnet4"
@@ -1189,18 +1191,18 @@ class PeerManager:
         # Resolve DNS seeds in parallel
         tasks = [self._resolve_dns_seed(seed, port) for seed in seeds]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         total_discovered = 0
-        for seed, result in zip(seeds, results):
+        for seed, result in zip(seeds, results, strict=False):
             if isinstance(result, Exception):
                 logger.warning(f"Failed to resolve {seed}: {result}")
             else:
                 count = result
                 total_discovered += count
                 logger.info(f"Discovered {count} peers from {seed}")
-        
+
         logger.info(f"Total known peers: {len(self.known_addrs)}")
-    
+
     async def _resolve_dns_seed(self, seed: str, port: int) -> int:
         """Resolve DNS seed and add addresses to known_addrs."""
         try:
@@ -1212,7 +1214,7 @@ class PeerManager:
                 family=socket.AF_INET,
                 type=socket.SOCK_STREAM
             )
-            
+
             count = 0
             for addr_info in addrs:
                 ip = addr_info[4][0]
@@ -1223,12 +1225,12 @@ class PeerManager:
                     count += 1
 
             return count
-            
+
         except Exception as e:
             logger.debug(f"Error resolving {seed}: {e}")
             return 0
-    
-    def _proxy_for_host(self, host: str) -> Optional[str]:
+
+    def _proxy_for_host(self, host: str) -> str | None:
         """Get SOCKS5 proxy for a host, if any.
 
         - .onion addresses use the onion proxy (or global proxy)
@@ -1254,7 +1256,7 @@ class PeerManager:
             return self._i2p_session is not None and self._i2p_session.is_connected
         return True
 
-    def _all_outbound_addrs(self) -> Set[str]:
+    def _all_outbound_addrs(self) -> set[str]:
         return set(self.peers.keys()) | set(self.block_relay_peers.keys())
 
     def _update_outbound_netgroups(self) -> None:
@@ -1484,20 +1486,20 @@ class PeerManager:
                         f"Removed {addr} from known addresses after "
                         f"{self.retry_counts[addr]} failures"
                     )
-    
+
     def _should_retry(self, addr: str) -> bool:
         retry_count = self.retry_counts.get(addr, 0)
         if retry_count == 0:
             return True
-        
+
         last_retry = self.last_retry_time.get(addr, 0)
         elapsed = time.time() - last_retry
-        
+
         # Exponential backoff: 2^retry_count seconds
         backoff_time = min(2 ** retry_count, 300)  # Max 5 minutes
-        
+
         return elapsed >= backoff_time
-    
+
     async def maintain_connections(self, start_height: int):
         """Maintain peer connections and eclipse protections."""
         while self.running:
@@ -1601,7 +1603,7 @@ class PeerManager:
             except Exception as e:
                 logger.error(f"Error in maintain_connections: {e}")
                 await asyncio.sleep(30)
-    
+
     # BIP 133 Fee Filter
 
     def _init_feefilter_rounder(self) -> None:
@@ -1649,7 +1651,6 @@ class PeerManager:
         current_filter = self._get_current_feefilter()
         current_time = time.time()
 
-        from ouroboros.p2p_messages import FeeFilterMessage
 
         for p in self.get_all_ready_peers():
             # Skip block-relay-only peers (they don't relay transactions)
@@ -1805,8 +1806,7 @@ class PeerManager:
 
         async def on_getblocktxn(msg: NetworkMessage):
             """Handle getblocktxn: respond with requested transactions."""
-            from ouroboros.compact_blocks import (
-                BlockTransactionsRequest, BlockTransactions)
+            from ouroboros.compact_blocks import BlockTransactions, BlockTransactionsRequest
             try:
                 req = BlockTransactionsRequest.deserialize(msg.payload)
                 logger.debug(
@@ -1864,7 +1864,7 @@ class PeerManager:
             if self._mempool is not None:
                 all_txids = list(self._mempool.transactions.keys())
                 if all_txids:
-                    from ouroboros.p2p_messages import InvMessage, INV_TYPE_TX
+                    from ouroboros.p2p_messages import INV_TYPE_TX, InvMessage
                     inv = InvMessage([(INV_TYPE_TX, txid) for txid in all_txids[:50000]])
                     try:
                         await peer.send_message(inv.to_network_message(self.network))
@@ -2002,7 +2002,7 @@ class PeerManager:
         return self._addr_relay_counts[addr] <= 1000
 
     @staticmethod
-    def _netaddr_to_host(net_addr) -> Optional[str]:
+    def _netaddr_to_host(net_addr) -> str | None:
         ip_bytes = net_addr.ip
         # IPv4-mapped IPv6: ::ffff:a.b.c.d
         if ip_bytes[:12] == b"\x00" * 10 + b"\xff\xff":
@@ -2013,7 +2013,7 @@ class PeerManager:
         return None
 
     @staticmethod
-    def _addr_bytes_to_host(net_id: int, addr_bytes: bytes) -> Optional[str]:
+    def _addr_bytes_to_host(net_id: int, addr_bytes: bytes) -> str | None:
         """Convert BIP155 address bytes to human-readable host string.
 
         Supports:
@@ -2357,7 +2357,7 @@ class PeerManager:
         """Check if a peer has Erlay negotiated."""
         return addr in self._erlay_peers
 
-    def get_erlay_peers(self) -> List[str]:
+    def get_erlay_peers(self) -> list[str]:
         """Return addresses of all Erlay-capable peers."""
         return list(self._erlay_peers.keys())
 
@@ -2383,10 +2383,10 @@ class PeerManager:
         for txid in list(recon.local_set):
             recon.mark_announced(txid)
 
-    def get_best_peer(self) -> Optional[Peer]:
+    def get_best_peer(self) -> Peer | None:
         """
         Get peer with lowest latency.
-        
+
         Returns:
             Best peer or None if no peers available
         """
@@ -2394,10 +2394,10 @@ class PeerManager:
             p for p in self.peers.values()
             if p.is_connected()
         ]
-        
+
         if not ready_peers:
             return None
-        
+
         # Sort by latency (or score if latency not available)
         return min(
             ready_peers,
@@ -2406,8 +2406,8 @@ class PeerManager:
                 -p.score  # Higher score is better
             )
         )
-    
-    def get_all_ready_peers(self) -> List[Peer]:
+
+    def get_all_ready_peers(self) -> list[Peer]:
         """
         Get all ready peers (full-relay outbound + block-relay-only + inbound).
 
@@ -2420,8 +2420,8 @@ class PeerManager:
             + list(self.inbound_peers.values())
         )
         return [p for p in all_peers if p.is_connected()]
-    
-    def get_peer_by_addr(self, addr: str) -> Optional[Peer]:
+
+    def get_peer_by_addr(self, addr: str) -> Peer | None:
         """
         Get peer by address (searches full-relay, block-relay-only, and inbound).
 
@@ -2436,11 +2436,11 @@ class PeerManager:
             or self.block_relay_peers.get(addr)
             or self.inbound_peers.get(addr)
         )
-    
+
     async def broadcast(self, msg: NetworkMessage):
         """
         Broadcast message to all ready peers.
-        
+
         Args:
             msg: NetworkMessage to broadcast
         """
@@ -2448,7 +2448,7 @@ class PeerManager:
         if not ready_peers:
             logger.warning("No peers available for broadcast")
             return
-        
+
         # Send to all peers in parallel
         tasks = []
         for peer in ready_peers:
@@ -2458,16 +2458,16 @@ class PeerManager:
                 except Exception as e:
                     logger.error(f"Failed to broadcast to {p.host}:{p.port}: {e}")
                     p.adjust_score(-5)  # Penalize for send failure
-            
+
             tasks.append(send_to_peer(peer))
-        
+
         await asyncio.gather(*tasks, return_exceptions=True)
         logger.debug(f"Broadcast {msg.command} to {len(ready_peers)} peers")
-    
+
     def ban_peer(self, addr: str, duration: int = 86400):
         """
         Ban a peer temporarily.
-        
+
         Args:
             addr: Peer address (host:port)
             duration: Ban duration in seconds (default: 24 hours)
@@ -2529,23 +2529,23 @@ class PeerManager:
     def unban_peer(self, addr: str):
         """
         Unban a peer.
-        
+
         Args:
             addr: Peer address (host:port)
         """
         self.ban_manager.unban(addr)
-    
+
     def add_peer_address(self, addr: str):
         """
         Add a peer address to known addresses.
-        
+
         Args:
             addr: Peer address (host:port)
         """
         if not self.ban_manager.is_banned(addr):
             self.known_addrs.add(addr)
             logger.debug(f"Added peer address: {addr}")
-    
+
     # --- Transaction Trickling (Privacy-Preserving Relay) ---
 
     async def _trickle_loop(self) -> None:
@@ -2709,7 +2709,7 @@ class PeerManager:
         if queue is not None:
             queue.wtxid_relay = wtxid_relay
 
-    def get_trickle_stats(self) -> Dict:
+    def get_trickle_stats(self) -> dict:
         """Get transaction trickling statistics.
 
         Returns:
@@ -2734,7 +2734,7 @@ class PeerManager:
         """Get number of ready peers"""
         return len(self.get_all_ready_peers())
 
-    def get_stats(self) -> Dict:
+    def get_stats(self) -> dict:
         """
         Get peer manager statistics.
 

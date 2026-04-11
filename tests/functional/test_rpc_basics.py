@@ -5,10 +5,10 @@ Tests that a single node can start, respond to RPC calls, and serve
 blockchain information.
 """
 
-import asyncio
 import pytest
+
 from tests.functional.framework import (
-    BitcoinTestFramework, assert_equal, assert_greater_than,
+    BitcoinTestFramework,
 )
 
 

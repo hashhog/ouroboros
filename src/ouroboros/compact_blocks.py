@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import hashlib
 import struct
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from ouroboros.p2p_messages import encode_varint, decode_varint
+from ouroboros.p2p_messages import decode_varint, encode_varint
 
 if TYPE_CHECKING:
     from ouroboros.database import Block, Transaction
@@ -46,11 +46,19 @@ def _siphash_2_4(key: bytes, data: bytes) -> int:
         m = int.from_bytes(data[i * 8:(i + 1) * 8], "little")
         v3 ^= m
         for _ in range(2):
-            v0 = (v0 + v1) & MASK64; v1 = rotl(v1, 13); v1 ^= v0
+            v0 = (v0 + v1) & MASK64
+            v1 = rotl(v1, 13)
+            v1 ^= v0
             v0 = rotl(v0, 32)
-            v2 = (v2 + v3) & MASK64; v3 = rotl(v3, 16); v3 ^= v2
-            v0 = (v0 + v3) & MASK64; v3 = rotl(v3, 21); v3 ^= v0
-            v2 = (v2 + v1) & MASK64; v1 = rotl(v1, 17); v1 ^= v2
+            v2 = (v2 + v3) & MASK64
+            v3 = rotl(v3, 16)
+            v3 ^= v2
+            v0 = (v0 + v3) & MASK64
+            v3 = rotl(v3, 21)
+            v3 ^= v0
+            v2 = (v2 + v1) & MASK64
+            v1 = rotl(v1, 17)
+            v1 ^= v2
             v2 = rotl(v2, 32)
         v0 ^= m
 
@@ -61,21 +69,37 @@ def _siphash_2_4(key: bytes, data: bytes) -> int:
 
     v3 ^= m
     for _ in range(2):
-        v0 = (v0 + v1) & MASK64; v1 = rotl(v1, 13); v1 ^= v0
+        v0 = (v0 + v1) & MASK64
+        v1 = rotl(v1, 13)
+        v1 ^= v0
         v0 = rotl(v0, 32)
-        v2 = (v2 + v3) & MASK64; v3 = rotl(v3, 16); v3 ^= v2
-        v0 = (v0 + v3) & MASK64; v3 = rotl(v3, 21); v3 ^= v0
-        v2 = (v2 + v1) & MASK64; v1 = rotl(v1, 17); v1 ^= v2
+        v2 = (v2 + v3) & MASK64
+        v3 = rotl(v3, 16)
+        v3 ^= v2
+        v0 = (v0 + v3) & MASK64
+        v3 = rotl(v3, 21)
+        v3 ^= v0
+        v2 = (v2 + v1) & MASK64
+        v1 = rotl(v1, 17)
+        v1 ^= v2
         v2 = rotl(v2, 32)
     v0 ^= m
 
     v2 ^= 0xFF
     for _ in range(4):
-        v0 = (v0 + v1) & MASK64; v1 = rotl(v1, 13); v1 ^= v0
+        v0 = (v0 + v1) & MASK64
+        v1 = rotl(v1, 13)
+        v1 ^= v0
         v0 = rotl(v0, 32)
-        v2 = (v2 + v3) & MASK64; v3 = rotl(v3, 16); v3 ^= v2
-        v0 = (v0 + v3) & MASK64; v3 = rotl(v3, 21); v3 ^= v0
-        v2 = (v2 + v1) & MASK64; v1 = rotl(v1, 17); v1 ^= v2
+        v2 = (v2 + v3) & MASK64
+        v3 = rotl(v3, 16)
+        v3 ^= v2
+        v0 = (v0 + v3) & MASK64
+        v3 = rotl(v3, 21)
+        v3 ^= v0
+        v2 = (v2 + v1) & MASK64
+        v1 = rotl(v1, 17)
+        v1 ^= v2
         v2 = rotl(v2, 32)
 
     return (v0 ^ v1 ^ v2 ^ v3) & MASK64
@@ -96,7 +120,7 @@ def short_txid(siphash_key: bytes, txid: bytes) -> int:
 class PrefilledTransaction:
     """A transaction pre-filled in the compact block (index + full tx)."""
     index: int
-    tx: 'Transaction'
+    tx: Transaction
 
 
 @dataclass
@@ -112,8 +136,8 @@ class CompactBlock:
     """
     header: bytes
     nonce: int
-    short_ids: List[int]
-    prefilled_txs: List[PrefilledTransaction]
+    short_ids: list[int]
+    prefilled_txs: list[PrefilledTransaction]
 
     @property
     def block_hash(self) -> bytes:
@@ -124,8 +148,8 @@ class CompactBlock:
         return compute_siphash_key(self.header, self.nonce)
 
     def reconstruct(
-        self, mempool: 'Mempool'
-    ) -> Tuple[Optional[List['Transaction']], List[int]]:
+        self, mempool: Mempool
+    ) -> tuple[list[Transaction] | None, list[int]]:
         """Reconstruct the tx list from the mempool.
 
         Returns ``(txs, missing_indices)``.  If all short IDs matched,
@@ -139,7 +163,7 @@ class CompactBlock:
         key = self.siphash_key()
 
         total_tx_count = len(self.short_ids) + len(self.prefilled_txs)
-        txs: List[Optional['Transaction']] = [None] * total_tx_count
+        txs: list[Transaction | None] = [None] * total_tx_count
 
         # Place pre-filled transactions using differential encoding
         # The index in PrefilledTransaction is relative to the last placed tx
@@ -156,7 +180,7 @@ class CompactBlock:
 
         # Fill remaining slots from matched mempool transactions
         sid_iter = iter(matched_txs)
-        missing: List[int] = []
+        missing: list[int] = []
         for i in range(total_tx_count):
             if txs[i] is not None:
                 continue
@@ -193,7 +217,7 @@ class CompactBlock:
         return bytes(data)
 
     @classmethod
-    def deserialize(cls, payload: bytes) -> 'CompactBlock':
+    def deserialize(cls, payload: bytes) -> CompactBlock:
         """Deserialize from ``cmpctblock`` payload."""
         from ouroboros.p2p_messages import TxMessage
 
@@ -204,7 +228,8 @@ class CompactBlock:
         nonce = struct.unpack("<Q", payload[80:88])[0]
         off = 88
 
-        sid_count, consumed = decode_varint(payload, off); off += consumed
+        sid_count, consumed = decode_varint(payload, off)
+        off += consumed
         short_ids = []
         for _ in range(sid_count):
             if off + 6 > len(payload):
@@ -213,11 +238,13 @@ class CompactBlock:
             short_ids.append(struct.unpack("<Q", raw)[0])
             off += 6
 
-        pf_count, consumed = decode_varint(payload, off); off += consumed
-        prefilled: List[PrefilledTransaction] = []
+        pf_count, consumed = decode_varint(payload, off)
+        off += consumed
+        prefilled: list[PrefilledTransaction] = []
         last_idx = -1
         for _ in range(pf_count):
-            diff, consumed = decode_varint(payload, off); off += consumed
+            diff, consumed = decode_varint(payload, off)
+            off += consumed
             abs_idx = last_idx + 1 + diff
 
             tx_msg = TxMessage.from_payload(payload[off:])
@@ -235,8 +262,8 @@ class CompactBlock:
 
     @classmethod
     def from_block(
-        cls, block: 'Block', nonce: int, *, prefill_coinbase: bool = True
-    ) -> 'CompactBlock':
+        cls, block: Block, nonce: int, *, prefill_coinbase: bool = True
+    ) -> CompactBlock:
         """
         Build a CompactBlock from a full block.
 
@@ -245,8 +272,8 @@ class CompactBlock:
         header = block.serialize()[:80]
         key = compute_siphash_key(header, nonce)
 
-        prefilled: List[PrefilledTransaction] = []
-        sids: List[int] = []
+        prefilled: list[PrefilledTransaction] = []
+        sids: list[int] = []
 
         for i, tx in enumerate(block.transactions):
             if prefill_coinbase and i == 0:
@@ -265,7 +292,7 @@ class CompactBlock:
 class BlockTransactionsRequest:
     """``getblocktxn`` — request missing transactions from a compact block."""
     block_hash: bytes
-    indices: List[int]
+    indices: list[int]
 
     def serialize(self) -> bytes:
         data = bytearray(self.block_hash)
@@ -278,16 +305,18 @@ class BlockTransactionsRequest:
         return bytes(data)
 
     @classmethod
-    def deserialize(cls, payload: bytes) -> 'BlockTransactionsRequest':
+    def deserialize(cls, payload: bytes) -> BlockTransactionsRequest:
         if len(payload) < 33:
             raise ValueError("getblocktxn payload too short")
         block_hash = payload[:32]
         off = 32
-        count, consumed = decode_varint(payload, off); off += consumed
-        indices: List[int] = []
+        count, consumed = decode_varint(payload, off)
+        off += consumed
+        indices: list[int] = []
         last = -1
         for _ in range(count):
-            diff, consumed = decode_varint(payload, off); off += consumed
+            diff, consumed = decode_varint(payload, off)
+            off += consumed
             abs_idx = last + 1 + diff
             indices.append(abs_idx)
             last = abs_idx
@@ -298,7 +327,7 @@ class BlockTransactionsRequest:
 class BlockTransactions:
     """``blocktxn`` — response with the requested missing transactions."""
     block_hash: bytes
-    transactions: List['Transaction']
+    transactions: list[Transaction]
 
     def serialize(self) -> bytes:
         data = bytearray(self.block_hash)
@@ -308,13 +337,14 @@ class BlockTransactions:
         return bytes(data)
 
     @classmethod
-    def deserialize(cls, payload: bytes) -> 'BlockTransactions':
+    def deserialize(cls, payload: bytes) -> BlockTransactions:
         from ouroboros.p2p_messages import TxMessage
         if len(payload) < 33:
             raise ValueError("blocktxn payload too short")
         block_hash = payload[:32]
         off = 32
-        count, consumed = decode_varint(payload, off); off += consumed
+        count, consumed = decode_varint(payload, off)
+        off += consumed
         txs = []
         for _ in range(count):
             tx_msg = TxMessage.from_payload(payload[off:])

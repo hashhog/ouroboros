@@ -7,38 +7,37 @@ handling new block announcements, validation, and chain reorganization.
 
 import asyncio
 import hashlib
+import logging
 import random
 import time
-import logging
-from typing import Dict, Set, Optional, List, Tuple, Callable
 from collections import defaultdict
+from collections.abc import Callable
+from typing import Optional
 
-from ouroboros.database import BlockchainDatabase, Block
-from ouroboros.validation import BlockValidator, SIG_CACHE
+from ouroboros.database import Block, BlockchainDatabase, Transaction
 from ouroboros.p2p_messages import (
-    NetworkMessage,
-    InvMessage,
+    INV_TYPE_BLOCK,
+    INV_TYPE_TX,
+    MSG_WITNESS_BLOCK,
+    MSG_WITNESS_TX,
+    MSG_WTX,
+    BlockHeader,
+    CmpctBlockMessage,
     GetDataMessage,
     GetHeadersMessage,
     HeadersMessage,
-    BlockHeader,
-    BlockMessage,
-    CmpctBlockMessage,
-    TxMessage,
-    INV_TYPE_TX,
-    INV_TYPE_BLOCK,
-    MSG_WITNESS_TX,
-    MSG_WITNESS_BLOCK,
-    MSG_WTX,
+    InvMessage,
+    NetworkMessage,
 )
 from ouroboros.peer import Peer
+from ouroboros.validation import SIG_CACHE, BlockValidator
 
 logger = logging.getLogger(__name__)
 
 
 class BlockSync:
     """Synchronizes new blocks from network"""
-    
+
     def __init__(
         self,
         db: BlockchainDatabase,
@@ -53,50 +52,50 @@ class BlockSync:
         self.peer_manager = peer_manager
         self.mempool = mempool
         self.fee_estimator = fee_estimator
-        
+
         # Track requested blocks (hash -> request_time)
         # FIXME: race condition if called from multiple threads?
-        self.requested_blocks: Dict[bytes, float] = {}
+        self.requested_blocks: dict[bytes, float] = {}
 
         # Track which peer each block was last requested from (hash -> Peer)
-        self._block_request_peer: Dict[bytes, Peer] = {}
+        self._block_request_peer: dict[bytes, Peer] = {}
 
         # Track requested transactions (hash -> request_time)
-        self._requested_txs: Dict[bytes, float] = {}
-        
+        self._requested_txs: dict[bytes, float] = {}
+
         # Track received blocks (hash -> Block)
-        self.received_blocks: Dict[bytes, Block] = {}
-        
+        self.received_blocks: dict[bytes, Block] = {}
+
         # Orphan blocks: hash -> Block (blocks whose parent is not in our chain)
         # Ref: bitcoin/src/net_processing.cpp orphan_work_set, ProcessOrphanTx
-        self.orphan_blocks: Dict[bytes, Block] = {}
+        self.orphan_blocks: dict[bytes, Block] = {}
         self._max_orphans = 200
-        
+
         # Track pending headers requests
-        self.pending_headers: Dict[bytes, float] = {}  # locator_hash -> request_time
-        
+        self.pending_headers: dict[bytes, float] = {}  # locator_hash -> request_time
+
         # Reorg detection
-        self.last_best_hash: Optional[bytes] = None
+        self.last_best_hash: bytes | None = None
         self.reorg_depth: int = 0
-        
+
         self._zmq_publisher = None
 
         self.running = False
-        self._sync_task: Optional[asyncio.Task] = None
-        
+        self._sync_task: asyncio.Task | None = None
+
         # Message handlers per peer (peer -> handler_dict)
-        self._peer_handlers: Dict[Peer, Dict[str, Callable]] = defaultdict(dict)
+        self._peer_handlers: dict[Peer, dict[str, Callable]] = defaultdict(dict)
 
         # Headers-first sync: validated header chain waiting for block download.
         # List of (block_hash, header) in chain order (oldest first).
-        self._validated_headers: List[Tuple[bytes, 'BlockHeader']] = []
+        self._validated_headers: list[tuple[bytes, BlockHeader]] = []
         # Max blocks to have in-flight at once during headers-first sync.
         self._max_blocks_in_flight: int = 256
 
         # Single sync peer for header downloads (Bitcoin Core pattern).
         # Only one peer is sent getheaders at a time to prevent out-of-order
         # header batches.  Switches to a different peer after a stall.
-        self._header_sync_peer: Optional[Peer] = None
+        self._header_sync_peer: Peer | None = None
         self._header_sync_time: float = 0.0  # When the last getheaders was sent
         self._header_sync_stall_timeout: float = 30.0  # Switch peer after 30s
 
@@ -104,9 +103,9 @@ class BlockSync:
         # keyed by block_hash until their parent is connected.  After each
         # successful connect, _drain_block_buffer() processes buffered
         # children sequentially.
-        self._ibd_block_buffer: Dict[bytes, Block] = {}
+        self._ibd_block_buffer: dict[bytes, Block] = {}
         self._max_ibd_buffer: int = 1024
-    
+
     def set_zmq_publisher(self, publisher) -> None:
         """Attach a ZMQPublisher for real-time block/tx notifications."""
         self._zmq_publisher = publisher
@@ -116,35 +115,35 @@ class BlockSync:
         if self.running:
             logger.warning("BlockSync already running")
             return
-        
+
         self.running = True
         logger.info("Starting block synchronization")
-        
+
         # Register message handlers for existing peers
         await self._register_handlers()
-        
+
         # Start sync task
         self._sync_task = asyncio.create_task(self.sync_loop())
-    
+
     async def stop(self):
         """Stop block synchronization"""
         if not self.running:
             return
-        
+
         logger.info("Stopping block synchronization")
         self.running = False
-        
+
         if self._sync_task:
             self._sync_task.cancel()
             try:
                 await self._sync_task
             except asyncio.CancelledError:
                 pass
-        
+
         # Unregister handlers
         for peer in list(self._peer_handlers.keys()):
             await self._unregister_handlers(peer)
-    
+
     async def _register_handlers(self):
         # Get all ready peers (assuming peer_manager has this method)
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
@@ -156,42 +155,42 @@ class BlockSync:
                 peers = [p for p in peers.values() if hasattr(p, 'is_connected') and p.is_connected()]
             elif not isinstance(peers, list):
                 peers = []
-        
+
         for peer in peers:
             if not isinstance(peer, Peer):
                 continue
-            
+
             # Register handlers
             peer.register_handler("inv", self._make_inv_handler(peer))
             peer.register_handler("block", self._make_block_handler(peer))
             peer.register_handler("headers", self._make_headers_handler(peer))
-            
+
             self._peer_handlers[peer] = {
                 "inv": self._make_inv_handler(peer),
                 "block": self._make_block_handler(peer),
                 "headers": self._make_headers_handler(peer),
             }
-    
+
     async def _unregister_handlers(self, peer: Peer):
         # Note: Peer class doesn't have unregister_handler, so we just remove from tracking
         if peer in self._peer_handlers:
             del self._peer_handlers[peer]
-    
+
     def _make_inv_handler(self, peer: Peer):
         async def handler(msg: NetworkMessage):
             await self.handle_inv(msg, peer)
         return handler
-    
+
     def _make_block_handler(self, peer: Peer):
         async def handler(msg: NetworkMessage):
             await self.handle_block(msg, peer)
         return handler
-    
+
     def _make_headers_handler(self, peer: Peer):
         async def handler(msg: NetworkMessage):
             await self.handle_headers(msg, peer)
         return handler
-    
+
     def _register_new_peers(self):
         """Register handlers for any newly connected peers."""
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
@@ -243,9 +242,9 @@ class BlockSync:
                                 # Get the block that's causing the reorg
                                 # For now, use the best block as the new tip
                                 await self._handle_reorg(prev_block, best_hash)
-                
+
                 self.last_best_hash = best_hash
-                
+
                 # Single-peer header sync (Bitcoin Core pattern).
                 # Send getheaders to ONE designated peer at a time.
                 # Switch peer if the current one stalls (no headers in 30s).
@@ -271,7 +270,7 @@ class BlockSync:
 
                 if self._header_sync_peer:
                     await self._catch_up(self._header_sync_peer, best_height)
-                
+
                 # Handle timeouts
                 await self._handle_timeouts()
 
@@ -294,7 +293,7 @@ class BlockSync:
                 await asyncio.sleep(1)
             else:
                 await asyncio.sleep(10)
-    
+
     async def handle_inv(self, msg: NetworkMessage, peer: Peer):
         """Handle inventory announcement (blocks + transactions)."""
         try:
@@ -381,7 +380,7 @@ class BlockSync:
         except Exception as e:
             logger.error(f"Error handling inv from {peer.host}:{peer.port}: {e}")
             peer.adjust_score(-2)
-    
+
     async def handle_block(self, msg: NetworkMessage, peer: Peer):
         """Handle block delivery.
 
@@ -486,7 +485,6 @@ class BlockSync:
 
             connected += 1
             current_height = new_height
-            current_hash = next_hash
             header_idx += 1
 
             # Feed fee estimator
@@ -523,7 +521,7 @@ class BlockSync:
             self._prune_validated_headers()
 
         return connected
-    
+
     def _header_to_block_hash(self, header) -> bytes:
         header_bytes = header.serialize()
         block_hash_raw = hashlib.sha256(hashlib.sha256(header_bytes).digest()).digest()
@@ -671,7 +669,7 @@ class BlockSync:
         if available == 0:
             return
 
-        to_request: List[Tuple[int, bytes]] = []
+        to_request: list[tuple[int, bytes]] = []
         for i in range(start, min(start + available, len(self._validated_headers))):
             block_hash, _ = self._validated_headers[i]
             if block_hash not in self.requested_blocks and not self.db.get_block(block_hash):
@@ -737,6 +735,7 @@ class BlockSync:
             try:
                 if p.wants_cmpctblock:
                     import os
+
                     from ouroboros.compact_blocks import CompactBlock
                     nonce = int.from_bytes(os.urandom(8), 'little')
                     cb = CompactBlock.from_block(block, nonce)
@@ -765,15 +764,15 @@ class BlockSync:
             (h, b) for h, b in self.orphan_blocks.items()
             if b.prev_blockhash == applied_block_hash
         ]
-        
+
         for block_hash, block in to_process:
             del self.orphan_blocks[block_hash]
-            
+
             valid, error = self.validator.validate_block(block)
             if not valid:
                 logger.warning(f"Orphan block {block_hash.hex()[:16]}... invalid: {error}")
                 continue
-            
+
             # Orphan extends the block we just applied; check if it matches current tip
             current_hash, _ = self.db.get_best_block()
             if block.prev_blockhash != current_hash:
@@ -787,7 +786,7 @@ class BlockSync:
                 self.validator.apply_block(block)
                 block_height = block.height if hasattr(block, 'height') and block.height else 0
                 logger.info(f"✓ Connected orphan block {block_height}: {block_hash.hex()[:16]}...")
-                
+
                 await self._announce_block(block, block_hash)
                 await self._process_orphans(block_hash)
 
@@ -795,51 +794,51 @@ class BlockSync:
         try:
             # Build locator
             locator = self._build_locator(our_height)
-            
+
             if not locator:
                 logger.warning("Could not build locator for catch-up")
                 return
-            
+
             # Request headers
             getheaders = GetHeadersMessage(
                 version=70015,
                 locator_hashes=locator,
                 hash_stop=b'\x00' * 32
             )
-            
+
             network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
             getheaders_msg = getheaders.to_network_message(network)
-            
+
             await peer.send_message(getheaders_msg)
             logger.info(f"Requested headers from {peer.host}:{peer.port} (locator: {len(locator)} hashes)")
-            
+
         except Exception as e:
             logger.error(f"Error in catch_up: {e}")
             peer.adjust_score(-2)
-    
-    def _build_locator(self, height: int) -> List[bytes]:
+
+    def _build_locator(self, height: int) -> list[bytes]:
         """Build block locator (exponential spacing)."""
         locator = []
         step = 1
         current_height = height
-        
+
         while current_height > 0:
             block = self.db.get_block_by_height(current_height)
             if block:
                 block_hash = block.hash
                 if isinstance(block_hash, bytes) and len(block_hash) == 32:
                     locator.append(block_hash)
-            
+
             # Exponential spacing: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ...
             if len(locator) >= 10:
                 step *= 2
-            
+
             current_height -= step
-            
+
             # Limit to reasonable depth
             if current_height < 0:
                 break
-        
+
         # Always include genesis
         genesis = self.db.get_block_by_height(0)
         if genesis:
@@ -847,10 +846,10 @@ class BlockSync:
             if isinstance(genesis_hash, bytes) and len(genesis_hash) == 32:
                 if genesis_hash not in locator:
                     locator.append(genesis_hash)
-        
+
         return locator
-    
-    def _get_sync_peer(self, our_height: int) -> Optional[Peer]:
+
+    def _get_sync_peer(self, our_height: int) -> Peer | None:
         """Pick a random peer that's ahead of us for header requests."""
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             peers = self.peer_manager.get_all_ready_peers()
@@ -867,7 +866,7 @@ class BlockSync:
             return None
         return random.choice(candidates)
 
-    def _get_peer_with_highest_block(self) -> Optional[Peer]:
+    def _get_peer_with_highest_block(self) -> Peer | None:
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             peers = self.peer_manager.get_all_ready_peers()
         else:
@@ -876,17 +875,17 @@ class BlockSync:
                 peers = [p for p in peers.values() if hasattr(p, 'is_connected') and p.is_connected()]
             elif not isinstance(peers, list):
                 peers = []
-        
+
         if not peers:
             return None
-        
+
         # Filter to Peer instances with start_height
         valid_peers = [p for p in peers if isinstance(p, Peer) and hasattr(p, 'start_height')]
         if not valid_peers:
             return None
-        
+
         return max(valid_peers, key=lambda p: p.start_height)
-    
+
     async def _handle_timeouts(self):
         """Re-request blocks that timed out, rotating to a different peer each time."""
         now = time.time()
@@ -965,7 +964,7 @@ class BlockSync:
                 for bh in block_hashes:
                     del self.requested_blocks[bh]
                     self._block_request_peer.pop(bh, None)
-    
+
     async def _find_transaction_in_blocks(self, txid: bytes, max_height: int, min_height: int = 0) -> Optional['Transaction']:
         # Search backwards from max_height to min_height
         for height in range(max_height, min_height - 1, -1):
@@ -973,7 +972,7 @@ class BlockSync:
                 block = self.db.get_block_by_height(height)
                 if not block:
                     continue
-                
+
                 # Search transactions in this block
                 for tx in block.transactions:
                     if tx.get_txid() == txid:
@@ -981,17 +980,17 @@ class BlockSync:
             except Exception as e:
                 logger.debug(f"Error searching block at height {height}: {e}")
                 continue
-        
+
         return None
-    
-    async def _restore_utxos_from_block(self, block: Block, max_search_height: int) -> List[Tuple[bytes, int, int, bytes]]:
+
+    async def _restore_utxos_from_block(self, block: Block, max_search_height: int) -> list[tuple[bytes, int, int, bytes]]:
         """Restore UTXOs that were spent in this block."""
         utxos_to_restore = []
-        
+
         for tx in block.transactions:
             if tx.is_coinbase:
                 continue
-            
+
             for tx_in in tx.inputs:
                 # Find the transaction that created this UTXO
                 prev_tx = await self._find_transaction_in_blocks(tx_in.prev_txid, max_search_height)
@@ -1001,7 +1000,7 @@ class BlockSync:
                         f"when disconnecting block, cannot restore UTXO"
                     )
                     continue
-                
+
                 # Get the output that was spent
                 if tx_in.prev_vout >= len(prev_tx.outputs):
                     logger.warning(
@@ -1009,9 +1008,9 @@ class BlockSync:
                         f"{tx_in.prev_txid.hex()[:16]}..."
                     )
                     continue
-                
+
                 output = prev_tx.outputs[tx_in.prev_vout]
-                
+
                 # Add to restore list
                 utxos_to_restore.append((
                     tx_in.prev_txid,  # txid
@@ -1019,9 +1018,9 @@ class BlockSync:
                     output.value,     # value
                     output.script_pubkey  # script_pubkey
                 ))
-        
+
         return utxos_to_restore
-    
+
     async def _handle_reorg(self, new_block: Block, new_chain_tip: bytes):
         """Handle chain reorganization."""
         logger.warning(f"Handling chain reorganization to new tip: {new_chain_tip.hex()[:16]}...")
@@ -1032,20 +1031,20 @@ class BlockSync:
         try:
             # Get current best block
             current_hash, current_height = self.db.get_best_block()
-            
+
             if current_hash == new_chain_tip:
                 # No reorg needed - we're already on this chain
                 return True
-            
+
             # Walk back chains to find common ancestor
             current_chain = []
             new_chain = []
-            
+
             # Build current chain back to reasonable depth (e.g., 100 blocks)
             # Also track heights for transaction search
             temp_hash = current_hash
             temp_height = current_height
-            for i in range(100):
+            for _ in range(100):
                 if temp_hash is None:
                     break
                 block = self.db.get_block(temp_hash)
@@ -1057,11 +1056,11 @@ class BlockSync:
                 temp_height -= 1
                 if temp_hash == bytes(32):  # Genesis block
                     break
-            
+
             # Build new chain back (new_block is the tip we received, may not be in db yet)
             temp_hash = new_chain_tip
             temp_height = current_height
-            for i in range(100):
+            for _ in range(100):
                 if temp_hash is None:
                     break
                 # Use the block we received if it's the tip; otherwise get from db
@@ -1087,12 +1086,12 @@ class BlockSync:
                 temp_height -= 1
                 if temp_hash == bytes(32):  # Genesis block
                     break
-            
+
             # Find common ancestor
             common_ancestor = None
             common_ancestor_height = 0
-            for curr_hash, curr_block, curr_height in current_chain:
-                for new_hash, new_block, new_height in new_chain:
+            for curr_hash, _, curr_height in current_chain:
+                for new_hash, _, _new_height in new_chain:
                     if curr_hash == new_hash:
                         common_ancestor = curr_hash
                         # Use the height from current_chain
@@ -1100,35 +1099,35 @@ class BlockSync:
                         break
                 if common_ancestor:
                     break
-            
+
             if not common_ancestor:
                 # No common ancestor found - this is a major reorg
                 # May need to re-validate entire chain
                 logger.warning("Major reorg detected - no common ancestor found within 100 blocks")
                 return False
-            
+
             logger.info(
                 f"Reorg: common ancestor at height {common_ancestor_height}, "
                 f"disconnecting {len([h for h, _, _ in current_chain if h != common_ancestor])} blocks, "
                 f"connecting {len([h for h, _, _ in new_chain if h != common_ancestor])} blocks"
             )
-            
+
             # Disconnect blocks from current chain (in reverse order)
             blocks_to_disconnect = [
                 (h, b, ht) for h, b, ht in current_chain
                 if h != common_ancestor
             ]
-            
+
             # Get current height for transaction search
             current_height = common_ancestor_height + len(blocks_to_disconnect)
-            
-            for curr_hash, curr_block, curr_height in reversed(blocks_to_disconnect):
+
+            for curr_hash, curr_block, _ in reversed(blocks_to_disconnect):
                 logger.debug(f"Disconnecting block {curr_hash.hex()[:16]}...")
-                
+
                 # Restore UTXOs that were spent in this block
                 try:
                     utxos_to_restore = await self._restore_utxos_from_block(curr_block, current_height)
-                    
+
                     if utxos_to_restore:
                         logger.info(f"Restoring {len(utxos_to_restore)} UTXOs from disconnected block")
                         for txid, vout, value, script_pubkey in utxos_to_restore:
@@ -1142,21 +1141,21 @@ class BlockSync:
                         logger.debug("No UTXOs to restore from this block")
                 except Exception as e:
                     logger.error(f"Error collecting UTXOs to restore: {e}")
-                
+
                 # Remove UTXOs that were created in this block
                 for tx in curr_block.transactions:
                     txid = tx.get_txid()
-                    for i, tx_out in enumerate(tx.outputs):
+                    for i, _tx_out in enumerate(tx.outputs):
                         try:
                             self.db.remove_utxo(txid, i)
                         except Exception as e:
                             logger.error(
                                 f"Error removing UTXO {txid.hex()[:16]}...:{i}: {e}"
                             )
-                
+
                 # Update current_height for next iteration
                 current_height -= 1
-            
+
             # Connect blocks from new chain (ancestor+1 to tip; new_chain is tip-first so reverse)
             blocks_to_connect = [
                 (h, b, ht) for h, b, ht in new_chain
@@ -1164,29 +1163,29 @@ class BlockSync:
             ]
             blocks_to_connect = list(reversed(blocks_to_connect))
 
-            for new_hash, new_block, new_height in blocks_to_connect:
+            for new_hash, new_block, _new_height in blocks_to_connect:
                 logger.debug(f"Connecting block {new_hash.hex()[:16]}...")
-                
+
                 # Validate block
                 valid, error = self.validator.validate_block(new_block)
                 if not valid:
                     logger.error(f"Invalid block in reorg: {new_hash.hex()[:16]}... - {error}")
                     return False
-                
+
                 # Apply block (spend/create UTXOs)
                 try:
                     self.validator.apply_block(new_block)
                 except Exception as e:
                     logger.error(f"Error applying block during reorg: {e}")
                     return False
-                
+
                 # Remove transactions now in block from mempool
                 if self.mempool:
                     self.mempool.remove_block_transactions(new_block)
-                
+
                 # Process orphans that may now have their parent
                 await self._process_orphans(new_hash)
-            
+
             # Update best block
             if blocks_to_connect:
                 final_hash = blocks_to_connect[-1][0]
@@ -1202,7 +1201,7 @@ class BlockSync:
 
             # Re-add transactions from disconnected blocks to mempool (re-validate)
             if self.mempool:
-                for curr_hash, curr_block, _ in reversed(blocks_to_disconnect):
+                for _, curr_block, _ in reversed(blocks_to_disconnect):
                     for tx in curr_block.transactions:
                         if not tx.is_coinbase:
                             _, best_h = self.db.get_best_block()
@@ -1215,7 +1214,7 @@ class BlockSync:
             logger.info(f"Reorg handled: new tip at height {final_height}")
             self.reorg_depth += 1
             return True
-        
+
         except Exception as e:
             logger.error(f"Error handling reorg: {e}", exc_info=True)
             return False

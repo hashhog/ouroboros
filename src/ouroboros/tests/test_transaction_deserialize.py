@@ -6,15 +6,15 @@ Verifies TxMessage.from_payload() correctly parses Bitcoin wire format:
 - SegWit: transactions with witness data (marker 0x00, flag 0x01)
 """
 
-import unittest
 import sys
+import unittest
 from pathlib import Path
 
 # Add src to path
 src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
-from ouroboros.p2p_messages import TxMessage
+from ouroboros.p2p_messages import TxMessage  # noqa: E402
 
 
 def hex_to_bytes(hex_str: str) -> bytes:

@@ -16,16 +16,17 @@ Stale Tip Detection (Bitcoin Core net_processing.cpp TipMayBeStale/ConsiderEvict
   evict worst outbound peer if a better chain is found.
 """
 
-from typing import Callable, Optional, List, TYPE_CHECKING
-import time
-import threading
-import logging
 import asyncio
+import logging
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from ouroboros.p2p import PeerManager
     from ouroboros.database import BlockchainDatabase
+    from ouroboros.p2p import PeerManager
 
 try:
     import sync  # Rust extension module
@@ -47,16 +48,16 @@ class SyncProgress:
     phase: str = "header"  # "header" or "block"
     total_known: bool = True  # False in header phase until we know actual chain tip
     peer_count: int = 0
-    
+
     def __str__(self) -> str:
         if self.total_height == 0:
             return "Syncing... (unknown total)"
-        
+
         percent = self.progress_percent
         current = self.current_height
         total = self.total_height
         speed = self.blocks_per_second
-        
+
         # Format ETA
         if self.eta_seconds < 60:
             eta_str = f"{self.eta_seconds}s"
@@ -66,7 +67,7 @@ class SyncProgress:
             hours = self.eta_seconds // 3600
             minutes = (self.eta_seconds % 3600) // 60
             eta_str = f"{hours}h {minutes}m"
-        
+
         return (
             f"Progress: {percent:.2f}% ({current:,}/{total:,} blocks) | "
             f"Speed: {speed:.1f} blocks/s | ETA: {eta_str}"
@@ -90,13 +91,13 @@ class SyncManager:
         self._canceller = self.fast_sync.get_canceller()
         self.data_dir = data_dir
         self.network = network
-        self._sync_thread: Optional[threading.Thread] = None
+        self._sync_thread: threading.Thread | None = None
         self._is_running = False
-        self._sync_error: Optional[Exception] = None
-        self._last_progress: Optional[SyncProgress] = None
+        self._sync_error: Exception | None = None
+        self._last_progress: SyncProgress | None = None
 
         # Checkpoint info for IBD optimization
-        self._last_checkpoint_height: Optional[int] = None
+        self._last_checkpoint_height: int | None = None
         self._init_checkpoint_info()
 
     def _init_checkpoint_info(self) -> None:
@@ -109,7 +110,7 @@ class SyncManager:
         except Exception as e:
             logger.debug(f"Could not get checkpoint info: {e}")
 
-    def get_last_checkpoint_height(self) -> Optional[int]:
+    def get_last_checkpoint_height(self) -> int | None:
         """Get the height of the last checkpoint for this network."""
         return self._last_checkpoint_height
 
@@ -131,12 +132,12 @@ class SyncManager:
             return sync.can_skip_scripts_for_block(self.network, height, block_hash)
         except Exception:
             return False
-        
+
     def perform_initial_sync(self,
-                            progress_callback: Optional[Callable[[SyncProgress], None]] = None,
-                            cancel_check: Optional[Callable[[], bool]] = None,
+                            progress_callback: Callable[[SyncProgress], None] | None = None,
+                            cancel_check: Callable[[], bool] | None = None,
                             progress_interval: float = 5.0,
-                            limit: Optional[int] = None) -> bool:
+                            limit: int | None = None) -> bool:
         """Run initial blockchain sync; returns True on completion, False if cancelled or on error.
 
         *progress_callback* receives :class:`SyncProgress` updates every *progress_interval* seconds.
@@ -144,16 +145,16 @@ class SyncManager:
         if self._is_running:
             logger.warning("Sync already in progress")
             return False
-        
+
         self._is_running = True
         self._sync_error = None
         self._last_progress = None
-        
+
         try:
             # Start sync in a separate thread to allow progress monitoring
             sync_complete = threading.Event()
             sync_exception = [None]  # Use list to allow modification in nested function
-            
+
             def sync_worker():
                 """Worker thread that runs the sync"""
                 try:
@@ -168,15 +169,15 @@ class SyncManager:
                     logger.error(f"Sync error: {e}", exc_info=True)
                     sync_exception[0] = e
                     sync_complete.set()
-            
+
             # Start sync thread
             self._sync_thread = threading.Thread(target=sync_worker, daemon=True)
             self._sync_thread.start()
-            
+
             # Monitor progress - do initial update immediately so user sees progress from start
             last_progress_time = 0.0  # Ensures first callback fires right away
             cancelled = False
-            
+
             if progress_callback is not None:
                 try:
                     progress = self.get_progress()
@@ -185,7 +186,7 @@ class SyncManager:
                         self._last_progress = progress
                 except Exception:
                     pass  # Ignore initial errors (e.g. DB not yet initialized)
-            
+
             while not sync_complete.is_set():
                 # Check for cancellation
                 if cancel_check is not None:
@@ -200,10 +201,10 @@ class SyncManager:
                             break
                     except Exception as e:
                         logger.warning(f"Error in cancel_check: {e}")
-                
+
                 # Report progress periodically
                 current_time = time.time()
-                if (progress_callback is not None and 
+                if (progress_callback is not None and
                     current_time - last_progress_time >= progress_interval):
                     try:
                         progress = self.get_progress()
@@ -218,20 +219,20 @@ class SyncManager:
                             logger.debug(f"Progress update error: {e}")
                         # Continue - the sync will keep working
                         pass
-                
+
                 # Sleep briefly to avoid busy-waiting
                 sync_complete.wait(timeout=0.5)
-            
+
             # Wait for sync thread to finish
             if self._sync_thread.is_alive():
                 self._sync_thread.join(timeout=10.0)
-            
+
             # Check for exceptions
             if sync_exception[0] is not None:
                 self._sync_error = sync_exception[0]
                 logger.error(f"Sync failed: {sync_exception[0]}")
                 return False
-            
+
             if cancelled:
                 # Still do final progress update so user sees accurate state (e.g. 100% if at tip)
                 if progress_callback is not None:
@@ -251,10 +252,10 @@ class SyncManager:
                         progress_callback(progress)
                 except Exception as e:
                     logger.warning(f"Error in final progress_callback: {e}")
-            
+
             logger.info("Sync completed successfully")
             return True
-            
+
         except Exception as e:
             logger.error(f"Sync manager error: {e}", exc_info=True)
             self._sync_error = e
@@ -262,7 +263,7 @@ class SyncManager:
         finally:
             self._is_running = False
             self._sync_thread = None
-    
+
     def is_synced(self) -> bool:
         """Return True when the blockchain has caught up to the network tip."""
         try:
@@ -270,8 +271,8 @@ class SyncManager:
         except Exception as e:
             logger.warning(f"Error checking sync status: {e}")
             return False
-    
-    def get_progress(self) -> Optional[SyncProgress]:
+
+    def get_progress(self) -> SyncProgress | None:
         """Return the latest :class:`SyncProgress` from the shared cache, or None if unavailable."""
         try:
             rust_progress = self._progress_reporter.get_progress()
@@ -301,7 +302,7 @@ class SyncManager:
             if self._last_progress is None:
                 logger.debug(f"Progress update error (will retry): {e}")
             return self._last_progress
-    
+
     def cancel_sync(self) -> None:
         """Request graceful cancellation of the ongoing sync (stops at the next safe checkpoint)."""
         if not self._is_running:
@@ -313,31 +314,31 @@ class SyncManager:
             logger.info("Sync cancellation requested")
         except Exception as e:
             logger.error(f"Error cancelling sync: {e}")
-    
-    def wait_for_sync(self, timeout: Optional[float] = None) -> bool:
+
+    def wait_for_sync(self, timeout: float | None = None) -> bool:
         """Block until sync completes (or *timeout* seconds elapse); returns True on success."""
         if not self._is_running or self._sync_thread is None:
             return self.is_synced()
-        
+
         if timeout is None:
             self._sync_thread.join()
         else:
             self._sync_thread.join(timeout=timeout)
-        
+
         return not self._sync_thread.is_alive() and self._sync_error is None
-    
+
     @property
     def is_running(self) -> bool:
         """Check if sync is currently running"""
         return self._is_running
-    
+
     @property
-    def last_error(self) -> Optional[Exception]:
+    def last_error(self) -> Exception | None:
         """Get last sync error, if any"""
         return self._sync_error
-    
+
     @property
-    def last_progress(self) -> Optional[SyncProgress]:
+    def last_progress(self) -> SyncProgress | None:
         """Get last reported progress"""
         return self._last_progress
 
@@ -417,7 +418,7 @@ class StaleTipDetector:
         self._peer_block_times: dict = {}
 
         self._running = False
-        self._check_task: Optional[asyncio.Task] = None
+        self._check_task: asyncio.Task | None = None
 
     def update_tip(self, height: int, timestamp: int) -> None:
         """Called when chain tip changes.
@@ -573,7 +574,7 @@ class StaleTipDetector:
         except Exception as e:
             logger.error(f"Error sending getheaders to peers: {e}")
 
-    def _build_block_locator(self) -> List[bytes]:
+    def _build_block_locator(self) -> list[bytes]:
         """Build a block locator from our chain tip.
 
         Returns list of block hashes exponentially spaced back from tip.
@@ -731,7 +732,7 @@ class StaleTipDetector:
             return
 
         # Find peer to evict - the one that least recently provided a block
-        worst_addr: Optional[str] = None
+        worst_addr: str | None = None
         worst_time: float = float('inf')
 
         for addr, peer in self.peer_manager.peers.items():

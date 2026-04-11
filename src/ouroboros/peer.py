@@ -7,27 +7,24 @@ Supports SOCKS5 proxy connections for Tor (.onion) and general proxying.
 """
 
 import asyncio
-import struct
 import hashlib
-import time
-import random
 import logging
-from typing import Optional, Callable, Dict, Tuple
+import random
+import struct
+import time
+from collections.abc import Callable
 from enum import Enum
 
 from ouroboros.p2p_messages import (
+    NODE_NETWORK,
+    NODE_P2P_V2,
+    NODE_WITNESS,
+    NetworkAddress,
     NetworkMessage,
-    VersionMessage,
     PingMessage,
     PongMessage,
-    NetworkAddress,
+    VersionMessage,
     get_magic,
-    MAGIC_MAINNET,
-    MAGIC_TESTNET,
-    MAGIC_REGTEST,
-    NODE_NETWORK,
-    NODE_WITNESS,
-    NODE_P2P_V2,
 )
 from ouroboros.transport_v2 import V2Handshake, V2Transport
 
@@ -57,7 +54,7 @@ def is_onion_host(host: str) -> bool:
     return host.lower().endswith(".onion")
 
 
-def parse_proxy_addr(proxy_str: str) -> Tuple[str, int]:
+def parse_proxy_addr(proxy_str: str) -> tuple[str, int]:
     """Parse a ``host:port`` proxy string and return ``(host, port)``; raises ValueError if invalid."""
     if not proxy_str:
         raise ValueError("empty proxy string")
@@ -80,7 +77,7 @@ async def socks5_connect(
     dest_host: str,
     dest_port: int,
     timeout: float = 10.0,
-) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """Establish a TCP connection through a SOCKS5 proxy (RFC 1928, no-auth, CONNECT).
 
     Sends *dest_host* as a domain name so the proxy (Tor) resolves .onion addresses.
@@ -185,7 +182,7 @@ class RelayType(Enum):
 
 class Peer:
     """Manages connection to a single Bitcoin peer"""
-    
+
     def __init__(
         self,
         host: str,
@@ -194,7 +191,7 @@ class Peer:
         transport_version: int = 1,
         inbound: bool = False,
         relay_txs: bool = True,
-        proxy: Optional[str] = None,
+        proxy: str | None = None,
     ):
         """Initialize peer connection."""
         self.host = host
@@ -208,27 +205,27 @@ class Peer:
             RelayType.FULL_RELAY if relay_txs else RelayType.BLOCK_RELAY_ONLY
         )
         self.state = PeerState.DISCONNECTED
-        
-        self.reader: Optional[asyncio.StreamReader] = None
-        self.writer: Optional[asyncio.StreamWriter] = None
-        
+
+        self.reader: asyncio.StreamReader | None = None
+        self.writer: asyncio.StreamWriter | None = None
+
         # BIP 324 v2 transport (set after successful negotiation)
-        self._v2_transport: Optional[V2Transport] = None
+        self._v2_transport: V2Transport | None = None
         self._v2_recv_buffer: bytes = b""
-        
-        self.version: Optional[int] = None
+
+        self.version: int | None = None
         self.services: int = 0
         self.user_agent: str = ""
         self.start_height: int = 0
-        
+
         self.last_ping: float = 0
         self.latency: float = 0
         self.score: int = 100  # Reputation score (0-100)
-        
-        self.message_handlers: Dict[str, Callable] = {}
-        self._listen_task: Optional[asyncio.Task] = None
-        self._ping_task: Optional[asyncio.Task] = None
-        
+
+        self.message_handlers: dict[str, Callable] = {}
+        self._listen_task: asyncio.Task | None = None
+        self._ping_task: asyncio.Task | None = None
+
         # Peer announcement preferences (set by sendheaders / sendcmpct)
         self.wants_headers: bool = False      # BIP 130: prefer headers announcements
         self.wants_cmpctblock: bool = False    # BIP 152: announce via cmpctblock
@@ -265,11 +262,11 @@ class Peer:
         self.wtxid_relay: bool = False
         # BIP 155: peer supports addrv2
         self.addrv2: bool = False
-    
+
     async def connect(self, start_height: int = 0, retry: bool = True) -> bool:
         """Connect to the peer, complete the version handshake, and start background tasks."""
         max_attempts = self._max_retries + 1 if retry else 1
-        
+
         for attempt in range(max_attempts):
             try:
                 logger.info(f"Connecting to {self.host}:{self.port} (attempt {attempt + 1}/{max_attempts})")
@@ -297,7 +294,7 @@ class Peer:
                         asyncio.open_connection(self.host, self.port),
                         timeout=10.0
                     )
-                
+
                 self.state = PeerState.CONNECTED
 
                 # BIP 324 v2 transport negotiation (before version handshake)
@@ -313,24 +310,24 @@ class Peer:
 
                 # Perform handshake
                 await self._handshake(start_height)
-                
+
                 self.state = PeerState.READY
                 self._retry_count = 0
-                
+
                 logger.info(
                     f"Connected to {self.host}:{self.port} - "
                     f"{self.user_agent} (version {self.version})"
                 )
-                
+
                 # Start listening for messages
                 self._listen_task = asyncio.create_task(self.listen())
-                
+
                 # Start periodic ping
                 self._ping_task = asyncio.create_task(self._ping_loop())
-                
+
                 return True
-                
-            except asyncio.TimeoutError:
+
+            except TimeoutError:
                 logger.warning(
                     f"Connection timeout to {self.host}:{self.port} "
                     f"(attempt {attempt + 1}/{max_attempts})"
@@ -338,7 +335,7 @@ class Peer:
                 await self.disconnect()
                 if attempt < max_attempts - 1:
                     await asyncio.sleep(self._retry_delay)
-                    
+
             except Exception as e:
                 logger.error(
                     f"Failed to connect to {self.host}:{self.port} "
@@ -347,10 +344,10 @@ class Peer:
                 await self.disconnect()
                 if attempt < max_attempts - 1:
                     await asyncio.sleep(self._retry_delay)
-        
+
         logger.error(f"Failed to connect to {self.host}:{self.port} after {max_attempts} attempts")
         return False
-    
+
     async def accept_inbound(
         self,
         reader: asyncio.StreamReader,
@@ -403,8 +400,11 @@ class Peer:
         self.state = PeerState.HANDSHAKING
 
         from ouroboros.p2p_messages import (
-            SendHeadersMessage, SendCmpctMessage,
-            FeeFilterMessage, WtxidRelayMessage, SendAddrV2Message,
+            FeeFilterMessage,
+            SendAddrV2Message,
+            SendCmpctMessage,
+            SendHeadersMessage,
+            WtxidRelayMessage,
         )
 
         # 1. Receive version from remote peer with handshake timeout
@@ -561,8 +561,11 @@ class Peer:
         self.state = PeerState.HANDSHAKING
 
         from ouroboros.p2p_messages import (
-            SendHeadersMessage, SendCmpctMessage,
-            FeeFilterMessage, WtxidRelayMessage, SendAddrV2Message,
+            FeeFilterMessage,
+            SendAddrV2Message,
+            SendCmpctMessage,
+            SendHeadersMessage,
+            WtxidRelayMessage,
         )
 
         # Create network addresses
@@ -690,7 +693,7 @@ class Peer:
                 )
         except Exception as feat_err:
             logger.debug(f"Feature negotiation error (non-fatal): {feat_err}")
-    
+
     def _create_network_address(self, host: str, port: int) -> NetworkAddress:
         """Create network address from host and port."""
         our_services = NODE_NETWORK | NODE_WITNESS
@@ -715,15 +718,15 @@ class Peer:
         # TODO: handle IPv6
         # Default to all zeros (unknown address)
         return NetworkAddress(services=our_services, ip=b'\x00' * 16, port=port)
-    
+
     async def send_message(self, msg: NetworkMessage):
         """Serialize and write *msg* to the peer (encrypted if BIP 324 v2 is active)."""
         if self.state != PeerState.READY and self.state != PeerState.HANDSHAKING:
             raise Exception(f"Cannot send message in state {self.state}")
-        
+
         if not self.writer:
             raise Exception("Not connected")
-        
+
         data = msg.serialize()
 
         if self._v2_transport is not None:
@@ -731,9 +734,9 @@ class Peer:
 
         self.writer.write(data)
         await self.writer.drain()
-        
+
         logger.debug(f"Sent {msg.command} to {self.host}:{self.port}")
-    
+
     async def receive_message(self, timeout: float = 30.0) -> NetworkMessage:
         """Read and parse the next message from the peer (v1 or BIP 324 v2); raises on timeout or bad format."""
         if not self.reader:
@@ -766,7 +769,7 @@ class Peer:
                 raise V2TransportError(
                     f"Peer {self.host}:{self.port} appears to use v2 transport, "
                     f"disconnecting gracefully"
-                )
+                ) from None
             raise Exception(
                 f"Invalid magic bytes from {self.host}:{self.port}: "
                 f"expected {expected_magic:08x}, got {magic:08x} — stream desync"
@@ -774,36 +777,36 @@ class Peer:
 
         try:
             command = command_bytes.rstrip(b'\x00').decode('ascii')
-        except UnicodeDecodeError:
+        except UnicodeDecodeError as exc:
             # Magic was correct but command is non-ASCII — this is a stream
             # framing error, NOT v2 transport.  Raise a normal exception so
             # the score-based handling can decide whether to disconnect.
             raise Exception(
                 f"Non-ASCII command bytes from {self.host}:{self.port} "
                 f"(likely stream desync): {command_bytes!r}"
-            )
-        
+            ) from exc
+
         # Read payload
         payload = b''
         if length > 0:
             if length > 32 * 1024 * 1024:  # 32 MB limit
                 raise Exception(f"Payload too large: {length} bytes")
-            
+
             payload = await asyncio.wait_for(
                 self.reader.readexactly(length),
                 timeout=timeout
             )
-        
+
         # Verify checksum
         expected_checksum = hashlib.sha256(
             hashlib.sha256(payload).digest()
         ).digest()[:4]
-        
+
         if checksum != expected_checksum:
             raise Exception(f"Checksum mismatch for {command}")
-        
+
         logger.debug(f"Received {command} from {self.host}:{self.port} ({len(payload)} bytes)")
-        
+
         return NetworkMessage(command=command, payload=payload, magic=magic)
 
     async def _receive_v2_message(self, timeout: float) -> NetworkMessage:
@@ -838,7 +841,7 @@ class Peer:
 
             # The payload is the original v1 serialised NetworkMessage
             return NetworkMessage.deserialize(payload, network=self.network)
-    
+
     def _is_handshake_message(self, command: str) -> bool:
         """Check if message is allowed during handshake (before handshake_complete)."""
         # Bitcoin Core net_processing.cpp: only version/verack/wtxidrelay/sendaddrv2
@@ -928,7 +931,7 @@ class Peer:
                             f"No handler for {msg.command} from {self.host}:{self.port}"
                         )
 
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Timeout is normal, just continue listening
                     logger.debug(f"Receive timeout from {self.host}:{self.port}")
                     continue
@@ -956,7 +959,7 @@ class Peer:
         except Exception as e:
             logger.error(f"Error in peer {self.host}:{self.port} listener: {e}")
             await self.disconnect()
-    
+
     async def _ping_loop(self):
         try:
             while self.state == PeerState.READY:
@@ -967,12 +970,12 @@ class Peer:
             logger.debug(f"Ping loop cancelled for {self.host}:{self.port}")
         except Exception as e:
             logger.error(f"Error in ping loop for {self.host}:{self.port}: {e}")
-    
+
     def register_handler(self, command: str, handler: Callable):
         """Register *handler* to be called when a message with *command* is received."""
         self.message_handlers[command] = handler
         logger.debug(f"Registered handler for {command} on {self.host}:{self.port}")
-    
+
     async def ping(self):
         """Send ping to peer"""
         nonce = self._generate_nonce()
@@ -981,13 +984,13 @@ class Peer:
         ping_msg = ping.to_network_message(self.network)
         await self.send_message(ping_msg)
         logger.debug(f"Sent ping to {self.host}:{self.port}")
-    
+
     async def disconnect(self):
         """Disconnect from peer"""
         logger.info(f"Disconnecting from {self.host}:{self.port}")
-        
+
         self.state = PeerState.DISCONNECTED
-        
+
         # Cancel tasks
         if self._listen_task:
             self._listen_task.cancel()
@@ -995,14 +998,14 @@ class Peer:
                 await self._listen_task
             except asyncio.CancelledError:
                 pass
-        
+
         if self._ping_task:
             self._ping_task.cancel()
             try:
                 await self._ping_task
             except asyncio.CancelledError:
                 pass
-        
+
         # Close connection
         if self.writer:
             try:
@@ -1010,23 +1013,23 @@ class Peer:
                 await self.writer.wait_closed()
             except Exception as e:
                 logger.debug(f"Error closing connection to {self.host}:{self.port}: {e}")
-        
+
         self.reader = None
         self.writer = None
-    
+
     def _generate_nonce(self) -> int:
         return random.randint(0, 2**64 - 1)
-    
+
     def adjust_score(self, delta: int):
         """Adjust the peer's reputation score by *delta* (result clamped to [0, 100])."""
         self.score = max(0, min(100, self.score + delta))
         if self.score == 0:
             logger.warning(f"Peer {self.host}:{self.port} banned (score=0)")
-    
+
     def is_connected(self) -> bool:
         """Check if peer is connected and ready"""
         return self.state == PeerState.READY
-    
+
     def __repr__(self) -> str:
         direction = "in" if self.inbound else "out"
         relay = "block-only" if not self.relay_txs else "full"

@@ -19,14 +19,11 @@ Usage:
 """
 
 import asyncio
-import json
 import logging
-import os
 import shutil
 import tempfile
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import httpx
 
@@ -43,7 +40,7 @@ class TestNode:
         network: str = "regtest",
         rpc_port: int = 18443,
         p2p_port: int = 18444,
-        extra_config: Optional[Dict[str, Any]] = None,
+        extra_config: dict[str, Any] | None = None,
     ):
         self.index = index
         self.datadir = datadir
@@ -53,7 +50,7 @@ class TestNode:
         self.config = extra_config or {}
         self._node = None
         self._task = None
-        self._rpc_client: Optional[httpx.AsyncClient] = None
+        self._rpc_client: httpx.AsyncClient | None = None
         self._rpc_user = "testuser"
         self._rpc_pass = "testpass"
         self.running = False
@@ -138,7 +135,7 @@ class TestNode:
         except httpx.ConnectError:
             return None
 
-    async def generate(self, nblocks: int, address: str = None) -> List[str]:
+    async def generate(self, nblocks: int, address: str = None) -> list[str]:
         """Generate blocks (regtest only)."""
         if address is None:
             address = await self.rpc("getnewaddress")
@@ -165,8 +162,8 @@ class BitcoinTestFramework:
 
     def __init__(self):
         self.num_nodes = 1
-        self.nodes: List[TestNode] = []
-        self._tmpdirs: List[str] = []
+        self.nodes: list[TestNode] = []
+        self._tmpdirs: list[str] = []
         self.network = "regtest"
         self.log = logging.getLogger(self.__class__.__name__)
 
@@ -266,4 +263,4 @@ def assert_raises_rpc_error(code, message, fun, *args, **kwargs):
         if message and message not in error_str:
             raise AssertionError(
                 f"Expected error containing '{message}' but got: {error_str}"
-            )
+            ) from None

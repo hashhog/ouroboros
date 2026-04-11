@@ -10,10 +10,11 @@ attributes the RPC method needs (``mempool``, ``db``).
 """
 
 import hashlib
-import pytest
-from ouroboros.mempool import Mempool
-from ouroboros.database import Transaction, TxIn, TxOut
 
+import pytest
+
+from ouroboros.database import Transaction, TxIn, TxOut
+from ouroboros.mempool import Mempool
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -132,21 +133,20 @@ def _build_cpfp_pair():
         output_value=confirmed_value - 1,  # 1 sat fee
     )
 
-    # The parent's txid (big-endian) as stored internally:
-    parent_txid_be = parent_tx.get_txid()
-    # Convert to wire format (LE) for use in the child's prev_txid
-    parent_txid_wire = parent_txid_be[::-1]
+    # The parent's txid in internal byte order (same as wire format):
+    parent_txid = parent_tx.get_txid()
 
     # Child: spends parent output, pays 9,999 sat fee
+    # prev_txid in wire format is the same as internal byte order (no reversal)
     child_tx, child_raw = _make_tx_via_roundtrip(
-        prev_txid_wire=parent_txid_wire,
+        prev_txid_wire=parent_txid,
         prev_vout=0,
         output_value=confirmed_value - 1 - 9_999,  # child fee = 9,999 sats
     )
 
-    # confirmed_txid in big-endian (what from_payload produces):
-    # Since b"\x01"*32 is symmetric, wire == be
-    confirmed_txid_be = confirmed_txid_wire[::-1]
+    # confirmed_txid in internal byte order (same as wire):
+    # Since b"\x01"*32 is symmetric, no change needed
+    confirmed_txid_be = confirmed_txid_wire
 
     return parent_tx, child_tx, parent_raw, child_raw, confirmed_txid_be, confirmed_value
 

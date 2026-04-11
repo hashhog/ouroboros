@@ -32,11 +32,9 @@ Reference: BIP 330, libminisketch, Erlay paper (Naumenko et al. 2019)
 
 from __future__ import annotations
 
-import hashlib
-import struct
 import logging
+import struct
 from dataclasses import dataclass, field
-from typing import List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +99,7 @@ def gf_pow(base: int, exp: int) -> int:
 
 # Berlekamp-Massey algorithm
 
-def berlekamp_massey(syndromes: List[int]) -> Optional[List[int]]:
+def berlekamp_massey(syndromes: list[int]) -> list[int] | None:
     """Berlekamp–Massey over GF(2^32): returns the error-locator polynomial Λ(x), or None on failure."""
     n = len(syndromes)
     # Current connection polynomial (LFSR taps)
@@ -144,7 +142,7 @@ def berlekamp_massey(syndromes: List[int]) -> Optional[List[int]]:
 
 # --- Polynomial arithmetic over GF(2^32) ---
 
-def _poly_mul(a: List[int], b: List[int]) -> List[int]:
+def _poly_mul(a: list[int], b: list[int]) -> list[int]:
     if not a or not b:
         return []
     result = [0] * (len(a) + len(b) - 1)
@@ -158,7 +156,7 @@ def _poly_mul(a: List[int], b: List[int]) -> List[int]:
     return result
 
 
-def _poly_mod(a: List[int], b: List[int]) -> List[int]:
+def _poly_mod(a: list[int], b: list[int]) -> list[int]:
     a = list(a)
     db = len(b) - 1
     inv_lead = gf_inv(b[db])
@@ -175,13 +173,13 @@ def _poly_mod(a: List[int], b: List[int]) -> List[int]:
     return a
 
 
-def _poly_divmod(a: List[int], b: List[int]) -> Tuple[List[int], List[int]]:
+def _poly_divmod(a: list[int], b: list[int]) -> tuple[list[int], list[int]]:
     a = list(a)
     db = len(b) - 1
     if db < 0 or (len(b) == 1 and b[0] == 0):
         raise ValueError("Division by zero polynomial")
     inv_lead = gf_inv(b[db])
-    quot: List[int] = []
+    quot: list[int] = []
     while len(a) >= len(b):
         coeff = gf_mul(a[-1], inv_lead)
         quot.append(coeff)
@@ -195,7 +193,7 @@ def _poly_divmod(a: List[int], b: List[int]) -> Tuple[List[int], List[int]]:
     return quot, a
 
 
-def _poly_gcd(a: List[int], b: List[int]) -> List[int]:
+def _poly_gcd(a: list[int], b: list[int]) -> list[int]:
     while b and not (len(b) == 1 and b[0] == 0):
         a, b = b, _poly_mod(a, b)
     # Normalize: make leading coefficient 1
@@ -205,7 +203,7 @@ def _poly_gcd(a: List[int], b: List[int]) -> List[int]:
     return a
 
 
-def _poly_powmod(base: List[int], exp: int, mod: List[int]) -> List[int]:
+def _poly_powmod(base: list[int], exp: int, mod: list[int]) -> list[int]:
     result = [1]  # polynomial 1
     base = _poly_mod(base, mod)
     while exp > 0:
@@ -218,7 +216,7 @@ def _poly_powmod(base: List[int], exp: int, mod: List[int]) -> List[int]:
 
 # Root finding via Cantor-Zassenhaus and square-free splitting
 
-def _solve_quadratic_trace(d: int) -> Optional[int]:
+def _solve_quadratic_trace(d: int) -> int | None:
     import random as _rng
     rng = _rng.Random(0xBEEF)  # deterministic for reproducibility
     for _ in range(200):
@@ -235,7 +233,7 @@ def _solve_quadratic_trace(d: int) -> Optional[int]:
     return None
 
 
-def _find_roots_linear(poly: List[int]) -> Optional[List[int]]:
+def _find_roots_linear(poly: list[int]) -> list[int] | None:
     if len(poly) != 2 or poly[1] == 0:
         return None
     root = gf_mul(poly[0], gf_inv(poly[1]))
@@ -244,7 +242,7 @@ def _find_roots_linear(poly: List[int]) -> Optional[List[int]]:
     return [root]
 
 
-def _find_roots_quadratic(poly: List[int]) -> Optional[List[int]]:
+def _find_roots_quadratic(poly: list[int]) -> list[int] | None:
     if len(poly) != 3 or poly[2] == 0:
         return None
     inv_a = gf_inv(poly[2])
@@ -272,7 +270,7 @@ def _find_roots_quadratic(poly: List[int]) -> Optional[List[int]]:
     return roots if roots else None
 
 
-def _factor_poly(poly: List[int]) -> Optional[List[int]]:
+def _factor_poly(poly: list[int]) -> list[int] | None:
     """Find all roots of a polynomial over GF(2^32) using randomized factorization."""
     import random as _random
 
@@ -288,7 +286,7 @@ def _factor_poly(poly: List[int]) -> Optional[List[int]]:
     inv_lead = gf_inv(poly[-1])
     poly = [gf_mul(c, inv_lead) for c in poly]
 
-    roots: List[int] = []
+    roots: list[int] = []
     stack = [poly]
     rng = _random.Random(0xBEEF)  # deterministic for reproducibility
 
@@ -379,7 +377,7 @@ def _factor_poly(poly: List[int]) -> Optional[List[int]]:
     return roots
 
 
-def find_roots(poly: List[int]) -> Optional[List[int]]:
+def find_roots(poly: list[int]) -> list[int] | None:
     """Return set-difference elements (inverse of roots) via Cantor–Zassenhaus; None on failure."""
     degree = len(poly) - 1
     if degree == 0:
@@ -428,7 +426,7 @@ class Minisketch:
                    (indices 0..c-1 store S_1, S_3, …, S_{2c-1})
     """
     capacity: int
-    syndromes: List[int] = field(default_factory=list)
+    syndromes: list[int] = field(default_factory=list)
 
     def __post_init__(self):
         if not self.syndromes:
@@ -448,7 +446,7 @@ class Minisketch:
             # Advance from element^(2i+1) to element^(2i+3) = element^(2i+1) * element^2
             val = gf_mul(val, e_sq)
 
-    def add_all(self, elements: Set[int]) -> None:
+    def add_all(self, elements: set[int]) -> None:
         """Add every element from a set into the sketch."""
         for e in elements:
             if e != 0:
@@ -456,7 +454,7 @@ class Minisketch:
 
     # Merge (XOR)
 
-    def merge(self, other: 'Minisketch') -> 'Minisketch':
+    def merge(self, other: Minisketch) -> Minisketch:
         """XOR *other* into this sketch and return a new Minisketch encoding the symmetric difference."""
         if self.capacity != other.capacity:
             raise ValueError(
@@ -469,7 +467,7 @@ class Minisketch:
         ]
         return Minisketch(capacity=self.capacity, syndromes=merged_syndromes)
 
-    def merge_inplace(self, other: 'Minisketch') -> None:
+    def merge_inplace(self, other: Minisketch) -> None:
         """XOR another sketch into this one (in place)."""
         if self.capacity != other.capacity:
             raise ValueError(
@@ -479,7 +477,7 @@ class Minisketch:
         for i in range(self.capacity):
             self.syndromes[i] ^= other.syndromes[i]
 
-    def _expand_syndromes(self) -> List[int]:
+    def _expand_syndromes(self) -> list[int]:
         n = self.capacity
         full = [0] * (2 * n)
         # Place odd syndromes: S_{2i+1} at index 2*i
@@ -494,7 +492,7 @@ class Minisketch:
 
     # Decode
 
-    def decode(self) -> Optional[Set[int]]:
+    def decode(self) -> set[int] | None:
         """Decode the sketch into its elements; returns None if the difference exceeds capacity."""
         # All-zero syndromes → empty difference
         if all(s == 0 for s in self.syndromes):
@@ -536,7 +534,7 @@ class Minisketch:
         return bytes(data)
 
     @classmethod
-    def deserialize(cls, data: bytes, capacity: int) -> 'Minisketch':
+    def deserialize(cls, data: bytes, capacity: int) -> Minisketch:
         """Deserialize a sketch from *capacity × 4* bytes (each syndrome as a 4-byte little-endian uint32)."""
         expected = capacity * 4
         if len(data) < expected:
@@ -584,8 +582,8 @@ class ReconciliationSet:
     """
     local_salt: int = 0
     remote_salt: int = 0
-    local_set: Set[bytes] = field(default_factory=set)
-    announced_txids: Set[bytes] = field(default_factory=set)
+    local_set: set[bytes] = field(default_factory=set)
+    announced_txids: set[bytes] = field(default_factory=set)
 
     def add_tx(self, txid: bytes) -> None:
         """Add a transaction to the reconciliation set."""
@@ -597,7 +595,7 @@ class ReconciliationSet:
         self.announced_txids.add(txid)
         self.local_set.discard(txid)
 
-    def get_short_ids(self) -> Set[int]:
+    def get_short_ids(self) -> set[int]:
         """Map all txids in the local set to short IDs."""
         return {
             compute_short_txid(txid, self.local_salt, self.remote_salt)

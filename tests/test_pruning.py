@@ -5,10 +5,9 @@ Tests both the Python pruning module and the underlying Rust flat file
 pruning implementation.
 """
 
-import pytest
 import tempfile
-import os
-from pathlib import Path
+
+import pytest
 
 # Import the sync module (Rust extension)
 try:

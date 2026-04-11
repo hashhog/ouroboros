@@ -3,49 +3,49 @@
 __version__ = "0.1.0"
 
 # Core modules
+# Rust extension module
+from sync import PyUTXO, SyncEngine  # noqa: F401
+
+from ouroboros.block_sync import BlockSync
+from ouroboros.config import NodeConfig
+from ouroboros.consensus import (
+    BuriedDeployment,
+    Deployment,
+    DeploymentState,
+    get_all_deployments_info,
+    get_deployment_state,
+    is_buried_deployment_active,
+    is_deployment_active,
+)
 from ouroboros.database import BlockchainDatabase
 from ouroboros.mempool import Mempool, MempoolEntry
 from ouroboros.node import BitcoinNode
-from ouroboros.p2p import PeerManager, P2PManager
-from ouroboros.peer import Peer, PeerState
-from ouroboros.block_sync import BlockSync
-from ouroboros.rpc import RPCServer
-from ouroboros.validation import BlockValidator, TransactionValidator, ValidationError
-from ouroboros.script import ScriptInterpreter
-from ouroboros.consensus import (
-    DeploymentState,
-    Deployment,
-    BuriedDeployment,
-    get_deployment_state,
-    is_deployment_active,
-    is_buried_deployment_active,
-    get_all_deployments_info,
-)
+from ouroboros.p2p import P2PManager, PeerManager
 from ouroboros.p2p_messages import (
-    NetworkMessage,
-    VersionMessage,
-    InvMessage,
-    GetDataMessage,
+    INV_TYPE_BLOCK,
+    INV_TYPE_TX,
+    MAGIC_MAINNET,
+    MAGIC_REGTEST,
+    MAGIC_TESTNET,
+    BlockHeader,
     BlockMessage,
-    TxMessage,
+    GetDataMessage,
     GetHeadersMessage,
     HeadersMessage,
+    InvMessage,
+    NetworkAddress,
+    NetworkMessage,
     PingMessage,
     PongMessage,
-    NetworkAddress,
-    BlockHeader,
-    MAGIC_MAINNET,
-    MAGIC_TESTNET,
-    MAGIC_REGTEST,
-    INV_TYPE_TX,
-    INV_TYPE_BLOCK,
+    TxMessage,
+    VersionMessage,
 )
-from ouroboros.wallet import Wallet
+from ouroboros.peer import Peer, PeerState
+from ouroboros.rpc import RPCServer
+from ouroboros.script import ScriptInterpreter
 from ouroboros.sync_manager import SyncManager, SyncProgress
-from ouroboros.config import NodeConfig
-
-# Rust extension module
-from sync import PyUTXO, SyncEngine  # noqa: F401
+from ouroboros.validation import BlockValidator, TransactionValidator, ValidationError
+from ouroboros.wallet import Wallet
 
 # Alias for backward compatibility
 Database = BlockchainDatabase

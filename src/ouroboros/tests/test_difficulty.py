@@ -5,17 +5,17 @@ Verifies that difficulty matches Bitcoin Core GetDifficulty formula.
 Ref: bitcoin/src/rpc/blockchain.cpp GetDifficulty()
 """
 
-import unittest
+import shutil
 import sys
 import tempfile
-import shutil
+import unittest
 from pathlib import Path
 
 # Add src to path
 src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
-from ouroboros.node import BitcoinNode
+from ouroboros.node import BitcoinNode  # noqa: E402
 
 
 class TestBitsToDifficulty(unittest.TestCase):

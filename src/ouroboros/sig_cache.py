@@ -14,10 +14,9 @@ Reference: bitcoin/src/script/sigcache.h
 
 from collections import OrderedDict
 from threading import Lock
-from typing import Tuple
 
 # Type alias for cache keys
-CacheKey = Tuple[str, int, int]  # (txid_hex, input_index, flags)
+CacheKey = tuple[str, int, int]  # (txid_hex, input_index, flags)
 
 
 class SigCache:

@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest.mock import AsyncMock
 
-from ouroboros.p2p import PeerManager, MAX_INBOUND
+from ouroboros.p2p import MAX_INBOUND, PeerManager
 from ouroboros.peer import Peer, PeerState
 
 

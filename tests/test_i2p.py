@@ -12,21 +12,18 @@ import asyncio
 import base64
 import hashlib
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
 
+from ouroboros.addrman import NET_I2P, AddrInfo, get_network_group
+from ouroboros.p2p import PeerManager
 from ouroboros.tor import (
     I2PSession,
-    _i2p_b64_encode,
     _i2p_b64_decode,
+    _i2p_b64_encode,
     i2p_destination_to_address,
+    is_anonymous_network,
     is_i2p_host,
     is_onion_host,
-    is_anonymous_network,
-    DEFAULT_I2P_SAM_PORT,
 )
-from ouroboros.addrman import AddrInfo, NET_I2P, get_network_group
-from ouroboros.p2p import PeerManager
-
 
 # ── I2P Base64 Encoding ──────────────────────────────────────────────
 
@@ -93,7 +90,6 @@ class TestI2PDestinationAddress(unittest.TestCase):
         dest = b"\x12\x34" * 16  # 32 bytes
         address = i2p_destination_to_address(dest)
         # 52 base32 chars + ".b32.i2p" = 60 total
-        b32_part = address.rstrip(".b32.i2p").replace(".b32.i2p", "")
         b32_part = address[:-8]  # Remove ".b32.i2p"
         self.assertEqual(len(b32_part), 52)
 

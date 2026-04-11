@@ -50,14 +50,14 @@ import hmac
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ouroboros.miniscript import MiniscriptNode
 
 import base58
 import bech32
-from coincurve import PrivateKey, PublicKey
+from coincurve import PublicKey
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -185,7 +185,7 @@ class ExtendedPubKey:
 
     # -- child derivation (public only — normal indices) -------------------
 
-    def derive_child(self, index: int) -> "ExtendedPubKey":
+    def derive_child(self, index: int) -> ExtendedPubKey:
         """Derive a normal (non-hardened) child extended public key."""
         if index & 0x80000000:
             raise ValueError("Cannot derive hardened child from public key")
@@ -206,7 +206,7 @@ class ExtendedPubKey:
             network=self.network,
         )
 
-    def derive_path(self, path: str) -> "ExtendedPubKey":
+    def derive_path(self, path: str) -> ExtendedPubKey:
         """Derive through a slash-separated path, e.g. ``"0/1/2"``."""
         node = self
         for part in path.split("/"):
@@ -234,7 +234,7 @@ class ExtendedPubKey:
         return base58.b58encode_check(payload).decode()
 
     @classmethod
-    def deserialize(cls, encoded: str) -> "ExtendedPubKey":
+    def deserialize(cls, encoded: str) -> ExtendedPubKey:
         """Deserialise an xpub/tpub/xprv/tprv string; xprv keys are converted to their public half."""
         raw = base58.b58decode_check(encoded)
         if len(raw) != 78:
@@ -289,10 +289,10 @@ class KeyOrigin:
 @dataclass
 class KeyExpression:
     """A parsed key expression inside a descriptor."""
-    origin: Optional[KeyOrigin] = None
+    origin: KeyOrigin | None = None
     # Exactly one of: hex pubkey *or* extended key
-    hex_pubkey: Optional[bytes] = None          # 33-byte compressed
-    ext_key: Optional[ExtendedPubKey] = None
+    hex_pubkey: bytes | None = None          # 33-byte compressed
+    ext_key: ExtendedPubKey | None = None
     ext_key_str: str = ""                       # original xpub/tpub/xprv/tprv
     derivation_suffix: str = ""                 # e.g. "/0/*"
     is_range: bool = False                      # True when suffix contains *
@@ -313,7 +313,7 @@ class KeyExpression:
             derived = self.ext_key
         return derived.public_key
 
-    def derive_range(self, start: int, count: int) -> List[bytes]:
+    def derive_range(self, start: int, count: int) -> list[bytes]:
         """Derive *count* public keys starting at *start*."""
         return [self.derive_pubkey(i) for i in range(start, start + count)]
 
@@ -367,7 +367,7 @@ def _parse_key_expression(raw: str) -> KeyExpression:
                     raise ValueError(f"Not a compressed pubkey: {hex_clean}")
                 expr.hex_pubkey = pubkey_bytes
             except ValueError:
-                raise ValueError(f"Invalid hex public key: {hex_clean}")
+                raise ValueError(f"Invalid hex public key: {hex_clean}") from None
         else:
             raise ValueError(f"Cannot parse key expression: {raw}")
 
@@ -386,7 +386,7 @@ class Descriptor:
                                   # "sortedmulti", "wsh-multi", "wsh-sortedmulti",
                                   # "wsh-miniscript", "tr-script", "sh-multi",
                                   # "sh-wsh-multi", "combo", "addr", "raw"
-    keys: List[KeyExpression] = field(default_factory=list)
+    keys: list[KeyExpression] = field(default_factory=list)
     multisig_threshold: int = 0   # M in multi(M, ...)
     is_range: bool = False
     raw: str = ""                 # original canonical string (no checksum)
@@ -396,9 +396,9 @@ class Descriptor:
     script_hex: str = ""          # raw script hex for raw() descriptors
     # For miniscript descriptors
     miniscript_expr: str = ""     # miniscript expression string
-    miniscript_node: Optional["MiniscriptNode"] = None  # parsed miniscript
+    miniscript_node: MiniscriptNode | None = None  # parsed miniscript
     # For tr() with script paths
-    tap_tree: Optional[List] = None  # Taproot script tree
+    tap_tree: list | None = None  # Taproot script tree
 
     # -- address / script derivation --------------------------------------
 
@@ -560,14 +560,14 @@ class Descriptor:
 
         raise ValueError(f"Unknown descriptor type: {dtype}")
 
-    def derive_all_scripts(self, index: int = 0) -> List[bytes]:
+    def derive_all_scripts(self, index: int = 0) -> list[bytes]:
         """For combo() descriptors, return all scriptPubKeys; otherwise a single-element list."""
         if self.descriptor_type != "combo":
             return [self.derive_script_pubkey(index)]
 
         # combo(KEY) expands to: P2PK, P2PKH, and if compressed: P2WPKH, P2SH-P2WPKH
         pub = self.keys[0].derive_pubkey(index)
-        scripts: List[bytes] = []
+        scripts: list[bytes] = []
         # P2PK
         scripts.append(_make_p2pk_script(pub))
         # P2PKH
@@ -582,14 +582,14 @@ class Descriptor:
             scripts.append(b"\xa9\x14" + _hash160(redeem) + b"\x87")
         return scripts
 
-    def derive_all_addresses(self, index: int = 0, network: str = "mainnet") -> List[str]:
+    def derive_all_addresses(self, index: int = 0, network: str = "mainnet") -> list[str]:
         """For combo() descriptors, return all addresses; otherwise a single-element list."""
         if self.descriptor_type != "combo":
             return [self.derive_address(index, network)]
 
         # combo(KEY) expands to: P2PK (as P2SH), P2PKH, and if compressed: P2WPKH, P2SH-P2WPKH
         pub = self.keys[0].derive_pubkey(index)
-        addresses: List[str] = []
+        addresses: list[str] = []
         # P2PK has no standard address; wrap in P2SH
         script = _make_p2pk_script(pub)
         addresses.append(_script_to_p2sh(script, network))
@@ -605,7 +605,7 @@ class Descriptor:
 
     def derive_addresses(
         self, start: int = 0, count: int = 20, network: str = "mainnet"
-    ) -> List[str]:
+    ) -> list[str]:
         """Derive a range of addresses."""
         return [self.derive_address(i, network) for i in range(start, start + count)]
 
@@ -640,7 +640,6 @@ class Descriptor:
 
     def _taproot_tweak_with_tree(self, pub: bytes, index: int = 0) -> bytes:
         """Compute taproot output key with script tree."""
-        from ouroboros.miniscript import MiniscriptContext, compile_miniscript, parse_miniscript
 
         x_only = pub[1:] if len(pub) == 33 else pub  # Get x-only pubkey
 
@@ -698,7 +697,7 @@ class Descriptor:
 
         return compute_tree(self.tap_tree)
 
-    def get_miniscript_satisfaction_size(self, index: int = 0) -> Optional[int]:
+    def get_miniscript_satisfaction_size(self, index: int = 0) -> int | None:
         """Get the witness size needed to satisfy this miniscript descriptor."""
         if self.descriptor_type not in ("wsh-miniscript", "tr-script"):
             return None
@@ -767,7 +766,7 @@ def _pubkey_to_p2tr(pub: bytes, network: str) -> str:
 
 
 def _make_multisig_script(
-    threshold: int, pubkeys: List[bytes], sorted_keys: bool = False
+    threshold: int, pubkeys: list[bytes], sorted_keys: bool = False
 ) -> bytes:
     if threshold < 1 or threshold > len(pubkeys):
         raise ValueError(
@@ -847,7 +846,7 @@ def _decode_address(addr: str, network: str = "mainnet") -> bytes:
     try:
         decoded = base58.b58decode_check(addr)
     except Exception:
-        raise ValueError(f"Invalid base58 address: {addr}")
+        raise ValueError(f"Invalid base58 address: {addr}") from None
 
     if len(decoded) != 21:
         raise ValueError(f"Invalid address length: {addr}")
@@ -953,7 +952,7 @@ def parse_descriptor(desc_str: str) -> Descriptor:
         try:
             bytes.fromhex(hex_str)
         except ValueError:
-            raise ValueError(f"Invalid hex in raw(): {hex_str}")
+            raise ValueError(f"Invalid hex in raw(): {hex_str}") from None
         return Descriptor(
             descriptor_type="raw",
             script_hex=hex_str,
@@ -1122,7 +1121,7 @@ def _parse_multi_inner(
     # Split by commas, but be careful about brackets in origins
     parts = _split_top_level_commas(inner)
     if len(parts) < 2:
-        raise ValueError(f"multi() requires threshold + at least one key")
+        raise ValueError("multi() requires threshold + at least one key")
     threshold = int(parts[0].strip())
     keys = [_parse_key_expression(p) for p in parts[1:]]
     if threshold < 1 or threshold > len(keys):
@@ -1140,10 +1139,10 @@ def _parse_multi_inner(
     )
 
 
-def _split_top_level_commas(s: str) -> List[str]:
-    parts: List[str] = []
+def _split_top_level_commas(s: str) -> list[str]:
+    parts: list[str] = []
     depth = 0
-    current: List[str] = []
+    current: list[str] = []
     for ch in s:
         if ch in "([{":
             depth += 1
@@ -1161,7 +1160,7 @@ def _split_top_level_commas(s: str) -> List[str]:
     return parts
 
 
-def _parse_wsh_miniscript(miniscript_expr: str, canonical: str) -> "Descriptor":
+def _parse_wsh_miniscript(miniscript_expr: str, canonical: str) -> Descriptor:
     """Parse a wsh(MINISCRIPT) descriptor."""
     from ouroboros.miniscript import MiniscriptContext, parse_miniscript
 
@@ -1192,7 +1191,7 @@ def _parse_wsh_miniscript(miniscript_expr: str, canonical: str) -> "Descriptor":
     )
 
 
-def _extract_keys_from_miniscript(expr: str) -> List["KeyExpression"]:
+def _extract_keys_from_miniscript(expr: str) -> list[KeyExpression]:
     """Extract all key expressions from a miniscript string."""
     import re
 
@@ -1228,7 +1227,7 @@ def _extract_keys_from_miniscript(expr: str) -> List["KeyExpression"]:
     return keys
 
 
-def _parse_tap_tree(tree_str: str) -> Tuple[Union[str, List], List["KeyExpression"]]:
+def _parse_tap_tree(tree_str: str) -> tuple[str | list, list[KeyExpression]]:
     """
     Parse a taproot script tree expression.
 
@@ -1240,9 +1239,9 @@ def _parse_tap_tree(tree_str: str) -> Tuple[Union[str, List], List["KeyExpressio
         Tuple of (parsed tree structure, list of keys found)
     """
     tree_str = tree_str.strip()
-    all_keys: List[KeyExpression] = []
+    all_keys: list[KeyExpression] = []
 
-    def parse_node(s: str) -> Union[str, List]:
+    def parse_node(s: str) -> str | list:
         s = s.strip()
         if s.startswith("{"):
             # It's a branch node
@@ -1271,7 +1270,7 @@ def _parse_tap_tree(tree_str: str) -> Tuple[Union[str, List], List["KeyExpressio
 # ---------------------------------------------------------------------------
 
 
-def getdescriptorinfo(desc_str: str) -> Dict:
+def getdescriptorinfo(desc_str: str) -> dict:
     """
     Analyze a descriptor string and return information about it.
 
@@ -1337,7 +1336,7 @@ class DescriptorEntry:
     internal: bool = False    # True for change descriptors
     label: str = ""
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         """Serialise for JSON storage."""
         return {
             "desc": self.desc_string,
@@ -1350,7 +1349,7 @@ class DescriptorEntry:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict) -> "DescriptorEntry":
+    def from_dict(cls, d: dict) -> DescriptorEntry:
         """Deserialise from JSON storage."""
         desc_str = d["desc"]
         # Strip checksum for parsing, re-add after

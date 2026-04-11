@@ -6,13 +6,13 @@ across multiple Ouroboros nodes running concurrently.
 """
 
 import asyncio
+
 import pytest
 
 from tests.functional.framework import (
     BitcoinTestFramework,
     TestNode,
     assert_equal,
-    assert_greater_than,
 )
 
 

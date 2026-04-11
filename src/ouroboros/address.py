@@ -6,7 +6,6 @@ P2TR (bc1p.../tb1p... — Taproot, BIP 350 bech32m), and
 P2A (Pay-to-Anchor — bc1pfeessrawgf... for CPFP anchors).
 """
 
-from typing import Tuple, Optional, List, Union
 
 # P2PKH: OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
 _P2PKH_PREFIX = bytes([0x76, 0xa9, 0x14])
@@ -35,7 +34,7 @@ _P2A_PROGRAM = bytes([0x4e, 0x73])
 _BECH32M_CONST = 0x2bc830a3
 
 
-def _decode_base58check(address: str) -> Tuple[int, bytes]:
+def _decode_base58check(address: str) -> tuple[int, bytes]:
     import base58
     decoded = base58.b58decode_check(address)
     if len(decoded) < 2:
@@ -79,7 +78,7 @@ def _bech32m_create_checksum(hrp: str, data: list, spec: str) -> list:
 _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
 
-def _bech32m_decode(address: str) -> Tuple[Optional[str], Optional[int], Optional[list]]:
+def _bech32m_decode(address: str) -> tuple[str | None, int | None, list | None]:
     """Decode a bech32 or bech32m address."""
     if any(ord(c) < 33 or ord(c) > 126 for c in address):
         return None, None, None
@@ -120,7 +119,7 @@ def _bech32m_encode(hrp: str, witness_version: int, witness_program: bytes) -> s
     return hrp + "1" + "".join(_BECH32_CHARSET[d] for d in combined + checksum)
 
 
-def _decode_bech32(address: str) -> Tuple[int, bytes]:
+def _decode_bech32(address: str) -> tuple[int, bytes]:
     import bech32
     hrp, witness_version, data_5bit = _bech32m_decode(address)
     if hrp is None or data_5bit is None or witness_version is None:

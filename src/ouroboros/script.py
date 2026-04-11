@@ -17,10 +17,8 @@ Taproot support (BIP 340/341/342):
 import hashlib
 import struct
 from enum import IntEnum
-from typing import List, Tuple, Optional
-from dataclasses import dataclass
 
-from ouroboros.database import Transaction, TxIn
+from ouroboros.database import Transaction
 
 
 class SigVersion(IntEnum):
@@ -55,6 +53,24 @@ SCRIPT_VERIFY_CONST_SCRIPTCODE = (1 << 16)
 SCRIPT_VERIFY_TAPROOT = (1 << 17)        # BIP 341
 SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION = (1 << 18)
 SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS = (1 << 19)
+
+# Flags that are active on mainnet after all softfork activations.
+# Used as the default for _execute_script so unit tests work without
+# having to pass explicit flags.
+SCRIPT_VERIFY_ALL_DEPLOYED = (
+    SCRIPT_VERIFY_P2SH
+    | SCRIPT_VERIFY_STRICTENC
+    | SCRIPT_VERIFY_DERSIG
+    | SCRIPT_VERIFY_LOW_S
+    | SCRIPT_VERIFY_NULLDUMMY
+    | SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
+    | SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
+    | SCRIPT_VERIFY_WITNESS
+    | SCRIPT_VERIFY_MINIMALIF
+    | SCRIPT_VERIFY_NULLFAIL
+    | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
+    | SCRIPT_VERIFY_TAPROOT
+)
 
 # Maximum push data size in bytes
 MAX_SCRIPT_ELEMENT_SIZE = 520
@@ -204,15 +220,18 @@ def _is_push_only(script: bytes) -> bool:
         elif opcode == 0x4c:
             if i >= len(script):
                 return False
-            n = script[i]; i += 1 + n
+            n = script[i]
+            i += 1 + n
         elif opcode == 0x4d:
             if i + 2 > len(script):
                 return False
-            n = int.from_bytes(script[i:i+2], 'little'); i += 2 + n
+            n = int.from_bytes(script[i:i+2], 'little')
+            i += 2 + n
         elif opcode == 0x4e:
             if i + 4 > len(script):
                 return False
-            n = int.from_bytes(script[i:i+4], 'little'); i += 4 + n
+            n = int.from_bytes(script[i:i+4], 'little')
+            i += 4 + n
     return True
 
 
@@ -228,15 +247,18 @@ def _is_push_only_simple(script: bytes) -> bool:
         elif opcode == 0x4c:
             if i >= len(script):
                 return False
-            n = script[i]; i += 1 + n
+            n = script[i]
+            i += 1 + n
         elif opcode == 0x4d:
             if i + 2 > len(script):
                 return False
-            n = int.from_bytes(script[i:i+2], 'little'); i += 2 + n
+            n = int.from_bytes(script[i:i+2], 'little')
+            i += 2 + n
         elif opcode == 0x4e:
             if i + 4 > len(script):
                 return False
-            n = int.from_bytes(script[i:i+4], 'little'); i += 4 + n
+            n = int.from_bytes(script[i:i+4], 'little')
+            i += 4 + n
         elif opcode == 0x4f:
             continue
         elif 0x51 <= opcode <= 0x60:
@@ -308,7 +330,7 @@ def _check_compressed_pubkey(pubkey: bytes) -> bool:
     return len(pubkey) == 33 and pubkey[0] in (0x02, 0x03)
 
 
-def _get_witness_version_and_program(script_pubkey: bytes) -> Optional[Tuple[int, bytes]]:
+def _get_witness_version_and_program(script_pubkey: bytes) -> tuple[int, bytes] | None:
     if len(script_pubkey) < 4 or len(script_pubkey) > 42:
         return None
     version_opcode = script_pubkey[0]
@@ -328,10 +350,10 @@ def _get_witness_version_and_program(script_pubkey: bytes) -> Optional[Tuple[int
 
 class ScriptInterpreter:
     """Interprets and verifies Bitcoin scripts"""
-    
+
     def __init__(self):
         pass
-    
+
     def verify(
         self,
         script_sig: bytes,
@@ -340,8 +362,8 @@ class ScriptInterpreter:
         input_index: int,
         flags: int = SCRIPT_VERIFY_NONE,
         amount: int = 0,
-        input_amounts: Optional[List[int]] = None,
-        input_script_pubkeys: Optional[List[bytes]] = None,
+        input_amounts: list[int] | None = None,
+        input_script_pubkeys: list[bytes] | None = None,
     ) -> bool:
         """
         Verify a script against the consensus rules indicated by *flags*.
@@ -456,11 +478,11 @@ class ScriptInterpreter:
         input_index: int,
         version: int,
         program: bytes,
-        witness: List[bytes],
+        witness: list[bytes],
         flags: int,
         amount: int = 0,
-        input_amounts: Optional[List[int]] = None,
-        input_script_pubkeys: Optional[List[bytes]] = None,
+        input_amounts: list[int] | None = None,
+        input_script_pubkeys: list[bytes] | None = None,
     ) -> bool:
         """Verify a segregated witness program (BIP 141)."""
         if version == 0:
@@ -485,7 +507,7 @@ class ScriptInterpreter:
 
     def _verify_witness_v0_keyhash(
         self, tx: Transaction, input_index: int,
-        keyhash: bytes, witness: List[bytes],
+        keyhash: bytes, witness: list[bytes],
         flags: int, amount: int,
     ) -> bool:
         """P2WPKH: witness = [sig, pubkey], keyhash = HASH160(pubkey)."""
@@ -519,7 +541,7 @@ class ScriptInterpreter:
 
     def _verify_witness_v0_scripthash(
         self, tx: Transaction, input_index: int,
-        scripthash: bytes, witness: List[bytes],
+        scripthash: bytes, witness: list[bytes],
         flags: int, amount: int,
     ) -> bool:
         if len(witness) < 1:
@@ -538,7 +560,7 @@ class ScriptInterpreter:
         if len(stack) != 1:
             return False
         return True
-    
+
     def _compute_segwit_v0_sighash(
         self,
         tx: Transaction,
@@ -612,19 +634,19 @@ class ScriptInterpreter:
         tx: Transaction,
         input_index: int,
         script_pubkey: bytes,
-        flags: int = SCRIPT_VERIFY_NONE,
-        initial_stack: Optional[List[bytes]] = None,
+        flags: int = SCRIPT_VERIFY_ALL_DEPLOYED,
+        initial_stack: list[bytes] | None = None,
         is_witness_v0: bool = False,
         witness_amount: int = 0,
         sig_version: "SigVersion" = SigVersion.BASE,
         # Tapscript-specific parameters (only used when sig_version == TAPSCRIPT)
-        input_amounts: Optional[List[int]] = None,
-        input_script_pubkeys: Optional[List[bytes]] = None,
-        annex: Optional[bytes] = None,
-        leaf_hash: Optional[bytes] = None,
-        default_sighash: Optional[bytes] = None,
+        input_amounts: list[int] | None = None,
+        input_script_pubkeys: list[bytes] | None = None,
+        annex: bytes | None = None,
+        leaf_hash: bytes | None = None,
+        default_sighash: bytes | None = None,
         witness_weight: int = 0,
-    ) -> List[bytes]:
+    ) -> list[bytes]:
         """Execute a Bitcoin script."""
         is_tapscript = sig_version == SigVersion.TAPSCRIPT
 
@@ -665,11 +687,10 @@ class ScriptInterpreter:
                         )
                     return [b"\x01"]  # immediate success
 
-        stack: List[bytes] = list(initial_stack) if initial_stack else []
-        altstack: List[bytes] = []
-        exec_stack: List[bool] = []
+        stack: list[bytes] = list(initial_stack) if initial_stack else []
+        altstack: list[bytes] = []
+        exec_stack: list[bool] = []
         op_count = 0
-        codesep_pos = -1  # updated by OP_CODESEPARATOR
 
         # Tapscript sigops budget (BIP 342): 50 + 50 * witness_weight
         sigops_budget = 50 + witness_weight if is_tapscript else 0
@@ -698,28 +719,35 @@ class ScriptInterpreter:
                 n = opcode
                 if i + n > len(script):
                     raise ValueError("Invalid data push")
-                push_data = script[i:i + n]; i += n
+                push_data = script[i:i + n]
+                i += n
             elif opcode == 0x4c:
                 if i >= len(script):
                     raise ValueError("Invalid OP_PUSHDATA1")
-                n = script[i]; i += 1
+                n = script[i]
+                i += 1
                 if i + n > len(script):
                     raise ValueError("Invalid OP_PUSHDATA1")
-                push_data = script[i:i + n]; i += n
+                push_data = script[i:i + n]
+                i += n
             elif opcode == 0x4d:
                 if i + 2 > len(script):
                     raise ValueError("Invalid OP_PUSHDATA2")
-                n = int.from_bytes(script[i:i + 2], 'little'); i += 2
+                n = int.from_bytes(script[i:i + 2], 'little')
+                i += 2
                 if i + n > len(script):
                     raise ValueError("Invalid OP_PUSHDATA2")
-                push_data = script[i:i + n]; i += n
+                push_data = script[i:i + n]
+                i += n
             elif opcode == 0x4e:
                 if i + 4 > len(script):
                     raise ValueError("Invalid OP_PUSHDATA4")
-                n = int.from_bytes(script[i:i + 4], 'little'); i += 4
+                n = int.from_bytes(script[i:i + 4], 'little')
+                i += 4
                 if i + n > len(script):
                     raise ValueError("Invalid OP_PUSHDATA4")
-                push_data = script[i:i + n]; i += n
+                push_data = script[i:i + n]
+                i += n
 
             if push_data is not None:
                 # PUSH_SIZE check applies even in non-executed branches
@@ -851,7 +879,8 @@ class ScriptInterpreter:
             if opcode == 0x6d:  # OP_2DROP
                 if len(stack) < 2:
                     raise ValueError("OP_2DROP: stack underflow")
-                stack.pop(); stack.pop()
+                stack.pop()
+                stack.pop()
                 continue
             if opcode == 0x6e:  # OP_2DUP
                 if len(stack) < 2:
@@ -1095,7 +1124,6 @@ class ScriptInterpreter:
                 # scripts (pre-SegWit context).
                 if (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE) and sig_version == SigVersion.BASE:
                     raise ValueError("CONST_SCRIPTCODE: OP_CODESEPARATOR in non-witness script")
-                codesep_pos = i  # position after the opcode
                 continue
 
             # Signature verification #
@@ -1257,7 +1285,7 @@ class ScriptInterpreter:
                 except ValueError:
                     raise
                 except Exception:
-                    raise ValueError("OP_CHECKSIGVERIFY failed")
+                    raise ValueError("OP_CHECKSIGVERIFY failed") from None
                 continue
 
             # OP_CHECKSIGADD (0xba) — BIP 342, tapscript only
@@ -1441,7 +1469,7 @@ class ScriptInterpreter:
             raise ValueError("Unbalanced OP_IF/OP_ENDIF")
 
         return stack
-    
+
     @staticmethod
     def _cast_to_bool(data: bytes) -> bool:
         for idx in range(len(data)):
@@ -1454,22 +1482,22 @@ class ScriptInterpreter:
     def _hash160(self, data: bytes) -> bytes:
         sha256_hash = hashlib.sha256(data).digest()
         return hashlib.new('ripemd160', sha256_hash).digest()
-    
+
     def _hash256(self, data: bytes) -> bytes:
         return hashlib.sha256(hashlib.sha256(data).digest()).digest()
-    
+
     def _read_num(self, data: bytes) -> int:
         if not data:
             return 0
         return int.from_bytes(data, 'little')
 
-    def _read_signed_num(self, data: bytes, max_len: int = 4, require_minimal: bool = False) -> int:
+    def _read_signed_num(self, data: bytes, max_len: int = 4, require_minimal: bool = True) -> int:
         if not data:
             return 0
         if len(data) > max_len:
             raise ValueError(f"CScriptNum overflow ({len(data)} > {max_len})")
 
-        # Minimal encoding check
+        # Minimal encoding check (always enforced by default, per Bitcoin Core CScriptNum)
         if require_minimal and len(data) > 0 and (data[-1] & 0x7f) == 0:
             if len(data) <= 1 or not (data[-2] & 0x80):
                 raise ValueError("Non-minimal CScriptNum encoding")
@@ -1530,7 +1558,8 @@ class ScriptInterpreter:
                 continue
             if op <= 0x4e:  # Data push opcodes
                 if op == 0:
-                    cleaned.append(op); pos += 1
+                    cleaned.append(op)
+                    pos += 1
                 elif op <= 75:
                     length = op
                     cleaned.extend(script_code[pos:pos + 1 + length])
@@ -1541,23 +1570,27 @@ class ScriptInterpreter:
                         cleaned.extend(script_code[pos:pos + 2 + length])
                         pos += 2 + length
                     else:
-                        cleaned.append(op); pos += 1
+                        cleaned.append(op)
+                        pos += 1
                 elif op == 0x4d:  # OP_PUSHDATA2
                     if pos + 2 < len(script_code):
                         length = int.from_bytes(script_code[pos+1:pos+3], 'little')
                         cleaned.extend(script_code[pos:pos + 3 + length])
                         pos += 3 + length
                     else:
-                        cleaned.append(op); pos += 1
+                        cleaned.append(op)
+                        pos += 1
                 elif op == 0x4e:  # OP_PUSHDATA4
                     if pos + 4 < len(script_code):
                         length = int.from_bytes(script_code[pos+1:pos+5], 'little')
                         cleaned.extend(script_code[pos:pos + 5 + length])
                         pos += 5 + length
                     else:
-                        cleaned.append(op); pos += 1
+                        cleaned.append(op)
+                        pos += 1
             else:
-                cleaned.append(op); pos += 1
+                cleaned.append(op)
+                pos += 1
         script_code = bytes(cleaned)
 
         base_type = sighash_type & 0x1f
@@ -1611,7 +1644,7 @@ class ScriptInterpreter:
         data.extend((sighash_type & 0xFFFFFFFF).to_bytes(4, 'little'))
 
         return hashlib.sha256(hashlib.sha256(bytes(data)).digest()).digest()
-    
+
     @staticmethod
     def _lax_der_to_compact(der_sig: bytes, normalize_s: bool = True):
         """Parse a lax DER signature into 64-byte compact R||S format."""
@@ -1635,10 +1668,12 @@ class ScriptInterpreter:
                 r_len = int.from_bytes(der_sig[pos:pos + num_len_bytes], 'big')
                 pos += num_len_bytes
             else:
-                r_len = der_sig[pos]; pos += 1
+                r_len = der_sig[pos]
+                pos += 1
             if pos + r_len > len(der_sig):
                 return None
-            r_bytes = der_sig[pos:pos + r_len]; pos += r_len
+            r_bytes = der_sig[pos:pos + r_len]
+            pos += r_len
             if pos >= len(der_sig) or der_sig[pos] != 0x02:
                 return None
             pos += 1
@@ -1653,7 +1688,8 @@ class ScriptInterpreter:
                 s_len = int.from_bytes(der_sig[pos:pos + num_len_bytes], 'big')
                 pos += num_len_bytes
             else:
-                s_len = der_sig[pos]; pos += 1
+                s_len = der_sig[pos]
+                pos += 1
             if pos + s_len > len(der_sig):
                 return None
             s_bytes = der_sig[pos:pos + s_len]
@@ -1700,7 +1736,7 @@ class ScriptInterpreter:
             compact = self._lax_der_to_compact(der_sig, normalize_s=False)
             if compact is not None:
                 try:
-                    from coincurve.ecdsa import deserialize_compact, cdata_to_der
+                    from coincurve.ecdsa import cdata_to_der, deserialize_compact
                     raw_sig = deserialize_compact(compact)
                     canonical_der = cdata_to_der(raw_sig)
                     if pk.verify(canonical_der, message_hash, hasher=None):
@@ -1711,7 +1747,7 @@ class ScriptInterpreter:
             compact_norm = self._lax_der_to_compact(der_sig, normalize_s=True)
             if compact_norm is not None and compact_norm != compact:
                 try:
-                    from coincurve.ecdsa import deserialize_compact, cdata_to_der
+                    from coincurve.ecdsa import cdata_to_der, deserialize_compact
                     raw_sig2 = deserialize_compact(compact_norm)
                     canonical_der2 = cdata_to_der(raw_sig2)
                     if pk.verify(canonical_der2, message_hash, hasher=None):
@@ -1726,8 +1762,8 @@ class ScriptInterpreter:
 
     def _verify_multisig(
         self,
-        sigs: List[bytes],
-        pubkeys: List[bytes],
+        sigs: list[bytes],
+        pubkeys: list[bytes],
         k: int,
         tx: Transaction,
         input_index: int,
@@ -1830,10 +1866,10 @@ class ScriptInterpreter:
         self,
         tx: Transaction,
         input_index: int,
-        witness: List[bytes],
+        witness: list[bytes],
         script_pubkey: bytes,
-        input_amounts: Optional[List[int]] = None,
-        input_script_pubkeys: Optional[List[bytes]] = None,
+        input_amounts: list[int] | None = None,
+        input_script_pubkeys: list[bytes] | None = None,
         flags: int = SCRIPT_VERIFY_NONE,
     ) -> bool:
         """
@@ -1879,9 +1915,9 @@ class ScriptInterpreter:
         input_index: int,
         sig_element: bytes,
         output_pubkey: bytes,
-        input_amounts: Optional[List[int]] = None,
-        input_script_pubkeys: Optional[List[bytes]] = None,
-        annex: Optional[bytes] = None,
+        input_amounts: list[int] | None = None,
+        input_script_pubkeys: list[bytes] | None = None,
+        annex: bytes | None = None,
     ) -> bool:
         """Key-path spend: witness is a single Schnorr signature (64 or 65 bytes)."""
         sighash_type = 0x00
@@ -1907,11 +1943,11 @@ class ScriptInterpreter:
         self,
         tx: Transaction,
         input_index: int,
-        witness: List[bytes],
+        witness: list[bytes],
         output_pubkey: bytes,
-        input_amounts: Optional[List[int]] = None,
-        input_script_pubkeys: Optional[List[bytes]] = None,
-        annex: Optional[bytes] = None,
+        input_amounts: list[int] | None = None,
+        input_script_pubkeys: list[bytes] | None = None,
+        annex: bytes | None = None,
         flags: int = SCRIPT_VERIFY_NONE,
     ) -> bool:
         """Script-path spend: witness = [...script_inputs, tapscript, control_block]."""
@@ -2005,7 +2041,7 @@ class ScriptInterpreter:
 
     def _taproot_tweak_pubkey(
         self, internal_key: bytes, tweak: bytes
-    ) -> Optional[Tuple[bytes, int]]:
+    ) -> tuple[bytes, int] | None:
         try:
             from coincurve import PublicKeyXOnly
             pk = PublicKeyXOnly(internal_key)
@@ -2044,11 +2080,11 @@ class ScriptInterpreter:
         input_index: int,
         sighash_type: int,
         *,
-        input_amounts: Optional[List[int]] = None,
-        input_script_pubkeys: Optional[List[bytes]] = None,
-        annex: Optional[bytes] = None,
+        input_amounts: list[int] | None = None,
+        input_script_pubkeys: list[bytes] | None = None,
+        annex: bytes | None = None,
         ext_flag: int = 0,
-        tap_leaf_hash: Optional[bytes] = None,
+        tap_leaf_hash: bytes | None = None,
     ) -> bytes:
         """Compute the signature hash for a Taproot spend (BIP 341 §4)."""
         # Determine hash type components
@@ -2160,17 +2196,17 @@ class ScriptInterpreter:
     def _execute_tapscript(
         self,
         script: bytes,
-        witness_inputs: List[bytes],
+        witness_inputs: list[bytes],
         tx: Transaction,
         input_index: int,
         default_sighash: bytes,
-        input_amounts: Optional[List[int]] = None,
-        input_script_pubkeys: Optional[List[bytes]] = None,
-        annex: Optional[bytes] = None,
-        leaf_hash: Optional[bytes] = None,
+        input_amounts: list[int] | None = None,
+        input_script_pubkeys: list[bytes] | None = None,
+        annex: bytes | None = None,
+        leaf_hash: bytes | None = None,
     ) -> bool:
         """Execute a tapscript (BIP 342)."""
-        stack: List[bytes] = list(witness_inputs)
+        stack: list[bytes] = list(witness_inputs)
         op_count = 0
         max_ops = 201
 
@@ -2192,18 +2228,22 @@ class ScriptInterpreter:
             if opcode == 0x4c:  # OP_PUSHDATA1
                 if i >= len(script):
                     return False
-                dlen = script[i]; i += 1
+                dlen = script[i]
+                i += 1
                 if i + dlen > len(script):
                     return False
-                stack.append(script[i:i + dlen]); i += dlen
+                stack.append(script[i:i + dlen])
+                i += dlen
                 continue
             if opcode == 0x4d:  # OP_PUSHDATA2
                 if i + 2 > len(script):
                     return False
-                dlen = int.from_bytes(script[i:i+2], 'little'); i += 2
+                dlen = int.from_bytes(script[i:i+2], 'little')
+                i += 2
                 if i + dlen > len(script):
                     return False
-                stack.append(script[i:i + dlen]); i += dlen
+                stack.append(script[i:i + dlen])
+                i += dlen
                 continue
 
             if opcode == 0x00:  # OP_0
@@ -2215,34 +2255,41 @@ class ScriptInterpreter:
 
             # OP_DUP
             if opcode == 0x76:
-                if not stack: return False
+                if not stack:
+                    return False
                 stack.append(stack[-1])
                 continue
             # OP_DROP
             if opcode == 0x75:
-                if not stack: return False
+                if not stack:
+                    return False
                 stack.pop()
                 continue
             # OP_EQUAL
             if opcode == 0x87:
-                if len(stack) < 2: return False
+                if len(stack) < 2:
+                    return False
                 a, b = stack.pop(), stack.pop()
                 stack.append(b'\x01' if a == b else b'')
                 continue
             # OP_EQUALVERIFY
             if opcode == 0x88:
-                if len(stack) < 2: return False
-                if stack.pop() != stack.pop(): return False
+                if len(stack) < 2:
+                    return False
+                if stack.pop() != stack.pop():
+                    return False
                 continue
             # OP_HASH160
             if opcode == 0xa9:
-                if not stack: return False
+                if not stack:
+                    return False
                 stack.append(self._hash160(stack.pop()))
                 continue
 
             # OP_CHECKSIG — Schnorr in tapscript
             if opcode == 0xac:
-                if len(stack) < 2: return False
+                if len(stack) < 2:
+                    return False
                 pubkey = stack.pop()
                 sig = stack.pop()
                 if not sig:
@@ -2280,7 +2327,8 @@ class ScriptInterpreter:
 
             # OP_CHECKSIGVERIFY
             if opcode == 0xad:
-                if len(stack) < 2: return False
+                if len(stack) < 2:
+                    return False
                 pubkey = stack.pop()
                 sig = stack.pop()
                 if len(pubkey) != 32 or not sig:
@@ -2288,8 +2336,10 @@ class ScriptInterpreter:
                 sighash_type = 0x00
                 raw_sig = sig
                 if len(sig) == 65:
-                    sighash_type = sig[-1]; raw_sig = sig[:-1]
-                    if sighash_type == 0x00: return False
+                    sighash_type = sig[-1]
+                    raw_sig = sig[:-1]
+                    if sighash_type == 0x00:
+                        return False
                 elif len(sig) != 64:
                     return False
                 sh = default_sighash if sighash_type == 0x00 else self._compute_taproot_sighash(
@@ -2304,7 +2354,8 @@ class ScriptInterpreter:
 
             # OP_CHECKSIGADD (0xba) — BIP 342
             if opcode == 0xba:
-                if len(stack) < 3: return False
+                if len(stack) < 3:
+                    return False
                 pubkey = stack.pop()
                 n = self._read_num(stack.pop())
                 sig = stack.pop()
@@ -2318,8 +2369,10 @@ class ScriptInterpreter:
                 sighash_type = 0x00
                 raw_sig = sig
                 if len(sig) == 65:
-                    sighash_type = sig[-1]; raw_sig = sig[:-1]
-                    if sighash_type == 0x00: return False
+                    sighash_type = sig[-1]
+                    raw_sig = sig[:-1]
+                    if sighash_type == 0x00:
+                        return False
                 elif len(sig) != 64:
                     return False
 
@@ -2380,23 +2433,23 @@ _TAPSCRIPT_OP_SUCCESS = frozenset(
 def disassemble_script(script: bytes) -> str:
     """
     Disassemble Bitcoin script to human-readable ASM format.
-    
+
     Args:
         script: Script bytes
-        
+
     Returns:
         Human-readable script assembly (e.g., "OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG")
     """
     if not script:
         return ""
-    
+
     asm_parts = []
     i = 0
-    
+
     while i < len(script):
         opcode = script[i]
         i += 1
-        
+
         # Data push opcodes
         if opcode == 0x00:
             asm_parts.append("OP_0")
@@ -2442,7 +2495,7 @@ def disassemble_script(script: bytes) -> str:
             # Opcode name
             opcode_name = _get_opcode_name(opcode)
             asm_parts.append(opcode_name)
-    
+
     return " ".join(asm_parts)
 
 

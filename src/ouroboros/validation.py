@@ -1,15 +1,19 @@
 """Block and transaction validation logic."""
 
-from typing import Dict, Tuple, List
 import hashlib
 import logging
-import time as _time
-from ouroboros.database import BlockchainDatabase, Transaction, TxIn, TxOut, Block
 import struct
+import time as _time
+
+from ouroboros.database import Block, BlockchainDatabase, Transaction, TxIn, TxOut
 from ouroboros.script import (
-    ScriptInterpreter, get_flags_for_height,
-    SCRIPT_VERIFY_NONE, SCRIPT_VERIFY_WITNESS,
-    SCRIPT_VERIFY_P2SH, SCRIPT_VERIFY_DERSIG, SCRIPT_VERIFY_NULLDUMMY,
+    SCRIPT_VERIFY_DERSIG,
+    SCRIPT_VERIFY_NONE,
+    SCRIPT_VERIFY_NULLDUMMY,
+    SCRIPT_VERIFY_P2SH,
+    SCRIPT_VERIFY_WITNESS,
+    ScriptInterpreter,
+    get_flags_for_height,
 )
 from ouroboros.sig_cache import SigCache
 
@@ -271,8 +275,8 @@ class BlockValidator:
         self.db = db
         self.network = network
         self.tx_validator = TransactionValidator(db, network)
-    
-    def validate_block(self, block: Block, known_height: int = 0) -> Tuple[bool, str]:
+
+    def validate_block(self, block: Block, known_height: int = 0) -> tuple[bool, str]:
         """Fully validate *block* (header, merkle root, weight, scripts); returns ``(ok, error_message)``.
 
         *known_height*: if >0, use this as the block's height instead of
@@ -373,7 +377,7 @@ class BlockValidator:
         # Build a temporary view of outputs created by earlier txs in this
         # block so that intra-block dependencies (tx N spending tx M's
         # output where M < N) can be resolved.
-        intra_block_utxos: Dict[Tuple[bytes, int], Dict] = {}
+        intra_block_utxos: dict[tuple[bytes, int], dict] = {}
         total_fees = 0
         for i, tx in enumerate(block.transactions):
             if i == 0:  # Coinbase
@@ -413,21 +417,21 @@ class BlockValidator:
             total_fees
         ):
             return False, "Coinbase amount invalid"
-        
+
         return True, ""
-    
+
     def apply_block(self, block: Block) -> None:
         """Apply *block*'s UTXO effects to the database (spend inputs, create outputs)."""
         spent = []
         created = []
-        
+
         # Collect spent and created UTXOs
         for tx in block.transactions:
             # Spent outputs (except coinbase)
             if not tx.is_coinbase:
                 for tx_in in tx.inputs:
                     spent.append((tx_in.prev_txid, tx_in.prev_vout))
-            
+
             # Created outputs
             for i, tx_out in enumerate(tx.outputs):
                 created.append({
@@ -436,14 +440,14 @@ class BlockValidator:
                     'value': tx_out.value,
                     'script_pubkey': tx_out.script_pubkey,
                 })
-        
+
         # Atomic update
         self.db.update_utxo_set(spent, created)
         # Note: Blocks are stored via the Rust API during sync (FastSync/BlockSync).
         # The Python store_block() method is not implemented because it requires
         # reconstructing the Rust BlockWrapper, which is complex. Blocks are
         # automatically stored when syncing via the Rust layer.
-    
+
     def _validate_header(
         self,
         block: Block,
@@ -571,7 +575,7 @@ class BlockValidator:
         return valid
 
     def _calculate_merkle_root_checked(
-        self, txids: List[bytes]
+        self, txids: list[bytes]
     ) -> tuple:
         """Calculate merkle root and detect malleation."""
         if not txids:
@@ -611,12 +615,12 @@ class BlockValidator:
 
         return level[0], mutated
 
-    def _calculate_merkle_root(self, txids: List[bytes]) -> bytes:
+    def _calculate_merkle_root(self, txids: list[bytes]) -> bytes:
         root, _ = self._calculate_merkle_root_checked(txids)
         return root
 
     # Block weight / sigops
-    def _validate_block_limits(self, block: Block) -> Tuple[bool, str]:
+    def _validate_block_limits(self, block: Block) -> tuple[bool, str]:
         """Validate block weight and sigops cost limits."""
         total_weight = 0
         total_sigops_cost = 0
@@ -702,14 +706,14 @@ class BlockValidator:
         return None
 
     def _calculate_witness_merkle_root(self, block: Block) -> bytes:
-        wtxids: List[bytes] = [bytes(32)]  # coinbase → null hash
+        wtxids: list[bytes] = [bytes(32)]  # coinbase → null hash
         for tx in block.transactions[1:]:
             wtxids.append(tx.get_wtxid())
         return self._calculate_merkle_root(wtxids)
 
     def _validate_witness_commitment(
         self, block: Block, height: int
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """Validate the SegWit witness commitment in the coinbase."""
         activation = self._SEGWIT_ACTIVATION.get(self.network, 481_824)
         if height < activation:
@@ -743,19 +747,19 @@ class BlockValidator:
         # Check it's actually a coinbase
         if not tx.is_coinbase:
             return False
-        
+
         # Check coinbase input
         if len(tx.inputs) != 1:
             return False
-        
+
         coinbase_input = tx.inputs[0]
         if coinbase_input.prev_txid != bytes(32):
             return False
-        
+
         # Check coinbase has at least one output
         if len(tx.outputs) == 0:
             return False
-        
+
         # Coinbase scriptSig must be 2-100 bytes (consensus rule)
         sig_len = len(coinbase_input.script_sig)
         if sig_len < 2 or sig_len > 100:
@@ -782,7 +786,7 @@ class BlockValidator:
                 return False
 
         return True
-    
+
     def _verify_coinbase_amount(
         self,
         coinbase_tx: Transaction,
@@ -791,23 +795,23 @@ class BlockValidator:
     ) -> bool:
         block_subsidy = self._calculate_block_subsidy(height)
         expected_amount = block_subsidy + total_fees
-        
+
         total_output = sum(out.value for out in coinbase_tx.outputs)
-        
+
         # Coinbase amount must not exceed subsidy + fees (miners may underpay)
         return total_output <= expected_amount
-    
+
     def _calculate_block_subsidy(self, height: int) -> int:
         halvings = height // 210000
         if halvings >= 64:
             return 0
         return 50 * 100_000_000 >> halvings
-    
+
     # Signet block solution (BIP 325)
 
     def _validate_signet_solution(
         self, block: Block, height: int
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """Validate the signet block signature (BIP 325)."""
         if self.network != "signet":
             return True, ""
@@ -1085,7 +1089,7 @@ class BlockValidator:
                 utxo = intra_block_utxos.get((tx_in.prev_txid, tx_in.prev_vout))
             if utxo:
                 total_input += utxo['value']
-        
+
         total_output = sum(out.value for out in tx.outputs)
         fee = total_input - total_output
         if fee < 0 or fee > MAX_MONEY:
@@ -1106,7 +1110,7 @@ class TransactionValidator:
         block_hash: bytes | None = None,
         intra_block_utxos: dict | None = None,
         skip_scripts: bool = False,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """Validate *tx* at *height* (structure, inputs, locktime, scripts); returns ``(ok, error_message)``.
 
         When *skip_scripts* is True (assume-valid during IBD), signature and
@@ -1127,10 +1131,10 @@ class TransactionValidator:
         #    needs the complete list of input amounts and scriptPubKeys
         #    before verifying ANY individual input.
         total_input = 0
-        input_utxos: List[dict] = []
-        input_amounts: List[int] = []
-        input_script_pubkeys: List[bytes] = []
-        for i, tx_in in enumerate(tx.inputs):
+        input_utxos: list[dict] = []
+        input_amounts: list[int] = []
+        input_script_pubkeys: list[bytes] = []
+        for _, tx_in in enumerate(tx.inputs):
             utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
             if utxo is None and intra_block_utxos:
                 utxo = intra_block_utxos.get((tx_in.prev_txid, tx_in.prev_vout))
@@ -1163,7 +1167,7 @@ class TransactionValidator:
                     return False, f"Invalid signature for input {i}"
 
             total_input += utxo['value']
-        
+
         # 4. Check amounts (consensus: inputs must cover outputs)
         if total_input > MAX_MONEY:
             return False, f"Total input {total_input} exceeds MAX_MONEY"
@@ -1172,11 +1176,11 @@ class TransactionValidator:
             return False, f"Outputs exceed inputs: {total_output} > {total_input}"
 
         # 5. BIP 68 relative lock-time
-        if not self.check_sequence_locks(tx, height, block_mtp, intra_block_utxos=intra_block_utxos):
+        if not self.check_sequence_locks(tx, height, block_mtp, network=self.network, intra_block_utxos=intra_block_utxos):
             return False, "BIP 68 sequence lock not satisfied"
-        
+
         return True, ""
-    
+
     @staticmethod
     def _is_final_tx(tx: Transaction, block_height: int, block_mtp: int) -> bool:
         LOCKTIME_THRESHOLD = 500_000_000
@@ -1203,19 +1207,19 @@ class TransactionValidator:
         # Check version is valid
         if tx.version < 1 or tx.version > 2:
             return False
-        
+
         # Check we have at least one input (unless coinbase)
         if len(tx.inputs) == 0:
             return False
-        
+
         # Check we have at least one output
         if len(tx.outputs) == 0:
             return False
-        
+
         # Check locktime is valid
         if tx.locktime < 0 or tx.locktime > 0xffffffff:
             return False
-        
+
         # Check all outputs have valid values and total doesn't overflow
         total_out = 0
         for out in tx.outputs:
@@ -1234,7 +1238,7 @@ class TransactionValidator:
             seen_inputs.add(outpoint)
 
         return True
-    
+
     def _verify_input_signature(
         self,
         tx: Transaction,
@@ -1242,8 +1246,8 @@ class TransactionValidator:
         utxo: dict,
         input_index: int,
         flags: int = SCRIPT_VERIFY_NONE,
-        input_amounts: List[int] = None,
-        input_script_pubkeys: List[bytes] = None,
+        input_amounts: list[int] = None,
+        input_script_pubkeys: list[bytes] = None,
     ) -> bool:
         # Build cache key: (txid_hex, input_index, flags)
         txid_hex = tx.get_txid().hex()
@@ -1270,7 +1274,7 @@ class TransactionValidator:
             SIG_CACHE.insert(cache_key)
 
         return result
-    
+
     # BIP 68 constants
     SEQUENCE_DISABLE = 1 << 31       # 0x80000000
     SEQUENCE_TYPE    = 1 << 22       # 0x00400000  (time-based if set)
@@ -1297,7 +1301,8 @@ class TransactionValidator:
 
         # Check if BIP68 is active at this height
         try:
-            from sync import is_bip68_active, check_sequence_locks as rust_check_sequence_locks
+            from sync import check_sequence_locks as rust_check_sequence_locks
+            from sync import is_bip68_active
             enforce_bip68 = is_bip68_active(block_height, network)
         except ImportError:
             # Fall back to Python implementation if Rust module unavailable
@@ -1384,15 +1389,15 @@ class TransactionValidator:
     def _calculate_min_fee(self, tx: Transaction) -> int:
         # Get transaction size in bytes
         tx_size = len(tx.serialize())
-        
+
         # Minimum fee: 1 satoshi per vbyte
         # For simplicity, we use bytes (vbytes would require segwit calculation)
         min_fee = tx_size  # 1 sat/vbyte
-        
+
         # Minimum fee floor (dust threshold)
         if min_fee < 1000:  # 1000 satoshis minimum
             min_fee = 1000
-        
+
         return min_fee
 
 

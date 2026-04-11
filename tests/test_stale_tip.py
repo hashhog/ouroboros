@@ -8,17 +8,15 @@ EvictExtraOutboundPeers()
 import asyncio
 import time
 import unittest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from ouroboros.sync_manager import (
-    StaleTipDetector,
-    PeerChainSyncState,
+    MAX_OUTBOUND_FULL_RELAY_CONNECTIONS,
+    MINIMUM_CONNECT_TIME,
     STALE_TIP_AGE_THRESHOLD,
     STALE_TIP_TIMESTAMP_THRESHOLD,
-    CHAIN_SYNC_TIMEOUT,
-    HEADERS_RESPONSE_TIME,
-    MINIMUM_CONNECT_TIME,
-    MAX_OUTBOUND_FULL_RELAY_CONNECTIONS,
+    PeerChainSyncState,
+    StaleTipDetector,
 )
 
 
@@ -368,7 +366,7 @@ class TestEvictExtraOutboundPeers(unittest.TestCase):
 
         now = time.time()
         # All peers have minimum connect time
-        for addr, peer in pm.peers.items():
+        for _, peer in pm.peers.items():
             peer.connected_at = now - MINIMUM_CONNECT_TIME - 10
 
         # Set block times - oldest is 10.0.0.5
@@ -399,7 +397,7 @@ class TestEvictExtraOutboundPeers(unittest.TestCase):
 
         now = time.time()
         # All peers just connected (below minimum time)
-        for addr, peer in pm.peers.items():
+        for _addr, peer in pm.peers.items():
             peer.connected_at = now - 5  # Only 5 seconds
 
         loop = asyncio.new_event_loop()

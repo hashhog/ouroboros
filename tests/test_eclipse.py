@@ -9,16 +9,15 @@ import json
 import os
 import tempfile
 import time
-import pytest
 
 from ouroboros.addrman import (
-    AddressManager,
-    AddrInfo,
-    get_network_group,
     NEW_BUCKET_COUNT,
     NEW_BUCKET_SIZE,
     TRIED_BUCKET_COUNT,
     TRIED_BUCKET_SIZE,
+    AddressManager,
+    AddrInfo,
+    get_network_group,
 )
 
 

@@ -32,9 +32,9 @@ Reference:
 from __future__ import annotations
 
 import hashlib
-import io
+import os
 import struct
-from typing import List, Optional, Set, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from ouroboros.compact_blocks import _siphash_2_4
 
@@ -147,7 +147,7 @@ class _BitReader:
 # Golomb-Rice coding
 # ---------------------------------------------------------------------------
 
-def _golomb_rice_encode(deltas: List[int], p: int) -> bytes:
+def _golomb_rice_encode(deltas: list[int], p: int) -> bytes:
     w = _BitWriter()
     for d in deltas:
         q = d >> p
@@ -161,9 +161,9 @@ def _golomb_rice_encode(deltas: List[int], p: int) -> bytes:
     return w.flush()
 
 
-def _golomb_rice_decode(data: bytes, n: int, p: int) -> List[int]:
+def _golomb_rice_decode(data: bytes, n: int, p: int) -> list[int]:
     reader = _BitReader(data)
-    deltas: List[int] = []
+    deltas: list[int] = []
     for _ in range(n):
         # Read unary quotient
         q = 0
@@ -195,7 +195,7 @@ def _hash_to_range(key: bytes, item: bytes, f: int) -> int:
 
 
 def construct_gcs_filter(
-    items: List[bytes],
+    items: list[bytes],
     key: bytes,
     p: int = GCS_P,
     m: int = GCS_M,
@@ -211,7 +211,7 @@ def construct_gcs_filter(
     hashed = sorted(_hash_to_range(key, item, f) for item in items)
 
     # Step 2: Compute deltas between consecutive sorted values
-    deltas: List[int] = []
+    deltas: list[int] = []
     prev = 0
     for val in hashed:
         deltas.append(val - prev)
@@ -259,7 +259,7 @@ def gcs_match(
 def gcs_match_any(
     filter_bytes: bytes,
     key: bytes,
-    targets: List[bytes],
+    targets: list[bytes],
     p: int = GCS_P,
     m: int = GCS_M,
 ) -> bool:
@@ -277,7 +277,7 @@ def gcs_match_any(
     f = n * m
 
     # Hash and sort all targets
-    target_vals = sorted(set(_hash_to_range(key, t, f) for t in targets))
+    target_vals = sorted({_hash_to_range(key, t, f) for t in targets})
 
     # Decode the filter and walk both sorted lists
     encoded_data = filter_bytes[offset:]
@@ -306,9 +306,9 @@ def _is_op_return(script: bytes) -> bool:
 
 
 def collect_block_scripts(
-    block: "Block",
-    db: Optional["BlockchainDatabase"] = None,
-) -> List[bytes]:
+    block: Block,
+    db: BlockchainDatabase | None = None,
+) -> list[bytes]:
     """
     Collect the scriptPubKeys that go into a basic block filter.
 
@@ -322,7 +322,7 @@ def collect_block_scripts(
     Duplicate scripts are kept (deduplication happens during GCS hashing
     via the ``set`` built into ``build_basic_filter``).
     """
-    scripts: List[bytes] = []
+    scripts: list[bytes] = []
 
     for tx in block.transactions:
         # --- Outputs ---
@@ -346,8 +346,8 @@ def collect_block_scripts(
 
 
 def build_basic_filter(
-    block: "Block",
-    db: Optional["BlockchainDatabase"] = None,
+    block: Block,
+    db: BlockchainDatabase | None = None,
 ) -> bytes:
     """Build a BIP 158 basic block filter for *block*.
 
@@ -356,7 +356,7 @@ def build_basic_filter(
     scripts = collect_block_scripts(block, db)
 
     # Deduplicate
-    unique_scripts: List[bytes] = list(set(scripts))
+    unique_scripts: list[bytes] = list(set(scripts))
 
     # Derive SipHash key from block hash
     key = _block_filter_siphash_key(block.hash)
@@ -420,9 +420,9 @@ class BlockFilterIndex:
 
     def add(
         self,
-        block: "Block",
-        db: Optional["BlockchainDatabase"] = None,
-        prev_header: Optional[bytes] = None,
+        block: Block,
+        db: BlockchainDatabase | None = None,
+        prev_header: bytes | None = None,
     ) -> tuple[bytes, bytes]:
         """Build, store, and return ``(filter_bytes, filter_header)`` for *block*."""
         filt = build_basic_filter(block, db)
@@ -441,15 +441,15 @@ class BlockFilterIndex:
 
         return filt, fheader
 
-    def get_filter(self, block_hash: bytes) -> Optional[bytes]:
+    def get_filter(self, block_hash: bytes) -> bytes | None:
         """Return the raw filter for *block_hash*, or None."""
         return self._filters.get(block_hash)
 
-    def get_header(self, block_hash: bytes) -> Optional[bytes]:
+    def get_header(self, block_hash: bytes) -> bytes | None:
         """Return the filter header for *block_hash*, or None."""
         return self._headers.get(block_hash)
 
-    def get_by_height(self, height: int) -> Optional[tuple[bytes, bytes]]:
+    def get_by_height(self, height: int) -> tuple[bytes, bytes] | None:
         """Return ``(filter, header)`` for a block at *height*, or None."""
         bh = self._height_to_hash.get(height)
         if bh is None:
@@ -532,10 +532,7 @@ class PersistentBlockFilterIndex:
 
         # Import here to avoid circular imports and allow graceful fallback
         try:
-            import sync
             # Open a dedicated database for block filters
-            # We use sync.PyBlockchainDB for RocksDB access
-            import os
             filter_db_path = os.path.join(data_dir, "blockfilter")
             os.makedirs(filter_db_path, exist_ok=True)
 
@@ -572,9 +569,9 @@ class PersistentBlockFilterIndex:
 
     def add(
         self,
-        block: "Block",
-        db: Optional["BlockchainDatabase"] = None,
-        prev_header: Optional[bytes] = None,
+        block: Block,
+        db: BlockchainDatabase | None = None,
+        prev_header: bytes | None = None,
     ) -> tuple[bytes, bytes]:
         """Build, store, and return ``(filter_bytes, filter_header)`` for *block*."""
         if self._memory_index is not None:
@@ -630,7 +627,7 @@ class PersistentBlockFilterIndex:
         with open(tip_path, 'wb') as f:
             f.write(header)
 
-    def get_filter(self, block_hash: bytes) -> Optional[bytes]:
+    def get_filter(self, block_hash: bytes) -> bytes | None:
         """Return the raw filter for *block_hash*, or None."""
         if self._memory_index is not None:
             return self._memory_index.get_filter(block_hash)
@@ -643,7 +640,7 @@ class PersistentBlockFilterIndex:
         except FileNotFoundError:
             return None
 
-    def get_header(self, block_hash: bytes) -> Optional[bytes]:
+    def get_header(self, block_hash: bytes) -> bytes | None:
         """Return the filter header for *block_hash*, or None."""
         if self._memory_index is not None:
             return self._memory_index.get_header(block_hash)
@@ -656,7 +653,7 @@ class PersistentBlockFilterIndex:
         except FileNotFoundError:
             return None
 
-    def get_by_height(self, height: int) -> Optional[tuple[bytes, bytes]]:
+    def get_by_height(self, height: int) -> tuple[bytes, bytes] | None:
         """Return ``(filter, header)`` for a block at *height*, or None."""
         if self._memory_index is not None:
             return self._memory_index.get_by_height(height)
@@ -684,7 +681,7 @@ class PersistentBlockFilterIndex:
             return self._memory_index.tip_header
         return self._get_tip_header()
 
-    def remove(self, block_hash: bytes, height: Optional[int] = None) -> bool:
+    def remove(self, block_hash: bytes, height: int | None = None) -> bool:
         """
         Remove a filter entry (used during disconnect_block for reorgs).
 
@@ -735,6 +732,3 @@ class PersistentBlockFilterIndex:
         else:
             self._set_tip_header(prev_header)
 
-
-# Import os at module level for PersistentBlockFilterIndex
-import os

@@ -9,12 +9,12 @@ import pytest
 # Import sync module (built with maturin)
 try:
     from sync import (
-        get_deployment_state,
+        check_version_signal,
         get_all_deployments_info,
+        get_deployment_state,
         is_deployment_active,
         versionbits_top_bits,
         versionbits_top_mask,
-        check_version_signal,
     )
     HAS_SYNC = True
 except ImportError:

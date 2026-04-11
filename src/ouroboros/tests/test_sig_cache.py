@@ -4,18 +4,18 @@ Test signature verification cache.
 Verifies SigCache behavior: lookup, insert, eviction, clear, and thread safety.
 """
 
-import unittest
-import threading
 import random
+import sys
+import threading
+import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import sys
 
 # Add src to path
 src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
-from ouroboros.sig_cache import SigCache
+from ouroboros.sig_cache import SigCache  # noqa: E402
 
 
 class TestSigCacheBasic(unittest.TestCase):

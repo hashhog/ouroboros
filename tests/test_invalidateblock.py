@@ -7,10 +7,9 @@ manual chain reorganization for testing and emergency intervention.
 Reference: Bitcoin Core validation.cpp InvalidateBlock(), ReconsiderBlock()
 """
 
-import pytest
 import tempfile
-import os
-from pathlib import Path
+
+import pytest
 
 # Import the sync module (Rust extension)
 try:

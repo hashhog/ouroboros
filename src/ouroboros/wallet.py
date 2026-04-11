@@ -23,12 +23,11 @@ import random
 import struct
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import base58
 import bech32
 from coincurve import PrivateKey, PublicKey
-
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -86,7 +85,7 @@ def decrypt_wallet_data(blob: bytes, passphrase: str) -> bytes:
     try:
         return AESGCM(key).decrypt(nonce, ciphertext, None)
     except Exception:
-        raise ValueError("Decryption failed (wrong passphrase or corrupt data)")
+        raise ValueError("Decryption failed (wrong passphrase or corrupt data)") from None
 
 
 def _hash160(data: bytes) -> bytes:
@@ -130,12 +129,12 @@ def _estimate_fee(n_inputs: int, n_outputs: int, fee_rate: float) -> int:
 
 
 def select_coins_bnb(
-    utxos: List[Dict],
+    utxos: list[dict],
     target: int,
     fee_rate: float,
     *,
-    cost_of_change: Optional[int] = None,
-) -> Optional[List[Dict]]:
+    cost_of_change: int | None = None,
+) -> list[dict] | None:
     """
     Branch-and-Bound coin selection (exact match, no change output).
 
@@ -154,9 +153,9 @@ def select_coins_bnb(
     if n == 0:
         return None
 
-    best: Optional[List[int]] = None
+    best: list[int] | None = None
     best_waste = float("inf")
-    current: List[int] = []
+    current: list[int] = []
     current_value = 0
     tries = 0
 
@@ -211,12 +210,12 @@ def select_coins_bnb(
 
 
 def select_coins_knapsack(
-    utxos: List[Dict],
+    utxos: list[dict],
     target: int,
     fee_rate: float,
     *,
     iterations: int = 1000,
-) -> Optional[List[Dict]]:
+) -> list[dict] | None:
     """
     Knapsack coin selection (randomised approximation).
 
@@ -236,7 +235,7 @@ def select_coins_knapsack(
     if total_eff < target:
         return None
 
-    best_selection: Optional[List[Dict]] = None
+    best_selection: list[dict] | None = None
     best_overshoot = float("inf")
 
     # Check if any single UTXO covers the target exactly or near-exactly
@@ -248,7 +247,7 @@ def select_coins_knapsack(
                 best_selection = [u]
 
     for _ in range(iterations):
-        selected: List[Dict] = []
+        selected: list[dict] = []
         selected_value = 0
 
         shuffled = list(effective)
@@ -271,10 +270,10 @@ def select_coins_knapsack(
 
 
 def select_coins_srd(
-    utxos: List[Dict],
+    utxos: list[dict],
     target: int,
     fee_rate: float,
-) -> Optional[List[Dict]]:
+) -> list[dict] | None:
     """
     Single Random Draw coin selection (last-resort fallback).
 
@@ -287,7 +286,7 @@ def select_coins_srd(
     pool = [u for u in utxos if u["value"] > input_fee]
     random.shuffle(pool)
 
-    selected: List[Dict] = []
+    selected: list[dict] = []
     total = 0
     for u in pool:
         selected.append(u)
@@ -303,7 +302,7 @@ def _non_input_fee(n_outputs: int, fee_rate: float) -> int:
 
 
 def _selection_waste(
-    selected: List[Dict],
+    selected: list[dict],
     fee_rate: float,
     long_term_fee_rate: float,
     has_change: bool,
@@ -315,12 +314,12 @@ def _selection_waste(
 
 
 def select_coins(
-    utxos: List[Dict],
+    utxos: list[dict],
     target_amount: int,
     fee_rate: float,
     *,
     long_term_fee_rate: float = DEFAULT_LONG_TERM_FEE_RATE,
-) -> Tuple[List[Dict], int, str]:
+) -> tuple[list[dict], int, str]:
     """Three-tier coin selection with waste-metric optimisation (BnB → Knapsack → SRD).
 
     Returns ``(selected_utxos, estimated_fee, algorithm_used)``; raises ValueError if funds
@@ -328,7 +327,7 @@ def select_coins(
     """
     # Collect (result, fee, algo_name, has_change) for every algorithm
     # that returns a valid selection.
-    candidates: List[Tuple[List[Dict], int, str, bool]] = []
+    candidates: list[tuple[list[dict], int, str, bool]] = []
 
     # BnB: target = amount + (overhead + 1 output fee).
     # BnB internally subtracts per-input cost from each UTXO's effective value.
@@ -396,8 +395,8 @@ class KeyPool:
         self.coin_type = 0 if network == "mainnet" else 1
 
         # Key pools: list of (index, WalletKey) tuples
-        self._receive_pool: List[Tuple[int, "WalletKey"]] = []
-        self._change_pool: List[Tuple[int, "WalletKey"]] = []
+        self._receive_pool: list[tuple[int, WalletKey]] = []
+        self._change_pool: list[tuple[int, WalletKey]] = []
 
         # Indices for next key derivation
         self._next_receive_index: int = 0
@@ -408,7 +407,7 @@ class KeyPool:
         self._used_change_indices: set = set()
 
         # Master key derived once
-        self._master: Optional["HDKey"] = None
+        self._master: HDKey | None = None
 
     @property
     def master(self) -> "HDKey":
@@ -448,7 +447,7 @@ class KeyPool:
         self,
         is_change: bool = False,
         address_type: str = "bech32",
-    ) -> Tuple[str, int]:
+    ) -> tuple[str, int]:
         """
         Get the next unused address from the pool.
 
@@ -493,7 +492,7 @@ class KeyPool:
         # Derive on demand
         return self._derive_key_at_path(is_change, index)
 
-    def get_all_keys(self, include_change: bool = True) -> List["WalletKey"]:
+    def get_all_keys(self, include_change: bool = True) -> list["WalletKey"]:
         """Return all keys in the pool (used for address scanning)."""
         keys = [k for _, k in self._receive_pool]
         if include_change:
@@ -508,7 +507,7 @@ class KeyPool:
         self._refill_pool(True)
         return (len(self._receive_pool) - before_receive) + (len(self._change_pool) - before_change)
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         """Serialize key pool state for persistence."""
         return {
             "seed_hex": self.seed.hex(),
@@ -522,7 +521,7 @@ class KeyPool:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict) -> "KeyPool":
+    def from_dict(cls, data: dict) -> "KeyPool":
         """Deserialize key pool from persisted state."""
         pool = cls(
             seed=bytes.fromhex(data["seed_hex"]),
@@ -604,11 +603,11 @@ class HDKey:
         """Derive the BIP 32 master key from a binary seed (16-64 bytes)."""
         if not 16 <= len(seed) <= 64:
             raise ValueError("Seed must be 16–64 bytes")
-        I = hmac.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
-        key = I[:32]
+        hmac_result = hmac.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
+        key = hmac_result[:32]
         if int.from_bytes(key, "big") == 0 or int.from_bytes(key, "big") >= SECP256K1_ORDER:
             raise ValueError("Invalid master key (out of range)")
-        return cls(private_key=key, chain_code=I[32:], network=network)
+        return cls(private_key=key, chain_code=hmac_result[32:], network=network)
 
     # child derivation
 
@@ -621,8 +620,8 @@ class HDKey:
         else:
             data = self.public_key + index.to_bytes(4, "big")
 
-        I = hmac.new(self.chain_code, data, hashlib.sha512).digest()
-        il = int.from_bytes(I[:32], "big")
+        hmac_result = hmac.new(self.chain_code, data, hashlib.sha512).digest()
+        il = int.from_bytes(hmac_result[:32], "big")
         if il >= SECP256K1_ORDER:
             raise ValueError("Derived key is out of range")
         child_int = (il + int.from_bytes(self.private_key, "big")) % SECP256K1_ORDER
@@ -631,7 +630,7 @@ class HDKey:
         child_key = child_int.to_bytes(32, "big")
         return HDKey(
             private_key=child_key,
-            chain_code=I[32:],
+            chain_code=hmac_result[32:],
             depth=self.depth + 1,
             parent_fingerprint=self.fingerprint,
             child_index=index,
@@ -814,7 +813,7 @@ class Wallet:
         data_dir: str,
         network: str = "mainnet",
         name: str = "default",
-        wallet_dir: Optional[str] = None,
+        wallet_dir: str | None = None,
     ):
         """
         Initialize a wallet.
@@ -841,16 +840,16 @@ class Wallet:
             self.wallet_dir = None
             self.wallet_path = self.data_dir / "wallets" / f"{name}.json"
 
-        self.keys: List[Dict] = []
-        self.descriptors: List = []  # List[DescriptorEntry]
+        self.keys: list[dict] = []
+        self.descriptors: list = []  # List[DescriptorEntry]
         self.db = None  # set via set_database()
         self.mempool = None  # set via set_mempool()
-        self._hd_seed: Optional[bytes] = None
+        self._hd_seed: bytes | None = None
         self._hd_next_index: int = 0
         self._hd_base_path: str = self.HD_BASE_PATH
-        self._passphrase: Optional[str] = None
-        self._encrypted_blob: Optional[bytes] = None
-        self._key_pool: Optional[KeyPool] = None  # BIP84 key pool
+        self._passphrase: str | None = None
+        self._encrypted_blob: bytes | None = None
+        self._key_pool: KeyPool | None = None  # BIP84 key pool
         self._disable_private_keys: bool = False  # watch-only mode
         self._load_or_create()
 
@@ -859,7 +858,7 @@ class Wallet:
     def init_hd(
         self,
         seed: bytes,
-        base_path: Optional[str] = None,
+        base_path: str | None = None,
         pool_size: int = KeyPool.DEFAULT_POOL_SIZE,
     ) -> str:
         """
@@ -891,7 +890,7 @@ class Wallet:
     def is_hd(self) -> bool:
         return self._hd_seed is not None
 
-    def get_hd_master(self) -> Optional[HDKey]:
+    def get_hd_master(self) -> HDKey | None:
         if self._hd_seed is None:
             return None
         return HDKey.from_seed(self._hd_seed, self.network)
@@ -949,7 +948,7 @@ class Wallet:
             logger.info(f"Created new wallet '{self.name}'")
 
     def _save(self) -> None:
-        inner: Dict = {
+        inner: dict = {
             "keys": self.keys,
         }
         if self.descriptors:
@@ -968,7 +967,7 @@ class Wallet:
         if self._passphrase is not None:
             plaintext = json.dumps(inner).encode("utf-8")
             blob = encrypt_wallet_data(plaintext, self._passphrase)
-            outer: Dict = {
+            outer: dict = {
                 "version": 1,
                 "network": self.network,
                 "encrypted": True,
@@ -1046,7 +1045,7 @@ class Wallet:
         self._passphrase = None
         logger.info(f"Wallet '{self.name}' locked")
 
-    def _read_encrypted_blob(self) -> Optional[bytes]:
+    def _read_encrypted_blob(self) -> bytes | None:
         if self.wallet_path.exists():
             with open(self.wallet_path) as f:
                 data = json.load(f)
@@ -1072,7 +1071,7 @@ class Wallet:
 
     # --- key / address operations ---------------------------------------------
 
-    def _get_wallet_key(self, key_data: Dict) -> WalletKey:
+    def _get_wallet_key(self, key_data: dict) -> WalletKey:
         return WalletKey.from_wif(key_data["wif"], self.network)
 
     async def generate_new_address(
@@ -1286,7 +1285,7 @@ class Wallet:
 
     async def bump_fee(
         self, txid: str, new_fee_rate: int, *, sign: bool = True
-    ) -> Optional[str]:
+    ) -> str | None:
         """Create an RBF fee-bumped version of *txid* at *new_fee_rate* sat/vB.
 
         Verifies the original signals RBF (sequence < 0xFFFFFFFE), then reduces
@@ -1320,13 +1319,13 @@ class Wallet:
 
         # 3. Gather input values and wallet keys
         # Build a lookup of wallet script_pubkeys → WalletKey
-        wallet_spk_map: Dict[bytes, "WalletKey"] = {}
+        wallet_spk_map: dict[bytes, WalletKey] = {}
         for kd in self.keys:
             k = self._get_wallet_key(kd)
             wallet_spk_map[k.get_script_pubkey()] = k
 
-        input_values: List[int] = []
-        input_keys: List[Optional["WalletKey"]] = []
+        input_values: list[int] = []
+        input_keys: list[WalletKey | None] = []
         for inp in orig_tx.inputs:
             # Try UTXO set first (confirmed), then check mempool outputs
             utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
@@ -1382,7 +1381,7 @@ class Wallet:
 
         # 5. Identify and reduce the change output
         # The change output is the one paying to a wallet address.
-        change_idx: Optional[int] = None
+        change_idx: int | None = None
         for i, out in enumerate(new_outputs):
             if out.script_pubkey in wallet_spk_map:
                 change_idx = i
@@ -1456,7 +1455,7 @@ class Wallet:
 
         if sign:
             # 7. Sign all inputs
-            for i, inp in enumerate(new_inputs):
+            for i, _ in enumerate(new_inputs):
                 if i < len(input_keys) and input_keys[i] is not None:
                     key = input_keys[i]
                     sighash = self._bip143_sighash(
@@ -1498,7 +1497,7 @@ class Wallet:
         new_outputs: list,
         input_values: list,
         input_keys: list,
-        wallet_spk_map: Dict[bytes, "WalletKey"],
+        wallet_spk_map: dict[bytes, "WalletKey"],
         new_fee_rate: int,
         target_fee: int,
         total_input_value: int,
@@ -1527,7 +1526,7 @@ class Wallet:
         available.sort(key=lambda u: u["value"], reverse=True)
 
         total_output_value = sum(o.value for o in new_outputs)
-        needed = target_fee - (total_input_value - total_output_value)
+        target_fee - (total_input_value - total_output_value)
 
         for utxo in available:
             utxo_txid = (
@@ -1578,8 +1577,8 @@ class Wallet:
     # --- descriptor operations ---------------------------------------------------
 
     def importdescriptors(
-        self, requests: List[Dict]
-    ) -> List[Dict]:
+        self, requests: list[dict]
+    ) -> list[dict]:
         """
         Import one or more output descriptors into the wallet.
 
@@ -1606,7 +1605,7 @@ class Wallet:
             verify_checksum,
         )
 
-        results: List[Dict] = []
+        results: list[dict] = []
 
         for req in requests:
             try:
@@ -1678,15 +1677,15 @@ class Wallet:
         self._save()
         return results
 
-    def listdescriptors(self) -> List[Dict]:
+    def listdescriptors(self) -> list[dict]:
         """Return all imported descriptors in JSON-serialisable form."""
         return [d.to_dict() for d in self.descriptors]
 
     def deriveaddresses(
-        self, desc_str: str, range_param: Optional[List[int]] = None
-    ) -> List[str]:
+        self, desc_str: str, range_param: list[int] | None = None
+    ) -> list[str]:
         """Derive addresses from *desc_str*; *range_param* is ``[start, end]`` (inclusive) or None for non-range descriptors."""
-        from ouroboros.descriptors import parse_descriptor, add_checksum
+        from ouroboros.descriptors import add_checksum, parse_descriptor
 
         if "#" not in desc_str:
             desc_str = add_checksum(desc_str)
@@ -1709,9 +1708,9 @@ class Wallet:
                 )
             return [descriptor.derive_address(0, self.network)]
 
-    def get_descriptor_addresses(self) -> List[str]:
+    def get_descriptor_addresses(self) -> list[str]:
         """Return all addresses derived from active descriptors up to next_index."""
-        addrs: List[str] = []
+        addrs: list[str] = []
         for entry in self.descriptors:
             if not entry.active:
                 continue
@@ -1767,10 +1766,10 @@ class Wallet:
 
     # --- UTXO helpers ----------------------------------------------------------
 
-    def _collect_utxos(self) -> List[Dict]:
+    def _collect_utxos(self) -> list[dict]:
         if self.db is None:
             return []
-        utxos: List[Dict] = []
+        utxos: list[dict] = []
         for kd in self.keys:
             k = self._get_wallet_key(kd)
             addr = k.get_p2wpkh_address()
@@ -1786,7 +1785,7 @@ class Wallet:
         amount: int,
         fee_rate: float,
         long_term_fee_rate: float = DEFAULT_LONG_TERM_FEE_RATE,
-    ) -> Tuple[List[Dict], int]:
+    ) -> tuple[list[dict], int]:
         all_utxos = self._collect_utxos()
         selected, est_fee, _algo = select_coins(
             all_utxos, amount, fee_rate,
@@ -1890,7 +1889,7 @@ class Wallet:
 
         # Build unsigned inputs
         # Use sequence 0xFFFFFFFD to signal RBF and enable locktime
-        inputs: List[TxIn] = []
+        inputs: list[TxIn] = []
         for utxo in selected:
             txid_bytes = bytes.fromhex(utxo["txid"]) if isinstance(utxo["txid"], str) else utxo["txid"]
             inputs.append(TxIn(
@@ -1962,17 +1961,17 @@ class WalletManager:
         self.wallets_dir.mkdir(parents=True, exist_ok=True)
 
         # Loaded wallets: name -> Wallet instance
-        self._wallets: Dict[str, Wallet] = {}
+        self._wallets: dict[str, Wallet] = {}
 
         # Default wallet (first loaded wallet)
-        self._default_wallet_name: Optional[str] = None
+        self._default_wallet_name: str | None = None
 
         # Database and mempool references (shared across wallets)
         self._db = None
         self._mempool = None
 
         # Wallet load callbacks
-        self._load_callbacks: List = []
+        self._load_callbacks: list = []
 
         logger.info(f"WalletManager initialized at {self.wallets_dir}")
 
@@ -2004,11 +2003,11 @@ class WalletManager:
         """Check if a wallet is currently loaded."""
         return name in self._wallets
 
-    def list_loaded_wallets(self) -> List[str]:
+    def list_loaded_wallets(self) -> list[str]:
         """Return list of loaded wallet names."""
         return list(self._wallets.keys())
 
-    def list_wallet_dir(self) -> List[Dict[str, str]]:
+    def list_wallet_dir(self) -> list[dict[str, str]]:
         """
         List all wallets in the wallet directory (loaded or not).
 
@@ -2026,7 +2025,7 @@ class WalletManager:
                     result.append({"name": entry.name})
         return result
 
-    def get_wallet(self, name: Optional[str] = None) -> Optional[Wallet]:
+    def get_wallet(self, name: str | None = None) -> Wallet | None:
         """
         Get a loaded wallet by name.
 
@@ -2039,7 +2038,7 @@ class WalletManager:
             return self._wallets.get(self._default_wallet_name)
         return self._wallets.get(name)
 
-    def get_default_wallet(self) -> Optional[Wallet]:
+    def get_default_wallet(self) -> Wallet | None:
         """Get the default wallet (first loaded wallet)."""
         return self.get_wallet(None)
 
@@ -2048,11 +2047,11 @@ class WalletManager:
         name: str,
         disable_private_keys: bool = False,
         blank: bool = False,
-        passphrase: Optional[str] = None,
+        passphrase: str | None = None,
         avoid_reuse: bool = False,
         descriptors: bool = True,
-        load_on_startup: Optional[bool] = None,
-    ) -> Tuple[Optional[Wallet], List[str]]:
+        load_on_startup: bool | None = None,
+    ) -> tuple[Wallet | None, list[str]]:
         """
         Create a new wallet.
 
@@ -2070,7 +2069,7 @@ class WalletManager:
 
         Reference: Bitcoin Core wallet/wallet.cpp CreateWallet
         """
-        warnings: List[str] = []
+        warnings: list[str] = []
 
         # Validate name
         if not name:
@@ -2150,8 +2149,8 @@ class WalletManager:
     def load_wallet(
         self,
         name: str,
-        load_on_startup: Optional[bool] = None,
-    ) -> Tuple[Optional[Wallet], List[str]]:
+        load_on_startup: bool | None = None,
+    ) -> tuple[Wallet | None, list[str]]:
         """
         Load an existing wallet.
 
@@ -2164,7 +2163,7 @@ class WalletManager:
 
         Reference: Bitcoin Core wallet/wallet.cpp LoadWallet
         """
-        warnings: List[str] = []
+        warnings: list[str] = []
 
         # Check if already loaded
         if name in self._wallets:
@@ -2216,8 +2215,8 @@ class WalletManager:
     def unload_wallet(
         self,
         name: str,
-        load_on_startup: Optional[bool] = None,
-    ) -> List[str]:
+        load_on_startup: bool | None = None,
+    ) -> list[str]:
         """
         Unload a wallet from memory.
 
@@ -2230,7 +2229,7 @@ class WalletManager:
 
         Reference: Bitcoin Core wallet/wallet.cpp UnloadWallet
         """
-        warnings: List[str] = []
+        warnings: list[str] = []
 
         if name not in self._wallets:
             raise ValueError(f"Wallet '{name}' is not loaded")
@@ -2260,7 +2259,7 @@ class WalletManager:
     def _update_load_on_startup(self, name: str, enabled: bool) -> None:
         """Update the load_on_startup setting for a wallet."""
         settings_file = self.wallets_dir / "settings.json"
-        settings: Dict[str, Any] = {}
+        settings: dict[str, Any] = {}
 
         if settings_file.exists():
             try:
@@ -2284,7 +2283,7 @@ class WalletManager:
         with open(settings_file, "w") as f:
             json.dump(settings, f, indent=2)
 
-    def get_load_on_startup_wallets(self) -> List[str]:
+    def get_load_on_startup_wallets(self) -> list[str]:
         """Get list of wallets configured to load on startup."""
         settings_file = self.wallets_dir / "settings.json"
         if not settings_file.exists():
@@ -2306,7 +2305,7 @@ class WalletManager:
             except Exception as e:
                 logger.warning(f"Failed to load wallet '{name}' on startup: {e}")
 
-    def get_wallet_info(self, name: str) -> Dict[str, Any]:
+    def get_wallet_info(self, name: str) -> dict[str, Any]:
         """Get wallet information dict for RPC."""
         if name not in self._wallets:
             raise ValueError(f"Wallet '{name}' is not loaded")

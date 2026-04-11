@@ -2,10 +2,10 @@
 Test address decoding and UTXO querying.
 """
 
-import unittest
+import shutil
 import sys
 import tempfile
-import shutil
+import unittest
 from pathlib import Path
 
 src_dir = Path(__file__).parent.parent.parent

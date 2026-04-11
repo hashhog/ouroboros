@@ -8,9 +8,8 @@ log rotation via RotatingFileHandler.
 import json
 import logging
 import logging.handlers
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 
 
 class JSONFormatter(logging.Formatter):
@@ -18,7 +17,7 @@ class JSONFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         entry = {
-            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc)
+            "ts": datetime.fromtimestamp(record.created, tz=UTC)
             .isoformat()
             .replace("+00:00", "Z"),
             "level": record.levelname,
@@ -37,7 +36,7 @@ def configure_logging(
     *,
     debug: bool = False,
     json_format: bool = False,
-    log_file: Optional[str] = None,
+    log_file: str | None = None,
     max_bytes: int = 10 * 1024 * 1024,  # 10 MB
     backup_count: int = 5,
 ) -> None:

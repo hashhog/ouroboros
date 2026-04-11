@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """RPC latency probe — measures getblockchaininfo response times."""
 
-import sys
-import time
-import json
-import urllib.request
 import base64
-import statistics
+import json
+import time
+import urllib.request
+
 
 def rpc_call(url, auth, method, params=None):
     payload = json.dumps({

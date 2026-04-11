@@ -17,9 +17,9 @@ import logging
 import os
 import secrets
 import struct
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,7 @@ class TorStreamIsolation:
         self._prefix = secrets.token_hex(8)
         self._counter = 0
 
-    def generate(self) -> Tuple[str, str]:
+    def generate(self) -> tuple[str, str]:
         """Generate unique credentials for stream isolation."""
         cred = f"{self._prefix}-{self._counter}"
         self._counter += 1
@@ -102,7 +102,7 @@ async def socks5_connect_isolated(
     dest_port: int,
     timeout: float = 10.0,
     isolate: bool = True,
-) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """
     Connect through SOCKS5 proxy with optional stream isolation.
 
@@ -241,9 +241,9 @@ class TorControllerState:
     """State for Tor control connection."""
     connected: bool = False
     authenticated: bool = False
-    service_id: Optional[str] = None  # e.g., "abc123...xyz"
-    private_key: Optional[str] = None  # base64 encoded
-    onion_address: Optional[str] = None  # e.g., "abc123...xyz.onion"
+    service_id: str | None = None  # e.g., "abc123...xyz"
+    private_key: str | None = None  # base64 encoded
+    onion_address: str | None = None  # e.g., "abc123...xyz.onion"
 
 
 class TorController:
@@ -262,23 +262,23 @@ class TorController:
         self,
         control_host: str = "127.0.0.1",
         control_port: int = DEFAULT_TOR_CONTROL_PORT,
-        password: Optional[str] = None,
-        data_dir: Optional[str] = None,
+        password: str | None = None,
+        data_dir: str | None = None,
     ):
         self._control_host = control_host
         self._control_port = control_port
         self._password = password
         self._data_dir = data_dir
 
-        self._reader: Optional[asyncio.StreamReader] = None
-        self._writer: Optional[asyncio.StreamWriter] = None
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
         self._state = TorControllerState()
 
         # Callbacks
-        self._on_service_ready: Optional[Callable[[str], None]] = None
+        self._on_service_ready: Callable[[str], None] | None = None
 
     @property
-    def onion_address(self) -> Optional[str]:
+    def onion_address(self) -> str | None:
         """The created onion address (e.g., 'xyz...abc.onion')."""
         return self._state.onion_address
 
@@ -316,7 +316,7 @@ class TorController:
                 pass
         self._state = TorControllerState()
 
-    async def _send_command(self, cmd: str) -> Tuple[int, str]:
+    async def _send_command(self, cmd: str) -> tuple[int, str]:
         """Send command and read response. Returns (reply_code, response_text)."""
         if not self._writer or not self._reader:
             raise Exception("Not connected to Tor control")
@@ -339,7 +339,7 @@ class TorController:
             try:
                 code = int(line[:3])
             except ValueError:
-                raise Exception(f"Tor control: invalid reply format: {line}")
+                raise Exception(f"Tor control: invalid reply format: {line}") from None
 
             separator = line[3:4]
             content = line[4:]
@@ -425,8 +425,8 @@ class TorController:
                 cookie = f.read()
             if len(cookie) != TOR_COOKIE_SIZE:
                 raise Exception(f"Invalid cookie size: {len(cookie)}")
-        except IOError as e:
-            raise Exception(f"Cannot read cookie file: {e}")
+        except OSError as e:
+            raise Exception(f"Cannot read cookie file: {e}") from None
 
         code, response = await self._send_command(f"AUTHENTICATE {cookie.hex()}")
         if code != TOR_REPLY_OK:
@@ -440,8 +440,8 @@ class TorController:
                 cookie = f.read()
             if len(cookie) != TOR_COOKIE_SIZE:
                 raise Exception(f"Invalid cookie size: {len(cookie)}")
-        except IOError as e:
-            raise Exception(f"Cannot read cookie file: {e}")
+        except OSError as e:
+            raise Exception(f"Cannot read cookie file: {e}") from None
 
         # Generate client nonce
         client_nonce = secrets.token_bytes(TOR_NONCE_SIZE)
@@ -490,7 +490,7 @@ class TorController:
         if code != TOR_REPLY_OK:
             raise Exception(f"SAFECOOKIE auth failed: {response}")
 
-    async def create_hidden_service(self, target_port: int) -> Optional[str]:
+    async def create_hidden_service(self, target_port: int) -> str | None:
         """
         Create an ephemeral hidden service pointing to target_port.
 
@@ -564,13 +564,13 @@ class TorController:
         self._state.onion_address = None
         return True
 
-    def _private_key_path(self) -> Optional[Path]:
+    def _private_key_path(self) -> Path | None:
         """Path to the private key file."""
         if not self._data_dir:
             return None
         return Path(self._data_dir) / "onion_v3_private_key"
 
-    def _load_private_key(self) -> Optional[str]:
+    def _load_private_key(self) -> str | None:
         """Load private key from disk."""
         path = self._private_key_path()
         if not path or not path.exists():
@@ -633,9 +633,9 @@ def i2p_destination_to_address(destination: bytes) -> str:
 class I2PSessionState:
     """State for an I2P SAM session."""
     connected: bool = False
-    session_id: Optional[str] = None
-    destination: Optional[str] = None  # base64 encoded
-    address: Optional[str] = None  # .b32.i2p address
+    session_id: str | None = None
+    destination: str | None = None  # base64 encoded
+    address: str | None = None  # .b32.i2p address
 
 
 class I2PSession:
@@ -656,7 +656,7 @@ class I2PSession:
         self,
         sam_host: str = "127.0.0.1",
         sam_port: int = DEFAULT_I2P_SAM_PORT,
-        data_dir: Optional[str] = None,
+        data_dir: str | None = None,
         persistent: bool = True,
     ):
         self._sam_host = sam_host
@@ -664,16 +664,16 @@ class I2PSession:
         self._data_dir = data_dir
         self._persistent = persistent
 
-        self._control_reader: Optional[asyncio.StreamReader] = None
-        self._control_writer: Optional[asyncio.StreamWriter] = None
+        self._control_reader: asyncio.StreamReader | None = None
+        self._control_writer: asyncio.StreamWriter | None = None
         self._state = I2PSessionState()
 
         # Accept socket for inbound connections
-        self._accept_reader: Optional[asyncio.StreamReader] = None
-        self._accept_writer: Optional[asyncio.StreamWriter] = None
+        self._accept_reader: asyncio.StreamReader | None = None
+        self._accept_writer: asyncio.StreamWriter | None = None
 
     @property
-    def address(self) -> Optional[str]:
+    def address(self) -> str | None:
         """The .b32.i2p address for this session."""
         return self._state.address
 
@@ -726,7 +726,7 @@ class I2PSession:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         cmd: str,
-    ) -> Dict[str, str]:
+    ) -> dict[str, str]:
         """Send SAM command and parse response."""
         writer.write((cmd + "\n").encode())
         await writer.drain()
@@ -743,7 +743,7 @@ class I2PSession:
 
         # Parse response
         parts = line.split()
-        result: Dict[str, str] = {}
+        result: dict[str, str] = {}
 
         for part in parts:
             if "=" in part:
@@ -814,7 +814,7 @@ class I2PSession:
         self,
         dest_address: str,
         timeout: float = 180.0,
-    ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """
         Connect to an I2P destination.
 
@@ -881,7 +881,7 @@ class I2PSession:
     async def stream_accept(
         self,
         timeout: float = 0,
-    ) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter, str]]:
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str] | None:
         """
         Accept an incoming I2P connection.
 
@@ -924,7 +924,7 @@ class I2PSession:
                 )
             else:
                 line = await self._accept_reader.readline()
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
 
         line = line.decode().strip()
@@ -945,13 +945,13 @@ class I2PSession:
         logger.debug(f"I2P accepted connection from {peer_dest[:32]}...")
         return reader, writer, peer_dest
 
-    def _private_key_path(self) -> Optional[Path]:
+    def _private_key_path(self) -> Path | None:
         """Path to the I2P private key file."""
         if not self._data_dir:
             return None
         return Path(self._data_dir) / "i2p_private_key"
 
-    def _load_private_key(self) -> Optional[str]:
+    def _load_private_key(self) -> str | None:
         """Load I2P private key from disk."""
         path = self._private_key_path()
         if not path or not path.exists():

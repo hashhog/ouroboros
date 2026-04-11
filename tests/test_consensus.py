@@ -5,24 +5,22 @@ Tests the Python consensus module which wraps the Rust versionbits
 implementation and provides buried deployment support.
 """
 
-import pytest
 
 from ouroboros.consensus import (
-    DeploymentState,
-    Deployment,
-    BuriedDeployment,
-    BURIED_DEPLOYMENTS,
     BIP9_DEPLOYMENTS,
+    BURIED_DEPLOYMENTS,
     VERSIONBITS_TOP_BITS,
     VERSIONBITS_TOP_MASK,
-    is_buried_deployment_active,
-    get_buried_deployment_height,
-    get_deployment_state,
-    is_deployment_active,
-    get_all_deployments_info,
+    Deployment,
+    DeploymentState,
     check_version_signal,
     compute_block_version,
+    get_all_deployments_info,
+    get_buried_deployment_height,
+    get_deployment_state,
     get_deployment_thresholds,
+    is_buried_deployment_active,
+    is_deployment_active,
 )
 
 

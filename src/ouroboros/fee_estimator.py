@@ -34,11 +34,9 @@ and ``CBlockPolicyEstimator::estimateSmartFee``.
 import bisect
 import json
 import logging
-import math
 import os
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +50,7 @@ MAX_BLOCK_HISTORY = 144  # blocks kept for the simple (fallback) estimator
 #: The first element is the lower bound of the first bucket; the last is the
 #: upper bound of the last bucket.  ``_bucket_index`` maps any fee rate to
 #: the appropriate bucket.
-FEE_RATE_BUCKETS: List[float] = [
+FEE_RATE_BUCKETS: list[float] = [
     1, 2, 3, 5, 7,
     10, 15, 20, 30, 50,
     75, 100, 150, 200, 300,
@@ -96,7 +94,7 @@ def _bucket_index(fee_rate: float) -> int:
 class BlockFeeData:
     """Fee rate statistics for a single confirmed block."""
     height: int
-    fee_rates: List[float]
+    fee_rates: list[float]
     median_fee_rate: float
     min_fee_rate: float
 
@@ -123,10 +121,10 @@ class FeeEstimator:
         # total[bucket][target] – how many txs in this bucket were tracked
         #   for this target window (confirmed OR still unconfirmed, after
         #   decay).
-        self.confirmed: List[List[float]] = [
+        self.confirmed: list[list[float]] = [
             [0.0] * (MAX_CONF_TARGET + 1) for _ in range(NUM_BUCKETS)
         ]
-        self.total: List[List[float]] = [
+        self.total: list[list[float]] = [
             [0.0] * (MAX_CONF_TARGET + 1) for _ in range(NUM_BUCKETS)
         ]
         # Running count of total observations fed into the bucket arrays
@@ -152,7 +150,7 @@ class FeeEstimator:
         #    *before* recording the new observations (decay must precede new data).
         self._apply_decay()
 
-        fee_rates: List[float] = []
+        fee_rates: list[float] = []
 
         for tx in block.transactions:
             if tx.is_coinbase:
@@ -197,7 +195,7 @@ class FeeEstimator:
     # Estimation
     # ------------------------------------------------------------------
 
-    def estimate_fee(self, conf_target: int = 6) -> Optional[float]:
+    def estimate_fee(self, conf_target: int = 6) -> float | None:
         """Estimate fee rate in sat/vB for *conf_target*-block confirmation; returns None if data is sparse."""
         conf_target = max(1, min(conf_target, MAX_CONF_TARGET))
 
@@ -210,7 +208,7 @@ class FeeEstimator:
         # Fallback to simple percentile method.
         return self._estimate_simple(conf_target)
 
-    def estimate_fee_per_kb(self, conf_target: int = 6) -> Optional[float]:
+    def estimate_fee_per_kb(self, conf_target: int = 6) -> float | None:
         """Return fee estimate in BTC/kB."""
         rate = self.estimate_fee(conf_target)
         if rate is None:
@@ -218,9 +216,9 @@ class FeeEstimator:
         # sat/vB → BTC/kB:  rate * 1000 / 1e8
         return rate * 1000 / 1e8
 
-    def get_fee_summary(self) -> Dict:
+    def get_fee_summary(self) -> dict:
         """Return summary statistics for diagnostics."""
-        summary: Dict = {
+        summary: dict = {
             "blocks_tracked": len(self.block_history),
             "bucket_observations": self._total_observations,
         }
@@ -239,9 +237,9 @@ class FeeEstimator:
 
         # Per-bucket snapshot (confirmed / total for a few representative
         # targets) — useful for debugging.
-        bucket_snapshot: List[Dict] = []
+        bucket_snapshot: list[dict] = []
         for i, boundary in enumerate(FEE_RATE_BUCKETS):
-            row = dict(bucket_sat_vb=boundary)
+            row = {"bucket_sat_vb": boundary}
             for t in (1, 3, 6, 12, 25):
                 total = self.total[i][t]
                 conf = self.confirmed[i][t]
@@ -281,7 +279,7 @@ class FeeEstimator:
             self.confirmed[bucket][t] += 1.0
             self.total[bucket][t] += 1.0
 
-    def _estimate_from_buckets(self, conf_target: int) -> Optional[float]:
+    def _estimate_from_buckets(self, conf_target: int) -> float | None:
         for i in range(NUM_BUCKETS):
             total = self.total[i][conf_target]
             if total < 2.0:
@@ -303,14 +301,14 @@ class FeeEstimator:
     # Internal: simple percentile fallback
     # ------------------------------------------------------------------
 
-    def _estimate_simple(self, conf_target: int) -> Optional[float]:
+    def _estimate_simple(self, conf_target: int) -> float | None:
         """Original percentile-based estimator (fallback)."""
         if len(self.block_history) < 3:
             return None
 
         sample_depth = min(len(self.block_history), max(conf_target * 2, 6))
 
-        all_rates: List[float] = []
+        all_rates: list[float] = []
         for block_data in list(self.block_history)[-sample_depth:]:
             all_rates.extend(block_data.fee_rates)
 
@@ -373,7 +371,7 @@ class FeeEstimator:
         if not os.path.exists(path):
             return False
         try:
-            with open(path, "r") as f:
+            with open(path) as f:
                 state = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
             logger.warning("Fee estimator: failed to load state: %s", e)

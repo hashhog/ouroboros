@@ -211,6 +211,7 @@ class TestSyncManagerCheckpoints:
     def test_sync_manager_checkpoint_height(self):
         """SyncManager should know last checkpoint height."""
         import tempfile
+
         from ouroboros.sync_manager import SyncManager
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -222,6 +223,7 @@ class TestSyncManagerCheckpoints:
     def test_sync_manager_is_below_checkpoint(self):
         """SyncManager.is_below_checkpoint should work."""
         import tempfile
+
         from ouroboros.sync_manager import SyncManager
 
         with tempfile.TemporaryDirectory() as tmpdir:

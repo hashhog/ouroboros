@@ -13,48 +13,57 @@ Single-element arrays are comments and are skipped.
 """
 
 # Mock the sync module BEFORE any ouroboros imports
-import types
 import sys
+import types
 
-sync = types.ModuleType("sync")
-sync.PyUTXO = type("PyUTXO", (), {})
-sync.SyncEngine = type("SyncEngine", (), {})
-sync.PyBlockchainDB = type("PyBlockchainDB", (), {})
-sys.modules["sync"] = sync
+if "sync" not in sys.modules:
+    sync = types.ModuleType("sync")
+    sync.PyUTXO = type("PyUTXO", (), {})
+    sync.SyncEngine = type("SyncEngine", (), {})
+    sync.PyBlockchainDB = type("PyBlockchainDB", (), {})
+    sys.modules["sync"] = sync
 
-import hashlib
-import json
-from pathlib import Path
+import hashlib  # noqa: E402
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
 
-import coincurve._libsecp256k1 as _secp256k1_lib
+import coincurve._libsecp256k1 as _secp256k1_lib  # noqa: E402
 
-from ouroboros.database import Transaction, TxIn, TxOut
-from ouroboros.script import (
-    ScriptInterpreter,
-    SCRIPT_VERIFY_NONE,
-    SCRIPT_VERIFY_P2SH,
-    SCRIPT_VERIFY_STRICTENC,
-    SCRIPT_VERIFY_DERSIG,
-    SCRIPT_VERIFY_LOW_S,
-    SCRIPT_VERIFY_NULLDUMMY,
-    SCRIPT_VERIFY_SIGPUSHONLY,
-    SCRIPT_VERIFY_MINIMALDATA,
-    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS,
-    SCRIPT_VERIFY_CLEANSTACK,
+from ouroboros.database import Transaction, TxIn, TxOut  # noqa: E402
+from ouroboros.script import (  # noqa: E402
     SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY,
     SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
-    SCRIPT_VERIFY_WITNESS,
-    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
-    SCRIPT_VERIFY_MINIMALIF,
-    SCRIPT_VERIFY_NULLFAIL,
-    SCRIPT_VERIFY_WITNESS_PUBKEYTYPE,
+    SCRIPT_VERIFY_CLEANSTACK,
     SCRIPT_VERIFY_CONST_SCRIPTCODE,
-    SCRIPT_VERIFY_TAPROOT,
-    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
+    SCRIPT_VERIFY_DERSIG,
     SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS,
+    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS,
+    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
+    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+    SCRIPT_VERIFY_LOW_S,
+    SCRIPT_VERIFY_MINIMALDATA,
+    SCRIPT_VERIFY_MINIMALIF,
+    SCRIPT_VERIFY_NONE,
+    SCRIPT_VERIFY_NULLDUMMY,
+    SCRIPT_VERIFY_NULLFAIL,
+    SCRIPT_VERIFY_P2SH,
+    SCRIPT_VERIFY_SIGPUSHONLY,
+    SCRIPT_VERIFY_STRICTENC,
+    SCRIPT_VERIFY_TAPROOT,
+    SCRIPT_VERIFY_WITNESS,
+    SCRIPT_VERIFY_WITNESS_PUBKEYTYPE,
+    ScriptInterpreter,
 )
 
-VECTOR_PATH = Path("/home/max/hashhog/bitcoin/src/test/data/script_tests.json")
+# Locate script_tests.json: check common locations for the Bitcoin Core source.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_CANDIDATE_PATHS = [
+    _REPO_ROOT / "bitcoin" / "src" / "test" / "data" / "script_tests.json",
+    Path("/home/work/hashhog/bitcoin-core/src/test/data/script_tests.json"),
+    Path("/home/work/hashhog/bitcoin/src/test/data/script_tests.json"),
+    Path("/home/max/hashhog/bitcoin/src/test/data/script_tests.json"),
+]
+VECTOR_PATH = next((p for p in _CANDIDATE_PATHS if p.exists()), _CANDIDATE_PATHS[0])
 
 # ---------------------------------------------------------------------------
 # Opcode name -> byte value mapping

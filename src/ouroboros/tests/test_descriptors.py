@@ -5,11 +5,7 @@ Verifies BIP 380–386 descriptor support: parsing, checksum computation,
 address derivation with range support, and wallet integration.
 """
 
-import json
-import os
 import sys
-import tempfile
-import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -27,27 +23,17 @@ if "sync" not in sys.modules:
     _mock_sync.SyncEngine = MagicMock
     sys.modules["sync"] = _mock_sync
 
-import pytest
+import pytest  # noqa: E402
 
-from ouroboros.descriptors import (
-    Descriptor,
+from ouroboros.descriptors import (  # noqa: E402
     DescriptorEntry,
     ExtendedPubKey,
-    KeyExpression,
+    _make_multisig_script,
     add_checksum,
     descriptor_checksum,
     parse_descriptor,
     verify_checksum,
-    _hash160,
-    _pubkey_to_p2wpkh,
-    _pubkey_to_p2pkh,
-    _pubkey_to_p2sh_p2wpkh,
-    _pubkey_to_p2tr,
-    _make_multisig_script,
-    _script_to_p2sh,
-    _script_to_p2wsh,
 )
-
 
 # Known test vectors
 #

@@ -6,121 +6,119 @@ database, validation, mempool, peer management, block synchronization, and RPC s
 """
 
 import asyncio
+import logging
 import os
 import signal
-import logging
-from typing import Optional
 from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
 
-from ouroboros.database import BlockchainDatabase
-from ouroboros.validation import BlockValidator, TransactionValidator
-from ouroboros.mempool import Mempool
-from ouroboros.p2p import PeerManager
 from ouroboros.block_sync import BlockSync
-from ouroboros.rpc import RPCServer
-from ouroboros.sync_manager import SyncManager
 from ouroboros.config import NodeConfig
+from ouroboros.cookie_auth import delete_cookie, generate_cookie
+from ouroboros.database import BlockchainDatabase
 from ouroboros.fee_estimator import FeeEstimator
-from ouroboros.wallet import Wallet, WalletManager
-from ouroboros.cookie_auth import generate_cookie, delete_cookie
-from ouroboros.zmq_notifier import ZMQNotifier
-from ouroboros.pruning import BlockPruner
+from ouroboros.mempool import Mempool
 from ouroboros.metrics import (
     init_metrics,
     update_chain_metrics,
     update_mempool_metrics,
-    NODE_INFO,
 )
+from ouroboros.p2p import PeerManager
+from ouroboros.pruning import BlockPruner
+from ouroboros.rpc import RPCServer
 from ouroboros.snapshot import SnapshotManager, read_snapshot_metadata
+from ouroboros.sync_manager import SyncManager
+from ouroboros.validation import BlockValidator, TransactionValidator
+from ouroboros.wallet import Wallet, WalletManager
+from ouroboros.zmq_notifier import ZMQNotifier
 
 logger = logging.getLogger(__name__)
 
 
 class BitcoinNode:
     """Main Bitcoin full node"""
-    
+
     def __init__(self, data_dir: str = "~/.ouroboros", network: str = "mainnet", config: dict = None):
         """Initialize Bitcoin node."""
         # Load configuration file (--config or datadir/ouroboros.conf)
         config_path = config.get('config_path') or config.get('config_file') if config else None
         data_dir_for_config = config.get('datadir', data_dir) if config else data_dir
         self.node_config = NodeConfig(config_path=config_path, data_dir=data_dir_for_config)
-        
+
         # Merge config file with provided config (provided config takes precedence)
         config_dict = self.node_config.to_dict()
         if config:
             config_dict.update(config)
         self.config = config_dict
-        
+
         # Set data_dir and network from config (with fallback to parameters)
         self.data_dir = str(Path(self.config.get('datadir', data_dir)).expanduser())
         self.network = self.config.get('network', network)
-        
+
         # Core components
-        self.db: Optional[BlockchainDatabase] = None
-        self.validator: Optional[BlockValidator] = None
-        self.tx_validator: Optional[TransactionValidator] = None
-        self.mempool: Optional[Mempool] = None
-        
+        self.db: BlockchainDatabase | None = None
+        self.validator: BlockValidator | None = None
+        self.tx_validator: TransactionValidator | None = None
+        self.mempool: Mempool | None = None
+
         # Fee estimator
-        self.fee_estimator: Optional[FeeEstimator] = None
+        self.fee_estimator: FeeEstimator | None = None
 
         # Wallet manager (multi-wallet support)
-        self.wallet_manager: Optional[WalletManager] = None
+        self.wallet_manager: WalletManager | None = None
         # Legacy single wallet reference (for backwards compatibility)
-        self.wallet: Optional[Wallet] = None
+        self.wallet: Wallet | None = None
 
         # Network components
-        self.peer_manager: Optional[PeerManager] = None
-        self.block_sync: Optional[BlockSync] = None
-        
+        self.peer_manager: PeerManager | None = None
+        self.block_sync: BlockSync | None = None
+
         # RPC server
-        self.rpc_server: Optional[RPCServer] = None
-        
+        self.rpc_server: RPCServer | None = None
+
         # Sync manager
-        self.sync_manager: Optional[SyncManager] = None
-        
+        self.sync_manager: SyncManager | None = None
+
         # Block pruner
-        self.pruner: Optional[BlockPruner] = None
+        self.pruner: BlockPruner | None = None
 
         # ZMQ notifier (replaces the older zmq_publisher)
-        self.zmq_notifier: Optional[ZMQNotifier] = None
+        self.zmq_notifier: ZMQNotifier | None = None
 
         # Snapshot manager for assumeUTXO
-        self.snapshot_manager: Optional[SnapshotManager] = None
+        self.snapshot_manager: SnapshotManager | None = None
 
         # State
         self.running = False
         self.synced = False
-        self._rpc_task: Optional[asyncio.Task] = None
-        self._shutdown_event: Optional[asyncio.Event] = None
-        self._rpc_username: Optional[str] = None
-        self._rpc_password: Optional[str] = None
-    
+        self._rpc_task: asyncio.Task | None = None
+        self._shutdown_event: asyncio.Event | None = None
+        self._rpc_username: str | None = None
+        self._rpc_password: str | None = None
+
     async def start(self, rpc_port: int = 8332, p2p_port: int = 8333):
         """Start the Bitcoin node (config file values override the port defaults)."""
         # Use config values if available, otherwise use parameters
         rpc_port = self.config.get('rpc_port', rpc_port)
         p2p_port = self.config.get('p2p_port', p2p_port)
-        
+
         logger.info(f"Starting Bitcoin Hybrid Node ({self.network})")
-        
+
         # Setup signal handlers for graceful shutdown
         self._shutdown_event = asyncio.Event()
         loop = asyncio.get_event_loop()
-        
+
         def signal_handler(signum, frame):
             logger.info(f"Received signal {signum}, shutting down...")
             self._shutdown_event.set()
             # Schedule stop in event loop
             loop.call_soon_threadsafe(lambda: asyncio.create_task(self.stop()))
-        
+
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-        
+
         try:
             # Initialize database
             logger.info(f"Initializing database at {self.data_dir}")
@@ -150,7 +148,7 @@ class BitcoinNode:
             logger.info("Initializing validators...")
             self.tx_validator = TransactionValidator(self.db)
             self.validator = BlockValidator(self.db, network=self.network)
-            
+
             # Initialize mempool
             logger.info("Initializing mempool...")
             self.mempool = Mempool(self.tx_validator)
@@ -194,7 +192,7 @@ class BitcoinNode:
 
             # Set legacy wallet reference for backwards compatibility
             self.wallet = self.wallet_manager.get_default_wallet()
-            
+
             # Initialize block pruner (optional — enabled when prune=<MB> is set)
             prune_target = self.config.get('prune')
             if prune_target:
@@ -212,14 +210,14 @@ class BitcoinNode:
 
             # Check if blockchain is synced
             self.synced = self._check_synced()
-            
+
             if not self.synced:
                 logger.warning("Blockchain not fully synced. Run 'sync' command first.")
                 logger.info("You can use SyncManager to perform initial sync.")
                 # Optionally auto-start sync here
                 # For now, we'll allow the node to start and sync later
                 # return
-            
+
             # Initialize peer manager
             _, best_height = self.db.get_best_block()
             logger.info(f"Initializing peer manager (current height: {best_height})...")
@@ -273,7 +271,7 @@ class BitcoinNode:
                 await self.block_sync.start()
             except Exception as e:
                 logger.warning(f"Block sync start error (node continues): {e}")
-            
+
             # Start RPC server (with optional REST interface)
             rest_enabled = str(self.config.get('rest', '0')).lower() in ('1', 'true', 'yes', 'on')
             logger.info(f"RPC server listening on 127.0.0.1:{rpc_port}")
@@ -330,10 +328,10 @@ class BitcoinNode:
                 from ouroboros.metrics import NODE_INFO as _node_info
                 if _node_info is not None:
                     _node_info.info({"version": "0.1.0", "network": self.network})
-            
+
             # Register message handlers
             self._register_handlers()
-            
+
             self.running = True
             logger.info("Bitcoin node started successfully")
 
@@ -345,31 +343,31 @@ class BitcoinNode:
 
             # Main loop — runs indefinitely until shutdown signal
             await self._main_loop()
-            
+
         except Exception as e:
             logger.error(f"Error starting node: {e}", exc_info=True)
             await self.stop()
             raise
-    
+
     async def stop(self):
         """Stop the Bitcoin node"""
         if not self.running:
             return
-        
+
         logger.info("Stopping Bitcoin node...")
         self.running = False
-        
+
         try:
             # Stop block sync
             if self.block_sync:
                 logger.info("Stopping block synchronization...")
                 await self.block_sync.stop()
-            
+
             # Stop peer manager
             if self.peer_manager:
                 logger.info("Stopping peer manager...")
                 await self.peer_manager.stop()
-            
+
             # Stop RPC server
             if self._rpc_task:
                 logger.info("Stopping RPC server...")
@@ -378,7 +376,7 @@ class BitcoinNode:
                     await self._rpc_task
                 except asyncio.CancelledError:
                     pass
-            
+
             # Stop ZMQ notifier
             if self.zmq_notifier:
                 logger.info("Stopping ZMQ notifier...")
@@ -402,10 +400,10 @@ class BitcoinNode:
             delete_cookie(self.data_dir)
 
             logger.info("Bitcoin node stopped")
-            
+
         except Exception as e:
             logger.error(f"Error stopping node: {e}", exc_info=True)
-    
+
     async def _main_loop(self):
         """Run indefinitely until an explicit shutdown signal is received.
 
@@ -445,7 +443,7 @@ class BitcoinNode:
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 await asyncio.sleep(10)
-    
+
     async def _periodic_tasks(self):
         """Periodic maintenance tasks"""
         try:
@@ -454,7 +452,7 @@ class BitcoinNode:
                 self.synced = self._check_synced()
                 if self.synced:
                     logger.info("Blockchain is now fully synced")
-            
+
             # Log statistics and update Prometheus gauges
             if self.db:
                 best_hash, best_height = self.db.get_best_block()
@@ -468,7 +466,7 @@ class BitcoinNode:
                     if self.mempool
                     else 0
                 )
-                
+
                 logger.info(
                     f"Height: {best_height}, "
                     f"Peers: {peer_count}, "
@@ -489,7 +487,7 @@ class BitcoinNode:
 
         except Exception as e:
             logger.error(f"Error in periodic tasks: {e}", exc_info=True)
-    
+
     async def _load_snapshot_if_needed(self, snapshot_path: str) -> None:
         """Load a UTXO snapshot if specified via -assumeutxo option.
 
@@ -694,22 +692,22 @@ class BitcoinNode:
     def _check_synced(self) -> bool:
         if not self.db:
             return False
-        
+
         try:
             # Check if we have blocks
             _, height = self.db.get_best_block()
-            
+
             # If we have a sync manager, use it to check sync status
             if self.sync_manager:
                 return self.sync_manager.is_synced()
-            
+
             # Simplified check: we're synced if we have blocks
             # In production, this should check against network
             return height > 0
-        
+
         except Exception:
             return False
-    
+
     def _register_handlers(self):
         """Register message handlers with peers"""
         if not self.peer_manager:
@@ -722,7 +720,9 @@ class BitcoinNode:
                     return
                 try:
                     from ouroboros.p2p_messages import (
-                        TxMessage, InvMessage, MSG_WITNESS_TX,
+                        MSG_WITNESS_TX,
+                        InvMessage,
+                        TxMessage,
                     )
 
                     tx_msg = TxMessage.from_payload(msg.payload)
@@ -788,13 +788,12 @@ class BitcoinNode:
             async def handler(msg):
                 try:
                     from ouroboros.p2p_messages import (
+                        INV_TYPE_BLOCK,
+                        INV_TYPE_TX,
+                        MSG_WITNESS_BLOCK,
+                        MSG_WITNESS_TX,
                         GetDataMessage,
                         TxMessage,
-                        InvMessage,
-                        INV_TYPE_TX,
-                        INV_TYPE_BLOCK,
-                        MSG_WITNESS_TX,
-                        MSG_WITNESS_BLOCK,
                     )
 
                     getdata = GetDataMessage.from_payload(msg.payload)
@@ -824,9 +823,9 @@ class BitcoinNode:
             async def handler(msg):
                 try:
                     from ouroboros.p2p_messages import (
+                        BlockHeader,
                         GetHeadersMessage,
                         HeadersMessage,
-                        BlockHeader,
                     )
 
                     getheaders = GetHeadersMessage.from_payload(msg.payload)
@@ -898,11 +897,11 @@ class BitcoinNode:
         self.peer_manager.set_inbound_peer_handler(_on_inbound_peer)
 
         logger.info("Transaction, getdata, and getheaders handlers registered")
-    
+
     def is_synced(self) -> bool:
         """Return True when the node has completed initial block synchronisation."""
         return self.synced
-    
+
     def _bits_to_difficulty(self, bits: int) -> float:
         """Convert compact target (bits) to difficulty."""
         n_shift = (bits >> 24) & 0xFF
@@ -921,40 +920,40 @@ class BitcoinNode:
             n_shift -= 1
 
         return d_diff
-    
+
     def get_current_difficulty(self) -> float:
         """Return the proof-of-work difficulty of the current chain tip."""
         if not self.db:
             return 1.0
-        
+
         try:
             # Get best block from database
             best_hash, best_height = self.db.get_best_block()
             block = self.db.get_block(best_hash)
-            
+
             if not block:
                 return 1.0
-            
+
             # Extract bits field from block header
             bits = block.bits
             return self._bits_to_difficulty(bits)
-        
+
         except Exception as e:
             logger.error(f"Error calculating current difficulty: {e}", exc_info=True)
             return 1.0
-    
-    def get_median_time(self, height: Optional[int] = None) -> int:
+
+    def get_median_time(self, height: int | None = None) -> int:
         """Median timestamp of the 11 blocks ending at *height* (or the chain tip when None)."""
         import time
-        
+
         if not self.db:
             return int(time.time())
-        
+
         try:
             # Get height if not provided
             if height is None:
                 _, height = self.db.get_best_block()
-            
+
             # Get timestamps of last 11 blocks (or fewer if not enough blocks)
             timestamps = []
             for h in range(max(0, height - 10), height + 1):
@@ -968,11 +967,11 @@ class BitcoinNode:
                 except Exception as e:
                     logger.debug(f"Error getting block at height {h} for median time: {e}")
                     continue
-            
+
             if not timestamps:
                 # No blocks found, return current time as fallback
                 return int(time.time())
-            
+
             # Sort and get median (middle of last 11 blocks, index 5 for 11 blocks)
             timestamps.sort()
             median_index = len(timestamps) // 2
@@ -981,34 +980,34 @@ class BitcoinNode:
         except Exception as e:
             logger.error(f"Error calculating median time at height {height}: {e}", exc_info=True)
             return int(time.time())  # Fallback when DB empty or error
-    
+
     def _calculate_block_work(self, bits: int) -> int:
         """Calculate proof-of-work for a block."""
         # Extract target from bits (same as difficulty calculation)
         mantissa = bits & 0x007fffff
         exponent = (bits >> 24) & 0xff
-        
+
         if mantissa == 0:
             return 0
-        
+
         # Calculate target: mantissa * 2^(8*(exponent-3))
         if exponent <= 3:
             target = mantissa >> (8 * (3 - exponent))
         else:
             target = mantissa << (8 * (exponent - 3))
-        
+
         # Calculate work = (2^256) / (target + 1)
         # Use Python's integer math for precision
         max_target = 2**256
         work = max_target // (target + 1)
-        
+
         return work
-    
+
     def _calculate_chainwork_at_height(self, height: int) -> int:
         """Calculate cumulative chainwork up to height."""
         if not self.db:
             return 0
-        
+
         try:
             # Prefer persisted chainwork from Rust BlockMetadata (computed during sync)
             persisted_chainwork = self.db.get_chainwork_by_height(height)
@@ -1027,7 +1026,7 @@ class BitcoinNode:
             cached_chainwork = self.db.get_block_chainwork(block_hash, height)
             if cached_chainwork > 0:
                 return cached_chainwork
-            
+
             # Calculate chainwork
             if height == 0:
                 # Genesis block
@@ -1048,25 +1047,25 @@ class BitcoinNode:
                             prev_chainwork = self._calculate_chainwork_at_height(height - 1)
                     else:
                         prev_chainwork = self._calculate_chainwork_at_height(height - 1)
-                
+
                 # Calculate current block work
                 work = self._calculate_block_work(block.bits)
                 chainwork = prev_chainwork + work
-            
+
             # Cache chainwork
             self.db.store_block_chainwork(block_hash, chainwork)
-            
+
             return chainwork
-        
+
         except Exception as e:
             logger.error(f"Error calculating chainwork at height {height}: {e}", exc_info=True)
             return 0
-    
+
     def get_chainwork(self) -> str:
         """Return cumulative chain work at the tip as a hex string."""
         if not self.db:
             return "0x0"
-        
+
         try:
             _, best_height = self.db.get_best_block()
             chainwork = self._calculate_chainwork_at_height(best_height)
@@ -1074,34 +1073,34 @@ class BitcoinNode:
         except Exception as e:
             logger.error(f"Error getting chainwork: {e}", exc_info=True)
             return "0x0"
-    
+
     def get_confirmations(self, height: int) -> int:
         """Return the number of confirmations for a block at *height*."""
         if not self.db:
             return 0
-        
+
         try:
             _, best_height = self.db.get_best_block()
             return max(0, best_height - height + 1)
-        except:
+        except Exception:
             return 0
-    
+
     def get_difficulty(self, bits: int) -> float:
         """Convert compact *bits* target to difficulty."""
         return self._bits_to_difficulty(bits)
-    
+
     def get_chainwork_at_height(self, height: int) -> str:
         """Return cumulative chain work up to *height* as a hex string."""
         if not self.db:
             return "0x0"
-        
+
         try:
             chainwork = self._calculate_chainwork_at_height(height)
             return f"0x{chainwork:x}"
         except Exception as e:
             logger.error(f"Error getting chainwork at height {height}: {e}", exc_info=True)
             return "0x0"
-    
+
     async def run(self) -> None:
         """Start the node and block until shutdown (convenience wrapper for ``start()``)."""
         try:

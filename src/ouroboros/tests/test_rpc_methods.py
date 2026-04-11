@@ -5,128 +5,131 @@ This test verifies that the new RPC methods (getrawmempool, getblockheader, gett
 are implemented and work correctly.
 """
 
-import unittest
+import shutil
 import sys
 import tempfile
-import shutil
+import unittest
 from pathlib import Path
 
 # Add src to path
 src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
-from ouroboros.node import BitcoinNode
-from ouroboros.rpc import RPCServer
+from ouroboros.node import BitcoinNode  # noqa: E402
+from ouroboros.rpc import RPCServer  # noqa: E402
 
 
 class TestRPCMethods(unittest.TestCase):
     """Test new RPC methods"""
-    
+
     def setUp(self):
         """Set up test fixtures"""
         self.temp_dir = tempfile.mkdtemp()
         self.node = BitcoinNode(data_dir=self.temp_dir, network="regtest")
         self.rpc_server = RPCServer(self.node, port=18332)
-    
+
     def tearDown(self):
         """Clean up test fixtures"""
         shutil.rmtree(self.temp_dir, ignore_errors=True)
-    
+
     def test_getrawmempool_method_exists(self):
         """Test that getrawmempool method exists"""
         self.assertTrue(hasattr(self.rpc_server, 'rpc_getrawmempool'))
         self.assertTrue(callable(getattr(self.rpc_server, 'rpc_getrawmempool', None)))
-    
+
     def test_getrawmempool_returns_list(self):
         """Test that getrawmempool returns a list when verbose=False"""
         import asyncio
-        
+
         async def test():
             result = await self.rpc_server.rpc_getrawmempool(verbose=False)
             self.assertIsInstance(result, list)
-        
+
         asyncio.run(test())
-    
+
     def test_getrawmempool_verbose_returns_dict(self):
         """Test that getrawmempool returns a dict when verbose=True"""
         import asyncio
-        
+
         async def test():
             result = await self.rpc_server.rpc_getrawmempool(verbose=True)
             self.assertIsInstance(result, dict)
-        
+
         asyncio.run(test())
-    
+
     def test_getblockheader_method_exists(self):
         """Test that getblockheader method exists"""
         self.assertTrue(hasattr(self.rpc_server, 'rpc_getblockheader'))
         self.assertTrue(callable(getattr(self.rpc_server, 'rpc_getblockheader', None)))
-    
+
     def test_getblockheader_handles_invalid_hash(self):
         """Test that getblockheader handles invalid hash"""
         import asyncio
+
         from fastapi import HTTPException
-        
+
         async def test():
             with self.assertRaises(HTTPException):
                 await self.rpc_server.rpc_getblockheader("invalid_hash", verbose=True)
-        
+
         asyncio.run(test())
-    
+
     def test_getblockheader_handles_not_found(self):
         """Test that getblockheader handles block not found"""
         import asyncio
+
         from fastapi import HTTPException
-        
+
         async def test():
             # Use a valid hex string but non-existent block
             fake_hash = "0" * 64
             with self.assertRaises(HTTPException):
                 await self.rpc_server.rpc_getblockheader(fake_hash, verbose=True)
-        
+
         asyncio.run(test())
-    
+
     def test_gettxout_method_exists(self):
         """Test that gettxout method exists"""
         self.assertTrue(hasattr(self.rpc_server, 'rpc_gettxout'))
         self.assertTrue(callable(getattr(self.rpc_server, 'rpc_gettxout', None)))
-    
+
     def test_gettxout_handles_invalid_txid(self):
         """Test that gettxout handles invalid transaction ID"""
         import asyncio
+
         from fastapi import HTTPException
-        
+
         async def test():
             with self.assertRaises(HTTPException):
                 await self.rpc_server.rpc_gettxout("invalid_txid", 0, includemempool=True)
-        
+
         asyncio.run(test())
-    
+
     def test_gettxout_returns_none_for_nonexistent(self):
         """Test that gettxout returns None for non-existent UTXO"""
         import asyncio
-        
+
         async def test():
             # Use a valid hex string but non-existent transaction
             fake_txid = "0" * 64
             result = await self.rpc_server.rpc_gettxout(fake_txid, 0, includemempool=True)
             # Should return None, not raise an exception
             self.assertIsNone(result)
-        
+
         asyncio.run(test())
-    
+
     def test_gettxout_with_mempool(self):
         """Test that gettxout checks mempool when includemempool=True"""
         import asyncio
-        
+
         async def test():
             # Even if mempool is empty, should not raise exception
             fake_txid = "0" * 64
             result = await self.rpc_server.rpc_gettxout(fake_txid, 0, includemempool=True)
             self.assertIsNone(result)
-        
+
         asyncio.run(test())
-    
+
     def test_gettxout_without_mempool(self):
         """Test that gettxout skips mempool when includemempool=False"""
         import asyncio
@@ -146,6 +149,7 @@ class TestRPCMethods(unittest.TestCase):
     def test_sendrawtransaction_invalid_hex(self):
         """Test sendrawtransaction rejects invalid hex"""
         import asyncio
+
         from fastapi import HTTPException
 
         async def test():
@@ -159,6 +163,7 @@ class TestRPCMethods(unittest.TestCase):
     def test_sendrawtransaction_coinbase_rejected(self):
         """Test sendrawtransaction rejects coinbase transactions"""
         import asyncio
+
         from fastapi import HTTPException
 
         # Genesis block coinbase tx hex
@@ -180,6 +185,7 @@ class TestRPCMethods(unittest.TestCase):
     def test_sendrawtransaction_mempool_unavailable(self):
         """Test sendrawtransaction when mempool is not available"""
         import asyncio
+
         from fastapi import HTTPException
 
         # Valid non-coinbase tx (P2PKH from Bitcoin Core test)
@@ -222,6 +228,7 @@ class TestSubmitPackage(unittest.TestCase):
     def test_submitpackage_rejects_empty_package(self):
         """Test that submitpackage rejects an empty package list."""
         import asyncio
+
         from fastapi import HTTPException
 
         async def test():
@@ -234,6 +241,7 @@ class TestSubmitPackage(unittest.TestCase):
     def test_submitpackage_rejects_invalid_hex(self):
         """Test that submitpackage rejects invalid hex strings."""
         import asyncio
+
         from fastapi import HTTPException
 
         async def test():
@@ -247,6 +255,7 @@ class TestSubmitPackage(unittest.TestCase):
     def test_submitpackage_rejects_coinbase(self):
         """Test that submitpackage rejects coinbase transactions."""
         import asyncio
+
         from fastapi import HTTPException
 
         # Genesis block coinbase tx hex
@@ -268,6 +277,7 @@ class TestSubmitPackage(unittest.TestCase):
     def test_submitpackage_mempool_unavailable(self):
         """Test that submitpackage returns error when mempool is not available."""
         import asyncio
+
         from fastapi import HTTPException
 
         # Valid non-coinbase tx hex
@@ -297,8 +307,9 @@ class TestSubmitPackage(unittest.TestCase):
         package fee rate above the minimum relay fee threshold.
         """
         import asyncio
-        from ouroboros.mempool import Mempool
+
         from ouroboros.database import Transaction, TxIn, TxOut
+        from ouroboros.mempool import Mempool
 
         # -- stub validator / UTXO DB -----------------------------------------
 
@@ -411,8 +422,9 @@ class TestSubmitPackage(unittest.TestCase):
     def test_submitpackage_validation_failure(self):
         """Test that submitpackage returns error for invalid package."""
         import asyncio
-        from ouroboros.mempool import Mempool
+
         from ouroboros.database import Transaction, TxIn, TxOut
+        from ouroboros.mempool import Mempool
 
         class _StubUTXODB:
             def __init__(self):
@@ -470,8 +482,8 @@ class TestMempoolEntryRPCs(unittest.TestCase):
         self.node = BitcoinNode(data_dir=self.temp_dir, network="regtest")
         self.rpc_server = RPCServer(self.node, port=18332)
 
-        from ouroboros.mempool import Mempool, MempoolEntry
         from ouroboros.database import Transaction, TxIn, TxOut
+        from ouroboros.mempool import Mempool, MempoolEntry
 
         class _StubValidator:
             class db:

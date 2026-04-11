@@ -5,10 +5,11 @@ This module provides a high-level Python interface to the Rust blockchain databa
 implementation, allowing Python code to interact with the blockchain storage layer.
 """
 
-from typing import Optional, List, Tuple, Dict, Any
-from dataclasses import dataclass, field
-import sync  # Rust extension module (required)
 import hashlib
+from dataclasses import dataclass
+from typing import Any
+
+import sync  # Rust extension module (required)
 
 
 @dataclass
@@ -20,87 +21,87 @@ class Block:
     timestamp: int
     bits: int
     nonce: int
-    transactions: List['Transaction']
+    transactions: list['Transaction']
     hash: bytes
-    height: Optional[int] = None  # Block height (if known)
-    
+    height: int | None = None  # Block height (if known)
+
     def hash(self) -> bytes:
         """Compute block hash"""
         return self.hash
-    
+
     def serialize(self) -> bytes:
         """Serialize block to Bitcoin wire format (80-byte header + tx list)."""
         from ouroboros.p2p_messages import encode_varint
-        
+
         data = bytearray()
-        
+
         # Serialize header (80 bytes)
         # Version (4 bytes)
         data.extend(self.version.to_bytes(4, 'little', signed=True))
-        
+
         # Previous block hash (32 bytes, already in internal/wire byte order)
         data.extend(self.prev_blockhash)
 
         # Merkle root (32 bytes, already in internal/wire byte order)
         data.extend(self.merkle_root)
-        
+
         # Timestamp (4 bytes)
         data.extend(self.timestamp.to_bytes(4, 'little'))
-        
+
         # Bits (4 bytes)
         data.extend(self.bits.to_bytes(4, 'little'))
-        
+
         # Nonce (4 bytes)
         data.extend(self.nonce.to_bytes(4, 'little'))
-        
+
         # Transaction count (varint)
         data.extend(encode_varint(len(self.transactions)))
-        
+
         # Serialize each transaction
         for tx in self.transactions:
             tx_bytes = tx.serialize()
             data.extend(tx_bytes)
-        
+
         return bytes(data)
-    
+
     @classmethod
     def deserialize(cls, data: bytes) -> 'Block':
         """Deserialize a block from Bitcoin wire format.
 
         Raises ValueError if data is invalid or too short.
         """
-        from ouroboros.p2p_messages import decode_varint, TxMessage
-        
+        from ouroboros.p2p_messages import TxMessage, decode_varint
+
         offset = 0
-        
+
         if len(data) < 80:  # Minimum header size
             raise ValueError("Block data too short for header")
-        
+
         # Parse header (80 bytes)
         version = int.from_bytes(data[offset:offset+4], byteorder='little', signed=True)
         offset += 4
-        
+
         prev_blockhash = data[offset:offset+32]  # Internal (little-endian) byte order — matches DB
         offset += 32
 
         merkle_root = data[offset:offset+32]  # Internal (little-endian) byte order
         offset += 32
-        
+
         timestamp = int.from_bytes(data[offset:offset+4], byteorder='little')
         offset += 4
-        
+
         bits = int.from_bytes(data[offset:offset+4], byteorder='little')
         offset += 4
-        
+
         nonce = int.from_bytes(data[offset:offset+4], byteorder='little')
         offset += 4
-        
+
         # Parse transaction count (varint)
         if len(data) <= offset:
             raise ValueError("Block data too short for transaction count")
         tx_count, varint_size = decode_varint(data, offset)
         offset += varint_size
-        
+
         # Parse transactions
         # We need to track transaction sizes accurately
         # Since transactions can have variable sizes and we need to know where each ends,
@@ -109,10 +110,10 @@ class Block:
         for i in range(tx_count):
             if offset >= len(data):
                 raise ValueError(f"Block data too short for transaction {i}")
-            
+
             # Store offset before parsing this transaction
             tx_start_offset = offset
-            
+
             # Parse transaction using TxMessage.from_payload
             tx_data = data[offset:]
             try:
@@ -129,19 +130,19 @@ class Block:
 
                 offset = tx_start_offset + tx_size
                 transactions.append(tx)
-                
+
             except ValueError as e:
                 # If parsing fails, try to recover by finding next transaction
                 # This is a fallback - ideally we should parse correctly
-                raise ValueError(f"Error parsing transaction {i} at offset {tx_start_offset}: {e}")
+                raise ValueError(f"Error parsing transaction {i} at offset {tx_start_offset}: {e}") from None
             except Exception as e:
-                raise ValueError(f"Unexpected error parsing transaction {i}: {e}")
-        
+                raise ValueError(f"Unexpected error parsing transaction {i}: {e}") from None
+
         # Calculate block hash
         import hashlib
         block_header = data[0:80]
         block_hash = hashlib.sha256(hashlib.sha256(block_header).digest()).digest()  # Internal byte order — matches DB
-        
+
         return cls(
             version=version,
             prev_blockhash=prev_blockhash,
@@ -161,32 +162,32 @@ class Transaction:
     txid: bytes
     version: int
     locktime: int
-    inputs: List['TxIn']
-    outputs: List['TxOut']
+    inputs: list['TxIn']
+    outputs: list['TxOut']
     has_witness: bool = False  # True if SegWit (marker 0x00, flag 0x01)
-    
+
     @property
     def is_coinbase(self) -> bool:
         """Check if this is a coinbase transaction"""
         return len(self.inputs) == 1 and self.inputs[0].prev_txid == bytes(32)
-    
+
     def get_txid(self) -> bytes:
         """Get transaction ID"""
         return self.txid
-    
+
     def serialize(self) -> bytes:
         """
         Serialize transaction to bytes for fee calculation.
-        
+
         This is a simplified serialization for size estimation.
         For full Bitcoin protocol serialization, use the Rust layer.
         """
         # Version (4 bytes)
         data = self.version.to_bytes(4, 'little')
-        
+
         # Input count (varint)
         data += self._encode_varint(len(self.inputs))
-        
+
         # Inputs
         for tx_in in self.inputs:
             data += tx_in.prev_txid  # 32 bytes
@@ -194,19 +195,19 @@ class Transaction:
             data += self._encode_varint(len(tx_in.script_sig))
             data += tx_in.script_sig
             data += tx_in.sequence.to_bytes(4, 'little')
-        
+
         # Output count (varint)
         data += self._encode_varint(len(self.outputs))
-        
+
         # Outputs
         for tx_out in self.outputs:
             data += tx_out.value.to_bytes(8, 'little')
             data += self._encode_varint(len(tx_out.script_pubkey))
             data += tx_out.script_pubkey
-        
+
         # Locktime (4 bytes)
         data += self.locktime.to_bytes(4, 'little')
-        
+
         return data
 
     def serialize_with_witness(self) -> bytes:
@@ -245,7 +246,7 @@ class Transaction:
         if not self.has_witness:
             return self.get_txid()
         return hashlib.sha256(hashlib.sha256(self.serialize_with_witness()).digest()).digest()
-    
+
     def _encode_varint(self, value: int) -> bytes:
         if value < 0xfd:
             return bytes([value])
@@ -255,7 +256,7 @@ class Transaction:
             return b'\xfe' + value.to_bytes(4, 'little')
         else:
             return b'\xff' + value.to_bytes(8, 'little')
-    
+
     def get_witness_bytes(self) -> int:
         """Total encoded witness size in bytes (0 for non-SegWit)."""
         if not self.has_witness:
@@ -280,7 +281,7 @@ class Transaction:
         stripped_size = len(self.serialize())
         total_size = len(self.serialize_with_witness())
         return stripped_size * 3 + total_size
-    
+
     def get_vsize(self) -> int:
         """Virtual size in bytes: ceil(weight / 4)."""
         weight = self.get_weight()
@@ -295,7 +296,7 @@ class TxIn:
     prev_vout: int
     script_sig: bytes
     sequence: int
-    witness: Optional[List[bytes]] = None  # SegWit witness stack; None = non-SegWit
+    witness: list[bytes] | None = None  # SegWit witness stack; None = non-SegWit
 
 
 @dataclass
@@ -307,14 +308,14 @@ class TxOut:
 
 class BlockchainDatabase:
     """Read/write access to blockchain data using Rust backend"""
-    
+
     def __init__(self, data_dir: str):
         self._db = sync.PyBlockchainDB(data_dir)
         self._data_dir = data_dir
         # Cached chain tip — updated after every block connect/disconnect.
         # RPC reads this instead of calling into Rust FFI, avoiding lock
         # contention during IBD.
-        self._cached_tip: Optional[Tuple[bytes, int]] = None
+        self._cached_tip: tuple[bytes, int] | None = None
         # Lightweight header-field cache for RPC — avoids full-block
         # deserialisation in getblockchaininfo.  Updated on connect.
         self._tip_bits: int = 0x1d00ffff
@@ -325,35 +326,35 @@ class BlockchainDatabase:
             self._cached_tip = self.get_best_block()
         except Exception:
             pass
-    
-    def get_block(self, block_hash: bytes) -> Optional[Block]:
+
+    def get_block(self, block_hash: bytes) -> Block | None:
         """Look up a block by its 32-byte hash; returns None if not found."""
         if len(block_hash) != 32:
             raise ValueError("Block hash must be 32 bytes")
-        
+
         py_block = self._db.get_block(block_hash)
         if py_block is None:
             return None
-        
+
         return self._py_block_to_block(py_block)
-    
-    def get_block_by_height(self, height: int) -> Optional[Block]:
+
+    def get_block_by_height(self, height: int) -> Block | None:
         """Look up a block by height; returns None if not found."""
         py_block = self._db.get_block_by_height(height)
         if py_block is None:
             return None
-        
+
         return self._py_block_to_block(py_block)
-    
-    def get_utxo(self, txid: bytes, vout: int) -> Optional[Dict[str, Any]]:
+
+    def get_utxo(self, txid: bytes, vout: int) -> dict[str, Any] | None:
         """Fetch a UTXO by outpoint; returns a dict (txid, vout, value, script_pubkey) or None."""
         if len(txid) != 32:
             raise ValueError("Transaction ID must be 32 bytes")
-        
+
         py_utxo = self._db.get_utxo(txid, vout)
         if py_utxo is None:
             return None
-        
+
         return {
             'txid': py_utxo.txid,
             'vout': py_utxo.vout,
@@ -361,14 +362,14 @@ class BlockchainDatabase:
             'script_pubkey': bytes(py_utxo.script_pubkey),
             'height': getattr(py_utxo, 'height', None),
         }
-    
+
     def store_block(self, block: Block) -> None:
         """Not implemented — use the Rust API via FastSync or BlockSync instead."""
         raise NotImplementedError(
             "store_block requires BlockWrapper reconstruction. "
             "Use Rust API directly via FastSync.store_block() or BlockSync"
         )
-    
+
     def disconnect_block(self, height: int) -> bytes:
         """
         Disconnect the block at the given height — reverse all UTXO changes.
@@ -412,7 +413,7 @@ class BlockchainDatabase:
         """
         return self._db.recover_from_crash()
 
-    def get_tx_index(self, txid: bytes) -> Optional[Tuple[bytes, int, int]]:
+    def get_tx_index(self, txid: bytes) -> tuple[bytes, int, int] | None:
         """Look up a confirmed transaction; returns ``(block_hash, height, tx_position)`` or None."""
         if len(txid) != 32:
             raise ValueError("Transaction ID must be 32 bytes")
@@ -422,7 +423,7 @@ class BlockchainDatabase:
         block_hash, height, tx_pos = result
         return (bytes(block_hash), height, tx_pos)
 
-    def get_best_block(self) -> Tuple[bytes, int]:
+    def get_best_block(self) -> tuple[bytes, int]:
         """Return the current chain tip as ``(block_hash, height)``."""
         if self._cached_tip is not None:
             return self._cached_tip
@@ -436,8 +437,8 @@ class BlockchainDatabase:
             raise ValueError("Block hash must be 32 bytes")
         self._db.update_best_block(block_hash, height)
         self._cached_tip = (bytes(block_hash), height)
-    
-    def get_median_time_past(self, height: int) -> Optional[int]:
+
+    def get_median_time_past(self, height: int) -> int | None:
         """Median timestamp of the 11 blocks up to *height* (BIP 68 / BIP 113 MTP).
 
         Uses the Rust backend's lightweight metadata lookup when available,
@@ -469,7 +470,7 @@ class BlockchainDatabase:
 
     def list_unspent_by_address(
         self, address: str, network: str = "mainnet"
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return UTXOs for *address* as a list of dicts (txid, vout, value, script_pubkey)."""
         from ouroboros.address import address_to_script_pubkey
 
@@ -482,7 +483,7 @@ class BlockchainDatabase:
             total += utxo["value"]
         return total
 
-    def _list_unspent_for_script_pubkey(self, script_pubkey: bytes) -> List[Dict[str, Any]]:
+    def _list_unspent_for_script_pubkey(self, script_pubkey: bytes) -> list[dict[str, Any]]:
         return list(self._iter_matching_utxos(script_pubkey))
 
     def _iter_matching_utxos(self, script_pubkey: bytes):
@@ -501,7 +502,7 @@ class BlockchainDatabase:
                     "script_pubkey": spk,
                 }
 
-    def get_block_hash_by_height(self, height: int) -> Optional[bytes]:
+    def get_block_hash_by_height(self, height: int) -> bytes | None:
         """Return the 32-byte block hash at *height*, or None if not found."""
         try:
             block_hash = self._db.get_block_hash_by_height(height)
@@ -517,7 +518,7 @@ class BlockchainDatabase:
                 return None
             return bytes(h() if callable(h) else h)
             return None
-    
+
     def get_chainwork_by_height(self, height: int) -> int:
         """Return cumulative chainwork at *height* (from Rust metadata), or 0 if missing."""
         try:
@@ -532,14 +533,14 @@ class BlockchainDatabase:
     def store_block_chainwork(self, block_hash: bytes, chainwork: int) -> None:
         """Cache chainwork for *block_hash* in memory (fallback when Rust metadata is unavailable)."""
         if not hasattr(self, "_chainwork_cache"):
-            self._chainwork_cache: Dict[bytes, int] = {}
+            self._chainwork_cache: dict[bytes, int] = {}
 
         if len(block_hash) != 32:
             raise ValueError("Block hash must be 32 bytes")
 
         self._chainwork_cache[block_hash] = chainwork
 
-    def get_block_chainwork(self, block_hash: bytes, height: Optional[int] = None) -> int:
+    def get_block_chainwork(self, block_hash: bytes, height: int | None = None) -> int:
         """Return chainwork for a block; prefers Rust metadata, falls back to in-memory cache."""
         if height is not None:
             persisted = self.get_chainwork_by_height(height)
@@ -553,7 +554,7 @@ class BlockchainDatabase:
             raise ValueError("Block hash must be 32 bytes")
 
         return self._chainwork_cache.get(block_hash, 0)
-    
+
     def connect_block_from_bytes(self, block_bytes: bytes, height: int) -> bytes:
         """Connect a block via Rust FFI and update the cached chain tip.
 
@@ -596,7 +597,7 @@ class BlockchainDatabase:
 
         return result
 
-    def refresh_tip_cache(self) -> Tuple[bytes, int]:
+    def refresh_tip_cache(self) -> tuple[bytes, int]:
         """Force-refresh the cached tip from Rust and return it."""
         hash_bytes, height = self._db.get_best_block()
         self._cached_tip = (bytes(hash_bytes), height)
@@ -627,11 +628,11 @@ class BlockchainDatabase:
 
     def __enter__(self):
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         # Database operations are already atomic via RocksDB
         return False
-    
+
     def _py_block_to_block(self, py_block) -> Block:
         # Type hint: py_block should be sync.PyBlock if available
         """Convert PyBlock to Block"""
@@ -660,7 +661,7 @@ class BlockchainDatabase:
                 inputs=inputs,
                 outputs=outputs,
             ))
-        
+
         return Block(
             version=py_block.version,
             prev_blockhash=bytes(py_block.prev_blockhash),

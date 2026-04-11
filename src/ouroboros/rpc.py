@@ -6,35 +6,36 @@ supporting standard Bitcoin RPC methods.
 """
 
 import asyncio
-from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.responses import JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.requests import Request
-from typing import Dict, Any, List, Optional, Union
+import hashlib as _hashlib
 import json
 import logging
 import statistics
+import struct as _struct
 import time
 from collections import defaultdict
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
-from ouroboros.database import Transaction, TxIn, TxOut, Block
-from ouroboros.script import disassemble_script
-from ouroboros.metrics import record_rpc_request
 from ouroboros.blockfilter import (
+    BlockFilterIndex,
     build_basic_filter,
     compute_filter_header,
-    compute_filter_hash,
-    BlockFilterIndex,
 )
+from ouroboros.database import Block, Transaction, TxIn, TxOut
+from ouroboros.metrics import record_rpc_request
+from ouroboros.script import disassemble_script
 from ouroboros.validation import (
-    _count_legacy_sigops,
-    _get_p2sh_sigops,
-    _count_witness_sigops,
-    _is_p2sh,
-    _get_last_push,
     WITNESS_SCALE_FACTOR,
+    _count_legacy_sigops,
+    _count_witness_sigops,
+    _get_last_push,
+    _get_p2sh_sigops,
+    _is_p2sh,
 )
 
 # BIP9 versionbits support
@@ -47,7 +48,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Rate limiting
-_rate_limit_store: Dict[str, List[float]] = defaultdict(list)
+_rate_limit_store: dict[str, list[float]] = defaultdict(list)
 _rate_limit_window = 60.0  # 1 minute
 _rate_limit_max_requests = 100000  # raised for IBD feeder throughput
 
@@ -56,26 +57,22 @@ class JSONRPCRequest(BaseModel):
     """JSON-RPC 2.0 request model"""
     jsonrpc: str = "2.0"
     method: str
-    params: Union[List[Any], Dict[str, Any]] = []
-    id: Optional[Union[int, str]] = None
+    params: list[Any] | dict[str, Any] = []
+    id: int | str | None = None
 
 
 class JSONRPCResponse(BaseModel):
     """JSON-RPC 2.0 response model"""
     jsonrpc: str = "2.0"
-    result: Optional[Any] = None
-    error: Optional[Dict[str, Any]] = None
-    id: Optional[Union[int, str]] = None
+    result: Any | None = None
+    error: dict[str, Any] | None = None
+    id: int | str | None = None
 
 
 
 # ---------------------------------------------------------------------------
 # Partial Merkle tree helpers (CMerkleBlock serialization / deserialization)
 # ---------------------------------------------------------------------------
-
-import hashlib as _hashlib
-import math as _math
-import struct as _struct
 
 
 def _dsha256(data: bytes) -> bytes:
@@ -229,8 +226,8 @@ class RPCServer:
         self,
         node: Any,
         port: int = 8332,
-        username: Optional[str] = None,
-        password: Optional[str] = None,
+        username: str | None = None,
+        password: str | None = None,
         rate_limit: bool = True,
         max_batch_size: int = 1000,
         enable_rest: bool = False,
@@ -271,7 +268,7 @@ class RPCServer:
             self.security = HTTPBasic()
 
         # Current wallet context (set per-request)
-        self._current_wallet_name: Optional[str] = None
+        self._current_wallet_name: str | None = None
 
         # Register RPC methods
         self._register_methods()
@@ -327,8 +324,8 @@ class RPCServer:
             return getattr(self.node, "wallet", None)
 
     async def _execute_single_rpc(
-        self, req_data: Dict[str, Any], wallet_name: Optional[str] = None
-    ) -> Dict[str, Any]:
+        self, req_data: dict[str, Any], wallet_name: str | None = None
+    ) -> dict[str, Any]:
         """Execute a single RPC call and return the response as a dict.
 
         This is used by both single request and batch request handlers.
@@ -397,7 +394,7 @@ class RPCServer:
         """Register all RPC methods"""
 
         async def _handle_rpc_common(
-            http_request: Request, wallet_name: Optional[str] = None
+            http_request: Request, wallet_name: str | None = None
         ):
             """Common handler for RPC requests with optional wallet context."""
             # Authentication — re-raise so FastAPI returns HTTP 401 with
@@ -505,7 +502,7 @@ class RPCServer:
             from urllib.parse import unquote
             wallet_name = unquote(wallet_name)
             return await _handle_rpc_common(http_request, wallet_name=wallet_name)
-        
+
         @self.app.get("/health")
         async def health():
             """Health check endpoint"""
@@ -514,7 +511,7 @@ class RPCServer:
         @self.app.get("/getblockstats")
         async def getblockstats(
             hash_or_height: str,
-            stats: Optional[str] = None,
+            stats: str | None = None,
             http_request: Request = None,
         ):
             """GET endpoint for getblockstats.
@@ -527,13 +524,13 @@ class RPCServer:
             return.
             """
             # Coerce to int when possible
-            parsed: Union[int, str]
+            parsed: int | str
             try:
                 parsed = int(hash_or_height)
             except ValueError:
                 parsed = hash_or_height
 
-            stats_list: Optional[List[str]] = None
+            stats_list: list[str] | None = None
             if stats:
                 stats_list = [s.strip() for s in stats.split(",") if s.strip()]
 
@@ -559,7 +556,7 @@ class RPCServer:
         self.app.include_router(rest_interface.router)
         logger.info("REST interface enabled at /rest/*")
 
-    async def _get_credentials(self, request: Request) -> Optional[HTTPBasicCredentials]:
+    async def _get_credentials(self, request: Request) -> HTTPBasicCredentials | None:
         if not self.security:
             return None
 
@@ -571,7 +568,7 @@ class RPCServer:
                 status_code=401,
                 detail="Authentication required",
                 headers=_www_auth,
-            )
+            ) from None
         if credentials.username != self.username or credentials.password != self.password:
             raise HTTPException(
                 status_code=401,
@@ -579,19 +576,19 @@ class RPCServer:
                 headers=_www_auth,
             )
         return credentials
-    
+
     def _get_client_ip_from_request(self, request: Request) -> str:
         # Try to get real IP from headers (for proxies)
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
             return forwarded.split(",")[0].strip()
-        
+
         # Fallback to direct client
         if request.client:
             return request.client.host
-        
+
         return "127.0.0.1"
-    
+
     def _check_rate_limit(self, client_ip: str) -> bool:
         now = time.time()
         requests = _rate_limit_store[client_ip]
@@ -605,10 +602,11 @@ class RPCServer:
 
         requests.append(now)
         return True
-    
+
     async def start(self):
         """Start RPC server"""
         import socket
+
         import uvicorn
 
         # Pre-check: is the port already in use?
@@ -643,10 +641,10 @@ class RPCServer:
                 f"RPC server OS error: {e}.  "
                 "Node continues running without RPC."
             )
-    
+
     # RPC Methods
-    
-    async def rpc_getblockchaininfo(self) -> Dict[str, Any]:
+
+    async def rpc_getblockchaininfo(self) -> dict[str, Any]:
         """Return blockchain information.
 
         Reference: Bitcoin Core rpc/blockchain.cpp getblockchaininfo
@@ -771,7 +769,7 @@ class RPCServer:
             except Exception:
                 chainwork = "0x0"
 
-        info: Dict[str, Any] = {
+        info: dict[str, Any] = {
             "chain": network,
             "blocks": best_height,
             "headers": headers_count,
@@ -799,25 +797,25 @@ class RPCServer:
         info["warnings"] = warnings
 
         return info
-    
+
     async def rpc_getblockcount(self) -> int:
         """Return block count"""
         if not hasattr(self.node, 'db'):
             raise HTTPException(status_code=500, detail="Database not available")
-        
+
         _, height = self.node.db.get_best_block()
         return height
-    
+
     async def rpc_getbestblockhash(self) -> str:
         """Return best block hash"""
         if not hasattr(self.node, 'db'):
             raise HTTPException(status_code=500, detail="Database not available")
-        
+
         hash_bytes, _ = self.node.db.get_best_block()
         if isinstance(hash_bytes, bytes):
             return hash_bytes[::-1].hex()
         return str(hash_bytes)
-    
+
     async def rpc_getblockhash(self, height: int) -> str:
         """Return block hash at height"""
         if not hasattr(self.node, 'db'):
@@ -826,17 +824,17 @@ class RPCServer:
         block = await asyncio.to_thread(self.node.db.get_block_by_height, height)
         if not block:
             raise HTTPException(status_code=404, detail="Block not found")
-        
+
         block_hash = block.hash if hasattr(block, 'hash') else block.get_txid() if hasattr(block, 'get_txid') else None
         if isinstance(block_hash, bytes):
             return block_hash[::-1].hex()
         raise HTTPException(status_code=500, detail="Could not get block hash")
-    
+
     async def rpc_getblock(
         self,
         blockhash: str,
         verbosity: int = 1
-    ) -> Union[str, Dict[str, Any]]:
+    ) -> str | dict[str, Any]:
         """Return block information.
 
         Reference: Bitcoin Core rpc/blockchain.cpp getblock
@@ -856,7 +854,7 @@ class RPCServer:
         try:
             block_hash = bytes.fromhex(blockhash)
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid block hash")
+            raise HTTPException(status_code=400, detail="Invalid block hash") from None
 
         if not hasattr(self.node, 'db'):
             raise HTTPException(status_code=500, detail="Database not available")
@@ -869,8 +867,8 @@ class RPCServer:
             # Return serialized block (hex)
             try:
                 return block.serialize().hex()
-            except:
-                raise HTTPException(status_code=500, detail="Block serialization not implemented")
+            except Exception:
+                raise HTTPException(status_code=500, detail="Block serialization not implemented") from None
 
         # Common fields for verbosity >= 1
         block_height = getattr(block, 'height', None)
@@ -916,7 +914,7 @@ class RPCServer:
         n_tx = len(block.transactions) if hasattr(block, 'transactions') and block.transactions else 0
 
         # Build result
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "hash": blockhash,
             "confirmations": confirmations,
             "size": size,
@@ -1002,13 +1000,13 @@ class RPCServer:
                 result["tx"] = []
 
         return result
-    
+
     async def rpc_getrawtransaction(
         self,
         txid: str,
-        verbose: Union[bool, int] = 0,
-        blockhash: Optional[str] = None
-    ) -> Union[str, Dict[str, Any]]:
+        verbose: bool | int = 0,
+        blockhash: str | None = None
+    ) -> str | dict[str, Any]:
         """Return raw transaction data.
 
         By default, this call only returns a transaction if it is in the
@@ -1033,7 +1031,7 @@ class RPCServer:
         try:
             tx_hash = bytes.fromhex(txid)
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid transaction id")
+            raise HTTPException(status_code=400, detail="Invalid transaction id") from None
 
         if len(tx_hash) != 32:
             raise HTTPException(status_code=400, detail="Invalid transaction id")
@@ -1052,7 +1050,7 @@ class RPCServer:
             try:
                 block_hash_bytes = bytes.fromhex(blockhash)
             except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid block hash")
+                raise HTTPException(status_code=400, detail="Invalid block hash") from None
             if len(block_hash_bytes) != 32:
                 raise HTTPException(status_code=400, detail="Invalid block hash")
 
@@ -1177,8 +1175,8 @@ class RPCServer:
         # which needs undo data or UTXO lookups
 
         return result
-    
-    async def rpc_getmempoolinfo(self) -> Dict[str, Any]:
+
+    async def rpc_getmempoolinfo(self) -> dict[str, Any]:
         """Return mempool information.
 
         Reference: Bitcoin Core rpc/mempool.cpp getmempoolinfo
@@ -1196,7 +1194,7 @@ class RPCServer:
         - unbroadcastcount: Number of transactions that haven't passed initial broadcast
         - fullrbf: True if mempool accepts RBF without signaling
         """
-        if not hasattr(self.node, 'mempool') or not self.node.mempool:
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
             return {
                 "loaded": True,
                 "size": 0,
@@ -1216,7 +1214,7 @@ class RPCServer:
 
         # Calculate total fees from all mempool entries
         total_fee_sat = 0
-        for txid, entry in mempool.transactions.items():
+        for _txid, entry in mempool.transactions.items():
             total_fee_sat += entry.fee
 
         # Get unbroadcast count if tracked
@@ -1272,14 +1270,14 @@ class RPCServer:
             "unbroadcastcount": unbroadcast_count,
             "fullrbf": full_rbf,
         }
-    
+
     # Default maxfeerate: 0.10 BTC/kvB (100,000 sat/kvB = 100 sat/vB)
     DEFAULT_MAX_RAW_TX_FEE_RATE = 0.10  # BTC/kvB
 
     async def rpc_sendrawtransaction(
         self,
         hexstring: str,
-        maxfeerate: Optional[float] = None
+        maxfeerate: float | None = None
     ) -> str:
         """
         Submit a raw transaction (serialized, hex-encoded) to the network.
@@ -1307,7 +1305,7 @@ class RPCServer:
             raise HTTPException(
                 status_code=400,
                 detail=f"TX decode failed: {e}"
-            )
+            ) from None
 
         try:
             from ouroboros.p2p_messages import TxMessage
@@ -1315,7 +1313,7 @@ class RPCServer:
             raise HTTPException(
                 status_code=500,
                 detail="P2P messages not available"
-            )
+            ) from None
 
         try:
             tx_msg = TxMessage.from_payload(tx_data)
@@ -1324,7 +1322,7 @@ class RPCServer:
             raise HTTPException(
                 status_code=400,
                 detail=f"TX decode failed. Make sure the tx has at least one input. {e}"
-            )
+            ) from None
 
         txid = tx.get_txid()
         txid_hex = txid.hex()
@@ -1336,7 +1334,7 @@ class RPCServer:
                 detail="coinbase"
             )
 
-        if not hasattr(self.node, 'mempool') or not self.node.mempool:
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
             raise HTTPException(
                 status_code=500,
                 detail="Mempool not available"
@@ -1486,8 +1484,8 @@ class RPCServer:
 
         # Default: return original error
         return error
-    
-    async def rpc_getnetworkinfo(self) -> Dict[str, Any]:
+
+    async def rpc_getnetworkinfo(self) -> dict[str, Any]:
         """Return network information.
 
         Reference: Bitcoin Core rpc/net.cpp getnetworkinfo
@@ -1627,26 +1625,26 @@ class RPCServer:
             "localaddresses": local_addresses,
             "warnings": warnings,
         }
-    
-    async def rpc_getrawmempool(self, verbose: bool = False) -> Union[List[str], Dict[str, Dict[str, Any]]]:
+
+    async def rpc_getrawmempool(self, verbose: bool = False) -> list[str] | dict[str, dict[str, Any]]:
         """
         Get all transaction IDs in mempool.
-        
+
         Args:
             verbose: If True, return detailed information for each transaction
-            
+
         Returns:
             If verbose=False: List of transaction IDs (hex strings)
             If verbose=True: Dictionary mapping txid to transaction info
         """
-        if not hasattr(self.node, 'mempool') or not self.node.mempool:
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
             return [] if not verbose else {}
-        
+
         txids = list(self.node.mempool.transactions.keys())
-        
+
         if not verbose:
             return [txid.hex() if isinstance(txid, bytes) else str(txid) for txid in txids]
-        
+
         # Return detailed information
         result = {}
         for txid in txids:
@@ -1656,8 +1654,8 @@ class RPCServer:
                 result[txid_hex] = self._format_mempool_entry(entry, txid)
 
         return result
-    
-    async def rpc_getblockheader(self, blockhash: str, verbose: bool = True) -> Union[str, Dict[str, Any]]:
+
+    async def rpc_getblockheader(self, blockhash: str, verbose: bool = True) -> str | dict[str, Any]:
         """
         Get block header information.
 
@@ -1737,7 +1735,7 @@ class RPCServer:
             # Number of transactions
             n_tx = len(block.transactions) if hasattr(block, 'transactions') and block.transactions else 0
 
-            result: Dict[str, Any] = {
+            result: dict[str, Any] = {
                 "hash": blockhash,
                 "confirmations": confirmations,
                 "height": block_height if block_height is not None else 0,
@@ -1767,16 +1765,16 @@ class RPCServer:
             return result
 
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}") from None
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"Error getting block header: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
-    
+            raise HTTPException(status_code=500, detail=str(e)) from None
+
     async def rpc_getblockfilter(
         self, blockhash: str, filtertype: str = "basic"
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Return the BIP 158 compact block filter for a block.
 
@@ -1796,7 +1794,7 @@ class RPCServer:
         try:
             block_hash = bytes.fromhex(blockhash)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}") from None
 
         if not hasattr(self.node, "db") or not self.node.db:
             raise HTTPException(status_code=500, detail="Database not available")
@@ -1814,7 +1812,7 @@ class RPCServer:
         prev_header = b"\x00" * 32
 
         # If the node keeps a BlockFilterIndex, try to use it.
-        bfi: Optional[BlockFilterIndex] = getattr(self.node, "block_filter_index", None)
+        bfi: BlockFilterIndex | None = getattr(self.node, "block_filter_index", None)
         if bfi is not None:
             cached_filter = bfi.get_filter(block_hash)
             cached_header = bfi.get_header(block_hash)
@@ -1843,7 +1841,7 @@ class RPCServer:
             "header": filter_header.hex(),
         }
 
-    async def rpc_gettxout(self, txid: str, n: int, includemempool: bool = True) -> Optional[Dict[str, Any]]:
+    async def rpc_gettxout(self, txid: str, n: int, includemempool: bool = True) -> dict[str, Any] | None:
         """
         Get UTXO information by outpoint.
 
@@ -1857,7 +1855,7 @@ class RPCServer:
         """
         try:
             txid_bytes = bytes.fromhex(txid)
-            
+
             # First check mempool if enabled
             if includemempool and hasattr(self.node, 'mempool') and self.node.mempool:
                 # Check if transaction is in mempool
@@ -1884,21 +1882,21 @@ class RPCServer:
                             },
                             "coinbase": tx.is_coinbase,
                         }
-            
+
             # Check database (confirmed UTXOs)
             if not hasattr(self.node, 'db') or not self.node.db:
                 return None
-            
+
             utxo = await asyncio.to_thread(self.node.db.get_utxo, txid_bytes, n)
             if not utxo:
                 return None
-            
+
             # Get block height for confirmations
             # Try to find which block contains this transaction
             block_height = 0  # Placeholder - would need transaction index
             best_hash, best_height = self.node.db.get_best_block()
             confirmations = max(0, best_height - block_height + 1) if block_height else 0
-            
+
             script_pubkey = utxo['script_pubkey']
             if isinstance(script_pubkey, bytes):
                 script_hex = script_pubkey.hex()
@@ -1906,7 +1904,7 @@ class RPCServer:
             else:
                 script_hex = str(script_pubkey)
                 script_pubkey_bytes = bytes(script_pubkey)
-            
+
             coinbase = self._is_coinbase_output(txid_bytes)
             return {
                 "bestblock": best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash),
@@ -1919,22 +1917,22 @@ class RPCServer:
                 },
                 "coinbase": coinbase,
             }
-        
+
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid transaction ID: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid transaction ID: {e}") from None
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"Error getting txout: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from None
 
     async def rpc_listunspent(
         self,
         minconf: int = 1,
         maxconf: int = 9999999,
-        addresses: Optional[List[str]] = None,
+        addresses: list[str] | None = None,
         include_unsafe: bool = True,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         List unspent outputs, optionally filtered by addresses.
 
@@ -2038,7 +2036,7 @@ class RPCServer:
         txid = await self.rpc_sendrawtransaction(raw_hex)
         return txid
 
-    async def rpc_sethdseed(self, seed_hex: str = None) -> Dict[str, Any]:
+    async def rpc_sethdseed(self, seed_hex: str = None) -> dict[str, Any]:
         """
         Initialise the wallet in HD (BIP 32 / BIP 44) mode.
 
@@ -2195,7 +2193,7 @@ class RPCServer:
             )
         return True
 
-    async def rpc_getwalletinfo(self) -> Dict[str, Any]:
+    async def rpc_getwalletinfo(self) -> dict[str, Any]:
         """
         Return wallet state info.
 
@@ -2213,7 +2211,7 @@ class RPCServer:
             addresses = await wallet.get_addresses()
             keypool_size = len(addresses)
 
-        info: Dict[str, Any] = {
+        info: dict[str, Any] = {
             "walletname": wallet.name,
             "walletversion": 1,
             "balance": balance / 1e8,
@@ -2282,11 +2280,12 @@ class RPCServer:
 
     # PSBT RPCs (BIP 174)
 
-    async def rpc_decodepsbt(self, psbt_base64: str) -> Dict[str, Any]:
+    async def rpc_decodepsbt(self, psbt_base64: str) -> dict[str, Any]:
         """
         Decode a base64-encoded PSBT into a human-readable dict.
         """
         import base64 as b64
+
         from ouroboros.psbt import PSBT
 
         try:
@@ -2305,11 +2304,12 @@ class RPCServer:
             )
         return psbt.decode()
 
-    async def rpc_combinepsbt(self, psbts: List[str]) -> str:
+    async def rpc_combinepsbt(self, psbts: list[str]) -> str:
         """
         Combine multiple base64-encoded PSBTs into one.
         """
         import base64 as b64
+
         from ouroboros.psbt import PSBT
 
         if not psbts or len(psbts) < 2:
@@ -2331,12 +2331,13 @@ class RPCServer:
 
     async def rpc_finalizepsbt(
         self, psbt_base64: str, extract: bool = True
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Finalise a PSBT. If *extract* is true and all inputs are finalised,
         extract the network transaction.
         """
         import base64 as b64
+
         from ouroboros.psbt import PSBT
 
         try:
@@ -2368,8 +2369,8 @@ class RPCServer:
 
     async def rpc_createpsbt(
         self,
-        inputs: List[Dict[str, Any]],
-        outputs: List[Dict[str, Any]],
+        inputs: list[dict[str, Any]],
+        outputs: list[dict[str, Any]],
         locktime: int = 0,
     ) -> str:
         """
@@ -2379,11 +2380,12 @@ class RPCServer:
         *outputs*: ``[{"<address>": <amount_sat>}, ...]``
         """
         import base64 as b64
-        from ouroboros.psbt import PSBT
-        from ouroboros.database import Transaction, TxIn, TxOut
-        from ouroboros.address import address_to_script_pubkey
 
-        tx_inputs: List[TxIn] = []
+        from ouroboros.address import address_to_script_pubkey
+        from ouroboros.database import Transaction, TxIn, TxOut
+        from ouroboros.psbt import PSBT
+
+        tx_inputs: list[TxIn] = []
         for inp in inputs:
             txid = inp.get("txid", "")
             vout = inp.get("vout", 0)
@@ -2402,7 +2404,7 @@ class RPCServer:
                 sequence=sequence,
             ))
 
-        tx_outputs: List[TxOut] = []
+        tx_outputs: list[TxOut] = []
         for out in outputs:
             for address, amount in out.items():
                 try:
@@ -2427,7 +2429,7 @@ class RPCServer:
         self,
         conf_target: int = 6,
         estimate_mode: str = "economical",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Estimate the fee rate needed for a transaction to confirm
         within conf_target blocks.
@@ -2457,13 +2459,13 @@ class RPCServer:
             "blocks": conf_target,
         }
 
-    async def rpc_validateaddress(self, address: str) -> Dict[str, Any]:
+    async def rpc_validateaddress(self, address: str) -> dict[str, Any]:
         """
         Validate a Bitcoin address and return information about it.
         """
         from ouroboros.address import address_to_script_pubkey
 
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "isvalid": False,
             "address": address,
         }
@@ -2490,8 +2492,8 @@ class RPCServer:
 
     async def rpc_gettxoutproof(
         self,
-        txids: List[str],
-        blockhash: Optional[str] = None,
+        txids: list[str],
+        blockhash: str | None = None,
     ) -> str:
         """
         Return a hex-encoded Merkle proof that transactions were included
@@ -2515,7 +2517,7 @@ class RPCServer:
             try:
                 target_set.add(bytes.fromhex(txid_hex))
             except ValueError:
-                raise HTTPException(status_code=400, detail=f"Invalid txid: {txid_hex}")
+                raise HTTPException(status_code=400, detail=f"Invalid txid: {txid_hex}") from None
 
         # Find the block
         block = None
@@ -2523,7 +2525,7 @@ class RPCServer:
             try:
                 block = await asyncio.to_thread(db.get_block, bytes.fromhex(blockhash))
             except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid blockhash")
+                raise HTTPException(status_code=400, detail="Invalid blockhash") from None
         else:
             _, best_height = db.get_best_block()
             for h in range(best_height, max(best_height - 100, -1), -1):
@@ -2550,7 +2552,7 @@ class RPCServer:
         proof = _build_partial_merkle_tree(block, all_txids, matches)
         return proof.hex()
 
-    async def rpc_verifytxoutproof(self, proof: str) -> List[str]:
+    async def rpc_verifytxoutproof(self, proof: str) -> list[str]:
         """
         Verify a Merkle proof and return the proven txids.
         """
@@ -2559,7 +2561,7 @@ class RPCServer:
         try:
             proof_bytes = bytes.fromhex(proof)
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid hex")
+            raise HTTPException(status_code=400, detail="Invalid hex") from None
 
         if len(proof_bytes) < 84:
             raise HTTPException(status_code=400, detail="Proof too short")
@@ -2583,7 +2585,7 @@ class RPCServer:
 
         return [txid.hex() for txid in matched]
 
-    async def rpc_getmininginfo(self) -> Dict[str, Any]:
+    async def rpc_getmininginfo(self) -> dict[str, Any]:
         """
         Return mining-related information.
         """
@@ -2603,7 +2605,7 @@ class RPCServer:
             "warnings": "",
         }
 
-    async def rpc_getblocktemplate(self, template_request: Dict = None) -> Dict[str, Any]:
+    async def rpc_getblocktemplate(self, template_request: dict = None) -> dict[str, Any]:
         """
         Construct a block template for mining (BIP 22 / BIP 23).
 
@@ -2622,8 +2624,8 @@ class RPCServer:
           in the last output, where commitment = SHA256d(witness_root || nonce)
           and nonce is 32 zero bytes (coinbase witness item).
         """
-        import time as _time
         import hashlib as _hl
+        import time as _time
 
         db = getattr(self.node, "db", None)
         if db is None:
@@ -2667,7 +2669,7 @@ class RPCServer:
 
         # gather transactions from mempool (dependency-aware)
         MAX_BLOCK_WEIGHT = 4_000_000
-        txs: List[Dict[str, Any]] = []
+        txs: list[dict[str, Any]] = []
         total_fees = 0
         total_weight = 0
 
@@ -2678,7 +2680,7 @@ class RPCServer:
 
             # Build a parent-dependency map: txid → set of in-mempool parents
             in_mempool = set(snap_txs.keys())
-            parents: Dict[bytes, set] = {}
+            parents: dict[bytes, set] = {}
             for txid_key, entry in snap_txs.items():
                 tx_parents: set = set()
                 for inp in entry.tx.inputs:
@@ -2688,7 +2690,7 @@ class RPCServer:
 
             included: set = set()
 
-            def _collect_ancestors(txid: bytes, already: set) -> List[bytes]:
+            def _collect_ancestors(txid: bytes, already: set) -> list[bytes]:
                 needed = []
                 queue = [txid]
                 visited = set()
@@ -2719,7 +2721,7 @@ class RPCServer:
             # ancestor_fee_rate = (entry.fee + sum(ancestor fees))
             #                   / (entry.size + sum(ancestor sizes))
             # Reference: Bitcoin Core BlockAssembler::addPackageTransactions()
-            ancestor_fee_rates: Dict[bytes, float] = {}
+            ancestor_fee_rates: dict[bytes, float] = {}
             for txid_key, entry in snap_txs.items():
                 # Collect full transitive ancestor set via BFS
                 all_ancestors: set = set()
@@ -2839,7 +2841,7 @@ class RPCServer:
         # witness commitment
         # Compute the SegWit witness merkle root from selected txs.
         # wtxids: coinbase is 32 zero-bytes, then each selected tx's wtxid.
-        wtxids: List[bytes] = [bytes(32)]  # coinbase placeholder
+        wtxids: list[bytes] = [bytes(32)]  # coinbase placeholder
         for tx_entry in txs:
             entry_txid = bytes.fromhex(tx_entry["txid"])
             entry_obj = snap_txs.get(entry_txid)
@@ -2920,7 +2922,7 @@ class RPCServer:
             "default_witness_commitment": default_witness_commitment,
         }
 
-    async def rpc_submitblock(self, hexdata: str) -> Optional[str]:
+    async def rpc_submitblock(self, hexdata: str) -> str | None:
         """
         Submit a mined block to the network.
 
@@ -3061,7 +3063,7 @@ class RPCServer:
             # Convert from display (big-endian) to internal (little-endian)
             block_hash_internal = bytes(reversed(block_hash))
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}") from None
 
         # Check if block exists
         db = self.node.db
@@ -3081,10 +3083,10 @@ class RPCServer:
                 )
         except Exception as e:
             if "not found" in str(e).lower():
-                raise HTTPException(status_code=404, detail=f"Block not found: {blockhash}")
+                raise HTTPException(status_code=404, detail=f"Block not found: {blockhash}") from None
             if "genesis" in str(e).lower():
-                raise HTTPException(status_code=400, detail="Cannot invalidate genesis block")
-            raise HTTPException(status_code=500, detail=str(e))
+                raise HTTPException(status_code=400, detail="Cannot invalidate genesis block") from None
+            raise HTTPException(status_code=500, detail=str(e)) from None
 
         return None
 
@@ -3124,7 +3126,7 @@ class RPCServer:
             # Convert from display (big-endian) to internal (little-endian)
             block_hash_internal = bytes(reversed(block_hash))
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}") from None
 
         # Reconsider the block
         db = self.node.db
@@ -3142,8 +3144,8 @@ class RPCServer:
                 )
         except Exception as e:
             if "not found" in str(e).lower():
-                raise HTTPException(status_code=404, detail=f"Block not found: {blockhash}")
-            raise HTTPException(status_code=500, detail=str(e))
+                raise HTTPException(status_code=404, detail=f"Block not found: {blockhash}") from None
+            raise HTTPException(status_code=500, detail=str(e)) from None
 
         return None
 
@@ -3182,7 +3184,7 @@ class RPCServer:
             return int(time.time() - start)
         return 0
 
-    async def rpc_getpeerinfo(self) -> List[Dict[str, Any]]:
+    async def rpc_getpeerinfo(self) -> list[dict[str, Any]]:
         """Return information about connected peers.
 
         Reference: Bitcoin Core rpc/net.cpp getpeerinfo
@@ -3280,7 +3282,7 @@ class RPCServer:
             # Min fee filter
             minfeefilter = getattr(peer, 'fee_filter', 0)
 
-            info: Dict[str, Any] = {
+            info: dict[str, Any] = {
                 "id": peer_id,
                 "addr": addr,
                 "services": services_hex,
@@ -3356,7 +3358,7 @@ class RPCServer:
             try:
                 port = int(parts[1])
             except ValueError:
-                raise ValueError(f"Invalid port in address: {node}")
+                raise ValueError(f"Invalid port in address: {node}") from None
         else:
             host = node
             port = getattr(pm, '_default_port', 8333)
@@ -3415,7 +3417,7 @@ class RPCServer:
         if not success:
             raise ValueError(f"setban failed for {subnet}")
 
-    async def rpc_listbanned(self) -> List[Dict[str, Any]]:
+    async def rpc_listbanned(self) -> list[dict[str, Any]]:
         """Return list of all banned IPs/subnets.
 
         Returns:
@@ -3442,7 +3444,7 @@ class RPCServer:
             bm._save_bans()
         logger.info("Cleared all bans")
 
-    async def rpc_getnettotals(self) -> Dict[str, Any]:
+    async def rpc_getnettotals(self) -> dict[str, Any]:
         """Return network traffic statistics."""
         return {
             "totalbytesrecv": getattr(self.node, 'bytes_recv', 0),
@@ -3476,7 +3478,7 @@ class RPCServer:
             return 0.0
         return 0.0
 
-    async def rpc_getchaintxstats(self, nblocks: int = 30) -> Dict[str, Any]:
+    async def rpc_getchaintxstats(self, nblocks: int = 30) -> dict[str, Any]:
         """Return chain transaction statistics."""
         if not hasattr(self.node, 'db') or not self.node.db:
             return {}
@@ -3488,7 +3490,7 @@ class RPCServer:
             "window_block_count": min(nblocks, best_height),
         }
 
-    async def rpc_getchaintips(self) -> List[Dict[str, Any]]:
+    async def rpc_getchaintips(self) -> list[dict[str, Any]]:
         """Return information about all known tips in the block tree.
 
         Reference: Bitcoin Core rpc/blockchain.cpp getchaintips
@@ -3512,7 +3514,7 @@ class RPCServer:
             raise HTTPException(status_code=500, detail="Database not available")
 
         db = self.node.db
-        tips: List[Dict[str, Any]] = []
+        tips: list[dict[str, Any]] = []
 
         # Active chain tip ---------------------------------------------------
         best_hash, best_height = db.get_best_block()
@@ -3535,7 +3537,7 @@ class RPCServer:
         # prev_blockhash by any other block.
 
         # Get all known block hashes
-        all_blocks: Dict[bytes, Any] = {}
+        all_blocks: dict[bytes, Any] = {}
         parent_refs: set = set()  # blocks that are someone's parent
 
         # If the database has a block index, iterate it
@@ -3549,7 +3551,7 @@ class RPCServer:
 
         elif hasattr(db, 'block_index'):
             # Direct access to block index
-            for block_hash, block_info in db.block_index.items():
+            for block_hash, _block_info in db.block_index.items():
                 block = await asyncio.to_thread(db.get_block, block_hash)
                 if block:
                     all_blocks[block_hash] = block
@@ -3641,7 +3643,7 @@ class RPCServer:
 
         return tips
 
-    async def rpc_gettxoutsetinfo(self) -> Dict[str, Any]:
+    async def rpc_gettxoutsetinfo(self) -> dict[str, Any]:
         """Return UTXO set statistics."""
         if not hasattr(self.node, 'db') or not self.node.db:
             return {}
@@ -3672,6 +3674,7 @@ class RPCServer:
             True if all checks pass, False otherwise
         """
         import hashlib
+
         from ouroboros.validation import _bits_to_target
 
         if not hasattr(self.node, "db") or not self.node.db:
@@ -3787,9 +3790,9 @@ class RPCServer:
 
     async def rpc_getmempoolancestors(
         self, txid: str, verbose: bool = False
-    ) -> Union[List[str], Dict[str, Any]]:
+    ) -> list[str] | dict[str, Any]:
         """Return all in-mempool ancestors of a transaction."""
-        if not hasattr(self.node, 'mempool') or not self.node.mempool:
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
             return [] if not verbose else {}
         txid_bytes = bytes.fromhex(txid)
         tx = self.node.mempool.get_transaction(txid_bytes)
@@ -3798,7 +3801,7 @@ class RPCServer:
         ancestors = self.node.mempool._get_ancestors(tx)
         if not verbose:
             return [a.hex() for a in ancestors]
-        result: Dict[str, Any] = {}
+        result: dict[str, Any] = {}
         for a_txid in ancestors:
             entry = self.node.mempool.get_transaction_entry(a_txid)
             if entry is not None:
@@ -3807,9 +3810,9 @@ class RPCServer:
 
     async def rpc_getmempooldescendants(
         self, txid: str, verbose: bool = False
-    ) -> Union[List[str], Dict[str, Any]]:
+    ) -> list[str] | dict[str, Any]:
         """Return all in-mempool descendants of a transaction."""
-        if not hasattr(self.node, 'mempool') or not self.node.mempool:
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
             return [] if not verbose else {}
         txid_bytes = bytes.fromhex(txid)
         if txid_bytes not in self.node.mempool.transactions:
@@ -3818,7 +3821,7 @@ class RPCServer:
         descendants.discard(txid_bytes)
         if not verbose:
             return [d.hex() for d in descendants]
-        result: Dict[str, Any] = {}
+        result: dict[str, Any] = {}
         for d_txid in descendants:
             entry = self.node.mempool.get_transaction_entry(d_txid)
             if entry is not None:
@@ -3826,11 +3829,12 @@ class RPCServer:
         return result
 
     async def rpc_createrawtransaction(
-        self, inputs: List[Dict], outputs: List[Dict],
+        self, inputs: list[dict], outputs: list[dict],
         locktime: int = 0, replaceable: bool = False
     ) -> str:
         """Create a raw transaction (unsigned)."""
-        from ouroboros.database import Transaction as DbTx, TxIn, TxOut
+        from ouroboros.database import Transaction as DbTx
+        from ouroboros.database import TxIn, TxOut
         tx_inputs = []
         for inp in inputs:
             txid_bytes = bytes.fromhex(inp['txid'])
@@ -3857,9 +3861,9 @@ class RPCServer:
         return tx.serialize().hex()
 
     async def rpc_signrawtransactionwithkey(
-        self, hexstring: str, privkeys: List[str],
-        prevtxs: List[Dict] = None, sighashtype: str = "ALL"
-    ) -> Dict[str, Any]:
+        self, hexstring: str, privkeys: list[str],
+        prevtxs: list[dict] = None, sighashtype: str = "ALL"
+    ) -> dict[str, Any]:
         """Sign a raw transaction with provided private keys.
 
         Args:
@@ -3877,9 +3881,10 @@ class RPCServer:
         """
         import hashlib
         import struct
+
+        from ouroboros.database import TxIn
         from ouroboros.p2p_messages import TxMessage
-        from ouroboros.database import Transaction as DbTx, TxIn, TxOut
-        from ouroboros.wallet import WalletKey, _hash160, _dsha256, _encode_varint
+        from ouroboros.wallet import WalletKey, _dsha256, _encode_varint, _hash160
 
         # --- Parse sighash type string -----------------------------------
         sighash_map = {
@@ -3894,12 +3899,12 @@ class RPCServer:
             tx_msg = TxMessage.from_payload(bytes.fromhex(hexstring))
             tx = tx_msg.transaction
         except Exception as e:
-            raise ValueError(f"TX decode failed: {e}")
+            raise ValueError(f"TX decode failed: {e}") from None
 
         # --- Build key lookup: pubkey_hash / pubkey -> WalletKey ---------
         network = getattr(self.node, "network", "mainnet")
-        keys_by_h160: Dict[bytes, WalletKey] = {}
-        keys_by_pubkey: Dict[bytes, WalletKey] = {}
+        keys_by_h160: dict[bytes, WalletKey] = {}
+        keys_by_pubkey: dict[bytes, WalletKey] = {}
         for wif in privkeys:
             try:
                 k = WalletKey.from_wif(wif, network)
@@ -3911,7 +3916,7 @@ class RPCServer:
                 pass
 
         # --- Build prevout lookup: (txid, vout) -> (scriptPubKey, value) -
-        prev_lookup: Dict[tuple, tuple] = {}
+        prev_lookup: dict[tuple, tuple] = {}
         if prevtxs:
             for p in prevtxs:
                 txid_bytes = bytes.fromhex(p["txid"])
@@ -4221,14 +4226,14 @@ class RPCServer:
         tx.txid = _dsha256(tx.serialize())
         signed_hex = tx.serialize_with_witness().hex()
         complete = len(errors) == 0
-        result: Dict[str, Any] = {"hex": signed_hex, "complete": complete}
+        result: dict[str, Any] = {"hex": signed_hex, "complete": complete}
         if errors:
             result["errors"] = errors
         return result
 
     async def rpc_testmempoolaccept(
-        self, rawtxs: List[str], maxfeerate: float = 0.10
-    ) -> List[Dict[str, Any]]:
+        self, rawtxs: list[str], maxfeerate: float = 0.10
+    ) -> list[dict[str, Any]]:
         """Test whether raw transactions would be accepted to mempool."""
         results = []
         for raw in rawtxs:
@@ -4252,7 +4257,7 @@ class RPCServer:
                 })
         return results
 
-    async def rpc_submitpackage(self, package: List[str]) -> Dict[str, Any]:
+    async def rpc_submitpackage(self, package: list[str]) -> dict[str, Any]:
         """Submit a package of raw transactions for validation and mempool acceptance.
 
         Accepts a list of raw transaction hex strings in topological order
@@ -4270,7 +4275,7 @@ class RPCServer:
         from ouroboros.p2p_messages import TxMessage
 
         # Deserialize each hex string into a Transaction
-        txs: List[Transaction] = []
+        txs: list[Transaction] = []
         for i, raw_hex in enumerate(package):
             try:
                 tx_data = bytes.fromhex(raw_hex.strip())
@@ -4278,7 +4283,7 @@ class RPCServer:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Invalid hex string at index {i}: {e}",
-                )
+                ) from None
             try:
                 tx_msg = TxMessage.from_payload(tx_data)
                 tx = tx_msg.transaction
@@ -4286,7 +4291,7 @@ class RPCServer:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Failed to decode transaction at index {i}: {e}",
-                )
+                ) from None
             if tx.is_coinbase:
                 raise HTTPException(
                     status_code=400,
@@ -4294,7 +4299,7 @@ class RPCServer:
                 )
             txs.append(tx)
 
-        if not hasattr(self.node, "mempool") or not self.node.mempool:
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
             raise HTTPException(status_code=500, detail="Mempool not available")
         if not hasattr(self.node, "db") or not self.node.db:
             raise HTTPException(status_code=500, detail="Database not available")
@@ -4310,7 +4315,7 @@ class RPCServer:
 
         # Build per-transaction results from the mempool entries that were
         # just inserted by validate_package.
-        tx_results: Dict[str, Any] = {}
+        tx_results: dict[str, Any] = {}
         for tx in txs:
             txid_hex = tx.get_txid().hex()
             entry = self.node.mempool.get_transaction_entry(tx.get_txid())
@@ -4337,7 +4342,7 @@ class RPCServer:
     async def rpc_listtransactions(
         self, label: str = "*", count: int = 10, skip: int = 0,
         include_watchonly: bool = True
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return recent transactions for the wallet."""
         if not hasattr(self.node, 'wallet') or not self.node.wallet:
             return []
@@ -4348,7 +4353,7 @@ class RPCServer:
             for t in txs[skip:skip + count]
         ]
 
-    async def rpc_gettransaction(self, txid: str) -> Dict[str, Any]:
+    async def rpc_gettransaction(self, txid: str) -> dict[str, Any]:
         """Get detailed information about a wallet transaction."""
         if not hasattr(self.node, 'db') or not self.node.db:
             raise ValueError("No database available")
@@ -4388,7 +4393,7 @@ class RPCServer:
             raise ValueError("No wallet loaded")
         self.node.wallet.backup(destination)
 
-    async def rpc_getaddressinfo(self, address: str) -> Dict[str, Any]:
+    async def rpc_getaddressinfo(self, address: str) -> dict[str, Any]:
         """Return information about a given address."""
         is_mine = False
         pubkey_hex = ""
@@ -4422,7 +4427,7 @@ class RPCServer:
             "label": "",
         }
 
-    async def rpc_listwallets(self) -> List[str]:
+    async def rpc_listwallets(self) -> list[str]:
         """
         Return list of currently loaded wallet names.
 
@@ -4436,7 +4441,7 @@ class RPCServer:
             return [self.node.wallet.name]
         return []
 
-    async def rpc_listwalletdir(self) -> Dict[str, List[Dict[str, str]]]:
+    async def rpc_listwalletdir(self) -> dict[str, list[dict[str, str]]]:
         """
         Return list of wallets in the wallet directory.
 
@@ -4457,9 +4462,9 @@ class RPCServer:
         passphrase: str = "",
         avoid_reuse: bool = False,
         descriptors: bool = True,
-        load_on_startup: Optional[bool] = None,
+        load_on_startup: bool | None = None,
         external_signer: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Create a new wallet.
 
@@ -4502,7 +4507,7 @@ class RPCServer:
                 load_on_startup=load_on_startup,
             )
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from None
 
         return {
             "name": wallet_name,
@@ -4512,8 +4517,8 @@ class RPCServer:
     async def rpc_loadwallet(
         self,
         filename: str,
-        load_on_startup: Optional[bool] = None,
-    ) -> Dict[str, Any]:
+        load_on_startup: bool | None = None,
+    ) -> dict[str, Any]:
         """
         Load a wallet from disk.
 
@@ -4539,7 +4544,7 @@ class RPCServer:
                 load_on_startup=load_on_startup,
             )
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from None
 
         return {
             "name": filename,
@@ -4548,9 +4553,9 @@ class RPCServer:
 
     async def rpc_unloadwallet(
         self,
-        wallet_name: Optional[str] = None,
-        load_on_startup: Optional[bool] = None,
-    ) -> Dict[str, Any]:
+        wallet_name: str | None = None,
+        load_on_startup: bool | None = None,
+    ) -> dict[str, Any]:
         """
         Unload a wallet from memory.
 
@@ -4598,7 +4603,7 @@ class RPCServer:
                 load_on_startup=load_on_startup,
             )
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from None
 
         return {
             "warning": "\n".join(warnings) if warnings else "",
@@ -4666,7 +4671,7 @@ class RPCServer:
 
     async def rpc_generatetoaddress(
         self, nblocks: int, address: str, maxtries: int = 1000000
-    ) -> List[str]:
+    ) -> list[str]:
         """Mine blocks to a given address (regtest only).
 
         Creates *nblocks* blocks whose coinbase pays to *address*, connects
@@ -4676,8 +4681,11 @@ class RPCServer:
         import hashlib as _hl
         import struct as _st
         import time as _time
+
         from ouroboros.address import address_to_script_pubkey
-        from ouroboros.database import Block as _Block, Transaction as _Tx, TxIn as _TxIn, TxOut as _TxOut
+        from ouroboros.database import Block as _Block
+        from ouroboros.database import TxIn as _TxIn
+        from ouroboros.database import TxOut as _TxOut
         from ouroboros.p2p_messages import encode_varint
 
         db = getattr(self.node, "db", None)
@@ -4690,9 +4698,9 @@ class RPCServer:
         try:
             output_spk = address_to_script_pubkey(address, network)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid address: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid address: {e}") from None
 
-        block_hashes: List[str] = []
+        block_hashes: list[str] = []
 
         for _ in range(nblocks):
             best_hash, best_height = db.get_best_block()
@@ -4846,7 +4854,7 @@ class RPCServer:
                 raise HTTPException(
                     status_code=500,
                     detail=f"Block generation failed: {e}",
-                )
+                ) from None
 
             # Remove confirmed txs from mempool (currently coinbase only)
             mempool = getattr(self.node, "mempool", None)
@@ -4862,7 +4870,7 @@ class RPCServer:
 
             # Announce new block to all connected peers
             try:
-                from ouroboros.p2p_messages import InvMessage, INV_TYPE_BLOCK
+                from ouroboros.p2p_messages import INV_TYPE_BLOCK, InvMessage
 
                 inv = InvMessage(
                     inventory=[(INV_TYPE_BLOCK, block_hash)]
@@ -4886,21 +4894,21 @@ class RPCServer:
             return mantissa >> (8 * (3 - exponent))
         return mantissa << (8 * (exponent - 3))
 
-    async def rpc_getrpcinfo(self) -> Dict[str, Any]:
+    async def rpc_getrpcinfo(self) -> dict[str, Any]:
         """Return info about the RPC server."""
         return {
             "active_commands": [],
         }
 
-    async def rpc_getindexinfo(self) -> Dict[str, Any]:
+    async def rpc_getindexinfo(self) -> dict[str, Any]:
         """Return the status of indices."""
         return {}
 
     # Fee Bumping (RBF)
 
     async def rpc_bumpfee(
-        self, txid: str, options: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+        self, txid: str, options: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """
         Bump the fee of a mempool transaction via RBF.
 
@@ -4922,7 +4930,7 @@ class RPCServer:
         if wallet is None:
             raise HTTPException(status_code=500, detail="No wallet loaded")
 
-        if not hasattr(self.node, "mempool") or not self.node.mempool:
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
             raise HTTPException(status_code=500, detail="Mempool not available")
 
         options = options or {}
@@ -4965,7 +4973,7 @@ class RPCServer:
 
         # Broadcast inv to peers
         try:
-            from ouroboros.p2p_messages import InvMessage, INV_TYPE_TX
+            from ouroboros.p2p_messages import INV_TYPE_TX, InvMessage
 
             inv = InvMessage(
                 inventory=[(INV_TYPE_TX, bytes.fromhex(new_txid))]
@@ -4984,8 +4992,8 @@ class RPCServer:
         }
 
     async def rpc_psbtbumpfee(
-        self, txid: str, options: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+        self, txid: str, options: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """
         Bump the fee of a mempool transaction, returning a PSBT.
 
@@ -5007,7 +5015,7 @@ class RPCServer:
         if wallet is None:
             raise HTTPException(status_code=500, detail="No wallet loaded")
 
-        if not hasattr(self.node, "mempool") or not self.node.mempool:
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
             raise HTTPException(status_code=500, detail="Mempool not available")
 
         options = options or {}
@@ -5064,18 +5072,18 @@ class RPCServer:
             "errors": [],
         }
 
-    def _format_mempool_entry(self, entry, txid_bytes: bytes) -> Dict[str, Any]:
+    def _format_mempool_entry(self, entry, txid_bytes: bytes) -> dict[str, Any]:
         """Format a MempoolEntry into the standard mempool dict."""
         mempool = self.node.mempool
 
         # -- depends: unconfirmed parents of this tx -----------------------
-        depends: List[str] = []
+        depends: list[str] = []
         for inp in entry.tx.inputs:
             if inp.prev_txid in mempool.transactions:
                 depends.append(inp.prev_txid.hex())
 
         # -- spentby: unconfirmed children spending this tx's outputs ------
-        spentby: List[str] = []
+        spentby: list[str] = []
         for other_txid, other_entry in mempool.transactions.items():
             if other_txid == txid_bytes:
                 continue
@@ -5127,9 +5135,9 @@ class RPCServer:
             "spentby": spentby,
         }
 
-    async def rpc_getmempoolentry(self, txid: str) -> Dict[str, Any]:
+    async def rpc_getmempoolentry(self, txid: str) -> dict[str, Any]:
         """Return mempool data for a given transaction."""
-        if not hasattr(self.node, 'mempool') or not self.node.mempool:
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
             raise ValueError("No mempool available")
         txid_bytes = bytes.fromhex(txid)
         entry = self.node.mempool.get_transaction_entry(txid_bytes)
@@ -5139,9 +5147,9 @@ class RPCServer:
 
     async def rpc_getblockstats(
         self,
-        hash_or_height: Union[str, int],
-        stats: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        hash_or_height: str | int,
+        stats: list[str] | None = None,
+    ) -> dict[str, Any]:
         """Return per-block statistics for a given block.
 
         ``hash_or_height`` may be a block hash (hex string) or a block height
@@ -5161,7 +5169,7 @@ class RPCServer:
         # ------------------------------------------------------------------
         # Resolve block from hash or height
         # ------------------------------------------------------------------
-        block: Optional[Block] = None
+        block: Block | None = None
         if isinstance(hash_or_height, int):
             block = await asyncio.to_thread(db.get_block_by_height, hash_or_height)
             if not block:
@@ -5175,7 +5183,7 @@ class RPCServer:
             except ValueError:
                 raise HTTPException(
                     status_code=400, detail="Invalid block hash"
-                )
+                ) from None
             block = await asyncio.to_thread(db.get_block, block_hash)
             if not block:
                 raise HTTPException(
@@ -5207,7 +5215,7 @@ class RPCServer:
         # ------------------------------------------------------------------
         # Iterate transactions and accumulate statistics
         # ------------------------------------------------------------------
-        txs_list: List[Transaction] = (
+        txs_list: list[Transaction] = (
             block.transactions if hasattr(block, "transactions") else []
         )
         num_txs = len(txs_list)
@@ -5227,9 +5235,9 @@ class RPCServer:
         utxo_increase = 0      # outputs created minus inputs spent
 
         # Per-tx collections (exclude coinbase for fee stats)
-        tx_fees: List[int] = []
-        tx_feerates: List[int] = []   # sat / vbyte (integer)
-        tx_sizes: List[int] = []
+        tx_fees: list[int] = []
+        tx_feerates: list[int] = []   # sat / vbyte (integer)
+        tx_sizes: list[int] = []
 
         for tx in txs_list:
             tx_size = len(tx.serialize())
@@ -5326,7 +5334,7 @@ class RPCServer:
         # ------------------------------------------------------------------
         # Build result
         # ------------------------------------------------------------------
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "avgfee": avgfee,
             "avgfeerate": avgfeerate,
             "avgtxsize": avgtxsize,
@@ -5365,11 +5373,11 @@ class RPCServer:
 
     # Helper methods
 
-    def _tx_to_dict(self, tx: Transaction) -> Dict[str, Any]:
+    def _tx_to_dict(self, tx: Transaction) -> dict[str, Any]:
         """Convert transaction to dictionary for RPC response."""
         txid = tx.get_txid() if hasattr(tx, 'get_txid') else tx.txid
         txid_hex = txid.hex() if isinstance(txid, bytes) else str(txid)
-        
+
         # Calculate weight and vsize using transaction methods
         if hasattr(tx, 'get_weight') and hasattr(tx, 'get_vsize'):
             weight = tx.get_weight()
@@ -5379,7 +5387,7 @@ class RPCServer:
             tx_size = len(tx.serialize())
             weight = tx_size * 4
             vsize = tx_size
-        
+
         hash_hex = (
             tx.get_wtxid().hex() if hasattr(tx, 'get_wtxid') and tx.has_witness
             else txid_hex
@@ -5395,11 +5403,11 @@ class RPCServer:
             "vin": [self._vin_to_dict(vin, i, tx) for i, vin in enumerate(tx.inputs)],
             "vout": [self._vout_to_dict(vout, i) for i, vout in enumerate(tx.outputs)],
         }
-    
-    def _vin_to_dict(self, vin: TxIn, index: int = 0, tx: Optional[Transaction] = None) -> Dict[str, Any]:
+
+    def _vin_to_dict(self, vin: TxIn, index: int = 0, tx: Transaction | None = None) -> dict[str, Any]:
         prev_txid = vin.prev_txid.hex() if isinstance(vin.prev_txid, bytes) else str(vin.prev_txid)
         script_sig = vin.script_sig.hex() if isinstance(vin.script_sig, bytes) else str(vin.script_sig)
-        
+
         result = {
             "txid": prev_txid,
             "vout": vin.prev_vout,
@@ -5412,11 +5420,11 @@ class RPCServer:
         if vin.witness:
             result["txinwitness"] = [item.hex() for item in vin.witness]
         return result
-    
-    def _vout_to_dict(self, vout: TxOut, n: int) -> Dict[str, Any]:
+
+    def _vout_to_dict(self, vout: TxOut, n: int) -> dict[str, Any]:
         script_pubkey = vout.script_pubkey.hex() if isinstance(vout.script_pubkey, bytes) else bytes(vout.script_pubkey).hex()
         script_pubkey_bytes = vout.script_pubkey if isinstance(vout.script_pubkey, bytes) else bytes(vout.script_pubkey)
-        
+
         return {
             "value": vout.value / 100_000_000,  # Convert satoshis to BTC
             "n": n,
@@ -5426,11 +5434,11 @@ class RPCServer:
                 "type": self._get_script_type(vout.script_pubkey),
             },
         }
-    
+
     def _get_script_type(self, script: bytes) -> str:
         if not isinstance(script, bytes):
             script = bytes(script)
-        
+
         # Simplified script type detection
         if len(script) == 25 and script[0] == 0x76 and script[1] == 0xa9 and script[23] == 0x88 and script[24] == 0xac:
             return "pubkeyhash"  # P2PKH
@@ -5464,7 +5472,7 @@ class RPCServer:
             return False
         except Exception:
             return False
-    
+
     def _is_synced(self) -> bool:
         if hasattr(self.node, 'is_synced'):
             return self.node.is_synced()
@@ -5472,7 +5480,7 @@ class RPCServer:
             return self.node.sync_manager.is_synced()
         return True  # Assume synced if can't check
 
-    def _get_softforks_info(self, height: int, network: str) -> Dict[str, Any]:
+    def _get_softforks_info(self, height: int, network: str) -> dict[str, Any]:
         """Get BIP9 softfork deployment info for getblockchaininfo.
 
         Returns a dict mapping deployment names to their state info.
@@ -5491,7 +5499,7 @@ class RPCServer:
             deployments = get_all_deployments_info(height, network, [], [])
 
             for dep in deployments:
-                sf_info: Dict[str, Any] = {
+                sf_info: dict[str, Any] = {
                     "type": "bip9",
                     "bip9": {
                         "status": dep.state,
@@ -5524,23 +5532,23 @@ class RPCServer:
 
         return softforks
 
-    def _get_confirmations(self, height: Optional[int]) -> int:
+    def _get_confirmations(self, height: int | None) -> int:
         if height is None:
             return 0
-        
+
         if not hasattr(self.node, 'db'):
             return 0
-        
+
         try:
             _, best_height = self.node.db.get_best_block()
             if best_height >= height:
                 return best_height - height + 1
-        except:
+        except Exception:
             pass
-        
+
         return 0
-    
-    async def _get_next_block_hash(self, height: int) -> Optional[str]:
+
+    async def _get_next_block_hash(self, height: int) -> str | None:
         if not hasattr(self.node, "db") or not self.node.db:
             return None
 
@@ -5554,45 +5562,10 @@ class RPCServer:
         except Exception as e:
             logger.debug(f"Error getting next block hash for height {height}: {e}")
             return None
-    
+
     # --- PSBT RPCs (BIP174/BIP370) --------------------------------------------
 
-    async def rpc_createpsbt(
-        self,
-        inputs: List[Dict[str, Any]],
-        outputs: List[Dict[str, Any]],
-        locktime: int = 0,
-        replaceable: bool = True,
-    ) -> str:
-        """
-        Create a Partially Signed Bitcoin Transaction (PSBT).
-
-        Args:
-            inputs: Array of input objects with txid, vout, and optional sequence
-            outputs: Array of output objects with address:amount pairs
-            locktime: Transaction locktime (default 0)
-            replaceable: Enable RBF (default True)
-
-        Returns:
-            Base64-encoded PSBT string
-        """
-        from ouroboros.psbt import createpsbt
-        return createpsbt(inputs, outputs, locktime, replaceable)
-
-    async def rpc_decodepsbt(self, psbt: str) -> Dict[str, Any]:
-        """
-        Decode a PSBT to human-readable format.
-
-        Args:
-            psbt: Base64-encoded PSBT
-
-        Returns:
-            Decoded PSBT as dictionary
-        """
-        from ouroboros.psbt import decodepsbt
-        return decodepsbt(psbt)
-
-    async def rpc_analyzepsbt(self, psbt: str) -> Dict[str, Any]:
+    async def rpc_analyzepsbt(self, psbt: str) -> dict[str, Any]:
         """
         Analyze a PSBT and determine the next action needed.
 
@@ -5605,37 +5578,8 @@ class RPCServer:
         from ouroboros.psbt import analyzepsbt
         return analyzepsbt(psbt)
 
-    async def rpc_combinepsbt(self, psbts: List[str]) -> str:
-        """
-        Combine multiple PSBTs for the same transaction.
-
-        Args:
-            psbts: Array of base64-encoded PSBTs
-
-        Returns:
-            Combined base64-encoded PSBT
-        """
-        from ouroboros.psbt import combinepsbt
-        return combinepsbt(psbts)
-
-    async def rpc_finalizepsbt(
-        self, psbt: str, extract: bool = True
-    ) -> Dict[str, Any]:
-        """
-        Finalize a PSBT and optionally extract the signed transaction.
-
-        Args:
-            psbt: Base64-encoded PSBT
-            extract: If True and complete, return hex transaction
-
-        Returns:
-            {psbt: base64, complete: bool, hex: raw_tx (if complete and extract)}
-        """
-        from ouroboros.psbt import finalizepsbt
-        return finalizepsbt(psbt, extract)
-
     async def rpc_utxoupdatepsbt(
-        self, psbt: str, descriptors: List[Any] = None
+        self, psbt: str, descriptors: list[Any] = None
     ) -> str:
         """
         Update a PSBT with UTXO information from the UTXO set.
@@ -5671,7 +5615,7 @@ class RPCServer:
 
         return psbt_obj.to_base64()
 
-    async def rpc_joinpsbts(self, psbts: List[str]) -> str:
+    async def rpc_joinpsbts(self, psbts: list[str]) -> str:
         """
         Join multiple PSBTs into a single PSBT.
 
@@ -5694,7 +5638,7 @@ class RPCServer:
         sign: bool = True,
         sighashtype: str = "ALL",
         bip32derivs: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Update a PSBT with wallet information and optionally sign inputs.
 
@@ -5709,8 +5653,9 @@ class RPCServer:
         """
         import hashlib
         import struct
-        from ouroboros.psbt import PSBT, SIGHASH_ALL
-        from ouroboros.wallet import WalletKey, _hash160, _dsha256
+
+        from ouroboros.psbt import PSBT
+        from ouroboros.wallet import WalletKey, _dsha256, _hash160
 
         # Parse sighash type
         sighash_map = {
@@ -5732,8 +5677,8 @@ class RPCServer:
 
         # Build key lookup from wallet
         network = getattr(self.node, 'network', 'mainnet')
-        keys_by_h160: Dict[bytes, WalletKey] = {}
-        keys_by_pubkey: Dict[bytes, WalletKey] = {}
+        keys_by_h160: dict[bytes, WalletKey] = {}
+        keys_by_pubkey: dict[bytes, WalletKey] = {}
 
         # Get all wallet keys
         for key_info in wallet.keys:
@@ -6035,14 +5980,14 @@ class RPCServer:
         Returns:
             Base64-encoded PSBT
         """
-        from ouroboros.psbt import PSBT
         from ouroboros.p2p_messages import TxMessage
+        from ouroboros.psbt import PSBT
 
         try:
             tx_msg = TxMessage.from_payload(bytes.fromhex(hexstring))
             tx = tx_msg.transaction
         except Exception as e:
-            raise ValueError(f"TX decode failed: {e}")
+            raise ValueError(f"TX decode failed: {e}") from None
 
         # Check for existing signatures unless permitted
         if not permitsigdata:
@@ -6059,7 +6004,7 @@ class RPCServer:
     # Descriptor RPCs (BIP 380-386)
     # -------------------------------------------------------------------------
 
-    async def rpc_getdescriptorinfo(self, descriptor: str) -> Dict[str, Any]:
+    async def rpc_getdescriptorinfo(self, descriptor: str) -> dict[str, Any]:
         """
         Analyze a descriptor string and return information about it.
 
@@ -6081,11 +6026,11 @@ class RPCServer:
         try:
             return getdescriptorinfo(descriptor)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from None
 
     async def rpc_deriveaddresses(
-        self, descriptor: str, range_param: Union[int, List[int], None] = None
-    ) -> List[str]:
+        self, descriptor: str, range_param: int | list[int] | None = None
+    ) -> list[str]:
         """
         Derive addresses from a descriptor.
 
@@ -6133,9 +6078,9 @@ class RPCServer:
                 return [desc.derive_address(0, self.node.network)]
 
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from None
 
-    async def rpc_importdescriptors(self, requests: List[Dict]) -> List[Dict]:
+    async def rpc_importdescriptors(self, requests: list[dict]) -> list[dict]:
         """
         Import output descriptors into the wallet.
 
@@ -6159,7 +6104,7 @@ class RPCServer:
 
         return self.node.wallet.importdescriptors(requests)
 
-    async def rpc_listdescriptors(self, private: bool = False) -> Dict[str, Any]:
+    async def rpc_listdescriptors(self, private: bool = False) -> dict[str, Any]:
         """
         List all imported descriptors in the wallet.
 
@@ -6184,7 +6129,7 @@ class RPCServer:
     # assumeUTXO (BIP305) RPC methods
     # ==========================================================================
 
-    async def rpc_loadtxoutset(self, path: str) -> Dict[str, Any]:
+    async def rpc_loadtxoutset(self, path: str) -> dict[str, Any]:
         """
         Load a UTXO snapshot to enable fast startup (BIP305 assumeUTXO).
 
@@ -6209,6 +6154,7 @@ class RPCServer:
         Reference: Bitcoin Core rpc/blockchain.cpp loadtxoutset
         """
         import os
+
         from ouroboros.snapshot import read_snapshot_metadata
 
         if not os.path.exists(path):
@@ -6251,9 +6197,9 @@ class RPCServer:
             }
 
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load snapshot: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load snapshot: {e}") from None
 
-    async def rpc_dumptxoutset(self, path: str) -> Dict[str, Any]:
+    async def rpc_dumptxoutset(self, path: str) -> dict[str, Any]:
         """
         Dump the current UTXO set to a file for use with loadtxoutset.
 
@@ -6314,9 +6260,9 @@ class RPCServer:
             }
 
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to dump snapshot: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to dump snapshot: {e}") from None
 
-    async def rpc_getchainstates(self) -> Dict[str, Any]:
+    async def rpc_getchainstates(self) -> dict[str, Any]:
         """
         Return information about all active chainstates (BIP305 assumeUTXO support).
 
@@ -6379,7 +6325,7 @@ class RPCServer:
 
     async def rpc_decoderawtransaction(
         self, hexstring: str, iswitness: bool = True
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Decode a hex-encoded raw transaction.
 
@@ -6398,18 +6344,18 @@ class RPCServer:
         try:
             raw_bytes = bytes.fromhex(hexstring)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid hex string: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid hex string: {e}") from None
 
         try:
             tx_msg = TxMessage.from_payload(raw_bytes)
             tx = tx_msg.transaction
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to decode transaction: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to decode transaction: {e}") from None
 
         # Use existing _tx_to_dict helper
         return self._tx_to_dict(tx)
 
-    async def rpc_decodescript(self, hexstring: str) -> Dict[str, Any]:
+    async def rpc_decodescript(self, hexstring: str) -> dict[str, Any]:
         """
         Decode a hex-encoded script.
 
@@ -6424,7 +6370,7 @@ class RPCServer:
         try:
             script_bytes = bytes.fromhex(hexstring)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid hex string: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid hex string: {e}") from None
 
         # Disassemble script to human-readable ASM
         asm = disassemble_script(script_bytes)
@@ -6432,7 +6378,7 @@ class RPCServer:
         # Classify script type
         script_type = self._classify_script(script_bytes)
 
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "asm": asm,
             "type": script_type,
             "hex": hexstring,
@@ -6449,6 +6395,7 @@ class RPCServer:
         # For P2PKH, extract address
         if script_type == "pubkeyhash" and len(script_bytes) == 25:
             import hashlib
+
             import base58
             pubkey_hash = script_bytes[3:23]
             network = getattr(self.node, 'network', 'mainnet')
@@ -6490,6 +6437,7 @@ class RPCServer:
         # Compute P2SH-wrapped address for this script (if it were used as redeem script)
         if len(script_bytes) > 0:
             import hashlib
+
             import base58
             script_hash = hashlib.new(
                 "ripemd160", hashlib.sha256(script_bytes).digest()
@@ -6652,9 +6600,9 @@ class RPCServer:
     async def rpc_signrawtransactionwithwallet(
         self,
         hexstring: str,
-        prevtxs: Optional[List[Dict]] = None,
+        prevtxs: list[dict] | None = None,
         sighashtype: str = "ALL",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Sign a raw transaction with wallet keys.
 
@@ -6671,7 +6619,7 @@ class RPCServer:
             JSON object with: hex (signed transaction), complete (bool)
         """
         from ouroboros.p2p_messages import TxMessage
-        from ouroboros.wallet import WalletKey, _hash160, _dsha256
+        from ouroboros.wallet import WalletKey, _dsha256, _hash160
 
         wallet = self._get_wallet_for_rpc()
         if wallet is None:
@@ -6702,10 +6650,10 @@ class RPCServer:
             tx_msg = TxMessage.from_payload(raw_bytes)
             tx = tx_msg.transaction
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to decode transaction: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to decode transaction: {e}") from None
 
         # Build a map of scriptPubKey -> WalletKey for signing
-        spk_to_key: Dict[bytes, WalletKey] = {}
+        spk_to_key: dict[bytes, WalletKey] = {}
         for key_data in wallet.keys:
             try:
                 key = WalletKey.from_wif(key_data["wif"], wallet.network)
@@ -6719,7 +6667,7 @@ class RPCServer:
                 continue
 
         # Build prevtxs lookup if provided
-        prevtxs_map: Dict[tuple, Dict] = {}
+        prevtxs_map: dict[tuple, dict] = {}
         if prevtxs:
             for prev in prevtxs:
                 txid = prev.get("txid", "")
@@ -6863,7 +6811,7 @@ class RPCServer:
 
         complete = len(errors) == 0 and signed_count == len(tx.inputs)
 
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "hex": signed_hex,
             "complete": complete,
         }
@@ -6877,7 +6825,7 @@ class RPCServer:
         self, tx, input_index: int, pubkey: bytes, value: int, sighash_type: int
     ) -> bytes:
         """Compute BIP143 signature hash for SegWit inputs."""
-        from ouroboros.wallet import _hash160, _dsha256
+        from ouroboros.wallet import _dsha256, _hash160
 
         pubkey_hash = _hash160(pubkey)
         script_code = b"\x76\xa9\x14" + pubkey_hash + b"\x88\xac"

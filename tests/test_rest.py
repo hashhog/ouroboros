@@ -4,8 +4,8 @@ Tests for the REST interface.
 Reference: Bitcoin Core rest.cpp
 """
 
+
 import pytest
-from unittest.mock import MagicMock, PropertyMock
 from fastapi.testclient import TestClient
 
 
@@ -91,6 +91,10 @@ class MockTx:
 
     def get_txid(self):
         return self._txid
+
+    def serialize_with_witness(self) -> bytes:
+        # Minimal stub: return a plausible serialized transaction length
+        return b'\x00' * 200
 
     def get_wtxid(self):
         return self._txid
@@ -514,9 +518,8 @@ class TestRESTNoAuth:
             'method': 'getblockcount',
             'id': 1,
         })
-        # Without auth, should get authentication error
-        data = response.json()
-        assert data.get('error') is not None
+        # Without auth, should get authentication error (401 or error field)
+        assert response.status_code == 401 or response.json().get('error') is not None
 
 
 class TestRESTDisabled:

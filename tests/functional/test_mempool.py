@@ -5,15 +5,20 @@ Tests that the mempool correctly enforces standardness, dust, and
 ancestor/descendant limits, as well as TRUC (v3 transaction) policy.
 """
 
-import pytest
-from ouroboros.mempool import (
-    Mempool, _is_standard_tx, _get_dust_threshold, _has_ephemeral_dust,
-    MAX_ANCESTOR_COUNT, MAX_DESCENDANT_COUNT, MAX_ANCESTOR_SIZE_KVB,
-    MAX_DESCENDANT_SIZE_KVB, MAX_STANDARD_TX_WEIGHT,
-    TRUC_VERSION, TRUC_MAX_VSIZE, TRUC_CHILD_MAX_VSIZE,
-    TRUC_ANCESTOR_LIMIT, TRUC_DESCENDANT_LIMIT,
-)
 from ouroboros.database import Transaction, TxIn, TxOut
+from ouroboros.mempool import (
+    MAX_ANCESTOR_COUNT,
+    MAX_STANDARD_TX_WEIGHT,
+    TRUC_ANCESTOR_LIMIT,
+    TRUC_CHILD_MAX_VSIZE,
+    TRUC_DESCENDANT_LIMIT,
+    TRUC_MAX_VSIZE,
+    TRUC_VERSION,
+    Mempool,
+    _get_dust_threshold,
+    _has_ephemeral_dust,
+    _is_standard_tx,
+)
 
 
 def _make_tx(
@@ -668,7 +673,8 @@ class TestEphemeralDust:
         utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
         pool = _truc_pool(utxos)
 
-        # Parent: v3 with two outputs — one normal, one zero-value (dust)
+        # Parent: v3 with two outputs — one normal, one zero-value (dust).
+        # Zero-fee (input value == sum of outputs) so ephemeral dust policy allows it.
         parent = Transaction(
             txid=b"\xAA" * 32,
             version=3,
@@ -682,14 +688,15 @@ class TestEphemeralDust:
                 ),
             ],
             outputs=[
-                TxOut(value=90_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+                TxOut(value=100_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
                 TxOut(value=0, script_pubkey=b"\x00\x14" + b"\x00" * 20),  # dust
             ],
         )
         # Confirm it has ephemeral dust
         assert _has_ephemeral_dust(parent) == [1]
 
-        # Child: v3, spends BOTH parent outputs (including dust at index 1)
+        # Child: v3, spends BOTH parent outputs (including dust at index 1).
+        # Pays the combined fee for the package.
         child = Transaction(
             txid=b"\xBB" * 32,
             version=3,
@@ -709,7 +716,7 @@ class TestEphemeralDust:
                 ),
             ],
             outputs=[
-                TxOut(value=80_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
+                TxOut(value=90_000, script_pubkey=b"\x00\x14" + b"\x00" * 20),
             ],
         )
 
@@ -949,7 +956,7 @@ class TestRBF:
         ok, _ = pool.add_transaction(original, height=100)
         assert ok
 
-        original_size = len(original.serialize())
+        len(original.serialize())
 
         # Replacement that barely exceeds old fee but doesn't cover incremental relay
         # Fee = 10001 (only 1 sat more than original)
@@ -1146,7 +1153,7 @@ class TestRBF:
         utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
         removed_txs = []
 
-        def on_removed(txid, reason):
+        def on_removed(txid, reason, seq=None):
             removed_txs.append((txid, reason))
 
         pool = _rbf_pool(utxos, on_tx_removed=on_removed)
@@ -1744,7 +1751,7 @@ class TestEphemeralDustPolicy:
 
     def test_ephemeral_dust_max_one_output(self):
         """Transaction cannot have more than 1 dust output."""
-        from ouroboros.mempool import _check_ephemeral_dust, MAX_DUST_OUTPUTS_PER_TX
+        from ouroboros.mempool import MAX_DUST_OUTPUTS_PER_TX
 
         assert MAX_DUST_OUTPUTS_PER_TX == 1
 
@@ -1797,7 +1804,7 @@ class TestEphemeralDustPolicy:
         utxos = {(b"\x00" * 32, 0): {"value": 100_000}}
         removed_txs = []
 
-        def on_removed(txid, reason):
+        def on_removed(txid, reason, seq=None):
             removed_txs.append((txid, reason))
 
         pool = Mempool(

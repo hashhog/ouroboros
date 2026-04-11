@@ -11,8 +11,9 @@ options (e.g. [testnet4]). Environment variables OROBOROS_<KEY> override config.
 
 import configparser
 import os
+import time as _time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any
 
 # Chain sections (Bitcoin-style: [main], [test], [testnet4], [regtest], [signet])
 CHAIN_SECTIONS = ('main', 'mainnet', 'test', 'testnet', 'testnet3', 'testnet4', 'regtest', 'signet')
@@ -101,24 +102,24 @@ class RegtestConfig:
 
 class NodeConfig:
     """Node configuration manager"""
-    
+
     def __init__(
         self,
-        config_path: Optional[str] = None,
-        data_dir: Optional[str] = None,
+        config_path: str | None = None,
+        data_dir: str | None = None,
     ):
         """Initialize configuration."""
         # Resolve data_dir: env overrides parameter
         data_dir = os.environ.get('OUROBOROS_DATADIR') or data_dir or str(Path.home() / ".ouroboros")
         data_dir = str(Path(data_dir).expanduser())
-        
+
         if config_path is None:
             config_path = Path(data_dir) / "ouroboros.conf"
-        
+
         self.config_path = Path(config_path)
         self.data_dir_default = data_dir
         self.config = configparser.ConfigParser()
-        
+
         # Get network from config file or environment to set appropriate defaults
         network = os.environ.get('OUROBOROS_NETWORK', 'mainnet')
         if self.config_path.exists():
@@ -131,7 +132,7 @@ class NodeConfig:
                         break
             except Exception:
                 pass
-        
+
         default_rpc_port, default_p2p_port = _ports_for_network(network)
         self.defaults = {
             'network': 'mainnet',
@@ -169,7 +170,7 @@ class NodeConfig:
             # Tor control password (for HASHEDPASSWORD auth)
             'torpassword': None,
         }
-        
+
         if self.config_path.exists():
             try:
                 self.config.read(self.config_path)
@@ -182,7 +183,7 @@ class NodeConfig:
                 logger = logging.getLogger(__name__)
                 logger.warning(f"Error reading config file {self.config_path}: {e}")
 
-    def _get_without_env(self, key: str) -> Optional[str]:
+    def _get_without_env(self, key: str) -> str | None:
         for sec in ('DEFAULT',) + CHAIN_SECTIONS:
             try:
                 if self.config.has_section(sec) and self.config.has_option(sec, key):
@@ -190,21 +191,21 @@ class NodeConfig:
             except (configparser.NoSectionError, configparser.NoOptionError):
                 pass
         return self.defaults.get(key)
-    
-    def get(self, key: str, section: Optional[str] = None) -> Optional[str]:
+
+    def get(self, key: str, section: str | None = None) -> str | None:
         """
         Get config value.
-        
+
         Priority order:
         1. Environment variable (OUROBOROS_<KEY>) - overrides all
         2. Config file: chain section (e.g. [testnet4]), then DEFAULT
         3. Default value
-        
+
         Args:
             key: Config key
             section: Optional section to check first. If None, uses chain section
                      based on current network, then DEFAULT.
-            
+
         Returns:
             Config value or default
         """
@@ -213,7 +214,7 @@ class NodeConfig:
         env_value = os.environ.get(env_key)
         if env_value is not None and env_value != '':
             return env_value
-        
+
         # 2. Config file
         sections_to_try = []
         if section:
@@ -233,18 +234,18 @@ class NodeConfig:
                 if sec not in sections_to_try and self.config.has_section(sec):
                     sections_to_try.append(sec)
             sections_to_try.append('DEFAULT')
-        
+
         for sec in sections_to_try:
             try:
                 if self.config.has_section(sec) and self.config.has_option(sec, key):
                     return self.config.get(sec, key)
             except (configparser.NoSectionError, configparser.NoOptionError):
                 pass
-        
+
         # 3. Default
         return self.defaults.get(key)
-    
-    def getint(self, key: str, section: Optional[str] = None) -> int:
+
+    def getint(self, key: str, section: str | None = None) -> int:
         """Get a config value as an integer."""
         value = self.get(key, section)
         if value is None:
@@ -257,16 +258,16 @@ class NodeConfig:
             return int(value)
         except ValueError:
             return 0
-    
-    def getboolean(self, key: str, section: Optional[str] = None) -> bool:
+
+    def getboolean(self, key: str, section: str | None = None) -> bool:
         """Get a config value as a boolean."""
         value = self.get(key, section)
         if value is None:
             default = self.defaults.get(key, '0')
             return default == '1' or default.lower() in ('true', 'yes', 'on')
         return value.lower() in ('1', 'true', 'yes', 'on')
-    
-    def to_dict(self) -> Dict[str, Any]:
+
+    def to_dict(self) -> dict[str, Any]:
         """Return all config values as a dictionary."""
         return {
             'network': self.get('network'),
@@ -330,7 +331,7 @@ class ChainParams:
             return []
         return self._sync_module.get_network_checkpoints(self.network)
 
-    def get_last_checkpoint(self) -> Optional[Any]:
+    def get_last_checkpoint(self) -> Any | None:
         """
         Get the last checkpoint for this network.
 
@@ -341,7 +342,7 @@ class ChainParams:
             return None
         return self._sync_module.get_last_network_checkpoint(self.network)
 
-    def get_last_checkpoint_height(self) -> Optional[int]:
+    def get_last_checkpoint_height(self) -> int | None:
         """
         Get the height of the last checkpoint.
 
@@ -367,7 +368,7 @@ class ChainParams:
             return False
         return self._sync_module.check_is_below_checkpoint(self.network, height)
 
-    def verify_checkpoint(self, height: int, block_hash: bytes) -> Optional[bool]:
+    def verify_checkpoint(self, height: int, block_hash: bytes) -> bool | None:
         """
         Verify a block hash matches the checkpoint at a given height.
 
@@ -402,7 +403,7 @@ class ChainParams:
             return False
         return self._sync_module.can_skip_scripts_for_block(self.network, height, block_hash)
 
-    def get_minimum_chain_work(self) -> Optional[str]:
+    def get_minimum_chain_work(self) -> str | None:
         """
         Get the minimum chain work for this network.
 
@@ -430,13 +431,11 @@ class ChainParams:
 # Mock Time Support (for regtest)
 # =============================================================================
 
-import time as _time
-
 # Global mock time state
-_mock_time: Optional[int] = None
+_mock_time: int | None = None
 
 
-def get_mock_time() -> Optional[int]:
+def get_mock_time() -> int | None:
     """
     Get the current mock time, if set.
 
@@ -446,7 +445,7 @@ def get_mock_time() -> Optional[int]:
     return _mock_time
 
 
-def set_mock_time(timestamp: Optional[int]) -> None:
+def set_mock_time(timestamp: int | None) -> None:
     """
     Set the mock time for testing.
 

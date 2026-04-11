@@ -23,10 +23,8 @@ Reference: bitcoin/src/zmq/
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import struct
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +43,7 @@ def _ensure_zmq():
             raise ImportError(
                 "pyzmq is required for ZMQ notifications. "
                 "Install it with: pip install pyzmq"
-            )
+            ) from None
     return _zmq
 
 
@@ -67,8 +65,8 @@ class ZMQPublisher:
 
     def __init__(self, endpoint: str = "tcp://127.0.0.1:28332"):
         self.endpoint = endpoint
-        self._socket: Optional[object] = None
-        self._context: Optional[object] = None
+        self._socket: object | None = None
+        self._context: object | None = None
         self._sequences: dict[bytes, int] = {
             self.TOPIC_HASH_BLOCK: 0,
             self.TOPIC_HASH_TX: 0,
