@@ -185,30 +185,44 @@ echo ""
 echo "📦 Step 5: Installing Python build tools..."
 
 pip install --upgrade pip setuptools wheel
-pip install maturin
+# patchelf silences maturin's rpath warning on Linux; harmless on macOS.
+pip install maturin patchelf
 print_status "Python build tools installed"
 
-# 6. Install Python dependencies (without Rust extension first)
+# 6. Build the Rust extension module first (installs `sync` as its own package)
+#
+# IMPORTANT: Order matters here. The `sync` extension MUST be installed before
+# the `ouroboros` Python package, because both are editable and maturin uses
+# ferrous-utils/sync/pyproject.toml (which declares name="sync") to keep the
+# two distributions independent. If we install ouroboros first and then run
+# maturin, maturin-generated editable metadata can overwrite or interact with
+# pip's editable registration in confusing ways. Installing sync first, then
+# pip-installing ouroboros last, gives the clean final state:
+#   - sync.so       — editable from ferrous-utils/sync/ (maturin)
+#   - ouroboros/    — editable from src/ouroboros/    (pip setuptools)
 echo ""
-echo "📦 Step 6: Installing Python dependencies..."
-
-pip install --upgrade pip setuptools wheel
-pip install -e ".[dev]"
-print_status "Python dependencies installed"
-
-# 7. Build Rust module
-echo ""
-echo "📦 Step 7: Building Rust extension module..."
+echo "📦 Step 6: Building Rust extension module with maturin..."
 
 # Verify Rust workspace compiles
 print_status "Verifying Rust workspace..."
 cargo check --workspace
 
-# Build the Rust extension module with maturin
+# maturin develop needs to be run from the subdirectory that owns the
+# pyproject.toml describing the sync package.
 print_status "Building Rust extension module with maturin..."
-maturin develop --manifest-path ferrous-utils/sync/Cargo.toml --release
+(
+    cd ferrous-utils/sync
+    maturin develop --release
+)
 
 print_status "Rust extension module built successfully"
+
+# 7. Install Python dependencies (AFTER the Rust extension is in place)
+echo ""
+echo "📦 Step 7: Installing Python dependencies..."
+
+pip install -e ".[dev]"
+print_status "Python dependencies installed"
 
 # Verify Rust module can be imported
 if python3 -c "from sync import SyncEngine; print('✓ Rust module imports successfully')" 2>/dev/null; then
