@@ -644,6 +644,25 @@ class RPCServer:
 
     # RPC Methods
 
+    @staticmethod
+    def _rpc_chain_name(network: str) -> str:
+        """Translate internal network names to Bitcoin Core canonical RPC chain identifiers.
+
+        Bitcoin Core uses "main" (not "mainnet") and "test" (not "testnet") in
+        all RPC responses. Internal ouroboros code uses "mainnet" / "testnet" as
+        config/CLI values, so this translation happens only at the RPC output layer.
+
+        Reference: Bitcoin Core CBaseChainParams::MAIN = "main" (chainparamsbase.cpp)
+        """
+        _CHAIN_NAME_MAP = {
+            "mainnet":  "main",
+            "testnet":  "test",
+            "testnet3": "test",
+            "testnet4": "test",
+            # signet and regtest match Core verbatim
+        }
+        return _CHAIN_NAME_MAP.get(network, network)
+
     async def rpc_getblockchaininfo(self) -> dict[str, Any]:
         """Return blockchain information.
 
@@ -770,7 +789,7 @@ class RPCServer:
                 chainwork = "0x0"
 
         info: dict[str, Any] = {
-            "chain": network,
+            "chain": self._rpc_chain_name(network),
             "blocks": best_height,
             "headers": headers_count,
             "bestblockhash": best_hash[::-1].hex() if isinstance(best_hash, bytes) else best_hash,
@@ -2601,7 +2620,7 @@ class RPCServer:
             "difficulty": self.node.get_current_difficulty(),
             "networkhashps": 0,
             "pooledtx": len(mempool.get_all_transactions()) if mempool else 0,
-            "chain": getattr(self.node, "network", "mainnet"),
+            "chain": self._rpc_chain_name(getattr(self.node, "network", "mainnet")),
             "warnings": "",
         }
 
