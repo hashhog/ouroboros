@@ -300,11 +300,20 @@ class RESTInterface:
             if active_hash == block_hash:
                 confirmations = max(0, best_height - block_height + 1)
 
-        # Calculate sizes
-        block_data = block.serialize()
-        size = len(block_data)
-        strippedsize = size
-        weight = size * 4
+        # Calculate sizes and weight (BIP 141)
+        block_data = block.serialize()  # stripped (no witness)
+        strippedsize = len(block_data)
+
+        txs_list = block.transactions if hasattr(block, 'transactions') else []
+        if txs_list:
+            from ouroboros.p2p_messages import encode_varint
+            hdr_varint = 80 + len(encode_varint(len(txs_list)))
+            total_tx = sum(len(tx.serialize_with_witness()) for tx in txs_list)
+            size = hdr_varint + total_tx
+            weight = strippedsize * 3 + size
+        else:
+            size = strippedsize
+            weight = size * 4
 
         # Get transactions
         txs = block.transactions if hasattr(block, 'transactions') else []

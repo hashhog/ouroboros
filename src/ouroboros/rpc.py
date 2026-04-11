@@ -867,41 +867,24 @@ class RPCServer:
             if active_hash == block_hash:
                 confirmations = max(0, best_height - block_height + 1)
 
-        # Calculate block sizes and weight
-        block_data_bytes = block.serialize()
-        size = len(block_data_bytes)
-
-        # Stripped size: size without witness data
-        # For non-SegWit blocks, strippedsize == size
-        strippedsize = size
-        weight = size * 4  # Default: no witness discount
+        # Calculate block sizes and weight using the same formula as
+        # Bitcoin Core's GetBlockWeight: stripped_size * 3 + total_size.
+        # block.serialize() uses stripped tx serialization (no witness).
+        strippedsize = len(block.serialize())
 
         if hasattr(block, 'transactions') and block.transactions:
-            # Calculate stripped size and weight accurately
-            total_base_size = 0
-            total_witness_size = 0
-
-            for tx in block.transactions:
-                if hasattr(tx, 'get_base_size') and hasattr(tx, 'get_witness_size'):
-                    total_base_size += tx.get_base_size()
-                    total_witness_size += tx.get_witness_size()
-                elif hasattr(tx, 'has_witness') and tx.has_witness:
-                    # Estimate: serialize with and without witness
-                    full_size = len(tx.serialize())
-                    # Witness flag is 2 bytes, then witness data
-                    # Rough estimate: assume witness is 50% of SegWit tx
-                    total_base_size += full_size // 2
-                    total_witness_size += full_size - (full_size // 2)
-                else:
-                    tx_size = len(tx.serialize())
-                    total_base_size += tx_size
-
-            # Block header is 80 bytes (no witness)
-            strippedsize = 80 + total_base_size + 1  # +1 for tx count varint (approx)
-
-            # Weight = base_size * 4 + witness_size
-            # For block: (header + tx_base) * 4 + witness
-            weight = strippedsize * 4 + total_witness_size
+            # Compute total (with-witness) block size:
+            # header(80) + varint(tx_count) + sum of per-tx total sizes.
+            from ouroboros.p2p_messages import encode_varint
+            hdr_varint = 80 + len(encode_varint(len(block.transactions)))
+            total_tx_size = sum(
+                len(tx.serialize_with_witness()) for tx in block.transactions
+            )
+            size = hdr_varint + total_tx_size
+            weight = strippedsize * 3 + size
+        else:
+            size = strippedsize
+            weight = size * 4
 
         # Calculate target from bits
         bits = block.bits
