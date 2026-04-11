@@ -761,11 +761,15 @@ class RPCServer:
         else:
             mediantime = block_time
 
-        # Chainwork — use lightweight Rust accessor if available, else cached
-        try:
-            chainwork = await asyncio.to_thread(self.node.get_chainwork)
-        except Exception:
-            chainwork = "0x0"
+        # Chainwork — use incrementally-cached value (no FFI needed)
+        cached_cw = getattr(db, '_cached_chainwork', 0)
+        if cached_cw > 0:
+            chainwork = f"0x{cached_cw:x}"
+        else:
+            try:
+                chainwork = await asyncio.to_thread(self.node.get_chainwork)
+            except Exception:
+                chainwork = "0x0"
 
         info: Dict[str, Any] = {
             "chain": network,

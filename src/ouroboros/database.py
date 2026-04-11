@@ -320,6 +320,7 @@ class BlockchainDatabase:
         self._tip_bits: int = 0x1d00ffff
         self._tip_timestamp: int = 0
         self._recent_timestamps: list = []  # last 11 block timestamps
+        self._cached_chainwork: int = 0  # cumulative chain work, updated on connect
         try:
             self._cached_tip = self.get_best_block()
         except Exception:
@@ -581,6 +582,17 @@ class BlockchainDatabase:
             # Keep only the last 11 timestamps for median-time calculation
             if len(self._recent_timestamps) > 11:
                 self._recent_timestamps = self._recent_timestamps[-11:]
+            # Accumulate chain work from bits (compact target)
+            # work = 2^256 / (target + 1)
+            mantissa = bits & 0x007FFFFF
+            exponent = (bits >> 24) & 0xFF
+            if mantissa > 0:
+                if exponent <= 3:
+                    target = mantissa >> (8 * (3 - exponent))
+                else:
+                    target = mantissa << (8 * (exponent - 3))
+                if target > 0:
+                    self._cached_chainwork += (2**256) // (target + 1)
 
         return result
 
