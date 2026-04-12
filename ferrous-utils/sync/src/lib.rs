@@ -2731,7 +2731,35 @@ impl PyBlockchainDB {
             )),
         }
     }
-    
+
+    /// Batch-get multiple UTXOs in a single FFI call.
+    ///
+    /// Takes a list of (txid_bytes, vout) pairs and returns a list of
+    /// Option<PyUTXO> in the same order.  Using one batch call instead of N
+    /// individual get_utxo() calls reduces Python→Rust boundary crossings
+    /// and GIL re-acquisition overhead during transaction validation.
+    ///
+    /// Each txid_bytes must be exactly 32 bytes; any invalid entry yields None.
+    fn get_utxo_batch(&self, outpoints: Vec<(Vec<u8>, u32)>) -> PyResult<Vec<Option<PyUTXO>>> {
+        let mut results = Vec::with_capacity(outpoints.len());
+        for (txid_bytes, vout) in outpoints {
+            if txid_bytes.len() != 32 {
+                results.push(None);
+                continue;
+            }
+            let mut txid_arr = [0u8; 32];
+            txid_arr.copy_from_slice(&txid_bytes);
+            let txid = bitcoin::Txid::from_byte_array(txid_arr);
+            let outpoint = bitcoin::OutPoint { txid, vout };
+            match self.db.get_utxo(&outpoint) {
+                Ok(Some(utxo)) => results.push(Some(PyUTXO::from(&utxo))),
+                Ok(None) => results.push(None),
+                Err(_) => results.push(None),
+            }
+        }
+        Ok(results)
+    }
+
     /// Store block
     fn store_block(&self, _block: &PyBlock) -> PyResult<()> {
         // This would require reconstructing BlockWrapper from PyBlock
