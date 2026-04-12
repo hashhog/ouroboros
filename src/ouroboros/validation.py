@@ -1130,19 +1130,46 @@ class TransactionValidator:
         # 3. Gather ALL input UTXOs first — Taproot sighash (BIP 341)
         #    needs the complete list of input amounts and scriptPubKeys
         #    before verifying ANY individual input.
+        #
+        #    Use batch lookup when all inputs come from the persistent UTXO set
+        #    (no intra-block dependency) to reduce Python→Rust FFI round-trips.
+        #    N individual get_utxo() calls → 1 get_utxo_batch() call, cutting
+        #    GIL re-acquisition overhead that caused p95 latency spikes during IBD.
         total_input = 0
         input_utxos: list[dict] = []
         input_amounts: list[int] = []
         input_script_pubkeys: list[bytes] = []
-        for _, tx_in in enumerate(tx.inputs):
-            utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
-            if utxo is None and intra_block_utxos:
-                utxo = intra_block_utxos.get((tx_in.prev_txid, tx_in.prev_vout))
-            if not utxo:
-                return False, f"Input not found: {tx_in.prev_txid.hex()}:{tx_in.prev_vout}"
-            input_utxos.append(utxo)
-            input_amounts.append(utxo['value'])
-            input_script_pubkeys.append(bytes(utxo['script_pubkey']))
+
+        # Separate inputs that may come from intra-block UTXOs (need individual
+        # lookup with fallback) from those we can batch-fetch from the DB.
+        intra_keys = set(intra_block_utxos.keys()) if intra_block_utxos else set()
+        needs_intra = any(
+            (tx_in.prev_txid, tx_in.prev_vout) in intra_keys
+            for tx_in in tx.inputs
+        )
+
+        if not needs_intra and hasattr(self.db, 'get_utxo_batch') and len(tx.inputs) > 1:
+            # Fast path: all inputs come from the persistent DB — one FFI call.
+            outpoints = [(tx_in.prev_txid, tx_in.prev_vout) for tx_in in tx.inputs]
+            batch = self.db.get_utxo_batch(outpoints)
+            for i, (tx_in, utxo) in enumerate(zip(tx.inputs, batch)):
+                if utxo is None:
+                    return False, f"Input not found: {tx_in.prev_txid.hex()}:{tx_in.prev_vout}"
+                input_utxos.append(utxo)
+                input_amounts.append(utxo['value'])
+                input_script_pubkeys.append(bytes(utxo['script_pubkey']))
+        else:
+            # Slow path: some inputs may spend outputs from earlier txs in this
+            # block (intra_block_utxos), so we must look them up individually.
+            for tx_in in tx.inputs:
+                utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                if utxo is None and intra_block_utxos:
+                    utxo = intra_block_utxos.get((tx_in.prev_txid, tx_in.prev_vout))
+                if not utxo:
+                    return False, f"Input not found: {tx_in.prev_txid.hex()}:{tx_in.prev_vout}"
+                input_utxos.append(utxo)
+                input_amounts.append(utxo['value'])
+                input_script_pubkeys.append(bytes(utxo['script_pubkey']))
 
         # Now verify each input with the COMPLETE amounts/spk lists
         for i, tx_in in enumerate(tx.inputs):
