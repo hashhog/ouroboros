@@ -702,8 +702,10 @@ class RPCServer:
         pruner = getattr(self.node, "pruner", None)
         pruned = pruner is not None and pruner.prune_height > 0
 
-        # Get softfork info from BIP9 versionbits
-        softforks = self._get_softforks_info(best_height, network)
+        # Get softfork/deployment info from the single shared helper so that
+        # getblockchaininfo.softforks and getdeploymentinfo.deployments always
+        # agree on deployment state.
+        softforks = self._build_deployment_state(best_height, network)
 
         # Read header fields from the lightweight cache populated on every
         # connect_block_from_bytes.  This avoids a full-block FFI round-trip
@@ -833,17 +835,11 @@ class RPCServer:
           bip9 sub-object: status, bit, start_time, timeout, since,
                            min_activation_height, [statistics]
         """
-        from ouroboros.consensus import BIP9_DEPLOYMENTS, BURIED_DEPLOYMENTS
-
         db = getattr(self.node, 'db', None)
 
         network = getattr(self.node, 'network', 'mainnet')
         if hasattr(self.node, 'config'):
             network = self.node.config.get('network', network)
-
-        network_lower = network.lower()
-        if network_lower == "bitcoin":
-            network_lower = "mainnet"
 
         if blockhash is not None:
             # Validate hex before trying the DB
@@ -885,91 +881,9 @@ class RPCServer:
             query_height = 0
             query_hash = "0" * 64
 
-        deployments: dict[str, Any] = {}
-
-        # --- Buried deployments ---
-        buried_for_net = BURIED_DEPLOYMENTS.get(network_lower, {})
-        for dep_name, buried_dep in buried_for_net.items():
-            active = query_height >= buried_dep.height
-            dep_info: dict[str, Any] = {
-                "type": "buried",
-                "active": active,
-                "height": buried_dep.height,
-                "min_activation_height": buried_dep.height,
-            }
-            deployments[dep_name] = dep_info
-
-        # --- BIP9 deployments (via Rust versionbits) ---
-        if HAS_VERSIONBITS:
-            try:
-                bip9_deps = get_all_deployments_info(query_height, network_lower, [], [])
-                for dep in bip9_deps:
-                    is_active = dep.state == "active"
-                    bip9_obj: dict[str, Any] = {
-                        "status": dep.state,
-                        "bit": dep.bit,
-                        "start_time": dep.start_time,
-                        "timeout": dep.timeout,
-                        "since": dep.since,
-                        "min_activation_height": dep.min_activation_height,
-                    }
-                    if dep.period is not None:
-                        bip9_obj["statistics"] = {
-                            "period": dep.period,
-                            "threshold": dep.threshold,
-                            "elapsed": dep.elapsed,
-                            "count": dep.count,
-                            "possible": dep.possible,
-                        }
-                    dep_entry: dict[str, Any] = {
-                        "type": "bip9",
-                        "active": is_active,
-                        "min_activation_height": dep.min_activation_height,
-                        "bip9": bip9_obj,
-                    }
-                    if is_active and dep.since > 0:
-                        dep_entry["height"] = dep.since
-                    deployments[dep.name] = dep_entry
-            except Exception as e:
-                logger.debug(f"Could not get BIP9 deployment info: {e}")
-                # Fall back to static BIP9 deployment info from consensus module
-                bip9_for_net = BIP9_DEPLOYMENTS.get(network_lower, {})
-                for dep_name, dep_params in bip9_for_net.items():
-                    # Without Rust state machine, report as active if ALWAYS_ACTIVE
-                    is_always_active = dep_params.start_time == -1  # ALWAYS_ACTIVE sentinel
-                    dep_entry = {
-                        "type": "bip9",
-                        "active": is_always_active,
-                        "min_activation_height": dep_params.min_activation_height,
-                        "bip9": {
-                            "status": "active" if is_always_active else "defined",
-                            "bit": dep_params.bit,
-                            "start_time": dep_params.start_time,
-                            "timeout": dep_params.timeout,
-                            "since": 0,
-                            "min_activation_height": dep_params.min_activation_height,
-                        },
-                    }
-                    deployments[dep_name] = dep_entry
-        else:
-            # No Rust versionbits available — use static Python data
-            bip9_for_net = BIP9_DEPLOYMENTS.get(network_lower, {})
-            for dep_name, dep_params in bip9_for_net.items():
-                is_always_active = dep_params.start_time == -1
-                dep_entry = {
-                    "type": "bip9",
-                    "active": is_always_active,
-                    "min_activation_height": dep_params.min_activation_height,
-                    "bip9": {
-                        "status": "active" if is_always_active else "defined",
-                        "bit": dep_params.bit,
-                        "start_time": dep_params.start_time,
-                        "timeout": dep_params.timeout,
-                        "since": 0,
-                        "min_activation_height": dep_params.min_activation_height,
-                    },
-                }
-                deployments[dep_name] = dep_entry
+        # Delegate to the shared helper so this RPC and getblockchaininfo
+        # always read from the same source of truth.
+        deployments = self._build_deployment_state(query_height, network)
 
         return {
             "hash": query_hash,
@@ -5659,57 +5573,119 @@ class RPCServer:
             return self.node.sync_manager.is_synced()
         return True  # Assume synced if can't check
 
-    def _get_softforks_info(self, height: int, network: str) -> dict[str, Any]:
-        """Get BIP9 softfork deployment info for getblockchaininfo.
+    def _build_deployment_state(self, height: int, network: str) -> dict[str, Any]:
+        """Build a canonical deployment-state dict for a given chain tip.
 
-        Returns a dict mapping deployment names to their state info.
+        This is the single source of truth shared by both rpc_getblockchaininfo
+        (exposed as ``softforks``) and rpc_getdeploymentinfo (exposed as
+        ``deployments``).  The two RPCs emit different JSON shapes but both
+        project from this dict, so they can never disagree.
+
+        Format mirrors Bitcoin Core's getdeploymentinfo output:
+          {
+            "<name>": {
+              "type":   "buried" | "bip9",
+              "active": bool,
+              "height": int,                 # activation height (always present)
+              "min_activation_height": int,  # buried: same as height; bip9: param
+              "bip9":  { ... },              # present only for type=="bip9"
+            },
+            ...
+          }
+
+        Reference: Bitcoin Core rpc/blockchain.cpp DeploymentInfo() /
+        SoftForkDescPushBack() helpers which are called by both RPCs.
         """
-        if not HAS_VERSIONBITS:
-            return {}
+        from ouroboros.consensus import BIP9_DEPLOYMENTS, BURIED_DEPLOYMENTS
 
-        # For a full implementation, we'd query block versions/MTPs from DB
-        # For now, return static info based on known activation heights
-        softforks = {}
+        network_lower = network.lower()
+        if network_lower == "bitcoin":
+            network_lower = "mainnet"
 
-        try:
-            # Get deployment info from Rust
-            # We need to pass block versions and MTPs for the BIP9 state machine
-            # For now, use empty lists which will return ALWAYS_ACTIVE deployments correctly
-            deployments = get_all_deployments_info(height, network, [], [])
+        result: dict[str, Any] = {}
 
-            for dep in deployments:
-                sf_info: dict[str, Any] = {
-                    "type": "bip9",
-                    "bip9": {
+        # --- Buried deployments ---
+        buried_for_net = BURIED_DEPLOYMENTS.get(network_lower, {})
+        for dep_name, buried_dep in buried_for_net.items():
+            active = height >= buried_dep.height
+            result[dep_name] = {
+                "type": "buried",
+                "active": active,
+                "height": buried_dep.height,
+                "min_activation_height": buried_dep.height,
+            }
+
+        # --- BIP9 deployments ---
+        if HAS_VERSIONBITS:
+            try:
+                bip9_deps = get_all_deployments_info(height, network_lower, [], [])
+                for dep in bip9_deps:
+                    is_active = dep.state == "active"
+                    bip9_obj: dict[str, Any] = {
                         "status": dep.state,
                         "bit": dep.bit,
                         "start_time": dep.start_time,
                         "timeout": dep.timeout,
                         "since": dep.since,
                         "min_activation_height": dep.min_activation_height,
+                    }
+                    if dep.period is not None:
+                        bip9_obj["statistics"] = {
+                            "period": dep.period,
+                            "threshold": dep.threshold,
+                            "elapsed": dep.elapsed,
+                            "count": dep.count,
+                            "possible": dep.possible,
+                        }
+                    dep_entry: dict[str, Any] = {
+                        "type": "bip9",
+                        "active": is_active,
+                        "height": dep.since if (is_active and dep.since > 0) else dep.min_activation_height,
+                        "min_activation_height": dep.min_activation_height,
+                        "bip9": bip9_obj,
+                    }
+                    result[dep.name] = dep_entry
+            except Exception as e:
+                logger.debug(f"Could not get BIP9 deployment info from Rust: {e}")
+                # Fall back to static BIP9 deployment info from consensus module
+                bip9_for_net = BIP9_DEPLOYMENTS.get(network_lower, {})
+                for dep_name, dep_params in bip9_for_net.items():
+                    is_always_active = dep_params.start_time == -1
+                    result[dep_name] = {
+                        "type": "bip9",
+                        "active": is_always_active,
+                        "height": dep_params.min_activation_height,
+                        "min_activation_height": dep_params.min_activation_height,
+                        "bip9": {
+                            "status": "active" if is_always_active else "defined",
+                            "bit": dep_params.bit,
+                            "start_time": dep_params.start_time,
+                            "timeout": dep_params.timeout,
+                            "since": 0,
+                            "min_activation_height": dep_params.min_activation_height,
+                        },
+                    }
+        else:
+            # No Rust versionbits available — use static Python data
+            bip9_for_net = BIP9_DEPLOYMENTS.get(network_lower, {})
+            for dep_name, dep_params in bip9_for_net.items():
+                is_always_active = dep_params.start_time == -1
+                result[dep_name] = {
+                    "type": "bip9",
+                    "active": is_always_active,
+                    "height": dep_params.min_activation_height,
+                    "min_activation_height": dep_params.min_activation_height,
+                    "bip9": {
+                        "status": "active" if is_always_active else "defined",
+                        "bit": dep_params.bit,
+                        "start_time": dep_params.start_time,
+                        "timeout": dep_params.timeout,
+                        "since": 0,
+                        "min_activation_height": dep_params.min_activation_height,
                     },
-                    "active": dep.state == "active",
                 }
 
-                # Add statistics if available (for STARTED/LOCKED_IN states)
-                if dep.period is not None:
-                    sf_info["bip9"]["statistics"] = {
-                        "period": dep.period,
-                        "threshold": dep.threshold,
-                        "elapsed": dep.elapsed,
-                        "count": dep.count,
-                        "possible": dep.possible,
-                    }
-
-                # Add activation height if known and active
-                if dep.state == "active" and dep.min_activation_height > 0:
-                    sf_info["height"] = dep.min_activation_height
-
-                softforks[dep.name] = sf_info
-        except Exception as e:
-            logger.debug(f"Could not get softfork info: {e}")
-
-        return softforks
+        return result
 
     def _get_confirmations(self, height: int | None) -> int:
         if height is None:
