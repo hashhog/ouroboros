@@ -361,7 +361,40 @@ class BlockchainDatabase:
             'value': py_utxo.value,
             'script_pubkey': bytes(py_utxo.script_pubkey),
             'height': getattr(py_utxo, 'height', None),
+            'is_coinbase': getattr(py_utxo, 'is_coinbase', False),
         }
+
+    def get_utxo_batch(self, outpoints: list[tuple[bytes, int]]) -> list[dict[str, Any] | None]:
+        """Batch-fetch UTXOs for a list of (txid, vout) pairs in one FFI call.
+
+        Returns a list of UTXO dicts (same shape as get_utxo) in the same order
+        as ``outpoints``.  None is returned for any outpoint not found in the
+        UTXO set.
+
+        Using this instead of N individual get_utxo() calls reduces Python→Rust
+        boundary crossings and GIL re-acquisition overhead during transaction
+        validation, which is particularly important during IBD.
+        """
+        if not hasattr(self._db, 'get_utxo_batch'):
+            # Fallback for older Rust builds without batch support
+            return [self.get_utxo(txid, vout) for txid, vout in outpoints]
+
+        raw_outpoints = [(bytes(txid), int(vout)) for txid, vout in outpoints]
+        py_utxos = self._db.get_utxo_batch(raw_outpoints)
+        results: list[dict[str, Any] | None] = []
+        for py_utxo in py_utxos:
+            if py_utxo is None:
+                results.append(None)
+            else:
+                results.append({
+                    'txid': py_utxo.txid,
+                    'vout': py_utxo.vout,
+                    'value': py_utxo.value,
+                    'script_pubkey': bytes(py_utxo.script_pubkey),
+                    'height': getattr(py_utxo, 'height', None),
+                    'is_coinbase': getattr(py_utxo, 'is_coinbase', False),
+                })
+        return results
 
     def store_block(self, block: Block) -> None:
         """Not implemented — use the Rust API via FastSync or BlockSync instead."""
