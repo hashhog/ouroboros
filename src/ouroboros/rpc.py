@@ -270,6 +270,16 @@ class RPCServer:
         # Current wallet context (set per-request)
         self._current_wallet_name: str | None = None
 
+        # Deployment-state cache: (height, network) -> dict.
+        # _build_deployment_state calls Rust FFI (get_all_deployments_info) which
+        # competes for the GIL during IBD.  Deployment state only changes at
+        # consensus activation heights, so we cache by height and recompute only
+        # when the chain tip advances.  This eliminates all FFI/GIL overhead from
+        # the getblockchaininfo hot path.
+        self._deployment_cache: dict[tuple[int, str], dict] = {}
+        self._deployment_cache_height: int = -1
+        self._deployment_cache_network: str = ""
+
         # Register RPC methods
         self._register_methods()
 
@@ -702,10 +712,13 @@ class RPCServer:
         pruner = getattr(self.node, "pruner", None)
         pruned = pruner is not None and pruner.prune_height > 0
 
-        # Get softfork/deployment info from the single shared helper so that
-        # getblockchaininfo.softforks and getdeploymentinfo.deployments always
-        # agree on deployment state.
-        softforks = self._build_deployment_state(best_height, network)
+        # Get softfork/deployment info — use height-keyed cache to avoid
+        # calling Rust FFI (get_all_deployments_info) on every request.
+        # Deployment state only changes at consensus activation heights so
+        # caching by (height, network) is safe and invalidates automatically
+        # when the chain tip advances.  This eliminates GIL contention from
+        # the validate_block thread pool worker during IBD.
+        softforks = self._get_deployment_state_cached(best_height, network)
 
         # Read header fields from the lightweight cache populated on every
         # connect_block_from_bytes.  This avoids a full-block FFI round-trip
@@ -729,21 +742,9 @@ class RPCServer:
             if hasattr(sm, 'header_height'):
                 headers_count = max(sm.header_height, best_height)
 
-        # Estimate size on disk (block files + undo files)
-        size_on_disk = 0
-        if hasattr(db, 'get_disk_usage'):
-            size_on_disk = db.get_disk_usage()
-        elif hasattr(db, 'data_dir'):
-            import os
-            data_dir = db.data_dir
-            if data_dir and os.path.isdir(data_dir):
-                for dirpath, _, filenames in os.walk(data_dir):
-                    for f in filenames:
-                        if f.endswith('.dat') or f.endswith('.ldb') or f.endswith('.log'):
-                            try:
-                                size_on_disk += os.path.getsize(os.path.join(dirpath, f))
-                            except OSError:
-                                pass
+        # Estimate size on disk — use cached estimate (TTL 30s) to avoid
+        # expensive os.walk on every getblockchaininfo call during IBD.
+        size_on_disk = self._get_disk_usage_cached(db)
 
         # Initial block download detection
         # IBD if: sync progress < 99.9% OR last block time > 24 hours ago
@@ -5572,6 +5573,74 @@ class RPCServer:
         if hasattr(self.node, 'sync_manager'):
             return self.node.sync_manager.is_synced()
         return True  # Assume synced if can't check
+
+    def _get_deployment_state_cached(self, height: int, network: str) -> dict[str, Any]:
+        """Return cached deployment state, recomputing only when height or network changes.
+
+        Deployment state only changes at consensus activation heights, so it is
+        safe to cache by (height, network).  This eliminates the Rust FFI call to
+        get_all_deployments_info (and associated GIL acquisition) from the
+        getblockchaininfo hot path during IBD, where validate_block threads
+        compete for the GIL on every UTXO lookup.
+        """
+        if height == self._deployment_cache_height and network == self._deployment_cache_network:
+            cache_key = (height, network)
+            if cache_key in self._deployment_cache:
+                return self._deployment_cache[cache_key]
+
+        state = self._build_deployment_state(height, network)
+
+        # Replace cache — only keep the most recent entry to bound memory.
+        self._deployment_cache.clear()
+        self._deployment_cache[(height, network)] = state
+        self._deployment_cache_height = height
+        self._deployment_cache_network = network
+        return state
+
+    def _get_disk_usage_cached(self, db: Any) -> int:
+        """Return estimated disk usage with a 30-second TTL to avoid repeated os.walk calls.
+
+        The size_on_disk field is informational and does not need to be exact on
+        every call.  Recomputing it via os.walk on every getblockchaininfo call
+        can take hundreds of milliseconds on large data directories.
+        """
+        import time as _t
+
+        now = _t.monotonic()
+        cached = getattr(self, '_disk_usage_cache', None)
+        cache_ts = getattr(self, '_disk_usage_cache_ts', 0.0)
+        if cached is not None and (now - cache_ts) < 30.0:
+            return cached
+
+        size_on_disk = 0
+        if hasattr(db, 'get_disk_usage'):
+            size_on_disk = db.get_disk_usage()
+        elif hasattr(db, '_data_dir'):
+            import os
+            data_dir = db._data_dir
+            if data_dir and os.path.isdir(data_dir):
+                for dirpath, _, filenames in os.walk(data_dir):
+                    for f in filenames:
+                        if f.endswith('.dat') or f.endswith('.ldb') or f.endswith('.log'):
+                            try:
+                                size_on_disk += os.path.getsize(os.path.join(dirpath, f))
+                            except OSError:
+                                pass
+        elif hasattr(db, 'data_dir'):
+            import os
+            data_dir = db.data_dir
+            if data_dir and os.path.isdir(data_dir):
+                for dirpath, _, filenames in os.walk(data_dir):
+                    for f in filenames:
+                        if f.endswith('.dat') or f.endswith('.ldb') or f.endswith('.log'):
+                            try:
+                                size_on_disk += os.path.getsize(os.path.join(dirpath, f))
+                            except OSError:
+                                pass
+
+        self._disk_usage_cache = size_on_disk
+        self._disk_usage_cache_ts = now
+        return size_on_disk
 
     def _build_deployment_state(self, height: int, network: str) -> dict[str, Any]:
         """Build a canonical deployment-state dict for a given chain tip.
