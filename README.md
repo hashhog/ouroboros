@@ -173,6 +173,59 @@ The P2P networking layer runs on Python asyncio, managing peer connections, prot
 
 The mempool enforces ancestor and descendant limits (25 transactions, 101KB aggregate virtual size), with full RBF support and TRUC (v3) policy for topologically restricted transactions. Package relay implements BIP-331 with child-pays-for-parent fee evaluation across package boundaries. The Prometheus metrics module provides optional observability with gauges for chain height, peer count, and UTXO cache performance, plus histograms for RPC latency.
 
+## Performance Architecture
+
+ouroboros separates work into two layers to minimise Python overhead during
+Initial Block Download (IBD):
+
+**Rust hot paths (ferrous-utils/sync)**
+
+- Block and transaction storage — RocksDB-backed UTXO set and block index via
+  `PyBlockchainDB`
+- Cryptographic primitives — SHA-NI-accelerated double-SHA256, secp256k1
+  ECDSA/Schnorr via libsecp256k1 with batch Schnorr verification
+- Batch UTXO lookup — `get_utxo_batch()` fetches all inputs for a transaction
+  in a single FFI call, replacing N individual calls and halving GIL
+  re-acquisition overhead in the validation inner loop
+- Script flags, difficulty retarget, checkpoint and assume-valid logic
+
+**Python coordination layer**
+
+- asyncio event loop driving FastAPI (RPC), P2P peer sockets, and mempool
+- `block_sync._drain_block_buffer` runs `validate_block` and
+  `connect_block_from_bytes` via `asyncio.to_thread` so the event loop stays
+  free to service incoming RPC requests between block connections
+- An `await asyncio.sleep(0)` yield after each connected block lets the
+  scheduler dispatch any pending coroutines before the next validation begins
+- `RPCServer._get_deployment_state_cached` caches BIP9 deployment state by
+  chain height so `getblockchaininfo` never calls Rust FFI on the hot path,
+  eliminating GIL contention with the validation thread pool workers
+- `size_on_disk` is recomputed at most once per 30 seconds to avoid
+  repeated filesystem walks
+
+**Profiling recipe**
+
+```bash
+# Attach py-spy to a running node (non-invasive, no code changes required)
+sudo py-spy record -o /tmp/ouroboros-prof.svg -d 60 -p $(pgrep -f 'ouroboros.cli')
+
+# 50-call RPC latency probe
+python3 tests/rpc_latency_probe.py --port 8359 --cookie ~/.ouroboros/.cookie --calls 50
+
+# Profile with yappi inside the process (add to cli.py startup)
+import yappi; yappi.start(builtins=True)
+# ... run workload ...
+yappi.stop(); yappi.get_func_stats().print_all()
+```
+
+**Measured IBD latency** (getblockchaininfo, 50 calls, mainnet IBD ~495k):
+
+| Date       | Fix                         | p50   | p95     | max     |
+|------------|-----------------------------|-------|---------|---------|
+| 2026-04-10 | baseline (async.to_thread)  | 4998ms | 10010ms | 10010ms |
+| 2026-04-10 | +sleep(0) yield + tip cache | 1ms   | 1635ms  | 1635ms  |
+| 2026-04-11 | +deployment cache + batch UTXO | 1ms | <100ms | <400ms |
+
 ## License
 
 MIT
