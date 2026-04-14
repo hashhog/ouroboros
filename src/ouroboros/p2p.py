@@ -796,7 +796,8 @@ class PeerManager:
 
         logger.info(f"New inbound connection from {addr} (netgroup={peer_group})")
 
-        peer = Peer(host, port, self.network, inbound=True)
+        peer = Peer(host, port, self.network, inbound=True,
+                    ban_manager=self.ban_manager)
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer
             self._register_compact_handlers(peer, addr)
@@ -894,6 +895,7 @@ class PeerManager:
                 transport_version=self.transport_version,
                 relay_txs=False,  # block-relay-only
                 proxy=peer_proxy,
+                ban_manager=self.ban_manager,
             )
 
             if await peer.connect(start_height, retry=True):
@@ -969,6 +971,7 @@ class PeerManager:
             transport_version=self.transport_version,
             relay_txs=False,  # feelers don't relay
             proxy=peer_proxy,
+            ban_manager=self.ban_manager,
         )
 
         self._feeler_peer = peer
@@ -1121,7 +1124,8 @@ class PeerManager:
                 writer.close()
                 return
 
-        peer = Peer(host, port, self.network, inbound=True)
+        peer = Peer(host, port, self.network, inbound=True,
+                    ban_manager=self.ban_manager)
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer
             self._register_compact_handlers(peer, addr)
@@ -1332,7 +1336,7 @@ class PeerManager:
 
             peer = Peer(host, port, self.network,
                         transport_version=self.transport_version, relay_txs=True,
-                        proxy=peer_proxy)
+                        proxy=peer_proxy, ban_manager=self.ban_manager)
 
             if await peer.connect(start_height, retry=False):
                 self.peers[addr] = peer
@@ -1383,7 +1387,7 @@ class PeerManager:
         peer_proxy = self._proxy_for_host(host)
         peer = Peer(host, port, self.network,
                      transport_version=self.transport_version, relay_txs=True,
-                     proxy=peer_proxy)
+                     proxy=peer_proxy, ban_manager=self.ban_manager)
 
         if await peer.connect(self._start_height, retry=False):
             self.peers[addr] = peer
@@ -1460,7 +1464,7 @@ class PeerManager:
 
             peer = Peer(host, port, self.network,
                         transport_version=self.transport_version, relay_txs=False,
-                        proxy=peer_proxy)
+                        proxy=peer_proxy, ban_manager=self.ban_manager)
 
             if await peer.connect(start_height, retry=False):
                 self.block_relay_peers[addr] = peer
