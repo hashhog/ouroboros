@@ -14,6 +14,10 @@ import struct
 import time
 from collections.abc import Callable
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ouroboros.banman import BanManager
 
 from ouroboros.p2p_messages import (
     NODE_NETWORK,
@@ -192,6 +196,7 @@ class Peer:
         inbound: bool = False,
         relay_txs: bool = True,
         proxy: str | None = None,
+        ban_manager: "BanManager | None" = None,
     ):
         """Initialize peer connection."""
         self.host = host
@@ -201,6 +206,15 @@ class Peer:
         self.inbound = inbound
         self.relay_txs = relay_txs
         self.proxy = proxy  # SOCKS5 proxy "host:port" or None
+        # Optional reference to PeerManager's BanManager so that adjust_score
+        # clamping at 0 can route the peer through the existing ban
+        # callback (which removes the peer + closes the socket).  Without
+        # this, score==0 was log-only — see wave3-2026-04-14/
+        # OUROBOROS-PEER-TIMEOUT-DIAG.md (Lever 1).
+        self.ban_manager = ban_manager
+        # Latch so that we only invoke the ban path once per Peer instance,
+        # even if adjust_score is called repeatedly after the clamp.
+        self._ban_recorded: bool = False
         self.relay_type = (
             RelayType.FULL_RELAY if relay_txs else RelayType.BLOCK_RELAY_ONLY
         )
@@ -1021,10 +1035,53 @@ class Peer:
         return random.randint(0, 2**64 - 1)
 
     def adjust_score(self, delta: int):
-        """Adjust the peer's reputation score by *delta* (result clamped to [0, 100])."""
+        """Adjust the peer's reputation score by *delta* (result clamped to [0, 100]).
+
+        When the score clamps at 0 we route the peer through the
+        BanManager (if one was supplied) which (a) records the host as
+        banned for the configured ban duration and (b) fires the
+        manager's on_ban callback — that callback is responsible for
+        removing the peer from PeerManager's dict and scheduling
+        ``peer.disconnect()``.
+
+        Prior to this change ``adjust_score`` was log-only at the clamp,
+        so a misbehaving peer was never disconnected and would re-trip
+        the WARNING every cycle.  See
+        wave3-2026-04-14/OUROBOROS-PEER-TIMEOUT-DIAG.md (Lever 1) — one
+        peer emitted 537 "banned" lines in 43 minutes without ever being
+        evicted.
+
+        ``adjust_score`` remains synchronous; the on_ban callback uses
+        ``asyncio.ensure_future(peer.disconnect())`` so the caller does
+        not need to await anything and may assume the peer object is
+        still safe to reference (its socket may close shortly afterward).
+        """
         self.score = max(0, min(100, self.score + delta))
-        if self.score == 0:
-            logger.warning(f"Peer {self.host}:{self.port} banned (score=0)")
+        if self.score == 0 and not self._ban_recorded:
+            self._ban_recorded = True
+            if self.ban_manager is not None:
+                # Idempotent: BanManager.ban() updates banned[host] and
+                # invokes _on_peer_banned which closes the socket and
+                # removes the peer from PeerManager.peers.  We use the
+                # latch above so we never call this twice for the same
+                # Peer instance.
+                ban_count = len(self.ban_manager.banned) + 1
+                logger.warning(
+                    f"Disconnecting peer {self.host}:{self.port} after "
+                    f"score clamp (ban count={ban_count})"
+                )
+                try:
+                    self.ban_manager.ban(self.host)
+                except Exception as exc:  # never let bookkeeping crash the loop
+                    logger.error(
+                        f"BanManager.ban failed for {self.host}: {exc}"
+                    )
+            else:
+                # Fallback: no manager wired in (e.g. unit tests with a
+                # bare Peer).  Preserve the original observable behaviour.
+                logger.warning(
+                    f"Peer {self.host}:{self.port} banned (score=0)"
+                )
 
     def is_connected(self) -> bool:
         """Check if peer is connected and ready"""
