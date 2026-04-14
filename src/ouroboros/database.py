@@ -338,6 +338,18 @@ class BlockchainDatabase:
 
         return self._py_block_to_block(py_block)
 
+    def has_block_hash(self, block_hash: bytes) -> bool:
+        """Return True if *block_hash* is present in the block store.
+
+        Cheap existence probe — avoids full block deserialisation. Used by
+        ``block_sync`` to filter already-known headers from inv/headers
+        batches without paying the cost of ``get_block``.
+        """
+        if len(block_hash) != 32:
+            raise ValueError("Block hash must be 32 bytes")
+
+        return self._db.has_block_hash(block_hash)
+
     def get_block_by_height(self, height: int) -> Block | None:
         """Look up a block by height; returns None if not found."""
         py_block = self._db.get_block_by_height(height)
