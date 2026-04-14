@@ -248,7 +248,14 @@ def _count_witness_sigops(prev_script_pubkey: bytes, witness: list | None) -> in
         if len(program) == 32:  # P2WSH → count from witness script
             if witness and len(witness) > 0:
                 witness_script = witness[-1]
-                return _count_legacy_sigops(witness_script)
+                # BIP141: witness scripts use accurate multisig counting
+                # (matches Bitcoin Core WitnessSigOps: subscript.GetSigOpCount(true)
+                # in script/interpreter.cpp).  Using inaccurate (default) counting
+                # here over-counts P2WSH N-of-M multisigs as 20 each instead of N,
+                # which can push valid blocks over MAX_BLOCK_SIGOPS_COST (80_000)
+                # and cause spurious rejections (e.g. mainnet block 713465 with
+                # raw cost 119681 after over-count vs. correct cost under 80000).
+                return _count_legacy_sigops(witness_script, accurate=True)
     elif version == 1:
         # Taproot key-path: 1 sigop; script-path: counted via sigops budget
         # during execution, not here.  Bitcoin Core counts 0 at this level.
