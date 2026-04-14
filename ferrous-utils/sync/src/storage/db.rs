@@ -141,6 +141,18 @@ impl BlockchainDB {
         }
     }
 
+    /// Existence probe for a block body keyed by hash.
+    ///
+    /// Skips the `bitcoin_deserialize` on the value — important for callers
+    /// that only need truthiness (e.g. validated-header scans in the Python
+    /// sync loop). Uses `get_pinned_cf` so the value bytes are not copied
+    /// into an owned `Vec<u8>`.
+    pub fn has_block_hash(&self, hash: &[u8; 32]) -> Result<bool> {
+        let cf = self.db.cf_handle(BLOCKS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
+        Ok(self.db.get_pinned_cf(cf, hash)?.is_some())
+    }
+
     /// Get a block by its height
     ///
     /// Note: This requires storing the block hash when storing block metadata.

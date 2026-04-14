@@ -143,6 +143,28 @@ mod tests {
     }
 
     #[test]
+    fn test_has_block_hash() {
+        let (db, _temp_dir) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        let block = create_test_block(0, prev_hash);
+        let hash_bytes = *block.block_hash().as_byte_array();
+
+        // Not present before insert.
+        assert!(!db.has_block_hash(&hash_bytes).unwrap());
+
+        // Random 32-byte hash is also absent.
+        let random_hash = [0x42u8; 32];
+        assert!(!db.has_block_hash(&random_hash).unwrap());
+
+        // Present after insert.
+        db.store_block(&block).unwrap();
+        assert!(db.has_block_hash(&hash_bytes).unwrap());
+
+        // An unrelated random hash is still absent.
+        assert!(!db.has_block_hash(&random_hash).unwrap());
+    }
+
+    #[test]
     fn test_store_and_retrieve_block_by_height() {
         let (db, _temp_dir) = create_test_db();
         let prev_hash = BlockHash::all_zeros();

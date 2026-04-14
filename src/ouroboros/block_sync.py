@@ -312,8 +312,7 @@ class BlockSync:
             has_new_blocks = False
             for inv_type, inv_hash in inv.inventory:
                 if inv_type == INV_TYPE_BLOCK:
-                    existing_block = self.db.get_block(inv_hash)
-                    if not existing_block:
+                    if not self.db.has_block_hash(inv_hash):
                         has_new_blocks = True
                         # Directly request the block if not already in-flight.
                         # This is critical for receiving blocks from mining
@@ -401,7 +400,7 @@ class BlockSync:
             self._block_request_peer.pop(block_hash, None)
 
             # Already have this block?
-            if self.db.get_block(block_hash):
+            if self.db.has_block_hash(block_hash):
                 return
 
             # Buffer the block (keyed by hash) for sequential processing.
@@ -443,7 +442,7 @@ class BlockSync:
         # each iteration, which was O(n^2).
         header_idx = 0
         for i, (bh, _hdr) in enumerate(self._validated_headers):
-            if self.db.get_block(bh):
+            if self.db.has_block_hash(bh):
                 header_idx = i + 1
             else:
                 break
@@ -572,7 +571,7 @@ class BlockSync:
                 block_hash = self._header_to_block_hash(header)
 
                 # Skip headers we already have in the DB.
-                if self.db.get_block(block_hash):
+                if self.db.has_block_hash(block_hash):
                     expected_prev = block_hash
                     continue
 
@@ -657,7 +656,7 @@ class BlockSync:
         # (or already in DB if pruning hasn't run yet).
         tip_idx = -1
         for i, (bh, _) in enumerate(self._validated_headers):
-            if self.db.get_block(bh):
+            if self.db.has_block_hash(bh):
                 tip_idx = i
             else:
                 break  # Headers are in order; first missing = end of connected chain.
@@ -672,7 +671,7 @@ class BlockSync:
         to_request: list[tuple[int, bytes]] = []
         for i in range(start, min(start + available, len(self._validated_headers))):
             block_hash, _ = self._validated_headers[i]
-            if block_hash not in self.requested_blocks and not self.db.get_block(block_hash):
+            if block_hash not in self.requested_blocks and not self.db.has_block_hash(block_hash):
                 to_request.append((MSG_WITNESS_BLOCK, block_hash))
                 self.requested_blocks[block_hash] = time.time()
 
@@ -714,7 +713,7 @@ class BlockSync:
         # Find how many leading headers are now in the DB.
         prune_count = 0
         for block_hash, _ in self._validated_headers:
-            if self.db.get_block(block_hash):
+            if self.db.has_block_hash(block_hash):
                 prune_count += 1
             else:
                 break
