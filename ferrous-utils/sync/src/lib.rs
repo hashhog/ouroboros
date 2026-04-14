@@ -2699,6 +2699,18 @@ impl PyBlockchainDB {
             )),
         }
     }
+
+    /// Cheap block-hash lookup by height: reads only the BLOCK_INDEX_CF
+    /// row (32-byte header prefix) rather than deserialising the full
+    /// block body. Used by block_sync's _build_locator hot path, which
+    /// rebuilds the locator every 1 s during IBD.
+    fn get_block_hash_by_height(&self, height: u32) -> PyResult<Option<[u8; 32]>> {
+        self.db.get_block_hash_by_height(height).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
     
     /// Get the median-time-past for a given height (11-block median timestamp).
     /// Uses lightweight block metadata instead of deserializing full blocks.
