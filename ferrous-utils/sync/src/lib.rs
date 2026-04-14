@@ -2656,10 +2656,10 @@ impl PyBlockchainDB {
                 "Block hash must be 32 bytes"
             ));
         }
-        
+
         let mut hash_bytes = [0u8; 32];
         hash_bytes.copy_from_slice(block_hash);
-        
+
         match self.db.get_block(&hash_bytes) {
             Ok(Some(block)) => Ok(Some(PyBlock::from_block_wrapper(&block))),
             Ok(None) => Ok(None),
@@ -2668,7 +2668,27 @@ impl PyBlockchainDB {
             )),
         }
     }
-    
+
+    /// Existence probe for a block by hash. Cheap alternative to `get_block`
+    /// when the caller only needs a truthy/falsy answer: no block body is
+    /// deserialized and no `PyBlock` is constructed.
+    fn has_block_hash(&self, block_hash: &[u8]) -> PyResult<bool> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+
+        self.db.has_block_hash(&hash_bytes).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
+
     /// Get block by height
     fn get_block_by_height(&self, height: u32) -> PyResult<Option<PyBlock>> {
         match self.db.get_block_by_height(height) {
