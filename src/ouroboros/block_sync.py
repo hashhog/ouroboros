@@ -816,17 +816,22 @@ class BlockSync:
             peer.adjust_score(-2)
 
     def _build_locator(self, height: int) -> list[bytes]:
-        """Build block locator (exponential spacing)."""
+        """Build block locator (exponential spacing).
+
+        Uses the cheap Rust-side ``get_block_hash_by_height`` which returns the
+        32-byte hash directly, instead of the full block (which would force a
+        complete tx-by-tx deserialisation of a ~1MB block through PyO3 just to
+        read ``block.hash``). The locator is rebuilt every ``sync_loop`` tick
+        (1s during IBD) so the savings are substantial at high tip heights.
+        """
         locator = []
         step = 1
         current_height = height
 
         while current_height > 0:
-            block = self.db.get_block_by_height(current_height)
-            if block:
-                block_hash = block.hash
-                if isinstance(block_hash, bytes) and len(block_hash) == 32:
-                    locator.append(block_hash)
+            block_hash = self.db.get_block_hash_by_height(current_height)
+            if isinstance(block_hash, bytes) and len(block_hash) == 32:
+                locator.append(block_hash)
 
             # Exponential spacing: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ...
             if len(locator) >= 10:
@@ -839,12 +844,10 @@ class BlockSync:
                 break
 
         # Always include genesis
-        genesis = self.db.get_block_by_height(0)
-        if genesis:
-            genesis_hash = genesis.hash
-            if isinstance(genesis_hash, bytes) and len(genesis_hash) == 32:
-                if genesis_hash not in locator:
-                    locator.append(genesis_hash)
+        genesis_hash = self.db.get_block_hash_by_height(0)
+        if isinstance(genesis_hash, bytes) and len(genesis_hash) == 32:
+            if genesis_hash not in locator:
+                locator.append(genesis_hash)
 
         return locator
 
