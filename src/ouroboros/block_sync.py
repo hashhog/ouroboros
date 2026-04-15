@@ -387,12 +387,30 @@ class BlockSync:
         multiple peers.  Instead of treating out-of-order blocks as orphans
         (which breaks bootstrapping), we buffer them keyed by hash and
         drain the buffer sequentially after each successful connect.
+
+        Perf: the block hash is computed from the 80-byte header only (cheap
+        double-SHA256).  Full Python-side `Block.deserialize` is deferred to
+        `_drain_block_buffer` where it runs inside `asyncio.to_thread`, so
+        the event loop is not stalled by a ~1 MB per-block deser each time a
+        peer delivers a block.  This is the primary bottleneck per py-spy
+        (W13): every inbound block held the GIL-owning MainThread for the
+        length of `Block.deserialize`, starving timeout handling, RPC, and
+        peer message dispatch — including blocks already sitting in the OS
+        socket buffer from other peers.
         """
         try:
-            from ouroboros.database import Block
+            payload = msg.payload
+            if len(payload) < 80:
+                logger.error(f"Block payload too short from {peer.host}:{peer.port}")
+                peer.adjust_score(-5)
+                return
 
-            block = Block.deserialize(msg.payload)
-            block_hash = block.hash
+            # Compute block hash from the 80-byte header only.  This matches
+            # wire / DB internal byte order used elsewhere in the codebase
+            # (see `_header_to_block_hash`).
+            block_hash = hashlib.sha256(
+                hashlib.sha256(payload[:80]).digest()
+            ).digest()
 
             # Remove from in-flight tracking
             if block_hash in self.requested_blocks:
@@ -403,9 +421,12 @@ class BlockSync:
             if self.db.has_block_hash(block_hash):
                 return
 
-            # Buffer the block (keyed by hash) for sequential processing.
+            # Buffer the raw payload (keyed by hash) for sequential
+            # processing.  `None` sentinel means "not yet deserialized" —
+            # the drainer will deserialize lazily in a worker thread when it
+            # actually needs to validate/connect this block.
             if len(self._ibd_block_buffer) < self._max_ibd_buffer:
-                self._ibd_block_buffer[block_hash] = (block, msg.payload)
+                self._ibd_block_buffer[block_hash] = (None, payload)
             else:
                 logger.debug(
                     f"IBD buffer full ({self._max_ibd_buffer}), dropping "
@@ -455,6 +476,20 @@ class BlockSync:
                 break  # need to wait for download
 
             block, raw_payload = self._ibd_block_buffer.pop(next_hash)
+
+            # Lazy-deserialize: `handle_block` defers the ~1 MB Python-side
+            # `Block.deserialize` here so it runs in a worker thread and
+            # does not stall the event loop on block arrival.  Sentinel
+            # `None` means "not yet deserialized".
+            if block is None:
+                try:
+                    block = await asyncio.to_thread(Block.deserialize, raw_payload)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to deserialize buffered block "
+                        f"{next_hash.hex()[:16]}...: {e}"
+                    )
+                    break
 
             # Validate and connect in a thread to avoid blocking the event
             # loop.  Individual block validations at higher heights can take
