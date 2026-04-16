@@ -489,6 +489,9 @@ class BlockSync:
                         f"Failed to deserialize buffered block "
                         f"{next_hash.hex()[:16]}...: {e}"
                     )
+                    # Deserialization failure is unrecoverable for this block —
+                    # the bytes are corrupt.  Drop it and let the timeout handler
+                    # re-fetch from a different peer.
                     break
 
             # Validate and connect in a thread to avoid blocking the event
@@ -503,6 +506,15 @@ class BlockSync:
                 logger.warning(
                     f"✗ Invalid block at height {new_height}: {error}"
                 )
+                # "Previous block not found" is a transient ordering error —
+                # the block data is good but the parent is not yet in the DB.
+                # Put the block back in the buffer so the next drain attempt
+                # can try again once the parent has been connected.
+                # Any other validation error is a permanent failure: the block
+                # bytes are bogus (sent by a misbehaving peer).  Drop it so
+                # the timeout handler re-fetches from a different peer.
+                if error == "Previous block not found":
+                    self._ibd_block_buffer[next_hash] = (block, raw_payload)
                 break
 
             # Connect block
@@ -515,6 +527,9 @@ class BlockSync:
                     await asyncio.to_thread(self.validator.apply_block, block)
             except Exception as e:
                 logger.error(f"Failed to connect block at height {new_height}: {e}")
+                # DB connect failure is also transient (e.g. chain-tip mismatch
+                # due to a concurrent update).  Put the block back so we retry.
+                self._ibd_block_buffer[next_hash] = (block, raw_payload)
                 break
 
             connected += 1
