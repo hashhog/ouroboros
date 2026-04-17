@@ -1083,6 +1083,8 @@ class BlockSync:
         network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
 
         for peer, block_hashes in peer_batches.items():
+            if not block_hashes:
+                continue
             try:
                 inventory = [(MSG_WITNESS_BLOCK, bh) for bh in block_hashes]
                 getdata = GetDataMessage(inventory=inventory)
@@ -1095,7 +1097,7 @@ class BlockSync:
             except Exception as e:
                 logger.error(f"Failed to re-request {len(block_hashes)} blocks from {peer.host}:{peer.port}: {e}")
                 for bh in block_hashes:
-                    del self.requested_blocks[bh]
+                    self.requested_blocks.pop(bh, None)
                     self._block_request_peer.pop(bh, None)
 
     async def _find_transaction_in_blocks(self, txid: bytes, max_height: int, min_height: int = 0) -> Optional['Transaction']:
