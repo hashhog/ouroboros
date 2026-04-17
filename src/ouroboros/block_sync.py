@@ -10,9 +10,16 @@ import hashlib
 import logging
 import random
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from typing import Optional
+
+# Bitcoin Core net_processing.cpp: MAX_BLOCKS_IN_FLIGHT_PER_PEER = 16.
+# Bounds the damage a single slow peer can do during IBD — without this,
+# the global 256-slot window divided across ~8 peers gives each peer ~32
+# concurrent requests, so one peer stalling holds 32 blocks hostage for
+# the full 20s timeout window.
+MAX_BLOCKS_IN_FLIGHT_PER_PEER = 16
 
 from ouroboros.database import Block, BlockchainDatabase, Transaction
 from ouroboros.p2p_messages import (
@@ -33,6 +40,42 @@ from ouroboros.peer import Peer
 from ouroboros.validation import SIG_CACHE, BlockValidator
 
 logger = logging.getLogger(__name__)
+
+
+def _distribute_blocks_round_robin(
+    items: list,
+    candidates: list,
+    peer_load: dict,
+    max_per_peer: int,
+) -> tuple[dict, list]:
+    """Round-robin distribute items across candidates, respecting per-peer cap.
+
+    ``peer_load`` is mutated in place to reflect new assignments so callers
+    can chain multiple distribution passes.  Returns ``(per_peer, assigned)``
+    where ``per_peer`` is a ``candidate -> [items]`` dict covering every
+    candidate (possibly with empty lists) and ``assigned`` is the subset of
+    ``items`` that was placed.  Any remaining items are deferred — all
+    candidates were at cap when iteration stopped.
+    """
+    per_peer: dict = {c: [] for c in candidates}
+    assigned: list = []
+    if not candidates:
+        return per_peer, assigned
+    n = len(candidates)
+    peer_idx = 0
+    for item in items:
+        for attempt in range(n):
+            target = candidates[(peer_idx + attempt) % n]
+            if peer_load.get(target, 0) < max_per_peer:
+                per_peer[target].append(item)
+                peer_load[target] = peer_load.get(target, 0) + 1
+                assigned.append(item)
+                peer_idx = (peer_idx + attempt + 1) % n
+                break
+        else:
+            # All candidates at cap — stop trying further items this round.
+            break
+    return per_peer, assigned
 
 
 class BlockSync:
@@ -723,12 +766,12 @@ class BlockSync:
             block_hash, _ = self._validated_headers[i]
             if block_hash not in self.requested_blocks and not self.db.has_block_hash(block_hash):
                 to_request.append((MSG_WITNESS_BLOCK, block_hash))
-                self.requested_blocks[block_hash] = time.time()
 
         if not to_request:
             return
 
-        # Distribute across connected peers round-robin.
+        # Distribute across connected peers round-robin, respecting the
+        # per-peer in-flight cap.
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             candidates = [p for p in self.peer_manager.get_all_ready_peers()
                           if isinstance(p, Peer) and p.is_connected()]
@@ -737,10 +780,17 @@ class BlockSync:
         if not candidates:
             return
 
-        per_peer: dict[Peer, list] = {c: [] for c in candidates}
-        for i, item in enumerate(to_request):
-            target = candidates[i % len(candidates)]
-            per_peer[target].append(item)
+        peer_load = Counter(self._block_request_peer.values())
+        per_peer, assigned = _distribute_blocks_round_robin(
+            to_request, candidates, peer_load, MAX_BLOCKS_IN_FLIGHT_PER_PEER,
+        )
+
+        if not assigned:
+            return
+
+        now = time.time()
+        for _, bh in assigned:
+            self.requested_blocks[bh] = now
 
         for target_peer, items in per_peer.items():
             if not items:
@@ -753,8 +803,18 @@ class BlockSync:
             except Exception as e:
                 logger.error(f"Failed to send getdata to {target_peer.host}:{target_peer.port}: {e}")
                 target_peer.adjust_score(-2)
+                # Un-mark blocks we failed to dispatch so another peer can try them.
+                for _, bh in items:
+                    self.requested_blocks.pop(bh, None)
+                    self._block_request_peer.pop(bh, None)
 
-        logger.info(f"Requested {len(to_request)} blocks (tip+{start}, in-flight: {in_flight}+{len(to_request)}/{self._max_blocks_in_flight})")
+        deferred = len(to_request) - len(assigned)
+        extra = f", deferred {deferred} (all peers at cap)" if deferred else ""
+        logger.info(
+            f"Requested {len(assigned)} blocks (tip+{start}, "
+            f"in-flight: {in_flight}+{len(assigned)}/{self._max_blocks_in_flight}"
+            f"{extra})"
+        )
 
     def _prune_validated_headers(self):
         """Remove validated headers that have already been connected to the chain."""
@@ -993,11 +1053,32 @@ class BlockSync:
         if not preferred:
             preferred = connected_peers
 
-        # Group re-requests by target peer for batched getdata messages
-        peer_batches: dict = {}
-        for i, block_hash in enumerate(timed_out):
-            peer = preferred[i % len(preferred)]
-            peer_batches.setdefault(peer, []).append(block_hash)
+        # Group re-requests by target peer, respecting the per-peer in-flight
+        # cap.  `peer_load` starts from the live in-flight map minus the blocks
+        # we're about to re-assign (they're still in _block_request_peer but
+        # their old peer slot no longer counts toward capacity).
+        peer_load = Counter(self._block_request_peer.values())
+        for bh in timed_out:
+            old_peer = self._block_request_peer.get(bh)
+            if old_peer is not None and peer_load[old_peer] > 0:
+                peer_load[old_peer] -= 1
+
+        to_items = [(MSG_WITNESS_BLOCK, bh) for bh in timed_out]
+        per_peer, assigned = _distribute_blocks_round_robin(
+            to_items, preferred, peer_load, MAX_BLOCKS_IN_FLIGHT_PER_PEER,
+        )
+        assigned_hashes = {bh for _, bh in assigned}
+        peer_batches: dict = {peer: [bh for _, bh in items] for peer, items in per_peer.items()}
+
+        deferred_count = len(timed_out) - len(assigned_hashes)
+        if deferred_count:
+            # Leave deferred blocks' timestamps alone so the next cycle re-tries
+            # them as soon as a peer frees a slot; don't drop them from the
+            # in-flight map (they're still "ours" to reassign).
+            logger.debug(
+                f"Deferring re-request of {deferred_count} blocks: all peers "
+                f"at per-peer cap ({MAX_BLOCKS_IN_FLIGHT_PER_PEER})"
+            )
 
         network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
 
