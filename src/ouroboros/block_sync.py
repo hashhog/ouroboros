@@ -149,6 +149,16 @@ class BlockSync:
         self._ibd_block_buffer: dict[bytes, Block] = {}
         self._max_ibd_buffer: int = 1024
 
+        # Drain-loop stage timings (W60 B0 instrumentation).
+        # Accumulates wall-clock ns spent in each stage since the last
+        # summary log.  Emitted every _drain_log_every blocks connected,
+        # then reset.  Used to choose between B1/B2/B3 pipelining designs.
+        self._drain_stat_count: int = 0
+        self._drain_stat_deserialize_ns: int = 0
+        self._drain_stat_validate_ns: int = 0
+        self._drain_stat_connect_ns: int = 0
+        self._drain_log_every: int = 1000
+
     def set_zmq_publisher(self, publisher) -> None:
         """Attach a ZMQPublisher for real-time block/tx notifications."""
         self._zmq_publisher = publisher
@@ -524,7 +534,9 @@ class BlockSync:
             # `Block.deserialize` here so it runs in a worker thread and
             # does not stall the event loop on block arrival.  Sentinel
             # `None` means "not yet deserialized".
+            deserialize_ns = 0
             if block is None:
+                t0 = time.perf_counter_ns()
                 try:
                     block = await asyncio.to_thread(Block.deserialize, raw_payload)
                 except Exception as e:
@@ -536,15 +548,18 @@ class BlockSync:
                     # the bytes are corrupt.  Drop it and let the timeout handler
                     # re-fetch from a different peer.
                     break
+                deserialize_ns = time.perf_counter_ns() - t0
 
             # Validate and connect in a thread to avoid blocking the event
             # loop.  Individual block validations at higher heights can take
             # seconds (Rust FFI + DB writes).  Running them in a thread lets
             # the event loop service RPC requests and peer messages meanwhile.
             new_height = current_height + 1
+            t_val = time.perf_counter_ns()
             valid, error = await asyncio.to_thread(
                 self.validator.validate_block, block, known_height=new_height
             )
+            validate_ns = time.perf_counter_ns() - t_val
             if not valid:
                 logger.warning(
                     f"✗ Invalid block at height {new_height}: {error}"
@@ -561,6 +576,7 @@ class BlockSync:
                 break
 
             # Connect block
+            t_con = time.perf_counter_ns()
             try:
                 if hasattr(self.db, 'connect_block_from_bytes'):
                     await asyncio.to_thread(
@@ -574,6 +590,35 @@ class BlockSync:
                 # due to a concurrent update).  Put the block back so we retry.
                 self._ibd_block_buffer[next_hash] = (block, raw_payload)
                 break
+            connect_ns = time.perf_counter_ns() - t_con
+
+            # W60 B0: accumulate per-stage timings.  Summary emitted every
+            # _drain_log_every blocks to characterise the drain-loop
+            # bottleneck (deserialize vs validate vs connect) without
+            # per-block log spam.  Chosen pipelining design (B1–B5) depends
+            # on this histogram.
+            self._drain_stat_count += 1
+            self._drain_stat_deserialize_ns += deserialize_ns
+            self._drain_stat_validate_ns += validate_ns
+            self._drain_stat_connect_ns += connect_ns
+            if self._drain_stat_count >= self._drain_log_every:
+                n = self._drain_stat_count
+                ds_ms = self._drain_stat_deserialize_ns / n / 1_000_000
+                va_ms = self._drain_stat_validate_ns / n / 1_000_000
+                co_ms = self._drain_stat_connect_ns / n / 1_000_000
+                total_ms = ds_ms + va_ms + co_ms
+                logger.info(
+                    f"drain stats (last {n} blk): "
+                    f"deserialize={ds_ms:.1f}ms "
+                    f"validate={va_ms:.1f}ms "
+                    f"connect={co_ms:.1f}ms "
+                    f"total={total_ms:.1f}ms/blk "
+                    f"(~{3600_000 / total_ms:.0f} blk/hr if drain-bound)"
+                )
+                self._drain_stat_count = 0
+                self._drain_stat_deserialize_ns = 0
+                self._drain_stat_validate_ns = 0
+                self._drain_stat_connect_ns = 0
 
             connected += 1
             current_height = new_height
