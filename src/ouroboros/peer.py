@@ -304,9 +304,13 @@ class Peer:
                         timeout=10.0,
                     )
                 else:
+                    # Clearnet TCP connect timeout. Bitcoin Core uses 5s
+                    # (CConnman::OpenNetworkConnection). Matching that here
+                    # halves refill-loop latency when addrman batches are
+                    # full of stale addrs — the W51 peer-starvation mode.
                     self.reader, self.writer = await asyncio.wait_for(
                         asyncio.open_connection(self.host, self.port),
-                        timeout=10.0
+                        timeout=5.0
                     )
 
                 self.state = PeerState.CONNECTED
