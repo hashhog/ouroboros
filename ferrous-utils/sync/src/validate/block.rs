@@ -286,16 +286,53 @@ impl BlockValidator {
         // amount = subsidy + fees after the per-tx loop.
         let mut total_fees: u64 = 0;
 
+        // Intra-block UTXO view so tx N can spend an output created by
+        // an earlier tx M<N in the same block. Python reference:
+        // `validation.py::validate_block` `intra_block_utxos`.
+        let mut intra_utxos: std::collections::HashMap<OutPoint, UTXO> =
+            std::collections::HashMap::new();
+
+        // Seed the view with the coinbase's outputs (coinbase maturity still
+        // applies to anyone trying to spend them).
+        let cb_txid = coinbase_tx.compute_txid();
+        for (vout, out) in coinbase_tx.output.iter().enumerate() {
+            let op = OutPoint { txid: cb_txid, vout: vout as u32 };
+            let outpoint_wrapper = common::OutPointWrapper::new(op);
+            intra_utxos.insert(op, UTXO::new(
+                outpoint_wrapper,
+                out.value.to_sat(),
+                out.script_pubkey.clone(),
+                Some(height),
+                true,
+            ));
+        }
+
         for tx in inner.txdata.iter().skip(1) {
             let tx_wrapper = TransactionWrapper::new(tx.clone());
             let fee = self.tx_validator
-                .validate_transaction_with_fee(&tx_wrapper, height)
+                .validate_transaction_with_fee(&tx_wrapper, height, &intra_utxos)
                 .map_err(BlockValidationError::TransactionValidation)?;
             total_fees = total_fees.checked_add(fee)
                 .ok_or(BlockValidationError::CoinbaseAmountExceeded)?;
 
             if enforce_bip68 && tx.version.0 >= 2 {
-                self.check_tx_sequence_locks(tx, prev_height, height, &mut block_median_time)?;
+                self.check_tx_sequence_locks(
+                    tx, prev_height, height, &mut block_median_time, &intra_utxos,
+                )?;
+            }
+
+            // Register this tx's outputs for subsequent txs in the same block.
+            let txid = tx.compute_txid();
+            for (vout, out) in tx.output.iter().enumerate() {
+                let op = OutPoint { txid, vout: vout as u32 };
+                let outpoint_wrapper = common::OutPointWrapper::new(op);
+                intra_utxos.insert(op, UTXO::new(
+                    outpoint_wrapper,
+                    out.value.to_sat(),
+                    out.script_pubkey.clone(),
+                    Some(height),
+                    false,
+                ));
             }
         }
 
@@ -521,6 +558,7 @@ impl BlockValidator {
         prev_height: u32,
         height: u32,
         block_median_time: &mut Option<i64>,
+        extras: &std::collections::HashMap<OutPoint, UTXO>,
     ) -> Result<()> {
         use super::sequence_lock::{
             InputLockInfo, check_sequence_locks,
@@ -537,9 +575,13 @@ impl BlockValidator {
 
         let mut input_infos = Vec::with_capacity(tx.input.len());
         for input in &tx.input {
-            let utxo = self.db.get_utxo(&input.previous_output)?
-                .ok_or_else(|| BlockValidationError::Bip68MissingUtxo(
-                    format!("{}:{}", input.previous_output.txid, input.previous_output.vout)))?;
+            let utxo = if let Some(u) = extras.get(&input.previous_output) {
+                u.clone()
+            } else {
+                self.db.get_utxo(&input.previous_output)?
+                    .ok_or_else(|| BlockValidationError::Bip68MissingUtxo(
+                        format!("{}:{}", input.previous_output.txid, input.previous_output.vout)))?
+            };
             let prev_h = utxo.height.unwrap_or(0);
 
             // MTP at (prev_h - 1) is only needed for time-locked live inputs.
