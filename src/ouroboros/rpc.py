@@ -910,6 +910,74 @@ class RPCServer:
             return hash_bytes[::-1].hex()
         return str(hash_bytes)
 
+    async def rpc_getsyncstate(self) -> dict[str, Any]:
+        """hashhog W70: uniform fleet-wide sync-state report.
+
+        Spec: meta-repo `spec/getsyncstate.md`.
+
+        SHOULD fields return JSON ``null`` (not omitted) so consumer
+        parsers can index by key without presence checks.
+        """
+        if not hasattr(self.node, 'db') or self.node.db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        db = self.node.db
+        best_hash, best_height = db.get_best_block()
+        tip_hash = best_hash[::-1].hex() if isinstance(best_hash, bytes) else str(best_hash)
+
+        # Header tip height — max with best_height so the invariant
+        # best_header_height >= tip_height holds at all times.
+        headers_count = best_height
+        sm = getattr(self.node, 'sync_manager', None)
+        if sm is not None and hasattr(sm, 'header_height'):
+            headers_count = max(sm.header_height, best_height)
+
+        # v1: ouroboros doesn't track a distinct header-tip hash;
+        # returning tip_hash is correct when caught up and acceptable
+        # during IBD (the hash field is still a well-formed 64-char hex).
+        header_hash = tip_hash
+
+        is_ibd = not self._is_synced()
+
+        pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
+        if pm is None:
+            num_peers = 0
+        else:
+            peer_list = getattr(pm, 'peers', [])
+            num_peers = len(peer_list) if peer_list is not None else 0
+
+        network = getattr(self.node, 'network', 'mainnet')
+        if hasattr(self.node, 'config'):
+            network = self.node.config.get('network', network)
+        chain = self._rpc_chain_name(network)
+
+        verification_progress = 1.0
+        if is_ibd and headers_count > 0:
+            verification_progress = min(1.0, best_height / headers_count)
+
+        bs = getattr(self.node, 'block_sync', None)
+        blocks_in_flight: int | None = None
+        if bs is not None and hasattr(bs, 'requested_blocks'):
+            try:
+                blocks_in_flight = len(bs.requested_blocks)
+            except (TypeError, AttributeError):
+                blocks_in_flight = None
+
+        return {
+            "tip_height": best_height,
+            "tip_hash": tip_hash,
+            "best_header_height": headers_count,
+            "best_header_hash": header_hash,
+            "initial_block_download": is_ibd,
+            "num_peers": num_peers,
+            "verification_progress": verification_progress,
+            "blocks_in_flight": blocks_in_flight,
+            "blocks_pending_connect": None,
+            "last_block_received_time": None,
+            "chain": chain,
+            "protocol_version": 70016,
+        }
+
     async def rpc_getblockhash(self, height: int) -> str:
         """Return block hash at height"""
         if not hasattr(self.node, 'db'):
