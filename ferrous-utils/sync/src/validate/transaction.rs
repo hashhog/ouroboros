@@ -3,12 +3,14 @@
 use std::sync::Arc;
 use std::collections::HashSet;
 
+use std::collections::HashMap;
+
 use bitcoin::{Transaction, OutPoint, absolute::LockTime};
 use bitcoin::hashes::Hash;
 use thiserror::Error;
 
 use crate::storage::{BlockchainDB, DbError};
-use common::TransactionWrapper;
+use common::{TransactionWrapper, UTXO};
 
 /// Coinbase transaction outputs can only be spent after this number of new blocks.
 /// Reference: Bitcoin Core consensus/consensus.h
@@ -127,9 +129,9 @@ impl TransactionValidator {
     ///
     /// Same semantics as `validate_transaction(tx, height, check_inputs=true)`
     /// but returns the computed fee (`total_input - total_output`) instead of
-    /// `()`. Uses `validate_transaction_inputs_at_height` so coinbase maturity
-    /// is enforced (the existing `validate_transaction` path uses the height=0
-    /// variant and does not enforce maturity — preserved for back-compat).
+    /// `()`. Uses `validate_transaction_inputs_with_extras_at_height` so
+    /// coinbase maturity is enforced AND outputs created by earlier txs in
+    /// the same block (`extras`) resolve intra-block dependencies.
     ///
     /// For coinbase txs returns `Ok(0)` — the caller aggregates only
     /// non-coinbase fees into the block subsidy check.
@@ -140,6 +142,7 @@ impl TransactionValidator {
         &self,
         tx: &TransactionWrapper,
         height: u32,
+        extras: &HashMap<OutPoint, UTXO>,
     ) -> Result<u64> {
         let inner = tx.inner();
 
@@ -153,8 +156,56 @@ impl TransactionValidator {
         if inner.is_coinbase() {
             return Ok(0);
         }
-        let total_input = self.validate_transaction_inputs_at_height(inner, height)?;
+        let total_input =
+            self.validate_transaction_inputs_with_extras_at_height(inner, height, extras)?;
         self.validate_amounts(inner, total_input)
+    }
+
+    /// Same as `validate_transaction_inputs_at_height` but resolves inputs
+    /// from `extras` (intra-block UTXOs) before falling back to the DB.
+    ///
+    /// `extras` holds `OutPoint → UTXO` for outputs created by earlier
+    /// transactions in the same block so that chained intra-block spends
+    /// validate correctly. Python reference: `validation.py` `intra_block_utxos`.
+    pub fn validate_transaction_inputs_with_extras_at_height(
+        &self,
+        tx: &Transaction,
+        spending_height: u32,
+        extras: &HashMap<OutPoint, UTXO>,
+    ) -> Result<u64> {
+        let mut total_input = 0u64;
+        let mut seen_outpoints = HashSet::new();
+
+        for input in tx.input.iter() {
+            let outpoint = OutPoint::new(input.previous_output.txid, input.previous_output.vout);
+
+            if !seen_outpoints.insert(outpoint) {
+                return Err(TransactionValidationError::DuplicateInput);
+            }
+
+            let utxo = if let Some(u) = extras.get(&outpoint) {
+                u.clone()
+            } else {
+                self.db.get_utxo(&outpoint)?
+                    .ok_or_else(|| TransactionValidationError::InputNotFound(
+                        format!("{}:{}", outpoint.txid, outpoint.vout)
+                    ))?
+            };
+
+            if spending_height > 0 && utxo.is_coinbase {
+                let utxo_height = utxo.height.unwrap_or(0);
+                let depth = spending_height as i64 - utxo_height as i64;
+                if depth < COINBASE_MATURITY as i64 {
+                    return Err(TransactionValidationError::PrematureCoinbaseSpend { depth });
+                }
+            }
+
+            total_input = total_input
+                .checked_add(utxo.amount)
+                .ok_or(TransactionValidationError::OutputAmountOverflow)?;
+        }
+
+        Ok(total_input)
     }
 
     /// Check transaction structure
