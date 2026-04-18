@@ -354,18 +354,30 @@ impl TransactionValidator {
     /// not block validation. Bitcoin Core enforces relay fees only for mempool
     /// policy, not consensus.
     pub fn validate_amounts(&self, tx: &Transaction, total_input: u64) -> Result<u64> {
+        // MAX_MONEY = 21_000_000 BTC in satoshis. Matches Python
+        // validation.py:48 and Bitcoin Core's COIN * 21_000_000.
+        const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+
         let mut total_output = 0u64;
 
         for output in &tx.output {
             let amount = output.value.to_sat();
 
-            if amount == 0 {
+            // Consensus allows zero-value outputs (OP_RETURN witness
+            // commitments, data-embedding txs, etc.). Core's CheckTransaction
+            // rejects only negative (unrepresentable in u64) and values above
+            // MAX_MONEY. Python validation.py:1260 uses the same rule.
+            if amount > MAX_MONEY {
                 return Err(TransactionValidationError::InvalidOutputAmount);
             }
 
             total_output = total_output
                 .checked_add(amount)
                 .ok_or(TransactionValidationError::OutputAmountOverflow)?;
+
+            if total_output > MAX_MONEY {
+                return Err(TransactionValidationError::OutputAmountOverflow);
+            }
         }
 
         if total_output > total_input {
@@ -704,6 +716,57 @@ mod tests {
         let wrapper = TransactionWrapper::new(coinbase_tx);
         let result = validator.check_coinbase(wrapper.inner(), 0);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_amounts_accepts_zero_value_output() {
+        // Regression: zero-value outputs are consensus-valid (OP_RETURN
+        // witness commitments, data-embed txs). The earlier `amount == 0`
+        // rejection broke every modern block in B3 cross-check.
+        let (_temp_dir, db) = create_test_db();
+        let validator = TransactionValidator::new(db);
+
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                bitcoin::TxOut {
+                    value: Amount::from_sat(500),
+                    script_pubkey: ScriptBuf::new(),
+                },
+                bitcoin::TxOut {
+                    value: Amount::ZERO, // OP_RETURN-style
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x00]),
+                },
+            ],
+        };
+
+        let result = validator.validate_amounts(&tx, 1000);
+        assert!(result.is_ok(), "zero-value output must not be rejected");
+        assert_eq!(result.unwrap(), 500, "fee = 1000 - 500 = 500");
+    }
+
+    #[test]
+    fn test_validate_amounts_rejects_single_output_over_max_money() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = TransactionValidator::new(db);
+
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![bitcoin::TxOut {
+                value: Amount::from_sat(21_000_001 * 100_000_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let result = validator.validate_amounts(&tx, u64::MAX);
+        assert!(matches!(
+            result,
+            Err(TransactionValidationError::InvalidOutputAmount)
+        ));
     }
 
     #[test]
