@@ -123,6 +123,40 @@ impl TransactionValidator {
         Ok(())
     }
 
+    /// Validate a non-coinbase transaction and return its fee.
+    ///
+    /// Same semantics as `validate_transaction(tx, height, check_inputs=true)`
+    /// but returns the computed fee (`total_input - total_output`) instead of
+    /// `()`. Uses `validate_transaction_inputs_at_height` so coinbase maturity
+    /// is enforced (the existing `validate_transaction` path uses the height=0
+    /// variant and does not enforce maturity — preserved for back-compat).
+    ///
+    /// For coinbase txs returns `Ok(0)` — the caller aggregates only
+    /// non-coinbase fees into the block subsidy check.
+    ///
+    /// Used by `BlockValidator::validate_block_with_flags` for the
+    /// Python drain-path route.
+    pub fn validate_transaction_with_fee(
+        &self,
+        tx: &TransactionWrapper,
+        height: u32,
+    ) -> Result<u64> {
+        let inner = tx.inner();
+
+        self.check_structure(inner)?;
+        self.check_size_limits(inner)?;
+        if inner.is_coinbase() {
+            self.check_coinbase(inner, height)?;
+        }
+        self.check_lock_time(inner, height)?;
+
+        if inner.is_coinbase() {
+            return Ok(0);
+        }
+        let total_input = self.validate_transaction_inputs_at_height(inner, height)?;
+        self.validate_amounts(inner, total_input)
+    }
+
     /// Check transaction structure
     fn check_structure(&self, tx: &Transaction) -> Result<()> {
         // Non-empty inputs
@@ -217,7 +251,7 @@ impl TransactionValidator {
         let mut total_input = 0u64;
         let mut seen_outpoints = HashSet::new();
 
-        for (input_idx, input) in tx.input.iter().enumerate() {
+        for input in tx.input.iter() {
             let outpoint = OutPoint::new(input.previous_output.txid, input.previous_output.vout);
 
             // Check for duplicate inputs in this transaction
@@ -245,21 +279,9 @@ impl TransactionValidator {
                 }
             }
 
-            // Check if UTXO is already spent (double spend check)
-            // This is simplified - in production, we'd track spending in the current block
-            // For now, we rely on the database to prevent double spends
-
-            // Verify signature
-            // This is a placeholder - full signature verification requires:
-            // 1. Creating the sighash for this input
-            // 2. Extracting signature and pubkey from script_sig
-            // 3. Verifying the signature cryptographically
-            // For now, we'll just check that script_sig is non-empty
-            if input.script_sig.is_empty() {
-                return Err(TransactionValidationError::SignatureVerificationFailed(
-                    format!("Empty script_sig for input {}", input_idx)
-                ));
-            }
+            // Signature verification lives in script.rs behind skip_scripts.
+            // An empty script_sig is legal for SegWit inputs (signature lives in
+            // the witness), so do NOT reject on that here.
 
             // Add to total input
             total_input = total_input

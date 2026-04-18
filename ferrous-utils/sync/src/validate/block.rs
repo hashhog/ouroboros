@@ -273,15 +273,26 @@ impl BlockValidator {
         let enforce_bip68 = super::sequence_lock::is_bip68_active(height, self.network);
         let mut block_median_time: Option<i64> = None;
 
+        // Accumulate fees across non-coinbase txs so we can verify coinbase
+        // amount = subsidy + fees after the per-tx loop.
+        let mut total_fees: u64 = 0;
+
         for tx in inner.txdata.iter().skip(1) {
             let tx_wrapper = TransactionWrapper::new(tx.clone());
-            self.tx_validator.validate_transaction(&tx_wrapper, height, true)
+            let fee = self.tx_validator
+                .validate_transaction_with_fee(&tx_wrapper, height)
                 .map_err(BlockValidationError::TransactionValidation)?;
+            total_fees = total_fees.checked_add(fee)
+                .ok_or(BlockValidationError::CoinbaseAmountExceeded)?;
 
             if enforce_bip68 && tx.version.0 >= 2 {
                 self.check_tx_sequence_locks(tx, prev_height, height, &mut block_median_time)?;
             }
         }
+
+        // 7c. Coinbase amount ≤ subsidy + fees (BIP34+ and coinbase-burn check).
+        //     Matches Python `validation.py:420-426`.
+        self.validate_block_subsidy(inner, height, total_fees)?;
 
         // 8. Sigop cost limit with BIP141 witness discount
         let (verify_p2sh, verify_witness) = self.get_sigop_flags(height);
