@@ -722,9 +722,15 @@ class BlockSync:
                             perr = python_result[1] or ""
                             marker = "Input not found: "
                             if marker in perr:
+                                # Extract failing tx index from the "Transaction N invalid:" prefix
+                                failing_tx_idx: int | None = None
+                                try:
+                                    m = perr.split("Transaction ", 1)[1]
+                                    failing_tx_idx = int(m.split(" ", 1)[0])
+                                except Exception:
+                                    pass
                                 tail = perr[perr.rindex(marker) + len(marker):]
                                 txhex, _, vout_s = tail.partition(":")
-                                # strip anything after the vout
                                 vout_s = vout_s.split(" ")[0].split(",")[0]
                                 op_txid = bytes.fromhex(txhex.strip())
                                 op_vout = int(vout_s.strip())
@@ -739,7 +745,48 @@ class BlockSync:
                                     f"B3 mismatch probe h={new_height} "
                                     f"outpoint={txhex}:{op_vout} "
                                     f"db_get_utxo={'HIT' if probe else 'MISS'} "
-                                    f"created_by_block_tx_index={created_in_block}"
+                                    f"created_by_block_tx_index={created_in_block} "
+                                    f"n_block_tx={len(block.transactions)} "
+                                    f"failing_tx_idx={failing_tx_idx}"
+                                )
+                                # Re-run Rust immediately on the same bytes.
+                                # If Rust now rejects, this is timing/state-
+                                # change (another block applied between the
+                                # two cross-check calls). If Rust still
+                                # accepts, the divergence is pure logic.
+                                try:
+                                    self.db.validate_block_from_bytes(
+                                        raw_payload, new_height - 1, True, network
+                                    )
+                                    rust_reprobe = "ACCEPT"
+                                except ValueError as e:
+                                    rust_reprobe = f"REJECT:{str(e)[:80]}"
+                                # Probe every input of the failing tx to see
+                                # how many resolve via DB (not yet checking
+                                # intra-block, since tx idx is known).
+                                db_hits = db_misses = intra_hits = 0
+                                if failing_tx_idx is not None and 0 <= failing_tx_idx < len(block.transactions):
+                                    ftx = block.transactions[failing_tx_idx]
+                                    intra: dict[tuple[bytes, int], int] = {}
+                                    for ti in range(failing_tx_idx):
+                                        ptx = block.transactions[ti]
+                                        ptxid = ptx.get_txid()
+                                        for vo in range(len(ptx.outputs)):
+                                            intra[(ptxid, vo)] = ti
+                                    for tin in ftx.inputs:
+                                        u = self.db.get_utxo(tin.prev_txid, tin.prev_vout)
+                                        if u is not None:
+                                            db_hits += 1
+                                        elif (tin.prev_txid, tin.prev_vout) in intra:
+                                            intra_hits += 1
+                                        else:
+                                            db_misses += 1
+                                logger.error(
+                                    f"B3 mismatch probe2 h={new_height} "
+                                    f"failing_tx={failing_tx_idx} "
+                                    f"n_inputs={len(ftx.inputs) if failing_tx_idx is not None else '?'} "
+                                    f"db_hits={db_hits} intra_hits={intra_hits} "
+                                    f"db_misses={db_misses} rust_reprobe={rust_reprobe}"
                                 )
                         except Exception as probe_err:
                             logger.debug(
