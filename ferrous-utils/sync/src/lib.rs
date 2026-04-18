@@ -2619,6 +2619,11 @@ impl PyTxOut {
 #[pyclass]
 pub struct PyBlockchainDB {
     db: Arc<BlockchainDB>,
+    /// Lazily-initialized BlockValidator for `validate_block_from_bytes`.
+    /// Constructed on first call with the caller-supplied network — network
+    /// is stable per datadir so the first value is cached for the life of
+    /// the PyBlockchainDB. See OUROBOROS-B3-STAGE1-KICKOFF.md.
+    block_validator: std::sync::OnceLock<Arc<BlockValidator>>,
 }
 
 #[pymethods]
@@ -2646,6 +2651,7 @@ impl PyBlockchainDB {
 
         Ok(Self {
             db: Arc::new(db),
+            block_validator: std::sync::OnceLock::new(),
         })
     }
 
@@ -2799,6 +2805,78 @@ impl PyBlockchainDB {
         Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
             "store_block requires BlockWrapper reconstruction - use Rust API directly"
         ))
+    }
+
+    /// Validate a block from raw wire-format bytes.
+    ///
+    /// Entry point for B3 Stage 1 — moves the Python IBD drain path's
+    /// `validate_block` call into Rust behind a single GIL-releasing FFI
+    /// call.  Matches Python's `skip_scripts=True` semantics: performs all
+    /// structural, amount, coinbase-maturity, and lock-time checks, but
+    /// does not verify signatures (today Rust never verifies signatures
+    /// in the production validate path; `skip_scripts` is plumbed through
+    /// for forward compat when script verification lands).
+    ///
+    /// On first call the `BlockValidator` is constructed from the
+    /// caller-supplied network and cached for the life of this
+    /// `PyBlockchainDB`.  Subsequent calls reuse the cached validator —
+    /// the `network` argument after the first call is ignored.
+    ///
+    /// # Arguments
+    /// * `block_bytes` — raw Bitcoin wire-format block
+    /// * `prev_height` — height of the block *before* this one (so this
+    ///   block's height is `prev_height + 1`)
+    /// * `skip_scripts` — reserved; today Rust never calls
+    ///   `script::verify_*` in the validate path
+    /// * `network` — network name ("mainnet", "testnet", "testnet4",
+    ///   "regtest", "signet"); used only on the first call to construct
+    ///   the cached validator
+    ///
+    /// Returns `Ok(())` on successful validation; `PyValueError` with a
+    /// descriptive message on any validation failure.
+    ///
+    /// Reference: OUROBOROS-B3-RUST-VALIDATE-SCOPE.md,
+    /// OUROBOROS-B3-STAGE1-KICKOFF.md.
+    fn validate_block_from_bytes(
+        &self,
+        py: Python,
+        block_bytes: Vec<u8>,
+        prev_height: u32,
+        skip_scripts: bool,
+        network: String,
+    ) -> PyResult<()> {
+        use common::BitcoinDeserialize;
+
+        // Resolve (and cache) the BlockValidator.  Construction only runs
+        // on the first call; subsequent calls hit the OnceLock fast path.
+        let validator = self.block_validator.get_or_init(|| {
+            let network_enum = match network.to_lowercase().as_str() {
+                "mainnet" | "bitcoin" => Network::Bitcoin,
+                "testnet" | "testnet3" => Network::Testnet,
+                "testnet4" => Network::Testnet4,
+                "regtest" => Network::Regtest,
+                "signet" => Network::Signet,
+                _ => Network::Bitcoin, // fall back to mainnet; caller-side validation is expected
+            };
+            Arc::new(BlockValidator::new(Arc::clone(&self.db), network_enum))
+        });
+        let validator = Arc::clone(validator);
+
+        // Deserialize + validate off-GIL.  This is the whole point of the
+        // pymethod — releases the GIL for the duration of validation so
+        // the Python drain loop can overlap deserialize(N+1) / peer I/O
+        // / RPC servicing with validate(N).
+        py.detach(|| {
+            let (block, _) = BlockWrapper::bitcoin_deserialize(&block_bytes)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("deserialize: {}", e)
+                ))?;
+            validator
+                .validate_block_with_flags(&block, prev_height, skip_scripts)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("validate: {}", e)
+                ))
+        })
     }
 
     /// Accept a fully-serialised block (Bitcoin wire format) and connect it
@@ -3704,6 +3782,11 @@ impl Clone for PyBlockchainDB {
     fn clone(&self) -> Self {
         Self {
             db: Arc::clone(&self.db),
+            // Each clone starts with a fresh empty OnceLock; the cached
+            // validator is local to each instance.  First call on the
+            // clone re-initializes it (cheap — BlockValidator::new just
+            // bundles Arcs + reads env).
+            block_validator: std::sync::OnceLock::new(),
         }
     }
 }
