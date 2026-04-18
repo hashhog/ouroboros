@@ -642,6 +642,26 @@ class BlockchainDatabase:
 
         return result
 
+    def validate_block_from_bytes(
+        self,
+        block_bytes: bytes,
+        prev_height: int,
+        skip_scripts: bool,
+        network: str,
+    ) -> None:
+        """Validate a block via the off-GIL Rust fast path (B3 Stage 1).
+
+        Thin passthrough to ``_db.validate_block_from_bytes``.  The Rust
+        side deserialises, validates, and releases the GIL for the duration
+        of the call.  No DB writes; caller still must apply/connect the
+        block separately on success.
+
+        Raises ``ValueError`` on any validation failure.
+        """
+        self._db.validate_block_from_bytes(
+            block_bytes, prev_height, skip_scripts, network
+        )
+
     def refresh_tip_cache(self) -> tuple[bytes, int]:
         """Force-refresh the cached tip from Rust and return it."""
         hash_bytes, height = self._db.get_best_block()

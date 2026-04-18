@@ -8,11 +8,23 @@ handling new block announcements, validation, and chain reorganization.
 import asyncio
 import hashlib
 import logging
+import os
 import random
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from typing import Optional
+
+# B3 Stage 1: optional fast-path routes IBD-drain validate_block through the
+# Rust FFI (off-GIL) when OUROBOROS_ROUTE_VALIDATE_TO_RUST=1.  Matches
+# Python's skip_scripts=True semantics.  Only used when the sync module is
+# present and the current block is below the assume-valid checkpoint.
+try:
+    import sync as _sync_module
+    _has_sync_module = True
+except ImportError:
+    _sync_module = None
+    _has_sync_module = False
 
 # Bitcoin Core net_processing.cpp: MAX_BLOCKS_IN_FLIGHT_PER_PEER = 16.
 # Bounds the damage a single slow peer can do during IBD — without this,
@@ -556,9 +568,53 @@ class BlockSync:
             # the event loop service RPC requests and peer messages meanwhile.
             new_height = current_height + 1
             t_val = time.perf_counter_ns()
-            valid, error = await asyncio.to_thread(
-                self.validator.validate_block, block, known_height=new_height
-            )
+
+            # B3 Stage 1 fast path: route skip_scripts=True validation through
+            # Rust (off-GIL).  Matches Python's skip_scripts=True semantics
+            # bit-for-bit (BIP30/BIP34/BIP68/BIP141/coinbase amount/sigops/
+            # weight/merkle).  Falls back to Python on any unexpected error.
+            validated_via_rust = False
+            if (
+                os.environ.get("OUROBOROS_ROUTE_VALIDATE_TO_RUST") == "1"
+                and _has_sync_module
+                and hasattr(self.db, "validate_block_from_bytes")
+            ):
+                try:
+                    network = (
+                        self.peer_manager.network
+                        if hasattr(self.peer_manager, "network")
+                        else "mainnet"
+                    )
+                    skip_scripts = _sync_module.can_skip_scripts_for_block(
+                        network, new_height, next_hash
+                    )
+                except Exception:
+                    skip_scripts = False
+                if skip_scripts:
+                    try:
+                        await asyncio.to_thread(
+                            self.db.validate_block_from_bytes,
+                            raw_payload,
+                            new_height - 1,
+                            True,
+                            network,
+                        )
+                        valid, error = True, ""
+                        validated_via_rust = True
+                    except ValueError as e:
+                        valid, error = False, str(e)
+                        validated_via_rust = True
+                    except Exception as e:
+                        logger.warning(
+                            f"Rust validate_block_from_bytes raised "
+                            f"unexpectedly at height {new_height}: {e}; "
+                            f"falling back to Python validator"
+                        )
+
+            if not validated_via_rust:
+                valid, error = await asyncio.to_thread(
+                    self.validator.validate_block, block, known_height=new_height
+                )
             validate_ns = time.perf_counter_ns() - t_val
             if not valid:
                 logger.warning(
