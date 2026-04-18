@@ -400,24 +400,27 @@ impl BlockValidator {
     /// BIP30 duplicate-txid prohibition.
     ///
     /// Rejects a block that contains a tx whose txid already has any unspent
-    /// outputs in the UTXO set. Only enforced on mainnet in the historical
-    /// window [227_931, 1_983_702]; heights 91_842 and 91_880 are the two
-    /// known pre-BIP30 duplicate pairs (both outside the window, kept explicit
-    /// for parity with Python `validation.py:336-354`).
+    /// outputs in the UTXO set. Enforcement rules (mirror of Python
+    /// `validation.py:336-354` and Bitcoin Core `IsBIP30Repeat`):
     ///
-    /// Post-BIP34 coinbase-height enforcement guarantees no further duplicates
-    /// within the window, but Core and Python continue to verify
-    /// defensively — we match.
+    /// - Heights 91_842 and 91_880 are the two historical grandfathered
+    ///   duplicates — never enforce.
+    /// - Within `[BIP34, BIP30_RECHECK)` = `[227_931, 1_983_702)` BIP34 coinbase
+    ///   height encoding guarantees uniqueness, so the check is skipped as a
+    ///   performance optimisation.
+    /// - Everywhere else on mainnet the check is enforced.
+    ///
+    /// Non-mainnet networks never enforce.
     fn check_bip30(&self, block: &Block, height: u32) -> Result<()> {
         if self.network != Network::Bitcoin {
             return Ok(());
         }
-        const BIP30_START: u32 = 227_931;
-        const BIP30_END: u32 = 1_983_702;
         if height == 91_842 || height == 91_880 {
             return Ok(());
         }
-        if height < BIP30_START || height > BIP30_END {
+        const BIP34_HEIGHT: u32 = 227_931;
+        const BIP30_RECHECK_HEIGHT: u32 = 1_983_702;
+        if height >= BIP34_HEIGHT && height < BIP30_RECHECK_HEIGHT {
             return Ok(());
         }
 
