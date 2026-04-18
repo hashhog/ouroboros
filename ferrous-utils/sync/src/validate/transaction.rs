@@ -383,9 +383,10 @@ impl TransactionValidator {
     ///
     /// Verifies:
     /// - Coinbase structure (first input has null prevout)
-    /// - Block height encoding in coinbase script
-    /// - Output amount (subsidy + fees)
-    pub fn check_coinbase(&self, tx: &Transaction, _height: u32) -> Result<()> {
+    /// - BIP34 block-height encoding in coinbase scriptSig (post-activation)
+    /// - Coinbase script 2–100 bytes
+    /// - At least one output
+    pub fn check_coinbase(&self, tx: &Transaction, height: u32) -> Result<()> {
         // Coinbase must have exactly one input
         if tx.input.len() != 1 {
             return Err(TransactionValidationError::InvalidCoinbase);
@@ -401,20 +402,39 @@ impl TransactionValidator {
         }
 
         // Coinbase script must be 2-100 bytes
-        if coinbase_input.script_sig.len() < 2 || coinbase_input.script_sig.len() > 100 {
+        let sig_len = coinbase_input.script_sig.len();
+        if sig_len < 2 || sig_len > 100 {
             return Err(TransactionValidationError::InvalidCoinbase);
         }
 
-        // Verify block height is encoded in coinbase script
-        // The first bytes should encode the height using compact size
-        // This is a simplified check - full validation would decode the height
-        if coinbase_input.script_sig.is_empty() {
-            return Err(TransactionValidationError::InvalidCoinbase);
+        // BIP34 (activated at mainnet height 227_931): the coinbase scriptSig
+        // must begin with a serialised push of the block height. Python
+        // reference: validation.py:775-793. We mirror Python's unsigned
+        // little-endian decode rather than full CScriptNum, which is
+        // intentionally lenient — Core is stricter about minimal encoding
+        // but the drain path must match Python bit-for-bit.
+        const BIP34_HEIGHT: u32 = 227_931;
+        if height >= BIP34_HEIGHT {
+            let script = coinbase_input.script_sig.as_bytes();
+            let push_size = script[0] as usize;
+            if push_size == 0 {
+                if height != 0 {
+                    return Err(TransactionValidationError::InvalidCoinbaseHeight);
+                }
+            } else {
+                if push_size > 4 || 1 + push_size > script.len() {
+                    return Err(TransactionValidationError::InvalidCoinbaseHeight);
+                }
+                let mut buf = [0u8; 8];
+                buf[..push_size].copy_from_slice(&script[1..1 + push_size]);
+                let encoded = u64::from_le_bytes(buf);
+                if encoded != height as u64 {
+                    return Err(TransactionValidationError::InvalidCoinbaseHeight);
+                }
+            }
         }
 
-        // Validate coinbase output amount
-        // This will be done in validate_amounts with the total fees
-        // For now, we'll just check that there's at least one output
+        // At least one output
         if tx.output.is_empty() {
             return Err(TransactionValidationError::InvalidCoinbase);
         }
