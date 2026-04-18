@@ -1270,6 +1270,27 @@ class RPCServer:
 
         return result
 
+    async def rpc_getcrosscheckstats(self) -> dict[str, Any]:
+        """Return validate-path cross-check counters.
+
+        Populated when ``OUROBOROS_VALIDATE_CROSS_CHECK=1`` is set — the
+        drain-loop runs both the Rust FFI and Python validators, compares
+        results, and records matches/mismatches here.
+
+        Returns:
+            matches (int): blocks where Rust and Python agreed
+            mismatches (int): blocks where they disagreed
+            samples (list): up to 32 most-recent mismatches, each with
+                the height and both ``(valid, error)`` tuples
+
+        Reference: OUROBOROS-B3-STAGE1-KICKOFF.md step 5.
+        """
+        try:
+            from ouroboros.block_sync import get_cross_check_stats
+            return get_cross_check_stats()
+        except Exception as e:
+            return {"error": str(e), "matches": 0, "mismatches": 0, "samples": []}
+
     async def rpc_getmempoolinfo(self) -> dict[str, Any]:
         """Return mempool information.
 

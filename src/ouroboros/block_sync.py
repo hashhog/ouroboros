@@ -10,6 +10,7 @@ import hashlib
 import logging
 import os
 import random
+import threading
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable
@@ -25,6 +26,56 @@ try:
 except ImportError:
     _sync_module = None
     _has_sync_module = False
+
+# B3 Stage 1 cross-check: OUROBOROS_VALIDATE_CROSS_CHECK=1 runs BOTH
+# validators and logs mismatches.  Counters exposed via
+# get_cross_check_stats() for the RPC layer.  Trust Python (Rust is
+# advisory during the cross-check window).
+_CROSS_CHECK_MAX_SAMPLES = 32
+_cross_check_lock = threading.Lock()
+_cross_check_stats: dict = {
+    "matches": 0,
+    "mismatches": 0,
+    "samples": [],  # recent mismatches: {"height", "rust": (v,e), "python": (v,e)}
+}
+
+
+def get_cross_check_stats() -> dict:
+    """Return a snapshot of the validate-path cross-check counters.
+
+    Used by the RPC layer (``get_cross_check_stats``) to surface
+    mismatch counts during the B3 Stage 1 soak window.
+    """
+    with _cross_check_lock:
+        return {
+            "matches": _cross_check_stats["matches"],
+            "mismatches": _cross_check_stats["mismatches"],
+            "samples": list(_cross_check_stats["samples"]),
+        }
+
+
+def _record_cross_check(
+    matched: bool,
+    *,
+    height: int,
+    rust_result: tuple,
+    python_result: tuple,
+) -> None:
+    with _cross_check_lock:
+        if matched:
+            _cross_check_stats["matches"] += 1
+        else:
+            _cross_check_stats["mismatches"] += 1
+            samples = _cross_check_stats["samples"]
+            samples.append(
+                {
+                    "height": height,
+                    "rust": rust_result,
+                    "python": python_result,
+                }
+            )
+            if len(samples) > _CROSS_CHECK_MAX_SAMPLES:
+                del samples[: len(samples) - _CROSS_CHECK_MAX_SAMPLES]
 
 # Bitcoin Core net_processing.cpp: MAX_BLOCKS_IN_FLIGHT_PER_PEER = 16.
 # Bounds the damage a single slow peer can do during IBD — without this,
@@ -569,52 +620,98 @@ class BlockSync:
             new_height = current_height + 1
             t_val = time.perf_counter_ns()
 
-            # B3 Stage 1 fast path: route skip_scripts=True validation through
-            # Rust (off-GIL).  Matches Python's skip_scripts=True semantics
-            # bit-for-bit (BIP30/BIP34/BIP68/BIP141/coinbase amount/sigops/
-            # weight/merkle).  Falls back to Python on any unexpected error.
-            validated_via_rust = False
-            if (
-                os.environ.get("OUROBOROS_ROUTE_VALIDATE_TO_RUST") == "1"
-                and _has_sync_module
+            # B3 Stage 1: Rust validate fast path.
+            #
+            # Two env-flag modes:
+            # - OUROBOROS_VALIDATE_CROSS_CHECK=1 → run BOTH Rust and Python,
+            #   compare results, log mismatches, trust Python.  Soak window.
+            # - OUROBOROS_ROUTE_VALIDATE_TO_RUST=1 → run Rust only, fall back
+            #   to Python only on unexpected errors.  Steady state.
+            #
+            # Both gated on can_skip_scripts_for_block (so below assumevalid
+            # checkpoint only); above the checkpoint, Python's script
+            # verification path is kept regardless of flags.
+            cross_check = os.environ.get("OUROBOROS_VALIDATE_CROSS_CHECK") == "1"
+            route_only = (
+                not cross_check
+                and os.environ.get("OUROBOROS_ROUTE_VALIDATE_TO_RUST") == "1"
+            )
+            rust_available = (
+                _has_sync_module
                 and hasattr(self.db, "validate_block_from_bytes")
-            ):
+            )
+            network = (
+                self.peer_manager.network
+                if hasattr(self.peer_manager, "network")
+                else "mainnet"
+            )
+            skip_scripts = False
+            if (cross_check or route_only) and rust_available:
                 try:
-                    network = (
-                        self.peer_manager.network
-                        if hasattr(self.peer_manager, "network")
-                        else "mainnet"
-                    )
                     skip_scripts = _sync_module.can_skip_scripts_for_block(
                         network, new_height, next_hash
                     )
                 except Exception:
                     skip_scripts = False
-                if skip_scripts:
-                    try:
-                        await asyncio.to_thread(
-                            self.db.validate_block_from_bytes,
-                            raw_payload,
-                            new_height - 1,
-                            True,
-                            network,
-                        )
-                        valid, error = True, ""
-                        validated_via_rust = True
-                    except ValueError as e:
-                        valid, error = False, str(e)
-                        validated_via_rust = True
-                    except Exception as e:
-                        logger.warning(
-                            f"Rust validate_block_from_bytes raised "
-                            f"unexpectedly at height {new_height}: {e}; "
-                            f"falling back to Python validator"
-                        )
 
-            if not validated_via_rust:
-                valid, error = await asyncio.to_thread(
-                    self.validator.validate_block, block, known_height=new_height
+            async def _run_rust() -> tuple[bool, str]:
+                try:
+                    await asyncio.to_thread(
+                        self.db.validate_block_from_bytes,
+                        raw_payload,
+                        new_height - 1,
+                        True,
+                        network,
+                    )
+                    return True, ""
+                except ValueError as e:
+                    return False, str(e)
+
+            async def _run_python() -> tuple[bool, str]:
+                return await asyncio.to_thread(
+                    self.validator.validate_block,
+                    block,
+                    known_height=new_height,
                 )
+
+            validated_via_rust = False
+            if cross_check and rust_available and skip_scripts:
+                try:
+                    rust_result = await _run_rust()
+                except Exception as e:
+                    logger.warning(
+                        f"Rust validate raised unexpectedly at height "
+                        f"{new_height}: {e}; skipping cross-check for this block"
+                    )
+                    rust_result = None
+                python_result = await _run_python()
+                valid, error = python_result
+                if rust_result is not None:
+                    matched = rust_result == python_result
+                    _record_cross_check(
+                        matched,
+                        height=new_height,
+                        rust_result=rust_result,
+                        python_result=python_result,
+                    )
+                    if not matched:
+                        logger.error(
+                            f"B3 cross-check MISMATCH at height {new_height}: "
+                            f"rust={rust_result} python={python_result}"
+                        )
+            elif route_only and rust_available and skip_scripts:
+                try:
+                    valid, error = await _run_rust()
+                    validated_via_rust = True
+                except Exception as e:
+                    logger.warning(
+                        f"Rust validate_block_from_bytes raised "
+                        f"unexpectedly at height {new_height}: {e}; "
+                        f"falling back to Python validator"
+                    )
+
+            if not validated_via_rust and not cross_check:
+                valid, error = await _run_python()
             validate_ns = time.perf_counter_ns() - t_val
             if not valid:
                 logger.warning(
