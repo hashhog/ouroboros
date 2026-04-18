@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::collections::HashSet;
 
-use bitcoin::{Block, Network};
+use bitcoin::{Block, Network, OutPoint};
 use bitcoin::hashes::Hash;
 use thiserror::Error;
 
@@ -56,6 +56,15 @@ pub enum BlockValidationError {
 
     #[error("Block not found: {0}")]
     BlockNotFound(String),
+
+    #[error("BIP30: duplicate unspent txid")]
+    Bip30DuplicateTxid,
+
+    #[error("BIP68: sequence lock not satisfied")]
+    InvalidSequenceLock,
+
+    #[error("BIP68: missing UTXO for input {0}")]
+    Bip68MissingUtxo(String),
 }
 
 /// Result type for block validation
@@ -249,16 +258,29 @@ impl BlockValidator {
         // 6. Duplicate tx check (structural, in-block only)
         self.check_duplicate_transactions(inner)?;
 
+        // 6b. BIP30 duplicate-txid against UTXO set (mainnet window only)
+        self.check_bip30(inner, height)?;
+
         // 7. Per-tx validation — always, regardless of assumevalid.
         //    Matches Python's skip_scripts=True path which keeps UTXO
         //    lookups, coinbase maturity, amount, and BIP68 checks.
         self.tx_validator.check_coinbase(coinbase_tx, height)
             .map_err(BlockValidationError::TransactionValidation)?;
 
+        // 7b. BIP68 sequence-lock enforcement is gated on network activation
+        //     and requires the previous block's MTP once. Fetch lazily on
+        //     first time-locked input; height-locked inputs don't need it.
+        let enforce_bip68 = super::sequence_lock::is_bip68_active(height, self.network);
+        let mut block_median_time: Option<i64> = None;
+
         for tx in inner.txdata.iter().skip(1) {
             let tx_wrapper = TransactionWrapper::new(tx.clone());
             self.tx_validator.validate_transaction(&tx_wrapper, height, true)
                 .map_err(BlockValidationError::TransactionValidation)?;
+
+            if enforce_bip68 && tx.version.0 >= 2 {
+                self.check_tx_sequence_locks(tx, prev_height, height, &mut block_median_time)?;
+            }
         }
 
         // 8. Sigop cost limit with BIP141 witness discount
@@ -349,6 +371,120 @@ impl BlockValidator {
             }
         }
 
+        Ok(())
+    }
+
+    /// BIP30 duplicate-txid prohibition.
+    ///
+    /// Rejects a block that contains a tx whose txid already has any unspent
+    /// outputs in the UTXO set. Only enforced on mainnet in the historical
+    /// window [227_931, 1_983_702]; heights 91_842 and 91_880 are the two
+    /// known pre-BIP30 duplicate pairs (both outside the window, kept explicit
+    /// for parity with Python `validation.py:336-354`).
+    ///
+    /// Post-BIP34 coinbase-height enforcement guarantees no further duplicates
+    /// within the window, but Core and Python continue to verify
+    /// defensively — we match.
+    fn check_bip30(&self, block: &Block, height: u32) -> Result<()> {
+        if self.network != Network::Bitcoin {
+            return Ok(());
+        }
+        const BIP30_START: u32 = 227_931;
+        const BIP30_END: u32 = 1_983_702;
+        if height == 91_842 || height == 91_880 {
+            return Ok(());
+        }
+        if height < BIP30_START || height > BIP30_END {
+            return Ok(());
+        }
+
+        for tx in &block.txdata {
+            let txid = tx.compute_txid();
+            for vout in 0..tx.output.len() as u32 {
+                let op = OutPoint { txid, vout };
+                if self.db.get_utxo(&op)?.is_some() {
+                    return Err(BlockValidationError::Bip30DuplicateTxid);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// BIP68 sequence-lock enforcement for a single non-coinbase transaction.
+    ///
+    /// `block_median_time` is the MTP of the *previous* block. It's lazily
+    /// fetched (11 block reads) only when a time-locked input is seen.
+    /// Height-locked inputs don't require it.
+    ///
+    /// Reference: Bitcoin Core `SequenceLocks`/`EvaluateSequenceLocks` and
+    /// Python `validation.py` `check_sequence_locks`.
+    fn check_tx_sequence_locks(
+        &self,
+        tx: &bitcoin::Transaction,
+        prev_height: u32,
+        height: u32,
+        block_median_time: &mut Option<i64>,
+    ) -> Result<()> {
+        use super::sequence_lock::{
+            InputLockInfo, check_sequence_locks,
+            SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_TYPE_FLAG,
+        };
+
+        // Fast path: if every input has the disable flag, nothing to check.
+        let any_live = tx.input.iter().any(|i| {
+            i.sequence.0 & SEQUENCE_LOCKTIME_DISABLE_FLAG == 0
+        });
+        if !any_live {
+            return Ok(());
+        }
+
+        let mut input_infos = Vec::with_capacity(tx.input.len());
+        for input in &tx.input {
+            let utxo = self.db.get_utxo(&input.previous_output)?
+                .ok_or_else(|| BlockValidationError::Bip68MissingUtxo(
+                    format!("{}:{}", input.previous_output.txid, input.previous_output.vout)))?;
+            let prev_h = utxo.height.unwrap_or(0);
+
+            // MTP at (prev_h - 1) is only needed for time-locked live inputs.
+            let is_time_locked =
+                input.sequence.0 & SEQUENCE_LOCKTIME_DISABLE_FLAG == 0
+                && input.sequence.0 & SEQUENCE_LOCKTIME_TYPE_FLAG != 0;
+            let prev_mtp = if is_time_locked && prev_h > 0 {
+                self.header_validator
+                    .get_median_time_past(prev_h.saturating_sub(1))? as i64
+            } else {
+                0
+            };
+
+            input_infos.push(InputLockInfo {
+                sequence: input.sequence.0,
+                prev_height: prev_h,
+                prev_median_time: prev_mtp,
+            });
+        }
+
+        // block_median_time = MTP of previous block. Only fetch if any live
+        // time-locked input exists in this tx.
+        let need_block_mtp = tx.input.iter().any(|i| {
+            let s = i.sequence.0;
+            s & SEQUENCE_LOCKTIME_DISABLE_FLAG == 0
+                && s & SEQUENCE_LOCKTIME_TYPE_FLAG != 0
+        });
+        let bmt = if need_block_mtp {
+            if let Some(v) = *block_median_time {
+                v
+            } else {
+                let v = self.header_validator.get_median_time_past(prev_height)? as i64;
+                *block_median_time = Some(v);
+                v
+            }
+        } else {
+            0
+        };
+
+        if !check_sequence_locks(tx.version.0, &input_infos, height, bmt, true) {
+            return Err(BlockValidationError::InvalidSequenceLock);
+        }
         Ok(())
     }
 
