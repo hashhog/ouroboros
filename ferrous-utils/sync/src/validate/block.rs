@@ -392,17 +392,17 @@ impl BlockValidator {
         Ok(())
     }
 
-    /// Check block size limits.
+    /// Check block weight limit (BIP141).
     ///
-    /// Uses transaction count as a fast upper-bound proxy instead of
-    /// re-serializing the entire block (which was the previous bottleneck).
-    /// Bitcoin's max block weight is 4M weight units; the absolute max
-    /// serialized size is 4MB.
+    /// Total block weight = sum of each tx's weight, where tx weight is
+    /// `base_size * 3 + total_size` (non-witness bytes counted 4×, witness
+    /// bytes counted 1×). Must not exceed MAX_BLOCK_WEIGHT (4_000_000).
+    ///
+    /// Matches Python `validation.py::_validate_block_limits` which sums
+    /// `tx.get_weight()` across all transactions.
     fn check_size_limits(&self, block: &Block) -> Result<()> {
-        // Each tx is at least 60 bytes serialized (version + 1 in + 1 out + locktime).
-        // 4_000_000 / 60 ≈ 66_666 transactions max. Use a generous ceiling.
-        const MAX_TX_COUNT: usize = 100_000;
-        if block.txdata.len() > MAX_TX_COUNT {
+        const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+        if block.weight().to_wu() > MAX_BLOCK_WEIGHT {
             return Err(BlockValidationError::SizeExceeded);
         }
         Ok(())
@@ -890,6 +890,91 @@ mod tests {
 
         // After 64 halvings: 0
         assert_eq!(validator.calculate_block_subsidy(64 * 210_000), 0);
+    }
+
+    #[test]
+    fn test_check_size_limits_accepts_normal_block() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Bitcoin);
+
+        let coinbase_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(
+                    bitcoin::Txid::from_byte_array([0u8; 32]),
+                    u32::MAX,
+                ),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x03, 0x00, 0x00, 0x00]),
+                sequence: bitcoin::transaction::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(50 * 100_000_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+
+        let block = Block {
+            header: bitcoin::blockdata::block::Header {
+                version: bitcoin::blockdata::block::Version::from_consensus(1),
+                prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+                merkle_root: bitcoin::blockdata::block::TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1234567890u32,
+                bits: bitcoin::CompactTarget::from_consensus(0x1d00ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase_tx],
+        };
+
+        assert!(block.weight().to_wu() < 4_000_000);
+        assert!(validator.check_size_limits(&block).is_ok());
+    }
+
+    #[test]
+    fn test_check_size_limits_rejects_overweight_block() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Bitcoin);
+
+        // Build a coinbase whose single output carries a huge OP_RETURN-style
+        // scriptPubKey so the base size (×4) exceeds 4M weight units.
+        // 1_100_000 base-size bytes → 4.4M weight units → over the cap.
+        let big_payload = vec![0u8; 1_100_000];
+        let coinbase_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(
+                    bitcoin::Txid::from_byte_array([0u8; 32]),
+                    u32::MAX,
+                ),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x03, 0x00, 0x00, 0x00]),
+                sequence: bitcoin::transaction::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(0),
+                script_pubkey: bitcoin::ScriptBuf::from(big_payload),
+            }],
+        };
+
+        let block = Block {
+            header: bitcoin::blockdata::block::Header {
+                version: bitcoin::blockdata::block::Version::from_consensus(1),
+                prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+                merkle_root: bitcoin::blockdata::block::TxMerkleNode::from_byte_array([0u8; 32]),
+                time: 1234567890u32,
+                bits: bitcoin::CompactTarget::from_consensus(0x1d00ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase_tx],
+        };
+
+        assert!(block.weight().to_wu() > 4_000_000);
+        assert!(matches!(
+            validator.check_size_limits(&block),
+            Err(BlockValidationError::SizeExceeded)
+        ));
     }
 
     // ---- witness-commitment test helpers ----
