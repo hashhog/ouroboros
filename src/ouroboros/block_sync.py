@@ -707,6 +707,45 @@ class BlockSync:
                             f"B3 cross-check MISMATCH at height {new_height}: "
                             f"rust={rust_result} python={python_result}"
                         )
+                        # B3 diagnostic: when Python rejected with
+                        # "Input not found: <txid>:<vout>" but Rust accepted,
+                        # re-probe the outpoint directly against the shared
+                        # DB to determine whether the two sides actually see
+                        # different UTXO state (a real Rust vs Python DB read
+                        # divergence) or whether the asymmetry is in the
+                        # intra-block view construction (one side finds it in
+                        # `extras`/`intra_block_utxos`, the other doesn't).
+                        # Also check whether the outpoint is created by an
+                        # earlier tx in the same block — if so, the divergence
+                        # is intra-block-view, not DB.
+                        try:
+                            perr = python_result[1] or ""
+                            marker = "Input not found: "
+                            if marker in perr:
+                                tail = perr[perr.rindex(marker) + len(marker):]
+                                txhex, _, vout_s = tail.partition(":")
+                                # strip anything after the vout
+                                vout_s = vout_s.split(" ")[0].split(",")[0]
+                                op_txid = bytes.fromhex(txhex.strip())
+                                op_vout = int(vout_s.strip())
+                                probe = self.db.get_utxo(op_txid, op_vout)
+                                created_in_block: int | None = None
+                                for ti, btx in enumerate(block.transactions):
+                                    if btx.get_txid() == op_txid:
+                                        if op_vout < len(btx.outputs):
+                                            created_in_block = ti
+                                        break
+                                logger.error(
+                                    f"B3 mismatch probe h={new_height} "
+                                    f"outpoint={txhex}:{op_vout} "
+                                    f"db_get_utxo={'HIT' if probe else 'MISS'} "
+                                    f"created_by_block_tx_index={created_in_block}"
+                                )
+                        except Exception as probe_err:
+                            logger.debug(
+                                f"B3 mismatch probe failed at "
+                                f"h={new_height}: {probe_err}"
+                            )
                     elif rust_result[1] != python_result[1]:
                         logger.debug(
                             f"B3 cross-check agree (different error text) "
