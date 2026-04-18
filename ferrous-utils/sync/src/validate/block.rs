@@ -65,6 +65,15 @@ pub enum BlockValidationError {
 
     #[error("BIP68: missing UTXO for input {0}")]
     Bip68MissingUtxo(String),
+
+    #[error("BIP141: block has witness data but no witness commitment")]
+    MissingWitnessCommitment,
+
+    #[error("BIP141: coinbase witness must be exactly one 32-byte item")]
+    InvalidCoinbaseWitnessNonce,
+
+    #[error("BIP141: witness commitment mismatch")]
+    WitnessCommitmentMismatch,
 }
 
 /// Result type for block validation
@@ -294,6 +303,9 @@ impl BlockValidator {
         //     Matches Python `validation.py:420-426`.
         self.validate_block_subsidy(inner, height, total_fees)?;
 
+        // 7d. BIP141 witness commitment.
+        self.check_witness_commitment(inner, height)?;
+
         // 8. Sigop cost limit with BIP141 witness discount
         let (verify_p2sh, verify_witness) = self.get_sigop_flags(height);
         let total_sigop_cost = super::sigop::get_block_sigop_cost(
@@ -419,6 +431,77 @@ impl BlockValidator {
             }
         }
         Ok(())
+    }
+
+    /// BIP141 witness-commitment verification.
+    ///
+    /// Post-SegWit activation, a block carrying any witness data must embed
+    /// a witness commitment in a coinbase `OP_RETURN` output in the form
+    /// `OP_RETURN 0x24 <magic=0xaa21a9ed> <32-byte commitment>`. The commitment
+    /// is `dSHA256(witness_merkle_root || coinbase_witness_nonce)`, where the
+    /// witness merkle root is computed over wtxids with the coinbase's wtxid
+    /// replaced by 32 zero bytes.
+    ///
+    /// If multiple qualifying outputs exist, **the last one wins** (per BIP141
+    /// and Bitcoin Core `GetWitnessCommitmentIndex`). Python reference:
+    /// `validation.py::_validate_witness_commitment`.
+    fn check_witness_commitment(&self, block: &Block, height: u32) -> Result<()> {
+        use bitcoin::hashes::{sha256d, Hash as _};
+        use super::script::activation_heights::segwit_height;
+
+        let activation = segwit_height(self.network);
+        if height < activation {
+            return Ok(());
+        }
+
+        let has_witness = block.txdata.iter().any(|tx| {
+            tx.input.iter().any(|inp| !inp.witness.is_empty())
+        });
+
+        let coinbase = &block.txdata[0];
+        let commitment: Option<[u8; 32]> = coinbase.output.iter().rev().find_map(|out| {
+            let spk = out.script_pubkey.as_bytes();
+            if spk.len() >= 38
+                && spk[0] == 0x6A
+                && spk[1] == 0x24
+                && spk[2..6] == [0xaa, 0x21, 0xa9, 0xed]
+            {
+                let mut c = [0u8; 32];
+                c.copy_from_slice(&spk[6..38]);
+                Some(c)
+            } else {
+                None
+            }
+        });
+
+        match (has_witness, commitment) {
+            (true, None) => Err(BlockValidationError::MissingWitnessCommitment),
+            (true, Some(commit)) => {
+                let cb_witness = &coinbase.input[0].witness;
+                let nonce = match cb_witness.last() {
+                    Some(n) if cb_witness.len() == 1 && n.len() == 32 => n,
+                    _ => return Err(BlockValidationError::InvalidCoinbaseWitnessNonce),
+                };
+
+                let mut wtxids: Vec<[u8; 32]> = Vec::with_capacity(block.txdata.len());
+                wtxids.push([0u8; 32]);
+                for tx in block.txdata.iter().skip(1) {
+                    wtxids.push(*tx.compute_wtxid().as_byte_array());
+                }
+                let witness_root = compute_merkle_root(&wtxids);
+
+                let mut buf = [0u8; 64];
+                buf[..32].copy_from_slice(&witness_root);
+                buf[32..].copy_from_slice(nonce);
+                let expected = sha256d::Hash::hash(&buf);
+
+                if *expected.as_byte_array() != commit {
+                    return Err(BlockValidationError::WitnessCommitmentMismatch);
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// BIP68 sequence-lock enforcement for a single non-coinbase transaction.
@@ -762,6 +845,154 @@ mod tests {
 
         // After 64 halvings: 0
         assert_eq!(validator.calculate_block_subsidy(64 * 210_000), 0);
+    }
+
+    // ---- witness-commitment test helpers ----
+
+    fn mk_coinbase(outputs: Vec<bitcoin::TxOut>, with_nonce: bool) -> Transaction {
+        let witness = if with_nonce {
+            bitcoin::Witness::from_slice(&[vec![0u8; 32]])
+        } else {
+            bitcoin::Witness::new()
+        };
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(
+                    bitcoin::Txid::from_byte_array([0u8; 32]),
+                    u32::MAX,
+                ),
+                script_sig: bitcoin::ScriptBuf::from(vec![0x03, 0x00, 0x00, 0x00]),
+                sequence: bitcoin::transaction::Sequence::MAX,
+                witness,
+            }],
+            output: outputs,
+        }
+    }
+
+    fn mk_witness_tx() -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(
+                    bitcoin::Txid::from_byte_array([1u8; 32]),
+                    0,
+                ),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::transaction::Sequence::MAX,
+                witness: bitcoin::Witness::from_slice(&[vec![0xaa; 71], vec![0xbb; 33]]),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        }
+    }
+
+    fn commitment_spk(commit: &[u8; 32]) -> bitcoin::ScriptBuf {
+        let mut spk = Vec::with_capacity(38);
+        spk.push(0x6A);
+        spk.push(0x24);
+        spk.extend_from_slice(&[0xaa, 0x21, 0xa9, 0xed]);
+        spk.extend_from_slice(commit);
+        bitcoin::ScriptBuf::from(spk)
+    }
+
+    fn mk_block(txs: Vec<Transaction>) -> Block {
+        let txids: Vec<[u8; 32]> = txs.iter()
+            .map(|tx| *tx.compute_txid().as_byte_array())
+            .collect();
+        let merkle_root = compute_merkle_root(&txids);
+        Block {
+            header: bitcoin::blockdata::block::Header {
+                version: bitcoin::blockdata::block::Version::from_consensus(1),
+                prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+                merkle_root: bitcoin::blockdata::block::TxMerkleNode::from_byte_array(merkle_root),
+                time: 1_234_567_890u32,
+                bits: bitcoin::CompactTarget::from_consensus(0x1d00ffff),
+                nonce: 0,
+            },
+            txdata: txs,
+        }
+    }
+
+    fn compute_expected_witness_commitment(block: &Block, nonce: &[u8; 32]) -> [u8; 32] {
+        use bitcoin::hashes::{sha256d, Hash as _};
+        let mut wtxids: Vec<[u8; 32]> = vec![[0u8; 32]];
+        for tx in block.txdata.iter().skip(1) {
+            wtxids.push(*tx.compute_wtxid().as_byte_array());
+        }
+        let witness_root = compute_merkle_root(&wtxids);
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&witness_root);
+        buf[32..].copy_from_slice(nonce);
+        *sha256d::Hash::hash(&buf).as_byte_array()
+    }
+
+    #[test]
+    fn test_witness_commitment_preactivation() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Bitcoin);
+        // has_witness=true but height < mainnet segwit activation (481_824) → no-op
+        let coinbase = mk_coinbase(vec![], true);
+        let block = mk_block(vec![coinbase, mk_witness_tx()]);
+        assert!(validator.check_witness_commitment(&block, 481_823).is_ok());
+    }
+
+    #[test]
+    fn test_witness_commitment_missing_when_has_witness() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Bitcoin);
+        // Post-activation, a witness-bearing tx but no commitment in coinbase → fail
+        let coinbase = mk_coinbase(vec![], false);
+        let block = mk_block(vec![coinbase, mk_witness_tx()]);
+        let r = validator.check_witness_commitment(&block, 500_000);
+        assert!(matches!(r, Err(BlockValidationError::MissingWitnessCommitment)));
+    }
+
+    #[test]
+    fn test_witness_commitment_mismatch() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Bitcoin);
+        let bogus = commitment_spk(&[0xff; 32]);
+        let coinbase = mk_coinbase(vec![bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: bogus,
+        }], true);
+        let block = mk_block(vec![coinbase, mk_witness_tx()]);
+        let r = validator.check_witness_commitment(&block, 500_000);
+        assert!(matches!(r, Err(BlockValidationError::WitnessCommitmentMismatch)));
+    }
+
+    #[test]
+    fn test_witness_commitment_valid() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Bitcoin);
+        // First build the block without commitment to compute it.
+        let placeholder_cb = mk_coinbase(vec![], true);
+        let block_seed = mk_block(vec![placeholder_cb.clone(), mk_witness_tx()]);
+        let nonce = [0u8; 32];
+        let commit = compute_expected_witness_commitment(&block_seed, &nonce);
+
+        // Rebuild coinbase with the correct commitment output.
+        let coinbase = mk_coinbase(vec![bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: commitment_spk(&commit),
+        }], true);
+        let block = mk_block(vec![coinbase, mk_witness_tx()]);
+        assert!(validator.check_witness_commitment(&block, 500_000).is_ok());
+    }
+
+    #[test]
+    fn test_witness_commitment_no_witness_no_commitment() {
+        // Post-activation, block has no witness anywhere and no commitment → Ok.
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Bitcoin);
+        let coinbase = mk_coinbase(vec![], false);
+        let block = mk_block(vec![coinbase]);
+        assert!(validator.check_witness_commitment(&block, 500_000).is_ok());
     }
 
     #[test]
