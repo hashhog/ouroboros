@@ -385,6 +385,30 @@ class BlockValidator:
         # block so that intra-block dependencies (tx N spending tx M's
         # output where M < N) can be resolved.
         intra_block_utxos: dict[tuple[bytes, int], dict] = {}
+
+        # B2-lite (W60): pre-fetch every non-coinbase outpoint referenced
+        # by this block in a SINGLE FFI call.  Profiling at height 768k
+        # showed validate_transaction spending ~1.1s/block, 82% of drain
+        # time, almost entirely in per-tx Python→Rust round-trips to
+        # get_utxo_batch.  One block-level batch cuts ~2000 FFI calls to
+        # 1, reducing validate cost by an expected 5–10×.  See
+        # wave60-2026-04-17/OUROBOROS-PIPELINED-DRAIN-SCOPE.md.
+        #
+        # Correctness: intra-block deps (tx N spending tx M<N's output)
+        # are NOT in the committed UTXO set; get_utxo_batch returns None
+        # for them.  The validate_transaction / _calculate_tx_fee
+        # fallbacks below check intra_block_utxos exactly as the per-tx
+        # code path did, preserving existing semantics.
+        prefetched_utxos: dict[tuple[bytes, int], dict | None] = {}
+        if hasattr(self.db, 'get_utxo_batch') and len(block.transactions) > 1:
+            all_outpoints: list[tuple[bytes, int]] = []
+            for tx in block.transactions[1:]:  # skip coinbase
+                for tx_in in tx.inputs:
+                    all_outpoints.append((tx_in.prev_txid, tx_in.prev_vout))
+            if all_outpoints:
+                batch = self.db.get_utxo_batch(all_outpoints)
+                prefetched_utxos = dict(zip(all_outpoints, batch))
+
         total_fees = 0
         for i, tx in enumerate(block.transactions):
             if i == 0:  # Coinbase
@@ -396,12 +420,13 @@ class BlockValidator:
                     block_hash=block.hash,
                     intra_block_utxos=intra_block_utxos,
                     skip_scripts=skip_scripts,
+                    prefetched_utxos=prefetched_utxos,
                 )
                 if not valid:
                     return False, f"Transaction {i} invalid: {error}"
 
                 # Calculate fee (also using intra-block UTXOs)
-                fee = self._calculate_tx_fee(tx, intra_block_utxos)
+                fee = self._calculate_tx_fee(tx, intra_block_utxos, prefetched_utxos)
                 total_fees += fee
 
             # Register this tx's outputs in the intra-block view for
@@ -1088,12 +1113,26 @@ class BlockValidator:
         )
         return tx
 
-    def _calculate_tx_fee(self, tx: Transaction, intra_block_utxos=None) -> int:
+    def _calculate_tx_fee(
+        self,
+        tx: Transaction,
+        intra_block_utxos=None,
+        prefetched_utxos: dict | None = None,
+    ) -> int:
         total_input = 0
         for tx_in in tx.inputs:
-            utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
-            if utxo is None and intra_block_utxos:
-                utxo = intra_block_utxos.get((tx_in.prev_txid, tx_in.prev_vout))
+            key = (tx_in.prev_txid, tx_in.prev_vout)
+            if prefetched_utxos is not None:
+                # B2-lite: read from the block-level prefetch first.  Falls
+                # back to intra_block_utxos for outputs created earlier in
+                # the same block (not in the committed UTXO set yet).
+                utxo = prefetched_utxos.get(key)
+                if utxo is None and intra_block_utxos:
+                    utxo = intra_block_utxos.get(key)
+            else:
+                utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                if utxo is None and intra_block_utxos:
+                    utxo = intra_block_utxos.get(key)
             if utxo:
                 total_input += utxo['value']
 
@@ -1117,12 +1156,21 @@ class TransactionValidator:
         block_hash: bytes | None = None,
         intra_block_utxos: dict | None = None,
         skip_scripts: bool = False,
+        prefetched_utxos: dict | None = None,
     ) -> tuple[bool, str]:
         """Validate *tx* at *height* (structure, inputs, locktime, scripts); returns ``(ok, error_message)``.
 
         When *skip_scripts* is True (assume-valid during IBD), signature and
         script verification is skipped.  UTXO existence, amounts, coinbase
         maturity, locktime, and BIP 68 checks are still enforced.
+
+        *prefetched_utxos* (B2-lite, W60) is an optional dict of
+        ``(txid, vout) -> utxo or None`` populated by the caller with one
+        block-level ``get_utxo_batch`` call.  When present, input lookups
+        read from this dict first and fall back to *intra_block_utxos* for
+        outputs created earlier in the same block; no per-input or per-tx
+        FFI is issued.  Mempool callers pass ``None`` and hit the legacy
+        per-tx paths.
         """
         flags = get_flags_for_height(height, block_hash, self.network)
 
@@ -1147,36 +1195,57 @@ class TransactionValidator:
         input_amounts: list[int] = []
         input_script_pubkeys: list[bytes] = []
 
-        # Separate inputs that may come from intra-block UTXOs (need individual
-        # lookup with fallback) from those we can batch-fetch from the DB.
-        intra_keys = set(intra_block_utxos.keys()) if intra_block_utxos else set()
-        needs_intra = any(
-            (tx_in.prev_txid, tx_in.prev_vout) in intra_keys
-            for tx_in in tx.inputs
-        )
-
-        if not needs_intra and hasattr(self.db, 'get_utxo_batch') and len(tx.inputs) > 1:
-            # Fast path: all inputs come from the persistent DB — one FFI call.
-            outpoints = [(tx_in.prev_txid, tx_in.prev_vout) for tx_in in tx.inputs]
-            batch = self.db.get_utxo_batch(outpoints)
-            for i, (tx_in, utxo) in enumerate(zip(tx.inputs, batch)):
-                if utxo is None:
-                    return False, f"Input not found: {tx_in.prev_txid.hex()}:{tx_in.prev_vout}"
-                input_utxos.append(utxo)
-                input_amounts.append(utxo['value'])
-                input_script_pubkeys.append(bytes(utxo['script_pubkey']))
-        else:
-            # Slow path: some inputs may spend outputs from earlier txs in this
-            # block (intra_block_utxos), so we must look them up individually.
+        if prefetched_utxos is not None:
+            # B2-lite fast path: the caller (validate_block) already issued
+            # ONE get_utxo_batch covering every outpoint in the block.  Input
+            # lookups become O(1) dict hits; no FFI here.  Entries with value
+            # None correspond to outpoints not in the committed UTXO set —
+            # either spent already (invalid) or created earlier in this block
+            # (valid; resolved via intra_block_utxos below).
             for tx_in in tx.inputs:
-                utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                key = (tx_in.prev_txid, tx_in.prev_vout)
+                utxo = prefetched_utxos.get(key)
                 if utxo is None and intra_block_utxos:
-                    utxo = intra_block_utxos.get((tx_in.prev_txid, tx_in.prev_vout))
+                    utxo = intra_block_utxos.get(key)
                 if not utxo:
                     return False, f"Input not found: {tx_in.prev_txid.hex()}:{tx_in.prev_vout}"
                 input_utxos.append(utxo)
                 input_amounts.append(utxo['value'])
                 input_script_pubkeys.append(bytes(utxo['script_pubkey']))
+        else:
+            # Legacy per-tx paths for callers without a block-level prefetch
+            # (mempool accept, RPC testmempoolaccept).
+            #
+            # Separate inputs that may come from intra-block UTXOs (need individual
+            # lookup with fallback) from those we can batch-fetch from the DB.
+            intra_keys = set(intra_block_utxos.keys()) if intra_block_utxos else set()
+            needs_intra = any(
+                (tx_in.prev_txid, tx_in.prev_vout) in intra_keys
+                for tx_in in tx.inputs
+            )
+
+            if not needs_intra and hasattr(self.db, 'get_utxo_batch') and len(tx.inputs) > 1:
+                # Fast path: all inputs come from the persistent DB — one FFI call.
+                outpoints = [(tx_in.prev_txid, tx_in.prev_vout) for tx_in in tx.inputs]
+                batch = self.db.get_utxo_batch(outpoints)
+                for i, (tx_in, utxo) in enumerate(zip(tx.inputs, batch)):
+                    if utxo is None:
+                        return False, f"Input not found: {tx_in.prev_txid.hex()}:{tx_in.prev_vout}"
+                    input_utxos.append(utxo)
+                    input_amounts.append(utxo['value'])
+                    input_script_pubkeys.append(bytes(utxo['script_pubkey']))
+            else:
+                # Slow path: some inputs may spend outputs from earlier txs in this
+                # block (intra_block_utxos), so we must look them up individually.
+                for tx_in in tx.inputs:
+                    utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                    if utxo is None and intra_block_utxos:
+                        utxo = intra_block_utxos.get((tx_in.prev_txid, tx_in.prev_vout))
+                    if not utxo:
+                        return False, f"Input not found: {tx_in.prev_txid.hex()}:{tx_in.prev_vout}"
+                    input_utxos.append(utxo)
+                    input_amounts.append(utxo['value'])
+                    input_script_pubkeys.append(bytes(utxo['script_pubkey']))
 
         # Now verify each input with the COMPLETE amounts/spk lists
         for i, tx_in in enumerate(tx.inputs):
