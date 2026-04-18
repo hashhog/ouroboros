@@ -687,7 +687,15 @@ class BlockSync:
                 python_result = await _run_python()
                 valid, error = python_result
                 if rust_result is not None:
-                    matched = rust_result == python_result
+                    # Match on the accept/reject boolean only. Rust and
+                    # Python often reject invalid blocks for different
+                    # diagnostic reasons (e.g. "Previous block hash
+                    # mismatch" vs "Previous block not found") — that is
+                    # not a consensus disagreement. The strict tuple-eq
+                    # check flagged those as mismatches during initial
+                    # soak, drowning out real (True, False) / (False,
+                    # True) divergences.
+                    matched = rust_result[0] == python_result[0]
                     _record_cross_check(
                         matched,
                         height=new_height,
@@ -698,6 +706,13 @@ class BlockSync:
                         logger.error(
                             f"B3 cross-check MISMATCH at height {new_height}: "
                             f"rust={rust_result} python={python_result}"
+                        )
+                    elif rust_result[1] != python_result[1]:
+                        logger.debug(
+                            f"B3 cross-check agree (different error text) "
+                            f"at height {new_height}: "
+                            f"rust={rust_result[1][:80]!r} "
+                            f"python={python_result[1][:80]!r}"
                         )
             elif route_only and rust_available and skip_scripts:
                 try:
