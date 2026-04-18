@@ -222,6 +222,16 @@ class BlockSync:
         self._drain_stat_connect_ns: int = 0
         self._drain_log_every: int = 1000
 
+        # Serializes `_drain_block_buffer` against itself.  The drain is
+        # invoked from both `sync_loop` (periodic) and `handle_block`
+        # (every incoming P2P block); without this lock two drains can
+        # interleave, each awaiting `asyncio.to_thread(validate)` while
+        # the other runs `connect_block_from_bytes` (mutates UTXO set).
+        # That produced cross-check mismatches where Rust validated
+        # against the pre-mutation UTXO and Python against the post-
+        # mutation UTXO.  Lazy-init: asyncio.Lock() needs a running loop.
+        self._drain_lock: asyncio.Lock | None = None
+
     def set_zmq_publisher(self, publisher) -> None:
         """Attach a ZMQPublisher for real-time block/tx notifications."""
         self._zmq_publisher = publisher
@@ -570,6 +580,19 @@ class BlockSync:
 
         Returns the number of blocks connected.
         """
+        if self._drain_lock is None:
+            self._drain_lock = asyncio.Lock()
+        # If another drain task already holds the lock, skip this
+        # invocation — that task will drain everything currently
+        # buffered, so there is nothing for us to do.  Blocking on
+        # acquire would queue up a redundant second pass that does no
+        # useful work.
+        if self._drain_lock.locked():
+            return 0
+        async with self._drain_lock:
+            return await self._drain_block_buffer_locked()
+
+    async def _drain_block_buffer_locked(self) -> int:
         connected = 0
         current_hash, current_height = self.db.get_best_block()
 
