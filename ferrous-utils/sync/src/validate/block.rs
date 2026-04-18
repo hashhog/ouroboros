@@ -189,6 +189,93 @@ impl BlockValidator {
         Ok(())
     }
 
+    /// Validate a block with explicit flags, matching Python's two-axis model.
+    ///
+    /// Unlike `validate_block()` which uses `assumevalid_height` to gate both
+    /// the per-tx loop *and* script verification together, this method:
+    ///
+    /// - **Always** runs the per-tx loop (structural + amount + coinbase
+    ///   maturity + lock-time checks), matching Python's `skip_scripts=True`
+    ///   behavior which still performs these checks.
+    /// - Reserves `skip_scripts` as a future gate for `script::verify_*`
+    ///   calls. Today it is unused because the production validate path does
+    ///   not call the script interpreter (see B3 Stage 1 audit); the flag is
+    ///   plumbed through for forward compat when script verification lands.
+    ///
+    /// This is the entry point used by the Python FFI path
+    /// (`validate_block_from_bytes`).  Internal Rust callers in
+    /// `FastSync`/`BlockSync` continue to use `validate_block()` to preserve
+    /// their current assumevalid-driven behavior.
+    ///
+    /// Reference: OUROBOROS-B3-RUST-VALIDATE-SCOPE.md,
+    /// OUROBOROS-B3-STAGE1-KICKOFF.md.
+    pub fn validate_block_with_flags(
+        &self,
+        block: &BlockWrapper,
+        prev_height: u32,
+        skip_scripts: bool,
+    ) -> Result<()> {
+        let _ = skip_scripts; // reserved for future script-verify gating
+        let inner = block.inner();
+        let height = prev_height + 1;
+
+        // 1. Validate header (PoW, timestamps, difficulty)
+        self.validate_header(block, prev_height)?;
+
+        // 2. Check block weight limit
+        self.check_size_limits(inner)?;
+
+        // 3. Verify merkle root
+        if !self.verify_merkle_root(inner) {
+            return Err(BlockValidationError::InvalidMerkleRoot);
+        }
+
+        // 4. Non-empty block
+        if inner.txdata.is_empty() {
+            return Err(BlockValidationError::NoTransactions);
+        }
+
+        // 5. Coinbase position + uniqueness
+        let coinbase_tx = &inner.txdata[0];
+        if !coinbase_tx.is_coinbase() {
+            return Err(BlockValidationError::NoCoinbase);
+        }
+        for tx in inner.txdata.iter().skip(1) {
+            if tx.is_coinbase() {
+                return Err(BlockValidationError::MultipleCoinbase);
+            }
+        }
+
+        // 6. Duplicate tx check (structural, in-block only)
+        self.check_duplicate_transactions(inner)?;
+
+        // 7. Per-tx validation — always, regardless of assumevalid.
+        //    Matches Python's skip_scripts=True path which keeps UTXO
+        //    lookups, coinbase maturity, amount, and BIP68 checks.
+        self.tx_validator.check_coinbase(coinbase_tx, height)
+            .map_err(BlockValidationError::TransactionValidation)?;
+
+        for tx in inner.txdata.iter().skip(1) {
+            let tx_wrapper = TransactionWrapper::new(tx.clone());
+            self.tx_validator.validate_transaction(&tx_wrapper, height, true)
+                .map_err(BlockValidationError::TransactionValidation)?;
+        }
+
+        // 8. Sigop cost limit with BIP141 witness discount
+        let (verify_p2sh, verify_witness) = self.get_sigop_flags(height);
+        let total_sigop_cost = super::sigop::get_block_sigop_cost(
+            &inner.txdata,
+            &self.db,
+            verify_p2sh,
+            verify_witness,
+        );
+        if total_sigop_cost > super::sigop::MAX_BLOCK_SIGOPS_COST {
+            return Err(BlockValidationError::TooManySigops);
+        }
+
+        Ok(())
+    }
+
     /// Get sigop verification flags based on block height and network.
     ///
     /// Returns (verify_p2sh, verify_witness) based on activation heights.
