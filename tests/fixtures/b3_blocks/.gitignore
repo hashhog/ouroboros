@@ -1,0 +1,6 @@
+# Only the smallest fixture is committed (block_770000.bin); the others
+# are fetched on demand via fetch.py to keep the repo small.
+block_700000.bin
+block_750000.bin
+block_760000.bin
+block_771000.bin
