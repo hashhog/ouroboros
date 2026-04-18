@@ -248,24 +248,66 @@ impl TransactionValidator {
     }
 
     /// Check lock time
+    ///
+    /// Implements Bitcoin Core's `IsFinalTx` for block-validation time.
+    /// Reference: `bitcoin-core/src/consensus/tx_verify.cpp`.
+    ///
+    /// A transaction is final (may be included in a block) iff ANY of:
+    ///   (a) `nLockTime == 0` (no lock-time restriction),
+    ///   (b) `nLockTime < height` for height-based lock-times (and
+    ///       `nLockTime < block_time` for time-based lock-times — see
+    ///       note below), OR
+    ///   (c) every input has `nSequence == SEQUENCE_FINAL` (`0xFFFFFFFF`),
+    ///       opting out of lock-time entirely.
+    ///
+    /// The SEQUENCE_FINAL escape hatch (c) is required for consensus and
+    /// was missing from the original implementation. W66 at mainnet
+    /// height 782,291 (2026-04-18) surfaced this: three transactions in
+    /// that block had `nLockTime > 782_291` (future) but all inputs at
+    /// `nSequence == 0xFFFFFFFF`. Every other mainnet node accepted the
+    /// block; ouroboros rejected it and wedged for ~5 h.
+    ///
+    /// Time-based lock-times: Bitcoin Core uses
+    /// `block.GetMedianTimePast()` post-BIP113 (active since height
+    /// 419,328). This validator does not yet plumb MTP through; for
+    /// time-based lock-times we preserve the previous accept-all
+    /// behaviour. That is a separate consensus hole for future work but
+    /// is not the cause of the W66 wedge and is extremely rare at the
+    /// heights currently involved in IBD.
     fn check_lock_time(&self, tx: &Transaction, height: u32) -> Result<()> {
-        let lock_time = tx.lock_time;
+        use bitcoin::Sequence;
 
-        match lock_time {
-            LockTime::Blocks(block_height) => {
-                // Block-based lock time: must be less than or equal to current height
-                if block_height.to_consensus_u32() > height {
-                    return Err(TransactionValidationError::InvalidLockTime);
-                }
-            }
-            LockTime::Seconds(timestamp) => {
-                // Time-based lock time: checked against block time
-                // For now, we accept it (would need block time to fully validate)
-                let _ = timestamp;
-            }
+        // Case (a): zero lock-time — always final.
+        if tx.lock_time == LockTime::ZERO {
+            return Ok(());
         }
 
-        Ok(())
+        // Case (b): lock-time is in the past relative to the block being
+        // validated. For height-based, `nLockTime < height` is final;
+        // for time-based, we defer to case (c) (see note above about
+        // BIP113 MTP plumbing).
+        let past = match tx.lock_time {
+            LockTime::Blocks(h) => h.to_consensus_u32() < height,
+            LockTime::Seconds(_) => false,
+        };
+        if past {
+            return Ok(());
+        }
+
+        // Case (c): every input opts out of lock-time via SEQUENCE_FINAL.
+        if tx.input.iter().all(|inp| inp.sequence == Sequence::MAX) {
+            return Ok(());
+        }
+
+        // Preserve prior accept-all behaviour for time-based lock-times
+        // whose nLockTime is not yet `past` and whose sequences are not
+        // all final. Fixing this properly requires MTP plumbing; for
+        // now, avoid regressing on any previously-accepted tx.
+        if matches!(tx.lock_time, LockTime::Seconds(_)) {
+            return Ok(());
+        }
+
+        Err(TransactionValidationError::InvalidLockTime)
     }
 
     /// Validate transaction inputs
@@ -815,6 +857,118 @@ mod tests {
         assert!(!validator.is_final(&tx, 50, 1000000));
         assert!(validator.is_final(&tx, 100, 1000000));
         assert!(validator.is_final(&tx, 150, 1000000));
+    }
+
+    /// Build a minimal one-input, one-output transaction with the given
+    /// lock-time and sequence. Used by the lock-time regression tests
+    /// below. Shape-valid, not signature-valid (we only exercise
+    /// `check_lock_time`).
+    fn make_locktime_tx(lock_time_consensus: u32, sequence: u32) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::from_consensus(lock_time_consensus),
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(
+                    bitcoin::Txid::from_byte_array([1u8; 32]),
+                    0,
+                ),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::transaction::Sequence(sequence),
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_check_lock_time_accepts_zero_locktime() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = TransactionValidator::new(db);
+
+        // nLockTime == 0 is always final regardless of sequence.
+        let tx = make_locktime_tx(0, 0);
+        assert!(validator.check_lock_time(&tx, 782_291).is_ok());
+    }
+
+    #[test]
+    fn test_check_lock_time_accepts_past_height_locktime() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = TransactionValidator::new(db);
+
+        // nLockTime < current height is final even without SEQUENCE_FINAL
+        // (anti-fee-snipe pattern: most wallets set lock_time = height-1
+        // and sequence = 0xFFFFFFFE for RBF).
+        let tx = make_locktime_tx(782_290, 0xFFFFFFFE);
+        assert!(validator.check_lock_time(&tx, 782_291).is_ok());
+    }
+
+    #[test]
+    fn test_check_lock_time_rejects_future_locktime_with_non_final_sequence() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = TransactionValidator::new(db);
+
+        // nLockTime > height AND any input has non-final sequence:
+        // the transaction is not yet final and MUST be rejected.
+        let tx = make_locktime_tx(782_300, 0xFFFFFFFE);
+        assert!(matches!(
+            validator.check_lock_time(&tx, 782_291),
+            Err(TransactionValidationError::InvalidLockTime)
+        ));
+    }
+
+    #[test]
+    fn test_check_lock_time_accepts_future_locktime_with_sequence_final() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = TransactionValidator::new(db);
+
+        // W66 regression: nLockTime > height but all inputs are
+        // SEQUENCE_FINAL (0xFFFFFFFF). Per BIP65/IsFinalTx the tx opts
+        // out of lock-time enforcement and is final. This is the pattern
+        // that wedged ouroboros at mainnet block 782,291 against txs
+        // #219 (locktime=782,300), #232 (locktime=782,295), and #233
+        // (locktime=782,299).
+        let tx = make_locktime_tx(782_299, 0xFFFFFFFF);
+        assert!(
+            validator.check_lock_time(&tx, 782_291).is_ok(),
+            "tx with future locktime + SEQUENCE_FINAL must be accepted (W66)"
+        );
+
+        // And at the exact block height, same story.
+        let tx = make_locktime_tx(782_291, 0xFFFFFFFF);
+        assert!(validator.check_lock_time(&tx, 782_291).is_ok());
+    }
+
+    #[test]
+    fn test_check_lock_time_rejects_locktime_at_block_height_without_final_sequence() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = TransactionValidator::new(db);
+
+        // Edge case: nLockTime == height with non-final sequence. Per
+        // Core's strict `<` comparison this is NOT yet final
+        // (the lock-time is not in the PAST, it's the CURRENT block).
+        // The previous implementation used `>` and accepted this
+        // incorrectly.
+        let tx = make_locktime_tx(782_291, 0xFFFFFFFE);
+        assert!(matches!(
+            validator.check_lock_time(&tx, 782_291),
+            Err(TransactionValidationError::InvalidLockTime)
+        ));
+    }
+
+    #[test]
+    fn test_check_lock_time_time_based_preserves_accept_all() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = TransactionValidator::new(db);
+
+        // Time-based lock-times (nLockTime >= 500,000,000) are accepted
+        // unconditionally by the current implementation (BIP113 MTP not
+        // yet plumbed through). This test locks in the behaviour so a
+        // stricter fix doesn't silently regress IBD.
+        let tx = make_locktime_tx(1_700_000_000, 0xFFFFFFFE);
+        assert!(validator.check_lock_time(&tx, 782_291).is_ok());
     }
 
     #[test]
