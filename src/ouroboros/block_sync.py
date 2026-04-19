@@ -232,6 +232,29 @@ class BlockSync:
         # mutation UTXO.  Lazy-init: asyncio.Lock() needs a running loop.
         self._drain_lock: asyncio.Lock | None = None
 
+        # W75-WATCHDOG: block-accept outcome counters + staleness guard.
+        # Motivated by the 2026-04-14..19 wedge where the running
+        # process accepted headers + requested blocks for 5 days but
+        # tip never advanced past 801188.  Restart cleared the wedge
+        # (see wave47-2026-04-16/W75-OUROBOROS-STALL.md).  These
+        # counters + the watchdog check in `sync_loop` will surface
+        # the next recurrence in-process instead of requiring an
+        # external operator to notice height staleness.
+        self._blk_received: int = 0
+        self._blk_too_short: int = 0
+        self._blk_duplicate: int = 0
+        self._blk_buffered: int = 0
+        self._blk_buffer_full: int = 0
+        self._blk_error: int = 0
+        self._blk_connected: int = 0
+        self._blk_validate_rejected: int = 0
+        self._blk_connect_failed: int = 0
+        self._last_tip_advance: float = time.time()
+        # Fire WARN once per _wedge_warn_every if no-advance > _wedge_warn_after.
+        self._wedge_warn_after: float = 300.0
+        self._wedge_warn_every: float = 300.0
+        self._last_wedge_warn: float = 0.0
+
     def set_zmq_publisher(self, publisher) -> None:
         """Attach a ZMQPublisher for real-time block/tx notifications."""
         self._zmq_publisher = publisher
@@ -410,6 +433,10 @@ class BlockSync:
                 # Prune validated headers that have been downloaded and connected.
                 self._prune_validated_headers()
 
+                # W75-WATCHDOG: surface the block-accept wedge class
+                # (tip frozen despite non-empty buffer + pending headers).
+                self._check_wedge_watchdog()
+
             except Exception as e:
                 logger.error(f"Error in sync loop: {e}", exc_info=True)
 
@@ -524,9 +551,11 @@ class BlockSync:
         peer message dispatch — including blocks already sitting in the OS
         socket buffer from other peers.
         """
+        self._blk_received += 1
         try:
             payload = msg.payload
             if len(payload) < 80:
+                self._blk_too_short += 1
                 logger.error(f"Block payload too short from {peer.host}:{peer.port}")
                 peer.adjust_score(-5)
                 return
@@ -545,6 +574,7 @@ class BlockSync:
 
             # Already have this block?
             if self.db.has_block_hash(block_hash):
+                self._blk_duplicate += 1
                 return
 
             # Buffer the raw payload (keyed by hash) for sequential
@@ -553,7 +583,9 @@ class BlockSync:
             # actually needs to validate/connect this block.
             if len(self._ibd_block_buffer) < self._max_ibd_buffer:
                 self._ibd_block_buffer[block_hash] = (None, payload)
+                self._blk_buffered += 1
             else:
+                self._blk_buffer_full += 1
                 logger.debug(
                     f"IBD buffer full ({self._max_ibd_buffer}), dropping "
                     f"{block_hash.hex()[:16]}..."
@@ -568,6 +600,7 @@ class BlockSync:
                 await self._request_next_blocks()
 
         except Exception as e:
+            self._blk_error += 1
             logger.error(f"Error handling block from {peer.host}:{peer.port}: {e}", exc_info=True)
             peer.adjust_score(-5)
 
@@ -838,6 +871,7 @@ class BlockSync:
                 valid, error = await _run_python()
             validate_ns = time.perf_counter_ns() - t_val
             if not valid:
+                self._blk_validate_rejected += 1
                 logger.warning(
                     f"✗ Invalid block at height {new_height}: {error}"
                 )
@@ -862,6 +896,7 @@ class BlockSync:
                 else:
                     await asyncio.to_thread(self.validator.apply_block, block)
             except Exception as e:
+                self._blk_connect_failed += 1
                 logger.error(f"Failed to connect block at height {new_height}: {e}")
                 # DB connect failure is also transient (e.g. chain-tip mismatch
                 # due to a concurrent update).  Put the block back so we retry.
@@ -900,6 +935,8 @@ class BlockSync:
             connected += 1
             current_height = new_height
             header_idx += 1
+            self._blk_connected += 1
+            self._last_tip_advance = time.time()
 
             # Feed fee estimator
             if self.fee_estimator is not None:
@@ -1151,6 +1188,47 @@ class BlockSync:
                 break
         if prune_count > 0:
             self._validated_headers = self._validated_headers[prune_count:]
+
+    def _check_wedge_watchdog(self) -> None:
+        """Emit a diagnostic WARN if the block-accept path looks wedged.
+
+        Wedge preconditions (all of):
+        - No tip advance in the last `_wedge_warn_after` seconds.
+        - Non-empty validated-header queue (we have headers to connect).
+        - Non-empty IBD block buffer (blocks arriving but not connecting).
+
+        Rate-limited to one WARN every `_wedge_warn_every` seconds.
+        See wave47-2026-04-16/W75-OUROBOROS-STALL.md for the manifestation
+        this is designed to surface.
+        """
+        now = time.time()
+        if now - self._last_wedge_warn < self._wedge_warn_every:
+            return
+        stale = now - self._last_tip_advance
+        if stale < self._wedge_warn_after:
+            return
+        if not self._validated_headers:
+            return  # caught up — stalling here is just "no new blocks to fetch"
+        if not self._ibd_block_buffer:
+            return  # downloader-bound, not accept-path-bound
+        try:
+            _, best_height = self.db.get_best_block()
+        except Exception:
+            best_height = -1
+        logger.warning(
+            f"[W75-WATCHDOG] tip-stall suspected: "
+            f"no_advance_for={stale:.0f}s tip={best_height} "
+            f"buffer={len(self._ibd_block_buffer)}/{self._max_ibd_buffer} "
+            f"pending_headers={len(self._validated_headers)} "
+            f"requested={len(self.requested_blocks)} "
+            f"| counters recv={self._blk_received} "
+            f"dup={self._blk_duplicate} buf={self._blk_buffered} "
+            f"full={self._blk_buffer_full} short={self._blk_too_short} "
+            f"err={self._blk_error} conn={self._blk_connected} "
+            f"val_rej={self._blk_validate_rejected} "
+            f"con_fail={self._blk_connect_failed}"
+        )
+        self._last_wedge_warn = now
 
     async def _announce_block(
         self, block: Block, block_hash: bytes, exclude_peer: Peer | None = None,
