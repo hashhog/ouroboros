@@ -229,15 +229,22 @@ class BlockSync:
         self._ibd_block_buffer: dict[bytes, Block] = {}
         self._max_ibd_buffer: int = 1024
 
-        # Drain-loop stage timings (W60 B0 instrumentation).
-        # Accumulates wall-clock ns spent in each stage since the last
-        # summary log.  Emitted every _drain_log_every blocks connected,
-        # then reset.  Used to choose between B1/B2/B3 pipelining designs.
-        self._drain_stat_count: int = 0
-        self._drain_stat_deserialize_ns: int = 0
-        self._drain_stat_validate_ns: int = 0
-        self._drain_stat_connect_ns: int = 0
-        self._drain_log_every: int = 1000
+        # Drain-loop stage timings (W60 B0, promoted to W76-PHASE cross-
+        # impl phase table).  Accumulates wall-clock ns spent in each
+        # stage since the last summary log, plus per-phase max for tail
+        # latency.  Emitted every _w76_log_every blocks connected, then
+        # reset.  Ouroboros's three-phase split (deserialize / validate
+        # / connect) maps to blockbrew's W76 boundaries as
+        # pre≈deserialize, first+script≈validate (conflated inside the
+        # Rust FFI), persist≈connect.
+        self._w76_blocks: int = 0
+        self._w76_deserialize_sum_ns: int = 0
+        self._w76_validate_sum_ns: int = 0
+        self._w76_connect_sum_ns: int = 0
+        self._w76_deserialize_max_ns: int = 0
+        self._w76_validate_max_ns: int = 0
+        self._w76_connect_max_ns: int = 0
+        self._w76_log_every: int = 1000
 
         # Serializes `_drain_block_buffer` against itself.  The drain is
         # invoked from both `sync_loop` (periodic) and `handle_block`
@@ -922,33 +929,7 @@ class BlockSync:
                 break
             connect_ns = time.perf_counter_ns() - t_con
 
-            # W60 B0: accumulate per-stage timings.  Summary emitted every
-            # _drain_log_every blocks to characterise the drain-loop
-            # bottleneck (deserialize vs validate vs connect) without
-            # per-block log spam.  Chosen pipelining design (B1–B5) depends
-            # on this histogram.
-            self._drain_stat_count += 1
-            self._drain_stat_deserialize_ns += deserialize_ns
-            self._drain_stat_validate_ns += validate_ns
-            self._drain_stat_connect_ns += connect_ns
-            if self._drain_stat_count >= self._drain_log_every:
-                n = self._drain_stat_count
-                ds_ms = self._drain_stat_deserialize_ns / n / 1_000_000
-                va_ms = self._drain_stat_validate_ns / n / 1_000_000
-                co_ms = self._drain_stat_connect_ns / n / 1_000_000
-                total_ms = ds_ms + va_ms + co_ms
-                logger.info(
-                    f"drain stats (last {n} blk): "
-                    f"deserialize={ds_ms:.1f}ms "
-                    f"validate={va_ms:.1f}ms "
-                    f"connect={co_ms:.1f}ms "
-                    f"total={total_ms:.1f}ms/blk "
-                    f"(~{3600_000 / total_ms:.0f} blk/hr if drain-bound)"
-                )
-                self._drain_stat_count = 0
-                self._drain_stat_deserialize_ns = 0
-                self._drain_stat_validate_ns = 0
-                self._drain_stat_connect_ns = 0
+            self._w76_record_phases(deserialize_ns, validate_ns, connect_ns)
 
             connected += 1
             current_height = new_height
@@ -1418,6 +1399,55 @@ class BlockSync:
             return None
 
         return max(valid_peers, key=lambda p: p.start_height)
+
+    def _w76_record_phases(
+        self, deserialize_ns: int, validate_ns: int, connect_ns: int
+    ) -> None:
+        """W76-PHASE: roll a per-block phase-timing tuple into the
+        cross-impl phase-table rollup.
+
+        Splitting this out of `_drain_block_buffer_locked` keeps the
+        telemetry independently testable (mirrors the W77 pattern).
+        Tracks sum + max per phase; max surfaces tail latency
+        independently of the average.  Emits one log line every
+        `_w76_log_every` blocks, then zeroes all counters.
+        """
+        self._w76_blocks += 1
+        self._w76_deserialize_sum_ns += deserialize_ns
+        self._w76_validate_sum_ns += validate_ns
+        self._w76_connect_sum_ns += connect_ns
+        if deserialize_ns > self._w76_deserialize_max_ns:
+            self._w76_deserialize_max_ns = deserialize_ns
+        if validate_ns > self._w76_validate_max_ns:
+            self._w76_validate_max_ns = validate_ns
+        if connect_ns > self._w76_connect_max_ns:
+            self._w76_connect_max_ns = connect_ns
+        if self._w76_blocks >= self._w76_log_every:
+            n = self._w76_blocks
+            ds_ms = self._w76_deserialize_sum_ns / n / 1_000_000
+            va_ms = self._w76_validate_sum_ns / n / 1_000_000
+            co_ms = self._w76_connect_sum_ns / n / 1_000_000
+            ds_max_ms = self._w76_deserialize_max_ns / 1_000_000
+            va_max_ms = self._w76_validate_max_ns / 1_000_000
+            co_max_ms = self._w76_connect_max_ns / 1_000_000
+            total_ms = ds_ms + va_ms + co_ms
+            rate = (3600_000 / total_ms) if total_ms > 0 else 0
+            logger.info(
+                "[W76-PHASE] blocks=%d "
+                "deserialize_avg_ms=%.1f deserialize_max_ms=%.0f "
+                "validate_avg_ms=%.1f validate_max_ms=%.0f "
+                "connect_avg_ms=%.1f connect_max_ms=%.0f "
+                "total_avg_ms=%.1f (~%.0f blk/hr)",
+                n, ds_ms, ds_max_ms, va_ms, va_max_ms, co_ms, co_max_ms,
+                total_ms, rate,
+            )
+            self._w76_blocks = 0
+            self._w76_deserialize_sum_ns = 0
+            self._w76_validate_sum_ns = 0
+            self._w76_connect_sum_ns = 0
+            self._w76_deserialize_max_ns = 0
+            self._w76_validate_max_ns = 0
+            self._w76_connect_max_ns = 0
 
     def _w77_record_connect(self, block_hash: bytes, connect_time: float) -> None:
         """W77: roll a successful connect into the 100-block timeout rollup.
