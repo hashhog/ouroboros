@@ -166,6 +166,23 @@ class BlockSync:
         # Track which peer each block was last requested from (hash -> Peer)
         self._block_request_peer: dict[bytes, Peer] = {}
 
+        # W77 — peer-timeout instrumentation.  100-block rollup emitted
+        # from _drain_block_buffer_locked at the connect point.  The
+        # per-cycle WARNING in _handle_timeouts obscures aggregate churn;
+        # this rollup captures timeouts/cycle, failed-peer fan-out,
+        # re-request distribution and request→connect latency.
+        #
+        # _w77_first_request_time retains the ORIGINAL request time;
+        # self.requested_blocks is mutated on re-request and loses it.
+        self._w77_blocks: int = 0
+        self._w77_timeouts_total: int = 0
+        self._w77_timeout_cycles: int = 0
+        self._w77_failed_peers: set = set()
+        self._w77_rerequest_peer_counts: Counter = Counter()
+        self._w77_latency_sum_s: float = 0.0
+        self._w77_latency_max_s: float = 0.0
+        self._w77_first_request_time: dict[bytes, float] = {}
+
         # Track requested transactions (hash -> request_time)
         self._requested_txs: dict[bytes, float] = {}
 
@@ -474,6 +491,7 @@ class BlockSync:
                         if inv_hash not in self.requested_blocks:
                             blocks_to_request.append((MSG_WITNESS_BLOCK, inv_hash))
                             self.requested_blocks[inv_hash] = now
+                            self._w77_first_request_time.setdefault(inv_hash, now)
 
                 elif inv_type in (INV_TYPE_TX, MSG_WITNESS_TX, MSG_WTX):
                     # Request transactions we don't already have
@@ -938,6 +956,8 @@ class BlockSync:
             self._blk_connected += 1
             self._last_tip_advance = time.time()
 
+            self._w77_record_connect(next_hash, self._last_tip_advance)
+
             # Feed fee estimator
             if self.fee_estimator is not None:
                 try:
@@ -1150,6 +1170,7 @@ class BlockSync:
         now = time.time()
         for _, bh in assigned:
             self.requested_blocks[bh] = now
+            self._w77_first_request_time.setdefault(bh, now)
 
         for target_peer, items in per_peer.items():
             if not items:
@@ -1398,6 +1419,50 @@ class BlockSync:
 
         return max(valid_peers, key=lambda p: p.start_height)
 
+    def _w77_record_connect(self, block_hash: bytes, connect_time: float) -> None:
+        """W77: roll a successful connect into the 100-block timeout rollup.
+
+        Splitting this out of `_drain_block_buffer_locked` keeps the
+        telemetry independently testable.  Uses the ORIGINAL request time
+        (first getdata) so a block re-requested three times before
+        arriving is billed for the full elapsed wall-clock, not just the
+        last hop.  Missing entries (pre-instrumentation restart, or a
+        compact-block fast path that skips the request map) are treated
+        as 0 so a missing baseline is not counted as infinite latency.
+        """
+        first_req = self._w77_first_request_time.pop(block_hash, None)
+        if first_req is not None:
+            lat_s = connect_time - first_req
+            if lat_s < 0:
+                lat_s = 0.0
+            self._w77_latency_sum_s += lat_s
+            if lat_s > self._w77_latency_max_s:
+                self._w77_latency_max_s = lat_s
+        self._w77_blocks += 1
+        if self._w77_blocks >= 100:
+            n = self._w77_blocks
+            avg_ms = (self._w77_latency_sum_s / n) * 1000.0
+            max_ms = self._w77_latency_max_s * 1000.0
+            cycles = self._w77_timeout_cycles
+            t_per_cycle = (self._w77_timeouts_total / cycles) if cycles else 0.0
+            rr_total = sum(self._w77_rerequest_peer_counts.values())
+            top_peers = self._w77_rerequest_peer_counts.most_common(3)
+            top_str = ",".join(f"{p}={c}" for p, c in top_peers) or "-"
+            logger.info(
+                "[W77-TIMEOUT] blocks=%d req_connect_avg_ms=%.1f "
+                "req_connect_max_ms=%.0f timeout_cycles=%d timeouts=%d "
+                "t_per_cycle=%.1f failed_peers=%d rerequests=%d top3=%s",
+                n, avg_ms, max_ms, cycles, self._w77_timeouts_total,
+                t_per_cycle, len(self._w77_failed_peers), rr_total, top_str,
+            )
+            self._w77_blocks = 0
+            self._w77_timeouts_total = 0
+            self._w77_timeout_cycles = 0
+            self._w77_failed_peers.clear()
+            self._w77_rerequest_peer_counts.clear()
+            self._w77_latency_sum_s = 0.0
+            self._w77_latency_max_s = 0.0
+
     async def _handle_timeouts(self):
         """Re-request blocks that timed out, rotating to a different peer each time."""
         now = time.time()
@@ -1448,6 +1513,12 @@ class BlockSync:
             f"(failed peers: {len(failed_peers)}, available peers: {len(connected_peers)})"
         )
 
+        # W77: roll up timeout cycle into the 100-block window.
+        self._w77_timeouts_total += len(timed_out)
+        self._w77_timeout_cycles += 1
+        for fp in failed_peers:
+            self._w77_failed_peers.add(f"{fp.host}:{fp.port}")
+
         # Batch re-requests: round-robin across available peers, preferring non-failed ones
         preferred = [p for p in connected_peers if p not in failed_peers]
         if not preferred:
@@ -1493,6 +1564,8 @@ class BlockSync:
                 for bh in block_hashes:
                     self.requested_blocks[bh] = now
                     self._block_request_peer[bh] = peer
+                # W77: track re-request distribution across peers.
+                self._w77_rerequest_peer_counts[f"{peer.host}:{peer.port}"] += len(block_hashes)
                 logger.info(f"Re-requested {len(block_hashes)} blocks from {peer.host}:{peer.port}")
             except Exception as e:
                 logger.error(f"Failed to re-request {len(block_hashes)} blocks from {peer.host}:{peer.port}: {e}")
