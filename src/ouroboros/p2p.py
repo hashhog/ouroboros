@@ -2738,6 +2738,29 @@ class PeerManager:
         """Get number of ready peers"""
         return len(self.get_all_ready_peers())
 
+    def get_time_offset(self) -> int:
+        """
+        Median clock-skew across connected peers in seconds.
+
+        Matches Bitcoin Core's GetTimeOffset() / getnetworkinfo.timeoffset:
+        the median of each peer's handshake-time skew
+        (their VERSION.timestamp minus our local time at receipt).
+        Returns 0 if no peer has completed a VERSION handshake.
+        """
+        offsets = [
+            p.time_offset
+            for p in self.get_all_ready_peers()
+            if getattr(p, "_version_received", False)
+        ]
+        if not offsets:
+            return 0
+        offsets.sort()
+        mid = len(offsets) // 2
+        if len(offsets) % 2:
+            return offsets[mid]
+        # Even count: integer average of the two middle values, rounded toward zero.
+        return (offsets[mid - 1] + offsets[mid]) // 2
+
     def get_stats(self) -> dict:
         """
         Get peer manager statistics.

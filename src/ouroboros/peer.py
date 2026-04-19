@@ -285,6 +285,10 @@ class Peer:
         self.bytes_recv: int = 0
         self.last_send: float = 0.0
         self.last_recv: float = 0.0
+        # Clock-skew at handshake: peer_version_timestamp - our_unix_time_at_receipt.
+        # Set once per peer when VERSION arrives; stays constant over the connection.
+        # Matches Bitcoin Core CNode::nTimeOffset semantics (seconds).
+        self.time_offset: int = 0
 
     async def connect(self, start_height: int = 0, retry: bool = True) -> bool:
         """Connect to the peer, complete the version handshake, and start background tasks."""
@@ -444,6 +448,7 @@ class Peer:
         self.services = version.services
         self.user_agent = version.user_agent
         self.start_height = version.start_height
+        self.time_offset = int(version.timestamp - time.time())
         self._version_received = True
 
         # Reject peers with version < MIN_PEER_VERSION (no segwit support)
@@ -630,6 +635,7 @@ class Peer:
         self.services = version.services
         self.user_agent = version.user_agent
         self.start_height = version.start_height
+        self.time_offset = int(version.timestamp - time.time())
         self._version_received = True
 
         # Reject peers with version < MIN_PEER_VERSION (no segwit support)
