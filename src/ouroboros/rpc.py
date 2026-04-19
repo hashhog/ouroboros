@@ -3433,13 +3433,18 @@ class RPCServer:
             if services & 2048: # NODE_P2P_V2
                 service_names.append("P2P_V2")
 
-            # Timestamps
+            # Timestamps.  Peer.connected_at (peer.py:259) is the canonical
+            # attribute; the old `connected_time` lookup always fell through
+            # to the default (current time), so every peer looked like it
+            # had just connected.
             now = int(_time.time())
-            lastsend = getattr(peer, 'last_send', 0)
-            lastrecv = getattr(peer, 'last_recv', 0)
-            conntime = getattr(peer, 'connected_time', now)
+            lastsend = int(getattr(peer, 'last_send', 0) or 0)
+            lastrecv = int(getattr(peer, 'last_recv', 0) or 0)
+            conntime = int(getattr(peer, 'connected_at', now) or now)
 
-            # Bytes sent/received
+            # Bytes sent/received — populated by peer.send_message /
+            # peer.receive_message.  Wire-bytes (include v1 header framing
+            # and v2 AEAD tags), matching Bitcoin Core's semantics.
             bytessent = getattr(peer, 'bytes_sent', 0)
             bytesrecv = getattr(peer, 'bytes_recv', 0)
 
@@ -3453,10 +3458,13 @@ class RPCServer:
             elif hasattr(peer, 'is_block_relay_only') and peer.is_block_relay_only:
                 connection_type = "block-relay-only"
 
-            # Ping times
-            pingtime = getattr(peer, 'ping_time', None)
-            minping = getattr(peer, 'min_ping_time', None)
-            pingwait = getattr(peer, 'ping_wait', None)
+            # Ping times.  Peer tracks `latency` (last pong RTT in seconds,
+            # peer.py:931); there is no running minimum, so `minping` is
+            # omitted rather than faked.  `ping_wait` is also not tracked.
+            latency = getattr(peer, 'latency', 0) or 0
+            pingtime = latency if latency > 0 else None
+            minping = None
+            pingwait = None
 
             # Block relay info
             bip152_hb_to = getattr(peer, 'bip152_highbandwidth_to', False)
@@ -3470,7 +3478,9 @@ class RPCServer:
                 "addr": addr,
                 "services": services_hex,
                 "servicesnames": service_names,
-                "relaytxes": getattr(peer, 'relay_txes', True),
+                # Peer.relay_txs (peer.py:207) — prior `relay_txes` lookup
+                # fell through to the `True` default on every peer.
+                "relaytxes": getattr(peer, 'relay_txs', True),
                 "lastsend": lastsend,
                 "lastrecv": lastrecv,
                 "last_transaction": getattr(peer, 'last_tx_time', 0),

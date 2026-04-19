@@ -277,6 +277,15 @@ class Peer:
         # BIP 155: peer supports addrv2
         self.addrv2: bool = False
 
+        # RPC getpeerinfo counters (populated by send_message / receive_message
+        # so `bytessent`, `bytesrecv`, `lastsend`, `lastrecv` stop reporting 0
+        # for every peer).  Wire-bytes, not decrypted-bytes, so the numbers
+        # include v1 header framing and v2 AEAD tags.
+        self.bytes_sent: int = 0
+        self.bytes_recv: int = 0
+        self.last_send: float = 0.0
+        self.last_recv: float = 0.0
+
     async def connect(self, start_height: int = 0, retry: bool = True) -> bool:
         """Connect to the peer, complete the version handshake, and start background tasks."""
         max_attempts = self._max_retries + 1 if retry else 1
@@ -753,6 +762,9 @@ class Peer:
         self.writer.write(data)
         await self.writer.drain()
 
+        self.bytes_sent += len(data)
+        self.last_send = time.time()
+
         logger.debug(f"Sent {msg.command} to {self.host}:{self.port}")
 
     async def receive_message(self, timeout: float = 30.0) -> NetworkMessage:
@@ -825,16 +837,21 @@ class Peer:
 
         logger.debug(f"Received {command} from {self.host}:{self.port} ({len(payload)} bytes)")
 
+        self.bytes_recv += 24 + len(payload)
+        self.last_recv = time.time()
+
         return NetworkMessage(command=command, payload=payload, magic=magic)
 
     async def _receive_v2_message(self, timeout: float) -> NetworkMessage:
         """Receive and decrypt a BIP 324 v2 message."""
+        wire_bytes_this_call = 0
         while True:
             # Read the encrypted length field (3 bytes + 16-byte Poly1305 tag)
             enc_length = await asyncio.wait_for(
                 self.reader.readexactly(3 + 16),
                 timeout=timeout,
             )
+            wire_bytes_this_call += 3 + 16
 
             length_plain = self._v2_transport.recv_cipher.decrypt(enc_length)
             msg_len = int.from_bytes(length_plain, "little")
@@ -847,6 +864,7 @@ class Peer:
                 self.reader.readexactly(msg_len + 16),
                 timeout=timeout,
             )
+            wire_bytes_this_call += msg_len + 16
 
             inner = self._v2_transport.recv_cipher.decrypt(enc_payload)
             from ouroboros.transport_v2 import PacketType
@@ -857,7 +875,11 @@ class Peer:
                 logger.debug(f"Discarded decoy packet from {self.host}:{self.port}")
                 continue
 
-            # The payload is the original v1 serialised NetworkMessage
+            # The payload is the original v1 serialised NetworkMessage.
+            # Decoy packets count against bytes_recv because the wire
+            # bytes were real — the decoder just throws them away.
+            self.bytes_recv += wire_bytes_this_call
+            self.last_recv = time.time()
             return NetworkMessage.deserialize(payload, network=self.network)
 
     def _is_handshake_message(self, command: str) -> bool:
