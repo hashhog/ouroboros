@@ -1496,7 +1496,12 @@ class BlockSync:
     async def _handle_timeouts(self):
         """Re-request blocks that timed out, rotating to a different peer each time."""
         now = time.time()
-        timeout = 20.0  # Reduced from 60s for faster IBD peer rotation
+        # W82: restored from 20s back to 60s. At post-500k heights blocks grow
+        # to 1-2MB and MAX_BLOCKS_IN_FLIGHT_PER_PEER=16 means a slow peer can
+        # have ~32MB queued; 20s was firing before peers could drain and
+        # causing cascading re-requests (rate halved from 1117 → 580 blk/hr
+        # at height 817k). Long-term fix is size-aware timeout scaling.
+        timeout = 60.0
 
         timed_out = [
             block_hash for block_hash, request_time in self.requested_blocks.items()
