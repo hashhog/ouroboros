@@ -391,18 +391,20 @@ class BlockValidator:
                 if not self._validate_coinbase(tx, expected_height):
                     return False, "Invalid coinbase"
             else:
+                # Capture the fee from validate_transaction directly to avoid
+                # re-fetching every input UTXO in _calculate_tx_fee (was doing
+                # ~6000 extra individual FFI calls per block at height 800k).
+                tx_fees: list[int] = []
                 valid, error = self.tx_validator.validate_transaction(
                     tx, expected_height, block_mtp,
                     block_hash=block.hash,
                     intra_block_utxos=intra_block_utxos,
                     skip_scripts=skip_scripts,
+                    fees_out=tx_fees,
                 )
                 if not valid:
                     return False, f"Transaction {i} invalid: {error}"
-
-                # Calculate fee (also using intra-block UTXOs)
-                fee = self._calculate_tx_fee(tx, intra_block_utxos)
-                total_fees += fee
+                total_fees += tx_fees[0] if tx_fees else 0
 
             # Register this tx's outputs in the intra-block view for
             # subsequent transactions.
@@ -1117,6 +1119,7 @@ class TransactionValidator:
         block_hash: bytes | None = None,
         intra_block_utxos: dict | None = None,
         skip_scripts: bool = False,
+        fees_out: list | None = None,
     ) -> tuple[bool, str]:
         """Validate *tx* at *height* (structure, inputs, locktime, scripts); returns ``(ok, error_message)``.
 
@@ -1147,27 +1150,24 @@ class TransactionValidator:
         input_amounts: list[int] = []
         input_script_pubkeys: list[bytes] = []
 
-        # Separate inputs that may come from intra-block UTXOs (need individual
-        # lookup with fallback) from those we can batch-fetch from the DB.
-        intra_keys = set(intra_block_utxos.keys()) if intra_block_utxos else set()
-        needs_intra = any(
-            (tx_in.prev_txid, tx_in.prev_vout) in intra_keys
-            for tx_in in tx.inputs
-        )
-
-        if not needs_intra and hasattr(self.db, 'get_utxo_batch') and len(tx.inputs) > 1:
-            # Fast path: all inputs come from the persistent DB — one FFI call.
+        # Phase 1.3: always batch-fetch all inputs from the DB in one FFI call,
+        # then overlay intra_block_utxos for any that come from earlier txs in
+        # the same block.  Prior code gated batch on `not needs_intra`, which
+        # forced every tx that followed an intra-block dep onto the per-input
+        # slow path even though most of its inputs still came from the DB.
+        if hasattr(self.db, 'get_utxo_batch') and tx.inputs:
             outpoints = [(tx_in.prev_txid, tx_in.prev_vout) for tx_in in tx.inputs]
             batch = self.db.get_utxo_batch(outpoints)
             for i, (tx_in, utxo) in enumerate(zip(tx.inputs, batch)):
+                if utxo is None and intra_block_utxos:
+                    utxo = intra_block_utxos.get((tx_in.prev_txid, tx_in.prev_vout))
                 if utxo is None:
                     return False, f"Input not found: {tx_in.prev_txid.hex()}:{tx_in.prev_vout}"
                 input_utxos.append(utxo)
                 input_amounts.append(utxo['value'])
                 input_script_pubkeys.append(bytes(utxo['script_pubkey']))
         else:
-            # Slow path: some inputs may spend outputs from earlier txs in this
-            # block (intra_block_utxos), so we must look them up individually.
+            # Fallback for test doubles that don't implement get_utxo_batch.
             for tx_in in tx.inputs:
                 utxo = self.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
                 if utxo is None and intra_block_utxos:
@@ -1213,6 +1213,11 @@ class TransactionValidator:
         if not self.check_sequence_locks(tx, height, block_mtp, network=self.network, intra_block_utxos=intra_block_utxos):
             return False, "BIP 68 sequence lock not satisfied"
 
+        # Phase 1.2: surface the fee to the caller so block-validate doesn't
+        # need to re-fetch UTXOs via _calculate_tx_fee (~6000 redundant
+        # per-input FFI calls per block).
+        if fees_out is not None:
+            fees_out.append(total_input - total_output)
         return True, ""
 
     @staticmethod
