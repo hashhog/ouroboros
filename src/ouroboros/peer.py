@@ -1033,19 +1033,29 @@ class Peer:
 
     async def disconnect(self):
         """Disconnect from peer"""
+        if getattr(self, "_disconnect_started", False):
+            return
+        self._disconnect_started = True
         logger.info(f"Disconnecting from {self.host}:{self.port}")
 
         self.state = PeerState.DISCONNECTED
 
-        # Cancel tasks
-        if self._listen_task:
+        current = asyncio.current_task()
+
+        # Cancel tasks.  If disconnect() was invoked from inside
+        # _listen_task or _ping_task (e.g. the listener's own
+        # `except Exception: await self.disconnect()` path), skip the
+        # await — a task cannot await itself, and asyncio raises
+        # `RuntimeError: await wasn't used with future` if we try.
+        # The task is still cancelled on its way out.
+        if self._listen_task and self._listen_task is not current:
             self._listen_task.cancel()
             try:
                 await self._listen_task
             except asyncio.CancelledError:
                 pass
 
-        if self._ping_task:
+        if self._ping_task and self._ping_task is not current:
             self._ping_task.cancel()
             try:
                 await self._ping_task
