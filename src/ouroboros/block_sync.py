@@ -246,6 +246,24 @@ class BlockSync:
         self._w76_connect_max_ns: int = 0
         self._w76_log_every: int = 1000
 
+        # W90 validation-path probe (2026-04-22).  W76-PHASE pins ~90% of
+        # per-block wall-clock on the 'validate' stage but doesn't say
+        # which validator ran or how the cost scales with tx count.  W90
+        # splits validate by path (Rust fast-path vs Python), records
+        # whether assumevalid's skip_scripts was in effect, and rolls up
+        # a per-tx cost estimate every 100 blocks.  Diagnostic only —
+        # remove once the W85 regression is root-caused.
+        self._w90_blocks: int = 0
+        self._w90_rust_used: int = 0
+        self._w90_python_used: int = 0
+        self._w90_skip_scripts_true: int = 0
+        self._w90_tx_count_sum: int = 0
+        self._w90_validate_sum_ns: int = 0
+        self._w90_validate_max_ns: int = 0
+        self._w90_slow_blocks: int = 0
+        self._w90_log_every: int = 100
+        self._w90_slow_threshold_ns: int = 8_000_000_000  # 8s
+
         # Serializes `_drain_block_buffer` against itself.  The drain is
         # invoked from both `sync_loop` (periodic) and `handle_block`
         # (every incoming P2P block); without this lock two drains can
@@ -291,6 +309,18 @@ class BlockSync:
 
         self.running = True
         logger.info("Starting block synchronization")
+
+        # W90: log the validation-path env-var state once at startup so
+        # we can correlate later [W90-VAL] rollups with the flag config
+        # the process actually booted with.
+        logger.info(
+            "[W90-INIT] route_validate_to_rust=%s cross_check=%s "
+            "has_sync_module=%s has_validate_block_from_bytes=%s",
+            os.environ.get("OUROBOROS_ROUTE_VALIDATE_TO_RUST") == "1",
+            os.environ.get("OUROBOROS_VALIDATE_CROSS_CHECK") == "1",
+            _has_sync_module,
+            hasattr(self.db, "validate_block_from_bytes"),
+        )
 
         # Register message handlers for existing peers
         await self._register_handlers()
@@ -930,6 +960,13 @@ class BlockSync:
             connect_ns = time.perf_counter_ns() - t_con
 
             self._w76_record_phases(deserialize_ns, validate_ns, connect_ns)
+            self._w90_record_validate(
+                validate_ns=validate_ns,
+                via_rust=validated_via_rust,
+                skip_scripts=skip_scripts,
+                tx_count=len(block.transactions) if block is not None else 0,
+                height=new_height,
+            )
 
             connected += 1
             current_height = new_height
@@ -1448,6 +1485,78 @@ class BlockSync:
             self._w76_deserialize_max_ns = 0
             self._w76_validate_max_ns = 0
             self._w76_connect_max_ns = 0
+
+    def _w90_record_validate(
+        self,
+        validate_ns: int,
+        via_rust: bool,
+        skip_scripts: bool,
+        tx_count: int,
+        height: int,
+    ) -> None:
+        """W90: per-block validation-path breakdown.
+
+        W76-PHASE pins ~90% of per-block wall-clock on 'validate' but
+        doesn't reveal which validator ran or how the cost scales with
+        tx count.  W90 splits validate by path (Rust vs Python),
+        records whether assumevalid's skip_scripts applied, and emits a
+        per-100-block rollup.  Outlier blocks (>8s validate) also log
+        inline with height + tx_count for post-hoc correlation.
+        """
+        self._w90_blocks += 1
+        self._w90_validate_sum_ns += validate_ns
+        self._w90_tx_count_sum += tx_count
+        if via_rust:
+            self._w90_rust_used += 1
+        else:
+            self._w90_python_used += 1
+        if skip_scripts:
+            self._w90_skip_scripts_true += 1
+        if validate_ns > self._w90_validate_max_ns:
+            self._w90_validate_max_ns = validate_ns
+        if validate_ns > self._w90_slow_threshold_ns:
+            self._w90_slow_blocks += 1
+            logger.info(
+                "[W90-SLOW] h=%d validate_ms=%.0f tx_count=%d "
+                "via_rust=%s skip_scripts=%s",
+                height,
+                validate_ns / 1_000_000,
+                tx_count,
+                via_rust,
+                skip_scripts,
+            )
+        if self._w90_blocks >= self._w90_log_every:
+            n = self._w90_blocks
+            va_avg_ms = self._w90_validate_sum_ns / n / 1_000_000
+            va_max_ms = self._w90_validate_max_ns / 1_000_000
+            avg_tx = self._w90_tx_count_sum / n
+            us_per_tx = (
+                (self._w90_validate_sum_ns / self._w90_tx_count_sum) / 1000
+                if self._w90_tx_count_sum > 0
+                else 0.0
+            )
+            logger.info(
+                "[W90-VAL] blocks=%d rust=%d python=%d skip_scripts=%d "
+                "slow=%d validate_avg_ms=%.1f validate_max_ms=%.0f "
+                "avg_tx=%.0f us_per_tx=%.0f",
+                n,
+                self._w90_rust_used,
+                self._w90_python_used,
+                self._w90_skip_scripts_true,
+                self._w90_slow_blocks,
+                va_avg_ms,
+                va_max_ms,
+                avg_tx,
+                us_per_tx,
+            )
+            self._w90_blocks = 0
+            self._w90_rust_used = 0
+            self._w90_python_used = 0
+            self._w90_skip_scripts_true = 0
+            self._w90_tx_count_sum = 0
+            self._w90_validate_sum_ns = 0
+            self._w90_validate_max_ns = 0
+            self._w90_slow_blocks = 0
 
     def _w77_record_connect(self, block_hash: bytes, connect_time: float) -> None:
         """W77: roll a successful connect into the 100-block timeout rollup.
