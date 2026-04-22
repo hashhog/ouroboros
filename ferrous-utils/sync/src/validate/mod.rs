@@ -36,6 +36,8 @@ pub use sequence_lock::{
 pub use sigop::{
     get_transaction_sigop_cost, get_block_sigop_cost, get_legacy_sigop_count,
     get_p2sh_sigop_count, count_script_sigops, count_witness_sigops_for_input,
+    get_transaction_sigop_cost_with_scripts,
+    get_block_sigop_cost_with_prefetched_scripts,
     MAX_BLOCK_SIGOPS_COST, WITNESS_SCALE_FACTOR, MAX_PUBKEYS_PER_MULTISIG,
 };
 pub use difficulty::{

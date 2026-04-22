@@ -457,6 +457,130 @@ pub fn get_block_sigop_cost(
 }
 
 // ============================================================================
+// Prefetched-scripts variants (W85 regression fix)
+// ============================================================================
+//
+// The functions above re-fetch every input's UTXO from RocksDB (3× per
+// non-coinbase input: once in P2SH, once in the witness loop, plus the
+// per-tx amount-validate fetch in `validate_transaction_inputs_*`). At
+// mainnet height ~820k that is ~18k redundant `get_cf` calls per block on
+// the validate hot path.
+//
+// `validate_block_with_flags` already fetches each input's UTXO once for
+// amount/coinbase-maturity checks. The functions below let callers pass
+// those previously-fetched script_pubkeys back in, so sigop counting reads
+// them from the slice instead of round-tripping through the DB.
+
+/// Same as `get_p2sh_sigop_count` but uses a caller-supplied slice of
+/// script_pubkeys (one per input, in input order) instead of doing a DB
+/// lookup per input.
+fn get_p2sh_sigop_count_with_scripts(
+    tx: &Transaction,
+    prev_script_pubkeys: &[bitcoin::ScriptBuf],
+) -> usize {
+    if tx.is_coinbase() {
+        return 0;
+    }
+    debug_assert_eq!(
+        prev_script_pubkeys.len(),
+        tx.input.len(),
+        "prefetched script count must match tx.input.len()"
+    );
+
+    let mut count = 0;
+    for (input, spk) in tx.input.iter().zip(prev_script_pubkeys.iter()) {
+        let script_pubkey = spk.as_bytes();
+        if is_p2sh(script_pubkey) {
+            let script_sig = input.script_sig.as_bytes();
+            if is_push_only(script_sig) {
+                if let Some(redeem_script) = get_last_push(script_sig) {
+                    count += count_script_sigops(&redeem_script, true);
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Same as `get_transaction_sigop_cost` but uses caller-supplied
+/// script_pubkeys (one per input) instead of a DB lookup. Coinbase
+/// transactions short-circuit to legacy sigops only and ignore the slice
+/// (callers should pass an empty slice for coinbase).
+pub fn get_transaction_sigop_cost_with_scripts(
+    tx: &Transaction,
+    prev_script_pubkeys: &[bitcoin::ScriptBuf],
+    verify_p2sh: bool,
+    verify_witness: bool,
+) -> i64 {
+    let mut sigop_cost = (get_legacy_sigop_count(tx) as i64) * WITNESS_SCALE_FACTOR;
+
+    if tx.is_coinbase() {
+        return sigop_cost;
+    }
+    debug_assert_eq!(
+        prev_script_pubkeys.len(),
+        tx.input.len(),
+        "prefetched script count must match tx.input.len()"
+    );
+
+    if verify_p2sh {
+        sigop_cost +=
+            (get_p2sh_sigop_count_with_scripts(tx, prev_script_pubkeys) as i64)
+                * WITNESS_SCALE_FACTOR;
+    }
+
+    if verify_witness {
+        for (input, spk) in tx.input.iter().zip(prev_script_pubkeys.iter()) {
+            let script_pubkey = spk.as_bytes();
+            let script_sig = input.script_sig.as_bytes();
+            sigop_cost += count_witness_sigops_for_input(
+                script_sig,
+                script_pubkey,
+                &input.witness,
+            ) as i64;
+        }
+    }
+
+    sigop_cost
+}
+
+/// Calculate total sigop cost for a block using caller-supplied
+/// script_pubkeys for every non-coinbase input.
+///
+/// `prev_script_pubkeys[i]` is the slice of input script_pubkeys for the
+/// i-th transaction in `transactions`, in input order. For the coinbase
+/// transaction (index 0) the slice should be empty — its inputs do not
+/// need previous-output lookups.
+///
+/// This is the W85 regression fix entry point: `validate_block_with_flags`
+/// already fetches every input's UTXO once for amount + coinbase-maturity
+/// checks, so the script_pubkeys can be threaded into sigop counting
+/// instead of being looked up a second and third time inside
+/// `get_p2sh_sigop_count` + the witness loop.
+///
+/// Behaviour matches `get_block_sigop_cost` exactly when the supplied
+/// scripts equal what `db.get_utxo(...)` would have returned for each input.
+pub fn get_block_sigop_cost_with_prefetched_scripts(
+    transactions: &[Transaction],
+    prev_script_pubkeys: &[Vec<bitcoin::ScriptBuf>],
+    verify_p2sh: bool,
+    verify_witness: bool,
+) -> i64 {
+    debug_assert_eq!(
+        transactions.len(),
+        prev_script_pubkeys.len(),
+        "must have one script-vec per transaction"
+    );
+
+    let mut total_cost = 0i64;
+    for (tx, scripts) in transactions.iter().zip(prev_script_pubkeys.iter()) {
+        total_cost +=
+            get_transaction_sigop_cost_with_scripts(tx, scripts, verify_p2sh, verify_witness);
+    }
+    total_cost
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -464,8 +588,10 @@ pub fn get_block_sigop_cost(
 mod tests {
     use super::{
         count_script_sigops, get_legacy_sigop_count, get_transaction_sigop_cost,
-        get_block_sigop_cost, count_witness_sigops, is_p2sh, parse_witness_program,
-        MAX_BLOCK_SIGOPS_COST, WITNESS_SCALE_FACTOR,
+        get_block_sigop_cost, get_block_sigop_cost_with_prefetched_scripts,
+        get_transaction_sigop_cost_with_scripts, count_witness_sigops, is_p2sh,
+        parse_witness_program, MAX_BLOCK_SIGOPS_COST, WITNESS_SCALE_FACTOR,
+        BYTE_OP_CHECKSIG,
     };
     use crate::storage::BlockchainDB;
     use bitcoin::{Amount, ScriptBuf, TxIn, TxOut, Transaction, Witness};
@@ -473,6 +599,8 @@ mod tests {
     use bitcoin::absolute::LockTime;
     use bitcoin::opcodes::all::*;
     use bitcoin::blockdata::script::Builder;
+    use bitcoin::hashes::Hash;
+    use common::{OutPointWrapper, UTXO};
     use std::sync::Arc;
     use tempdir::TempDir;
 
@@ -823,5 +951,240 @@ mod tests {
     #[test]
     fn test_witness_scale_factor_constant() {
         assert_eq!(WITNESS_SCALE_FACTOR, 4);
+    }
+
+    // -------------------------------------------------------------------------
+    // Prefetched-scripts equivalence tests (W85 regression fix)
+    //
+    // The refactor must produce IDENTICAL sigop costs to the DB-lookup
+    // variant. These tests pin that invariant across legacy, P2SH, and
+    // witness shapes — the exact shapes that mattered during the W85
+    // regression hunt.
+    // -------------------------------------------------------------------------
+
+    /// Seed a UTXO in the test DB with the supplied script_pubkey so that
+    /// `get_block_sigop_cost` (DB path) can look it up.
+    fn seed_utxo(
+        db: &Arc<BlockchainDB>,
+        outpoint: bitcoin::OutPoint,
+        script_pubkey: ScriptBuf,
+    ) {
+        let utxo = UTXO::new(
+            OutPointWrapper::new(outpoint),
+            1_000,
+            script_pubkey,
+            Some(1),
+            false,
+        );
+        db.add_utxo(&outpoint, &utxo).expect("seed utxo");
+    }
+
+    fn mk_coinbase() -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000_000),
+                script_pubkey: Builder::new().push_opcode(OP_CHECKSIG).into_script(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_prefetched_equivalence_legacy_only() {
+        let (_tmp, db) = create_test_db();
+
+        let prev_txid = bitcoin::Txid::from_byte_array([7u8; 32]);
+        let prev_out = bitcoin::OutPoint::new(prev_txid, 0);
+        let prev_spk = Builder::new()
+            .push_opcode(OP_DUP)
+            .push_opcode(OP_HASH160)
+            .push_slice(&[0u8; 20])
+            .push_opcode(OP_EQUALVERIFY)
+            .push_opcode(OP_CHECKSIG)
+            .into_script(); // standard P2PKH — no P2SH, no witness
+        seed_utxo(&db, prev_out, prev_spk.clone());
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev_out,
+                script_sig: Builder::new()
+                    .push_slice(&[0u8; 71])
+                    .push_slice(&[0u8; 33])
+                    .into_script(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(500),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let txs = vec![mk_coinbase(), tx];
+        let prefetched = vec![Vec::<ScriptBuf>::new(), vec![prev_spk]];
+
+        let db_cost = get_block_sigop_cost(&txs, &db, true, true);
+        let pref_cost =
+            get_block_sigop_cost_with_prefetched_scripts(&txs, &prefetched, true, true);
+        assert_eq!(db_cost, pref_cost, "P2PKH path must match");
+    }
+
+    #[test]
+    fn test_prefetched_equivalence_p2sh_redeem() {
+        let (_tmp, db) = create_test_db();
+
+        // Redeem script with 2 CHECKSIGs (2 sigops in accurate mode).
+        let redeem_script = Builder::new()
+            .push_opcode(OP_CHECKSIG)
+            .push_opcode(OP_CHECKSIG)
+            .into_script();
+        // P2SH scriptPubKey: OP_HASH160 <20> OP_EQUAL
+        let p2sh_spk = Builder::new()
+            .push_opcode(OP_HASH160)
+            .push_slice(&[0xaa; 20])
+            .push_opcode(OP_EQUAL)
+            .into_script();
+
+        let prev_out = bitcoin::OutPoint::new(
+            bitcoin::Txid::from_byte_array([8u8; 32]),
+            0,
+        );
+        seed_utxo(&db, prev_out, p2sh_spk.clone());
+
+        // Push-only scriptSig ending in the redeem script. The redeem script
+        // is a 2-byte push (OP_CHECKSIG OP_CHECKSIG), comfortably under the
+        // 75-byte direct-push ceiling.
+        let redeem_bytes_array: [u8; 2] = [BYTE_OP_CHECKSIG, BYTE_OP_CHECKSIG];
+        let script_sig = Builder::new()
+            .push_slice(&[0u8; 71])
+            .push_slice(redeem_bytes_array)
+            .into_script();
+        // Sanity: the bytes we just pushed equal the redeem script we built
+        // with the Bitcoin builder above.
+        assert_eq!(redeem_bytes_array.as_slice(), redeem_script.as_bytes());
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev_out,
+                script_sig,
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(500),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let txs = vec![mk_coinbase(), tx];
+        let prefetched = vec![Vec::<ScriptBuf>::new(), vec![p2sh_spk]];
+
+        let db_cost = get_block_sigop_cost(&txs, &db, true, true);
+        let pref_cost =
+            get_block_sigop_cost_with_prefetched_scripts(&txs, &prefetched, true, true);
+        assert_eq!(db_cost, pref_cost, "P2SH redeem-script path must match");
+        // Sanity: non-zero (2 redeem sigops × WITNESS_SCALE_FACTOR = 8).
+        assert!(db_cost >= 8);
+    }
+
+    #[test]
+    fn test_prefetched_equivalence_p2wpkh_witness() {
+        let (_tmp, db) = create_test_db();
+
+        // P2WPKH scriptPubKey: OP_0 <20>
+        let p2wpkh_spk = Builder::new()
+            .push_opcode(OP_PUSHBYTES_0)
+            .push_slice(&[0u8; 20])
+            .into_script();
+        let prev_out = bitcoin::OutPoint::new(
+            bitcoin::Txid::from_byte_array([9u8; 32]),
+            0,
+        );
+        seed_utxo(&db, prev_out, p2wpkh_spk.clone());
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev_out,
+                script_sig: ScriptBuf::new(), // SegWit: scriptSig is empty
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![0u8; 71], vec![0u8; 33]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(500),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let txs = vec![mk_coinbase(), tx];
+        let prefetched = vec![Vec::<ScriptBuf>::new(), vec![p2wpkh_spk]];
+
+        let db_cost = get_block_sigop_cost(&txs, &db, true, true);
+        let pref_cost =
+            get_block_sigop_cost_with_prefetched_scripts(&txs, &prefetched, true, true);
+        assert_eq!(db_cost, pref_cost, "P2WPKH witness path must match");
+    }
+
+    #[test]
+    fn test_prefetched_equivalence_coinbase_only() {
+        let (_tmp, db) = create_test_db();
+        let txs = vec![mk_coinbase()];
+        let prefetched = vec![Vec::<ScriptBuf>::new()];
+
+        let db_cost = get_block_sigop_cost(&txs, &db, true, true);
+        let pref_cost =
+            get_block_sigop_cost_with_prefetched_scripts(&txs, &prefetched, true, true);
+        assert_eq!(db_cost, pref_cost);
+    }
+
+    #[test]
+    fn test_prefetched_tx_cost_matches_db_variant() {
+        // Direct tx-level equivalence: `get_transaction_sigop_cost` (DB path)
+        // must match `get_transaction_sigop_cost_with_scripts` when the
+        // scripts slice equals what the DB would return.
+        let (_tmp, db) = create_test_db();
+
+        let prev_spk = Builder::new()
+            .push_opcode(OP_CHECKSIG)
+            .push_opcode(OP_CHECKSIG)
+            .push_opcode(OP_CHECKSIG)
+            .into_script();
+        let prev_out = bitcoin::OutPoint::new(
+            bitcoin::Txid::from_byte_array([10u8; 32]),
+            3,
+        );
+        seed_utxo(&db, prev_out, prev_spk.clone());
+
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev_out,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(500),
+                script_pubkey: Builder::new().push_opcode(OP_CHECKSIG).into_script(),
+            }],
+        };
+
+        let db_cost = get_transaction_sigop_cost(&tx, &db, true, true);
+        let pref_cost =
+            get_transaction_sigop_cost_with_scripts(&tx, &[prev_spk], true, true);
+        assert_eq!(db_cost, pref_cost);
     }
 }

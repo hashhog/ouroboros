@@ -307,13 +307,23 @@ impl BlockValidator {
             ));
         }
 
+        // W85 regression fix: collect each input's script_pubkey from the
+        // UTXO fetch we already do here, so the sigop pass below can read
+        // them out of memory instead of issuing 2 more `db.get_utxo()`
+        // round-trips per input. Indexed by tx position; the coinbase
+        // (index 0) gets an empty Vec since it has no real prevouts.
+        let mut prefetched_input_scripts: Vec<Vec<bitcoin::ScriptBuf>> =
+            Vec::with_capacity(inner.txdata.len());
+        prefetched_input_scripts.push(Vec::new()); // coinbase
+
         for tx in inner.txdata.iter().skip(1) {
             let tx_wrapper = TransactionWrapper::new(tx.clone());
-            let fee = self.tx_validator
-                .validate_transaction_with_fee(&tx_wrapper, height, &intra_utxos)
+            let (fee, input_scripts) = self.tx_validator
+                .validate_transaction_with_fee_and_scripts(&tx_wrapper, height, &intra_utxos)
                 .map_err(BlockValidationError::TransactionValidation)?;
             total_fees = total_fees.checked_add(fee)
                 .ok_or(BlockValidationError::CoinbaseAmountExceeded)?;
+            prefetched_input_scripts.push(input_scripts);
 
             if enforce_bip68 && tx.version.0 >= 2 {
                 self.check_tx_sequence_locks(
@@ -343,11 +353,14 @@ impl BlockValidator {
         // 7d. BIP141 witness commitment.
         self.check_witness_commitment(inner, height)?;
 
-        // 8. Sigop cost limit with BIP141 witness discount
+        // 8. Sigop cost limit with BIP141 witness discount.
+        //    W85 fix: use prefetched script_pubkeys instead of re-fetching
+        //    every input's UTXO from RocksDB inside `get_p2sh_sigop_count`
+        //    + the witness loop.
         let (verify_p2sh, verify_witness) = self.get_sigop_flags(height);
-        let total_sigop_cost = super::sigop::get_block_sigop_cost(
+        let total_sigop_cost = super::sigop::get_block_sigop_cost_with_prefetched_scripts(
             &inner.txdata,
-            &self.db,
+            &prefetched_input_scripts,
             verify_p2sh,
             verify_witness,
         );

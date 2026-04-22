@@ -144,6 +144,27 @@ impl TransactionValidator {
         height: u32,
         extras: &HashMap<OutPoint, UTXO>,
     ) -> Result<u64> {
+        let (fee, _scripts) = self.validate_transaction_with_fee_and_scripts(tx, height, extras)?;
+        Ok(fee)
+    }
+
+    /// Same as `validate_transaction_with_fee` but additionally returns the
+    /// script_pubkey of each input in input order.
+    ///
+    /// For coinbase transactions the returned `Vec` is empty (the coinbase
+    /// has no real previous outputs to look up).
+    ///
+    /// W85 regression fix: `validate_block_with_flags` already pays for one
+    /// UTXO fetch per input here for amount + coinbase-maturity checks. By
+    /// returning the script_pubkeys, the block-level sigop counter can
+    /// reuse them for `is_p2sh` / witness-program detection instead of
+    /// performing 2 additional `db.get_utxo()` round-trips per input.
+    pub fn validate_transaction_with_fee_and_scripts(
+        &self,
+        tx: &TransactionWrapper,
+        height: u32,
+        extras: &HashMap<OutPoint, UTXO>,
+    ) -> Result<(u64, Vec<bitcoin::ScriptBuf>)> {
         let inner = tx.inner();
 
         self.check_structure(inner)?;
@@ -154,11 +175,14 @@ impl TransactionValidator {
         self.check_lock_time(inner, height)?;
 
         if inner.is_coinbase() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
-        let total_input =
-            self.validate_transaction_inputs_with_extras_at_height(inner, height, extras)?;
-        self.validate_amounts(inner, total_input)
+        let (total_input, scripts) = self
+            .validate_transaction_inputs_with_extras_at_height_and_scripts(
+                inner, height, extras,
+            )?;
+        let fee = self.validate_amounts(inner, total_input)?;
+        Ok((fee, scripts))
     }
 
     /// Same as `validate_transaction_inputs_at_height` but resolves inputs
@@ -173,8 +197,28 @@ impl TransactionValidator {
         spending_height: u32,
         extras: &HashMap<OutPoint, UTXO>,
     ) -> Result<u64> {
+        let (total_input, _scripts) = self
+            .validate_transaction_inputs_with_extras_at_height_and_scripts(
+                tx, spending_height, extras,
+            )?;
+        Ok(total_input)
+    }
+
+    /// Same as `validate_transaction_inputs_with_extras_at_height` but also
+    /// returns the script_pubkey of each input (in input order).
+    ///
+    /// The script_pubkey vector is sized exactly `tx.input.len()`. Used by
+    /// the validate hot path to dedupe UTXO fetches with sigop counting
+    /// (see `get_block_sigop_cost_with_prefetched_scripts`).
+    pub fn validate_transaction_inputs_with_extras_at_height_and_scripts(
+        &self,
+        tx: &Transaction,
+        spending_height: u32,
+        extras: &HashMap<OutPoint, UTXO>,
+    ) -> Result<(u64, Vec<bitcoin::ScriptBuf>)> {
         let mut total_input = 0u64;
         let mut seen_outpoints = HashSet::new();
+        let mut script_pubkeys: Vec<bitcoin::ScriptBuf> = Vec::with_capacity(tx.input.len());
 
         for input in tx.input.iter() {
             let outpoint = OutPoint::new(input.previous_output.txid, input.previous_output.vout);
@@ -203,9 +247,10 @@ impl TransactionValidator {
             total_input = total_input
                 .checked_add(utxo.amount)
                 .ok_or(TransactionValidationError::OutputAmountOverflow)?;
+            script_pubkeys.push(utxo.script_pubkey);
         }
 
-        Ok(total_input)
+        Ok((total_input, script_pubkeys))
     }
 
     /// Check transaction structure
