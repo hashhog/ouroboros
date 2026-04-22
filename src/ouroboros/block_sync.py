@@ -264,6 +264,29 @@ class BlockSync:
         self._w90_log_every: int = 100
         self._w90_slow_threshold_ns: int = 8_000_000_000  # 8s
 
+        # W91 drain-loop wall-clock probe (2026-04-22).  W90 showed the
+        # validator drops 2.3× with Rust+skip_scripts but overall rate
+        # got WORSE (−31%), meaning the 'non-work' budget per block
+        # ballooned from ~138s/100-blocks to ~714s/100-blocks.  W91
+        # splits that non-work time into (a) intra-drain async/DB
+        # overhead (gap = wallclock − deser − val − con per block) and
+        # (b) time the drain loop was idle between invocations
+        # (drain_idle = entry_time − prev_exit_time).  A high
+        # drain_idle_avg means peer delivery is rate-limiting; a high
+        # gap_avg means connect / mempool / asyncio.sleep is the hotspot.
+        self._w91_blocks: int = 0
+        self._w91_wallclock_sum_ns: int = 0
+        self._w91_wallclock_max_ns: int = 0
+        self._w91_work_sum_ns: int = 0
+        self._w91_last_connect_perf_ns: int = 0  # 0 = uninitialised
+        self._w91_drain_entries: int = 0
+        self._w91_drain_noprogress: int = 0
+        self._w91_drain_idle_sum_ns: int = 0
+        self._w91_drain_idle_max_ns: int = 0
+        self._w91_last_drain_exit_perf_ns: int = 0
+        self._w91_buffer_on_entry_sum: int = 0
+        self._w91_log_every: int = 100
+
         # Serializes `_drain_block_buffer` against itself.  The drain is
         # invoked from both `sync_loop` (periodic) and `handle_block`
         # (every incoming P2P block); without this lock two drains can
@@ -682,6 +705,17 @@ class BlockSync:
 
     async def _drain_block_buffer_locked(self) -> int:
         connected = 0
+        # W91: record drain entry — idle since previous exit, and buffer
+        # size at the moment we start draining.
+        _w91_entry_ns = time.perf_counter_ns()
+        self._w91_drain_entries += 1
+        self._w91_buffer_on_entry_sum += len(self._ibd_block_buffer)
+        if self._w91_last_drain_exit_perf_ns:
+            idle_ns = _w91_entry_ns - self._w91_last_drain_exit_perf_ns
+            if idle_ns > 0:
+                self._w91_drain_idle_sum_ns += idle_ns
+                if idle_ns > self._w91_drain_idle_max_ns:
+                    self._w91_drain_idle_max_ns = idle_ns
         current_hash, current_height = self.db.get_best_block()
 
         # Find the first unconnected header index by scanning once, then
@@ -967,6 +1001,7 @@ class BlockSync:
                 tx_count=len(block.transactions) if block is not None else 0,
                 height=new_height,
             )
+            self._w91_record_connect(deserialize_ns, validate_ns, connect_ns)
 
             connected += 1
             current_height = new_height
@@ -1008,6 +1043,14 @@ class BlockSync:
         # Prune connected headers to prevent unbounded growth
         if connected > 0:
             self._prune_validated_headers()
+
+        # W91: record drain exit.  No-progress drains (connected==0)
+        # are counted separately — they indicate the drain woke up but
+        # the next-expected block wasn't buffered.  Exit timestamp
+        # feeds into the next drain's idle measurement.
+        if connected == 0:
+            self._w91_drain_noprogress += 1
+        self._w91_last_drain_exit_perf_ns = time.perf_counter_ns()
 
         return connected
 
@@ -1557,6 +1600,78 @@ class BlockSync:
             self._w90_validate_sum_ns = 0
             self._w90_validate_max_ns = 0
             self._w90_slow_blocks = 0
+
+    def _w91_record_connect(
+        self, deserialize_ns: int, validate_ns: int, connect_ns: int
+    ) -> None:
+        """W91: per-block wall-clock + intra-drain gap.
+
+        'wallclock_ns' is the time between this connect and the
+        previous one (on any drain invocation).  'work_ns' is the sum
+        of deserialize + validate + connect timers, i.e. actual
+        compute for this block.  The difference is 'gap_ns' — async
+        overhead (to_thread round-trip, asyncio.sleep(0), W76/W77/W90
+        bookkeeping, mempool/fee/zmq post-processing) PLUS any time
+        the drain loop was idle between exit and re-entry.
+
+        Paired with the drain-level idle tracking in
+        `_drain_block_buffer_locked`, this lets us separate 'drain
+        loop is slow per block' (high gap, low drain_idle) from 'drain
+        loop waits for peers' (low gap, high drain_idle).
+        """
+        now = time.perf_counter_ns()
+        work_ns = deserialize_ns + validate_ns + connect_ns
+        if self._w91_last_connect_perf_ns:
+            wall_ns = now - self._w91_last_connect_perf_ns
+            if wall_ns > 0:
+                self._w91_blocks += 1
+                self._w91_wallclock_sum_ns += wall_ns
+                self._w91_work_sum_ns += work_ns
+                if wall_ns > self._w91_wallclock_max_ns:
+                    self._w91_wallclock_max_ns = wall_ns
+        self._w91_last_connect_perf_ns = now
+        if self._w91_blocks >= self._w91_log_every:
+            n = self._w91_blocks
+            wall_avg_ms = self._w91_wallclock_sum_ns / n / 1_000_000
+            wall_max_ms = self._w91_wallclock_max_ns / 1_000_000
+            work_avg_ms = self._w91_work_sum_ns / n / 1_000_000
+            gap_avg_ms = max(0.0, wall_avg_ms - work_avg_ms)
+            drain_entries = self._w91_drain_entries
+            drain_noprog = self._w91_drain_noprogress
+            drains_per_blk = drain_entries / n if n else 0.0
+            buf_avg_entry = (
+                self._w91_buffer_on_entry_sum / drain_entries
+                if drain_entries else 0.0
+            )
+            # drain_idle averaged over drain entries that HAD a prior
+            # exit (skip the very first).  Use drain_entries as
+            # denominator (close enough; the −1 off-by-one is
+            # negligible at N=100+).
+            idle_avg_ms = (
+                self._w91_drain_idle_sum_ns / drain_entries / 1_000_000
+                if drain_entries else 0.0
+            )
+            idle_max_ms = self._w91_drain_idle_max_ns / 1_000_000
+            rate = 3600_000 / wall_avg_ms if wall_avg_ms > 0 else 0
+            logger.info(
+                "[W91-WALL] blocks=%d wallclock_avg_ms=%.0f "
+                "wallclock_max_ms=%.0f work_avg_ms=%.0f gap_avg_ms=%.0f "
+                "drains=%d noprog=%d drains_per_blk=%.2f "
+                "buffer_avg_on_entry=%.0f drain_idle_avg_ms=%.0f "
+                "drain_idle_max_ms=%.0f (~%.0f blk/hr)",
+                n, wall_avg_ms, wall_max_ms, work_avg_ms, gap_avg_ms,
+                drain_entries, drain_noprog, drains_per_blk,
+                buf_avg_entry, idle_avg_ms, idle_max_ms, rate,
+            )
+            self._w91_blocks = 0
+            self._w91_wallclock_sum_ns = 0
+            self._w91_wallclock_max_ns = 0
+            self._w91_work_sum_ns = 0
+            self._w91_drain_entries = 0
+            self._w91_drain_noprogress = 0
+            self._w91_drain_idle_sum_ns = 0
+            self._w91_drain_idle_max_ns = 0
+            self._w91_buffer_on_entry_sum = 0
 
     def _w77_record_connect(self, block_hash: bytes, connect_time: float) -> None:
         """W77: roll a successful connect into the 100-block timeout rollup.
