@@ -16,10 +16,13 @@ from collections import Counter, defaultdict
 from collections.abc import Callable
 from typing import Optional
 
-# B3 Stage 1: optional fast-path routes IBD-drain validate_block through the
-# Rust FFI (off-GIL) when OUROBOROS_ROUTE_VALIDATE_TO_RUST=1.  Matches
-# Python's skip_scripts=True semantics.  Only used when the sync module is
-# present and the current block is below the assume-valid checkpoint.
+# B3 Stage 1: IBD-drain validate_block runs through the Rust FFI (off-GIL)
+# by default.  Matches Python's skip_scripts=True semantics, and only
+# engaged when the sync module is present and the current block is below
+# the assume-valid checkpoint.  The W90/W91 soak (2026-04-22) confirmed
+# ~2.3× validate speedup with zero fallbacks or cross-check mismatches
+# across >400 blocks, so this path flipped from opt-in to default-on.
+# Set OUROBOROS_DISABLE_RUST_VALIDATE=1 to force the Python validator.
 try:
     import sync as _sync_module
     _has_sync_module = True
@@ -337,9 +340,10 @@ class BlockSync:
         # we can correlate later [W90-VAL] rollups with the flag config
         # the process actually booted with.
         logger.info(
-            "[W90-INIT] route_validate_to_rust=%s cross_check=%s "
+            "[W90-INIT] rust_validate_default=True "
+            "disabled_by_env=%s cross_check=%s "
             "has_sync_module=%s has_validate_block_from_bytes=%s",
-            os.environ.get("OUROBOROS_ROUTE_VALIDATE_TO_RUST") == "1",
+            os.environ.get("OUROBOROS_DISABLE_RUST_VALIDATE") == "1",
             os.environ.get("OUROBOROS_VALIDATE_CROSS_CHECK") == "1",
             _has_sync_module,
             hasattr(self.db, "validate_block_from_bytes"),
@@ -765,21 +769,24 @@ class BlockSync:
             new_height = current_height + 1
             t_val = time.perf_counter_ns()
 
-            # B3 Stage 1: Rust validate fast path.
+            # B3 Stage 1: Rust validate fast path (default-on as of the
+            # W90/W91 soak, 2026-04-22).
             #
             # Two env-flag modes:
             # - OUROBOROS_VALIDATE_CROSS_CHECK=1 → run BOTH Rust and Python,
             #   compare results, log mismatches, trust Python.  Soak window.
-            # - OUROBOROS_ROUTE_VALIDATE_TO_RUST=1 → run Rust only, fall back
-            #   to Python only on unexpected errors.  Steady state.
+            # - OUROBOROS_DISABLE_RUST_VALIDATE=1 → force the Python
+            #   validator (emergency opt-out; retained for diagnostics).
+            # - otherwise (default) → run Rust only, fall back to Python
+            #   on unexpected errors.  Steady state.
             #
-            # Both gated on can_skip_scripts_for_block (so below assumevalid
-            # checkpoint only); above the checkpoint, Python's script
-            # verification path is kept regardless of flags.
+            # Both Rust-using paths are gated on can_skip_scripts_for_block
+            # (so below assumevalid checkpoint only); above the checkpoint,
+            # Python's script verification path is kept regardless of flags.
             cross_check = os.environ.get("OUROBOROS_VALIDATE_CROSS_CHECK") == "1"
             route_only = (
                 not cross_check
-                and os.environ.get("OUROBOROS_ROUTE_VALIDATE_TO_RUST") == "1"
+                and os.environ.get("OUROBOROS_DISABLE_RUST_VALIDATE") != "1"
             )
             rust_available = (
                 _has_sync_module
