@@ -1227,6 +1227,13 @@ class BlockSync:
         if not candidates:
             return
 
+        # Sort peers by score (descending) so round-robin hands the
+        # chain-closest (head-of-window) blocks to the highest-quality
+        # peers first.  get_all_ready_peers() returns insertion order,
+        # which consistently awarded candidates[0] to a slow peer during
+        # W91 soaks (98% no-progress drains).
+        candidates.sort(key=lambda p: -getattr(p, 'score', 100))
+
         peer_load = Counter(self._block_request_peer.values())
         per_peer, assigned = _distribute_blocks_round_robin(
             to_request, candidates, peer_load, MAX_BLOCKS_IN_FLIGHT_PER_PEER,
@@ -1732,12 +1739,37 @@ class BlockSync:
         # have ~32MB queued; 20s was firing before peers could drain and
         # causing cascading re-requests (rate halved from 1117 → 580 blk/hr
         # at height 817k). Long-term fix is size-aware timeout scaling.
-        timeout = 60.0
+        #
+        # W92: split into a tight head-of-window rescue and the general
+        # conservative 60s cap.  The W91 probe showed 98% of drains found
+        # no next-expected block with the buffer holding 150-290 future
+        # blocks — the chain-closest slot was held hostage by a slow
+        # peer while later blocks piled up.  Rescue the first 8 unfetched
+        # slots at 10s so the drain can advance; penalize peer score
+        # only on the 60s general path (optimistic reroutes aren't a
+        # verdict on peer quality).
+        HEAD_OF_WINDOW = 8
+        HEAD_TIMEOUT = 10.0
+        TIMEOUT = 60.0
 
-        timed_out = [
-            block_hash for block_hash, request_time in self.requested_blocks.items()
-            if now - request_time > timeout
-        ]
+        head_set: set[bytes] = set()
+        for bh, _ in self._validated_headers:
+            if self.db.has_block_hash(bh):
+                continue
+            head_set.add(bh)
+            if len(head_set) >= HEAD_OF_WINDOW:
+                break
+
+        head_timed_out: list[bytes] = []
+        general_timed_out: list[bytes] = []
+        for block_hash, request_time in self.requested_blocks.items():
+            elapsed = now - request_time
+            if block_hash in head_set:
+                if elapsed > HEAD_TIMEOUT:
+                    head_timed_out.append(block_hash)
+            elif elapsed > TIMEOUT:
+                general_timed_out.append(block_hash)
+        timed_out = head_timed_out + general_timed_out
 
         if not timed_out:
             return
@@ -1752,13 +1784,21 @@ class BlockSync:
                 raw = list(raw.values())
             all_peers = [p for p in raw if isinstance(p, Peer)]
 
-        # Penalize each failed peer only ONCE per cycle (not per block)
-        failed_peers = set()
+        # Penalize each failed peer only ONCE per cycle (not per block).
+        # Only peers holding general (60s) timeouts get a score penalty;
+        # head-of-window rescues at 10s are optimistic reroutes, not
+        # verdicts on peer quality — a legitimately-serving peer might
+        # need >10s for a 2 MB block.
+        general_set = set(general_timed_out)
+        failed_peers: set[Peer] = set()
+        penalize_peers: set[Peer] = set()
         for block_hash in timed_out:
             failed_peer = self._block_request_peer.get(block_hash)
             if failed_peer is not None:
                 failed_peers.add(failed_peer)
-        for peer in failed_peers:
+                if block_hash in general_set:
+                    penalize_peers.add(failed_peer)
+        for peer in penalize_peers:
             peer.adjust_score(-1)
 
         connected_peers = [p for p in all_peers if p.is_connected()]
@@ -1776,7 +1816,11 @@ class BlockSync:
 
         logger.warning(
             f"{len(timed_out)} block requests timed out "
-            f"(failed peers: {len(failed_peers)}, available peers: {len(connected_peers)})"
+            f"(head={len(head_timed_out)}/{len(head_set)}@10s, "
+            f"general={len(general_timed_out)}@60s, "
+            f"failed peers: {len(failed_peers)}, "
+            f"penalized: {len(penalize_peers)}, "
+            f"available peers: {len(connected_peers)})"
         )
 
         # W77: roll up timeout cycle into the 100-block window.
@@ -1789,6 +1833,9 @@ class BlockSync:
         preferred = [p for p in connected_peers if p not in failed_peers]
         if not preferred:
             preferred = connected_peers
+        # W92: sort preferred by score (descending) so rescued head-of-
+        # window blocks go to the highest-quality peers first.
+        preferred.sort(key=lambda p: -getattr(p, 'score', 100))
 
         # Group re-requests by target peer, respecting the per-peer in-flight
         # cap.  `peer_load` starts from the live in-flight map minus the blocks
