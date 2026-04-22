@@ -1204,7 +1204,23 @@ class BlockSync:
         # Request blocks starting just after the connected tip, up to window size.
         start = tip_idx + 1
         in_flight = len(self.requested_blocks)
-        available = max(0, self._max_blocks_in_flight - in_flight)
+        cap_inflight = max(0, self._max_blocks_in_flight - in_flight)
+
+        # W93: throttle new requests against IBD-buffer pressure.  W92's
+        # 2.7× rate gain accelerated the W85 wedge from ~10h to ~2h21m
+        # because download outpaced drain — buffer filled with non-tip+1
+        # blocks until next-expected arrivals were dropped at the cap.
+        # Hold (buffer_used + in_flight) under buffer_safety × capacity
+        # so the buffer never reaches the deadlock threshold.  Already-
+        # in-flight blocks (including tip+1) and timed-out re-requests
+        # bypass this cap; only NEW requests get held back.
+        buffer_safety = 0.75
+        buffer_target = int(self._max_ibd_buffer * buffer_safety)
+        buffer_used = len(self._ibd_block_buffer)
+        cap_buffer = max(0, buffer_target - buffer_used - in_flight)
+        throttled_by_buffer = cap_buffer < cap_inflight
+
+        available = min(cap_inflight, cap_buffer)
         if available == 0:
             return
 
@@ -1265,6 +1281,8 @@ class BlockSync:
 
         deferred = len(to_request) - len(assigned)
         extra = f", deferred {deferred} (all peers at cap)" if deferred else ""
+        if throttled_by_buffer:
+            extra += f" [W93 throttle: buf={buffer_used}+inflight={in_flight}, target={buffer_target}]"
         logger.info(
             f"Requested {len(assigned)} blocks (tip+{start}, "
             f"in-flight: {in_flight}+{len(assigned)}/{self._max_blocks_in_flight}"
