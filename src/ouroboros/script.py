@@ -1190,12 +1190,12 @@ class ScriptInterpreter:
                 if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
                     raise ValueError("WITNESS_PUBKEYTYPE: uncompressed pubkey in witness v0")
                 if not sig:
-                    stack.append(b'\x00')
+                    stack.append(b'')
                     continue
                 if len(pubkey) < 1:
                     if (flags & SCRIPT_VERIFY_NULLFAIL) and sig:
                         raise ValueError("NULLFAIL: non-empty sig for empty pubkey")
-                    stack.append(b'\x00')
+                    stack.append(b'')
                     continue
                 der_sig = sig[:-1]
                 sighash_type = sig[-1]
@@ -1212,11 +1212,14 @@ class ScriptInterpreter:
                     ok = self._verify_ecdsa_signature(msg, der_sig, pubkey)
                     if not ok and (flags & SCRIPT_VERIFY_NULLFAIL):
                         raise ValueError("NULLFAIL: signature verification failed with non-empty sig")
-                    stack.append(b'\x01' if ok else b'\x00')
+                    # Per Bitcoin Core script.h: vchFalse is zero-length, vchTrue is single byte 0x01.
+                    # Pushing b'\x00' would later trip MINIMALIF on patterns that branch on a
+                    # CHECKSIG-produced false (e.g. multisig-fallthrough scripts).
+                    stack.append(b'\x01' if ok else b'')
                 except ValueError:
                     raise
                 except Exception:
-                    stack.append(b'\x00')
+                    stack.append(b'')
                 continue
 
             if opcode == 0xad:  # OP_CHECKSIGVERIFY
@@ -1364,7 +1367,7 @@ class ScriptInterpreter:
                     for s in sigs:
                         if s:
                             raise ValueError("NULLFAIL: non-empty sig in failed multisig")
-                stack.append(b'\x01' if valid else b'\x00')
+                stack.append(b'\x01' if valid else b'')
                 continue
 
             if opcode == 0xaf:  # OP_CHECKMULTISIGVERIFY
