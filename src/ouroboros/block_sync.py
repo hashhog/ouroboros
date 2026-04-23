@@ -928,12 +928,28 @@ class BlockSync:
 
                 block, raw_payload = self._ibd_block_buffer.pop(next_hash)
 
-            # Lazy-deserialize: `handle_block` defers the ~1 MB Python-side
-            # `Block.deserialize` here so it runs in a worker thread and
-            # does not stall the event loop on block arrival.  Sentinel
-            # `None` means "not yet deserialized".
+            # plan-W98: on-demand Python `Block.deserialize`.  The Rust
+            # validator parses raw network-format bytes directly via
+            # `validate_block_from_bytes`, and connect goes through
+            # `connect_block_from_bytes`, so the steady-state fast path
+            # never instantiates a Python Block object — saving ~1 MB of
+            # allocation + ~1 ms of CPU per block at mainnet tip.  The
+            # structured view is still needed for (a) Python validator
+            # fallback (`OUROBOROS_DISABLE_RUST_VALIDATE=1` or above the
+            # assumevalid checkpoint), (b) cross-check diagnostic probe
+            # (`OUROBOROS_VALIDATE_CROSS_CHECK=1`), and (c) Python
+            # `apply_block` connect when `connect_block_from_bytes` is
+            # unavailable.  `_ensure_block()` memoises the result so
+            # repeat calls within a single iteration pay the cost once.
             deserialize_ns = 0
-            if block is None:
+            deserialize_failed = False
+
+            async def _ensure_block() -> bool:
+                nonlocal block, deserialize_ns, deserialize_failed
+                if block is not None:
+                    return True
+                if deserialize_failed:
+                    return False
                 t0 = time.perf_counter_ns()
                 try:
                     block = await asyncio.to_thread(Block.deserialize, raw_payload)
@@ -942,11 +958,10 @@ class BlockSync:
                         f"Failed to deserialize buffered block "
                         f"{next_hash.hex()[:16]}...: {e}"
                     )
-                    # Deserialization failure is unrecoverable for this block —
-                    # the bytes are corrupt.  Drop it and let the timeout handler
-                    # re-fetch from a different peer.
-                    break
+                    deserialize_failed = True
+                    return False
                 deserialize_ns = time.perf_counter_ns() - t0
+                return True
 
             # Validate and connect in a thread to avoid blocking the event
             # loop.  Individual block validations at higher heights can take
@@ -1006,6 +1021,16 @@ class BlockSync:
                     return False, str(e)
 
             async def _run_python() -> tuple[bool, str]:
+                # plan-W98: materialise the Python Block here (instead of
+                # pre-deserialising every block upfront); only the
+                # Python-using paths pay the ~1 ms cost.
+                if not await _ensure_block():
+                    # Bytes were unparseable by the Python deserialiser
+                    # (e.g. Python-side BIP144 accepts but wire witness
+                    # framing is malformed).  Report as a rejection so
+                    # the outer drain enters its reject/drop path.  The
+                    # Rust cross-check still runs and is the authority.
+                    return False, "Python deserialize failed"
                 return await asyncio.to_thread(
                     self.validator.validate_block,
                     block,
@@ -1187,6 +1212,15 @@ class BlockSync:
                         self.db.connect_block_from_bytes, raw_payload, new_height
                     )
                 else:
+                    # plan-W98: Python `apply_block` needs the structured
+                    # Block view.  In practice `connect_block_from_bytes`
+                    # is always present (wired via the W85 Rust route),
+                    # so this branch is the emergency fallback only.
+                    if not await _ensure_block():
+                        raise ValueError(
+                            "Python Block.deserialize failed; cannot "
+                            "apply_block via Python fallback"
+                        )
                     await asyncio.to_thread(self.validator.apply_block, block)
             except Exception as e:
                 self._blk_connect_failed += 1
