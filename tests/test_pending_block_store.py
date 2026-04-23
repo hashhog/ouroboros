@@ -210,3 +210,43 @@ def test_atomic_write_leaves_no_tmp_on_success():
         s.save(_fake_hash(1), _fake_raw(1))
         files = os.listdir(os.path.join(d, "pending_blocks"))
         assert all(not f.endswith(".tmp") for f in files), files
+
+
+def test_concurrent_save_of_same_hash_does_not_race_rename():
+    """Two threads calling save() on the same block_hash must both
+    return cleanly.  Pre-fix: both entered past the has() guard, both
+    wrote to a shared ``<hash>.blk.tmp`` path, first rename won,
+    second rename raised FileNotFoundError — handle_block then dropped
+    the block and the scheduler re-requested it.  Observed live on
+    mainnet 2026-04-23 minutes after the plan-W98 deploy.  The fix
+    makes the tmp name per-thread so concurrent saves can't collide."""
+    import threading
+
+    with tempfile.TemporaryDirectory() as d:
+        s = PendingBlockStore(d)
+        h = _fake_hash(42)
+        raw = _fake_raw(42)
+
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(8)
+
+        def save_once():
+            try:
+                barrier.wait()
+                s.save(h, raw)
+            except BaseException as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=save_once) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"concurrent save raised: {errors}"
+        assert s.has(h)
+        assert s.load(h) == raw
+        files = os.listdir(os.path.join(d, "pending_blocks"))
+        assert all(not f.endswith(".tmp") and ".tmp." not in f for f in files), (
+            f"stale tmp files left behind: {files}"
+        )

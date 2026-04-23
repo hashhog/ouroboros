@@ -8,6 +8,7 @@ implementation, allowing Python code to interact with the blockchain storage lay
 import hashlib
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -72,16 +73,31 @@ class PendingBlockStore:
         tmp-write + fsync + rename ensures that a crash mid-write does
         not leave a half-populated file readable by load().  Idempotent:
         re-saving a hash already present is a no-op.
+
+        The tmp filename is per-thread (pid+tid suffix) because
+        asyncio.to_thread dispatches concurrent save() calls for the
+        same block hash onto distinct worker threads when IBD pulls
+        the same block from multiple peers before the first write
+        completes.  A shared tmp path produced FileNotFoundError on
+        rename when thread A replaced ``<hash>.blk.tmp`` → ``<hash>.blk``
+        and thread B then tried to rename the now-missing tmp.
         """
         if block_hash in self._hashes:
             return
         path = self._path(block_hash)
-        tmp = path + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(raw)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(raw)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
         self._hashes.add(block_hash)
 
     def load(self, block_hash: bytes) -> bytes | None:
