@@ -45,6 +45,17 @@ from ouroboros.script import (  # noqa: E402
     ScriptInterpreter,
 )
 
+# Exact flag set used by the live BlockValidator at mainnet h=850846 — captured
+# from the wedged process via diagnostic dump.  Differs from
+# SCRIPT_VERIFY_ALL_DEPLOYED (no TAPROOT, no STRICTENC; has CONST_SCRIPTCODE,
+# CLEANSTACK, MINIMALDATA, SIGPUSHONLY, DISCOURAGE_UPGRADABLE_NOPS).  The first
+# cut of the CODESEPARATOR fix passed under ALL_DEPLOYED but still rejected the
+# block live, because ALL_DEPLOYED does not set CONST_SCRIPTCODE — the check
+# mis-fired on witness-v0 scripts where sig_version was left at the BASE
+# default even though is_witness_v0=True.  Pin the live value here so the
+# regression test actually exercises that path.
+LIVE_FLAGS = 0x1EFFD
+
 
 TX_HEX = (
     "0200000000010134cfe21ad49968fee8000a71fa0aa7039c13a8092546d82433ed0de63d56440b"
@@ -141,16 +152,23 @@ def _deserialize(raw: bytes) -> Transaction:
 
 
 def test_block_850846_tx_811_input_0_verifies():
-    """Mainnet tx that wedged ouroboros on 2026-04-23 — must verify True."""
+    """Mainnet tx that wedged ouroboros on 2026-04-23 — must verify True.
+
+    Exercises both the in-tree ALL_DEPLOYED flag bundle and the exact LIVE_FLAGS
+    used by the BlockValidator, because the initial CODESEPARATOR fix passed
+    under ALL_DEPLOYED while still rejecting live (CONST_SCRIPTCODE mis-fire
+    on SegWit v0 witness scripts).
+    """
     tx = _deserialize(bytes.fromhex(TX_HEX))
     interp = ScriptInterpreter()
-    assert interp.verify(
-        script_sig=tx.inputs[0].script_sig,
-        script_pubkey=INPUT0_SCRIPT_PUBKEY,
-        tx=tx,
-        input_index=0,
-        flags=SCRIPT_VERIFY_ALL_DEPLOYED,
-        amount=INPUT0_VALUE_SATS,
-        input_amounts=[INPUT0_VALUE_SATS],
-        input_script_pubkeys=[INPUT0_SCRIPT_PUBKEY],
-    ) is True
+    for flags in (SCRIPT_VERIFY_ALL_DEPLOYED, LIVE_FLAGS):
+        assert interp.verify(
+            script_sig=tx.inputs[0].script_sig,
+            script_pubkey=INPUT0_SCRIPT_PUBKEY,
+            tx=tx,
+            input_index=0,
+            flags=flags,
+            amount=INPUT0_VALUE_SATS,
+            input_amounts=[INPUT0_VALUE_SATS],
+            input_script_pubkeys=[INPUT0_SCRIPT_PUBKEY],
+        ) is True, f"verify() must be True under flags=0x{flags:x}"
