@@ -6,10 +6,123 @@ implementation, allowing Python code to interact with the blockchain storage lay
 """
 
 import hashlib
+import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import sync  # Rust extension module (required)
+
+logger = logging.getLogger(__name__)
+
+
+class PendingBlockStore:
+    """plan-W96 on-disk cache for received-but-not-yet-connected blocks.
+
+    Lives at ``<data_dir>/pending_blocks/<hex>.blk`` — one file per block,
+    holding the exact raw payload received from a peer.  The Rust chain
+    store keeps *connected* blocks; this store keeps *pending* ones so
+    the ouroboros RAM-buffer wedge mode (`_ibd_block_buffer` filling
+    while the chain-next block is held by a slow peer) becomes
+    structurally impossible.
+
+    One file per block (rather than a packed blk*.dat with an index) is
+    intentional: the pending set is bounded by BLOCK_DOWNLOAD_WINDOW
+    (≤1024 blocks, a few GB at post-500k mainnet sizes), deletion is
+    frequent (after every successful connect), and per-file layout
+    eliminates an index-corruption failure mode.
+
+    All operations are idempotent: save on an existing hash is a no-op;
+    delete on a missing hash is a no-op; has() uses an in-memory set
+    seeded at construction time and kept in sync with save/delete.
+    Thread-safe for the single-drainer pattern used by block_sync.
+    """
+
+    _EXT = ".blk"
+
+    def __init__(self, data_dir: str):
+        self._dir = os.path.join(data_dir, "pending_blocks")
+        os.makedirs(self._dir, exist_ok=True)
+        self._hashes: set[bytes] = set()
+        for name in os.listdir(self._dir):
+            if not name.endswith(self._EXT):
+                continue
+            try:
+                h = bytes.fromhex(name[: -len(self._EXT)])
+            except ValueError:
+                continue
+            if len(h) == 32:
+                self._hashes.add(h)
+        if self._hashes:
+            logger.info(
+                "PendingBlockStore: recovered %d blocks from %s",
+                len(self._hashes),
+                self._dir,
+            )
+
+    def _path(self, block_hash: bytes) -> str:
+        return os.path.join(self._dir, block_hash.hex() + self._EXT)
+
+    def has(self, block_hash: bytes) -> bool:
+        return block_hash in self._hashes
+
+    def save(self, block_hash: bytes, raw: bytes) -> None:
+        """Atomically persist a block payload to the pending directory.
+
+        tmp-write + fsync + rename ensures that a crash mid-write does
+        not leave a half-populated file readable by load().  Idempotent:
+        re-saving a hash already present is a no-op.
+        """
+        if block_hash in self._hashes:
+            return
+        path = self._path(block_hash)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        self._hashes.add(block_hash)
+
+    def load(self, block_hash: bytes) -> bytes | None:
+        if block_hash not in self._hashes:
+            return None
+        try:
+            with open(self._path(block_hash), "rb") as f:
+                return f.read()
+        except FileNotFoundError:
+            # Directory state drifted out from under us (concurrent rm?
+            # manual intervention?).  Update the in-memory set so future
+            # has() calls are honest.
+            self._hashes.discard(block_hash)
+            return None
+
+    def delete(self, block_hash: bytes) -> None:
+        self._hashes.discard(block_hash)
+        try:
+            os.unlink(self._path(block_hash))
+        except FileNotFoundError:
+            pass
+
+    def gc(self, keep: set[bytes]) -> int:
+        """Remove pending entries not in *keep*.  Returns count removed.
+
+        Called after header-chain advances to prune blocks that no
+        longer appear in the validated-header queue (e.g. after a
+        reorg dropped their branch).  O(|pending|); run off the hot
+        path.
+        """
+        to_remove = self._hashes - keep
+        for h in to_remove:
+            try:
+                os.unlink(self._path(h))
+            except FileNotFoundError:
+                pass
+        self._hashes.difference_update(to_remove)
+        return len(to_remove)
+
+    def __len__(self) -> int:
+        return len(self._hashes)
 
 
 @dataclass
@@ -312,6 +425,12 @@ class BlockchainDatabase:
     def __init__(self, data_dir: str):
         self._db = sync.PyBlockchainDB(data_dir)
         self._data_dir = data_dir
+        # plan-W96: pending-block disk cache.  Always constructed (cheap —
+        # just an mkdir + directory scan), but only populated when
+        # block_sync is in OUROBOROS_DISK_BUFFER=1 mode.  Leaving it
+        # always-available means RPC can introspect the pending set
+        # even if the drain path hasn't written anything yet.
+        self.pending_blocks = PendingBlockStore(data_dir)
         # Cached chain tip — updated after every block connect/disconnect.
         # RPC reads this instead of calling into Rust FFI, avoiding lock
         # contention during IBD.

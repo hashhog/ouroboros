@@ -241,6 +241,24 @@ class BlockSync:
         self._ibd_block_buffer: dict[bytes, Block] = {}
         self._max_ibd_buffer: int = 1024
 
+        # plan-W96 (disk-on-receipt): when OUROBOROS_DISK_BUFFER=1, the
+        # receive path writes raw payload to db.pending_blocks and the
+        # drain path loads back from disk, eliminating the RAM-buffer
+        # wedge mode described in project_w85_ouroboros_route_to_rust_regression.md
+        # and project_ouroboros_hard_wedge_post_w85.md.  Off by default
+        # during soak; flip on per-deployment once testnet4 validates.
+        self._use_disk_buffer: bool = (
+            os.environ.get("OUROBOROS_DISK_BUFFER") == "1"
+            and hasattr(self.db, "pending_blocks")
+        )
+        if self._use_disk_buffer:
+            logger.info(
+                "plan-W96: disk-on-receipt block buffer ENABLED "
+                "(pending blocks dir: %s, recovered %d pending)",
+                self.db.pending_blocks._dir,
+                len(self.db.pending_blocks),
+            )
+
         # Drain-loop stage timings (W60 B0, promoted to W76-PHASE cross-
         # impl phase table).  Accumulates wall-clock ns spent in each
         # stage since the last summary log, plus per-phase max for tail
@@ -678,20 +696,31 @@ class BlockSync:
                 self._blk_duplicate += 1
                 return
 
-            # Buffer the raw payload (keyed by hash) for sequential
-            # processing.  `None` sentinel means "not yet deserialized" —
-            # the drainer will deserialize lazily in a worker thread when it
-            # actually needs to validate/connect this block.
-            if len(self._ibd_block_buffer) < self._max_ibd_buffer:
-                self._ibd_block_buffer[block_hash] = (None, payload)
+            # plan-W96: disk-on-receipt path.  save() is idempotent and
+            # atomic (tmp + fsync + rename), so re-deliveries from
+            # rotated peers are a no-op rather than a dropped block.
+            # No buffer cap — the in-flight window caps us upstream,
+            # and pending disk usage is ≤ BLOCK_DOWNLOAD_WINDOW blocks.
+            if self._use_disk_buffer:
+                await asyncio.to_thread(
+                    self.db.pending_blocks.save, block_hash, payload
+                )
                 self._blk_buffered += 1
             else:
-                self._blk_buffer_full += 1
-                logger.debug(
-                    f"IBD buffer full ({self._max_ibd_buffer}), dropping "
-                    f"{block_hash.hex()[:16]}..."
-                )
-                return
+                # Buffer the raw payload (keyed by hash) for sequential
+                # processing.  `None` sentinel means "not yet deserialized" —
+                # the drainer will deserialize lazily in a worker thread when it
+                # actually needs to validate/connect this block.
+                if len(self._ibd_block_buffer) < self._max_ibd_buffer:
+                    self._ibd_block_buffer[block_hash] = (None, payload)
+                    self._blk_buffered += 1
+                else:
+                    self._blk_buffer_full += 1
+                    logger.debug(
+                        f"IBD buffer full ({self._max_ibd_buffer}), dropping "
+                        f"{block_hash.hex()[:16]}..."
+                    )
+                    return
 
             # Try to drain buffered blocks in chain order.
             connected = await self._drain_block_buffer()
@@ -755,11 +784,30 @@ class BlockSync:
         while header_idx < len(self._validated_headers):
             next_hash, _ = self._validated_headers[header_idx]
 
-            # Is the next block in our buffer?
-            if next_hash not in self._ibd_block_buffer:
-                break  # need to wait for download
+            # plan-W96: disk-on-receipt path — load from pending_blocks
+            # instead of the RAM buffer.  `block` starts None so the
+            # existing lazy-deserialize block below still runs (the disk
+            # path never holds a deserialized Block object).  We don't
+            # delete the pending file here; deletion happens after a
+            # successful connect at the end of this iteration so a
+            # mid-connect crash leaves the block recoverable on restart.
+            if self._use_disk_buffer:
+                if not self.db.pending_blocks.has(next_hash):
+                    break  # need to wait for download
+                raw_payload = await asyncio.to_thread(
+                    self.db.pending_blocks.load, next_hash
+                )
+                if raw_payload is None:
+                    # has()/load() drift — file was unlinked between the
+                    # two calls.  Treat as not-yet-arrived.
+                    break
+                block = None
+            else:
+                # Is the next block in our buffer?
+                if next_hash not in self._ibd_block_buffer:
+                    break  # need to wait for download
 
-            block, raw_payload = self._ibd_block_buffer.pop(next_hash)
+                block, raw_payload = self._ibd_block_buffer.pop(next_hash)
 
             # Lazy-deserialize: `handle_block` defers the ~1 MB Python-side
             # `Block.deserialize` here so it runs in a worker thread and
@@ -998,7 +1046,18 @@ class BlockSync:
                 # bytes are bogus (sent by a misbehaving peer).  Drop it so
                 # the timeout handler re-fetches from a different peer.
                 if error == "Previous block not found":
-                    self._ibd_block_buffer[next_hash] = (block, raw_payload)
+                    if self._use_disk_buffer:
+                        # plan-W96: file is still on disk (we load without
+                        # deleting); next drain will retry.  Nothing to do.
+                        pass
+                    else:
+                        self._ibd_block_buffer[next_hash] = (block, raw_payload)
+                elif self._use_disk_buffer:
+                    # plan-W96: permanent validation failure — drop the
+                    # pending file so a fresh fetch from a different peer
+                    # replaces it.  Mirrors the in-memory path where the
+                    # pop() at the top of the loop already discarded it.
+                    self.db.pending_blocks.delete(next_hash)
                 break
 
             # Connect block
@@ -1015,7 +1074,12 @@ class BlockSync:
                 logger.error(f"Failed to connect block at height {new_height}: {e}")
                 # DB connect failure is also transient (e.g. chain-tip mismatch
                 # due to a concurrent update).  Put the block back so we retry.
-                self._ibd_block_buffer[next_hash] = (block, raw_payload)
+                if self._use_disk_buffer:
+                    # plan-W96: pending file is already on disk; next
+                    # drain reloads it.
+                    pass
+                else:
+                    self._ibd_block_buffer[next_hash] = (block, raw_payload)
                 break
             connect_ns = time.perf_counter_ns() - t_con
 
@@ -1034,6 +1098,14 @@ class BlockSync:
             header_idx += 1
             self._blk_connected += 1
             self._last_tip_advance = time.time()
+
+            # plan-W96: block is now committed to the Rust chain store;
+            # the pending file is redundant.  Unlink on the worker thread
+            # so the drain loop isn't blocked on fs metadata.
+            if self._use_disk_buffer:
+                await asyncio.to_thread(
+                    self.db.pending_blocks.delete, next_hash
+                )
 
             self._w77_record_connect(next_hash, self._last_tip_advance)
 
