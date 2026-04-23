@@ -1124,9 +1124,13 @@ class ScriptInterpreter:
 
             # OP_CODESEPARATOR (0xab)
             if opcode == 0xab:
-                # CONST_SCRIPTCODE: reject OP_CODESEPARATOR in non-segwit
-                # scripts (pre-SegWit context).
-                if (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE) and sig_version == SigVersion.BASE:
+                # CONST_SCRIPTCODE: reject OP_CODESEPARATOR in pre-SegWit
+                # scripts only.  SegWit v0 and tapscript are excluded.
+                # (The caller passes is_witness_v0=True for witness v0
+                # execution but leaves sig_version at the BASE default, so
+                # we can't gate on sig_version alone here.)
+                is_pre_segwit = not is_witness_v0 and not is_tapscript
+                if (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE) and is_pre_segwit:
                     raise ValueError("CONST_SCRIPTCODE: OP_CODESEPARATOR in non-witness script")
                 script_code_start = i
                 continue
