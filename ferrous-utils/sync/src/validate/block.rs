@@ -91,6 +91,21 @@ fn assumevalid_height_from_env() -> Option<u32> {
     }
 }
 
+/// Effective assumevalid height for `network` — env override or per-network default.
+/// Returns `0` if disabled (user set `OUROBOROS_ASSUMEVALID=0`).
+///
+/// Shared between `BlockValidator::new` (which skips full tx validation) and
+/// `crate::can_skip_scripts_for_block` (which gates the Rust fast path). The
+/// two must agree or we'll either double-validate or leave the fast path off.
+pub fn get_assumevalid_height(network: Network) -> u32 {
+    let default_height = match network {
+        Network::Bitcoin => 938_343,   // Bitcoin Core v28 default assumevalid
+        Network::Testnet4 => 123_613,  // Testnet4 assumevalid
+        _ => 0,                        // Validate everything on other networks
+    };
+    assumevalid_height_from_env().unwrap_or(default_height)
+}
+
 /// Block validator
 pub struct BlockValidator {
     db: Arc<BlockchainDB>,
@@ -109,12 +124,7 @@ impl BlockValidator {
         let header_validator = HeaderValidator::new(Arc::clone(&db), network);
         let tx_validator = TransactionValidator::new(Arc::clone(&db));
 
-        let default_height = match network {
-            Network::Bitcoin => 938_343,   // Bitcoin Core v28 default assumevalid
-            Network::Testnet4 => 123_613,  // Testnet4 assumevalid
-            _ => 0,                        // Validate everything on other networks
-        };
-        let assumevalid_height = assumevalid_height_from_env().unwrap_or(default_height);
+        let assumevalid_height = get_assumevalid_height(network);
 
         if assumevalid_height == 0 {
             log::info!("[validator] assumevalid disabled — full validation for all blocks");

@@ -1093,8 +1093,22 @@ fn verify_block_checkpoint(network: String, height: u32, block_hash: Vec<u8>) ->
 
 /// Check if script validation can be skipped for a block during IBD.
 ///
-/// Blocks at or below the last checkpoint can skip script validation
-/// (only PoW and merkle root need to be verified).
+/// Two script-skip gates, matching Bitcoin Core's distinction between hard
+/// consensus checkpoints (hash-committed) and the softer assumevalid trust
+/// anchor:
+///
+///   1. Below the last hard checkpoint, script verification is skipped
+///      unconditionally once the hash matches — this is a consensus rule,
+///      not a trust knob.
+///   2. Below the assumevalid height, script verification is skipped as a
+///      performance optimisation. Core does the same (see src/validation.cpp,
+///      `fScriptChecks = !IsAssumeValidSupportedByChainstate(...)`).
+///
+/// Without branch 2, mainnet blocks between the last checkpoint (850k) and
+/// the v28 assumevalid height (938_343) forced every signature through
+/// Python verification — ~12 s/block ceiling observed on the plan-w98 mainnet
+/// soak, vs the ~1500 blk/hr expected steady state (see project memory
+/// `project_plan_w98_mainnet_deploy.md`).
 #[pyfunction]
 fn can_skip_scripts_for_block(network: String, height: u32, block_hash: Vec<u8>) -> PyResult<bool> {
     let network_enum = match network.to_lowercase().as_str() {
@@ -1116,21 +1130,26 @@ fn can_skip_scripts_for_block(network: String, height: u32, block_hash: Vec<u8>)
         ));
     }
 
-    // Must be below last checkpoint
-    if !is_below_last_checkpoint(network_enum, height) {
-        return Ok(false);
-    }
-
-    // If at a checkpoint height, verify hash matches
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&block_hash);
-    if let Some(matches) = verify_checkpoint(network_enum, height, &hash) {
-        if !matches {
-            return Ok(false); // Checkpoint mismatch
+
+    // Branch 1: below last hard checkpoint.
+    if is_below_last_checkpoint(network_enum, height) {
+        if let Some(matches) = verify_checkpoint(network_enum, height, &hash) {
+            if !matches {
+                return Ok(false); // Checkpoint mismatch — reject, don't skip.
+            }
         }
+        return Ok(true);
     }
 
-    Ok(true)
+    // Branch 2: below assumevalid height (soft trust anchor, Core-compatible).
+    let assumevalid = crate::validate::block::get_assumevalid_height(network_enum);
+    if assumevalid > 0 && height <= assumevalid {
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 /// Python wrapper for HeadersSyncPhase enum
