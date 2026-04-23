@@ -1763,11 +1763,13 @@ class BlockSync:
         # no next-expected block with the buffer holding 150-290 future
         # blocks — the chain-closest slot was held hostage by a slow
         # peer while later blocks piled up.  Rescue the first 8 unfetched
-        # slots at 10s so the drain can advance; penalize peer score
+        # slots at 2s so the drain can advance; penalize peer score
         # only on the 60s general path (optimistic reroutes aren't a
         # verdict on peer quality).
+        # 2s matches Bitcoin Core's BLOCK_STALLING_TIMEOUT
+        # (net_processing.cpp).  Tightened from 10s in W94b.
         HEAD_OF_WINDOW = 8
-        HEAD_TIMEOUT = 10.0
+        HEAD_TIMEOUT = 2.0
         TIMEOUT = 60.0
 
         head_set: set[bytes] = set()
