@@ -691,6 +691,10 @@ class ScriptInterpreter:
         altstack: list[bytes] = []
         exec_stack: list[bool] = []
         op_count = 0
+        # BIP143 / legacy CODESEPARATOR: sighash scriptCode starts at the
+        # byte after the most recently executed OP_CODESEPARATOR.  Matches
+        # Bitcoin Core's pbegincodehash (interpreter.cpp).
+        script_code_start = 0
 
         # Tapscript sigops budget (BIP 342): 50 + 50 * witness_weight
         sigops_budget = 50 + witness_weight if is_tapscript else 0
@@ -1124,6 +1128,7 @@ class ScriptInterpreter:
                 # scripts (pre-SegWit context).
                 if (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE) and sig_version == SigVersion.BASE:
                     raise ValueError("CONST_SCRIPTCODE: OP_CODESEPARATOR in non-witness script")
+                script_code_start = i
                 continue
 
             # Signature verification #
@@ -1199,14 +1204,17 @@ class ScriptInterpreter:
                     continue
                 der_sig = sig[:-1]
                 sighash_type = sig[-1]
+                # BIP143/legacy: scriptCode starts at the last executed
+                # OP_CODESEPARATOR (script_code_start=0 if none has run).
+                script_code = script[script_code_start:]
                 try:
                     if is_witness_v0:
                         msg = self._compute_segwit_v0_sighash(
-                            tx, input_index, script_pubkey, witness_amount, sighash_type)
+                            tx, input_index, script_code, witness_amount, sighash_type)
                     else:
                         # FindAndDelete: remove the signature from script
                         # code before hashing (legacy consensus rule).
-                        cleaned = self._find_and_delete(script_pubkey, sig)
+                        cleaned = self._find_and_delete(script_code, sig)
                         msg = self._calculate_signature_hash(
                             tx, input_index, cleaned, sighash_type)
                     ok = self._verify_ecdsa_signature(msg, der_sig, pubkey)
@@ -1275,12 +1283,13 @@ class ScriptInterpreter:
                     raise ValueError("OP_CHECKSIGVERIFY failed")
                 der_sig = sig[:-1]
                 sighash_type = sig[-1]
+                script_code = script[script_code_start:]
                 try:
                     if is_witness_v0:
                         msg = self._compute_segwit_v0_sighash(
-                            tx, input_index, script_pubkey, witness_amount, sighash_type)
+                            tx, input_index, script_code, witness_amount, sighash_type)
                     else:
-                        cleaned = self._find_and_delete(script_pubkey, sig)
+                        cleaned = self._find_and_delete(script_code, sig)
                         msg = self._calculate_signature_hash(
                             tx, input_index, cleaned, sighash_type)
                     if not self._verify_ecdsa_signature(msg, der_sig, pubkey):
@@ -1361,7 +1370,7 @@ class ScriptInterpreter:
                 if (flags & SCRIPT_VERIFY_NULLDUMMY) and dummy:
                     raise ValueError("NULLDUMMY: dummy element is not empty")
                 valid = self._verify_multisig(
-                    sigs, pubkeys, k, tx, input_index, script_pubkey,
+                    sigs, pubkeys, k, tx, input_index, script[script_code_start:],
                     flags, is_witness_v0, witness_amount)
                 if not valid and (flags & SCRIPT_VERIFY_NULLFAIL):
                     for s in sigs:
@@ -1398,7 +1407,7 @@ class ScriptInterpreter:
                 if (flags & SCRIPT_VERIFY_NULLDUMMY) and dummy:
                     raise ValueError("NULLDUMMY: dummy element is not empty")
                 if not self._verify_multisig(
-                    sigs, pubkeys, k, tx, input_index, script_pubkey,
+                    sigs, pubkeys, k, tx, input_index, script[script_code_start:],
                     flags, is_witness_v0, witness_amount):
                     raise ValueError("OP_CHECKMULTISIGVERIFY failed")
                 continue
