@@ -1741,39 +1741,47 @@ class ScriptInterpreter:
 
         try:
             from coincurve import PublicKey
+        except ImportError:
+            return False
+
+        # Invalid pubkeys (malformed encoding, not on curve) must return
+        # False, not propagate.  Bitcoin Core's CPubKey::IsValid() check
+        # does exactly this: CHECKSIG / CHECKMULTISIG get `false` and carry
+        # on.  Counterparty-style fake pubkeys in bare-multisig outputs
+        # rely on this to not wedge verification (block 851204 tx 26).
+        try:
             pk = PublicKey(pubkey)
+        except Exception:
+            return False
+
+        try:
+            if pk.verify(der_sig, message_hash, hasher=None):
+                return True
+        except Exception:
+            pass
+        # Strict DER failed or returned False — try lax parsing
+        # First try without S normalization (preserves original S)
+        compact = self._lax_der_to_compact(der_sig, normalize_s=False)
+        if compact is not None:
             try:
-                if pk.verify(der_sig, message_hash, hasher=None):
+                from coincurve.ecdsa import cdata_to_der, deserialize_compact
+                raw_sig = deserialize_compact(compact)
+                canonical_der = cdata_to_der(raw_sig)
+                if pk.verify(canonical_der, message_hash, hasher=None):
                     return True
             except Exception:
                 pass
-            # Strict DER failed or returned False — try lax parsing
-            # First try without S normalization (preserves original S)
-            compact = self._lax_der_to_compact(der_sig, normalize_s=False)
-            if compact is not None:
-                try:
-                    from coincurve.ecdsa import cdata_to_der, deserialize_compact
-                    raw_sig = deserialize_compact(compact)
-                    canonical_der = cdata_to_der(raw_sig)
-                    if pk.verify(canonical_der, message_hash, hasher=None):
-                        return True
-                except Exception:
-                    pass
-            # Try again with S normalization (for high-S sigs)
-            compact_norm = self._lax_der_to_compact(der_sig, normalize_s=True)
-            if compact_norm is not None and compact_norm != compact:
-                try:
-                    from coincurve.ecdsa import cdata_to_der, deserialize_compact
-                    raw_sig2 = deserialize_compact(compact_norm)
-                    canonical_der2 = cdata_to_der(raw_sig2)
-                    if pk.verify(canonical_der2, message_hash, hasher=None):
-                        return True
-                except Exception:
-                    pass
-            return False
-        except ImportError:
-            pass
-
+        # Try again with S normalization (for high-S sigs)
+        compact_norm = self._lax_der_to_compact(der_sig, normalize_s=True)
+        if compact_norm is not None and compact_norm != compact:
+            try:
+                from coincurve.ecdsa import cdata_to_der, deserialize_compact
+                raw_sig2 = deserialize_compact(compact_norm)
+                canonical_der2 = cdata_to_der(raw_sig2)
+                if pk.verify(canonical_der2, message_hash, hasher=None):
+                    return True
+            except Exception:
+                pass
         return False
 
     def _verify_multisig(
