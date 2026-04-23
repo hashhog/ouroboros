@@ -29,6 +29,14 @@ RPC_PORT="${OURO_RPC_PORT:-8359}"
 P2P_PORT="${OURO_P2P_PORT:-0}"
 LOG="${OURO_LOG:-/data/nvme1/hashhog-mainnet/logs/ouroboros.log}"
 
+# OUROBOROS-CORE-ALIGNMENT-PLAN deploy (plan-w98 soak, 2026-04-23):
+#   OUROBOROS_DISK_BUFFER=1    plan-W96 disk-on-receipt pending store
+#   OUROBOROS_PER_PEER_SCHED=1 plan-W97 per-peer FindNextBlocksToDownload
+# plan-W98 (on-demand Block.deserialize) is unconditional — no flag.
+# Unset these (or edit this file) to revert to legacy round-robin + in-memory buffer.
+export OUROBOROS_DISK_BUFFER="${OUROBOROS_DISK_BUFFER:-1}"
+export OUROBOROS_PER_PEER_SCHED="${OUROBOROS_PER_PEER_SCHED:-1}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
