@@ -186,6 +186,15 @@ class BlockSync:
         self._w77_latency_max_s: float = 0.0
         self._w77_first_request_time: dict[bytes, float] = {}
 
+        # W95 — recent-block-size EMA (MB), used by _handle_timeouts to
+        # scale the general block-download timeout with payload size.
+        # Initialised at 1.0 MB (roughly the mainnet average post-500k);
+        # updated on every received block in handle_block.  Small alpha
+        # keeps the signal smooth — we care about the bulk height
+        # trend, not spikes from individual oversized blocks.
+        self._w95_block_mb_ema: float = 1.0
+        self._w95_block_mb_alpha: float = 0.05
+
         # Track requested transactions (hash -> request_time)
         self._requested_txs: dict[bytes, float] = {}
 
@@ -641,6 +650,16 @@ class BlockSync:
                 logger.error(f"Block payload too short from {peer.host}:{peer.port}")
                 peer.adjust_score(-5)
                 return
+
+            # W95: feed the recent-block-size EMA used by _handle_timeouts.
+            # Do this on every received block (including duplicates we're
+            # about to drop below) so the signal tracks the true payload
+            # distribution rather than just the unique-block subset.
+            block_mb = len(payload) / (1024.0 * 1024.0)
+            self._w95_block_mb_ema = (
+                (1.0 - self._w95_block_mb_alpha) * self._w95_block_mb_ema
+                + self._w95_block_mb_alpha * block_mb
+            )
 
             # Compute block hash from the 80-byte header only.  This matches
             # wire / DB internal byte order used elsewhere in the codebase
@@ -1749,28 +1768,56 @@ class BlockSync:
             self._w77_latency_sum_s = 0.0
             self._w77_latency_max_s = 0.0
 
+    @staticmethod
+    def _w95_compute_general_timeout(avg_mb: float, n_in_flight: int) -> float:
+        """W95: size-aware general-path block-download timeout.
+
+        Extracted so the arithmetic is unit-testable without spinning the
+        full timeout loop.  See `_handle_timeouts` for the tuning rationale
+        and the parameter rollout history (W82 60s uniform → W95 scaled).
+        """
+        W95_BASE_TIMEOUT_S = 20.0
+        W95_PER_MB_S = 30.0
+        W95_PER_IN_FLIGHT_S = 3.0
+        W95_MIN_TIMEOUT = 20.0
+        W95_MAX_TIMEOUT = 240.0
+        mb = max(0.1, avg_mb)
+        t = (
+            W95_BASE_TIMEOUT_S
+            + W95_PER_MB_S * mb
+            + W95_PER_IN_FLIGHT_S * max(0, n_in_flight - 1)
+        )
+        if t < W95_MIN_TIMEOUT:
+            return W95_MIN_TIMEOUT
+        if t > W95_MAX_TIMEOUT:
+            return W95_MAX_TIMEOUT
+        return t
+
     async def _handle_timeouts(self):
         """Re-request blocks that timed out, rotating to a different peer each time."""
         now = time.time()
-        # W82: restored from 20s back to 60s. At post-500k heights blocks grow
-        # to 1-2MB and MAX_BLOCKS_IN_FLIGHT_PER_PEER=16 means a slow peer can
-        # have ~32MB queued; 20s was firing before peers could drain and
-        # causing cascading re-requests (rate halved from 1117 → 580 blk/hr
-        # at height 817k). Long-term fix is size-aware timeout scaling.
-        #
         # W92: split into a tight head-of-window rescue and the general
-        # conservative 60s cap.  The W91 probe showed 98% of drains found
-        # no next-expected block with the buffer holding 150-290 future
+        # timeout path.  The W91 probe showed 98% of drains found no
+        # next-expected block with the buffer holding 150-290 future
         # blocks — the chain-closest slot was held hostage by a slow
         # peer while later blocks piled up.  Rescue the first 8 unfetched
-        # slots at 2s so the drain can advance; penalize peer score
-        # only on the 60s general path (optimistic reroutes aren't a
+        # slots at HEAD_TIMEOUT so the drain can advance; penalize peer
+        # score only on the general path (optimistic reroutes aren't a
         # verdict on peer quality).
-        # 2s matches Bitcoin Core's BLOCK_STALLING_TIMEOUT
-        # (net_processing.cpp).  Tightened from 10s in W94b.
+        # HEAD_TIMEOUT=2s matches Bitcoin Core's BLOCK_STALLING_TIMEOUT
+        # (net_processing.cpp).  Tightened from 10s in W94b (fc63a2f).
+        #
+        # W95: replace the uniform 60s general TIMEOUT with a size-aware
+        # budget.  History: W82 had to restore 60s after a 20s regression
+        # (rate 1117 → 580 blk/hr at h=817k) — big blocks plus saturated
+        # per-peer queues need more time; small blocks don't.  60s is a
+        # one-size-fits-all value that is too lenient for the early chain
+        # (<500k, blocks <100 KB) and still too aggressive for 2 MB blocks
+        # when MAX_BLOCKS_IN_FLIGHT_PER_PEER=16.  Formula below scales
+        # with the recent-payload EMA and the per-peer in-flight count;
+        # clamped to [MIN,MAX] so an outlier block can't wedge the loop.
         HEAD_OF_WINDOW = 8
         HEAD_TIMEOUT = 2.0
-        TIMEOUT = 60.0
 
         head_set: set[bytes] = set()
         for bh, _ in self._validated_headers:
@@ -1780,6 +1827,12 @@ class BlockSync:
             if len(head_set) >= HEAD_OF_WINDOW:
                 break
 
+        # W95: snapshot per-peer in-flight counts before any reassignment
+        # so the timeout scaling uses the true current load, not the
+        # adjusted post-reassignment one recomputed later in this method.
+        peer_load_snapshot: Counter = Counter(self._block_request_peer.values())
+        avg_mb = max(0.1, self._w95_block_mb_ema)
+
         head_timed_out: list[bytes] = []
         general_timed_out: list[bytes] = []
         for block_hash, request_time in self.requested_blocks.items():
@@ -1787,7 +1840,11 @@ class BlockSync:
             if block_hash in head_set:
                 if elapsed > HEAD_TIMEOUT:
                     head_timed_out.append(block_hash)
-            elif elapsed > TIMEOUT:
+                continue
+            req_peer = self._block_request_peer.get(block_hash)
+            n_in_flight = peer_load_snapshot.get(req_peer, 1) if req_peer is not None else 1
+            timeout = self._w95_compute_general_timeout(avg_mb, n_in_flight)
+            if elapsed > timeout:
                 general_timed_out.append(block_hash)
         timed_out = head_timed_out + general_timed_out
 
@@ -1806,9 +1863,9 @@ class BlockSync:
 
         # Penalize each failed peer only ONCE per cycle (not per block).
         # Only peers holding general (60s) timeouts get a score penalty;
-        # head-of-window rescues at 10s are optimistic reroutes, not
-        # verdicts on peer quality — a legitimately-serving peer might
-        # need >10s for a 2 MB block.
+        # head-of-window rescues at HEAD_TIMEOUT (2s) are optimistic
+        # reroutes, not verdicts on peer quality — a legitimately-serving
+        # peer might need >2s to deliver a 2 MB block.
         general_set = set(general_timed_out)
         failed_peers: set[Peer] = set()
         penalize_peers: set[Peer] = set()
@@ -1836,8 +1893,8 @@ class BlockSync:
 
         logger.warning(
             f"{len(timed_out)} block requests timed out "
-            f"(head={len(head_timed_out)}/{len(head_set)}@10s, "
-            f"general={len(general_timed_out)}@60s, "
+            f"(head={len(head_timed_out)}/{len(head_set)}@{HEAD_TIMEOUT:.0f}s, "
+            f"general={len(general_timed_out)} [W95 avg_mb={avg_mb:.2f}], "
             f"failed peers: {len(failed_peers)}, "
             f"penalized: {len(penalize_peers)}, "
             f"available peers: {len(connected_peers)})"
