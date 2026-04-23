@@ -1262,18 +1262,39 @@ class BlockSync:
 
             self._w77_record_connect(next_hash, self._last_tip_advance)
 
+            # plan-W98 interaction: on the Rust fast path `block` is still
+            # None (we validated + connected straight from raw bytes).  The
+            # three consumers below (fee estimator, mempool, zmq publisher)
+            # all want the structured Block, so materialise on demand before
+            # invoking them.  If we're the only consumer left — i.e. nothing
+            # is listening — skip the deserialise entirely and keep the
+            # fast path cheap.
+            #
+            # Guard each consumer with `block is not None` so a pathological
+            # deserialize failure (already logged by `_ensure_block()`) just
+            # skips the consumer rather than crashing the drain loop —
+            # same failure mode as pre-W98 when deserialize raised before
+            # the validate step.
+            needs_block_for_consumers = (
+                self.fee_estimator is not None
+                or self.mempool is not None
+                or self._zmq_publisher is not None
+            )
+            if needs_block_for_consumers and block is None:
+                await _ensure_block()
+
             # Feed fee estimator
-            if self.fee_estimator is not None:
+            if self.fee_estimator is not None and block is not None:
                 try:
                     self.fee_estimator.process_block(block, new_height, self.mempool)
                 except Exception:
                     pass
 
             # Remove confirmed txs from mempool
-            if self.mempool is not None:
+            if self.mempool is not None and block is not None:
                 self.mempool.remove_block_transactions(block)
 
-            if self._zmq_publisher:
+            if self._zmq_publisher and block is not None:
                 self._zmq_publisher.notify_block(block)
 
             # Log progress every 1000 blocks

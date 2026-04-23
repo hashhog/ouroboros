@@ -213,3 +213,41 @@ async def test_fast_path_never_calls_apply_block(
     db.connect_block_from_bytes.assert_called_once()
     bs.validator.apply_block.assert_not_called()
     assert deserialize_counter[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_fast_path_with_mempool_materialises_block_for_removal(
+    rust_sync_patched, deserialize_counter
+):
+    """Regression: 2026-04-23 mainnet crash.  Once `can_skip_scripts_for_block`
+    returned True above the last hard checkpoint (via the assumevalid branch),
+    the Rust fast path started running for all of IBD.  But W98 left `block`
+    as None on the fast path, and `_drain_block_buffer_locked` unconditionally
+    called `self.mempool.remove_block_transactions(block)` — a hot-loop
+    `AttributeError: 'NoneType' object has no attribute 'transactions'`.
+
+    With a mempool attached, the fast path must now materialise the Block
+    before handing off to consumers (one deserialise, memoised).  Without a
+    mempool/fee/zmq consumer, the old zero-deserialize behaviour still holds
+    (pinned by test_rust_fast_path_does_not_deserialize)."""
+    raw, block_hash, header = _load_fixture(770000)
+
+    bs, _db = _make_block_sync(rust_succeeds=True)
+    bs.mempool = MagicMock()
+    bs._validated_headers = [(block_hash, header)]
+    bs._ibd_block_buffer[block_hash] = (None, raw)
+
+    connected = await bs._drain_block_buffer_locked()
+
+    assert connected == 1
+    assert deserialize_counter[0] == 1, (
+        "fast path must materialise Block exactly once when a mempool "
+        "consumer is attached (so remove_block_transactions can walk "
+        f"block.transactions); got {deserialize_counter[0]} call(s)"
+    )
+    bs.mempool.remove_block_transactions.assert_called_once()
+    (called_block,) = bs.mempool.remove_block_transactions.call_args.args
+    assert called_block is not None, (
+        "remove_block_transactions received a None block — the crash "
+        "observed on mainnet 2026-04-23 post-assumevalid-fix"
+    )
