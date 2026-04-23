@@ -87,6 +87,17 @@ def _record_cross_check(
 # the full 20s timeout window.
 MAX_BLOCKS_IN_FLIGHT_PER_PEER = 16
 
+# plan-W97 — Bitcoin Core net_processing.cpp: BLOCK_DOWNLOAD_WINDOW = 1024.
+# Per-peer FindNextBlocksToDownload walks the validated header chain
+# forward from the connected tip and stops at tip + this window.  Blocks
+# beyond the window are not asked for even if peers have capacity — Core
+# uses the window to bound the disk/memory pressure of out-of-order
+# arrivals.  Intended to replace the legacy `_max_blocks_in_flight=256`
+# global cap, which was a global in-flight cap rather than a lookahead
+# cap (semantically different — 256 in-flight is well below the 1024
+# lookahead).
+BLOCK_DOWNLOAD_WINDOW = 1024
+
 from ouroboros.database import Block, BlockchainDatabase, Transaction
 from ouroboros.p2p_messages import (
     INV_TYPE_BLOCK,
@@ -142,6 +153,95 @@ def _distribute_blocks_round_robin(
             # All candidates at cap — stop trying further items this round.
             break
     return per_peer, assigned
+
+
+def _find_next_blocks_per_peer(
+    validated_headers: list,
+    tip_idx: int,
+    window: int,
+    peers: list,
+    peer_load: dict,
+    max_per_peer: int,
+    requested_blocks,
+    is_on_disk=None,
+) -> dict:
+    """plan-W97 — per-peer chain-walk block assignment, FindNextBlocksToDownload analog.
+
+    Models Bitcoin Core's `FindNextBlocksToDownload` in
+    `src/net_processing.cpp`.  For each peer (in caller-supplied order),
+    walk the validated header chain forward from `tip_idx + 1` and assign
+    up to that peer's remaining capacity (`max_per_peer - peer_load[p]`).
+
+    Key differences vs `_distribute_blocks_round_robin`:
+    - Contiguous chunks, not interleaved: peer A gets blocks [tip+1..tip+capA],
+      peer B gets [tip+capA+1..tip+capA+capB], etc.  Callers that want
+      a specific peer to receive the head-of-window should sort `peers`
+      accordingly (the W92 score-sort pattern still applies).
+    - Window-bounded: walk stops at `tip_idx + window`.  Core's
+      `BLOCK_DOWNLOAD_WINDOW = 1024` prevents a single peer from
+      requesting blocks far ahead of the connected tip, bounding the
+      out-of-order arrival set that any buffer (RAM or disk) must hold.
+    - Capacity-based: fast peers receive more blocks over time because
+      they clear their in-flight slots sooner.  No round-robin shuffling.
+
+    Args:
+        validated_headers: ordered list of `(hash, header)` tuples — the
+            same structure `BlockSync._validated_headers` maintains.
+        tip_idx: index of the last header already persisted to the DB.
+            Use `-1` if nothing is connected yet.  Walk starts at
+            `tip_idx + 1`.
+        window: lookahead cap from the connected tip (Core's 1024).
+        peers: candidate peers in caller-chosen order (priority first).
+        peer_load: current in-flight request count per peer.  Mutated in
+            place so callers chaining additional passes see the updated
+            counts (matches `_distribute_blocks_round_robin` contract).
+        max_per_peer: `MAX_BLOCKS_IN_FLIGHT_PER_PEER` (16 in Core).
+        requested_blocks: container supporting `in` — hashes currently
+            in-flight from any peer (so we don't duplicate-request).
+            Accepts a `dict` or `set`.
+        is_on_disk: optional callable `(hash) -> bool` returning True if
+            the block has already been received and is awaiting drain.
+            Used with the plan-W96 disk-on-receipt buffer or the legacy
+            in-memory buffer — either way, re-requesting would waste
+            bandwidth.  Defaults to "nothing on disk".
+
+    Returns:
+        ``{peer: [block_hash, ...]}`` — every input peer is a key, with
+        possibly empty lists.  Callers iterate and dispatch via getdata.
+    """
+    per_peer: dict = {p: [] for p in peers}
+    if not peers or not validated_headers:
+        return per_peer
+    if is_on_disk is None:
+        is_on_disk = _FALSE_PRED
+    start = tip_idx + 1
+    end = min(tip_idx + 1 + window, len(validated_headers))
+    if start >= end:
+        return per_peer
+    assigned_this_pass: set = set()
+    for peer in peers:
+        capacity = max_per_peer - peer_load.get(peer, 0)
+        if capacity <= 0:
+            continue
+        for i in range(start, end):
+            block_hash, _ = validated_headers[i]
+            if block_hash in requested_blocks:
+                continue
+            if block_hash in assigned_this_pass:
+                continue
+            if is_on_disk(block_hash):
+                continue
+            per_peer[peer].append(block_hash)
+            assigned_this_pass.add(block_hash)
+            peer_load[peer] = peer_load.get(peer, 0) + 1
+            capacity -= 1
+            if capacity == 0:
+                break
+    return per_peer
+
+
+def _FALSE_PRED(_h):  # noqa: N802 — default for is_on_disk
+    return False
 
 
 class BlockSync:
@@ -257,6 +357,25 @@ class BlockSync:
                 "(pending blocks dir: %s, recovered %d pending)",
                 self.db.pending_blocks._dir,
                 len(self.db.pending_blocks),
+            )
+
+        # plan-W97 — per-peer FindNextBlocksToDownload scheduler.  When
+        # OUROBOROS_PER_PEER_SCHED=1, the primary request path uses a
+        # contiguous per-peer chain walk (Core's design) in place of the
+        # round-robin + score-sort path (W92).  Off-by-default during
+        # soak; the reassign/timeout path is unaffected and still uses
+        # round-robin until a later cleanup wave deletes the legacy
+        # scheduler after the W96 disk buffer has validated in
+        # production.
+        self._use_per_peer_sched: bool = (
+            os.environ.get("OUROBOROS_PER_PEER_SCHED") == "1"
+        )
+        if self._use_per_peer_sched:
+            logger.info(
+                "plan-W97: per-peer FindNextBlocksToDownload scheduler ENABLED "
+                "(BLOCK_DOWNLOAD_WINDOW=%d, MAX_BLOCKS_IN_FLIGHT_PER_PEER=%d)",
+                BLOCK_DOWNLOAD_WINDOW,
+                MAX_BLOCKS_IN_FLIGHT_PER_PEER,
             )
 
         # Drain-loop stage timings (W60 B0, promoted to W76-PHASE cross-
@@ -1277,6 +1396,10 @@ class BlockSync:
         DB.  This ensures blocks arrive roughly in order and can chain
         sequentially, avoiding orphan cascades.
         """
+        if self._use_per_peer_sched:
+            await self._request_next_blocks_per_peer()
+            return
+
         if not self._validated_headers:
             return
 
@@ -1378,6 +1501,103 @@ class BlockSync:
             f"Requested {len(assigned)} blocks (tip+{start}, "
             f"in-flight: {in_flight}+{len(assigned)}/{self._max_blocks_in_flight}"
             f"{extra})"
+        )
+
+    async def _request_next_blocks_per_peer(self) -> None:
+        """plan-W97 — per-peer FindNextBlocksToDownload dispatch.
+
+        Alternative to the legacy round-robin `_request_next_blocks`.  Walks
+        the validated header chain forward from the connected tip and hands
+        each peer a contiguous chunk sized to its remaining capacity
+        (`MAX_BLOCKS_IN_FLIGHT_PER_PEER - in_flight_from_peer`), bounded by
+        `BLOCK_DOWNLOAD_WINDOW`.  Mirrors Bitcoin Core's
+        `FindNextBlocksToDownload` in `src/net_processing.cpp`.
+
+        Preserves the W92 score-sort (highest-score peer first in the peer
+        list) so the head-of-window always goes to the most reliable peer.
+        Drops the W93 buffer-pressure throttle from this path: with the
+        W96 disk buffer the RAM buffer cannot wedge, and with the window
+        cap (1024) the number of out-of-order blocks a single peer can
+        accumulate is already bounded.
+        """
+        if not self._validated_headers:
+            return
+
+        network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
+
+        tip_idx = -1
+        for i, (bh, _) in enumerate(self._validated_headers):
+            if self.db.has_block_hash(bh):
+                tip_idx = i
+            else:
+                break
+
+        if hasattr(self.peer_manager, 'get_all_ready_peers'):
+            peers = [p for p in self.peer_manager.get_all_ready_peers()
+                     if isinstance(p, Peer) and p.is_connected()]
+        else:
+            peers = []
+        if not peers:
+            return
+
+        # Highest-score peer first so contiguous head-of-window goes to
+        # the most reliable peer (W92 carry-over).  Core doesn't need
+        # this because it disconnects misbehaving peers faster; our
+        # score is more forgiving.
+        peers.sort(key=lambda p: -getattr(p, 'score', 100))
+
+        peer_load = Counter(self._block_request_peer.values())
+
+        if self._use_disk_buffer:
+            is_on_disk = self.db.pending_blocks.has
+        else:
+            # Legacy path: blocks received but not yet drained live in the
+            # in-memory buffer.  Avoid re-requesting them.
+            ibd_buf = self._ibd_block_buffer
+            is_on_disk = ibd_buf.__contains__
+
+        assignment = _find_next_blocks_per_peer(
+            validated_headers=self._validated_headers,
+            tip_idx=tip_idx,
+            window=BLOCK_DOWNLOAD_WINDOW,
+            peers=peers,
+            peer_load=peer_load,
+            max_per_peer=MAX_BLOCKS_IN_FLIGHT_PER_PEER,
+            requested_blocks=self.requested_blocks,
+            is_on_disk=is_on_disk,
+        )
+
+        total = sum(len(v) for v in assignment.values())
+        if total == 0:
+            return
+
+        now = time.time()
+        peers_with_work = 0
+        for peer, hashes in assignment.items():
+            if not hashes:
+                continue
+            peers_with_work += 1
+            try:
+                inventory = [(MSG_WITNESS_BLOCK, bh) for bh in hashes]
+                getdata = GetDataMessage(inventory=inventory)
+                await peer.send_message(getdata.to_network_message(network))
+                for bh in hashes:
+                    self.requested_blocks[bh] = now
+                    self._block_request_peer[bh] = peer
+                    self._w77_first_request_time.setdefault(bh, now)
+            except Exception as e:
+                logger.error(
+                    f"Failed to send getdata to {peer.host}:{peer.port}: {e}"
+                )
+                peer.adjust_score(-2)
+                for bh in hashes:
+                    self.requested_blocks.pop(bh, None)
+                    self._block_request_peer.pop(bh, None)
+
+        logger.info(
+            f"[W97] Requested {total} blocks across {peers_with_work} peers "
+            f"(tip+{tip_idx + 1}, window={BLOCK_DOWNLOAD_WINDOW}, "
+            f"in-flight={len(self.requested_blocks)})"
         )
 
     def _prune_validated_headers(self):
