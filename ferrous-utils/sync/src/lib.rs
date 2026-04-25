@@ -2697,7 +2697,7 @@ impl PyBlockchainDB {
     /// Existence probe for a block by hash. Cheap alternative to `get_block`
     /// when the caller only needs a truthy/falsy answer: no block body is
     /// deserialized and no `PyBlock` is constructed.
-    fn has_block_hash(&self, block_hash: &[u8]) -> PyResult<bool> {
+    fn has_block_hash(&self, py: Python<'_>, block_hash: &[u8]) -> PyResult<bool> {
         if block_hash.len() != 32 {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "Block hash must be 32 bytes"
@@ -2707,10 +2707,19 @@ impl PyBlockchainDB {
         let mut hash_bytes = [0u8; 32];
         hash_bytes.copy_from_slice(block_hash);
 
-        self.db.has_block_hash(&hash_bytes).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Database error: {}", e)
-            )
+        // Release the GIL while the RocksDB read happens. Called per-header
+        // inside block_sync.py::_drain_block_buffer_locked (hundreds of
+        // calls per drain). Without this, a write-stalled RocksDB freezes
+        // the entire asyncio event loop for seconds, producing the
+        // recv-keeps-growing-while-val_rej/buf/dup-flat wedge that has
+        // required a manual restart ~2×/day.
+        let db = Arc::clone(&self.db);
+        py.detach(move || {
+            db.has_block_hash(&hash_bytes).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Database error: {}", e)
+                )
+            })
         })
     }
 
@@ -3504,13 +3513,19 @@ impl PyBlockchainDB {
     }
 
     /// Get best block (chain tip)
-    fn get_best_block(&self) -> PyResult<(Vec<u8>, u32)> {
-        match self.db.get_best_block() {
-            Ok((hash, height)) => Ok((hash.to_vec(), height)),
-            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Database error: {}", e)
-            )),
-        }
+    fn get_best_block(&self, py: Python<'_>) -> PyResult<(Vec<u8>, u32)> {
+        // Release the GIL during the RocksDB read; same reasoning as
+        // has_block_hash above. Called once per drain in block_sync.py
+        // alongside the per-header has_block_hash loop.
+        let db = Arc::clone(&self.db);
+        py.detach(move || {
+            match db.get_best_block() {
+                Ok((hash, height)) => Ok((hash.to_vec(), height)),
+                Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Database error: {}", e)
+                )),
+            }
+        })
     }
 
     /// Update the best block (chain tip). Used during reorg.
