@@ -9,6 +9,7 @@ Supports SOCKS5 proxy connections for Tor (.onion) and general proxying.
 import asyncio
 import hashlib
 import logging
+import os
 import random
 import struct
 import time
@@ -605,9 +606,16 @@ class Peer:
     async def _negotiate_v2(self) -> None:
         """Drive the outbound BIP 324 v2 ElligatorSwift handshake.
 
-        Wire layout (initiator side):
-            ->  64 bytes ElligatorSwift-encoded ephemeral pubkey
-            <-  64 bytes ElligatorSwift-encoded ephemeral pubkey
+        Wire layout (initiator side, per BIP 324 § "Wire format" and
+        ``bitcoin-core/src/net.cpp`` V2Transport state machine):
+
+            ->  64 bytes ElligatorSwift pubkey || sent_garbage (0..N bytes)
+            <-  64 bytes ElligatorSwift pubkey || recv_garbage  (0..MAX_GARBAGE_LEN bytes)
+            ->  send_garbage_terminator (16) || version-packet (AAD = sent_garbage)
+            <-  recv_garbage_terminator (16) || decoy*+version-packet (first AEAD AAD = recv_garbage)
+
+        We then transition to the application phase; subsequent packets
+        carry empty AAD on both directions.
 
         v1 fallback heuristic: peek the first 4 bytes of the response.
         A v1-only peer that received our 64 bytes will either disconnect
@@ -617,25 +625,43 @@ class Peer:
         so the caller can mark this address v1-only and reconnect.
 
         Mirrors Bitcoin Core ``V2Transport`` initiator behaviour
-        (net.cpp:1555 ShouldReconnectV1).
+        (net.cpp:989 StartSendingHandshake; net.cpp:1143 ProcessReceivedKeyBytes;
+        net.cpp:1180 ProcessReceivedGarbageBytes; BIP-324 spec section
+        "Overall handshake pseudocode").
         """
         if not self.reader or not self.writer:
             raise V2NegotiationFailed("Not connected")
 
-        handshake = V2Handshake(initiator=True)
+        from ouroboros.transport_v2 import (
+            CHACHA20POLY1305_EXPANSION,
+            GARBAGE_TERMINATOR_LEN,
+            HEADER_LEN,
+            LENGTH_FIELD_LEN,
+            MAX_GARBAGE_LEN,
+        )
 
-        # Send our 64-byte ElligatorSwift public key
+        handshake = V2Handshake(initiator=True, network=self.network)
+
+        # Generate small random garbage to send after our ellswift pubkey.
+        # Spec allows 0..MAX_GARBAGE_LEN; Core picks uniform-random in that
+        # full range, but a small bound (0..32) keeps the wire-overhead
+        # minimal while still proving we exercise the AAD-binding path.
+        sent_garbage = os.urandom(random.randint(0, 32))
+
+        # 1. Send 64-byte ellswift pubkey + garbage in a single write.
         try:
-            self.writer.write(handshake.local_pubkey_bytes)
+            self.writer.write(handshake.local_pubkey_bytes + sent_garbage)
             await self.writer.drain()
         except (ConnectionResetError, BrokenPipeError, OSError) as e:
             raise V2NegotiationFailed(
-                f"write failed during v2 send: {e}"
+                f"write failed during v2 ellswift+garbage send: {e}"
             ) from e
 
-        # Read first 4 bytes with a short timeout; we use this to fail
+        # 2. Read first 4 bytes with a short timeout; we use this to fail
         # fast against v1-only peers that respond with a v1 header
-        # (network magic) instead of an ElligatorSwift pubkey.
+        # (network magic) instead of an ElligatorSwift pubkey.  The peer's
+        # 64-byte ellswift is uniformly random, so a coincidental match
+        # against the 4-byte network magic happens with probability 2^-32.
         expected_magic = get_magic(self.network).to_bytes(4, "little")
         try:
             head = await asyncio.wait_for(
@@ -653,7 +679,7 @@ class Peer:
                 "peer replied with v1 network magic — speaks v1 only"
             )
 
-        # Read the remaining 60 bytes of the ElligatorSwift response.
+        # 3. Read the remaining 60 bytes of the ElligatorSwift response.
         try:
             tail = await asyncio.wait_for(
                 self.reader.readexactly(60),
@@ -673,8 +699,109 @@ class Peer:
             raise V2NegotiationFailed(
                 f"v2 key derivation failed: {e}"
             ) from e
+
+        # 4. Send the garbage terminator + version packet (empty contents,
+        # AAD = sent_garbage).  We bundle them in one write so the peer
+        # can decode in a single pass, matching Core net.cpp:1159-1173.
+        send_term = self._v2_transport.send_garbage_terminator
+        version_packet = self._v2_transport.encrypt_message(
+            b"", aad=sent_garbage
+        )
+        try:
+            self.writer.write(send_term + version_packet)
+            await self.writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            raise V2NegotiationFailed(
+                f"write failed during v2 terminator+version send: {e}"
+            ) from e
+
+        # 5. Scan incoming bytes for the recv_garbage_terminator.  Bound
+        # the scan at MAX_GARBAGE_LEN + 16 — Core treats the absence of a
+        # terminator within that window as a protocol violation and
+        # disconnects (net.cpp:1192 ProcessReceivedGarbageBytes).
+        recv_term = self._v2_transport.recv_garbage_terminator
+        recv_garbage = b""
+        try:
+            # Read the first 16 bytes (smallest case: zero-length garbage,
+            # peer sent the terminator immediately).
+            window = await asyncio.wait_for(
+                self.reader.readexactly(GARBAGE_TERMINATOR_LEN),
+                timeout=10.0,
+            )
+            while True:
+                if window[-GARBAGE_TERMINATOR_LEN:] == recv_term:
+                    recv_garbage = window[:-GARBAGE_TERMINATOR_LEN]
+                    break
+                if len(window) >= MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN:
+                    raise V2NegotiationFailed(
+                        f"recv_garbage_terminator not seen within "
+                        f"{MAX_GARBAGE_LEN} bytes — protocol violation"
+                    )
+                # Slide the window forward one byte and look again.  Core
+                # also processes one byte at a time here (net.cpp:1297
+                # GetMaxBytesToProcess returns 1 in GARB_GARBTERM state)
+                # because the terminator may begin at any offset.
+                next_byte = await asyncio.wait_for(
+                    self.reader.readexactly(1),
+                    timeout=10.0,
+                )
+                window += next_byte
+        except (asyncio.IncompleteReadError, ConnectionResetError,
+                BrokenPipeError, OSError, TimeoutError) as e:
+            raise V2NegotiationFailed(
+                f"v2 garbage-terminator scan failed: {e}"
+            ) from e
+
+        # 6. Drain incoming AEAD packets until we receive a non-decoy
+        # packet (the peer's version packet).  The first decryption uses
+        # AAD = recv_garbage; all subsequent decryptions during this drain
+        # use empty AAD (Core net.cpp:1243 ClearShrink(m_recv_aad) after
+        # the first successful decrypt — even decoys clear it).
+        next_aad: bytes = recv_garbage
+        try:
+            for _attempt in range(1024):  # generous decoy bound
+                enc_length = await asyncio.wait_for(
+                    self.reader.readexactly(LENGTH_FIELD_LEN),
+                    timeout=10.0,
+                )
+                contents_len = self._v2_transport.decrypt_length(enc_length)
+                if contents_len > 32 * 1024 * 1024:
+                    raise V2NegotiationFailed(
+                        f"v2 version-phase packet too large: {contents_len}"
+                    )
+                aead_len = HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
+                aead_ct = await asyncio.wait_for(
+                    self.reader.readexactly(aead_len),
+                    timeout=10.0,
+                )
+                _payload, is_decoy = self._v2_transport.decrypt_contents(
+                    aead_ct, contents_len, aad=next_aad
+                )
+                # AAD is consumed by the first decrypt regardless of decoy.
+                next_aad = b""
+                if not is_decoy:
+                    # Version packet contents are reserved for future
+                    # extensions; Core currently ignores them entirely.
+                    break
+            else:  # pragma: no cover — we'd never see 1024 decoys in practice
+                raise V2NegotiationFailed(
+                    "v2 version drain exceeded 1024 decoy packets"
+                )
+        except V2NegotiationFailed:
+            raise
+        except (asyncio.IncompleteReadError, ConnectionResetError,
+                BrokenPipeError, OSError, TimeoutError) as e:
+            raise V2NegotiationFailed(
+                f"v2 version-packet drain failed: {e}"
+            ) from e
+        except Exception as e:
+            raise V2NegotiationFailed(
+                f"v2 version-packet decrypt failed: {e}"
+            ) from e
+
         logger.info(
-            f"BIP 324 v2 transport established with {self.host}:{self.port}"
+            f"BIP 324 v2 transport established with {self.host}:{self.port} "
+            f"(sent_garbage={len(sent_garbage)}B, recv_garbage={len(recv_garbage)}B)"
         )
 
     async def _handshake(self, start_height: int):

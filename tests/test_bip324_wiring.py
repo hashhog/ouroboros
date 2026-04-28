@@ -61,24 +61,58 @@ def _free_port() -> int:
 
 @pytest.mark.asyncio
 async def test_negotiate_v2_happy_path():
-    """Two ouroboros peers exchanging 64-byte ElligatorSwift pubkeys
-    successfully derive matching session keys."""
+    """Two ouroboros peers exchanging the full BIP 324 handshake
+    (ellswift pubkey + garbage + terminator + version packet) on both
+    sides successfully derive matching session keys."""
+    import os as _os
+    from ouroboros.transport_v2 import (
+        CHACHA20POLY1305_EXPANSION,
+        GARBAGE_TERMINATOR_LEN,
+        HEADER_LEN,
+        LENGTH_FIELD_LEN,
+    )
+
     port = _free_port()
     server_handshake_done = asyncio.Event()
     server_session: dict = {}
 
     async def server_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        # Read 64 bytes of initiator's ElligatorSwift pubkey
+        # 1. Read the initiator's 64-byte ellswift pubkey first.
         peer_pub = await reader.readexactly(64)
-        # Send our 64-byte ElligatorSwift response as a "responder" handshake
-        responder = V2Handshake(initiator=False)
-        writer.write(responder.local_pubkey_bytes)
+        responder = V2Handshake(initiator=False, network="regtest")
+        # 2. Send our 64-byte ellswift response + (zero-length) garbage.
+        server_garbage = b""
+        writer.write(responder.local_pubkey_bytes + server_garbage)
         await writer.drain()
+        # 3. Now we know the shared secret; build the cipher.
         responder.receive_remote_pubkey(peer_pub)
-        server_session["transport"] = V2Transport.from_handshake(responder)
+        server_t = V2Transport.from_handshake(responder)
+        server_session["transport"] = server_t
+        # 4. Send our garbage terminator + version packet (AAD = our garbage).
+        version_packet = server_t.encrypt_message(b"", aad=server_garbage)
+        writer.write(server_t.send_garbage_terminator + version_packet)
+        await writer.drain()
+        # 5. Scan incoming bytes for the initiator's recv_garbage_terminator
+        # (== our send_garbage_terminator from the server's view? no — from
+        # the responder's perspective, recv == initiator_terminator).  We
+        # mirror the initiator's drain logic in miniature here.
+        recv_term = server_t.recv_garbage_terminator
+        window = await reader.readexactly(GARBAGE_TERMINATOR_LEN)
+        for _ in range(4096):
+            if window[-GARBAGE_TERMINATOR_LEN:] == recv_term:
+                break
+            window += await reader.readexactly(1)
+        recv_garbage = window[:-GARBAGE_TERMINATOR_LEN]
+        # 6. Read and decrypt one packet (the initiator's version packet).
+        enc_len = await reader.readexactly(LENGTH_FIELD_LEN)
+        contents_len = server_t.decrypt_length(enc_len)
+        body = await reader.readexactly(
+            HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
+        )
+        server_t.decrypt_contents(body, contents_len, aad=recv_garbage)
         server_handshake_done.set()
-        # Hold the connection open briefly so the client can finish
-        await asyncio.sleep(0.5)
+        # Hold the connection open briefly so the client can finish.
+        await asyncio.sleep(0.2)
         writer.close()
         try:
             await writer.wait_closed()
@@ -92,7 +126,7 @@ async def test_negotiate_v2_happy_path():
             "127.0.0.1", port
         )
         await peer._negotiate_v2()
-        await server_handshake_done.wait()
+        await asyncio.wait_for(server_handshake_done.wait(), timeout=5.0)
         assert peer._v2_transport is not None, "client transport not set"
         assert server_session["transport"] is not None, "server transport not set"
         assert not peer.v2_negotiation_failed
@@ -105,6 +139,7 @@ async def test_negotiate_v2_happy_path():
     finally:
         server.close()
         await server.wait_closed()
+    _ = _os  # silence unused-import warning
 
 
 # ── _negotiate_v2: peer replies with v1 magic ───────────────────────────
@@ -390,8 +425,8 @@ async def test_v2_self_consistent_message_roundtrip():
     from ouroboros.p2p_messages import NetworkMessage, PingMessage
 
     # Both sides do a synchronous in-memory handshake.
-    initiator = V2Handshake(initiator=True)
-    responder = V2Handshake(initiator=False)
+    initiator = V2Handshake(initiator=True, network="regtest")
+    responder = V2Handshake(initiator=False, network="regtest")
     initiator.receive_remote_pubkey(responder.local_pubkey_bytes)
     responder.receive_remote_pubkey(initiator.local_pubkey_bytes)
     i_transport = V2Transport.from_handshake(initiator)
@@ -456,8 +491,8 @@ def test_cipher_handshake_session_key_symmetry():
     ECDH (so it could pass Bitcoin Core's bip324_tests.cpp packet
     vectors) this test would still hold.
     """
-    initiator = V2Handshake(initiator=True)
-    responder = V2Handshake(initiator=False)
+    initiator = V2Handshake(initiator=True, network="regtest")
+    responder = V2Handshake(initiator=False, network="regtest")
     initiator.receive_remote_pubkey(responder.local_pubkey_bytes)
     responder.receive_remote_pubkey(initiator.local_pubkey_bytes)
     i_send, i_recv = initiator.derive_session_keys()
@@ -466,6 +501,198 @@ def test_cipher_handshake_session_key_symmetry():
     assert i_recv == r_send, "initiator recv-key must match responder send-key"
     assert len(i_send) == 32
     assert len(i_recv) == 32
+
+
+# ── BIP 324 garbage-exchange wire layer ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_negotiate_v2_handles_nonempty_recv_garbage():
+    """Server sends a non-empty garbage chunk (47 bytes) before its
+    terminator + version packet.  The initiator must scan past the
+    garbage, locate the terminator, and decrypt the version packet
+    using the received garbage as AAD."""
+    import os as _os
+    from ouroboros.transport_v2 import (
+        CHACHA20POLY1305_EXPANSION,
+        GARBAGE_TERMINATOR_LEN,
+        HEADER_LEN,
+        LENGTH_FIELD_LEN,
+    )
+
+    port = _free_port()
+    server_done = asyncio.Event()
+    server_session: dict = {}
+
+    async def server_handler(reader, writer):
+        peer_pub = await reader.readexactly(64)
+        responder = V2Handshake(initiator=False, network="regtest")
+        # 47-byte non-empty garbage stresses the byte-by-byte scan loop.
+        server_garbage = _os.urandom(47)
+        writer.write(responder.local_pubkey_bytes + server_garbage)
+        await writer.drain()
+        responder.receive_remote_pubkey(peer_pub)
+        server_t = V2Transport.from_handshake(responder)
+        server_session["transport"] = server_t
+        version_packet = server_t.encrypt_message(b"", aad=server_garbage)
+        writer.write(server_t.send_garbage_terminator + version_packet)
+        await writer.drain()
+
+        # Read initiator's terminator + version packet on the server side.
+        recv_term = server_t.recv_garbage_terminator
+        window = await reader.readexactly(GARBAGE_TERMINATOR_LEN)
+        for _ in range(4096):
+            if window[-GARBAGE_TERMINATOR_LEN:] == recv_term:
+                break
+            window += await reader.readexactly(1)
+        recv_garbage = window[:-GARBAGE_TERMINATOR_LEN]
+        enc_len = await reader.readexactly(LENGTH_FIELD_LEN)
+        contents_len = server_t.decrypt_length(enc_len)
+        body = await reader.readexactly(
+            HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
+        )
+        server_t.decrypt_contents(body, contents_len, aad=recv_garbage)
+        server_done.set()
+        await asyncio.sleep(0.1)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    server = await asyncio.start_server(server_handler, "127.0.0.1", port)
+    try:
+        peer = Peer("127.0.0.1", port, "regtest", transport_version=2)
+        peer.reader, peer.writer = await asyncio.open_connection(
+            "127.0.0.1", port
+        )
+        await peer._negotiate_v2()
+        await asyncio.wait_for(server_done.wait(), timeout=5.0)
+        assert peer._v2_transport is not None
+        # Ciphers stayed in lock-step despite the 47-byte garbage chunk
+        # and the version-packet AAD binding.
+        client = peer._v2_transport
+        server_t = server_session["transport"]
+        assert client.send_cipher.key == server_t.recv_cipher.key
+        assert client.recv_cipher.key == server_t.send_cipher.key
+        peer.writer.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_negotiate_v2_drops_decoy_packets_before_version():
+    """Server inserts 3 decoy packets between its garbage terminator
+    and its (real) version packet.  The initiator must drop the decoys
+    and decrypt the version packet, with AAD = received garbage on the
+    very first decryption only.  Mirrors Bitcoin Core net.cpp:1243
+    (m_recv_aad cleared after first successful decrypt, regardless of
+    whether the decrypted packet was a decoy)."""
+    from ouroboros.transport_v2 import (
+        CHACHA20POLY1305_EXPANSION,
+        GARBAGE_TERMINATOR_LEN,
+        HEADER_LEN,
+        LENGTH_FIELD_LEN,
+    )
+
+    port = _free_port()
+    server_done = asyncio.Event()
+
+    async def server_handler(reader, writer):
+        peer_pub = await reader.readexactly(64)
+        responder = V2Handshake(initiator=False, network="regtest")
+        server_garbage = b"hello-garbage"
+        writer.write(responder.local_pubkey_bytes + server_garbage)
+        await writer.drain()
+        responder.receive_remote_pubkey(peer_pub)
+        server_t = V2Transport.from_handshake(responder)
+        # Send terminator, then 3 decoys (first decoy uses AAD = garbage,
+        # next two use empty AAD), then the real version packet (also
+        # empty AAD).
+        out = server_t.send_garbage_terminator
+        out += server_t.encrypt_message(b"\x00" * 7, aad=server_garbage, decoy=True)
+        out += server_t.encrypt_message(b"\x00" * 3, aad=b"", decoy=True)
+        out += server_t.encrypt_message(b"\x00" * 11, aad=b"", decoy=True)
+        out += server_t.encrypt_message(b"", aad=b"")  # the version packet
+        writer.write(out)
+        await writer.drain()
+
+        # Mirror initiator-side drain.
+        recv_term = server_t.recv_garbage_terminator
+        window = await reader.readexactly(GARBAGE_TERMINATOR_LEN)
+        for _ in range(4096):
+            if window[-GARBAGE_TERMINATOR_LEN:] == recv_term:
+                break
+            window += await reader.readexactly(1)
+        recv_garbage = window[:-GARBAGE_TERMINATOR_LEN]
+        enc_len = await reader.readexactly(LENGTH_FIELD_LEN)
+        contents_len = server_t.decrypt_length(enc_len)
+        body = await reader.readexactly(
+            HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
+        )
+        server_t.decrypt_contents(body, contents_len, aad=recv_garbage)
+        server_done.set()
+        await asyncio.sleep(0.1)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    server = await asyncio.start_server(server_handler, "127.0.0.1", port)
+    try:
+        peer = Peer("127.0.0.1", port, "regtest", transport_version=2)
+        peer.reader, peer.writer = await asyncio.open_connection(
+            "127.0.0.1", port
+        )
+        await peer._negotiate_v2()
+        await asyncio.wait_for(server_done.wait(), timeout=5.0)
+        assert peer._v2_transport is not None
+        peer.writer.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_negotiate_v2_aborts_on_missing_garbage_terminator():
+    """A peer that never sends a recv_garbage_terminator within
+    MAX_GARBAGE_LEN bytes triggers ``V2NegotiationFailed``.  Matches
+    Bitcoin Core's GARB_GARBTERM abort (net.cpp:1192)."""
+    port = _free_port()
+
+    async def server_handler(reader, writer):
+        await reader.readexactly(64)
+        responder = V2Handshake(initiator=False, network="regtest")
+        # Send pubkey, then 4096 bytes of /dev/urandom-style noise that
+        # is exceedingly unlikely to contain the (random, derived)
+        # 16-byte send_garbage_terminator.  Receiver should give up
+        # after MAX_GARBAGE_LEN (4095) bytes.
+        writer.write(responder.local_pubkey_bytes)
+        # 4112 = 4096 garbage + 16 fake-terminator suffix that won't match.
+        writer.write(b"\xaa" * 4112)
+        await writer.drain()
+        await asyncio.sleep(0.5)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    server = await asyncio.start_server(server_handler, "127.0.0.1", port)
+    try:
+        peer = Peer("127.0.0.1", port, "regtest", transport_version=2)
+        peer.reader, peer.writer = await asyncio.open_connection(
+            "127.0.0.1", port
+        )
+        with pytest.raises(V2NegotiationFailed) as exc:
+            await peer._negotiate_v2()
+        assert "garbage" in str(exc.value).lower()
+        peer.writer.close()
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 if __name__ == "__main__":
