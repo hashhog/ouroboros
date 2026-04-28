@@ -948,33 +948,58 @@ class Peer:
         return NetworkMessage(command=command, payload=payload, magic=magic)
 
     async def _receive_v2_message(self, timeout: float) -> NetworkMessage:
-        """Receive and decrypt a BIP 324 v2 message."""
+        """Receive and decrypt a BIP 324 v2 packet.
+
+        Wire layout per BIP 324 (bitcoin-core/src/bip324.h):
+          enc_length         3 bytes (FSChaCha20-encrypted u24, no auth tag)
+          ciphertext         1 byte header + contents + 16-byte Poly1305 tag
+
+        Decoy packets (header byte high bit set) are silently dropped and
+        the read loops to the next packet.
+        """
+        from ouroboros.transport_v2 import (
+            CHACHA20POLY1305_EXPANSION,
+            HEADER_LEN,
+            LENGTH_FIELD_LEN,
+        )
+
         wire_bytes_this_call = 0
         while True:
-            # Read the encrypted length field (3 bytes + 16-byte Poly1305 tag)
+            # Read the 3-byte encrypted length prefix (no auth tag — the
+            # length cipher is plain FSChaCha20, not AEAD; the contents
+            # cipher's Poly1305 covers the body).
             enc_length = await asyncio.wait_for(
-                self.reader.readexactly(3 + 16),
+                self.reader.readexactly(LENGTH_FIELD_LEN),
                 timeout=timeout,
             )
-            wire_bytes_this_call += 3 + 16
+            wire_bytes_this_call += LENGTH_FIELD_LEN
 
-            length_plain = self._v2_transport.recv_cipher.decrypt(enc_length)
-            msg_len = int.from_bytes(length_plain, "little")
+            try:
+                contents_len = self._v2_transport.decrypt_length(enc_length)
+            except Exception as e:
+                raise V2TransportError(
+                    f"v2 length decrypt failed for {self.host}:{self.port}: {e}"
+                ) from e
 
-            if msg_len > 32 * 1024 * 1024:
-                raise Exception(f"v2 payload too large: {msg_len} bytes")
+            if contents_len > 32 * 1024 * 1024:
+                raise Exception(f"v2 payload too large: {contents_len} bytes")
 
-            # Read the encrypted payload (msg_len + 16-byte tag)
-            enc_payload = await asyncio.wait_for(
-                self.reader.readexactly(msg_len + 16),
+            # Read the AEAD-encrypted body: HEADER_LEN + contents_len + tag.
+            aead_len = HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
+            aead_ct = await asyncio.wait_for(
+                self.reader.readexactly(aead_len),
                 timeout=timeout,
             )
-            wire_bytes_this_call += msg_len + 16
+            wire_bytes_this_call += aead_len
 
-            inner = self._v2_transport.recv_cipher.decrypt(enc_payload)
-            from ouroboros.transport_v2 import PacketType
-            is_decoy = inner[0] == PacketType.DECOY
-            payload = inner[1:]
+            try:
+                payload, is_decoy = self._v2_transport.decrypt_contents(
+                    aead_ct, contents_len
+                )
+            except Exception as e:
+                raise V2TransportError(
+                    f"v2 contents decrypt failed for {self.host}:{self.port}: {e}"
+                ) from e
 
             if is_decoy:
                 logger.debug(f"Discarded decoy packet from {self.host}:{self.port}")
