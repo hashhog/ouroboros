@@ -12,6 +12,14 @@ P2P message is encrypted and authenticated.
 
 Reference: https://github.com/bitcoin/bips/blob/master/bip-0324.mediawiki
            bitcoin/src/bip324.cpp, bitcoin/src/bip324.h
+           libsecp256k1 ellswift module (modules/ellswift/main_impl.h)
+
+ECDH backend: real ``secp256k1_ellswift_create`` /
+``secp256k1_ellswift_xdh`` with the BIP 324 hash function, called
+through ``coincurve``'s bundled libsecp256k1 cffi bindings.  The
+shared-secret path is byte-for-byte equivalent to libsecp256k1's
+``ellswift_xdh_tests_bip324`` reference vectors (see
+``tests/test_bip324_vectors.py``).
 """
 
 from __future__ import annotations
@@ -24,6 +32,119 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+# --- Real secp256k1 ElligatorSwift / XDH (BIP 324) ---
+#
+# coincurve ships its own libsecp256k1 with the ellswift module enabled.
+# We bind directly through its cffi handle rather than re-vendoring or
+# rolling a custom ctypes wrapper — both because coincurve is already a
+# hard dependency of ouroboros (used elsewhere for secp256k1 ops) and
+# because its build pins a known-good libsecp256k1 version with the
+# ellswift symbols.  See camlcoin/lib/schnorr_stubs.c:622-732 (commit
+# 559c3d1) for the C-wrapper analog of this binding.
+from coincurve._libsecp256k1 import ffi as _secp_ffi, lib as _secp_lib
+from coincurve.context import GLOBAL_CONTEXT as _SECP_CTX
+
+if not all(
+    hasattr(_secp_lib, sym)
+    for sym in (
+        "secp256k1_ellswift_create",
+        "secp256k1_ellswift_xdh",
+        "secp256k1_ellswift_xdh_hash_function_bip324",
+    )
+):  # pragma: no cover — guarded by hard dep on coincurve >= 21.x
+    raise ImportError(
+        "coincurve's libsecp256k1 is missing ellswift symbols required "
+        "for BIP 324 v2 transport; please upgrade coincurve to >= 21.x"
+    )
+
+
+def secp256k1_ellswift_create(
+    secret_key: bytes, aux_rand32: bytes
+) -> bytes:
+    """Wrap ``secp256k1_ellswift_create``.
+
+    Returns the 64-byte ElligatorSwift-encoded public key for ``secret_key``,
+    using ``aux_rand32`` to randomise the encoding (see BIP 324 §
+    "ElligatorSwift encoding of curve X coordinates").
+
+    Both inputs MUST be exactly 32 bytes.  ``secret_key`` MUST be a valid
+    secp256k1 scalar (1 ≤ d < n).
+    """
+    if len(secret_key) != 32:
+        raise ValueError("secret_key must be 32 bytes")
+    if len(aux_rand32) != 32:
+        raise ValueError("aux_rand32 must be 32 bytes")
+    out64 = _secp_ffi.new("unsigned char[64]")
+    sk_buf = _secp_ffi.new("unsigned char[32]", secret_key)
+    aux_buf = _secp_ffi.new("unsigned char[32]", aux_rand32)
+    ok = _secp_lib.secp256k1_ellswift_create(
+        _SECP_CTX.ctx, out64, sk_buf, aux_buf
+    )
+    if not ok:  # pragma: no cover — only reachable on invalid secret
+        raise ValueError("secp256k1_ellswift_create failed (invalid secret?)")
+    return bytes(out64)
+
+
+def secp256k1_ellswift_xdh(
+    ell_ours: bytes,
+    ell_theirs: bytes,
+    secret_key: bytes,
+    initiating: bool,
+) -> bytes:
+    """Wrap ``secp256k1_ellswift_xdh`` with the BIP 324 hash function.
+
+    Returns the 32-byte BIP 324 ECDH shared secret.  Matches
+    libsecp256k1's reference convention from
+    ``modules/ellswift/tests_impl.h:217``::
+
+        party = !initiating
+        ell_a64 = party ? theirs : ours
+        ell_b64 = party ? ours   : theirs
+
+    so initiator and responder feed the same ordered (ell_a, ell_b)
+    pair and produce the same shared secret — that's the whole point
+    of an XDH.
+    """
+    if len(ell_ours) != 64 or len(ell_theirs) != 64:
+        raise ValueError("ellswift pubkeys must be 64 bytes")
+    if len(secret_key) != 32:
+        raise ValueError("secret_key must be 32 bytes")
+    party = 0 if initiating else 1
+    ell_a64 = ell_theirs if party else ell_ours
+    ell_b64 = ell_ours if party else ell_theirs
+    out32 = _secp_ffi.new("unsigned char[32]")
+    a_buf = _secp_ffi.new("unsigned char[64]", ell_a64)
+    b_buf = _secp_ffi.new("unsigned char[64]", ell_b64)
+    sk_buf = _secp_ffi.new("unsigned char[32]", secret_key)
+    hash_fn = _secp_lib.secp256k1_ellswift_xdh_hash_function_bip324
+    ok = _secp_lib.secp256k1_ellswift_xdh(
+        _SECP_CTX.ctx,
+        out32,
+        a_buf,
+        b_buf,
+        sk_buf,
+        party,
+        hash_fn,
+        _secp_ffi.NULL,
+    )
+    if not ok:  # pragma: no cover — invalid pubkey would already be rejected
+        raise ValueError("secp256k1_ellswift_xdh failed")
+    return bytes(out32)
+
+
+def _generate_secret_key() -> bytes:
+    """Generate a uniformly random 32-byte secp256k1 scalar (1 ≤ d < n)."""
+    # secp256k1's curve order n is just below 2^256, so the rejection
+    # rate of os.urandom(32) is negligible (~2^-128).  But ellswift_create
+    # itself rejects 0 and values >= n, so we loop defensively.
+    while True:
+        sk = os.urandom(32)
+        # All-zero is the only practically-likely invalid value;
+        # libsecp256k1 will tell us about anything else by returning 0
+        # from ellswift_create, which our wrapper raises on.
+        if sk != b"\x00" * 32:
+            return sk
 
 # constants
 
@@ -107,28 +228,43 @@ class V2Handshake:
     """
     BIP 324 handshake state.
 
-    Simplified model: both sides generate a 32-byte ephemeral private
-    key, produce a 64-byte ElligatorSwift-encoded public key, perform
-    ECDH to derive shared secrets, and then derive per-direction
-    symmetric keys.
+    Both sides generate a 32-byte ephemeral secret key, produce a
+    64-byte ElligatorSwift-encoded public key via
+    ``secp256k1_ellswift_create``, exchange them on the wire, and then
+    derive a 32-byte shared secret via ``secp256k1_ellswift_xdh`` with
+    the BIP 324 hash function (party=0 for initiator, party=1 for
+    responder).  Per-direction symmetric keys are then expanded from
+    that shared secret.
 
-    In this implementation the ECDH is simulated via a Diffie-Hellman
-    exchange using x25519-equivalent semantics for testability, since
-    the full ElligatorSwift encoding depends on a custom secp256k1
-    implementation.  The wire format and key schedule are faithful to
-    BIP 324.
+    The shared-secret derivation is byte-for-byte equivalent to the
+    libsecp256k1 reference vectors in
+    ``modules/ellswift/tests_impl.h:156-164``
+    (``ellswift_xdh_tests_bip324``).  See
+    ``tests/test_bip324_vectors.py`` for the validation suite.
+
+    Note on session-key derivation: BIP 324 specifies a more elaborate
+    HKDF schedule (separate keys for length cipher, packet cipher,
+    garbage terminators, and a session id) keyed off the shared
+    secret.  This module currently keeps a simpler one-key-per-direction
+    expansion for self-consistency with the existing ``V2Transport``
+    framing — full BIP 324 packet-format compliance with Bitcoin Core
+    requires a follow-up.  But the *shared secret itself* now matches
+    Core's bit-for-bit, which is the prerequisite the whole rest of
+    the v2 stack stands on.
     """
     initiator: bool = True
-    _private_key: bytes = field(default_factory=lambda: os.urandom(32))
+    _private_key: bytes = field(default_factory=_generate_secret_key)
+    _aux_rand: bytes = field(default_factory=lambda: os.urandom(32), repr=False)
     _local_eswift: bytes = field(default=b"", repr=False)
     _remote_eswift: bytes = field(default=b"", repr=False)
     _shared_secret: bytes | None = None
 
     def __post_init__(self):
         if not self._local_eswift:
-            self._local_eswift = _tagged_hash(
-                "bip324_eswift_local", self._private_key
-            ) + _tagged_hash("bip324_eswift_local2", self._private_key)
+            # Real ElligatorSwift encoding via libsecp256k1.
+            self._local_eswift = secp256k1_ellswift_create(
+                self._private_key, self._aux_rand
+            )
 
     @property
     def local_pubkey_bytes(self) -> bytes:
@@ -143,11 +279,17 @@ class V2Handshake:
         self._derive_shared_secret()
 
     def _derive_shared_secret(self) -> None:
-        # In real BIP 324 both sides compute the same ECDH point.
-        # We simulate this by sorting the two public keys so both
-        # sides produce identical input to the hash.
-        keys = sorted([self._local_eswift, self._remote_eswift])
-        self._shared_secret = _tagged_hash("bip324_ecdh", keys[0] + keys[1])
+        # Real BIP 324 ECDH via libsecp256k1.  Both sides compute the
+        # same 32-byte secret because secp256k1_ellswift_xdh(party=0,
+        # ours, theirs, our_priv) and ellswift_xdh(party=1, ours,
+        # theirs, their_priv) produce identical output by definition
+        # of the X-only ECDH protocol.
+        self._shared_secret = secp256k1_ellswift_xdh(
+            self._local_eswift,
+            self._remote_eswift,
+            self._private_key,
+            self.initiator,
+        )
 
     def derive_session_keys(self) -> tuple[bytes, bytes]:
         """
