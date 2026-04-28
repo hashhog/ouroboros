@@ -3,23 +3,32 @@ BIP 324 — v2 P2P Transport Protocol.
 
 Implements encrypted and authenticated P2P connections using:
 - ElligatorSwift key exchange (X-only ECDH over secp256k1)
-- ChaCha20-Poly1305 AEAD for packet encryption
-- Length encryption to prevent traffic analysis
-
-Each direction of the connection has its own symmetric key derived
-from the ECDH shared secret.  After the handshake every subsequent
-P2P message is encrypted and authenticated.
+- ChaCha20-Poly1305 AEAD for packet contents (with periodic rekey)
+- Plain ChaCha20 for the 3-byte length prefix (with periodic rekey)
+- Per-direction garbage terminators sent right after the ellswift pubkey
 
 Reference: https://github.com/bitcoin/bips/blob/master/bip-0324.mediawiki
-           bitcoin/src/bip324.cpp, bitcoin/src/bip324.h
+           bitcoin-core/src/bip324.{cpp,h}
+           bitcoin-core/src/test/bip324_tests.cpp
+           bitcoin-core/test/functional/test_framework/v2_p2p.py
+           bitcoin-core/test/functional/test_framework/crypto/{chacha20.py,bip324_cipher.py}
            libsecp256k1 ellswift module (modules/ellswift/main_impl.h)
 
 ECDH backend: real ``secp256k1_ellswift_create`` /
 ``secp256k1_ellswift_xdh`` with the BIP 324 hash function, called
-through ``coincurve``'s bundled libsecp256k1 cffi bindings.  The
-shared-secret path is byte-for-byte equivalent to libsecp256k1's
-``ellswift_xdh_tests_bip324`` reference vectors (see
-``tests/test_bip324_vectors.py``).
+through ``coincurve``'s bundled libsecp256k1 cffi bindings.
+
+Packet-format compliance (this commit): the key derivation now follows
+BIP 324 exactly — HKDF-Extract over salt ``b'bitcoin_v2_shared_secret'
++ network_magic`` and HKDF-Expand for ``initiator_L``, ``initiator_P``,
+``responder_L``, ``responder_P``, ``garbage_terminators``,
+``session_id``.  Length cipher is FSChaCha20, contents cipher is
+FSChaCha20Poly1305 with a 1-byte header carrying the IGNORE bit.  Both
+ciphers rekey every ``REKEY_INTERVAL`` packets via the BIP 324 schedule.
+
+Validated against Bitcoin Core's published packet test vectors
+(``bitcoin-core/src/test/bip324_tests.cpp::packet_test_vectors``); see
+``tests/test_bip324_packet_vectors.py``.
 """
 
 from __future__ import annotations
@@ -31,6 +40,7 @@ import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
 
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 # --- Real secp256k1 ElligatorSwift / XDH (BIP 324) ---
@@ -69,7 +79,7 @@ def secp256k1_ellswift_create(
     "ElligatorSwift encoding of curve X coordinates").
 
     Both inputs MUST be exactly 32 bytes.  ``secret_key`` MUST be a valid
-    secp256k1 scalar (1 ≤ d < n).
+    secp256k1 scalar (1 <= d < n).
     """
     if len(secret_key) != 32:
         raise ValueError("secret_key must be 32 bytes")
@@ -134,48 +144,90 @@ def secp256k1_ellswift_xdh(
 
 
 def _generate_secret_key() -> bytes:
-    """Generate a uniformly random 32-byte secp256k1 scalar (1 ≤ d < n)."""
+    """Generate a uniformly random 32-byte secp256k1 scalar (1 <= d < n)."""
     # secp256k1's curve order n is just below 2^256, so the rejection
     # rate of os.urandom(32) is negligible (~2^-128).  But ellswift_create
     # itself rejects 0 and values >= n, so we loop defensively.
     while True:
         sk = os.urandom(32)
-        # All-zero is the only practically-likely invalid value;
-        # libsecp256k1 will tell us about anything else by returning 0
-        # from ellswift_create, which our wrapper raises on.
         if sk != b"\x00" * 32:
             return sk
 
-# constants
 
-NETWORK_MAGIC_V2 = b""  # v2 has no network magic; first 64 bytes are ESwift keys
-REKEY_INTERVAL = 224     # re-key after this many messages (BIP 324)
+# --- constants -------------------------------------------------------------
+
+NETWORK_MAGIC_V2 = b""    # v2 has no network magic; first 64 bytes are ESwift keys
+REKEY_INTERVAL = 224      # re-key after this many messages (BIP 324)
 
 # BIP 324 transport versioning
 TRANSPORT_V1 = 1
 TRANSPORT_V2 = 2
 
+# Fixed BIP 324 layout constants.  Mirrors bitcoin-core/src/bip324.h.
+LENGTH_FIELD_LEN = 3
+HEADER_LEN = 1
+GARBAGE_TERMINATOR_LEN = 16
+SESSION_ID_LEN = 32
+MAX_GARBAGE_LEN = 4095
+CHACHA20POLY1305_EXPANSION = 16  # Poly1305 tag
+
 
 class PacketType(IntEnum):
-    """BIP 324 packet content flags."""
-    GENUINE = 0
-    DECOY = 128
+    """BIP 324 packet header flag bit values.
+
+    Per BIP 324, the high bit of the 1-byte header (``IGNORE_BIT_POS = 7``)
+    flags a decoy / "ignore" packet.  All other bits MUST be zero.
+    """
+    GENUINE = 0x00
+    DECOY = 0x80
 
 
-# tagged hash (BIP 340-style)
-
-def _tagged_hash(tag: str, data: bytes) -> bytes:
-    tag_hash = hashlib.sha256(tag.encode()).digest()
-    return hashlib.sha256(tag_hash + tag_hash + data).digest()
+IGNORE_BIT = 0x80  # high bit of the BIP 324 header byte
 
 
-# --- HKDF-SHA256 (extract + expand, single-info) ---
+# --- network magic mapping for HKDF salt ----------------------------------
+#
+# BIP 324's salt = ``b'bitcoin_v2_shared_secret' + network_magic`` where
+# ``network_magic`` is the 4-byte ``pchMessageStart`` constant (the same
+# bytes that prefix v1 message frames).  Bitcoin Core stores them as raw
+# byte arrays (e.g. ``f9 be b4 d9`` for mainnet); ouroboros stores them
+# as little-endian uint32s in p2p_messages.MAGIC_*.  We expose the byte
+# form here to avoid a circular import.
 
-def _hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, length: int = 32) -> bytes:
-    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
-    # Single expand block is sufficient for 32-byte output
-    t = b""
+_MAGIC_BYTES_BY_NETWORK: dict[str, bytes] = {
+    "mainnet":  bytes([0xf9, 0xbe, 0xb4, 0xd9]),
+    "main":     bytes([0xf9, 0xbe, 0xb4, 0xd9]),
+    "testnet":  bytes([0x0b, 0x11, 0x09, 0x07]),
+    "testnet3": bytes([0x0b, 0x11, 0x09, 0x07]),
+    "testnet4": bytes([0x1c, 0x16, 0x3f, 0x28]),
+    "regtest":  bytes([0xfa, 0xbf, 0xb5, 0xda]),
+    "signet":   bytes([0x0a, 0x03, 0xcf, 0x40]),
+}
+
+
+def _network_magic_bytes(network: str) -> bytes:
+    """Return the 4-byte network magic used as the HKDF salt suffix.
+
+    Defaults to mainnet on unknown network strings; this matches the
+    bitcoin-core packet test vectors which use mainnet exclusively
+    (see bip324_tests.cpp::packet_test_vectors and SelectParams(MAIN)).
+    """
+    return _MAGIC_BYTES_BY_NETWORK.get(network.lower(), bytes([0xf9, 0xbe, 0xb4, 0xd9]))
+
+
+# --- HKDF-SHA256 (RFC 5869, multi-block expand) ---------------------------
+
+def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
+    """RFC 5869 HKDF-Extract with SHA-256."""
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    """RFC 5869 HKDF-Expand with SHA-256."""
+    if length > 255 * 32:
+        raise ValueError("HKDF-Expand length too large")
     okm = b""
+    t = b""
     counter = 1
     while len(okm) < length:
         t = hmac.new(prk, t + info + bytes([counter]), hashlib.sha256).digest()
@@ -184,15 +236,187 @@ def _hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, length: int = 32) -> byte
     return okm[:length]
 
 
-# ChaCha20-Poly1305 cipher for a single direction
+def hkdf_sha256(*, salt: bytes, ikm: bytes, info: bytes, length: int = 32) -> bytes:
+    """RFC 5869 HKDF-SHA256 (extract-then-expand).  Public for vector tests."""
+    prk = _hkdf_extract(salt, ikm)
+    return _hkdf_expand(prk, info, length)
+
+
+# tagged hash (BIP 340-style) — used by legacy CipherState rekey path
+def _tagged_hash(tag: str, data: bytes) -> bytes:
+    tag_hash = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(tag_hash + tag_hash + data).digest()
+
+
+# --- ChaCha20 block primitive (RFC 8439 IETF variant) ---------------------
+
+def _chacha20_block(key: bytes, nonce_12: bytes, counter: int) -> bytes:
+    """64-byte ChaCha20 keystream block (IETF variant, 32-bit counter).
+
+    Equivalent to bitcoin-core/test/functional/test_framework/crypto/
+    chacha20.py::chacha20_block.  We implement on top of
+    ``cryptography.hazmat`` because it is already a hard dependency
+    (used for ChaCha20Poly1305) and the bundled implementation is
+    constant-time C; the test-framework Python version is documented as
+    "trivially vulnerable to side channel attacks. Do not use for
+    anything but tests."
+    """
+    iv16 = counter.to_bytes(4, "little") + nonce_12
+    enc = Cipher(algorithms.ChaCha20(key, iv16), None).encryptor()
+    return enc.update(b"\x00" * 64)
+
+
+# --- FSChaCha20 (length cipher) -------------------------------------------
+
+class FSChaCha20:
+    """Re-keying ChaCha20 stream cipher used for BIP 324 length encryption.
+
+    Matches bitcoin-core's reference implementation in
+    ``test/functional/test_framework/crypto/chacha20.py`` exactly:
+
+    - Each chunk is XOR'd with fresh keystream bytes drawn from a
+      ChaCha20 instance keyed by ``self._key``.
+    - The 12-byte nonce is ``\\x00\\x00\\x00\\x00`` || little-endian-8
+      (chunk_counter // rekey_interval).
+    - The block counter starts at 0 and increments per 64-byte
+      keystream block produced; it resets when the key rotates.
+    - After every ``rekey_interval`` chunks (BIP 324 default = 224)
+      the next 32 bytes of keystream become the new key, and the
+      block + nonce counters reset.
+    """
+
+    def __init__(self, initial_key: bytes, rekey_interval: int = REKEY_INTERVAL):
+        if len(initial_key) != 32:
+            raise ValueError("FSChaCha20 key must be 32 bytes")
+        self._key = initial_key
+        self._rekey_interval = rekey_interval
+        self._block_counter = 0
+        self._chunk_counter = 0
+        self._keystream = b""
+
+    def _get_keystream_bytes(self, nbytes: int) -> bytes:
+        while len(self._keystream) < nbytes:
+            nonce = (
+                (0).to_bytes(4, "little")
+                + (self._chunk_counter // self._rekey_interval).to_bytes(8, "little")
+            )
+            self._keystream += _chacha20_block(self._key, nonce, self._block_counter)
+            self._block_counter += 1
+        ret = self._keystream[:nbytes]
+        self._keystream = self._keystream[nbytes:]
+        return ret
+
+    def crypt(self, chunk: bytes) -> bytes:
+        ks = self._get_keystream_bytes(len(chunk))
+        ret = bytes(ks[i] ^ chunk[i] for i in range(len(chunk)))
+        if ((self._chunk_counter + 1) % self._rekey_interval) == 0:
+            # Rotate key from the next 32 bytes of the current keystream
+            # before resetting block counter and clearing the buffer.
+            self._key = self._get_keystream_bytes(32)
+            self._block_counter = 0
+            self._keystream = b""
+        self._chunk_counter += 1
+        return ret
+
+
+# --- ChaCha20-Poly1305 AEAD (RFC 8439) ------------------------------------
+
+def _aead_chacha20_poly1305_encrypt(
+    key: bytes, nonce_12: bytes, aad: bytes, plaintext: bytes
+) -> bytes:
+    """RFC 8439 AEAD_CHACHA20_POLY1305 encrypt.  Thin wrapper over
+    ``cryptography``'s constant-time C implementation, exposed because
+    BIP 324 needs the IETF nonce shape ``(packet_counter % rekey_interval,
+    packet_counter // rekey_interval)`` rather than a free-form 12-byte
+    nonce.
+    """
+    cipher = ChaCha20Poly1305(key)
+    return cipher.encrypt(nonce_12, plaintext, aad)
+
+
+def _aead_chacha20_poly1305_decrypt(
+    key: bytes, nonce_12: bytes, aad: bytes, ciphertext: bytes
+) -> bytes | None:
+    """RFC 8439 AEAD_CHACHA20_POLY1305 decrypt.  Returns ``None`` on
+    authentication failure rather than raising, matching the
+    test-framework reference implementation.
+    """
+    try:
+        cipher = ChaCha20Poly1305(key)
+        return cipher.decrypt(nonce_12, ciphertext, aad)
+    except Exception:
+        return None
+
+
+# --- FSChaCha20Poly1305 (contents cipher) ---------------------------------
+
+class FSChaCha20Poly1305:
+    """Re-keying ChaCha20-Poly1305 AEAD used for BIP 324 packet contents.
+
+    Matches bitcoin-core reference (``bip324_cipher.py::FSChaCha20Poly1305``):
+
+    - Per-packet nonce =
+      ``LE32(packet_counter % rekey_interval) || LE64(packet_counter // rekey_interval)``
+    - Every ``rekey_interval`` packets the key is rotated to the first 32
+      bytes of ``aead_chacha20_poly1305_encrypt(old_key, FFFFFFFF||LE64(epoch), b'', \\0*32)``.
+    - The packet counter is monotone and never resets.
+    """
+
+    def __init__(self, initial_key: bytes, rekey_interval: int = REKEY_INTERVAL):
+        if len(initial_key) != 32:
+            raise ValueError("FSChaCha20Poly1305 key must be 32 bytes")
+        self._key = initial_key
+        self._rekey_interval = rekey_interval
+        self._packet_counter = 0
+
+    def _nonce(self) -> bytes:
+        return (
+            (self._packet_counter % self._rekey_interval).to_bytes(4, "little")
+            + (self._packet_counter // self._rekey_interval).to_bytes(8, "little")
+        )
+
+    def _maybe_rekey(self, current_nonce: bytes) -> None:
+        if (self._packet_counter + 1) % self._rekey_interval == 0:
+            rekey_nonce = b"\xFF\xFF\xFF\xFF" + current_nonce[4:]
+            new_key = _aead_chacha20_poly1305_encrypt(
+                self._key, rekey_nonce, b"", b"\x00" * 32
+            )[:32]
+            self._key = new_key
+
+    def encrypt(self, aad: bytes, plaintext: bytes) -> bytes:
+        nonce = self._nonce()
+        ct = _aead_chacha20_poly1305_encrypt(self._key, nonce, aad, plaintext)
+        self._maybe_rekey(nonce)
+        self._packet_counter += 1
+        return ct
+
+    def decrypt(self, aad: bytes, ciphertext: bytes) -> bytes | None:
+        nonce = self._nonce()
+        pt = _aead_chacha20_poly1305_decrypt(self._key, nonce, aad, ciphertext)
+        # Even on auth failure we MUST advance the schedule, otherwise
+        # the receiver desyncs on the very next packet.  bitcoin-core
+        # does the same thing — the connection is supposed to drop on
+        # auth failure anyway, so the post-failure state is moot.
+        self._maybe_rekey(nonce)
+        self._packet_counter += 1
+        return pt
+
+
+# --- legacy CipherState (kept for compat with the rekey unit test) -------
 
 @dataclass
 class CipherState:
-    """
-    Symmetric cipher state for one direction of the v2 transport.
+    """One-key-per-direction ChaCha20-Poly1305 wrapper.
 
-    Handles nonce tracking, encryption/decryption, and periodic
-    re-keying after ``REKEY_INTERVAL`` packets.
+    Pre-BIP-324 ouroboros used a single nonce-counter cipher per
+    direction.  The proper BIP 324 transport now lives in
+    ``BIP324Cipher`` / ``V2Transport`` with separate length and contents
+    keys; this class is retained as a thin shim only so the legacy
+    ``test_rekey_happens`` regression test continues to pass.
+
+    New code should NOT use ``CipherState``.  It is an internal compat
+    surface scheduled for removal once the wiring tests no longer
+    reference ``send_cipher.key`` / ``recv_cipher.key`` directly.
     """
     key: bytes
     nonce_counter: int = 0
@@ -221,7 +445,147 @@ class CipherState:
         self.nonce_counter = 0
 
 
-# v2 Handshake & Session #
+# --- BIP 324 cipher core --------------------------------------------------
+
+@dataclass
+class BIP324Cipher:
+    """BIP 324 packet cipher (encryption + decryption).
+
+    Owns the four FSChaCha20 / FSChaCha20Poly1305 instances (send/recv ×
+    L/P), the 16-byte send/recv garbage terminators, and the 32-byte
+    session id.  Mirrors the C++ ``BIP324Cipher`` class in
+    ``bitcoin-core/src/bip324.h``.
+
+    Construction goes through ``BIP324Cipher.from_secrets(...)`` after
+    the ECDH shared secret is known; direct ``__init__`` is used by
+    ``V2Transport`` to wire from a ``V2Handshake``.
+    """
+
+    send_l: FSChaCha20
+    recv_l: FSChaCha20
+    send_p: FSChaCha20Poly1305
+    recv_p: FSChaCha20Poly1305
+    send_garbage_terminator: bytes
+    recv_garbage_terminator: bytes
+    session_id: bytes
+
+    @classmethod
+    def from_secrets(
+        cls,
+        ecdh_secret: bytes,
+        *,
+        initiator: bool,
+        network: str = "mainnet",
+        self_decrypt: bool = False,
+    ) -> "BIP324Cipher":
+        """Build a cipher from the 32-byte ECDH shared secret.
+
+        ``self_decrypt=True`` swaps send/recv keys; only used by the
+        Core packet-vector test harness (``bip324_tests.cpp``) so that a
+        single side can encrypt-then-decrypt a packet without knowing
+        the other side's private key.  Default is False for production.
+        """
+        if len(ecdh_secret) != 32:
+            raise ValueError("ECDH secret must be 32 bytes")
+
+        salt = b"bitcoin_v2_shared_secret" + _network_magic_bytes(network)
+        prk = _hkdf_extract(salt, ecdh_secret)
+
+        # Six independent 32-byte expansions, one per BIP 324 label.
+        init_l = _hkdf_expand(prk, b"initiator_L", 32)
+        init_p = _hkdf_expand(prk, b"initiator_P", 32)
+        resp_l = _hkdf_expand(prk, b"responder_L", 32)
+        resp_p = _hkdf_expand(prk, b"responder_P", 32)
+        garb_terms_32 = _hkdf_expand(prk, b"garbage_terminators", 32)
+        session_id = _hkdf_expand(prk, b"session_id", 32)
+
+        # ``side`` chooses which set of keys is used for sending vs
+        # receiving.  See bip324.cpp:Initialize for the truth-table
+        # (``side = initiator != self_decrypt``).
+        side = bool(initiator) != bool(self_decrypt)
+
+        if side:
+            send_l_key, recv_l_key = init_l, resp_l
+            send_p_key, recv_p_key = init_p, resp_p
+        else:
+            send_l_key, recv_l_key = resp_l, init_l
+            send_p_key, recv_p_key = resp_p, init_p
+
+        # Garbage terminators are split ``[:16]`` for the initiator's
+        # send and ``[16:]`` for the initiator's recv; the responder's
+        # send/recv are the mirror image.  The choice keys off
+        # ``initiator``, NOT ``side`` — this is independent of the
+        # ``self_decrypt`` flip.
+        if initiator:
+            send_term = garb_terms_32[:GARBAGE_TERMINATOR_LEN]
+            recv_term = garb_terms_32[GARBAGE_TERMINATOR_LEN:]
+        else:
+            send_term = garb_terms_32[GARBAGE_TERMINATOR_LEN:]
+            recv_term = garb_terms_32[:GARBAGE_TERMINATOR_LEN]
+
+        return cls(
+            send_l=FSChaCha20(send_l_key),
+            recv_l=FSChaCha20(recv_l_key),
+            send_p=FSChaCha20Poly1305(send_p_key),
+            recv_p=FSChaCha20Poly1305(recv_p_key),
+            send_garbage_terminator=send_term,
+            recv_garbage_terminator=recv_term,
+            session_id=session_id,
+        )
+
+    # --- packet encrypt / decrypt ----------------------------------------
+
+    def encrypt_packet(
+        self, contents: bytes, *, aad: bytes = b"", ignore: bool = False
+    ) -> bytes:
+        """Encrypt one BIP 324 packet.
+
+        Wire layout:
+            enc_length (3 bytes, FSChaCha20 over little-endian u24)
+            ciphertext (1 + len(contents) + 16 = HEADER_LEN + len(contents) + tag)
+        """
+        if len(contents) > 0xFFFFFF:
+            raise ValueError("BIP 324 packet contents must be < 2^24 bytes")
+
+        header = bytes([IGNORE_BIT if ignore else 0])
+        plaintext = header + contents
+        aead_ct = self.send_p.encrypt(aad, plaintext)
+        enc_len = self.send_l.crypt(len(contents).to_bytes(LENGTH_FIELD_LEN, "little"))
+        return enc_len + aead_ct
+
+    def decrypt_length(self, enc_length: bytes) -> int:
+        """Decrypt the 3-byte length prefix.  Advances the recv length cipher."""
+        if len(enc_length) != LENGTH_FIELD_LEN:
+            raise ValueError(f"length prefix must be {LENGTH_FIELD_LEN} bytes")
+        plain = self.recv_l.crypt(enc_length)
+        return int.from_bytes(plain, "little")
+
+    def decrypt_contents(
+        self, aead_ct: bytes, contents_len: int, *, aad: bytes = b""
+    ) -> tuple[bytes, bool] | None:
+        """Decrypt the AEAD-encrypted body of a BIP 324 packet.
+
+        ``aead_ct`` MUST have length ``HEADER_LEN + contents_len + 16``
+        (header + payload + Poly1305 tag).  ``contents_len`` is the
+        plaintext-content length returned by ``decrypt_length``.
+
+        Returns ``(contents, is_decoy)`` on success, or ``None`` on
+        authentication failure.
+        """
+        expected = HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
+        if len(aead_ct) != expected:
+            raise ValueError(
+                f"AEAD ciphertext length {len(aead_ct)} != expected {expected}"
+            )
+        plain = self.recv_p.decrypt(aad, aead_ct)
+        if plain is None:
+            return None
+        header_byte = plain[0]
+        is_decoy = (header_byte & IGNORE_BIT) != 0
+        return plain[HEADER_LEN:], is_decoy
+
+
+# --- v2 Handshake ---------------------------------------------------------
 
 @dataclass
 class V2Handshake:
@@ -232,27 +596,11 @@ class V2Handshake:
     64-byte ElligatorSwift-encoded public key via
     ``secp256k1_ellswift_create``, exchange them on the wire, and then
     derive a 32-byte shared secret via ``secp256k1_ellswift_xdh`` with
-    the BIP 324 hash function (party=0 for initiator, party=1 for
-    responder).  Per-direction symmetric keys are then expanded from
-    that shared secret.
-
-    The shared-secret derivation is byte-for-byte equivalent to the
-    libsecp256k1 reference vectors in
-    ``modules/ellswift/tests_impl.h:156-164``
-    (``ellswift_xdh_tests_bip324``).  See
-    ``tests/test_bip324_vectors.py`` for the validation suite.
-
-    Note on session-key derivation: BIP 324 specifies a more elaborate
-    HKDF schedule (separate keys for length cipher, packet cipher,
-    garbage terminators, and a session id) keyed off the shared
-    secret.  This module currently keeps a simpler one-key-per-direction
-    expansion for self-consistency with the existing ``V2Transport``
-    framing — full BIP 324 packet-format compliance with Bitcoin Core
-    requires a follow-up.  But the *shared secret itself* now matches
-    Core's bit-for-bit, which is the prerequisite the whole rest of
-    the v2 stack stands on.
+    the BIP 324 hash function.  The shared secret feeds the BIP 324
+    HKDF key schedule; see ``BIP324Cipher.from_secrets``.
     """
     initiator: bool = True
+    network: str = "mainnet"
     _private_key: bytes = field(default_factory=_generate_secret_key)
     _aux_rand: bytes = field(default_factory=lambda: os.urandom(32), repr=False)
     _local_eswift: bytes = field(default=b"", repr=False)
@@ -261,7 +609,6 @@ class V2Handshake:
 
     def __post_init__(self):
         if not self._local_eswift:
-            # Real ElligatorSwift encoding via libsecp256k1.
             self._local_eswift = secp256k1_ellswift_create(
                 self._private_key, self._aux_rand
             )
@@ -279,11 +626,6 @@ class V2Handshake:
         self._derive_shared_secret()
 
     def _derive_shared_secret(self) -> None:
-        # Real BIP 324 ECDH via libsecp256k1.  Both sides compute the
-        # same 32-byte secret because secp256k1_ellswift_xdh(party=0,
-        # ours, theirs, our_priv) and ellswift_xdh(party=1, ours,
-        # theirs, their_priv) produce identical output by definition
-        # of the X-only ECDH protocol.
         self._shared_secret = secp256k1_ellswift_xdh(
             self._local_eswift,
             self._remote_eswift,
@@ -291,90 +633,187 @@ class V2Handshake:
             self.initiator,
         )
 
+    @property
+    def shared_secret(self) -> bytes:
+        if self._shared_secret is None:
+            raise ValueError("Handshake not complete")
+        return self._shared_secret
+
     def derive_session_keys(self) -> tuple[bytes, bytes]:
-        """
-        Derive (send_key, recv_key) from the shared secret.
+        """Return ``(send_p_key, recv_p_key)`` derived from the shared secret.
 
-        Both sides derive the same two keys (``initiator_key`` and
-        ``responder_key``) from the shared secret.  The initiator
-        sends with ``initiator_key`` and receives with
-        ``responder_key``; the responder does the opposite.
+        Compatibility helper retained for legacy callers (the wiring
+        regression test in ``test_bip324_wiring.py`` asserts
+        ``client.send_cipher.key == server.recv_cipher.key`` etc).  The
+        underlying P (contents) keys are exactly what the wiring test
+        wants to compare.
 
-        Returns two 32-byte symmetric keys.
+        Use ``BIP324Cipher.from_secrets`` for new code.
         """
         if self._shared_secret is None:
             raise ValueError("Handshake not complete")
-        initiator_key = _hkdf_sha256(
-            salt=self._shared_secret,
-            ikm=b"bip324_initiator",
-            info=b"expand",
-        )
-        responder_key = _hkdf_sha256(
-            salt=self._shared_secret,
-            ikm=b"bip324_responder",
-            info=b"expand",
-        )
+        salt = b"bitcoin_v2_shared_secret" + _network_magic_bytes(self.network)
+        prk = _hkdf_extract(salt, self._shared_secret)
+        init_p = _hkdf_expand(prk, b"initiator_P", 32)
+        resp_p = _hkdf_expand(prk, b"responder_P", 32)
         if self.initiator:
-            return initiator_key, responder_key
-        return responder_key, initiator_key
+            return init_p, resp_p
+        return resp_p, init_p
 
+
+# --- v2 Transport ---------------------------------------------------------
 
 @dataclass
 class V2Transport:
-    """
-    Full BIP 324 v2 encrypted transport session.
+    """Full BIP 324 v2 encrypted transport session.
 
-    After handshake completion, call ``encrypt_message`` and
-    ``decrypt_message`` for each P2P payload.
+    Wraps a :class:`BIP324Cipher` with the legacy ``send_cipher``/
+    ``recv_cipher`` :class:`CipherState` view so existing wiring tests
+    that compare per-direction keys (:func:`test_bip324_wiring.
+    test_negotiate_v2_happy_path`) continue to type-check.
+
+    For sending and receiving packets, callers should use
+    :meth:`encrypt_message` / :meth:`decrypt_message` (one-shot, packet
+    self-contained) or :meth:`decrypt_length` + :meth:`decrypt_contents`
+    (streaming — needed by ``Peer._receive_v2_message`` because the
+    payload size is only known after the length cipher decrypts the
+    first 3 bytes).
     """
+
+    cipher: BIP324Cipher
     send_cipher: CipherState
     recv_cipher: CipherState
 
     @classmethod
-    def from_handshake(cls, handshake: V2Handshake) -> V2Transport:
-        send_key, recv_key = handshake.derive_session_keys()
+    def from_handshake(
+        cls, handshake: V2Handshake, *, self_decrypt: bool = False
+    ) -> "V2Transport":
+        cipher = BIP324Cipher.from_secrets(
+            handshake.shared_secret,
+            initiator=handshake.initiator,
+            network=handshake.network,
+            self_decrypt=self_decrypt,
+        )
+        # Re-key the legacy view with the (P) contents-cipher keys so
+        # downstream callers that introspect ``send_cipher.key`` /
+        # ``recv_cipher.key`` see the property they expect: both sides'
+        # initiator_P and responder_P keys match across the connection.
+        send_p_key, recv_p_key = handshake.derive_session_keys()
         return cls(
-            send_cipher=CipherState(key=send_key),
-            recv_cipher=CipherState(key=recv_key),
+            cipher=cipher,
+            send_cipher=CipherState(key=send_p_key),
+            recv_cipher=CipherState(key=recv_p_key),
         )
 
-    # packet format
-
-    def encrypt_message(self, payload: bytes, *, decoy: bool = False) -> bytes:
+    @classmethod
+    def from_secrets(
+        cls,
+        ecdh_secret: bytes,
+        *,
+        initiator: bool,
+        network: str = "mainnet",
+        self_decrypt: bool = False,
+    ) -> "V2Transport":
+        """Build a transport directly from an ECDH secret.  Used by the
+        packet-vector test harness, where the shared secret is read
+        from the test vector rather than derived live.
         """
-        Encrypt a P2P message payload into a v2 packet.
+        cipher = BIP324Cipher.from_secrets(
+            ecdh_secret,
+            initiator=initiator,
+            network=network,
+            self_decrypt=self_decrypt,
+        )
+        salt = b"bitcoin_v2_shared_secret" + _network_magic_bytes(network)
+        prk = _hkdf_extract(salt, ecdh_secret)
+        init_p = _hkdf_expand(prk, b"initiator_P", 32)
+        resp_p = _hkdf_expand(prk, b"responder_P", 32)
+        if initiator != self_decrypt:
+            send_p_key, recv_p_key = init_p, resp_p
+        else:
+            send_p_key, recv_p_key = resp_p, init_p
+        return cls(
+            cipher=cipher,
+            send_cipher=CipherState(key=send_p_key),
+            recv_cipher=CipherState(key=recv_p_key),
+        )
 
-        Packet layout:
-          encrypted_length (3 bytes, encrypted with length cipher)
-          encrypted_payload (variable + 16 byte Poly1305 tag)
+    # --- one-shot packet API ---------------------------------------------
 
-        The first byte of the plaintext payload carries the packet
-        type flag (``GENUINE`` or ``DECOY``).
+    def encrypt_message(
+        self,
+        payload: bytes,
+        *,
+        aad: bytes = b"",
+        decoy: bool = False,
+    ) -> bytes:
+        """Encrypt a BIP 324 packet with ``payload`` as contents.
+
+        ``aad`` is the additional-authenticated-data field — used during
+        the post-garbage version-packet exchange to bind the received
+        garbage into the first packet's MAC.
         """
-        flag = PacketType.DECOY if decoy else PacketType.GENUINE
-        inner = bytes([flag]) + payload
-        length_bytes = len(inner).to_bytes(3, "little")
-        enc_length = self.send_cipher.encrypt(length_bytes)
-        enc_payload = self.send_cipher.encrypt(inner)
-        return enc_length + enc_payload
+        return self.cipher.encrypt_packet(payload, aad=aad, ignore=decoy)
 
-    def decrypt_message(self, data: bytes) -> tuple[bytes, bool, int]:
-        """
-        Decrypt a v2 packet.
+    def decrypt_message(
+        self, data: bytes, *, aad: bytes = b""
+    ) -> tuple[bytes, bool, int]:
+        """Decrypt one BIP 324 packet.
 
-        Returns (payload, is_decoy, bytes_consumed).
+        Returns ``(contents, is_decoy, bytes_consumed)``.  Raises
+        :class:`ValueError` if the wire frame is too short, and a
+        :class:`ValueError` "Authentication failed" if the AEAD tag
+        does not validate.
         """
-        if len(data) < 3 + 16:
+        if len(data) < LENGTH_FIELD_LEN + HEADER_LEN + CHACHA20POLY1305_EXPANSION:
             raise ValueError("Packet too short")
-        enc_length = data[:3 + 16]  # 3 bytes + 16 byte tag
-        length_plain = self.recv_cipher.decrypt(enc_length)
-        msg_len = int.from_bytes(length_plain, "little")
-
-        total = 3 + 16 + msg_len + 16  # length packet + payload packet
+        enc_length = data[:LENGTH_FIELD_LEN]
+        contents_len = self.cipher.decrypt_length(enc_length)
+        total = (
+            LENGTH_FIELD_LEN
+            + HEADER_LEN
+            + contents_len
+            + CHACHA20POLY1305_EXPANSION
+        )
         if len(data) < total:
             raise ValueError(f"Need {total} bytes, have {len(data)}")
+        aead_ct = data[LENGTH_FIELD_LEN:total]
+        result = self.cipher.decrypt_contents(aead_ct, contents_len, aad=aad)
+        if result is None:
+            raise ValueError("BIP 324 packet authentication failed")
+        contents, is_decoy = result
+        return contents, is_decoy, total
 
-        enc_payload = data[3 + 16 : total]
-        inner = self.recv_cipher.decrypt(enc_payload)
-        is_decoy = inner[0] == PacketType.DECOY
-        return inner[1:], is_decoy, total
+    # --- streaming API (used by Peer._receive_v2_message) ---------------
+
+    def decrypt_length(self, enc_length: bytes) -> int:
+        """Decrypt the 3-byte length prefix; advances the recv L cipher."""
+        return self.cipher.decrypt_length(enc_length)
+
+    def decrypt_contents(
+        self, aead_ct: bytes, contents_len: int, *, aad: bytes = b""
+    ) -> tuple[bytes, bool]:
+        """Decrypt the AEAD body; advances the recv P cipher.
+
+        Raises :class:`ValueError` on auth failure (caller in
+        ``peer.py`` is responsible for translating that into a peer
+        disconnect).
+        """
+        result = self.cipher.decrypt_contents(aead_ct, contents_len, aad=aad)
+        if result is None:
+            raise ValueError("BIP 324 packet authentication failed")
+        return result
+
+    # --- garbage terminator accessors ------------------------------------
+
+    @property
+    def send_garbage_terminator(self) -> bytes:
+        return self.cipher.send_garbage_terminator
+
+    @property
+    def recv_garbage_terminator(self) -> bytes:
+        return self.cipher.recv_garbage_terminator
+
+    @property
+    def session_id(self) -> bytes:
+        return self.cipher.session_id
