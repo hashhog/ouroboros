@@ -42,6 +42,24 @@ class V2TransportError(Exception):
     pass
 
 
+class V2NegotiationFailed(Exception):
+    """Raised when the BIP 324 v2 outbound handshake fails (peer probably
+    speaks v1 only, dropped the connection, or is otherwise unreachable
+    over v2).  The caller should:
+
+      1. Close the (now-corrupt) socket — we have already sent 64 bytes of
+         ElligatorSwift garbage that the peer interpreted as a partial v1
+         message header, so this socket cannot be salvaged for a v1
+         handshake.
+      2. Mark the peer-address as v1-only via PeerManager so subsequent
+         retries skip the v2 probe.
+      3. Reconnect on a fresh socket with ``transport_version=1``.
+
+    Mirrors Bitcoin Core's ``V2Transport::ShouldReconnectV1()`` flow
+    (net.cpp ~1555–1570 + the m_reconnections queue at ~1949)."""
+    pass
+
+
 # SOCKS5 constants (RFC 1928)
 
 SOCKS5_VERSION = 0x05
@@ -226,6 +244,10 @@ class Peer:
         # BIP 324 v2 transport (set after successful negotiation)
         self._v2_transport: V2Transport | None = None
         self._v2_recv_buffer: bytes = b""
+        # Latched True when an outbound v2 handshake fails — the caller
+        # (PeerManager) inspects this after ``connect()`` returns False
+        # to mark the address v1-only and reconnect with v1.
+        self.v2_negotiation_failed: bool = False
 
         self.version: int | None = None
         self.services: int = 0
@@ -332,12 +354,36 @@ class Peer:
                 if self.transport_version == 2:
                     try:
                         await self._negotiate_v2()
-                    except Exception as v2_err:
-                        logger.warning(
+                    except V2NegotiationFailed as v2_err:
+                        # Socket has 64 bytes of v2 garbage written to it
+                        # already; v1 cannot be retried on the same stream.
+                        # Set the flag, close cleanly, and stop retrying —
+                        # PeerManager will inspect ``v2_negotiation_failed``
+                        # and reconnect with transport_version=1 on a
+                        # fresh socket.  Mirrors Bitcoin Core's
+                        # m_reconnections queue (net.cpp ~1949).
+                        logger.info(
                             f"v2 transport negotiation failed with "
-                            f"{self.host}:{self.port}, falling back to v1: {v2_err}"
+                            f"{self.host}:{self.port} ({v2_err}); "
+                            "flagging peer v1-only for fresh-socket retry"
                         )
                         self._v2_transport = None
+                        self.v2_negotiation_failed = True
+                        await self.disconnect()
+                        return False
+                    except Exception as v2_err:  # pragma: no cover
+                        # Defensive: any other failure path should be
+                        # treated as a v2 negotiation failure to avoid a
+                        # half-encrypted v1 handshake on a corrupt stream.
+                        logger.warning(
+                            f"v2 transport negotiation raised unexpected "
+                            f"{type(v2_err).__name__} from "
+                            f"{self.host}:{self.port}: {v2_err}"
+                        )
+                        self._v2_transport = None
+                        self.v2_negotiation_failed = True
+                        await self.disconnect()
+                        return False
 
                 # Perform handshake
                 await self._handshake(start_height)
@@ -557,23 +603,76 @@ class Peer:
             logger.debug(f"Feature negotiation error (non-fatal): {feat_err}")
 
     async def _negotiate_v2(self) -> None:
+        """Drive the outbound BIP 324 v2 ElligatorSwift handshake.
+
+        Wire layout (initiator side):
+            ->  64 bytes ElligatorSwift-encoded ephemeral pubkey
+            <-  64 bytes ElligatorSwift-encoded ephemeral pubkey
+
+        v1 fallback heuristic: peek the first 4 bytes of the response.
+        A v1-only peer that received our 64 bytes will either disconnect
+        (raising IncompleteReadError) or — on some implementations — send
+        back a v1-framed reject message starting with the network magic.
+        Either case is detected and re-raised as ``V2NegotiationFailed``
+        so the caller can mark this address v1-only and reconnect.
+
+        Mirrors Bitcoin Core ``V2Transport`` initiator behaviour
+        (net.cpp:1555 ShouldReconnectV1).
+        """
         if not self.reader or not self.writer:
-            raise Exception("Not connected")
+            raise V2NegotiationFailed("Not connected")
 
         handshake = V2Handshake(initiator=True)
 
         # Send our 64-byte ElligatorSwift public key
-        self.writer.write(handshake.local_pubkey_bytes)
-        await self.writer.drain()
+        try:
+            self.writer.write(handshake.local_pubkey_bytes)
+            await self.writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            raise V2NegotiationFailed(
+                f"write failed during v2 send: {e}"
+            ) from e
 
-        # Read the peer's 64-byte ElligatorSwift public key
-        remote_pubkey = await asyncio.wait_for(
-            self.reader.readexactly(64),
-            timeout=10.0,
-        )
+        # Read first 4 bytes with a short timeout; we use this to fail
+        # fast against v1-only peers that respond with a v1 header
+        # (network magic) instead of an ElligatorSwift pubkey.
+        expected_magic = get_magic(self.network).to_bytes(4, "little")
+        try:
+            head = await asyncio.wait_for(
+                self.reader.readexactly(4),
+                timeout=5.0,
+            )
+        except (asyncio.IncompleteReadError, ConnectionResetError,
+                BrokenPipeError, OSError, TimeoutError) as e:
+            raise V2NegotiationFailed(
+                f"v2 read of first 4 bytes failed (peer probably v1-only): {e}"
+            ) from e
 
-        handshake.receive_remote_pubkey(remote_pubkey)
-        self._v2_transport = V2Transport.from_handshake(handshake)
+        if head == expected_magic:
+            raise V2NegotiationFailed(
+                "peer replied with v1 network magic — speaks v1 only"
+            )
+
+        # Read the remaining 60 bytes of the ElligatorSwift response.
+        try:
+            tail = await asyncio.wait_for(
+                self.reader.readexactly(60),
+                timeout=10.0,
+            )
+        except (asyncio.IncompleteReadError, ConnectionResetError,
+                BrokenPipeError, OSError, TimeoutError) as e:
+            raise V2NegotiationFailed(
+                f"v2 read of remaining 60 bytes failed: {e}"
+            ) from e
+
+        remote_pubkey = head + tail
+        try:
+            handshake.receive_remote_pubkey(remote_pubkey)
+            self._v2_transport = V2Transport.from_handshake(handshake)
+        except Exception as e:
+            raise V2NegotiationFailed(
+                f"v2 key derivation failed: {e}"
+            ) from e
         logger.info(
             f"BIP 324 v2 transport established with {self.host}:{self.port}"
         )
