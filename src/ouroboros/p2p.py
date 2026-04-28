@@ -72,6 +72,15 @@ MAX_FILTER_FEERATE = 1e7
 MIN_RELAY_FEE_RATE = 1000
 
 
+# BIP 324 v2 fall-back TTL.  An address that fails the v2 ElligatorSwift
+# handshake is recorded with the current unix timestamp; subsequent
+# outbound connections to the same address within this window dial v1
+# directly instead of probing v2 again.  24 h matches Bitcoin Core's
+# typical behaviour of remembering v1-only peers across the dialer's
+# lifetime; we use a TTL so eventual v2-upgraded peers are re-probed.
+V2_FALLBACK_TTL = 86400.0  # seconds
+
+
 class FeeFilterRounder:
     """Quantize fee rates for privacy before broadcasting.
 
@@ -445,6 +454,15 @@ class PeerManager:
         # Connection retry tracking (addr -> retry_count)
         self.retry_counts: dict[str, int] = defaultdict(int)
         self.last_retry_time: dict[str, float] = {}
+
+        # BIP 324 v2 fall-back state.  When an outbound v2 handshake
+        # fails for an address we record a unix-timestamp here so
+        # subsequent connection attempts within ``V2_FALLBACK_TTL``
+        # seconds skip the v2 probe and dial directly with v1.  This
+        # mirrors Bitcoin Core's m_reconnections queue (net.cpp:1949)
+        # except as a TTL cache rather than a one-shot list — ouroboros
+        # does not have Core's 1:1 reconnect-pump architecture.
+        self._v1_only_addrs: dict[str, float] = {}
 
         self.running = False
         self._maintenance_task: asyncio.Task | None = None
@@ -890,15 +908,14 @@ class PeerManager:
             if is_onion_host(host) and not peer_proxy:
                 continue
 
-            peer = Peer(
-                host, port, self.network,
-                transport_version=self.transport_version,
+            peer = await self._dial_outbound(
+                host, port,
                 relay_txs=False,  # block-relay-only
-                proxy=peer_proxy,
-                ban_manager=self.ban_manager,
+                start_height=start_height,
+                retry=True,
             )
 
-            if await peer.connect(start_height, retry=True):
+            if peer is not None:
                 self.block_relay_peers[addr] = peer
                 self.addrman.mark_good(host, port)
                 group = self._netgroup(host)
@@ -966,18 +983,19 @@ class PeerManager:
 
         logger.debug(f"Making feeler connection to {addr}")
 
-        peer = Peer(
-            host, port, self.network,
-            transport_version=self.transport_version,
-            relay_txs=False,  # feelers don't relay
-            proxy=peer_proxy,
-            ban_manager=self.ban_manager,
-        )
-
-        self._feeler_peer = peer
         self.addrman.mark_attempt(host, port)
+        # _dial_outbound handles v2-first + v1 fall-back transparently.
+        # We pre-set _feeler_peer to a sentinel so concurrent feeler
+        # calls see "in flight" via is_connected() check at entry.
+        peer = await self._dial_outbound(
+            host, port,
+            relay_txs=False,  # feelers don't relay
+            start_height=self._start_height,
+            retry=False,
+        )
+        self._feeler_peer = peer
 
-        if await peer.connect(self._start_height, retry=False):
+        if peer is not None:
             # Successful - mark as good and disconnect
             self.addrman.mark_good(host, port)
             logger.debug(f"Feeler to {addr} succeeded, moving to tried table")
@@ -1271,6 +1289,97 @@ class PeerManager:
         for peer in self.block_relay_peers.values():
             self._outbound_netgroups.add(self._netgroup(peer.host))
 
+    # BIP 324 v2 transport fall-back tracking
+    # See V2_FALLBACK_TTL.  A peer that failed the outbound v2
+    # ElligatorSwift handshake is dialed v1 directly until the TTL
+    # expires.
+
+    def _is_v1_only_addr(self, addr: str) -> bool:
+        """Return True if *addr* is currently flagged as v1-only.
+
+        Removes stale entries (older than ``V2_FALLBACK_TTL``) lazily.
+        """
+        ts = self._v1_only_addrs.get(addr)
+        if ts is None:
+            return False
+        if time.time() - ts > V2_FALLBACK_TTL:
+            self._v1_only_addrs.pop(addr, None)
+            return False
+        return True
+
+    def _mark_v1_only(self, addr: str) -> None:
+        """Record that *addr* failed v2 negotiation; subsequent retries
+        within ``V2_FALLBACK_TTL`` will dial v1 directly."""
+        self._v1_only_addrs[addr] = time.time()
+        logger.info(
+            f"BIP 324: marking {addr} v1-only for {V2_FALLBACK_TTL:.0f}s"
+        )
+
+    def _transport_for(self, addr: str) -> int:
+        """Return the transport version we should use to dial *addr*.
+
+        Honours the per-address v1-only fall-back cache so we don't
+        re-probe v2 against peers we already know speak v1.
+        """
+        if self.transport_version == 2 and self._is_v1_only_addr(addr):
+            return 1
+        return self.transport_version
+
+    async def _dial_outbound(
+        self,
+        host: str,
+        port: int,
+        *,
+        relay_txs: bool,
+        start_height: int,
+        retry: bool = False,
+    ) -> Peer | None:
+        """Dial an outbound peer with BIP 324 v2-first + v1 fall-back.
+
+        Returns the connected ``Peer`` on success, or ``None`` on
+        failure.  When the v2 ElligatorSwift handshake fails (peer is
+        v1-only or the TCP stream got out of sync) the address is
+        recorded in ``_v1_only_addrs`` and an immediate fresh-socket
+        retry is performed with ``transport_version=1``.
+
+        Centralises the transport-negotiation policy so all outbound
+        construction sites (full-relay, block-relay-only, anchor,
+        feeler, manual addnode) get identical behaviour.
+        """
+        addr = f"{host}:{port}"
+        peer_proxy = self._proxy_for_host(host)
+        attempt_v2 = self._transport_for(addr) == 2
+
+        # First attempt: v2 if configured-and-not-fallback-flagged,
+        # otherwise v1.
+        peer = Peer(
+            host, port, self.network,
+            transport_version=2 if attempt_v2 else 1,
+            relay_txs=relay_txs,
+            proxy=peer_proxy,
+            ban_manager=self.ban_manager,
+        )
+        ok = await peer.connect(start_height, retry=retry)
+        if ok:
+            return peer
+
+        # If the failure was specifically a v2-handshake failure, mark
+        # the address v1-only and immediately retry with v1 on a fresh
+        # socket.  This matches Bitcoin Core's m_reconnections flow
+        # (net.cpp:1949) at a per-dial granularity.
+        if attempt_v2 and getattr(peer, "v2_negotiation_failed", False):
+            self._mark_v1_only(addr)
+            v1_peer = Peer(
+                host, port, self.network,
+                transport_version=1,
+                relay_txs=relay_txs,
+                proxy=peer_proxy,
+                ban_manager=self.ban_manager,
+            )
+            if await v1_peer.connect(start_height, retry=retry):
+                return v1_peer
+        return None
+
     async def connect_to_peers(self, start_height: int = 0):
         """Connect to full-relay peers up to max_peers.
 
@@ -1334,11 +1443,14 @@ class PeerManager:
                 logger.debug(f"Skipping .onion peer {addr}: no proxy configured")
                 continue
 
-            peer = Peer(host, port, self.network,
-                        transport_version=self.transport_version, relay_txs=True,
-                        proxy=peer_proxy, ban_manager=self.ban_manager)
+            peer = await self._dial_outbound(
+                host, port,
+                relay_txs=True,
+                start_height=start_height,
+                retry=False,
+            )
 
-            if await peer.connect(start_height, retry=False):
+            if peer is not None:
                 self.peers[addr] = peer
                 self.retry_counts[addr] = 0  # Reset retry count on success
                 self.addrman.mark_good(host, port)
@@ -1384,12 +1496,14 @@ class PeerManager:
             logger.warning(f"Cannot connect to banned peer {addr}")
             return False
 
-        peer_proxy = self._proxy_for_host(host)
-        peer = Peer(host, port, self.network,
-                     transport_version=self.transport_version, relay_txs=True,
-                     proxy=peer_proxy, ban_manager=self.ban_manager)
+        peer = await self._dial_outbound(
+            host, port,
+            relay_txs=True,
+            start_height=self._start_height,
+            retry=False,
+        )
 
-        if await peer.connect(self._start_height, retry=False):
+        if peer is not None:
             self.peers[addr] = peer
             self.retry_counts[addr] = 0
             self.addrman.mark_good(host, port)
@@ -1462,11 +1576,14 @@ class PeerManager:
                 logger.debug(f"Skipping .onion block-relay peer {addr}: no proxy configured")
                 continue
 
-            peer = Peer(host, port, self.network,
-                        transport_version=self.transport_version, relay_txs=False,
-                        proxy=peer_proxy, ban_manager=self.ban_manager)
+            peer = await self._dial_outbound(
+                host, port,
+                relay_txs=False,
+                start_height=start_height,
+                retry=False,
+            )
 
-            if await peer.connect(start_height, retry=False):
+            if peer is not None:
                 self.block_relay_peers[addr] = peer
                 self.retry_counts[addr] = 0
                 self.addrman.mark_good(host, port)
