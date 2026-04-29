@@ -240,12 +240,25 @@ class BitcoinNode:
             # Treat explicit "0" or False as disabled
             if str(listen_enabled).lower() in ("0", "false", "no"):
                 listen_enabled = False
+            # BIP 111 -peerbloomfilters (Core parity, default false).  Same
+            # string-coerce dance as v2transport so a conf value of "0"
+            # disables advertisement.
+            pbf_raw = self.config.get('peerbloomfilters', False)
+            if isinstance(pbf_raw, str):
+                peer_bloom_filters = pbf_raw.lower() in ("1", "true", "yes", "on")
+            else:
+                peer_bloom_filters = bool(pbf_raw)
+            logger.info(
+                f"BIP 111 NODE_BLOOM advertisement: "
+                f"{'enabled' if peer_bloom_filters else 'disabled (Core parity default)'}"
+            )
             self.peer_manager = PeerManager(
                 self.network,
                 max_peers=max_peers,
                 data_dir=self.data_dir,
                 transport_version=p2p_transport,
                 listen=bool(listen_enabled),
+                peer_bloom_filters=peer_bloom_filters,
             )
             # BIP 152: Provide mempool and database for compact block relay
             self.peer_manager.set_mempool(self.mempool)
