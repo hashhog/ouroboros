@@ -9,7 +9,9 @@ Bitcoin Core reference: net_processing.cpp ~4855
         !pfrom.HasPermission(NetPermissionFlags::Mempool))
 
 This module verifies:
-  1. NODE_BLOOM is advertised in our_services after handshake setup.
+  1. NODE_BLOOM is NOT advertised by default (Core parity:
+     DEFAULT_PEERBLOOMFILTERS = false in net_processing.h:44).  The
+     `peer_bloom_filters=True` Peer arg flips it on.
   2. on_mempool returns immediately when our_services lacks NODE_BLOOM
      (no inv sent), regardless of peer.relay_txs.
   3. on_mempool dumps the mempool as inv chunks of MAX_INV_SZ=50000
@@ -204,6 +206,48 @@ class TestBip35Advertisement(unittest.TestCase):
         """Before handshake runs, our_services starts at 0 (Core parity)."""
         p = Peer("10.0.0.1", 18333, "regtest")
         self.assertEqual(p.our_services, 0)
+
+    def test_default_peer_bloom_filters_false(self) -> None:
+        """peer_bloom_filters defaults to False (Core's
+        DEFAULT_PEERBLOOMFILTERS = false in net_processing.h:44)."""
+        p = Peer("10.0.0.1", 18333, "regtest")
+        self.assertFalse(p.peer_bloom_filters)
+
+    def test_create_network_address_omits_bloom_by_default(self) -> None:
+        """_create_network_address must NOT set NODE_BLOOM when the flag
+        is off (Core-parity default)."""
+        p = Peer("10.0.0.1", 18333, "regtest")
+        addr = p._create_network_address("10.0.0.1", 18333)
+        self.assertFalse(addr.services & NODE_BLOOM,
+                         "NODE_BLOOM must not be advertised by default")
+        self.assertTrue(addr.services & NODE_NETWORK)
+        self.assertTrue(addr.services & NODE_WITNESS)
+
+    def test_create_network_address_sets_bloom_when_enabled(self) -> None:
+        """When peer_bloom_filters=True, _create_network_address advertises
+        NODE_BLOOM (matches -peerbloomfilters=1)."""
+        p = Peer("10.0.0.1", 18333, "regtest", peer_bloom_filters=True)
+        self.assertTrue(p.peer_bloom_filters)
+        addr = p._create_network_address("10.0.0.1", 18333)
+        self.assertTrue(addr.services & NODE_BLOOM,
+                        "NODE_BLOOM must be advertised when flag is on")
+        self.assertTrue(addr.services & NODE_NETWORK)
+        self.assertTrue(addr.services & NODE_WITNESS)
+
+
+class TestBip35ConfigFlag(unittest.TestCase):
+    """Verify the --peerbloomfilters / config plumbing through PeerManager."""
+
+    def test_peer_manager_default_disables_bloom(self) -> None:
+        """PeerManager() default leaves peer_bloom_filters=False."""
+        pm = PeerManager(network="regtest", listen=False)
+        self.assertFalse(pm.peer_bloom_filters)
+
+    def test_peer_manager_propagates_flag(self) -> None:
+        """Explicit peer_bloom_filters=True is stored on the manager."""
+        pm = PeerManager(network="regtest", listen=False,
+                         peer_bloom_filters=True)
+        self.assertTrue(pm.peer_bloom_filters)
 
 
 if __name__ == "__main__":

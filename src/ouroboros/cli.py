@@ -314,8 +314,17 @@ def sync(ctx, reset, limit):
         "config default is on). v1 fall-back is automatic per address."
     ),
 )
+@click.option(
+    "--peerbloomfilters/--nopeerbloomfilters",
+    default=None,
+    help=(
+        "Advertise NODE_BLOOM (BIP 111) and service BIP-35 MEMPOOL "
+        "requests (default: from config; config default is off, matching "
+        "Bitcoin Core's DEFAULT_PEERBLOOMFILTERS=false)."
+    ),
+)
 @click.pass_context
-def start(ctx, rpc_port, p2p_port, listen, connect, force, v2transport):
+def start(ctx, rpc_port, p2p_port, listen, connect, force, v2transport, peerbloomfilters):
     """Start the Bitcoin node"""
     global _node, _cancelled
     _cancelled = False
@@ -370,6 +379,11 @@ def start(ctx, rpc_port, p2p_port, listen, connect, force, v2transport):
         # (which itself defaults to enabled) wins.
         if v2transport is not None:
             config["v2transport"] = bool(v2transport)
+        # Same conf-vs-CLI precedence for --peerbloomfilters.  When the
+        # operator omits the flag the conf-file value (default off, Core
+        # parity) wins.
+        if peerbloomfilters is not None:
+            config["peerbloomfilters"] = bool(peerbloomfilters)
 
         _node = BitcoinNode(config=config)
 
