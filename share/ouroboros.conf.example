@@ -32,6 +32,14 @@ rpcallowip=127.0.0.1
 # Maximum number of peer connections
 maxconnections=125
 
+# BIP 324 v2 encrypted P2P transport (1=enabled, 0=v1-only).
+# Default is enabled.  The cipher + handshake are Core-compatible
+# (verified against the BIP 324 reference vectors and Core's reference
+# state machine) and v1 fall-back is automatic — peers that don't speak
+# v2 are detected and re-dialled with v1 on a fresh socket, so leaving
+# this on is safe even on networks where v2 deployment is partial.
+v2transport=1
+
 # ------------------------------------------------------------------------------
 # Logging / Debug
 # ------------------------------------------------------------------------------
