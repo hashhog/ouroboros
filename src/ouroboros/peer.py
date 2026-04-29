@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from ouroboros.banman import BanManager
 
 from ouroboros.p2p_messages import (
+    NODE_BLOOM,
     NODE_NETWORK,
     NODE_P2P_V2,
     NODE_WITNESS,
@@ -311,6 +312,13 @@ class Peer:
 
         self.version: int | None = None
         self.services: int = 0
+        # Services we advertise to this peer in our `version` message.
+        # Mirrors Bitcoin Core's `Peer::m_our_services`. Used as the
+        # source of truth for BIP-35 (mempool) gating — see Core
+        # net_processing.cpp ~4855: the MEMPOOL handler is gated on
+        # `peer.m_our_services & NODE_BLOOM`, independent of BIP-37
+        # fRelay.
+        self.our_services: int = 0
         self.user_agent: str = ""
         self.start_height: int = 0
 
@@ -622,9 +630,14 @@ class Peer:
         addr_recv = self._create_network_address(self.host, self.port)
         addr_from = self._create_network_address("0.0.0.0", 8333)
 
-        our_services = NODE_NETWORK | NODE_WITNESS
+        # BIP 111 NODE_BLOOM is advertised unconditionally (no
+        # peer-bloom-filters config flag in ouroboros yet); BIP-35
+        # MEMPOOL servicing is gated on this flag in p2p.py
+        # (matches Bitcoin Core net_processing.cpp ~4855).
+        our_services = NODE_NETWORK | NODE_BLOOM | NODE_WITNESS
         if self.transport_version >= 2:
             our_services |= NODE_P2P_V2
+        self.our_services = our_services
         version_msg = VersionMessage(
             version=70016,
             services=our_services,
@@ -1102,9 +1115,14 @@ class Peer:
         # Send version message
         # Block-relay-only connections set relay=False (BIP 37) to signal
         # that we do not want transaction relay on this connection.
-        our_services = NODE_NETWORK | NODE_WITNESS
+        # BIP 111 NODE_BLOOM is advertised unconditionally (no
+        # peer-bloom-filters config flag in ouroboros yet); BIP-35
+        # MEMPOOL servicing is gated on this flag in p2p.py
+        # (matches Bitcoin Core net_processing.cpp ~4855).
+        our_services = NODE_NETWORK | NODE_BLOOM | NODE_WITNESS
         if self.transport_version >= 2:
             our_services |= NODE_P2P_V2
+        self.our_services = our_services
         version_msg = VersionMessage(
             version=70016,
             services=our_services,
@@ -1224,7 +1242,7 @@ class Peer:
 
     def _create_network_address(self, host: str, port: int) -> NetworkAddress:
         """Create network address from host and port."""
-        our_services = NODE_NETWORK | NODE_WITNESS
+        our_services = NODE_NETWORK | NODE_BLOOM | NODE_WITNESS
 
         # .onion addresses — use all-zeros IP (the real routing happens
         # via the SOCKS5 proxy; the version message just needs a valid
