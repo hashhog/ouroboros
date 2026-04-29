@@ -922,6 +922,20 @@ class BitcoinNode:
 
         self.peer_manager.set_inbound_peer_handler(_on_inbound_peer)
 
+        # Mirror the same wiring on every newly-dialed outbound peer.  Without
+        # this hook, post-startup outbound peers (full-relay dials picked from
+        # addrman, anchors, addnode, block-relay-only) silently dropped tx /
+        # getdata / getheaders messages because handlers were only registered
+        # for peers already connected when _register_handlers() ran (typically
+        # only the --connect peers).  See PARITY-MATRIX.md Category B.
+        if hasattr(self.peer_manager, "set_outbound_peer_handler"):
+            async def _on_outbound_peer(peer):
+                peer.register_handler("tx", _make_tx_handler(peer))
+                peer.register_handler("getdata", _make_getdata_handler(peer))
+                peer.register_handler("getheaders", _make_getheaders_handler(peer))
+
+            self.peer_manager.set_outbound_peer_handler(_on_outbound_peer)
+
         logger.info("Transaction, getdata, and getheaders handlers registered")
 
     def is_synced(self) -> bool:

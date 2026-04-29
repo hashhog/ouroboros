@@ -1,4 +1,17 @@
 //! Bitcoin P2P peer connection and communication
+//!
+//! This module is the Rust IBD-only peer.  It performs the handshake,
+//! reads block/header messages, and exposes a generic `Message` stream
+//! to the caller.  Tx relay, BIP-152 compact blocks, and the matching
+//! serving paths live in the Python layer (`src/ouroboros/p2p.py`,
+//! `src/ouroboros/node.py`); see the cross-impl P2P parity audit
+//! (PARITY-MATRIX.md, Category B).
+//!
+//! TODO(serve): if/when ferrous-utils is consumed by another front-end,
+//! port the Python serving handlers (tx, getdata, getheaders,
+//! sendcmpct, cmpctblock, getblocktxn, blocktxn) here.  Until then the
+//! handshake correctly advertises NODE_NETWORK | NODE_WITNESS so peers
+//! see consistent capabilities even when the Rust path is in use.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -221,9 +234,19 @@ impl Peer {
             0,
         );
 
+        // Bitcoin Core service flags (protocol.h):
+        //   NODE_NETWORK = 1 << 0 — full block + tx relay
+        //   NODE_WITNESS = 1 << 3 — serves segwit (witness) data
+        // ferrous-utils validates witness data, so we must advertise
+        // NODE_WITNESS too. Otherwise Core peers refuse to send us
+        // post-segwit blocks via getdata MSG_WITNESS_BLOCK.
+        const NODE_NETWORK: u64 = 1 << 0;
+        const NODE_WITNESS: u64 = 1 << 3;
+        let services = NODE_NETWORK | NODE_WITNESS;
+
         let version_msg = VersionMessage::new(
             70015, // Protocol version
-            1,     // Services: NODE_NETWORK (full node capability)
+            services,
             timestamp,
             addr_recv,
             remote_addr,
