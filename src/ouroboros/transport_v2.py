@@ -185,6 +185,143 @@ class PacketType(IntEnum):
 IGNORE_BIT = 0x80  # high bit of the BIP 324 header byte
 
 
+# --- BIP 324 short message-ID table ---------------------------------------
+#
+# Per BIP 324, the *contents* of an application packet are wrapped as:
+#
+#     short_id (1 byte, 0x01..0x1c) + payload                  (short form)
+#  OR
+#     0x00 + 12-byte ASCII command (NUL-padded) + payload      (long form)
+#
+# The 24-byte v1 magic|cmd|len|checksum header is NOT part of v2 contents —
+# it is replaced by this 1- or 13-byte type prefix.  Reference:
+# bitcoin-core/src/net.cpp ``V2_MESSAGE_IDS`` (constexpr array of 33) and
+# ``V2Transport::SetMessageToSend`` / ``GetMessageType``.
+#
+# Index 0 ("") is reserved for long-form encoding; indices 29-32 are the
+# four "Unimplemented" slots BIP 324 reserves for future use.  We do not
+# emit them on the wire.  On decode, unknown short IDs fall through to
+# ``None`` and the caller drops the packet (Core net.cpp:1426-1428).
+V2_MESSAGE_IDS: tuple[str, ...] = (
+    "",            # 0  — long encoding marker
+    "addr",        # 1
+    "block",       # 2
+    "blocktxn",    # 3
+    "cmpctblock",  # 4
+    "feefilter",   # 5
+    "filteradd",   # 6
+    "filterclear", # 7
+    "filterload",  # 8
+    "getblocks",   # 9
+    "getblocktxn", # 10
+    "getdata",     # 11
+    "getheaders",  # 12
+    "headers",     # 13
+    "inv",         # 14
+    "mempool",     # 15
+    "merkleblock", # 16
+    "notfound",    # 17
+    "ping",        # 18
+    "pong",        # 19
+    "sendcmpct",   # 20
+    "tx",          # 21
+    "getcfilters", # 22
+    "cfilter",     # 23
+    "getcfheaders",# 24
+    "cfheaders",   # 25
+    "getcfcheckpt",# 26
+    "cfcheckpt",   # 27
+    "addrv2",      # 28
+    # 29-32 reserved for future use per BIP 324; do not emit.
+)
+
+_V2_SHORT_ID_BY_COMMAND: dict[str, int] = {
+    cmd: idx for idx, cmd in enumerate(V2_MESSAGE_IDS) if cmd
+}
+
+
+def v2_short_id(command: str) -> int | None:
+    """Return the 1-byte BIP 324 short ID for ``command`` or ``None``.
+
+    ``None`` means the message MUST be encoded with the long (12-byte)
+    form.  This is the encoder side; only the BIP 324 spec range 1..28
+    is emitted.
+    """
+    return _V2_SHORT_ID_BY_COMMAND.get(command)
+
+
+def v2_command_from_short_id(short_id: int) -> str | None:
+    """Return the command name for a BIP 324 short ID, or ``None``.
+
+    Decoder side.  Only the BIP 324 spec range 1..28 is recognised here;
+    unknown / extended / reserved IDs (0, 29..255) return ``None`` and
+    the caller should drop the packet without disconnecting the peer
+    (forward-compat with future BIP 324 amendments).
+    """
+    if 1 <= short_id < len(V2_MESSAGE_IDS):
+        cmd = V2_MESSAGE_IDS[short_id]
+        return cmd if cmd else None
+    return None
+
+
+def encode_v2_contents(command: str, payload: bytes) -> bytes:
+    """Wrap a (command, payload) into BIP 324 v2 packet contents.
+
+    Mirrors ``V2Transport::SetMessageToSend`` (bitcoin-core/src/net.cpp:
+    1484-1514).  The 24-byte v1 magic|cmd|len|checksum header is NOT
+    included — it is the v1 framing that v2 replaces.
+    """
+    short_id = v2_short_id(command)
+    if short_id is not None:
+        return bytes([short_id]) + payload
+    # Long form: 0x00 + 12-byte NUL-padded ASCII command + payload.
+    cmd_bytes = command.encode("ascii")
+    if len(cmd_bytes) > 12:
+        raise ValueError(f"v2 long-form command too long: {command!r}")
+    cmd_field = cmd_bytes + b"\x00" * (12 - len(cmd_bytes))
+    return b"\x00" + cmd_field + payload
+
+
+def decode_v2_contents(contents: bytes) -> tuple[str, bytes] | None:
+    """Inverse of :func:`encode_v2_contents`.
+
+    Returns ``(command, payload)`` or ``None`` if the contents are
+    malformed / use an unknown short ID.  Mirrors
+    ``V2Transport::GetMessageType`` (bitcoin-core/src/net.cpp:1415-1453).
+    """
+    if not contents:
+        return None
+    first = contents[0]
+    rest = contents[1:]
+    if first != 0:
+        cmd = v2_command_from_short_id(first)
+        if cmd is None:
+            return None
+        return cmd, rest
+    # Long encoding: must have at least 12 bytes for the command field.
+    if len(rest) < 12:
+        return None
+    cmd_field = rest[:12]
+    payload = rest[12:]
+    # The first 0x00 terminates; bytes after must also be 0x00, and bytes
+    # before must be printable ASCII (Core net.cpp:1437-1448).
+    msg_type_len = 0
+    while msg_type_len < 12 and cmd_field[msg_type_len] != 0:
+        b = cmd_field[msg_type_len]
+        if b < 0x20 or b > 0x7F:
+            return None
+        msg_type_len += 1
+    while msg_type_len < 12:
+        if cmd_field[msg_type_len] != 0:
+            return None
+        msg_type_len += 1
+    try:
+        command = cmd_field.rstrip(b"\x00").decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return command, payload
+
+
 # --- network magic mapping for HKDF salt ----------------------------------
 #
 # BIP 324's salt = ``b'bitcoin_v2_shared_secret' + network_magic`` where
