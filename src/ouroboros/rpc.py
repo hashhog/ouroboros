@@ -3594,7 +3594,26 @@ class RPCServer:
         return total
 
     async def rpc_addnode(self, node: str, command: str = "add") -> None:
-        """Add or remove a peer."""
+        """Add or remove a peer.
+
+        Mirrors Bitcoin Core's ``addnode`` semantics
+        (``src/rpc/net.cpp::addnode``): the dial is queued and the RPC
+        returns immediately. Awaiting the full TCP + (BIP-324) cipher +
+        version handshake races against any client-side timeout (e.g. the
+        BC interop harness uses a 20s curl) and causes the in-flight
+        handshake task to be cancelled mid-stream when the client gives
+        up — which in turn evicts the half-open peer slot on the remote
+        side.
+
+        For ``add`` / ``onetry`` we therefore fire-and-forget the dial via
+        ``asyncio.create_task`` and return ``None``. The background task
+        runs with a generous 60s timeout so the BIP-324 v2 cipher
+        handshake + encrypted version exchange has time to complete even
+        on a loaded node, decoupled from the JSON-RPC response latency.
+
+        ``remove`` is fast (in-process state mutation only) so it stays
+        synchronous, matching Core's ``RemoveAddedNode``.
+        """
         pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
         if pm is None:
             raise ValueError("No peer manager available")
@@ -3612,12 +3631,52 @@ class RPCServer:
             port = getattr(pm, '_default_port', 8333)
 
         if command in ("add", "onetry"):
-            if hasattr(pm, 'connect_to_node'):
-                ok = await pm.connect_to_node(host, port)
-                if not ok and command == "add":
-                    raise ValueError(f"Failed to connect to {node}")
-            elif hasattr(pm, 'add_peer'):
-                await pm.add_peer(node)
+            # Fire-and-forget: queue the dial as a background task and
+            # return immediately. Matches Bitcoin Core
+            # OpenNetworkConnection / AddNode behaviour.
+            async def _bg_dial(_host: str, _port: int, _node: str, _command: str) -> None:
+                try:
+                    if hasattr(pm, 'connect_to_node'):
+                        ok = await asyncio.wait_for(
+                            pm.connect_to_node(_host, _port),
+                            timeout=60.0,
+                        )
+                        if not ok:
+                            logger.info(
+                                "rpc_addnode background dial: connect_to_node returned False for %s",
+                                _node,
+                            )
+                    elif hasattr(pm, 'add_peer'):
+                        await asyncio.wait_for(pm.add_peer(_node), timeout=60.0)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "rpc_addnode background dial timed out after 60s for %s",
+                        _node,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - background, must not crash loop
+                    logger.warning(
+                        "rpc_addnode background dial failed for %s: %s",
+                        _node,
+                        exc,
+                    )
+
+            task = asyncio.create_task(
+                _bg_dial(host, port, node, command),
+                name=f"rpc_addnode-{host}:{port}",
+            )
+
+            # Track tasks on the RPCServer so the event loop keeps a
+            # strong reference (otherwise create_task() may be GC'd
+            # before completion) and so tests / shutdown can introspect.
+            tasks: set = getattr(self, '_addnode_tasks', None)
+            if tasks is None:
+                tasks = set()
+                self._addnode_tasks = tasks
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+            return None
         elif command == "remove":
             addr = f"{host}:{port}"
             peers = getattr(pm, 'peers', {})

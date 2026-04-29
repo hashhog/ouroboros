@@ -785,5 +785,102 @@ class TestMempoolEntryRPCs(unittest.TestCase):
         asyncio.run(test())
 
 
+class TestRPCAddnodeFireAndForget(unittest.TestCase):
+    """Regression test: rpc_addnode must NOT block on the dial.
+
+    Bitcoin Core's ``addnode`` returns immediately after queueing the
+    request. The earlier ouroboros implementation awaited the entire
+    TCP + BIP-324 cipher handshake, which races against client-side
+    curl timeouts and silently aborts the in-flight handshake task —
+    see wave-bip324-live-core-2026-04-29/RESULTS.md follow-up #3.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.mkdtemp()
+        self.node = BitcoinNode(data_dir=self.temp_dir, network="regtest")
+        self.rpc_server = RPCServer(self.node, port=18333)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_rpc_addnode_returns_immediately_when_dial_is_slow(self):
+        """addnode returns in <100ms even when the dial blocks for seconds."""
+        import asyncio
+        import time
+
+        class SlowPeerManager:
+            """connect_to_node sleeps 5s — simulates a stuck cipher handshake."""
+
+            _default_port = 8333
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, int]] = []
+
+            async def connect_to_node(self, host: str, port: int) -> bool:
+                self.calls.append((host, port))
+                await asyncio.sleep(5.0)
+                return True
+
+        async def run() -> None:
+            slow_pm = SlowPeerManager()
+            self.rpc_server.node.peer_manager = slow_pm
+
+            t0 = time.monotonic()
+            result = await self.rpc_server.rpc_addnode(
+                "127.0.0.1:51500", "onetry"
+            )
+            elapsed = time.monotonic() - t0
+
+            # Must return quickly — handler is no longer blocked on the dial.
+            # 100ms is comfortably above any reasonable scheduling jitter
+            # while still ~50× faster than the 5s slow-dial fixture.
+            self.assertLess(
+                elapsed,
+                0.1,
+                f"rpc_addnode blocked for {elapsed:.3f}s (expected <0.1s)",
+            )
+            self.assertIsNone(result)
+
+            # The background task should still be running and a single
+            # connect_to_node call should have been issued.
+            tasks = getattr(self.rpc_server, "_addnode_tasks", set())
+            self.assertEqual(len(tasks), 1)
+            bg_task = next(iter(tasks))
+            self.assertFalse(bg_task.done())
+
+            # Wait for the background task to finish so the dial actually
+            # ran, then assert the peer manager was called exactly once.
+            await bg_task
+            self.assertEqual(slow_pm.calls, [("127.0.0.1", 51500)])
+
+        asyncio.run(run())
+
+    def test_rpc_addnode_swallows_background_dial_failure(self):
+        """A background dial that raises must not crash the event loop."""
+        import asyncio
+
+        class FailingPeerManager:
+            _default_port = 8333
+
+            async def connect_to_node(self, host: str, port: int) -> bool:
+                raise RuntimeError("simulated handshake failure")
+
+        async def run() -> None:
+            self.rpc_server.node.peer_manager = FailingPeerManager()
+
+            # The RPC handler itself must not raise — Bitcoin Core's
+            # addnode also returns null even when the dial ultimately
+            # fails (the error surfaces asynchronously in the log).
+            await self.rpc_server.rpc_addnode("127.0.0.1:51500", "onetry")
+
+            tasks = getattr(self.rpc_server, "_addnode_tasks", set())
+            self.assertEqual(len(tasks), 1)
+            await asyncio.wait(list(tasks))
+            # _bg_dial must catch the RuntimeError and clear itself
+            self.assertEqual(len(self.rpc_server._addnode_tasks), 0)
+
+        asyncio.run(run())
+
+
 if __name__ == '__main__':
     unittest.main()
