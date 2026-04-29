@@ -222,7 +222,20 @@ class BitcoinNode:
             _, best_height = self.db.get_best_block()
             logger.info(f"Initializing peer manager (current height: {best_height})...")
             max_peers = self.config.get('max_connections', 8)
-            p2p_transport = 2 if self.config.get('v2transport') else 1
+            # v2transport may arrive as bool (NodeConfig.to_dict normalises)
+            # or as a raw "0"/"1"/"true"/"false" string (CLI/dict override
+            # before normalisation).  Treat the same way we handle ``listen``
+            # below to avoid the "string '0' is truthy" footgun that used
+            # to silently keep v2transport=0 enabled.
+            v2_raw = self.config.get('v2transport', False)
+            if isinstance(v2_raw, str):
+                v2_enabled = v2_raw.lower() in ("1", "true", "yes", "on")
+            else:
+                v2_enabled = bool(v2_raw)
+            p2p_transport = 2 if v2_enabled else 1
+            logger.info(
+                f"BIP 324 v2 transport: {'enabled' if v2_enabled else 'disabled (v1-only)'}"
+            )
             listen_enabled = self.config.get('listen', True)
             # Treat explicit "0" or False as disabled
             if str(listen_enabled).lower() in ("0", "false", "no"):
