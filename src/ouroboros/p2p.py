@@ -47,6 +47,7 @@ from ouroboros.p2p_messages import (
     SendCmpctMessage,
     SendTxRcnclMessage,
     SketchMessage,
+    get_magic,
 )
 from ouroboros.peer import Peer, is_onion_host
 from ouroboros.tor import (
@@ -2451,6 +2452,19 @@ class PeerManager:
         peer.register_handler("reqtxrcncl", on_reqtxrcncl)
         peer.register_handler("sketch", on_sketch)
         peer.register_handler("reconcildiff", on_reconcildiff)
+
+        # If the peer sent sendtxrcncl during the pre-verack window the
+        # raw payload was stashed on the Peer; replay it now that the
+        # handler is wired (BIP 330 / bitcoin-core net_processing.cpp).
+        pending = getattr(peer, "_pending_sendtxrcncl_payload", None)
+        if pending is not None:
+            peer._pending_sendtxrcncl_payload = None
+            replay = NetworkMessage(
+                command="sendtxrcncl",
+                payload=pending,
+                magic=get_magic(self.network),
+            )
+            asyncio.create_task(on_sendtxrcncl(replay))
 
     async def _reconciliation_loop(self) -> None:
         """Periodically reconcile transaction sets with Erlay peers."""

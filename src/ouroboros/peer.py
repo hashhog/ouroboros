@@ -352,6 +352,10 @@ class Peer:
 
         # BIP 330: Erlay reconciliation support
         self.erlay_enabled: bool = False       # Set to True when sendtxrcncl exchanged
+        # If the peer sent us sendtxrcncl during the pre-verack window we
+        # cache the raw payload here so the post-handshake on_sendtxrcncl
+        # handler in p2p.py can replay it once it has been registered.
+        self._pending_sendtxrcncl_payload: bytes | None = None
 
         # Timestamps used by the inbound eviction algorithm
         self.connected_at: float = time.time()
@@ -689,8 +693,12 @@ class Peer:
         self._verack_sent = True
 
         # 6. Receive verack with handshake timeout.
-        # The remote peer may send wtxidrelay / sendaddrv2 before its verack.
-        for _attempt in range(10):
+        # The remote peer may send any of the legal pre-verack negotiation
+        # messages (BIP 339 wtxidrelay, BIP 155 sendaddrv2, BIP 330
+        # sendtxrcncl) before its verack.  Per bitcoin-core
+        # net_processing.cpp ProcessMessage, anything else received before
+        # verack is logged and ignored (NOT a disconnect-worthy offense).
+        for _attempt in range(20):
             msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
             if msg.command == "verack":
                 break
@@ -702,7 +710,23 @@ class Peer:
                 self.addrv2 = True
                 logger.debug(f"Received sendaddrv2 from {self.host}:{self.port} during inbound handshake")
                 continue
-            raise Exception(f"Expected verack, got {msg.command}")
+            if msg.command == "sendtxrcncl":
+                # BIP 330: peer is offering Erlay reconciliation.  Mark
+                # the peer; the actual salt-exchange handler is wired
+                # post-handshake in p2p.py (_register_erlay_handlers).
+                # Stash the raw payload so the handler can replay it
+                # once the peer transitions to the connected state.
+                self.erlay_enabled = True
+                self._pending_sendtxrcncl_payload = msg.payload
+                logger.debug(f"Received sendtxrcncl from {self.host}:{self.port} during inbound handshake")
+                continue
+            # Unknown / unsupported pre-verack message.  Match Core
+            # behaviour: log and ignore rather than disconnecting,
+            # which keeps us forward-compatible with new BIPs.
+            logger.debug(
+                f"Ignoring unsupported pre-verack message {msg.command!r} "
+                f"from {self.host}:{self.port}"
+            )
         else:
             raise Exception("Did not receive verack within expected message count")
         self._verack_received = True
@@ -1208,9 +1232,12 @@ class Peer:
         self._verack_sent = True
 
         # Receive verack with handshake timeout.
-        # The remote peer may send wtxidrelay / sendaddrv2 before its verack
-        # (this is standard Bitcoin Core behaviour), so consume those first.
-        for _attempt in range(10):  # safety bound
+        # The remote peer may send any of the legal pre-verack negotiation
+        # messages (BIP 339 wtxidrelay, BIP 155 sendaddrv2, BIP 330
+        # sendtxrcncl) before its verack.  Per bitcoin-core
+        # net_processing.cpp ProcessMessage, anything else received before
+        # verack is logged and ignored (NOT a disconnect-worthy offense).
+        for _attempt in range(20):  # safety bound
             msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
             if msg.command == "verack":
                 break
@@ -1222,7 +1249,23 @@ class Peer:
                 self.addrv2 = True
                 logger.debug(f"Received sendaddrv2 from {self.host}:{self.port} during handshake")
                 continue
-            raise Exception(f"Expected verack, got {msg.command}")
+            if msg.command == "sendtxrcncl":
+                # BIP 330: peer is offering Erlay reconciliation.  Mark
+                # the peer; the actual salt-exchange handler is wired
+                # post-handshake in p2p.py (_register_erlay_handlers).
+                # Stash the raw payload so the handler can replay it
+                # once the peer transitions to the connected state.
+                self.erlay_enabled = True
+                self._pending_sendtxrcncl_payload = msg.payload
+                logger.debug(f"Received sendtxrcncl from {self.host}:{self.port} during handshake")
+                continue
+            # Unknown / unsupported pre-verack message.  Match Core
+            # behaviour: log and ignore rather than disconnecting,
+            # which keeps us forward-compatible with new BIPs.
+            logger.debug(
+                f"Ignoring unsupported pre-verack message {msg.command!r} "
+                f"from {self.host}:{self.port}"
+            )
         else:
             raise Exception("Did not receive verack within expected message count")
         self._verack_received = True
