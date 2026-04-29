@@ -306,8 +306,16 @@ def sync(ctx, reset, limit):
 @click.option("--listen/--nolisten", default=True, help="Accept inbound P2P connections")
 @click.option("--connect", multiple=True, help="Connect to specific peer(s) host:port (can repeat)")
 @click.option("--force", is_flag=True, default=False, help="Skip sync check prompt")
+@click.option(
+    "--v2transport/--nov2transport",
+    default=None,
+    help=(
+        "Enable BIP 324 v2 encrypted P2P transport (default: from config; "
+        "config default is on). v1 fall-back is automatic per address."
+    ),
+)
 @click.pass_context
-def start(ctx, rpc_port, p2p_port, listen, connect, force):
+def start(ctx, rpc_port, p2p_port, listen, connect, force, v2transport):
     """Start the Bitcoin node"""
     global _node, _cancelled
     _cancelled = False
@@ -356,6 +364,12 @@ def start(ctx, rpc_port, p2p_port, listen, connect, force):
         }
         if connect:
             config["connect"] = list(connect)
+        # Only override the conf-file value when the operator explicitly
+        # passed --v2transport / --nov2transport.  Click leaves the option
+        # at None when the flag was omitted so the conf file's value
+        # (which itself defaults to enabled) wins.
+        if v2transport is not None:
+            config["v2transport"] = bool(v2transport)
 
         _node = BitcoinNode(config=config)
 

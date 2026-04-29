@@ -169,6 +169,13 @@ class NodeConfig:
             'torcontrol': None,
             # Tor control password (for HASHEDPASSWORD auth)
             'torpassword': None,
+            # BIP 324 v2 encrypted transport (1=enabled, 0=v1-only).
+            # Defaults ON: the cipher + handshake have been verified
+            # Core-compatible (commits 8ea9b81 + 5e28a8a + 27519ff) and
+            # outbound v1 fall-back is wired (commit 66ad0f3) — peers
+            # that don't speak v2 are detected and re-dialled with v1
+            # on a fresh socket.  Set v2transport=0 to force v1-only.
+            'v2transport': '1',
         }
 
         if self.config_path.exists():
@@ -287,6 +294,12 @@ class NodeConfig:
             'i2psam': self.get('i2psam'),
             'torcontrol': self.get('torcontrol'),
             'torpassword': self.get('torpassword'),
+            # BIP 324 v2 encrypted transport toggle.  Coerced to bool here
+            # so consumers (node.py initial PeerManager wiring) don't have
+            # to reinterpret the raw "0"/"1"/"true" string — and to avoid
+            # the classic "0"-string-is-truthy footgun that previously
+            # silently dropped v2transport=0 in conf.
+            'v2transport': self.getboolean('v2transport'),
         }
 
 
