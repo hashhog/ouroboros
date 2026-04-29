@@ -197,6 +197,65 @@ MIN_PEER_VERSION = 70015
 HANDSHAKE_TIMEOUT = 60.0
 
 
+class _PrefixedStreamReader:
+    """Adapter that prepends a fixed prefix to an :class:`asyncio.StreamReader`.
+
+    Inbound BIP 324 detection requires reading and classifying the first
+    4 bytes off the wire (network magic ⇒ v1, otherwise an ElligatorSwift
+    pubkey ⇒ v2).  When we classify v1, those 4 bytes are still part of
+    the v1 message header, so we wrap the reader in this adapter to
+    yield the consumed prefix back before delegating to the real
+    reader.  Only the methods used by ``Peer.receive_message`` need to
+    be implemented (``readexactly`` is the only one in practice).
+
+    Mirrors the equivalent peek-based design in ``clearbit/src/peer.zig``
+    (``peekBytes`` + classify) — Python's asyncio.StreamReader does not
+    expose MSG_PEEK, so we consume-then-prepend instead.
+    """
+
+    def __init__(self, reader: asyncio.StreamReader, prefix: bytes):
+        self._reader = reader
+        self._prefix = bytes(prefix)
+
+    async def readexactly(self, n: int) -> bytes:
+        if not self._prefix:
+            return await self._reader.readexactly(n)
+        if n <= len(self._prefix):
+            head = self._prefix[:n]
+            self._prefix = self._prefix[n:]
+            return head
+        head = self._prefix
+        self._prefix = b""
+        tail = await self._reader.readexactly(n - len(head))
+        return head + tail
+
+    async def read(self, n: int = -1) -> bytes:
+        if self._prefix and (n < 0 or n >= len(self._prefix)):
+            head = self._prefix
+            self._prefix = b""
+            if n < 0:
+                tail = await self._reader.read(-1)
+            else:
+                tail = await self._reader.read(n - len(head))
+            return head + tail
+        if self._prefix:
+            head = self._prefix[:n]
+            self._prefix = self._prefix[n:]
+            return head
+        return await self._reader.read(n)
+
+    def at_eof(self) -> bool:
+        if self._prefix:
+            return False
+        return self._reader.at_eof()
+
+    def __getattr__(self, name):
+        # Delegate any other attribute (feed_eof, exception, etc.) to
+        # the underlying reader so callers that introspect the stream
+        # see the real connection state.
+        return getattr(self._reader, name)
+
+
 class RelayType(Enum):
     """Peer relay type — determines what messages we exchange."""
     FULL_RELAY = "full_relay"
@@ -434,12 +493,54 @@ class Peer:
     ) -> bool:
         """Accept an already-established inbound connection and complete the reversed handshake.
 
-        Waits for the peer's version first, then sends ours — the opposite of outbound order.
+        When ``transport_version >= 2`` the wire is classified by reading
+        and inspecting the first 4 bytes: a match against the network
+        magic means v1 plaintext, otherwise the bytes are the head of
+        the peer's 64-byte ElligatorSwift pubkey and the BIP 324
+        responder handshake is driven.  Mirrors clearbit's peek+classify
+        flow (``clearbit/src/peer.zig:880-930``).
+
+        After a v2 handshake, falls through to the application
+        version/verack handshake on the encrypted transport.
         """
         try:
             self.reader = reader
             self.writer = writer
             self.state = PeerState.CONNECTED
+
+            # BIP 324 inbound classification: only when v2 is enabled.
+            # The 4-byte read is "destructive" (asyncio.StreamReader has
+            # no MSG_PEEK), so on the v1 path we wrap the reader with a
+            # ``_PrefixedStreamReader`` that yields the consumed bytes
+            # back ahead of the underlying socket data.
+            if self.transport_version >= 2:
+                try:
+                    prefix = await asyncio.wait_for(
+                        self.reader.readexactly(4),
+                        timeout=HANDSHAKE_TIMEOUT,
+                    )
+                except (asyncio.IncompleteReadError, ConnectionResetError,
+                        BrokenPipeError, OSError, TimeoutError) as e:
+                    raise Exception(
+                        f"inbound classify-read failed: {e}"
+                    ) from e
+                expected_magic = get_magic(self.network).to_bytes(4, "little")
+                if prefix == expected_magic:
+                    # v1: re-wrap reader so the v1 handshake sees the
+                    # consumed magic at the head of the stream.  Also
+                    # downgrade transport_version so the version message
+                    # we send back to the peer doesn't advertise
+                    # NODE_P2P_V2 when the actual transport is v1.
+                    self.reader = _PrefixedStreamReader(
+                        self.reader, prefix
+                    )
+                    self.transport_version = 1
+                else:
+                    # v2: drive the responder handshake.  ``prefix`` is
+                    # the first 4 bytes of the peer's 64-byte ellswift
+                    # pubkey; ``_negotiate_v2_inbound`` reads the
+                    # remaining 60 itself.
+                    await self._negotiate_v2_inbound(initial_prefix=prefix)
 
             # Inbound handshake: receive version first, then send ours
             await self._inbound_handshake(start_height)
@@ -800,7 +901,175 @@ class Peer:
             ) from e
 
         logger.info(
-            f"BIP 324 v2 transport established with {self.host}:{self.port} "
+            f"BIP 324 v2 handshake complete (initiator) — {self.host}:{self.port} "
+            f"(sent_garbage={len(sent_garbage)}B, recv_garbage={len(recv_garbage)}B)"
+        )
+
+    async def _negotiate_v2_inbound(self, initial_prefix: bytes) -> None:
+        """Drive the BIP 324 v2 responder handshake.
+
+        Symmetric to :meth:`_negotiate_v2` but with ``initiator=False``;
+        used by :meth:`accept_inbound` once the wire has been classified
+        as non-v1.  ``initial_prefix`` MUST be the 4 bytes already
+        consumed by the classifier (head of the peer's 64-byte
+        ElligatorSwift pubkey).
+
+        Wire layout (responder side, per BIP 324 § "Wire format" and
+        ``bitcoin-core/src/net.cpp`` V2Transport state machine):
+
+            <-  64 bytes ElligatorSwift pubkey || recv_garbage  (0..MAX_GARBAGE_LEN bytes)
+            ->  64 bytes ElligatorSwift pubkey || sent_garbage  (0..N bytes)
+            <-  recv_garbage_terminator (16) || decoy*+version-packet (first AEAD AAD = recv_garbage)
+            ->  send_garbage_terminator (16) || version-packet (AAD = sent_garbage)
+
+        Mirrors Bitcoin Core ``V2Transport`` responder behaviour
+        (net.cpp:1143 ProcessReceivedKeyBytes; net.cpp:1180
+        ProcessReceivedGarbageBytes; BIP-324 spec section "Overall
+        handshake pseudocode").
+        """
+        if not self.reader or not self.writer:
+            raise V2NegotiationFailed("Not connected")
+        if len(initial_prefix) != 4:
+            raise V2NegotiationFailed(
+                f"initial_prefix must be exactly 4 bytes, got {len(initial_prefix)}"
+            )
+
+        from ouroboros.transport_v2 import (
+            CHACHA20POLY1305_EXPANSION,
+            GARBAGE_TERMINATOR_LEN,
+            HEADER_LEN,
+            LENGTH_FIELD_LEN,
+            MAX_GARBAGE_LEN,
+        )
+
+        handshake = V2Handshake(initiator=False, network=self.network)
+
+        # 1. Finish reading the peer's 64-byte ellswift pubkey (we have
+        # 4 bytes from the classifier; read the remaining 60).
+        try:
+            tail = await asyncio.wait_for(
+                self.reader.readexactly(60),
+                timeout=10.0,
+            )
+        except (asyncio.IncompleteReadError, ConnectionResetError,
+                BrokenPipeError, OSError, TimeoutError) as e:
+            raise V2NegotiationFailed(
+                f"v2 read of remaining 60 bytes failed: {e}"
+            ) from e
+        remote_pubkey = initial_prefix + tail
+        try:
+            handshake.receive_remote_pubkey(remote_pubkey)
+            self._v2_transport = V2Transport.from_handshake(handshake)
+        except Exception as e:
+            raise V2NegotiationFailed(
+                f"v2 key derivation failed (responder): {e}"
+            ) from e
+
+        # 2. Send our ellswift pubkey + (small random) garbage AND
+        # immediately stage our terminator + version-packet behind it.
+        # Both sides send these without waiting on the other; the
+        # initiator's outbound path mirrors this order (ellswift then
+        # terminator+version, then read).  Sending terminator+version
+        # before reading the peer's avoids a deadlock when the peer's
+        # asyncio writer hasn't drained yet.  Same 0..32-byte garbage
+        # bound as the initiator path.
+        sent_garbage = os.urandom(random.randint(0, 32))
+        try:
+            self.writer.write(handshake.local_pubkey_bytes + sent_garbage)
+            await self.writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            raise V2NegotiationFailed(
+                f"write failed during v2 ellswift+garbage send: {e}"
+            ) from e
+
+        send_term = self._v2_transport.send_garbage_terminator
+        version_packet = self._v2_transport.encrypt_message(
+            b"", aad=sent_garbage
+        )
+        try:
+            self.writer.write(send_term + version_packet)
+            await self.writer.drain()
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            raise V2NegotiationFailed(
+                f"write failed during v2 terminator+version send: {e}"
+            ) from e
+
+        # 3. Scan incoming bytes for the recv_garbage_terminator (peer's
+        # garbage came after their pubkey; same MAX_GARBAGE_LEN bound as
+        # the initiator path — net.cpp:1192 ProcessReceivedGarbageBytes).
+        recv_term = self._v2_transport.recv_garbage_terminator
+        recv_garbage = b""
+        try:
+            window = await asyncio.wait_for(
+                self.reader.readexactly(GARBAGE_TERMINATOR_LEN),
+                timeout=10.0,
+            )
+            while True:
+                if window[-GARBAGE_TERMINATOR_LEN:] == recv_term:
+                    recv_garbage = window[:-GARBAGE_TERMINATOR_LEN]
+                    break
+                if len(window) >= MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN:
+                    raise V2NegotiationFailed(
+                        f"recv_garbage_terminator not seen within "
+                        f"{MAX_GARBAGE_LEN} bytes — protocol violation"
+                    )
+                next_byte = await asyncio.wait_for(
+                    self.reader.readexactly(1),
+                    timeout=10.0,
+                )
+                window += next_byte
+        except (asyncio.IncompleteReadError, ConnectionResetError,
+                BrokenPipeError, OSError, TimeoutError) as e:
+            raise V2NegotiationFailed(
+                f"v2 garbage-terminator scan failed (responder): {e}"
+            ) from e
+
+        # 5. Drain incoming AEAD packets until we receive a non-decoy
+        # version packet.  AAD on the first decrypt is the peer's
+        # sent_garbage (== our recv_garbage); subsequent decrypts use
+        # empty AAD per net.cpp:1243 ClearShrink.
+        next_aad: bytes = recv_garbage
+        try:
+            for _attempt in range(1024):
+                enc_length = await asyncio.wait_for(
+                    self.reader.readexactly(LENGTH_FIELD_LEN),
+                    timeout=10.0,
+                )
+                contents_len = self._v2_transport.decrypt_length(enc_length)
+                if contents_len > 32 * 1024 * 1024:
+                    raise V2NegotiationFailed(
+                        f"v2 version-phase packet too large: {contents_len}"
+                    )
+                aead_len = HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
+                aead_ct = await asyncio.wait_for(
+                    self.reader.readexactly(aead_len),
+                    timeout=10.0,
+                )
+                _payload, is_decoy = self._v2_transport.decrypt_contents(
+                    aead_ct, contents_len, aad=next_aad
+                )
+                next_aad = b""
+                if not is_decoy:
+                    break
+            else:  # pragma: no cover
+                raise V2NegotiationFailed(
+                    "v2 version drain exceeded 1024 decoy packets"
+                )
+        except V2NegotiationFailed:
+            raise
+        except (asyncio.IncompleteReadError, ConnectionResetError,
+                BrokenPipeError, OSError, TimeoutError) as e:
+            raise V2NegotiationFailed(
+                f"v2 version-packet drain failed (responder): {e}"
+            ) from e
+        except Exception as e:
+            raise V2NegotiationFailed(
+                f"v2 version-packet decrypt failed (responder): {e}"
+            ) from e
+
+        logger.info(
+            f"BIP 324 v2 handshake complete (responder) — inbound peer "
+            f"{self.host}:{self.port} "
             f"(sent_garbage={len(sent_garbage)}B, recv_garbage={len(recv_garbage)}B)"
         )
 
