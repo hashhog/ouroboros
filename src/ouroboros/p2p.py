@@ -428,6 +428,7 @@ class PeerManager:
         i2psam: str | None = None,
         torcontrol: str | None = None,
         torpassword: str | None = None,
+        peer_bloom_filters: bool = False,
     ):
         """Initialize peer manager."""
         self.network = network
@@ -440,6 +441,11 @@ class PeerManager:
         self.i2psam = i2psam  # I2P SAM bridge (host:port)
         self.torcontrol = torcontrol  # Tor control port (host:port)
         self.torpassword = torpassword  # Tor control password
+        # BIP 111 NODE_BLOOM advertisement (Core parity: -peerbloomfilters,
+        # default false).  Forwarded to every Peer constructed here so the
+        # version handshakes (inbound + outbound) and BIP-35 MEMPOOL gate
+        # see a consistent value.
+        self.peer_bloom_filters = peer_bloom_filters
 
         self.peers: dict[str, Peer] = {}  # addr -> Peer (full-relay outbound)
         self.block_relay_peers: dict[str, Peer] = {}  # addr -> Peer (block-relay-only outbound)
@@ -821,7 +827,8 @@ class PeerManager:
         peer = Peer(host, port, self.network,
                     transport_version=self.transport_version,
                     inbound=True,
-                    ban_manager=self.ban_manager)
+                    ban_manager=self.ban_manager,
+                    peer_bloom_filters=self.peer_bloom_filters)
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer
             self._register_compact_handlers(peer, addr)
@@ -1151,7 +1158,8 @@ class PeerManager:
         peer = Peer(host, port, self.network,
                     transport_version=self.transport_version,
                     inbound=True,
-                    ban_manager=self.ban_manager)
+                    ban_manager=self.ban_manager,
+                    peer_bloom_filters=self.peer_bloom_filters)
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer
             self._register_compact_handlers(peer, addr)
@@ -1366,6 +1374,7 @@ class PeerManager:
             relay_txs=relay_txs,
             proxy=peer_proxy,
             ban_manager=self.ban_manager,
+            peer_bloom_filters=self.peer_bloom_filters,
         )
         ok = await peer.connect(start_height, retry=retry)
         if ok:
@@ -1383,6 +1392,7 @@ class PeerManager:
                 relay_txs=relay_txs,
                 proxy=peer_proxy,
                 ban_manager=self.ban_manager,
+                peer_bloom_filters=self.peer_bloom_filters,
             )
             if await v1_peer.connect(start_height, retry=retry):
                 return v1_peer

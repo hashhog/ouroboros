@@ -176,6 +176,13 @@ class NodeConfig:
             # that don't speak v2 are detected and re-dialled with v1
             # on a fresh socket.  Set v2transport=0 to force v1-only.
             'v2transport': '1',
+            # BIP 111 NODE_BLOOM advertisement (1=advertise, 0=do not).
+            # Mirrors Bitcoin Core's -peerbloomfilters option, whose
+            # DEFAULT_PEERBLOOMFILTERS = false (net_processing.h:44).
+            # When disabled (the Core-parity default) the node neither
+            # advertises NODE_BLOOM in its `version` message nor services
+            # BIP-35 MEMPOOL requests (gated in p2p.py on_mempool).
+            'peerbloomfilters': '0',
         }
 
         if self.config_path.exists():
@@ -300,6 +307,10 @@ class NodeConfig:
             # the classic "0"-string-is-truthy footgun that previously
             # silently dropped v2transport=0 in conf.
             'v2transport': self.getboolean('v2transport'),
+            # BIP 111 NODE_BLOOM advertisement (Core: -peerbloomfilters).
+            # Same string-coercion note applies.  Default false to match
+            # Core's DEFAULT_PEERBLOOMFILTERS.
+            'peerbloomfilters': self.getboolean('peerbloomfilters'),
         }
 
 
