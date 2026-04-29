@@ -695,5 +695,277 @@ async def test_negotiate_v2_aborts_on_missing_garbage_terminator():
         await server.wait_closed()
 
 
+# ── _negotiate_v2_inbound (responder) ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_negotiate_v2_inbound_happy_path():
+    """An ouroboros peer accepting an inbound v2 dialer drives the
+    responder handshake to completion: both sides end up with the
+    same session keys and the encrypted transport is wired up."""
+    from ouroboros.transport_v2 import (
+        CHACHA20POLY1305_EXPANSION,
+        GARBAGE_TERMINATOR_LEN,
+        HEADER_LEN,
+        LENGTH_FIELD_LEN,
+    )
+
+    port = _free_port()
+    server_session: dict = {}
+    server_done = asyncio.Event()
+
+    async def server_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        # The "server" here is the ouroboros peer that just accepted
+        # an inbound TCP connection — i.e. the v2 responder.  The
+        # "client" is a v2 initiator simulated below.
+        peer = Peer("127.0.0.1", 0, "regtest",
+                    transport_version=2, inbound=True)
+        peer.reader = reader
+        peer.writer = writer
+        # Pre-read 4 bytes (the classifier in accept_inbound does this)
+        # and call _negotiate_v2_inbound directly so we exercise just
+        # the handshake without the full version/verack phase.
+        prefix = await reader.readexactly(4)
+        await peer._negotiate_v2_inbound(initial_prefix=prefix)
+        server_session["peer"] = peer
+        server_done.set()
+        await asyncio.sleep(0.2)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    server = await asyncio.start_server(server_handler, "127.0.0.1", port)
+    try:
+        # Drive a manual initiator (mirrors the body of _negotiate_v2).
+        initiator = V2Handshake(initiator=True, network="regtest")
+        client_garbage = b""  # zero-length garbage exercises the AAD path
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(initiator.local_pubkey_bytes + client_garbage)
+            await writer.drain()
+            # Read the responder's pubkey + (random 0..32-byte) garbage —
+            # we don't know the garbage length yet, so read pubkey first
+            # and then scan for the terminator.
+            peer_pub = await reader.readexactly(64)
+            initiator.receive_remote_pubkey(peer_pub)
+            client_t = V2Transport.from_handshake(initiator)
+            # Now read the responder's garbage + send_garbage_terminator,
+            # which from the *initiator's* perspective is recv_term.
+            recv_term = client_t.recv_garbage_terminator
+            window = await reader.readexactly(GARBAGE_TERMINATOR_LEN)
+            for _ in range(4096):
+                if window[-GARBAGE_TERMINATOR_LEN:] == recv_term:
+                    break
+                window += await reader.readexactly(1)
+            recv_garbage = window[:-GARBAGE_TERMINATOR_LEN]
+            # Read and decrypt the responder's version packet.
+            enc_len = await reader.readexactly(LENGTH_FIELD_LEN)
+            contents_len = client_t.decrypt_length(enc_len)
+            body = await reader.readexactly(
+                HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
+            )
+            client_t.decrypt_contents(body, contents_len, aad=recv_garbage)
+            # Send our garbage terminator + version packet (AAD = client_garbage).
+            send_term = client_t.send_garbage_terminator
+            version_packet = client_t.encrypt_message(b"", aad=client_garbage)
+            writer.write(send_term + version_packet)
+            await writer.drain()
+            await asyncio.wait_for(server_done.wait(), timeout=5.0)
+
+            assert "peer" in server_session, "responder never finished"
+            responder_peer = server_session["peer"]
+            assert responder_peer._v2_transport is not None
+            # Session-key symmetry: client.send == responder.recv etc.
+            r_t = responder_peer._v2_transport
+            assert client_t.send_cipher.key == r_t.recv_cipher.key
+            assert client_t.recv_cipher.key == r_t.send_cipher.key
+            # Garbage-terminator symmetry across roles.
+            assert client_t.send_garbage_terminator == r_t.recv_garbage_terminator
+            assert client_t.recv_garbage_terminator == r_t.send_garbage_terminator
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_negotiate_v2_inbound_rejects_short_prefix():
+    """Defensive: the responder must refuse to run with a non-4-byte
+    classifier prefix (programmer-error guard)."""
+    peer = Peer("127.0.0.1", 0, "regtest",
+                transport_version=2, inbound=True)
+
+    # Need a reader/writer pair so the Not-connected branch isn't hit.
+    rsock, wsock = await asyncio.open_connection(
+        *await _make_local_pair_addr()
+    ) if False else (None, None)  # placeholder — see below
+    # Build minimal in-memory streams via a loopback server.
+    port = _free_port()
+
+    async def noop_handler(reader, writer):
+        await asyncio.sleep(0.5)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    server = await asyncio.start_server(noop_handler, "127.0.0.1", port)
+    try:
+        peer.reader, peer.writer = await asyncio.open_connection(
+            "127.0.0.1", port
+        )
+        with pytest.raises(V2NegotiationFailed):
+            await peer._negotiate_v2_inbound(initial_prefix=b"\x00\x00")
+        peer.writer.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def _make_local_pair_addr():  # pragma: no cover (helper for typing)
+    return ("127.0.0.1", _free_port())
+
+
+@pytest.mark.asyncio
+async def test_accept_inbound_classifies_v1_magic_and_passes_prefix():
+    """When ``transport_version=2`` is set on an inbound peer but the
+    dialer sends a v1 VERSION header, the classifier must consume the
+    4-byte network magic, recognise it, and re-feed those bytes back
+    to the v1 path so the wrapped reader yields the full 24-byte
+    header to ``_inbound_handshake``.  We assert the prefix-injection
+    contract directly via ``_PrefixedStreamReader``."""
+    from ouroboros.peer import _PrefixedStreamReader
+
+    port = _free_port()
+
+    async def server_handler(reader, writer):
+        # Send a v1 VERSION header + minimum-viable payload so the
+        # peek+inject works end-to-end.  We don't assert handshake
+        # success here — only that the classifier doesn't lose the
+        # 4-byte magic prefix.
+        magic = get_magic("regtest").to_bytes(4, "little")
+        writer.write(magic + b"version\x00\x00\x00\x00\x00")
+        writer.write(struct.pack("<I", 0))  # length
+        writer.write(b"\x5d\xf6\xe0\xe2")   # checksum
+        await writer.drain()
+        # Stay open briefly so the reader can drain.
+        await asyncio.sleep(0.3)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    server = await asyncio.start_server(server_handler, "127.0.0.1", port)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        # Manually run the classifier read step.
+        prefix = await reader.readexactly(4)
+        wrapped = _PrefixedStreamReader(reader, prefix)
+        # First 4 bytes from the wrapper must be the magic prefix.
+        roundtrip = await wrapped.readexactly(4)
+        assert roundtrip == prefix
+        # Next read draws from the underlying socket.
+        cmd = await wrapped.readexactly(12)
+        assert cmd == b"version\x00\x00\x00\x00\x00"
+        writer.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+# ── getpeerinfo RPC: v2 transport visibility ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_getpeerinfo_reports_v2_transport_for_inbound_peers():
+    """``getpeerinfo`` must list inbound peers AND mark them with
+    ``transport_protocol_type="v2"`` when ``Peer._v2_transport`` is set.
+
+    Cross-impl interop tooling (``tools/bip324-interop-matrix.sh``)
+    and ``fleet-snapshot.sh`` match on these fields, so omitting them
+    silently misclassified ouroboros-inbound v2 connections as v1 in
+    the 2026-04-28 matrix run.
+
+    The PeerManager exposes three peer buckets (``peers`` outbound
+    full-relay, ``block_relay_peers`` outbound block-relay-only,
+    ``inbound_peers``); all three must be enumerated.
+    """
+    from types import SimpleNamespace
+
+    from ouroboros.rpc import RPCServer
+
+    # Build a fake peer with a real V2Transport stapled on (via a
+    # local self-handshake) so the session_id field is exercised.
+    init = V2Handshake(initiator=True, network="regtest")
+    resp = V2Handshake(initiator=False, network="regtest")
+    init.receive_remote_pubkey(resp.local_pubkey_bytes)
+    resp.receive_remote_pubkey(init.local_pubkey_bytes)
+    v2 = V2Transport.from_handshake(init)
+
+    inbound_peer = Peer("203.0.113.7", 8333, "regtest",
+                        transport_version=2, inbound=True)
+    inbound_peer._v2_transport = v2
+    inbound_peer.user_agent = "/dialer:1/"
+    inbound_peer.version = 70016
+
+    outbound_peer = Peer("198.51.100.5", 8333, "regtest",
+                         transport_version=1, inbound=False)
+    outbound_peer.user_agent = "/v1-peer:1/"
+    outbound_peer.version = 70016
+
+    fake_pm = SimpleNamespace(
+        peers={"198.51.100.5:8333": outbound_peer},
+        block_relay_peers={},
+        inbound_peers={"203.0.113.7:8333": inbound_peer},
+    )
+    fake_node = SimpleNamespace(peer_manager=fake_pm, p2p=None)
+    rpc = RPCServer.__new__(RPCServer)
+    rpc.node = fake_node
+
+    info = await rpc.rpc_getpeerinfo()
+    addrs = {p["addr"]: p for p in info}
+    assert "203.0.113.7:8333" in addrs, "inbound peer missing from getpeerinfo"
+    assert "198.51.100.5:8333" in addrs, "outbound peer missing from getpeerinfo"
+    assert addrs["203.0.113.7:8333"]["transport_protocol_type"] == "v2"
+    assert addrs["203.0.113.7:8333"]["session_id"] != ""
+    assert len(addrs["203.0.113.7:8333"]["session_id"]) == 64  # 32 bytes hex
+    assert addrs["198.51.100.5:8333"]["transport_protocol_type"] == "v1"
+    assert addrs["198.51.100.5:8333"]["session_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_getconnectioncount_includes_all_peer_buckets():
+    """``getconnectioncount`` must count every direction, mirroring
+    Bitcoin Core rpc/net.cpp getconnectioncount."""
+    from types import SimpleNamespace
+
+    from ouroboros.rpc import RPCServer
+
+    p_out = Peer("198.51.100.1", 8333, "regtest", inbound=False)
+    p_blk = Peer("198.51.100.2", 8333, "regtest", inbound=False, relay_txs=False)
+    p_in = Peer("203.0.113.4", 8333, "regtest", inbound=True)
+
+    fake_pm = SimpleNamespace(
+        peers={"198.51.100.1:8333": p_out},
+        block_relay_peers={"198.51.100.2:8333": p_blk},
+        inbound_peers={"203.0.113.4:8333": p_in},
+    )
+    fake_node = SimpleNamespace(peer_manager=fake_pm, p2p=None)
+    rpc = RPCServer.__new__(RPCServer)
+    rpc.node = fake_node
+
+    n = await rpc.rpc_getconnectioncount()
+    assert n == 3
+
+
 if __name__ == "__main__":
     unittest.main()

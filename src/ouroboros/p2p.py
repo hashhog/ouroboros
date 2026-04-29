@@ -814,7 +814,13 @@ class PeerManager:
 
         logger.info(f"New inbound connection from {addr} (netgroup={peer_group})")
 
-        peer = Peer(host, port, self.network, inbound=True,
+        # Inbound peers honour the manager's configured transport_version
+        # so that BIP 324 v2 detection runs in accept_inbound.  When the
+        # manager is v1-only (transport_version == 1), this short-circuits
+        # the peek+classify path and the legacy v1 handshake runs unchanged.
+        peer = Peer(host, port, self.network,
+                    transport_version=self.transport_version,
+                    inbound=True,
                     ban_manager=self.ban_manager)
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer
@@ -1142,7 +1148,9 @@ class PeerManager:
                 writer.close()
                 return
 
-        peer = Peer(host, port, self.network, inbound=True,
+        peer = Peer(host, port, self.network,
+                    transport_version=self.transport_version,
+                    inbound=True,
                     ban_manager=self.ban_manager)
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer

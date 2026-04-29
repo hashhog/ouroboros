@@ -3397,9 +3397,27 @@ class RPCServer:
         if pm is None:
             return []
 
-        peer_list = getattr(pm, 'peers', [])
-        if isinstance(peer_list, dict):
-            peer_list = list(peer_list.values())
+        # Aggregate every category PeerManager tracks.  Prior to this change
+        # only the outbound full-relay set (``pm.peers``) was returned, so
+        # inbound peers and block-relay-only outbounds were invisible to
+        # ``getpeerinfo`` — Bitcoin Core lists every connection in the
+        # vNodes vector regardless of direction (rpc/net.cpp getpeerinfo).
+        # Cross-impl tooling (BIP-324 interop matrix, fleet-snapshot) uses
+        # this RPC to detect inbound v2 transports, so the listing has to
+        # be complete.
+        peer_list: list = []
+        seen_ids: set[int] = set()
+        for bucket_name in ("peers", "block_relay_peers", "inbound_peers"):
+            bucket = getattr(pm, bucket_name, None)
+            if bucket is None:
+                continue
+            iterable = bucket.values() if isinstance(bucket, dict) else bucket
+            for peer in iterable:
+                pid = id(peer)
+                if pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+                peer_list.append(peer)
 
         for i, peer in enumerate(peer_list):
             # Get peer ID (use internal ID if available)
@@ -3473,6 +3491,23 @@ class RPCServer:
             # Min fee filter
             minfeefilter = getattr(peer, 'fee_filter', 0)
 
+            # BIP-324 transport classification.  Bitcoin Core exposes
+            # ``transport_protocol_type`` ("v1" | "v2" | "detecting") and
+            # the 32-byte hex ``session_id`` on getpeerinfo (rpc/net.cpp
+            # 24.0+).  Cross-impl interop tooling matches on these fields,
+            # so omitting them caused the matrix harness to misclassify
+            # ouroboros-inbound v2 connections as v1.
+            v2_obj = getattr(peer, '_v2_transport', None)
+            if v2_obj is not None:
+                transport_protocol_type = "v2"
+                try:
+                    session_id_hex = v2_obj.session_id.hex()
+                except Exception:
+                    session_id_hex = ""
+            else:
+                transport_protocol_type = "v1"
+                session_id_hex = ""
+
             info: dict[str, Any] = {
                 "id": peer_id,
                 "addr": addr,
@@ -3505,6 +3540,8 @@ class RPCServer:
                 "permissions": getattr(peer, 'permissions', []),
                 "minfeefilter": minfeefilter / 1e8 if minfeefilter > 0 else 0.0,
                 "connection_type": connection_type,
+                "transport_protocol_type": transport_protocol_type,
+                "session_id": session_id_hex,
             }
 
             # Optional ping fields
@@ -3531,12 +3568,30 @@ class RPCServer:
         return peers
 
     async def rpc_getconnectioncount(self) -> int:
-        """Return the number of active connections."""
+        """Return the number of active connections.
+
+        Counts every direction PeerManager tracks (outbound full-relay,
+        outbound block-relay-only, and inbound).  Mirrors Bitcoin Core
+        rpc/net.cpp getconnectioncount which iterates the full vNodes
+        vector regardless of direction.
+        """
         pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
         if pm is None:
             return 0
-        peers = getattr(pm, 'peers', [])
-        return len(peers) if isinstance(peers, list) else len(list(peers))
+        total = 0
+        seen: set[int] = set()
+        for bucket_name in ("peers", "block_relay_peers", "inbound_peers"):
+            bucket = getattr(pm, bucket_name, None)
+            if bucket is None:
+                continue
+            iterable = bucket.values() if isinstance(bucket, dict) else bucket
+            for peer in iterable:
+                pid = id(peer)
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                total += 1
+        return total
 
     async def rpc_addnode(self, node: str, command: str = "add") -> None:
         """Add or remove a peer."""
