@@ -479,6 +479,14 @@ class PeerManager:
         # Callback for registering handlers on newly accepted inbound peers
         self._on_inbound_peer: asyncio.coroutines | None = None
 
+        # Callback for registering handlers on newly dialed outbound peers.
+        # Invoked from every outbound success site (full-relay, block-relay,
+        # anchor, feeler, addnode) so the node can wire up tx / getdata /
+        # getheaders handlers symmetrically to inbound peers.  Without this
+        # hook, post-startup outbound peers silently drop those messages —
+        # the node could IBD but could not serve the remote side's queries.
+        self._on_outbound_peer: asyncio.coroutines | None = None
+
         # Address manager for peer gossip
         self.addrman = AddressManager(data_dir=data_dir)
 
@@ -864,6 +872,30 @@ class PeerManager:
         its handshake.  ``handler(peer: Peer) -> None``."""
         self._on_inbound_peer = handler
 
+    def set_outbound_peer_handler(self, handler) -> None:
+        """Register an async callback invoked when an outbound peer completes
+        its handshake.  ``handler(peer: Peer) -> None``.
+
+        Mirrors :meth:`set_inbound_peer_handler` for outbound dials.  Used
+        by ``Node`` to register tx / getdata / getheaders handlers on every
+        outbound peer (full-relay, block-relay-only, anchor, feeler) so we
+        actually serve the peer's queries instead of silently ignoring them.
+        """
+        self._on_outbound_peer = handler
+
+    async def _fire_outbound_peer_callback(self, peer: "Peer") -> None:
+        """Invoke the outbound-peer handler if one is registered.
+
+        Best-effort: a callback exception is logged but does not fail the
+        connection (the peer is already past handshake at this point).
+        """
+        if self._on_outbound_peer is None:
+            return
+        try:
+            await self._on_outbound_peer(peer)
+        except Exception as e:
+            logger.error(f"Error in outbound peer callback: {e}")
+
     # Eclipse protection: anchor connections
 
     def _load_anchors(self) -> None:
@@ -935,6 +967,9 @@ class PeerManager:
                 group = self._netgroup(host)
                 self._outbound_netgroups.add(group)
                 self._register_compact_handlers(peer, addr)
+                # Fire outbound-peer hook so the node can attach tx /
+                # getdata / getheaders handlers to this anchor peer.
+                asyncio.ensure_future(self._fire_outbound_peer_callback(peer))
                 logger.info(f"Connected to anchor peer {addr}")
             else:
                 self.addrman.mark_attempt(host, port)
@@ -1483,6 +1518,9 @@ class PeerManager:
                 if self.erlay_enabled:
                     self._register_erlay_handlers(peer, addr)
                     asyncio.ensure_future(self._negotiate_erlay(peer, addr))
+                # Fire outbound-peer hook so the node attaches tx /
+                # getdata / getheaders serving handlers to this peer.
+                asyncio.ensure_future(self._fire_outbound_peer_callback(peer))
                 # Initialize trickle queue for outbound peer (2s avg delay)
                 self._trickle_queues[addr] = TrickleQueue(
                     is_inbound=False, wtxid_relay=peer.wtxid_relay
@@ -1535,6 +1573,8 @@ class PeerManager:
             if self.erlay_enabled:
                 self._register_erlay_handlers(peer, addr)
                 asyncio.ensure_future(self._negotiate_erlay(peer, addr))
+            # Fire outbound-peer hook for handler attachment.
+            asyncio.ensure_future(self._fire_outbound_peer_callback(peer))
             self._trickle_queues[addr] = TrickleQueue(
                 is_inbound=False, wtxid_relay=peer.wtxid_relay
             )
@@ -1612,6 +1652,9 @@ class PeerManager:
                 # and do NOT register addr handlers or request addresses.
                 self._register_compact_handlers(peer, addr)
                 # Explicitly skip: negotiate_compact_blocks, _register_addr_handlers, _send_getaddr
+                # Block-relay-only peers still benefit from the outbound
+                # callback so that getheaders/getdata for blocks works.
+                asyncio.ensure_future(self._fire_outbound_peer_callback(peer))
                 logger.info(
                     f"Connected to block-relay-only peer {addr} "
                     f"({len(self.block_relay_peers)}/{self.max_block_relay_only}, group={group})"
