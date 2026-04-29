@@ -967,5 +967,125 @@ async def test_getconnectioncount_includes_all_peer_buckets():
     assert n == 3
 
 
+# ── BIP 324 v2 contents wrapping (no v1 24-byte header) ────────────────
+
+
+def test_v2_encode_short_id_strips_v1_header():
+    """Short-form: contents = [short_id (1B)] + payload.  The v1 24-byte
+    magic|cmd|len|checksum header MUST NOT appear.
+
+    Mirrors Core's ``V2Transport::SetMessageToSend`` (net.cpp:1484-1514)
+    and clearbit's ``sendMessage`` (v2_transport.zig:1287-1300).
+    """
+    from ouroboros.transport_v2 import (
+        V2_MESSAGE_IDS,
+        decode_v2_contents,
+        encode_v2_contents,
+    )
+
+    payload = b"\xde\xad\xbe\xef" * 8
+    contents = encode_v2_contents("ping", payload)
+    # First byte is the short ID for "ping" (=18 per BIP 324).
+    assert contents[0] == V2_MESSAGE_IDS.index("ping") == 18
+    # Rest is the bare payload.  Total = 1 + len(payload), no 24-byte header.
+    assert contents == bytes([18]) + payload
+    assert len(contents) == 1 + len(payload)
+    # Round-trip through decode.
+    decoded = decode_v2_contents(contents)
+    assert decoded == ("ping", payload)
+
+
+def test_v2_encode_long_form_strips_v1_header():
+    """Long-form: contents = 0x00 + 12B NUL-padded cmd + payload.
+    Used for messages outside the short-ID table (version, verack,
+    sendheaders, wtxidrelay, sendaddrv2, getaddr).
+    """
+    from ouroboros.transport_v2 import decode_v2_contents, encode_v2_contents
+
+    payload = b"\x01\x02\x03"
+    for cmd in ("version", "verack", "sendheaders", "wtxidrelay",
+                "sendaddrv2", "getaddr"):
+        contents = encode_v2_contents(cmd, payload)
+        # 0x00 marker + 12-byte cmd + payload.
+        assert contents[0] == 0x00, f"{cmd}: first byte must be 0x00"
+        cmd_field = contents[1:13]
+        assert cmd_field == cmd.encode("ascii") + b"\x00" * (12 - len(cmd))
+        assert contents[13:] == payload
+        # Round-trip through decode.
+        decoded = decode_v2_contents(contents)
+        assert decoded == (cmd, payload), f"{cmd}: round-trip mismatch"
+
+
+@pytest.mark.asyncio
+async def test_v2_send_message_no_v1_header_in_contents():
+    """End-to-end: ``Peer.send_message`` over a v2 transport produces
+    BIP 324 contents that start with a short-ID/long-form prefix — NOT
+    a v1 magic|cmd|len|checksum header.  This is the regression that
+    haskoin's TCP-reject debug agent caught.
+
+    We capture the encrypted bytes off the wire, decrypt them with the
+    peer's transport, and assert the contents do not begin with the
+    network magic and parse as a (command, payload) pair.
+    """
+    from ouroboros.p2p_messages import PingMessage, get_magic
+    from ouroboros.peer import PeerState
+    from ouroboros.transport_v2 import (
+        CHACHA20POLY1305_EXPANSION,
+        HEADER_LEN,
+        LENGTH_FIELD_LEN,
+        V2_MESSAGE_IDS,
+        decode_v2_contents,
+    )
+
+    # In-memory handshake — no real socket needed for the encode side.
+    initiator = V2Handshake(initiator=True, network="regtest")
+    responder = V2Handshake(initiator=False, network="regtest")
+    initiator.receive_remote_pubkey(responder.local_pubkey_bytes)
+    responder.receive_remote_pubkey(initiator.local_pubkey_bytes)
+    i_t = V2Transport.from_handshake(initiator)
+    r_t = V2Transport.from_handshake(responder)
+
+    # Wire the client peer's writer to a BytesIO-style capture.
+    captured = bytearray()
+
+    class _CaptureWriter:
+        def write(self, data: bytes) -> None:
+            captured.extend(data)
+        async def drain(self) -> None:
+            return None
+
+    client = Peer("127.0.0.1", 0, "regtest", transport_version=2)
+    client.writer = _CaptureWriter()  # type: ignore[assignment]
+    client._v2_transport = i_t
+    client.state = PeerState.READY
+
+    ping = PingMessage(nonce=0xCAFEBABE)
+    await client.send_message(ping.to_network_message("regtest"))
+
+    # The wire bytes are: 3B enc_length || HEADER_LEN || contents || tag.
+    enc_len = bytes(captured[:LENGTH_FIELD_LEN])
+    contents_len = r_t.decrypt_length(enc_len)
+    body_start = LENGTH_FIELD_LEN
+    body_end = body_start + HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
+    aead_ct = bytes(captured[body_start:body_end])
+    contents, is_decoy = r_t.decrypt_contents(aead_ct, contents_len)
+
+    assert not is_decoy
+    # Critical: contents must NOT start with the network magic — that
+    # would be the v1 24-byte legacy header, which is exactly the bug.
+    magic_le = get_magic("regtest").to_bytes(4, "little")
+    assert not contents.startswith(magic_le), (
+        f"v2 contents must not contain v1 magic; got {contents[:24].hex()}"
+    )
+    # Contents = short_id(ping=18) + 8-byte LE payload.
+    assert contents[0] == V2_MESSAGE_IDS.index("ping") == 18
+    decoded = decode_v2_contents(contents)
+    assert decoded is not None
+    cmd, payload = decoded
+    assert cmd == "ping"
+    # PingMessage payload is 8 bytes (LE u64 nonce).
+    assert payload == (0xCAFEBABE).to_bytes(8, "little")
+
+
 if __name__ == "__main__":
     unittest.main()

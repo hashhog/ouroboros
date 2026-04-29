@@ -1248,17 +1248,30 @@ class Peer:
         return NetworkAddress(services=our_services, ip=b'\x00' * 16, port=port)
 
     async def send_message(self, msg: NetworkMessage):
-        """Serialize and write *msg* to the peer (encrypted if BIP 324 v2 is active)."""
+        """Serialize and write *msg* to the peer (encrypted if BIP 324 v2 is active).
+
+        v1 wire format: 24-byte magic|cmd|len|checksum header + payload.
+        v2 wire format: BIP 324 packet whose *contents* are
+        ``[short_id (1B) | 0x00 + 12B cmd] + payload`` — the v1 24-byte
+        header is NOT included, it is the v1 framing that v2 replaces
+        (Core net.cpp:1484-1514 ``V2Transport::SetMessageToSend``).
+        """
         if self.state != PeerState.READY and self.state != PeerState.HANDSHAKING:
             raise Exception(f"Cannot send message in state {self.state}")
 
         if not self.writer:
             raise Exception("Not connected")
 
-        data = msg.serialize()
-
         if self._v2_transport is not None:
-            data = self._v2_transport.encrypt_message(data)
+            # v2 path — strip the v1 24-byte header (do NOT call
+            # msg.serialize()).  Build BIP 324 contents from the bare
+            # (command, payload) pair, then AEAD-encrypt the packet.
+            from ouroboros.transport_v2 import encode_v2_contents
+            contents = encode_v2_contents(msg.command, msg.payload)
+            data = self._v2_transport.encrypt_message(contents)
+        else:
+            # v1 path — the legacy magic|cmd|len|checksum frame.
+            data = msg.serialize()
 
         self.writer.write(data)
         await self.writer.drain()
@@ -1353,10 +1366,12 @@ class Peer:
         Decoy packets (header byte high bit set) are silently dropped and
         the read loops to the next packet.
         """
+        from ouroboros.p2p_messages import get_magic
         from ouroboros.transport_v2 import (
             CHACHA20POLY1305_EXPANSION,
             HEADER_LEN,
             LENGTH_FIELD_LEN,
+            decode_v2_contents,
         )
 
         wire_bytes_this_call = 0
@@ -1389,7 +1404,7 @@ class Peer:
             wire_bytes_this_call += aead_len
 
             try:
-                payload, is_decoy = self._v2_transport.decrypt_contents(
+                contents, is_decoy = self._v2_transport.decrypt_contents(
                     aead_ct, contents_len
                 )
             except Exception as e:
@@ -1397,16 +1412,35 @@ class Peer:
                     f"v2 contents decrypt failed for {self.host}:{self.port}: {e}"
                 ) from e
 
+            self.bytes_recv += wire_bytes_this_call
+            self.last_recv = time.time()
+
             if is_decoy:
+                # Decoy packets count against bytes_recv because the wire
+                # bytes were real — the decoder just throws them away.
                 logger.debug(f"Discarded decoy packet from {self.host}:{self.port}")
                 continue
 
-            # The payload is the original v1 serialised NetworkMessage.
-            # Decoy packets count against bytes_recv because the wire
-            # bytes were real — the decoder just throws them away.
-            self.bytes_recv += wire_bytes_this_call
-            self.last_recv = time.time()
-            return NetworkMessage.deserialize(payload, network=self.network)
+            # BIP 324 contents = (1B short_id | 0x00+12B cmd) + payload.
+            # The v1 24-byte header is NOT present (Core net.cpp:1415-1453
+            # ``V2Transport::GetMessageType``).
+            decoded = decode_v2_contents(contents)
+            if decoded is None:
+                # Unknown short ID or malformed long form — Core drops the
+                # message but keeps the connection (net.cpp:1474-1477).
+                # We mirror that, but loop to read the next packet.
+                logger.debug(
+                    f"v2: dropping packet with unknown/invalid type prefix "
+                    f"from {self.host}:{self.port} ({contents_len} bytes)"
+                )
+                continue
+
+            command, payload = decoded
+            return NetworkMessage(
+                command=command,
+                payload=payload,
+                magic=get_magic(self.network),
+            )
 
     def _is_handshake_message(self, command: str) -> bool:
         """Check if message is allowed during handshake (before handshake_complete)."""
