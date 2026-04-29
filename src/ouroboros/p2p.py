@@ -1986,19 +1986,44 @@ class PeerManager:
             logger.debug(f"Peer {addr} notfound: {len(nf.inventory)} items")
 
         async def on_mempool(msg: NetworkMessage):
-            # Block-relay-only peers must not receive transaction INVs
-            if not peer.relay_txs:
-                logger.debug(f"Ignoring mempool request from block-relay-only peer {addr}")
+            # BIP-35: gate the MEMPOOL handler on whether *we* advertised
+            # NODE_BLOOM in our version message. This mirrors Bitcoin
+            # Core net_processing.cpp ~4855:
+            #     if (!(peer.m_our_services & NODE_BLOOM) &&
+            #         !pfrom.HasPermission(NetPermissionFlags::Mempool))
+            # The BIP-37 fRelay (peer.relay_txs) check is independent —
+            # it gates outbound tx-INV relay, not mempool dump requests.
+            from ouroboros.p2p_messages import (
+                INV_TYPE_TX,
+                MSG_WTX,
+                NODE_BLOOM,
+                NODE_WITNESS,
+                InvMessage,
+            )
+            if not (peer.our_services & NODE_BLOOM):
+                logger.debug(
+                    f"Ignoring mempool request from {addr}: "
+                    "NODE_BLOOM not advertised"
+                )
                 return
-            if self._mempool is not None:
-                all_txids = list(self._mempool.transactions.keys())
-                if all_txids:
-                    from ouroboros.p2p_messages import INV_TYPE_TX, InvMessage
-                    inv = InvMessage([(INV_TYPE_TX, txid) for txid in all_txids[:50000]])
-                    try:
-                        await peer.send_message(inv.to_network_message(self.network))
-                    except Exception as e:
-                        logger.warning(f"Failed to send mempool inv to {addr}: {e}")
+            if self._mempool is None:
+                return
+            all_txids = list(self._mempool.transactions.keys())
+            if not all_txids:
+                return
+            # Use wtxid (MSG_WTX) inv type for peers that advertised
+            # NODE_WITNESS; otherwise fall back to MSG_TX (legacy txid).
+            # Chunk at MAX_INV_SZ = 50_000 (Bitcoin Core protocol.h).
+            MAX_INV_SZ = 50000
+            inv_type = MSG_WTX if (peer.services & NODE_WITNESS) else INV_TYPE_TX
+            for chunk_start in range(0, len(all_txids), MAX_INV_SZ):
+                chunk = all_txids[chunk_start:chunk_start + MAX_INV_SZ]
+                inv = InvMessage([(inv_type, txid) for txid in chunk])
+                try:
+                    await peer.send_message(inv.to_network_message(self.network))
+                except Exception as e:
+                    logger.warning(f"Failed to send mempool inv to {addr}: {e}")
+                    return
 
         peer.register_handler("sendcmpct", on_sendcmpct)
         peer.register_handler("cmpctblock", on_cmpctblock)
