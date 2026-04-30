@@ -19,6 +19,15 @@ from rich.progress import (
 )
 from rich.table import Table
 
+from ouroboros.daemon import (
+    PidFile,
+    daemonize,
+    install_sighup_log_reopen,
+    parse_debug_categories,
+    sd_notify_ready,
+    sd_notify_status,
+    sd_notify_stopping,
+)
 from ouroboros.database import BlockchainDatabase
 from ouroboros.mempool import Mempool
 from ouroboros.node import BitcoinNode
@@ -31,6 +40,7 @@ _sync_manager: SyncManager | None = None
 _node: BitcoinNode | None = None
 _cancelled = False
 _interruption_shown = False
+_pid_file: PidFile | None = None
 
 
 def handle_sigint(signum, frame):
@@ -58,6 +68,17 @@ def handle_sigint(signum, frame):
             asyncio.run(_node.stop())
         except Exception as e:
             console.print(f"[red]Error stopping node: {e}[/red]")
+
+    # Best-effort PID file cleanup + systemd STOPPING=1.
+    if _pid_file is not None:
+        try:
+            _pid_file.remove()
+        except Exception:
+            pass
+    try:
+        sd_notify_stopping("ouroboros stopping")
+    except Exception:
+        pass
 
 
 def handle_sigterm(signum, frame):
@@ -94,10 +115,30 @@ def expand_path(path_str: str) -> Path:
     type=click.Choice(["mainnet", "testnet", "testnet3", "testnet4", "regtest", "signet"]),
     help="Bitcoin network",
 )
-@click.option("--debug", is_flag=True, help="Enable debug logging")
+@click.option(
+    "--debug",
+    default=None,
+    is_flag=False,
+    flag_value="all",
+    help=(
+        "Enable debug logging. Pass without an argument for all categories, "
+        "or a comma-separated list (Bitcoin Core parity): "
+        "--debug=net,mempool,validation. '0' disables, '1'/'all' enables every "
+        "category."
+    ),
+)
 @click.option("--log-json", is_flag=True, help="Emit structured JSON log lines")
+@click.option(
+    "--printtoconsole/--noprinttoconsole",
+    "print_to_console",
+    default=None,
+    help=(
+        "Send log output to stderr (in addition to the rotating log file). "
+        "Default: on when running in the foreground, off under --daemon."
+    ),
+)
 @click.pass_context
-def cli(ctx, data_dir, config_file, network, debug, log_json):
+def cli(ctx, data_dir, config_file, network, debug, log_json, print_to_console):
     """Bitcoin Hybrid Node - Rust sync, Python operations"""
     from ouroboros.logging_config import configure_logging
 
@@ -107,15 +148,31 @@ def cli(ctx, data_dir, config_file, network, debug, log_json):
     # Ensure data directory exists
     Path(data_dir).mkdir(parents=True, exist_ok=True)
 
-    # Wire --debug through to Rust logging (OUROBOROS_VERBOSE=1 sets sync=debug)
-    if debug:
+    # --debug accepts a category list (Core parity).  ``--debug`` without
+    # an argument falls through as ``"all"``; absent flag is None.
+    debug_categories = parse_debug_categories(debug)
+    debug_enabled = debug is not None and debug not in {"0", "false", "no"}
+
+    if debug_enabled:
         os.environ["OUROBOROS_VERBOSE"] = "1"
 
+    # Default: stderr on, rotating file on.  Operators can opt out with
+    # --noprinttoconsole; subcommands (notably ``start --daemon``) flip
+    # the default to file-only.
+    effective_console = True if print_to_console is None else bool(print_to_console)
+
     configure_logging(
-        debug=debug,
+        debug=debug_enabled,
         json_format=log_json,
-        log_file=str(Path(data_dir) / "ouroboros.log") if not debug else None,
+        log_file=str(Path(data_dir) / "ouroboros.log"),
+        debug_categories=debug_categories,
+        print_to_console=effective_console,
     )
+
+    # Wire SIGHUP -> reopen rotating log file (parity with Core, lets
+    # logrotate rotate without restarting).
+    from ouroboros.logging_config import reopen_log_file
+    install_sighup_log_reopen(reopen_log_file)
 
     # Config path: --config or data_dir/ouroboros.conf
     config_path = config_file or str(Path(data_dir) / "ouroboros.conf")
@@ -123,6 +180,10 @@ def cli(ctx, data_dir, config_file, network, debug, log_json):
         "data_dir": data_dir,
         "network": network,
         "config_path": config_path,
+        "debug": debug_enabled,
+        "debug_categories": debug_categories,
+        "log_json": log_json,
+        "print_to_console_explicit": print_to_console,
     }
 
 
@@ -333,21 +394,71 @@ def sync(ctx, reset, limit):
         "off, matching Bitcoin Core's -blockfilterindex=0)."
     ),
 )
+@click.option(
+    "--daemon",
+    is_flag=True,
+    default=False,
+    help=(
+        "Detach from the controlling terminal after init (POSIX double-fork, "
+        "parity with Bitcoin Core's -daemon). Stdio is redirected to /dev/null "
+        "and console logging is disabled unless --printtoconsole is explicit."
+    ),
+)
+@click.option(
+    "--pid",
+    "pid_path",
+    default=None,
+    help=(
+        "Path for the PID file (default: <datadir>/ouroboros.pid). Written "
+        "at startup, removed on graceful shutdown."
+    ),
+)
+@click.option(
+    "--reindex",
+    is_flag=True,
+    default=False,
+    help=(
+        "Marker flag accepted for Bitcoin Core operational parity. Honest "
+        "progress: full block-storage reindex is not yet implemented; the "
+        "flag is recognised so ops scripts won't error, and a clear warning "
+        "is emitted at startup. Use --reset on `ouroboros sync` to clear "
+        "chainstate and re-run IBD."
+    ),
+)
 @click.pass_context
-def start(ctx, rpc_port, p2p_port, listen, connect, force, v2transport, peerbloomfilters, blockfilterindex):
+def start(
+    ctx, rpc_port, p2p_port, listen, connect, force, v2transport,
+    peerbloomfilters, blockfilterindex, daemon, pid_path, reindex,
+):
     """Start the Bitcoin node"""
-    global _node, _cancelled
+    global _node, _cancelled, _pid_file
     _cancelled = False
 
     data_dir = ctx.obj["data_dir"]
     network = ctx.obj["network"]
 
+    if reindex:
+        # Honest-progress marker.  See --reindex help text and CLAUDE.md
+        # ops-parity audit: full reindex is deferred — operators wanting
+        # to clear and rebuild can use ``ouroboros sync --reset``.
+        console.print(
+            "[yellow]⚠ --reindex acknowledged but not implemented; full block "
+            "reindex is deferred. Use 'ouroboros sync --reset' to clear "
+            "chainstate and re-IBD.[/yellow]"
+        )
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "--reindex requested but not implemented; continuing as a normal "
+            "startup. Use 'ouroboros sync --reset' to rebuild from scratch."
+        )
+
     console.print(Panel.fit(
         f"[bold]Starting Bitcoin Node[/bold]\n"
         f"Network: [cyan]{network}[/cyan]\n"
         f"Data directory: [cyan]{data_dir}[/cyan]\n"
-        f"RPC port: [cyan]{rpc_port}[/cyan] | P2P port: [cyan]{p2p_port}[/cyan]\n\n"
-        f"[dim]Node will display status when ready. Press Ctrl+C to stop.[/dim]",
+        f"RPC port: [cyan]{rpc_port}[/cyan] | P2P port: [cyan]{p2p_port}[/cyan]"
+        + (f"\nMode: [cyan]daemon[/cyan]" if daemon else "")
+        + f"\n\n[dim]Node will display status when ready. Press Ctrl+C to stop.[/dim]",
         border_style="green"
     ))
 
@@ -399,18 +510,73 @@ def start(ctx, rpc_port, p2p_port, listen, connect, force, v2transport, peerbloo
         if blockfilterindex is not None:
             config["blockfilterindex"] = bool(blockfilterindex)
 
+        # Daemonize BEFORE writing the PID file so the recorded PID is
+        # the post-fork process (parity with Bitcoin Core).
+        if daemon:
+            # If the operator didn't explicitly ask for console logging,
+            # silence stderr in the daemonized child — file logging
+            # remains active via the rotating handler installed by the
+            # ``cli`` group.
+            print_to_console_explicit = ctx.obj.get("print_to_console_explicit")
+            if print_to_console_explicit is None or print_to_console_explicit is False:
+                from ouroboros.logging_config import configure_logging
+                configure_logging(
+                    debug=ctx.obj.get("debug", False),
+                    json_format=ctx.obj.get("log_json", False),
+                    log_file=str(Path(data_dir) / "ouroboros.log"),
+                    debug_categories=ctx.obj.get("debug_categories"),
+                    print_to_console=False,
+                )
+            try:
+                daemonize()
+            except Exception as e:
+                console.print(f"[red]✗ Failed to daemonize: {e}[/red]")
+                sys.exit(1)
+
+        # PID file: default location under datadir; written post-fork so
+        # the recorded PID matches the running process.
+        pid_target = pid_path or str(Path(data_dir) / "ouroboros.pid")
+        _pid_file = PidFile(pid_target)
+        try:
+            _pid_file.write()
+        except Exception as e:
+            # Don't take down the node over a stale PID file race —
+            # log loudly and continue.  Operators reading the file will
+            # see the warning in the rotating log.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Could not write PID file %s: %s", pid_target, e
+            )
+
         _node = BitcoinNode(config=config)
+
+        # Tell systemd we're up (best-effort; no-op when NOTIFY_SOCKET
+        # isn't set, i.e. not running under systemd).
+        sd_notify_status("starting node")
 
         # Run node (blocks until Ctrl+C — status panel shown when ready)
         try:
+            sd_notify_ready("ouroboros up")
             asyncio.run(_node.run())
         except KeyboardInterrupt:
             console.print("\n[yellow]Shutting down node...[/yellow]")
             asyncio.run(_node.stop())
             console.print("[green]✓ Node stopped gracefully[/green]")
+        finally:
+            sd_notify_stopping("ouroboros stopped")
+            if _pid_file is not None:
+                try:
+                    _pid_file.remove()
+                except Exception:
+                    pass
 
     except Exception as e:
         console.print(f"[red]✗ Error starting node: {e}[/red]")
+        if _pid_file is not None:
+            try:
+                _pid_file.remove()
+            except Exception:
+                pass
         sys.exit(1)
 
 
