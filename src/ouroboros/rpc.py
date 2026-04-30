@@ -1968,7 +1968,14 @@ class RPCServer:
             If verbose=False: Hex-encoded block header (80 bytes)
         """
         try:
-            block_hash = bytes.fromhex(blockhash)
+            # JSON-RPC convention: hashes are display-order (big-endian) hex.
+            # Internal storage uses little-endian uint256 keying. Reverse the
+            # bytes so the lookup hits the BLOCKS_CF entry written by
+            # connect_block_from_bytes (which uses the internal byte order).
+            # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
+            block_hash = bytes.fromhex(blockhash)[::-1]
+            if len(block_hash) != 32:
+                raise ValueError("Block hash must be 32 bytes")
             if not hasattr(self.node, 'db') or not self.node.db:
                 raise HTTPException(status_code=500, detail="Database not available")
 
