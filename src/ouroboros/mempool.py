@@ -2576,25 +2576,100 @@ class Mempool:
             logger.info(f"Cleared mempool ({count} transactions removed)")
 
     # Persistence
+    # ──────────────────────────────────────────────────────────────────────────
+    # mempool.dat format — Bitcoin Core compatible (kernel/mempool_persist.cpp)
+    #
+    # Reference: Bitcoin Core src/node/mempool_persist.cpp DumpMempool/LoadMempool.
+    #
+    # Layout (all little-endian, no padding):
+    #   uint64 version              = 1 (no XOR) or 2 (XOR-obfuscated)
+    #   if version == 2:
+    #       compact_size key_len    = 8
+    #       byte[8]    xor_key      (random; first 8 bytes that follow are XORed
+    #                                with this key, repeating)
+    #   uint64 tx_count
+    #   per tx:
+    #       CTransaction (TX_WITH_WITNESS — segwit-marker form)
+    #       int64  nTime            (seconds since UNIX epoch)
+    #       int64  nFeeDelta
+    #   compact_size mapDeltas_count
+    #     per mapDeltas entry:
+    #       byte[32] txid           (Core's Txid, internal byte order)
+    #       int64    delta          (CAmount)
+    #   compact_size unbroadcast_count
+    #     per unbroadcast entry:
+    #       byte[32] txid
+    #
+    # The XOR key is applied byte-wise starting AFTER the obfuscation header
+    # (i.e. the version + key bytes are stored in plaintext; everything that
+    # follows is XOR-obfuscated).  Position-aware: byte[i_after_header] ^=
+    # xor_key[i_after_header % 8].
+    # ──────────────────────────────────────────────────────────────────────────
 
-    MEMPOOL_DUMP_VERSION = 1
+    MEMPOOL_DUMP_VERSION_NO_XOR_KEY = 1
+    MEMPOOL_DUMP_VERSION = 2  # default: XOR-obfuscated (Core ≥ v25)
 
-    def dump_to_file(self, filepath: str) -> int:
+    @staticmethod
+    def _write_compact_size(buf: bytearray, n: int) -> None:
+        """Append a CompactSize-encoded uint to *buf* (Bitcoin serialize.h)."""
+        if n < 253:
+            buf.append(n)
+        elif n <= 0xFFFF:
+            buf.append(253)
+            buf.extend(struct.pack("<H", n))
+        elif n <= 0xFFFFFFFF:
+            buf.append(254)
+            buf.extend(struct.pack("<I", n))
+        else:
+            buf.append(255)
+            buf.extend(struct.pack("<Q", n))
+
+    @staticmethod
+    def _read_compact_size(data: bytes, offset: int) -> tuple[int, int]:
+        """Decode a CompactSize-encoded uint at *offset*; returns (value, new_offset)."""
+        if offset >= len(data):
+            raise ValueError("Truncated CompactSize")
+        first = data[offset]
+        offset += 1
+        if first < 253:
+            return first, offset
+        if first == 253:
+            if offset + 2 > len(data):
+                raise ValueError("Truncated CompactSize<u16>")
+            return struct.unpack_from("<H", data, offset)[0], offset + 2
+        if first == 254:
+            if offset + 4 > len(data):
+                raise ValueError("Truncated CompactSize<u32>")
+            return struct.unpack_from("<I", data, offset)[0], offset + 4
+        if offset + 8 > len(data):
+            raise ValueError("Truncated CompactSize<u64>")
+        return struct.unpack_from("<Q", data, offset)[0], offset + 8
+
+    @staticmethod
+    def _xor_obfuscate(payload: bytearray, key: bytes) -> None:
+        """Apply Core's position-aware XOR-obfuscation to *payload* in place.
+
+        Each byte at index ``i`` in the payload is XORed with ``key[i % 8]``,
+        matching ``util/obfuscation.h`` Obfuscation::operator() with
+        ``key_offset = 0``.  This is symmetric, so the same routine handles
+        both serialization and deserialization.
         """
-        Persist mempool to disk.
+        if not key or all(b == 0 for b in key):
+            return
+        klen = len(key)
+        for i in range(len(payload)):
+            payload[i] ^= key[i % klen]
 
-        File format:
-        - version byte (1)
-        - tx count (4 bytes LE)
-        - for each tx:
-            - raw_tx_len (4 bytes LE)
-            - raw_tx_bytes (witness-format serialization)
-            - fee (8 bytes LE)
-            - time_added (double, 8 bytes LE)
+    def dump_to_file(self, filepath: str, *, use_xor: bool = True) -> int:
+        """Persist mempool to *filepath* in Bitcoin Core's mempool.dat format.
 
-        Returns the number of transactions written.
+        ``use_xor=True`` (the default) writes version 2 with a random 8-byte
+        XOR-obfuscation key, matching ``persist_v1_dat = false`` in Core.
+        ``use_xor=False`` writes version 1 (plaintext); useful for tests.
+
+        Returns the number of transactions written (0 if mempool is empty,
+        in which case any stale file at *filepath* is removed).
         """
-
         count = len(self.transactions)
         if count == 0:
             # Remove stale file
@@ -2604,19 +2679,46 @@ class Mempool:
                 pass
             return 0
 
-        tmp = filepath + ".tmp"
+        # Build the obfuscated payload first; the version + xor-key header
+        # is written in plaintext after the payload is XORed.
+        body = bytearray()
+        body.extend(struct.pack("<Q", count))  # uint64 mempool_transactions_to_write
+        for entry in self.transactions.values():
+            raw = entry.tx.serialize_with_witness()
+            body.extend(raw)
+            body.extend(struct.pack("<q", int(entry.time_added)))  # int64 nTime
+            # nFeeDelta: prioritise-tx delta in Core; we don't track per-tx
+            # priority, so write zero (matches "no PrioritiseTransaction").
+            body.extend(struct.pack("<q", 0))  # int64 nFeeDelta
+        # mapDeltas — empty (we don't track prioritise-tx deltas yet)
+        self._write_compact_size(body, 0)
+        # unbroadcast_txids — empty (we don't track unbroadcast set yet)
+        self._write_compact_size(body, 0)
+
+        if use_xor:
+            xor_key = os.urandom(8)
+            self._xor_obfuscate(body, xor_key)
+            version = self.MEMPOOL_DUMP_VERSION
+        else:
+            xor_key = b""
+            version = self.MEMPOOL_DUMP_VERSION_NO_XOR_KEY
+
+        tmp = filepath + ".new"  # match Core's ".new" temp name
         try:
             with open(tmp, "wb") as f:
-                f.write(struct.pack("<B", self.MEMPOOL_DUMP_VERSION))
-                f.write(struct.pack("<I", count))
-                for entry in self.transactions.values():
-                    raw = entry.tx.serialize_with_witness()
-                    f.write(struct.pack("<I", len(raw)))
-                    f.write(raw)
-                    f.write(struct.pack("<q", entry.fee))
-                    f.write(struct.pack("<d", entry.time_added))
+                f.write(struct.pack("<Q", version))
+                if use_xor:
+                    # compact_size(8) prefix + 8-byte key (Vec<byte>)
+                    header = bytearray()
+                    self._write_compact_size(header, len(xor_key))
+                    header.extend(xor_key)
+                    f.write(bytes(header))
+                f.write(bytes(body))
             os.replace(tmp, filepath)
-            logger.info(f"Saved {count} mempool transactions to {filepath}")
+            logger.info(
+                f"Saved {count} mempool transactions to {filepath} "
+                f"(format=v{version})"
+            )
             return count
         except Exception as e:
             logger.warning(f"Failed to dump mempool: {e}")
@@ -2626,13 +2728,61 @@ class Mempool:
                 pass
             return 0
 
-    def load_from_file(self, filepath: str, height: int) -> int:
+    def _load_legacy_format(
+        self, raw: bytes, height: int
+    ) -> tuple[int, int]:
+        """Best-effort load from the pre-Core ``v1 byte`` dump format.
+
+        Returns ``(loaded, skipped)``.  Old format:
+            uint8 version=1, uint32 count, repeat[uint32 raw_len, raw,
+            int64 fee, double time_added].
         """
-        Reload mempool from a previous dump.
+        from ouroboros.p2p_messages import TxMessage
+
+        loaded = 0
+        skipped = 0
+        offset = 0
+        if len(raw) < 5:
+            return 0, 0
+        # Skip 1-byte version + 4-byte count
+        count = struct.unpack_from("<I", raw, 1)[0]
+        offset = 5
+        for _ in range(count):
+            if offset + 4 > len(raw):
+                break
+            raw_len = struct.unpack_from("<I", raw, offset)[0]
+            offset += 4
+            if offset + raw_len + 16 > len(raw):
+                break
+            tx_bytes = raw[offset:offset + raw_len]
+            offset += raw_len
+            time_added = struct.unpack_from("<d", raw, offset + 8)[0]
+            offset += 16
+            try:
+                tx = TxMessage.from_payload(tx_bytes).transaction
+            except Exception:
+                skipped += 1
+                continue
+            ok, _err = self.add_transaction(tx, height)
+            if ok:
+                txid = tx.get_txid()
+                if txid in self.transactions:
+                    self.transactions[txid].time_added = time_added
+                loaded += 1
+            else:
+                skipped += 1
+        return loaded, skipped
+
+    def load_from_file(self, filepath: str, height: int) -> int:
+        """Reload mempool from a Bitcoin Core compatible ``mempool.dat``.
 
         Each transaction is re-validated before being accepted (UTXOs may
         have changed since the dump was written).  Transactions that fail
         validation are silently skipped.
+
+        The legacy custom format produced by ouroboros < 2026-04-29 is
+        auto-detected and converted: txs are re-loaded from the old layout
+        and the file is rewritten in Core format on next dump.
 
         Returns the number of transactions successfully loaded.
         """
@@ -2645,59 +2795,111 @@ class Mempool:
         skipped = 0
         try:
             with open(filepath, "rb") as f:
-                ver_bytes = f.read(1)
-                if not ver_bytes:
-                    return 0
-                version = struct.unpack("<B", ver_bytes)[0]
-                if version != self.MEMPOOL_DUMP_VERSION:
+                raw = f.read()
+
+            if len(raw) < 8:
+                return 0
+
+            # Auto-detect format. Core writes uint64 version in [1, 2].
+            # Legacy ouroboros wrote uint8 version=1, so the first 8 bytes
+            # interpreted as uint64 LE will almost always exceed 2.
+            version = struct.unpack_from("<Q", raw, 0)[0]
+            if version not in (
+                self.MEMPOOL_DUMP_VERSION_NO_XOR_KEY,
+                self.MEMPOOL_DUMP_VERSION,
+            ):
+                # Fall back to legacy custom format.
+                logger.info(
+                    f"mempool.dat at {filepath} is in legacy ouroboros "
+                    "format; converting on next dump"
+                )
+                loaded, skipped = self._load_legacy_format(raw, height)
+                logger.info(
+                    f"Loaded {loaded} mempool transactions from {filepath}"
+                    + (f" ({skipped} skipped)" if skipped else "")
+                )
+                # Remove old-format file so the next dump writes Core format
+                try:
+                    os.remove(filepath)
+                except FileNotFoundError:
+                    pass
+                return loaded
+
+            offset = 8
+            xor_key = b""
+            if version == self.MEMPOOL_DUMP_VERSION:
+                # Read xor_key (Vec<byte> = compact_size + bytes)
+                key_len, offset = self._read_compact_size(raw, offset)
+                if key_len != 8:
                     logger.warning(
-                        f"Unknown mempool.dat version {version}, skipping"
+                        f"mempool.dat XOR key has unexpected length "
+                        f"{key_len}, expected 8"
                     )
                     return 0
+                xor_key = raw[offset:offset + key_len]
+                offset += key_len
 
-                count_bytes = f.read(4)
-                if len(count_bytes) < 4:
-                    return 0
-                count = struct.unpack("<I", count_bytes)[0]
+            # XOR-deobfuscate the rest of the file in place
+            body = bytearray(raw[offset:])
+            self._xor_obfuscate(body, xor_key)
+            body = bytes(body)
+            offset = 0
 
-                for _ in range(count):
-                    # Read tx length + raw bytes
-                    raw_len_bytes = f.read(4)
-                    if len(raw_len_bytes) < 4:
-                        break
-                    raw_len = struct.unpack("<I", raw_len_bytes)[0]
-                    raw = f.read(raw_len)
-                    if len(raw) < raw_len:
-                        break
+            if len(body) < 8:
+                return 0
+            tx_count = struct.unpack_from("<Q", body, offset)[0]
+            offset += 8
 
-                    # Read fee and time_added
-                    meta = f.read(16)  # 8 + 8
-                    if len(meta) < 16:
-                        break
-                    struct.unpack("<q", meta[:8])[0]
-                    time_added = struct.unpack("<d", meta[8:16])[0]
+            for _ in range(tx_count):
+                # Parse one CTransaction-with-witness from `body[offset:]`.
+                # TxMessage.from_payload sets bytes_consumed for us.
+                try:
+                    tx_msg = TxMessage.from_payload(body[offset:])
+                    consumed = getattr(tx_msg, "bytes_consumed", 0)
+                except Exception as e:
+                    logger.warning(f"Failed to parse tx in mempool.dat: {e}")
+                    skipped += 1
+                    break
+                offset += consumed
 
-                    # Deserialize the transaction
-                    try:
-                        tx_msg = TxMessage.from_payload(raw)
-                        tx = tx_msg.transaction
-                    except Exception:
-                        skipped += 1
-                        continue
+                # int64 nTime + int64 nFeeDelta
+                if offset + 16 > len(body):
+                    break
+                n_time = struct.unpack_from("<q", body, offset)[0]
+                offset += 8
+                _n_fee_delta = struct.unpack_from("<q", body, offset)[0]
+                offset += 8
 
-                    # Re-validate and add
-                    ok, err = self.add_transaction(tx, height)
-                    if ok:
-                        # Restore original time_added
-                        txid = tx.get_txid()
-                        if txid in self.transactions:
-                            self.transactions[txid].time_added = time_added
-                        loaded += 1
-                    else:
-                        skipped += 1
+                tx = tx_msg.transaction
+                ok, _err = self.add_transaction(tx, height)
+                if ok:
+                    txid = tx.get_txid()
+                    if txid in self.transactions:
+                        self.transactions[txid].time_added = float(n_time)
+                    loaded += 1
+                else:
+                    skipped += 1
+
+            # mapDeltas + unbroadcast_txids — parse and discard for now.
+            try:
+                if offset < len(body):
+                    map_count, offset = self._read_compact_size(body, offset)
+                    for _ in range(map_count):
+                        if offset + 32 + 8 > len(body):
+                            break
+                        offset += 32 + 8  # txid + int64 delta
+                if offset < len(body):
+                    ub_count, offset = self._read_compact_size(body, offset)
+                    for _ in range(ub_count):
+                        if offset + 32 > len(body):
+                            break
+                        offset += 32
+            except Exception as e:
+                logger.debug(f"Trailing mempool.dat sections skipped: {e}")
 
             logger.info(
-                f"Loaded {loaded} mempool transactions from {filepath}"
+                f"Loaded {loaded} mempool transactions from {filepath} "
+                f"(format=v{version})"
                 + (f" ({skipped} skipped)" if skipped else "")
             )
         except Exception as e:
