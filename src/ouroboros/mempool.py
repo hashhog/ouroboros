@@ -1010,6 +1010,12 @@ class Mempool:
         self._on_tx_added = on_tx_added
 
         self.transactions: dict[bytes, MempoolEntry] = {}  # txid -> entry
+        # BIP 152 / BIP 339 dual index: keep a wtxid->txid map alongside the
+        # txid->entry table.  Every entry is registered in both maps in
+        # add/remove/clear; the cmpctblock path uses this to look up txs by
+        # short-id without a per-call O(N) scan.  Reference: txmempool.h —
+        # mapTx is keyed by txid AND wtxid in Bitcoin Core.
+        self.wtxid_to_txid: dict[bytes, bytes] = {}
         self.spent_outputs: set[OutPoint] = set()
 
         # Sorted by fee rate (for mining)
@@ -1270,6 +1276,13 @@ class Mempool:
         )
 
         self.transactions[txid] = entry
+        # BIP 152 / BIP 339 dual index — register wtxid → txid.  For non-
+        # segwit txs wtxid == txid and the entry is overwritten harmlessly.
+        try:
+            wtxid = tx.get_wtxid()
+        except Exception:
+            wtxid = txid
+        self.wtxid_to_txid[wtxid] = txid
         self.current_size += tx_size
 
         # Track spent outputs
@@ -1898,6 +1911,18 @@ class Mempool:
             self.by_fee_rate.remove(txid)
 
         del self.transactions[txid]
+        # BIP 152 / BIP 339 dual index — drop the wtxid mapping.  Compute
+        # wtxid from the entry we still have a handle on; for non-segwit
+        # transactions wtxid == txid.
+        try:
+            wtxid = entry.tx.get_wtxid()
+        except Exception:
+            wtxid = txid
+        # Defensive: only pop if the wtxid maps back to this txid
+        # (the table can briefly disagree if two txs share a wtxid because
+        # of equal txid/non-witness, which Core forbids but we don't).
+        if self.wtxid_to_txid.get(wtxid) == txid:
+            self.wtxid_to_txid.pop(wtxid, None)
 
         # Update cluster manager
         self._cluster_manager.remove_transaction(txid)
@@ -2569,6 +2594,7 @@ class Mempool:
         with self._lock:
             count = len(self.transactions)
             self.transactions.clear()
+            self.wtxid_to_txid.clear()
             self.spent_outputs.clear()
             self.by_fee_rate.clear()
             self._cluster_manager.rebuild()  # Clear cluster data
@@ -2939,6 +2965,18 @@ class Mempool:
 
     # --- BIP 152 Compact Block Support ---
 
+    def get_transaction_by_wtxid(self, wtxid: bytes) -> Transaction | None:
+        """O(1) wtxid → Transaction lookup via the dual index.
+
+        Used by BIP 331 (getpkgtxns) and the cmpctblock path.  Returns None
+        if no mempool entry has the given wtxid.
+        """
+        txid = self.wtxid_to_txid.get(wtxid)
+        if txid is None:
+            return None
+        entry = self.transactions.get(txid)
+        return entry.tx if entry is not None else None
+
     def build_short_txid_map(
         self, siphash_key: bytes
     ) -> dict[int, Transaction]:
@@ -2946,8 +2984,9 @@ class Mempool:
         Build a map of short txid -> transaction for compact block reconstruction.
 
         This is called when we receive a cmpctblock message and need to match
-        the 6-byte short txids against our mempool. Bitcoin Core iterates over
-        txns_randomized for optimal cache behavior; we iterate over the dict.
+        the 6-byte short txids against our mempool.  Iterates the dual
+        ``wtxid_to_txid`` index so the inner loop is a single dict lookup
+        per entry — no on-demand wtxid recomputation.
 
         Args:
             siphash_key: 16-byte SipHash key derived from block header + nonce
@@ -2960,13 +2999,14 @@ class Mempool:
         from ouroboros.compact_blocks import short_txid
 
         result: dict[int, Transaction] = {}
-        for entry in self.transactions.values():
-            tx = entry.tx
-            wtxid = tx.get_wtxid()
+        for wtxid, txid in self.wtxid_to_txid.items():
+            entry = self.transactions.get(txid)
+            if entry is None:
+                continue
             sid = short_txid(siphash_key, wtxid)
             # On collision, we could null out the entry like Bitcoin Core,
             # but for simplicity we just overwrite (caller handles missing txs)
-            result[sid] = tx
+            result[sid] = entry.tx
         return result
 
     def match_compact_block(
@@ -2976,7 +3016,9 @@ class Mempool:
         Match a list of short txids against the mempool.
 
         Used during compact block reconstruction to find which transactions
-        we already have in our mempool.
+        we already have in our mempool.  Drives the inner loop off the
+        ``wtxid_to_txid`` dual index so the wtxid is read directly instead
+        of being recomputed from the transaction body.
 
         Args:
             short_ids: List of 48-bit short txids from the cmpctblock
@@ -2989,19 +3031,20 @@ class Mempool:
         """
         from ouroboros.compact_blocks import short_txid
 
-        # Build wtxid -> tx lookup, then compute short ids
+        # Build short_id -> tx via the wtxid index (no per-call wtxid hash).
         wtxid_to_tx: dict[int, Transaction] = {}
         collisions: set[int] = set()
 
-        for entry in self.transactions.values():
-            tx = entry.tx
-            wtxid = tx.get_wtxid()
+        for wtxid, txid in self.wtxid_to_txid.items():
+            entry = self.transactions.get(txid)
+            if entry is None:
+                continue
             sid = short_txid(siphash_key, wtxid)
             if sid in wtxid_to_tx:
                 # Collision - mark both as unavailable
                 collisions.add(sid)
             else:
-                wtxid_to_tx[sid] = tx
+                wtxid_to_tx[sid] = entry.tx
 
         # Remove collisions (like Bitcoin Core's duplicate detection)
         for sid in collisions:
