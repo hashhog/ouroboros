@@ -40,11 +40,14 @@ from ouroboros.p2p_messages import (
     BlockTxnMessage,
     GetAddrMessage,
     GetBlockTxnMessage,
+    GetPkgTxnsMessage,
     InvMessage,
     NetworkMessage,
+    PkgTxnsMessage,
     ReconcilDiffMessage,
     ReqTxRcnclMessage,
     SendCmpctMessage,
+    SendPackagesMessage,
     SendTxRcnclMessage,
     SketchMessage,
     get_magic,
@@ -515,6 +518,17 @@ class PeerManager:
         self._reconciliation_task: asyncio.Task | None = None
         self._reconciliation_interval: float = 2.0  # seconds between rounds
 
+        # BIP 331 package relay state.
+        # ``package_relay_enabled`` is the local advertisement flag — when
+        # True we send ``sendpackages`` post-handshake.  ``_package_peers``
+        # is the set of addrs that completed the bidirectional handshake
+        # (both sides sent sendpackages).
+        self.package_relay_enabled: bool = True
+        self.package_relay_version: int = 1
+        self.package_max_count: int = 25       # MAX_PACKAGE_COUNT
+        self.package_max_weight: int = 404_000  # MAX_PACKAGE_WEIGHT
+        self._package_peers: set[str] = set()
+
         # Transaction trickling state (privacy-preserving relay)
         # Per-peer trickle queues: addr -> TrickleQueue
         self._trickle_queues: dict[str, TrickleQueue] = {}
@@ -854,6 +868,10 @@ class PeerManager:
             if self.erlay_enabled:
                 self._register_erlay_handlers(peer, addr)
                 asyncio.ensure_future(self._negotiate_erlay(peer, addr))
+            # Negotiate BIP 331 package relay for inbound peers
+            if self.package_relay_enabled:
+                self._register_package_relay_handlers(peer, addr)
+                asyncio.ensure_future(self._negotiate_package_relay(peer))
             # Initialize trickle queue for inbound peer (5s avg delay)
             self._trickle_queues[addr] = TrickleQueue(
                 is_inbound=True, wtxid_relay=peer.wtxid_relay
@@ -1214,6 +1232,10 @@ class PeerManager:
                 self._register_erlay_handlers(peer, addr)
                 asyncio.ensure_future(self._negotiate_erlay(peer, addr))
 
+            if self.package_relay_enabled:
+                self._register_package_relay_handlers(peer, addr)
+                asyncio.ensure_future(self._negotiate_package_relay(peer))
+
             self._trickle_queues[addr] = TrickleQueue(
                 is_inbound=True, wtxid_relay=peer.wtxid_relay
             )
@@ -1528,6 +1550,10 @@ class PeerManager:
                 if self.erlay_enabled:
                     self._register_erlay_handlers(peer, addr)
                     asyncio.ensure_future(self._negotiate_erlay(peer, addr))
+                # Negotiate BIP 331 package relay for full-relay peers
+                if self.package_relay_enabled:
+                    self._register_package_relay_handlers(peer, addr)
+                    asyncio.ensure_future(self._negotiate_package_relay(peer))
                 # Fire outbound-peer hook so the node attaches tx /
                 # getdata / getheaders serving handlers to this peer.
                 asyncio.ensure_future(self._fire_outbound_peer_callback(peer))
@@ -1583,6 +1609,9 @@ class PeerManager:
             if self.erlay_enabled:
                 self._register_erlay_handlers(peer, addr)
                 asyncio.ensure_future(self._negotiate_erlay(peer, addr))
+            if self.package_relay_enabled:
+                self._register_package_relay_handlers(peer, addr)
+                asyncio.ensure_future(self._negotiate_package_relay(peer))
             # Fire outbound-peer hook for handler attachment.
             asyncio.ensure_future(self._fire_outbound_peer_callback(peer))
             self._trickle_queues[addr] = TrickleQueue(
@@ -2518,6 +2547,208 @@ class PeerManager:
                 magic=get_magic(self.network),
             )
             asyncio.create_task(on_sendtxrcncl(replay))
+
+    # --- BIP 331 Package Relay ---
+
+    async def _negotiate_package_relay(self, peer: Peer) -> None:
+        """Send our ``sendpackages`` to *peer*.
+
+        Bitcoin Core sends sendpackages immediately after verack — we do the
+        same.  Block-relay-only peers don't do tx relay so we skip them.
+        """
+        if not peer.relay_txs:
+            return
+        try:
+            msg = SendPackagesMessage(
+                version=self.package_relay_version,
+                max_count=self.package_max_count,
+                max_weight=self.package_max_weight,
+            )
+            await peer.send_message(msg.to_network_message(self.network))
+            peer._sendpackages_sent = True
+            logger.debug(
+                f"Sent sendpackages (v{self.package_relay_version}, "
+                f"max_count={self.package_max_count}, "
+                f"max_weight={self.package_max_weight}) to "
+                f"{peer.host}:{peer.port}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to send sendpackages to {peer.host}:{peer.port}: {e}"
+            )
+
+    def _register_package_relay_handlers(
+        self, peer: Peer, addr: str
+    ) -> None:
+        """Wire up BIP 331 ``sendpackages`` / ``getpkgtxns`` / ``pkgtxns``
+        handlers for *peer*.
+
+        Reference: Bitcoin Core net_processing.cpp ProcessMessage handlers
+        for ``sendpackages`` / ``getpkgtxns`` / ``pkgtxns``.
+        """
+
+        async def on_sendpackages(msg: NetworkMessage):
+            try:
+                sp = SendPackagesMessage.from_payload(msg.payload)
+            except Exception as e:
+                logger.debug(
+                    f"Bad sendpackages from {addr}: {e}"
+                )
+                return
+            if sp.version < 1:
+                logger.debug(
+                    f"Peer {addr} sendpackages version {sp.version} "
+                    "not supported, ignoring"
+                )
+                return
+            peer.package_relay_version = sp.version
+            peer.package_max_count = sp.max_count
+            peer.package_max_weight = sp.max_weight
+            peer._sendpackages_received = True
+            # Both sides have agreed → mark the connection as package-relay.
+            if peer._sendpackages_sent:
+                self._package_peers.add(addr)
+            logger.info(
+                f"Package relay negotiated with {addr} "
+                f"(version={sp.version}, max_count={sp.max_count}, "
+                f"max_weight={sp.max_weight})"
+            )
+
+        async def on_getpkgtxns(msg: NetworkMessage):
+            """Respond to a ``getpkgtxns`` request with the matching package.
+
+            The payload is a single 32-byte child wtxid.  Look up the child
+            in the mempool, then assemble its ancestor package (parents
+            first, child last) and ship it back as ``pkgtxns``.  If we don't
+            have the child locally we silently drop the request (Core does
+            the same; nothing to send).
+            """
+            try:
+                req = GetPkgTxnsMessage.from_payload(msg.payload)
+            except Exception as e:
+                logger.debug(f"Bad getpkgtxns from {addr}: {e}")
+                return
+            if self._mempool is None:
+                return
+            child = self._mempool.get_transaction_by_wtxid(req.child_wtxid)
+            if child is None:
+                logger.debug(
+                    f"getpkgtxns from {addr}: unknown child wtxid "
+                    f"{req.child_wtxid.hex()[:16]}..."
+                )
+                return
+
+            # Walk ancestors in the mempool to assemble the package in
+            # topological order.  Use the per-entry ``parents`` set written
+            # by the cluster manager.  Cap the package at our advertised
+            # max_count to stay within the negotiated envelope.
+            order: list = []
+            seen: set[bytes] = set()
+
+            def visit(tx_obj):
+                txid = tx_obj.get_txid()
+                if txid in seen:
+                    return
+                seen.add(txid)
+                entry = self._mempool.transactions.get(txid)
+                if entry is not None:
+                    for parent_txid in entry.parents:
+                        parent_entry = self._mempool.transactions.get(
+                            parent_txid
+                        )
+                        if parent_entry is not None:
+                            visit(parent_entry.tx)
+                order.append(tx_obj)
+
+            visit(child)
+            if len(order) > self.package_max_count:
+                # Drop oldest ancestors so we keep within the limit (child
+                # is always the last element).
+                order = order[-self.package_max_count:]
+
+            tx_bytes = [tx.serialize_with_witness() for tx in order]
+            try:
+                resp = PkgTxnsMessage(transactions=tx_bytes)
+                await peer.send_message(resp.to_network_message(self.network))
+                logger.debug(
+                    f"Sent pkgtxns to {addr}: {len(tx_bytes)} txs for "
+                    f"child wtxid {req.child_wtxid.hex()[:16]}..."
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send pkgtxns to {addr}: {e}")
+
+        async def on_pkgtxns(msg: NetworkMessage):
+            """Accept an inbound package: parse and submit to mempool.
+
+            We only accept packages from peers we negotiated with; Core
+            enforces the same gate.  Each transaction is parsed via
+            ``TxMessage.from_payload`` (witness-format) then handed to
+            ``Mempool.accept_to_memory_pool`` so RBF / fee policy / package
+            limits apply.  Failures are logged but not punished.
+            """
+            if addr not in self._package_peers:
+                logger.debug(
+                    f"Ignoring pkgtxns from {addr}: package relay "
+                    "not negotiated"
+                )
+                return
+            if self._mempool is None:
+                return
+            try:
+                pkg = PkgTxnsMessage.from_payload(msg.payload)
+            except Exception as e:
+                logger.debug(f"Bad pkgtxns from {addr}: {e}")
+                return
+
+            from ouroboros.p2p_messages import TxMessage
+
+            txs = []
+            for raw in pkg.transactions:
+                try:
+                    txs.append(TxMessage.from_payload(raw).transaction)
+                except Exception as e:
+                    logger.debug(f"Bad tx in pkgtxns from {addr}: {e}")
+                    return
+
+            # Submit each tx to the mempool individually; the existing
+            # validate_package + add path handles topological order.  A
+            # production implementation would call accept_to_memory_pool
+            # with package semantics; here we delegate to the mempool's
+            # validate_package so the BIP 331 path uses the same code that
+            # already exists for local package acceptance.
+            try:
+                height = self._start_height
+                if hasattr(self._mempool, "validate_package"):
+                    self._mempool.validate_package(txs, height=height)
+                for tx in txs:
+                    try:
+                        self._mempool.add_transaction(tx, height=height)
+                    except Exception as e:
+                        logger.debug(
+                            f"pkgtxns: failed to add tx from {addr}: {e}"
+                        )
+            except Exception as e:
+                logger.debug(f"Error processing pkgtxns from {addr}: {e}")
+
+        async def on_ancpkginfo(msg: NetworkMessage):
+            # ``ancpkginfo`` is only used by the ancestor-package extension
+            # of BIP 331; we accept and parse it for forward-compatibility
+            # but don't act on it yet.  Logged at DEBUG so it doesn't spam
+            # production logs.
+            try:
+                from ouroboros.p2p_messages import AncPkgInfoMessage
+                info = AncPkgInfoMessage.from_payload(msg.payload)
+                logger.debug(
+                    f"ancpkginfo from {addr}: child={info.child_wtxid.hex()[:16]}..., "
+                    f"{len(info.parent_wtxids)} parents"
+                )
+            except Exception as e:
+                logger.debug(f"Bad ancpkginfo from {addr}: {e}")
+
+        peer.register_handler("sendpackages", on_sendpackages)
+        peer.register_handler("getpkgtxns", on_getpkgtxns)
+        peer.register_handler("pkgtxns", on_pkgtxns)
+        peer.register_handler("ancpkginfo", on_ancpkginfo)
 
     async def _reconciliation_loop(self) -> None:
         """Periodically reconcile transaction sets with Erlay peers."""

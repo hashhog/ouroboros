@@ -365,6 +365,17 @@ class Peer:
         # handler in p2p.py can replay it once it has been registered.
         self._pending_sendtxrcncl_payload: bytes | None = None
 
+        # BIP 331: package relay (sendpackages negotiation)
+        # ``package_relay_version`` is 0 until we receive a sendpackages from
+        # the peer.  ``package_max_count`` and ``package_max_weight`` mirror
+        # the sender-side limits the peer advertised.  Both sides must send
+        # ``sendpackages`` for package relay to be active for the connection.
+        self.package_relay_version: int = 0
+        self.package_max_count: int = 0
+        self.package_max_weight: int = 0
+        self._sendpackages_sent: bool = False
+        self._sendpackages_received: bool = False
+
         # Timestamps used by the inbound eviction algorithm
         self.connected_at: float = time.time()
         self.last_block_time: float = 0.0  # last useful block relay activity
