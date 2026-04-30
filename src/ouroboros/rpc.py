@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 from ouroboros.blockfilter import (
     BlockFilterIndex,
+    PersistentBlockFilterIndex,
     build_basic_filter,
     compute_filter_header,
 )
@@ -1994,8 +1995,11 @@ class RPCServer:
         # a sane default when no persistent filter index is available.
         prev_header = b"\x00" * 32
 
-        # If the node keeps a BlockFilterIndex, try to use it.
-        bfi: BlockFilterIndex | None = getattr(self.node, "block_filter_index", None)
+        # If the node keeps a BlockFilterIndex (in-memory or persistent),
+        # try to use it.  Both variants share the read API used below.
+        bfi: BlockFilterIndex | PersistentBlockFilterIndex | None = (
+            getattr(self.node, "block_filter_index", None)
+        )
         if bfi is not None:
             cached_filter = bfi.get_filter(block_hash)
             cached_header = bfi.get_header(block_hash)
@@ -2012,12 +2016,22 @@ class RPCServer:
 
         filter_header = compute_filter_header(filter_bytes, prev_header)
 
-        # Cache if index is available
+        # Cache if index is available.  Prefer the public add_block API
+        # (mirrors block-connect path) so this works for both the
+        # in-memory BlockFilterIndex and PersistentBlockFilterIndex
+        # variants without reaching into private attributes.
         if bfi is not None:
-            bfi._filters[block_hash] = filter_bytes
-            bfi._headers[block_hash] = filter_header
-            if block.height is not None:
-                bfi._height_to_hash[block.height] = block_hash
+            try:
+                bfi.add_block(block, height=block.height, db=self.node.db)
+            except Exception:
+                # Cache failures are best-effort — fall through to the
+                # legacy private-attr path used historically when the
+                # in-memory index lacked an add_block method.
+                if hasattr(bfi, "_filters"):
+                    bfi._filters[block_hash] = filter_bytes
+                    bfi._headers[block_hash] = filter_header
+                    if block.height is not None:
+                        bfi._height_to_hash[block.height] = block_hash
 
         return {
             "filter": filter_bytes.hex(),

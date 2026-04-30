@@ -323,8 +323,18 @@ def sync(ctx, reset, limit):
         "Bitcoin Core's DEFAULT_PEERBLOOMFILTERS=false)."
     ),
 )
+@click.option(
+    "--blockfilterindex/--noblockfilterindex",
+    default=None,
+    help=(
+        "Maintain a BIP 157/158 basic block filter index, serve cfilter / "
+        "cfheaders / cfcheckpt P2P queries, and advertise "
+        "NODE_COMPACT_FILTERS (default: from config; config default is "
+        "off, matching Bitcoin Core's -blockfilterindex=0)."
+    ),
+)
 @click.pass_context
-def start(ctx, rpc_port, p2p_port, listen, connect, force, v2transport, peerbloomfilters):
+def start(ctx, rpc_port, p2p_port, listen, connect, force, v2transport, peerbloomfilters, blockfilterindex):
     """Start the Bitcoin node"""
     global _node, _cancelled
     _cancelled = False
@@ -384,6 +394,10 @@ def start(ctx, rpc_port, p2p_port, listen, connect, force, v2transport, peerbloo
         # parity) wins.
         if peerbloomfilters is not None:
             config["peerbloomfilters"] = bool(peerbloomfilters)
+        # Same conf-vs-CLI precedence for --blockfilterindex.  Default off
+        # (Core parity, DEFAULT_BLOCKFILTERINDEX=false).
+        if blockfilterindex is not None:
+            config["blockfilterindex"] = bool(blockfilterindex)
 
         _node = BitcoinNode(config=config)
 

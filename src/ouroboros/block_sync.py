@@ -154,6 +154,7 @@ class BlockSync:
         peer_manager,  # PeerManager or compatible interface
         mempool=None,  # Optional mempool for re-adding txs after reorg
         fee_estimator=None,  # Optional FeeEstimator to feed confirmed-block fee data
+        block_filter_index=None,  # Optional BIP 157/158 block-filter index
     ):
         """Initialize block synchronizer."""
         self.db = db
@@ -161,6 +162,10 @@ class BlockSync:
         self.peer_manager = peer_manager
         self.mempool = mempool
         self.fee_estimator = fee_estimator
+        # BIP 157/158 — when set, every successfully connected block is
+        # passed to ``block_filter_index.add_block(block, height)`` so the
+        # index stays in lock-step with the chain tip.  None = disabled.
+        self.block_filter_index = block_filter_index
 
         # Track requested blocks (hash -> request_time)
         # FIXME: race condition if called from multiple threads?
@@ -1043,6 +1048,27 @@ class BlockSync:
                     self.fee_estimator.process_block(block, new_height, self.mempool)
                 except Exception:
                     pass
+
+            # BIP 157/158 — index the basic filter for this block once it
+            # is canonically connected.  Off-thread because filter
+            # construction touches the DB (prevout lookups) and is tens of
+            # ms per block; we don't want to gate the connect loop on it.
+            # Errors here are non-fatal: an index fault must never stall
+            # IBD.  TODO(BIP157): batch-flush the underlying file writes
+            # rather than open(...wb) per block; reorg-aware rollback.
+            if self.block_filter_index is not None:
+                try:
+                    await asyncio.to_thread(
+                        self.block_filter_index.add_block,
+                        block,
+                        new_height,
+                        self.db,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"block_filter_index.add_block failed at "
+                        f"height {new_height}: {e}"
+                    )
 
             # Remove confirmed txs from mempool
             if self.mempool is not None:
