@@ -488,6 +488,28 @@ class BlockFilterIndex:
         """Set the tip header (used after reorg to restore previous state)."""
         self._tip_header = prev_header
 
+    # -- BIP 157 helper API --
+
+    def add_block(
+        self,
+        block: Block,
+        height: int | None = None,
+        db: BlockchainDatabase | None = None,
+    ) -> tuple[bytes, bytes]:
+        """Convenience wrapper used by the node block-connect hook.
+
+        Stamps *height* onto the block (so :meth:`add` records the height
+        mapping), then delegates to :meth:`add`.  Idempotent — repeat calls
+        for the same block hash overwrite the cached entry.
+        """
+        if height is not None:
+            block.height = height
+        return self.add(block, db=db)
+
+    def get_block_hash_by_height(self, height: int) -> bytes | None:
+        """Return the indexed block hash at *height*, or ``None``."""
+        return self._height_to_hash.get(height)
+
 
 # ---------------------------------------------------------------------------
 # Persistent Block Filter Index
@@ -731,4 +753,40 @@ class PersistentBlockFilterIndex:
             self._memory_index.set_tip_header(prev_header)
         else:
             self._set_tip_header(prev_header)
+
+    # -- BIP 157 helper API --
+
+    def add_block(
+        self,
+        block: Block,
+        height: int | None = None,
+        db: BlockchainDatabase | None = None,
+    ) -> tuple[bytes, bytes]:
+        """Convenience wrapper used by the node block-connect hook.
+
+        Stamps *height* onto the block (so :meth:`add` records the height
+        mapping), then delegates to :meth:`add`.  When the persistent path
+        is in use this also writes the height -> hash mapping to disk.
+
+        Idempotent — repeat calls for the same block hash overwrite the
+        cached entry; the prev_header is taken from the on-disk tip header
+        so re-application after restart still chains correctly when called
+        in canonical order.
+        """
+        if height is not None:
+            block.height = height
+        return self.add(block, db=db)
+
+    def get_block_hash_by_height(self, height: int) -> bytes | None:
+        """Return the indexed block hash at *height*, or ``None``."""
+        if self._memory_index is not None:
+            return self._memory_index.get_block_hash_by_height(height)
+        height_path = os.path.join(
+            self._height_path, self._height_to_filename(height)
+        )
+        try:
+            with open(height_path, 'rb') as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
 

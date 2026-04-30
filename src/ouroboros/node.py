@@ -90,6 +90,12 @@ class BitcoinNode:
         # Snapshot manager for assumeUTXO
         self.snapshot_manager: SnapshotManager | None = None
 
+        # BIP 157/158 compact block filter index (-blockfilterindex).
+        # Lazily instantiated in start() when the flag is enabled; remains
+        # None otherwise (RPC + P2P handlers fall back to the legacy
+        # build-on-demand path used before this option was added).
+        self.block_filter_index = None
+
         # State
         self.running = False
         self.synced = False
@@ -252,6 +258,33 @@ class BitcoinNode:
                 f"BIP 111 NODE_BLOOM advertisement: "
                 f"{'enabled' if peer_bloom_filters else 'disabled (Core parity default)'}"
             )
+            # BIP 157/158 -blockfilterindex (Core parity, default false).
+            bfi_raw = self.config.get('blockfilterindex', False)
+            if isinstance(bfi_raw, str):
+                block_filter_index_enabled = bfi_raw.lower() in ("1", "true", "yes", "on")
+            else:
+                block_filter_index_enabled = bool(bfi_raw)
+            if block_filter_index_enabled:
+                from ouroboros.blockfilter import PersistentBlockFilterIndex
+                try:
+                    self.block_filter_index = PersistentBlockFilterIndex(
+                        data_dir=self.data_dir, enabled=True,
+                    )
+                    logger.info(
+                        "BIP 157/158 block filter index: enabled "
+                        "(NODE_COMPACT_FILTERS will be advertised)"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to open block filter index ({e}); "
+                        "continuing without -blockfilterindex"
+                    )
+                    self.block_filter_index = None
+                    block_filter_index_enabled = False
+            else:
+                logger.info(
+                    "BIP 157/158 block filter index: disabled (Core parity default)"
+                )
             self.peer_manager = PeerManager(
                 self.network,
                 max_peers=max_peers,
@@ -259,6 +292,7 @@ class BitcoinNode:
                 transport_version=p2p_transport,
                 listen=bool(listen_enabled),
                 peer_bloom_filters=peer_bloom_filters,
+                node_compact_filters=block_filter_index_enabled,
             )
             # BIP 152: Provide mempool and database for compact block relay
             self.peer_manager.set_mempool(self.mempool)
@@ -292,6 +326,7 @@ class BitcoinNode:
                 self.db, self.validator, self.peer_manager,
                 mempool=self.mempool,
                 fee_estimator=self.fee_estimator,
+                block_filter_index=self.block_filter_index,
             )
             try:
                 await self.block_sync.start()
@@ -906,6 +941,203 @@ class BitcoinNode:
 
             return handler
 
+        # BIP 157/158 — getcfilters / getcfheaders / getcfcheckpt handlers.
+        # Active only when the node has --blockfilterindex enabled (the
+        # constructor in start() leaves block_filter_index = None when the
+        # flag is off, in which case we skip handler registration entirely
+        # so peers do not see NODE_COMPACT_FILTERS or any cfilter response).
+        def _make_getcfilters_handler(peer):
+            async def handler(msg):
+                try:
+                    from ouroboros.blockfilter import (
+                        BASIC_FILTER_TYPE,
+                        build_basic_filter,
+                        compute_filter_header,
+                    )
+                    from ouroboros.p2p_messages import (
+                        MAX_GETCFILTERS_SIZE,
+                        CFilterMessage,
+                        GetCFiltersMessage,
+                    )
+
+                    req = GetCFiltersMessage.from_payload(msg.payload)
+                    network = getattr(peer, 'network', 'mainnet')
+                    if req.filter_type != BASIC_FILTER_TYPE:
+                        return  # Core silently ignores unsupported types
+                    stop_block = self.db.get_block(req.stop_hash)
+                    if stop_block is None or stop_block.height is None:
+                        return
+                    stop_height = stop_block.height
+                    if (req.start_height > stop_height
+                            or stop_height - req.start_height + 1 > MAX_GETCFILTERS_SIZE):
+                        return
+                    bfi = self.block_filter_index
+                    for h in range(req.start_height, stop_height + 1):
+                        block_hash: bytes | None = None
+                        filter_bytes: bytes | None = None
+                        if bfi is not None:
+                            block_hash = bfi.get_block_hash_by_height(h)
+                            if block_hash is not None:
+                                filter_bytes = bfi.get_filter(block_hash)
+                        if block_hash is None:
+                            blk = self.db.get_block_by_height(h)
+                            if blk is None:
+                                continue
+                            block_hash = blk.hash
+                        if filter_bytes is None:
+                            blk = self.db.get_block(block_hash)
+                            if blk is None:
+                                continue
+                            filter_bytes = await asyncio.to_thread(
+                                build_basic_filter, blk, self.db,
+                            )
+                        out = CFilterMessage(
+                            filter_type=BASIC_FILTER_TYPE,
+                            block_hash=block_hash,
+                            filter_bytes=filter_bytes,
+                        )
+                        await peer.send_message(out.to_network_message(network))
+                    # silence unused-import warning when prev_header path
+                    # not exercised; reserved for future header-only stub.
+                    _ = compute_filter_header
+                except Exception as e:
+                    logger.error(
+                        f"Error handling getcfilters from "
+                        f"{peer.host}:{peer.port}: {e}"
+                    )
+
+            return handler
+
+        def _make_getcfheaders_handler(peer):
+            async def handler(msg):
+                try:
+                    from ouroboros.blockfilter import (
+                        BASIC_FILTER_TYPE,
+                        build_basic_filter,
+                        compute_filter_hash,
+                        compute_filter_header,
+                    )
+                    from ouroboros.p2p_messages import (
+                        MAX_GETCFHEADERS_SIZE,
+                        CFHeadersMessage,
+                        GetCFHeadersMessage,
+                    )
+
+                    req = GetCFHeadersMessage.from_payload(msg.payload)
+                    network = getattr(peer, 'network', 'mainnet')
+                    if req.filter_type != BASIC_FILTER_TYPE:
+                        return
+                    stop_block = self.db.get_block(req.stop_hash)
+                    if stop_block is None or stop_block.height is None:
+                        return
+                    stop_height = stop_block.height
+                    if (req.start_height > stop_height
+                            or stop_height - req.start_height + 1 > MAX_GETCFHEADERS_SIZE):
+                        return
+                    bfi = self.block_filter_index
+
+                    # Resolve previous filter header.  start_height==0 →
+                    # all-zeros (genesis prev), else look up the header
+                    # at start_height-1 from the index when available.
+                    prev_filter_header = b'\x00' * 32
+                    if req.start_height > 0:
+                        prev_hash = None
+                        if bfi is not None:
+                            prev_hash = bfi.get_block_hash_by_height(req.start_height - 1)
+                        if prev_hash is None:
+                            prev_blk = self.db.get_block_by_height(req.start_height - 1)
+                            if prev_blk is not None:
+                                prev_hash = prev_blk.hash
+                        if prev_hash is not None and bfi is not None:
+                            ph = bfi.get_header(prev_hash)
+                            if ph is not None:
+                                prev_filter_header = ph
+
+                    filter_hashes: list[bytes] = []
+                    for h in range(req.start_height, stop_height + 1):
+                        filt: bytes | None = None
+                        if bfi is not None:
+                            block_hash = bfi.get_block_hash_by_height(h)
+                            if block_hash is not None:
+                                filt = bfi.get_filter(block_hash)
+                        if filt is None:
+                            blk = self.db.get_block_by_height(h)
+                            if blk is None:
+                                return
+                            filt = await asyncio.to_thread(
+                                build_basic_filter, blk, self.db,
+                            )
+                        filter_hashes.append(compute_filter_hash(filt))
+
+                    out = CFHeadersMessage(
+                        filter_type=BASIC_FILTER_TYPE,
+                        stop_hash=req.stop_hash,
+                        previous_filter_header=prev_filter_header,
+                        filter_hashes=filter_hashes,
+                    )
+                    await peer.send_message(out.to_network_message(network))
+                    _ = compute_filter_header
+                except Exception as e:
+                    logger.error(
+                        f"Error handling getcfheaders from "
+                        f"{peer.host}:{peer.port}: {e}"
+                    )
+
+            return handler
+
+        def _make_getcfcheckpt_handler(peer):
+            async def handler(msg):
+                try:
+                    from ouroboros.blockfilter import BASIC_FILTER_TYPE
+                    from ouroboros.p2p_messages import (
+                        CFCHECKPT_INTERVAL,
+                        CFCheckptMessage,
+                        GetCFCheckptMessage,
+                    )
+
+                    req = GetCFCheckptMessage.from_payload(msg.payload)
+                    network = getattr(peer, 'network', 'mainnet')
+                    if req.filter_type != BASIC_FILTER_TYPE:
+                        return
+                    stop_block = self.db.get_block(req.stop_hash)
+                    if stop_block is None or stop_block.height is None:
+                        return
+                    stop_height = stop_block.height
+                    bfi = self.block_filter_index
+
+                    headers: list[bytes] = []
+                    n_checkpoints = stop_height // CFCHECKPT_INTERVAL
+                    for i in range(1, n_checkpoints + 1):
+                        h = i * CFCHECKPT_INTERVAL
+                        if bfi is None:
+                            return
+                        block_hash = bfi.get_block_hash_by_height(h)
+                        if block_hash is None:
+                            return
+                        ph = bfi.get_header(block_hash)
+                        if ph is None:
+                            return
+                        headers.append(ph)
+
+                    out = CFCheckptMessage(
+                        filter_type=BASIC_FILTER_TYPE,
+                        stop_hash=req.stop_hash,
+                        filter_headers=headers,
+                    )
+                    await peer.send_message(out.to_network_message(network))
+                except Exception as e:
+                    logger.error(
+                        f"Error handling getcfcheckpt from "
+                        f"{peer.host}:{peer.port}: {e}"
+                    )
+
+            return handler
+
+        # Register cfilter handlers on every peer (always — so an external
+        # peer that wrongly probes us still gets a non-crashing response).
+        # The handlers themselves no-op cleanly when the index is disabled.
+        cfilter_enabled = self.block_filter_index is not None
+
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             peers = self.peer_manager.get_all_ready_peers()
             for peer in peers:
@@ -913,12 +1145,20 @@ class BitcoinNode:
                     peer.register_handler("tx", _make_tx_handler(peer))
                     peer.register_handler("getdata", _make_getdata_handler(peer))
                     peer.register_handler("getheaders", _make_getheaders_handler(peer))
+                    if cfilter_enabled:
+                        peer.register_handler("getcfilters", _make_getcfilters_handler(peer))
+                        peer.register_handler("getcfheaders", _make_getcfheaders_handler(peer))
+                        peer.register_handler("getcfcheckpt", _make_getcfcheckpt_handler(peer))
 
         # Register callback for future inbound peers so they get handlers too
         async def _on_inbound_peer(peer):
             peer.register_handler("tx", _make_tx_handler(peer))
             peer.register_handler("getdata", _make_getdata_handler(peer))
             peer.register_handler("getheaders", _make_getheaders_handler(peer))
+            if cfilter_enabled:
+                peer.register_handler("getcfilters", _make_getcfilters_handler(peer))
+                peer.register_handler("getcfheaders", _make_getcfheaders_handler(peer))
+                peer.register_handler("getcfcheckpt", _make_getcfcheckpt_handler(peer))
 
         self.peer_manager.set_inbound_peer_handler(_on_inbound_peer)
 
@@ -933,6 +1173,10 @@ class BitcoinNode:
                 peer.register_handler("tx", _make_tx_handler(peer))
                 peer.register_handler("getdata", _make_getdata_handler(peer))
                 peer.register_handler("getheaders", _make_getheaders_handler(peer))
+                if cfilter_enabled:
+                    peer.register_handler("getcfilters", _make_getcfilters_handler(peer))
+                    peer.register_handler("getcfheaders", _make_getcfheaders_handler(peer))
+                    peer.register_handler("getcfcheckpt", _make_getcfcheckpt_handler(peer))
 
             self.peer_manager.set_outbound_peer_handler(_on_outbound_peer)
 

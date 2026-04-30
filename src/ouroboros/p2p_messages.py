@@ -40,6 +40,7 @@ MSG_WTX = 5  # BIP 339 wtxid-based relay
 NODE_NETWORK = 1 << 0           # 0x0001 — full block history
 NODE_BLOOM = 1 << 2             # 0x0004 — BIP 111 bloom filters
 NODE_WITNESS = 1 << 3           # 0x0008 — SegWit (BIP 144)
+NODE_COMPACT_FILTERS = 1 << 6   # 0x0040 — BIP 157/158 compact block filters
 NODE_NETWORK_LIMITED = 1 << 10  # 0x0400 — BIP 159 pruned node (last 288 blocks)
 NODE_P2P_V2 = 1 << 11          # 0x0800 — BIP 324 encrypted transport
 
@@ -893,6 +894,245 @@ class BlockTxnMessage:
     def to_block_transactions(self):
         from ouroboros.compact_blocks import BlockTransactions
         return BlockTransactions.deserialize(self.payload_bytes)
+
+
+# ---------------------------------------------------------------------------
+# BIP 157 / 158 compact-filter P2P messages
+# ---------------------------------------------------------------------------
+
+# BIP-157 protocol limits — match Bitcoin Core src/net_processing.cpp.
+MAX_GETCFILTERS_SIZE = 1000      # max blocks per getcfilters request
+MAX_GETCFHEADERS_SIZE = 2000     # max blocks per getcfheaders request
+CFCHECKPT_INTERVAL = 1000        # cfcheckpt header spacing
+
+
+@dataclass
+class GetCFiltersMessage:
+    """
+    ``getcfilters`` (BIP 157) — request a range of compact filters.
+
+    Wire format:
+        filter_type    (1 byte)
+        start_height   (uint32, little-endian)
+        stop_hash      (32 bytes, internal byte order)
+    """
+    filter_type: int = 0
+    start_height: int = 0
+    stop_hash: bytes = b'\x00' * 32
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = (
+            struct.pack('<B', self.filter_type & 0xFF)
+            + struct.pack('<I', self.start_height & 0xFFFFFFFF)
+            + bytes(self.stop_hash)
+        )
+        return NetworkMessage(
+            command="getcfilters", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> GetCFiltersMessage:
+        if len(payload) < 1 + 4 + 32:
+            raise ValueError("getcfilters payload too short")
+        filter_type = payload[0]
+        start_height = struct.unpack('<I', payload[1:5])[0]
+        stop_hash = bytes(payload[5:5 + 32])
+        return cls(
+            filter_type=filter_type,
+            start_height=start_height,
+            stop_hash=stop_hash,
+        )
+
+
+@dataclass
+class CFilterMessage:
+    """
+    ``cfilter`` (BIP 157) — single compact filter response.
+
+    Wire format:
+        filter_type     (1 byte)
+        block_hash      (32 bytes)
+        filter_bytes    (CompactSize-prefixed byte vector)
+    """
+    filter_type: int = 0
+    block_hash: bytes = b'\x00' * 32
+    filter_bytes: bytes = b''
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = (
+            struct.pack('<B', self.filter_type & 0xFF)
+            + bytes(self.block_hash)
+            + encode_varint(len(self.filter_bytes))
+            + bytes(self.filter_bytes)
+        )
+        return NetworkMessage(
+            command="cfilter", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> CFilterMessage:
+        if len(payload) < 1 + 32 + 1:
+            raise ValueError("cfilter payload too short")
+        filter_type = payload[0]
+        block_hash = bytes(payload[1:33])
+        n, consumed = decode_varint(payload, 33)
+        offset = 33 + consumed
+        if offset + n > len(payload):
+            raise ValueError("cfilter payload truncated")
+        filter_bytes = bytes(payload[offset:offset + n])
+        return cls(
+            filter_type=filter_type,
+            block_hash=block_hash,
+            filter_bytes=filter_bytes,
+        )
+
+
+@dataclass
+class GetCFHeadersMessage:
+    """
+    ``getcfheaders`` (BIP 157) — request filter headers and filter hashes.
+
+    Same wire format as getcfilters.
+    """
+    filter_type: int = 0
+    start_height: int = 0
+    stop_hash: bytes = b'\x00' * 32
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = (
+            struct.pack('<B', self.filter_type & 0xFF)
+            + struct.pack('<I', self.start_height & 0xFFFFFFFF)
+            + bytes(self.stop_hash)
+        )
+        return NetworkMessage(
+            command="getcfheaders", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> GetCFHeadersMessage:
+        if len(payload) < 1 + 4 + 32:
+            raise ValueError("getcfheaders payload too short")
+        filter_type = payload[0]
+        start_height = struct.unpack('<I', payload[1:5])[0]
+        stop_hash = bytes(payload[5:5 + 32])
+        return cls(
+            filter_type=filter_type,
+            start_height=start_height,
+            stop_hash=stop_hash,
+        )
+
+
+@dataclass
+class CFHeadersMessage:
+    """
+    ``cfheaders`` (BIP 157) — response to getcfheaders.
+
+    Wire format:
+        filter_type        (1 byte)
+        stop_hash          (32 bytes)
+        previous_filter_header (32 bytes)
+        filter_hashes      (CompactSize length-prefixed list of 32-byte hashes)
+    """
+    filter_type: int = 0
+    stop_hash: bytes = b'\x00' * 32
+    previous_filter_header: bytes = b'\x00' * 32
+    filter_hashes: list[bytes] = field(default_factory=list)
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = bytearray()
+        payload.append(self.filter_type & 0xFF)
+        payload.extend(bytes(self.stop_hash))
+        payload.extend(bytes(self.previous_filter_header))
+        payload.extend(encode_varint(len(self.filter_hashes)))
+        for h in self.filter_hashes:
+            payload.extend(bytes(h))
+        return NetworkMessage(
+            command="cfheaders", payload=bytes(payload), magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> CFHeadersMessage:
+        if len(payload) < 1 + 32 + 32 + 1:
+            raise ValueError("cfheaders payload too short")
+        filter_type = payload[0]
+        stop_hash = bytes(payload[1:33])
+        prev_header = bytes(payload[33:65])
+        n, consumed = decode_varint(payload, 65)
+        offset = 65 + consumed
+        if offset + n * 32 > len(payload):
+            raise ValueError("cfheaders payload truncated")
+        hashes = [bytes(payload[offset + 32 * i:offset + 32 * (i + 1)]) for i in range(n)]
+        return cls(
+            filter_type=filter_type,
+            stop_hash=stop_hash,
+            previous_filter_header=prev_header,
+            filter_hashes=hashes,
+        )
+
+
+@dataclass
+class GetCFCheckptMessage:
+    """
+    ``getcfcheckpt`` (BIP 157) — request evenly spaced filter headers.
+
+    Wire format:
+        filter_type   (1 byte)
+        stop_hash     (32 bytes)
+    """
+    filter_type: int = 0
+    stop_hash: bytes = b'\x00' * 32
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = struct.pack('<B', self.filter_type & 0xFF) + bytes(self.stop_hash)
+        return NetworkMessage(
+            command="getcfcheckpt", payload=payload, magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> GetCFCheckptMessage:
+        if len(payload) < 1 + 32:
+            raise ValueError("getcfcheckpt payload too short")
+        filter_type = payload[0]
+        stop_hash = bytes(payload[1:33])
+        return cls(filter_type=filter_type, stop_hash=stop_hash)
+
+
+@dataclass
+class CFCheckptMessage:
+    """
+    ``cfcheckpt`` (BIP 157) — response with checkpoint filter headers
+    every CFCHECKPT_INTERVAL blocks up to *stop_hash*.
+
+    Wire format:
+        filter_type      (1 byte)
+        stop_hash        (32 bytes)
+        filter_headers   (CompactSize-prefixed list of 32-byte filter headers)
+    """
+    filter_type: int = 0
+    stop_hash: bytes = b'\x00' * 32
+    filter_headers: list[bytes] = field(default_factory=list)
+
+    def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
+        payload = bytearray()
+        payload.append(self.filter_type & 0xFF)
+        payload.extend(bytes(self.stop_hash))
+        payload.extend(encode_varint(len(self.filter_headers)))
+        for h in self.filter_headers:
+            payload.extend(bytes(h))
+        return NetworkMessage(
+            command="cfcheckpt", payload=bytes(payload), magic=get_magic(network))
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> CFCheckptMessage:
+        if len(payload) < 1 + 32 + 1:
+            raise ValueError("cfcheckpt payload too short")
+        filter_type = payload[0]
+        stop_hash = bytes(payload[1:33])
+        n, consumed = decode_varint(payload, 33)
+        offset = 33 + consumed
+        if offset + n * 32 > len(payload):
+            raise ValueError("cfcheckpt payload truncated")
+        headers = [bytes(payload[offset + 32 * i:offset + 32 * (i + 1)]) for i in range(n)]
+        return cls(
+            filter_type=filter_type,
+            stop_hash=stop_hash,
+            filter_headers=headers,
+        )
 
 
 # --- Additional P2P messages for chain-tip operation ---

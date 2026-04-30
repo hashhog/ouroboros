@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 from ouroboros.p2p_messages import (
     NODE_BLOOM,
+    NODE_COMPACT_FILTERS,
     NODE_NETWORK,
     NODE_P2P_V2,
     NODE_WITNESS,
@@ -277,6 +278,7 @@ class Peer:
         proxy: str | None = None,
         ban_manager: "BanManager | None" = None,
         peer_bloom_filters: bool = False,
+        node_compact_filters: bool = False,
     ):
         """Initialize peer connection."""
         self.host = host
@@ -293,6 +295,12 @@ class Peer:
         # MEMPOOL requests; when False (the Core-parity default) we do
         # neither.
         self.peer_bloom_filters = peer_bloom_filters
+        # BIP 157 NODE_COMPACT_FILTERS advertisement toggle.  Mirrors
+        # Bitcoin Core's -blockfilterindex option (default false).  When
+        # True we OR NODE_COMPACT_FILTERS (1<<6) into the advertised
+        # services in our `version` message; the actual P2P serving is
+        # gated on the same flag in node._register_handlers.
+        self.node_compact_filters = node_compact_filters
         # Optional reference to PeerManager's BanManager so that adjust_score
         # clamping at 0 can route the peer through the existing ban
         # callback (which removes the peer + closes the socket).  Without
@@ -649,6 +657,8 @@ class Peer:
         our_services = NODE_NETWORK | NODE_WITNESS
         if self.peer_bloom_filters:
             our_services |= NODE_BLOOM
+        if self.node_compact_filters:
+            our_services |= NODE_COMPACT_FILTERS
         if self.transport_version >= 2:
             our_services |= NODE_P2P_V2
         self.our_services = our_services
@@ -1156,6 +1166,8 @@ class Peer:
         our_services = NODE_NETWORK | NODE_WITNESS
         if self.peer_bloom_filters:
             our_services |= NODE_BLOOM
+        if self.node_compact_filters:
+            our_services |= NODE_COMPACT_FILTERS
         if self.transport_version >= 2:
             our_services |= NODE_P2P_V2
         self.our_services = our_services
@@ -1298,9 +1310,12 @@ class Peer:
     def _create_network_address(self, host: str, port: int) -> NetworkAddress:
         """Create network address from host and port."""
         # NODE_BLOOM advertised iff peer_bloom_filters enabled (Core parity).
+        # NODE_COMPACT_FILTERS advertised iff blockfilterindex enabled.
         our_services = NODE_NETWORK | NODE_WITNESS
         if self.peer_bloom_filters:
             our_services |= NODE_BLOOM
+        if self.node_compact_filters:
+            our_services |= NODE_COMPACT_FILTERS
 
         # .onion addresses — use all-zeros IP (the real routing happens
         # via the SOCKS5 proxy; the version message just needs a valid

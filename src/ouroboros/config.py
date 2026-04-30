@@ -183,6 +183,15 @@ class NodeConfig:
             # advertises NODE_BLOOM in its `version` message nor services
             # BIP-35 MEMPOOL requests (gated in p2p.py on_mempool).
             'peerbloomfilters': '0',
+            # BIP 157/158 compact block filter index (1=enabled, 0=off).
+            # Mirrors Bitcoin Core's -blockfilterindex option, default off.
+            # When enabled the node builds a basic-filter index alongside
+            # block validation, advertises NODE_COMPACT_FILTERS (1<<6) in
+            # its `version` services bitfield, and serves the BIP-157 P2P
+            # message family (getcfilters/cfilter/getcfheaders/cfheaders/
+            # getcfcheckpt/cfcheckpt).  When disabled (the default) the
+            # node behaves identically to before this option was added.
+            'blockfilterindex': '0',
         }
 
         if self.config_path.exists():
@@ -311,6 +320,11 @@ class NodeConfig:
             # Same string-coercion note applies.  Default false to match
             # Core's DEFAULT_PEERBLOOMFILTERS.
             'peerbloomfilters': self.getboolean('peerbloomfilters'),
+            # BIP 157/158 compact block filter index (Core: -blockfilterindex).
+            # Default false (Core parity).  When true the node builds the
+            # filter index, serves BIP-157 P2P queries, and advertises
+            # NODE_COMPACT_FILTERS in version handshakes.
+            'blockfilterindex': self.getboolean('blockfilterindex'),
         }
 
 
