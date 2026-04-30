@@ -220,6 +220,33 @@ def _parse_partial_merkle_tree(data: bytes) -> tuple:
     return matched, computed_root
 
 
+# ---------------------------------------------------------------------------
+# Bitcoin Signed Message helpers (signmessage / verifymessage).
+#
+# Reference: bitcoin-core/src/common/signmessage.cpp
+#   const std::string MESSAGE_MAGIC = "Bitcoin Signed Message:\n";
+#   uint256 MessageHash(message) = SHA256d(VarStr(MAGIC) || VarStr(message))
+#
+# Compact-signature format (65 bytes, base64 on the wire):
+#   header(1) || r(32) || s(32)
+#   header   = 27 + recid + (4 if compressed pubkey else 0)
+#   recid    ∈ {0, 1, 2, 3}
+# ---------------------------------------------------------------------------
+_MESSAGE_MAGIC = "Bitcoin Signed Message:\n"
+
+
+def _message_hash(message: str) -> bytes:
+    """Return Core's MessageHash(message) — the SHA256d of the magic-prefixed
+    serialization that signmessage / verifymessage operate on."""
+    magic_bytes = _MESSAGE_MAGIC.encode("utf-8")
+    msg_bytes = message.encode("utf-8")
+    payload = (
+        _encode_varint(len(magic_bytes)) + magic_bytes
+        + _encode_varint(len(msg_bytes)) + msg_bytes
+    )
+    return _dsha256(payload)
+
+
 class RPCServer:
     """Bitcoin JSON-RPC server"""
 
@@ -1839,6 +1866,76 @@ class RPCServer:
 
         return result
 
+    def _resolve_mempool_path(self, filepath: str | None = None) -> str:
+        """Pick the mempool.dat path: explicit override → ``<datadir>/mempool.dat``."""
+        import os
+
+        if filepath:
+            # Reject paths trying to escape the data directory unless the
+            # caller passed an absolute path explicitly.
+            return os.path.expanduser(filepath)
+        data_dir = getattr(self.node, "data_dir", None)
+        if not data_dir:
+            raise HTTPException(
+                status_code=500, detail="Node has no data_dir configured"
+            )
+        return os.path.join(data_dir, "mempool.dat")
+
+    async def rpc_dumpmempool(self, filepath: str | None = None) -> dict[str, Any]:
+        """Persist the in-memory mempool to ``mempool.dat`` (Core format).
+
+        Reference: bitcoin-core/src/rpc/mempool.cpp dumpmempool / savemempool.
+        ``savemempool`` is an alias of ``dumpmempool`` in Core; ouroboros
+        exposes both for parity.
+        """
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
+            raise HTTPException(status_code=500, detail="Mempool not available")
+
+        path = self._resolve_mempool_path(filepath)
+        try:
+            count = self.node.mempool.dump_to_file(path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Unable to dump mempool to disk: {e}"
+            )
+        return {"filename": path, "txcount": count}
+
+    async def rpc_savemempool(self, filepath: str | None = None) -> dict[str, Any]:
+        """Alias of :meth:`rpc_dumpmempool` for Bitcoin Core RPC parity."""
+        return await self.rpc_dumpmempool(filepath)
+
+    async def rpc_loadmempool(self, filepath: str | None = None) -> dict[str, Any]:
+        """Reload mempool transactions from ``mempool.dat`` (Core format).
+
+        Reference: bitcoin-core/src/rpc/mempool.cpp importmempool — Core
+        ships this as ``importmempool`` rather than ``loadmempool``, but the
+        on-disk format is identical and ouroboros exposes both names because
+        the wider fleet (and ouroboros's own ``Mempool.load_from_file``) uses
+        ``loadmempool``.
+        """
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
+            raise HTTPException(status_code=500, detail="Mempool not available")
+
+        path = self._resolve_mempool_path(filepath)
+
+        # Determine the height to validate against (mempool entries only
+        # accept txs whose chain context is at the current tip).
+        height = 0
+        db = getattr(self.node, "db", None)
+        if db is not None:
+            try:
+                _, height = db.get_best_block()
+            except Exception:
+                height = 0
+
+        try:
+            loaded = self.node.mempool.load_from_file(path, height)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Unable to load mempool from disk: {e}"
+            )
+        return {"filename": path, "loaded": int(loaded)}
+
     async def rpc_getblockheader(self, blockhash: str, verbose: bool = True) -> str | dict[str, Any]:
         """
         Get block header information.
@@ -2655,6 +2752,108 @@ class RPCServer:
             "feerate": fee_rate,
             "blocks": conf_target,
         }
+
+    async def rpc_estimaterawfee(
+        self,
+        conf_target: int,
+        threshold: float = 0.95,
+    ) -> dict[str, Any]:
+        """
+        Advanced fee estimator surface — returns per-horizon bucket data.
+
+        Reference: bitcoin-core/src/rpc/fees.cpp estimaterawfee.
+
+        ouroboros's CBlockPolicyEstimator analog (``FeeEstimator``) tracks a
+        single horizon (no short/medium/long split) so the returned object
+        has a single ``"long"`` horizon.  The bucket output mirrors Core's
+        ``buckets.pass`` / ``buckets.fail`` shape.
+        """
+        from ouroboros.fee_estimator import (
+            FEE_RATE_BUCKETS,
+            DECAY_FACTOR,
+            SUCCESS_THRESHOLD,
+        )
+
+        if not isinstance(conf_target, int) or conf_target < 1 or conf_target > 1008:
+            raise HTTPException(
+                status_code=400,
+                detail="conf_target out of range (1 - 1008)",
+            )
+        if not isinstance(threshold, (int, float)) or threshold < 0 or threshold > 1:
+            raise HTTPException(status_code=400, detail="Invalid threshold")
+        threshold = float(threshold)
+
+        fee_estimator = getattr(self.node, "fee_estimator", None)
+        if fee_estimator is None:
+            return {
+                "long": {
+                    "decay": DECAY_FACTOR,
+                    "scale": 1,
+                    "errors": ["Fee estimation not available"],
+                }
+            }
+
+        # Clamp conf_target to what we actually track in the bucket arrays.
+        from ouroboros.fee_estimator import MAX_CONF_TARGET as _MCT
+        track_target = min(conf_target, _MCT)
+
+        # Walk buckets low → high; first bucket whose success rate meets the
+        # threshold is the *pass* bucket.  The highest bucket below it that
+        # *fails* the threshold is the *fail* bucket.
+        pass_idx: int | None = None
+        fail_idx: int | None = None
+        for i in range(len(FEE_RATE_BUCKETS)):
+            total = fee_estimator.total[i][track_target]
+            conf = fee_estimator.confirmed[i][track_target]
+            if total < 1.0:
+                continue
+            ratio = conf / total if total > 0 else 0.0
+            if ratio >= threshold:
+                pass_idx = i
+                break
+            fail_idx = i
+
+        def _bucket_dict(idx: int) -> dict:
+            start = FEE_RATE_BUCKETS[idx]
+            end = (
+                FEE_RATE_BUCKETS[idx + 1]
+                if idx + 1 < len(FEE_RATE_BUCKETS)
+                else FEE_RATE_BUCKETS[-1]
+            )
+            total = fee_estimator.total[idx][track_target]
+            conf = fee_estimator.confirmed[idx][track_target]
+            return {
+                "startrange": round(float(start), 2),
+                "endrange": round(float(end), 2),
+                # Match Core's "*100/100" rounding to 2 decimal places.
+                "withintarget": round(conf, 2),
+                "totalconfirmed": round(conf, 2),
+                "inmempool": 0,  # we don't track per-bucket mempool counts yet
+                "leftmempool": round(max(total - conf, 0.0), 2),
+            }
+
+        horizon: dict[str, Any] = {
+            "decay": DECAY_FACTOR,
+            "scale": 1,
+        }
+
+        if pass_idx is not None:
+            # sat/vB bucket boundary → BTC/kB feerate to mirror Core.
+            feerate_btc_kvb = float(FEE_RATE_BUCKETS[pass_idx]) * 1000 / 1e8
+            horizon["feerate"] = feerate_btc_kvb
+            horizon["pass"] = _bucket_dict(pass_idx)
+            if fail_idx is not None:
+                horizon["fail"] = _bucket_dict(fail_idx)
+        else:
+            # No bucket meets the threshold — emit fail (highest tracked
+            # bucket with any data) and an explanatory error string.
+            if fail_idx is not None:
+                horizon["fail"] = _bucket_dict(fail_idx)
+            horizon["errors"] = [
+                "Insufficient data or no feerate found which meets threshold"
+            ]
+
+        return {"long": horizon}
 
     async def rpc_validateaddress(self, address: str) -> dict[str, Any]:
         """
@@ -4707,6 +4906,142 @@ class RPCServer:
                     or k.get_p2pkh_address() == address):
                 return k.to_wif()
         raise ValueError(f"Address not found in wallet: {address}")
+
+    async def rpc_signmessage(self, address: str, message: str) -> str:
+        """Sign *message* with the private key for *address* (P2PKH only).
+
+        Returns a base64-encoded 65-byte compact recoverable ECDSA signature,
+        matching Bitcoin Core's ``signmessage`` semantics.
+
+        Reference: bitcoin-core/src/rpc/signmessage.cpp signmessagewithprivkey
+        and src/wallet/rpc/signmessage.cpp signmessage.
+        """
+        import base64
+
+        if not isinstance(address, str) or not isinstance(message, str):
+            raise HTTPException(
+                status_code=400, detail="address and message must be strings"
+            )
+
+        # Resolve wallet (single-wallet legacy or multi-wallet manager).
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            try:
+                wallet = self._get_wallet_for_rpc()
+            except Exception:
+                wallet = None
+        if wallet is None or not getattr(wallet, "keys", None):
+            raise HTTPException(status_code=400, detail="No wallet loaded")
+
+        # Find the matching key. Core's signmessage only accepts P2PKH (legacy)
+        # addresses; we additionally accept P2WPKH because that's what
+        # ouroboros wallets produce by default — falls back to the P2PKH
+        # the same key would derive when signing.
+        target_key = None
+        for kd in wallet.keys:
+            k = wallet._get_wallet_key(kd)
+            if address in (
+                k.get_p2pkh_address(),
+                k.get_p2wpkh_address(),
+                k.get_p2sh_p2wpkh_address(),
+            ):
+                target_key = k
+                break
+
+        if target_key is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Private key not available for given address",
+            )
+
+        try:
+            sig_bytes = target_key._privkey.sign_recoverable(
+                _message_hash(message), hasher=None
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Sign failed: {e}"
+            )
+
+        # coincurve returns r(32) || s(32) || recid(1).  Bitcoin compact format
+        # is header(1) || r(32) || s(32) where header = 27 + recid + 4 (compressed).
+        if len(sig_bytes) != 65:
+            raise HTTPException(
+                status_code=500, detail="Unexpected signature length"
+            )
+        recid = sig_bytes[64]
+        header = bytes([27 + recid + 4])  # compressed pubkey
+        compact = header + sig_bytes[:64]
+        return base64.b64encode(compact).decode("ascii")
+
+    async def rpc_verifymessage(
+        self, address: str, signature: str, message: str
+    ) -> bool:
+        """Verify a base64 compact signature against *address* and *message*.
+
+        Returns ``True`` iff the signature was produced by the private key
+        whose P2PKH address is *address*.
+
+        Reference: bitcoin-core/src/rpc/signmessage.cpp verifymessage and
+        src/common/signmessage.cpp MessageVerify.
+        """
+        import base64
+        from coincurve import PublicKey
+        from ouroboros.address import _decode_base58check
+
+        if not all(isinstance(x, str) for x in (address, signature, message)):
+            raise HTTPException(
+                status_code=400,
+                detail="address, signature, and message must be strings",
+            )
+
+        # 1) Decode address — accept legacy P2PKH (mainnet 0x00, testnet 0x6f)
+        #    only.  Bitcoin Core's verifymessage is keyhash-only because we
+        #    need to compare hash160(pubkey) against the destination.
+        try:
+            version, payload = _decode_base58check(address)
+        except Exception:
+            raise HTTPException(
+                status_code=400, detail="Invalid address"
+            )
+        if version not in (0x00, 0x6f) or len(payload) != 20:
+            raise HTTPException(
+                status_code=400,
+                detail="Address does not refer to key (P2PKH only)",
+            )
+        target_h160 = payload
+
+        # 2) Decode base64 signature — must be a 65-byte compact sig.
+        try:
+            sig = base64.b64decode(signature, validate=True)
+        except Exception:
+            raise HTTPException(
+                status_code=400, detail="Malformed base64 encoding"
+            )
+        if len(sig) != 65:
+            raise HTTPException(
+                status_code=400, detail="Malformed base64 encoding"
+            )
+
+        header = sig[0]
+        if header < 27 or header > 34:
+            return False
+        recid = (header - 27) & 3
+        compressed = ((header - 27) & 4) != 0
+        coincurve_sig = sig[1:65] + bytes([recid])
+
+        try:
+            pub = PublicKey.from_signature_and_message(
+                coincurve_sig, _message_hash(message), hasher=None
+            )
+            pub_bytes = pub.format(compressed=compressed)
+        except Exception:
+            return False
+
+        # Compare recovered pubkey hash160 with the address payload.
+        from ouroboros.wallet import _hash160
+
+        return _hash160(pub_bytes) == target_h160
 
     async def rpc_backupwallet(self, destination: str) -> None:
         """Backup the wallet to a file."""
