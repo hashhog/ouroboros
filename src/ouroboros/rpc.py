@@ -1042,7 +1042,14 @@ class RPCServer:
             If verbosity = 3: JSON object with transaction details and prevout info
         """
         try:
-            block_hash = bytes.fromhex(blockhash)
+            # JSON-RPC convention: hashes are display-order (big-endian) hex.
+            # Internal storage uses little-endian uint256 keying. Reverse the
+            # bytes so the lookup hits the BLOCKS_CF entry written by
+            # connect_block_from_bytes.
+            # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
+            block_hash = bytes.fromhex(blockhash)[::-1]
+            if len(block_hash) != 32:
+                raise ValueError("Block hash must be 32 bytes")
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid block hash") from None
 
@@ -1238,7 +1245,10 @@ class RPCServer:
 
         if explicit_blockhash:
             try:
-                block_hash_bytes = bytes.fromhex(blockhash)
+                # JSON-RPC convention: hashes are display-order (big-endian) hex.
+                # Internal storage keys blocks by little-endian uint256 bytes.
+                # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
+                block_hash_bytes = bytes.fromhex(blockhash)[::-1]
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid block hash") from None
             if len(block_hash_bytes) != 32:
@@ -1344,7 +1354,10 @@ class RPCServer:
         # Add block context fields for confirmed transactions
         if not in_mempool and block is not None:
             if block_hash_bytes:
-                result["blockhash"] = block_hash_bytes.hex()
+                # block_hash_bytes is internal little-endian (either reversed
+                # from caller hex or from get_tx_index). Convert to display
+                # order for JSON-RPC output.
+                result["blockhash"] = block_hash_bytes[::-1].hex()
             if block_height is not None:
                 result["confirmations"] = self._get_confirmations(block_height)
             else:
@@ -2080,7 +2093,13 @@ class RPCServer:
             )
 
         try:
-            block_hash = bytes.fromhex(blockhash)
+            # JSON-RPC convention: hashes are display-order (big-endian) hex.
+            # Internal storage keys blocks (and the BlockFilterIndex) by
+            # little-endian uint256 bytes. Reverse for the lookup.
+            # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
+            block_hash = bytes.fromhex(blockhash)[::-1]
+            if len(block_hash) != 32:
+                raise ValueError("Block hash must be 32 bytes")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}") from None
 
@@ -2918,7 +2937,14 @@ class RPCServer:
         target_set = set()
         for txid_hex in txids:
             try:
-                target_set.add(bytes.fromhex(txid_hex))
+                # JSON-RPC convention: txids are display-order (big-endian)
+                # hex; internal txids (`tx.get_txid()`) are little-endian.
+                # Reverse for the in-block comparison below.
+                # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
+                txid_bytes = bytes.fromhex(txid_hex)[::-1]
+                if len(txid_bytes) != 32:
+                    raise ValueError("Transaction id must be 32 bytes")
+                target_set.add(txid_bytes)
             except ValueError:
                 raise HTTPException(status_code=400, detail=f"Invalid txid: {txid_hex}") from None
 
@@ -2926,7 +2952,13 @@ class RPCServer:
         block = None
         if blockhash:
             try:
-                block = await asyncio.to_thread(db.get_block, bytes.fromhex(blockhash))
+                # JSON-RPC convention: hashes are display-order (big-endian) hex.
+                # Internal storage keys blocks by little-endian uint256 bytes.
+                # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
+                bh_bytes = bytes.fromhex(blockhash)[::-1]
+                if len(bh_bytes) != 32:
+                    raise ValueError("Block hash must be 32 bytes")
+                block = await asyncio.to_thread(db.get_block, bh_bytes)
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid blockhash") from None
         else:
@@ -2946,9 +2978,10 @@ class RPCServer:
         all_txids = [tx.get_txid() for tx in block.transactions]
         for t in target_set:
             if t not in all_txids:
+                # `t` is internal byte order; report in display order.
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Transaction {t.hex()} not found in block",
+                    detail=f"Transaction {t[::-1].hex()} not found in block",
                 )
 
         matches = [txid in target_set for txid in all_txids]
@@ -5842,7 +5875,13 @@ class RPCServer:
                 )
         else:
             try:
-                block_hash = bytes.fromhex(hash_or_height)
+                # JSON-RPC convention: hashes are display-order (big-endian)
+                # hex. Internal storage keys blocks by little-endian uint256
+                # bytes. Reference: Bitcoin Core src/rpc/blockchain.cpp
+                # ParseHashV.
+                block_hash = bytes.fromhex(hash_or_height)[::-1]
+                if len(block_hash) != 32:
+                    raise ValueError("Block hash must be 32 bytes")
             except ValueError:
                 raise HTTPException(
                     status_code=400, detail="Invalid block hash"
@@ -5857,7 +5896,8 @@ class RPCServer:
         block_hash_bytes = (
             block.hash if isinstance(block.hash, bytes) else bytes(32)
         )
-        blockhash_hex = block_hash_bytes.hex()
+        # block.hash is internal little-endian; reverse for JSON-RPC display.
+        blockhash_hex = block_hash_bytes[::-1].hex()
         block_time = block.timestamp
 
         # Median time past
