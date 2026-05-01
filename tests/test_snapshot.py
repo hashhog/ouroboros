@@ -482,8 +482,9 @@ def test_snapshot_manager_round_trip(tmp_path) -> None:
 
     # Now load into a fresh DB and verify byte-perfect parity per UTXO.
     # strict=False: this fixture is 3 synthetic UTXOs, so it cannot match
-    # the published mainnet@840k MuHash3072 commitment. The strict check
-    # is exercised in test_load_snapshot_strict_muhash_check below.
+    # the published mainnet@840k HASH_SERIALIZED commitment. The strict
+    # check is exercised in test_load_snapshot_strict_hash_serialized_check
+    # below.
     dst = _StubDB()
     sm_load = SnapshotManager(dst, "mainnet", str(tmp_path / "dst"))
     md2 = sm_load.load_snapshot(str(snap_path), strict=False)
@@ -519,15 +520,17 @@ def test_snapshot_manager_rejects_unknown_blockhash(tmp_path) -> None:
         sm_load.load_snapshot(str(snap_path))
 
 
-def test_load_snapshot_strict_muhash_check(tmp_path, monkeypatch) -> None:
-    """Strict load enforces the MuHash3072 commitment per validation.cpp:5912.
+def test_load_snapshot_strict_hash_serialized_check(tmp_path, monkeypatch) -> None:
+    """Strict load enforces the SHA256d (HASH_SERIALIZED) commitment per
+    validation.cpp:5902-5915 + kernel/coinstats.cpp:161-163.
 
     Builds a 1-coin snapshot at the mainnet@840k whitelisted hash, swaps the
-    chainparams MuHash entry to (a) the right value -> load passes,
+    chainparams entry to (a) the right SHA256d value -> load passes,
     (b) a different value -> load raises 'Bad snapshot content hash'.
     """
     from ouroboros import snapshot as _snapshot_mod
-    from ouroboros.muhash import MuHash3072, coin_element
+    from ouroboros.muhash import coin_element
+    from ouroboros.snapshot import HashWriter
 
     au = get_assumeutxo_data("mainnet", 840_000)
     assert au is not None
@@ -546,8 +549,11 @@ def test_load_snapshot_strict_muhash_check(tmp_path, monkeypatch) -> None:
         str(snap_path)
     )
 
-    expected = MuHash3072()
-    expected.insert(coin_element(
+    # Pre-compute the SHA256d commitment over the 1-coin set. Same path
+    # the loader uses (HashWriter feeding TxOutSer bytes in (txid, vout)
+    # order, finalize via double-SHA256).
+    expected = HashWriter()
+    expected.update(coin_element(
         txid=one_utxo.txid, vout=one_utxo.vout, height=one_utxo.height,
         is_coinbase=one_utxo.is_coinbase, amount=one_utxo.amount,
         script_pubkey=one_utxo.script_pubkey,
@@ -590,6 +596,198 @@ def test_load_snapshot_strict_muhash_check(tmp_path, monkeypatch) -> None:
     with pytest.raises(ValueError, match="Bad snapshot content hash"):
         sm_bad.load_snapshot(str(snap_path))
     assert not sm_bad.snapshot_loaded
+
+
+def test_hashwriter_matches_core_chash256() -> None:
+    """HashWriter.digest() must equal SHA256d (CHash256), per Core's
+    HashWriter::GetHash (hash.h:115-120). Fixed test vectors so any
+    drift away from double-SHA256 (e.g. accidental single SHA-256)
+    is caught immediately.
+    """
+    import hashlib
+
+    from ouroboros.snapshot import HashWriter
+
+    # Vector 1: empty input. SHA256d("") =
+    #   SHA256(SHA256(""))
+    #   = SHA256(e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855)
+    h = HashWriter()
+    expected_empty = hashlib.sha256(hashlib.sha256(b"").digest()).digest()
+    assert h.digest() == expected_empty
+    # Confirm it's NOT a single SHA-256 -- guards against the bug we
+    # just fixed (compute_utxo_hash used to do single-SHA256 in
+    # hash_serialized mode).
+    assert h.digest() != hashlib.sha256(b"").digest()
+
+    # Vector 2: streaming update equivalence.
+    h = HashWriter()
+    h.update(b"hello").update(b" ").update(b"world")
+    once = hashlib.sha256(b"hello world").digest()
+    expected = hashlib.sha256(once).digest()
+    assert h.digest() == expected
+
+    # Vector 3: well-known SHA256d("abc"):
+    #   SHA256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+    #   SHA256(that)  = 4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358
+    h = HashWriter()
+    h.update(b"abc")
+    assert h.digest().hex() == (
+        "4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358"
+    )
+
+
+def test_compute_utxo_hash_serialized_matches_streaming_load(tmp_path) -> None:
+    """``compute_utxo_hash(hash_type='hash_serialized')`` and the
+    streaming HashWriter inside ``load_snapshot`` must produce the same
+    SHA256d digest for the same UTXO set. Pins both to a single
+    canonical SHA256d-via-HashWriter implementation.
+    """
+    from ouroboros.muhash import coin_element
+    from ouroboros.snapshot import HashWriter, compute_utxo_hash
+
+    au = get_assumeutxo_data("mainnet", 840_000)
+    assert au is not None
+
+    # Build a fixture with a few UTXOs so order-sensitive hashing is
+    # exercised non-trivially. Use unsorted insertion to make sure the
+    # in-DB hasher does the (txid, vout) sort.
+    src = _StubDB()
+    src.best_hash = au.block_hash
+    src.best_height = au.height
+    utxos = [
+        _UTXOEntry(txid=b"\x33" * 32, vout=2, amount=300,
+                   script_pubkey=_p2pkh(b"\x03" * 20),
+                   height=200_000, is_coinbase=False),
+        _UTXOEntry(txid=b"\x11" * 32, vout=0, amount=100,
+                   script_pubkey=_p2pkh(b"\x01" * 20),
+                   height=100_000, is_coinbase=True),
+        _UTXOEntry(txid=b"\x22" * 32, vout=1, amount=200,
+                   script_pubkey=_p2pkh(b"\x02" * 20),
+                   height=150_000, is_coinbase=False),
+    ]
+    src.utxos.extend(utxos)
+
+    # Hash via the in-DB compute path (sorts internally).
+    in_db_digest = compute_utxo_hash(src, hash_type="hash_serialized")
+
+    # Hash via direct HashWriter over the canonically sorted list. Same
+    # bytes Core would feed into HashWriter via TxOutSer + cursor walk.
+    sorted_utxos = sorted(utxos, key=lambda u: (u.txid, u.vout))
+    direct = HashWriter()
+    for u in sorted_utxos:
+        direct.update(coin_element(
+            txid=u.txid, vout=u.vout, height=u.height,
+            is_coinbase=u.is_coinbase, amount=u.amount,
+            script_pubkey=u.script_pubkey,
+        ))
+    assert in_db_digest == direct.digest()
+
+    # Now build a real snapshot file and compare to the streaming
+    # digest from inside load_snapshot. We can't read the loader's
+    # internal hasher state directly, but we can confirm the strict
+    # gate matches the in-DB digest by injecting it into chainparams:
+    snap_path = tmp_path / "fix.dat"
+    SnapshotManager(src, "mainnet", str(tmp_path / "src")).dump_snapshot(
+        str(snap_path)
+    )
+    from ouroboros import snapshot as _snapshot_mod
+
+    patched = _snapshot_mod.AssumeutxoData(
+        height=au.height, block_hash=au.block_hash,
+        hash_serialized=in_db_digest, chain_tx_count=au.chain_tx_count,
+    )
+    saved = list(_snapshot_mod._MAINNET_ASSUMEUTXO)
+    try:
+        _snapshot_mod._MAINNET_ASSUMEUTXO[:] = [
+            patched if d.height == au.height else d for d in saved
+        ]
+        dst = _StubDB()
+        sm = SnapshotManager(dst, "mainnet", str(tmp_path / "dst"))
+        # If the streaming hasher disagrees with compute_utxo_hash,
+        # this raises "Bad snapshot content hash".
+        sm.load_snapshot(str(snap_path))
+        assert sm.snapshot_loaded
+    finally:
+        _snapshot_mod._MAINNET_ASSUMEUTXO[:] = saved
+
+
+def test_compute_utxo_hash_default_is_hash_serialized() -> None:
+    """The default ``hash_type`` for ``compute_utxo_hash`` must be
+    ``"hash_serialized"`` (SHA256d), matching what the loadtxoutset
+    strict gate uses. Catches accidental switches to MuHash3072 (the
+    bug this commit reverts).
+    """
+    from ouroboros.snapshot import compute_utxo_hash
+
+    src = _StubDB()
+    src.utxos.append(_UTXOEntry(
+        txid=b"\xaa" * 32, vout=0, amount=42,
+        script_pubkey=_p2pkh(b"\xbb" * 20),
+        height=1, is_coinbase=False,
+    ))
+
+    default = compute_utxo_hash(src)
+    explicit = compute_utxo_hash(src, hash_type="hash_serialized")
+    assert default == explicit
+
+    # And it must NOT equal the MuHash3072 digest.
+    muhash = compute_utxo_hash(src, hash_type="muhash")
+    assert default != muhash
+
+
+def test_strict_gate_rejects_muhash_value(tmp_path, monkeypatch) -> None:
+    """If chainparams ever shipped a MuHash3072 digest where
+    HASH_SERIALIZED is expected, the strict gate must reject the
+    snapshot. This is the regression that motivated this commit:
+    pre-fix, ouroboros computed MuHash and compared it to chainparams
+    -- both wrong-type. Post-fix, chainparams holds SHA256d and the
+    loader computes SHA256d, so a MuHash there must fail.
+    """
+    from ouroboros import snapshot as _snapshot_mod
+    from ouroboros.muhash import MuHash3072, coin_element
+
+    au = get_assumeutxo_data("mainnet", 840_000)
+    assert au is not None
+
+    src = _StubDB()
+    src.best_hash = au.block_hash
+    src.best_height = au.height
+    one_utxo = _UTXOEntry(
+        txid=b"\xab" * 32, vout=0, amount=12345,
+        script_pubkey=_p2pkh(b"\xcd" * 20),
+        height=100_000, is_coinbase=False,
+    )
+    src.utxos.append(one_utxo)
+    snap_path = tmp_path / "muhash.dat"
+    SnapshotManager(src, "mainnet", str(tmp_path / "src")).dump_snapshot(
+        str(snap_path)
+    )
+
+    # Compute the MuHash digest -- the value the buggy implementation
+    # would have published in chainparams. Inject it as the supposed
+    # HASH_SERIALIZED value; the strict gate (which now correctly
+    # computes SHA256d) must reject it.
+    muhash = MuHash3072()
+    muhash.insert(coin_element(
+        txid=one_utxo.txid, vout=one_utxo.vout, height=one_utxo.height,
+        is_coinbase=one_utxo.is_coinbase, amount=one_utxo.amount,
+        script_pubkey=one_utxo.script_pubkey,
+    ))
+    patched = _snapshot_mod.AssumeutxoData(
+        height=au.height, block_hash=au.block_hash,
+        hash_serialized=muhash.digest(),  # WRONG type for this gate
+        chain_tx_count=au.chain_tx_count,
+    )
+    monkeypatch.setattr(
+        _snapshot_mod, "_MAINNET_ASSUMEUTXO",
+        [patched if d.height == au.height else d
+         for d in _snapshot_mod._MAINNET_ASSUMEUTXO],
+    )
+    dst = _StubDB()
+    sm = SnapshotManager(dst, "mainnet", str(tmp_path / "dst"))
+    with pytest.raises(ValueError, match="Bad snapshot content hash"):
+        sm.load_snapshot(str(snap_path))
+    assert not sm.snapshot_loaded
 
 
 # ---------------------------------------------------------------------------
@@ -797,14 +995,15 @@ def test_rpc_loadtxoutset_accepts_whitelisted_blockhash_with_raw_insert(
     and its UTXOs inserted via add_utxo_raw. Uses mainnet height 840k.
 
     We override the published hash_serialized for the duration of the test
-    with the MuHash3072 commitment over our 1-coin synthetic UTXO set, so
-    the strict assumeUTXO check (mirrors validation.cpp:5912-5914) passes
+    with the SHA256d commitment over our 1-coin synthetic UTXO set, so
+    the strict assumeUTXO check (mirrors validation.cpp:5902-5915) passes
     on this fixture.
     """
     import asyncio
 
     from ouroboros import snapshot as _snapshot_mod
-    from ouroboros.muhash import MuHash3072, coin_element
+    from ouroboros.muhash import coin_element
+    from ouroboros.snapshot import HashWriter
 
     au = get_assumeutxo_data("mainnet", 840_000)
     assert au is not None
@@ -824,10 +1023,10 @@ def test_rpc_loadtxoutset_accepts_whitelisted_blockhash_with_raw_insert(
         str(tmp_path / "good.dat")
     )
 
-    # Pre-compute the MuHash over the 1-coin set and inject it into the
-    # mainnet AU table for the duration of the test.
-    expected = MuHash3072()
-    expected.insert(coin_element(
+    # Pre-compute the SHA256d commitment over the 1-coin set and inject
+    # it into the mainnet AU table for the duration of the test.
+    expected = HashWriter()
+    expected.update(coin_element(
         txid=one_utxo.txid, vout=one_utxo.vout, height=one_utxo.height,
         is_coinbase=one_utxo.is_coinbase, amount=one_utxo.amount,
         script_pubkey=one_utxo.script_pubkey,
