@@ -100,7 +100,7 @@ Global options (before command):
 | `start` | Start the Bitcoin node |
 | `status` | Show node status |
 | `getbalance` | Get balance for an address |
-| `import-utxo` | Import UTXO snapshot from HDOG file |
+| `import-utxo` | Import UTXO snapshot in Bitcoin Core dumptxoutset v2 format |
 | `import-blocks` | Import blocks from framed binary file or stdin |
 
 ### Config File
