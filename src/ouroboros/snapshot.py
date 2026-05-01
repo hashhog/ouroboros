@@ -44,6 +44,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from .muhash import MuHash3072, coin_element
+
 logger = logging.getLogger(__name__)
 
 # Snapshot format constants -- match SNAPSHOT_MAGIC_BYTES + VERSION in Core.
@@ -680,6 +682,7 @@ class SnapshotManager:
         self,
         snapshot_path: str,
         progress_callback: Callable[[int, int], None] | None = None,
+        strict: bool = True,
     ) -> SnapshotMetadata:
         """
         Load a UTXO snapshot from a file.
@@ -687,6 +690,15 @@ class SnapshotManager:
         Validates the snapshot against hardcoded assumeUTXO parameters and
         loads all UTXOs into the database. Wire format matches Core's
         `loadtxoutset` exactly.
+
+        When ``strict=True`` (default) and assumeUTXO data is available,
+        we run the post-load MuHash3072 commitment check that mirrors
+        ``validation.cpp:5912-5914``: if the rolling MuHash over the
+        coins in the snapshot does not match the
+        ``AssumeutxoData.hash_serialized`` published in chainparams,
+        the load is rejected. This is the same gate Core's
+        ``loadtxoutset`` RPC enforces before accepting a snapshot as
+        the active chainstate.
         """
         with open(snapshot_path, "rb") as f:
             metadata = _read_metadata_header(f, self.network)
@@ -703,6 +715,10 @@ class SnapshotManager:
             logger.info(
                 f"[snapshot] Loading snapshot at height {height} with {metadata.coins_count:,} coins"
             )
+
+            # Rolling MuHash3072 over coins as we stream them in. Mirrors
+            # Core's MUHASH path through ApplyCoinHash (kernel/coinstats.cpp:58).
+            muhash = MuHash3072()
 
             coins_left = metadata.coins_count
             coins_loaded = 0
@@ -730,11 +746,42 @@ class SnapshotManager:
                         is_coinbase=is_coinbase,
                     )
 
+                    muhash.insert(
+                        coin_element(
+                            txid=txid,
+                            vout=vout,
+                            height=coin_height,
+                            is_coinbase=is_coinbase,
+                            amount=amount,
+                            script_pubkey=script,
+                        )
+                    )
+
                     coins_left -= 1
                     coins_loaded += 1
 
                     if progress_callback and coins_loaded % 100_000 == 0:
                         progress_callback(coins_loaded, metadata.coins_count)
+
+        # Strict commitment check (validation.cpp:5912-5914). Only enforced
+        # when chainparams ship a hash for this snapshot height.
+        computed = muhash.digest()
+        if strict and au_data is not None:
+            if computed != au_data.hash_serialized:
+                raise ValueError(
+                    "Bad snapshot content hash: expected "
+                    f"{au_data.hash_serialized_hex()}, got "
+                    f"{computed[::-1].hex()}"
+                )
+            logger.info(
+                f"[snapshot] MuHash3072 commitment OK at height {height} "
+                f"({computed[::-1].hex()})"
+            )
+        elif au_data is None:
+            logger.warning(
+                "[snapshot] No assumeUTXO commitment available for "
+                f"{metadata.base_blockhash_hex()}; skipping MuHash check"
+            )
 
         # Update database best block to snapshot tip.
         self.db.update_best_block(metadata.base_blockhash, height)
@@ -775,16 +822,36 @@ class SnapshotManager:
                     if progress_callback:
                         progress_callback(height, target_height)
 
-                # After reaching target height, compute UTXO hash and compare.
-                # TODO: switch to MuHash3072 to match Core's hash_serialized.
-                # For now, declare success without a real comparison since
-                # this code path was never wired up to a real chainstate.
+                # After reaching target height, recompute the MuHash3072
+                # commitment over the live UTXO set and compare against
+                # the assumeUTXO chainparams entry. Mirrors validation.cpp's
+                # post-load assertion (lines 5912-5914), but here it runs
+                # against the chainstate as rebuilt during background IBD,
+                # so it doubles as an end-of-IBD audit.
                 au_data = get_assumeutxo_by_hash(self.network, self.snapshot_hash)
-                if au_data:
-                    logger.info(
-                        f"[snapshot] Background validation completed at height {target_height}"
-                    )
-                    self.background_validated = True
+                if au_data is not None:
+                    try:
+                        digest = compute_utxo_hash(self.db, hash_type="muhash")
+                    except Exception as e:
+                        logger.error(
+                            f"[snapshot] Background validation: digest failed: {e}"
+                        )
+                        self.background_validated = False
+                        return
+                    if digest == au_data.hash_serialized:
+                        logger.info(
+                            f"[snapshot] Background validation OK at height {target_height} "
+                            f"(MuHash3072={digest[::-1].hex()})"
+                        )
+                        self.background_validated = True
+                    else:
+                        logger.error(
+                            "[snapshot] Background validation hash mismatch "
+                            f"at height {target_height}: expected "
+                            f"{au_data.hash_serialized_hex()}, got "
+                            f"{digest[::-1].hex()}"
+                        )
+                        self.background_validated = False
                 else:
                     logger.warning(
                         "[snapshot] Background validation completed but no assumeUTXO data to verify"
@@ -870,44 +937,59 @@ class SnapshotManager:
         }
 
 
-def compute_utxo_hash(db) -> bytes:
+def compute_utxo_hash(db, hash_type: str = "muhash") -> bytes:
     """
     Compute a deterministic 32-byte digest over the UTXO set.
 
-    NOTE: this is NOT yet Core's `hashSerialized` -- Core uses MuHash3072
-    over (outpoint || (height<<1)+coinbase || TxOut), and this digest will
-    not match the values in `AssumeutxoData.hash_serialized`. The
-    AssumeutxoData entries are populated from Core's chainparams so a
-    future MuHash3072 implementation can compare against them directly.
+    Two hash types are supported:
 
-    For now we keep a stable SHA256 over a Core-compatible coin
-    serialization so callers have *something* to compare across runs.
+    - ``"muhash"`` (default): Core's MuHash3072 over the same per-coin
+      element used in ``kernel/coinstats.cpp::TxOutSer`` (outpoint ||
+      (height<<1)+coinbase || TxOut). Order-independent, so this matches
+      Core regardless of iteration order. The returned 32 bytes are the
+      raw SHA-256 output of MuHash3072::Finalize -- byte-reverse for
+      display/uint256 hex.
+
+    - ``"hash_serialized"``: legacy SHA-256 over the same coin
+      serialization in (txid, vout) order. Useful as a stable
+      cross-run digest when MuHash is not desired. ``loadtxoutset``
+      strict validation uses this in Core (validation.cpp:5902-5903),
+      but assumeUTXO commitments published in chainparams are MuHash
+      (CoinStatsHashType::MUHASH), so prefer the default for
+      assumeUTXO comparison.
     """
-    hasher = hashlib.sha256()
+    if hash_type == "muhash":
+        muhash = MuHash3072()
+        for utxo in db.iter_utxos():
+            element = coin_element(
+                txid=utxo.txid,
+                vout=utxo.vout,
+                height=utxo.height,
+                is_coinbase=bool(utxo.is_coinbase),
+                amount=int(utxo.amount),
+                script_pubkey=bytes(utxo.script_pubkey),
+            )
+            muhash.insert(element)
+        return muhash.digest()
 
+    if hash_type != "hash_serialized":
+        raise ValueError(
+            f"compute_utxo_hash: unsupported hash_type={hash_type!r}; "
+            f"expected 'muhash' or 'hash_serialized'"
+        )
+
+    hasher = hashlib.sha256()
     utxos = list(db.iter_utxos())
     utxos.sort(key=lambda u: (u.txid, u.vout))
-
     for utxo in utxos:
-        # Outpoint: txid (32 bytes, internal order) + vout u32 LE.
-        hasher.update(utxo.txid)
-        hasher.update(struct.pack("<I", utxo.vout))
-        # code as u32 LE matches Core's TxOutSer in coinstats.cpp.
-        code = (utxo.height << 1) | (1 if utxo.is_coinbase else 0)
-        hasher.update(struct.pack("<I", code))
-        # TxOut: value (i64 LE) + scriptPubKey (CompactSize-prefixed).
-        hasher.update(struct.pack("<q", utxo.amount))
-        script = bytes(utxo.script_pubkey)
-        # Inline the CompactSize for the script length so this routine has no
-        # external dependencies beyond hashlib/struct.
-        if len(script) < 0xfd:
-            hasher.update(bytes([len(script)]))
-        elif len(script) <= 0xffff:
-            hasher.update(b"\xfd" + struct.pack("<H", len(script)))
-        elif len(script) <= 0xffffffff:
-            hasher.update(b"\xfe" + struct.pack("<I", len(script)))
-        else:
-            hasher.update(b"\xff" + struct.pack("<Q", len(script)))
-        hasher.update(script)
-
+        hasher.update(
+            coin_element(
+                txid=utxo.txid,
+                vout=utxo.vout,
+                height=utxo.height,
+                is_coinbase=bool(utxo.is_coinbase),
+                amount=int(utxo.amount),
+                script_pubkey=bytes(utxo.script_pubkey),
+            )
+        )
     return hasher.digest()
