@@ -6988,7 +6988,10 @@ class RPCServer:
         """
         import os
 
-        from ouroboros.snapshot import read_snapshot_metadata
+        from ouroboros.snapshot import (
+            get_assumeutxo_by_hash,
+            read_snapshot_metadata,
+        )
 
         if not os.path.exists(path):
             raise HTTPException(status_code=400, detail=f"File not found: {path}")
@@ -7010,6 +7013,47 @@ class RPCServer:
             network = getattr(self.node, 'network', 'mainnet')
             metadata = read_snapshot_metadata(path, network)
 
+            # Core-strict assumeUTXO whitelist check.
+            #
+            # Reference: bitcoin-core/src/validation.cpp ActivateSnapshot,
+            # roughly L5775-5780 — Core looks up the start blockheader to
+            # find its height, then asks GetParams().AssumeutxoForHeight();
+            # if there's no entry for that height it refuses with:
+            #
+            #   "Assumeutxo height in snapshot metadata not recognized
+            #    (<H>) - refusing to load snapshot"
+            #
+            # Our table is keyed by hash, so we look the snapshot's
+            # base_blockhash up directly. If we have the corresponding
+            # block-index entry locally we surface the real height in the
+            # error; otherwise we report 'unknown' (still lossless because
+            # the hex blockhash is in the snapshot for the operator).
+            au_data = get_assumeutxo_by_hash(network, metadata.base_blockhash)
+            if au_data is None:
+                # Try to recover the height from our own block index for a
+                # better error message; fall back to "unknown" if we don't
+                # have this header yet.
+                base_height_str = "unknown"
+                try:
+                    db = getattr(self.node, "db", None)
+                    if db is not None and hasattr(db, "_db") and hasattr(
+                        db._db, "get_block"
+                    ):
+                        py_block = db._db.get_block(metadata.base_blockhash)
+                        if py_block is not None:
+                            h = getattr(py_block, "height", None)
+                            if h is not None:
+                                base_height_str = str(int(h))
+                except Exception:
+                    pass
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Assumeutxo height in snapshot metadata not recognized "
+                        f"({base_height_str}) - refusing to load snapshot"
+                    ),
+                )
+
             # Load the snapshot
             def progress_callback(loaded: int, total: int):
                 pass  # Could emit progress via ZMQ or websockets
@@ -7029,6 +7073,10 @@ class RPCServer:
                 "path": path,
             }
 
+        except HTTPException:
+            # Already-formed RPC errors (incl. the Core-strict whitelist
+            # refusal) bubble out with their original status + detail.
+            raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load snapshot: {e}") from None
 
