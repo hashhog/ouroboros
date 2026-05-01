@@ -2415,10 +2415,15 @@ pub struct PyUTXO {
     pub vout: u32,
     #[pyo3(get)]
     pub value: u64,
+    /// Alias of `value` so callers (snapshot dumper) can read `amount` directly.
+    #[pyo3(get)]
+    pub amount: u64,
     #[pyo3(get)]
     pub script_pubkey: Vec<u8>,
     #[pyo3(get)]
     pub height: Option<u32>,
+    #[pyo3(get)]
+    pub is_coinbase: bool,
 }
 
 impl From<UTXO> for PyUTXO {
@@ -2427,8 +2432,10 @@ impl From<UTXO> for PyUTXO {
             txid: utxo.txid().to_string(),
             vout: utxo.vout(),
             value: utxo.value(),
+            amount: utxo.amount,
             script_pubkey: utxo.script_pubkey.as_bytes().to_vec(),
             height: utxo.height,
+            is_coinbase: utxo.is_coinbase,
         }
     }
 }
@@ -2439,8 +2446,10 @@ impl From<&UTXO> for PyUTXO {
             txid: utxo.txid().to_string(),
             vout: utxo.vout(),
             value: utxo.value(),
+            amount: utxo.amount,
             script_pubkey: utxo.script_pubkey.as_bytes().to_vec(),
             height: utxo.height,
+            is_coinbase: utxo.is_coinbase,
         }
     }
 }
@@ -3940,6 +3949,83 @@ impl PyBlockchainDB {
                     format!("Database error: {}", e)
                 )
             })
+    }
+
+    // ========== UTXO set iteration / counting / raw insertion ==========
+    //
+    // Used by the Python `SnapshotManager` (dumptxoutset / loadtxoutset).
+    // `utxo_count` and `iter_utxos` mirror the Rust `BlockchainDB` methods
+    // of the same name; `add_utxo_raw` is a thin wrapper over `add_utxo`
+    // that accepts already-decoded scalar fields (no PyUTXO round-trip),
+    // which is what the snapshot loader has after parsing the wire format.
+
+    /// Count the number of UTXOs in the chainstate.
+    fn utxo_count(&self) -> PyResult<u64> {
+        self.db.utxo_count().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
+
+    /// Iterate the entire UTXO set as a vector of PyUTXO.
+    ///
+    /// Returns a snapshot of every UTXO currently in the chainstate
+    /// column family.  Used by `dumptxoutset` to build the per-txid
+    /// groups required by Core's snapshot wire format.
+    fn iter_utxos(&self) -> PyResult<Vec<PyUTXO>> {
+        match self.db.iter_utxos() {
+            Ok(pairs) => {
+                let utxos = pairs.into_iter()
+                    .map(|(_outpoint, utxo)| PyUTXO::from(utxo))
+                    .collect();
+                Ok(utxos)
+            }
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )),
+        }
+    }
+
+    /// Insert a UTXO into the chainstate from raw scalar fields.
+    ///
+    /// `txid` must be 32 bytes (internal byte order). `script_pubkey` is
+    /// taken as the raw script body (already decompressed if it came from
+    /// a Core-compressed snapshot).
+    #[pyo3(signature = (txid, vout, amount, script_pubkey, height, is_coinbase))]
+    fn add_utxo_raw(
+        &self,
+        txid: &[u8],
+        vout: u32,
+        amount: u64,
+        script_pubkey: Vec<u8>,
+        height: u32,
+        is_coinbase: bool,
+    ) -> PyResult<()> {
+        if txid.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Transaction ID must be 32 bytes"
+            ));
+        }
+        let mut txid_arr = [0u8; 32];
+        txid_arr.copy_from_slice(txid);
+        let bitcoin_txid = bitcoin::Txid::from_byte_array(txid_arr);
+        let outpoint = bitcoin::OutPoint { txid: bitcoin_txid, vout };
+
+        let script = bitcoin::ScriptBuf::from_bytes(script_pubkey);
+        let utxo = UTXO::new(
+            OutPointWrapper::new(outpoint),
+            amount,
+            script,
+            Some(height),
+            is_coinbase,
+        );
+
+        self.db.add_utxo(&outpoint, &utxo).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
     }
 
     /// Context manager support for transactions
