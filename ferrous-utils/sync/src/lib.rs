@@ -2615,6 +2615,151 @@ impl PyTxOut {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bitcoin Core dumptxoutset / loadtxoutset wire-format helpers.
+//
+// These mirror the Python helpers in `src/ouroboros/snapshot.py`. Used by
+// `PyBlockchainDB::import_core_snapshot` to fast-load a Core-emitted UTXO
+// snapshot directly into the chainstate column family.
+//
+// Reference:
+//   bitcoin-core/src/serialize.h        -- ReadVarInt / WriteVarInt + CompactSize
+//   bitcoin-core/src/compressor.{h,cpp} -- CompressAmount / CompressScript
+//   bitcoin-core/src/coins.h            -- Coin::Serialize
+// ---------------------------------------------------------------------------
+
+const SNAPSHOT_N_SPECIAL_SCRIPTS: u64 = 6;
+const SNAPSHOT_MAX_SCRIPT_SIZE: u64 = 10_000;
+
+fn read_compact_size<R: std::io::Read>(r: &mut R) -> Result<u64, String> {
+    let mut first = [0u8; 1];
+    r.read_exact(&mut first).map_err(|e| format!("EOF: {}", e))?;
+    let n = first[0];
+    if n < 0xfd {
+        return Ok(n as u64);
+    }
+    if n == 0xfd {
+        let mut b = [0u8; 2];
+        r.read_exact(&mut b).map_err(|e| format!("EOF u16: {}", e))?;
+        return Ok(u16::from_le_bytes(b) as u64);
+    }
+    if n == 0xfe {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b).map_err(|e| format!("EOF u32: {}", e))?;
+        return Ok(u32::from_le_bytes(b) as u64);
+    }
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b).map_err(|e| format!("EOF u64: {}", e))?;
+    Ok(u64::from_le_bytes(b))
+}
+
+/// Read Bitcoin's bit-packed VARINT (NOT CompactSize).
+///
+/// Reference: `ReadVarInt` in `bitcoin-core/src/serialize.h`. See the
+/// matching encoder in `WriteVarInt`.
+fn read_varint<R: std::io::Read>(r: &mut R) -> Result<u64, String> {
+    let mut n: u64 = 0;
+    loop {
+        let mut byte = [0u8; 1];
+        r.read_exact(&mut byte).map_err(|e| format!("EOF: {}", e))?;
+        let ch = byte[0];
+        if n > (u64::MAX >> 7) {
+            return Err("VARINT: size too large".to_string());
+        }
+        n = (n << 7) | (ch & 0x7F) as u64;
+        if ch & 0x80 != 0 {
+            if n == u64::MAX {
+                return Err("VARINT: size too large".to_string());
+            }
+            n += 1;
+        } else {
+            return Ok(n);
+        }
+    }
+}
+
+/// Inverse of `CompressAmount` from `bitcoin-core/src/compressor.cpp`.
+fn decompress_amount(mut x: u64) -> u64 {
+    if x == 0 {
+        return 0;
+    }
+    x -= 1;
+    let e = x % 10;
+    x /= 10;
+    let mut n;
+    if e < 9 {
+        let d = (x % 9) + 1;
+        x /= 9;
+        n = x * 10 + d;
+    } else {
+        n = x + 1;
+    }
+    let mut e = e;
+    while e > 0 {
+        n *= 10;
+        e -= 1;
+    }
+    n
+}
+
+/// Inverse of Core's `ScriptCompression::Ser`. Mirrors the special-script
+/// table from `bitcoin-core/src/compressor.cpp::DecompressScript`. Tags
+/// 0x04/0x05 (uncompressed-key P2PK) require pubkey decompression and are
+/// not yet supported here -- the function errors if it sees one. P2PKH,
+/// P2SH, and compressed-key P2PK round-trip cleanly; the raw-fallback path
+/// covers everything else (segwit / taproot / nonstandard).
+fn read_compressed_script<R: std::io::Read>(r: &mut R) -> Result<Vec<u8>, String> {
+    let n_size = read_varint(r)?;
+    if n_size < SNAPSHOT_N_SPECIAL_SCRIPTS {
+        match n_size {
+            0x00 => {
+                let mut h160 = [0u8; 20];
+                r.read_exact(&mut h160).map_err(|e| format!("EOF P2PKH body: {}", e))?;
+                let mut out = Vec::with_capacity(25);
+                out.extend_from_slice(&[0x76, 0xa9, 20]);
+                out.extend_from_slice(&h160);
+                out.extend_from_slice(&[0x88, 0xac]);
+                Ok(out)
+            }
+            0x01 => {
+                let mut h160 = [0u8; 20];
+                r.read_exact(&mut h160).map_err(|e| format!("EOF P2SH body: {}", e))?;
+                let mut out = Vec::with_capacity(23);
+                out.extend_from_slice(&[0xa9, 20]);
+                out.extend_from_slice(&h160);
+                out.push(0x87);
+                Ok(out)
+            }
+            0x02 | 0x03 => {
+                let mut body = [0u8; 32];
+                r.read_exact(&mut body).map_err(|e| format!("EOF P2PK comp: {}", e))?;
+                let mut out = Vec::with_capacity(35);
+                out.push(33);
+                out.push(n_size as u8);
+                out.extend_from_slice(&body);
+                out.push(0xac);
+                Ok(out)
+            }
+            0x04 | 0x05 => Err(
+                "decompress_script: P2PK uncompressed-key forms (tag 0x04/0x05) require \
+                 secp256k1 pubkey decompression; not yet implemented".to_string(),
+            ),
+            _ => Err(format!("decompress_script: unknown special tag {}", n_size)),
+        }
+    } else {
+        let raw_len = n_size - SNAPSHOT_N_SPECIAL_SCRIPTS;
+        if raw_len > SNAPSHOT_MAX_SCRIPT_SIZE {
+            // Match Core: replace overlong scripts with OP_RETURN, skip the body.
+            let mut sink = vec![0u8; raw_len as usize];
+            r.read_exact(&mut sink).map_err(|e| format!("EOF overlong: {}", e))?;
+            return Ok(vec![0x6a]);
+        }
+        let mut script = vec![0u8; raw_len as usize];
+        r.read_exact(&mut script).map_err(|e| format!("EOF script body: {}", e))?;
+        Ok(script)
+    }
+}
+
 /// Python wrapper for BlockchainDB
 #[pyclass]
 pub struct PyBlockchainDB {
@@ -3234,180 +3379,216 @@ impl PyBlockchainDB {
         Ok(imported)
     }
 
-    /// Import a UTXO snapshot in HDOG binary format.
+    /// Import a UTXO snapshot in Bitcoin Core's `dumptxoutset` v2 format.
     ///
-    /// HDOG format:
+    /// Wire format (matches `bitcoin-core/src/node/utxo_snapshot.h`
+    /// SnapshotMetadata + the per-coin layout from
+    /// `WriteUTXOSnapshot` in `bitcoin-core/src/rpc/blockchain.cpp`):
+    ///
     /// ```text
-    /// Header (52 bytes):
-    ///   Magic:        4 bytes    "HDOG"
-    ///   Version:      u32 LE     (1)
-    ///   Block Hash:   32 bytes   (little-endian)
-    ///   Block Height: u32 LE
-    ///   UTXO Count:   u64 LE
+    /// Header (51 bytes):
+    ///   Magic:           5 bytes  -- b"utxo\xff" (SNAPSHOT_MAGIC_BYTES)
+    ///   Version:         u16 LE   -- 2
+    ///   Network Magic:   4 bytes  -- pchMessageStart
+    ///   Base Block Hash: 32 bytes -- internal byte order
+    ///   Coins Count:     u64 LE
     ///
-    /// Per UTXO:
-    ///   TxID:         32 bytes   (little-endian)
-    ///   Vout:         u32 LE
-    ///   Amount:       i64 LE     (satoshis)
-    ///   Height+CB:    u32 LE     (height in bits [31:1], coinbase flag in bit [0])
-    ///   Script Len:   u16 LE
-    ///   Script:       N bytes    (raw scriptPubKey)
+    /// Per txid group (sorted by raw txid bytes):
+    ///   TxID:            32 bytes
+    ///   Coins per txid:  CompactSize
+    ///   For each coin (sorted by vout):
+    ///     Vout:          CompactSize
+    ///     Code:          Bitcoin VARINT  -- (height << 1) | fCoinBase
+    ///     Value:         Bitcoin VARINT  -- CompressAmount(satoshis)
+    ///     Script:        ScriptCompression -- VARINT(nSize) + body
     /// ```
     ///
     /// Clears existing chainstate, loads all UTXOs using WriteBatch (flushed
     /// every `batch_size` entries), and sets the chain tip.
     ///
-    /// Returns `(block_hash_hex, height, utxo_count)`.
-    fn import_hdog_snapshot(
+    /// `expected_network_magic`, when provided, is the 4-byte pchMessageStart
+    /// the caller expects. If it does not match, the import aborts before
+    /// any writes. Pass `None` to accept any network magic (regtest helper).
+    ///
+    /// Returns `(block_hash_hex, height, utxo_count)`. Note that the
+    /// snapshot itself does NOT carry the height -- the caller must supply
+    /// it via `base_height`, which is then verified to match the assumeutxo
+    /// blockhash table on the Python side.
+    fn import_core_snapshot(
         &self,
         path: String,
+        base_height: u32,
+        expected_network_magic: Option<[u8; 4]>,
         batch_size: Option<u64>,
     ) -> PyResult<(String, u32, u64)> {
         use std::io::{BufReader, Read};
 
         let batch_size = batch_size.unwrap_or(100_000);
 
-        // Open file
         let file = std::fs::File::open(&path).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Cannot open {}: {}", path, e))
         })?;
         let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
 
-        // Read header (52 bytes)
-        let mut header = [0u8; 52];
-        reader.read_exact(&mut header).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read header: {}", e))
+        // ---------------- Header ----------------
+        let mut magic = [0u8; 5];
+        reader.read_exact(&mut magic).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read magic: {}", e))
         })?;
-
-        // Validate magic
-        if &header[0..4] != b"HDOG" {
+        if magic != [b'u', b't', b'x', b'o', 0xff] {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Invalid magic: expected HDOG, got {:?}", &header[0..4]),
+                format!("Invalid snapshot magic: expected utxo\\xff, got {:?}", magic),
             ));
         }
-
-        let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        if version != 1 {
+        let mut version_buf = [0u8; 2];
+        reader.read_exact(&mut version_buf).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read version: {}", e))
+        })?;
+        let version = u16::from_le_bytes(version_buf);
+        if version != 2 {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Unsupported HDOG version: {}", version),
+                format!("Unsupported snapshot version: {} (expected 2)", version),
             ));
         }
-
+        let mut net_magic = [0u8; 4];
+        reader.read_exact(&mut net_magic).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read network magic: {}", e))
+        })?;
+        if let Some(want) = expected_network_magic {
+            if net_magic != want {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Network magic mismatch: file={:?}, expected={:?}", net_magic, want),
+                ));
+            }
+        }
         let mut block_hash = [0u8; 32];
-        block_hash.copy_from_slice(&header[8..40]);
+        reader.read_exact(&mut block_hash).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read base_blockhash: {}", e))
+        })?;
+        let mut count_buf = [0u8; 8];
+        reader.read_exact(&mut count_buf).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to read coins_count: {}", e))
+        })?;
+        let utxo_count = u64::from_le_bytes(count_buf);
 
-        let block_height = u32::from_le_bytes([header[40], header[41], header[42], header[43]]);
-        let utxo_count = u64::from_le_bytes([
-            header[44], header[45], header[46], header[47],
-            header[48], header[49], header[50], header[51],
-        ]);
-
-        // Block hash display (big-endian hex)
         let mut display_hash = block_hash;
         display_hash.reverse();
         let block_hash_hex = hex::encode(display_hash);
 
         log::info!(
-            "[hdog] Importing snapshot: height={}, utxo_count={}, block={}",
-            block_height, utxo_count, block_hash_hex,
+            "[snapshot] Importing core snapshot: height={}, utxo_count={}, block={}",
+            base_height, utxo_count, block_hash_hex,
         );
 
-        // Clear existing chainstate
-        log::info!("[hdog] Clearing existing chainstate...");
+        // ---------------- Clear & set up ----------------
+        log::info!("[snapshot] Clearing existing chainstate...");
         self.db.clear_chainstate().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to clear chainstate: {}", e))
         })?;
 
-        // Get column family handle
         let cf = self.db.raw_db().cf_handle(crate::storage::schema::CHAINSTATE_CF)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("chainstate CF not found"))?;
 
-        // Import UTXOs in batches
         let mut batch = self.db.create_batch();
         let mut loaded: u64 = 0;
         let start_time = std::time::Instant::now();
         let mut last_log_time = start_time;
 
-        // Pre-allocate a buffer for the fixed-size part of each UTXO record (32+4+8+4+2 = 50 bytes)
-        let mut utxo_fixed = [0u8; 50];
-
-        for _ in 0..utxo_count {
-            // Read fixed-size fields (50 bytes)
-            reader.read_exact(&mut utxo_fixed).map_err(|e| {
+        // ---------------- Per-coin loop ----------------
+        let mut coins_left = utxo_count;
+        while coins_left > 0 {
+            let mut txid = [0u8; 32];
+            reader.read_exact(&mut txid).map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                    format!("Failed to read UTXO {} of {}: {}", loaded, utxo_count, e),
+                    format!("Failed to read txid at coin {}: {}", loaded, e),
                 )
             })?;
 
-            let txid_bytes: [u8; 32] = utxo_fixed[0..32].try_into().unwrap();
-            let vout = u32::from_le_bytes(utxo_fixed[32..36].try_into().unwrap());
-            let amount = i64::from_le_bytes(utxo_fixed[36..44].try_into().unwrap()) as u64;
-            let height_cb = u32::from_le_bytes(utxo_fixed[44..48].try_into().unwrap());
-            let script_len = u16::from_le_bytes(utxo_fixed[48..50].try_into().unwrap()) as usize;
-
-            let coin_height = height_cb >> 1;
-            let is_coinbase = (height_cb & 1) != 0;
-
-            // Read script
-            let mut script = vec![0u8; script_len];
-            if script_len > 0 {
-                reader.read_exact(&mut script).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                        format!("Failed to read script for UTXO {}: {}", loaded, e),
-                    )
-                })?;
+            let coins_per_txid = read_compact_size(&mut reader).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Bad coins_per_txid at coin {}: {}", loaded, e),
+                )
+            })?;
+            if coins_per_txid == 0 || coins_per_txid > coins_left {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid coins_per_txid={} (coins_left={})", coins_per_txid, coins_left),
+                ));
             }
 
-            // Build the RocksDB key: [32-byte txid LE] + [4-byte vout LE]
-            let key = crate::storage::schema::encode_outpoint(&txid_bytes, vout);
-
-            // Build the RocksDB value using the same serialization as UTXO::to_bytes():
-            // [OutPoint consensus (txid LE 32 + vout LE 4)] + [amount u64 LE 8]
-            // + [script_pubkey (varint len + bytes)] + [1 byte height flag] + [4 bytes height] + [1 byte is_coinbase]
-            let mut value = Vec::with_capacity(36 + 8 + 1 + script_len + 1 + 4 + 1);
-            // OutPoint: txid (32 bytes) + vout (4 bytes LE) — consensus encoding
-            value.extend_from_slice(&txid_bytes);
-            value.extend_from_slice(&vout.to_le_bytes());
-            // Amount (u64 LE)
-            value.extend_from_slice(&amount.to_le_bytes());
-            // ScriptPubKey: varint length + bytes (Bitcoin consensus encoding)
-            let script_len_varint = common::encode_varint(script_len as u64);
-            value.extend_from_slice(&script_len_varint);
-            value.extend_from_slice(&script);
-            // Height: flag byte (1 = Some) + u32 LE
-            value.push(1u8);
-            value.extend_from_slice(&coin_height.to_le_bytes());
-            // is_coinbase: bool as u8
-            value.push(if is_coinbase { 1u8 } else { 0u8 });
-
-            batch.put_cf(&cf, key, value);
-            loaded += 1;
-
-            if loaded % batch_size == 0 {
-                self.db.apply_batch(batch).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        format!("WriteBatch failed at UTXO {}: {}", loaded, e),
+            for _ in 0..coins_per_txid {
+                let vout = read_compact_size(&mut reader).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Bad vout at coin {}: {}", loaded, e),
+                    )
+                })? as u32;
+                let code = read_varint(&mut reader).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Bad code at coin {}: {}", loaded, e),
                     )
                 })?;
-                batch = rocksdb::WriteBatch::default();
+                let coin_height = (code >> 1) as u32;
+                let is_coinbase = (code & 1) != 0;
 
-                let now = std::time::Instant::now();
-                if now.duration_since(last_log_time).as_secs() >= 5 || loaded % 1_000_000 == 0 {
-                    let elapsed = now.duration_since(start_time).as_secs_f64();
-                    let rate = loaded as f64 / elapsed;
-                    let eta = (utxo_count - loaded) as f64 / rate;
-                    log::info!(
-                        "[hdog] Loaded {}/{} UTXOs ({:.1}%) — {:.0} utxo/s — ETA {:.0}s",
-                        loaded, utxo_count,
-                        loaded as f64 / utxo_count as f64 * 100.0,
-                        rate, eta,
-                    );
-                    last_log_time = now;
+                let amount_compressed = read_varint(&mut reader).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Bad amount at coin {}: {}", loaded, e),
+                    )
+                })?;
+                let amount = decompress_amount(amount_compressed);
+
+                let script = read_compressed_script(&mut reader).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Bad script at coin {}: {}", loaded, e),
+                    )
+                })?;
+                let script_len = script.len();
+
+                // Build the RocksDB key: [32-byte txid LE] + [4-byte vout LE]
+                let key = crate::storage::schema::encode_outpoint(&txid, vout);
+
+                // Build the RocksDB value using the same serialization as UTXO::to_bytes():
+                // [OutPoint consensus (txid LE 32 + vout LE 4)] + [amount u64 LE 8]
+                // + [script_pubkey (varint len + bytes)] + [1 byte height flag] + [4 bytes height] + [1 byte is_coinbase]
+                let mut value = Vec::with_capacity(36 + 8 + 1 + script_len + 1 + 4 + 1);
+                value.extend_from_slice(&txid);
+                value.extend_from_slice(&vout.to_le_bytes());
+                value.extend_from_slice(&amount.to_le_bytes());
+                let script_len_varint = common::encode_varint(script_len as u64);
+                value.extend_from_slice(&script_len_varint);
+                value.extend_from_slice(&script);
+                value.push(1u8);
+                value.extend_from_slice(&coin_height.to_le_bytes());
+                value.push(if is_coinbase { 1u8 } else { 0u8 });
+
+                batch.put_cf(&cf, key, value);
+                loaded += 1;
+                coins_left -= 1;
+
+                if loaded % batch_size == 0 {
+                    self.db.apply_batch(batch).map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            format!("WriteBatch failed at UTXO {}: {}", loaded, e),
+                        )
+                    })?;
+                    batch = rocksdb::WriteBatch::default();
+
+                    let now = std::time::Instant::now();
+                    if now.duration_since(last_log_time).as_secs() >= 5 || loaded % 1_000_000 == 0 {
+                        let elapsed = now.duration_since(start_time).as_secs_f64();
+                        let rate = loaded as f64 / elapsed;
+                        let eta = (utxo_count.saturating_sub(loaded)) as f64 / rate.max(1.0);
+                        log::info!(
+                            "[snapshot] Loaded {}/{} UTXOs ({:.1}%) -- {:.0} utxo/s -- ETA {:.0}s",
+                            loaded, utxo_count,
+                            loaded as f64 / utxo_count.max(1) as f64 * 100.0,
+                            rate, eta,
+                        );
+                        last_log_time = now;
+                    }
                 }
             }
         }
 
-        // Flush remaining batch
         if batch.len() > 0 {
             self.db.apply_batch(batch).map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
@@ -3417,25 +3598,24 @@ impl PyBlockchainDB {
         }
 
         let elapsed = start_time.elapsed().as_secs_f64();
-        let rate = loaded as f64 / elapsed;
+        let rate = loaded as f64 / elapsed.max(1e-3);
         log::info!(
-            "[hdog] Loaded all {} UTXOs in {:.1}s ({:.0} utxo/s)",
+            "[snapshot] Loaded all {} UTXOs in {:.1}s ({:.0} utxo/s)",
             loaded, elapsed, rate,
         );
 
-        // Set chain tip
-        self.db.update_best_block(&block_hash, block_height).map_err(|e| {
+        self.db.update_best_block(&block_hash, base_height).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 format!("Failed to update chain tip: {}", e),
             )
         })?;
 
         log::info!(
-            "[hdog] Chain tip set to height {} ({})",
-            block_height, block_hash_hex,
+            "[snapshot] Chain tip set to height {} ({})",
+            base_height, block_hash_hex,
         );
 
-        Ok((block_hash_hex, block_height, loaded))
+        Ok((block_hash_hex, base_height, loaded))
     }
 
     /// Update UTXO set atomically

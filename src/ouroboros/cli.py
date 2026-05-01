@@ -666,17 +666,23 @@ def getbalance(ctx, address, network):
 )
 @click.pass_context
 def import_utxo(ctx, snapshot_path, batch_size):
-    """Import a UTXO snapshot in HDOG binary format.
+    """Import a UTXO snapshot in Bitcoin Core's dumptxoutset v2 format.
 
     This loads a pre-generated UTXO set so the node can start syncing near the
-    chain tip instead of doing full IBD.  The existing chainstate is cleared
+    chain tip instead of doing full IBD. The existing chainstate is cleared
     before import.
 
-    SNAPSHOT_PATH is the path to a .hdog file.
+    SNAPSHOT_PATH is the path to a snapshot file emitted by Core's
+    `dumptxoutset` RPC (or any compatible producer including ouroboros'
+    own dumptxoutset). The legacy HDOG format is no longer supported.
     """
-    import struct
-
     import sync
+
+    from ouroboros.snapshot import (
+        NETWORK_MAGIC,
+        get_assumeutxo_by_hash,
+        read_snapshot_metadata,
+    )
 
     data_dir = ctx.obj["data_dir"]
     network = ctx.obj["network"]
@@ -686,49 +692,55 @@ def import_utxo(ctx, snapshot_path, batch_size):
         f"[dim]Data: {data_dir}  Snapshot: {snapshot_path}[/dim]"
     )
 
-    # Quick header peek for display
-    with open(snapshot_path, "rb") as f:
-        header = f.read(52)
-    if len(header) < 52 or header[:4] != b"HDOG":
-        console.print("[red]Invalid HDOG file (bad magic or too short)[/red]")
+    # Read & validate metadata (Core format).
+    try:
+        metadata = read_snapshot_metadata(snapshot_path, network)
+    except Exception as e:
+        console.print(f"[red]Invalid snapshot: {e}[/red]")
         sys.exit(1)
 
-    version = struct.unpack_from("<I", header, 4)[0]
-    block_hash = header[8:40]
-    block_height = struct.unpack_from("<I", header, 40)[0]
-    utxo_count = struct.unpack_from("<Q", header, 44)[0]
-
-    # Display hash (big-endian)
-    display_hash = block_hash[::-1].hex()
+    # Resolve height from the assumeutxo blockhash table.
+    au_data = get_assumeutxo_by_hash(network, metadata.base_blockhash)
+    if au_data is None and network != "regtest":
+        console.print(
+            f"[red]assumeUTXO blockhash {metadata.base_blockhash_hex()} not "
+            f"recognized for network {network}.[/red]"
+        )
+        sys.exit(1)
+    block_height = au_data.height if au_data else 0
 
     console.print(
-        f"  Version:    [cyan]{version}[/cyan]\n"
-        f"  Block hash: [cyan]{display_hash}[/cyan]\n"
+        f"  Version:    [cyan]{metadata.version}[/cyan]\n"
+        f"  Block hash: [cyan]{metadata.base_blockhash_hex()}[/cyan]\n"
         f"  Height:     [cyan]{block_height:,}[/cyan]\n"
-        f"  UTXOs:      [cyan]{utxo_count:,}[/cyan]\n"
+        f"  UTXOs:      [cyan]{metadata.coins_count:,}[/cyan]\n"
         f"  Batch size: [cyan]{batch_size:,}[/cyan]"
     )
 
     # Confirm
     if sys.stdin.isatty():
         if not click.confirm(
-            f"This will CLEAR the existing chainstate and load {utxo_count:,} UTXOs. Continue?",
+            f"This will CLEAR the existing chainstate and load "
+            f"{metadata.coins_count:,} UTXOs. Continue?",
             default=True,
         ):
             console.print("[yellow]Aborted.[/yellow]")
             return
 
-    # Open DB and delegate to Rust
+    # Open DB and delegate to Rust.
     try:
         db = sync.PyBlockchainDB(data_dir)
     except Exception as e:
         console.print(f"[red]Failed to open database: {e}[/red]")
         sys.exit(1)
 
+    expected_magic = NETWORK_MAGIC.get(network)
+    expected_magic_arg = list(expected_magic) if expected_magic is not None else None
+
     start_time = time.time()
     try:
-        block_hash_hex, height, loaded = db.import_hdog_snapshot(
-            snapshot_path, batch_size
+        block_hash_hex, height, loaded = db.import_core_snapshot(
+            snapshot_path, block_height, expected_magic_arg, batch_size
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Import interrupted[/yellow]")
