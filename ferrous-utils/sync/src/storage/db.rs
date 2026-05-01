@@ -1466,17 +1466,335 @@ impl BlockchainDB {
             }
         }
 
-        // After clearing flags, check if we should switch chains
-        // This would require comparing chainwork, which we defer to the sync logic
-        // For now, return the current best height
-        let (_, current_best_height) = self.get_best_block()?;
+        // After clearing flags, walk forward and re-activate any block-tree
+        // leaf whose chainwork now exceeds our current best — Bitcoin Core's
+        // ActivateBestChain analog. See ``reactivate_best_chain`` below.
+        let new_tip_height = self.reactivate_best_chain()?;
 
         log::info!(
             "Block reconsideration complete. Chain tip height: {}",
-            current_best_height
+            new_tip_height
         );
 
-        Ok(current_best_height)
+        Ok(new_tip_height)
+    }
+
+    /// Re-activate the highest-chainwork valid block-tree leaf as the active
+    /// chain tip — ouroboros's analog of Bitcoin Core's
+    /// ``CChainState::ActivateBestChain`` / ``FindMostWorkChain``
+    /// (validation.cpp).
+    ///
+    /// Algorithm:
+    /// 1. Scan block-index for the highest height whose `BlockMetadata` has
+    ///    no `BLOCK_FAILED_*` flag, the block body is on disk, AND whose
+    ///    chainwork exceeds the current `best_block`'s chainwork.
+    /// 2. If no such leaf exists (no chain has more work than current best),
+    ///    return the current best height unchanged — no-op.
+    /// 3. Walk back from that leaf to find the fork point with the current
+    ///    `best_block`. For the rollback case the fork point IS the current
+    ///    best (since `invalidate_block` only disconnected on the active
+    ///    chain), so the walk-back terminates immediately.
+    /// 4. Walk forward from `fork_height + 1` up to the leaf, calling
+    ///    ``connect_block`` on each height. If any reconnect fails, return
+    ///    the height we managed to reach.
+    ///
+    /// Returns the height of the chain tip after the re-activation pass
+    /// (may equal the input height if no reactivation was needed, or a
+    /// higher value if blocks were reconnected).
+    ///
+    /// # Reference
+    /// Bitcoin Core: validation.cpp `ActivateBestChain()` /
+    /// `FindMostWorkChain()`. We sidestep the full block-tree (CBlockIndex
+    /// graph) — ouroboros's `BLOCK_INDEX_CF` only stores the active-chain
+    /// height->hash mapping, so "leaves" here are simply the highest height
+    /// in the index whose entry isn't flagged invalid. For the
+    /// `dumptxoutset` rollback flow this is sufficient: we know the
+    /// disconnected blocks still live in `BLOCKS_CF` and their metadata is
+    /// still indexed by their original height. A future reorg-aware
+    /// implementation would walk a real block-tree.
+    pub fn reactivate_best_chain(&self) -> Result<u32> {
+        let (best_hash, best_height) = self.get_best_block()?;
+        let current_chainwork = self.get_chainwork_by_height(best_height)?;
+
+        // ----------------------------------------------------------------
+        // Step 1: Find the highest-chainwork valid leaf with stored block
+        // data. We scan downward from a generous upper bound; for the
+        // rollback path this will be the original tip height. We cap the
+        // scan to avoid an infinite loop if the block index has stray
+        // entries — the index is contiguous from genesis to original tip.
+        // ----------------------------------------------------------------
+        const SCAN_HORIZON: u32 = 1_000;
+        let mut scan_height = best_height.saturating_add(SCAN_HORIZON);
+
+        // Trim scan_height down to the actual highest indexed height.
+        while scan_height > best_height {
+            if self.get_block_hash_by_height(scan_height)?.is_some() {
+                break;
+            }
+            scan_height -= 1;
+        }
+
+        // Now find the highest height whose metadata is valid (no FAILED
+        // flag) AND has block body data, AND has more chainwork than
+        // current best.
+        let mut leaf_height: Option<u32> = None;
+        for h in (best_height + 1..=scan_height).rev() {
+            let metadata = match self.get_block_metadata(h)? {
+                Some(m) => m,
+                None => continue,
+            };
+            if metadata.is_invalid() {
+                continue;
+            }
+            // Compare chainwork as 32-byte big-endian (display-order)
+            // unsigned integer — same comparison as Core's `arith_uint256`.
+            if metadata.chainwork <= current_chainwork {
+                continue;
+            }
+            // Block body must actually be on disk to reconnect it.
+            if !self.has_block_data(h)? {
+                continue;
+            }
+            leaf_height = Some(h);
+            break;
+        }
+
+        let leaf_height = match leaf_height {
+            Some(h) => h,
+            None => return Ok(best_height), // already at best chain
+        };
+
+        // ----------------------------------------------------------------
+        // Step 2: Walk down from the leaf to find fork point with current
+        // best. The fork point is the highest height where the leaf's
+        // ancestor chain agrees with the current active chain. For our
+        // rollback flow this is `best_height` (the rollback target); the
+        // disconnected blocks were on the same chain.
+        // ----------------------------------------------------------------
+        let leaf_hash = self.get_block_hash_by_height(leaf_height)?
+            .ok_or_else(|| DbError::InvalidData(format!(
+                "Block hash missing for leaf at height {}", leaf_height
+            )))?;
+
+        let mut walk_hash = leaf_hash;
+        let mut walk_height = leaf_height;
+        let mut fork_height = walk_height;
+        loop {
+            // Check if walk_hash matches the active chain at walk_height.
+            // For heights > best_height the active chain has no entry so
+            // this is automatically a no-match.
+            if walk_height <= best_height {
+                if let Some(active_hash) = self.get_block_hash_by_height(walk_height)? {
+                    if active_hash == walk_hash {
+                        // Found the fork point — agree at this height.
+                        fork_height = walk_height;
+                        break;
+                    }
+                }
+            }
+            if walk_height == 0 {
+                // Walked all the way to genesis without finding fork —
+                // unrecoverable; the leaf is on a totally different chain.
+                return Err(DbError::InvalidData(
+                    "Could not find fork point with active chain".to_string()
+                ));
+            }
+            // Step back one block via the block body's prev_blockhash.
+            let block = self.get_block(&walk_hash)?
+                .ok_or_else(|| DbError::InvalidData(format!(
+                    "Block body missing for {} during fork walk",
+                    hex::encode(walk_hash)
+                )))?;
+            walk_hash = *block.inner().header.prev_blockhash.as_byte_array();
+            walk_height -= 1;
+        }
+
+        // For the rollback flow we expect fork_height == best_height. If
+        // it's lower, we'd need to disconnect blocks from the current
+        // active chain first (real reorg). We don't do that here — that's
+        // the responsibility of the sync loop.
+        if fork_height < best_height {
+            log::warn!(
+                "reactivate_best_chain: fork at height {} below current best {} — \
+                 reorg required, deferring to sync loop",
+                fork_height, best_height
+            );
+            return Ok(best_height);
+        }
+
+        // Sanity: best_hash should match the fork-point hash.
+        let fork_hash = self.get_block_hash_by_height(fork_height)?
+            .ok_or_else(|| DbError::InvalidData(format!(
+                "Fork-point hash missing at height {}", fork_height
+            )))?;
+        if fork_hash != best_hash {
+            return Err(DbError::InvalidData(format!(
+                "Fork point hash {} does not match current best {}",
+                hex::encode(fork_hash), hex::encode(best_hash)
+            )));
+        }
+
+        // ----------------------------------------------------------------
+        // Step 3: Walk forward from fork+1 up to leaf, reconnecting each
+        // block. Each call updates `best_block` so the next iteration's
+        // prevhash check works against the new tip.
+        // ----------------------------------------------------------------
+        log::info!(
+            "reactivate_best_chain: reconnecting blocks {}..={} (current tip {})",
+            fork_height + 1, leaf_height, best_height
+        );
+
+        let mut connected_to = best_height;
+        for h in (fork_height + 1)..=leaf_height {
+            match self.connect_block_at_height(h) {
+                Ok(()) => {
+                    connected_to = h;
+                }
+                Err(e) => {
+                    log::error!(
+                        "reactivate_best_chain: connect_block at height {} failed: {} \
+                         — chain stranded at {}",
+                        h, e, connected_to
+                    );
+                    return Ok(connected_to);
+                }
+            }
+        }
+
+        log::info!(
+            "reactivate_best_chain: reconnected up to height {}",
+            connected_to
+        );
+        Ok(connected_to)
+    }
+
+    /// Reconnect a previously-disconnected block at `height` whose body and
+    /// metadata are still in the database.
+    ///
+    /// Mirrors `BlockValidator::apply_block` (validate/block.rs:689) but
+    /// lives on `BlockchainDB` because the reactivation path doesn't need
+    /// full block validation — these blocks were validated once already
+    /// (they were on the active chain before invalidate_block disconnected
+    /// them). We only need to:
+    ///
+    /// 1. Look up the block body via the block-index entry at `height`.
+    /// 2. Verify prev_blockhash links to the current chain tip.
+    /// 3. Spend each input (read from CHAINSTATE_CF, write undo to
+    ///    SPENT_CF, delete from CHAINSTATE_CF).
+    /// 4. Add each output to CHAINSTATE_CF.
+    /// 5. Re-store transaction-index entries.
+    /// 6. Update BEST_BLOCK_HASH / BEST_HEIGHT.
+    ///
+    /// All mutations are batched into a single atomic write via
+    /// `WriteBatch` (matching `apply_block`'s crash-safety pattern).
+    pub fn connect_block_at_height(&self, height: u32) -> Result<()> {
+        if height == 0 {
+            return Err(DbError::InvalidData(
+                "Cannot reconnect genesis block via connect_block_at_height".to_string()
+            ));
+        }
+
+        // Fetch block body via the height index.
+        let block = self.get_block_by_height(height)?
+            .ok_or_else(|| DbError::InvalidData(format!(
+                "Block body missing at height {}", height
+            )))?;
+        let inner = block.inner();
+        let block_hash = *block.block_hash().as_byte_array();
+        let prev_blockhash = *inner.header.prev_blockhash.as_byte_array();
+
+        // Verify prev_blockhash links to current tip.
+        let (tip_hash, tip_height) = self.get_best_block()?;
+        if tip_height + 1 != height {
+            return Err(DbError::InvalidData(format!(
+                "connect_block_at_height: height {} does not follow tip height {}",
+                height, tip_height
+            )));
+        }
+        if prev_blockhash != tip_hash {
+            return Err(DbError::InvalidData(format!(
+                "connect_block_at_height: prev_hash {} does not match tip {}",
+                hex::encode(prev_blockhash), hex::encode(tip_hash)
+            )));
+        }
+
+        // Single WriteBatch for all DB mutations in this block.
+        let mut batch = self.create_batch();
+
+        // HEAD_BLOCKS marker (Phase 1 of two-phase commit, crash-safety).
+        self.write_head_blocks_batch(
+            &mut batch, &tip_hash, tip_height, &block_hash, height,
+        )?;
+
+        // Resolve CF handles for direct batch operations.
+        let chainstate_cf = self.db.cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+        let spent_cf = self.db.cf_handle(SPENT_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(SPENT_CF.to_string()))?;
+
+        // Spend inputs + add outputs + tx index, in tx order.
+        for (tx_pos, tx) in inner.txdata.iter().enumerate() {
+            let txid = tx.compute_txid();
+            let txid_bytes = *txid.as_byte_array();
+
+            // Spend inputs (skip coinbase).
+            if !tx.is_coinbase() {
+                for input in &tx.input {
+                    let outpoint = input.previous_output;
+                    let prev_txid = *outpoint.txid.as_byte_array();
+                    let key = encode_outpoint(&prev_txid, outpoint.vout);
+
+                    // Read UTXO from CHAINSTATE_CF — these were restored
+                    // during disconnect_block, so they should be present.
+                    if let Some(utxo_bytes) = self.db.get_cf(chainstate_cf, &key)? {
+                        // Write undo record to SPENT_CF.
+                        let mut undo_value = Vec::with_capacity(32 + utxo_bytes.len());
+                        undo_value.extend_from_slice(&txid_bytes);
+                        undo_value.extend_from_slice(&utxo_bytes);
+                        batch.put_cf(&spent_cf, &key, &undo_value);
+                        // Delete from CHAINSTATE_CF.
+                        batch.delete_cf(&chainstate_cf, &key);
+                    } else {
+                        // Missing UTXO — disconnect must have failed to
+                        // restore it. Log and continue; the block was
+                        // valid when first connected, so this is a real
+                        // inconsistency. Don't fail the whole reactivation
+                        // — try to make forward progress.
+                        log::warn!(
+                            "connect_block_at_height: missing UTXO {:?}:{} at height {}",
+                            outpoint.txid, outpoint.vout, height
+                        );
+                    }
+                }
+            }
+
+            // Add outputs (including OP_RETURN — apply_block stores them).
+            for (vout, output) in tx.output.iter().enumerate() {
+                let outpoint = bitcoin::OutPoint { txid, vout: vout as u32 };
+                let utxo = UTXO::new(
+                    common::OutPointWrapper::new(outpoint),
+                    output.value.to_sat(),
+                    output.script_pubkey.clone(),
+                    Some(height),
+                    tx.is_coinbase(),
+                );
+                self.add_utxo_batch(&mut batch, &outpoint, &utxo)?;
+            }
+
+            // Re-store the transaction index entry.
+            self.store_tx_index_batch(
+                &mut batch, &txid_bytes, &block_hash, height, tx_pos as u32,
+            )?;
+        }
+
+        // Update best block + delete HEAD_BLOCKS marker (Phase 2).
+        self.update_best_block_batch(&mut batch, &block_hash, height)?;
+        self.delete_head_blocks_batch(&mut batch)?;
+
+        // Atomic write.
+        self.apply_batch(batch)?;
+
+        Ok(())
     }
 
     /// Check if a block at `height` is an ancestor of the block at `descendant_height`.

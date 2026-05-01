@@ -7103,21 +7103,16 @@ class RPCServer:
           block height (int) or hash (hex string), dump, put back.
 
         The rollback dance uses ``invalidate_block`` + ``reconsider_block``
-        (Bitcoin Core's ``TemporaryRollback`` pattern, blockchain.cpp
-        :3056-3067). ``invalidate_block`` disconnects every block from the
-        target's child up to the current tip and unwinds UTXOs via the
-        stored undo data. ``reconsider_block`` clears the BLOCK_FAILED_*
-        flags so the next P2P/IBD pass can re-activate the original tip.
-
-        TODO(rollback): ouroboros's ``reconsider_block`` only clears flags
-        — it does NOT re-activate already-stored blocks back to the
-        original tip (see ferrous-utils/sync/src/storage/db.rs:1469-1471
-        "would require comparing chainwork, which we defer to the sync
-        logic"). After this RPC returns, the chain tip remains at the
-        rollback height; block_sync will re-fetch + re-connect on its
-        next pass. For now, callers should expect a temporary lag and
-        rely on P2P resync. Bitcoin Core invokes ActivateBestChain
-        which we don't expose yet.
+        + ``reactivate_best_chain`` (Bitcoin Core's ``TemporaryRollback``
+        pattern, blockchain.cpp:3056-3067). ``invalidate_block``
+        disconnects every block from the target's child up to the current
+        tip and unwinds UTXOs via the stored undo data.
+        ``reconsider_block`` clears the BLOCK_FAILED_* flags.
+        ``reactivate_best_chain`` then walks forward from the rollback
+        target, re-connecting each previously-disconnected block until
+        the chain returns to the original tip (Core's
+        ``CChainState::ActivateBestChain`` analog). On success
+        ``chain_restored=True`` is returned.
 
         Args:
             path: Path to write the snapshot file.
@@ -7391,9 +7386,10 @@ class RPCServer:
             ) from None
 
         # ------------------------------------------------------------------
-        # TemporaryRollback dtor: reconsider_block lifts the FAILED flags.
-        # NB: ouroboros's reconsider_block does NOT re-activate the chain;
-        # see TODO above. We surface chain_restored=False so callers know.
+        # TemporaryRollback dtor: reconsider_block lifts the FAILED flags
+        # then reactivate_best_chain walks the disconnected blocks back up
+        # to the original tip (Core ActivateBestChain analog). On success
+        # the chain is fully restored and chain_restored=True.
         # ------------------------------------------------------------------
         if invalidate_target_hash is not None:
             rust_db = getattr(db, "rust_db", None) or getattr(db, "_db", None)
@@ -7404,6 +7400,22 @@ class RPCServer:
             except Exception as e:
                 logger.error(
                     "[dumptxoutset] reconsider_block failed: %s", e
+                )
+
+            # reactivate_best_chain reconnects the disconnected blocks.
+            # On a stub DB without this method (older bindings or test
+            # double), fall back to flag-only behaviour with a warning.
+            if hasattr(rust_db, "reactivate_best_chain"):
+                try:
+                    await asyncio.to_thread(rust_db.reactivate_best_chain)
+                except Exception as e:
+                    logger.error(
+                        "[dumptxoutset] reactivate_best_chain failed: %s", e
+                    )
+            else:
+                logger.warning(
+                    "[dumptxoutset] rust_db has no reactivate_best_chain; "
+                    "chain may stay at rollback height until next P2P sync"
                 )
             if hasattr(db, "_cached_tip"):
                 db._cached_tip = None
@@ -7416,7 +7428,7 @@ class RPCServer:
             if not chain_restored:
                 logger.warning(
                     "[dumptxoutset] chain not restored: tip is now %d, "
-                    "was %d. block_sync should re-activate stored blocks "
+                    "was %d. Block_sync should re-activate stored blocks "
                     "on next pass; alternatively, restart the node.",
                     post_height, original_tip_height,
                 )
