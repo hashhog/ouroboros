@@ -41,17 +41,45 @@ class _UTXOEntry:
 
 class _RustDBStub:
     """Stand-in for ``sync.PyBlockchainDB``. Records calls so tests can
-    assert the rollback dance fired."""
+    assert the rollback dance fired.
+
+    Models the production behaviour of ``invalidate_block`` /
+    ``reconsider_block`` / ``reactivate_best_chain``: invalidate
+    disconnects (best tip drops, but block-tree entries remain because
+    the real DB keeps body+metadata in BLOCKS_CF/BLOCK_INDEX_CF after
+    disconnect). reactivate_best_chain walks back up to the highest
+    indexed leaf with valid metadata.
+    """
 
     def __init__(self, parent):
         self._parent = parent
         self.invalidate_calls: list[bytes] = []
         self.reconsider_calls: list[bytes] = []
+        self.reactivate_calls: int = 0
+        # Mirror of BLOCK_INDEX_CF: maps height -> hash for ALL blocks the
+        # DB has ever seen, even if disconnected. Distinct from
+        # _StubDB.chain (which models the active chain).
+        self._index: dict[int, bytes] = {}
+        # Mirror of BLOCK_INDEX_CF status: blocks marked invalid are
+        # excluded from the reactivation scan.
+        self._invalid: set[int] = set()
+        # Toggle to simulate a partial reactivation (e.g. for the
+        # "stranded mid-walk" test).
+        self.fail_reactivate_at: int | None = None
+
+    def _seed_index(self) -> None:
+        """Snapshot the current active chain into _index. Called on
+        first invalidate so the stub remembers the leaf we were at."""
+        if not self._index:
+            self._index = dict(self._parent.chain)
 
     def invalidate_block(self, block_hash: bytes) -> int:
         if len(block_hash) != 32:
             raise ValueError("block_hash must be 32 bytes")
         self.invalidate_calls.append(bytes(block_hash))
+
+        self._seed_index()
+
         # Find which height this hash sits at (it was looked up as the
         # *child* of the rollback target, so disconnect everything from
         # that height up to the current tip).
@@ -62,10 +90,13 @@ class _RustDBStub:
                 break
         if target_height is None:
             raise RuntimeError("block not found")
-        # Disconnect: drop chain entries from target_height onwards.
+        # Disconnect: drop chain entries from target_height onwards (the
+        # active chain shrinks). The block-tree _index keeps them so
+        # reactivate_best_chain can find them.
         for h in sorted(self._parent.chain.keys()):
             if h >= target_height:
                 self._parent.chain.pop(h, None)
+                self._invalid.add(h)
         # Update best block to parent of target.
         new_tip_height = target_height - 1
         if new_tip_height < 0:
@@ -78,9 +109,35 @@ class _RustDBStub:
         if len(block_hash) != 32:
             raise ValueError("block_hash must be 32 bytes")
         self.reconsider_calls.append(bytes(block_hash))
-        # ouroboros's reconsider_block clears flags but does NOT
-        # re-activate the chain. Mirror that: chain stays at the
-        # rolled-back tip. Caller knows via chain_restored=False.
+        # Clear the FAILED flags on the target and its descendants, but
+        # don't move best_block — that's reactivate_best_chain's job.
+        self._invalid.clear()
+        return self._parent.best_height
+
+    def reactivate_best_chain(self) -> int:
+        """Walk forward from current best_height through _index,
+        re-activating blocks until we hit either the highest indexed
+        height or a still-invalid block. Mirrors the Rust impl's
+        find-leaf + walk-up algorithm."""
+        self.reactivate_calls += 1
+        if not self._index:
+            # Never invalidated; nothing to do.
+            return self._parent.best_height
+        max_indexed = max(self._index.keys())
+        # Walk up height by height, restoring chain entries.
+        h = self._parent.best_height
+        while h < max_indexed:
+            next_h = h + 1
+            if next_h in self._invalid:
+                break
+            if next_h not in self._index:
+                break
+            if self.fail_reactivate_at is not None and next_h == self.fail_reactivate_at:
+                break
+            self._parent.chain[next_h] = self._index[next_h]
+            self._parent.best_height = next_h
+            self._parent.best_hash = self._index[next_h]
+            h = next_h
         return self._parent.best_height
 
 
@@ -281,11 +338,15 @@ async def test_dumptxoutset_rollback_by_height(tmp_path) -> None:
     assert db._db.invalidate_calls[0] == expected_child_hash
     # reconsider was called exactly once on the same hash (TemporaryRollback dtor).
     assert db._db.reconsider_calls == [expected_child_hash]
+    # reactivate_best_chain was invoked after reconsider (the new fix).
+    assert db._db.reactivate_calls == 1
 
     # Dump landed at the rolled-back height.
     assert res["base_height"] == target
-    # Our reconsider stub doesn't re-activate, so chain_restored is False.
-    assert res["chain_restored"] is False
+    # Reactivation walked the chain back up to the original tip.
+    assert res["chain_restored"] is True
+    assert db.best_height == original_tip
+    assert db.best_hash == db.chain[original_tip]
 
 
 @pytest.mark.asyncio
@@ -468,3 +529,130 @@ async def test_dumptxoutset_reconsiders_on_dump_failure(tmp_path, monkeypatch) -
 
     assert db._db.invalidate_calls == [expected_child_hash]
     assert db._db.reconsider_calls == [expected_child_hash]
+
+
+# ---------------------------------------------------------------------------
+# Reactivation: dumptxoutset rollback now leaves chain at original tip.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dumptxoutset_reactivation_restores_original_tip(tmp_path) -> None:
+    """After dump completes, the chain is back at the original tip
+    (Core ActivateBestChain analog). chain_restored=True."""
+    db = _make_db_with_chain(tip_height=8)
+    rpc = _make_rpc(db, tmp_path=tmp_path)
+    original_tip_height = db.best_height
+    original_tip_hash = db.best_hash
+    out_path = tmp_path / "reactivate.dat"
+
+    res = await rpc.rpc_dumptxoutset(str(out_path), options={"rollback": 3})
+
+    # Dump captured the rolled-back state.
+    assert res["rollback_height"] == 3
+    assert res["base_height"] == 3
+    # Chain is restored to original tip after reactivation.
+    assert res["chain_restored"] is True
+    assert res["original_tip_height"] == original_tip_height
+    assert db.best_height == original_tip_height
+    assert db.best_hash == original_tip_hash
+    # reactivate_best_chain was called exactly once.
+    assert db._db.reactivate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_dumptxoutset_reactivation_with_independently_invalid_block(
+    tmp_path,
+) -> None:
+    """If a block in [target+1..original_tip] is independently invalid
+    (separate from the rollback dance), reactivation must stop at that
+    block. chain_restored=False with the height we actually reached."""
+    db = _make_db_with_chain(tip_height=8)
+    rpc = _make_rpc(db, tmp_path=tmp_path)
+    out_path = tmp_path / "stuck.dat"
+
+    # Simulate: reactivation will fail to reconnect at height 6 (e.g.
+    # because that block was independently flagged invalid). Stub
+    # captures this via fail_reactivate_at.
+    db._db.fail_reactivate_at = 6
+
+    res = await rpc.rpc_dumptxoutset(str(out_path), options={"rollback": 3})
+
+    assert res["rollback_height"] == 3
+    # Reactivation walked 4 -> 5 then stopped before 6.
+    assert db.best_height == 5
+    # chain_restored is False because we didn't reach the original tip 8.
+    assert res["chain_restored"] is False
+    assert res["original_tip_height"] == 8
+
+
+@pytest.mark.asyncio
+async def test_dumptxoutset_reactivation_noop_when_at_tip(tmp_path) -> None:
+    """Rolling back to the current tip is a no-op rollback dance:
+    reactivation isn't called because invalidate/reconsider didn't fire."""
+    db = _make_db_with_chain(tip_height=5)
+    rpc = _make_rpc(db, tmp_path=tmp_path)
+    out_path = tmp_path / "noop.dat"
+
+    res = await rpc.rpc_dumptxoutset(
+        str(out_path), options={"rollback": db.best_height}
+    )
+
+    assert res["rollback_height"] == db.best_height
+    # No rollback dance, so no reactivation either.
+    assert db._db.reactivate_calls == 0
+    assert db._db.invalidate_calls == []
+    assert db._db.reconsider_calls == []
+    # chain_restored should still be reported as True (chain never moved).
+    assert res["chain_restored"] is True
+
+
+@pytest.mark.asyncio
+async def test_dumptxoutset_reactivation_fires_after_reconsider(
+    tmp_path,
+) -> None:
+    """The order is invariant: reconsider_block must precede
+    reactivate_best_chain. We assert this by capturing call timestamps
+    via list ordering on the stub."""
+    db = _make_db_with_chain(tip_height=6)
+    rpc = _make_rpc(db, tmp_path=tmp_path)
+    out_path = tmp_path / "order.dat"
+
+    # Hook reactivate_best_chain to assert it sees a non-empty
+    # reconsider_calls history when invoked.
+    real_reactivate = db._db.reactivate_best_chain
+
+    def wrapped() -> int:
+        # By the time we're called, reconsider_block must already have run.
+        assert len(db._db.reconsider_calls) >= 1
+        return real_reactivate()
+    db._db.reactivate_best_chain = wrapped
+
+    res = await rpc.rpc_dumptxoutset(str(out_path), options={"rollback": 2})
+
+    assert res["chain_restored"] is True
+    assert db.best_height == 6
+
+
+@pytest.mark.asyncio
+async def test_dumptxoutset_reactivation_explicit_hash_path(tmp_path) -> None:
+    """Reactivation also restores chain when rollback was specified by
+    display-order hash (not height)."""
+    db = _make_db_with_chain(tip_height=7)
+    rpc = _make_rpc(db, tmp_path=tmp_path)
+    out_path = tmp_path / "byhash-restore.dat"
+
+    target_height = 4
+    target_hash_internal = db.chain[target_height]
+    target_hash_display = target_hash_internal[::-1].hex()
+    original_tip = db.best_height
+
+    res = await rpc.rpc_dumptxoutset(
+        str(out_path), options={"rollback": target_hash_display}
+    )
+
+    assert res["rollback_height"] == target_height
+    # Reactivation put us back at the original tip.
+    assert res["chain_restored"] is True
+    assert db.best_height == original_tip
+    assert db._db.reactivate_calls == 1
