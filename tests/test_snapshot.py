@@ -481,9 +481,12 @@ def test_snapshot_manager_round_trip(tmp_path) -> None:
     assert md.base_blockhash == au.block_hash
 
     # Now load into a fresh DB and verify byte-perfect parity per UTXO.
+    # strict=False: this fixture is 3 synthetic UTXOs, so it cannot match
+    # the published mainnet@840k MuHash3072 commitment. The strict check
+    # is exercised in test_load_snapshot_strict_muhash_check below.
     dst = _StubDB()
     sm_load = SnapshotManager(dst, "mainnet", str(tmp_path / "dst"))
-    md2 = sm_load.load_snapshot(str(snap_path))
+    md2 = sm_load.load_snapshot(str(snap_path), strict=False)
     assert md2.coins_count == md.coins_count
 
     src_sorted = sorted(src.utxos, key=lambda u: (u.txid, u.vout))
@@ -514,6 +517,79 @@ def test_snapshot_manager_rejects_unknown_blockhash(tmp_path) -> None:
     sm_load = SnapshotManager(dst, "mainnet", str(tmp_path / "dst"))
     with pytest.raises(ValueError, match="not recognized"):
         sm_load.load_snapshot(str(snap_path))
+
+
+def test_load_snapshot_strict_muhash_check(tmp_path, monkeypatch) -> None:
+    """Strict load enforces the MuHash3072 commitment per validation.cpp:5912.
+
+    Builds a 1-coin snapshot at the mainnet@840k whitelisted hash, swaps the
+    chainparams MuHash entry to (a) the right value -> load passes,
+    (b) a different value -> load raises 'Bad snapshot content hash'.
+    """
+    from ouroboros import snapshot as _snapshot_mod
+    from ouroboros.muhash import MuHash3072, coin_element
+
+    au = get_assumeutxo_data("mainnet", 840_000)
+    assert au is not None
+
+    src = _StubDB()
+    src.best_hash = au.block_hash
+    src.best_height = au.height
+    one_utxo = _UTXOEntry(
+        txid=b"\xab" * 32, vout=0, amount=12345,
+        script_pubkey=_p2pkh(b"\xcd" * 20),
+        height=100_000, is_coinbase=False,
+    )
+    src.utxos.append(one_utxo)
+    snap_path = tmp_path / "good.dat"
+    SnapshotManager(src, "mainnet", str(tmp_path / "src")).dump_snapshot(
+        str(snap_path)
+    )
+
+    expected = MuHash3072()
+    expected.insert(coin_element(
+        txid=one_utxo.txid, vout=one_utxo.vout, height=one_utxo.height,
+        is_coinbase=one_utxo.is_coinbase, amount=one_utxo.amount,
+        script_pubkey=one_utxo.script_pubkey,
+    ))
+    expected_digest = expected.digest()
+
+    # (a) Correct commitment -> load passes.
+    patched_ok = _snapshot_mod.AssumeutxoData(
+        height=au.height,
+        block_hash=au.block_hash,
+        hash_serialized=expected_digest,
+        chain_tx_count=au.chain_tx_count,
+    )
+    monkeypatch.setattr(
+        _snapshot_mod, "_MAINNET_ASSUMEUTXO",
+        [patched_ok if d.height == au.height else d
+         for d in _snapshot_mod._MAINNET_ASSUMEUTXO],
+    )
+    dst_ok = _StubDB()
+    sm_ok = SnapshotManager(dst_ok, "mainnet", str(tmp_path / "dst-ok"))
+    sm_ok.load_snapshot(str(snap_path))
+    assert sm_ok.snapshot_loaded
+    assert len(dst_ok.utxos) == 1
+
+    # (b) Wrong commitment -> load raises with Core wording.
+    bad_digest = bytes(b ^ 0xff for b in expected_digest)
+    patched_bad = _snapshot_mod.AssumeutxoData(
+        height=au.height,
+        block_hash=au.block_hash,
+        hash_serialized=bad_digest,
+        chain_tx_count=au.chain_tx_count,
+    )
+    monkeypatch.setattr(
+        _snapshot_mod, "_MAINNET_ASSUMEUTXO",
+        [patched_bad if d.height == au.height else d
+         for d in _snapshot_mod._MAINNET_ASSUMEUTXO],
+    )
+    dst_bad = _StubDB()
+    sm_bad = SnapshotManager(dst_bad, "mainnet", str(tmp_path / "dst-bad"))
+    with pytest.raises(ValueError, match="Bad snapshot content hash"):
+        sm_bad.load_snapshot(str(snap_path))
+    assert not sm_bad.snapshot_loaded
 
 
 # ---------------------------------------------------------------------------
@@ -715,12 +791,20 @@ def test_rpc_loadtxoutset_rejects_regtest_genesis_blockhash(
 
 
 def test_rpc_loadtxoutset_accepts_whitelisted_blockhash_with_raw_insert(
-    rpc_loader_factory, tmp_path
+    rpc_loader_factory, tmp_path, monkeypatch
 ) -> None:
     """A snapshot whose base_blockhash IS in the AU table must be accepted
     and its UTXOs inserted via add_utxo_raw. Uses mainnet height 840k.
+
+    We override the published hash_serialized for the duration of the test
+    with the MuHash3072 commitment over our 1-coin synthetic UTXO set, so
+    the strict assumeUTXO check (mirrors validation.cpp:5912-5914) passes
+    on this fixture.
     """
     import asyncio
+
+    from ouroboros import snapshot as _snapshot_mod
+    from ouroboros.muhash import MuHash3072, coin_element
 
     au = get_assumeutxo_data("mainnet", 840_000)
     assert au is not None
@@ -730,14 +814,35 @@ def test_rpc_loadtxoutset_accepts_whitelisted_blockhash_with_raw_insert(
     src = _StubDB()
     src.best_hash = au.block_hash
     src.best_height = au.height
-    src.utxos.append(_UTXOEntry(
+    one_utxo = _UTXOEntry(
         txid=b"\xab" * 32, vout=0, amount=12345,
         script_pubkey=_p2pkh(b"\xcd" * 20),
         height=100_000, is_coinbase=False,
-    ))
+    )
+    src.utxos.append(one_utxo)
     SnapshotManager(src, "mainnet", str(tmp_path / "src")).dump_snapshot(
         str(tmp_path / "good.dat")
     )
+
+    # Pre-compute the MuHash over the 1-coin set and inject it into the
+    # mainnet AU table for the duration of the test.
+    expected = MuHash3072()
+    expected.insert(coin_element(
+        txid=one_utxo.txid, vout=one_utxo.vout, height=one_utxo.height,
+        is_coinbase=one_utxo.is_coinbase, amount=one_utxo.amount,
+        script_pubkey=one_utxo.script_pubkey,
+    ))
+    patched_au = _snapshot_mod.AssumeutxoData(
+        height=au.height,
+        block_hash=au.block_hash,
+        hash_serialized=expected.digest(),
+        chain_tx_count=au.chain_tx_count,
+    )
+    patched_table = [
+        patched_au if d.height == au.height else d
+        for d in _snapshot_mod._MAINNET_ASSUMEUTXO
+    ]
+    monkeypatch.setattr(_snapshot_mod, "_MAINNET_ASSUMEUTXO", patched_table)
 
     rpc, sm, dst = rpc_loader_factory("mainnet")
 
