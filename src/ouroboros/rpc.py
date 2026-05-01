@@ -7080,27 +7080,55 @@ class RPCServer:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load snapshot: {e}") from None
 
-    async def rpc_dumptxoutset(self, path: str) -> dict[str, Any]:
+    async def rpc_dumptxoutset(
+        self,
+        path: str,
+        type: str = "",
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """
-        Dump the current UTXO set to a file for use with loadtxoutset.
+        Dump the UTXO set to a file for use with loadtxoutset.
 
-        This serializes the entire UTXO set to a file that can be used
-        for fast startup on another node using the -assumeutxo option
-        or the loadtxoutset RPC.
+        Three operating modes (matches Bitcoin Core rpc/blockchain.cpp
+        ``dumptxoutset`` 27.x semantics):
+
+        - ``type="latest"`` (or empty + no rollback option): dump the
+          current chain tip's UTXO set. No reorg.
+        - ``type="rollback"`` (no explicit height): pick the highest
+          assumeutxo entry from chainparams that is ``<= current_tip``,
+          temporarily roll back to that block, dump, then put the chain
+          back. Mirrors Core's "latest valid snapshot block that can
+          currently be loaded with loadtxoutset".
+        - ``options={"rollback": <height|hash>}``: roll back to a specific
+          block height (int) or hash (hex string), dump, put back.
+
+        The rollback dance uses ``invalidate_block`` + ``reconsider_block``
+        (Bitcoin Core's ``TemporaryRollback`` pattern, blockchain.cpp
+        :3056-3067). ``invalidate_block`` disconnects every block from the
+        target's child up to the current tip and unwinds UTXOs via the
+        stored undo data. ``reconsider_block`` clears the BLOCK_FAILED_*
+        flags so the next P2P/IBD pass can re-activate the original tip.
+
+        TODO(rollback): ouroboros's ``reconsider_block`` only clears flags
+        — it does NOT re-activate already-stored blocks back to the
+        original tip (see ferrous-utils/sync/src/storage/db.rs:1469-1471
+        "would require comparing chainwork, which we defer to the sync
+        logic"). After this RPC returns, the chain tip remains at the
+        rollback height; block_sync will re-fetch + re-connect on its
+        next pass. For now, callers should expect a temporary lag and
+        rely on P2P resync. Bitcoin Core invokes ActivateBestChain
+        which we don't expose yet.
 
         Args:
-            path: Path to write the snapshot file
+            path: Path to write the snapshot file.
+            type: ``"latest"``, ``"rollback"``, or empty.
+            options: ``{"rollback": <height int | hash hex>}``.
 
         Returns:
-            Object with dump results:
-            - coins_written: Number of UTXOs written
-            - base_hash: Block hash of the snapshot
-            - base_height: Block height at time of dump
-            - path: Path to the created snapshot
-
-        Note:
-            The node should be stopped or in a stable state when creating
-            snapshots to ensure consistency.
+            ``coins_written`` / ``base_hash`` / ``base_height`` / ``path``.
+            On rollback paths, includes ``rollback_height``,
+            ``rollback_hash``, ``original_tip_height``, ``original_tip_hash``,
+            and ``chain_restored`` (False if reactivation is incomplete).
 
         Reference: Bitcoin Core rpc/blockchain.cpp dumptxoutset
         """
@@ -7113,35 +7141,299 @@ class RPCServer:
             raise HTTPException(status_code=500, detail="Snapshot manager not initialized")
 
         sm = self.node.snapshot_manager
+        db = self.node.db
+        opts = options or {}
 
-        # Check if path exists and warn
+        # ------------------------------------------------------------------
+        # Mode resolution. Matches the precedence in Core's RPC handler:
+        # an explicit `options.rollback` always wins; "rollback" alone
+        # picks the highest assumeutxo height <= tip; "latest" or empty
+        # is current-tip dump.
+        # ------------------------------------------------------------------
+        rollback_value = opts.get("rollback") if isinstance(opts, dict) else None
+
+        if rollback_value is not None:
+            if type and type != "rollback":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid snapshot type \"{type}\" specified with rollback option",
+                )
+            mode = "rollback_explicit"
+        elif type == "rollback":
+            mode = "rollback_auto"
+        elif type in ("", "latest"):
+            mode = "latest"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid snapshot type \"{type}\" specified. Please specify \"rollback\" or \"latest\"",
+            )
+
         if os.path.exists(path):
             raise HTTPException(
                 status_code=400,
-                detail=f"File already exists: {path}. Remove it first."
+                detail=f"File already exists: {path}. Remove it first.",
             )
 
+        original_tip_hash, original_tip_height = db.get_best_block()
+
+        # ------------------------------------------------------------------
+        # Resolve target height/hash for rollback modes.
+        # ------------------------------------------------------------------
+        target_height: int | None = None
+        target_hash: bytes | None = None
+
+        if mode == "rollback_auto":
+            from ouroboros.snapshot import get_assumeutxo_params
+            params = get_assumeutxo_params(self.node.network)
+            eligible = [p for p in params if p.height <= original_tip_height]
+            if not eligible:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No assumeutxo entry available at or below current tip "
+                        f"({original_tip_height}); specify a height via "
+                        "options.rollback"
+                    ),
+                )
+            chosen = max(eligible, key=lambda p: p.height)
+            target_height = chosen.height
+            target_hash = chosen.block_hash
+
+        elif mode == "rollback_explicit":
+            # Either an integer height or a hex-encoded big-endian hash.
+            if isinstance(rollback_value, bool):
+                raise HTTPException(
+                    status_code=400, detail="rollback must be an integer height or hex hash",
+                )
+            if isinstance(rollback_value, int):
+                if rollback_value < 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Target block height {rollback_value} is negative",
+                    )
+                if rollback_value > original_tip_height:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Target block height {rollback_value} after current "
+                            f"tip {original_tip_height}"
+                        ),
+                    )
+                target_height = rollback_value
+                resolved = await asyncio.to_thread(
+                    db.get_block_hash_by_height, target_height
+                )
+                if resolved is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"No block in chain at height {target_height}",
+                    )
+                target_hash = bytes(resolved)
+            elif isinstance(rollback_value, str):
+                try:
+                    h = bytes.fromhex(rollback_value)
+                    if len(h) != 32:
+                        raise ValueError("hash must be 32 bytes")
+                except ValueError as e:
+                    raise HTTPException(
+                        status_code=400, detail=f"Invalid rollback hash: {e}"
+                    ) from None
+                # Big-endian display hex -> internal little-endian bytes.
+                target_hash = h[::-1]
+                if not await asyncio.to_thread(db.has_block_hash, target_hash):
+                    raise HTTPException(
+                        status_code=404, detail="Block not found"
+                    )
+                # PyBlock doesn't carry a height field, so we resolve by
+                # scanning ``get_block_hash_by_height`` from the current tip
+                # downwards. This is O(N) in the worst case but only runs
+                # once per RPC call on the rollback path.
+                resolved_height: int | None = None
+                for h_candidate in range(original_tip_height, -1, -1):
+                    chain_hash = await asyncio.to_thread(
+                        db.get_block_hash_by_height, h_candidate
+                    )
+                    if chain_hash is not None and bytes(chain_hash) == target_hash:
+                        resolved_height = h_candidate
+                        break
+                if resolved_height is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=(
+                            "Rollback hash not on active chain "
+                            f"(scanned 0..{original_tip_height})"
+                        ),
+                    )
+                target_height = resolved_height
+            else:
+                raise HTTPException(
+                    status_code=400, detail="rollback must be an integer height or hex hash",
+                )
+
+        # ------------------------------------------------------------------
+        # Optional rollback dance (TemporaryRollback analog).
+        # ------------------------------------------------------------------
+        chain_restored = True
+        invalidate_target_hash: bytes | None = None
+
+        if mode in ("rollback_auto", "rollback_explicit"):
+            assert target_height is not None
+            assert target_hash is not None
+
+            if target_height > original_tip_height:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Rollback target {target_height} above tip "
+                        f"{original_tip_height}"
+                    ),
+                )
+
+            if target_height < original_tip_height:
+                # We invalidate the *child* of the target — same as Core's
+                # `chainstate->m_chain.Next(target_index)` (blockchain.cpp:3185).
+                # That disconnects every block from target+1 up to tip and
+                # leaves target as the new tip.
+                rust_db = getattr(db, "rust_db", None) or getattr(db, "_db", None)
+                if rust_db is None or not hasattr(rust_db, "invalidate_block"):
+                    raise HTTPException(
+                        status_code=500,
+                        detail="rollback requires Rust database bindings (invalidate_block)",
+                    )
+
+                child_height = target_height + 1
+                child_hash = await asyncio.to_thread(
+                    db.get_block_hash_by_height, child_height
+                )
+                if child_hash is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            f"Could not find child block at height {child_height}; "
+                            "cannot perform rollback"
+                        ),
+                    )
+                invalidate_target_hash = bytes(child_hash)
+
+                logger.info(
+                    "[dumptxoutset] rollback: invalidating block %s at height %d "
+                    "to roll tip %d -> %d",
+                    invalidate_target_hash[::-1].hex()[:16],
+                    child_height,
+                    original_tip_height,
+                    target_height,
+                )
+
+                try:
+                    await asyncio.to_thread(
+                        rust_db.invalidate_block, invalidate_target_hash
+                    )
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Rollback (invalidate_block) failed: {e}",
+                    ) from None
+                # Bust any cached tip on the Python wrapper.
+                if hasattr(db, "_cached_tip"):
+                    db._cached_tip = None
+
+                # Sanity-check the rolled-back tip.
+                rolled_hash, rolled_height = db.get_best_block()
+                if rolled_height != target_height or bytes(rolled_hash) != target_hash:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            f"Rollback landed at height={rolled_height} hash="
+                            f"{bytes(rolled_hash)[::-1].hex()}, expected "
+                            f"height={target_height} hash="
+                            f"{target_hash[::-1].hex()}"
+                        ),
+                    )
+
+        # ------------------------------------------------------------------
+        # Dump the snapshot.
+        # ------------------------------------------------------------------
         try:
-            # Get current best block info
-            best_hash, best_height = self.node.db.get_best_block()
-
             def progress_callback(written: int, total: int):
-                pass  # Could emit progress via ZMQ or websockets
+                pass  # Future: emit progress via ZMQ.
 
-            coins_written = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: sm.dump_snapshot(path, progress_callback),
+            coins_written = await asyncio.to_thread(
+                sm.dump_snapshot, path, progress_callback
             )
 
-            return {
+            dump_hash, dump_height = db.get_best_block()
+            result: dict[str, Any] = {
                 "coins_written": coins_written,
-                "base_hash": best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash),
-                "base_height": best_height,
+                "base_hash": (
+                    dump_hash.hex()
+                    if isinstance(dump_hash, bytes)
+                    else str(dump_hash)
+                ),
+                "base_height": dump_height,
                 "path": path,
             }
-
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to dump snapshot: {e}") from None
+            # If dump fails after rollback, still try to put the chain back.
+            if invalidate_target_hash is not None:
+                try:
+                    rust_db = getattr(db, "rust_db", None) or getattr(db, "_db", None)
+                    if rust_db is not None:
+                        await asyncio.to_thread(
+                            rust_db.reconsider_block, invalidate_target_hash
+                        )
+                except Exception:
+                    logger.exception(
+                        "[dumptxoutset] reconsider_block failed during dump-error cleanup"
+                    )
+            raise HTTPException(
+                status_code=500, detail=f"Failed to dump snapshot: {e}"
+            ) from None
+
+        # ------------------------------------------------------------------
+        # TemporaryRollback dtor: reconsider_block lifts the FAILED flags.
+        # NB: ouroboros's reconsider_block does NOT re-activate the chain;
+        # see TODO above. We surface chain_restored=False so callers know.
+        # ------------------------------------------------------------------
+        if invalidate_target_hash is not None:
+            rust_db = getattr(db, "rust_db", None) or getattr(db, "_db", None)
+            try:
+                await asyncio.to_thread(
+                    rust_db.reconsider_block, invalidate_target_hash
+                )
+            except Exception as e:
+                logger.error(
+                    "[dumptxoutset] reconsider_block failed: %s", e
+                )
+            if hasattr(db, "_cached_tip"):
+                db._cached_tip = None
+
+            post_hash, post_height = db.get_best_block()
+            chain_restored = (
+                post_height == original_tip_height
+                and bytes(post_hash) == original_tip_hash
+            )
+            if not chain_restored:
+                logger.warning(
+                    "[dumptxoutset] chain not restored: tip is now %d, "
+                    "was %d. block_sync should re-activate stored blocks "
+                    "on next pass; alternatively, restart the node.",
+                    post_height, original_tip_height,
+                )
+
+        if mode in ("rollback_auto", "rollback_explicit"):
+            assert target_hash is not None and target_height is not None
+            result["rollback_height"] = target_height
+            result["rollback_hash"] = target_hash[::-1].hex()
+            result["original_tip_height"] = original_tip_height
+            result["original_tip_hash"] = (
+                original_tip_hash[::-1].hex()
+                if isinstance(original_tip_hash, bytes)
+                else str(original_tip_hash)
+            )
+            result["chain_restored"] = chain_restored
+
+        return result
 
     async def rpc_getchainstates(self) -> dict[str, Any]:
         """
