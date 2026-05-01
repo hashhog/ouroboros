@@ -576,3 +576,187 @@ def test_minimal_snapshot_matches_known_bytes(tmp_path) -> None:
         f"snapshot byte mismatch:\n  actual  : {actual.hex()}\n"
         f"  expected: {bytes(expected).hex()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# dumptxoutset on an empty UTXO set: header-only, exactly 51 bytes
+# ---------------------------------------------------------------------------
+#
+# Snapshot v2 header layout:
+#   magic         5 B  ("utxo\xff")
+#   version       2 B  uint16 LE     (= 2)
+#   network_magic 4 B  pchMessageStart
+#   base_blockhash 32 B internal byte order
+#   coins_count   8 B  uint64 LE
+#   ----------------
+#   total        51 B
+#
+# A coins_count=0 dump must produce exactly the header and nothing else --
+# no per-txid groups. This pins the no-UTXO branch of the dumper.
+
+
+def test_dumptxoutset_empty_utxo_set_is_51_byte_header(tmp_path) -> None:
+    db = _StubDB()
+    # An empty regtest dump still needs *some* base hash so the header
+    # encodes; pick the regtest genesis so the bytes are deterministic.
+    regtest_genesis_le = bytes.fromhex(
+        "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+    )[::-1]
+    db.best_hash = regtest_genesis_le
+    db.best_height = 0
+    assert db.utxo_count() == 0
+
+    sm = SnapshotManager(db, "regtest", str(tmp_path / "src"))
+    out = tmp_path / "empty.dat"
+    n = sm.dump_snapshot(str(out))
+    assert n == 0
+
+    raw = out.read_bytes()
+    assert len(raw) == 51, (
+        f"empty snapshot must be exactly 51 bytes (header only), got {len(raw)}"
+    )
+
+    expected = (
+        SNAPSHOT_MAGIC
+        + struct.pack("<H", SNAPSHOT_VERSION)
+        + NETWORK_MAGIC["regtest"]
+        + regtest_genesis_le
+        + struct.pack("<Q", 0)
+    )
+    assert raw == expected, (
+        f"empty-snapshot bytes differ:\n  actual  : {raw.hex()}\n"
+        f"  expected: {expected.hex()}"
+    )
+
+    # And the header must round-trip through read_snapshot_metadata.
+    md = read_snapshot_metadata(str(out), "regtest")
+    assert md.coins_count == 0
+    assert md.base_blockhash == regtest_genesis_le
+    assert md.version == SNAPSHOT_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Core-strict assumeUTXO whitelist on the loadtxoutset RPC handler
+# ---------------------------------------------------------------------------
+
+
+def _build_minimal_snapshot(
+    tmp_path, network: str, base_blockhash_le: bytes
+) -> str:
+    """Write a header-only snapshot file (coins_count=0) and return its path."""
+    path = tmp_path / f"snap-{network}.dat"
+    with open(path, "wb") as f:
+        from ouroboros.snapshot import _write_metadata_header
+        _write_metadata_header(f, network, base_blockhash_le, 0)
+    return str(path)
+
+
+class _RPCStubNode:
+    """Minimal node surface needed by RPCServer.rpc_loadtxoutset."""
+
+    def __init__(self, db, network: str, snapshot_manager) -> None:
+        self.db = db
+        self.network = network
+        self.snapshot_manager = snapshot_manager
+
+
+@pytest.fixture
+def rpc_loader_factory(tmp_path):
+    """Build an RPCServer wired to a stub node + snapshot manager."""
+    from ouroboros.rpc import RPCServer
+
+    def _factory(network: str, db: _StubDB | None = None):
+        if db is None:
+            db = _StubDB()
+        sm = SnapshotManager(db, network, str(tmp_path / f"sm-{network}"))
+        rpc = RPCServer.__new__(RPCServer)
+        rpc.node = _RPCStubNode(db, network, sm)
+        return rpc, sm, db
+
+    return _factory
+
+
+def test_rpc_loadtxoutset_rejects_regtest_genesis_blockhash(
+    rpc_loader_factory, tmp_path
+) -> None:
+    """The loadtxoutset RPC must refuse a snapshot whose base_blockhash is
+    not in the assumeUTXO whitelist. Reference: bitcoin-core
+    validation.cpp:5775-5780. We exercise this with the regtest genesis,
+    which has no entry in any AU table, and assert the Core error
+    wording.
+    """
+    import asyncio
+
+    from fastapi import HTTPException
+
+    regtest_genesis_le = bytes.fromhex(
+        "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+    )[::-1]
+    snap = _build_minimal_snapshot(tmp_path, "regtest", regtest_genesis_le)
+
+    rpc, sm, _ = rpc_loader_factory("regtest")
+
+    async def _call() -> None:
+        await rpc.rpc_loadtxoutset(snap)
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(_call())
+
+    # Core's error: "Assumeutxo height in snapshot metadata not recognized
+    # (<H>) - refusing to load snapshot". We don't have the height locally
+    # so we report 'unknown' in its place; both the prefix and suffix must
+    # match Core verbatim.
+    assert excinfo.value.status_code == 400
+    detail = excinfo.value.detail
+    assert "Assumeutxo height in snapshot metadata not recognized" in detail
+    assert "refusing to load snapshot" in detail
+    # Snapshot loader must NOT have been activated.
+    assert sm.snapshot_loaded is False
+
+
+def test_rpc_loadtxoutset_accepts_whitelisted_blockhash_with_raw_insert(
+    rpc_loader_factory, tmp_path
+) -> None:
+    """A snapshot whose base_blockhash IS in the AU table must be accepted
+    and its UTXOs inserted via add_utxo_raw. Uses mainnet height 840k.
+    """
+    import asyncio
+
+    au = get_assumeutxo_data("mainnet", 840_000)
+    assert au is not None
+
+    # Build a real 1-coin snapshot at the whitelisted hash by going through
+    # the dumper (so the wire bytes are guaranteed loader-compatible).
+    src = _StubDB()
+    src.best_hash = au.block_hash
+    src.best_height = au.height
+    src.utxos.append(_UTXOEntry(
+        txid=b"\xab" * 32, vout=0, amount=12345,
+        script_pubkey=_p2pkh(b"\xcd" * 20),
+        height=100_000, is_coinbase=False,
+    ))
+    SnapshotManager(src, "mainnet", str(tmp_path / "src")).dump_snapshot(
+        str(tmp_path / "good.dat")
+    )
+
+    rpc, sm, dst = rpc_loader_factory("mainnet")
+
+    async def _call() -> dict:
+        return await rpc.rpc_loadtxoutset(str(tmp_path / "good.dat"))
+
+    result = asyncio.run(_call())
+    assert result["coins_loaded"] == 1
+    assert result["base_height"] == au.height
+    # Snapshot metadata exposes blockhash in big-endian display form.
+    assert result["base_hash"] == au.block_hash[::-1].hex()
+
+    # And the raw insertion must have populated the destination DB exactly
+    # once with the correct fields.
+    assert sm.snapshot_loaded is True
+    assert len(dst.utxos) == 1
+    inserted = dst.utxos[0]
+    assert inserted.txid == b"\xab" * 32
+    assert inserted.vout == 0
+    assert inserted.amount == 12345
+    assert inserted.height == 100_000
+    assert inserted.is_coinbase is False

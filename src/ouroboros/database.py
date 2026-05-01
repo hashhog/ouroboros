@@ -306,6 +306,23 @@ class TxOut:
     script_pubkey: bytes
 
 
+@dataclass
+class _SnapshotUTXOView:
+    """Lightweight UTXO view yielded by ``BlockchainDatabase.iter_utxos``.
+
+    Mirrors the fields the snapshot dumper expects (raw 32-byte ``txid``
+    in internal order, ``vout``, ``amount``, ``script_pubkey``, ``height``,
+    ``is_coinbase``).  Kept private so callers depend on field names, not
+    the concrete type.
+    """
+    txid: bytes
+    vout: int
+    amount: int
+    script_pubkey: bytes
+    height: int
+    is_coinbase: bool
+
+
 class BlockchainDatabase:
     """Read/write access to blockchain data using Rust backend"""
 
@@ -375,6 +392,87 @@ class BlockchainDatabase:
             'height': getattr(py_utxo, 'height', None),
             'is_coinbase': getattr(py_utxo, 'is_coinbase', False),
         }
+
+    def utxo_count(self) -> int:
+        """Return the number of UTXOs currently in the chainstate.
+
+        Used by ``dumptxoutset`` (BIP305 snapshot creation) to write
+        the per-snapshot ``coins_count`` header field. Returns 0 if
+        the underlying Rust extension does not yet expose
+        ``utxo_count`` (older builds), so that an empty-set dump
+        still succeeds rather than raising.
+        """
+        if hasattr(self._db, "utxo_count"):
+            return int(self._db.utxo_count())
+        # Fallback: count via iteration if the count method isn't available.
+        if hasattr(self._db, "iter_utxos"):
+            return sum(1 for _ in self._db.iter_utxos())
+        return 0
+
+    def iter_utxos(self):
+        """Yield every UTXO in the chainstate as PyUTXO-shaped objects.
+
+        Used by ``dumptxoutset`` to assemble per-txid groups for the
+        snapshot wire format. The yielded items expose ``txid`` (raw
+        32-byte hash), ``vout``, ``amount``, ``script_pubkey``, ``height``,
+        and ``is_coinbase`` — matching the fields the snapshot dumper
+        reads.
+        """
+        if not hasattr(self._db, "iter_utxos"):
+            return
+        for py_utxo in self._db.iter_utxos():
+            # Rust returns txid as a hex string; the snapshot format wants
+            # raw 32 bytes, internal byte order. The Rust ``Txid::to_string``
+            # produces the *display* (reversed) hex, so we reverse here to
+            # recover the wire/internal byte order.
+            raw_txid = py_utxo.txid
+            if isinstance(raw_txid, str):
+                raw_txid = bytes.fromhex(raw_txid)[::-1]
+            else:
+                raw_txid = bytes(raw_txid)
+            yield _SnapshotUTXOView(
+                txid=raw_txid,
+                vout=int(py_utxo.vout),
+                amount=int(getattr(py_utxo, "amount", py_utxo.value)),
+                script_pubkey=bytes(py_utxo.script_pubkey),
+                height=int(py_utxo.height) if py_utxo.height is not None else 0,
+                is_coinbase=bool(getattr(py_utxo, "is_coinbase", False)),
+            )
+
+    def add_utxo_raw(
+        self,
+        *,
+        txid: bytes,
+        vout: int,
+        amount: int,
+        script_pubkey: bytes,
+        height: int,
+        is_coinbase: bool,
+    ) -> None:
+        """Insert a UTXO into the chainstate from already-decoded scalar fields.
+
+        Used by the ``loadtxoutset`` snapshot loader: the snapshot wire
+        format produces (txid, vout, amount, scriptPubKey, height,
+        is_coinbase) per coin, so this skips the PyUTXO round-trip and
+        feeds the values straight to Rust ``add_utxo``.
+
+        Raises ValueError if ``txid`` is not 32 bytes.
+        """
+        if len(txid) != 32:
+            raise ValueError("Transaction ID must be 32 bytes")
+        if not hasattr(self._db, "add_utxo_raw"):
+            raise NotImplementedError(
+                "Rust extension does not expose add_utxo_raw; rebuild the "
+                "ferrous-utils/sync extension"
+            )
+        self._db.add_utxo_raw(
+            bytes(txid),
+            int(vout),
+            int(amount),
+            bytes(script_pubkey),
+            int(height),
+            bool(is_coinbase),
+        )
 
     def get_utxo_batch(self, outpoints: list[tuple[bytes, int]]) -> list[dict[str, Any] | None]:
         """Batch-fetch UTXOs for a list of (txid, vout) pairs in one FFI call.
