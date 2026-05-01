@@ -3922,6 +3922,34 @@ impl PyBlockchainDB {
         })
     }
 
+    /// Re-activate the highest-chainwork valid block-tree leaf.
+    ///
+    /// After ``invalidate_block`` + ``reconsider_block``, the FAILED flags
+    /// on the previously-active blocks are cleared but the chain tip is
+    /// still at the rolled-back height. This walks forward from the
+    /// current tip, reconnecting each stored block in height order until
+    /// we reach the highest-chainwork valid leaf — Bitcoin Core's
+    /// ``ActivateBestChain`` analog.
+    ///
+    /// Used by ``rpc_dumptxoutset`` to put the chain back at its original
+    /// tip after a temporary rollback for snapshot dumping.
+    ///
+    /// # Returns
+    /// The height of the chain tip after re-activation. Equal to the
+    /// input tip height if no reactivation was needed (chain already at
+    /// best-work tip). Greater than input tip if blocks were reconnected.
+    ///
+    /// # Reference
+    /// Bitcoin Core: validation.cpp `CChainState::ActivateBestChain()`
+    /// and `FindMostWorkChain()`.
+    fn reactivate_best_chain(&self) -> PyResult<u32> {
+        self.db.reactivate_best_chain().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to reactivate best chain: {}", e)
+            )
+        })
+    }
+
     /// Check if a block at a given height is marked as invalid.
     ///
     /// Returns True if the block has BLOCK_FAILED_VALID or BLOCK_FAILED_CHILD
