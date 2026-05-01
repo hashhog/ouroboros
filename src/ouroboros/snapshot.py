@@ -48,6 +48,50 @@ from .muhash import MuHash3072, coin_element
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# HashWriter (CHash256 / SHA256d) -- streaming double-SHA256, mirrors
+# bitcoin-core/src/hash.h::HashWriter.
+#
+# Core's `loadtxoutset` strict assumeUTXO gate hashes the UTXO set using
+# `CoinStatsHashType::HASH_SERIALIZED`, which feeds TxOutSer bytes into a
+# single CSHA256 context and then double-SHA256s the digest at the end
+# (validation.cpp:5902-5915, kernel/coinstats.cpp:161-163, hash.h:115-120).
+#
+# The streaming class lets us hash coins as they arrive in a snapshot
+# without materializing the full coin list. Order-sensitive: the snapshot
+# wire format already iterates (txid asc, vout asc), which is the same
+# order Core's CCoinsViewCursor walks the leveldb cursor.
+# ---------------------------------------------------------------------------
+
+
+class HashWriter:
+    """Streaming SHA256d hasher matching Core's HashWriter::GetHash().
+
+    Internal state is a single SHA-256 context; ``digest()`` finalizes
+    that context and runs SHA-256 over the result (CHash256). Used by
+    Core's `loadtxoutset` strict commitment check on the UTXO set.
+    """
+
+    __slots__ = ("_ctx",)
+
+    def __init__(self) -> None:
+        self._ctx = hashlib.sha256()
+
+    def update(self, data: bytes) -> "HashWriter":
+        self._ctx.update(data)
+        return self
+
+    def digest(self) -> bytes:
+        """Compute SHA256d (double-SHA256) over the buffered input.
+
+        Mirrors `HashWriter::GetHash` (hash.h:115-120):
+            ctx.Finalize -> sha256.Reset.Write(result).Finalize
+        """
+        first = self._ctx.digest()
+        return hashlib.sha256(first).digest()
+
+
 # Snapshot format constants -- match SNAPSHOT_MAGIC_BYTES + VERSION in Core.
 SNAPSHOT_MAGIC = b"utxo\xff"
 SNAPSHOT_VERSION = 2
@@ -692,13 +736,19 @@ class SnapshotManager:
         `loadtxoutset` exactly.
 
         When ``strict=True`` (default) and assumeUTXO data is available,
-        we run the post-load MuHash3072 commitment check that mirrors
-        ``validation.cpp:5912-5914``: if the rolling MuHash over the
-        coins in the snapshot does not match the
-        ``AssumeutxoData.hash_serialized`` published in chainparams,
-        the load is rejected. This is the same gate Core's
-        ``loadtxoutset`` RPC enforces before accepting a snapshot as
-        the active chainstate.
+        we run the post-load SHA256d commitment check that mirrors
+        ``validation.cpp:5902-5915``: Core hashes the loaded UTXO set
+        with ``CoinStatsHashType::HASH_SERIALIZED`` (a ``HashWriter``
+        feeding ``TxOutSer`` bytes, double-SHA256 finalize -- see
+        kernel/coinstats.cpp:161-163 + hash.h:115-120) and rejects the
+        snapshot if the digest does not match
+        ``AssumeutxoData.hash_serialized`` from chainparams. We do the
+        same: a streaming HashWriter accumulates bytes as the snapshot
+        coins are deserialized in (txid, vout) order (the snapshot's
+        canonical wire order, matching CCoinsViewCursor's leveldb walk).
+
+        The MuHash3072 path is the gettxoutsetinfo digest, NOT what
+        loadtxoutset enforces -- see compute_utxo_hash(hash_type=...).
         """
         with open(snapshot_path, "rb") as f:
             metadata = _read_metadata_header(f, self.network)
@@ -716,9 +766,13 @@ class SnapshotManager:
                 f"[snapshot] Loading snapshot at height {height} with {metadata.coins_count:,} coins"
             )
 
-            # Rolling MuHash3072 over coins as we stream them in. Mirrors
-            # Core's MUHASH path through ApplyCoinHash (kernel/coinstats.cpp:58).
-            muhash = MuHash3072()
+            # Streaming SHA256d (HashWriter) over coins as we deserialize
+            # them. Mirrors Core's HASH_SERIALIZED path through
+            # ApplyCoinHash (kernel/coinstats.cpp:53-56), which is what
+            # loadtxoutset's strict gate uses (validation.cpp:5902-5915).
+            # The wire format already iterates (txid asc, vout asc), the
+            # same order Core's CCoinsViewCursor walks.
+            hasher = HashWriter()
 
             coins_left = metadata.coins_count
             coins_loaded = 0
@@ -746,7 +800,7 @@ class SnapshotManager:
                         is_coinbase=is_coinbase,
                     )
 
-                    muhash.insert(
+                    hasher.update(
                         coin_element(
                             txid=txid,
                             vout=vout,
@@ -765,7 +819,7 @@ class SnapshotManager:
 
         # Strict commitment check (validation.cpp:5912-5914). Only enforced
         # when chainparams ship a hash for this snapshot height.
-        computed = muhash.digest()
+        computed = hasher.digest()
         if strict and au_data is not None:
             if computed != au_data.hash_serialized:
                 raise ValueError(
@@ -774,13 +828,13 @@ class SnapshotManager:
                     f"{computed[::-1].hex()}"
                 )
             logger.info(
-                f"[snapshot] MuHash3072 commitment OK at height {height} "
+                f"[snapshot] HASH_SERIALIZED commitment OK at height {height} "
                 f"({computed[::-1].hex()})"
             )
         elif au_data is None:
             logger.warning(
                 "[snapshot] No assumeUTXO commitment available for "
-                f"{metadata.base_blockhash_hex()}; skipping MuHash check"
+                f"{metadata.base_blockhash_hex()}; skipping commitment check"
             )
 
         # Update database best block to snapshot tip.
@@ -822,16 +876,17 @@ class SnapshotManager:
                     if progress_callback:
                         progress_callback(height, target_height)
 
-                # After reaching target height, recompute the MuHash3072
-                # commitment over the live UTXO set and compare against
-                # the assumeUTXO chainparams entry. Mirrors validation.cpp's
-                # post-load assertion (lines 5912-5914), but here it runs
-                # against the chainstate as rebuilt during background IBD,
-                # so it doubles as an end-of-IBD audit.
+                # After reaching target height, recompute the
+                # HASH_SERIALIZED (SHA256d) commitment over the live
+                # UTXO set and compare against the assumeUTXO chainparams
+                # entry. Mirrors validation.cpp's post-load assertion
+                # (lines 5902-5915), but here it runs against the
+                # chainstate as rebuilt during background IBD, so it
+                # doubles as an end-of-IBD audit.
                 au_data = get_assumeutxo_by_hash(self.network, self.snapshot_hash)
                 if au_data is not None:
                     try:
-                        digest = compute_utxo_hash(self.db, hash_type="muhash")
+                        digest = compute_utxo_hash(self.db, hash_type="hash_serialized")
                     except Exception as e:
                         logger.error(
                             f"[snapshot] Background validation: digest failed: {e}"
@@ -841,7 +896,7 @@ class SnapshotManager:
                     if digest == au_data.hash_serialized:
                         logger.info(
                             f"[snapshot] Background validation OK at height {target_height} "
-                            f"(MuHash3072={digest[::-1].hex()})"
+                            f"(HASH_SERIALIZED={digest[::-1].hex()})"
                         )
                         self.background_validated = True
                     else:
@@ -937,26 +992,27 @@ class SnapshotManager:
         }
 
 
-def compute_utxo_hash(db, hash_type: str = "muhash") -> bytes:
+def compute_utxo_hash(db, hash_type: str = "hash_serialized") -> bytes:
     """
     Compute a deterministic 32-byte digest over the UTXO set.
 
-    Two hash types are supported:
+    Two hash types are supported, mirroring Core's
+    ``CoinStatsHashType`` (kernel/coinstats.cpp::ComputeUTXOStats):
 
-    - ``"muhash"`` (default): Core's MuHash3072 over the same per-coin
-      element used in ``kernel/coinstats.cpp::TxOutSer`` (outpoint ||
-      (height<<1)+coinbase || TxOut). Order-independent, so this matches
-      Core regardless of iteration order. The returned 32 bytes are the
-      raw SHA-256 output of MuHash3072::Finalize -- byte-reverse for
-      display/uint256 hex.
+    - ``"hash_serialized"`` (default): SHA256d via ``HashWriter`` over
+      ``TxOutSer`` bytes for each coin in (txid, vout) order. This is
+      what Core's ``loadtxoutset`` uses for the strict assumeUTXO
+      commitment check (validation.cpp:5902-5915), and what the
+      published ``AssumeutxoData.hash_serialized`` chainparams entries
+      contain. Bytes returned are internal byte order; reverse for
+      uint256 display hex.
 
-    - ``"hash_serialized"``: legacy SHA-256 over the same coin
-      serialization in (txid, vout) order. Useful as a stable
-      cross-run digest when MuHash is not desired. ``loadtxoutset``
-      strict validation uses this in Core (validation.cpp:5902-5903),
-      but assumeUTXO commitments published in chainparams are MuHash
-      (CoinStatsHashType::MUHASH), so prefer the default for
-      assumeUTXO comparison.
+    - ``"muhash"``: MuHash3072 over the same per-coin element. Matches
+      Core's ``gettxoutsetinfo hash_type=muhash`` path. Order-independent
+      (multiplicative incremental hash).
+
+    Matches Core's ``ComputeUTXOStats`` switch on ``CoinStatsHashType``
+    (kernel/coinstats.cpp:160-172).
     """
     if hash_type == "muhash":
         muhash = MuHash3072()
@@ -978,7 +1034,10 @@ def compute_utxo_hash(db, hash_type: str = "muhash") -> bytes:
             f"expected 'muhash' or 'hash_serialized'"
         )
 
-    hasher = hashlib.sha256()
+    # SHA256d via HashWriter, fed in canonical (txid, vout) order so that
+    # the digest matches what Core computes when its CCoinsViewCursor
+    # walks the leveldb sorted by (txid, vout).
+    hasher = HashWriter()
     utxos = list(db.iter_utxos())
     utxos.sort(key=lambda u: (u.txid, u.vout))
     for utxo in utxos:
