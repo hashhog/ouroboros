@@ -256,9 +256,80 @@ def test_compress_script_overlong_rejected() -> None:
         write_compressed_script(buf, script)
 
 
-def test_decompress_script_uncompressed_p2pk_unsupported() -> None:
-    with pytest.raises(NotImplementedError):
-        decompress_script(0x04, bytes(32))
+def test_decompress_script_uncompressed_p2pk_generator_point() -> None:
+    """
+    Tag 0x04/0x05 must recover the full 65-byte uncompressed pubkey via
+    secp256k1, matching `bitcoin-core/src/compressor.cpp::DecompressScript`.
+
+    Vector: secp256k1 generator point G.
+      Gx = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+      Gy = 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8
+      Compressed (y even) -> 0x02 || Gx     -> wire tag 0x04
+      Uncompressed        -> 0x04 || Gx || Gy
+      Output script       -> 0x41 || pubkey65 || 0xac (67 bytes total)
+    """
+    gx = bytes.fromhex(
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    )
+    gy_even = bytes.fromhex(
+        "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"
+    )
+    # Tag 0x04 = compressed prefix 0x02 (y even)
+    decoded = decompress_script(0x04, gx)
+    assert len(decoded) == 67
+    assert decoded[0] == 65
+    assert decoded[1] == 0x04
+    assert decoded[2:34] == gx
+    assert decoded[34:66] == gy_even
+    assert decoded[66] == _OP_CHECKSIG
+
+    # Tag 0x05 = compressed prefix 0x03 (y odd) -> mirror y -> p - y
+    # secp256k1 field prime p
+    p = (1 << 256) - (1 << 32) - 0x3D1
+    gy_odd_int = p - int.from_bytes(gy_even, "big")
+    gy_odd = gy_odd_int.to_bytes(32, "big")
+    decoded_odd = decompress_script(0x05, gx)
+    assert len(decoded_odd) == 67
+    assert decoded_odd[0] == 65
+    assert decoded_odd[1] == 0x04
+    assert decoded_odd[2:34] == gx
+    assert decoded_odd[34:66] == gy_odd
+    assert decoded_odd[66] == _OP_CHECKSIG
+
+
+def test_decompress_script_uncompressed_p2pk_off_curve_fails_closed() -> None:
+    """An x-coordinate that is not on the secp256k1 curve must fail closed."""
+    # x = 5: y^2 = 132 mod p is a quadratic non-residue, no valid y exists.
+    bad_x = (5).to_bytes(32, "big")
+    with pytest.raises(ValueError):
+        decompress_script(0x04, bad_x)
+    with pytest.raises(ValueError):
+        decompress_script(0x05, bad_x)
+
+
+def test_decompress_script_uncompressed_p2pk_wrong_size() -> None:
+    with pytest.raises(ValueError):
+        decompress_script(0x04, bytes(31))
+    with pytest.raises(ValueError):
+        decompress_script(0x05, bytes(33))
+
+
+def test_decompress_script_uncompressed_p2pk_round_trip_via_read() -> None:
+    """
+    Going through `write_varint(tag) + body` must produce the same 67-byte
+    P2PK script as `decompress_script` directly. Exercises the wire-level
+    `read_compressed_script` path that `loadtxoutset` actually hits.
+    """
+    gx = bytes.fromhex(
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    )
+    buf = io.BytesIO()
+    write_varint(buf, 0x04)
+    buf.write(gx)
+    buf.seek(0)
+    decoded = read_compressed_script(buf)
+    assert decoded == decompress_script(0x04, gx)
+    assert len(decoded) == 67
 
 
 # ---------------------------------------------------------------------------
