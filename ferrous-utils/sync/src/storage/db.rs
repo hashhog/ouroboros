@@ -1768,8 +1768,19 @@ impl BlockchainDB {
                 }
             }
 
-            // Add outputs (including OP_RETURN — apply_block stores them).
+            // Add outputs.  Skip provably unspendable outputs
+            // (OP_RETURN / oversize scriptPubKey) per Core's
+            // `CScript::IsUnspendable` (script.h:563-566) so the
+            // chainstate matches what `dumptxoutset` emits — must
+            // mirror `apply_block` / `connect_block_from_bytes`.
             for (vout, output) in tx.output.iter().enumerate() {
+                let script = output.script_pubkey.as_bytes();
+                let is_unspendable =
+                    (!script.is_empty() && script[0] == 0x6a /* OP_RETURN */)
+                    || script.len() > 10_000 /* MAX_SCRIPT_SIZE */;
+                if is_unspendable {
+                    continue;
+                }
                 let outpoint = bitcoin::OutPoint { txid, vout: vout as u32 };
                 let utxo = UTXO::new(
                     common::OutPointWrapper::new(outpoint),
