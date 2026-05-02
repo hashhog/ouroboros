@@ -2712,11 +2712,18 @@ fn decompress_amount(mut x: u64) -> u64 {
 }
 
 /// Inverse of Core's `ScriptCompression::Ser`. Mirrors the special-script
-/// table from `bitcoin-core/src/compressor.cpp::DecompressScript`. Tags
-/// 0x04/0x05 (uncompressed-key P2PK) require pubkey decompression and are
-/// not yet supported here -- the function errors if it sees one. P2PKH,
-/// P2SH, and compressed-key P2PK round-trip cleanly; the raw-fallback path
-/// covers everything else (segwit / taproot / nonstandard).
+/// table from `bitcoin-core/src/compressor.cpp::DecompressScript`.
+///
+/// Tag table:
+///   0x00 - P2PKH (20-byte hash160)        -> 25-byte standard P2PKH
+///   0x01 - P2SH  (20-byte hash160)        -> 23-byte standard P2SH
+///   0x02/0x03 - compressed-key P2PK       -> 35-byte P2PK with 33-byte pubkey
+///   0x04/0x05 - uncompressed-key P2PK     -> 67-byte P2PK with 65-byte pubkey
+///                (y-coordinate recovered via secp256k1; tag - 2 yields the
+///                compressed-form sign byte 0x02/0x03 and we round-trip
+///                through `secp256k1_ec_pubkey_parse` then serialize
+///                uncompressed).
+/// Raw-fallback path covers everything else (segwit / taproot / nonstandard).
 fn read_compressed_script<R: std::io::Read>(r: &mut R) -> Result<Vec<u8>, String> {
     let n_size = read_varint(r)?;
     if n_size < SNAPSHOT_N_SPECIAL_SCRIPTS {
@@ -2749,10 +2756,33 @@ fn read_compressed_script<R: std::io::Read>(r: &mut R) -> Result<Vec<u8>, String
                 out.push(0xac);
                 Ok(out)
             }
-            0x04 | 0x05 => Err(
-                "decompress_script: P2PK uncompressed-key forms (tag 0x04/0x05) require \
-                 secp256k1 pubkey decompression; not yet implemented".to_string(),
-            ),
+            0x04 | 0x05 => {
+                // Uncompressed-key P2PK. Mirrors compressor.cpp:122-135:
+                //   vch = (nSize - 2) || x[32]      // 33-byte compressed form
+                //   pubkey.Decompress()              // -> 65-byte uncompressed
+                //   script = 0x41 || pubkey[65] || 0xac
+                let mut x32 = [0u8; 32];
+                r.read_exact(&mut x32)
+                    .map_err(|e| format!("EOF P2PK uncomp x: {}", e))?;
+                let mut compressed = [0u8; 33];
+                compressed[0] = (n_size as u8) - 2; // 0x02 or 0x03
+                compressed[1..].copy_from_slice(&x32);
+                let uncompressed =
+                    common::crypto::secp::uncompress_pubkey(&compressed).map_err(|e| {
+                        format!(
+                            "decompress_script: P2PK uncompressed-key (tag {:#x}): \
+                             secp256k1 decompress failed: {}",
+                            n_size, e
+                        )
+                    })?;
+                debug_assert_eq!(uncompressed.len(), 65);
+                debug_assert_eq!(uncompressed[0], 0x04);
+                let mut out = Vec::with_capacity(67);
+                out.push(65);
+                out.extend_from_slice(&uncompressed);
+                out.push(0xac);
+                Ok(out)
+            }
             _ => Err(format!("decompress_script: unknown special tag {}", n_size)),
         }
     } else {
@@ -4769,5 +4799,43 @@ mod tests {
 
         let py_utxo = PyUTXO::from(&utxo);
         assert_eq!(py_utxo.script_pubkey, script_bytes);
+    }
+
+    /// secp256k1 generator point G fed through tag 0x04 must yield the full
+    /// 67-byte uncompressed P2PK script. Mirrors Core's
+    /// `bitcoin-core/src/compressor.cpp::DecompressScript` cases 0x04/0x05.
+    #[test]
+    fn test_read_compressed_script_uncompressed_p2pk_generator() {
+        let gx =
+            hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
+        let gy_even =
+            hex::decode("483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")
+                .unwrap();
+
+        // wire = VARINT(0x04) || x32  (VARINT of 4 = single byte 0x04)
+        let mut wire = vec![0x04u8];
+        wire.extend_from_slice(&gx);
+        let mut cur = std::io::Cursor::new(wire);
+        let decoded = read_compressed_script(&mut cur).expect("tag 0x04 must decode");
+        assert_eq!(decoded.len(), 67);
+        assert_eq!(decoded[0], 65);
+        assert_eq!(decoded[1], 0x04);
+        assert_eq!(&decoded[2..34], gx.as_slice());
+        assert_eq!(&decoded[34..66], gy_even.as_slice());
+        assert_eq!(decoded[66], 0xac);
+    }
+
+    /// Off-curve x-coordinate (x=5, y² = 132 ≡ non-residue mod p) must fail
+    /// closed; mirrors Core's `pubkey.Decompress()` returning false in
+    /// compressor.cpp:128-129.
+    #[test]
+    fn test_read_compressed_script_uncompressed_p2pk_off_curve_fails() {
+        let mut bad = vec![0x04u8];
+        bad.extend_from_slice(&[0u8; 31]);
+        bad.push(0x05); // x = 5, off-curve on secp256k1
+        let mut cur = std::io::Cursor::new(bad);
+        let result = read_compressed_script(&mut cur);
+        assert!(result.is_err(), "off-curve x must fail closed");
     }
 }
