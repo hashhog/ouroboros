@@ -485,6 +485,81 @@ impl BlockchainDB {
         Ok(())
     }
 
+    /// Walk every entry in `CHAINSTATE_CF` and delete any whose
+    /// `script_pubkey` is provably unspendable (OP_RETURN / oversize) per
+    /// `validate::block::is_unspendable_script` (mirrors Core's
+    /// `CScript::IsUnspendable`).
+    ///
+    /// Operator-invoked one-shot scrub. Used to clean orphan OP_RETURN
+    /// outputs left in the on-disk chainstate by pre-fix code paths
+    /// (notably the segwit-coinbase witness commitment) so the live
+    /// datadir matches what `dumptxoutset` would emit byte-for-byte after
+    /// the write-time filter landed in `apply_block` /
+    /// `connect_block_from_bytes` / `connect_block_at_height`.
+    ///
+    /// Returns `(removed_count, bytes_freed)` where `bytes_freed` is the
+    /// summed size of the deleted (key + value) payloads — an approximate
+    /// floor on reclaimable space (RocksDB reclaims lazily via
+    /// background compaction).
+    ///
+    /// Idempotent: a second call after a successful scrub returns
+    /// `(0, 0)` because the write-time filter prevents new orphans from
+    /// being added.
+    ///
+    /// Deletes are committed in chunks via `WriteBatch` so a 100M-entry
+    /// chainstate does not balloon into a single batch.
+    pub fn scrub_unspendable_coins(&self) -> Result<(u64, u64)> {
+        const COMMIT_EVERY: usize = 50_000;
+
+        let cf = self.db
+            .cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+
+        let mut removed: u64 = 0;
+        let mut bytes_freed: u64 = 0;
+        let mut batch = WriteBatch::default();
+        let mut pending: usize = 0;
+
+        let iter = self.db.iterator_cf(cf, IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item.map_err(DbError::RocksDb)?;
+            // Only the 36-byte (txid || vout) layout is a chainstate
+            // coin; defensively skip anything else.
+            if key.len() != 36 {
+                continue;
+            }
+
+            // Deserialize just enough to inspect script_pubkey.
+            let utxo = match UTXO::bitcoin_deserialize(&value) {
+                Ok((u, _)) => u,
+                Err(_) => continue, // unparseable -> leave alone, log noise avoided
+            };
+
+            if !crate::validate::block::is_unspendable_script(
+                utxo.script_pubkey.as_bytes(),
+            ) {
+                continue;
+            }
+
+            batch.delete_cf(cf, &key);
+            removed += 1;
+            bytes_freed += (key.len() + value.len()) as u64;
+            pending += 1;
+
+            if pending >= COMMIT_EVERY {
+                let drained = std::mem::replace(&mut batch, WriteBatch::default());
+                self.db.write(drained)?;
+                pending = 0;
+            }
+        }
+
+        if pending > 0 {
+            self.db.write(batch)?;
+        }
+
+        Ok((removed, bytes_freed))
+    }
+
     /// Expose the inner Arc<DB> for direct WriteBatch operations (e.g. bulk import).
     pub fn raw_db(&self) -> &Arc<DB> {
         &self.db
