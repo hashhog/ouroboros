@@ -332,6 +332,16 @@ class BlockSync:
         self._blk_validate_rejected: int = 0
         self._blk_connect_failed: int = 0
         self._last_tip_advance: float = time.time()
+
+        # Permanent reject set: hashes of blocks whose validation deterministically
+        # failed (NOT including transient "Previous block not found").  When peers
+        # redeliver a perm-rejected block, handle_block drops it without re-buffering
+        # so we don't spin retrying the same bad bytes.  Capped at
+        # ``_perm_rejected_max`` entries (FIFO eviction) to bound memory.
+        self._perm_rejected_blocks: set[bytes] = set()
+        self._perm_rejected_order: list[bytes] = []
+        self._perm_rejected_max: int = 10000
+        self._blk_perm_rejected_dropped: int = 0
         # Fire WARN once per _wedge_warn_every if no-advance > _wedge_warn_after.
         self._wedge_warn_after: float = 300.0
         self._wedge_warn_every: float = 300.0
@@ -340,6 +350,18 @@ class BlockSync:
     def set_zmq_publisher(self, publisher) -> None:
         """Attach a ZMQPublisher for real-time block/tx notifications."""
         self._zmq_publisher = publisher
+
+    def _mark_perm_rejected(self, block_hash: bytes) -> None:
+        """Add *block_hash* to the permanent-reject set, evicting the oldest
+        entry once the set is full.  Idempotent: re-adding an existing hash
+        does not advance the FIFO position."""
+        if block_hash in self._perm_rejected_blocks:
+            return
+        if len(self._perm_rejected_order) >= self._perm_rejected_max:
+            evicted = self._perm_rejected_order.pop(0)
+            self._perm_rejected_blocks.discard(evicted)
+        self._perm_rejected_blocks.add(block_hash)
+        self._perm_rejected_order.append(block_hash)
 
     async def start(self):
         """Start block synchronization"""
@@ -683,6 +705,18 @@ class BlockSync:
                 self._blk_duplicate += 1
                 return
 
+            # Permanently rejected on a prior validation pass?  Drop without
+            # re-buffering and dock the redelivering peer.  Without this guard,
+            # peer redeliveries of the same bad bytes spin the drain loop.
+            if block_hash in self._perm_rejected_blocks:
+                self._blk_perm_rejected_dropped += 1
+                logger.debug(
+                    f"Dropping perm-rejected block {block_hash.hex()[:16]}... "
+                    f"redelivered from {peer.host}:{peer.port}"
+                )
+                peer.adjust_score(-5)
+                return
+
             # Buffer the raw payload (keyed by hash) for sequential
             # processing.  `None` sentinel means "not yet deserialized" —
             # the drainer will deserialize lazily in a worker thread when it
@@ -1001,9 +1035,14 @@ class BlockSync:
                 # can try again once the parent has been connected.
                 # Any other validation error is a permanent failure: the block
                 # bytes are bogus (sent by a misbehaving peer).  Drop it so
-                # the timeout handler re-fetches from a different peer.
+                # the timeout handler re-fetches from a different peer, and
+                # add the hash to ``_perm_rejected_blocks`` so subsequent
+                # redeliveries from any peer get dropped at handle_block
+                # without a fresh deserialize / validate cycle.
                 if error == "Previous block not found":
                     self._ibd_block_buffer[next_hash] = (block, raw_payload)
+                else:
+                    self._mark_perm_rejected(next_hash)
                 break
 
             # Connect block
