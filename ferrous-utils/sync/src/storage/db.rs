@@ -75,7 +75,12 @@ impl BlockchainDB {
         opts.set_min_write_buffer_number_to_merge(2);
         opts.set_target_file_size_base(128 * 1024 * 1024); // 128MB
         opts.set_max_bytes_for_level_base(512 * 1024 * 1024); // 512MB
-        opts.set_max_open_files(512);
+        // Bumped 512 → 16384 to reduce SST mmap churn during IBD.  Each
+        // open file consumes ~1 FD; 16k is safe under maxbox's
+        // ulimit -n 524288.  At 512 the 18k+ chainstate SSTs were being
+        // constantly evicted and re-mmaped, producing page-cache D-state
+        // hangs in heavy IBD.
+        opts.set_max_open_files(16384);
         opts.increase_parallelism(num_cpus::get() as i32);
         opts.optimize_for_point_lookup(1024); // 1GB block cache (up from 10MB)
 
