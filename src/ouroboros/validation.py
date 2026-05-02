@@ -732,6 +732,13 @@ class BlockValidator:
         commitment = self._find_witness_commitment(block.transactions[0])
 
         if has_witness and commitment is None:
+            logger.error(
+                "[diag] _validate_witness_commitment FAIL h=%d: has_witness=True but "
+                "no OP_RETURN+0xaa21a9ed commitment found in coinbase outputs "
+                "(coinbase has %d outputs)",
+                height,
+                len(block.transactions[0].outputs),
+            )
             return False, "Block has witness data but no witness commitment"
 
         if commitment is not None and has_witness:
@@ -739,6 +746,13 @@ class BlockValidator:
             coinbase_input = block.transactions[0].inputs[0]
             witness = coinbase_input.witness or []
             if len(witness) != 1 or len(witness[0]) != 32:
+                logger.error(
+                    "[diag] _validate_witness_commitment FAIL h=%d: coinbase witness "
+                    "len=%d (expected 1), item0_len=%d (expected 32)",
+                    height,
+                    len(witness),
+                    len(witness[0]) if witness else -1,
+                )
                 return False, "Coinbase witness nonce must be a single 32-byte item"
 
             nonce = witness[0]
@@ -747,6 +761,37 @@ class BlockValidator:
                 hashlib.sha256(witness_root + nonce).digest()
             ).digest()
             if expected != commitment:
+                # Diagnostic: dump expected vs computed and the first few wtxids/witness
+                # summaries so the next IBD pass surfaces the actual divergence.
+                wtxids_preview = [
+                    bytes(32).hex() if i == 0 else block.transactions[i].get_wtxid().hex()
+                    for i in range(min(5, len(block.transactions)))
+                ]
+                witness_summary = []
+                for i, tx in enumerate(block.transactions[:5]):
+                    if tx.has_witness:
+                        per_input = []
+                        for tin in tx.inputs:
+                            wlist = tin.witness or []
+                            per_input.append(
+                                f"items={len(wlist)} bytes={sum(len(w) for w in wlist)}"
+                            )
+                        witness_summary.append(f"tx{i}:[{','.join(per_input)}]")
+                    else:
+                        witness_summary.append(f"tx{i}:none")
+                logger.error(
+                    "[diag] _validate_witness_commitment FAIL h=%d: "
+                    "commitment_in_coinbase=%s computed=%s witness_root=%s "
+                    "nonce=%s n_tx=%d wtxids[:5]=%s witness[:5]=%s",
+                    height,
+                    commitment.hex(),
+                    expected.hex(),
+                    witness_root.hex(),
+                    nonce.hex(),
+                    len(block.transactions),
+                    wtxids_preview,
+                    witness_summary,
+                )
                 return False, "Witness commitment mismatch"
 
         return True, ""
@@ -755,23 +800,50 @@ class BlockValidator:
         """Validate coinbase transaction."""
         # Check it's actually a coinbase
         if not tx.is_coinbase:
+            logger.error(
+                "[diag] _validate_coinbase FAIL h=%d: tx.is_coinbase=False "
+                "(n_inputs=%d, first.prev_txid=%s)",
+                height,
+                len(tx.inputs),
+                tx.inputs[0].prev_txid.hex() if tx.inputs else "<no inputs>",
+            )
             return False
 
         # Check coinbase input
         if len(tx.inputs) != 1:
+            logger.error(
+                "[diag] _validate_coinbase FAIL h=%d: n_inputs=%d (expected 1)",
+                height,
+                len(tx.inputs),
+            )
             return False
 
         coinbase_input = tx.inputs[0]
         if coinbase_input.prev_txid != bytes(32):
+            logger.error(
+                "[diag] _validate_coinbase FAIL h=%d: prev_txid=%s (expected all-zero)",
+                height,
+                coinbase_input.prev_txid.hex(),
+            )
             return False
 
         # Check coinbase has at least one output
         if len(tx.outputs) == 0:
+            logger.error(
+                "[diag] _validate_coinbase FAIL h=%d: zero outputs", height
+            )
             return False
 
         # Coinbase scriptSig must be 2-100 bytes (consensus rule)
         sig_len = len(coinbase_input.script_sig)
         if sig_len < 2 or sig_len > 100:
+            logger.error(
+                "[diag] _validate_coinbase FAIL h=%d: scriptSig len=%d (must be 2..100), "
+                "scriptSig=%s",
+                height,
+                sig_len,
+                coinbase_input.script_sig.hex(),
+            )
             return False
 
         # BIP34: coinbase scriptSig must start with the serialized block height
@@ -785,13 +857,38 @@ class BlockValidator:
                 # Height zero can use OP_0 (0x00), but for heights >= BIP34,
                 # push_size should be 1-4 bytes of CScriptNum encoding.
                 if not (height == 0 and push_size == 0):
+                    logger.error(
+                        "[diag] _validate_coinbase FAIL h=%d: BIP34 push_size=%d "
+                        "(must be 1..4); scriptSig=%s",
+                        height,
+                        push_size,
+                        script.hex(),
+                    )
                     return False
             if 1 + push_size > sig_len:
+                logger.error(
+                    "[diag] _validate_coinbase FAIL h=%d: BIP34 push_size=%d exceeds "
+                    "scriptSig len=%d; scriptSig=%s",
+                    height,
+                    push_size,
+                    sig_len,
+                    script.hex(),
+                )
                 return False
             # Decode the little-endian height from the push data
             height_bytes = script[1:1 + push_size]
             encoded_height = int.from_bytes(height_bytes, "little")
             if encoded_height != height:
+                logger.error(
+                    "[diag] _validate_coinbase FAIL h=%d: BIP34 encoded_height=%d "
+                    "expected=%d; push_size=%d height_bytes=%s scriptSig=%s",
+                    height,
+                    encoded_height,
+                    height,
+                    push_size,
+                    height_bytes.hex(),
+                    script.hex(),
+                )
                 return False
 
         return True
