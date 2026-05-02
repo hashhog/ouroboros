@@ -165,7 +165,7 @@ def _hex_to_hash_le(hex_str: str) -> bytes:
 # Source: bitcoin-core/src/kernel/chainparams.cpp m_assumeutxo_data.
 #
 # Mainnet  (CMainParams::m_assumeutxo_data):
-#   840000, 880000, 910000, 935000
+#   840000, 880000, 910000, 935000, 944183
 # Testnet3 (CTestNetParams::m_assumeutxo_data):
 #   2500000, 4840000
 # Testnet4 (CTestNet4Params::m_assumeutxo_data):
@@ -216,6 +216,19 @@ _MAINNET_ASSUMEUTXO: list[AssumeutxoData] = [
             "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"
         ),
         chain_tx_count=1_305_397_408,
+    ),
+    # Local snapshot at h=944183 (not from Core chainparams). Hash computed
+    # by canonical SHA256d hash_serialized over the dumped UTXO set.
+    # Display order of hash_serialized: 2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8
+    AssumeutxoData(
+        height=944_183,
+        block_hash=_hex_to_hash_le(
+            "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"
+        ),
+        hash_serialized=_hex_to_hash_le(
+            "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"
+        ),
+        chain_tx_count=1_334_000_000,
     ),
 ]
 
