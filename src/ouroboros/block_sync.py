@@ -363,6 +363,101 @@ class BlockSync:
         self._perm_rejected_blocks.add(block_hash)
         self._perm_rejected_order.append(block_hash)
 
+    # BIP34 activation height (mainnet).  Below this height the coinbase
+    # scriptSig is unconstrained; above it the first push must encode the
+    # block's height as little-endian CScriptNum.
+    _BIP34_ACTIVATION_HEIGHT = 227_931
+
+    @staticmethod
+    def _decode_bip34_height(coinbase_script_sig: bytes) -> int | None:
+        """Decode the BIP34-encoded height from a coinbase ``scriptSig``.
+
+        Returns ``None`` if the scriptSig does not match the BIP34 shape we
+        can decode (push-size 1..4, push fits within scriptSig).  This is
+        not a consensus check — callers compare against an expected height
+        and raise on mismatch.
+        """
+        if len(coinbase_script_sig) < 2:
+            return None
+        push_size = coinbase_script_sig[0]
+        if push_size < 1 or push_size > 4:
+            return None
+        if 1 + push_size > len(coinbase_script_sig):
+            return None
+        return int.from_bytes(coinbase_script_sig[1:1 + push_size], "little")
+
+    def _coinbase_height_mismatch(self, block, expected_height: int) -> bool:
+        """True if the block's BIP34-encoded coinbase height disagrees with
+        ``expected_height`` at heights where BIP34 is active.
+
+        This is a slot-alignment guard, not a script-level consensus check
+        (the validator does the full BIP34 enforcement).  A True here means
+        the block we are about to validate at slot N is not actually the
+        block at chain height N — the validated-header queue is corrupt.
+        """
+        if expected_height < self._BIP34_ACTIVATION_HEIGHT:
+            return False
+        try:
+            txs = getattr(block, "transactions", None)
+            if not txs:
+                return False
+            coinbase = txs[0]
+            inputs = getattr(coinbase, "inputs", None)
+            if not inputs:
+                return False
+            script_sig = inputs[0].script_sig
+        except (AttributeError, IndexError, TypeError):
+            return False
+        encoded = self._decode_bip34_height(script_sig)
+        if encoded is None:
+            # scriptSig isn't BIP34-decodable; let the validator handle it.
+            return False
+        return encoded != expected_height
+
+    def _handle_misaligned_block(
+        self, block_hash: bytes, expected_height: int, block
+    ) -> None:
+        """Recovery path when a buffered block's BIP34 height does not match
+        the slot we were about to validate it at.
+
+        The queue index is corrupt: slot 0 of ``_validated_headers`` is the
+        header of a block several heights above our actual chain tip, which
+        is what triggered the 938231 vs 938349 wedge after a
+        ``dumptxoutset`` rollback.  Discard the validated-header queue and
+        the IBD block buffer, clear in-flight tracking, and let the next
+        ``sync_loop`` tick rebuild the header chain from our real tip.
+
+        The block is NOT marked as ``_perm_rejected_blocks``: its bytes are
+        canonical mainnet data, just delivered at the wrong slot.  Marking
+        it permanently rejected would also discard valid future redeliveries
+        once the queue is realigned.
+        """
+        encoded = None
+        try:
+            encoded = self._decode_bip34_height(block.transactions[0].inputs[0].script_sig)
+        except Exception:
+            pass
+        logger.error(
+            "[slot-misalign] BIP34 height %s != expected slot %d for block "
+            "%s — rebuilding validated_headers from chain tip "
+            "(queue=%d, buffer=%d, in-flight=%d)",
+            encoded,
+            expected_height,
+            block_hash.hex()[:16],
+            len(self._validated_headers),
+            len(self._ibd_block_buffer),
+            len(self.requested_blocks),
+        )
+        self._validated_headers.clear()
+        self._ibd_block_buffer.clear()
+        self.requested_blocks.clear()
+        self._block_request_peer.clear()
+        # Reset the header-sync stall timer so sync_loop picks a fresh
+        # header sync peer immediately rather than waiting out the previous
+        # peer's stall window.
+        self._header_sync_peer = None
+        self._header_sync_time = 0.0
+
     async def start(self):
         """Start block synchronization"""
         if self.running:
@@ -825,6 +920,23 @@ class BlockSync:
             # seconds (Rust FFI + DB writes).  Running them in a thread lets
             # the event loop service RPC requests and peer messages meanwhile.
             new_height = current_height + 1
+
+            # Defensive BIP34 height-vs-slot sanity check.
+            # Decode the BIP34-encoded height from the coinbase scriptSig and
+            # confirm it matches the slot we're about to validate this block
+            # against.  A mismatch means our `_validated_headers` queue is
+            # misaligned (slot N is holding a header whose block-hash maps
+            # to a different chain height than tip+1).  This is the live
+            # 938231 vs 938349 wedge: peers correctly delivered the block
+            # whose hash sat at slot 0 in our queue, but that hash was the
+            # NEXT chain-tip after a disconnected old chain — not tip+1.
+            # When this fires, the slot index is corrupt — drop the
+            # validated_headers queue and request fresh headers rather than
+            # spinning the drain loop and starving the connect path.
+            if self._coinbase_height_mismatch(block, new_height):
+                self._handle_misaligned_block(next_hash, new_height, block)
+                break
+
             t_val = time.perf_counter_ns()
 
             # B3 Stage 1: Rust validate fast path (default-on as of the
@@ -1194,15 +1306,28 @@ class BlockSync:
             for header in headers_msg.headers:
                 block_hash = self._header_to_block_hash(header)
 
-                # Skip headers we already have in the DB.
-                if self.db.has_block_hash(block_hash):
-                    expected_prev = block_hash
-                    continue
-
-                # Skip duplicates already in our validated queue.
+                # Skip duplicates already in our validated queue.  This is
+                # safe because such hashes were chain-validated when first
+                # appended; advancing expected_prev preserves slot ordering.
                 if block_hash in known_hashes:
                     expected_prev = block_hash
                     continue
+
+                # NOTE: do NOT skip on `db.has_block_hash(block_hash)` here.
+                # `BLOCKS_CF` retains every block we have ever received — it
+                # is NOT pruned to the active chain when a block is
+                # disconnected (e.g. by a `dumptxoutset` rollback or a reorg).
+                # Skipping orphaned-but-stored headers and advancing
+                # expected_prev along the OLD chain causes _validated_headers
+                # slot 0 to become a header several blocks past our actual
+                # tip: when block download then proceeds, the peer (correctly)
+                # delivers a block whose BIP34 height does not match the slot
+                # we requested it for, and validation rejects it with
+                # "Invalid coinbase" forever.  See the 938231 vs 938349 wedge
+                # in /data/nvme1/hashhog-mainnet/logs/ouroboros.log on
+                # 2026-05-02 for the live manifestation.  Chain-prev
+                # validation below catches all the cases the old skip was
+                # papering over.
 
                 # Validate chain continuity: header must extend expected_prev.
                 header_prev = header.prev_blockhash if hasattr(header, 'prev_blockhash') else None
