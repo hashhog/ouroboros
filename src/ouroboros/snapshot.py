@@ -438,10 +438,10 @@ def decompress_amount(x: int) -> int:
 #              -- requires libsecp256k1 to round-trip; we only emit the raw
 #              fallback for these in honest-progress mode (TODO below).
 #
-# Read side: same. For 0x04/0x05 we lack a pubkey decompression primitive in
-# pure Python (would need secp256k1), so we raise an explicit error if a
-# Core-compressed snapshot ever feeds us one. P2PKH/P2SH/P2PK-compressed
-# round-trip cleanly.
+# Read side: same. Tags 0x04/0x05 (uncompressed-key P2PK) are handled by
+# round-tripping through libsecp256k1 (via `coincurve`) to recover the full
+# y-coordinate, matching Core's `pubkey.Decompress()` path. P2PKH/P2SH/P2PK
+# (compressed) round-trip cleanly without any external dependency.
 # ---------------------------------------------------------------------------
 
 
@@ -476,11 +476,13 @@ def compress_script(script: bytes) -> bytes | None:
     `script` does not match any recognized template. The returned body
     starts with the 1-byte tag (0x00..0x05).
 
-    Note: for 0x04/0x05 (uncompressed-key P2PK) we'd need to compress the
-    pubkey via secp256k1 to recover the full 65-byte form on read. We do
-    not yet implement that path, so we fall through to raw encoding for
-    uncompressed-key P2PK. P2PKH, P2SH, and compressed-key P2PK are fully
-    supported. (TODO: hook libsecp256k1 to enable 0x04/0x05 emission.)
+    Note: tags 0x04/0x05 (uncompressed-key P2PK on the wire) are fully
+    supported on the *read* side (`decompress_script` recovers the full
+    pubkey via libsecp256k1). On the write side we currently fall through
+    to raw encoding for 67-byte uncompressed-key P2PK -- this is a Core
+    parity gap when ouroboros emits its own snapshots, but does not block
+    `loadtxoutset` against Core dumps (which is the consumer of this code).
+    TODO: emit tag 0x04|(y&1) || x32 for 67-byte uncompressed P2PK.
     """
     ok, h160 = _is_p2pkh(script)
     if ok:
@@ -502,9 +504,14 @@ def decompress_script(tag: int, body: bytes) -> bytes:
     """
     Reverse of compress_script for a given tag (0x00..0x05) and body bytes.
 
-    Raises ValueError if the tag is unknown or the body has the wrong size,
-    or NotImplementedError for tags 0x04/0x05 (would require secp256k1
-    pubkey decompression).
+    Mirrors `bitcoin-core/src/compressor.cpp::DecompressScript`. For tags
+    0x04/0x05 the body holds the x-coordinate of an uncompressed-key P2PK
+    output; the full 65-byte pubkey is recovered via libsecp256k1 (the
+    compressed form `(tag - 2) || x[32]` is parsed and then re-serialized
+    uncompressed). Fails closed (ValueError) on an x-coordinate that is
+    not on the curve.
+
+    Raises ValueError if the tag is unknown or the body has the wrong size.
     """
     if tag == 0x00:
         if len(body) != 20:
@@ -521,13 +528,37 @@ def decompress_script(tag: int, body: bytes) -> bytes:
         pubkey = bytes([tag]) + body
         return bytes([33]) + pubkey + bytes([_OP_CHECKSIG])
     if tag in (0x04, 0x05):
-        # Would require secp256k1 to recover the y-coordinate of the pubkey.
-        # Snapshots that contain uncompressed-key P2PK outputs are very rare
-        # post-segwit; punt explicitly so the caller knows.
-        raise NotImplementedError(
-            "decompress_script: P2PK uncompressed-key forms (0x04/0x05) require "
-            "secp256k1 pubkey decompression; not yet implemented."
-        )
+        if len(body) != 32:
+            raise ValueError(
+                f"decompress_script(P2PK uncompressed): expected 32 bytes, got {len(body)}"
+            )
+        # Mirror compressor.cpp:122-135. Build the 33-byte compressed pubkey
+        # `(tag - 2) || x[32]` (so 0x04->0x02, 0x05->0x03), parse via
+        # libsecp256k1, then re-serialize uncompressed (65 bytes, 0x04 prefix).
+        # Output is a 67-byte P2PK: 0x41 <pubkey65> 0xac.
+        try:
+            from coincurve import PublicKey
+        except ImportError as exc:  # pragma: no cover - dependency declared in pyproject
+            raise RuntimeError(
+                "decompress_script: coincurve is required for P2PK uncompressed-key decoding"
+            ) from exc
+        compressed = bytes([tag - 2]) + body
+        try:
+            pk = PublicKey(compressed)
+            uncompressed = pk.format(compressed=False)
+        except Exception as exc:
+            # Off-curve or otherwise unparseable x-coordinate -> fail closed,
+            # matching Core's `pubkey.Decompress()` returning false.
+            raise ValueError(
+                f"decompress_script(P2PK uncompressed): secp256k1 decompress "
+                f"failed for tag {tag:#x}: {exc}"
+            ) from exc
+        if len(uncompressed) != 65 or uncompressed[0] != 0x04:
+            raise ValueError(
+                f"decompress_script(P2PK uncompressed): unexpected serialized form "
+                f"(len={len(uncompressed)}, prefix={uncompressed[:1].hex()})"
+            )
+        return bytes([65]) + uncompressed + bytes([_OP_CHECKSIG])
     raise ValueError(f"decompress_script: unknown tag {tag:#x}")
 
 
