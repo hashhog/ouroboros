@@ -4032,6 +4032,23 @@ impl PyBlockchainDB {
         }
     }
 
+    /// Walk `CHAINSTATE_CF` and delete any orphan UTXO whose
+    /// `script_pubkey` is provably unspendable per Core's
+    /// `CScript::IsUnspendable`.
+    ///
+    /// Operator-invoked one-shot scrub for datadirs written by pre-fix
+    /// code paths that did not filter OP_RETURN / oversize-script
+    /// outputs at write time (notably the segwit-coinbase witness
+    /// commitment).  Idempotent: a clean chainstate returns
+    /// `(0, 0)`.  Returns `(removed_count, bytes_freed)`.
+    fn scrub_unspendable_coins(&self) -> PyResult<(u64, u64)> {
+        self.db.scrub_unspendable_coins().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("scrub_unspendable_coins failed: {}", e)
+            )
+        })
+    }
+
     /// Insert a UTXO into the chainstate from raw scalar fields.
     ///
     /// `txid` must be 32 bytes (internal byte order). `script_pubkey` is

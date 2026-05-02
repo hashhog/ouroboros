@@ -548,4 +548,164 @@ mod tests {
         let duration = start.elapsed();
         println!("Batch write (100 UTXOs): {:?} ({:?} per UTXO)", duration, duration / 100);
     }
+
+    // ========== scrub_unspendable_coins ==========
+
+    /// Seed the chainstate with a mix of spendable and provably-unspendable
+    /// outputs (OP_RETURN witness-commitment shape and oversize script),
+    /// scrub, and check counts.  Then re-scrub and verify idempotency.
+    #[test]
+    fn test_scrub_unspendable_coins_removes_op_return_and_oversize() {
+        use bitcoin::hashes::Hash;
+
+        let (db, _temp_dir) = create_test_db();
+
+        // 5 spendable P2PKH-shaped outputs.
+        for i in 0..5u32 {
+            let mut tx = [0u8; 32];
+            tx[0..4].copy_from_slice(&i.to_le_bytes());
+            let txid = bitcoin::Txid::from_byte_array(tx);
+            let outpoint = OutPoint::new(txid, 0);
+            let mut p2pkh = vec![0x76u8, 0xa9, 0x14];
+            p2pkh.extend(std::iter::repeat(0u8).take(20));
+            p2pkh.extend_from_slice(&[0x88, 0xac]);
+            let utxo = UTXO::new(
+                OutPointWrapper::new(outpoint),
+                10_000 + i as u64,
+                ScriptBuf::from_bytes(p2pkh),
+                Some(100 + i),
+                false,
+            );
+            db.add_utxo(&outpoint, &utxo).unwrap();
+        }
+
+        // 3 OP_RETURN outputs (witness-commitment style: 0x6a 0x24 [magic] [32]).
+        for i in 100..103u32 {
+            let mut tx = [0u8; 32];
+            tx[0..4].copy_from_slice(&i.to_le_bytes());
+            let txid = bitcoin::Txid::from_byte_array(tx);
+            let outpoint = OutPoint::new(txid, 0);
+            let mut spk = vec![0x6au8, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+            spk.extend(std::iter::repeat(0u8).take(32));
+            let utxo = UTXO::new(
+                OutPointWrapper::new(outpoint),
+                0,
+                ScriptBuf::from_bytes(spk),
+                Some(500_000 + i),
+                false,
+            );
+            db.add_utxo(&outpoint, &utxo).unwrap();
+        }
+
+        // 1 oversize script (> MAX_SCRIPT_SIZE).
+        {
+            let txid = bitcoin::Txid::from_byte_array([0xAA; 32]);
+            let outpoint = OutPoint::new(txid, 7);
+            let oversize = vec![0x51u8; crate::validate::block::MAX_SCRIPT_SIZE + 1];
+            let utxo = UTXO::new(
+                OutPointWrapper::new(outpoint),
+                1234,
+                ScriptBuf::from_bytes(oversize),
+                Some(700_000),
+                false,
+            );
+            db.add_utxo(&outpoint, &utxo).unwrap();
+        }
+
+        // 1 bare OP_RETURN.
+        {
+            let txid = bitcoin::Txid::from_byte_array([0xBB; 32]);
+            let outpoint = OutPoint::new(txid, 1);
+            let utxo = UTXO::new(
+                OutPointWrapper::new(outpoint),
+                0,
+                ScriptBuf::from_bytes(vec![0x6a]),
+                Some(1),
+                true,
+            );
+            db.add_utxo(&outpoint, &utxo).unwrap();
+        }
+
+        // Pre-scrub: 5 + 3 + 1 + 1 = 10 entries.
+        assert_eq!(db.utxo_count().unwrap(), 10);
+
+        let (removed, bytes_freed) = db.scrub_unspendable_coins().unwrap();
+        assert_eq!(removed, 5, "expected 5 unspendable entries removed");
+        assert!(bytes_freed > 0, "bytes_freed should be non-zero");
+
+        // Post-scrub: only 5 spendable entries remain.
+        assert_eq!(db.utxo_count().unwrap(), 5);
+
+        // Sanity: the spendable entries are still queryable.
+        for i in 0..5u32 {
+            let mut tx = [0u8; 32];
+            tx[0..4].copy_from_slice(&i.to_le_bytes());
+            let txid = bitcoin::Txid::from_byte_array(tx);
+            let outpoint = OutPoint::new(txid, 0);
+            assert!(db.get_utxo(&outpoint).unwrap().is_some(),
+                "spendable utxo {} should survive scrub", i);
+        }
+    }
+
+    /// Idempotency: scrub a clean chainstate, then re-scrub.  Both calls
+    /// must return (0, 0) and leave the chainstate untouched.
+    #[test]
+    fn test_scrub_unspendable_coins_is_idempotent() {
+        use bitcoin::hashes::Hash;
+
+        let (db, _temp_dir) = create_test_db();
+
+        // Seed with only spendable outputs.
+        for i in 0..3u32 {
+            let mut tx = [0u8; 32];
+            tx[0..4].copy_from_slice(&i.to_le_bytes());
+            let txid = bitcoin::Txid::from_byte_array(tx);
+            let outpoint = OutPoint::new(txid, i);
+            let utxo = UTXO::new(
+                OutPointWrapper::new(outpoint),
+                42 + i as u64,
+                ScriptBuf::from_bytes(vec![0x51u8]), // OP_1: spendable
+                Some(i),
+                false,
+            );
+            db.add_utxo(&outpoint, &utxo).unwrap();
+        }
+
+        let pre_count = db.utxo_count().unwrap();
+        assert_eq!(pre_count, 3);
+
+        let (r1, b1) = db.scrub_unspendable_coins().unwrap();
+        assert_eq!(r1, 0);
+        assert_eq!(b1, 0);
+        assert_eq!(db.utxo_count().unwrap(), pre_count);
+
+        // Second pass must be a no-op too.
+        let (r2, b2) = db.scrub_unspendable_coins().unwrap();
+        assert_eq!(r2, 0);
+        assert_eq!(b2, 0);
+        assert_eq!(db.utxo_count().unwrap(), pre_count);
+
+        // Now mix in one OP_RETURN, scrub, re-scrub.
+        let txid = bitcoin::Txid::from_byte_array([0xCC; 32]);
+        let outpoint = OutPoint::new(txid, 0);
+        let utxo = UTXO::new(
+            OutPointWrapper::new(outpoint),
+            0,
+            ScriptBuf::from_bytes(vec![0x6a, 0x10]),
+            Some(123),
+            false,
+        );
+        db.add_utxo(&outpoint, &utxo).unwrap();
+
+        let (r3, b3) = db.scrub_unspendable_coins().unwrap();
+        assert_eq!(r3, 1);
+        assert!(b3 > 0);
+        assert_eq!(db.utxo_count().unwrap(), 3);
+
+        // Re-scrub: clean again.
+        let (r4, b4) = db.scrub_unspendable_coins().unwrap();
+        assert_eq!(r4, 0);
+        assert_eq!(b4, 0);
+        assert_eq!(db.utxo_count().unwrap(), 3);
+    }
 }

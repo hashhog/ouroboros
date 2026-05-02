@@ -7080,6 +7080,57 @@ class RPCServer:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to load snapshot: {e}") from None
 
+    async def rpc_scrubunspendable(self) -> dict[str, int]:
+        """
+        Walk the existing chainstate and remove orphan provably-unspendable
+        coins (OP_RETURN scripts and scripts > MAX_SCRIPT_SIZE) left behind
+        by pre-fix code paths that did not filter them at write time.
+
+        Idempotent: a clean chainstate returns ``{"removed": 0,
+        "bytes_freed": 0}``.
+
+        Operator-invoked only — there is no automatic trigger on startup.
+        Used to bring an existing on-disk datadir into byte-identity with
+        what ``dumptxoutset`` would emit after the write-time
+        `is_unspendable_script` filter landed in ``apply_block`` /
+        ``connect_block_from_bytes`` / ``connect_block_at_height``.
+
+        Reference: Bitcoin Core ``CScript::IsUnspendable`` (script.h:563-566)
+        and ``AddCoins`` (coins.cpp:96-99).
+
+        Returns:
+            Mapping with ``removed`` (entries deleted) and
+            ``bytes_freed`` (approximate sum of key+value bytes freed —
+            actual disk reclaim is lazy via RocksDB compaction).
+        """
+        if not hasattr(self.node, "db") or self.node.db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        db = self.node.db
+        if not hasattr(db, "scrub_unspendable_coins"):
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "scrubunspendable requires Rust database bindings "
+                    "with scrub_unspendable_coins"
+                ),
+            )
+
+        try:
+            removed, bytes_freed = await asyncio.to_thread(
+                db.scrub_unspendable_coins
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"scrubunspendable failed: {e}"
+            ) from None
+
+        logger.info(
+            "scrubunspendable: removed=%d bytes_freed=%d",
+            removed, bytes_freed,
+        )
+        return {"removed": int(removed), "bytes_freed": int(bytes_freed)}
+
     async def rpc_dumptxoutset(
         self,
         path: str,
