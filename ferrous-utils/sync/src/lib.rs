@@ -3246,20 +3246,37 @@ impl PyBlockchainDB {
         }
 
         // --- Phase 3: Add outputs + tx index ---
+        //
+        // Special case: genesis block coinbase is unspendable per Core
+        // (validation.cpp:2337-2343), so we never add height-0 outputs
+        // to the chainstate.  Tx index is still maintained so genesis
+        // coinbase txid lookups continue to work.
+        let store_utxos = height > 0;
         for (tx_pos, tx) in inner.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
 
-            for (vout, output) in tx.output.iter().enumerate() {
-                let outpoint = OutPointWrapper::from_txid_vout(txid, vout as u32);
-                let utxo = UTXO::new(
-                    outpoint.clone(),
-                    output.value.to_sat(),
-                    output.script_pubkey.clone(),
-                    Some(height),
-                    tx.is_coinbase(),
-                );
-                self.db.add_utxo_batch(&mut batch, outpoint.inner(), &utxo)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+            if store_utxos {
+                for (vout, output) in tx.output.iter().enumerate() {
+                    // Skip provably unspendable outputs (OP_RETURN /
+                    // oversize script) — see `is_unspendable_script` /
+                    // Core's `CScript::IsUnspendable`.  Required for
+                    // byte-identical `dumptxoutset`.
+                    if crate::validate::block::is_unspendable_script(
+                        output.script_pubkey.as_bytes(),
+                    ) {
+                        continue;
+                    }
+                    let outpoint = OutPointWrapper::from_txid_vout(txid, vout as u32);
+                    let utxo = UTXO::new(
+                        outpoint.clone(),
+                        output.value.to_sat(),
+                        output.script_pubkey.clone(),
+                        Some(height),
+                        tx.is_coinbase(),
+                    );
+                    self.db.add_utxo_batch(&mut batch, outpoint.inner(), &utxo)
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+                }
             }
 
             self.db.store_tx_index_batch(&mut batch, txid.as_byte_array(), &block_hash, height, tx_pos as u32)

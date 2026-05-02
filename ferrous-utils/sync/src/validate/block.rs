@@ -91,6 +91,31 @@ fn assumevalid_height_from_env() -> Option<u32> {
     }
 }
 
+/// Maximum script size — matches Core's `MAX_SCRIPT_SIZE` in
+/// `bitcoin-core/src/script/script.h:40`.  Outputs whose `scriptPubKey`
+/// exceeds this length are provably unspendable (the script interpreter
+/// rejects them at execution).
+pub const MAX_SCRIPT_SIZE: usize = 10_000;
+
+/// Returns `true` for outputs that are provably unspendable and therefore
+/// must NEVER enter the UTXO set.  Mirrors Core's
+/// `CScript::IsUnspendable` (script.h:563-566):
+///
+/// ```text
+///   bool IsUnspendable() const {
+///       return (size() > 0 && *begin() == OP_RETURN) || (size() > MAX_SCRIPT_SIZE);
+///   }
+/// ```
+///
+/// Used by `apply_block` and `connect_block_from_bytes` to filter outputs
+/// before writing into `CHAINSTATE_CF`, which keeps `dumptxoutset` output
+/// byte-identical to Core (e.g. the witness-commitment OP_RETURN in
+/// segwit-coinbase blocks must NOT appear in the snapshot).
+pub fn is_unspendable_script(script: &[u8]) -> bool {
+    (!script.is_empty() && script[0] == 0x6a /* OP_RETURN */)
+        || script.len() > MAX_SCRIPT_SIZE
+}
+
 /// Block validator
 pub struct BlockValidator {
     db: Arc<BlockchainDB>,
@@ -708,7 +733,15 @@ impl BlockValidator {
             height,
         )?;
 
-        // UTXO mutations + transaction index
+        // UTXO mutations + transaction index.
+        //
+        // Special case: genesis block coinbase is unspendable per Core
+        // (validation.cpp:2337-2343 — "Special case for the genesis
+        // block, skipping connection of its transactions (its coinbase
+        // is unspendable)"), so we never add height-0 outputs to the
+        // chainstate.  We still maintain the tx index so RPCs that look
+        // up the genesis coinbase by txid keep working.
+        let store_utxos = height > 0;
         for (tx_pos, tx) in inner.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
 
@@ -719,16 +752,26 @@ impl BlockValidator {
                 }
             }
 
-            for (vout, output) in tx.output.iter().enumerate() {
-                let outpoint = OutPointWrapper::from_txid_vout(txid, vout as u32);
-                let utxo = UTXO::new(
-                    outpoint.clone(),
-                    output.value.to_sat(),
-                    output.script_pubkey.clone(),
-                    Some(height),
-                    tx.is_coinbase(),
-                );
-                self.db.add_utxo_batch(&mut batch, outpoint.inner(), &utxo)?;
+            if store_utxos {
+                for (vout, output) in tx.output.iter().enumerate() {
+                    // Skip provably unspendable outputs (OP_RETURN /
+                    // oversize script).  Mirrors Core's `AddCoins`
+                    // skipping `out.scriptPubKey.IsUnspendable()`
+                    // (coins.cpp:96-99) — keeps `dumptxoutset` byte-
+                    // identical to Core.
+                    if is_unspendable_script(output.script_pubkey.as_bytes()) {
+                        continue;
+                    }
+                    let outpoint = OutPointWrapper::from_txid_vout(txid, vout as u32);
+                    let utxo = UTXO::new(
+                        outpoint.clone(),
+                        output.value.to_sat(),
+                        output.script_pubkey.clone(),
+                        Some(height),
+                        tx.is_coinbase(),
+                    );
+                    self.db.add_utxo_batch(&mut batch, outpoint.inner(), &utxo)?;
+                }
             }
 
             // Store transaction index: txid → (block_hash, height, position)
@@ -883,6 +926,46 @@ mod tests {
 
         let block_wrapper = BlockWrapper::new(block);
         assert!(validator.verify_merkle_root(block_wrapper.inner()));
+    }
+
+    #[test]
+    fn test_is_unspendable_script() {
+        // Empty script: spendable (matches Core: size() > 0 required for OP_RETURN check)
+        assert!(!is_unspendable_script(&[]));
+
+        // Bare OP_RETURN: unspendable
+        assert!(is_unspendable_script(&[0x6a]));
+        // OP_RETURN <data>: unspendable (anything that *starts* with OP_RETURN)
+        assert!(is_unspendable_script(&[0x6a, 0x01, 0x42]));
+        // Witness-commitment shape (segwit coinbase OP_RETURN): unspendable
+        let mut wc = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        wc.extend(std::iter::repeat(0u8).take(32));
+        assert!(is_unspendable_script(&wc));
+
+        // P2PKH-ish (76 a9 14 <20-byte hash> 88 ac): spendable
+        let mut p2pkh = vec![0x76, 0xa9, 0x14];
+        p2pkh.extend(std::iter::repeat(0u8).take(20));
+        p2pkh.extend_from_slice(&[0x88, 0xac]);
+        assert!(!is_unspendable_script(&p2pkh));
+
+        // P2WSH (00 20 <32-byte hash>): spendable
+        let mut p2wsh = vec![0x00, 0x20];
+        p2wsh.extend(std::iter::repeat(0u8).take(32));
+        assert!(!is_unspendable_script(&p2wsh));
+
+        // Exactly MAX_SCRIPT_SIZE non-OP_RETURN: spendable (boundary)
+        let max_ok = vec![0x51u8; MAX_SCRIPT_SIZE]; // OP_1 repeated
+        assert_eq!(max_ok.len(), MAX_SCRIPT_SIZE);
+        assert!(!is_unspendable_script(&max_ok));
+
+        // MAX_SCRIPT_SIZE + 1: unspendable (oversize)
+        let oversize = vec![0x51u8; MAX_SCRIPT_SIZE + 1];
+        assert!(is_unspendable_script(&oversize));
+
+        // Single byte that is NOT OP_RETURN: spendable
+        assert!(!is_unspendable_script(&[0x51])); // OP_1
+        // Pushdata sequences that don't start with OP_RETURN: spendable
+        assert!(!is_unspendable_script(&[0x4c, 0x01, 0x42]));
     }
 
     #[test]
