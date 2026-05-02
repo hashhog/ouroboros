@@ -790,13 +790,28 @@ class BlockSync:
                 hashlib.sha256(payload[:80]).digest()
             ).digest()
 
-            # Remove from in-flight tracking
-            if block_hash in self.requested_blocks:
+            # Was this delivery in response to one of our outstanding requests?
+            # We sample this BEFORE clearing the in-flight entry so the
+            # post-rollback duplicate suppression below can distinguish a
+            # solicited redelivery (we still want it; the validated-header
+            # queue includes its hash) from a genuinely-already-have-it
+            # spontaneous duplicate.
+            was_requested = block_hash in self.requested_blocks
+            if was_requested:
                 del self.requested_blocks[block_hash]
             self._block_request_peer.pop(block_hash, None)
 
-            # Already have this block?
-            if self.db.has_block_hash(block_hash):
+            # Already have this block?  Skip duplicate ONLY if we did not
+            # request it.  After a chainstate rollback, BLOCKS_CF still
+            # contains the previously-stored bytes for blocks that have
+            # since been disconnected from the active chain, so
+            # `has_block_hash=True` does NOT mean "block is on chain".  If
+            # the block is something we asked for, accept the bytes into
+            # the buffer so the drain path can re-validate and re-connect
+            # them — without this, after a rollback we would drop every
+            # peer redelivery on the floor and the drain would wait
+            # forever for a buffer entry that never arrives.
+            if not was_requested and self.db.has_block_hash(block_hash):
                 self._blk_duplicate += 1
                 return
 
@@ -875,16 +890,33 @@ class BlockSync:
                     self._w91_drain_idle_max_ns = idle_ns
         current_hash, current_height = self.db.get_best_block()
 
-        # Find the first unconnected header index by scanning once, then
-        # advance linearly.  The old code re-scanned from index 0 and
-        # called db.get_block() for every already-connected header on
-        # each iteration, which was O(n^2).
+        # Sanity-check the queue invariant before draining.  If
+        # ``_validated_headers[0]`` does not extend the active chain tip
+        # (which can happen after a chainstate rollback or reorg between
+        # when the queue was built and now), drop the entire queue and
+        # let the next sync_loop tick rebuild it.  We deliberately do NOT
+        # use ``has_block_hash`` to "skip already-connected" headers: that
+        # probe returns True for any stored block, including ones
+        # disconnected from the active chain by a rollback, and the skip
+        # silently advances the drain pointer past orphaned slots — that
+        # is the 938231 wedge from 2026-05-02.  Slot 0 is always tip+1
+        # by the invariant we now enforce.
+        if not self._queue_anchored_to_tip():
+            logger.warning(
+                "[slot-misalign] validated_headers no longer anchors to tip "
+                "%s — dropping queue (%d entries) for fresh resync",
+                current_hash.hex()[:16] if current_hash else "?",
+                len(self._validated_headers),
+            )
+            self._validated_headers.clear()
+            self._ibd_block_buffer.clear()
+            self.requested_blocks.clear()
+            self._block_request_peer.clear()
+            self._header_sync_peer = None
+            self._header_sync_time = 0.0
+            self._w91_last_drain_exit_perf_ns = time.perf_counter_ns()
+            return 0
         header_idx = 0
-        for i, (bh, _hdr) in enumerate(self._validated_headers):
-            if self.db.has_block_hash(bh):
-                header_idx = i + 1
-            else:
-                break
 
         while header_idx < len(self._validated_headers):
             next_hash, _ = self._validated_headers[header_idx]
@@ -1243,9 +1275,17 @@ class BlockSync:
             # multi-second RPC latency spikes.
             await asyncio.sleep(0)
 
-        # Prune connected headers to prevent unbounded growth
+        # Prune connected headers to prevent unbounded growth.
+        # `connected` blocks were popped from slot 0 in chain order, so the
+        # first `connected` entries in _validated_headers are the ones we
+        # just stored.  Drop them.  We deliberately do NOT use
+        # has_block_hash to drive pruning: post-rollback BLOCKS_CF still
+        # contains orphaned blocks, and a hash-based prune would silently
+        # drop slots whose blocks are not on the active chain — masking
+        # the slot-misalignment wedge instead of letting the anchor check
+        # at the next drain entry detect and recover.
         if connected > 0:
-            self._prune_validated_headers()
+            self._validated_headers = self._validated_headers[connected:]
 
         # W91: record drain exit.  No-progress drains (connected==0)
         # are counted separately — they indicate the drain woke up but
@@ -1400,18 +1440,17 @@ class BlockSync:
 
         network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
 
-        # Find where our connected tip sits in the header queue.
-        # After pruning, index 0 is the first header not yet in the DB
-        # (or already in DB if pruning hasn't run yet).
-        tip_idx = -1
-        for i, (bh, _) in enumerate(self._validated_headers):
-            if self.db.has_block_hash(bh):
-                tip_idx = i
-            else:
-                break  # Headers are in order; first missing = end of connected chain.
-
-        # Request blocks starting just after the connected tip, up to window size.
-        start = tip_idx + 1
+        # Slot 0 of `_validated_headers` is the next block to request after
+        # our active tip (invariant enforced by the chain-prev check in
+        # handle_headers and the anchor check in _drain_block_buffer_locked).
+        # We MUST NOT use db.has_block_hash here to "skip already-connected
+        # slots": that probe returns True for any block ever stored,
+        # including blocks disconnected from the active chain by a rollback
+        # or reorg, which advances `start` past orphaned hashes and ends up
+        # requesting a block several heights above tip+1 — the 938231
+        # misalignment wedge from 2026-05-02.
+        _, current_height = self.db.get_best_block()
+        start = 0
         in_flight = len(self.requested_blocks)
         cap_inflight = max(0, self._max_blocks_in_flight - in_flight)
 
@@ -1436,8 +1475,9 @@ class BlockSync:
         to_request: list[tuple[int, bytes]] = []
         for i in range(start, min(start + available, len(self._validated_headers))):
             block_hash, _ = self._validated_headers[i]
-            if block_hash not in self.requested_blocks and not self.db.has_block_hash(block_hash):
-                to_request.append((MSG_WITNESS_BLOCK, block_hash))
+            if block_hash in self.requested_blocks:
+                continue
+            to_request.append((MSG_WITNESS_BLOCK, block_hash))
 
         if not to_request:
             return
@@ -1498,19 +1538,64 @@ class BlockSync:
             f"{extra})"
         )
 
+    def _queue_anchored_to_tip(self) -> bool:
+        """Sanity check: does ``_validated_headers[0]`` extend our current
+        chain tip?
+
+        The intended invariant of ``_validated_headers`` is that slot 0 is
+        always tip+1.  The queue can become stale across a chainstate
+        rollback (e.g. ``dumptxoutset`` rolled tip from 938348 → 938230 on
+        2026-05-02) or a reorg: the queue was built relative to the OLD
+        tip, so its slot 0 now extends a block that is no longer the
+        active tip.  Detecting that here lets the caller drop the queue
+        rather than spinning the drain on stale slot indexes.
+
+        Note: we deliberately do NOT consult ``has_block_hash`` /
+        ``get_block_hash_by_height`` here.  Those CFs are not pruned on
+        block disconnect — after a rollback they still point at the OLD
+        chain's hashes, so using them to "skip already-connected" headers
+        re-introduces exactly the 938231 wedge we are trying to avoid.
+        Active-chain membership is defined by walkability from the actual
+        tip via ``prev_blockhash``, which is what we check here.
+        """
+        if not self._validated_headers:
+            return True  # vacuously anchored
+        try:
+            current_hash, _ = self.db.get_best_block()
+        except Exception:
+            return True  # cannot determine; conservative: assume OK
+        _bh, hdr = self._validated_headers[0]
+        return getattr(hdr, "prev_blockhash", None) == current_hash
+
     def _prune_validated_headers(self):
-        """Remove validated headers that have already been connected to the chain."""
+        """Drop the queue if it no longer anchors to the active chain tip.
+
+        With the post-2026-05-02 fix, the per-connect path in
+        ``_drain_block_buffer_locked`` pops connected headers itself, so
+        this function is reduced to a stale-queue safety net: if some
+        external code (rollback, reorg, RPC ``invalidateblock``) has
+        moved the active tip out from under us, slot 0 of
+        ``_validated_headers`` no longer extends ``get_best_block()``.
+        Drop the queue rather than pretending the stale slots are
+        connected — a hash-based prune would silently bury the
+        misalignment under `has_block_hash` returning True for orphaned
+        blocks.
+        """
         if not self._validated_headers:
             return
-        # Find how many leading headers are now in the DB.
-        prune_count = 0
-        for block_hash, _ in self._validated_headers:
-            if self.db.has_block_hash(block_hash):
-                prune_count += 1
-            else:
-                break
-        if prune_count > 0:
-            self._validated_headers = self._validated_headers[prune_count:]
+        if not self._queue_anchored_to_tip():
+            try:
+                current_hash, _ = self.db.get_best_block()
+                tip_short = current_hash.hex()[:16]
+            except Exception:
+                tip_short = "?"
+            logger.warning(
+                "[slot-misalign] _prune_validated_headers dropping stale "
+                "queue (%d entries) — slot 0 no longer extends tip %s",
+                len(self._validated_headers),
+                tip_short,
+            )
+            self._validated_headers.clear()
 
     def _check_wedge_watchdog(self) -> None:
         """Emit a diagnostic WARN if the block-accept path looks wedged.
@@ -2009,9 +2094,15 @@ class BlockSync:
         HEAD_OF_WINDOW = 8
         HEAD_TIMEOUT = 2.0
 
+        # Build the head-of-window set: the first HEAD_OF_WINDOW headers
+        # that are NOT yet on the active chain.  Active-chain membership
+        # via get_block_hash_by_height (NOT has_block_hash) so orphaned
+        # blocks don't make us skip the genuine head-of-window — same
+        # rationale as `_first_unconnected_header_idx`.
+        _, current_height = self.db.get_best_block()
         head_set: set[bytes] = set()
-        for bh, _ in self._validated_headers:
-            if self.db.has_block_hash(bh):
+        for i, (bh, _) in enumerate(self._validated_headers):
+            if self.db.get_block_hash_by_height(current_height + 1 + i) == bh:
                 continue
             head_set.add(bh)
             if len(head_set) >= HEAD_OF_WINDOW:
