@@ -1064,3 +1064,235 @@ def test_rpc_loadtxoutset_accepts_whitelisted_blockhash_with_raw_insert(
     assert inserted.amount == 12345
     assert inserted.height == 100_000
     assert inserted.is_coinbase is False
+
+
+# ---------------------------------------------------------------------------
+# Chainstate filter tests (require the Rust `sync` extension).
+#
+# These exercise the real `connect_block_from_bytes` / `dump_snapshot` path
+# against a temporary RocksDB datadir, which is the same path the
+# `dumptxoutset` RPC uses in production.
+#
+# Two correctness invariants live here:
+#
+#   1. Provably unspendable outputs (OP_RETURN / oversize scriptPubKey)
+#      must NEVER enter the UTXO set, mirroring Core's `CScript::IsUnspendable`
+#      filter inside `AddCoins` (coins.cpp:96-99).  Without this, every
+#      witness-commitment OP_RETURN in a segwit-coinbase block ends up in
+#      `dumptxoutset`, so ouroboros' snapshot diverges from Core's.
+#   2. The genesis-block coinbase is unspendable per Core
+#      (validation.cpp:2337-2343).  Adding it to the chainstate causes a
+#      single-coin off-by-one in `coins_count` against Core's reference.
+#
+# Both bugs were caught by tools/snapshot-byte-identity.sh (regtest, 110
+# Core-mined blocks): pre-fix ouroboros produced 12679B / 221 coins, where
+# Core / rustoshi / hotbuns / lunarblock all produced 7908B / 110 coins.
+# ---------------------------------------------------------------------------
+
+
+def _try_import_sync() -> object | None:
+    """Return the real Rust `sync` extension, bypassing conftest's stub.
+
+    `tests/conftest.py` installs a pure-Python stub at `sys.modules["sync"]`
+    so most of the test suite can import ouroboros without building the
+    native extension.  The chainstate-filter tests below need the *real*
+    extension to exercise `connect_block_from_bytes`.
+
+    Caching the result so subsequent tests reuse the same module: the
+    Rust extension's `PyInit_sync` symbol can only be loaded once per
+    process (a pyo3 limitation — re-init fails with "module already
+    initialized").
+    """
+    import importlib
+    import sys
+    from pathlib import Path
+
+    if "_sync_real" in sys.modules:
+        return sys.modules["_sync_real"]
+
+    # Detect whether sys.modules["sync"] is the Python stub from conftest
+    # or the real Rust .so.
+    stub = sys.modules.get("sync")
+    is_stub = stub is not None and getattr(stub, "__file__", "") == "<test-mock>"
+
+    if not is_stub:
+        # Already real (or absent) — try plain import.
+        try:
+            mod = importlib.import_module("sync")
+        except ImportError:
+            return None
+        if not hasattr(mod, "PyBlockchainDB") or not hasattr(
+            mod.PyBlockchainDB, "connect_block_from_bytes"
+        ):
+            return None
+        sys.modules["_sync_real"] = mod
+        return mod
+
+    # Conftest installed a stub.  Confirm a real wheel exists in the venv
+    # before we touch sys.modules.
+    venv_root = Path(__file__).parent.parent / ".venv"
+    candidates = sorted(venv_root.glob(
+        "lib/python*/site-packages/sync/sync*.so"
+    ))
+    if not candidates:
+        return None
+
+    saved = sys.modules.pop("sync")
+    try:
+        mod = importlib.import_module("sync")
+    except ImportError:
+        sys.modules["sync"] = saved
+        return None
+    finally:
+        # Re-install the stub so other tests that import via the stub
+        # keep working.  The real module is cached under `_sync_real`.
+        sys.modules["sync"] = saved
+    if not hasattr(mod, "PyBlockchainDB") or not hasattr(
+        mod.PyBlockchainDB, "connect_block_from_bytes"
+    ):
+        return None
+    sys.modules["_sync_real"] = mod
+    return mod
+
+
+def _make_regtest_genesis_bytes() -> bytes:
+    """Reconstruct the regtest genesis block (header + coinbase tx).
+
+    Mirrors what `node._init_genesis_block` builds for the regtest network.
+    """
+    import struct as _struct
+
+    prev_block = b"\x00" * 32
+    merkle_root = bytes.fromhex(
+        "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+    )[::-1]
+    ts, bits, nonce = 1296688602, 0x207FFFFF, 2
+    coinbase_tx = bytes.fromhex(
+        "01000000"
+        "01"
+        "0000000000000000000000000000000000000000000000000000000000000000"
+        "ffffffff"
+        "4d"
+        "04ffff001d0104455468652054696d65732030332f4a616e2f323030"
+        "39204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73"
+        "ffffffff"
+        "01"
+        "00f2052a01000000"
+        "43"
+        "4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac"
+        "00000000"
+    )
+    header = _struct.pack("<i", 1) + prev_block + merkle_root
+    header += _struct.pack("<III", ts, bits, nonce)
+    return header + b"\x01" + coinbase_tx
+
+
+def test_chainstate_skips_genesis_coinbase(tmp_path) -> None:
+    """Genesis coinbase output must NOT enter the chainstate.
+
+    Mirrors Core (validation.cpp:2337-2343, "Special case for the genesis
+    block, skipping connection of its transactions (its coinbase is
+    unspendable)").  Without this, `dumptxoutset` reports 1 extra coin.
+    """
+    sync = _try_import_sync()
+    if sync is None or not hasattr(sync, "PyBlockchainDB"):
+        pytest.skip("Rust `sync` extension not installed")
+
+    db = sync.PyBlockchainDB(str(tmp_path / "db"))
+    block_bytes = _make_regtest_genesis_bytes()
+    db.connect_block_from_bytes(block_bytes, 0)
+
+    # Tip is at genesis but UTXO set is empty (genesis coinbase is unspendable).
+    _, height = db.get_best_block()
+    assert height == 0
+    assert db.utxo_count() == 0
+
+
+def test_chainstate_skips_op_return(tmp_path) -> None:
+    """OP_RETURN outputs must NOT enter the chainstate.
+
+    Mirrors Core's `CScript::IsUnspendable` filter inside `AddCoins`
+    (script.h:563-566 + coins.cpp:96-99).  Without this, every
+    witness-commitment OP_RETURN in a segwit-coinbase block ends up in
+    `dumptxoutset`, doubling the coin count.
+
+    We craft a synthetic non-genesis block whose coinbase has both a
+    spendable P2WSH output AND an OP_RETURN witness-commitment output,
+    matching the structure of Core's segwit regtest coinbase.  Only the
+    P2WSH output should be present after `connect_block_from_bytes`.
+    """
+    import hashlib as _hashlib
+    import struct as _struct
+
+    sync = _try_import_sync()
+    if sync is None or not hasattr(sync, "PyBlockchainDB"):
+        pytest.skip("Rust `sync` extension not installed")
+
+    db = sync.PyBlockchainDB(str(tmp_path / "db"))
+
+    # We need a tip first; just plant the regtest genesis (UTXO-empty per
+    # the test above) so the next block links cleanly.
+    db.connect_block_from_bytes(_make_regtest_genesis_bytes(), 0)
+    genesis_hash, _ = db.get_best_block()
+
+    # Build a coinbase with two outputs: spendable P2WSH + OP_RETURN.
+    # P2WSH output: 0x00 0x20 <32-byte program>  (always-anyone-can-spend
+    # script-hash).
+    p2wsh_script = bytes([0x00, 0x20]) + (b"\xab" * 32)
+    p2wsh_value = 50 * 100_000_000  # 50 BTC subsidy (regtest)
+
+    # OP_RETURN witness commitment: 0x6a 0x24 0xaa21a9ed <32-byte commit>
+    op_return_script = bytes([0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]) + (b"\x00" * 32)
+    op_return_value = 0
+
+    # Coinbase tx: 1 input with all-zero prevout, 2 outputs.
+    coinbase_tx = (
+        _struct.pack("<I", 1)                              # version
+        + b"\x01"                                          # 1 input
+        + b"\x00" * 32                                     # prev_txid
+        + _struct.pack("<I", 0xFFFFFFFF)                   # prev_vout
+        + b"\x02\x51\x01"                                  # scriptSig: BIP34 height push + OP_1
+        + _struct.pack("<I", 0xFFFFFFFF)                   # sequence
+        + b"\x02"                                          # 2 outputs
+        + _struct.pack("<Q", p2wsh_value)                  # value 1
+        + bytes([len(p2wsh_script)]) + p2wsh_script        # script 1
+        + _struct.pack("<Q", op_return_value)              # value 2
+        + bytes([len(op_return_script)]) + op_return_script  # script 2
+        + _struct.pack("<I", 0)                            # locktime
+    )
+    txid = _hashlib.sha256(_hashlib.sha256(coinbase_tx).digest()).digest()
+    merkle_root = txid
+
+    # Solve the regtest header (target = 0x207fffff is permissive enough
+    # that nonce=0 usually works).
+    version = _struct.pack("<i", 1)
+    bits = _struct.pack("<I", 0x207FFFFF)
+    nonce = 0
+    while True:
+        header = (
+            version
+            + genesis_hash
+            + merkle_root
+            + _struct.pack("<I", 1296688700)               # time
+            + bits
+            + _struct.pack("<I", nonce)
+        )
+        block_hash = _hashlib.sha256(_hashlib.sha256(header).digest()).digest()
+        # regtest target = 0x207fffff → 0x7fffff0000...000 LE.  Hash must
+        # be <= target as a 256-bit LE int.  Trivially: top byte == 0x7f.
+        if block_hash[31] < 0x7f or (block_hash[31] == 0x7f and block_hash[30] <= 0xff):
+            break
+        nonce += 1
+        if nonce > 1_000_000:
+            pytest.skip("could not solve regtest header (cosmic ray?)")
+
+    block = header + b"\x01" + coinbase_tx
+    db.connect_block_from_bytes(block, 1)
+
+    # P2WSH output is in the UTXO set; OP_RETURN output is filtered out.
+    assert db.utxo_count() == 1
+    utxos = list(db.iter_utxos())
+    assert len(utxos) == 1
+    coin = utxos[0]
+    assert bytes(coin.script_pubkey) == p2wsh_script
+    assert int(coin.amount) == p2wsh_value
