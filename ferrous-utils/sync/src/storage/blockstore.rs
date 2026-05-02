@@ -251,7 +251,9 @@ impl BlockStore {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        db_opts.set_max_open_files(512);
+        // Bumped 512 → 16384 to reduce SST mmap churn during IBD (parity
+        // with the chainstate DB).  Safe under maxbox ulimit -n 524288.
+        db_opts.set_max_open_files(16384);
 
         let cf_descriptors = vec![
             ColumnFamilyDescriptor::new("default", Options::default()),
