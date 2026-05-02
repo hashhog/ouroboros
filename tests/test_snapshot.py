@@ -408,9 +408,21 @@ def test_metadata_rejects_network_mismatch(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_mainnet_assumeutxo_has_all_four_heights() -> None:
+def test_mainnet_assumeutxo_has_all_five_heights() -> None:
     heights = [d.height for d in get_assumeutxo_params("mainnet")]
-    assert heights == [840_000, 880_000, 910_000, 935_000]
+    assert heights == [840_000, 880_000, 910_000, 935_000, 944_183]
+
+
+def test_mainnet_assumeutxo_944183_entry_present() -> None:
+    """Local snapshot entry for h=944183 (recovery snapshot, not Core chainparams)."""
+    data = get_assumeutxo_data("mainnet", 944_183)
+    assert data is not None
+    assert data.block_hash[::-1].hex() == (
+        "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"
+    )
+    assert data.hash_serialized[::-1].hex() == (
+        "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"
+    )
 
 
 def test_testnet4_assumeutxo_has_two_heights() -> None:
