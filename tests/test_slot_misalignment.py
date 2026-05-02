@@ -255,6 +255,104 @@ async def test_handle_headers_does_not_skip_orphaned_db_hashes(monkeypatch):
     assert bs._validated_headers[0][0] == bs._header_to_block_hash(h0)
 
 
+# ---------------------------------------------------------------------------
+# _queue_anchored_to_tip + handle_block accepting requested redeliveries
+# ---------------------------------------------------------------------------
+
+
+def test_queue_anchored_to_tip_empty_queue():
+    """An empty queue is vacuously anchored — the drain has nothing to do."""
+    bs = _make_block_sync()
+    assert bs._queue_anchored_to_tip() is True
+
+
+def test_queue_anchored_to_tip_matching_prev():
+    """Slot 0's prev_blockhash matches the active tip — anchored."""
+    bs = _make_block_sync()
+    tip_hash = bytes.fromhex("aa" * 32)
+    bs.db.get_best_block.return_value = (tip_hash, 938_230)
+
+    hdr = MagicMock()
+    hdr.prev_blockhash = tip_hash
+    bs._validated_headers = [(b"\xbb" * 32, hdr)]
+    assert bs._queue_anchored_to_tip() is True
+
+
+def test_queue_anchored_to_tip_stale_after_rollback():
+    """After a rollback the queue's slot 0 still extends the OLD tip; the
+    anchor probe must report False so the caller drops the queue."""
+    bs = _make_block_sync()
+    new_tip = bytes.fromhex("11" * 32)  # post-rollback tip
+    old_tip = bytes.fromhex("22" * 32)  # pre-rollback tip the queue extends
+    bs.db.get_best_block.return_value = (new_tip, 938_230)
+
+    hdr = MagicMock()
+    hdr.prev_blockhash = old_tip
+    bs._validated_headers = [(b"\xcc" * 32, hdr)]
+    assert bs._queue_anchored_to_tip() is False
+
+
+@pytest.mark.asyncio
+async def test_handle_block_accepts_requested_redelivery_post_rollback():
+    """After a chainstate rollback, BLOCKS_CF still contains the bytes for
+    blocks above the new tip.  A peer redelivering block N (which IS the
+    block we just requested at slot 0) must NOT be dropped on the
+    `has_block_hash=True` duplicate path — its bytes need to land in the
+    IBD buffer so the drain can re-validate and re-connect them.
+
+    Pre-fix, every redelivery for an orphan-tagged block was discarded as
+    a duplicate; the drain then waited forever for a buffer entry that
+    never arrived.
+    """
+    import hashlib
+
+    bs = _make_block_sync()
+    # The block hash is in BLOCKS_CF (post-rollback orphan) but it IS
+    # something we asked for via requested_blocks.
+    header = b"\xee" * 80
+    block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()
+    bs.db.has_block_hash = MagicMock(return_value=True)
+    bs.requested_blocks[block_hash] = 1.0
+
+    msg = MagicMock()
+    msg.payload = header
+    peer = MagicMock()
+    peer.host = "127.0.0.1"
+    peer.port = 8333
+
+    await bs.handle_block(msg, peer)
+
+    # Solicited delivery: bytes ended up in the IBD buffer despite
+    # has_block_hash=True.
+    assert block_hash in bs._ibd_block_buffer
+    # in-flight cleared.
+    assert block_hash not in bs.requested_blocks
+
+
+@pytest.mark.asyncio
+async def test_handle_block_drops_unsolicited_duplicate():
+    """If a peer spontaneously delivers a block we already have AND did
+    not request, drop it (no in-flight tracking, no buffer churn)."""
+    import hashlib
+
+    bs = _make_block_sync()
+    header = b"\xff" * 80
+    block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()
+    bs.db.has_block_hash = MagicMock(return_value=True)
+    # NOT in requested_blocks — unsolicited.
+
+    msg = MagicMock()
+    msg.payload = header
+    peer = MagicMock()
+    peer.host = "127.0.0.1"
+    peer.port = 8333
+
+    await bs.handle_block(msg, peer)
+
+    assert block_hash not in bs._ibd_block_buffer
+    assert bs._blk_duplicate >= 1
+
+
 @pytest.mark.asyncio
 async def test_handle_headers_breaks_on_chain_disconnect(monkeypatch):
     """If the very first header's prev does not match our tip, drop the
