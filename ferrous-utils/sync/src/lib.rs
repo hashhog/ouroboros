@@ -448,6 +448,11 @@ fn get_next_work_required(
 ///
 /// # Arguments
 /// * `last_bits` - nBits of the last block in the period
+/// * `first_bits` - nBits of the first block in the period.
+///                  On BIP94 networks (testnet4) this is the base for the
+///                  retarget; on non-BIP94 networks `last_bits` is used as
+///                  the base and this argument is consulted only as a sanity
+///                  field (but must still be provided by the caller).
 /// * `first_timestamp` - Timestamp of the first block in the period
 /// * `last_timestamp` - Timestamp of the last block in the period
 /// * `network` - Network name
@@ -457,6 +462,7 @@ fn get_next_work_required(
 #[pyfunction]
 fn calculate_next_difficulty(
     last_bits: u32,
+    first_bits: u32,
     first_timestamp: u32,
     last_timestamp: u32,
     network: String,
@@ -481,8 +487,13 @@ fn calculate_next_difficulty(
         bits: last_bits,
         timestamp: last_timestamp,
     };
+    let first_block = BlockIndexInfo {
+        height: 0, // Dummy, not used in calculation
+        bits: first_bits,
+        timestamp: first_timestamp,
+    };
 
-    let new_bits = difficulty::calculate_next_work_required(&last_block, first_timestamp, &params);
+    let new_bits = difficulty::calculate_next_work_required(&last_block, &first_block, &params);
     Ok(new_bits)
 }
 

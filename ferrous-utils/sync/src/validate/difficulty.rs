@@ -109,23 +109,29 @@ where
         None => return pow_limit_bits, // Shouldn't happen, but safe fallback
     };
 
-    calculate_next_work_required(last_block, first_block.timestamp, &params)
+    calculate_next_work_required(last_block, &first_block, &params)
 }
 
 /// Calculate the next difficulty target at a retarget boundary.
 ///
-/// Matches Bitcoin Core's CalculateNextWorkRequired() in pow.cpp.
+/// Matches Bitcoin Core's CalculateNextWorkRequired() in pow.cpp:50-85.
+///
+/// For BIP94 networks (testnet4), uses the first block's nBits as the base
+/// to defend against the time-warp attack. For all other networks, uses the
+/// last block's nBits.
 ///
 /// # Arguments
 /// * `last_block` - The last block in the period (height % 2016 == 2015)
-/// * `first_block_time` - Timestamp of the first block in the period
+/// * `first_block` - The first block in the period (height = last - 2015).
+///                   Both `first_block.timestamp` (used for actualTimespan) and
+///                   `first_block.bits` (used as BIP94 base) are required.
 /// * `params` - Consensus parameters
 ///
 /// # Returns
 /// The new difficulty in compact "bits" format
 pub fn calculate_next_work_required(
     last_block: &BlockIndexInfo,
-    first_block_time: u32,
+    first_block: &BlockIndexInfo,
     params: &ConsensusParams,
 ) -> u32 {
     // If no retargeting (regtest), keep the same difficulty
@@ -134,7 +140,7 @@ pub fn calculate_next_work_required(
     }
 
     // Calculate actual timespan
-    let mut actual_timespan = (last_block.timestamp as i64) - (first_block_time as i64);
+    let mut actual_timespan = (last_block.timestamp as i64) - (first_block.timestamp as i64);
 
     // Clamp timespan to [target/4, target*4]
     if actual_timespan < TARGET_TIMESPAN / 4 {
@@ -144,17 +150,14 @@ pub fn calculate_next_work_required(
         actual_timespan = TARGET_TIMESPAN * 4;
     }
 
-    // BIP94 (testnet4): use the first block's difficulty instead of last
-    // This prevents the "time warp" attack where miners lower difficulty
-    // then raise timestamps
+    // BIP94 (testnet4): use the first block's nBits as the base instead of
+    // the last block's. The first block of a period cannot use the
+    // min-difficulty exception, so this preserves the real difficulty across
+    // the retarget and prevents the time-warp attack where miners lower
+    // difficulty via min-diff blocks then raise timestamps at the boundary.
+    // Reference: bitcoin-core/src/pow.cpp:67-76 (enforce_BIP94 branch).
     let base_bits = if params.enforce_bip94 {
-        // For BIP94, we need to get the first block's bits
-        // In the testnet4 case, we use first block of period
-        let first_height = last_block.height - (DIFFICULTY_ADJUSTMENT_INTERVAL - 1);
-        // Note: In practice, we'd need the actual bits from first block
-        // For now, we use last_block.bits as Bitcoin Core does in most cases
-        // The BIP94 fix uses pindexFirst->nBits, which we'd need passed in
-        last_block.bits // TODO: Pass first block bits for full BIP94 compliance
+        first_block.bits
     } else {
         last_block.bits
     };
@@ -191,46 +194,20 @@ pub fn target_to_bits(target: U256) -> u32 {
 
 /// Calculate difficulty adjustment with BIP94 support.
 ///
-/// For testnet4, this uses the first block's difficulty as the base
-/// to prevent time warp attacks.
+/// Deprecated: as of the BIP94 wiring fix, `calculate_next_work_required`
+/// now natively reads `first_block.bits` and applies the BIP94 rule when
+/// `params.enforce_bip94` is true. This function is preserved as a thin
+/// wrapper for backward compatibility with any out-of-tree callers.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use calculate_next_work_required directly; BIP94 is now handled natively."
+)]
 pub fn calculate_next_work_required_bip94(
     last_block: &BlockIndexInfo,
     first_block: &BlockIndexInfo,
     params: &ConsensusParams,
 ) -> u32 {
-    if params.pow_no_retargeting {
-        return last_block.bits;
-    }
-
-    let mut actual_timespan = (last_block.timestamp as i64) - (first_block.timestamp as i64);
-
-    // Clamp timespan
-    if actual_timespan < TARGET_TIMESPAN / 4 {
-        actual_timespan = TARGET_TIMESPAN / 4;
-    }
-    if actual_timespan > TARGET_TIMESPAN * 4 {
-        actual_timespan = TARGET_TIMESPAN * 4;
-    }
-
-    // BIP94: Use first block's bits instead of last block's
-    let base_bits = if params.enforce_bip94 {
-        first_block.bits
-    } else {
-        last_block.bits
-    };
-
-    let base_target = bits_to_target(base_bits);
-    let pow_limit = bits_to_target(params.pow_limit_bits);
-
-    let new_target = (base_target * U256::from(actual_timespan as u64)) / U256::from(TARGET_TIMESPAN as u64);
-
-    let final_target = if new_target > pow_limit {
-        pow_limit
-    } else {
-        new_target
-    };
-
-    target_to_bits(final_target)
+    calculate_next_work_required(last_block, first_block, params)
 }
 
 /// Check if a difficulty transition is permitted.
@@ -327,6 +304,13 @@ mod tests {
         }
     }
 
+    /// Helper for mainnet retarget tests: build a `first_block` with a given
+    /// timestamp. `bits` is irrelevant on non-BIP94 networks (last_block.bits
+    /// is used as the base) so we mirror last_block.bits for clarity.
+    fn first_block(height: u32, bits: u32, timestamp: u32) -> BlockIndexInfo {
+        BlockIndexInfo { height, bits, timestamp }
+    }
+
     #[test]
     fn test_difficulty_adjustment_no_change() {
         // When actual timespan equals target, difficulty shouldn't change
@@ -336,9 +320,9 @@ mod tests {
             bits: 0x1d00ffff,
             timestamp: 1231006505 + (TARGET_TIMESPAN as u32),
         };
-        let first_time = 1231006505;
+        let first = first_block(0, 0x1d00ffff, 1231006505);
 
-        let new_bits = calculate_next_work_required(&last_block, first_time, &params);
+        let new_bits = calculate_next_work_required(&last_block, &first, &params);
         assert_eq!(new_bits, 0x1d00ffff);
     }
 
@@ -351,9 +335,9 @@ mod tests {
             bits: 0x1d00ffff,
             timestamp: 1231006505 + ((TARGET_TIMESPAN / 2) as u32),
         };
-        let first_time = 1231006505;
+        let first = first_block(0, 0x1d00ffff, 1231006505);
 
-        let new_bits = calculate_next_work_required(&last_block, first_time, &params);
+        let new_bits = calculate_next_work_required(&last_block, &first, &params);
 
         // New difficulty should be higher (lower bits value)
         // Target halved means bits should be lower
@@ -371,9 +355,9 @@ mod tests {
             bits: 0x1d00ffff,
             timestamp: 1231006505 + ((TARGET_TIMESPAN * 2) as u32),
         };
-        let first_time = 1231006505;
+        let first = first_block(0, 0x1d00ffff, 1231006505);
 
-        let new_bits = calculate_next_work_required(&last_block, first_time, &params);
+        let new_bits = calculate_next_work_required(&last_block, &first, &params);
 
         // At genesis difficulty (pow_limit), it can't get any easier
         // So it should stay the same
@@ -390,9 +374,9 @@ mod tests {
             bits: start_bits,
             timestamp: 1231006505 + ((TARGET_TIMESPAN * 10) as u32), // 10x target time
         };
-        let first_time = 1231006505;
+        let first = first_block(0, start_bits, 1231006505);
 
-        let new_bits = calculate_next_work_required(&last_block, first_time, &params);
+        let new_bits = calculate_next_work_required(&last_block, &first, &params);
 
         // Should be clamped to 4x adjustment max
         let old_target = bits_to_target(start_bits);
@@ -412,9 +396,9 @@ mod tests {
             bits: start_bits,
             timestamp: 1231006505 + 1000, // Very fast blocks
         };
-        let first_time = 1231006505;
+        let first = first_block(0, start_bits, 1231006505);
 
-        let new_bits = calculate_next_work_required(&last_block, first_time, &params);
+        let new_bits = calculate_next_work_required(&last_block, &first, &params);
 
         // Should be clamped to 1/4 adjustment min
         let old_target = bits_to_target(start_bits);
@@ -563,5 +547,229 @@ mod tests {
             0x1d00ffff,
             Network::Testnet
         ));
+    }
+
+    // ----------------------------------------------------------------------
+    // BIP94 (testnet4) regression tests
+    //
+    // Per Bitcoin Core pow.cpp:67-76, when `enforce_BIP94` is true the
+    // retarget formula uses pindexFirst->nBits (first block of the period)
+    // instead of pindexLast->nBits. This blocks the time-warp attack where
+    // an attacker uses the testnet min-difficulty exception to inflate the
+    // tip's nBits and then warp forward at the boundary.
+    //
+    // Before this fix, the Rust path silently used last_block.bits even
+    // when params.enforce_bip94 was true (TODO comment at line 157).
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_bip94_uses_first_block_bits_not_last() {
+        // Adversarial scenario: at the retarget boundary the last block was
+        // a min-difficulty block (POW_LIMIT_TESTNET), but the first block
+        // of the period had the real difficulty (0x1b0404cb).
+        //
+        // - With BIP94 (testnet4): base = first_block.bits  -> retarget away from
+        //   real difficulty, NOT from the min-diff tip.
+        // - Without BIP94 (testnet3): base = last_block.bits -> retarget away
+        //   from POW_LIMIT_TESTNET (which is what the time-warp exploit relies on).
+        //
+        // We verify the two paths diverge: the testnet4 result must be HARDER
+        // than the testnet3 result given the same actual_timespan.
+        let real_bits = 0x1b0404cb;
+        let min_diff = POW_LIMIT_TESTNET;
+        let first_time: u32 = 1700000000;
+        let last_time: u32 = first_time + (TARGET_TIMESPAN as u32); // exact target timespan
+
+        let last_block = BlockIndexInfo {
+            height: 2015,
+            bits: min_diff,         // tip ended on a min-difficulty block
+            timestamp: last_time,
+        };
+        let first = BlockIndexInfo {
+            height: 0,
+            bits: real_bits,        // period's first block had real difficulty
+            timestamp: first_time,
+        };
+
+        let testnet4_params = get_consensus_params(Network::Testnet4);
+        assert!(testnet4_params.enforce_bip94, "testnet4 must enforce BIP94");
+        let testnet4_bits = calculate_next_work_required(&last_block, &first, &testnet4_params);
+
+        let testnet3_params = get_consensus_params(Network::Testnet);
+        assert!(!testnet3_params.enforce_bip94, "testnet3 must NOT enforce BIP94");
+        let testnet3_bits = calculate_next_work_required(&last_block, &first, &testnet3_params);
+
+        // BIP94 must use first_block.bits as the base, so when the actual
+        // timespan equals the target, the result is ~first_block.bits.
+        assert_eq!(
+            testnet4_bits, real_bits,
+            "BIP94 must base retarget on first_block.bits ({:#010x}), got {:#010x}",
+            real_bits, testnet4_bits,
+        );
+
+        // testnet3 (no BIP94) bases retarget on last_block.bits == min_diff,
+        // so the retarget result is ~min_diff (capped at pow_limit).
+        assert_eq!(
+            testnet3_bits, min_diff,
+            "Non-BIP94 must base retarget on last_block.bits ({:#010x}), got {:#010x}",
+            min_diff, testnet3_bits,
+        );
+
+        // Sanity: the two paths must diverge — this is the whole point of BIP94.
+        assert_ne!(
+            testnet4_bits, testnet3_bits,
+            "BIP94 path must diverge from non-BIP94 path on the time-warp scenario",
+        );
+        // BIP94 result must be the harder difficulty (lower target = lower bits
+        // when the exponents match; here real_bits=0x1b... < min_diff=0x1d...).
+        assert!(
+            testnet4_bits < testnet3_bits,
+            "BIP94 must yield harder difficulty than non-BIP94 in time-warp scenario",
+        );
+    }
+
+    #[test]
+    fn test_bip94_get_next_work_required_end_to_end() {
+        // End-to-end: drive get_next_work_required (the entry point that
+        // validation calls) on a testnet4 retarget boundary and confirm
+        // it consults first_block.bits, not last_block.bits.
+        let real_bits = 0x1b0404cb;
+        let min_diff = POW_LIMIT_TESTNET;
+        let first_time: u32 = 1700000000;
+
+        // Build a 2016-block period: height 0..=2015. first block (height 0)
+        // has real difficulty, last block (height 2015) is min-diff after a
+        // string of min-diff blocks. The next block to validate is height 2016
+        // (a retarget boundary).
+        let last_block = BlockIndexInfo {
+            height: 2015,
+            bits: min_diff,
+            timestamp: first_time + (TARGET_TIMESPAN as u32),
+        };
+
+        let new_block_time = last_block.timestamp + TARGET_SPACING as u32;
+
+        // Ancestor lookup returns the period's first block at height 0.
+        let result = get_next_work_required(
+            &last_block,
+            new_block_time,
+            Network::Testnet4,
+            |h| {
+                if h == 0 {
+                    Some(BlockIndexInfo {
+                        height: 0,
+                        bits: real_bits,
+                        timestamp: first_time,
+                    })
+                } else {
+                    None
+                }
+            },
+        );
+
+        // BIP94 must compute the new bits from first_block.bits (real_bits),
+        // not from last_block.bits (min_diff). With actual_timespan == target,
+        // the retarget yields ~first_block.bits.
+        assert_eq!(
+            result, real_bits,
+            "testnet4 retarget must use first_block.bits (BIP94); got {:#010x}, want {:#010x}",
+            result, real_bits,
+        );
+
+        // Cross-check: the same call on testnet3 (no BIP94) yields the
+        // last_block.bits result (min_diff). The two networks MUST produce
+        // different nBits for the same scenario.
+        let result_testnet3 = get_next_work_required(
+            &last_block,
+            new_block_time,
+            Network::Testnet,
+            |h| {
+                if h == 0 {
+                    Some(BlockIndexInfo {
+                        height: 0,
+                        bits: real_bits,
+                        timestamp: first_time,
+                    })
+                } else {
+                    None
+                }
+            },
+        );
+        assert_ne!(
+            result, result_testnet3,
+            "testnet4 (BIP94) and testnet3 paths must diverge at retarget; \
+             both returned {:#010x}",
+            result,
+        );
+    }
+
+    #[test]
+    fn test_bip94_matches_python_path_on_simple_retarget() {
+        // Mirror the Python path in src/ouroboros/validation.py:691-696:
+        //   if self.network == "testnet4":
+        //       old_target = _bits_to_target(period_start_block.bits)
+        //   else:
+        //       old_target = _bits_to_target(prev_block.bits)
+        //
+        // For a clean retarget (actual == target timespan), BIP94 yields
+        // first_block.bits exactly; the legacy Rust path (using
+        // last_block.bits) would yield last_block.bits and silently fork.
+        let testnet4_params = get_consensus_params(Network::Testnet4);
+        let last_block = BlockIndexInfo {
+            height: 2015,
+            bits: 0x1d00abcd,        // Different from first; pre-fix would emit ~this
+            timestamp: 1700000000 + (TARGET_TIMESPAN as u32),
+        };
+        let first = BlockIndexInfo {
+            height: 0,
+            bits: 0x1c00ffff,        // The "real" period-start difficulty
+            timestamp: 1700000000,
+        };
+
+        let bits = calculate_next_work_required(&last_block, &first, &testnet4_params);
+
+        // BIP94 must base retarget on first.bits, giving ~first.bits exactly
+        // (because actual_timespan == TARGET_TIMESPAN). The pre-fix code
+        // would have emitted ~last_block.bits (0x1d00abcd) instead.
+        assert_eq!(
+            bits, first.bits,
+            "BIP94 must emit first.bits ({:#010x}); pre-fix code would have emitted \
+             ~last_block.bits ({:#010x}). got {:#010x}",
+            first.bits, last_block.bits, bits,
+        );
+        assert_ne!(
+            bits, last_block.bits,
+            "BIP94 must NOT emit last_block.bits ({:#010x}) — that is the bug \
+             fixed by wiring first_block.bits through calculate_next_work_required",
+            last_block.bits,
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_bip94_wrapper_matches_canonical_path() {
+        // The deprecated calculate_next_work_required_bip94 wrapper must
+        // remain byte-identical with the canonical path for all networks.
+        let last_block = BlockIndexInfo {
+            height: 2015,
+            bits: 0x1d00abcd,
+            timestamp: 1700000000 + (TARGET_TIMESPAN as u32),
+        };
+        let first = BlockIndexInfo {
+            height: 0,
+            bits: 0x1c00ffff,
+            timestamp: 1700000000,
+        };
+
+        for network in [Network::Bitcoin, Network::Testnet, Network::Testnet4] {
+            let params = get_consensus_params(network);
+            let canonical = calculate_next_work_required(&last_block, &first, &params);
+            let deprecated = calculate_next_work_required_bip94(&last_block, &first, &params);
+            assert_eq!(
+                canonical, deprecated,
+                "deprecated wrapper must match canonical path on network {:?}",
+                network,
+            );
+        }
     }
 }
