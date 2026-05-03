@@ -230,10 +230,27 @@ class TestTransactionStructure:
         valid, msg = self.validator.validate_transaction(tx, height=1)
         assert not valid
 
-    def test_invalid_version_rejected(self):
+    def test_v3_tx_passes_structure_check(self):
+        # BIP-431 TRUC: tx version 3 is mempool/relay policy, NOT consensus.
+        # Bitcoin Core's consensus/tx_check.cpp::CheckTransaction has no
+        # nVersion check — block consensus accepts any nVersion. Pre-fix
+        # ouroboros rejected version=3 in _check_structure, which wedged
+        # mainnet IBD past the snapshot tip on block 944,184 tx 217 (txid
+        # 7372defce8713521da62fe0284b4fd23c3f33c8a7a23275788b50762db8fc0a3).
+        tx = _make_tx(version=3, inputs=[_make_txin()], outputs=[_make_txout()])
+        assert self.validator._check_structure(tx) is True
+
+    def test_v0_tx_passes_structure_check(self):
+        # Per Core, even version=0 is consensus-valid (mempool would
+        # reject via IsStandardTx, but block validation does not).
         tx = _make_tx(version=0, inputs=[_make_txin()], outputs=[_make_txout()])
-        valid, msg = self.validator.validate_transaction(tx, height=1)
-        assert not valid
+        assert self.validator._check_structure(tx) is True
+
+    def test_high_version_tx_passes_structure_check(self):
+        # Future soft-fork tx versions must be consensus-accepted
+        # (forward compatibility).
+        tx = _make_tx(version=99, inputs=[_make_txin()], outputs=[_make_txout()])
+        assert self.validator._check_structure(tx) is True
 
     def test_negative_output_value_rejected(self):
         tx = _make_tx(inputs=[_make_txin()], outputs=[_make_txout(value=-1)])
