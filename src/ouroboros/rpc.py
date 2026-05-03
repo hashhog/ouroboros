@@ -7167,6 +7167,29 @@ class RPCServer:
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
+        Dispatch wrapper for ``dumptxoutset`` that enforces the
+        NetworkDisable RAII contract via a Python ``try/finally``.
+
+        Mirrors Bitcoin Core's NetworkDisable destructor in
+        ``rpc/blockchain.cpp::dumptxoutset``: on every exit path
+        (success, ``HTTPException``, unexpected exception) the
+        ``block_submission_paused`` flag is cleared so subsequent
+        ``submitblock`` requests in the same process don't see stale
+        state. The actual rewind→dump→replay implementation lives in
+        :meth:`_rpc_dumptxoutset_impl`.
+        """
+        try:
+            return await self._rpc_dumptxoutset_impl(path, type=type, options=options)
+        finally:
+            self.block_submission_paused = False
+
+    async def _rpc_dumptxoutset_impl(
+        self,
+        path: str,
+        type: str = "",
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
         Dump the UTXO set to a file for use with loadtxoutset.
 
         Three operating modes (matches Bitcoin Core rpc/blockchain.cpp
@@ -7391,6 +7414,15 @@ class RPCServer:
                     )
 
             if target_height < original_tip_height:
+                # NetworkDisable RAII. Mirrors Bitcoin Core's
+                # NetworkDisable wrapper around TemporaryRollback in
+                # rpc/blockchain.cpp::dumptxoutset. Pause inbound block
+                # acceptance for the duration of the rewind→dump→replay
+                # dance; the matching restore lives inside a finally
+                # clause at the very bottom of this method (covers
+                # success, HTTPException, and unexpected exceptions).
+                self.block_submission_paused = True
+
                 # We invalidate the *child* of the target — same as Core's
                 # `chainstate->m_chain.Next(target_index)` (blockchain.cpp:3185).
                 # That disconnects every block from target+1 up to tip and
@@ -7550,6 +7582,8 @@ class RPCServer:
             )
             result["chain_restored"] = chain_restored
 
+        # NetworkDisable flag is cleared by the rpc_dumptxoutset wrapper's
+        # finally clause (covers success, error, unexpected exception).
         return result
 
     async def rpc_getchainstates(self) -> dict[str, Any]:
