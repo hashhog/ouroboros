@@ -16,6 +16,7 @@ from ouroboros.script import (
     get_flags_for_height,
 )
 from ouroboros.sig_cache import SigCache
+from ouroboros.consensus import BURIED_DEPLOYMENTS
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,30 @@ SIGNET_SCRIPT_FLAGS = (
     | SCRIPT_VERIFY_DERSIG
     | SCRIPT_VERIFY_NULLDUMMY
 )
+
+
+def _encode_bip34_height(height: int) -> bytes:
+    """Return the canonical BIP-34 byte encoding for a block height.
+
+    Mirrors Bitcoin Core's CScript() << nHeight (script.h:433-448):
+      height == 0  → b'\\x00'        (OP_0, single byte)
+      1..16        → b'\\x51'..b'\\x60'  (OP_1..OP_16, single byte)
+      otherwise    → length-prefixed sign-magnitude CScriptNum
+    """
+    if height == 0:
+        return b"\x00"  # OP_0
+    if 1 <= height <= 16:
+        return bytes([0x50 + height])  # OP_1..OP_16
+    # CScriptNum: minimal little-endian sign-magnitude with length prefix.
+    le = []
+    h = height
+    while h > 0:
+        le.append(h & 0xFF)
+        h >>= 8
+    # If high bit of last byte is set, append zero sign byte.
+    if le[-1] & 0x80:
+        le.append(0x00)
+    return bytes([len(le)]) + bytes(le)
 
 
 def _bits_to_target(bits: int) -> int:
@@ -950,47 +975,26 @@ class BlockValidator:
             )
             return False
 
-        # BIP34: coinbase scriptSig must start with the serialized block height
-        # Activated at height 227,931 on mainnet.
-        BIP34_HEIGHT = 227_931
-        if height >= BIP34_HEIGHT:
+        # BIP34: coinbase scriptSig must start with the byte-exact canonical
+        # encoding of the block height.
+        # Bitcoin Core validation.cpp:4151-4159:
+        #   CScript expect = CScript() << nHeight;
+        #   sig.size() >= expect.size() && equal(expect, sig[:expect.size()])
+        #
+        # Activation height is per-network (NOT hardcoded to mainnet 227931).
+        # testnet4/signet/regtest all have bip34_height=1.
+        bip34_deployment = BURIED_DEPLOYMENTS.get(self.network, {}).get("bip34")
+        bip34_activation = bip34_deployment.height if bip34_deployment is not None else 227_931
+        if height >= bip34_activation:
             script = coinbase_input.script_sig
-            # First byte is the push-size for the height
-            push_size = script[0]
-            if push_size == 0 or push_size > 4:
-                # Height zero can use OP_0 (0x00), but for heights >= BIP34,
-                # push_size should be 1-4 bytes of CScriptNum encoding.
-                if not (height == 0 and push_size == 0):
-                    logger.error(
-                        "[diag] _validate_coinbase FAIL h=%d: BIP34 push_size=%d "
-                        "(must be 1..4); scriptSig=%s",
-                        height,
-                        push_size,
-                        script.hex(),
-                    )
-                    return False
-            if 1 + push_size > sig_len:
+            expect = _encode_bip34_height(height)
+            n = len(expect)
+            if len(script) < n or script[:n] != expect:
                 logger.error(
-                    "[diag] _validate_coinbase FAIL h=%d: BIP34 push_size=%d exceeds "
-                    "scriptSig len=%d; scriptSig=%s",
+                    "[diag] _validate_coinbase FAIL h=%d: BIP34 bad encoding "
+                    "expected_prefix=%s scriptSig=%s",
                     height,
-                    push_size,
-                    sig_len,
-                    script.hex(),
-                )
-                return False
-            # Decode the little-endian height from the push data
-            height_bytes = script[1:1 + push_size]
-            encoded_height = int.from_bytes(height_bytes, "little")
-            if encoded_height != height:
-                logger.error(
-                    "[diag] _validate_coinbase FAIL h=%d: BIP34 encoded_height=%d "
-                    "expected=%d; push_size=%d height_bytes=%s scriptSig=%s",
-                    height,
-                    encoded_height,
-                    height,
-                    push_size,
-                    height_bytes.hex(),
+                    expect.hex(),
                     script.hex(),
                 )
                 return False
