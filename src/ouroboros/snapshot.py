@@ -986,40 +986,77 @@ class SnapshotManager:
         by txid (sorted by raw txid bytes, ascending) and within each group
         by vout. Header uses SnapshotMetadata; each coin is encoded with
         VARINT(code) + VARINT(compress(value)) + ScriptCompression.
+
+        Atomic-write protocol: bytes go to ``<output_path>.incomplete``,
+        the fd is fsynced, then renamed to ``<output_path>``. Mirrors
+        Bitcoin Core's flow in ``rpc/blockchain.cpp::dumptxoutset``
+        (``temppath = path + ".incomplete"``; write; fsync; rename). On
+        any error the temp file is best-effort deleted so a crashed
+        dump never leaves a torn ``<output_path>`` behind — only the
+        ``.incomplete`` artifact, which can be cleaned up out-of-band.
         """
+        import os
+
         best_hash, _ = self.db.get_best_block()
         total_coins = self.db.utxo_count()
         logger.info(f"[snapshot] Dumping {total_coins:,} coins to snapshot")
 
-        with open(output_path, "wb") as f:
-            _write_metadata_header(f, self.network, best_hash, total_coins)
+        temp_path = output_path + ".incomplete"
+        coins_written = 0
+        try:
+            with open(temp_path, "wb") as f:
+                _write_metadata_header(f, self.network, best_hash, total_coins)
 
-            # Group UTXOs by txid; sort by raw txid bytes (Core's leveldb
-            # cursor delivers them in lexicographic order over the COutPoint
-            # key, which is txid || vout LE -- so a per-txid bucketed sort
-            # plus a per-bucket vout sort matches the on-the-fly stream).
-            utxo_groups: dict[bytes, list[tuple[int, Any]]] = {}
-            for utxo in self.db.iter_utxos():
-                utxo_groups.setdefault(utxo.txid, []).append((utxo.vout, utxo))
+                # Group UTXOs by txid; sort by raw txid bytes (Core's
+                # leveldb cursor delivers them in lexicographic order
+                # over the COutPoint key, which is txid || vout LE --
+                # so a per-txid bucketed sort plus a per-bucket vout
+                # sort matches the on-the-fly stream).
+                utxo_groups: dict[bytes, list[tuple[int, Any]]] = {}
+                for utxo in self.db.iter_utxos():
+                    utxo_groups.setdefault(utxo.txid, []).append((utxo.vout, utxo))
 
-            coins_written = 0
-            for txid in sorted(utxo_groups.keys()):
-                coins = utxo_groups[txid]
-                coins.sort(key=lambda x: x[0])
-                f.write(txid)
-                _write_compact_size(f, len(coins))
-                for vout, utxo in coins:
-                    _write_compact_size(f, vout)
-                    serialize_coin(
-                        f,
-                        height=utxo.height,
-                        is_coinbase=bool(utxo.is_coinbase),
-                        amount=int(utxo.amount),
-                        script=bytes(utxo.script_pubkey),
-                    )
-                    coins_written += 1
-                    if progress_callback and coins_written % 100_000 == 0:
-                        progress_callback(coins_written, total_coins)
+                for txid in sorted(utxo_groups.keys()):
+                    coins = utxo_groups[txid]
+                    coins.sort(key=lambda x: x[0])
+                    f.write(txid)
+                    _write_compact_size(f, len(coins))
+                    for vout, utxo in coins:
+                        _write_compact_size(f, vout)
+                        serialize_coin(
+                            f,
+                            height=utxo.height,
+                            is_coinbase=bool(utxo.is_coinbase),
+                            amount=int(utxo.amount),
+                            script=bytes(utxo.script_pubkey),
+                        )
+                        coins_written += 1
+                        if progress_callback and coins_written % 100_000 == 0:
+                            progress_callback(coins_written, total_coins)
+
+                # Durability barrier: flush the user-space buffer and
+                # fsync the fd BEFORE the rename. Without this, a power
+                # loss between rename and dirty-page flush could leave
+                # ``<output_path>`` visible with zero-length / torn
+                # contents.
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Atomic rename: temp -> final. After this point the
+            # snapshot is visible to any concurrent reader.
+            os.replace(temp_path, output_path)
+        except BaseException:
+            # Best-effort cleanup of the .incomplete temp on any error
+            # (write failure, KeyboardInterrupt, OS-level errors...).
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning(
+                    f"[snapshot] failed to clean up {temp_path}: {e}"
+                )
+            raise
 
         logger.info(f"[snapshot] Wrote {coins_written:,} coins to {output_path}")
         return coins_written
