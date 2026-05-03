@@ -153,7 +153,17 @@ class BitcoinNode:
             # Initialize validators
             logger.info("Initializing validators...")
             self.tx_validator = TransactionValidator(self.db)
-            self.validator = BlockValidator(self.db, network=self.network)
+            # Pass the snapshot manager so the validator can synthesize a
+            # prev block for the snapshot tip (the FIRST block above the
+            # snapshot base would otherwise fail with "Previous block not
+            # found" forever -- BLOCKS_CF has no entry for the snapshot
+            # tip and the loadtxoutset wire format does not carry the tip
+            # block's bytes).  See BlockValidator._synthesize_snapshot_prev_block.
+            self.validator = BlockValidator(
+                self.db,
+                network=self.network,
+                snapshot_manager=self.snapshot_manager,
+            )
 
             # Initialize mempool
             logger.info("Initializing mempool...")
