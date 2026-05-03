@@ -126,11 +126,33 @@ N_SPECIAL_SCRIPTS = 6
 
 @dataclass
 class AssumeutxoData:
-    """Hardcoded assumeUTXO data for a specific block height."""
+    """Hardcoded assumeUTXO data for a specific block height.
+
+    ``base_header`` is the 80-byte serialized block header (version,
+    prev_blockhash, merkle_root, time, bits, nonce in wire/internal byte
+    order) for ``block_hash``.  When the snapshot is loaded, only
+    META_CF's best_block tip is updated -- BLOCKS_CF and BLOCK_INDEX_CF
+    have no entry for the snapshot tip, because the full block bytes
+    are intentionally not part of the snapshot wire format.  Validating
+    the FIRST block above the snapshot tip therefore requires the prev
+    header's ``timestamp`` and ``bits`` (matching Bitcoin Core's
+    ``LookupBlockIndex(snap_hash)`` which returns the in-memory
+    CBlockIndex populated by the header sync that runs before the
+    snapshot load).  We bake the 80-byte header in here so the post-
+    snapshot prev-block lookup succeeds without requiring header sync
+    to have already produced the snapshot tip's header bytes.
+
+    ``base_header`` may be ``None`` for snapshot heights we have not
+    yet provisioned (e.g. testnet snapshots that aren't used live);
+    in that case the post-snapshot prev-block fallback is unavailable
+    and the validator must wait until headers/blocks for the prev
+    height arrive via the network.
+    """
     height: int
     block_hash: bytes  # 32 bytes, internal byte order
     hash_serialized: bytes  # 32-byte commitment from Core's coinstats
     chain_tx_count: int
+    base_header: bytes | None = None  # 80-byte serialized header, internal byte order
 
     def block_hash_hex(self) -> str:
         """Get block hash as hex string (big-endian display format)."""
@@ -186,6 +208,14 @@ _MAINNET_ASSUMEUTXO: list[AssumeutxoData] = [
             "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"
         ),
         chain_tx_count=991_032_194,
+        # 80-byte serialized header (wire / internal byte order). Source:
+        # `getblockheader <hash> false` against any synced node. The header
+        # parses to: version 0x2a5fe000, prev 0000...0172014ba58d6645578a25d0ad512365adcd0791491b91ea84948,
+        # merkle 031b417c3a1828ddf3d6527fc210daafcc9218e81f98257f88d4d43bd7a5894f,
+        # time 1714049975 (2024-04-25), bits 0x17034219, nonce 0xea63987d.
+        base_header=bytes.fromhex(
+            "00e05f2aab948491071265ad552351d0ad625745668da54b0172010000000000000000004f89a5d73bd4d4887f25981fe81892ccafda10c27f52d6f3dd28183a7c411b03b7072366194203177d9863ea"
+        ),
     ),
     AssumeutxoData(
         height=880_000,
@@ -196,6 +226,9 @@ _MAINNET_ASSUMEUTXO: list[AssumeutxoData] = [
             "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9"
         ),
         chain_tx_count=1_145_604_538,
+        base_header=bytes.fromhex(
+            "00e08b2686dde705907acd8ddb3825e41e7f4bd470ae0d89657b01000000000000000000031ee4c43ad4b36796f2d2312138ac39356cf9e182748de7900d8d572bd73e6fffa98d67618c02174b491507"
+        ),
     ),
     AssumeutxoData(
         height=910_000,
@@ -206,6 +239,9 @@ _MAINNET_ASSUMEUTXO: list[AssumeutxoData] = [
             "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"
         ),
         chain_tx_count=1_226_586_151,
+        base_header=bytes.fromhex(
+            "00a0572be06d4f01a2ed2228dec965539cc8b96512ccde7d2824010000000000000000006f28c30dc748f6b1430fb2b9a5a94b5b34a5df6e318c6cc5c310a1a35b432b59a3ab9d68b32c021719d103e9"
+        ),
     ),
     AssumeutxoData(
         height=935_000,
@@ -216,6 +252,9 @@ _MAINNET_ASSUMEUTXO: list[AssumeutxoData] = [
             "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"
         ),
         chain_tx_count=1_305_397_408,
+        base_header=bytes.fromhex(
+            "00e00520c5f33700321310024933d3549d13176bc3f11210de280100000000000000000090d1e6e4d2be8cab3a503ba29c3fd1d21b55da72854356d1b1fee656d151168abe568369a1fc011700ed55d4"
+        ),
     ),
     # Local snapshot at h=944183 (not from Core chainparams). Hash computed
     # by canonical SHA256d hash_serialized over the dumped UTXO set.
@@ -229,6 +268,13 @@ _MAINNET_ASSUMEUTXO: list[AssumeutxoData] = [
             "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"
         ),
         chain_tx_count=1_334_000_000,
+        # bits = 0x17020684 (the difficulty in effect for the period
+        # containing 944183/944184; non-retarget so 944184 must use the
+        # same value). time = 1775651930 (2026-04-29), nonce = 0xae00fc06,
+        # prev = 00000000000000000000d6e603dff7e37cffedb78c4d090436cc428e956a6904.
+        base_header=bytes.fromhex(
+            "00c0052004696a958e42cc3604094d8cb7edff7ce3f7df03e6d600000000000000000000a86bcf724ea11137002a564c761911343722766b19c268eb56ea2e58c1e4b20f5a4cd66984060217a0a5fbad"
+        ),
     ),
 ]
 
@@ -766,6 +812,46 @@ class SnapshotManager:
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         (snapshot_dir / "base_blockhash").write_bytes(block_hash)
 
+    def read_snapshot_base_blockheader(self) -> bytes | None:
+        """Read the 80-byte serialized header for the snapshot base block.
+
+        Mirrors Bitcoin Core's persisted ``CBlockIndex`` for the snapshot
+        tip: it lets the validator answer ``timestamp`` / ``bits`` for the
+        prev block when validating the FIRST block above the snapshot tip
+        (whose ``prev_blockhash`` is the snapshot base hash but whose
+        prev block bytes are intentionally not in BLOCKS_CF).
+
+        Returns ``None`` if the sibling file was never written -- i.e. the
+        snapshot was loaded by an older build that did not yet persist the
+        header, or the chainparams entry for the snapshot height has no
+        ``base_header`` provisioned.  Callers must tolerate ``None`` and
+        fall back to the existing "buffer the block, retry later" path.
+        """
+        header_file = self.get_snapshot_chainstate_dir() / "base_blockheader"
+        if header_file.exists():
+            data = header_file.read_bytes()
+            if len(data) == 80:
+                return data
+            logger.warning(
+                f"[snapshot] base_blockheader has unexpected size {len(data)}, "
+                f"ignoring (expected 80 bytes)"
+            )
+        return None
+
+    def write_snapshot_base_blockheader(self, header: bytes) -> None:
+        """Write the 80-byte snapshot base header to the snapshot chainstate dir.
+
+        ``header`` must be the standard Bitcoin block header in wire/internal
+        byte order (version || prev || merkle || time || bits || nonce).
+        """
+        if len(header) != 80:
+            raise ValueError(
+                f"snapshot base header must be 80 bytes, got {len(header)}"
+            )
+        snapshot_dir = self.get_snapshot_chainstate_dir()
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        (snapshot_dir / "base_blockheader").write_bytes(header)
+
     def load_snapshot(
         self,
         snapshot_path: str,
@@ -884,6 +970,15 @@ class SnapshotManager:
         # Update database best block to snapshot tip.
         self.db.update_best_block(metadata.base_blockhash, height)
         self.write_snapshot_base_blockhash(metadata.base_blockhash)
+
+        # Persist the 80-byte header for the snapshot tip if chainparams
+        # has it (mainnet entries do; testnet entries may not).  Without
+        # this, the FIRST block above the snapshot tip cannot be validated
+        # (its prev_block lookup returns None and validate_block rejects
+        # it with "Previous block not found", forcing an infinite retry
+        # loop).  See AssumeutxoData.base_header for the rationale.
+        if au_data is not None and au_data.base_header is not None:
+            self.write_snapshot_base_blockheader(au_data.base_header)
 
         self.snapshot_loaded = True
         self.snapshot_height = height
