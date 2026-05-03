@@ -1444,9 +1444,14 @@ class TransactionValidator:
 
     def _check_structure(self, tx: Transaction) -> bool:
         """Check basic transaction structure"""
-        # Check version is valid
-        if tx.version < 1 or tx.version > 2:
-            return False
+        # Tx version is NOT a consensus check per Bitcoin Core
+        # (consensus/tx_check.cpp::CheckTransaction has no nVersion check —
+        # the version is mempool/relay policy only, enforced by
+        # validation.cpp::IsStandardTx). Block consensus accepts any
+        # nVersion value (including v3 BIP-431 TRUC, which is policy at
+        # the relay layer). The pre-fix `version < 1 or version > 2` check
+        # rejected mainnet block 944,184 tx 217 which has version=3 and
+        # is consensus-valid.
 
         # Check we have at least one input (unless coinbase)
         if len(tx.inputs) == 0:
