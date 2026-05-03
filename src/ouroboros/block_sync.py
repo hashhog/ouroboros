@@ -1736,20 +1736,60 @@ class BlockSync:
     def _build_locator(self, height: int) -> list[bytes]:
         """Build block locator (exponential spacing).
 
+        Mirrors Bitcoin Core's ``LocatorEntries`` (chain.cpp:26):
+        the FIRST entry is always the chain tip, and the rest walk back
+        exponentially.  The peer iterates the locator front-to-back and
+        sends headers starting from the child of the FIRST hash it
+        recognises on its best chain — so if our tip is missing, the peer
+        falls back to a much older block and we get a stream of headers
+        whose ``prev_blockhash`` does not match our actual tip.
+
         Uses the cheap Rust-side ``get_block_hash_by_height`` which returns the
         32-byte hash directly, instead of the full block (which would force a
         complete tx-by-tx deserialisation of a ~1MB block through PyO3 just to
         read ``block.hash``). The locator is rebuilt every ``sync_loop`` tick
         (1s during IBD) so the savings are substantial at high tip heights.
+
+        IMPORTANT (post-snapshot wedge fix, 2026-05-02): after a
+        ``loadtxoutset`` recovery, ``BLOCK_INDEX_CF`` is empty for all
+        snapshot-loaded heights — only META_CF gets ``best_block_hash`` /
+        ``best_height`` updated.  ``get_block_hash_by_height(944183)`` then
+        returns ``None`` and the old code silently dropped the entry,
+        producing a locator full of stale low-height hashes from before
+        the snapshot.  Every peer matched one of those tiny hashes
+        instead of our tip, so the resulting headers' ``prev`` was
+        ``ebf2a133...`` (height ~999) rather than our tip
+        ``17d8ce98...`` (height 944183), and every batch was rejected
+        with "does not connect".  Fix: anchor the locator on
+        ``get_best_block().hash`` from META_CF — this is the
+        authoritative tip and is always present.
         """
-        locator = []
+        locator: list[bytes] = []
+
+        # Tip-first anchor (Bitcoin Core chain.cpp:34).  This is the
+        # authoritative tip from META_CF, NOT a BLOCK_INDEX_CF lookup, so
+        # it survives snapshot loads and rollbacks where the per-height
+        # index is stale or missing.
+        try:
+            best_hash, best_height = self.db.get_best_block()
+        except Exception:
+            best_hash, best_height = None, height
+        if isinstance(best_hash, (bytes, bytearray)) and len(best_hash) == 32:
+            locator.append(bytes(best_hash))
+
+        # Use the authoritative tip height as the start of the walk so we
+        # don't walk past it from a stale ``height`` argument.
+        if isinstance(best_height, int) and best_height >= 0:
+            height = max(int(best_height), int(height))
+
         step = 1
-        current_height = height
+        current_height = height - 1  # tip already added above
 
         while current_height > 0:
             block_hash = self.db.get_block_hash_by_height(current_height)
             if isinstance(block_hash, bytes) and len(block_hash) == 32:
-                locator.append(block_hash)
+                if block_hash not in locator:
+                    locator.append(block_hash)
 
             # Exponential spacing: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ...
             if len(locator) >= 10:
