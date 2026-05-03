@@ -696,7 +696,13 @@ class ScriptInterpreter:
         # Bitcoin Core's pbegincodehash (interpreter.cpp).
         script_code_start = 0
 
-        # Tapscript sigops budget (BIP 342): 50 + 50 * witness_weight
+        # BIP-342 validation-weight budget (interpreter.cpp:1981):
+        #   m_validation_weight_left = ::GetSerializeSize(witness.stack)
+        #                              + VALIDATION_WEIGHT_OFFSET (50)
+        # Caller passes ``witness_weight`` = GetSerializeSize(witness.stack);
+        # we add the +50 OFFSET here. Each non-empty CHECKSIG /
+        # CHECKSIGVERIFY / CHECKSIGADD then deducts
+        # VALIDATION_WEIGHT_PER_SIGOP_PASSED (50) and aborts on negative.
         sigops_budget = 50 + witness_weight if is_tapscript else 0
 
         _DISABLED = frozenset([
@@ -1147,6 +1153,17 @@ class ScriptInterpreter:
                     if not sig:
                         stack.append(b"")
                         continue
+                    # BIP-342 validation-weight budget: decrement BEFORE
+                    # pubkey inspection / Schnorr verify, gated on
+                    # non-empty sig. Mirrors Core's
+                    # `success = !sig.empty()` deduction at
+                    # interpreter.cpp:357-366. Per Core's comment,
+                    # "Passing with an upgradable public key version
+                    # is also counted", so the deduction fires for the
+                    # unknown-pubkey-type forward-compat path too.
+                    sigops_budget -= 50
+                    if sigops_budget < 0:
+                        raise ValueError("Tapscript sigops budget exceeded")
                     if len(pubkey) != 32:
                         # Unknown pubkey type in tapscript — succeed for
                         # forward compatibility (len > 0 only)
@@ -1175,9 +1192,6 @@ class ScriptInterpreter:
                         sh = default_sighash
                     if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
                         raise ValueError("OP_CHECKSIG: Schnorr verification failed")
-                    sigops_budget -= 50
-                    if sigops_budget < 0:
-                        raise ValueError("Tapscript sigops budget exceeded")
                     stack.append(b"\x01")
                     continue
 
@@ -1243,6 +1257,12 @@ class ScriptInterpreter:
                 if is_tapscript:
                     if not sig or len(pubkey) == 0:
                         raise ValueError("OP_CHECKSIGVERIFY failed in tapscript")
+                    # BIP-342 validation-weight budget: see CHECKSIG above
+                    # for the ordering rationale. CHECKSIGVERIFY shares
+                    # the same EvalChecksigTapscript path in Core.
+                    sigops_budget -= 50
+                    if sigops_budget < 0:
+                        raise ValueError("Tapscript sigops budget exceeded")
                     if len(pubkey) != 32:
                         # Unknown pubkey type — succeed for forward compat
                         continue
@@ -1263,9 +1283,6 @@ class ScriptInterpreter:
                     )
                     if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
                         raise ValueError("OP_CHECKSIGVERIFY: Schnorr failed")
-                    sigops_budget -= 50
-                    if sigops_budget < 0:
-                        raise ValueError("Tapscript sigops budget exceeded")
                     continue
 
                 # Legacy / SegWit v0 ECDSA CHECKSIGVERIFY
@@ -1314,10 +1331,22 @@ class ScriptInterpreter:
                 n = self._read_num(stack.pop())
                 sig = stack.pop()
                 if not sig:
+                    # Empty sig: push n unchanged. Empty sigs do NOT
+                    # consume the BIP-342 validation-weight budget —
+                    # Core only decrements when `success = !sig.empty()`
+                    # (interpreter.cpp:357-366).
                     stack.append(self._encode_script_num(n))
                     continue
                 if len(pubkey) == 0:
                     raise ValueError("OP_CHECKSIGADD: empty pubkey")
+                # BIP-342 validation-weight budget: decrement BEFORE
+                # pubkey inspection / Schnorr verify, gated on non-empty
+                # sig (already established above). Per Core, the
+                # unknown-pubkey-type forward-compat success path also
+                # consumes budget.
+                sigops_budget -= 50
+                if sigops_budget < 0:
+                    raise ValueError("Tapscript sigops budget exceeded")
                 if len(pubkey) != 32:
                     # Unknown pubkey type — succeed for forward compat
                     stack.append(self._encode_script_num(n + 1))
@@ -1339,9 +1368,6 @@ class ScriptInterpreter:
                 )
                 if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
                     raise ValueError("OP_CHECKSIGADD: Schnorr failed")
-                sigops_budget -= 50
-                if sigops_budget < 0:
-                    raise ValueError("Tapscript sigops budget exceeded")
                 stack.append(self._encode_script_num(n + 1))
                 continue
 
@@ -1926,9 +1952,15 @@ class ScriptInterpreter:
             )
 
         if len(effective_witness) >= 2:
+            # Pass the ORIGINAL `witness` (annex INCLUDED) so the
+            # BIP-342 validation-weight budget can be seeded from
+            # ::GetSerializeSize(witness.stack) per Core's
+            # interpreter.cpp:1981. effective_witness has the annex
+            # popped, but Core's witness.stack does NOT.
             return self._verify_taproot_scriptpath(
                 tx, input_index, effective_witness, output_pubkey,
                 input_amounts, input_script_pubkeys, annex, flags,
+                full_witness=witness,
             )
 
         return False
@@ -1973,8 +2005,14 @@ class ScriptInterpreter:
         input_script_pubkeys: list[bytes] | None = None,
         annex: bytes | None = None,
         flags: int = SCRIPT_VERIFY_NONE,
+        full_witness: list[bytes] | None = None,
     ) -> bool:
-        """Script-path spend: witness = [...script_inputs, tapscript, control_block]."""
+        """Script-path spend: witness = [...script_inputs, tapscript, control_block].
+
+        `full_witness`, if supplied, is the ORIGINAL pre-strip witness stack
+        (annex INCLUDED). Used to seed the BIP-342 validation-weight budget
+        via ::GetSerializeSize(witness.stack) per Core's interpreter.cpp:1981.
+        """
         if len(witness) < 2:
             return False
 
@@ -2028,8 +2066,21 @@ class ScriptInterpreter:
                 ext_flag=1,
                 tap_leaf_hash=leaf_hash,
             )
-            # Compute witness weight for sigops budget
-            w_weight = sum(len(item) for item in witness)
+            # BIP-342 validation-weight budget seed (interpreter.cpp:1981):
+            #   m_validation_weight_left = ::GetSerializeSize(witness.stack)
+            #                              + VALIDATION_WEIGHT_OFFSET (50)
+            # `witness.stack` is the ORIGINAL pre-pop stack (annex INCLUDED,
+            # control block + script INCLUDED, args INCLUDED). We pass
+            # `full_witness` (ouroboros's pre-strip name); fall back to
+            # post-strip `witness` if a caller didn't thread it.
+            #
+            # Note: `_execute_script` adds the +50 OFFSET itself; what we
+            # compute here is the GetSerializeSize portion only, so the
+            # naming `witness_weight` is now a slight misnomer — it's the
+            # serialized size of the witness stack, including compact-size
+            # prefixes for the count and per-item lengths.
+            stack_for_budget = full_witness if full_witness is not None else witness
+            w_weight = self._serialized_witness_stack_size(stack_for_budget)
             try:
                 result_stack = self._execute_script(
                     tap_script,
@@ -2097,6 +2148,38 @@ class ScriptInterpreter:
             return b'\xfe' + struct.pack('<I', n)
         else:
             return b'\xff' + struct.pack('<Q', n)
+
+    @staticmethod
+    def _compact_size_len(n: int) -> int:
+        """Byte length of a Bitcoin compact-size encoding for ``n``.
+
+        Mirrors Core's GetSizeOfCompactSize (serialize.h):
+            < 0xfd            -> 1 byte
+            <= 0xffff         -> 3 bytes (0xfd || u16)
+            <= 0xffffffff     -> 5 bytes (0xfe || u32)
+            else              -> 9 bytes (0xff || u64)
+        """
+        if n < 0xfd:
+            return 1
+        if n <= 0xffff:
+            return 3
+        if n <= 0xffffffff:
+            return 5
+        return 9
+
+    @classmethod
+    def _serialized_witness_stack_size(cls, items: list[bytes]) -> int:
+        """Serialized byte-size of a witness stack, the way Core counts it.
+
+        Mirrors ``::GetSerializeSize(witness.stack)``: a compact-size item
+        count followed by, for each item, its compact-size length prefix
+        and the item bytes themselves. Used to seed the BIP-342 tapscript
+        validation-weight budget at the leaf entry point.
+        """
+        total = cls._compact_size_len(len(items))
+        for it in items:
+            total += cls._compact_size_len(len(it)) + len(it)
+        return total
 
     def _compute_taproot_sighash(
         self,
