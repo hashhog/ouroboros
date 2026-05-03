@@ -37,6 +37,18 @@ LOG="${OURO_LOG:-/data/nvme1/hashhog-mainnet/logs/ouroboros.log}"
 export OUROBOROS_DISK_BUFFER="${OUROBOROS_DISK_BUFFER:-1}"
 export OUROBOROS_PER_PEER_SCHED="${OUROBOROS_PER_PEER_SCHED:-1}"
 
+# Post-snapshot BIP-68 stopgap (2026-05-03):
+#   Ouroboros's loadtxoutset path does not import the prior 11 block
+#   headers Core uses for MTP computation, so check_sequence_locks
+#   cannot enforce relative locktime on inputs whose prev block is
+#   pre-snapshot.  Enabling this flag SKIPS BIP-68 for those inputs
+#   (logging a single de-duped WARN per (block_height, prevout)).
+#   The proper fix is Option 1 (backwards-header-sync after snapshot
+#   load); see commit message for details.
+#   Set OUROBOROS_BIP68_STOPGAP=0 to disable (will re-wedge IBD on a
+#   block whose tx has a pre-snapshot prevout with a non-trivial seq).
+export OUROBOROS_BIP68_STOPGAP="${OUROBOROS_BIP68_STOPGAP:-1}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
