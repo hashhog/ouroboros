@@ -28,10 +28,18 @@ from ouroboros.script import (
     _check_der_signature,
     _is_push_only_simple,
     get_flags_for_height,
+    get_standard_script_flags,
 )
 
 
 class TestFlagActivation:
+    """
+    Tests for get_flags_for_height() (consensus-only flags) and
+    get_standard_script_flags() (mempool/policy flags).
+
+    Ref: Bitcoin Core policy/policy.h:105-111 (MANDATORY) vs 119-132 (STANDARD).
+    """
+
     def test_no_flags_before_p2sh(self):
         flags = get_flags_for_height(0)
         assert flags == 0
@@ -41,7 +49,16 @@ class TestFlagActivation:
         assert flags & SCRIPT_VERIFY_P2SH
 
     def test_dersig_active(self):
+        # DERSIG is consensus; LOW_S is policy-only (not in consensus flags).
         flags = get_flags_for_height(BIP66_ACTIVATION_HEIGHT)
+        assert flags & SCRIPT_VERIFY_DERSIG
+        assert not (flags & SCRIPT_VERIFY_LOW_S), (
+            "LOW_S is policy-only and must NOT be in consensus flags"
+        )
+
+    def test_dersig_standard_includes_low_s(self):
+        # LOW_S IS in the standard (mempool) flags.
+        flags = get_standard_script_flags(BIP66_ACTIVATION_HEIGHT)
         assert flags & SCRIPT_VERIFY_DERSIG
         assert flags & SCRIPT_VERIFY_LOW_S
 
@@ -53,8 +70,25 @@ class TestFlagActivation:
         flags = get_flags_for_height(BIP68_ACTIVATION_HEIGHT)
         assert flags & SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
 
-    def test_segwit_flags(self):
+    def test_segwit_consensus_flags(self):
+        # Consensus: WITNESS + NULLDUMMY only.
         flags = get_flags_for_height(SEGWIT_ACTIVATION_HEIGHT)
+        assert flags & SCRIPT_VERIFY_WITNESS
+        assert flags & SCRIPT_VERIFY_NULLDUMMY
+        # Policy-only flags must NOT be present in consensus path.
+        assert not (flags & SCRIPT_VERIFY_NULLFAIL), (
+            "NULLFAIL is policy-only and must NOT be in consensus flags"
+        )
+        assert not (flags & SCRIPT_VERIFY_CLEANSTACK), (
+            "CLEANSTACK is policy-only and must NOT be in consensus flags"
+        )
+        assert not (flags & SCRIPT_VERIFY_SIGPUSHONLY), (
+            "SIGPUSHONLY is policy-only and must NOT be in consensus flags"
+        )
+
+    def test_segwit_standard_flags(self):
+        # Standard (mempool) flags add policy bits on top.
+        flags = get_standard_script_flags(SEGWIT_ACTIVATION_HEIGHT)
         assert flags & SCRIPT_VERIFY_WITNESS
         assert flags & SCRIPT_VERIFY_NULLDUMMY
         assert flags & SCRIPT_VERIFY_NULLFAIL

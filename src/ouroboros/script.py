@@ -114,11 +114,19 @@ def get_flags_for_height(
     network: str = "mainnet",
 ) -> int:
     """
-    Script verification flags for *height*; checks historical exceptions when *block_hash* is given.
+    Consensus script verification flags for *height*.
 
-    This function returns the appropriate script verification flags based on
-    which soft forks are active at the given height. It uses the consensus
-    module to check buried deployment activation heights per network.
+    Returns ONLY Bitcoin Core MANDATORY_SCRIPT_VERIFY_FLAGS:
+      P2SH | DERSIG | NULLDUMMY | CLTV | CSV | WITNESS | TAPROOT
+    (each gated on its BIP deployment height, plus two named block-hash
+    exceptions per validation.cpp:2250-2289).
+
+    Policy-only flags (NULLFAIL, LOW_S, CLEANSTACK, SIGPUSHONLY,
+    MINIMALDATA, MINIMALIF, WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE,
+    DISCOURAGE_UPGRADABLE_NOPS, etc.) are NOT set here — they belong in
+    get_standard_script_flags() for mempool/relay use only.
+
+    Ref: Bitcoin Core policy/policy.h:105-111 + validation.cpp:2250-2289.
 
     Args:
         height: Block height
@@ -126,7 +134,7 @@ def get_flags_for_height(
         network: Network name (mainnet, testnet, testnet4, regtest, signet)
 
     Returns:
-        Combined script verification flags
+        Combined consensus-only script verification flags
     """
     # Check for historical exception blocks first
     if block_hash is not None and block_hash in _SCRIPT_FLAG_EXCEPTIONS:
@@ -142,18 +150,16 @@ def get_flags_for_height(
     flags = SCRIPT_VERIFY_NONE
 
     if use_consensus:
-        # Use consensus module for network-aware deployment checks
         # P2SH (BIP16) - not a buried deployment but always active
         # (activated via ISM, hardcoded to height 173805 on mainnet)
         if network.lower() in ("regtest", "testnet4", "signet"):
-            # Active from genesis on these networks
             flags |= SCRIPT_VERIFY_P2SH
         elif height >= BIP16_ACTIVATION_HEIGHT:
             flags |= SCRIPT_VERIFY_P2SH
 
-        # BIP66 - strict DER signatures
+        # BIP66 - strict DER signatures (DERSIG only; LOW_S is policy-only)
         if is_buried_deployment_active("bip66", height, network):
-            flags |= SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S
+            flags |= SCRIPT_VERIFY_DERSIG
 
         # BIP65 - CHECKLOCKTIMEVERIFY
         if is_buried_deployment_active("bip65", height, network):
@@ -163,21 +169,16 @@ def get_flags_for_height(
         if is_buried_deployment_active("csv", height, network):
             flags |= SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
 
-        # SegWit (BIP141/143/147)
+        # SegWit (BIP141/143/147) — WITNESS + NULLDUMMY only.
+        # NULLFAIL, CLEANSTACK, SIGPUSHONLY, MINIMALDATA, MINIMALIF,
+        # WITNESS_PUBKEYTYPE, DISCOURAGE_UPGRADABLE_NOPS, CONST_SCRIPTCODE
+        # are all STANDARD_SCRIPT_VERIFY_FLAGS (policy only).
         if is_buried_deployment_active("segwit", height, network):
-            flags |= (SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_NULLDUMMY
-                       | SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_CLEANSTACK
-                       | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
-                       | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
-                       | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS
-                       | SCRIPT_VERIFY_CONST_SCRIPTCODE)
+            flags |= SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_NULLDUMMY
 
-        # Taproot (BIP340/341/342)
-        # NOTE: DISCOURAGE_UPGRADABLE_TAPROOT_VERSION and DISCOURAGE_OP_SUCCESS
-        # are policy flags for mempool/relay only.  Block consensus validation
-        # must NOT include them — unknown leaf versions succeed unconditionally
-        # per BIP 341 to allow future soft-fork upgrades.
-        # Ref: Bitcoin Core validation.cpp line 2262 uses only SCRIPT_VERIFY_TAPROOT.
+        # Taproot (BIP340/341/342) — TAPROOT only.
+        # DISCOURAGE_UPGRADABLE_TAPROOT_VERSION and DISCOURAGE_OP_SUCCESS
+        # are policy flags for mempool/relay only.
         if is_deployment_active("taproot", height, network):
             flags |= SCRIPT_VERIFY_TAPROOT
 
@@ -186,19 +187,67 @@ def get_flags_for_height(
         if height >= BIP16_ACTIVATION_HEIGHT:
             flags |= SCRIPT_VERIFY_P2SH
         if height >= BIP66_ACTIVATION_HEIGHT:
-            flags |= SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S
+            flags |= SCRIPT_VERIFY_DERSIG
         if height >= BIP65_ACTIVATION_HEIGHT:
             flags |= SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
         if height >= BIP68_ACTIVATION_HEIGHT:
             flags |= SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
         if height >= SEGWIT_ACTIVATION_HEIGHT:
-            flags |= (SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_NULLDUMMY
-                       | SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_CLEANSTACK
-                       | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
-                       | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
-                       | SCRIPT_VERIFY_CONST_SCRIPTCODE)
+            flags |= SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_NULLDUMMY
         if height >= TAPROOT_ACTIVATION_HEIGHT:
             flags |= SCRIPT_VERIFY_TAPROOT
+
+    return flags
+
+
+def get_standard_script_flags(
+    height: int,
+    block_hash: bytes | None = None,
+    network: str = "mainnet",
+) -> int:
+    """
+    Standard (mempool/relay) script verification flags for *height*.
+
+    Composes the consensus flags from get_flags_for_height() and adds the
+    policy-only flags from STANDARD_SCRIPT_VERIFY_FLAGS that mempool uses
+    to reject non-standard transactions.  Must NOT be used for block
+    validation — use get_flags_for_height() there.
+
+    Ref: Bitcoin Core policy/policy.h:119-132.
+    """
+    flags = get_flags_for_height(height, block_hash, network)
+
+    # Add policy-only flags for mempool/relay standardness
+    try:
+        from ouroboros.consensus import is_buried_deployment_active, is_deployment_active
+        use_consensus = True
+    except ImportError:
+        use_consensus = False
+
+    if use_consensus:
+        if is_buried_deployment_active("bip66", height, network):
+            flags |= SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC
+        if is_buried_deployment_active("segwit", height, network):
+            flags |= (SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_CLEANSTACK
+                      | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
+                      | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
+                      | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS
+                      | SCRIPT_VERIFY_CONST_SCRIPTCODE)
+        if is_deployment_active("taproot", height, network):
+            flags |= (SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
+                      | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
+    else:
+        if height >= BIP66_ACTIVATION_HEIGHT:
+            flags |= SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC
+        if height >= SEGWIT_ACTIVATION_HEIGHT:
+            flags |= (SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_CLEANSTACK
+                      | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
+                      | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
+                      | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS
+                      | SCRIPT_VERIFY_CONST_SCRIPTCODE)
+        if height >= TAPROOT_ACTIVATION_HEIGHT:
+            flags |= (SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
+                      | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
 
     return flags
 
