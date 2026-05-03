@@ -655,4 +655,70 @@ async def test_dumptxoutset_reactivation_explicit_hash_path(tmp_path) -> None:
     # Reactivation put us back at the original tip.
     assert res["chain_restored"] is True
     assert db.best_height == original_tip
+
+
+# ---------------------------------------------------------------------------
+# Pruned-mode pre-check (Bitcoin Core rpc/blockchain.cpp:dumptxoutset
+# "Block height N not available (pruned data). Use a height after M.")
+# ---------------------------------------------------------------------------
+
+
+class _StubPruner:
+    """Minimal stand-in for ``ouroboros.pruning.Pruner``: only the
+    ``prune_height`` attribute is consulted by the rollback pre-check."""
+
+    def __init__(self, prune_height: int) -> None:
+        self.prune_height = prune_height
+
+
+@pytest.mark.asyncio
+async def test_dumptxoutset_rollback_below_prune_horizon_rejected(tmp_path) -> None:
+    """A pruned node must fail-fast when the rollback target is at or
+    below ``pruner.prune_height`` — every block from genesis up to and
+    including that height has had its undo data removed."""
+    db = _make_db_with_chain(tip_height=10)
+    rpc = _make_rpc(db, tmp_path=tmp_path)
+    rpc.node.pruner = _StubPruner(prune_height=4)  # blocks 1..4 are gone
+    out_path = tmp_path / "pruned-target.dat"
+
+    with pytest.raises(Exception) as excinfo:
+        await rpc.rpc_dumptxoutset(str(out_path), options={"rollback": 3})
+
+    msg = str(excinfo.value)
+    assert "not available" in msg
+    assert "pruned data" in msg
+    # Error names the lowest available height (prune_height).
+    assert "Use a height after 4" in msg
+    # Critical: the rewind dance MUST NOT have started.
+    assert db._db.invalidate_calls == []
+
+
+@pytest.mark.asyncio
+async def test_dumptxoutset_rollback_above_prune_horizon_accepted(tmp_path) -> None:
+    """A pruned node still allows rollback to any block above the prune
+    horizon — those bodies and their undo data are still on disk."""
+    db = _make_db_with_chain(tip_height=10)
+    rpc = _make_rpc(db, tmp_path=tmp_path)
+    rpc.node.pruner = _StubPruner(prune_height=2)
+    out_path = tmp_path / "above-horizon.dat"
+
+    res = await rpc.rpc_dumptxoutset(str(out_path), options={"rollback": 6})
+
+    assert res["chain_restored"] is True
+    assert res["rollback_height"] == 6
+
+
+@pytest.mark.asyncio
+async def test_dumptxoutset_rollback_unpruned_node_unaffected(tmp_path) -> None:
+    """Sanity: when no pruner is wired (or prune_height==0) the
+    pre-check is a no-op and any in-range rollback still works."""
+    db = _make_db_with_chain(tip_height=10)
+    rpc = _make_rpc(db, tmp_path=tmp_path)
+    rpc.node.pruner = _StubPruner(prune_height=0)  # never pruned
+    out_path = tmp_path / "no-prune.dat"
+
+    res = await rpc.rpc_dumptxoutset(str(out_path), options={"rollback": 1})
+
+    assert res["chain_restored"] is True
+    assert res["rollback_height"] == 1
     assert db._db.reactivate_calls == 1
