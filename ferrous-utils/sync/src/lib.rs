@@ -3224,6 +3224,35 @@ impl PyBlockchainDB {
             }
         }
 
+        // BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
+        // block timestamp must be strictly greater than the median-time-past
+        // of the previous 11 blocks.
+        // Reference: bitcoin-core/src/validation.cpp:4092
+        if height > 0 {
+            let prev_height = height - 1;
+            let start = if prev_height >= 10 { prev_height - 10 } else { 0 };
+            let mut ts_buf: Vec<u32> = Vec::with_capacity(11);
+            for h in start..=prev_height {
+                if let Ok(Some(meta)) = self.db.get_block_metadata(h) {
+                    ts_buf.push(meta.timestamp);
+                } else if let Ok(Some(block)) = self.db.get_block_by_height(h) {
+                    ts_buf.push(block.header().time);
+                }
+            }
+            if !ts_buf.is_empty() {
+                ts_buf.sort_unstable();
+                let mtp = ts_buf[ts_buf.len() / 2];
+                if inner.header.time <= mtp {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!(
+                            "Timestamp not greater than median time past: {} <= {}",
+                            inner.header.time, mtp
+                        )
+                    ));
+                }
+            }
+        }
+
         // Single WriteBatch for all DB mutations in this block
         let mut batch = self.db.create_batch();
 
