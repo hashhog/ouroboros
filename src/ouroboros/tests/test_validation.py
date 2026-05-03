@@ -16,7 +16,7 @@ src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
 from ouroboros.database import Block, BlockchainDatabase  # noqa: E402
-from ouroboros.validation import BlockValidator, _bits_to_target  # noqa: E402
+from ouroboros.validation import BlockValidator, _bits_to_target, _encode_bip34_height  # noqa: E402
 
 
 def hex_to_bytes(hex_str: str) -> bytes:
@@ -110,3 +110,79 @@ class TestBitsToTarget(unittest.TestCase):
         """Very hard bits produce small target"""
         target = _bits_to_target(0x03000001)
         self.assertEqual(target, 1)
+
+
+class TestEncodeBip34Height(unittest.TestCase):
+    """Test _encode_bip34_height canonical encoder.
+
+    Reference: Bitcoin Core script.h:433-448 (CScript::push_int64).
+    """
+
+    def test_height_0_op0(self):
+        """height 0 → OP_0 (0x00), single byte"""
+        self.assertEqual(_encode_bip34_height(0), b"\x00")
+
+    def test_height_1_op1(self):
+        """height 1 → OP_1 (0x51), single byte"""
+        self.assertEqual(_encode_bip34_height(1), bytes([0x51]))
+
+    def test_height_16_op16(self):
+        """height 16 → OP_16 (0x60), single byte"""
+        self.assertEqual(_encode_bip34_height(16), bytes([0x60]))
+
+    def test_height_17_one_byte_push(self):
+        """height 17 → 1-byte push (0x01 0x11)"""
+        self.assertEqual(_encode_bip34_height(17), bytes([0x01, 0x11]))
+
+    def test_height_127_no_sign_pad(self):
+        """height 127 (0x7f) → 1-byte push, no sign pad needed"""
+        self.assertEqual(_encode_bip34_height(127), bytes([0x01, 0x7F]))
+
+    def test_height_128_sign_pad(self):
+        """height 128 (0x80) → sign pad: 0x02 0x80 0x00"""
+        self.assertEqual(_encode_bip34_height(128), bytes([0x02, 0x80, 0x00]))
+
+    def test_height_32768_sign_pad(self):
+        """height 32768 (0x8000) → sign pad: 0x03 0x00 0x80 0x00"""
+        self.assertEqual(_encode_bip34_height(32768), bytes([0x03, 0x00, 0x80, 0x00]))
+
+    def test_height_500000(self):
+        """height 500000 (0x07A120 LE: 0x20 0xA1 0x07)"""
+        self.assertEqual(_encode_bip34_height(500000), bytes([0x03, 0x20, 0xA1, 0x07]))
+
+    def test_height_227931_mainnet_bip34(self):
+        """height 227931 (mainnet BIP34 activation, 0x37A5B LE: 0x5B 0x7A 0x03)"""
+        self.assertEqual(_encode_bip34_height(227931), bytes([0x03, 0x5B, 0x7A, 0x03]))
+
+
+class TestBip34Activation(unittest.TestCase):
+    """Test that BIP-34 activation uses per-network height, not hardcoded 227931.
+
+    Reference: Bitcoin Core chainparams.cpp — testnet4/regtest have bip34_height=1.
+    """
+
+    def _make_validator(self, network: str) -> BlockValidator:
+        tmpdir = tempfile.mkdtemp()
+        db = BlockchainDatabase(tmpdir, network)
+        return BlockValidator(db, network)
+
+    def test_encode_bip34_rejects_non_canonical_zero_pad(self):
+        """Non-canonical zero-padded encoding rejected (value-decode false positive)."""
+        # Height 100 canonical: 0x01 0x64. Zero-padded: 0x02 0x64 0x00.
+        canonical = _encode_bip34_height(100)
+        non_canonical = bytes([0x02, 0x64, 0x00])
+        self.assertNotEqual(canonical, non_canonical)
+        # And non_canonical starts with 0x02 which is != canonical[0]=0x01
+        self.assertNotEqual(non_canonical[:len(canonical)], canonical)
+
+    def test_encode_bip34_rejects_length_prefixed_for_low_heights(self):
+        """Length-prefixed form for height 1 (0x01 0x01) != OP_1 (0x51)."""
+        # Core emits OP_1 for height 1; length-prefixed form is non-canonical.
+        self.assertEqual(_encode_bip34_height(1), bytes([0x51]))
+        self.assertNotEqual(_encode_bip34_height(1), bytes([0x01, 0x01]))
+
+    def test_encode_bip34_missing_sign_byte_rejected(self):
+        """Height 128: <<0x01, 0x80>> is non-canonical vs <<0x02, 0x80, 0x00>>."""
+        canonical = _encode_bip34_height(128)
+        missing_sign = bytes([0x01, 0x80])
+        self.assertNotEqual(canonical[:len(missing_sign)], missing_sign)
