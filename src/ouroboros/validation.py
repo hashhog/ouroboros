@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import os
 import struct
 import time as _time
 
@@ -311,7 +312,7 @@ class BlockValidator:
     ):
         self.db = db
         self.network = network
-        self.tx_validator = TransactionValidator(db, network)
+        self.tx_validator = TransactionValidator(db, network, snapshot_manager=snapshot_manager)
         # Snapshot manager is consulted when prev_block lookup misses --
         # it lets the validator synthesize the snapshot tip's prev block
         # from the persisted 80-byte header so the FIRST block above the
@@ -1314,10 +1315,34 @@ class BlockValidator:
 class TransactionValidator:
     """Validates transactions for mempool and new blocks"""
 
-    def __init__(self, db: BlockchainDatabase, network: str = "mainnet"):
+    def __init__(
+        self,
+        db: BlockchainDatabase,
+        network: str = "mainnet",
+        snapshot_manager: "SnapshotManager | None" = None,
+    ):
         self.db = db
         self.network = network
         self.script_interpreter = ScriptInterpreter()
+        # Snapshot manager is consulted by the BIP-68 stopgap path
+        # (check_sequence_locks) to detect inputs whose prev block is
+        # below the snapshot height -- those prev blocks have no header
+        # bytes loaded, so we can't compute their MTP for time-based
+        # locks, and depth-based locks may not be enforceable either if
+        # the snapshot import elided per-coin height for any subset of
+        # coins.  When OUROBOROS_BIP68_STOPGAP=1 is set, we skip BIP-68
+        # for those inputs and emit a WARN.
+        self.snapshot_manager = snapshot_manager
+        # De-dupe state for the BIP-68 stopgap WARN: one log line per
+        # (block_height, prevout) avoids drowning the live log when a
+        # block has many pre-snapshot inputs.
+        self._bip68_stopgap_warned: set[tuple[int, bytes, int]] = set()
+        # Cache the resolved snapshot height so the env-flag fast path
+        # doesn't re-read the on-disk base_blockhash on every input.
+        # ``None`` means "no snapshot loaded" (or "unable to resolve"),
+        # which is the expected state for genesis-IBD nodes.  ``-1``
+        # is a sentinel meaning "not yet probed this process".
+        self._cached_snapshot_height: int | None = -1
 
     def validate_transaction(
         self, tx: Transaction, height: int, block_mtp: int = 0,
@@ -1529,6 +1554,130 @@ class TransactionValidator:
     SEQUENCE_TYPE    = 1 << 22       # 0x00400000  (time-based if set)
     SEQUENCE_MASK    = 0x0000ffff
 
+    # Env-flag for the BIP-68 stopgap (see ``_resolve_snapshot_height``).
+    # When set to a truthy value, BIP-68 is skipped for any input whose
+    # prevout was confirmed at or below the snapshot height (i.e. the
+    # prevout is "pre-snapshot" -- we lack the prior 11 headers needed
+    # to compute its MTP, and depth-based locks crossing the snapshot
+    # boundary are also unverifiable in any meaningful sense).
+    _BIP68_STOPGAP_ENV = "OUROBOROS_BIP68_STOPGAP"
+
+    def _bip68_stopgap_enabled(self) -> bool:
+        """Return True if the operator has opted in to the BIP-68 stopgap.
+
+        Treats common true-ish values (``1`` / ``true`` / ``yes`` / ``on``,
+        case-insensitive) as enabled; everything else (including empty
+        string and "0") is disabled.  Read on every call so the env-var
+        can be flipped without a process restart for soak/diagnostic
+        runs.
+        """
+        v = os.environ.get(self._BIP68_STOPGAP_ENV, "")
+        return v.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _resolve_snapshot_height(self) -> int | None:
+        """Return the snapshot tip height when an assumeUTXO snapshot has
+        been loaded into this datadir, else ``None``.
+
+        Two sources, in order:
+          1. ``snapshot_manager.snapshot_height`` -- set when this
+             process performed the load itself (cheap, in-RAM).
+          2. The on-disk ``chainstate_snapshot/base_blockhash`` file
+             plus a ``get_assumeutxo_by_hash`` lookup against the
+             chainparams table -- needed across restarts because
+             ``snapshot_height`` is *not* repopulated when the loader
+             takes the early-return "snapshot already exists" path
+             (see ``node.py:577``).
+
+        The resolved value is cached on the validator for the rest of
+        the process so we don't pay the file read on every input.
+        ``-1`` is the "not probed yet" sentinel; once probed we store
+        either an int or ``None``.
+        """
+        if self._cached_snapshot_height != -1:
+            return self._cached_snapshot_height  # type: ignore[return-value]
+
+        sm = self.snapshot_manager
+        if sm is None:
+            self._cached_snapshot_height = None
+            return None
+
+        # Cheap in-RAM source: set by load_snapshot() during this process.
+        if getattr(sm, "snapshot_height", None) is not None:
+            self._cached_snapshot_height = int(sm.snapshot_height)
+            return self._cached_snapshot_height
+
+        # Cross-restart source: re-derive from the on-disk base_blockhash
+        # via the chainparams table.  Lazy-import to avoid a circular
+        # dependency at module load.
+        try:
+            base_hash = sm.read_snapshot_base_blockhash()
+        except Exception:
+            base_hash = None
+        if not base_hash:
+            self._cached_snapshot_height = None
+            return None
+        try:
+            from ouroboros.snapshot import get_assumeutxo_by_hash
+            au = get_assumeutxo_by_hash(self.network, base_hash)
+        except Exception:
+            au = None
+        if au is None:
+            self._cached_snapshot_height = None
+            return None
+        self._cached_snapshot_height = int(au.height)
+        return self._cached_snapshot_height
+
+    def _is_pre_snapshot_prevout(self, utxo_height: int | None) -> bool:
+        """True iff ``utxo_height`` is at or below the snapshot tip.
+
+        Used by the BIP-68 stopgap to decide whether to skip relative
+        locktime enforcement on a given input.  Returns False when no
+        snapshot has been loaded -- the stopgap is a no-op for
+        genesis-IBD nodes.
+        """
+        if utxo_height is None:
+            return False
+        snap_h = self._resolve_snapshot_height()
+        if snap_h is None:
+            return False
+        return int(utxo_height) <= snap_h
+
+    def _log_bip68_stopgap_skip(
+        self, block_height: int, inp: TxIn, utxo_height: int
+    ) -> None:
+        """Emit a single WARN per (block_height, prevout) for the stopgap.
+
+        Without de-duping, the live mainnet log gets one line per input
+        per retry of a wedged block, drowning out everything else.  The
+        ``_bip68_stopgap_warned`` set is per-process and bounded; we
+        cap it at 4096 entries and reset when full so RAM is bounded
+        across a long-running soak.
+        """
+        key = (int(block_height), bytes(inp.prev_txid), int(inp.prev_vout))
+        if key in self._bip68_stopgap_warned:
+            return
+        if len(self._bip68_stopgap_warned) > 4096:
+            self._bip68_stopgap_warned.clear()
+        self._bip68_stopgap_warned.add(key)
+        snap_h = self._resolve_snapshot_height()
+        is_time = bool(inp.sequence & self.SEQUENCE_TYPE)
+        kind = "time" if is_time else "height"
+        masked = inp.sequence & self.SEQUENCE_MASK
+        logger.warning(
+            "[BIP68-STOPGAP] block=%d skipping %s-based seqlock for "
+            "input %s:%d (utxo_height=%d snapshot_height=%s seq=0x%08x mask=%d) -- "
+            "%s. TODO: replace with backwards-header-sync (Option 1).",
+            int(block_height),
+            kind,
+            bytes(inp.prev_txid)[::-1].hex(),
+            int(inp.prev_vout),
+            int(utxo_height),
+            "?" if snap_h is None else str(snap_h),
+            int(inp.sequence),
+            masked,
+            "OUROBOROS_BIP68_STOPGAP=1 (operator-acknowledged consensus relaxation)",
+        )
+
     def check_sequence_locks(
         self, tx: Transaction, block_height: int, block_mtp: int,
         network: str = "mainnet",
@@ -1543,6 +1692,16 @@ class TransactionValidator:
           - time-based:   MTP must exceed UTXO's MTP by (sequence & MASK) * 512 s
 
         Uses Rust implementation via PyO3 for performance and consistency.
+
+        STOPGAP: when ``OUROBOROS_BIP68_STOPGAP=1`` is set in the
+        environment AND a UTXO snapshot has been loaded, inputs whose
+        ``prev_height <= snapshot_height`` are treated as if their
+        sequence's DISABLE bit were set (i.e. BIP-68 is skipped for
+        those inputs).  This is **not consensus-correct in the strict
+        sense** -- it papers over the structural gap that ouroboros's
+        snapshot loader does not import the prior 11 headers needed for
+        MTP computation.  See ``_log_bip68_stopgap_skip``.  Long-term
+        fix is Option 1 (backwards-header-sync after snapshot load).
         """
         # BIP68 only applies to version 2+ transactions
         if tx.version < 2:
@@ -1562,6 +1721,7 @@ class TransactionValidator:
 
         # Build input info for Rust: list of (sequence, prev_height, prev_median_time)
         input_infos = []
+        stopgap_enabled = self._bip68_stopgap_enabled()
         for inp in tx.inputs:
             utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
             if utxo is None and intra_block_utxos:
@@ -1573,6 +1733,30 @@ class TransactionValidator:
             if utxo_height is None:
                 # No height metadata — treat as disabled (skip this input)
                 # This matches assumevalid-era UTXO handling
+                input_infos.append((inp.sequence | self.SEQUENCE_DISABLE, 0, 0))
+                continue
+
+            # BIP-68 stopgap (OUROBOROS_BIP68_STOPGAP=1): skip enforcement
+            # when the prevout was confirmed at or below the snapshot tip.
+            # Pre-snapshot blocks have no header bytes loaded post-
+            # assumeutxo (Core would have headers from genesis-first sync;
+            # ouroboros's snapshot loader does not require that), so
+            # ``get_median_time_past(utxo_height-1)`` returns ``None`` and
+            # time-based locks fall back to coin_time=0 -- which makes
+            # them silently pass.  Height-based locks crossing the
+            # snapshot boundary are similarly unverifiable.  The stopgap
+            # makes that "we cannot verify, so we skip" explicit and
+            # logged, instead of relying on the silent ``utxo_mtp = 0``
+            # fallback.  See block_sync wedge at h=944,184 / tx 920 on
+            # 2026-05-02 for the live failure mode.
+            if (
+                stopgap_enabled
+                and not (inp.sequence & self.SEQUENCE_DISABLE)
+                and self._is_pre_snapshot_prevout(utxo_height)
+            ):
+                self._log_bip68_stopgap_skip(
+                    block_height, inp, utxo_height,
+                )
                 input_infos.append((inp.sequence | self.SEQUENCE_DISABLE, 0, 0))
                 continue
 
@@ -1606,6 +1790,7 @@ class TransactionValidator:
         if tx.version < 2:
             return True
 
+        stopgap_enabled = self._bip68_stopgap_enabled()
         for inp in tx.inputs:
             if inp.sequence & self.SEQUENCE_DISABLE:
                 continue
@@ -1617,6 +1802,11 @@ class TransactionValidator:
             utxo_height = utxo.get('height')
             if utxo_height is None:
                 continue  # no height metadata — skip (assumevalid-era UTXO)
+
+            # BIP-68 stopgap: see check_sequence_locks() for rationale.
+            if stopgap_enabled and self._is_pre_snapshot_prevout(utxo_height):
+                self._log_bip68_stopgap_skip(block_height, inp, utxo_height)
+                continue
 
             if inp.sequence & self.SEQUENCE_TYPE:
                 # Time-based: units of 512 seconds

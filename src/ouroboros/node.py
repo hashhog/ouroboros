@@ -152,7 +152,16 @@ class BitcoinNode:
 
             # Initialize validators
             logger.info("Initializing validators...")
-            self.tx_validator = TransactionValidator(self.db)
+            # The mempool's TransactionValidator also needs the snapshot
+            # manager so the BIP-68 stopgap (OUROBOROS_BIP68_STOPGAP=1)
+            # can detect pre-snapshot prevouts on relayed/mempool tx
+            # validation paths -- not just block-validation paths.  The
+            # BlockValidator below propagates ``snapshot_manager`` to a
+            # *separate* TransactionValidator instance it owns, so we
+            # must wire it here too (the two instances do not share).
+            self.tx_validator = TransactionValidator(
+                self.db, network=self.network, snapshot_manager=self.snapshot_manager,
+            )
             # Pass the snapshot manager so the validator can synthesize a
             # prev block for the snapshot tip (the FIRST block above the
             # snapshot base would otherwise fail with "Previous block not
