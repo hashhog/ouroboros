@@ -308,6 +308,15 @@ class RPCServer:
         self._deployment_cache_height: int = -1
         self._deployment_cache_network: str = ""
 
+        # NetworkDisable flag: when True, ``rpc_submitblock`` (and any P2P
+        # block-handler callsite that consults this flag) refuses new
+        # blocks. Set during ``rpc_dumptxoutset``'s rewind→dump→replay
+        # dance to mirror Bitcoin Core's NetworkDisable RAII guard around
+        # TemporaryRollback in rpc/blockchain.cpp::dumptxoutset. Peers
+        # stay connected; only block acceptance is gated. Single-threaded
+        # async so a plain bool is sufficient (no lock needed).
+        self.block_submission_paused: bool = False
+
         # Register RPC methods
         self._register_methods()
 
@@ -3366,6 +3375,16 @@ class RPCServer:
         Stores the block in the database (block data, header/height index,
         UTXO set, tx index) and updates the chain tip.
         """
+        # NetworkDisable gate: refuse submissions while a ``dumptxoutset
+        # rollback`` rewind→dump→replay dance is in progress. Mirrors
+        # Bitcoin Core's NetworkDisable RAII around TemporaryRollback in
+        # rpc/blockchain.cpp::dumptxoutset.
+        if self.block_submission_paused:
+            return (
+                "rejected: block submission paused "
+                "(dumptxoutset rollback in progress)"
+            )
+
         try:
             block_bytes = bytes.fromhex(hexdata)
         except ValueError:
@@ -3407,6 +3426,16 @@ class RPCServer:
         results: null for success, or an error string for each block.
         Blocks are applied sequentially in the order given.
         """
+        # NetworkDisable gate: refuse the whole batch while a
+        # ``dumptxoutset rollback`` rewind→dump→replay dance is in
+        # progress. Mirrors Bitcoin Core's NetworkDisable RAII around
+        # TemporaryRollback in rpc/blockchain.cpp::dumptxoutset.
+        if self.block_submission_paused:
+            return [
+                "rejected: block submission paused "
+                "(dumptxoutset rollback in progress)"
+            ] * len(hexblocks)
+
         db = getattr(self.node, "db", None)
         if db is None:
             return ["Database not available"] * len(hexblocks)
@@ -7335,6 +7364,31 @@ class RPCServer:
                         f"{original_tip_height}"
                     ),
                 )
+
+            # Pruned-mode pre-check. Mirrors Bitcoin Core
+            # rpc/blockchain.cpp:dumptxoutset:
+            #   if (IsPruneMode() &&
+            #       target_index->nHeight <
+            #       node.chainman->m_blockman.GetFirstBlock()->nHeight)
+            #       throw "Block height N not available (pruned data).
+            #              Use a height after M.";
+            # ouroboros tracks the prune horizon via
+            # ``self.node.pruner.prune_height`` (highest pruned height; see
+            # ``ouroboros.pruning``). We fail fast so a pruned datadir does
+            # not begin an invalidate_block walk that is guaranteed to fail
+            # when undo data has been deleted.
+            pruner = getattr(self.node, "pruner", None)
+            if pruner is not None and pruner.prune_height > 0:
+                first_available = pruner.prune_height + 1
+                if target_height < first_available:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Block height {target_height} not available "
+                            f"(pruned data). Use a height after "
+                            f"{first_available - 1}."
+                        ),
+                    )
 
             if target_height < original_tip_height:
                 # We invalidate the *child* of the target — same as Core's
