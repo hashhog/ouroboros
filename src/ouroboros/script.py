@@ -850,6 +850,15 @@ class ScriptInterpreter:
             if opcode in _DISABLED:
                 raise ValueError(f"Disabled opcode 0x{opcode:02x}")
 
+            # CONST_SCRIPTCODE: OP_CODESEPARATOR in BASE (legacy non-segwit)
+            # scripts is rejected even in unexecuted branches when the flag is
+            # set.  Mirrors Core interpreter.cpp:474-476, which fires BEFORE
+            # the fExec gate.  Core checks `sigversion == SigVersion::BASE` —
+            # not witness — because OP_CODESEPARATOR is valid in witness scripts.
+            if opcode == 0xab and not is_witness_v0 and not is_tapscript:
+                if flags & SCRIPT_VERIFY_CONST_SCRIPTCODE:
+                    raise ValueError("CONST_SCRIPTCODE: OP_CODESEPARATOR in non-witness script")
+
             # Flow control (always processed for nesting)
             if opcode == 0x63:  # OP_IF
                 val = False
@@ -1178,15 +1187,9 @@ class ScriptInterpreter:
                 continue
 
             # OP_CODESEPARATOR (0xab)
+            # CONST_SCRIPTCODE check has already been applied above the fExec
+            # gate (Core interpreter.cpp:474-476); here we just update state.
             if opcode == 0xab:
-                # CONST_SCRIPTCODE: reject OP_CODESEPARATOR in pre-SegWit
-                # scripts only.  SegWit v0 and tapscript are excluded.
-                # (The caller passes is_witness_v0=True for witness v0
-                # execution but leaves sig_version at the BASE default, so
-                # we can't gate on sig_version alone here.)
-                is_pre_segwit = not is_witness_v0 and not is_tapscript
-                if (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE) and is_pre_segwit:
-                    raise ValueError("CONST_SCRIPTCODE: OP_CODESEPARATOR in non-witness script")
                 script_code_start = i
                 continue
 
@@ -2241,6 +2244,7 @@ class ScriptInterpreter:
         annex: bytes | None = None,
         ext_flag: int = 0,
         tap_leaf_hash: bytes | None = None,
+        codesep_pos: int = 0xFFFFFFFF,
     ) -> bytes:
         """Compute the signature hash for a Taproot spend (BIP 341 §4)."""
         # Determine hash type components
@@ -2345,7 +2349,11 @@ class ScriptInterpreter:
         if ext_flag == 1 and tap_leaf_hash:
             data.extend(tap_leaf_hash)
             data.append(0x00)  # key_version
-            data.extend(struct.pack('<i', -1))  # codesep_pos = -1 (none executed)
+            # BIP-341: codesep_pos is the 0-based opcode index of the last
+            # executed OP_CODESEPARATOR, or 0xFFFFFFFF if none has fired.
+            # Core writes `execdata.m_codeseparator_pos` as uint32 LE
+            # (interpreter.cpp:1565).  Must use unsigned uint32, not signed int.
+            data.extend(struct.pack('<I', codesep_pos & 0xFFFFFFFF))
 
         return _tagged_hash("TapSighash", bytes(data))
 
@@ -2365,11 +2373,23 @@ class ScriptInterpreter:
         stack: list[bytes] = list(witness_inputs)
         op_count = 0
         max_ops = 201
+        # BIP-341/342: 0-based opcode index counter, committed to the tapscript
+        # sigmsg when OP_CODESEPARATOR is encountered.  Mirrors Core's
+        # `opcode_pos` (interpreter.cpp:433, incremented at the top of the
+        # for-loop, so the first opcode sees opcode_pos=0).
+        # Initialized to 0xFFFFFFFF (sentinel = no CODESEPARATOR executed).
+        codesep_pos: int = 0xFFFFFFFF
+        opcode_pos: int = 0
 
         i = 0
         while i < len(script):
             opcode = script[i]
             i += 1
+            # Capture the 0-based index of this opcode, then advance.
+            # Placed before any `continue` so push-data ops also advance it,
+            # matching Core's unconditional `++opcode_pos`.
+            current_opcode_pos = opcode_pos
+            opcode_pos += 1
             op_count += 1
             if op_count > max_ops:
                 return False
@@ -2442,6 +2462,15 @@ class ScriptInterpreter:
                 stack.append(self._hash160(stack.pop()))
                 continue
 
+            # OP_CODESEPARATOR in tapscript (0xab) — BIP 342
+            if opcode == 0xab:
+                # Record the 0-based opcode index for the tapscript sigmsg.
+                # Mirrors Core: `execdata.m_codeseparator_pos = opcode_pos`
+                # (interpreter.cpp:1055), committed at interpreter.cpp:1565.
+                # CONST_SCRIPTCODE does NOT apply in tapscript (only BASE).
+                codesep_pos = current_opcode_pos
+                continue
+
             # OP_CHECKSIG — Schnorr in tapscript
             if opcode == 0xac:
                 if len(stack) < 2:
@@ -2470,9 +2499,26 @@ class ScriptInterpreter:
                             annex=annex,
                             ext_flag=1,
                             tap_leaf_hash=leaf_hash,
+                            codesep_pos=codesep_pos,
                         )
                     else:
-                        sighash = default_sighash
+                        # SIGHASH_DEFAULT: recompute if OP_CODESEPARATOR has
+                        # fired (codesep_pos changed from sentinel 0xFFFFFFFF),
+                        # since default_sighash was pre-computed with the
+                        # sentinel value.  This matches Core: the sighash
+                        # is computed on-demand with the live codesep_pos.
+                        if codesep_pos == 0xFFFFFFFF:
+                            sighash = default_sighash
+                        else:
+                            sighash = self._compute_taproot_sighash(
+                                tx, input_index, 0x00,
+                                input_amounts=input_amounts,
+                                input_script_pubkeys=input_script_pubkeys,
+                                annex=annex,
+                                ext_flag=1,
+                                tap_leaf_hash=leaf_hash,
+                                codesep_pos=codesep_pos,
+                            )
 
                     if not self._verify_schnorr_signature(sighash, raw_sig, pubkey):
                         return False
@@ -2498,12 +2544,22 @@ class ScriptInterpreter:
                         return False
                 elif len(sig) != 64:
                     return False
-                sh = default_sighash if sighash_type == 0x00 else self._compute_taproot_sighash(
-                    tx, input_index, sighash_type,
-                    input_amounts=input_amounts,
-                    input_script_pubkeys=input_script_pubkeys,
-                    annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
-                )
+                if sighash_type == 0x00:
+                    sh = default_sighash if codesep_pos == 0xFFFFFFFF else self._compute_taproot_sighash(
+                        tx, input_index, 0x00,
+                        input_amounts=input_amounts,
+                        input_script_pubkeys=input_script_pubkeys,
+                        annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
+                        codesep_pos=codesep_pos,
+                    )
+                else:
+                    sh = self._compute_taproot_sighash(
+                        tx, input_index, sighash_type,
+                        input_amounts=input_amounts,
+                        input_script_pubkeys=input_script_pubkeys,
+                        annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
+                        codesep_pos=codesep_pos,
+                    )
                 if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
                     return False
                 continue
@@ -2532,12 +2588,22 @@ class ScriptInterpreter:
                 elif len(sig) != 64:
                     return False
 
-                sh = default_sighash if sighash_type == 0x00 else self._compute_taproot_sighash(
-                    tx, input_index, sighash_type,
-                    input_amounts=input_amounts,
-                    input_script_pubkeys=input_script_pubkeys,
-                    annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
-                )
+                if sighash_type == 0x00:
+                    sh = default_sighash if codesep_pos == 0xFFFFFFFF else self._compute_taproot_sighash(
+                        tx, input_index, 0x00,
+                        input_amounts=input_amounts,
+                        input_script_pubkeys=input_script_pubkeys,
+                        annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
+                        codesep_pos=codesep_pos,
+                    )
+                else:
+                    sh = self._compute_taproot_sighash(
+                        tx, input_index, sighash_type,
+                        input_amounts=input_amounts,
+                        input_script_pubkeys=input_script_pubkeys,
+                        annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
+                        codesep_pos=codesep_pos,
+                    )
                 if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
                     return False
                 stack.append(self._encode_script_num(n + 1))
