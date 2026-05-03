@@ -54,6 +54,93 @@ _rate_limit_window = 60.0  # 1 minute
 _rate_limit_max_requests = 100000  # raised for IBD feeder throughput
 
 
+def bip22_result_string(error: str) -> str:
+    """Map an internal block-validation error string to a canonical BIP-22
+    submitblock result string.
+
+    BIP-22: https://github.com/bitcoin/bips/blob/master/bip-0022.mediawiki
+    Reference: Bitcoin Core BIP22ValidationResult() in src/rpc/mining.cpp
+
+    Consensus rejections are returned in the JSON-RPC *result* field as a
+    short ASCII string (not as a JSON-RPC error object).
+
+    Error strings come from:
+      - BlockValidationError variants (block.rs via PyO3 __str__)
+      - HeaderValidationError variants (header.rs via PyO3 __str__)
+      - Python-side checks in rpc_submitblock
+    """
+    s = error.lower()
+
+    # Already-canonical strings pass through unchanged
+    if s in ("duplicate", "inconclusive", "duplicate-invalid",
+             "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
+             "bad-cb-amount", "bad-blk-sigops", "bad-cb-height",
+             "bad-txns-nonfinal", "bad-txns-duplicate", "rejected",
+             "mandatory-script-verify-flag-failed",
+             "bad-txns-inputs-missingorspent"):
+        return s
+
+    # PoW / difficulty errors
+    if ("proof of work" in s or "invalid pow" in s or "invalid difficulty" in s
+            or ("difficulty" in s and ("does not match" in s or "expected" in s))):
+        return "high-hash"
+
+    # Merkle root errors
+    if "merkle root" in s and "witness" not in s:
+        return "bad-txnmrklroot"
+
+    # Witness commitment errors (BIP141)
+    if ("witness commitment" in s or "witness nonce" in s
+            or ("coinbase witness" in s and "32-byte" in s)):
+        return "bad-witness-merkle-match"
+
+    # Coinbase value / subsidy
+    if "coinbase amount" in s or "subsidy" in s or "coinbase value" in s:
+        return "bad-cb-amount"
+
+    # Sigops limit
+    if "sigops" in s:
+        return "bad-blk-sigops"
+
+    # BIP34 coinbase height
+    if "coinbase height" in s or "bad-cb-height" in s:
+        return "bad-cb-height"
+
+    # Non-final / sequence lock
+    if "sequence lock" in s or "non-final" in s or "not final" in s:
+        return "bad-txns-nonfinal"
+
+    # Duplicate transactions / BIP30
+    if "duplicate" in s and ("tx" in s or "transaction" in s or "unspent" in s):
+        return "bad-txns-duplicate"
+
+    # Missing inputs / UTXO
+    if "missing" in s and ("input" in s or "utxo" in s):
+        return "bad-txns-inputs-missingorspent"
+
+    # Script / signature verification failures
+    if any(k in s for k in ("script", "signature", "checksig", "tapscript",
+                             "witness program", "transaction validation")):
+        return "mandatory-script-verify-flag-failed"
+
+    # Timestamp errors
+    if "too far in the future" in s or "time-too-new" in s:
+        return "time-too-new"
+    if ("before median" in s or "time-too-old" in s
+            or "not greater than median" in s or "timestamp" in s and "median" in s):
+        return "time-too-old"
+
+    # Block size / weight
+    if "size" in s and "exceed" in s:
+        return "bad-blk-length"
+
+    # Previous block not found → inconclusive (we don't know the chain context)
+    if "previous block not found" in s or "block not found" in s:
+        return "inconclusive"
+
+    return "rejected"
+
+
 class JSONRPCRequest(BaseModel):
     """JSON-RPC 2.0 request model"""
     jsonrpc: str = "2.0"
@@ -3388,19 +3475,17 @@ class RPCServer:
         # Bitcoin Core's NetworkDisable RAII around TemporaryRollback in
         # rpc/blockchain.cpp::dumptxoutset.
         if self.block_submission_paused:
-            return (
-                "rejected: block submission paused "
-                "(dumptxoutset rollback in progress)"
-            )
+            # BIP-22: return canonical string in result field, not a long message.
+            return "rejected"
 
         try:
             block_bytes = bytes.fromhex(hexdata)
         except ValueError:
-            return "Invalid hex"
+            return "rejected"
 
         db = getattr(self.node, "db", None)
         if db is None:
-            return "Database not available"
+            return "rejected"
 
         try:
             _, best_height = db.get_best_block()
@@ -3424,7 +3509,10 @@ class RPCServer:
 
             return None
         except Exception as e:
-            return str(e)
+            # Map internal error strings to canonical BIP-22 result strings.
+            # BIP-22: rejection reason goes in the result field as a plain
+            # string, not as a JSON-RPC error object.
+            return bip22_result_string(str(e))
 
     async def rpc_submitblockbatch(self, hexblocks: list) -> list:
         """
@@ -3439,14 +3527,12 @@ class RPCServer:
         # progress. Mirrors Bitcoin Core's NetworkDisable RAII around
         # TemporaryRollback in rpc/blockchain.cpp::dumptxoutset.
         if self.block_submission_paused:
-            return [
-                "rejected: block submission paused "
-                "(dumptxoutset rollback in progress)"
-            ] * len(hexblocks)
+            # BIP-22: return canonical "rejected" strings, not long messages.
+            return ["rejected"] * len(hexblocks)
 
         db = getattr(self.node, "db", None)
         if db is None:
-            return ["Database not available"] * len(hexblocks)
+            return ["rejected"] * len(hexblocks)
 
         def _connect_batch():
             results = []
@@ -3454,7 +3540,7 @@ class RPCServer:
                 try:
                     block_bytes = bytes.fromhex(hexdata)
                 except (ValueError, TypeError):
-                    results.append("Invalid hex")
+                    results.append("rejected")
                     continue
 
                 try:
@@ -3463,7 +3549,8 @@ class RPCServer:
                     db.connect_block_from_bytes(block_bytes, next_height)
                     results.append(None)
                 except Exception as e:
-                    results.append(str(e))
+                    # Map to canonical BIP-22 result string
+                    results.append(bip22_result_string(str(e)))
             return results
 
         return await asyncio.to_thread(_connect_batch)
