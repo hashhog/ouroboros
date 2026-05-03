@@ -589,6 +589,53 @@ def test_snapshot_manager_round_trip(tmp_path) -> None:
     assert dst.best_height == au.height
 
 
+def test_dump_snapshot_atomic_write(tmp_path) -> None:
+    """Mirrors Bitcoin Core's rpc/blockchain.cpp::dumptxoutset which writes
+    to <path>.incomplete, fsyncs, and renames. After a successful write
+    only <path> should exist; the .incomplete temp must be gone so that
+    operators copying the snapshot mid-dump never see a torn file.
+    """
+    import os
+    src = _make_fixture_db()
+    sm = SnapshotManager(src, "mainnet", str(tmp_path / "src"))
+
+    snap_path = tmp_path / "atomic.dat"
+    temp_path = tmp_path / "atomic.dat.incomplete"
+
+    sm.dump_snapshot(str(snap_path))
+
+    assert snap_path.exists(), "final path missing after successful dump"
+    assert not temp_path.exists(), \
+        ".incomplete temp left on disk after successful dump"
+
+
+def test_dump_snapshot_cleans_temp_on_error(tmp_path, monkeypatch) -> None:
+    """If serialization raises mid-dump the .incomplete temp must be
+    cleaned up best-effort so a crashed dump never leaves a torn
+    artifact behind. No final-path snapshot should appear.
+    """
+    src = _make_fixture_db()
+    sm = SnapshotManager(src, "mainnet", str(tmp_path / "src"))
+
+    snap_path = tmp_path / "fail.dat"
+    temp_path = tmp_path / "fail.dat.incomplete"
+
+    # Patch serialize_coin to throw on the first call so the dump
+    # exits before reaching the rename.
+    from ouroboros import snapshot as _snapshot_mod
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated serialize_coin failure")
+
+    monkeypatch.setattr(_snapshot_mod, "serialize_coin", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated"):
+        sm.dump_snapshot(str(snap_path))
+
+    assert not snap_path.exists(), "final path should not exist on failure"
+    assert not temp_path.exists(), ".incomplete temp leaked after failure"
+
+
 def test_snapshot_manager_rejects_unknown_blockhash(tmp_path) -> None:
     src = _make_fixture_db()
     src.best_hash = b"\xde" * 32  # not in the assumeutxo table
