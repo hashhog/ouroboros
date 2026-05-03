@@ -3114,9 +3114,11 @@ class RPCServer:
 
         # gather transactions from mempool (dependency-aware)
         MAX_BLOCK_WEIGHT = 4_000_000
+        MAX_BLOCK_SIGOPS_COST = 80_000
         txs: list[dict[str, Any]] = []
         total_fees = 0
         total_weight = 0
+        total_sigops = 0
 
         if mempool:
             # Take a consistent snapshot so concurrent mutations don't
@@ -3269,6 +3271,11 @@ class RPCServer:
                             witness_spk, inp.witness
                         )
 
+                    # Enforce MAX_BLOCK_SIGOPS_COST budget (Core BlockAssembler parity).
+                    # Reference: bitcoin-core/src/node/miner.cpp TestChunkBlockLimits
+                    if total_sigops + tx_sigops_cost > MAX_BLOCK_SIGOPS_COST:
+                        continue  # tx would push block over sigops limit — skip
+
                     txs.append({
                         "data": raw.hex(),
                         "txid": t.hex(),
@@ -3279,6 +3286,7 @@ class RPCServer:
                     })
                     total_fees += e.fee
                     total_weight += tw
+                    total_sigops += tx_sigops_cost
                     included.add(t)
         else:
             snap_txs = {}
