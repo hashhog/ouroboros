@@ -278,10 +278,102 @@ def _get_p2sh_sigops(script_sig: bytes, prev_script_pubkey: bytes) -> int:
 class BlockValidator:
     """Validates new blocks"""
 
-    def __init__(self, db: BlockchainDatabase, network: str = "mainnet"):
+    def __init__(
+        self,
+        db: BlockchainDatabase,
+        network: str = "mainnet",
+        snapshot_manager: "SnapshotManager | None" = None,
+    ):
         self.db = db
         self.network = network
         self.tx_validator = TransactionValidator(db, network)
+        # Snapshot manager is consulted when prev_block lookup misses --
+        # it lets the validator synthesize the snapshot tip's prev block
+        # from the persisted 80-byte header so the FIRST block above the
+        # snapshot tip can validate without requiring its prev block's
+        # bytes (matching Core's `LookupBlockIndex(snap_hash)` flow,
+        # which returns the in-memory CBlockIndex even when full block
+        # bytes are pruned).  May be None for unit tests.
+        self.snapshot_manager = snapshot_manager
+
+    def _synthesize_snapshot_prev_block(
+        self, prev_blockhash: bytes
+    ) -> "Block | None":
+        """Return a synthetic Block for ``prev_blockhash`` if it is the
+        snapshot base tip, else ``None``.
+
+        Reads the persisted ``base_blockheader`` (80 bytes, written at
+        snapshot load time) and constructs a ``Block`` with empty
+        ``transactions`` -- this is sufficient to satisfy the prev-block
+        accesses in ``validate_block`` (only ``timestamp`` and ``bits``
+        are read on mainnet, plus ``height`` which we derive from the
+        snapshot manager's known tip).
+
+        Returns ``None`` if:
+        - no snapshot manager is wired (e.g. unit-test path)
+        - no snapshot has been loaded
+        - ``prev_blockhash`` doesn't match the snapshot base hash
+        - the chainparams entry for this snapshot height has no
+          ``base_header`` provisioned (testnet snapshots, for now)
+        """
+        sm = self.snapshot_manager
+        if sm is None:
+            return None
+        try:
+            snap_hash = sm.read_snapshot_base_blockhash()
+        except Exception:
+            return None
+        if snap_hash is None or snap_hash != prev_blockhash:
+            return None
+        try:
+            header = sm.read_snapshot_base_blockheader()
+        except Exception:
+            return None
+        if header is None or len(header) != 80:
+            return None
+        # Parse the 80-byte header and build a synthetic Block. The
+        # ``transactions`` list is empty because the snapshot wire format
+        # does not carry the tip block's tx data; the validator never
+        # touches it for a prev block (we only read .timestamp / .bits /
+        # .height / .prev_blockhash).
+        version = int.from_bytes(header[0:4], "little", signed=True)
+        prev_prev = header[4:36]
+        merkle_root = header[36:68]
+        timestamp = int.from_bytes(header[68:72], "little")
+        bits = int.from_bytes(header[72:76], "little")
+        nonce = int.from_bytes(header[76:80], "little")
+        # Verify the header round-trips to ``prev_blockhash`` -- defends
+        # against an on-disk header that doesn't match the stored hash
+        # (e.g. corrupted file, mismatched chainparams).
+        recomputed = hashlib.sha256(hashlib.sha256(header).digest()).digest()
+        if recomputed != prev_blockhash:
+            logger.warning(
+                "[snapshot-prev] base_blockheader hashes to "
+                f"{recomputed[::-1].hex()}, expected "
+                f"{prev_blockhash[::-1].hex()} -- ignoring"
+            )
+            return None
+        # Snapshot tip height comes from the manager's metadata; if it is
+        # unset (e.g. process just restarted and load_snapshot hasn't
+        # been re-driven), derive from the database tip -- which is the
+        # snapshot tip itself when no blocks have been connected yet.
+        snap_height = sm.snapshot_height
+        if snap_height is None:
+            try:
+                _, snap_height = self.db.get_best_block()
+            except Exception:
+                snap_height = None
+        return Block(
+            version=version,
+            prev_blockhash=prev_prev,
+            merkle_root=merkle_root,
+            timestamp=timestamp,
+            bits=bits,
+            nonce=nonce,
+            transactions=[],
+            hash=prev_blockhash,
+            height=snap_height,
+        )
 
     def validate_block(self, block: Block, known_height: int = 0) -> tuple[bool, str]:
         """Fully validate *block* (header, merkle root, weight, scripts); returns ``(ok, error_message)``.
@@ -290,8 +382,20 @@ class BlockValidator:
         deriving it from the previous block in the DB.  This avoids
         incorrect height=1 when the DB doesn't store height on Block objects.
         """
-        # 1. Get previous block
+        # 1. Get previous block.
+        #
+        # If the prev block is the snapshot base tip, BLOCKS_CF has no
+        # entry for it (the snapshot wire format doesn't carry block
+        # bytes -- only the UTXO set + base_blockhash).  Fall back to a
+        # synthetic prev block reconstructed from the 80-byte header
+        # persisted at snapshot load.  This mirrors Bitcoin Core's
+        # `LookupBlockIndex(snap_hash)` returning the in-memory
+        # CBlockIndex from the header sync that runs before snapshot
+        # load -- the full block bytes are not required for the
+        # prev-link header check.
         prev_block = self.db.get_block(block.prev_blockhash)
+        if not prev_block:
+            prev_block = self._synthesize_snapshot_prev_block(block.prev_blockhash)
         if not prev_block:
             return False, "Previous block not found"
 
