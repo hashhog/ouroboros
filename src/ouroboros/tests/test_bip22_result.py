@@ -86,8 +86,9 @@ class TestBip22ResultString:
         assert bip22_result_string("BIP30: duplicate unspent txid") == "bad-txns-duplicate"
 
     def test_duplicate_transaction(self):
-        # BlockValidationError::DuplicateTransaction
-        assert bip22_result_string("Duplicate transaction detected") == "bad-txns-duplicate"
+        # BlockValidationError::DuplicateTransaction — Core parity (bad-txns-inputs-missingorspent)
+        # Core reaches ConnectBlock prevout-already-spent for the same block.
+        assert bip22_result_string("Duplicate transaction detected") == "bad-txns-inputs-missingorspent"
 
     def test_missing_utxo_for_input(self):
         # BlockValidationError::Bip68MissingUtxo
