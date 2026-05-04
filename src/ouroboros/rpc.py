@@ -141,6 +141,13 @@ def bip22_result_string(error: str) -> str:
     if "missing" in s and ("input" in s or "utxo" in s):
         return "bad-txns-inputs-missingorspent"
 
+    # Negative output value: Rust NegativeOutputAmount ("Negative output value") wrapped as
+    # "Transaction validation error: Negative output value".  Must fire BEFORE the generic
+    # "transaction validation" catch-all below.
+    # Reference: consensus/tx_check.cpp::CheckTransaction (Core parity).
+    if "negative output" in s:
+        return "bad-txns-vout-negative"
+
     # Script / signature verification failures
     if any(k in s for k in ("script", "signature", "checksig", "tapscript",
                              "witness program", "transaction validation")):
