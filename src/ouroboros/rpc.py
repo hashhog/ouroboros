@@ -76,7 +76,7 @@ def bip22_result_string(error: str) -> str:
              "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
              "bad-cb-amount", "bad-blk-sigops", "bad-cb-height",
              "bad-txns-nonfinal", "bad-txns-duplicate", "rejected",
-             "mandatory-script-verify-flag-failed",
+             "block-script-verify-flag-failed",
              "bad-txns-inputs-missingorspent"):
         return s
 
@@ -156,9 +156,11 @@ def bip22_result_string(error: str) -> str:
         return "bad-txns-vout-toolarge"
 
     # Script / signature verification failures
+    # Connect-block stage: Core validation.cpp:2122 strprintf("block-script-verify-flag-failed (%s)",...)
     if any(k in s for k in ("script", "signature", "checksig", "tapscript",
-                             "witness program", "transaction validation")):
-        return "mandatory-script-verify-flag-failed"
+                             "witness program", "transaction validation",
+                             "disabled opcode")):
+        return "block-script-verify-flag-failed"
 
     # Timestamp errors
     if "too far in the future" in s or "time-too-new" in s:
@@ -3570,6 +3572,26 @@ class RPCServer:
                     False,        # skip_scripts: always verify scripts on submitblock
                     _network,
                 )
+
+            # Python-side script verification: the Rust validate_block_with_flags
+            # ignores skip_scripts (reserved for future wiring per block.rs:261).
+            # Run Python's validator.validate_block so that disabled-opcode checks
+            # (script.py::_DISABLED) and signature verification always fire on
+            # submitblock regardless of assumevalid.  Mirrors the IBD drain path
+            # which runs _run_python() in addition to _run_rust().
+            # Reference: Bitcoin Core EvalScript() disabled-opcode gate
+            # (interpreter.cpp) — no flag, no soft-fork: unconditional rejection.
+            _py_validator = getattr(self.node, "validator", None)
+            if _py_validator is not None:
+                from ouroboros.database import Block as _SubmitBlock
+                _blk_obj = _SubmitBlock.deserialize(block_bytes)
+                _valid, _err = await asyncio.to_thread(
+                    _py_validator.validate_block,
+                    _blk_obj,
+                    next_height,
+                )
+                if not _valid:
+                    raise ValueError(_err)
 
             # Use Rust connect_block_from_bytes for full persistence
             # (deserialisation + UTXO updates + block storage all in Rust)
