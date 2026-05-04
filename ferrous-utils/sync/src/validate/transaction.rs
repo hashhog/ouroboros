@@ -52,6 +52,9 @@ pub enum TransactionValidationError {
     #[error("Negative output value")]
     NegativeOutputAmount,
 
+    #[error("Output value exceeds MAX_MONEY")]
+    OutputAmountTooLarge,
+
     #[error("Invalid output amount")]
     InvalidOutputAmount,
 
@@ -463,12 +466,10 @@ impl TransactionValidator {
                 return Err(TransactionValidationError::NegativeOutputAmount);
             }
 
-            // Consensus allows zero-value outputs (OP_RETURN witness
-            // commitments, data-embedding txs, etc.). Core's CheckTransaction
-            // rejects only negative (unrepresentable in u64) and values above
-            // MAX_MONEY. Python validation.py:1260 uses the same rule.
+            // Per-output upper-bound check (consensus/tx_check.cpp::CheckTransaction — Core parity).
+            // Core: "bad-txns-vout-toolarge". Mirrors the negative check above.
             if amount > MAX_MONEY {
-                return Err(TransactionValidationError::InvalidOutputAmount);
+                return Err(TransactionValidationError::OutputAmountTooLarge);
             }
 
             total_output = total_output
