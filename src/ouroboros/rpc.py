@@ -180,6 +180,135 @@ def bip22_result_string(error: str) -> str:
     return "rejected"
 
 
+async def accept_block(
+    db,
+    node,
+    block_bytes: bytes,
+    next_height: int,
+    *,
+    skip_scripts: bool = False,
+) -> bytes:
+    """Unified block-acceptance helper — Core's ProcessNewBlock pipeline.
+
+    All RPC and P2P entry points that need to validate + connect a block MUST
+    call this function rather than invoking ``validate_block_from_bytes`` /
+    ``connect_block_from_bytes`` directly.  Routing every path through a single
+    helper makes it structurally impossible to accidentally skip validation for
+    one entry point (the recurring pattern that wave-29 audit 0d56486 found for
+    ouroboros).
+
+    Mirrors Bitcoin Core's ``Chainstate::ProcessNewBlock`` pipeline
+    (validation.cpp):
+        1. BIP-34 coinbase-height byte-prefix check (Python, network-aware)
+        2. ``validate_block_from_bytes`` (Rust, off-GIL CheckBlock +
+           ContextualCheckBlock + per-input scripts)
+        3. Python ``BlockValidator.validate_block`` (disabled-opcode, Python
+           script verify — complements Rust path)
+        4. ``connect_block_from_bytes`` (Rust, UTXO mutation + persistence)
+        5. Mempool eviction of confirmed transactions (best-effort)
+
+    Args:
+        db:           The ``PyBlockchainDB`` Rust extension object.
+        node:         The live ``Node`` instance (provides ``network``,
+                      ``validator``, ``mempool``).
+        block_bytes:  Raw Bitcoin wire-format block.
+        next_height:  Height this block will occupy (= ``best_height + 1``).
+        skip_scripts: When True, skip per-input script verification (used by
+                      the IBD drain below the assumevalid checkpoint).  BIP-34,
+                      structural checks, and UTXO checks always run regardless.
+
+    Returns:
+        The 32-byte block hash (internal byte order, as returned by
+        ``connect_block_from_bytes``).
+
+    Raises:
+        ValueError: on any validation or connection failure.  The caller is
+                    responsible for converting to a BIP-22 result string via
+                    ``bip22_result_string()`` when returning to an RPC client.
+
+    Reference: Bitcoin Core src/validation.cpp Chainstate::ProcessNewBlock.
+    Closed gaps: O1 (rpc_submitblockbatch), O2 (rpc_generatetoaddress),
+    O3 (import_blocks_from_file via Rust companion change).
+    """
+    network = getattr(node, "network", "mainnet")
+    best_height = next_height - 1
+
+    # Step 1 — BIP-34 coinbase height byte-exact prefix check.
+    # Rust connect_block_from_bytes has no network context so it cannot enforce
+    # the per-network activation height.  Run a lightweight Python check here.
+    # Reference: Bitcoin Core ContextualCheckBlock validation.cpp:4151-4159.
+    from ouroboros.validation import _encode_bip34_height
+    from ouroboros.consensus import BURIED_DEPLOYMENTS
+    _bip34_depl = BURIED_DEPLOYMENTS.get(network, {}).get("bip34")
+    _bip34_activation = _bip34_depl.height if _bip34_depl is not None else 227_931
+    if next_height >= _bip34_activation:
+        try:
+            from ouroboros.database import Block as _Block
+            _blk = _Block.deserialize(block_bytes)
+            if _blk.transactions:
+                _coinbase = _blk.transactions[0]
+                if _coinbase.inputs:
+                    _script = _coinbase.inputs[0].script_sig
+                    _expect = _encode_bip34_height(next_height)
+                    _n = len(_expect)
+                    if len(_script) < _n or _script[:_n] != _expect:
+                        raise ValueError("bad-cb-height")
+        except ValueError:
+            raise
+        except Exception:
+            pass  # deserialization failures fall through to Rust
+
+    # Step 2 — Rust structural + contextual validation (off-GIL).
+    # Covers: PoW, merkle root, prev-link, MTP timestamp, cb-len, witness
+    # commitment, IsFinalTx, BIP-30, BIP-68, duplicate-txid, sigop budget,
+    # block weight.  skip_scripts is honoured by the validator for blocks
+    # below the assumevalid checkpoint.
+    if hasattr(db, "validate_block_from_bytes"):
+        await asyncio.to_thread(
+            db.validate_block_from_bytes,
+            block_bytes,
+            best_height,  # prev_height = best_height (= next_height - 1)
+            skip_scripts,
+            network,
+        )
+
+    # Step 3 — Python script verification.
+    # Rust validate_block_with_flags currently reserves skip_scripts for future
+    # wiring (block.rs:261).  Run Python's validator so disabled-opcode checks
+    # (script.py::_DISABLED) and signature verification always fire when
+    # skip_scripts is False.
+    # Reference: Bitcoin Core EvalScript() disabled-opcode gate (interpreter.cpp).
+    if not skip_scripts:
+        _py_validator = getattr(node, "validator", None)
+        if _py_validator is not None:
+            from ouroboros.database import Block as _Blk
+            _blk_obj = _Blk.deserialize(block_bytes)
+            _valid, _err = await asyncio.to_thread(
+                _py_validator.validate_block,
+                _blk_obj,
+                next_height,
+            )
+            if not _valid:
+                raise ValueError(_err)
+
+    # Step 4 — Connect block (UTXO mutation + persistence, Rust).
+    block_hash: bytes = await asyncio.to_thread(
+        db.connect_block_from_bytes, block_bytes, next_height
+    )
+
+    # Step 5 — Evict confirmed transactions from the mempool (best-effort).
+    mempool = getattr(node, "mempool", None)
+    if mempool is not None and len(mempool) > 0:
+        try:
+            from ouroboros.database import Block as _Blk
+            _blk = _Blk.deserialize(block_bytes)
+            mempool.remove_block_transactions(_blk)
+        except Exception:
+            pass
+
+    return bytes(block_hash)
+
+
 class JSONRPCRequest(BaseModel):
     """JSON-RPC 2.0 request model"""
     jsonrpc: str = "2.0"
@@ -3508,6 +3637,10 @@ class RPCServer:
         Returns None on success, an error string on failure.
         Stores the block in the database (block data, header/height index,
         UTXO set, tx index) and updates the chain tip.
+
+        Routes through the unified ``accept_block`` helper (Core
+        ProcessNewBlock parity) — all structural, contextual, and script
+        checks fire before any UTXO mutation.
         """
         # NetworkDisable gate: refuse submissions while a ``dumptxoutset
         # rollback`` rewind→dump→replay dance is in progress. Mirrors
@@ -3530,84 +3663,17 @@ class RPCServer:
             _, best_height = db.get_best_block()
             next_height = best_height + 1
 
-            # BIP-34 coinbase height byte-exact prefix check.
-            # connect_block_from_bytes (Rust) does not carry network context so
-            # cannot apply the per-network activation height.  Do a lightweight
-            # Python-side check here before handing off to Rust.
-            # Reference: Bitcoin Core ContextualCheckBlock validation.cpp:4151-4159.
-            from ouroboros.validation import _encode_bip34_height
-            from ouroboros.consensus import BURIED_DEPLOYMENTS
-            _bip34_depl = BURIED_DEPLOYMENTS.get(self.node.network, {}).get("bip34")
-            _bip34_activation = _bip34_depl.height if _bip34_depl is not None else 227_931
-            if next_height >= _bip34_activation:
-                try:
-                    from ouroboros.database import Block as _Block
-                    _blk = _Block.deserialize(block_bytes)
-                    if _blk.transactions:
-                        _coinbase = _blk.transactions[0]
-                        if _coinbase.inputs:
-                            _script = _coinbase.inputs[0].script_sig
-                            _expect = _encode_bip34_height(next_height)
-                            _n = len(_expect)
-                            if len(_script) < _n or _script[:_n] != _expect:
-                                return "bad-cb-height"
-                except Exception:
-                    pass  # If deserialization fails, let Rust handle it
-
-            # Run validate_block_from_bytes before connecting, mirroring the
-            # IBD drain at block_sync.py::_process_pending_blocks (lines 1011-1022).
-            # This closes 4 gaps vs the IBD path: sigop cost budget, block weight,
-            # duplicate-txid (CVE-2012-2459), and per-input script verification —
-            # none of which connect_block_from_bytes enforces.
-            # Reference: Bitcoin Core ProcessNewBlock calls AcceptBlock (CheckBlock
-            # + ContextualCheckBlock) before ConnectBlock.
-            # Submitblock is rare in production so the extra validation cost is
-            # acceptable; skip_scripts=False ensures scripts always fire here.
-            _network = getattr(self.node, "network", "mainnet")
-            if hasattr(db, "validate_block_from_bytes"):
-                await asyncio.to_thread(
-                    db.validate_block_from_bytes,
-                    block_bytes,
-                    best_height,  # prev_height = best_height (= next_height - 1)
-                    False,        # skip_scripts: always verify scripts on submitblock
-                    _network,
-                )
-
-            # Python-side script verification: the Rust validate_block_with_flags
-            # ignores skip_scripts (reserved for future wiring per block.rs:261).
-            # Run Python's validator.validate_block so that disabled-opcode checks
-            # (script.py::_DISABLED) and signature verification always fire on
-            # submitblock regardless of assumevalid.  Mirrors the IBD drain path
-            # which runs _run_python() in addition to _run_rust().
-            # Reference: Bitcoin Core EvalScript() disabled-opcode gate
-            # (interpreter.cpp) — no flag, no soft-fork: unconditional rejection.
-            _py_validator = getattr(self.node, "validator", None)
-            if _py_validator is not None:
-                from ouroboros.database import Block as _SubmitBlock
-                _blk_obj = _SubmitBlock.deserialize(block_bytes)
-                _valid, _err = await asyncio.to_thread(
-                    _py_validator.validate_block,
-                    _blk_obj,
-                    next_height,
-                )
-                if not _valid:
-                    raise ValueError(_err)
-
-            # Use Rust connect_block_from_bytes for full persistence
-            # (deserialisation + UTXO updates + block storage all in Rust)
-            # Run in thread to avoid blocking the event loop during IBD.
-            await asyncio.to_thread(db.connect_block_from_bytes, block_bytes, next_height)
-
-            # Remove confirmed transactions from mempool (lazy — only
-            # deserialise block if the mempool is non-empty)
-            mempool = getattr(self.node, "mempool", None)
-            if mempool is not None and len(mempool) > 0:
-                try:
-                    from ouroboros.database import Block as _Block
-                    block = _Block.deserialize(block_bytes)
-                    mempool.remove_block_transactions(block)
-                except Exception:
-                    pass  # mempool cleanup is best-effort
+            # Route through the unified accept_block helper.
+            # skip_scripts=False: submitblock always verifies scripts regardless
+            # of the assumevalid setting — same as Bitcoin Core's AcceptBlock
+            # calling CheckBlock with fCheckPOW=true, fCheckMerkleRoot=true.
+            await accept_block(
+                db,
+                self.node,
+                block_bytes,
+                next_height,
+                skip_scripts=False,
+            )
 
             return None
         except Exception as e:
@@ -3623,6 +3689,14 @@ class RPCServer:
         Accepts a JSON array of hex-encoded blocks. Returns a list of
         results: null for success, or an error string for each block.
         Blocks are applied sequentially in the order given.
+
+        Previously this called ``connect_block_from_bytes`` directly,
+        bypassing all validation (Gap O1, wave-29 audit).  Now routes
+        through the unified ``accept_block`` helper so the same
+        CheckBlock + ContextualCheckBlock + script-verify pipeline runs
+        as for ``rpc_submitblock`` and the P2P drain.  skip_scripts=False
+        because this is an over-the-wire RPC — the caller is trusted to
+        supply sequential blocks but NOT trusted to supply valid ones.
         """
         # NetworkDisable gate: refuse the whole batch while a
         # ``dumptxoutset rollback`` rewind→dump→replay dance is in
@@ -3636,26 +3710,38 @@ class RPCServer:
         if db is None:
             return ["rejected"] * len(hexblocks)
 
-        def _connect_batch():
-            results = []
-            for hexdata in hexblocks:
-                try:
-                    block_bytes = bytes.fromhex(hexdata)
-                except (ValueError, TypeError):
-                    results.append("rejected")
-                    continue
+        results = []
+        for hexdata in hexblocks:
+            try:
+                block_bytes = bytes.fromhex(hexdata)
+            except (ValueError, TypeError):
+                results.append("rejected")
+                continue
 
-                try:
-                    _, best_height = db.get_best_block()
-                    next_height = best_height + 1
-                    db.connect_block_from_bytes(block_bytes, next_height)
-                    results.append(None)
-                except Exception as e:
-                    # Map to canonical BIP-22 result string
-                    results.append(bip22_result_string(str(e)))
-            return results
+            try:
+                _, best_height = db.get_best_block()
+                next_height = best_height + 1
+                await accept_block(
+                    db,
+                    self.node,
+                    block_bytes,
+                    next_height,
+                    skip_scripts=False,
+                )
+                results.append(None)
+            except Exception as e:
+                # Map to canonical BIP-22 result string.
+                # On failure, stop processing subsequent blocks in the batch:
+                # a validation failure means the chain tip did not advance,
+                # so the next block would also fail (wrong prev_hash).
+                results.append(bip22_result_string(str(e)))
+                # Pad remaining entries as "rejected" (stale prev context).
+                remaining = len(hexblocks) - len(results)
+                if remaining > 0:
+                    results.extend(["rejected"] * remaining)
+                break
 
-        return await asyncio.to_thread(_connect_batch)
+        return results
 
     async def rpc_pruneblockchain(self, height: int) -> int:
         """
@@ -5759,18 +5845,33 @@ class RPCServer:
 
             block_bytes = bytes(block_data)
 
-            # --- Store via Rust DB ---
+            # --- Validate + Store via unified accept_block helper ---
+            # Previously called connect_block_from_bytes directly, skipping
+            # all validation (Gap O2, wave-29 audit).  Now routes through
+            # accept_block so that structural checks (BIP-34, merkle, witness
+            # commitment, cb-len) fire and catch any future build-helper bug.
+            # skip_scripts=False: we mined this block ourselves so scripts
+            # will be trivially valid, but running them is cheap on regtest
+            # and catches any future coding error in the block builder.
+            # Reference: Bitcoin Core generateSingleBlock calls ProcessNewBlock
+            # which applies the same CheckBlock + ContextualCheckBlock checks.
             try:
-                stored_hash = db.connect_block_from_bytes(block_bytes, next_height)
-                # Rust returns hash in display byte order (same as as_byte_array())
+                stored_hash = await accept_block(
+                    db,
+                    self.node,
+                    block_bytes,
+                    next_height,
+                    skip_scripts=False,
+                )
+                # accept_block already handles mempool eviction; derive hash.
                 block_hash_hex = bytes(stored_hash).hex()
             except AttributeError:
-                # Fallback: Rust extension doesn't have connect_block_from_bytes
-                # (needs rebuild). Use display hash from mined header.
+                # Fallback: Rust extension not yet rebuilt.
                 block_hash_hex = block_hash[::-1].hex()
                 logger.warning(
-                    "connect_block_from_bytes not available; block not persisted. "
-                    "Rebuild the Rust extension (maturin develop)."
+                    "accept_block: connect_block_from_bytes not available; "
+                    "block not persisted.  Rebuild the Rust extension "
+                    "(maturin develop)."
                 )
             except Exception as e:
                 raise HTTPException(
@@ -5778,14 +5879,8 @@ class RPCServer:
                     detail=f"Block generation failed: {e}",
                 ) from None
 
-            # Remove confirmed txs from mempool (currently coinbase only)
-            mempool = getattr(self.node, "mempool", None)
-            if mempool is not None:
-                try:
-                    blk = _Block.deserialize(block_bytes)
-                    mempool.remove_block_transactions(blk)
-                except Exception:
-                    pass
+            # accept_block handles mempool eviction internally; no duplicate
+            # call needed here.
 
             block_hashes.append(block_hash_hex)
             logger.info(f"Generated block {next_height}: {block_hash_hex[:16]}...")
