@@ -103,16 +103,25 @@ def bip22_result_string(error: str) -> str:
     if "sigops" in s:
         return "bad-blk-sigops"
 
-    # Coinbase scriptSig length (consensus/tx_check.cpp:49 — 2..=100 bytes)
-    if "bad-cb-length" in s or ("coinbase scriptsig length" in s and "not in" in s):
+    # Coinbase scriptSig length (consensus/tx_check.cpp:49 — 2..=100 bytes).
+    # Also catches Rust validate_block_from_bytes coinbase-structure error when
+    # the script length is out of range: "Transaction validation error: Invalid
+    # coinbase structure" (TransactionValidationError::InvalidCoinbase, which
+    # fires for scriptsig length 0 or >100 in check_coinbase).
+    if ("bad-cb-length" in s
+            or ("coinbase scriptsig length" in s and "not in" in s)
+            or ("invalid coinbase structure" in s and "coinbase" in s)):
         return "bad-cb-length"
 
     # BIP34 coinbase height
     if "coinbase height" in s or "bad-cb-height" in s:
         return "bad-cb-height"
 
-    # Non-final / sequence lock
-    if "sequence lock" in s or "non-final" in s or "not final" in s:
+    # Non-final / sequence lock — also catches Rust validate_block_from_bytes errors:
+    # TransactionValidationError::InvalidLockTime  → "Invalid lock time"
+    # TransactionValidationError::NotFinal         → "Transaction is not final"
+    if ("sequence lock" in s or "non-final" in s or "not final" in s
+            or "invalid lock time" in s or "is not final" in s):
         return "bad-txns-nonfinal"
 
     # Duplicate transactions / BIP30
@@ -3519,6 +3528,25 @@ class RPCServer:
                                 return "bad-cb-height"
                 except Exception:
                     pass  # If deserialization fails, let Rust handle it
+
+            # Run validate_block_from_bytes before connecting, mirroring the
+            # IBD drain at block_sync.py::_process_pending_blocks (lines 1011-1022).
+            # This closes 4 gaps vs the IBD path: sigop cost budget, block weight,
+            # duplicate-txid (CVE-2012-2459), and per-input script verification —
+            # none of which connect_block_from_bytes enforces.
+            # Reference: Bitcoin Core ProcessNewBlock calls AcceptBlock (CheckBlock
+            # + ContextualCheckBlock) before ConnectBlock.
+            # Submitblock is rare in production so the extra validation cost is
+            # acceptable; skip_scripts=False ensures scripts always fire here.
+            _network = getattr(self.node, "network", "mainnet")
+            if hasattr(db, "validate_block_from_bytes"):
+                await asyncio.to_thread(
+                    db.validate_block_from_bytes,
+                    block_bytes,
+                    best_height,  # prev_height = best_height (= next_height - 1)
+                    False,        # skip_scripts: always verify scripts on submitblock
+                    _network,
+                )
 
             # Use Rust connect_block_from_bytes for full persistence
             # (deserialisation + UTXO updates + block storage all in Rust)
