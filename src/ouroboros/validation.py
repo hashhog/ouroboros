@@ -1494,10 +1494,19 @@ class TransactionValidator:
         if tx.locktime < 0 or tx.locktime > 0xffffffff:
             return False
 
-        # Check all outputs have valid values and total doesn't overflow
+        # Check all outputs have valid values and total doesn't overflow.
+        # out.value is deserialized as unsigned (int.from_bytes without signed=True);
+        # a negative wire value (-1 = 0xffffffffffffffff) arrives as a large positive
+        # integer with the high bit set.  Reinterpret as signed before the negative check
+        # so we produce the correct BIP-22 error string.
+        # Mirrors Bitcoin Core consensus/tx_check.cpp::CheckTransaction (negative first).
+        INT64_MAX = 0x7FFFFFFFFFFFFFFF
         total_out = 0
         for out in tx.outputs:
-            if out.value < 0 or out.value > MAX_MONEY:
+            signed_value = out.value - (1 << 64) if out.value > INT64_MAX else out.value
+            if signed_value < 0:
+                return False
+            if out.value > MAX_MONEY:
                 return False
             total_out += out.value
             if total_out > MAX_MONEY:

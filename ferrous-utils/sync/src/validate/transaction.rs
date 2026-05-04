@@ -49,6 +49,9 @@ pub enum TransactionValidationError {
     #[error("Signature verification failed: {0}")]
     SignatureVerificationFailed(String),
 
+    #[error("Negative output value")]
+    NegativeOutputAmount,
+
     #[error("Invalid output amount")]
     InvalidOutputAmount,
 
@@ -449,6 +452,16 @@ impl TransactionValidator {
 
         for output in &tx.output {
             let amount = output.value.to_sat();
+
+            // Bitcoin's wire format uses int64 for output values; the bitcoin
+            // crate deserialises as u64.  A negative wire value (e.g. -1 =
+            // 0xffffffffffffffff) arrives with the high bit set.  Check for
+            // sign before the upper-bound check — mirrors Bitcoin Core
+            // consensus/tx_check.cpp::CheckTransaction (negative first, then
+            // toolarge).
+            if (amount as i64) < 0 {
+                return Err(TransactionValidationError::NegativeOutputAmount);
+            }
 
             // Consensus allows zero-value outputs (OP_RETURN witness
             // commitments, data-embedding txs, etc.). Core's CheckTransaction
