@@ -124,9 +124,18 @@ def bip22_result_string(error: str) -> str:
             or "invalid lock time" in s or "is not final" in s):
         return "bad-txns-nonfinal"
 
-    # Duplicate transactions / BIP30
-    if "duplicate" in s and ("tx" in s or "transaction" in s or "unspent" in s):
+    # BIP30 cross-block duplicate UTXO: both Rust ("BIP30: duplicate unspent txid")
+    # and Python ("BIP30: duplicate txid ... with unspent output") contain "bip30".
+    # Core canonical for this path is "bad-txns-duplicate".
+    if "bip30" in s and "duplicate" in s:
         return "bad-txns-duplicate"
+
+    # In-block dup-txid (CVE-2012-2459): "Duplicate transaction detected"
+    # Core reaches ConnectBlock prevout-already-spent and returns
+    # "bad-txns-inputs-missingorspent" for the same block
+    # (corpus entry dup-txid-merkle-malleation).
+    if "duplicate" in s and ("tx" in s or "transaction" in s):
+        return "bad-txns-inputs-missingorspent"
 
     # Missing inputs / UTXO
     if "missing" in s and ("input" in s or "utxo" in s):
