@@ -3253,6 +3253,99 @@ impl PyBlockchainDB {
             }
         }
 
+        // Coinbase scriptSig length: 2..=100 bytes (consensus/tx_check.cpp:49)
+        // Reference: Bitcoin Core src/consensus/tx_check.cpp CheckTransaction()
+        {
+            let coinbase = &inner.txdata[0];
+            if coinbase.input.is_empty() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "bad-cb-length: coinbase has no inputs".to_string()
+                ));
+            }
+            let script_sig_len = coinbase.input[0].script_sig.len();
+            if script_sig_len < 2 || script_sig_len > 100 {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!(
+                        "bad-cb-length: coinbase scriptSig length {} not in 2..=100",
+                        script_sig_len
+                    )
+                ));
+            }
+        }
+
+        // BIP141 witness commitment recompute (validation.cpp:3870-3901)
+        // Reference: Bitcoin Core CheckWitnessMalleation() / GetWitnessCommitmentIndex()
+        // Rule: whenever the commitment OUTPUT (0xaa21a9ed magic) is present in
+        // the coinbase, ALWAYS recompute SHA256d(witness_merkle_root || nonce)
+        // and compare against the on-chain bytes.  Gate is commitment OUTPUT
+        // presence, not height or whether non-coinbase txs have witness data.
+        // (No network field on PyBlockchainDB — height-gate omitted; the check
+        // is a no-op when neither commitment nor witness data are present.)
+        {
+            use bitcoin::hashes::{sha256d, Hash as _};
+            use common::crypto::compute_merkle_root;
+
+            let coinbase = &inner.txdata[0];
+            let witness_commitment_prefix: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+
+            // Scan coinbase outputs in REVERSE order (Core uses last match)
+            let commitment_in_coinbase: Option<[u8; 32]> = coinbase.output.iter().rev()
+                .find_map(|out| {
+                    let spk = out.script_pubkey.as_bytes();
+                    if spk.len() >= 38 && spk[0..6] == witness_commitment_prefix {
+                        let mut c = [0u8; 32];
+                        c.copy_from_slice(&spk[6..38]);
+                        Some(c)
+                    } else {
+                        None
+                    }
+                });
+
+            let has_witness = inner.txdata.iter()
+                .any(|tx| tx.input.iter().any(|inp| !inp.witness.is_empty()));
+
+            match (commitment_in_coinbase, has_witness) {
+                (Some(on_chain_commit), _) => {
+                    // Commitment output present → ALWAYS verify the recomputed hash
+                    let cb_witness = &coinbase.input[0].witness;
+                    if cb_witness.len() != 1 || cb_witness.last().map_or(0, |w| w.len()) != 32 {
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                            "bad-witness-merkle-match: coinbase witness nonce must be exactly one 32-byte item".to_string()
+                        ));
+                    }
+                    let nonce = cb_witness.last().unwrap();
+
+                    // Compute wtxid merkle root (coinbase wtxid = 0x00...00)
+                    let mut wtxids: Vec<[u8; 32]> = Vec::with_capacity(inner.txdata.len());
+                    wtxids.push([0u8; 32]);
+                    for tx in inner.txdata.iter().skip(1) {
+                        wtxids.push(*tx.compute_wtxid().as_byte_array());
+                    }
+                    let witness_root = compute_merkle_root(&wtxids);
+
+                    let mut buf = [0u8; 64];
+                    buf[..32].copy_from_slice(&witness_root);
+                    buf[32..].copy_from_slice(nonce);
+                    let expected = *sha256d::Hash::hash(&buf).as_byte_array();
+
+                    if expected != on_chain_commit {
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                            "bad-witness-merkle-match: witness commitment mismatch".to_string()
+                        ));
+                    }
+                }
+                (None, true) => {
+                    // Has witness data but no commitment output → reject
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "bad-witness-merkle-match: block has witness data but no witness commitment".to_string()
+                    ));
+                }
+                (None, false) => {
+                    // No commitment, no witness — nothing to check
+                }
+            }
+        }
+
         // Single WriteBatch for all DB mutations in this block
         let mut batch = self.db.create_batch();
 
