@@ -3226,9 +3226,10 @@ impl PyBlockchainDB {
 
         // BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
         // block timestamp must be strictly greater than the median-time-past
-        // of the previous 11 blocks.
+        // of the previous 11 blocks.  Also compute prev_mtp for the per-tx
+        // IsFinalTx check below (BIP-113 locktime cutoff).
         // Reference: bitcoin-core/src/validation.cpp:4092
-        if height > 0 {
+        let prev_mtp: i64 = if height > 0 {
             let prev_height = height - 1;
             let start = if prev_height >= 10 { prev_height - 10 } else { 0 };
             let mut ts_buf: Vec<u32> = Vec::with_capacity(11);
@@ -3250,8 +3251,13 @@ impl PyBlockchainDB {
                         )
                     ));
                 }
+                mtp as i64
+            } else {
+                0i64
             }
-        }
+        } else {
+            0i64
+        };
 
         // Coinbase scriptSig length: 2..=100 bytes (consensus/tx_check.cpp:49)
         // Reference: Bitcoin Core src/consensus/tx_check.cpp CheckTransaction()
@@ -3342,6 +3348,40 @@ impl PyBlockchainDB {
                 }
                 (None, false) => {
                     // No commitment, no witness — nothing to check
+                }
+            }
+        }
+
+        // ContextualCheckBlock: enforce IsFinalTx for every transaction
+        // (Bitcoin Core validation.cpp:4146). Consensus rule that runs even
+        // under assumevalid — assumevalid only skips script verification.
+        // lock_time_cutoff = prev_mtp (MTP-of-11) when BIP-113/CSV is active
+        // (prev_mtp > 0 implies we're post-genesis); else block header timestamp.
+        // Reference: bitcoin-core/src/consensus/tx_verify.cpp:IsFinalTx, BIP-113.
+        {
+            // prev_mtp is 0 only at/before genesis; use block.timestamp then
+            let lock_time_cutoff: i64 = if prev_mtp > 0 {
+                prev_mtp
+            } else {
+                inner.header.time as i64
+            };
+            for (tx_idx, tx) in inner.txdata.iter().enumerate() {
+                if tx.is_coinbase() {
+                    continue;
+                }
+                let locktime = tx.lock_time.to_consensus_u32();
+                let sequences: Vec<u32> = tx.input.iter()
+                    .map(|inp| inp.sequence.0)
+                    .collect();
+                if !sequence_lock::is_final_tx(locktime, &sequences, height, lock_time_cutoff) {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!(
+                            "bad-txns-nonfinal: tx {} at index {} has non-final locktime {}",
+                            tx.compute_txid(),
+                            tx_idx,
+                            locktime,
+                        )
+                    ));
                 }
             }
         }
