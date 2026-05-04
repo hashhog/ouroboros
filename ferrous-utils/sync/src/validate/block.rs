@@ -687,13 +687,16 @@ impl BlockValidator {
 
     /// Calculate block subsidy for a given height
     ///
-    /// Bitcoin subsidy starts at 50 BTC and halves every 210,000 blocks.
+    /// Bitcoin subsidy starts at 50 BTC = 5_000_000_000 satoshis and halves
+    /// every 210,000 blocks.
+    /// Reference: Bitcoin Core validation.cpp::GetBlockSubsidy — nSubsidy = 50 * COIN
+    /// where COIN = 100_000_000 (src/consensus/amount.h).
     pub fn calculate_block_subsidy(&self, height: u32) -> u64 {
         let halvings = height / 210_000;
         if halvings >= 64 {
             return 0;
         }
-        50_000_000_000u64 >> halvings
+        5_000_000_000u64 >> halvings
     }
 
     /// Apply block to database using a two-phase commit for crash safety.
@@ -973,16 +976,17 @@ mod tests {
         let (_temp_dir, db) = create_test_db();
         let validator = BlockValidator::new(db, Network::Bitcoin);
 
-        // Genesis block: 50 BTC
-        assert_eq!(validator.calculate_block_subsidy(0), 50_000_000_000);
-        assert_eq!(validator.calculate_block_subsidy(209_999), 50_000_000_000);
+        // Genesis block: 50 BTC = 5_000_000_000 satoshis
+        // Reference: Bitcoin Core amount.h COIN = 100_000_000; nSubsidy = 50 * COIN
+        assert_eq!(validator.calculate_block_subsidy(0), 5_000_000_000);
+        assert_eq!(validator.calculate_block_subsidy(209_999), 5_000_000_000);
 
-        // After first halving: 25 BTC
-        assert_eq!(validator.calculate_block_subsidy(210_000), 25_000_000_000);
-        assert_eq!(validator.calculate_block_subsidy(419_999), 25_000_000_000);
+        // After first halving: 25 BTC = 2_500_000_000 satoshis
+        assert_eq!(validator.calculate_block_subsidy(210_000), 2_500_000_000);
+        assert_eq!(validator.calculate_block_subsidy(419_999), 2_500_000_000);
 
-        // After second halving: 12.5 BTC
-        assert_eq!(validator.calculate_block_subsidy(420_000), 12_500_000_000);
+        // After second halving: 12.5 BTC = 1_250_000_000 satoshis
+        assert_eq!(validator.calculate_block_subsidy(420_000), 1_250_000_000);
 
         // After 64 halvings: 0
         assert_eq!(validator.calculate_block_subsidy(64 * 210_000), 0);
