@@ -90,7 +90,8 @@ def bip22_result_string(error: str) -> str:
         return "bad-txnmrklroot"
 
     # Witness commitment errors (BIP141)
-    if ("witness commitment" in s or "witness nonce" in s
+    if ("bad-witness-merkle-match" in s or "witness commitment" in s
+            or "witness nonce" in s
             or ("coinbase witness" in s and "32-byte" in s)):
         return "bad-witness-merkle-match"
 
@@ -101,6 +102,10 @@ def bip22_result_string(error: str) -> str:
     # Sigops limit
     if "sigops" in s:
         return "bad-blk-sigops"
+
+    # Coinbase scriptSig length (consensus/tx_check.cpp:49 — 2..=100 bytes)
+    if "bad-cb-length" in s or ("coinbase scriptsig length" in s and "not in" in s):
+        return "bad-cb-length"
 
     # BIP34 coinbase height
     if "coinbase height" in s or "bad-cb-height" in s:
