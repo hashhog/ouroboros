@@ -148,6 +148,13 @@ def bip22_result_string(error: str) -> str:
     if "negative output" in s:
         return "bad-txns-vout-negative"
 
+    # Output value > MAX_MONEY: Rust OutputAmountTooLarge ("Output value exceeds MAX_MONEY")
+    # wrapped as "Transaction validation error: Output value exceeds MAX_MONEY".
+    # Must fire BEFORE the generic "transaction validation" catch-all below.
+    # Reference: consensus/tx_check.cpp::CheckTransaction (Core parity).
+    if "exceeds max_money" in s or "output value exceeds" in s:
+        return "bad-txns-vout-toolarge"
+
     # Script / signature verification failures
     if any(k in s for k in ("script", "signature", "checksig", "tapscript",
                              "witness program", "transaction validation")):
