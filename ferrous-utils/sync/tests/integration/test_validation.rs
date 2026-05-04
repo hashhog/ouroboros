@@ -63,10 +63,11 @@ fn test_block_subsidy_calculation() {
     let validator = BlockValidator::new(Arc::clone(&db), Network::Bitcoin);
     
     // Test block subsidy at various heights
-    assert_eq!(validator.calculate_block_subsidy(0), 50_000_000_000); // 50 BTC
-    assert_eq!(validator.calculate_block_subsidy(209999), 50_000_000_000); // Still 50 BTC
-    assert_eq!(validator.calculate_block_subsidy(210000), 25_000_000_000); // First halving
-    assert_eq!(validator.calculate_block_subsidy(419999), 25_000_000_000); // Still 25 BTC
-    assert_eq!(validator.calculate_block_subsidy(420000), 12_500_000_000); // Second halving
+    // Reference: Bitcoin Core amount.h COIN = 100_000_000; nSubsidy = 50 * COIN = 5_000_000_000
+    assert_eq!(validator.calculate_block_subsidy(0), 5_000_000_000); // 50 BTC
+    assert_eq!(validator.calculate_block_subsidy(209999), 5_000_000_000); // Still 50 BTC
+    assert_eq!(validator.calculate_block_subsidy(210000), 2_500_000_000); // First halving: 25 BTC
+    assert_eq!(validator.calculate_block_subsidy(419999), 2_500_000_000); // Still 25 BTC
+    assert_eq!(validator.calculate_block_subsidy(420000), 1_250_000_000); // Second halving: 12.5 BTC
 }
 
