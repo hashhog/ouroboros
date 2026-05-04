@@ -971,6 +971,14 @@ class BlockSync:
 
             t_val = time.perf_counter_ns()
 
+            # P2P block acceptance pipeline — Core ProcessNewBlock parity.
+            # Entry point 3 of 5 (wave-29 audit).  The validate→connect
+            # sequence below is the canonical IBD path.  RPC entry points
+            # (rpc_submitblock, rpc_submitblockbatch, rpc_generatetoaddress)
+            # use the unified ``accept_block`` helper in rpc.py which mirrors
+            # this same pipeline.  The Rust import-blocks path
+            # (import_blocks_from_file) was updated alongside this commit.
+            #
             # B3 Stage 1: Rust validate fast path (default-on as of the
             # W90/W91 soak, 2026-04-22).
             #
