@@ -3496,6 +3496,30 @@ class RPCServer:
             _, best_height = db.get_best_block()
             next_height = best_height + 1
 
+            # BIP-34 coinbase height byte-exact prefix check.
+            # connect_block_from_bytes (Rust) does not carry network context so
+            # cannot apply the per-network activation height.  Do a lightweight
+            # Python-side check here before handing off to Rust.
+            # Reference: Bitcoin Core ContextualCheckBlock validation.cpp:4151-4159.
+            from ouroboros.validation import _encode_bip34_height
+            from ouroboros.consensus import BURIED_DEPLOYMENTS
+            _bip34_depl = BURIED_DEPLOYMENTS.get(self.node.network, {}).get("bip34")
+            _bip34_activation = _bip34_depl.height if _bip34_depl is not None else 227_931
+            if next_height >= _bip34_activation:
+                try:
+                    from ouroboros.database import Block as _Block
+                    _blk = _Block.deserialize(block_bytes)
+                    if _blk.transactions:
+                        _coinbase = _blk.transactions[0]
+                        if _coinbase.inputs:
+                            _script = _coinbase.inputs[0].script_sig
+                            _expect = _encode_bip34_height(next_height)
+                            _n = len(_expect)
+                            if len(_script) < _n or _script[:_n] != _expect:
+                                return "bad-cb-height"
+                except Exception:
+                    pass  # If deserialization fails, let Rust handle it
+
             # Use Rust connect_block_from_bytes for full persistence
             # (deserialisation + UTXO updates + block storage all in Rust)
             # Run in thread to avoid blocking the event loop during IBD.
