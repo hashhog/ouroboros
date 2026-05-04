@@ -3523,17 +3523,47 @@ impl PyBlockchainDB {
     /// Frame format: [4 bytes height LE] [4 bytes size LE] [size bytes raw block]
     ///
     /// Reads all frames from the file, skipping blocks at or below `start_height`.
-    /// Connects each block using `connect_block_from_bytes`.
+    /// Validates each block via `BlockValidator::validate_block_with_flags` before
+    /// connecting it — closing Gap O3 (wave-29 audit) where the previous
+    /// implementation called `connect_block_from_bytes` directly without any
+    /// validation.  Mirrors Bitcoin Core's ProcessNewBlock which runs
+    /// CheckBlock + ContextualCheckBlock before ConnectBlock.
+    ///
+    /// The `network` parameter is required when validation is desired (pass
+    /// "mainnet", "testnet4", "regtest", etc.).  If the `OnceLock` validator
+    /// was already initialised by a prior `validate_block_from_bytes` call on
+    /// this same `PyBlockchainDB` object, the cached network is reused and
+    /// `network` need not match exactly.
+    ///
     /// Returns the number of blocks imported.
     fn import_blocks_from_file(
         &self,
         path: String,
         start_height: u32,
         progress_interval: Option<u32>,
+        network: Option<String>,
     ) -> PyResult<u32> {
         use std::io::Read;
+        use common::BitcoinDeserialize;
 
         let interval = progress_interval.unwrap_or(10000);
+
+        // Resolve (and cache) the BlockValidator — same OnceLock pattern as
+        // `validate_block_from_bytes`.  If `network` is None, fall back to
+        // mainnet (import-blocks is almost always run against a mainnet datadir).
+        let net_str = network.as_deref().unwrap_or("mainnet");
+        let network_enum = match net_str.to_lowercase().as_str() {
+            "mainnet" | "bitcoin" => Network::Bitcoin,
+            "testnet" | "testnet3" => Network::Testnet,
+            "testnet4" => Network::Testnet4,
+            "regtest" => Network::Regtest,
+            "signet" => Network::Signet,
+            _ => Network::Bitcoin,
+        };
+        let validator = self.block_validator.get_or_init(|| {
+            Arc::new(BlockValidator::new(Arc::clone(&self.db), network_enum))
+        });
+        let validator = Arc::clone(validator);
 
         let mut file: Box<dyn Read> = if path == "-" {
             Box::new(std::io::stdin().lock())
@@ -3583,6 +3613,26 @@ impl PyBlockchainDB {
             if frame_height <= start_height {
                 skipped += 1;
                 continue;
+            }
+
+            // Validate before connecting — Core ProcessNewBlock parity.
+            // The importer previously trusted the framed input unconditionally
+            // (Gap O3, wave-29 audit).  Validate with skip_scripts=true so
+            // that structural checks (PoW, merkle, cb-len, witness commitment,
+            // IsFinalTx, BIP-30) always run, but per-input script verification
+            // is skipped for blocks below the assumevalid height (matching
+            // the IBD drain path in block_sync.py::_drain_block_buffer_locked).
+            {
+                let (block, _) = BlockWrapper::bitcoin_deserialize(&block_data)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("import-blocks: deserialize at height {}: {}", frame_height, e)
+                    ))?;
+                let prev_height = frame_height.saturating_sub(1);
+                validator
+                    .validate_block_with_flags(&block, prev_height, true)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("import-blocks: validate at height {}: {}", frame_height, e)
+                    ))?;
             }
 
             self.connect_block_from_bytes(block_data, frame_height)?;
