@@ -532,6 +532,13 @@ class BlockchainDatabase:
 
         Raises:
             RuntimeError: If the block is not found or the Rust API fails.
+
+        NOTE (wave-33b dead-symbol audit, TIER-3): This Python-layer wrapper
+        has ZERO live callers from ouroboros Python code. The reorg path uses
+        the Rust FFI directly via self._db (ferrous_utils.RocksDB). Any future
+        Python-level reorg logic should call this method (not the Rust object
+        directly) so cache invalidation stays consistent. Do not add consensus
+        logic here — fixes belong in the Rust crate.
         """
         result = bytes(self._db.disconnect_block(height))
         # Invalidate cache — next get_best_block() will re-fetch from Rust
