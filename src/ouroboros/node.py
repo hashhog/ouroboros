@@ -875,7 +875,13 @@ class BitcoinNode:
             return handler
 
         def _make_getdata_handler(peer):
-            """Handle getdata: respond with tx from mempool or block from db"""
+            """Handle getdata: respond with tx from mempool or block from db.
+
+            BIP-159 peer-served-blocks gate: when prune mode is on, refuse
+            to serve blocks below tip - 288 (NODE_NETWORK_LIMITED_MIN_BLOCKS).
+            Mirrors Core's net_processing.cpp short-circuit; emits notfound
+            rather than reading a possibly-deleted block file.
+            """
             async def handler(msg):
                 try:
                     from ouroboros.p2p_messages import (
@@ -884,12 +890,25 @@ class BitcoinNode:
                         MSG_WITNESS_BLOCK,
                         MSG_WITNESS_TX,
                         GetDataMessage,
+                        NotFoundMessage,
                         TxMessage,
                     )
 
                     getdata = GetDataMessage.from_payload(msg.payload)
                     network = getattr(peer, 'network', 'mainnet')
 
+                    # Compute prune horizon once for the whole batch.
+                    MIN_BLOCKS_TO_KEEP = 288
+                    prune_horizon = -1
+                    if self.pruner is not None:
+                        try:
+                            _, best_h = self.db.get_best_block()
+                            if best_h is not None and best_h > MIN_BLOCKS_TO_KEEP:
+                                prune_horizon = best_h - MIN_BLOCKS_TO_KEEP
+                        except Exception:
+                            prune_horizon = -1
+
+                    not_found = []
                     for inv_type, inv_hash in getdata.inventory:
                         if inv_type in (INV_TYPE_TX, MSG_WITNESS_TX) and self.mempool:
                             tx = self.mempool.get_transaction(inv_hash)
@@ -897,13 +916,31 @@ class BitcoinNode:
                                 tx_msg = TxMessage(transaction=tx)
                                 await peer.send_message(tx_msg.to_network_message(network))
                                 logger.debug(f"Sent tx {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
+                            else:
+                                not_found.append((inv_type, inv_hash))
                         elif inv_type in (INV_TYPE_BLOCK, MSG_WITNESS_BLOCK):
                             block = self.db.get_block(inv_hash)
+                            if block is not None and prune_horizon >= 0:
+                                # Decline pre-prune-horizon blocks per BIP-159.
+                                bh = getattr(block, 'height', None)
+                                if bh is not None and bh < prune_horizon:
+                                    not_found.append((inv_type, inv_hash))
+                                    continue
                             if block:
                                 from ouroboros.p2p_messages import BlockMessage
                                 block_msg = BlockMessage(block=block)
                                 await peer.send_message(block_msg.to_network_message(network))
                                 logger.debug(f"Sent block {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
+                            else:
+                                not_found.append((inv_type, inv_hash))
+
+                    if not_found:
+                        try:
+                            nf_msg = NotFoundMessage(inventory=not_found)
+                            await peer.send_message(nf_msg.to_network_message(network))
+                        except Exception:
+                            # NotFoundMessage may not exist in older builds; silently drop.
+                            pass
                 except Exception as e:
                     logger.error(f"Error handling getdata from {peer.host}:{peer.port}: {e}")
 
