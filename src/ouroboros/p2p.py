@@ -434,6 +434,7 @@ class PeerManager:
         torpassword: str | None = None,
         peer_bloom_filters: bool = False,
         node_compact_filters: bool = False,
+        node_network_limited: bool = False,
     ):
         """Initialize peer manager."""
         self.network = network
@@ -456,6 +457,12 @@ class PeerManager:
         # the version handshakes advertise the bit only when the index is
         # actually enabled at the node level.
         self.node_compact_filters = node_compact_filters
+        # BIP-159 NODE_NETWORK_LIMITED advertisement (Core parity:
+        # `IsPruneMode()` gate in init.cpp).  Set when prune mode is on
+        # (`prune > 0` in node config).  Forwarded to every Peer so the
+        # version handshakes advertise the bit only when we actually
+        # serve only the recent ~288-block window.
+        self.node_network_limited = node_network_limited
 
         self.peers: dict[str, Peer] = {}  # addr -> Peer (full-relay outbound)
         self.block_relay_peers: dict[str, Peer] = {}  # addr -> Peer (block-relay-only outbound)
@@ -858,7 +865,8 @@ class PeerManager:
                     inbound=True,
                     ban_manager=self.ban_manager,
                     peer_bloom_filters=self.peer_bloom_filters,
-                    node_compact_filters=self.node_compact_filters)
+                    node_compact_filters=self.node_compact_filters,
+                    node_network_limited=self.node_network_limited)
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer
             self._register_compact_handlers(peer, addr)
@@ -1221,7 +1229,8 @@ class PeerManager:
                     inbound=True,
                     ban_manager=self.ban_manager,
                     peer_bloom_filters=self.peer_bloom_filters,
-                    node_compact_filters=self.node_compact_filters)
+                    node_compact_filters=self.node_compact_filters,
+                    node_network_limited=self.node_network_limited)
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer
             self._register_compact_handlers(peer, addr)
@@ -1442,6 +1451,7 @@ class PeerManager:
             ban_manager=self.ban_manager,
             peer_bloom_filters=self.peer_bloom_filters,
             node_compact_filters=self.node_compact_filters,
+            node_network_limited=self.node_network_limited,
         )
         ok = await peer.connect(start_height, retry=retry)
         if ok:
@@ -1461,6 +1471,7 @@ class PeerManager:
                 ban_manager=self.ban_manager,
                 peer_bloom_filters=self.peer_bloom_filters,
                 node_compact_filters=self.node_compact_filters,
+                node_network_limited=self.node_network_limited,
             )
             if await v1_peer.connect(start_height, retry=retry):
                 return v1_peer
