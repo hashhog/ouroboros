@@ -114,6 +114,38 @@ class TestBlockPruner:
         assert files_pruned == 0
         assert bytes_freed == 0
 
+    def test_manual_mode_target_size_mb_1(self, block_store):
+        """`-prune=1` puts the pruner in manual mode (Bitcoin Core
+        init.cpp:524 / blockmanager_args.cpp:27). The auto-prune
+        trigger short-circuits; only `prune_to_height` (driven by the
+        pruneblockchain RPC) may delete data."""
+        pruner = BlockPruner(block_store, target_size_mb=1, keep_blocks=288)
+        assert pruner.manual is True
+
+    def test_manual_mode_prune_blocks_is_noop(self, block_store):
+        """In manual mode, `prune_blocks` (the auto-prune entrypoint
+        called from periodic tasks) returns (0, 0) regardless of
+        current_height. Mirrors Core's PRUNE_TARGET_MANUAL behavior:
+        IsPruneMode() is true but FindFilesToPrune does no work."""
+        pruner = BlockPruner(block_store, target_size_mb=1, keep_blocks=288)
+        # Even at a height well above the keep window, manual mode must
+        # not auto-prune.
+        files_pruned, bytes_freed = pruner.prune_blocks(1_000_000)
+        assert files_pruned == 0
+        assert bytes_freed == 0
+        # prune_to_target delegates to prune_blocks → also a no-op.
+        files_pruned, bytes_freed = pruner.prune_to_target(1_000_000)
+        assert files_pruned == 0
+        assert bytes_freed == 0
+
+    def test_automatic_mode_not_marked_manual(self, block_store):
+        """Sanity: a normal -prune=550 (or higher) target leaves
+        manual=False so the auto-prune loop is alive."""
+        pruner = BlockPruner(block_store, target_size_mb=550, keep_blocks=288)
+        assert pruner.manual is False
+        pruner_big = BlockPruner(block_store, target_size_mb=10_000, keep_blocks=288)
+        assert pruner_big.manual is False
+
     def test_get_prune_info(self, pruner):
         """get_prune_info returns proper dict."""
         info = pruner.get_prune_info()

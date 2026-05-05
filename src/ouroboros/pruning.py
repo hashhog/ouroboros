@@ -90,12 +90,22 @@ class BlockPruner:
         Args:
             block_store: PyBlockStore instance (from sync module).
                          Also accepted as keyword argument ``db`` for compatibility.
-            target_size_mb: Target disk usage in MB (minimum 550)
+            target_size_mb: Target disk usage in MB. Special values:
+                            ``1`` → manual mode (Bitcoin Core init.cpp:524 /
+                            blockmanager_args.cpp:27): node is in prune mode
+                            (NODE_NETWORK_LIMITED, getblockchaininfo.pruned=true)
+                            but the automatic prune trigger does not fire; only
+                            ``prune_to_height`` (driven by the pruneblockchain
+                            RPC) deletes data. Any other value <550 is silently
+                            promoted to 550 for the auto-prune target.
             keep_blocks: Minimum blocks to keep above prune height (minimum 288)
         """
         if db is not None and block_store is None:
             block_store = db
         self.block_store = block_store
+        # `-prune=1` manual-only sentinel (Core PRUNE_TARGET_MANUAL,
+        # node/blockstorage.h:408). Maps to "auto-prune off; manual via RPC".
+        self.manual = target_size_mb == 1
         self.target_size = max(target_size_mb, self.MIN_TARGET_MB) * 1_000_000
         self.keep_blocks = max(keep_blocks, self.MIN_KEEP_BLOCKS)
 
@@ -127,6 +137,10 @@ class BlockPruner:
 
         Deletes block files whose highest block is at least ``keep_blocks``
         below ``current_height``, until disk usage is below ``target_size``.
+        In `-prune=1` manual mode this is a no-op — only ``prune_to_height``
+        (RPC-driven) may delete data, matching Bitcoin Core's
+        ``PRUNE_TARGET_MANUAL`` sentinel behavior in
+        ``BlockManager::FindFilesToPrune``.
 
         Args:
             current_height: Current best block height
@@ -134,6 +148,8 @@ class BlockPruner:
         Returns:
             Tuple of (files_pruned, bytes_freed).
         """
+        if self.manual:
+            return 0, 0
         if current_height <= self.keep_blocks:
             return 0, 0
 
