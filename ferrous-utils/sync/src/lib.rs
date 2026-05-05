@@ -2870,6 +2870,41 @@ impl PyBlockchainDB {
         }
     }
 
+    /// Fetch the raw consensus-serialized bytes for a stored block (incl. witnesses).
+    ///
+    /// Used by the Python-side reorg path to re-feed a side-chain block into
+    /// `connect_block_from_bytes` (which writes SPENT_CF undo data, allowing
+    /// the block to be cleanly disconnected later if the chain re-reorgs).
+    /// `PyBlock.serialize()` is deliberately not implemented because PyBlock
+    /// drops witness data; this method returns the original BLOCKS_CF bytes.
+    fn get_block_bytes(&self, block_hash: &[u8]) -> PyResult<Option<Vec<u8>>> {
+        use common::BitcoinSerialize;
+
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+
+        match self.db.get_block(&hash_bytes) {
+            Ok(Some(block)) => {
+                let bytes = block.bitcoin_serialize().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        format!("Failed to serialize block: {}", e)
+                    )
+                })?;
+                Ok(Some(bytes))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )),
+        }
+    }
+
     /// Existence probe for a block by hash. Cheap alternative to `get_block`
     /// when the caller only needs a truthy/falsy answer: no block body is
     /// deserialized and no `PyBlock` is constructed.

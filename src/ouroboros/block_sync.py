@@ -2292,64 +2292,33 @@ class BlockSync:
                     self.requested_blocks.pop(bh, None)
                     self._block_request_peer.pop(bh, None)
 
-    async def _find_transaction_in_blocks(self, txid: bytes, max_height: int, min_height: int = 0) -> Optional['Transaction']:
-        # Search backwards from max_height to min_height
-        for height in range(max_height, min_height - 1, -1):
-            try:
-                block = self.db.get_block_by_height(height)
-                if not block:
-                    continue
-
-                # Search transactions in this block
-                for tx in block.transactions:
-                    if tx.get_txid() == txid:
-                        return tx
-            except Exception as e:
-                logger.debug(f"Error searching block at height {height}: {e}")
-                continue
-
-        return None
-
-    async def _restore_utxos_from_block(self, block: Block, max_search_height: int) -> list[tuple[bytes, int, int, bytes]]:
-        """Restore UTXOs that were spent in this block."""
-        utxos_to_restore = []
-
-        for tx in block.transactions:
-            if tx.is_coinbase:
-                continue
-
-            for tx_in in tx.inputs:
-                # Find the transaction that created this UTXO
-                prev_tx = await self._find_transaction_in_blocks(tx_in.prev_txid, max_search_height)
-                if not prev_tx:
-                    logger.warning(
-                        f"Previous transaction {tx_in.prev_txid.hex()[:16]}... not found "
-                        f"when disconnecting block, cannot restore UTXO"
-                    )
-                    continue
-
-                # Get the output that was spent
-                if tx_in.prev_vout >= len(prev_tx.outputs):
-                    logger.warning(
-                        f"Invalid vout {tx_in.prev_vout} for transaction "
-                        f"{tx_in.prev_txid.hex()[:16]}..."
-                    )
-                    continue
-
-                output = prev_tx.outputs[tx_in.prev_vout]
-
-                # Add to restore list
-                utxos_to_restore.append((
-                    tx_in.prev_txid,  # txid
-                    tx_in.prev_vout,  # vout
-                    output.value,     # value
-                    output.script_pubkey  # script_pubkey
-                ))
-
-        return utxos_to_restore
-
     async def _handle_reorg(self, new_block: Block, new_chain_tip: bytes):
-        """Handle chain reorganization."""
+        """Handle chain reorganization.
+
+        Disconnect side delegates to the Rust crate's
+        ``disconnect_block_at_height`` (exposed as ``db.disconnect_block``):
+        it loads the per-block undo record from SPENT_CF / UNDO_CF and
+        restores each spent UTXO with its full ``Coin`` metadata
+        (``height`` and ``is_coinbase`` are preserved — both were dropped
+        on the floor by the previous Python implementation, breaking the
+        coinbase-maturity rule for any tx that spent a coinbase across a
+        reorg).  Reference: Bitcoin Core ``DisconnectBlock`` /
+        ``ApplyTxInUndo`` (validation.cpp:2149+, 2179+).
+
+        Connect side feeds the raw side-chain block bytes (witnesses
+        included) back through ``connect_block_from_bytes`` so that the
+        reorg leaves the chainstate, tx-index, and SPENT_CF undo records
+        in the same shape as a fresh forward sync would have produced —
+        important for any subsequent re-reorg that needs to disconnect
+        the freshly connected blocks.
+
+        Mempool refill: each non-coinbase tx from the disconnected
+        side-chain is re-evaluated against the new tip via
+        ``mempool.add_transaction`` (which runs BIP-113 / BIP-68
+        / standardness against the current chain state).  Children of
+        rejected txs are dropped implicitly because their parents are
+        not in the UTXO set any more.
+        """
         logger.warning(f"Handling chain reorganization to new tip: {new_chain_tip.hex()[:16]}...")
 
         # Clear signature cache on reorg to prevent stale entries from invalidated chain
@@ -2364,8 +2333,8 @@ class BlockSync:
                 return True
 
             # Walk back chains to find common ancestor
-            current_chain = []
-            new_chain = []
+            current_chain: list[tuple[bytes, Block, int]] = []
+            new_chain: list[tuple[bytes, Block, int]] = []
 
             # Build current chain back to reasonable depth (e.g., 100 blocks)
             # Also track heights for transaction search
@@ -2433,110 +2402,157 @@ class BlockSync:
                 logger.warning("Major reorg detected - no common ancestor found within 100 blocks")
                 return False
 
-            logger.info(
-                f"Reorg: common ancestor at height {common_ancestor_height}, "
-                f"disconnecting {len([h for h, _, _ in current_chain if h != common_ancestor])} blocks, "
-                f"connecting {len([h for h, _, _ in new_chain if h != common_ancestor])} blocks"
-            )
-
-            # Disconnect blocks from current chain (in reverse order)
             blocks_to_disconnect = [
                 (h, b, ht) for h, b, ht in current_chain
                 if h != common_ancestor
             ]
-
-            # Get current height for transaction search
-            current_height = common_ancestor_height + len(blocks_to_disconnect)
-
-            for curr_hash, curr_block, _ in reversed(blocks_to_disconnect):
-                logger.debug(f"Disconnecting block {curr_hash.hex()[:16]}...")
-
-                # Restore UTXOs that were spent in this block
-                try:
-                    utxos_to_restore = await self._restore_utxos_from_block(curr_block, current_height)
-
-                    if utxos_to_restore:
-                        logger.info(f"Restoring {len(utxos_to_restore)} UTXOs from disconnected block")
-                        for txid, vout, value, script_pubkey in utxos_to_restore:
-                            try:
-                                self.db.restore_utxo(txid, vout, value, script_pubkey)
-                            except Exception as e:
-                                logger.error(
-                                    f"Error restoring UTXO {txid.hex()[:16]}...:{vout}: {e}"
-                                )
-                    else:
-                        logger.debug("No UTXOs to restore from this block")
-                except Exception as e:
-                    logger.error(f"Error collecting UTXOs to restore: {e}")
-
-                # Remove UTXOs that were created in this block
-                for tx in curr_block.transactions:
-                    txid = tx.get_txid()
-                    for i, _tx_out in enumerate(tx.outputs):
-                        try:
-                            self.db.remove_utxo(txid, i)
-                        except Exception as e:
-                            logger.error(
-                                f"Error removing UTXO {txid.hex()[:16]}...:{i}: {e}"
-                            )
-
-                # Update current_height for next iteration
-                current_height -= 1
-
-            # Connect blocks from new chain (ancestor+1 to tip; new_chain is tip-first so reverse)
-            blocks_to_connect = [
+            blocks_to_connect = list(reversed([
                 (h, b, ht) for h, b, ht in new_chain
                 if h != common_ancestor
-            ]
-            blocks_to_connect = list(reversed(blocks_to_connect))
+            ]))
 
-            for new_hash, new_block, _new_height in blocks_to_connect:
-                logger.debug(f"Connecting block {new_hash.hex()[:16]}...")
+            logger.info(
+                f"Reorg: common ancestor at height {common_ancestor_height}, "
+                f"disconnecting {len(blocks_to_disconnect)} blocks, "
+                f"connecting {len(blocks_to_connect)} blocks"
+            )
 
-                # Validate block
-                valid, error = self.validator.validate_block(new_block)
-                if not valid:
-                    logger.error(f"Invalid block in reorg: {new_hash.hex()[:16]}... - {error}")
-                    return False
-
-                # Apply block (spend/create UTXOs)
+            # ----------------------------------------------------------
+            # Disconnect side: tip → fork point.  Each call to
+            # ``self.db.disconnect_block(height)`` is a single Rust write
+            # batch that:
+            #   • removes outputs created by the block from CHAINSTATE_CF
+            #   • restores spent inputs from SPENT_CF/UNDO_CF (full Coin
+            #     including height + is_coinbase)
+            #   • rolls BEST_BLOCK_HASH / BEST_HEIGHT back one step
+            # so the loop below leaves the chain tip at common_ancestor.
+            # Reference: ferrous-utils/sync/src/storage/db.rs:1061
+            # (disconnect_block_at_height) and src/lib.rs:4122 (PyO3
+            # binding).
+            # ----------------------------------------------------------
+            disconnect_height = common_ancestor_height + len(blocks_to_disconnect)
+            for curr_hash, _curr_block, _ in reversed(blocks_to_disconnect):
+                logger.debug(
+                    f"Disconnecting block {curr_hash.hex()[:16]}... at height {disconnect_height}"
+                )
                 try:
-                    self.validator.apply_block(new_block)
+                    await asyncio.to_thread(self.db.disconnect_block, disconnect_height)
                 except Exception as e:
-                    logger.error(f"Error applying block during reorg: {e}")
+                    logger.error(
+                        f"Failed to disconnect block at height {disconnect_height} "
+                        f"(hash {curr_hash.hex()[:16]}...): {e}"
+                    )
+                    return False
+                disconnect_height -= 1
+
+            # Sanity: tip should now be at the common ancestor height.
+            tip_hash, tip_height = self.db.get_best_block()
+            if tip_hash != common_ancestor:
+                logger.error(
+                    f"Reorg disconnect left tip at {tip_hash.hex()[:16]}... "
+                    f"(height {tip_height}); expected common ancestor "
+                    f"{common_ancestor.hex()[:16]}... at {common_ancestor_height}"
+                )
+                return False
+
+            # ----------------------------------------------------------
+            # Connect side: fork point + 1 → new tip.  Feed the raw
+            # block bytes (witnesses included) into the Rust connect
+            # path so that SPENT_CF undo records are written for the new
+            # chain — required for a clean disconnect if we re-reorg
+            # later.
+            # ----------------------------------------------------------
+            for new_hash, new_block_obj, _new_height in blocks_to_connect:
+                connect_height = self.db.get_best_block()[1] + 1
+                logger.debug(
+                    f"Connecting block {new_hash.hex()[:16]}... at height {connect_height}"
+                )
+
+                raw_bytes: bytes | None = None
+                if hasattr(self.db, "get_block_bytes"):
+                    try:
+                        raw_bytes = self.db.get_block_bytes(new_hash)
+                    except Exception as e:
+                        logger.warning(
+                            f"get_block_bytes failed for {new_hash.hex()[:16]}...: {e}"
+                        )
+                        raw_bytes = None
+
+                if raw_bytes is None and getattr(new_block_obj, "raw_payload", None):
+                    raw_bytes = new_block_obj.raw_payload
+
+                if raw_bytes is None:
+                    # Last-ditch fallback: re-serialize from the Python
+                    # Block object.  This drops witness data, so consensus
+                    # checks on segwit blocks may misbehave under this
+                    # branch.  Keep the path so a missing-bytes case fails
+                    # loudly rather than silently committing wrong state.
+                    logger.error(
+                        f"Reorg connect: no raw bytes available for "
+                        f"{new_hash.hex()[:16]}... at height {connect_height}; "
+                        f"refusing to fall back to witness-stripped serialize()"
+                    )
                     return False
 
-                # Remove transactions now in block from mempool
+                try:
+                    if hasattr(self.db, "connect_block_from_bytes"):
+                        await asyncio.to_thread(
+                            self.db.connect_block_from_bytes, raw_bytes, connect_height
+                        )
+                    else:
+                        # Last-resort path used only when the Rust
+                        # extension is not built (e.g. pure-Python tests).
+                        valid, error = self.validator.validate_block(new_block_obj)
+                        if not valid:
+                            logger.error(
+                                f"Invalid block in reorg: {new_hash.hex()[:16]}... - {error}"
+                            )
+                            return False
+                        self.validator.apply_block(new_block_obj)
+                        self.db.update_best_block(new_hash, connect_height)
+                except Exception as e:
+                    logger.error(
+                        f"Error connecting block {new_hash.hex()[:16]}... "
+                        f"at height {connect_height} during reorg: {e}"
+                    )
+                    return False
+
+                # Remove transactions now in block from mempool.
                 if self.mempool:
-                    self.mempool.remove_block_transactions(new_block)
+                    self.mempool.remove_block_transactions(new_block_obj)
 
                 # Process orphans that may now have their parent
                 await self._process_orphans(new_hash)
 
-            # Update best block
-            if blocks_to_connect:
-                final_hash = blocks_to_connect[-1][0]
-                final_height = blocks_to_connect[-1][2]
-                try:
-                    self.db.update_best_block(final_hash, final_height)
-                except Exception as e:
-                    logger.error(f"Failed to update best block after reorg: {e}")
-                    return False
-            else:
-                final_height = common_ancestor_height
-                final_hash = common_ancestor
+            final_hash, final_height = self.db.get_best_block()
 
-            # Re-add transactions from disconnected blocks to mempool (re-validate)
+            # ----------------------------------------------------------
+            # Mempool refill: re-add disconnected-block txs to the
+            # mempool subject to the new tip's policy. ``add_transaction``
+            # runs the same checks as a freshly received tx (BIP-113
+            # IsFinalTx, BIP-68 SequenceLocks, standardness, double-spend
+            # against new-chain UTXOs), so this is policy-correct against
+            # the new tip.
+            # ----------------------------------------------------------
             if self.mempool:
                 for _, curr_block, _ in reversed(blocks_to_disconnect):
                     for tx in curr_block.transactions:
-                        if not tx.is_coinbase:
-                            _, best_h = self.db.get_best_block()
-                            success, _ = self.mempool.add_transaction(tx, best_h)
+                        if tx.is_coinbase:
+                            continue
+                        try:
+                            success, reason = self.mempool.add_transaction(tx, final_height)
                             if success:
                                 logger.debug(
                                     f"Re-added tx {tx.get_txid().hex()[:16]}... to mempool"
                                 )
+                            else:
+                                logger.debug(
+                                    f"Tx {tx.get_txid().hex()[:16]}... not re-added to mempool: {reason}"
+                                )
+                        except Exception as e:
+                            logger.debug(
+                                f"Error re-adding tx {tx.get_txid().hex()[:16]}...: {e}"
+                            )
 
             logger.info(f"Reorg handled: new tip at height {final_height}")
             self.reorg_depth += 1
