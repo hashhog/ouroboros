@@ -1,8 +1,22 @@
 """
 Test UTXO restoration during chain reorganization.
 
-This test verifies that UTXOs are properly restored when blocks are disconnected
-during a chain reorganization.
+This module verifies the *structural* contract of the reorg path:
+
+* ``BlockSync._handle_reorg`` exists and is async-callable.
+* The dead helpers ``_restore_utxos_from_block`` /
+  ``_find_transaction_in_blocks`` (which dropped ``height`` +
+  ``is_coinbase`` from restored UTXOs and were never wired to a real
+  ``db.restore_utxo`` method) are gone.
+* The Python ``BlockchainDatabase`` exposes ``disconnect_block`` (the
+  Rust-routed correct disconnect path) and ``get_block_bytes`` (used by
+  the new reorg connect side to feed witness-preserving block bytes back
+  into the Rust connect path).
+
+End-to-end correctness — that the disconnect path actually preserves
+``height`` and ``is_coinbase`` post-reorg — is exercised by
+``tests/test_reorg_handle_rust_path.py`` against the real Rust
+extension.
 """
 
 import shutil
@@ -16,12 +30,12 @@ src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
 from ouroboros.block_sync import BlockSync  # noqa: E402
-from ouroboros.database import Block, BlockchainDatabase, Transaction, TxIn, TxOut  # noqa: E402
+from ouroboros.database import BlockchainDatabase  # noqa: E402
 from ouroboros.validation import BlockValidator  # noqa: E402
 
 
 class TestReorgUTXORestoration(unittest.TestCase):
-    """Test UTXO restoration during reorg"""
+    """Test reorg UTXO restoration plumbing"""
 
     def setUp(self):
         """Set up test fixtures"""
@@ -45,117 +59,33 @@ class TestReorgUTXORestoration(unittest.TestCase):
         """Clean up test fixtures"""
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_find_transaction_in_blocks(self):
-        """Test finding a transaction in blocks"""
-        # Create a test block with a transaction
-        tx = Transaction(
-            txid=bytes(32),
-            version=1,
-            locktime=0,
-            inputs=[],
-            outputs=[
-                TxOut(value=50000000, script_pubkey=b'\x76\xa9\x14' + bytes(20) + b'\x88\xac')
-            ]
-        )
-        tx.txid = b'\x01' * 32  # Set a known txid
+    def test_handle_reorg_exists(self):
+        """The reorg entry point must still be there for the sync loop."""
+        self.assertTrue(hasattr(self.block_sync, '_handle_reorg'))
+        self.assertTrue(callable(self.block_sync._handle_reorg))
 
-        Block(
-            version=1,
-            prev_blockhash=bytes(32),
-            merkle_root=bytes(32),
-            timestamp=1231006505,
-            bits=0x1d00ffff,
-            nonce=2083236893,
-            transactions=[tx],
-            hash=bytes(32),
-            height=0
-        )
+    def test_dead_helpers_removed(self):
+        """The previous (broken) Python disconnect path is gone.
 
-        # Store block (if possible) or simulate
-        # For now, just test that the method exists
-        self.assertTrue(hasattr(self.block_sync, '_find_transaction_in_blocks'))
-        self.assertTrue(hasattr(self.block_sync, '_restore_utxos_from_block'))
+        ``_restore_utxos_from_block`` searched only the prior 100 blocks
+        and dropped ``height`` + ``is_coinbase`` from the restored UTXO,
+        breaking the matured-coinbase rule on any reorg that crossed a
+        coinbase spend.  ``_find_transaction_in_blocks`` was its only
+        caller.  Both should be gone — the Rust path
+        (``db.disconnect_block``) is the live one now.
+        """
+        self.assertFalse(hasattr(self.block_sync, '_restore_utxos_from_block'))
+        self.assertFalse(hasattr(self.block_sync, '_find_transaction_in_blocks'))
 
-    def test_restore_utxos_from_block_structure(self):
-        """Test that restore_utxos_from_block returns correct structure"""
-        # Create a block with a transaction that spends a UTXO
-        prev_tx = Transaction(
-            txid=b'\x02' * 32,
-            version=1,
-            locktime=0,
-            inputs=[],
-            outputs=[
-                TxOut(value=100000000, script_pubkey=b'\x76\xa9\x14' + bytes(20) + b'\x88\xac')
-            ]
-        )
+    def test_database_disconnect_block_method(self):
+        """db.disconnect_block (Rust-routed) must be present and callable."""
+        self.assertTrue(hasattr(self.db, 'disconnect_block'))
+        self.assertTrue(callable(getattr(self.db, 'disconnect_block', None)))
 
-        spending_tx = Transaction(
-            txid=b'\x03' * 32,
-            version=1,
-            locktime=0,
-            inputs=[
-                TxIn(
-                    prev_txid=prev_tx.txid,
-                    prev_vout=0,
-                    script_sig=b'',
-                    sequence=0xffffffff
-                )
-            ],
-            outputs=[
-                TxOut(value=50000000, script_pubkey=b'\x76\xa9\x14' + bytes(20) + b'\x88\xac')
-            ]
-        )
-
-        Block(
-            version=1,
-            prev_blockhash=bytes(32),
-            merkle_root=bytes(32),
-            timestamp=1231006505,
-            bits=0x1d00ffff,
-            nonce=2083236893,
-            transactions=[spending_tx],
-            hash=bytes(32),
-            height=1
-        )
-
-        # Test that the method exists and can be called
-        # Note: This will fail if prev_tx is not found, which is expected
-        # The actual test would need to set up a proper blockchain state
-        self.assertTrue(hasattr(self.block_sync, '_restore_utxos_from_block'))
-
-    def test_database_restore_utxo_method(self):
-        """Test that database has restore_utxo method"""
-        self.assertTrue(hasattr(self.db, 'restore_utxo'))
-        self.assertTrue(callable(getattr(self.db, 'restore_utxo', None)))
-        self.assertTrue(hasattr(self.db, 'remove_utxo'))
-        self.assertTrue(callable(getattr(self.db, 'remove_utxo', None)))
-
-    def test_restore_utxo_signature(self):
-        """Test restore_utxo method signature"""
-        # Test that restore_utxo accepts correct parameters
-        try:
-            # This will fail if Rust module is not available, but that's okay
-            # We're just testing the method exists and has correct signature
-            self.db.restore_utxo(
-                txid=bytes(32),
-                vout=0,
-                value=100000000,
-                script_pubkey=b'\x76\xa9\x14' + bytes(20) + b'\x88\xac'
-            )
-        except (ImportError, NotImplementedError, Exception):
-            # Expected if Rust module not available or method not fully implemented
-            pass
-
-    def test_remove_utxo_signature(self):
-        """Test remove_utxo method signature"""
-        try:
-            self.db.remove_utxo(
-                txid=bytes(32),
-                vout=0
-            )
-        except (ImportError, NotImplementedError, Exception):
-            # Expected if Rust module not available or method not fully implemented
-            pass
+    def test_database_get_block_bytes_method(self):
+        """db.get_block_bytes (witness-preserving raw bytes) must exist."""
+        self.assertTrue(hasattr(self.db, 'get_block_bytes'))
+        self.assertTrue(callable(getattr(self.db, 'get_block_bytes', None)))
 
 
 if __name__ == '__main__':
