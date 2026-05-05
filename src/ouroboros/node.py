@@ -559,9 +559,20 @@ class BitcoinNode:
                 # Run block pruning if enabled
                 if self.pruner is not None:
                     try:
-                        removed = self.pruner.prune_to_target(best_height)
-                        if removed > 0:
-                            logger.info(f"Pruned {removed} old block(s)")
+                        # prune_to_target returns (files_pruned, bytes_freed).
+                        # Previously this code did `if removed > 0` on the
+                        # tuple, which raises TypeError on every trigger and
+                        # was silently swallowed by the surrounding except —
+                        # so auto-pruning never actually fired in production.
+                        # See _pruning-cross-impl-audit-2026-05-05.md (Bug 3).
+                        removed_files, bytes_freed = self.pruner.prune_to_target(
+                            best_height
+                        )
+                        if removed_files > 0:
+                            logger.info(
+                                f"Pruned {removed_files} old block file(s) "
+                                f"({bytes_freed / 1_000_000:.1f} MB freed)"
+                            )
                     except Exception as prune_err:
                         logger.debug(f"Pruning error: {prune_err}")
 
