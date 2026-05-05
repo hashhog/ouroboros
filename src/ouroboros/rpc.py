@@ -155,6 +155,15 @@ def bip22_result_string(error: str) -> str:
     if "exceeds max_money" in s or "output value exceeds" in s:
         return "bad-txns-vout-toolarge"
 
+    # Coinbase maturity violation (consensus/tx_verify.cpp::CheckTxInputs).
+    # Core: state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase").
+    # Rust BlockValidationError::TransactionValidation(PrematureCoinbaseSpend) renders as:
+    # "Transaction validation error: Premature spend of coinbase at depth N".
+    # Python validation.py: "Coinbase maturity not met for input N: depth D < 100".
+    # Must fire BEFORE the generic "transaction validation" catch-all below.
+    if "premature" in s or "coinbase maturity" in s or "not yet mature" in s or "not mature" in s:
+        return "bad-txns-premature-spend-of-coinbase"
+
     # Script / signature verification failures
     # Connect-block stage: Core validation.cpp:2122 strprintf("block-script-verify-flag-failed (%s)",...)
     if any(k in s for k in ("script", "signature", "checksig", "tapscript",
