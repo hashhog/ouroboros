@@ -164,6 +164,15 @@ def bip22_result_string(error: str) -> str:
     if "premature" in s or "coinbase maturity" in s or "not yet mature" in s or "not mature" in s:
         return "bad-txns-premature-spend-of-coinbase"
 
+    # Non-coinbase tx where sum(inputs) < sum(outputs).
+    # Core consensus/tx_verify.cpp::CheckTxInputs:
+    #   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
+    # Rust TransactionValidationError::OutputsExceedInputs renders as
+    # "Transaction validation error: Outputs exceed inputs" after BlockValidationError wrapping.
+    # Must fire BEFORE the generic "transaction validation" catch-all below.
+    if "outputs exceed inputs" in s or "bad-txns-in-belowout" in s:
+        return "bad-txns-in-belowout"
+
     # Script / signature verification failures
     # Connect-block stage: Core validation.cpp:2122 strprintf("block-script-verify-flag-failed (%s)",...)
     if any(k in s for k in ("script", "signature", "checksig", "tapscript",
