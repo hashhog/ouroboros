@@ -367,6 +367,26 @@ class BlockchainDatabase:
 
         return self._db.has_block_hash(block_hash)
 
+    def get_block_bytes(self, block_hash: bytes) -> bytes | None:
+        """Fetch the raw consensus-serialised bytes of a stored block.
+
+        Unlike :meth:`get_block`, the returned bytes preserve segwit
+        witness data — the Python ``Block`` dataclass strips witnesses on
+        the round-trip. The reorg path uses this to re-feed side-chain
+        blocks into ``connect_block_from_bytes`` so that SPENT_CF undo
+        records are re-written and the block can be cleanly disconnected
+        if the chain re-reorgs.
+        """
+        if len(block_hash) != 32:
+            raise ValueError("Block hash must be 32 bytes")
+
+        if not hasattr(self._db, "get_block_bytes"):
+            return None
+        result = self._db.get_block_bytes(block_hash)
+        if result is None:
+            return None
+        return bytes(result)
+
     def get_block_by_height(self, height: int) -> Block | None:
         """Look up a block by height; returns None if not found."""
         py_block = self._db.get_block_by_height(height)
