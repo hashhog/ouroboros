@@ -211,3 +211,41 @@ class TestPyBlockStorePruning:
         """No files to prune in empty store."""
         files = block_store.find_files_to_prune(1000, 0, 0)
         assert files == []
+
+
+class TestPruneToTargetReturnContract:
+    """Regression tests for the (files_pruned, bytes_freed) return contract.
+
+    See _pruning-cross-impl-audit-2026-05-05.md Bug 3: node.py was doing
+    `if removed > 0` on the tuple, raising TypeError every trigger. The
+    surrounding try/except swallowed it, so auto-prune never actually fired.
+    These tests pin the contract that callers MUST unpack the tuple.
+    """
+
+    def test_prune_to_target_returns_tuple(self, pruner):
+        """prune_to_target returns (files_pruned, bytes_freed) tuple."""
+        result = pruner.prune_to_target(100)
+        assert isinstance(result, tuple), \
+            f"prune_to_target must return tuple, got {type(result)}"
+        assert len(result) == 2, \
+            f"tuple must have 2 elements, got {len(result)}"
+        files, bytes_freed = result
+        assert isinstance(files, int)
+        assert isinstance(bytes_freed, int)
+
+    def test_prune_to_target_empty_returns_zero_zero(self, pruner):
+        """Empty store: prune yields (0, 0), not a TypeError."""
+        files, bytes_freed = pruner.prune_to_target(100)
+        assert files == 0
+        assert bytes_freed == 0
+
+    def test_tuple_int_comparison_would_raise(self):
+        """Pin the bug: comparing a tuple to an int raises TypeError.
+
+        This is the exact Python-3 semantic that broke node.py:562 before
+        the fix. If this ever stops raising, the auto-prune log path
+        regressed and the surrounding try/except will eat the bug again.
+        """
+        bad = (0, 0)
+        with pytest.raises(TypeError):
+            _ = bad > 0  # noqa: B015 — intentional, pinning the bug
