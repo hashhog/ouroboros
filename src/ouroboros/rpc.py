@@ -1423,6 +1423,23 @@ class RPCServer:
             if next_hash:
                 result["nextblockhash"] = next_hash
 
+        # Build coinbase_tx from first transaction's first input (Core 27+ field)
+        if hasattr(block, 'transactions') and block.transactions:
+            cb = block.transactions[0]
+            cb_inp = cb.inputs[0] if cb.inputs else None
+            cb_script = cb_inp.script_sig if cb_inp else b''
+            cb_script_hex = cb_script.hex() if isinstance(cb_script, bytes) else str(cb_script)
+            cb_seq = cb_inp.sequence if cb_inp else 0xffffffff
+            coinbase_tx_obj: dict[str, Any] = {
+                "version": cb.version,
+                "locktime": cb.locktime,
+                "sequence": cb_seq,
+                "coinbase": cb_script_hex,
+            }
+            if cb_inp and cb_inp.witness:
+                coinbase_tx_obj["witness"] = cb_inp.witness[0].hex() if isinstance(cb_inp.witness[0], bytes) else str(cb_inp.witness[0])
+            result["coinbase_tx"] = coinbase_tx_obj
+
         if verbosity == 1:
             # Transaction IDs only
             result["tx"] = [
@@ -3306,6 +3323,7 @@ class RPCServer:
     async def rpc_getmininginfo(self) -> dict[str, Any]:
         """
         Return mining-related information.
+        Reference: Bitcoin Core src/rpc/mining.cpp getmininginfo
         """
         db = getattr(self.node, "db", None)
         if db is None:
@@ -3314,12 +3332,34 @@ class RPCServer:
         _, height = db.get_best_block()
         mempool = getattr(self.node, "mempool", None)
 
+        # Get tip bits for bits/target fields
+        bits = getattr(db, '_tip_bits', 0x1d00ffff)
+        mantissa = bits & 0x007FFFFF
+        exponent = (bits >> 24) & 0xFF
+        if exponent <= 3:
+            target_int = mantissa >> (8 * (3 - exponent))
+        else:
+            target_int = mantissa << (8 * (exponent - 3))
+        bits_hex = f"{bits:08x}"
+        target_hex = f"{target_int:064x}"
+        difficulty = self.node.get_current_difficulty()
+        next_height = height + 1
+
         return {
             "blocks": height,
-            "difficulty": self.node.get_current_difficulty(),
+            "bits": bits_hex,
+            "difficulty": difficulty,
+            "target": target_hex,
+            "blockmintxfee": 0.00001000,
             "networkhashps": 0,
             "pooledtx": len(mempool.get_all_transactions()) if mempool else 0,
             "chain": self._rpc_chain_name(getattr(self.node, "network", "mainnet")),
+            "next": {
+                "height": next_height,
+                "bits": bits_hex,
+                "difficulty": difficulty,
+                "target": target_hex,
+            },
             "warnings": "",
         }
 
