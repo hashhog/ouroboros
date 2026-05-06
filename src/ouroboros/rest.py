@@ -630,9 +630,16 @@ class RESTInterface:
                 detail=f"output format not found (available: {available_formats_string()})"
             )
 
-        # Parse txid
+        # Parse txid.  REST convention mirrors JSON-RPC: txids in URLs are
+        # display-order (big-endian) hex; internal storage (mempool keys
+        # and the ``tx_index`` column family written by
+        # ``store_tx_index_batch``) is little-endian. Reverse on parse so
+        # the mempool lookup at :649 and the txindex hit at :654 both see
+        # consistent LE bytes — and so the ``found_txid == tx_hash``
+        # compare at :661 succeeds when the block contains the tx.
+        # Pattern C0 (txindex-revert-on-reorg corpus, 2026-05-05).
         try:
-            tx_hash = bytes.fromhex(param)
+            tx_hash = bytes.fromhex(param)[::-1]
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid hash: {param}") from None
 

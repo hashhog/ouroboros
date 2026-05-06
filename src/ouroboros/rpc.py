@@ -1542,9 +1542,23 @@ class RPCServer:
 
         Reference: Bitcoin Core rpc/rawtransaction.cpp getrawtransaction
         """
-        # Parse txid
+        # Parse txid.
+        #
+        # JSON-RPC convention: txids are display-order (big-endian) hex.
+        # Internal storage (mempool keys, ``store_tx_index_batch`` keys, and
+        # ``Transaction.get_txid()`` returns) all use little-endian uint256
+        # bytes (the bitcoinconsensus / Core wire form). Reverse on parse
+        # so every downstream consumer — mempool lookup at :1587, the
+        # txindex CF at :1621, and the ``found_txid == tx_hash`` compare
+        # at :1632 — sees a consistent LE byte string. Pre-fix, this hop
+        # treated display-order as internal-order and `getrawtransaction`
+        # for any confirmed tx returned `tx-err` even when the txindex CF
+        # contained the entry (Pattern C0, txindex-revert-on-reorg corpus
+        # entry, 2026-05-05). Mirrors how `blockhash` is parsed at :1569
+        # and how Bitcoin Core's `rpc/rawtransaction.cpp::ParseHashV` does
+        # the same byte reversal at the boundary.
         try:
-            tx_hash = bytes.fromhex(txid)
+            tx_hash = bytes.fromhex(txid)[::-1]
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid transaction id") from None
 
