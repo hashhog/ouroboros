@@ -395,6 +395,18 @@ def sync(ctx, reset, limit):
     ),
 )
 @click.option(
+    "--cfilter",
+    "cfilter",
+    type=int,
+    default=None,
+    help=(
+        "Compact-block-filter index mode (BIP 157/158).  ``0`` = off, "
+        "``1`` = basic filter index (equivalent to "
+        "--blockfilterindex).  Convenience alias for the boolean "
+        "--blockfilterindex flag."
+    ),
+)
+@click.option(
     "--daemon",
     is_flag=True,
     default=False,
@@ -428,7 +440,7 @@ def sync(ctx, reset, limit):
 @click.pass_context
 def start(
     ctx, rpc_port, p2p_port, listen, connect, force, v2transport,
-    peerbloomfilters, blockfilterindex, daemon, pid_path, reindex,
+    peerbloomfilters, blockfilterindex, cfilter, daemon, pid_path, reindex,
 ):
     """Start the Bitcoin node"""
     global _node, _cancelled, _pid_file
@@ -509,6 +521,16 @@ def start(
         # (Core parity, DEFAULT_BLOCKFILTERINDEX=false).
         if blockfilterindex is not None:
             config["blockfilterindex"] = bool(blockfilterindex)
+        # --cfilter=N (alias):  0 = off, 1 = basic filter index.  Maps onto
+        # the same config key as --blockfilterindex; explicit
+        # --blockfilterindex wins when both are provided so the boolean
+        # variant remains the canonical control surface.
+        if cfilter is not None and blockfilterindex is None:
+            if cfilter not in (0, 1):
+                raise click.BadParameter(
+                    f"--cfilter must be 0 (off) or 1 (basic), got {cfilter}"
+                )
+            config["blockfilterindex"] = bool(cfilter)
 
         # Daemonize BEFORE writing the PID file so the recorded PID is
         # the post-fork process (parity with Bitcoin Core).
