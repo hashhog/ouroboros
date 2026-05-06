@@ -1054,6 +1054,9 @@ impl BlockchainDB {
     /// 3. For each transaction (reverse order):
     ///    a. Delete outputs (UTXOs created by this block) from chainstate.
     ///    b. Restore inputs (UTXOs spent by this block) from undo data.
+    ///    c. Delete the txid → DiskTxPos entry from TX_INDEX_CF (Pattern C
+    ///       revert — see Bitcoin Core's `BaseIndex::BlockDisconnected`
+    ///       calling `CTxIndex::CustomRemove` in `index/txindex.cpp`).
     /// 4. Delete the undo data.
     /// 5. Update BEST_BLOCK_HASH / BEST_HEIGHT to the previous block.
     ///
@@ -1127,6 +1130,22 @@ impl BlockchainDB {
                     self.delete_spent_record(&outpoint)?;
                 }
             }
+
+            // 3. Drop the txid → DiskTxPos mapping (Pattern C revert).
+            //
+            // Without this, `getrawtransaction(<disconnected-tx>, true)`
+            // continues to resolve through the stale TX_INDEX_CF row,
+            // returning a positive `confirmations` count for a tx whose
+            // only block is no longer on the active chain. Mirrors
+            // `validate/block.rs::disconnect_block` (the parallel
+            // disconnect helper used by the validator pipeline) and the
+            // Bitcoin Core `BaseIndex::BlockDisconnected` →
+            // `CTxIndex::CustomRemove` chain (`src/index/base.cpp`,
+            // `src/index/txindex.cpp`). Pre-fix this method only
+            // touched UTXOs + UNDO_CF, leaving the txindex stale on
+            // submitblock-driven reorgs (Pattern C, txindex-revert-on-
+            // reorg corpus, 2026-05-05).
+            self.delete_tx_index(txid.as_byte_array())?;
         }
 
         // Delete the undo data
