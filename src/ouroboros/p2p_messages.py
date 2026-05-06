@@ -1499,10 +1499,20 @@ class GetBlocksMessage:
         offset += 4
         count, consumed = decode_varint(payload, offset)
         offset += consumed
+        # Anti-DoS: Bitcoin Core's MAX_LOCATOR_SZ = 101 (chain.h). Reject
+        # before allocating to prevent an attacker from forcing arbitrary
+        # memory allocation via a crafted getblocks message. Mirrors the
+        # existing cap on GetHeadersMessage.from_payload above.
+        if count > 101:
+            raise ValueError(f"Too many locator hashes: {count}")
         hashes = []
         for _ in range(count):
+            if offset + 32 > len(payload):
+                raise ValueError("Not enough data for locator hash")
             hashes.append(payload[offset:offset+32])
             offset += 32
+        if offset + 32 > len(payload):
+            raise ValueError("Not enough data for hash_stop")
         hash_stop = payload[offset:offset+32]
         return cls(version=version, locator_hashes=hashes, hash_stop=hash_stop)
 
