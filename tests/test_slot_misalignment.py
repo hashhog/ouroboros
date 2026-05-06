@@ -218,13 +218,16 @@ async def test_handle_headers_does_not_skip_orphaned_db_hashes(monkeypatch):
     bs.db.has_block_hash.return_value = True  # the orphaned-but-stored case
 
     # Build a single header that connects to our tip (so chain-prev check
-    # passes) but encodes a different block.
+    # passes) but encodes a different block.  Use regtest min-difficulty
+    # (bits=0x207fffff) so virtually any nonce satisfies the per-header
+    # PoW gate added in 2026-05-06's HSync wave — this test exercises
+    # the chain-prev / orphan-skip path, not PoW.
     h0 = BlockHeader(
         version=1,
         prev_blockhash=tip_hash,
         merkle_root=b"\xaa" * 32,
         timestamp=1_700_000_000,
-        bits=0x1d00ffff,
+        bits=0x207fffff,
         nonce=0,
     )
     headers_msg = HeadersMessage(headers=[h0])

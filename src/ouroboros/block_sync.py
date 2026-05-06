@@ -347,6 +347,21 @@ class BlockSync:
         self._wedge_warn_every: float = 300.0
         self._last_wedge_warn: float = 0.0
 
+        # BIP-130 / Core HeadersSyncState (PRESYNC/REDOWNLOAD anti-DoS).
+        # Per-peer Rust state machine that tracks cumulative work +
+        # 1-bit commitments during initial header sync.  Implemented in
+        # `ferrous-utils/sync/src/validate/headers_presync.rs` and
+        # exposed via `sync.PyHeadersSyncState`.  Pre-2026-05-06 the
+        # production handler bypassed this and only checked chain
+        # continuity — see CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-
+        # audit-2026-05-06-part2.md, RED finding #1.  Keyed by
+        # (host, port); recreated when the sync peer changes or when
+        # the state finalizes (success or failure).
+        self._presync_states: dict[tuple[str, int], object] = {}
+        # Counters for the per-header PoW gate (used by tests + ops).
+        self._headers_pow_rejected: int = 0
+        self._headers_presync_failures: int = 0
+
     def set_zmq_publisher(self, publisher) -> None:
         """Attach a ZMQPublisher for real-time block/tx notifications."""
         self._zmq_publisher = publisher
@@ -1310,6 +1325,121 @@ class BlockSync:
         block_hash_raw = hashlib.sha256(hashlib.sha256(header_bytes).digest()).digest()
         return block_hash_raw  # internal byte order — matches DB and wire
 
+    @staticmethod
+    def _bits_to_target(bits: int) -> int:
+        """Decode Bitcoin's compact 'bits' representation into a 256-bit target.
+
+        Mirrors ``ouroboros.validation._bits_to_target`` (and Core's
+        ``arith_uint256::SetCompact``) — duplicated here to keep
+        ``handle_headers`` import-free of the heavyweight validator
+        module on the hot header-receive path.
+        """
+        mantissa = bits & 0x007FFFFF
+        exponent = (bits >> 24) & 0xFF
+        if mantissa == 0:
+            return 0
+        if exponent <= 3:
+            return mantissa >> (8 * (3 - exponent))
+        return mantissa << (8 * (exponent - 3))
+
+    @classmethod
+    def _header_meets_pow(cls, header) -> bool:
+        """Return True iff ``double-SHA256(header)`` interpreted as a
+        little-endian uint256 is ``<=`` the target encoded in
+        ``header.bits``.
+
+        This is the per-header PoW gate that Bitcoin Core enforces
+        before accepting headers in ``CheckBlockHeader`` — without it,
+        a peer can flood low-difficulty-claimed headers whose hashes
+        do NOT actually meet the claimed target, exhausting our
+        validated-header queue (50K cap) cheaply.  Pairs with the
+        Rust ``HeadersSyncState`` presync state machine which
+        accumulates work from claimed bits but does not itself
+        verify hash≤target on each header.
+
+        Ref: bitcoin/src/pow.cpp ``CheckProofOfWork``;
+        CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part2.md
+        RED finding #1.
+        """
+        try:
+            header_bytes = header.serialize()
+            block_hash = hashlib.sha256(hashlib.sha256(header_bytes).digest()).digest()
+            hash_as_int = int.from_bytes(block_hash, "little")
+            target = cls._bits_to_target(int(header.bits))
+            if target <= 0:
+                return False
+            return hash_as_int <= target
+        except Exception:
+            # Malformed bits or serialization → treat as failed PoW.
+            return False
+
+    def _get_presync_state(self, peer: Peer):
+        """Lazily create / fetch the Rust ``PyHeadersSyncState`` for *peer*.
+
+        Returns ``None`` if the Rust ``sync`` module does not export the
+        anti-DoS state machine (older builds / test stubs).  In that
+        case the caller still gets the per-header PoW gate +
+        chain-continuity checks; only the presync commitment-tracking
+        defense-in-depth is skipped.
+
+        State is keyed by ``(peer.host, peer.port)`` and reused across
+        successive ``headers`` messages from the same peer so cumulative
+        work + commitments accumulate correctly (Core's
+        ``HeadersSyncState`` is per-peer).
+        """
+        if not _has_sync_module:
+            return None
+        cls = getattr(_sync_module, "PyHeadersSyncState", None)
+        if cls is None:
+            return None  # Test stub or older build without presync exposed.
+        try:
+            host = getattr(peer, "host", None)
+            port = getattr(peer, "port", None)
+            key = (host, port)
+        except Exception:
+            return None
+        state = self._presync_states.get(key)
+        if state is not None:
+            return state
+        # Build a fresh state.  ``chain_start_hash`` = our current best
+        # block hash; ``chain_start_time`` = our tip's MTP (best
+        # available proxy here is current wall-clock — Rust uses it
+        # only to bound max commitments, not for any chain math).
+        try:
+            best_hash, _ = self.db.get_best_block()
+        except Exception:
+            best_hash = b"\x00" * 32
+        if not isinstance(best_hash, (bytes, bytearray)) or len(best_hash) != 32:
+            best_hash = b"\x00" * 32
+        try:
+            mtp = int(self.db.get_median_time_past()) if hasattr(self.db, "get_median_time_past") else 0
+        except Exception:
+            mtp = 0
+        if mtp <= 0:
+            mtp = int(time.time())
+        network = self.peer_manager.network if hasattr(self.peer_manager, "network") else "mainnet"
+        try:
+            state = cls(network, bytes(best_hash), int(mtp))
+        except Exception as e:
+            logger.debug(f"PyHeadersSyncState init failed ({network}): {e}")
+            return None
+        self._presync_states[key] = state
+        return state
+
+    def _drop_presync_state(self, peer: Peer):
+        """Forget any presync state associated with *peer*.
+
+        Called after a presync failure (the state has self-finalized to
+        ``Final``) or when the peer disconnects.  Prevents stale state
+        from poisoning a subsequent retry against a different peer.
+        """
+        try:
+            host = getattr(peer, "host", None)
+            port = getattr(peer, "port", None)
+            self._presync_states.pop((host, port), None)
+        except Exception:
+            pass
+
     async def handle_headers(self, msg: NetworkMessage, peer: Peer):
         """Handle headers message — headers-first sync.
 
@@ -1347,6 +1477,12 @@ class BlockSync:
                 expected_prev = best_hash
 
             accepted = 0
+            # Headers that pass PoW + chain continuity in this batch and
+            # therefore should be fed to the Rust ``HeadersSyncState``
+            # presync state machine for commitment tracking.  Collected
+            # here so we hand them to the state machine in one call
+            # after the loop, matching Core's batch semantics.
+            presync_feed: list = []
             # Build the known-hash set ONCE before the loop instead of
             # rebuilding it for every header.  With 200K+ queued headers
             # this was O(n*m) and burned 97% CPU, starving RPC.
@@ -1360,6 +1496,32 @@ class BlockSync:
                 if block_hash in known_hashes:
                     expected_prev = block_hash
                     continue
+
+                # Per-header PoW gate (BIP-130 anti-DoS).  Pre-2026-05-06
+                # this loop only checked chain continuity, letting a peer
+                # flood our 50K-slot queue with valid-prev forged-PoW
+                # headers (audit RED #1).  We now require
+                # ``double-SHA256(header) <= target(bits)`` before append.
+                # Mirrors Bitcoin Core's CheckBlockHeader sequence.
+                if not self._header_meets_pow(header):
+                    self._headers_pow_rejected += 1
+                    logger.warning(
+                        f"Header {block_hash.hex()[:16]}... fails PoW "
+                        f"(bits=0x{int(header.bits):08x}) from "
+                        f"{peer.host}:{peer.port} — dropping batch"
+                    )
+                    # Treat as misbehavior: a peer that sends a header
+                    # whose hash does not meet its claimed target is
+                    # either attacking or corrupt.  Discard the rest of
+                    # this batch and tell the peer manager.
+                    peer.adjust_score(-20)
+                    if hasattr(self.peer_manager, "misbehaving"):
+                        addr = f"{peer.host}:{peer.port}"
+                        self.peer_manager.misbehaving(
+                            addr, 100, "header fails PoW (hash > target)"
+                        )
+                    self._drop_presync_state(peer)
+                    return
 
                 # NOTE: do NOT skip on `db.has_block_hash(block_hash)` here.
                 # `BLOCKS_CF` retains every block we have ever received — it
@@ -1392,6 +1554,45 @@ class BlockSync:
                 known_hashes.add(block_hash)
                 expected_prev = block_hash
                 accepted += 1
+                presync_feed.append(header)
+
+            # Hand the freshly-accepted, PoW-validated, chain-connected
+            # headers to the Rust ``PyHeadersSyncState`` for commitment
+            # tracking + cumulative-work accounting.  This is the
+            # defense-in-depth presync layer: even if an attacker were to
+            # somehow slip past the per-header PoW gate (e.g., via a fork
+            # of unbounded difficulty drops), the cumulative-work check
+            # vs ``nMinimumChainWork`` and the 1-bit commitments still
+            # detect bogus chains.
+            #
+            # Note: we feed only freshly-appended headers, not duplicates
+            # already in our queue.  Errors from the Rust state machine
+            # are logged + the state is dropped (it self-finalises to
+            # ``Final``); failure does NOT roll back the per-header
+            # accept already done — the PoW gate above is the
+            # consensus-relevant gate, the presync is anti-DoS only.
+            if presync_feed:
+                presync = self._get_presync_state(peer)
+                if presync is not None:
+                    try:
+                        full_message = len(headers_msg.headers) >= 2000
+                        serialized = [h.serialize() for h in presync_feed]
+                        result = presync.process_headers(serialized, full_message)
+                        if not result.success:
+                            self._headers_presync_failures += 1
+                            logger.warning(
+                                f"PyHeadersSyncState rejected batch from "
+                                f"{peer.host}:{peer.port}: {result.error}"
+                            )
+                            self._drop_presync_state(peer)
+                    except Exception as e:
+                        # Defense-in-depth only: a Rust-side error here
+                        # must not break header sync.  Log + drop the
+                        # state so a later batch can retry from scratch.
+                        logger.debug(
+                            f"PyHeadersSyncState.process_headers raised: {e}"
+                        )
+                        self._drop_presync_state(peer)
 
             if accepted:
                 logger.info(
