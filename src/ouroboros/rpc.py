@@ -1368,8 +1368,18 @@ class RPCServer:
             except Exception:
                 raise HTTPException(status_code=500, detail="Block serialization not implemented") from None
 
-        # Common fields for verbosity >= 1
-        block_height = getattr(block, 'height', None)
+        # Common fields for verbosity >= 1.
+        #
+        # Block height MUST be resolved from the chainstate index by hash —
+        # the deserialised ``Block`` dataclass doesn't carry a height (PyBlock
+        # has no height field) so the legacy ``getattr(block, 'height', None)``
+        # always returned None, then ``height if height else 0`` falsy-coerced
+        # to 0 in the response. That tripped Pattern D D1 (gbbh_h disagrees
+        # with gbc) + D3-roundtrip (getblockheader(getblockhash(50)).height
+        # returns 0, not 50) on the post-reorg-consistency corpus entry.
+        # Reference: bitcoin-core/src/rpc/blockchain.cpp blockToJSON reads
+        # nHeight off pblockindex (CBlockIndex), never off the block body.
+        block_height = await asyncio.to_thread(self._get_block_height, self.node.db, block_hash)
 
         # Get confirmations (-1 if not on main chain)
         confirmations = -1
@@ -1418,7 +1428,7 @@ class RPCServer:
             "size": size,
             "strippedsize": strippedsize,
             "weight": weight,
-            "height": block_height if block_height else 0,
+            "height": block_height if block_height is not None else 0,
             "version": block.version,
             "versionHex": f"{block.version:08x}",
             "merkleroot": block.merkle_root[::-1].hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
@@ -2351,8 +2361,17 @@ class RPCServer:
                 header_data.extend(block.nonce.to_bytes(4, 'little'))
                 return header_data.hex()
 
-            # Return verbose JSON
-            block_height = block.height if hasattr(block, 'height') and block.height is not None else None
+            # Return verbose JSON.
+            #
+            # Resolve height from the chainstate index keyed by hash; do NOT
+            # read it off the deserialised ``Block`` object. Height is an
+            # index-level concept that the serialised header doesn't carry,
+            # so PyBlock omits it. Pre-fix this returned ``height: 0`` for
+            # every header probe (Pattern D D3-roundtrip on the
+            # post-reorg-consistency corpus entry, 2026-05-05). Reference:
+            # bitcoin-core/src/rpc/blockchain.cpp getblockheader reads
+            # ``pblockindex->nHeight``.
+            block_height = await asyncio.to_thread(self._get_block_height, self.node.db, block_hash)
 
             # Get confirmations
             # -1 if block is not on the main chain
@@ -3730,6 +3749,69 @@ class RPCServer:
             "weightlimit": MAX_BLOCK_WEIGHT,
             "default_witness_commitment": default_witness_commitment,
         }
+
+    def _get_block_height(self, db, block_hash: bytes) -> int | None:
+        """Resolve a block's height from its 32-byte hash via the chainstate
+        index, returning ``None`` if the hash is unknown to the node.
+
+        ``getblock`` and ``getblockheader`` previously read height off the
+        deserialised ``Block`` dataclass via ``getattr(block, 'height', None)``
+        and falsy-coerced the result to ``0``. The Rust ``PyBlock`` does not
+        carry a ``height`` field (height is a chainstate-level concept, not a
+        serialised-block field), so the response always reported
+        ``height: 0`` — the Pattern D / D1+D3 failure mode caught by the
+        ``post-reorg-consistency`` corpus entry on 2026-05-05.
+
+        This helper instead consults the chainstate index, reusing the same
+        active-tip / side-branch / linear-scan tiering already used by
+        :meth:`_resolve_parent_height` so that probes against a recently
+        disconnected block also resolve.
+
+        Resolution order (cheapest first):
+          1. Active-tip fast path (``get_best_block``)
+          2. Side-branch buffer (``submitblock`` reorg shim)
+          3. Rust ``find_height_of_hash`` if exposed by the db
+          4. Python walk via ``get_block_hash_by_height`` (active chain only)
+
+        Reference: Bitcoin Core ``CBlockIndex::nHeight`` is set when the
+        block is added to ``BlockManager::m_block_index``; ``rpc/blockchain.cpp``
+        ``getblock`` / ``getblockheader`` read it off the index, never off the
+        deserialised block body. Mirrored here.
+        """
+        try:
+            tip_hash, tip_height = db.get_best_block()
+        except Exception:
+            tip_hash, tip_height = None, None
+        if tip_hash is not None and block_hash == tip_hash:
+            return tip_height
+
+        # Side-branch buffer (submitblock reorg shim, keyed by block hash).
+        side_entry = self._side_branch_blocks.get(block_hash)
+        if side_entry is not None:
+            _, side_height, _ = side_entry
+            return side_height
+
+        # Native Rust scan if available — single FFI call, walks
+        # BLOCK_INDEX_CF rows backwards from the tip.
+        if hasattr(db, "find_height_of_hash") and tip_height is not None:
+            try:
+                h = db.find_height_of_hash(block_hash, tip_height)
+                if h is not None:
+                    return h
+            except Exception:
+                pass
+
+        # Python fallback: walk active chain backwards via the cheap
+        # 32-byte-prefix lookup (no full block deserialisation).
+        if tip_height is not None and hasattr(db, "get_block_hash_by_height"):
+            for h in range(tip_height, -1, -1):
+                try:
+                    candidate = db.get_block_hash_by_height(h)
+                except Exception:
+                    candidate = None
+                if candidate is not None and bytes(candidate) == block_hash:
+                    return h
+        return None
 
     def _resolve_parent_height(self, db, prev_hash: bytes) -> int | None:
         """Return the height of ``prev_hash`` in either the active chain or
