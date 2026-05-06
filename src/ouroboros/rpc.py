@@ -1138,6 +1138,14 @@ class RPCServer:
             except Exception:
                 chainwork = "0x0"
 
+        # BIP 157/158 — surface whether the compact block filter index is
+        # active.  Mirrors Bitcoin Core's getblockchaininfo "compact_filters"
+        # behaviour: clients use this to know whether they can issue
+        # ``getblockfilter`` / P2P ``getcfilters`` against this node.
+        compact_filters_enabled = (
+            getattr(self.node, "block_filter_index", None) is not None
+        )
+
         info: dict[str, Any] = {
             "chain": self._rpc_chain_name(network),
             "blocks": best_height,
@@ -1154,6 +1162,7 @@ class RPCServer:
             "size_on_disk": size_on_disk,
             "pruned": pruned,
             "softforks": softforks,
+            "compact_filters_enabled": compact_filters_enabled,
         }
 
         if pruner is not None:
