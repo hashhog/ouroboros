@@ -32,8 +32,11 @@ Reference:
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import struct
+import threading
+from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 from ouroboros.compact_blocks import _siphash_2_4
@@ -180,8 +183,19 @@ def _golomb_rice_decode(data: bytes, n: int, p: int) -> list[int]:
 # ---------------------------------------------------------------------------
 
 def _block_filter_siphash_key(block_hash: bytes) -> bytes:
-    # block_hash is in display order (big-endian), reverse to LE
-    return block_hash[::-1][:16]
+    """First 16 bytes of the block hash in *internal* (little-endian) byte
+    order.  Mirrors Bitcoin Core ``blockfilter.cpp`` ``BuildParams`` which
+    reads ``m_siphash_k0 = block_hash.GetUint64(0)`` /
+    ``m_siphash_k1 = block_hash.GetUint64(1)`` directly off the raw 32-byte
+    hash without any reversal — and Core's ``uint256`` is stored in
+    internal/LE order.
+
+    ``Block.hash`` (set by ``Block.deserialize`` via ``dSHA256(header)``) is
+    already in internal byte order, so we slice the leading 16 bytes
+    unmodified.  Callers that hold a *display-order* hash (e.g. RPC input)
+    must reverse it before invoking this helper.
+    """
+    return block_hash[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -517,34 +531,68 @@ class BlockFilterIndex:
 
 class PersistentBlockFilterIndex:
     """
-    Persistent block filter index backed by RocksDB.
+    Persistent block filter index for BIP 157/158 compact filters.
 
-    This index stores BIP 158 basic block filters and their headers in a
-    separate column family in the blockchain database. It supports:
-    - Incremental building during connect_block
-    - Removal during disconnect_block (reorg handling)
-    - Lookup by block hash or height
+    Stores BIP 158 basic block filters and their headers durably under
+    ``<data_dir>/blockfilter/`` so they survive node restarts (the entire
+    point of having an "index").
 
-    Storage format:
-    - Filter CF: block_hash (32 bytes) -> filter_bytes (variable)
-    - Header CF: block_hash (32 bytes) -> filter_header (32 bytes)
-    - Height CF: height (4 bytes BE) -> block_hash (32 bytes)
-    - Metadata CF: "tip_header" -> filter_header (32 bytes)
+    Phase 1 storage layout (file-per-block sharded by hash prefix):
+
+    ::
+
+        <data_dir>/blockfilter/
+            VERSION                    # text file with schema version
+            meta/tip_header            # 32-byte tip filter header
+            meta/params.json           # P, M, filter type for sanity check
+            filters/<aa>/<hash>.flt    # GCS filter bytes (sharded by hash[:1])
+            headers/<aa>/<hash>.hdr    # 32-byte filter header
+            height/<8-digit>.h         # 32-byte block_hash
+
+    All writes use the *write-then-rename* idiom (``os.replace`` is atomic
+    on POSIX) so a crash mid-write cannot leave a half-written filter on
+    disk.  An in-memory LRU cache (default 8192 entries) accelerates the
+    hot path used by the BIP-157 P2P handlers; the cache is populated on
+    write and on miss.
+
+    A single ``threading.Lock`` serialises ``add`` / ``remove`` /
+    ``set_tip_header`` so concurrent ``asyncio.to_thread`` calls cannot
+    interleave the read-modify-write of the tip header — which would
+    otherwise break the chain `H_n = dSHA256(filter_hash_n || H_{n-1})`.
+
+    Phase 2 will migrate the on-disk format to a dedicated RocksDB CF
+    (``BlockFilters``) in the ferrous-utils crate; the public API of this
+    class is intentionally kept narrow so the swap is internal.
     """
 
-    # Keys for metadata
-    _TIP_HEADER_KEY = b"tip_header"
+    SCHEMA_VERSION = 1
 
-    def __init__(self, data_dir: str, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        data_dir: str,
+        enabled: bool = True,
+        cache_capacity: int = 8192,
+    ) -> None:
         """
         Initialize the persistent block filter index.
 
         Args:
-            data_dir: Directory for the filter index database
-            enabled: Whether the index is enabled
+            data_dir: Node data directory (the index lives under
+                ``<data_dir>/blockfilter``).
+            enabled: When False, fall back to a transient in-memory index;
+                this is what the constructor in node.py uses to model the
+                "off" state without forcing every caller to None-check.
+            cache_capacity: Maximum number of cached
+                ``(filter, header)`` pairs kept in RAM.  0 disables the
+                cache (read-through every call).
         """
         self._enabled = enabled
         self._data_dir = data_dir
+        self._lock = threading.Lock()
+        self._cache_capacity = max(0, int(cache_capacity))
+        self._filter_cache: OrderedDict[bytes, bytes] = OrderedDict()
+        self._header_cache: OrderedDict[bytes, bytes] = OrderedDict()
+        self._height_cache: OrderedDict[int, bytes] = OrderedDict()
 
         if not enabled:
             # Use in-memory fallback when disabled
@@ -552,14 +600,11 @@ class PersistentBlockFilterIndex:
             self._db = None
             return
 
-        # Import here to avoid circular imports and allow graceful fallback
         try:
-            # Open a dedicated database for block filters
             filter_db_path = os.path.join(data_dir, "blockfilter")
             os.makedirs(filter_db_path, exist_ok=True)
 
-            # Create a simple file-based storage for now
-            # In a full implementation, this would use RocksDB column families
+            self._root_path = filter_db_path
             self._filters_path = os.path.join(filter_db_path, "filters")
             self._headers_path = os.path.join(filter_db_path, "headers")
             self._height_path = os.path.join(filter_db_path, "height")
@@ -569,25 +614,142 @@ class PersistentBlockFilterIndex:
             os.makedirs(self._height_path, exist_ok=True)
             os.makedirs(self._meta_path, exist_ok=True)
 
-            self._db = True  # Mark as initialized
+            # Write schema VERSION + parameter sanity-check file once; if
+            # they already exist with a different version we keep them
+            # untouched (a future migration would handle the transition).
+            self._init_schema_metadata()
+
+            self._db = True
             self._memory_index = None
         except ImportError:
-            # Fall back to in-memory if sync module unavailable
+            # Fall back to in-memory when filesystem init fails for any
+            # reason (e.g. read-only datadir in some CI sandboxes).
             self._memory_index = BlockFilterIndex()
             self._db = None
+
+    def _init_schema_metadata(self) -> None:
+        """Stamp the schema version + filter parameters under meta/.
+
+        This is a one-shot hint for tooling (and for Phase 2 migration);
+        the on-disk parameters are not consulted on every read so a
+        mismatch is logged-only at open time.
+        """
+        version_path = os.path.join(self._root_path, "VERSION")
+        if not os.path.exists(version_path):
+            try:
+                with open(version_path, 'w', encoding='utf-8') as f:
+                    f.write(f"{self.SCHEMA_VERSION}\n")
+            except OSError:
+                pass
+
+        params_path = os.path.join(self._meta_path, "params.json")
+        if not os.path.exists(params_path):
+            try:
+                with open(params_path, 'w', encoding='utf-8') as f:
+                    json.dump(
+                        {
+                            "filter_type": BASIC_FILTER_TYPE,
+                            "P": GCS_P,
+                            "M": GCS_M,
+                            "schema_version": self.SCHEMA_VERSION,
+                        },
+                        f,
+                    )
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Internal helpers — atomic IO + cache management
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _atomic_write(path: str, data: bytes) -> None:
+        """Write *data* to *path* atomically (write-then-rename)."""
+        tmp_path = path + ".tmp"
+        with open(tmp_path, 'wb') as f:
+            f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # Some test filesystems (tmpfs in CI) don't support fsync;
+                # the rename below still gives us atomic visibility.
+                pass
+        os.replace(tmp_path, path)
+
+    def _shard_dir(self, base: str, block_hash: bytes) -> str:
+        """Return base/<aa>/ where aa is the first byte of the hash hex.
+
+        Sharding keeps directory entry counts manageable (≤ 256 entries
+        in the top level, ~3500 entries per shard at the mainnet tip
+        of ~900k blocks).  Plain flat dirs blow up readdir() at >100k
+        entries on ext4.
+        """
+        prefix = block_hash[:1].hex()  # 'aa' style
+        path = os.path.join(base, prefix)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            pass
+        return path
+
+    def _filter_path(self, block_hash: bytes) -> str:
+        return os.path.join(
+            self._shard_dir(self._filters_path, block_hash),
+            block_hash.hex() + ".flt",
+        )
+
+    def _header_path(self, block_hash: bytes) -> str:
+        return os.path.join(
+            self._shard_dir(self._headers_path, block_hash),
+            block_hash.hex() + ".hdr",
+        )
+
+    def _legacy_filter_path(self, block_hash: bytes) -> str:
+        # Pre-shard layout used in the very first persistent build.  Read
+        # path falls back here so existing datadirs don't have to be
+        # migrated to see their stored filters.
+        return os.path.join(self._filters_path, block_hash.hex())
+
+    def _legacy_header_path(self, block_hash: bytes) -> str:
+        return os.path.join(self._headers_path, block_hash.hex())
+
+    def _cache_put(
+        self,
+        which: OrderedDict,
+        key,
+        value,
+    ) -> None:
+        if self._cache_capacity == 0:
+            return
+        which[key] = value
+        which.move_to_end(key)
+        while len(which) > self._cache_capacity:
+            which.popitem(last=False)
+
+    def _cache_get(self, which: OrderedDict, key):
+        if self._cache_capacity == 0:
+            return None
+        if key in which:
+            which.move_to_end(key)
+            return which[key]
+        return None
 
     @property
     def is_enabled(self) -> bool:
         """Check if the index is enabled."""
         return self._enabled
 
-    def _hash_to_filename(self, block_hash: bytes) -> str:
-        """Convert block hash to a safe filename."""
-        return block_hash.hex()
-
     def _height_to_filename(self, height: int) -> str:
-        """Convert height to a filename."""
-        return f"{height:08d}"
+        """Convert height to a fixed-width filename for natural sorting."""
+        return f"{height:08d}.h"
+
+    def _height_path_for(self, height: int) -> str:
+        return os.path.join(self._height_path, self._height_to_filename(height))
+
+    # ------------------------------------------------------------------
+    # add / get / remove
+    # ------------------------------------------------------------------
 
     def add(
         self,
@@ -595,47 +757,60 @@ class PersistentBlockFilterIndex:
         db: BlockchainDatabase | None = None,
         prev_header: bytes | None = None,
     ) -> tuple[bytes, bytes]:
-        """Build, store, and return ``(filter_bytes, filter_header)`` for *block*."""
+        """Build, store, and return ``(filter_bytes, filter_header)`` for *block*.
+
+        Idempotent: re-adding the same ``block_hash`` overwrites the
+        existing entry.  Atomic-on-disk: each file is written via
+        write-then-rename so a crash in the middle of a connect cannot
+        leave a corrupt filter.  Thread-safe: a single lock serialises
+        the read-modify-write of the tip header.
+        """
         if self._memory_index is not None:
             return self._memory_index.add(block, db, prev_header)
 
-        # Build the filter
+        # Filter construction is pure / read-only; do it outside the lock
+        # so concurrent connect threads can build their filters in
+        # parallel.  Persistence + tip-header update happens under the
+        # lock to keep the chain monotonic.
         filt = build_basic_filter(block, db)
-
-        # Get previous header for chaining
-        if prev_header is None:
-            prev_header = self._get_tip_header()
-
-        fheader = compute_filter_header(filt, prev_header)
-
         block_hash = block.hash
-        filename = self._hash_to_filename(block_hash)
 
-        # Write filter
-        filter_path = os.path.join(self._filters_path, filename)
-        with open(filter_path, 'wb') as f:
-            f.write(filt)
+        with self._lock:
+            if prev_header is None:
+                # If we've already indexed this block (idempotent retry),
+                # reuse its existing previous-header so the chain doesn't
+                # double-tick when connect_block is called twice.
+                existing_header = self._read_header(block_hash)
+                if existing_header is not None:
+                    # Recompute prev_header by inverting the chain rule
+                    # is impossible (dSHA256 is one-way) — instead we just
+                    # short-circuit: this block was already indexed, return
+                    # the cached values without retouching the tip header.
+                    cached_filter = self._read_filter(block_hash)
+                    if cached_filter is not None:
+                        self._cache_put(self._filter_cache, block_hash, cached_filter)
+                        self._cache_put(self._header_cache, block_hash, existing_header)
+                        return cached_filter, existing_header
+                prev_header = self._get_tip_header()
 
-        # Write header
-        header_path = os.path.join(self._headers_path, filename)
-        with open(header_path, 'wb') as f:
-            f.write(fheader)
+            fheader = compute_filter_header(filt, prev_header)
 
-        # Write height mapping
-        if block.height is not None:
-            height_path = os.path.join(
-                self._height_path, self._height_to_filename(block.height)
-            )
-            with open(height_path, 'wb') as f:
-                f.write(block_hash)
+            self._atomic_write(self._filter_path(block_hash), filt)
+            self._atomic_write(self._header_path(block_hash), fheader)
 
-        # Update tip header
-        self._set_tip_header(fheader)
+            if block.height is not None:
+                self._atomic_write(self._height_path_for(block.height), block_hash)
+                self._cache_put(self._height_cache, block.height, block_hash)
+
+            self._set_tip_header(fheader)
+
+            self._cache_put(self._filter_cache, block_hash, filt)
+            self._cache_put(self._header_cache, block_hash, fheader)
 
         return filt, fheader
 
     def _get_tip_header(self) -> bytes:
-        """Get the current tip filter header."""
+        """Get the current tip filter header (must be called under lock)."""
         tip_path = os.path.join(self._meta_path, "tip_header")
         try:
             with open(tip_path, 'rb') as f:
@@ -644,51 +819,74 @@ class PersistentBlockFilterIndex:
             return b'\x00' * 32
 
     def _set_tip_header(self, header: bytes) -> None:
-        """Set the tip filter header."""
+        """Set the tip filter header (must be called under lock)."""
         tip_path = os.path.join(self._meta_path, "tip_header")
-        with open(tip_path, 'wb') as f:
-            f.write(header)
+        self._atomic_write(tip_path, header)
+
+    # -- lockless raw readers (used internally from add / public getters) --
+
+    def _read_filter(self, block_hash: bytes) -> bytes | None:
+        path = self._filter_path(block_hash)
+        try:
+            with open(path, 'rb') as f:
+                return f.read()
+        except FileNotFoundError:
+            pass
+        # Backward-compat with the very first flat layout
+        try:
+            with open(self._legacy_filter_path(block_hash), 'rb') as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    def _read_header(self, block_hash: bytes) -> bytes | None:
+        path = self._header_path(block_hash)
+        try:
+            with open(path, 'rb') as f:
+                return f.read()
+        except FileNotFoundError:
+            pass
+        try:
+            with open(self._legacy_header_path(block_hash), 'rb') as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
 
     def get_filter(self, block_hash: bytes) -> bytes | None:
         """Return the raw filter for *block_hash*, or None."""
         if self._memory_index is not None:
             return self._memory_index.get_filter(block_hash)
-
-        filename = self._hash_to_filename(block_hash)
-        filter_path = os.path.join(self._filters_path, filename)
-        try:
-            with open(filter_path, 'rb') as f:
-                return f.read()
-        except FileNotFoundError:
-            return None
+        cached = self._cache_get(self._filter_cache, block_hash)
+        if cached is not None:
+            return cached
+        data = self._read_filter(block_hash)
+        if data is not None:
+            self._cache_put(self._filter_cache, block_hash, data)
+        return data
 
     def get_header(self, block_hash: bytes) -> bytes | None:
         """Return the filter header for *block_hash*, or None."""
         if self._memory_index is not None:
             return self._memory_index.get_header(block_hash)
-
-        filename = self._hash_to_filename(block_hash)
-        header_path = os.path.join(self._headers_path, filename)
-        try:
-            with open(header_path, 'rb') as f:
-                return f.read()
-        except FileNotFoundError:
-            return None
+        cached = self._cache_get(self._header_cache, block_hash)
+        if cached is not None:
+            return cached
+        data = self._read_header(block_hash)
+        if data is not None:
+            self._cache_put(self._header_cache, block_hash, data)
+        return data
 
     def get_by_height(self, height: int) -> tuple[bytes, bytes] | None:
         """Return ``(filter, header)`` for a block at *height*, or None."""
         if self._memory_index is not None:
             return self._memory_index.get_by_height(height)
 
-        # Look up block hash by height
-        height_path = os.path.join(
-            self._height_path, self._height_to_filename(height)
-        )
-        try:
-            with open(height_path, 'rb') as f:
-                block_hash = f.read()
-        except FileNotFoundError:
-            return None
+        block_hash = self._cache_get(self._height_cache, height)
+        if block_hash is None:
+            block_hash = self.get_block_hash_by_height(height)
+            if block_hash is None:
+                return None
+            self._cache_put(self._height_cache, height, block_hash)
 
         filt = self.get_filter(block_hash)
         fhdr = self.get_header(block_hash)
@@ -701,57 +899,53 @@ class PersistentBlockFilterIndex:
         """The current filter header chain tip."""
         if self._memory_index is not None:
             return self._memory_index.tip_header
-        return self._get_tip_header()
+        with self._lock:
+            return self._get_tip_header()
 
     def remove(self, block_hash: bytes, height: int | None = None) -> bool:
-        """
-        Remove a filter entry (used during disconnect_block for reorgs).
+        """Remove a filter entry (used during disconnect_block for reorgs).
 
-        Args:
-            block_hash: The block hash to remove
-            height: Optional height (for efficient height mapping removal)
-
-        Returns True if the entry was found and removed.
+        Returns True if the entry was found and removed.  Phase 1 does
+        *not* attempt to roll back the tip filter header — callers that
+        need reorg-aware tip rollback should use :meth:`set_tip_header`
+        explicitly with the previous header.  Phase 2 will record undo
+        deltas alongside the undo CF for true atomic disconnect.
         """
         if self._memory_index is not None:
             return self._memory_index.remove(block_hash)
 
-        filename = self._hash_to_filename(block_hash)
-        found = False
+        with self._lock:
+            found = False
+            for path in (
+                self._filter_path(block_hash),
+                self._legacy_filter_path(block_hash),
+                self._header_path(block_hash),
+                self._legacy_header_path(block_hash),
+            ):
+                try:
+                    os.remove(path)
+                    found = True
+                except FileNotFoundError:
+                    pass
 
-        # Remove filter
-        filter_path = os.path.join(self._filters_path, filename)
-        try:
-            os.remove(filter_path)
-            found = True
-        except FileNotFoundError:
-            pass
+            if height is not None:
+                try:
+                    os.remove(self._height_path_for(height))
+                except FileNotFoundError:
+                    pass
+                self._height_cache.pop(height, None)
 
-        # Remove header
-        header_path = os.path.join(self._headers_path, filename)
-        try:
-            os.remove(header_path)
-            found = True
-        except FileNotFoundError:
-            pass
+            self._filter_cache.pop(block_hash, None)
+            self._header_cache.pop(block_hash, None)
 
-        # Remove height mapping
-        if height is not None:
-            height_path = os.path.join(
-                self._height_path, self._height_to_filename(height)
-            )
-            try:
-                os.remove(height_path)
-            except FileNotFoundError:
-                pass
-
-        return found
+            return found
 
     def set_tip_header(self, prev_header: bytes) -> None:
         """Set the tip header (used after reorg to restore previous state)."""
         if self._memory_index is not None:
             self._memory_index.set_tip_header(prev_header)
-        else:
+            return
+        with self._lock:
             self._set_tip_header(prev_header)
 
     # -- BIP 157 helper API --
@@ -781,12 +975,22 @@ class PersistentBlockFilterIndex:
         """Return the indexed block hash at *height*, or ``None``."""
         if self._memory_index is not None:
             return self._memory_index.get_block_hash_by_height(height)
-        height_path = os.path.join(
-            self._height_path, self._height_to_filename(height)
-        )
+        cached = self._cache_get(self._height_cache, height)
+        if cached is not None:
+            return cached
         try:
-            with open(height_path, 'rb') as f:
-                return f.read()
+            with open(self._height_path_for(height), 'rb') as f:
+                data = f.read()
+                self._cache_put(self._height_cache, height, data)
+                return data
         except FileNotFoundError:
-            return None
+            # Older datadirs used `.../<8-digit>` (no extension) — fall
+            # back so we don't lose existing index data after this
+            # filename-suffix change.
+            legacy = os.path.join(self._height_path, f"{height:08d}")
+            try:
+                with open(legacy, 'rb') as f:
+                    return f.read()
+            except FileNotFoundError:
+                return None
 

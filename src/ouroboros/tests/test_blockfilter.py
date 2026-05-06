@@ -221,11 +221,16 @@ class TestSipHashKey(unittest.TestCase):
     """Test SipHash key derivation from block hash."""
 
     def test_genesis_key(self):
-        """Key is first 16 bytes of block hash in internal (LE) order."""
-        key = _block_filter_siphash_key(GENESIS_HASH)
-        self.assertEqual(len(key), 16)
-        # Genesis hash reversed (internal byte order)
+        """Key is first 16 bytes of block hash in internal (LE) order.
+
+        Mirrors Bitcoin Core's ``BlockFilter::BuildParams``, which reads
+        ``siphash_k0 = block_hash.GetUint64(0)`` straight off the raw
+        ``uint256`` (which is itself stored in LE/internal order).
+        """
+        # Genesis hash in internal (LE) order
         genesis_le = GENESIS_HASH[::-1]
+        key = _block_filter_siphash_key(genesis_le)
+        self.assertEqual(len(key), 16)
         self.assertEqual(key, genesis_le[:16])
 
     def test_key_length(self):
