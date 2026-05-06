@@ -108,6 +108,16 @@ from ouroboros.validation import SIG_CACHE, BlockValidator
 logger = logging.getLogger(__name__)
 
 
+# Bitcoin Core's ``MAX_NUM_UNCONNECTING_HEADERS_MSGS`` from
+# ``net_processing.cpp``.  A peer that delivers more than this many
+# successive unconnecting-headers messages is misbehavior-scored and
+# disconnected.  Tolerating up to 10 transient unlinked batches
+# matches Core and prevents banning honest peers caught in a brief
+# reorg, while still bounding the soft-DoS surface where a malicious
+# peer keeps us in an infinite getheaders/orphan loop.
+_MAX_NUM_UNCONNECTING_HEADERS_MSGS: int = 10
+
+
 def _distribute_blocks_round_robin(
     items: list,
     candidates: list,
@@ -231,6 +241,21 @@ class BlockSync:
         self._validated_headers: list[tuple[bytes, BlockHeader]] = []
         # Max blocks to have in-flight at once during headers-first sync.
         self._max_blocks_in_flight: int = 256
+
+        # Per-peer counter of consecutive unconnecting-headers messages.
+        # Mirrors Bitcoin Core's ``nUnconnectingHeaders`` accounting in
+        # ``net_processing.cpp::ProcessHeadersMessage``.  Keyed by peer
+        # ``host:port`` string.  Incremented on every header batch whose
+        # first header doesn't connect; reset on any successful
+        # connecting batch.  When the counter would exceed
+        # ``_MAX_NUM_UNCONNECTING_HEADERS_MSGS`` (=10) we
+        # ``misbehaving(20)`` the peer.  Pre-fix, ouroboros silently
+        # ``break``ed out of the per-header loop on orphan with no
+        # penalty — a malicious peer could keep us in a getheaders
+        # loop forever.  See
+        # ``CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md``
+        # (Pattern B), extended to Part-2 impls.
+        self._unconnecting_headers_count: dict[str, int] = {}
 
         # Single sync peer for header downloads (Bitcoin Core pattern).
         # Only one peer is sent getheaders at a time to prevent out-of-order
@@ -1440,6 +1465,45 @@ class BlockSync:
         except Exception:
             pass
 
+    def _peer_key(self, peer: Peer) -> str:
+        """Stable lookup key for the per-peer unconnecting-headers map.
+
+        Uses the same ``host:port`` form the misbehavior path passes to
+        ``peer_manager.misbehaving``.
+        """
+        host = getattr(peer, "host", "?")
+        port = getattr(peer, "port", "?")
+        return f"{host}:{port}"
+
+    def _note_unconnecting_headers(self, peer: Peer) -> bool:
+        """Increment the per-peer unconnecting-headers counter for *peer*.
+
+        Returns ``True`` if the counter has exceeded
+        ``_MAX_NUM_UNCONNECTING_HEADERS_MSGS`` (caller MUST disconnect /
+        misbehavior-score the peer); returns ``False`` to indicate the
+        counter is still under the bound.  Mirrors Bitcoin Core's
+        ``nUnconnectingHeaders`` increment in
+        ``net_processing.cpp::ProcessHeadersMessage``.
+        """
+        key = self._peer_key(peer)
+        next_count = self._unconnecting_headers_count.get(key, 0) + 1
+        self._unconnecting_headers_count[key] = next_count
+        return next_count > _MAX_NUM_UNCONNECTING_HEADERS_MSGS
+
+    def _reset_unconnecting_headers(self, peer: Peer) -> None:
+        """Reset the unconnecting-headers counter for *peer*.
+
+        Called on every successful connecting headers batch (Core's
+        ``nUnconnectingHeaders = 0`` in the success path) and after
+        the threshold-exceeded ban path so a re-connect under the
+        same address starts fresh.
+        """
+        self._unconnecting_headers_count.pop(self._peer_key(peer), None)
+
+    def _unconnecting_headers_count_for(self, peer: Peer) -> int:
+        """Read the per-peer counter (used by tests)."""
+        return self._unconnecting_headers_count.get(self._peer_key(peer), 0)
+
     async def handle_headers(self, msg: NetworkMessage, peer: Peer):
         """Handle headers message — headers-first sync.
 
@@ -1548,6 +1612,32 @@ class BlockSync:
                         f"got {header_prev.hex()[:16] if header_prev else 'None'}...) — "
                         f"dropping remaining {len(headers_msg.headers) - accepted} headers"
                     )
+                    # Core-parity unconnecting-headers counter: when the
+                    # FIRST header of the batch fails the chain-continuity
+                    # check (accepted == 0), this is the
+                    # ``nUnconnectingHeaders`` case in
+                    # net_processing.cpp::ProcessHeadersMessage.
+                    # Tolerate up to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10
+                    # successive misses before banning the peer.  Pre-fix,
+                    # ouroboros silently ``break``ed with no penalty; see
+                    # CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+                    # (Pattern B).
+                    if accepted == 0:
+                        if self._note_unconnecting_headers(peer):
+                            addr = f"{peer.host}:{peer.port}"
+                            logger.warning(
+                                f"Peer {addr} exceeded "
+                                f"MAX_NUM_UNCONNECTING_HEADERS_MSGS="
+                                f"{_MAX_NUM_UNCONNECTING_HEADERS_MSGS}, "
+                                f"misbehaving + dropping presync state"
+                            )
+                            peer.adjust_score(-20)
+                            if hasattr(self.peer_manager, "misbehaving"):
+                                self.peer_manager.misbehaving(
+                                    addr, 20, "too many unconnecting headers"
+                                )
+                            self._reset_unconnecting_headers(peer)
+                            self._drop_presync_state(peer)
                     break
 
                 self._validated_headers.append((block_hash, header))
@@ -1555,6 +1645,12 @@ class BlockSync:
                 expected_prev = block_hash
                 accepted += 1
                 presync_feed.append(header)
+
+            # Successful connecting batch resets the per-peer
+            # unconnecting-headers counter (Core's
+            # ``nUnconnectingHeaders = 0`` in the success path).
+            if accepted > 0:
+                self._reset_unconnecting_headers(peer)
 
             # Hand the freshly-accepted, PoW-validated, chain-connected
             # headers to the Rust ``PyHeadersSyncState`` for commitment
