@@ -2184,16 +2184,26 @@ class RPCServer:
 
         txids = list(self.node.mempool.transactions.keys())
 
+        # Bitcoin Core displays txids in BIG-ENDIAN (reverse-byte) hex order
+        # at the RPC boundary; internal storage is little-endian. Match Core
+        # so cross-impl harnesses (tools/diff-test.sh,
+        # tools/snapshot-byte-identity.sh) compare apples to apples.
+        # Reference: bitcoin-core/src/util/strencodings.cpp (HexStr) +
+        # rpc/util.cpp (TxToUniv).
+        def _display_txid(txid):
+            if isinstance(txid, bytes):
+                return txid[::-1].hex()
+            return str(txid)
+
         if not verbose:
-            return [txid.hex() if isinstance(txid, bytes) else str(txid) for txid in txids]
+            return [_display_txid(txid) for txid in txids]
 
         # Return detailed information
         result = {}
         for txid in txids:
             entry = self.node.mempool.get_transaction_entry(txid)
             if entry:
-                txid_hex = txid.hex() if isinstance(txid, bytes) else str(txid)
-                result[txid_hex] = self._format_mempool_entry(entry, txid)
+                result[_display_txid(txid)] = self._format_mempool_entry(entry, txid)
 
         return result
 
@@ -4015,6 +4025,40 @@ class RPCServer:
             current_height,
             len(chain_to_connect),
         )
+
+        # ----------------------------------------------------------
+        # Capture non-coinbase txs from each block we are about to
+        # disconnect, BEFORE the disconnect loop fires.  Once
+        # ``db.disconnect_block(h)`` runs, the block is gone from the
+        # active chain (the chainstate row is rolled back); we cannot
+        # fetch the tx list afterwards.  We pre-load by height-walk
+        # on the active chain — same shape as
+        # ``BlockSync._handle_reorg`` (block_sync.py:2336-2350) which
+        # also captures ``current_chain`` BEFORE the disconnect loop.
+        #
+        # Pattern B refill (mempool-refill-on-reorg-2026-05-05):
+        # this is the data ``self.node.mempool.add_transaction`` consumes
+        # after the connect loop completes, mirroring Bitcoin Core's
+        # ``MaybeUpdateMempoolForReorg`` (validation.cpp).
+        # ----------------------------------------------------------
+        disconnected_txs: list = []
+        for h in range(current_height, common_ancestor_height, -1):
+            try:
+                blk = db.get_block_by_height(h)
+            except Exception as e:
+                logger.warning(
+                    "submitblock reorg: pre-disconnect get_block_by_height(%d) "
+                    "failed: %s — mempool refill will skip this block",
+                    h, e,
+                )
+                continue
+            if blk is None:
+                continue
+            for tx in getattr(blk, "transactions", []) or []:
+                if getattr(tx, "is_coinbase", False):
+                    continue
+                disconnected_txs.append(tx)
+
         disconnect_height = current_height
         while disconnect_height > common_ancestor_height:
             try:
@@ -4062,6 +4106,51 @@ class RPCServer:
         # whose buffered height is now stale-equal to the displaced A-chain.
         for h in connected_hashes:
             self._side_branch_blocks.pop(h, None)
+
+        # ----------------------------------------------------------
+        # Mempool refill (Pattern B closure for the submitblock path).
+        # Mirror ``BlockSync._handle_reorg`` (block_sync.py:2537-2555):
+        # feed each disconnected non-coinbase tx back to the mempool so
+        # that on a chain reorg, transactions valid against the new tip
+        # don't silently vanish. ``add_transaction`` runs the same
+        # checks as a freshly received tx (BIP-113 IsFinalTx, BIP-68
+        # SequenceLocks, standardness, double-spend against new-chain
+        # UTXOs), so this is policy-correct against the new tip.
+        #
+        # Counterpart in Bitcoin Core: ``Chainstate::DisconnectTip`` →
+        # ``MaybeUpdateMempoolForReorg`` (validation.cpp).
+        #
+        # Today's c822cc1 introduced this submitblock-driven reorg path
+        # but routed disconnect through ``db.disconnect_block`` directly,
+        # bypassing the refill loop that ``_handle_reorg`` already had —
+        # the "Pattern B miswire" identified in
+        # CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
+        # ----------------------------------------------------------
+        mempool = getattr(self.node, "mempool", None)
+        if mempool is not None and disconnected_txs:
+            try:
+                _, final_height = db.get_best_block()
+            except Exception:
+                final_height = -1
+            refilled = 0
+            for tx in disconnected_txs:
+                try:
+                    success, reason = mempool.add_transaction(tx, final_height)
+                    if success:
+                        refilled += 1
+                    else:
+                        logger.debug(
+                            "submitblock reorg: tx %s not re-added: %s",
+                            tx.get_txid().hex()[:16], reason,
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "submitblock reorg: error re-adding tx: %s", e,
+                    )
+            logger.info(
+                "submitblock reorg: refilled %d/%d disconnected txs to mempool",
+                refilled, len(disconnected_txs),
+            )
 
         return None
 
