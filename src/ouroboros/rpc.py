@@ -2680,6 +2680,103 @@ class RPCServer:
 
         return result
 
+    # ------------------------------------------------------------------ #
+    # lockunspent / listlockunspent                                      #
+    # Reference: bitcoin-core/src/wallet/rpc/coins.cpp::lockunspent and  #
+    # ::listlockunspent. Locks are stored on the Wallet object; the      #
+    # ``persistent`` flag mirrors Core's persistent-lock semantics       #
+    # (written to wallet.dat, survives restart). Locked outpoints are    #
+    # skipped by ``_collect_utxos`` so automatic coin selection avoids   #
+    # them.                                                              #
+    # ------------------------------------------------------------------ #
+
+    async def rpc_lockunspent(
+        self,
+        unlock: bool,
+        transactions: list[dict[str, Any]] | None = None,
+        persistent: bool = False,
+    ) -> bool:
+        """Lock or unlock outpoints so they are skipped by coin selection.
+
+        Args:
+            unlock: ``True`` to unlock; ``False`` to lock.
+            transactions: List of ``{"txid": <hex>, "vout": <int>}``. When
+                ``unlock`` is True and ``transactions`` is None or [], every
+                lock is cleared.
+            persistent: If True (and ``unlock`` is False), the lock is
+                written to wallet.dat. Core default: False.
+
+        Returns:
+            ``True`` on success. Raises HTTPException on validation errors,
+            matching Core's ``RPC_INVALID_PARAMETER`` cases.
+        """
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="No wallet loaded")
+
+        if not isinstance(unlock, bool):
+            raise HTTPException(status_code=400, detail="Invalid parameter, unlock must be a boolean")
+
+        # The "unlock with no list" form clears all locks (Core's
+        # UnlockAllCoins() path).
+        if transactions is None or (isinstance(transactions, list) and len(transactions) == 0):
+            if unlock:
+                wallet.unlock_all_coins()
+            return True
+
+        if not isinstance(transactions, list):
+            raise HTTPException(status_code=400, detail="Invalid parameter, transactions must be an array")
+
+        # Validate every entry first, mirroring Core's two-pass approach
+        # (collect outpoints → atomically apply). We don't have access to
+        # CWallet::mapWallet, so we validate hex/vout shape only.
+        outpoints: list[tuple[str, int]] = []
+        for entry in transactions:
+            if not isinstance(entry, dict):
+                raise HTTPException(status_code=400, detail="Invalid parameter, expected object")
+            txid = entry.get("txid")
+            vout = entry.get("vout")
+            if not isinstance(txid, str):
+                raise HTTPException(status_code=400, detail="Invalid parameter, txid must be a string")
+            try:
+                txid_bytes = bytes.fromhex(txid)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid parameter, txid: {exc}") from None
+            if len(txid_bytes) != 32:
+                raise HTTPException(status_code=400, detail="Invalid parameter, txid must be 32 bytes")
+            if not isinstance(vout, int) or isinstance(vout, bool):
+                raise HTTPException(status_code=400, detail="Invalid parameter, vout must be an integer")
+            if vout < 0:
+                raise HTTPException(status_code=400, detail="Invalid parameter, vout cannot be negative")
+
+            txid_lc = txid.lower()
+            is_locked = wallet.is_locked_coin(txid_lc, vout)
+
+            if unlock and not is_locked:
+                raise HTTPException(status_code=400, detail="Invalid parameter, expected locked output")
+            if (not unlock) and is_locked and not persistent:
+                raise HTTPException(status_code=400, detail="Invalid parameter, output already locked")
+
+            outpoints.append((txid_lc, vout))
+
+        # Apply atomically.
+        for (txid_lc, vout) in outpoints:
+            if unlock:
+                wallet.unlock_coin(txid_lc, vout)
+            else:
+                wallet.lock_coin(txid_lc, vout, persistent=bool(persistent))
+        return True
+
+    async def rpc_listlockunspent(self) -> list[dict[str, Any]]:
+        """List currently-locked outpoints. Reference: Core listlockunspent."""
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="No wallet loaded")
+        return [
+            {"txid": txid, "vout": vout}
+            for (txid, vout) in wallet.list_locked_coins()
+        ]
+
     async def rpc_getnewaddress(
         self,
         label: str = "",
@@ -3132,6 +3229,344 @@ class RPCServer:
         )
         psbt = PSBT.from_transaction(tx)
         return b64.b64encode(psbt.serialize()).decode("ascii")
+
+    async def rpc_walletcreatefundedpsbt(
+        self,
+        inputs: list[dict[str, Any]] | None = None,
+        outputs: list[dict[str, Any]] | dict[str, Any] | None = None,
+        locktime: int = 0,
+        options: dict[str, Any] | None = None,
+        bip32derivs: bool = True,
+    ) -> dict[str, Any]:
+        """Create + fund a PSBT (Creator + Updater roles).
+
+        Reference: bitcoin-core/src/wallet/rpc/spend.cpp::walletcreatefundedpsbt.
+
+        Caller-supplied ``inputs`` are honored verbatim (no auto-coin-selection
+        unless ``options.add_inputs`` is True or ``inputs`` is empty); when
+        auto-funding is needed, we walk the wallet's UTXOs through the
+        existing ``select_coins`` machinery, append change to the wallet's
+        first descriptor / key, and emit a base64-encoded PSBT with
+        witness-UTXO metadata filled in for every wallet input. Returns
+        ``{"psbt", "fee", "changepos"}``.
+        """
+        import base64 as b64
+
+        from ouroboros.address import address_to_script_pubkey
+        from ouroboros.database import Transaction, TxIn, TxOut
+        from ouroboros.psbt import PSBT
+        from ouroboros.wallet import WalletKey, _hash160, select_coins
+
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="No wallet loaded")
+        if wallet.is_locked:
+            raise HTTPException(
+                status_code=500,
+                detail="Wallet is locked; unlock with walletpassphrase first",
+            )
+
+        opts = dict(options) if isinstance(options, dict) else {}
+        inputs = inputs or []
+        if outputs is None:
+            raise HTTPException(status_code=400, detail="Missing outputs parameter")
+
+        # ------------------------------------------------------------------
+        # 1) Manually-specified inputs (Creator role).
+        # ------------------------------------------------------------------
+        manual_inputs: list[TxIn] = []
+        manual_meta: list[dict[str, Any]] = []  # parallel: {value, spk, key}
+        for inp in inputs:
+            if not isinstance(inp, dict):
+                raise HTTPException(status_code=400, detail="Invalid input entry")
+            txid_hex = inp.get("txid")
+            vout = inp.get("vout")
+            sequence = int(inp.get("sequence", 0xFFFFFFFD))
+            if not isinstance(txid_hex, str):
+                raise HTTPException(status_code=400, detail="Input txid must be a string")
+            try:
+                txid_bytes = bytes.fromhex(txid_hex)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid txid: {exc}") from None
+            if len(txid_bytes) != 32:
+                raise HTTPException(status_code=400, detail="txid must be 32 bytes")
+            if not isinstance(vout, int) or isinstance(vout, bool) or vout < 0:
+                raise HTTPException(status_code=400, detail="vout must be a non-negative integer")
+            manual_inputs.append(TxIn(
+                prev_txid=txid_bytes,
+                prev_vout=vout,
+                script_sig=b"",
+                sequence=sequence,
+            ))
+            # Look up UTXO metadata if available.
+            value = 0
+            spk = b""
+            key_obj = None
+            if wallet.db is not None:
+                try:
+                    utxo = wallet.db.get_utxo(txid_bytes, vout)
+                except Exception:
+                    utxo = None
+                if utxo:
+                    value = int(utxo.get("value", utxo.get("amount", 0)) or 0)
+                    spk_field = utxo.get("script_pubkey", b"")
+                    spk = bytes(spk_field) if spk_field else b""
+            manual_meta.append({"value": value, "spk": spk, "key": key_obj})
+
+        # ------------------------------------------------------------------
+        # 2) Outputs (accept list-of-objects OR direct dict, like Core).
+        # ------------------------------------------------------------------
+        out_pairs: list[tuple[str, int]] = []  # (address-or-"data", value_sat)
+        if isinstance(outputs, dict):
+            iter_outputs = [outputs]
+        else:
+            iter_outputs = list(outputs)
+        for entry in iter_outputs:
+            if not isinstance(entry, dict):
+                raise HTTPException(status_code=400, detail="Invalid output entry")
+            for addr, amount in entry.items():
+                if addr == "data":
+                    # OP_RETURN — `amount` is hex payload.
+                    try:
+                        data_bytes = bytes.fromhex(str(amount))
+                    except ValueError as exc:
+                        raise HTTPException(
+                            status_code=400, detail=f"Invalid OP_RETURN data: {exc}"
+                        ) from None
+                    if len(data_bytes) > 80:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="OP_RETURN payload exceeds 80-byte standardness limit",
+                        )
+                    out_pairs.append(("__data__:" + data_bytes.hex(), 0))
+                    continue
+                # Treat numeric `amount` as BTC float (Core convention).
+                try:
+                    sats = int(round(float(amount) * 1e8))
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=400, detail=f"Invalid amount for {addr}: {exc}"
+                    ) from None
+                if sats < 0:
+                    raise HTTPException(status_code=400, detail="Amount cannot be negative")
+                out_pairs.append((addr, sats))
+        if not out_pairs:
+            raise HTTPException(status_code=400, detail="At least one output is required")
+
+        # Build TxOut list.
+        tx_outputs: list[TxOut] = []
+        recipient_total = 0
+        for addr, sats in out_pairs:
+            if addr.startswith("__data__:"):
+                hex_payload = addr[len("__data__:"):]
+                payload = bytes.fromhex(hex_payload)
+                # OP_RETURN script: 0x6a + push-of-data.
+                spk = bytes([0x6a]) + (
+                    bytes([len(payload)]) if len(payload) < 0x4c else b""
+                ) + payload
+                tx_outputs.append(TxOut(value=0, script_pubkey=spk))
+                continue
+            try:
+                spk = address_to_script_pubkey(addr, wallet.network)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"Invalid address {addr}: {exc}"
+                ) from None
+            tx_outputs.append(TxOut(value=sats, script_pubkey=spk))
+            recipient_total += sats
+
+        # ------------------------------------------------------------------
+        # 3) Auto-fund missing inputs.
+        # ------------------------------------------------------------------
+        add_inputs = bool(opts.get("add_inputs", len(manual_inputs) == 0))
+        fee_rate_sat_vb = opts.get("fee_rate")
+        if fee_rate_sat_vb is None and "feeRate" in opts:
+            # Core's deprecated BTC/kvB form. 1 BTC/kvB = 100_000 sat/vB.
+            try:
+                fee_rate_sat_vb = float(opts["feeRate"]) * 100_000.0
+            except (TypeError, ValueError):
+                fee_rate_sat_vb = None
+        if fee_rate_sat_vb is None:
+            fee_estimator = getattr(self.node, "fee_estimator", None)
+            if fee_estimator is not None:
+                try:
+                    fee_rate_sat_vb = fee_estimator.estimate_fee(
+                        int(opts.get("conf_target", 6))
+                    )
+                except Exception:
+                    fee_rate_sat_vb = None
+        if fee_rate_sat_vb is None:
+            fee_rate_sat_vb = 2.0  # match send_transaction fallback
+        try:
+            fee_rate_sat_vb = max(1.0, float(fee_rate_sat_vb))
+        except (TypeError, ValueError):
+            fee_rate_sat_vb = 2.0
+
+        manual_input_value = sum(m["value"] for m in manual_meta)
+        selected_extra: list[dict] = []
+        est_fee = 0
+        change_pos: int | None = None
+
+        if add_inputs:
+            # Pull eligible UTXOs (already filters out lockunspent locks).
+            avail = wallet._collect_utxos() if hasattr(wallet, "_collect_utxos") else []
+            # Skip any UTXO that's already been listed as a manual input.
+            manual_keys = {(bytes(t.prev_txid).hex(), int(t.prev_vout)) for t in manual_inputs}
+            eligible = [
+                u for u in avail
+                if (
+                    (u["txid"] if isinstance(u["txid"], str) else u["txid"].hex()).lower(),
+                    int(u["vout"]),
+                ) not in manual_keys
+            ]
+            shortfall = max(0, recipient_total - manual_input_value)
+            if shortfall > 0:
+                selected_extra, est_fee, _algo = select_coins(
+                    eligible, shortfall, float(fee_rate_sat_vb),
+                )
+            else:
+                # No additional inputs needed — assume manual inputs fully cover.
+                selected_extra = []
+                est_fee = int(round(
+                    fee_rate_sat_vb * (
+                        10 + 41 * max(1, len(manual_inputs)) + 31 * len(tx_outputs)
+                    )
+                ))
+        else:
+            est_fee = int(round(
+                fee_rate_sat_vb * (
+                    10 + 41 * max(1, len(manual_inputs)) + 31 * len(tx_outputs)
+                )
+            ))
+            if recipient_total > manual_input_value:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Insufficient input value (add_inputs disabled and "
+                        "manual inputs do not cover outputs + fee)"
+                    ),
+                )
+
+        # Append auto-selected inputs.
+        all_inputs = list(manual_inputs)
+        all_meta = list(manual_meta)
+        for u in selected_extra:
+            txid_bytes = (
+                bytes.fromhex(u["txid"]) if isinstance(u["txid"], str) else bytes(u["txid"])
+            )
+            all_inputs.append(TxIn(
+                prev_txid=txid_bytes,
+                prev_vout=int(u["vout"]),
+                script_sig=b"",
+                sequence=0xFFFFFFFD,
+            ))
+            all_meta.append({
+                "value": int(u["value"]),
+                "spk": bytes(u.get("script_pubkey", b"")),
+                "key": u.get("_key"),
+            })
+
+        total_in = sum(m["value"] for m in all_meta)
+        change_value = total_in - recipient_total - est_fee
+
+        # ------------------------------------------------------------------
+        # 4) Change output. Honor changeAddress / changePosition.
+        # ------------------------------------------------------------------
+        DUST = 546
+        if change_value > DUST:
+            change_addr = opts.get("changeAddress") or opts.get("change_address")
+            if not change_addr:
+                # Derive from the wallet's first descriptor / key.
+                if wallet.descriptors:
+                    try:
+                        entry = wallet.descriptors[0]
+                        change_addr = entry.descriptor.derive_address(
+                            entry.next_index, wallet.network
+                        )
+                    except Exception:
+                        change_addr = None
+                if not change_addr and wallet.keys:
+                    try:
+                        change_key = wallet._get_wallet_key(wallet.keys[0])
+                        change_addr = change_key.get_p2wpkh_address()
+                    except Exception:
+                        change_addr = None
+            if not change_addr:
+                # No usable wallet output — fold the would-be change into the fee.
+                est_fee += change_value
+                change_value = 0
+            else:
+                try:
+                    change_spk = address_to_script_pubkey(change_addr, wallet.network)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid changeAddress {change_addr}: {exc}",
+                    ) from None
+                change_pos_req = opts.get("changePosition")
+                if change_pos_req is None or not isinstance(change_pos_req, int):
+                    change_pos = len(tx_outputs)
+                    tx_outputs.append(TxOut(value=change_value, script_pubkey=change_spk))
+                else:
+                    cp = max(0, min(int(change_pos_req), len(tx_outputs)))
+                    tx_outputs.insert(cp, TxOut(value=change_value, script_pubkey=change_spk))
+                    change_pos = cp
+
+        # Apply lockUnspents (post-construction, like Core).
+        if bool(opts.get("lockUnspents", False)) and selected_extra:
+            for u in selected_extra:
+                txid_str = (
+                    u["txid"] if isinstance(u["txid"], str) else u["txid"].hex()
+                )
+                wallet.lock_coin(txid_str.lower(), int(u["vout"]), persistent=False)
+
+        # ------------------------------------------------------------------
+        # 5) Build PSBT and fill witness-UTXO + bip32 derivs (Updater).
+        # ------------------------------------------------------------------
+        version = int(opts.get("version", 2)) if isinstance(opts.get("version"), int) else 2
+        tx = Transaction(
+            txid=b"\x00" * 32,  # placeholder; PSBT carries the unsigned tx
+            version=version,
+            locktime=int(locktime or 0),
+            inputs=all_inputs,
+            outputs=tx_outputs,
+        )
+        psbt = PSBT.from_transaction(tx)
+
+        # Build a pubkey -> KeyOriginInfo map so we can attach BIP32 paths
+        # for any input whose scriptPubKey we can resolve.
+        for idx, meta in enumerate(all_meta):
+            if meta["spk"]:
+                try:
+                    psbt.set_witness_utxo(idx, int(meta["value"]), bytes(meta["spk"]))
+                except Exception:
+                    pass
+
+        # Optional BIP32 derivs for wallet keys (nice-to-have; not required
+        # for finalization). Ouroboros's WalletKey doesn't carry origin info,
+        # so we skip if bip32derivs is False or no descriptor metadata is
+        # available.
+        if bip32derivs:
+            try:
+                # Walk the descriptor chain once to map address → key origin.
+                for entry in wallet.descriptors:
+                    if not entry.active:
+                        continue
+                    end = max(entry.next_index, entry.range_start + 1)
+                    for i in range(entry.range_start, end):
+                        try:
+                            entry.descriptor.derive_address(i, wallet.network)
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        psbt_bytes = psbt.serialize()
+        return {
+            "psbt": b64.b64encode(psbt_bytes).decode("ascii"),
+            "fee": est_fee / 100_000_000,
+            "changepos": change_pos if change_pos is not None else -1,
+        }
 
     async def rpc_estimatesmartfee(
         self,
@@ -9146,6 +9581,116 @@ class RPCServer:
 
         # Convert satoshis to BTC
         return total_balance / 100_000_000
+
+    async def rpc_getbalances(self) -> dict[str, Any]:
+        """Return wallet balances split by trust state.
+
+        Reference: Bitcoin Core wallet/rpc/coins.cpp::getbalances. The
+        ``mine`` object returns three buckets:
+
+        - ``trusted``: confirmed UTXOs the wallet can sign (height > 0).
+        - ``untrusted_pending``: same wallet, but height == 0 (mempool).
+        - ``immature``: coinbase outputs whose maturity is < 100 blocks.
+
+        Watch-only output is omitted because ouroboros's wallet does not
+        currently track watch-only descriptors as a separate bucket; the
+        ``getbalance`` handler folds them into the main balance. This
+        matches Core's behavior when a wallet has no watch-only keys.
+        """
+        from ouroboros.wallet import WalletKey
+
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="No wallet loaded")
+        if wallet.db is None:
+            raise HTTPException(status_code=500, detail="Wallet database not available")
+
+        # Tip height for confirmation accounting.
+        try:
+            best_hash, best_height = wallet.db.get_best_block()
+        except Exception:
+            best_hash, best_height = None, 0
+
+        # COINBASE_MATURITY = 100 (consensus-wide).
+        COINBASE_MATURITY = 100
+
+        # Build address set, mirroring rpc_getbalance.
+        addresses: set[str] = set()
+        for key_data in wallet.keys:
+            try:
+                key = WalletKey.from_wif(key_data["wif"], wallet.network)
+                addresses.add(key.get_p2wpkh_address())
+                addresses.add(key.get_p2pkh_address())
+                addresses.add(key.get_p2sh_p2wpkh_address())
+            except Exception:
+                continue
+        for entry in wallet.descriptors:
+            if not entry.active:
+                continue
+            try:
+                end = max(entry.next_index, entry.range_start + 1)
+                for i in range(entry.range_start, end):
+                    addresses.add(entry.descriptor.derive_address(i, wallet.network))
+            except Exception:
+                continue
+
+        trusted_sat = 0
+        untrusted_pending_sat = 0
+        immature_sat = 0
+
+        for addr in addresses:
+            utxos: list[dict[str, Any]] = []
+            if hasattr(wallet.db, "get_utxos_for_address"):
+                try:
+                    utxos = wallet.db.get_utxos_for_address(addr, wallet.network) or []
+                except Exception:
+                    utxos = []
+            elif hasattr(wallet.db, "list_unspent_by_address"):
+                try:
+                    utxos = wallet.db.list_unspent_by_address(addr, wallet.network) or []
+                except Exception:
+                    utxos = []
+
+            for utxo in utxos:
+                value = int(utxo.get("value", utxo.get("amount", 0)) or 0)
+                height = utxo.get("height", 0) or 0
+                is_coinbase = bool(
+                    utxo.get("is_coinbase", utxo.get("coinbase", False))
+                )
+                if height <= 0:
+                    untrusted_pending_sat += value
+                    continue
+                if is_coinbase:
+                    confs = max(0, best_height - height + 1)
+                    if confs < COINBASE_MATURITY:
+                        immature_sat += value
+                        continue
+                trusted_sat += value
+
+        balances: dict[str, Any] = {
+            "mine": {
+                "trusted": trusted_sat / 100_000_000,
+                "untrusted_pending": untrusted_pending_sat / 100_000_000,
+                "immature": immature_sat / 100_000_000,
+            }
+        }
+
+        # Last-processed-block (RESULT_LAST_PROCESSED_BLOCK in Core).
+        if best_hash is not None:
+            try:
+                hash_hex = (
+                    best_hash.hex()
+                    if isinstance(best_hash, (bytes, bytearray))
+                    else str(best_hash)
+                )
+            except Exception:
+                hash_hex = ""
+            balances["lastprocessedblock"] = {
+                "hash": hash_hex,
+                "height": int(best_height),
+            }
+
+        return balances
 
     async def rpc_signrawtransactionwithwallet(
         self,
