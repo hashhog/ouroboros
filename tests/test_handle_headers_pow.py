@@ -350,3 +350,65 @@ async def test_handle_headers_rejects_bad_pow_in_middle_of_batch(monkeypatch):
     assert len(bs._validated_headers) == 1
     assert bs._validated_headers[0][1] == good
     assert bs._headers_pow_rejected == 1
+
+
+# ---------------------------------------------------------------------------
+# Core-parity unconnecting-headers counter (Pattern B closure)
+# ---------------------------------------------------------------------------
+#
+# Per CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+# (Pattern B), the per-peer unconnecting-headers counter must tolerate up
+# to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10 successive unlinked batches
+# before misbehavior-scoring the peer.  Mirrors Bitcoin Core's
+# nUnconnectingHeaders accounting in
+# net_processing.cpp::ProcessHeadersMessage.  Pre-fix, ouroboros silently
+# `break`ed the per-header loop on the first orphan with no penalty —
+# a malicious peer could keep us in an infinite getheaders loop.
+
+
+def test_unconnecting_headers_counter_under_threshold():
+    """10 successive .note_unconnecting_headers() calls must NOT exceed."""
+    bs = _make_block_sync()
+    peer = _make_peer()
+    for i in range(1, 11):
+        exceeded = bs._note_unconnecting_headers(peer)
+        assert not exceeded, f"call #{i} should not yet exceed threshold"
+        assert bs._unconnecting_headers_count_for(peer) == i
+
+
+def test_unconnecting_headers_counter_exceeds_threshold():
+    """11th call must signal exceeded (caller bans the peer)."""
+    bs = _make_block_sync()
+    peer = _make_peer()
+    for _ in range(10):
+        assert not bs._note_unconnecting_headers(peer)
+    assert bs._note_unconnecting_headers(peer)
+
+
+def test_unconnecting_headers_reset_clears_count():
+    """_reset_unconnecting_headers wipes the per-peer entry."""
+    bs = _make_block_sync()
+    peer = _make_peer()
+    for _ in range(5):
+        bs._note_unconnecting_headers(peer)
+    assert bs._unconnecting_headers_count_for(peer) == 5
+    bs._reset_unconnecting_headers(peer)
+    assert bs._unconnecting_headers_count_for(peer) == 0
+    # Subsequent unconnecting starts fresh.
+    bs._note_unconnecting_headers(peer)
+    assert bs._unconnecting_headers_count_for(peer) == 1
+
+
+def test_unconnecting_headers_per_peer_independent():
+    """Each (host, port) tuple gets its own counter."""
+    bs = _make_block_sync()
+    peer_a = _make_peer(host="1.2.3.4", port=8333)
+    peer_b = _make_peer(host="5.6.7.8", port=8333)
+    for _ in range(10):
+        bs._note_unconnecting_headers(peer_a)
+    assert bs._unconnecting_headers_count_for(peer_a) == 10
+    assert bs._unconnecting_headers_count_for(peer_b) == 0
+    # Peer B's first note does NOT trip the threshold.
+    assert not bs._note_unconnecting_headers(peer_b)
+    # Peer A's 11th note trips.
+    assert bs._note_unconnecting_headers(peer_a)
