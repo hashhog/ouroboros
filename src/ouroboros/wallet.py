@@ -851,6 +851,11 @@ class Wallet:
         self._encrypted_blob: bytes | None = None
         self._key_pool: KeyPool | None = None  # BIP84 key pool
         self._disable_private_keys: bool = False  # watch-only mode
+        # Locked outpoints — see Bitcoin Core wallet/wallet.cpp LockCoin/IsLockedCoin.
+        # Stored as {(txid_hex, vout): persistent_bool}. Persistent locks survive
+        # restart (written to disk); non-persistent locks are memory-only and
+        # cleared on _load_or_create().
+        self._locked_coins: dict[tuple[str, int], bool] = {}
         self._load_or_create()
 
     # HD seed management #
@@ -934,6 +939,15 @@ class Wallet:
                 self._key_pool.top_up()
             # Load wallet flags
             self._disable_private_keys = data.get("disable_private_keys", False)
+            # Load persistent lockunspent entries (memory-only locks are dropped
+            # by virtue of process exit; see Core wallet.cpp LockCoin docs).
+            for entry in data.get("locked_coins", []):
+                try:
+                    txid = str(entry["txid"])
+                    vout = int(entry["vout"])
+                    self._locked_coins[(txid, vout)] = True
+                except (KeyError, ValueError, TypeError):
+                    continue
             logger.info(
                 f"Loaded wallet '{self.name}' with {len(self.keys)} keys, "
                 f"{len(self.descriptors)} descriptors"
@@ -963,6 +977,14 @@ class Wallet:
             inner["key_pool"] = self._key_pool.to_dict()
         if self._disable_private_keys:
             inner["disable_private_keys"] = True
+        # Persist only the persistent locks (matches Core's wallet-db semantics).
+        persistent_locks = [
+            {"txid": txid, "vout": vout}
+            for (txid, vout), persistent in self._locked_coins.items()
+            if persistent
+        ]
+        if persistent_locks:
+            inner["locked_coins"] = persistent_locks
 
         if self._passphrase is not None:
             plaintext = json.dumps(inner).encode("utf-8")
@@ -1774,9 +1796,62 @@ class Wallet:
             k = self._get_wallet_key(kd)
             addr = k.get_p2wpkh_address()
             for u in self.db.list_unspent_by_address(addr, self.network):
+                # Honor lockunspent — skip coins the user has explicitly locked.
+                # Reference: Bitcoin Core wallet/spend.cpp AvailableCoins().
+                txid_field = u.get("txid", "")
+                txid_str = txid_field if isinstance(txid_field, str) else txid_field.hex()
+                if self.is_locked_coin(txid_str, int(u.get("vout", 0))):
+                    continue
                 u["_key"] = k
                 utxos.append(u)
         return utxos
+
+    # --- lockunspent / listlockunspent -----------------------------------------
+    # Reference: Bitcoin Core wallet/wallet.cpp::LockCoin / UnlockCoin /
+    # ListLockedCoins / IsLockedCoin and wallet/rpc/coins.cpp::lockunspent.
+
+    def is_locked_coin(self, txid: str, vout: int) -> bool:
+        """Return True if (txid, vout) is currently locked (persistent or not)."""
+        return (txid.lower(), int(vout)) in self._locked_coins
+
+    def lock_coin(self, txid: str, vout: int, persistent: bool = False) -> None:
+        """Lock the outpoint so coin selection skips it.
+
+        ``persistent=True`` means the lock is written to the wallet database
+        and survives restart, matching Core's persistent-lock semantics.
+        """
+        key = (txid.lower(), int(vout))
+        existing = self._locked_coins.get(key)
+        # Once persistent, stay persistent — Core's LockCoin does the same:
+        # an upgrade from in-memory → persistent persists, but a transient
+        # re-lock never demotes a persistent lock.
+        new_persistent = bool(persistent or existing)
+        if self._locked_coins.get(key) == new_persistent and key in self._locked_coins:
+            return
+        self._locked_coins[key] = new_persistent
+        if persistent:
+            self._save()
+
+    def unlock_coin(self, txid: str, vout: int) -> bool:
+        """Unlock the outpoint. Returns True if the entry was removed."""
+        key = (txid.lower(), int(vout))
+        was_persistent = self._locked_coins.pop(key, None)
+        if was_persistent:
+            self._save()
+            return True
+        return was_persistent is not None
+
+    def unlock_all_coins(self) -> bool:
+        """Unlock every coin. Returns True (Core's UnlockAllCoins always does)."""
+        had_persistent = any(p for p in self._locked_coins.values())
+        self._locked_coins.clear()
+        if had_persistent:
+            self._save()
+        return True
+
+    def list_locked_coins(self) -> list[tuple[str, int]]:
+        """Return all currently-locked outpoints as ``(txid, vout)`` tuples."""
+        return [(txid, vout) for (txid, vout) in self._locked_coins]
 
     # --- coin selection --------------------------------------------------------
 
