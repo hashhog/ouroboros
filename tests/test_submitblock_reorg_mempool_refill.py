@@ -111,6 +111,19 @@ def _make_server_with_side_branch(
         return [b"\x00" * 32 for _ in range(tip_h - anc_h)]
 
     db.disconnect_blocks_atomic.side_effect = _disconnect_blocks_atomic
+
+    # Pattern D D-FULL — atomic-connect helper. For multi-block reorgs the
+    # connect side now batches every block into a single ``WriteBatch``.
+    # Return one fake hash per (raw_bytes, height) pair so the per-call
+    # shape mirrors what the live Rust extension returns.
+    def _connect_blocks_atomic(blocks, network):
+        return [b"\x00" * 32 for _ in blocks]
+
+    db.connect_blocks_atomic.side_effect = _connect_blocks_atomic
+    # Mock validate_block_from_bytes to a no-op so the pre-flight pass
+    # doesn't reject our opaque raw_bytes.
+    db.validate_block_from_bytes.return_value = None
+
     db.find_height_of_hash.side_effect = lambda h, tip: (
         common_ancestor_height if h == common_ancestor_hash else None
     )
@@ -207,9 +220,26 @@ def test_reorg_to_side_branch_tip_refills_mempool_with_disconnected_txs(monkeypa
     # Reorg drive returned None (success / accept).
     assert result is None, f"reorg returned non-None: {result!r}"
 
-    # Connect loop fired for B1+B2+B3.
-    assert len(accept_calls) == 3, (
-        f"expected 3 accept_block calls (B1,B2,B3); got {len(accept_calls)}"
+    # Pattern D D-FULL — multi-block reorgs route through the atomic
+    # connect helper, NOT the per-block accept_block path. Pre-D-FULL
+    # this fired ``accept_block`` 3 times (one per side-branch block);
+    # post-D-FULL the connect side is a single ``connect_blocks_atomic``
+    # call covering all 3 blocks in one ``WriteBatch``.
+    assert len(accept_calls) == 0, (
+        f"per-block accept_block leaked through the D-FULL connect path; "
+        f"this regresses Pattern D back to M batches. Got {len(accept_calls)} calls."
+    )
+    atomic_connect_calls = db.connect_blocks_atomic.call_args_list
+    assert len(atomic_connect_calls) == 1, (
+        f"expected exactly one connect_blocks_atomic call; got "
+        f"{len(atomic_connect_calls)}"
+    )
+    # The blocks_arg is a list of (raw_bytes, height) tuples in forward
+    # chain order (B1, B2, B3 at heights 111, 112, 113).
+    submitted_blocks = atomic_connect_calls[0].args[0]
+    submitted_heights = [h for (_, h) in submitted_blocks]
+    assert submitted_heights == [111, 112, 113], (
+        f"expected connect-batch heights [111,112,113]; got {submitted_heights}"
     )
 
     # Pattern D — disconnect side fires ONCE via the atomic helper,
@@ -282,8 +312,16 @@ def test_reorg_to_side_branch_tip_no_mempool_refill_when_no_mempool(monkeypatch)
 
     result = asyncio.run(server._reorg_to_side_branch_tip(db, b2_hash))
     assert result is None
-    # Connect loop still ran (B1, B2).
-    assert len(accept_calls) == 2
+    # Pattern D D-FULL — connect side now batches via connect_blocks_atomic.
+    # Per-block accept_block MUST NOT have fired.
+    assert len(accept_calls) == 0
+    atomic_connect_calls = db.connect_blocks_atomic.call_args_list
+    assert len(atomic_connect_calls) == 1
+    submitted_blocks = atomic_connect_calls[0].args[0]
+    submitted_heights = [h for (_, h) in submitted_blocks]
+    assert submitted_heights == [111, 112], (
+        f"expected connect-batch heights [111,112]; got {submitted_heights}"
+    )
     # Pattern D — disconnect side fires once via the atomic helper.
     assert db.disconnect_block.call_count == 0
     atomic_calls = [
