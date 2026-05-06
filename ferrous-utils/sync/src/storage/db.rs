@@ -1159,6 +1159,168 @@ impl BlockchainDB {
         Ok(block_hash)
     }
 
+    /// Atomically disconnect a contiguous range of blocks `[ancestor+1, tip]`
+    /// from the active tip down to (but not including) `ancestor_height`.
+    ///
+    /// All UTXO restores, output deletes, txindex deletes, spent-record
+    /// cleanups, undo deletes, and the BEST_BLOCK pointer rewrite are
+    /// accumulated into a **single RocksDB `WriteBatch`** and applied with
+    /// one atomic write at the end. Either every disconnect lands or none
+    /// does — the on-disk chainstate cannot end up half-disconnected.
+    ///
+    /// This is the multi-block-atomicity half of Pattern D
+    /// (`CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md`).
+    /// Without this, a crash between two `disconnect_block_at_height` calls
+    /// in a multi-block reorg leaves N-k blocks rolled back and k still
+    /// applied — the riskiest crash window flagged by the audit.
+    ///
+    /// # Arguments
+    /// * `tip_height` — current best-chain tip height (highest block to disconnect).
+    /// * `ancestor_height` — height of the common ancestor (NOT disconnected).
+    ///
+    /// # Returns
+    /// The list of disconnected block hashes, ordered tip-to-ancestor
+    /// (i.e. reverse chain order).
+    ///
+    /// # Reference
+    /// Bitcoin Core does NOT batch reorgs at this level (per-block flushes),
+    /// but recovers via undo data on restart. We get a stronger property
+    /// than Core for the disconnect side. See the audit appendix table:
+    /// camlcoin is the only fleet impl with this property pre-fix; this
+    /// brings ouroboros to D-PARTIAL parity with camlcoin.
+    pub fn disconnect_blocks_atomic(
+        &self,
+        tip_height: u32,
+        ancestor_height: u32,
+    ) -> Result<Vec<[u8; 32]>> {
+        if tip_height <= ancestor_height {
+            return Ok(Vec::new());
+        }
+
+        // Cache CF handles up front — used many times below.
+        let chainstate_cf = self.db.cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+        let spent_cf = self.db.cf_handle(SPENT_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(SPENT_CF.to_string()))?;
+        let tx_index_cf = self.db.cf_handle(TX_INDEX_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(TX_INDEX_CF.to_string()))?;
+        let undo_cf = self.db.cf_handle(UNDO_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(UNDO_CF.to_string()))?;
+        let meta_cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+
+        let mut batch = WriteBatch::default();
+        let mut disconnected_hashes: Vec<[u8; 32]> = Vec::new();
+        let mut last_prev_hash: Option<[u8; 32]> = None;
+
+        // Walk tip → ancestor+1 (reverse chain order).
+        for height in (ancestor_height + 1..=tip_height).rev() {
+            let block = self
+                .get_block_by_height(height)?
+                .ok_or(DbError::BlockNotFound)?;
+            let inner = block.inner();
+            let block_hash = *block.block_hash().as_byte_array();
+            let prev_block_hash = *inner.header.prev_blockhash.as_byte_array();
+            disconnected_hashes.push(block_hash);
+            last_prev_hash = Some(prev_block_hash);
+
+            // Try to load undo data (consensus-correct path); fall back to
+            // SPENT_CF per-input lookup when undo is missing.
+            let block_undo = self.get_block_undo(height, &prev_block_hash).ok();
+
+            // Process txdata in REVERSE order (mirrors disconnect_block_at_height).
+            for (tx_idx, tx) in inner.txdata.iter().enumerate().rev() {
+                let txid = tx.compute_txid();
+
+                // 1. Delete outputs created by this block.
+                for vout in 0..tx.output.len() {
+                    let outpoint_key = encode_outpoint(
+                        txid.as_byte_array(),
+                        vout as u32,
+                    );
+                    batch.delete_cf(chainstate_cf, &outpoint_key);
+                }
+
+                // 2. Restore inputs spent by this block.
+                if !tx.is_coinbase() {
+                    let tx_undo_idx = tx_idx - 1;
+
+                    for (input_idx, input) in tx.input.iter().enumerate() {
+                        let outpoint = input.previous_output;
+                        let outpoint_key = encode_outpoint(
+                            outpoint.txid.as_byte_array(),
+                            outpoint.vout,
+                        );
+
+                        let restored_from_undo = if let Some(ref undo) = block_undo {
+                            if let Some(tx_undo) = undo.tx_undo.get(tx_undo_idx) {
+                                if let Some(coin) = tx_undo.prev_outputs.get(input_idx) {
+                                    let utxo = UTXO::new(
+                                        common::OutPointWrapper::new(outpoint),
+                                        coin.value,
+                                        coin.script_pubkey.clone(),
+                                        Some(coin.height),
+                                        coin.is_coinbase,
+                                    );
+                                    let utxo_bytes = utxo.bitcoin_serialize()?;
+                                    batch.put_cf(chainstate_cf, &outpoint_key, &utxo_bytes);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if !restored_from_undo {
+                            // Fall back to SPENT_CF lookup. This is a read,
+                            // not an in-batch op — the SPENT_CF entry was
+                            // written by the original connect_block_from_bytes
+                            // call and is on disk already.
+                            if let Ok(Some((_spending_txid, utxo))) = self.get_spent_utxo(&outpoint) {
+                                let utxo_bytes = utxo.bitcoin_serialize()?;
+                                batch.put_cf(chainstate_cf, &outpoint_key, &utxo_bytes);
+                            } else {
+                                log::warn!(
+                                    "Missing undo data for input {:?}:{} at height {}",
+                                    outpoint.txid, outpoint.vout, height
+                                );
+                            }
+                        }
+
+                        // Drop the SPENT_CF row.
+                        batch.delete_cf(spent_cf, &outpoint_key);
+                    }
+                }
+
+                // 3. Drop the txid → DiskTxPos mapping (Pattern C revert).
+                batch.delete_cf(tx_index_cf, txid.as_byte_array());
+            }
+
+            // 4. Delete the undo data for this height.
+            let undo_key = encode_height(height);
+            batch.delete_cf(undo_cf, &undo_key);
+        }
+
+        // 5. Single best-block update at the end of the batch — the new tip
+        //    is the common ancestor's block hash + height.
+        if let Some(prev_hash) = last_prev_hash {
+            // The prev_blockhash on the lowest-disconnected block points at
+            // the common ancestor (which is at `ancestor_height`).
+            batch.put_cf(meta_cf, meta_keys::BEST_BLOCK_HASH, &prev_hash);
+            let height_bytes = encode_height(ancestor_height);
+            batch.put_cf(meta_cf, meta_keys::BEST_HEIGHT, &height_bytes);
+        }
+
+        // Atomic apply — either every write lands or none does.
+        self.db.write(batch)?;
+
+        Ok(disconnected_hashes)
+    }
+
     // ========== Batch Operations ==========
 
     /// Create a new write batch

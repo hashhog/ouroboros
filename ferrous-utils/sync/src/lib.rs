@@ -4163,6 +4163,44 @@ impl PyBlockchainDB {
         }
     }
 
+    /// Atomically disconnect every block in the inclusive range
+    /// `[ancestor_height + 1, tip_height]` using a single RocksDB
+    /// `WriteBatch`.
+    ///
+    /// All UTXO restores, output deletes, txindex deletes, spent-record
+    /// cleanups, undo deletes, and the BEST_BLOCK_HASH/BEST_HEIGHT pointer
+    /// rewrite are applied with one atomic write — the on-disk chainstate
+    /// cannot end up half-disconnected mid-reorg.
+    ///
+    /// Returns the list of disconnected block hashes (32-byte each),
+    /// ordered tip-to-ancestor. Reorg depth is enforced by the Python
+    /// caller via `MAX_REORG_DEPTH`.
+    ///
+    /// # Reference
+    /// Pattern D atomicity (multi-block reorg = single batch). See
+    /// `CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md`.
+    fn disconnect_blocks_atomic(
+        &self,
+        tip_height: u32,
+        ancestor_height: u32,
+    ) -> PyResult<Vec<Vec<u8>>> {
+        if tip_height < ancestor_height {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!(
+                    "disconnect_blocks_atomic: tip_height ({}) must be >= ancestor_height ({})",
+                    tip_height, ancestor_height
+                ),
+            ));
+        }
+        match self.db.disconnect_blocks_atomic(tip_height, ancestor_height) {
+            Ok(hashes) => Ok(hashes.into_iter().map(|h| h.to_vec()).collect()),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "disconnect_blocks_atomic({}, {}) failed: {}",
+                tip_height, ancestor_height, e
+            ))),
+        }
+    }
+
     // ========== Block Invalidation Methods ==========
 
     /// Invalidate a block and all its descendants.

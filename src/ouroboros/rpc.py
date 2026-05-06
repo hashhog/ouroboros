@@ -198,6 +198,24 @@ def bip22_result_string(error: str) -> str:
     return "rejected"
 
 
+# ---------------------------------------------------------------------------
+# Reorg safety constants
+# ---------------------------------------------------------------------------
+#
+# Hard cap on the depth of a single submitblock-driven reorg. Mirrors the
+# operational reorg-safety margin used elsewhere in ouroboros (see
+# ``rpc_loadtxoutset`` / pruning code which use the same 288-block Core
+# convention). 100 is a deliberately tight cap for the *atomic* reorg path:
+# it bounds the size of the single in-Rust ``WriteBatch`` (so we can't OOM
+# the process by accepting a 10k-deep side branch through ``submitblock``)
+# without coming anywhere near a real-world reorg depth (Core has not seen
+# a >10-deep reorg in ~14 years of operation).
+#
+# Reference: ``CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md``
+# Pattern D.
+MAX_REORG_DEPTH: int = 100
+
+
 async def accept_block(
     db,
     node,
@@ -4123,9 +4141,31 @@ class RPCServer:
         )
 
         # ----------------------------------------------------------
+        # Pattern D — atomic multi-block disconnect.
+        #
+        # Bound the total reorg depth (disconnect side + connect side)
+        # to ``MAX_REORG_DEPTH`` so a malicious/buggy peer cannot drive
+        # the in-Rust ``WriteBatch`` to unbounded size. 100 is a
+        # generous cap relative to any realistic reorg (Core has not
+        # observed a >10-deep mainnet reorg in ~14y of operation).
+        # ----------------------------------------------------------
+        disconnect_depth = current_height - common_ancestor_height
+        connect_depth = len(chain_to_connect)
+        if disconnect_depth > MAX_REORG_DEPTH or connect_depth > MAX_REORG_DEPTH:
+            logger.warning(
+                "submitblock reorg: depth cap exceeded — disconnect=%d "
+                "connect=%d cap=%d",
+                disconnect_depth, connect_depth, MAX_REORG_DEPTH,
+            )
+            return bip22_result_string(
+                f"reorg-too-deep: disconnect={disconnect_depth} "
+                f"connect={connect_depth} cap={MAX_REORG_DEPTH}"
+            )
+
+        # ----------------------------------------------------------
         # Capture non-coinbase txs from each block we are about to
         # disconnect, BEFORE the disconnect loop fires.  Once
-        # ``db.disconnect_block(h)`` runs, the block is gone from the
+        # ``db.disconnect_block(s)_*`` runs, the block is gone from the
         # active chain (the chainstate row is rolled back); we cannot
         # fetch the tx list afterwards.  We pre-load by height-walk
         # on the active chain — same shape as
@@ -4155,17 +4195,54 @@ class RPCServer:
                     continue
                 disconnected_txs.append(tx)
 
-        disconnect_height = current_height
-        while disconnect_height > common_ancestor_height:
+        # ----------------------------------------------------------
+        # Pattern D — single-batch atomic disconnect of all N blocks.
+        #
+        # Pre-fix this loop called ``db.disconnect_block(h)`` once per
+        # height; each call was its own RocksDB ``WriteBatch``. A crash
+        # mid-loop left N-k blocks rolled back and k still applied —
+        # the riskiest crash window flagged by the Pattern D static
+        # audit (post-reorg-consistency, 2026-05-05).
+        #
+        # Post-fix: a single Rust call accumulates all UTXO restores,
+        # output deletes, txindex deletes, spent-record cleanups, undo
+        # deletes, and the BEST_BLOCK pointer rewrite into one
+        # ``WriteBatch`` and applies once. Either every block lands or
+        # none does — pre-state OR post-disconnect-state, never partial.
+        #
+        # Brings ouroboros from D-AT-RISK to D-PARTIAL parity with
+        # camlcoin (the only impl with single-batch disconnect pre-fix,
+        # rated "best in fleet" by the audit).
+        # ----------------------------------------------------------
+        if hasattr(db, "disconnect_blocks_atomic") and current_height > common_ancestor_height:
             try:
-                await asyncio.to_thread(db.disconnect_block, disconnect_height)
+                await asyncio.to_thread(
+                    db.disconnect_blocks_atomic,
+                    current_height,
+                    common_ancestor_height,
+                )
             except Exception as e:
                 logger.error(
-                    "submitblock reorg: disconnect_block(%d) failed: %s",
-                    disconnect_height, e,
+                    "submitblock reorg: disconnect_blocks_atomic(%d→%d) failed: %s",
+                    current_height, common_ancestor_height, e,
                 )
                 return bip22_result_string(f"reorg-disconnect-failed: {e}")
-            disconnect_height -= 1
+        else:
+            # Compatibility fallback for older sync extensions that
+            # don't ship the atomic helper. Per-block disconnect retains
+            # the pre-Pattern-D semantics (per-block atomic, multi-block
+            # sequential).
+            disconnect_height = current_height
+            while disconnect_height > common_ancestor_height:
+                try:
+                    await asyncio.to_thread(db.disconnect_block, disconnect_height)
+                except Exception as e:
+                    logger.error(
+                        "submitblock reorg: disconnect_block(%d) failed: %s",
+                        disconnect_height, e,
+                    )
+                    return bip22_result_string(f"reorg-disconnect-failed: {e}")
+                disconnect_height -= 1
 
         # Connect each side-branch block via the unified accept_block
         # helper. accept_block runs the same CheckBlock + ConnectBlock

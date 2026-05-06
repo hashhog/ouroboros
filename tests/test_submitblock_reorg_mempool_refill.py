@@ -104,6 +104,13 @@ def _make_server_with_side_branch(
 
     db.get_best_block.side_effect = _get_best_block
     db.disconnect_block.return_value = b"\x00" * 32
+    # Pattern D atomic-disconnect helper — return one fake hash per
+    # disconnected height so the per-call shape mirrors what the live
+    # Rust extension returns.
+    def _disconnect_blocks_atomic(tip_h: int, anc_h: int):
+        return [b"\x00" * 32 for _ in range(tip_h - anc_h)]
+
+    db.disconnect_blocks_atomic.side_effect = _disconnect_blocks_atomic
     db.find_height_of_hash.side_effect = lambda h, tip: (
         common_ancestor_height if h == common_ancestor_hash else None
     )
@@ -205,11 +212,21 @@ def test_reorg_to_side_branch_tip_refills_mempool_with_disconnected_txs(monkeypa
         f"expected 3 accept_block calls (B1,B2,B3); got {len(accept_calls)}"
     )
 
-    # Disconnect loop fired for h=112 then h=111 (current_height down to
-    # common_ancestor_height + 1).
-    disconnect_args = [c.args[0] for c in db.disconnect_block.call_args_list]
-    assert disconnect_args == [112, 111], (
-        f"expected disconnect heights [112, 111]; got {disconnect_args}"
+    # Pattern D — disconnect side fires ONCE via the atomic helper,
+    # covering the full range (tip=112, ancestor=110) in a single
+    # RocksDB WriteBatch. Pre-fix this was a per-height
+    # ``db.disconnect_block(112)`` then ``db.disconnect_block(111)``
+    # loop; post-fix it is one ``disconnect_blocks_atomic(112, 110)``
+    # call. Per-block ``disconnect_block`` MUST NOT have been called.
+    assert db.disconnect_block.call_count == 0, (
+        "per-block disconnect_block leaked through the atomic path; "
+        "this regresses Pattern D back to N batches."
+    )
+    atomic_calls = [
+        (c.args[0], c.args[1]) for c in db.disconnect_blocks_atomic.call_args_list
+    ]
+    assert atomic_calls == [(112, 110)], (
+        f"expected single atomic disconnect (112, 110); got {atomic_calls}"
     )
 
     # *** The Pattern B assertion ***
@@ -267,6 +284,9 @@ def test_reorg_to_side_branch_tip_no_mempool_refill_when_no_mempool(monkeypatch)
     assert result is None
     # Connect loop still ran (B1, B2).
     assert len(accept_calls) == 2
-    # Disconnect loop still ran for h=111.
-    disconnect_args = [c.args[0] for c in db.disconnect_block.call_args_list]
-    assert disconnect_args == [111]
+    # Pattern D — disconnect side fires once via the atomic helper.
+    assert db.disconnect_block.call_count == 0
+    atomic_calls = [
+        (c.args[0], c.args[1]) for c in db.disconnect_blocks_atomic.call_args_list
+    ]
+    assert atomic_calls == [(111, 110)]
