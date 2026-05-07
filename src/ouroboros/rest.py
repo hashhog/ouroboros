@@ -26,6 +26,14 @@ MAX_REST_HEADERS_RESULTS = 2000
 # Maximum number of outpoints that can be queried at once
 MAX_GETUTXOS_OUTPOINTS = 15
 
+# BIP 157 filter type name -> numeric type code (Bitcoin Core blockfilter.cpp:23
+# `BlockFilterType::BASIC == 0`).  The /rest/blockfilter and
+# /rest/blockfilterheaders URIs accept the *name* form and we translate to the
+# integer used internally by ``ouroboros.blockfilter``.
+BLOCK_FILTER_TYPES_BY_NAME: dict[str, int] = {
+    "basic": 0,
+}
+
 
 class RESTResponseFormat(Enum):
     """REST response format types."""
@@ -108,6 +116,24 @@ class RESTInterface:
             name="rest_headers",
         )
 
+        # BIP 157 compact-filter endpoints.  The two prefixes are distinct
+        # ("blockfilter" vs "blockfilterheaders") so route order does not
+        # matter, but they share a single internal helper for filter-type
+        # parsing and 404 messaging — see ``rest_blockfilter_headers`` for
+        # the deprecated ``<count>/<hash>`` segment-count variant.
+        self.router.add_api_route(
+            "/blockfilterheaders/{path:path}",
+            self.rest_blockfilter_headers,
+            methods=["GET"],
+            name="rest_blockfilter_headers",
+        )
+        self.router.add_api_route(
+            "/blockfilter/{path:path}",
+            self.rest_blockfilter,
+            methods=["GET"],
+            name="rest_blockfilter",
+        )
+
         # Transaction endpoint
         self.router.add_api_route(
             "/tx/{txid:path}",
@@ -165,6 +191,29 @@ class RESTInterface:
         if not hasattr(self.node, 'mempool') or not self.node.mempool:
             raise HTTPException(status_code=404, detail="Mempool disabled or instance not found")
         return self.node.mempool
+
+    def _get_block_filter_index(self, filter_type_name: str):
+        """Resolve a filter-type name to the active index, mirroring Core
+        ``rest.cpp``: 400 on unknown name, 400 on disabled index.
+
+        Returns the active ``BlockFilterIndex`` / ``PersistentBlockFilterIndex``
+        instance.  Raises ``HTTPException`` on any error so callers can stay
+        purely on the happy path.
+        """
+        if filter_type_name not in BLOCK_FILTER_TYPES_BY_NAME:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown filtertype {filter_type_name}",
+            )
+        # Currently only BASIC (0) is implemented across the fleet — fall
+        # through once non-basic filter types land on the index side.
+        index = getattr(self.node, 'block_filter_index', None)
+        if index is None or not getattr(index, 'is_enabled', True):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Index is not enabled for filtertype {filter_type_name}",
+            )
+        return index
 
     def _format_response(
         self,
@@ -613,6 +662,226 @@ class RESTInterface:
         raise HTTPException(
             status_code=404,
             detail=f"output format not found (available: {available_formats_string()})"
+        )
+
+    async def rest_blockfilter(self, path: str) -> Response:
+        """
+        Get the BIP 158 compact block filter for a single block.
+
+        Path: /rest/blockfilter/<filtertype>/<blockhash>.<format>
+
+        Mirrors Bitcoin Core ``rest.cpp::rest_block_filter``.  *filtertype*
+        is the textual filter-type name (currently only ``basic`` is
+        supported, mapping to ``BlockFilterType::BASIC == 0``).
+        """
+        # Path arrives as "<filtertype>/<blockhash>.<format>" — split on the
+        # last '/' so the hash+format suffix can be parsed by the shared
+        # ``parse_format`` helper used everywhere else in this module.
+        parts = path.split('/')
+        if len(parts) != 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid URI format. Expected /rest/blockfilter/<filtertype>/<blockhash>",
+            )
+
+        filter_type_name = parts[0]
+        hash_str, rf = parse_format(parts[1])
+        if rf is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"output format not found (available: {available_formats_string()})",
+            )
+
+        # Validate hash early — Core returns 400 on malformed hex regardless of
+        # whether the index exists.
+        try:
+            hash_be = bytes.fromhex(hash_str)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid hash: {hash_str}") from None
+        if len(hash_be) != 32:
+            raise HTTPException(status_code=400, detail=f"Invalid hash: {hash_str}")
+
+        # URL is display-order (BE); db / index use internal/LE — same
+        # convention as ``rest_tx`` (see Pattern C0 comment at line 642).
+        block_hash_le = hash_be[::-1]
+
+        index = self._get_block_filter_index(filter_type_name)
+
+        # Confirm the block actually exists in the active chain so we can
+        # produce Core-compatible error messages.  ``get_block`` returns
+        # ``None`` for unknown hashes and side-branch hashes don't have
+        # filters indexed (BIP-157 only indexes the active chain).
+        db = self._get_db()
+        block = db.get_block(block_hash_le)
+        if block is None:
+            raise HTTPException(status_code=404, detail=f"{hash_str} not found")
+
+        filter_bytes = index.get_filter(block_hash_le)
+        if filter_bytes is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Filter not found. Block filters are still in the process "
+                    "of being indexed."
+                ),
+            )
+
+        if rf == RESTResponseFormat.BINARY:
+            return Response(content=filter_bytes, media_type="application/octet-stream")
+        elif rf == RESTResponseFormat.HEX:
+            return PlainTextResponse(
+                content=filter_bytes.hex() + "\n",
+                media_type="text/plain",
+            )
+        elif rf == RESTResponseFormat.JSON:
+            # Core ``rest_block_filter`` emits ``{"filter": "<hex>"}`` — match
+            # that shape exactly so existing block-explorer tooling works
+            # unchanged against an ouroboros node.
+            return JSONResponse(content={"filter": filter_bytes.hex()})
+
+        raise HTTPException(
+            status_code=404,
+            detail=f"output format not found (available: {available_formats_string()})",
+        )
+
+    async def rest_blockfilter_headers(
+        self,
+        path: str,
+        count: int | None = Query(default=None),
+    ) -> Response:
+        """
+        Get a contiguous range of BIP 157 filter headers along the active chain.
+
+        Paths:
+            /rest/blockfilterheaders/<filtertype>/<count>/<blockhash>.<format>
+                (deprecated)
+            /rest/blockfilterheaders/<filtertype>/<blockhash>.<format>?count=<count>
+                (preferred)
+
+        Mirrors Bitcoin Core ``rest.cpp::rest_filter_header``.  Walks forward
+        from *blockhash* along the active chain and returns up to *count*
+        filter headers (default 5, max ``MAX_REST_HEADERS_RESULTS``).
+        """
+        parts = path.split('/')
+
+        if len(parts) == 3:
+            # Deprecated: /rest/blockfilterheaders/<filtertype>/<count>/<hash>.<fmt>
+            filter_type_name = parts[0]
+            raw_count = parts[1]
+            hash_with_format = parts[2]
+        elif len(parts) == 2:
+            # New form: /rest/blockfilterheaders/<filtertype>/<hash>.<fmt>?count=N
+            filter_type_name = parts[0]
+            raw_count = str(count) if count is not None else "5"
+            hash_with_format = parts[1]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Invalid URI format. Expected "
+                    "/rest/blockfilterheaders/<filtertype>/<blockhash>.<ext>?count=<count>"
+                ),
+            )
+
+        hash_str, rf = parse_format(hash_with_format)
+        if rf is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"output format not found (available: {available_formats_string()})",
+            )
+
+        try:
+            num_headers = int(raw_count)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Header count is invalid or out of acceptable range "
+                    f"(1-{MAX_REST_HEADERS_RESULTS}): {raw_count}"
+                ),
+            ) from None
+
+        if num_headers < 1 or num_headers > MAX_REST_HEADERS_RESULTS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Header count is invalid or out of acceptable range "
+                    f"(1-{MAX_REST_HEADERS_RESULTS}): {raw_count}"
+                ),
+            )
+
+        try:
+            hash_be = bytes.fromhex(hash_str)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid hash: {hash_str}") from None
+        if len(hash_be) != 32:
+            raise HTTPException(status_code=400, detail=f"Invalid hash: {hash_str}")
+
+        block_hash_le = hash_be[::-1]
+
+        index = self._get_block_filter_index(filter_type_name)
+
+        db = self._get_db()
+        start_block = db.get_block(block_hash_le)
+        if start_block is None:
+            raise HTTPException(status_code=404, detail=f"{hash_str} not found")
+
+        # Walk forward along the active chain — same algorithm as the
+        # existing ``rest_headers`` handler at line ~566 — but pull filter
+        # headers (not block headers) from the BIP-157 index for each step.
+        start_height = getattr(start_block, 'height', None)
+        if start_height is None:
+            # Without a height we cannot walk the active chain; fall back to
+            # the single starting block so the response is at least
+            # well-formed.
+            blocks_in_range: list[Any] = [start_block]
+        else:
+            blocks_in_range = []
+            for i in range(num_headers):
+                blk = db.get_block_by_height(start_height + i)
+                if blk is None:
+                    break
+                blocks_in_range.append(blk)
+
+        filter_headers: list[bytes] = []
+        for blk in blocks_in_range:
+            blk_hash = blk.hash if hasattr(blk, 'hash') else blk.get_hash()
+            fhdr = index.get_header(blk_hash)
+            if fhdr is None:
+                # Mirror Core's "Filter not found." 404 with the same
+                # not-yet-indexed hint so client tooling parses identically.
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        "Filter not found. Block filters are still in the "
+                        "process of being indexed."
+                    ),
+                )
+            filter_headers.append(fhdr)
+
+        if rf == RESTResponseFormat.BINARY:
+            return Response(
+                content=b''.join(filter_headers),
+                media_type="application/octet-stream",
+            )
+        elif rf == RESTResponseFormat.HEX:
+            return PlainTextResponse(
+                content=b''.join(filter_headers).hex() + "\n",
+                media_type="text/plain",
+            )
+        elif rf == RESTResponseFormat.JSON:
+            # Core emits a JSON array of hex strings; the headers are
+            # serialized as 32-byte values display-order in the hex form
+            # rendered by ``uint256::GetHex`` (i.e. reversed from internal
+            # storage).  We mirror that here so the JSON output is byte-
+            # comparable with Core's own response.
+            return JSONResponse(
+                content=[h[::-1].hex() for h in filter_headers],
+            )
+
+        raise HTTPException(
+            status_code=404,
+            detail=f"output format not found (available: {available_formats_string()})",
         )
 
     async def rest_tx(self, txid: str) -> Response:

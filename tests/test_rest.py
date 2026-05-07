@@ -542,3 +542,201 @@ class TestRESTDisabled:
         # REST endpoint should return 404
         response = client.get('/rest/chaininfo.json')
         assert response.status_code == 404
+
+
+class _MockBlockFilterIndex:
+    """Minimal stand-in for ``BlockFilterIndex`` used by the BIP-157 REST
+    tests.  Stores filters/headers keyed by the *internal* (LE) block hash
+    bytes — same convention as the production index — so the URL-hex →
+    LE-bytes reversal in the handler can be exercised end-to-end.
+    """
+
+    def __init__(self):
+        self.is_enabled = True
+        self._filters: dict[bytes, bytes] = {}
+        self._headers: dict[bytes, bytes] = {}
+
+    def add(self, block_hash_le: bytes, filter_bytes: bytes, header_bytes: bytes) -> None:
+        self._filters[block_hash_le] = filter_bytes
+        self._headers[block_hash_le] = header_bytes
+
+    def get_filter(self, block_hash: bytes):
+        return self._filters.get(block_hash)
+
+    def get_header(self, block_hash: bytes):
+        return self._headers.get(block_hash)
+
+
+@pytest.fixture
+def rest_client_with_cfilter(mock_node):
+    """REST client whose mock node has a populated BIP-157 filter index.
+
+    The mock DB tip block (hash ``\\xab`` × 32, height 100) is wired up
+    with a deterministic filter (a single varint ``0`` byte = empty GCS)
+    and a deterministic 32-byte filter header so tests can byte-compare
+    binary responses without re-implementing the GCS pipeline.
+    """
+    from ouroboros.rpc import RPCServer
+
+    bfi = _MockBlockFilterIndex()
+    # Genesis (height 0, hash 0x00*32) and tip (height 100, hash 0xab*32)
+    # both palindromic so URL hex and internal LE bytes coincide; this
+    # keeps the asserts free of byte-order surprises.
+    bfi.add(b'\x00' * 32, b'\x00', b'\x11' * 32)
+    bfi.add(b'\xab' * 32, b'\x00', b'\x22' * 32)
+    mock_node.block_filter_index = bfi
+
+    server = RPCServer(
+        mock_node,
+        port=8332,
+        username=None,
+        password=None,
+        rate_limit=False,
+        enable_rest=True,
+    )
+    return TestClient(server.app)
+
+
+class TestRESTBlockFilter:
+    """Tests for /rest/blockfilter/<filtertype>/<hash>.<format> (BIP 157)."""
+
+    def test_blockfilter_json(self, rest_client_with_cfilter, mock_node):
+        block_hash = mock_node.db.best_hash.hex()
+        response = rest_client_with_cfilter.get(f'/rest/blockfilter/basic/{block_hash}.json')
+        assert response.status_code == 200
+        data = response.json()
+        assert data == {"filter": "00"}
+
+    def test_blockfilter_hex(self, rest_client_with_cfilter, mock_node):
+        block_hash = mock_node.db.best_hash.hex()
+        response = rest_client_with_cfilter.get(f'/rest/blockfilter/basic/{block_hash}.hex')
+        assert response.status_code == 200
+        assert response.text.strip() == "00"
+
+    def test_blockfilter_bin(self, rest_client_with_cfilter, mock_node):
+        block_hash = mock_node.db.best_hash.hex()
+        response = rest_client_with_cfilter.get(f'/rest/blockfilter/basic/{block_hash}.bin')
+        assert response.status_code == 200
+        assert response.content == b'\x00'
+
+    def test_blockfilter_unknown_filtertype(self, rest_client_with_cfilter, mock_node):
+        block_hash = mock_node.db.best_hash.hex()
+        response = rest_client_with_cfilter.get(
+            f'/rest/blockfilter/notreal/{block_hash}.json'
+        )
+        assert response.status_code == 400
+        assert 'Unknown filtertype' in response.json()['detail']
+
+    def test_blockfilter_index_disabled(self, rest_client, mock_node):
+        # The default ``rest_client`` fixture builds a node *without* the
+        # filter index attribute, which must surface as a 400 (Core mirrors
+        # this case from rest.cpp:646-648).
+        block_hash = mock_node.db.best_hash.hex()
+        response = rest_client.get(f'/rest/blockfilter/basic/{block_hash}.json')
+        assert response.status_code == 400
+        assert 'Index is not enabled' in response.json()['detail']
+
+    def test_blockfilter_block_not_found(self, rest_client_with_cfilter):
+        # 0xff*32 is not in the mock DB.
+        response = rest_client_with_cfilter.get(
+            f'/rest/blockfilter/basic/{"ff" * 32}.json'
+        )
+        assert response.status_code == 404
+
+    def test_blockfilter_invalid_hash(self, rest_client_with_cfilter):
+        response = rest_client_with_cfilter.get('/rest/blockfilter/basic/zz.json')
+        assert response.status_code == 400
+
+    def test_blockfilter_invalid_uri(self, rest_client_with_cfilter):
+        # Missing the <hash> segment entirely.
+        response = rest_client_with_cfilter.get('/rest/blockfilter/basic.json')
+        assert response.status_code == 400
+
+
+class TestRESTBlockFilterHeaders:
+    """Tests for /rest/blockfilterheaders/... (BIP 157)."""
+
+    def test_blockfilterheaders_json_count_query(
+        self, rest_client_with_cfilter, mock_node
+    ):
+        # Genesis at height 0; mock has only height 0 and 100, so count=1
+        # returns the genesis filter header only.
+        block_hash = '00' * 32
+        response = rest_client_with_cfilter.get(
+            f'/rest/blockfilterheaders/basic/{block_hash}.json?count=1'
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data, list)
+        assert len(data) == 1
+        # 0x11 * 32 reversed = same; assert raw display hex.
+        assert data[0] == '11' * 32
+
+    def test_blockfilterheaders_bin_query(
+        self, rest_client_with_cfilter, mock_node
+    ):
+        block_hash = '00' * 32
+        response = rest_client_with_cfilter.get(
+            f'/rest/blockfilterheaders/basic/{block_hash}.bin?count=1'
+        )
+        assert response.status_code == 200
+        # 32 raw filter-header bytes, no separators.
+        assert response.content == b'\x11' * 32
+
+    def test_blockfilterheaders_hex_query(
+        self, rest_client_with_cfilter, mock_node
+    ):
+        block_hash = '00' * 32
+        response = rest_client_with_cfilter.get(
+            f'/rest/blockfilterheaders/basic/{block_hash}.hex?count=1'
+        )
+        assert response.status_code == 200
+        assert response.text.strip() == '11' * 32
+
+    def test_blockfilterheaders_deprecated_path(
+        self, rest_client_with_cfilter, mock_node
+    ):
+        # Deprecated path: /rest/blockfilterheaders/<filtertype>/<count>/<hash>
+        block_hash = '00' * 32
+        response = rest_client_with_cfilter.get(
+            f'/rest/blockfilterheaders/basic/1/{block_hash}.json'
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+
+    def test_blockfilterheaders_unknown_filtertype(
+        self, rest_client_with_cfilter
+    ):
+        response = rest_client_with_cfilter.get(
+            f'/rest/blockfilterheaders/wat/{"00" * 32}.json?count=1'
+        )
+        assert response.status_code == 400
+        assert 'Unknown filtertype' in response.json()['detail']
+
+    def test_blockfilterheaders_count_out_of_range(
+        self, rest_client_with_cfilter
+    ):
+        response = rest_client_with_cfilter.get(
+            f'/rest/blockfilterheaders/basic/{"00" * 32}.json?count=0'
+        )
+        assert response.status_code == 400
+        response = rest_client_with_cfilter.get(
+            f'/rest/blockfilterheaders/basic/{"00" * 32}.json?count=99999'
+        )
+        assert response.status_code == 400
+
+    def test_blockfilterheaders_index_disabled(self, rest_client):
+        response = rest_client.get(
+            f'/rest/blockfilterheaders/basic/{"00" * 32}.json?count=1'
+        )
+        assert response.status_code == 400
+        assert 'Index is not enabled' in response.json()['detail']
+
+    def test_blockfilterheaders_block_not_found(
+        self, rest_client_with_cfilter
+    ):
+        response = rest_client_with_cfilter.get(
+            f'/rest/blockfilterheaders/basic/{"ff" * 32}.json?count=1'
+        )
+        assert response.status_code == 404
