@@ -871,3 +871,177 @@ class TestBIP174Strictness:
         # Positive-shape sanity: byte 4 should be the compactsize for
         # num_inputs (== 1), so 0x01.
         assert unsigned_tx_bytes[4] == 0x01
+
+
+class TestW43MultisigFinalize:
+    """W43 regression tests: legacy P2SH-multisig finalize and
+    bare-P2WSH multisig sig ordering by witnessScript pubkey order
+    (NOT pubkey-byte sort).
+
+    The bug class this guards: CHECKMULTISIG is order-sensitive — sigs
+    must appear in the witness/scriptSig in the same order as the
+    matching pubkeys appear in the redeemScript / witnessScript.
+    Bitcoin Core's ProduceSignature emits this order (sign.cpp,
+    GetMultisigSigner). Ouroboros previously emitted by
+    ``sorted(partial_sigs.keys())``, which is correct ONLY by
+    coincidence and silently produced rejected scripts otherwise.
+    """
+
+    def _build_multisig_script(self, m: int, pubkeys: list[bytes]) -> bytes:
+        """Build a bare ``OP_M <pk1>...<pkN> OP_N OP_CHECKMULTISIG``."""
+        assert 1 <= m <= 16 and 1 <= len(pubkeys) <= 16
+        out = bytearray()
+        out.append(0x50 + m)  # OP_M
+        for pk in pubkeys:
+            assert len(pk) in (33, 65)
+            out.append(len(pk))
+            out.extend(pk)
+        out.append(0x50 + len(pubkeys))  # OP_N
+        out.append(0xAE)  # OP_CHECKMULTISIG
+        return bytes(out)
+
+    def _make_unsigned_psbt(self) -> PSBT:
+        tx = Transaction(
+            txid=bytes(32),
+            version=2,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=bytes(32),
+                    prev_vout=0,
+                    script_sig=b"",
+                    sequence=0xFFFFFFFF,
+                )
+            ],
+            outputs=[TxOut(value=50000, script_pubkey=bytes.fromhex("0014" + "00" * 20))],
+        )
+        return PSBT.from_transaction(tx)
+
+    # Two distinct compressed pubkey shapes whose lex ordering does NOT
+    # match the script-pubkey order we hand to the redeemScript. We
+    # deliberately put pkB (lex-larger) first in the script so that
+    # ``sorted(partial_sigs.keys())`` would emit (pkA, pkB) — the wrong
+    # order — and the W43 fix walks (pkB, pkA) instead.
+    PK_A = bytes.fromhex("02" + "11" * 32)  # lex-smaller
+    PK_B = bytes.fromhex("03" + "ee" * 32)  # lex-larger
+    SIG_A = b"\xa1" * 71 + b"\x01"  # mock DER + sighash
+    SIG_B = b"\xb2" * 72 + b"\x01"
+
+    def test_legacy_p2sh_multisig_finalize_script_order(self):
+        """W43 fix #1: legacy P2SH 2-of-2 finalize emits OP_0 + sig(pkB) +
+        sig(pkA) + push(redeemScript), where redeemScript declares pkB
+        before pkA. partial_sigs are inserted in REVERSE script order
+        (pkA first then pkB) to ensure the finalizer cannot accidentally
+        pass via insertion order.
+        """
+        from ouroboros.wallet import _hash160
+
+        # redeemScript declares pkB BEFORE pkA — so script order is [pkB, pkA].
+        redeem_script = self._build_multisig_script(2, [self.PK_B, self.PK_A])
+        h160 = _hash160(redeem_script)
+        spk_p2sh = b"\xa9\x14" + h160 + b"\x87"  # OP_HASH160 <h160> OP_EQUAL
+
+        psbt = self._make_unsigned_psbt()
+        psbt.inputs[0].redeem_script = redeem_script
+        psbt.inputs[0].witness_utxo = (100000, spk_p2sh)
+        # Insert in reverse pubkey-script order to defeat insertion-order
+        # finalizers. Insert pkA first, then pkB.
+        psbt.inputs[0].partial_sigs[self.PK_A] = self.SIG_A
+        psbt.inputs[0].partial_sigs[self.PK_B] = self.SIG_B
+
+        psbt.finalize()
+        inp = psbt.inputs[0]
+        assert inp.is_finalized(), "legacy P2SH-multisig must finalize"
+        assert inp.final_script_sig is not None and len(inp.final_script_sig) > 0
+        # Witness must be empty/None for non-segwit P2SH.
+        assert inp.final_script_witness is None or inp.final_script_witness == []
+
+        # Walk the scriptSig: OP_0 then push(SIG_B) then push(SIG_A) then
+        # push(redeemScript). Sigs must appear in script-pubkey order.
+        ss = inp.final_script_sig
+        assert ss[0] == 0x00, f"first byte must be OP_0, got 0x{ss[0]:02x}"
+        # Expected layout: 0x00 || len(SIG_B) || SIG_B || len(SIG_A) || SIG_A
+        # || push(redeem_script). All sigs are 72/73 bytes => single-byte
+        # length prefix (< 0x4c).
+        i = 1
+        assert ss[i] == len(self.SIG_B)
+        i += 1
+        assert ss[i : i + len(self.SIG_B)] == self.SIG_B, (
+            "sig for pkB must come FIRST (script-pubkey order)"
+        )
+        i += len(self.SIG_B)
+        assert ss[i] == len(self.SIG_A)
+        i += 1
+        assert ss[i : i + len(self.SIG_A)] == self.SIG_A
+        i += len(self.SIG_A)
+        # Followed by push of redeemScript. redeem_script is 71 bytes
+        # (1 OP_M + 2*(1+33) + 1 OP_N + 1 OP_CHECKMULTISIG = 71), so
+        # single-byte push prefix.
+        assert ss[i] == len(redeem_script)
+        i += 1
+        assert ss[i : i + len(redeem_script)] == redeem_script
+        assert i + len(redeem_script) == len(ss), "no trailing junk"
+
+        # And non-final fields must be cleared (W41 cleanup shape).
+        assert inp.partial_sigs == {}
+        assert inp.redeem_script is None
+
+    def test_bare_p2wsh_multisig_finalize_script_order(self):
+        """W43 fix #2: bare P2WSH 2-of-2 finalize emits witness stack
+        [OP_0, sig(pkB), sig(pkA), witnessScript] where the witnessScript
+        declares pkB before pkA. Previously ouroboros walked
+        ``sorted(partial_sigs.keys())`` which would emit (pkA, pkB) — the
+        wrong order — and Core would reject the broadcast.
+        """
+        import hashlib
+
+        witness_script = self._build_multisig_script(2, [self.PK_B, self.PK_A])
+        ws_hash = hashlib.sha256(witness_script).digest()
+        spk_p2wsh = b"\x00\x20" + ws_hash  # OP_0 <32 bytes>
+
+        psbt = self._make_unsigned_psbt()
+        psbt.inputs[0].witness_script = witness_script
+        psbt.inputs[0].witness_utxo = (100000, spk_p2wsh)
+        # Reverse insertion order again.
+        psbt.inputs[0].partial_sigs[self.PK_A] = self.SIG_A
+        psbt.inputs[0].partial_sigs[self.PK_B] = self.SIG_B
+
+        psbt.finalize()
+        inp = psbt.inputs[0]
+        assert inp.is_finalized(), "bare P2WSH multisig must finalize"
+        assert inp.final_script_sig == b""
+        assert inp.final_script_witness is not None
+        wit = inp.final_script_witness
+        # Stack: [OP_0_dummy, sig_pkB, sig_pkA, witnessScript]
+        assert len(wit) == 4, f"expected 4-element witness stack, got {len(wit)}: {wit}"
+        assert wit[0] == b"", "first witness item must be empty (CHECKMULTISIG dummy)"
+        assert wit[1] == self.SIG_B, (
+            "sig for pkB must come FIRST (witnessScript pubkey order, NOT byte sort)"
+        )
+        assert wit[2] == self.SIG_A
+        assert wit[3] == witness_script
+
+        # Non-final fields cleared.
+        assert inp.partial_sigs == {}
+        assert inp.witness_script is None
+
+    def test_legacy_p2sh_multisig_insufficient_sigs_does_not_finalize(self):
+        """W43: with M=2 and only 1 partial sig, finalize must NOT
+        emit a final_script_sig — guards against the new branch
+        accidentally producing an under-signed scriptSig.
+        """
+        from ouroboros.wallet import _hash160
+
+        redeem_script = self._build_multisig_script(2, [self.PK_B, self.PK_A])
+        h160 = _hash160(redeem_script)
+        spk_p2sh = b"\xa9\x14" + h160 + b"\x87"
+
+        psbt = self._make_unsigned_psbt()
+        psbt.inputs[0].redeem_script = redeem_script
+        psbt.inputs[0].witness_utxo = (100000, spk_p2sh)
+        psbt.inputs[0].partial_sigs[self.PK_A] = self.SIG_A  # only one
+
+        psbt.finalize()
+        inp = psbt.inputs[0]
+        assert not inp.is_finalized()
+        assert inp.final_script_sig is None or inp.final_script_sig == b""
