@@ -6415,50 +6415,11 @@ class RPCServer:
             return _dsha256(bytes(data))
 
         # --- Helper: BIP 143 (SegWit v0) sighash ------------------------
-        def _bip143_sighash(tx, idx, script_code, value, sh_type):
-            base = sh_type & 0x1F
-            acp = (sh_type & 0x80) != 0
-            if not acp:
-                prevouts = b""
-                for i in tx.inputs:
-                    prevouts += i.prev_txid + struct.pack("<I", i.prev_vout)
-                hp = _dsha256(prevouts)
-            else:
-                hp = b"\x00" * 32
-            if not acp and base not in (2, 3):
-                seqs = b""
-                for i in tx.inputs:
-                    seqs += struct.pack("<I", i.sequence)
-                hs = _dsha256(seqs)
-            else:
-                hs = b"\x00" * 32
-            if base not in (2, 3):
-                outs = b""
-                for o in tx.outputs:
-                    outs += struct.pack("<q", o.value)
-                    outs += _encode_varint(len(o.script_pubkey))
-                    outs += o.script_pubkey
-                ho = _dsha256(outs)
-            elif base == 3 and idx < len(tx.outputs):
-                o = tx.outputs[idx]
-                single = struct.pack("<q", o.value)
-                single += _encode_varint(len(o.script_pubkey))
-                single += o.script_pubkey
-                ho = _dsha256(single)
-            else:
-                ho = b"\x00" * 32
-            inp = tx.inputs[idx]
-            sc_with_len = bytes([len(script_code)]) + script_code
-            pre = struct.pack("<i", tx.version)
-            pre += hp + hs
-            pre += inp.prev_txid + struct.pack("<I", inp.prev_vout)
-            pre += sc_with_len
-            pre += struct.pack("<q", value)
-            pre += struct.pack("<I", inp.sequence)
-            pre += ho
-            pre += struct.pack("<I", tx.locktime)
-            pre += struct.pack("<I", sh_type)
-            return _dsha256(pre)
+        # Single source of truth lives in ``ouroboros.segwit_v0`` — see
+        # the module docstring for why three local copies were
+        # consolidated (W29-A). DO NOT inline a private copy here; the
+        # ``test_bip143_no_inline_impl`` parity sentinel will fail.
+        from ouroboros.segwit_v0 import bip143_sighash as _bip143_sighash
 
         # --- Helper: taproot key-path sighash (BIP 341) ------------------
         def _taproot_sighash(tx, idx, sh_type, amounts, spks):
@@ -8687,50 +8648,9 @@ class RPCServer:
             else:
                 return b'\xff' + struct.pack('<Q', n)
 
-        def _bip143_sighash(tx, idx, script_code, value, sh_type):
-            base = sh_type & 0x1F
-            acp = (sh_type & 0x80) != 0
-            if not acp:
-                prevouts = b""
-                for i in tx.inputs:
-                    prevouts += i.prev_txid + struct.pack("<I", i.prev_vout)
-                hp = _dsha256(prevouts)
-            else:
-                hp = b"\x00" * 32
-            if not acp and base not in (2, 3):
-                seqs = b""
-                for i in tx.inputs:
-                    seqs += struct.pack("<I", i.sequence)
-                hs = _dsha256(seqs)
-            else:
-                hs = b"\x00" * 32
-            if base not in (2, 3):
-                outs = b""
-                for o in tx.outputs:
-                    outs += struct.pack("<q", o.value)
-                    outs += _encode_varint(len(o.script_pubkey))
-                    outs += o.script_pubkey
-                ho = _dsha256(outs)
-            elif base == 3 and idx < len(tx.outputs):
-                o = tx.outputs[idx]
-                single = struct.pack("<q", o.value)
-                single += _encode_varint(len(o.script_pubkey))
-                single += o.script_pubkey
-                ho = _dsha256(single)
-            else:
-                ho = b"\x00" * 32
-            inp = tx.inputs[idx]
-            sc_with_len = bytes([len(script_code)]) + script_code
-            pre = struct.pack("<i", tx.version)
-            pre += hp + hs
-            pre += inp.prev_txid + struct.pack("<I", inp.prev_vout)
-            pre += sc_with_len
-            pre += struct.pack("<q", value)
-            pre += struct.pack("<I", inp.sequence)
-            pre += ho
-            pre += struct.pack("<I", tx.locktime)
-            pre += struct.pack("<I", sh_type)
-            return _dsha256(pre)
+        # BIP-143 sighash — single source of truth in
+        # ``ouroboros.segwit_v0``. See W29-A for the consolidation.
+        from ouroboros.segwit_v0 import bip143_sighash as _bip143_sighash
 
         def _taproot_sighash(tx, idx, sh_type, amounts, spks):
             acp = (sh_type & 0x80) != 0
@@ -10317,11 +10237,25 @@ class RPCServer:
             # Determine signing method based on script type
             script_type = self._get_script_type(script_pubkey)
 
+            # BIP-143 sighash — single source of truth lives in
+            # ``ouroboros.segwit_v0`` (W29-A). The legacy
+            # ``self._compute_bip143_sighash`` helper that used to live
+            # below was removed because it byte-reversed ``prev_txid``
+            # against ``Transaction.serialize_with_witness``'s wire
+            # convention, producing sighashes that didn't verify on the
+            # network. See
+            # ``tests/test_rpc_signrawtransactionwithwallet_bip143.py``.
+            from ouroboros.segwit_v0 import bip143_sighash
+
             try:
                 if script_type == "witness_v0_keyhash":
-                    # P2WPKH signing (BIP143)
-                    sighash_bytes = self._compute_bip143_sighash(
-                        tx, i, key.pubkey, value, sighash
+                    # P2WPKH signing (BIP143). scriptCode is the
+                    # canonical P2PKH script over the witness program's
+                    # 20-byte hash.
+                    h160 = _hash160(key.pubkey)
+                    script_code = b"\x76\xa9\x14" + h160 + b"\x88\xac"
+                    sighash_bytes = bip143_sighash(
+                        tx, i, script_code, value, sighash
                     )
                     sig = key.sign(sighash_bytes) + bytes([sighash])
                     tx.inputs[i].witness = [sig, key.pubkey]
@@ -10333,8 +10267,9 @@ class RPCServer:
                     h160 = _hash160(key.pubkey)
                     redeem_script = b"\x00\x14" + h160
                     tx.inputs[i].script_sig = bytes([len(redeem_script)]) + redeem_script
-                    sighash_bytes = self._compute_bip143_sighash(
-                        tx, i, key.pubkey, value, sighash
+                    script_code = b"\x76\xa9\x14" + h160 + b"\x88\xac"
+                    sighash_bytes = bip143_sighash(
+                        tx, i, script_code, value, sighash
                     )
                     sig = key.sign(sighash_bytes) + bytes([sighash])
                     tx.inputs[i].witness = [sig, key.pubkey]
@@ -10387,70 +10322,14 @@ class RPCServer:
 
         return result
 
-    def _compute_bip143_sighash(
-        self, tx, input_index: int, pubkey: bytes, value: int, sighash_type: int
-    ) -> bytes:
-        """Compute BIP143 signature hash for SegWit inputs."""
-        from ouroboros.wallet import _dsha256, _hash160
-
-        pubkey_hash = _hash160(pubkey)
-        script_code = b"\x76\xa9\x14" + pubkey_hash + b"\x88\xac"
-        script_code_with_len = bytes([len(script_code)]) + script_code
-
-        anyonecanpay = bool(sighash_type & 0x80)
-        base_type = sighash_type & 0x1f
-
-        # hashPrevouts
-        if anyonecanpay:
-            hash_prevouts = b"\x00" * 32
-        else:
-            prevouts = b""
-            for inp in tx.inputs:
-                prevouts += inp.prev_txid[::-1] + inp.prev_vout.to_bytes(4, 'little')
-            hash_prevouts = _dsha256(prevouts)
-
-        # hashSequence
-        if anyonecanpay or base_type in (0x02, 0x03):  # NONE or SINGLE
-            hash_sequence = b"\x00" * 32
-        else:
-            sequences = b""
-            for inp in tx.inputs:
-                sequences += inp.sequence.to_bytes(4, 'little')
-            hash_sequence = _dsha256(sequences)
-
-        # hashOutputs
-        if base_type == 0x02:  # NONE
-            hash_outputs = b"\x00" * 32
-        elif base_type == 0x03 and input_index < len(tx.outputs):  # SINGLE
-            out = tx.outputs[input_index]
-            output_data = out.value.to_bytes(8, 'little')
-            output_data += self._encode_varint(len(out.script_pubkey))
-            output_data += out.script_pubkey
-            hash_outputs = _dsha256(output_data)
-        elif base_type == 0x03:
-            hash_outputs = b"\x00" * 32
-        else:  # ALL
-            outputs = b""
-            for out in tx.outputs:
-                outputs += out.value.to_bytes(8, 'little')
-                outputs += self._encode_varint(len(out.script_pubkey))
-                outputs += out.script_pubkey
-            hash_outputs = _dsha256(outputs)
-
-        inp = tx.inputs[input_index]
-        preimage = tx.version.to_bytes(4, 'little', signed=True)
-        preimage += hash_prevouts
-        preimage += hash_sequence
-        preimage += inp.prev_txid[::-1] + inp.prev_vout.to_bytes(4, 'little')
-        preimage += script_code_with_len
-        preimage += value.to_bytes(8, 'little')
-        preimage += inp.sequence.to_bytes(4, 'little')
-        preimage += hash_outputs
-        preimage += tx.locktime.to_bytes(4, 'little')
-        preimage += sighash_type.to_bytes(4, 'little')
-
-        return _dsha256(preimage)
-
+    # NOTE: ``_compute_bip143_sighash`` was removed in W29-A. It was a
+    # third drift-prone copy of BIP-143 sighash and — critically — it
+    # byte-reversed ``prev_txid`` against
+    # ``Transaction.serialize_with_witness``'s wire convention. The
+    # ``signrawtransactionwithwallet`` callers above now route through
+    # ``ouroboros.segwit_v0.bip143_sighash`` (the single source of
+    # truth, also used by ``signrawtransactionwithkey`` and
+    # ``walletprocesspsbt``).
     def _compute_legacy_sighash(
         self, tx, input_index: int, script_pubkey: bytes, sighash_type: int
     ) -> bytes:
