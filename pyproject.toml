@@ -71,6 +71,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"ouroboros.data" = ["*.txt"]
+
 # Note: The Rust extension module is built separately using maturin
 # See setup.sh or run: maturin develop --manifest-path ferrous-utils/sync/Cargo.toml
 
