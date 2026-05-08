@@ -560,7 +560,41 @@ class BlockValidator:
         return True, ""
 
     def apply_block(self, block: Block) -> None:
-        """Apply *block*'s UTXO effects to the database (spend inputs, create outputs)."""
+        """Apply *block*'s UTXO effects to the database (spend inputs, create outputs).
+
+        DEAD-CODE PATH (W23 belt-and-suspenders).
+
+        In production, every IBD / orphan / reorg call site in
+        ``block_sync.py`` reaches the database through the Rust FFI
+        ``connect_block_from_bytes`` (defined unconditionally on
+        ``BlockchainDatabase``); the ``else`` branches that call this
+        method only fire if the Rust extension is missing, which is
+        not a supported configuration. The method itself is also
+        broken downstream — ``self.db.update_utxo_set`` does not exist
+        on ``BlockchainDatabase`` and would raise ``AttributeError``
+        before any UTXO write — so even a hypothetical activation
+        would crash before mutating the chainstate.
+
+        We keep the method (rather than deleting it) because the
+        unconditional call site at ``_process_orphans`` (block_sync.py)
+        is structurally reachable, and removing it without rewriting
+        that handler is out of scope for this wave.
+
+        BIP-30 / Core ``ConnectBlock`` (validation.cpp:2337-2343)
+        special-cases the genesis block: its coinbase outputs are
+        intentionally excluded from the UTXO set. Add a defensive
+        early-return so that if this path is ever revived, it cannot
+        accidentally insert genesis coinbase outputs into the
+        chainstate (which would corrupt UTXO-set hashes and break
+        consensus with Core).
+        """
+        # Genesis special-case (Core validation.cpp:2337-2343): the
+        # genesis coinbase is unspendable and not added to the UTXO
+        # set. Match that behavior here as belt-and-suspenders.
+        height = getattr(block, "height", None)
+        if height == 0:
+            return
+
         spent = []
         created = []
 
