@@ -1067,6 +1067,8 @@ class PSBT:
                 continue
             if self._try_finalize_p2sh_p2wsh(psbt_in, i):
                 continue
+            if self._try_finalize_p2sh_multisig(psbt_in, i):
+                continue
             if self._try_finalize_p2pkh(psbt_in, i):
                 continue
             if self._try_finalize_p2wsh(psbt_in, i):
@@ -1249,6 +1251,93 @@ class PSBT:
 
         return False
 
+    def _try_finalize_p2sh_multisig(self, psbt_in: PSBTInput, idx: int) -> bool:
+        """Try to finalize as legacy (non-segwit) P2SH-multisig (W43).
+
+        Shape: scriptPubKey is BIP-16 P2SH; redeemScript is a bare
+        ``OP_M <pk1>...<pkN> OP_N OP_CHECKMULTISIG``. This branch fills
+        the long-standing gap exposed by the W42-A diagnostic — the
+        finalize() ladder previously jumped from P2SH-P2WSH straight to
+        P2PKH, leaving ordinary 2-of-2 / 2-of-3 / m-of-n legacy multisig
+        unhandled. Bitcoin Core's canonical sign.cpp ProduceSignature
+        path emits ``OP_0 <sig1> <sig2> ... <pushRedeemScript>`` and
+        critically orders the sigs by redeemScript pubkey order, NOT by
+        partial_sigs map iteration order — see ``GetMultisigSigner``.
+
+        Distinguishes from P2SH-P2WPKH and P2SH-P2WSH (handled above)
+        by parse_multisig_script() returning a hit. Refuses to finalize
+        if witness_script is set (shape mismatch) or if witness_utxo is
+        present *with* a witness program (this is segwit, not legacy).
+        """
+        if psbt_in.redeem_script is None:
+            return False
+        # Legacy P2SH-multisig is non-segwit: witnessScript MUST be unset
+        # (would mean this is segwit-wrapped) and any witness_utxo must
+        # NOT be a witness program (segwit shapes handled above).
+        if psbt_in.witness_script is not None:
+            return False
+
+        from ouroboros.segwit_v0 import parse_multisig_script
+
+        multisig = parse_multisig_script(psbt_in.redeem_script)
+        if multisig is None:
+            return False
+        m, script_pubkeys = multisig
+
+        if len(psbt_in.partial_sigs) < m:
+            return False
+
+        # If witness_utxo is set, refuse — bare P2SH spends use
+        # non_witness_utxo per BIP-174; presence of witness_utxo here
+        # likely means the caller wired the wrong UTXO type and we
+        # should not silently produce a non-segwit scriptSig over a
+        # segwit UTXO shape.
+        if psbt_in.witness_utxo is not None:
+            _value, spk = psbt_in.witness_utxo
+            # Allow only if spk is itself a P2SH (segwit witness programs
+            # would have been matched by the earlier P2SH-P2W* branches).
+            if not (
+                len(spk) == 23
+                and spk[0] == 0xA9
+                and spk[1] == 0x14
+                and spk[22] == 0x87
+            ):
+                return False
+
+        # Build scriptSig: OP_0 <sig1> <sig2> ... <push(redeemScript)>.
+        # Sigs are ordered by redeemScript pubkey order (Core's
+        # ProduceSignature/ GetMultisigSigner, validation.cpp /
+        # script/sign.cpp). We collect at most m sigs in script order;
+        # extra partial sigs (typical for n>m schemes) are dropped.
+        from ouroboros.segwit_v0 import _push_data
+
+        rs = psbt_in.redeem_script
+        script_sig = bytearray()
+        # OP_0 dummy push for the CHECKMULTISIG off-by-one bug.
+        script_sig.append(0x00)
+        sigs_used = 0
+        for pk in script_pubkeys:
+            if sigs_used >= m:
+                break
+            sig = psbt_in.partial_sigs.get(pk)
+            if sig is None:
+                continue
+            script_sig.extend(_push_data(sig))
+            sigs_used += 1
+
+        if sigs_used < m:
+            return False
+
+        # Final push of the redeem script.
+        script_sig.extend(_push_data(rs))
+
+        psbt_in.final_script_sig = bytes(script_sig)
+        # Legacy P2SH has no witness — ensure final_script_witness is
+        # left unset (None) or explicitly empty; PSBTInput.is_finalized
+        # only requires final_script_sig OR final_script_witness.
+        self._clear_non_final_fields(psbt_in)
+        return True
+
     def _try_finalize_p2pkh(self, psbt_in: PSBTInput, idx: int) -> bool:
         """Try to finalize as P2PKH."""
         if psbt_in.witness_utxo is not None:
@@ -1272,32 +1361,50 @@ class PSBT:
         return True
 
     def _try_finalize_p2wsh(self, psbt_in: PSBTInput, idx: int) -> bool:
-        """Try to finalize as P2WSH (multisig or miniscript)."""
+        """Try to finalize as P2WSH (multisig or miniscript).
+
+        W43: sigs are now ordered by witnessScript pubkey order (Core's
+        ProduceSignature in script/sign.cpp), not by raw pubkey-byte
+        sort. CHECKMULTISIG is order-sensitive — the previous
+        ``sorted(partial_sigs.keys())`` produced silently-invalid
+        scripts whenever the script-pubkey order did not happen to
+        coincide with a lexicographic key sort, and Core rejected the
+        broadcast. Mirrors the working pattern in
+        ``_try_finalize_p2sh_p2wsh`` (line ~1215).
+        """
         if psbt_in.witness_script is None:
             return False
+
+        from ouroboros.segwit_v0 import parse_multisig_script
 
         ws = psbt_in.witness_script
 
         # First try standard multisig
         # OP_M <pubkeys...> OP_N OP_CHECKMULTISIG
-        if len(ws) >= 3 and ws[-1] == 0xAE:  # OP_CHECKMULTISIG
-            m = ws[0] - 0x50 if ws[0] >= 0x51 and ws[0] <= 0x60 else None
-            if m is not None and len(psbt_in.partial_sigs) >= m:
+        multisig = parse_multisig_script(ws)
+        if multisig is not None:
+            m, script_pubkeys = multisig
+            if len(psbt_in.partial_sigs) >= m:
                 # Build witness stack: OP_0 <sig1> <sig2> ... <witness_script>
                 witness: list[bytes] = [b""]  # OP_0 for CHECKMULTISIG bug
 
-                # Add signatures in pubkey order
-                for pubkey in sorted(psbt_in.partial_sigs.keys()):
+                # Add signatures in witnessScript pubkey order (NOT
+                # pubkey-byte order). Mirrors P2SH-P2WSH path.
+                for pk in script_pubkeys:
                     if len(witness) - 1 >= m:
                         break
-                    witness.append(psbt_in.partial_sigs[pubkey])
+                    sig = psbt_in.partial_sigs.get(pk)
+                    if sig is None:
+                        continue
+                    witness.append(sig)
 
-                witness.append(psbt_in.witness_script)
+                if len(witness) - 1 >= m:
+                    witness.append(psbt_in.witness_script)
 
-                psbt_in.final_script_witness = witness
-                psbt_in.final_script_sig = b""
-                self._clear_non_final_fields(psbt_in)
-                return True
+                    psbt_in.final_script_witness = witness
+                    psbt_in.final_script_sig = b""
+                    self._clear_non_final_fields(psbt_in)
+                    return True
 
         # Try miniscript finalization
         if self._try_finalize_miniscript(psbt_in, idx):
