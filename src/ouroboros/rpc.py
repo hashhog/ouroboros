@@ -6318,6 +6318,18 @@ class RPCServer:
                 keys_by_pubkey[k.pubkey] = k
                 # Also index by x-only key for Taproot
                 keys_by_pubkey[k.pubkey[1:]] = k
+                # P2TR scriptPubKey contains the BIP-341 tweaked output
+                # key, not the internal x-only key. Index by both so the
+                # lookup at rpc.py:6582 / 8595 matches.
+                try:
+                    from ouroboros.taproot import (
+                        derive_taproot_output_xonly,
+                    )
+                    keys_by_pubkey[
+                        derive_taproot_output_xonly(k.pubkey, None)
+                    ] = k
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -6589,13 +6601,29 @@ class RPCServer:
                     sh = _taproot_sighash(
                         tx, idx, sighash_type, all_amounts, all_spks
                     )
+                    # BIP-341 / BIP-86: sign with the tweaked spending key,
+                    # not the raw internal key. ouroboros wallets only
+                    # produce key-path-only (BIP-86) P2TR outputs, so the
+                    # merkle root is empty.
+                    from ouroboros.taproot import derive_taproot_sign_secret
+                    try:
+                        tweaked_secret = derive_taproot_sign_secret(
+                            key.secret, None
+                        )
+                    except Exception as e:
+                        errors.append({
+                            "txid": inp.prev_txid.hex(),
+                            "vout": inp.prev_vout,
+                            "error": f"P2TR key tweak failed: {e}",
+                        })
+                        continue
                     try:
                         import sync as _sync
-                        raw_sig = _sync.sign_schnorr(sh, key.secret)
+                        raw_sig = _sync.sign_schnorr(sh, tweaked_secret)
                     except (ImportError, AttributeError):
                         try:
                             from coincurve import PrivateKey as CPrivKey
-                            raw_sig = CPrivKey(key.secret).sign_schnorr(sh)
+                            raw_sig = CPrivKey(tweaked_secret).sign_schnorr(sh)
                         except Exception:
                             errors.append({
                                 "txid": inp.prev_txid.hex(),
@@ -8368,6 +8396,14 @@ class RPCServer:
         keys_by_h160: dict[bytes, WalletKey] = {}
         keys_by_pubkey: dict[bytes, WalletKey] = {}
 
+        # P2TR scriptPubKey contains the BIP-341 tweaked output key, not
+        # the internal x-only key. Index by both so PSBT signing finds
+        # the match.
+        try:
+            from ouroboros.taproot import derive_taproot_output_xonly
+        except Exception:
+            derive_taproot_output_xonly = None  # type: ignore
+
         # Get all wallet keys
         for key_info in wallet.keys:
             try:
@@ -8375,6 +8411,13 @@ class RPCServer:
                 keys_by_h160[_hash160(k.pubkey)] = k
                 keys_by_pubkey[k.pubkey] = k
                 keys_by_pubkey[k.pubkey[1:]] = k  # x-only for Taproot
+                if derive_taproot_output_xonly is not None:
+                    try:
+                        keys_by_pubkey[
+                            derive_taproot_output_xonly(k.pubkey, None)
+                        ] = k
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -8385,6 +8428,13 @@ class RPCServer:
                     keys_by_h160[_hash160(wk.pubkey)] = wk
                     keys_by_pubkey[wk.pubkey] = wk
                     keys_by_pubkey[wk.pubkey[1:]] = wk
+                    if derive_taproot_output_xonly is not None:
+                        try:
+                            keys_by_pubkey[
+                                derive_taproot_output_xonly(wk.pubkey, None)
+                            ] = wk
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -8581,13 +8631,31 @@ class RPCServer:
                             sh = _taproot_sighash(
                                 tx, idx, sighash_type, all_amounts, all_spks
                             )
+                            # BIP-341 / BIP-86: sign with the tweaked
+                            # spending key. Key-path-only (no script
+                            # tree) → empty merkle root.
+                            from ouroboros.taproot import (
+                                derive_taproot_sign_secret,
+                            )
+                            try:
+                                tweaked_secret = derive_taproot_sign_secret(
+                                    key.secret, None
+                                )
+                            except Exception:
+                                # Skip this input; PSBT remains unsigned
+                                # rather than producing an invalid sig.
+                                continue
                             try:
                                 import sync as _sync
-                                raw_sig = _sync.sign_schnorr(sh, key.secret)
+                                raw_sig = _sync.sign_schnorr(
+                                    sh, tweaked_secret
+                                )
                             except (ImportError, AttributeError):
                                 try:
                                     from coincurve import PrivateKey as CPrivKey
-                                    raw_sig = CPrivKey(key.secret).sign_schnorr(sh)
+                                    raw_sig = CPrivKey(
+                                        tweaked_secret
+                                    ).sign_schnorr(sh)
                                 except Exception:
                                     continue
                             if sighash_type != 0x00:
