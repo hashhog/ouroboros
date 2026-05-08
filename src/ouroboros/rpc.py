@@ -6335,6 +6335,10 @@ class RPCServer:
 
         # --- Build prevout lookup: (txid, vout) -> (scriptPubKey, value) -
         prev_lookup: dict[tuple, tuple] = {}
+        # Side table for optional redeemScript / witnessScript per prevout.
+        # P2SH-P2WSH and bare P2WSH require these to compute BIP-143 sighash
+        # with the witnessScript as the scriptCode.
+        prev_scripts: dict[tuple, dict] = {}
         if prevtxs:
             for p in prevtxs:
                 txid_bytes = bytes.fromhex(p["txid"])
@@ -6342,6 +6346,13 @@ class RPCServer:
                 spk = bytes.fromhex(p["scriptPubKey"])
                 amount = int(float(p.get("amount", 0)) * 1e8)
                 prev_lookup[(txid_bytes, vout)] = (spk, amount)
+                extra: dict = {}
+                if p.get("redeemScript"):
+                    extra["redeem_script"] = bytes.fromhex(p["redeemScript"])
+                if p.get("witnessScript"):
+                    extra["witness_script"] = bytes.fromhex(p["witnessScript"])
+                if extra:
+                    prev_scripts[(txid_bytes, vout)] = extra
 
         # --- Helper: look up prevout info --------------------------------
         def _get_prevout(inp: TxIn):
@@ -6565,27 +6576,100 @@ class RPCServer:
                     tx.has_witness = True
 
                 elif len(spk) == 23 and spk[0] == 0xA9 and spk[1] == 0x14:
-                    # P2SH — check for P2SH-P2WPKH
+                    # P2SH — check for P2SH-P2WPKH first, then P2SH-P2WSH
+                    # (BIP-141 nested-witness wraps).
                     signed = False
-                    for h160, key in keys_by_h160.items():
-                        redeem_script = b"\x00\x14" + h160
-                        if _hash160(redeem_script) == spk[2:22]:
-                            script_code = b"\x76\xa9\x14" + h160 + b"\x88\xac"
-                            sh = _bip143_sighash(
-                                tx, idx, script_code, amount, sighash_type
-                            )
-                            sig = key.sign(sh) + bytes([sighash_type])
-                            inp.script_sig = (
-                                bytes([len(redeem_script)]) + redeem_script
-                            )
-                            inp.witness = [sig, key.pubkey]
+                    extras = prev_scripts.get(
+                        (inp.prev_txid, inp.prev_vout), {}
+                    )
+                    explicit_witness_script = extras.get("witness_script")
+                    explicit_redeem_script = extras.get("redeem_script")
+
+                    # ---- P2SH-P2WSH branch (witnessScript supplied) ----
+                    if explicit_witness_script is not None and not signed:
+                        # The redeemScript for P2SH-P2WSH is always
+                        # OP_0 <SHA256(witnessScript)> — verify it
+                        # hashes to the scriptPubKey p2sh hash.
+                        from ouroboros.segwit_v0 import (
+                            sign_p2sh_p2wsh_input,
+                        )
+                        ws_redeem = (
+                            b"\x00\x20"
+                            + hashlib.sha256(
+                                explicit_witness_script
+                            ).digest()
+                        )
+                        if _hash160(ws_redeem) == spk[2:22]:
+                            try:
+                                ss, witness, sigs = sign_p2sh_p2wsh_input(
+                                    tx, idx, explicit_witness_script,
+                                    amount, list(keys_by_h160.values())
+                                    + list({
+                                        id(v): v
+                                        for v in keys_by_pubkey.values()
+                                    }.values()),
+                                    sighash_type,
+                                )
+                            except ValueError as ve:
+                                errors.append({
+                                    "txid": inp.prev_txid.hex(),
+                                    "vout": inp.prev_vout,
+                                    "error": str(ve),
+                                })
+                                continue
+                            inp.script_sig = ss
+                            inp.witness = witness
                             tx.has_witness = True
                             signed = True
-                            break
+                            # If we couldn't gather any signatures,
+                            # mark partial.
+                            if not sigs:
+                                errors.append({
+                                    "txid": inp.prev_txid.hex(),
+                                    "vout": inp.prev_vout,
+                                    "error": "P2SH-P2WSH: no matching keys for witnessScript",
+                                })
+
+                    # ---- P2SH-P2WPKH branch ----
+                    if not signed:
+                        for h160, key in keys_by_h160.items():
+                            redeem_script = b"\x00\x14" + h160
+                            if _hash160(redeem_script) == spk[2:22]:
+                                script_code = (
+                                    b"\x76\xa9\x14" + h160 + b"\x88\xac"
+                                )
+                                sh = _bip143_sighash(
+                                    tx, idx, script_code, amount,
+                                    sighash_type,
+                                )
+                                sig = key.sign(sh) + bytes([sighash_type])
+                                inp.script_sig = (
+                                    bytes([len(redeem_script)])
+                                    + redeem_script
+                                )
+                                inp.witness = [sig, key.pubkey]
+                                tx.has_witness = True
+                                signed = True
+                                break
+
+                    # ---- Caller-supplied redeemScript fallback ----
+                    # If a redeemScript was supplied that hashes to spk
+                    # but isn't P2WPKH and isn't a P2WSH wrapper, we
+                    # currently don't sign legacy P2SH (out of scope —
+                    # Phase 2c per the design doc).
+                    if not signed and explicit_redeem_script is not None:
+                        if _hash160(explicit_redeem_script) == spk[2:22]:
+                            errors.append({
+                                "txid": inp.prev_txid.hex(),
+                                "vout": inp.prev_vout,
+                                "error": "Legacy P2SH redeemScript signing not supported (only P2SH-P2WPKH and P2SH-P2WSH wraps)",
+                            })
+                            signed = True  # don't double-emit error below
+
                     if not signed:
                         errors.append({
                             "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
-                            "error": "No matching key for P2SH-P2WPKH",
+                            "error": "No matching key for P2SH-P2WPKH (P2SH-P2WSH requires witnessScript in prevtxs)",
                         })
 
                 elif len(spk) == 34 and spk[0] == 0x51 and spk[1] == 0x20:
@@ -6637,12 +6721,59 @@ class RPCServer:
                     tx.has_witness = True
 
                 elif len(spk) == 34 and spk[0] == 0x00 and spk[1] == 0x20:
-                    # P2WSH: OP_0 <32-byte-hash> — need witnessScript
-                    errors.append({
-                        "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
-                        "error": "P2WSH signing requires witnessScript "
-                                 "(not yet supported)",
-                    })
+                    # P2WSH: OP_0 <32-byte-hash>. Pull witnessScript from
+                    # the prevtxs entry; verify SHA256 hashes to spk.
+                    extras = prev_scripts.get(
+                        (inp.prev_txid, inp.prev_vout), {}
+                    )
+                    witness_script = extras.get("witness_script")
+                    if witness_script is None:
+                        errors.append({
+                            "txid": inp.prev_txid.hex(),
+                            "vout": inp.prev_vout,
+                            "error": "P2WSH input missing witnessScript in prevtxs",
+                        })
+                        continue
+                    if hashlib.sha256(witness_script).digest() != spk[2:34]:
+                        errors.append({
+                            "txid": inp.prev_txid.hex(),
+                            "vout": inp.prev_vout,
+                            "error": "P2WSH witnessScript does not hash to scriptPubKey",
+                        })
+                        continue
+                    from ouroboros.segwit_v0 import sign_p2wsh_input
+                    # Build a deduplicated, type-uniform key list
+                    # (h160 lookup buckets duplicate-store keys, so dedup).
+                    candidate_keys: list = []
+                    seen_secrets: set = set()
+                    for k in list(keys_by_h160.values()) + list(
+                        keys_by_pubkey.values()
+                    ):
+                        sid = id(k)
+                        if sid in seen_secrets:
+                            continue
+                        seen_secrets.add(sid)
+                        candidate_keys.append(k)
+                    try:
+                        witness, sigs = sign_p2wsh_input(
+                            tx, idx, witness_script, amount,
+                            candidate_keys, sighash_type,
+                        )
+                    except ValueError as ve:
+                        errors.append({
+                            "txid": inp.prev_txid.hex(),
+                            "vout": inp.prev_vout,
+                            "error": str(ve),
+                        })
+                        continue
+                    inp.witness = witness
+                    tx.has_witness = True
+                    if not sigs:
+                        errors.append({
+                            "txid": inp.prev_txid.hex(),
+                            "vout": inp.prev_vout,
+                            "error": "P2WSH: no matching keys for witnessScript",
+                        })
 
                 else:
                     errors.append({
