@@ -1497,9 +1497,13 @@ class RPCServer:
             result["coinbase_tx"] = coinbase_tx_obj
 
         if verbosity == 1:
-            # Transaction IDs only
+            # Transaction IDs only — emit in display order (BE), see
+            # bitcoin-core/src/rpc/blockchain.cpp::blockToJSON which writes
+            # ``tx->GetHash().GetHex()`` for each ``tx`` in the block. See
+            # W41 for the cross-handler audit + fix.
             result["tx"] = [
-                tx.get_txid().hex() if hasattr(tx, 'get_txid') else str(tx.txid)
+                (tx.get_txid()[::-1].hex() if hasattr(tx, 'get_txid')
+                 else str(tx.txid))
                 for tx in block.transactions
             ] if hasattr(block, 'transactions') and block.transactions else []
         elif verbosity >= 2:
@@ -1918,7 +1922,12 @@ class RPCServer:
             ) from None
 
         txid = tx.get_txid()
-        txid_hex = txid.hex()
+        # JSON-RPC convention: txids in responses are display-order (BE).
+        # Internal ``txid`` is LE (Core's uint256 byte order). Reverse for
+        # the value returned to the caller and for any user-facing log
+        # line; downstream INV / mempool / txindex lookups continue to
+        # use the LE ``txid`` directly. See W41.
+        txid_hex = txid[::-1].hex()
 
         # Reject coinbase transactions
         if tx.is_coinbase:
@@ -8159,9 +8168,22 @@ class RPCServer:
     # Helper methods
 
     def _tx_to_dict(self, tx: Transaction) -> dict[str, Any]:
-        """Convert transaction to dictionary for RPC response."""
+        """Convert transaction to dictionary for RPC response.
+
+        JSON-RPC convention: txids and wtxids in JSON are emitted in
+        display order (reversed-byte / "big-endian"). Internally
+        ``Transaction.get_txid()``/``get_wtxid()`` return the LE hash
+        form (Core's uint256 byte order). Reverse before hex-encoding
+        for any field that goes out as a txid string. This mirrors
+        bitcoin-core/src/rpc/rawtransaction.cpp::TxToUniv calling
+        ``tx.GetHash().GetHex()`` (which prints display-order). Pre-W41
+        the byte-reversal hop was missing here, so getrawtransaction /
+        decoderawtransaction / gettransaction / getblock(verbosity>=2)
+        all emitted byte-reversed txids — surfaced by
+        ``tools/psbt-multi-input-test.sh`` and audited fleet-wide.
+        """
         txid = tx.get_txid() if hasattr(tx, 'get_txid') else tx.txid
-        txid_hex = txid.hex() if isinstance(txid, bytes) else str(txid)
+        txid_hex = txid[::-1].hex() if isinstance(txid, bytes) else str(txid)
 
         # Calculate weight and vsize using transaction methods
         if hasattr(tx, 'get_weight') and hasattr(tx, 'get_vsize'):
@@ -8174,7 +8196,8 @@ class RPCServer:
             vsize = tx_size
 
         hash_hex = (
-            tx.get_wtxid().hex() if hasattr(tx, 'get_wtxid') and tx.has_witness
+            tx.get_wtxid()[::-1].hex()
+            if hasattr(tx, 'get_wtxid') and tx.has_witness
             else txid_hex
         )
         return {
@@ -8190,7 +8213,13 @@ class RPCServer:
         }
 
     def _vin_to_dict(self, vin: TxIn, index: int = 0, tx: Transaction | None = None) -> dict[str, Any]:
-        prev_txid = vin.prev_txid.hex() if isinstance(vin.prev_txid, bytes) else str(vin.prev_txid)
+        # vin.prev_txid is internal LE; JSON-RPC emits display-order (BE).
+        # Mirrors bitcoin-core/src/rpc/rawtransaction.cpp::TxToUniv which
+        # writes ``txin.prevout.hash.GetHex()`` (display order). See W41.
+        prev_txid = (
+            vin.prev_txid[::-1].hex() if isinstance(vin.prev_txid, bytes)
+            else str(vin.prev_txid)
+        )
         script_sig = vin.script_sig.hex() if isinstance(vin.script_sig, bytes) else str(vin.script_sig)
 
         result = {
@@ -8723,22 +8752,97 @@ class RPCServer:
             amount = 0
             spk = b""
 
-            if psbt_in.witness_utxo is not None:
-                amount, spk = psbt_in.witness_utxo
-            elif psbt_in.non_witness_utxo is not None:
-                # Parse the prev tx to get the output
+            tx_in = tx.inputs[idx]
+
+            # Resolve UTXO from PSBT fields with strict consistency checks.
+            #
+            # Two PSBT-level integrity rules apply here, in this order:
+            #
+            # (A1) When ``non_witness_utxo`` is supplied, ``sha256d`` of its
+            #      canonical serialization MUST equal the spent input's
+            #      ``prev_txid`` (BIP-174 PSBT_IN_NON_WITNESS_UTXO sanity:
+            #      see bitcoin-core/src/psbt.cpp PSBTInput::IsSane). Without
+            #      this, a malicious wallet/coordinator can hand us a
+            #      crafted prev-tx blob whose outputs[prev_vout] points at
+            #      *any* amount/spk we don't actually own, and the signer
+            #      will happily commit BIP-143 ``hashAmount`` to that
+            #      forged value — the CVE-2020-14199 amount-oracle.
+            #
+            # (A2) When BOTH ``witness_utxo`` and ``non_witness_utxo`` are
+            #      present, the (amount, scriptPubKey) extracted from each
+            #      MUST match. Bitcoin Core treats a mismatch as the same
+            #      class of attack as A1: trust the tx-derived (amount,
+            #      spk), and reject when the fast-path witness_utxo lies.
+            #
+            # Pre-fix (W40-A audit, W41 fix): line 8726 took the witness
+            # value unconditionally, and the fallback at 8728-8736 indexed
+            # ``prev_tx.outputs[prev_vout]`` with no sha256d check on
+            # ``non_witness_utxo``. The reject error code -25 mirrors
+            # Core's ``MapPSBTError`` for "PSBT signing failed because of
+            # non-canonical or inconsistent UTXO data".
+            non_witness_amount = None
+            non_witness_spk = None
+            if psbt_in.non_witness_utxo is not None:
                 try:
+                    nwu_raw = psbt_in.non_witness_utxo
+                    nwu_hash = hashlib.sha256(
+                        hashlib.sha256(nwu_raw).digest()
+                    ).digest()
+                    if nwu_hash != tx_in.prev_txid:
+                        # txids in error messages use display-order (BE).
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                "PSBT non_witness_utxo hash mismatch for "
+                                f"input {idx}: sha256d(non_witness_utxo)="
+                                f"{nwu_hash[::-1].hex()} != prev_txid="
+                                f"{tx_in.prev_txid[::-1].hex()}"
+                            ),
+                        )
                     from ouroboros.psbt import _deserialize_tx
-                    prev_tx = _deserialize_tx(psbt_in.non_witness_utxo)
-                    tx_in = tx.inputs[idx]
+                    prev_tx = _deserialize_tx(nwu_raw)
+                    if tx_in.prev_vout >= len(prev_tx.outputs):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"PSBT input {idx} prev_vout "
+                                f"{tx_in.prev_vout} out of range "
+                                f"(non_witness_utxo has "
+                                f"{len(prev_tx.outputs)} outputs)"
+                            ),
+                        )
                     out = prev_tx.outputs[tx_in.prev_vout]
-                    amount = out.value
-                    spk = out.script_pubkey
-                except Exception:
-                    pass
+                    non_witness_amount = out.value
+                    non_witness_spk = out.script_pubkey
+                except HTTPException:
+                    raise
+
+            if psbt_in.witness_utxo is not None:
+                w_amount, w_spk = psbt_in.witness_utxo
+                # A2: cross-check against non_witness_utxo if present.
+                if non_witness_amount is not None and (
+                    w_amount != non_witness_amount or w_spk != non_witness_spk
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"PSBT input {idx} witness_utxo "
+                            f"(amount={w_amount}) disagrees with "
+                            f"non_witness_utxo[{tx_in.prev_vout}] "
+                            f"(amount={non_witness_amount}); refusing to "
+                            "sign (CVE-2020-14199 class)."
+                        ),
+                    )
+                # Prefer the tx-derived values when both are present —
+                # they are consensus-bound and cheaper to forge-detect.
+                if non_witness_amount is not None:
+                    amount, spk = non_witness_amount, non_witness_spk
+                else:
+                    amount, spk = w_amount, w_spk
+            elif non_witness_amount is not None:
+                amount, spk = non_witness_amount, non_witness_spk
             else:
                 # Try to look up from database
-                tx_in = tx.inputs[idx]
                 if hasattr(self.node, 'db') and self.node.db:
                     try:
                         utxo = await asyncio.to_thread(

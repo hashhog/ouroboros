@@ -1401,8 +1401,19 @@ class PSBT:
         }
 
         if self.tx is not None:
+            # JSON-RPC convention: txids are reversed-byte (display / BE).
+            # Internal storage on ``Transaction.txid`` and ``TxIn.prev_txid``
+            # is the LE hash form (Bitcoin Core's uint256 byte order).
+            # Reverse before hex-encoding for any txid emitted to JSON; the
+            # vin loop already does this for ``inp.prev_txid``, but the
+            # outer ``self.tx.txid`` was missing the reversal — surfaced by
+            # ``tools/psbt-multi-input-test.sh`` (W40-C harness): expected
+            # ``82efd652d7ab1197f01a5f4d9a30cb4c68bb79ab6fec58dfa1bf112291d1617b``,
+            # got the byte-reversed ``7b61d191...``. Aligns with
+            # bitcoin-core/src/rpc/rawtransaction.cpp::TxToUniv which calls
+            # ``tx.GetHash().GetHex()`` (display-order).
             result["tx"] = {
-                "txid": self.tx.txid.hex(),
+                "txid": self.tx.txid[::-1].hex(),
                 "version": self.tx.version,
                 "locktime": self.tx.locktime,
                 "vin": [
