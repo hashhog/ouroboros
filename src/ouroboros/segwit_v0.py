@@ -417,6 +417,79 @@ def sign_p2sh_p2wpkh_input(
     return _push_data(redeem_script), [sig, key.pubkey]
 
 
+# ---------------------------------------------------------------------------
+# P2SH / P2WSH commitment-check helpers
+# ---------------------------------------------------------------------------
+#
+# BIP-16 (P2SH) commits the redeemScript to the scriptPubKey via
+# HASH160(redeemScript). BIP-141 (P2WSH) commits the witnessScript via
+# SHA256(witnessScript). Validators MUST check both before accepting any
+# script-side data — but PSBT *finalizers* operate on data that arrived
+# from a multi-party workflow and can be forged independently of the
+# UTXO. The pre-W31 PSBT finalizer here checked the redeemScript *shape*
+# (OP_0 <20 bytes>) but never compared HASH160(redeemScript) against
+# witness_utxo.scriptPubKey[2:22]; a malicious cosigner could swap in a
+# different P2WPKH redeemScript and produce a structurally valid PSBT
+# that, when extracted, broadcasts a transaction whose scriptSig fails
+# script verification. The hotbuns W29-D wave fixed the same class of
+# bug in TS; this is the Python parity fix.
+
+
+def verify_p2sh_commitment(redeem_script: bytes, script_pubkey: bytes) -> None:
+    """Raise ``ValueError`` if ``HASH160(redeem_script)`` does not match the P2SH
+    scriptPubKey commitment.
+
+    A P2SH scriptPubKey is the 23-byte sequence
+    ``OP_HASH160 <20-byte push> OP_EQUAL`` (``0xa9 0x14 <h160> 0x87``).
+    This helper enforces:
+
+      1. ``script_pubkey`` is exactly 23 bytes with the canonical prefix
+         and trailing ``OP_EQUAL``.
+      2. ``HASH160(redeem_script) == script_pubkey[2:22]``.
+
+    Used by the PSBT finalizer (P2SH-P2WPKH and P2SH-P2WSH paths) and is
+    safe to call from any other validator that needs to assert the
+    BIP-16 commitment before relying on a redeem-script.
+    """
+    from ouroboros.wallet import _hash160
+
+    if (
+        len(script_pubkey) != 23
+        or script_pubkey[0] != 0xA9
+        or script_pubkey[1] != 0x14
+        or script_pubkey[22] != 0x87
+    ):
+        raise ValueError("scriptPubKey is not P2SH")
+    expected = script_pubkey[2:22]
+    actual = _hash160(redeem_script)
+    if expected != actual:
+        raise ValueError(
+            "redeem_script does not commit to scriptPubKey "
+            f"(expected hash160={expected.hex()}, got {actual.hex()})"
+        )
+
+
+def verify_p2wsh_commitment(witness_script: bytes, program: bytes) -> None:
+    """Raise ``ValueError`` if ``SHA256(witness_script)`` does not match the
+    P2WSH 32-byte witness program.
+
+    ``program`` is the *bare* 32-byte witness program (i.e. what follows
+    the ``OP_0 0x20`` prefix in a P2WSH scriptPubKey or redeemScript) —
+    *not* the full 34-byte scriptPubKey. Callers who have the full
+    scriptPubKey should slice ``[2:34]`` themselves; that asymmetry with
+    ``verify_p2sh_commitment`` is deliberate (a P2WSH program can appear
+    bare inside a P2SH-P2WSH redeemScript).
+    """
+    if len(program) != 32:
+        raise ValueError(f"P2WSH program must be 32 bytes, got {len(program)}")
+    actual = hashlib.sha256(witness_script).digest()
+    if program != actual:
+        raise ValueError(
+            "witness_script does not commit to P2WSH program "
+            f"(expected sha256={program.hex()}, got {actual.hex()})"
+        )
+
+
 def sign_p2sh_p2wsh_input(
     tx: "Transaction",
     input_index: int,

@@ -1047,6 +1047,8 @@ class PSBT:
                 continue
             if self._try_finalize_p2sh_p2wpkh(psbt_in, i):
                 continue
+            if self._try_finalize_p2sh_p2wsh(psbt_in, i):
+                continue
             if self._try_finalize_p2pkh(psbt_in, i):
                 continue
             if self._try_finalize_p2wsh(psbt_in, i):
@@ -1101,7 +1103,20 @@ class PSBT:
         return True
 
     def _try_finalize_p2sh_p2wpkh(self, psbt_in: PSBTInput, idx: int) -> bool:
-        """Try to finalize as P2SH-P2WPKH."""
+        """Try to finalize as P2SH-P2WPKH.
+
+        BIP-16 commits the redeemScript to the P2SH scriptPubKey via
+        ``HASH160``. The pre-W31 finalizer here checked only the
+        *shape* of the redeemScript (OP_0 <20 bytes>) but never compared
+        ``HASH160(redeemScript)`` against the witness_utxo's
+        scriptPubKey hash — a malicious cosigner could swap in a
+        different P2WPKH redeemScript and produce a structurally valid
+        PSBT that yields a transaction whose scriptSig fails script
+        verification at broadcast. We now raise ``ValueError`` when the
+        commitment fails (the cosigner is malicious or buggy — silently
+        skipping would let other shapes try, but no other shape will
+        match a P2WPKH-shaped redeemScript, so loud is correct here).
+        """
         if psbt_in.redeem_script is None:
             return False
 
@@ -1114,12 +1129,107 @@ class PSBT:
         if len(psbt_in.partial_sigs) != 1:
             return False
 
+        # BIP-16 commitment check. Requires witness_utxo (the P2SH
+        # scriptPubKey we're spending). If absent we cannot prove the
+        # redeemScript matches the UTXO and must refuse to finalize.
+        if psbt_in.witness_utxo is None:
+            return False
+        from ouroboros.segwit_v0 import verify_p2sh_commitment
+
+        _value, spk = psbt_in.witness_utxo
+        verify_p2sh_commitment(psbt_in.redeem_script, spk)
+
         pubkey, sig = next(iter(psbt_in.partial_sigs.items()))
         psbt_in.final_script_witness = [sig, pubkey]
         # scriptSig = push(redeem_script)
         psbt_in.final_script_sig = bytes([len(psbt_in.redeem_script)]) + psbt_in.redeem_script
         self._clear_non_final_fields(psbt_in)
         return True
+
+    def _try_finalize_p2sh_p2wsh(self, psbt_in: PSBTInput, idx: int) -> bool:
+        """Try to finalize as P2SH-P2WSH.
+
+        Outer wrap: BIP-16 P2SH whose redeemScript is itself a P2WSH
+        scriptPubKey (``OP_0 <32-byte SHA256(witnessScript)>``).
+        Witness stack is identical to bare P2WSH; ``scriptSig`` is a
+        single push of the redeemScript.
+
+        Mirrors the W28 RPC ``signrawtransactionwithkey`` /
+        ``signrawtransactionwithwallet`` paths and the dedicated
+        ``segwit_v0.sign_p2sh_p2wsh_input`` helper. The W29-A canonical
+        BIP-143 sighash is what produced the partial sigs that we
+        consume here — finalize itself does not re-sign.
+        """
+        if psbt_in.redeem_script is None or psbt_in.witness_script is None:
+            return False
+        if psbt_in.witness_utxo is None:
+            return False
+
+        # redeem_script must be a P2WSH program: OP_0 <32 bytes>.
+        rs = psbt_in.redeem_script
+        if len(rs) != 34 or rs[0] != 0x00 or rs[1] != 0x20:
+            return False
+
+        from ouroboros.segwit_v0 import (
+            parse_multisig_script,
+            parse_p2pk_checksig_script,
+            verify_p2sh_commitment,
+            verify_p2wsh_commitment,
+        )
+
+        # Outer P2SH commitment: HASH160(redeem_script) == spk[2:22].
+        _value, spk = psbt_in.witness_utxo
+        verify_p2sh_commitment(rs, spk)
+
+        # Inner P2WSH commitment: SHA256(witness_script) == redeem_script[2:34].
+        verify_p2wsh_commitment(psbt_in.witness_script, rs[2:34])
+
+        ws = psbt_in.witness_script
+
+        # Build witness stack — same shape as bare P2WSH finalizer.
+        # Multisig path: OP_M <pks> OP_N OP_CHECKMULTISIG.
+        multisig = parse_multisig_script(ws)
+        if multisig is not None:
+            m, script_pubkeys = multisig
+            if len(psbt_in.partial_sigs) < m:
+                return False
+            witness: list[bytes] = [b""]  # CHECKMULTISIG off-by-one dummy
+            for pk in script_pubkeys:
+                if len(witness) - 1 >= m:
+                    break
+                sig = psbt_in.partial_sigs.get(pk)
+                if sig is None:
+                    continue
+                witness.append(sig)
+            if len(witness) - 1 < m:
+                return False
+            witness.append(ws)
+            psbt_in.final_script_witness = witness
+            psbt_in.final_script_sig = bytes([len(rs)]) + rs
+            self._clear_non_final_fields(psbt_in)
+            return True
+
+        # Single-key <pk> OP_CHECKSIG path.
+        pk = parse_p2pk_checksig_script(ws)
+        if pk is not None:
+            sig = psbt_in.partial_sigs.get(pk)
+            if sig is None:
+                return False
+            psbt_in.final_script_witness = [sig, ws]
+            psbt_in.final_script_sig = bytes([len(rs)]) + rs
+            self._clear_non_final_fields(psbt_in)
+            return True
+
+        # Try miniscript-driven P2WSH witness construction (covers
+        # Miniscript-emitted witnessScripts that aren't bare multisig
+        # or P2PK-CHECKSIG). Reuses the same helper as bare P2WSH.
+        if self._try_finalize_miniscript(psbt_in, idx):
+            # _try_finalize_miniscript writes final_script_sig=b"" for
+            # bare P2WSH; for the P2SH wrap we need the redeemScript push.
+            psbt_in.final_script_sig = bytes([len(rs)]) + rs
+            return True
+
+        return False
 
     def _try_finalize_p2pkh(self, psbt_in: PSBTInput, idx: int) -> bool:
         """Try to finalize as P2PKH."""
