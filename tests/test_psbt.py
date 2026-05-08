@@ -752,3 +752,122 @@ class TestPreimageFields:
 
         assert hash_val in restored.hash160_preimages
         assert restored.hash160_preimages[hash_val] == preimage
+
+
+class TestBIP174Strictness:
+    """W34-D: BIP-174 conformance — EOF strictness, key ordering, segwit marker."""
+
+    def _make_minimal_psbt(self) -> PSBT:
+        tx = Transaction(
+            txid=bytes(32),
+            version=2,
+            locktime=0,
+            inputs=[TxIn(prev_txid=bytes(32), prev_vout=0, script_sig=b"", sequence=0)],
+            outputs=[TxOut(value=50_000, script_pubkey=b"\x00\x14" + bytes(20))],
+        )
+        return PSBT.from_transaction(tx)
+
+    def test_eof_without_separator_raises(self):
+        """A PSBT truncated before its trailing 0x00 separator must be rejected.
+
+        BIP-174 mandates the separator at the end of every map (global,
+        per-input, per-output). Bitcoin Core throws ios_base::failure
+        ("Separator is missing at the end of an input map"). We surface
+        a ValueError with a clear message.
+        """
+        psbt = self._make_minimal_psbt()
+        # Add an unknown key so the global map is non-empty and we can drop
+        # the trailing separator without making the stream syntactically
+        # ambiguous in some other way.
+        psbt.unknown_global[b"\xfc\x09unknownkey"] = b"unknownval"
+
+        raw = psbt.serialize()
+        # Last byte of any well-formed PSBT is the final 0x00 separator
+        # (the tail map's terminator). Drop it.
+        assert raw[-1:] == b"\x00"
+        truncated = raw[:-1]
+
+        with pytest.raises(ValueError, match="missing trailing 0x00 separator"):
+            PSBT.deserialize(truncated)
+
+    def test_lexicographic_key_ordering(self):
+        """Serializer must sort map keys ascending by raw bytes.
+
+        Build a PSBT with multiple unknown-global keys inserted in
+        non-sorted order, serialize, and assert the on-the-wire key
+        order is ascending. Then round-trip and assert byte-identity.
+        """
+        psbt = self._make_minimal_psbt()
+        # Insertion order: zz, aa, mm — must come out aa, mm, zz.
+        psbt.unknown_global[b"\xfc\x02zz"] = b"v_zz"
+        psbt.unknown_global[b"\xfc\x02aa"] = b"v_aa"
+        psbt.unknown_global[b"\xfc\x02mm"] = b"v_mm"
+
+        raw = psbt.serialize()
+
+        # Assert the three unknown-global keys appear in ascending byte order
+        # by checking offsets. (Each key is 4 bytes incl. proprietary prefix
+        # \xfc + len + name — but we just check substring positions of the
+        # 2-byte name fragments.)
+        i_aa = raw.find(b"\xfc\x02aa")
+        i_mm = raw.find(b"\xfc\x02mm")
+        i_zz = raw.find(b"\xfc\x02zz")
+        assert i_aa != -1 and i_mm != -1 and i_zz != -1
+        assert i_aa < i_mm < i_zz, (
+            f"keys not in ascending order: aa={i_aa}, mm={i_mm}, zz={i_zz}"
+        )
+
+        # Round-trip + re-serialize: deserialize-then-serialize must be
+        # byte-identical, because both passes apply the same canonical
+        # ordering. This is the property third-party PSBTs depend on.
+        restored = PSBT.deserialize(raw)
+        assert restored.serialize() == raw
+
+    def test_unsigned_tx_no_segwit_marker(self):
+        """Global UNSIGNED_TX MUST NOT carry the segwit \\x00\\x01 marker/flag.
+
+        BIP-174: "The transaction must be in the old serialization format
+        (without witnesses)." Even if the wallet has witness data on the
+        inputs, the global UNSIGNED_TX bytes must serialize without the
+        marker (0x00) + flag (0x01) bytes that follow the version field
+        in BIP-141 segwit serialization.
+        """
+        # Build a witness input on an actual P2WPKH-spending tx
+        witness_inp = TxIn(
+            prev_txid=bytes(32), prev_vout=0, script_sig=b"", sequence=0xFFFFFFFF
+        )
+        # Tag witness data on the input (mirrors how the wallet primes it)
+        witness_inp.witness = [b"\x30" * 71, b"\x02" + b"\x33" * 32]
+
+        tx = Transaction(
+            txid=bytes(32),
+            version=2,
+            locktime=0,
+            inputs=[witness_inp],
+            outputs=[TxOut(value=10_000, script_pubkey=b"\x00\x14" + bytes(20))],
+        )
+        psbt = PSBT.from_transaction(tx)
+
+        raw = psbt.serialize()
+
+        # Decode the global map and inspect the UNSIGNED_TX value
+        # directly — this is the authoritative bytes that go on the wire.
+        f = io.BytesIO(raw)
+        magic = f.read(5)
+        assert magic == PSBT_MAGIC
+        from ouroboros.psbt import _read_kv_pairs, PSBTGlobalType
+        global_kv = _read_kv_pairs(f)
+        unsigned_tx_bytes = global_kv[bytes([PSBTGlobalType.UNSIGNED_TX])]
+
+        # Layout: <version: 4 LE> then either compactsize(num_inputs) for
+        # legacy, or 0x00 0x01 (marker || flag) for BIP-141 segwit. The
+        # legal PSBT shape is the legacy one — bytes 4..6 must NOT be
+        # \x00\x01.
+        assert len(unsigned_tx_bytes) >= 6
+        marker_flag = unsigned_tx_bytes[4:6]
+        assert marker_flag != b"\x00\x01", (
+            f"PSBT UNSIGNED_TX leaked segwit marker/flag: {marker_flag.hex()}"
+        )
+        # Positive-shape sanity: byte 4 should be the compactsize for
+        # num_inputs (== 1), so 0x01.
+        assert unsigned_tx_bytes[4] == 0x01
