@@ -186,3 +186,58 @@ class TestBip34Activation(unittest.TestCase):
         canonical = _encode_bip34_height(128)
         missing_sign = bytes([0x01, 0x80])
         self.assertNotEqual(canonical[:len(missing_sign)], missing_sign)
+
+
+class TestApplyBlockGenesisGate(unittest.TestCase):
+    """Belt-and-suspenders: BlockValidator.apply_block must not insert
+    genesis (height 0) coinbase outputs into the UTXO set.
+
+    The Python ``apply_block`` is dead code in production (every IBD /
+    reorg / orphan path goes through the Rust FFI
+    ``connect_block_from_bytes``), but the W23 fix wired in a defensive
+    early-return so that if the path is ever revived it still matches
+    Bitcoin Core's ``ConnectBlock`` genesis special-case
+    (validation.cpp:2337-2343). This test pins that gate.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db = BlockchainDatabase(data_dir=self.temp_dir)
+        self.validator = BlockValidator(self.db)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _make_block(self, height):
+        # Height-only block with empty tx list. update_utxo_set does
+        # not exist on BlockchainDatabase (the path is dead), so any
+        # block that *does* reach the bottom of apply_block raises
+        # AttributeError. The genesis-gated path returns early and
+        # therefore must NOT raise.
+        return Block(
+            version=1,
+            prev_blockhash=bytes(32),
+            merkle_root=bytes(32),
+            timestamp=0,
+            bits=0x1d00ffff,
+            nonce=0,
+            transactions=[],
+            hash=bytes(32),
+            height=height,
+        )
+
+    def test_height_zero_returns_without_db_write(self):
+        """Genesis block (height=0) returns early — no AttributeError."""
+        try:
+            self.validator.apply_block(self._make_block(0))
+        except AttributeError as e:  # pragma: no cover
+            self.fail(
+                f"apply_block(height=0) hit dead update_utxo_set path: {e}"
+            )
+
+    def test_non_genesis_height_falls_through(self):
+        """Non-genesis heights skip the gate and hit the dead path
+        (AttributeError on update_utxo_set), confirming the gate is
+        scoped to height 0 only."""
+        with self.assertRaises(AttributeError):
+            self.validator.apply_block(self._make_block(1))
