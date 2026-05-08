@@ -888,6 +888,14 @@ class Wallet:
         self.db = None  # set via set_database()
         self.mempool = None  # set via set_mempool()
         self._hd_seed: bytes | None = None
+        # Optional BIP-39 metadata. When the wallet was initialised from a
+        # mnemonic (via init_hd or restore_from_mnemonic), we persist the
+        # mnemonic and the BIP-39 passphrase used to derive the seed so
+        # that dumpmnemonic can later return them. The BIP-39 passphrase
+        # is wallet-encryption-orthogonal (BIP-39 §"From mnemonic to seed"),
+        # so it is stored under the same encrypted blob as the seed.
+        self._hd_mnemonic: list[str] | None = None
+        self._hd_bip39_passphrase: str | None = None
         self._hd_next_index: int = 0
         self._hd_base_path: str = self.HD_BASE_PATH
         self._passphrase: str | None = None
@@ -905,18 +913,55 @@ class Wallet:
 
     def init_hd(
         self,
-        seed: bytes,
+        seed: bytes | None = None,
         base_path: str | None = None,
         pool_size: int = KeyPool.DEFAULT_POOL_SIZE,
+        *,
+        mnemonic: list[str] | str | None = None,
+        bip39_passphrase: str = "",
     ) -> str:
         """
-        Initialise the wallet in HD mode from a BIP 32 *seed*.
+        Initialise the wallet in HD mode.
+
+        Either provide a raw BIP-32 *seed* (16-64 bytes) or a BIP-39
+        *mnemonic* (12/15/18/21/24 words). When a mnemonic is supplied
+        the seed is derived via PBKDF2-HMAC-SHA512(*mnemonic*,
+        ``"mnemonic" + bip39_passphrase``, 2048 iters, 64-byte dklen) per
+        BIP-39, and the mnemonic + passphrase are persisted alongside the
+        seed so that ``dumpmnemonic`` can later return them.
 
         Creates a BIP84 key pool with pre-generated keys (default 1000).
         Returns the xprv of the master key.
 
-        Reference: Bitcoin Core wallet/scriptpubkeyman.cpp SetupDescriptorGeneration()
+        Reference:
+          Bitcoin Core wallet/scriptpubkeyman.cpp SetupDescriptorGeneration()
+          BIP-39 https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
         """
+        from ouroboros.bip39 import (
+            mnemonic_to_seed as _bip39_mnemonic_to_seed,
+            validate_mnemonic as _bip39_validate_mnemonic,
+        )
+
+        if (seed is None) == (mnemonic is None):
+            raise ValueError("init_hd requires exactly one of seed= or mnemonic=")
+
+        if mnemonic is not None:
+            # Normalise + validate the mnemonic before deriving the seed.
+            if isinstance(mnemonic, str):
+                words = mnemonic.split()
+            else:
+                words = list(mnemonic)
+            _bip39_validate_mnemonic(words)
+            seed = _bip39_mnemonic_to_seed(words, bip39_passphrase)
+            self._hd_mnemonic = words
+            self._hd_bip39_passphrase = bip39_passphrase
+        else:
+            # Raw-seed path. Clear any previous BIP-39 metadata to avoid a
+            # stale (mnemonic, seed) pair drifting out of sync.
+            self._hd_mnemonic = None
+            self._hd_bip39_passphrase = None
+
+        assert seed is not None
         master = HDKey.from_seed(seed, self.network)
         self._hd_seed = seed
         self._hd_next_index = 0
@@ -931,8 +976,45 @@ class Wallet:
         logger.info(
             f"Wallet '{self.name}' initialised in HD mode with "
             f"{pool_size} key pool size"
+            + (" (BIP-39 mnemonic)" if self._hd_mnemonic else "")
         )
         return master.serialize_xprv()
+
+    def restore_from_mnemonic(
+        self,
+        mnemonic: list[str] | str,
+        bip39_passphrase: str = "",
+        base_path: str | None = None,
+        pool_size: int = KeyPool.DEFAULT_POOL_SIZE,
+    ) -> str:
+        """
+        Restore wallet HD state from a BIP-39 *mnemonic* + optional
+        *bip39_passphrase*. Convenience wrapper around
+        :meth:`init_hd(mnemonic=...)`. Returns the xprv of the master key.
+
+        WARNING: this overwrites any existing HD seed / key pool. Callers
+        should refuse to restore over a non-empty wallet at a higher
+        layer (the RPC handler does this).
+        """
+        return self.init_hd(
+            mnemonic=mnemonic,
+            bip39_passphrase=bip39_passphrase,
+            base_path=base_path,
+            pool_size=pool_size,
+        )
+
+    def get_mnemonic(self) -> tuple[list[str] | None, str | None]:
+        """
+        Return ``(mnemonic_words, bip39_passphrase)`` if the wallet was
+        initialised from a mnemonic, else ``(None, None)``.
+
+        Wallets initialised from a raw seed (legacy path) cannot return a
+        mnemonic — there is no inverse for ``HDKey.from_seed``.
+        """
+        return (
+            list(self._hd_mnemonic) if self._hd_mnemonic else None,
+            self._hd_bip39_passphrase,
+        )
 
     @property
     def is_hd(self) -> bool:
@@ -972,6 +1054,10 @@ class Wallet:
                 self._hd_seed = bytes.fromhex(hd["seed_hex"])
                 self._hd_next_index = hd.get("next_index", 0)
                 self._hd_base_path = hd.get("base_path", self.HD_BASE_PATH)
+                mnemonic = hd.get("mnemonic")
+                if mnemonic:
+                    self._hd_mnemonic = list(mnemonic)
+                    self._hd_bip39_passphrase = hd.get("bip39_passphrase", "")
             # Load key pool if present
             key_pool_data = data.get("key_pool")
             if key_pool_data:
@@ -1011,11 +1097,19 @@ class Wallet:
         if self.descriptors:
             inner["descriptors"] = [d.to_dict() for d in self.descriptors]
         if self._hd_seed is not None:
-            inner["hd"] = {
+            hd_inner: dict = {
                 "seed_hex": self._hd_seed.hex(),
                 "next_index": self._hd_next_index,
                 "base_path": self._hd_base_path,
             }
+            # BIP-39 metadata only present if the wallet was created from
+            # a mnemonic. We persist the mnemonic words and the BIP-39
+            # passphrase so dumpmnemonic can reproduce the exact source
+            # the user wrote down.
+            if self._hd_mnemonic is not None:
+                hd_inner["mnemonic"] = list(self._hd_mnemonic)
+                hd_inner["bip39_passphrase"] = self._hd_bip39_passphrase or ""
+            inner["hd"] = hd_inner
         if self._key_pool is not None:
             inner["key_pool"] = self._key_pool.to_dict()
         if self._disable_private_keys:
@@ -1085,6 +1179,10 @@ class Wallet:
             self._hd_seed = bytes.fromhex(hd["seed_hex"])
             self._hd_next_index = hd.get("next_index", 0)
             self._hd_base_path = hd.get("base_path", self.HD_BASE_PATH)
+            mnemonic = hd.get("mnemonic")
+            if mnemonic:
+                self._hd_mnemonic = list(mnemonic)
+                self._hd_bip39_passphrase = hd.get("bip39_passphrase", "")
         # Load key pool
         key_pool_data = data.get("key_pool")
         if key_pool_data:
@@ -1105,6 +1203,8 @@ class Wallet:
         self.keys = []
         self.descriptors = []
         self._hd_seed = None
+        self._hd_mnemonic = None
+        self._hd_bip39_passphrase = None
         self._hd_next_index = 0
         self._key_pool = None
         self._passphrase = None
@@ -2169,6 +2269,8 @@ class WalletManager:
         avoid_reuse: bool = False,
         descriptors: bool = True,
         load_on_startup: bool | None = None,
+        mnemonic: list[str] | str | None = None,
+        bip39_passphrase: str = "",
     ) -> tuple[Wallet | None, list[str]]:
         """
         Create a new wallet.
@@ -2181,6 +2283,12 @@ class WalletManager:
             avoid_reuse: Enable coin reuse tracking (not implemented)
             descriptors: Must be True (legacy wallets not supported)
             load_on_startup: Add to auto-load list
+            mnemonic: BIP-39 mnemonic (12/15/18/21/24 words). If None and
+                the wallet is non-blank, a fresh 12-word mnemonic is
+                generated via :func:`bip39.generate_mnemonic`. Pass a
+                list/str to restore from an existing seed phrase.
+            bip39_passphrase: BIP-39 passphrase ("25th word"). Distinct
+                from *passphrase* (which encrypts the wallet at rest).
 
         Returns:
             (wallet, warnings) tuple. wallet is None on error.
@@ -2228,18 +2336,38 @@ class WalletManager:
         # Set disable_private_keys flag
         wallet._disable_private_keys = disable_private_keys
 
-        # Initialize HD seed if not blank and not watch-only
+        # Initialize HD seed if not blank and not watch-only.
+        # As of W21, fresh wallets are seeded from a BIP-39 mnemonic by
+        # default — this lets users dumpmnemonic for backup. Restoring
+        # from an existing mnemonic is also supported via the *mnemonic*
+        # argument.
         if not blank and not disable_private_keys:
-            seed = os.urandom(32)
+            from ouroboros.bip39 import generate_mnemonic as _gen_mnemonic
+
+            if mnemonic is None:
+                mnemonic_words: list[str] = _gen_mnemonic(128)  # 12 words
+            elif isinstance(mnemonic, str):
+                mnemonic_words = mnemonic.split()
+            else:
+                mnemonic_words = list(mnemonic)
+
             if passphrase:
                 # For encrypted wallets, create blank first then encrypt
                 wallet.encrypt(passphrase)
                 wallet.unlock(passphrase)
-                wallet.init_hd(seed, pool_size=1000)
+                wallet.init_hd(
+                    mnemonic=mnemonic_words,
+                    bip39_passphrase=bip39_passphrase,
+                    pool_size=1000,
+                )
                 wallet.lock()
                 wallet.unlock(passphrase)  # Keep unlocked for use
             else:
-                wallet.init_hd(seed, pool_size=1000)
+                wallet.init_hd(
+                    mnemonic=mnemonic_words,
+                    bip39_passphrase=bip39_passphrase,
+                    pool_size=1000,
+                )
         elif passphrase and not disable_private_keys:
             # Blank wallet with passphrase
             wallet.encrypt(passphrase)
