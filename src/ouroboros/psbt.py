@@ -168,11 +168,21 @@ def _read_compact_size(f: io.BytesIO) -> int:
 # =============================================================================
 
 def _read_kv_pairs(f: io.BytesIO) -> dict[bytes, bytes]:
-    """Read key-value pairs until separator (0x00)."""
+    """Read key-value pairs until separator (0x00).
+
+    BIP-174 mandates a trailing 0x00 separator at the end of every map
+    (global, per-input, per-output). A truncated stream that ends without
+    the separator is malformed and MUST be rejected — matches Bitcoin Core
+    `psbt.h` "Separator is missing at the end of an input map".
+    """
     pairs: dict[bytes, bytes] = {}
     while True:
         key_len_byte = f.read(1)
-        if not key_len_byte or key_len_byte == b"\x00":
+        if not key_len_byte:
+            raise ValueError(
+                "PSBT truncated: missing trailing 0x00 separator"
+            )
+        if key_len_byte == b"\x00":
             break
         f.seek(f.tell() - 1)
         key_len = _read_compact_size(f)
@@ -186,9 +196,17 @@ def _read_kv_pairs(f: io.BytesIO) -> dict[bytes, bytes]:
 
 
 def _write_kv_pairs(pairs: dict[bytes, bytes]) -> bytes:
-    """Write key-value pairs with separator."""
+    """Write key-value pairs with separator.
+
+    Keys are emitted in ascending lexicographic order. BIP-174 does not
+    strictly mandate ordering, but Bitcoin Core canonicalizes by sorting
+    (see `psbt.h` per-map serialization), and round-trip byte-identity
+    against third-party PSBTs that arrived in non-insertion order is only
+    guaranteed if we re-sort on the way out.
+    """
     out = bytearray()
-    for key, val in pairs.items():
+    for key in sorted(pairs.keys()):
+        val = pairs[key]
         out += _write_compact_size(len(key))
         out += key
         out += _write_compact_size(len(val))
