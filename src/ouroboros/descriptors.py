@@ -639,22 +639,31 @@ class Descriptor:
         return compile_miniscript(node, ctx)
 
     def _taproot_tweak_with_tree(self, pub: bytes, index: int = 0) -> bytes:
-        """Compute taproot output key with script tree."""
+        """Compute taproot output key with script tree.
 
-        x_only = pub[1:] if len(pub) == 33 else pub  # Get x-only pubkey
+        Per BIP-341 the on-chain output key is::
+
+            Q = lift_x(P) + tagged_hash("TapTweak", x_only(P) || merkle) * G
+
+        i.e. the *internal* point must be lifted to even-Y before applying
+        the tweak. The pre-W23 implementation called
+        ``coincurve.PublicKey(pub).add(tweak)`` directly, which uses the
+        actual parity of ``pub`` and produces a different ``Q`` whenever
+        the internal Y is odd — silently corrupting every ``tr(KEY)`` /
+        ``tr(KEY, TREE)`` address whose internal pubkey hits 0x03.
+
+        Routes through ``derive_taproot_output_xonly`` so the
+        even-Y normalization lives in exactly one place (shared with
+        the wallet signing path in ``taproot.py``).
+        """
+        from ouroboros.taproot import derive_taproot_output_xonly
 
         if self.tap_tree is None:
-            # Key-path only
-            tweak = _tagged_hash("TapTweak", x_only)
+            merkle_root: bytes | None = None
         else:
-            # Compute merkle root from tap tree
             merkle_root = self._compute_tap_tree_merkle(index)
-            tweak = _tagged_hash("TapTweak", x_only + merkle_root)
 
-        # Compute P + t*G
-        pk = PublicKey(pub)
-        tweaked = pk.add(tweak)
-        return tweaked.format(compressed=True)[1:]
+        return derive_taproot_output_xonly(pub, merkle_root)
 
     def _compute_tap_tree_merkle(self, index: int = 0) -> bytes:
         """Compute merkle root of taproot script tree."""
@@ -750,12 +759,17 @@ def _pubkey_to_p2sh_p2wpkh(pub: bytes, network: str) -> str:
 
 
 def _taproot_tweak_pubkey(pub: bytes) -> bytes:
-    x_only = pub[1:]  # drop 02/03 prefix
-    tweak = _tagged_hash("TapTweak", x_only)
-    # Compute P + t*G
-    pk = PublicKey(pub)
-    tweaked = pk.add(tweak)
-    return tweaked.format(compressed=True)[1:]  # x-only
+    """BIP-86 single-key taproot tweak.
+
+    Per BIP-341 the internal point must be lifted to even-Y before
+    adding ``t*G``. ``coincurve.PublicKey(pub).add(tweak)`` honors the
+    actual parity of ``pub`` and silently returns the wrong ``Q``
+    when ``pub`` is odd-Y (prefix 0x03). Route through
+    ``derive_taproot_output_xonly`` for a single source of truth shared
+    with the wallet/PSBT signing path.
+    """
+    from ouroboros.taproot import derive_taproot_output_xonly
+    return derive_taproot_output_xonly(pub, None)
 
 
 def _pubkey_to_p2tr(pub: bytes, network: str) -> str:

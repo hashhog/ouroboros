@@ -387,6 +387,138 @@ class TestScriptPubKey:
         assert len(spk) == 34
 
 
+# --- BIP-86 / BIP-341 even-Y descriptor regression (W23) ---
+
+
+class TestTaprootDescriptorEvenY:
+    """Regression tests for the W23 ``tr(KEY)`` even-Y bug.
+
+    Pre-W23 ``descriptors._taproot_tweak_pubkey`` and
+    ``DescriptorEntry._taproot_tweak_with_tree`` passed the raw
+    compressed pubkey to ``coincurve.PublicKey(...).add(tweak)``,
+    which honors the actual Y parity of the input. BIP-341 mandates
+    lifting the internal point to even-Y *before* applying the
+    tweak; without that, every ``tr(KEY)`` whose internal pubkey
+    has odd Y (prefix 0x03) derived a different output key from
+    the W20 wallet path, leaving funds at descriptor-derived
+    addresses unspendable by the wallet.
+
+    These tests cycle keys until they hit each parity, then assert
+    the descriptor-derived address matches both:
+      (a) ``derive_taproot_output_xonly`` (the W20 helper, single
+          source of truth), and
+      (b) ``WalletKey.get_p2tr_address`` (the wallet path) for the
+          BIP-86 canonical vector.
+    """
+
+    @staticmethod
+    def _addr_from_xonly(out_x: bytes, network: str = "mainnet") -> str:
+        from ouroboros.address import _bech32m_encode
+        hrp = "bc" if network == "mainnet" else "tb"
+        return _bech32m_encode(hrp, 1, out_x)
+
+    def _find_pub_with_parity(self, parity_byte: int) -> bytes:
+        """Return a 33-byte compressed pubkey with the requested parity."""
+        import os
+        from coincurve import PrivateKey
+        for _ in range(128):
+            d = os.urandom(32)
+            if int.from_bytes(d, "big") == 0:
+                continue
+            pub = PrivateKey(d).public_key.format(compressed=True)
+            if pub[0] == parity_byte:
+                return pub
+        pytest.skip(f"no {parity_byte:#04x}-parity key in 128 tries")
+
+    def test_tr_descriptor_even_y_matches_helper(self):
+        """tr(KEY) with even-Y internal pubkey matches the W20 helper."""
+        from ouroboros.taproot import derive_taproot_output_xonly
+        pub = self._find_pub_with_parity(0x02)
+        desc = parse_descriptor(f"tr({pub.hex()})")
+        addr = desc.derive_address(0, "mainnet")
+        out_x = derive_taproot_output_xonly(pub, None)
+        assert addr == self._addr_from_xonly(out_x)
+
+    def test_tr_descriptor_odd_y_matches_helper(self):
+        """tr(KEY) with odd-Y internal pubkey matches the W20 helper.
+
+        This is the bug-trigger case: pre-W23 the descriptor would
+        derive a *different* address for odd-Y inputs because it
+        skipped the even-Y normalization.
+        """
+        from ouroboros.taproot import derive_taproot_output_xonly
+        pub = self._find_pub_with_parity(0x03)
+        desc = parse_descriptor(f"tr({pub.hex()})")
+        addr = desc.derive_address(0, "mainnet")
+        out_x = derive_taproot_output_xonly(pub, None)
+        assert addr == self._addr_from_xonly(out_x)
+
+    def test_tr_descriptor_odd_y_differs_from_naive(self):
+        """Sanity: the fixed path differs from the pre-W23 (buggy) path
+        for an odd-Y input. This guards against a regression where the
+        even-Y lift gets removed and the test still passes by coincidence.
+        """
+        import hashlib
+        from coincurve import PublicKey
+        pub = self._find_pub_with_parity(0x03)
+
+        # Reconstruct the pre-W23 (buggy) computation: pass pub straight
+        # to coincurve.add() without the even-Y lift.
+        x_only = pub[1:]
+        tag = hashlib.sha256(b"TapTweak").digest()
+        tweak = hashlib.sha256(tag + tag + x_only).digest()
+        buggy_x = PublicKey(pub).add(tweak).format(compressed=True)[1:]
+        buggy_addr = self._addr_from_xonly(buggy_x)
+
+        desc = parse_descriptor(f"tr({pub.hex()})")
+        fixed_addr = desc.derive_address(0, "mainnet")
+
+        assert fixed_addr != buggy_addr, (
+            "descriptor address matches the pre-W23 buggy derivation; "
+            "BIP-341 even-Y normalization may have regressed"
+        )
+
+    def test_tr_descriptor_bip86_canonical_vector(self):
+        """tr(KEY) of the BIP-86 vector internal-x produces the canonical
+        BIP-86 address ``bc1p5cyxnu...kedrcr``. The vector's internal-x
+        is even-Y when prefixed 0x02, so this exercises the canonical path.
+        """
+        # Canonical BIP-86 vector — internal x-only key (even-Y when
+        # prefixed 0x02). See test_taproot_bip86.py for source.
+        bip86_internal_x = (
+            "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115"
+        )
+        bip86_address = (
+            "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
+        )
+        desc = parse_descriptor(f"tr(02{bip86_internal_x})")
+        addr = desc.derive_address(0, "mainnet")
+        assert addr == bip86_address
+
+    def test_tr_descriptor_spk_uses_tweaked_key(self):
+        """The script-pubkey path (`derive_script_pubkey`) must use
+        the same tweaked output key as `derive_address`. Pre-W23 these
+        two paths went through *different* tweak helpers
+        (``_taproot_tweak_pubkey`` for spk, ``_taproot_tweak_with_tree``
+        for addr); both had the same bug but a future regression in
+        only one would slip past the address-only test.
+        """
+        pub = self._find_pub_with_parity(0x03)
+        desc = parse_descriptor(f"tr({pub.hex()})")
+        spk = desc.derive_script_pubkey(0)
+        assert spk[:2] == b"\x51\x20"
+        spk_program = spk[2:]
+
+        # Decode bech32m address back to its 32-byte program.
+        from ouroboros.address import _bech32m_decode
+        import bech32 as _bech32
+        addr = desc.derive_address(0, "mainnet")
+        hrp, ver, data = _bech32m_decode(addr)
+        assert hrp == "bc" and ver == 1 and data is not None
+        addr_program = bytes(_bech32.convertbits(data, 5, 8, False))
+        assert spk_program == addr_program
+
+
 # --- Multisig script tests ---
 
 
