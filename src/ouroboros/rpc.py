@@ -7034,6 +7034,8 @@ class RPCServer:
         descriptors: bool = True,
         load_on_startup: bool | None = None,
         external_signer: bool = False,
+        mnemonic: str = "",
+        bip39_passphrase: str = "",
     ) -> dict[str, Any]:
         """
         Create a new wallet.
@@ -7047,6 +7049,12 @@ class RPCServer:
             descriptors: Create descriptor wallet (must be True)
             load_on_startup: Add to auto-load list on node startup
             external_signer: Use external signer (not implemented)
+            mnemonic: Optional BIP-39 mnemonic to seed the wallet from
+                     (12/15/18/21/24 words, space-separated). Empty =
+                     generate a fresh 12-word mnemonic.
+            bip39_passphrase: Optional BIP-39 passphrase ("25th word").
+                     Distinct from *passphrase*, which encrypts the
+                     wallet at rest.
 
         Returns:
             Dict with 'name' (wallet name) and 'warning' (any warnings)
@@ -7075,6 +7083,8 @@ class RPCServer:
                 avoid_reuse=avoid_reuse,
                 descriptors=descriptors,
                 load_on_startup=load_on_startup,
+                mnemonic=mnemonic if mnemonic else None,
+                bip39_passphrase=bip39_passphrase,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from None
@@ -7083,6 +7093,103 @@ class RPCServer:
             "name": wallet_name,
             "warning": "\n".join(warnings) if warnings else "",
         }
+
+    async def rpc_dumpmnemonic(self) -> dict[str, Any]:
+        """
+        Reveal the BIP-39 mnemonic used to seed the active wallet.
+
+        WARNING: backup hygiene matters. Anyone with this mnemonic can
+        spend every coin the wallet ever controlled. Write it down on
+        paper, store it offline, and treat it like cash. The RPC returns
+        plaintext over JSON-RPC; never expose this endpoint to a remote
+        host.
+
+        Returns:
+            Dict with:
+              ``mnemonic``        — space-separated BIP-39 words
+              ``mnemonic_words``  — list of BIP-39 words (same order)
+              ``bip39_passphrase`` — the BIP-39 passphrase (empty string if none)
+              ``warning``         — backup-hygiene reminder
+
+        Raises HTTP 400 if the wallet was created from a raw seed (legacy
+        path) — there is no inverse for ``HDKey.from_seed`` so the
+        mnemonic is genuinely unrecoverable.
+
+        Reference: BIP-39
+            https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki
+        """
+        wallet = self._get_wallet_for_rpc()
+        words, bip39_passphrase = wallet.get_mnemonic()
+        if words is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Wallet was not initialised from a BIP-39 mnemonic; "
+                    "no mnemonic can be returned. Use a wallet created "
+                    "with the BIP-39 path (W21+) to enable dumpmnemonic."
+                ),
+            )
+        return {
+            "mnemonic": " ".join(words),
+            "mnemonic_words": words,
+            "bip39_passphrase": bip39_passphrase or "",
+            "warning": (
+                "BACKUP HYGIENE: write the mnemonic on paper and store it "
+                "offline. Anyone with these words can spend every coin "
+                "this wallet ever controls. Never share over the network."
+            ),
+        }
+
+    async def rpc_restorewallet(
+        self,
+        wallet_name: str,
+        mnemonic: str,
+        bip39_passphrase: str = "",
+        passphrase: str = "",
+        load_on_startup: bool | None = None,
+    ) -> dict[str, Any]:
+        """
+        Create a new wallet seeded from an existing BIP-39 mnemonic.
+
+        Convenience wrapper around ``createwallet`` that requires a
+        mnemonic. Useful for cross-impl seed restore: dumpmnemonic on
+        node A, restorewallet on node B, derive an address on either —
+        the addresses must match.
+
+        Args:
+            wallet_name: Name for the restored wallet
+            mnemonic: BIP-39 mnemonic (12/15/18/21/24 words,
+                     space-separated). Required.
+            bip39_passphrase: Optional BIP-39 passphrase ("25th word")
+            passphrase: Optional wallet-encryption passphrase
+            load_on_startup: Add to auto-load list
+
+        Returns:
+            Dict with 'name' and 'warning'.
+        """
+        if not mnemonic.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="restorewallet requires a non-empty mnemonic",
+            )
+        # Validate up-front so the error is clear and we don't half-create
+        # a wallet directory before failing.
+        from ouroboros.bip39 import Bip39Error, validate_mnemonic
+        try:
+            validate_mnemonic(mnemonic.split())
+        except Bip39Error as e:
+            raise HTTPException(status_code=400, detail=f"Invalid mnemonic: {e}") from None
+
+        return await self.rpc_createwallet(
+            wallet_name=wallet_name,
+            disable_private_keys=False,
+            blank=False,
+            passphrase=passphrase,
+            descriptors=True,
+            load_on_startup=load_on_startup,
+            mnemonic=mnemonic,
+            bip39_passphrase=bip39_passphrase,
+        )
 
     async def rpc_loadwallet(
         self,
