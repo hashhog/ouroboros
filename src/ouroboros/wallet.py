@@ -738,24 +738,58 @@ class WalletKey:
         return base58.b58encode_check(version + script_hash).decode()
 
     def get_p2tr_address(self) -> str:
-        """Taproot bech32m P2TR address (key-path only, no scripts)."""
+        """Taproot bech32m P2TR address (BIP-86 key-path only, no scripts).
+
+        Per BIP-341 the on-chain output key is::
+
+            Q = lift_x(P) + tagged_hash("TapTweak", x_only(P)) * G
+
+        i.e. the internal pubkey is forced to even-Y before adding the
+        tweak. ``coincurve.PublicKey(self.pubkey).add(tweak)`` would use
+        the *actual* parity of ``self.pubkey``, producing a different Q
+        when the internal Y is odd; force even-Y by re-prefixing.
+
+        Any failure here MUST be raised — never fall back to the
+        untweaked key, which would produce a valid-looking but
+        unspendable address.
+        """
         from ouroboros.address import _bech32m_encode
 
-        x_only = self.pubkey[1:]  # drop the 0x02/0x03 prefix
-        # Tweak with empty merkle root for key-path-only spending
+        if not isinstance(self.pubkey, (bytes, bytearray)) or len(
+            self.pubkey
+        ) != 33 or self.pubkey[0] not in (0x02, 0x03):
+            raise ValueError(
+                "BIP-86 address derive: invalid 33-byte compressed pubkey"
+            )
+
+        x_only = self.pubkey[1:]
+        # BIP-341 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data)
         tweak = hashlib.sha256(
             hashlib.sha256(b"TapTweak").digest()
             + hashlib.sha256(b"TapTweak").digest()
             + x_only
         ).digest()
-        # We need to compute P + t*G. Use coincurve for point arithmetic.
+
+        # Force even-Y on the internal point before the tweak (BIP-341).
+        even_y_compressed = b"\x02" + x_only
         try:
             from coincurve import PublicKey as CPublicKey
-            pk = CPublicKey(self.pubkey)
+            pk = CPublicKey(even_y_compressed)
             tweaked = pk.add(tweak)
             tweaked_x = tweaked.format(compressed=True)[1:]
-        except Exception:
-            tweaked_x = x_only
+        except Exception as e:
+            # Do NOT silently fall back to the untweaked x-only key:
+            # that would yield a valid-looking address whose funds are
+            # unspendable by this wallet.
+            raise ValueError(
+                f"Failed to derive BIP-86 tweaked Taproot address: {e}"
+            ) from e
+
+        if len(tweaked_x) != 32:
+            raise ValueError(
+                f"Tweaked Taproot output key has wrong length: "
+                f"{len(tweaked_x)}"
+            )
 
         hrp = "bc" if self.network == "mainnet" else "tb"
         return _bech32m_encode(hrp, 1, tweaked_x)
@@ -765,9 +799,18 @@ class WalletKey:
         return b"\x00\x14" + _hash160(self.pubkey)
 
     def get_p2tr_script_pubkey(self) -> bytes:
-        """P2TR scriptPubKey: OP_1 <32-byte-x-only-key>."""
-        x_only = self.pubkey[1:]
-        return b"\x51\x20" + x_only
+        """P2TR scriptPubKey: ``OP_1 <32-byte-tweaked-output-x>``.
+
+        The 32-byte program is the BIP-341 *output* key (internal
+        pubkey + TapTweak), NOT the internal x-only key. Returning the
+        internal x-only would emit a scriptPubKey that does not match
+        the address ``get_p2tr_address`` produces, leaving funds
+        invisible to the wallet's UTXO scanner.
+        """
+        from ouroboros.taproot import derive_taproot_output_xonly
+
+        tweaked_x = derive_taproot_output_xonly(self.pubkey, None)
+        return b"\x51\x20" + tweaked_x
 
     # --- WIF -------------------------------------------------------------------
 
