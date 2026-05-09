@@ -112,6 +112,20 @@ pub const TX_INDEX_CF: &str = "tx_index";
 /// the undo data matches the expected chain position.
 pub const UNDO_CF: &str = "undo";
 
+/// Column family name for header-only store (hash -> header data)
+///
+/// **Key**: `block_hash` (32 bytes, internal byte order)
+/// **Value**: `[80-byte raw header][4-byte nTx u32 LE]`
+///
+/// Stores the 80-byte serialized block header plus the transaction count.
+/// Populated from `connect_block_from_bytes` (full blocks) and from the
+/// P2P headers-first sync path (headers without block bodies).  Allows
+/// `getblockheader` to serve historical blocks whose full body is absent
+/// from BLOCKS_CF (e.g. after an assumeutxo snapshot load).
+///
+/// The nTx field is 0 when only the header is available (no full block).
+pub const HEADERS_CF: &str = "headers";
+
 /// Metadata keys
 pub mod meta_keys {
     /// Key for best block hash in META_CF
@@ -362,6 +376,7 @@ pub fn get_column_families() -> Vec<String> {
         META_CF.to_string(),
         TX_INDEX_CF.to_string(),
         UNDO_CF.to_string(),
+        HEADERS_CF.to_string(),
     ]
 }
 
