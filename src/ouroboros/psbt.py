@@ -42,6 +42,215 @@ if TYPE_CHECKING:
 # BIP 174 magic bytes
 PSBT_MAGIC = b"psbt\xff"
 
+# =============================================================================
+# W51 decodepsbt JSON shape helpers (Core-byte-identity)
+# =============================================================================
+#
+# These helpers implement the 5-point W50 prescription so that decodepsbt
+# produces a JSON shape that is byte-identical to Bitcoin Core 31.99 once
+# both sides are normalized through `jq -S`.
+#
+# References:
+#   bitcoin-core/src/core_io.cpp   ScriptToAsmStr, ScriptToUniv
+#   bitcoin-core/src/rpc/rawtransaction.cpp  decodepsbt
+#   bitcoin-core/src/script/descriptor.cpp  InferDescriptor
+
+
+class BTCAmount:
+    """Sentinel for a satoshi amount that must serialize as Core's
+    ``%d.%08d`` fixed-decimal JSON number (e.g. ``1.00000000``).
+
+    Stored as a raw decimal string so the custom encoder can emit it as an
+    unquoted number token without Python's float rounding the trailing zeros
+    away.  Reference: bitcoin-core/src/core_io.cpp ``ValueFromAmount``.
+    """
+    __slots__ = ('_text',)
+
+    def __init__(self, sats: int) -> None:
+        neg = sats < 0
+        abs_sats = abs(sats)
+        whole = abs_sats // 100_000_000
+        frac = abs_sats % 100_000_000
+        self._text = f"{'-' if neg else ''}{whole}.{frac:08d}"
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+
+def _spk_type(script: bytes) -> str:
+    """Classify a scriptPubKey — mirrors ``_get_script_type`` in rpc.py."""
+    if not isinstance(script, bytes):
+        script = bytes(script)
+    n = len(script)
+    if n == 25 and script[0] == 0x76 and script[1] == 0xa9 and script[23] == 0x88 and script[24] == 0xac:
+        return "pubkeyhash"
+    if n == 23 and script[0] == 0xa9 and script[22] == 0x87:
+        return "scripthash"
+    if n == 22 and script[0] == 0x00 and script[1] == 0x14:
+        return "witness_v0_keyhash"
+    if n == 34 and script[0] == 0x00 and script[1] == 0x20:
+        return "witness_v0_scripthash"
+    if n == 34 and script[0] == 0x51 and script[1] == 0x20:
+        return "witness_v1_taproot"
+    if n == 35 and script[0] == 0x41 and script[34] == 0xac:
+        return "pubkey"
+    if n == 67 and script[0] == 0x41 and script[66] == 0xac:
+        return "pubkey"
+    if n == 66 and script[0] == 0x21 and script[65] == 0xac:
+        return "pubkey"
+    if n == 35 and script[0] == 0x21 and script[34] == 0xac:
+        return "pubkey"
+    if n > 0 and script[0] == 0x6a:
+        return "nulldata"
+    return "nonstandard"
+
+
+def _spk_to_address(script: bytes, network: str) -> str | None:
+    """Extract a human-readable address from a scriptPubKey, mirroring
+    Bitcoin Core's ``ExtractDestination``.  Returns None for script types
+    that Core does not encode as an address (pubkey, multisig, OP_RETURN,
+    nonstandard).
+    """
+    if not isinstance(script, bytes):
+        script = bytes(script)
+    n = len(script)
+    # Determine network prefix constants
+    is_mainnet = (network == "mainnet")
+    is_regtest = (network in ("regtest", "signet"))
+    # testnet4/testnet → tb1 hrp + version 0x6f P2PKH / 0xc4 P2SH
+    p2pkh_ver = 0x00 if is_mainnet else 0x6f
+    p2sh_ver  = 0x05 if is_mainnet else 0xc4
+    bech32_hrp = "bc" if is_mainnet else ("bcrt" if is_regtest else "tb")
+
+    try:
+        import base58
+        import bech32 as _bech32_mod
+
+        if n == 25 and script[0] == 0x76 and script[1] == 0xa9 and script[23] == 0x88 and script[24] == 0xac:
+            # P2PKH
+            payload = bytes([p2pkh_ver]) + script[3:23]
+            return base58.b58encode_check(payload).decode()
+
+        if n == 23 and script[0] == 0xa9 and script[22] == 0x87:
+            # P2SH
+            payload = bytes([p2sh_ver]) + script[2:22]
+            return base58.b58encode_check(payload).decode()
+
+        if n == 22 and script[0] == 0x00 and script[1] == 0x14:
+            # P2WPKH — bech32 v0
+            program = script[2:]
+            data_5bit = _bech32_mod.convertbits(program, 8, 5)
+            if data_5bit is not None:
+                return _bech32_mod.bech32_encode(bech32_hrp, [0] + data_5bit)
+
+        if n == 34 and script[0] == 0x00 and script[1] == 0x20:
+            # P2WSH — bech32 v0
+            program = script[2:]
+            data_5bit = _bech32_mod.convertbits(program, 8, 5)
+            if data_5bit is not None:
+                return _bech32_mod.bech32_encode(bech32_hrp, [0] + data_5bit)
+
+        if n == 34 and script[0] == 0x51 and script[1] == 0x20:
+            # P2TR — bech32m v1
+            program = script[2:]
+            data_5bit = _bech32_mod.convertbits(program, 8, 5)
+            if data_5bit is not None:
+                from ouroboros.address import _bech32m_encode
+                return _bech32m_encode(bech32_hrp, 1, program)
+
+        if n == 4 and script[0] == 0x51 and script[1] == 0x02:
+            # P2A (Pay-to-Anchor)
+            program = script[2:]
+            from ouroboros.address import _bech32m_encode
+            return _bech32m_encode(bech32_hrp, 1, program)
+
+    except Exception:
+        pass
+
+    # P2PK, multisig, OP_RETURN, nonstandard → no address
+    return None
+
+
+# Core's ScriptToAsmStr uses numeric tokens for small push-number opcodes:
+#   OP_0 → "0", OP_1 → "1" … OP_16 → "16", OP_1NEGATE → "-1"
+# The existing disassemble_script uses OP_0/OP_1/… which diverges from Core.
+_SMALL_NUM_OPCODE: dict[int, str] = {0x00: "0", 0x4f: "-1"}
+_SMALL_NUM_OPCODE.update({0x50 + i: str(i) for i in range(1, 17)})
+
+def _spk_asm(script: bytes) -> str:
+    """Disassemble a scriptPubKey to Core-style ASM.
+
+    Same as ``disassemble_script`` but emits numeric tokens for small
+    push-number opcodes (OP_0 → "0", OP_1 → "1" … OP_16 → "16"), matching
+    Bitcoin Core's ``ScriptToAsmStr`` (core_io.cpp).
+    """
+    from ouroboros.script import disassemble_script
+    if not script:
+        return ""
+    raw_asm = disassemble_script(script)
+    if not raw_asm:
+        return raw_asm
+    parts = raw_asm.split(" ")
+    out = []
+    for part in parts:
+        if part == "OP_0":
+            out.append("0")
+        elif part == "OP_1NEGATE":
+            out.append("-1")
+        elif len(part) == 4 and part[:3] == "OP_" and part[3:].isdigit():
+            # OP_1 … OP_16
+            num = int(part[3:])
+            if 1 <= num <= 16:
+                out.append(str(num))
+            else:
+                out.append(part)
+        else:
+            out.append(part)
+    return " ".join(out)
+
+
+def _infer_descriptor(script: bytes, address: str | None) -> str:
+    """Build a BIP-380 descriptor string for a scriptPubKey, mirroring
+    Bitcoin Core's no-provider ``InferDescriptor`` fallback path
+    (script/descriptor.cpp:2897).
+
+    For address-encodable scripts: ``addr(<address>)#<checksum>``
+    Otherwise: ``raw(<hex>)#<checksum>``
+    """
+    from ouroboros.descriptors import add_checksum
+    if address is not None:
+        payload = f"addr({address})"
+    else:
+        payload = f"raw({script.hex()})"
+    try:
+        return add_checksum(payload)
+    except Exception:
+        return payload
+
+
+def _build_spk_json(script: bytes, network: str) -> dict[str, Any]:
+    """Build a scriptPubKey JSON object matching Core's ``ScriptToUniv``
+    (core_io.cpp) shape: ``{asm, desc, hex, address?, type}``.
+
+    ``address`` is omitted for pubkey-type scripts, matching Core's
+    ``ScriptPubKeyToUniv`` suppression rule.
+    """
+    spk_type = _spk_type(script)
+    address = _spk_to_address(script, network)
+    desc = _infer_descriptor(script, address)
+    asm = _spk_asm(script)
+    result: dict[str, Any] = {
+        "asm": asm,
+        "desc": desc,
+        "hex": script.hex(),
+        "type": spk_type,
+    }
+    # Core suppresses "address" for bare-pubkey outputs (type == "pubkey")
+    if address is not None and spk_type != "pubkey":
+        result["address"] = address
+    return result
+
 # Maximum PSBT file size (100 MB, per Bitcoin Core)
 MAX_PSBT_SIZE = 100_000_000
 
@@ -1555,11 +1764,29 @@ class PSBT:
     # Decoding (human-readable)
     # ==========================================================================
 
-    def decode(self) -> dict[str, Any]:
-        """Return a human-readable dictionary representation (``decodepsbt``)."""
-        result: dict[str, Any] = {
-            "version": self.version,
-        }
+    def decode(self, network: str = "mainnet") -> dict[str, Any]:
+        """Return a human-readable dictionary representation (``decodepsbt``).
+
+        W51: shape is now byte-identical to Bitcoin Core 31.99's decodepsbt
+        output when normalized via ``jq -S``.  Changes vs prior version:
+
+        - amount fields use ``BTCAmount(sats)`` so they serialize as Core's
+          fixed ``%d.%08d`` decimal (``1.00000000``, not Python's ``1.0``).
+        - ``tx.vin`` gains ``scriptSig: {asm, hex}`` (empty string for the
+          unsigned PSBT global tx).
+        - ``tx.vout.scriptPubKey`` emits the full Core shape
+          ``{asm, desc, hex, address?, type}`` via ``_build_spk_json``.
+        - ``tx`` gains ``hash``, ``size``, ``vsize``, ``weight``.
+        - Top-level ``version`` renamed to ``psbt_version`` (Core's field name).
+        - ``global_xpubs: []`` is always emitted (mandatory in Core, even when
+          the PSBT carries no XPUB records).
+        - ``proprietary: []`` and ``unknown: {}`` always emitted.
+
+        Args:
+            network: Network context for address encoding
+                     (``"mainnet"`` / ``"testnet4"`` / ``"regtest"``).
+        """
+        result: dict[str, Any] = {}
 
         if self.tx is not None:
             # JSON-RPC convention: txids are reversed-byte (display / BE).
@@ -1573,31 +1800,45 @@ class PSBT:
             # got the byte-reversed ``7b61d191...``. Aligns with
             # bitcoin-core/src/rpc/rawtransaction.cpp::TxToUniv which calls
             # ``tx.GetHash().GetHex()`` (display-order).
+            #
+            # The PSBT global tx is the unsigned transaction (no witness data),
+            # so hash == txid for all PSBTs (no witness discount applies).
+            txid_hex = self.tx.txid[::-1].hex()
+            tx_size = len(self.tx.serialize())
+            tx_weight = self.tx.get_weight()
+            tx_vsize = self.tx.get_vsize()
             result["tx"] = {
-                "txid": self.tx.txid[::-1].hex(),
+                "txid": txid_hex,
+                "hash": txid_hex,
                 "version": self.tx.version,
+                "size": tx_size,
+                "vsize": tx_vsize,
+                "weight": tx_weight,
                 "locktime": self.tx.locktime,
                 "vin": [
                     {
                         "txid": inp.prev_txid[::-1].hex() if inp.prev_txid else "",
                         "vout": inp.prev_vout,
+                        "scriptSig": {
+                            "asm": _spk_asm(inp.script_sig) if inp.script_sig else "",
+                            "hex": inp.script_sig.hex() if inp.script_sig else "",
+                        },
                         "sequence": inp.sequence,
                     }
                     for inp in self.tx.inputs
                 ],
                 "vout": [
                     {
-                        "value": out.value / 100_000_000,
+                        "value": BTCAmount(out.value),
                         "n": i,
-                        "scriptPubKey": {
-                            "hex": out.script_pubkey.hex(),
-                        },
+                        "scriptPubKey": _build_spk_json(out.script_pubkey, network),
                     }
                     for i, out in enumerate(self.tx.outputs)
                 ],
             }
 
-        # Global xpubs
+        # Global xpubs — always emitted (Core mandates this field even when
+        # the PSBT has no XPUB records).
         if self.global_xpubs:
             result["global_xpubs"] = [
                 {
@@ -1607,6 +1848,16 @@ class PSBT:
                 }
                 for xpub, origin in self.global_xpubs.items()
             ]
+        else:
+            result["global_xpubs"] = []
+
+        # PSBT version — Core calls this "psbt_version", not "version".
+        result["psbt_version"] = self.version
+
+        # Proprietary records and unknown key-value pairs — always emitted
+        # (Core mandates these fields even when empty).
+        result["proprietary"] = []
+        result["unknown"] = {}
 
         # Inputs
         result["inputs"] = []
@@ -1616,8 +1867,8 @@ class PSBT:
             if psbt_in.witness_utxo is not None:
                 val, spk = psbt_in.witness_utxo
                 info["witness_utxo"] = {
-                    "amount": val / 100_000_000,
-                    "scriptPubKey": {"hex": spk.hex()},
+                    "amount": BTCAmount(val),
+                    "scriptPubKey": _build_spk_json(spk, network),
                 }
 
             if psbt_in.non_witness_utxo is not None:
@@ -1705,11 +1956,12 @@ class PSBT:
 
             result["outputs"].append(info)
 
-        # Compute fee if possible
+        # Compute fee if possible (W53 territory — not in scope for W51 target
+        # entries, but maintain the field for non-target entries).
         try:
             fee = self._compute_fee()
             if fee is not None:
-                result["fee"] = fee / 100_000_000
+                result["fee"] = BTCAmount(fee)
         except Exception:
             pass
 
