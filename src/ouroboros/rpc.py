@@ -10368,9 +10368,16 @@ class RPCServer:
             if 0x51 <= first <= 0x60:  # OP_1 to OP_16
                 return "multisig"
 
-        # OP_RETURN (nulldata)
+        # OP_RETURN (nulldata) — only if the tail is entirely valid push ops.
+        # A truncated push (e.g. 6a 09 dead beef — PUSH9 with 4 data bytes)
+        # must be classified nonstandard, not nulldata.
+        # Reference: Bitcoin Core script/solver.cpp Solver() ~line 185:
+        #   if (IsPushOnly(script.begin()+1, script.end())) return TX_NULL_DATA;
         if len(script) > 0 and script[0] == 0x6a:
-            return "nulldata"
+            from ouroboros.mempool import _is_push_only_from
+            if _is_push_only_from(script, 1):
+                return "nulldata"
+            return "nonstandard"
 
         return "nonstandard"
 
