@@ -1045,3 +1045,186 @@ class TestW43MultisigFinalize:
         inp = psbt.inputs[0]
         assert not inp.is_finalized()
         assert inp.final_script_sig is None or inp.final_script_sig == b""
+
+
+class TestW46PartialSigsCanonicalOrder:
+    """W46 regression tests: combinepsbt must produce byte-identical
+    output regardless of insertion order of ``partial_sigs``.
+
+    Bitcoin Core stores ``partial_sigs`` in
+    ``std::map<CKeyID, SigPair>`` (psbt.h:270); the per-input serializer
+    walks that map in key order, i.e. sorted by ``HASH160(pubkey)``.
+    Ouroboros previously sorted on emit by raw wire-key (= pubkey
+    bytes), which produced a stable but Core-incompatible order for
+    multi-sig partial-sig sets whose pubkey lex-order differs from
+    their HASH160 lex-order. That is the W43-3 follow-up "T2 DIVERGE"
+    on ``tools/psbt-multi-input-test.sh`` (W42-A diagnostic).
+    """
+
+    # Two compressed pubkeys whose HASH160 ordering is the OPPOSITE of
+    # their raw-bytes ordering. We pre-computed these by brute-forcing
+    # the second-byte ramp until the order flipped — required so the
+    # test is meaningful: a fixture where raw-sort happens to agree
+    # with HASH160-sort would silently pass under both the old AND new
+    # serializer.
+    #
+    # PK_LEX_LO is lex-smaller than PK_LEX_HI as raw bytes, but
+    # HASH160(PK_LEX_LO) > HASH160(PK_LEX_HI). The W46 fix MUST emit
+    # PK_LEX_HI's PARTIAL_SIG entry first.
+    # Constants chosen by brute-force search over (0x02 || i, 0x03 || j)
+    # to guarantee raw_lex_order(PK_LO, PK_HI) is INVERTED relative to
+    # h160_order(PK_LO, PK_HI). With these:
+    #   h160(PK_LEX_LO) = e01b06b9dce4b03b169c1e9c9d59d7907b2b6e5b
+    #   h160(PK_LEX_HI) = 429d7e0ec4135a738ae573c85de9c9b4385688e8
+    # PK_LEX_LO < PK_LEX_HI raw, but h160(PK_LEX_LO) > h160(PK_LEX_HI).
+    PK_LEX_LO = bytes.fromhex(
+        "020000000000000000000000000000000000000000000000000000000000000001"
+    )
+    PK_LEX_HI = bytes.fromhex(
+        "030000000000000000000000000000000000000000000000000000000000000003"
+    )
+    SIG_LO = b"\x30" + b"\xaa" * 70 + b"\x01"  # mock DER + sighash
+    SIG_HI = b"\x30" + b"\xbb" * 70 + b"\x01"
+
+    def _make_unsigned_psbt(self) -> PSBT:
+        tx = Transaction(
+            txid=bytes(32),
+            version=2,
+            locktime=0,
+            inputs=[
+                TxIn(
+                    prev_txid=bytes(32),
+                    prev_vout=0,
+                    script_sig=b"",
+                    sequence=0xFFFFFFFF,
+                )
+            ],
+            outputs=[TxOut(value=50000, script_pubkey=bytes.fromhex("0014" + "00" * 20))],
+        )
+        return PSBT.from_transaction(tx)
+
+    def test_pubkeys_have_inverted_hash160_order(self):
+        """Sanity check: the chosen pubkeys actually exercise the bug.
+
+        If raw-sort and HASH160-sort happen to agree, the regression
+        test below is vacuous. Force the assumption to fail loudly if
+        the constants ever drift.
+        """
+        import hashlib
+
+        def h160(pk: bytes) -> bytes:
+            return hashlib.new("ripemd160", hashlib.sha256(pk).digest()).digest()
+
+        assert self.PK_LEX_LO < self.PK_LEX_HI, "raw-byte order assumption"
+        assert h160(self.PK_LEX_LO) > h160(self.PK_LEX_HI), (
+            "HASH160 order must invert raw-byte order for this test to "
+            "exercise the W46 fix; chosen constants do not. Pick new keys."
+        )
+
+    def test_combinepsbt_byte_identity_regardless_of_insertion_order(self):
+        """W46 fix: two PSBTs that differ only in ``partial_sigs``
+        insertion order, then combined, MUST serialize to identical
+        bytes. This is the property Bitcoin Core gets for free from
+        ``std::map<CKeyID, SigPair>``.
+        """
+        # PSBT_A: insert LO first, then HI.
+        psbt_a1 = self._make_unsigned_psbt()
+        psbt_a1.inputs[0].partial_sigs[self.PK_LEX_LO] = self.SIG_LO
+        psbt_a2 = self._make_unsigned_psbt()
+        psbt_a2.inputs[0].partial_sigs[self.PK_LEX_HI] = self.SIG_HI
+        combined_a_b64 = combinepsbt([psbt_a1.to_base64(), psbt_a2.to_base64()])
+
+        # PSBT_B: insert HI first, then LO. Same two sigs, opposite
+        # combine order.
+        psbt_b1 = self._make_unsigned_psbt()
+        psbt_b1.inputs[0].partial_sigs[self.PK_LEX_HI] = self.SIG_HI
+        psbt_b2 = self._make_unsigned_psbt()
+        psbt_b2.inputs[0].partial_sigs[self.PK_LEX_LO] = self.SIG_LO
+        combined_b_b64 = combinepsbt([psbt_b1.to_base64(), psbt_b2.to_base64()])
+
+        assert combined_a_b64 == combined_b_b64, (
+            "combinepsbt is non-deterministic under partial_sigs "
+            "insertion-order permutation — W46 fix did not land."
+        )
+
+    def test_partial_sigs_emitted_in_hash160_order_not_raw_order(self):
+        """Stronger property than byte-identity: the ON-WIRE order of
+        PARTIAL_SIG entries MUST be HASH160(pubkey) ascending, NOT raw
+        pubkey ascending. Decodes the serialized bytes and checks the
+        physical layout.
+        """
+        import hashlib
+        from ouroboros.psbt import (
+            PSBT_MAGIC,
+            PSBTInputType,
+            _read_compact_size,
+            _read_kv_pairs,
+        )
+
+        def h160(pk: bytes) -> bytes:
+            return hashlib.new("ripemd160", hashlib.sha256(pk).digest()).digest()
+
+        psbt = self._make_unsigned_psbt()
+        # Insert LO first to defeat insertion-order emission.
+        psbt.inputs[0].partial_sigs[self.PK_LEX_LO] = self.SIG_LO
+        psbt.inputs[0].partial_sigs[self.PK_LEX_HI] = self.SIG_HI
+
+        raw = psbt.serialize()
+
+        # Skip magic + global map.
+        f = io.BytesIO(raw)
+        assert f.read(5) == PSBT_MAGIC
+        _ = _read_kv_pairs(f)  # global
+
+        # Read the per-input map manually so we observe byte order, not
+        # dict iteration order.
+        partial_sig_keys_in_wire_order: list[bytes] = []
+        while True:
+            kl_byte = f.read(1)
+            assert kl_byte, "truncated PSBT"
+            if kl_byte == b"\x00":
+                break
+            f.seek(f.tell() - 1)
+            kl = _read_compact_size(f)
+            key = f.read(kl)
+            vl = _read_compact_size(f)
+            _ = f.read(vl)
+            if key and key[0] == PSBTInputType.PARTIAL_SIG:
+                partial_sig_keys_in_wire_order.append(key[1:])
+
+        assert len(partial_sig_keys_in_wire_order) == 2, (
+            f"expected 2 partial_sigs on the wire, got "
+            f"{len(partial_sig_keys_in_wire_order)}"
+        )
+        # HI's HASH160 < LO's HASH160 (verified above), so HI must
+        # appear FIRST on the wire under the W46 fix. Under the old
+        # raw-sort behavior, LO came first.
+        assert partial_sig_keys_in_wire_order[0] == self.PK_LEX_HI, (
+            "first PARTIAL_SIG on the wire must be the pubkey with the "
+            "smaller HASH160 (Core's std::map<CKeyID, SigPair> order)"
+        )
+        assert partial_sig_keys_in_wire_order[1] == self.PK_LEX_LO
+
+        # Belt-and-braces: the wire order matches sort-by-HASH160.
+        sorted_by_hash160 = sorted(
+            partial_sig_keys_in_wire_order, key=h160
+        )
+        assert partial_sig_keys_in_wire_order == sorted_by_hash160
+
+    def test_combinepsbt_round_trips_through_decode(self):
+        """The combined PSBT must still parse cleanly. Guards against
+        the fix accidentally corrupting the wire format (e.g. wrong
+        compactsize length, mis-emitted separator).
+        """
+        psbt1 = self._make_unsigned_psbt()
+        psbt1.inputs[0].partial_sigs[self.PK_LEX_LO] = self.SIG_LO
+        psbt2 = self._make_unsigned_psbt()
+        psbt2.inputs[0].partial_sigs[self.PK_LEX_HI] = self.SIG_HI
+
+        combined_b64 = combinepsbt([psbt1.to_base64(), psbt2.to_base64()])
+        combined = PSBT.from_base64(combined_b64)
+
+        assert self.PK_LEX_LO in combined.inputs[0].partial_sigs
+        assert self.PK_LEX_HI in combined.inputs[0].partial_sigs
+        assert combined.inputs[0].partial_sigs[self.PK_LEX_LO] == self.SIG_LO
+        assert combined.inputs[0].partial_sigs[self.PK_LEX_HI] == self.SIG_HI
