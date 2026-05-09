@@ -9892,6 +9892,12 @@ class RPCServer:
 
         Reference: Bitcoin Core rpc/rawtransaction.cpp decoderawtransaction
 
+        Produces output byte-identical to Core's TxToUniv (core_io.cpp) via the
+        shared _tx_to_univ helper from psbt.py.  BTCAmount sentinels in the
+        returned dict are serialized by _BTCEncoder (wired to all RPC responses
+        via _BTCJsonResponse in the dispatch layer), giving the Core-exact
+        "%d.%08d" decimal format for value fields.
+
         Args:
             hexstring: The hex-encoded transaction data
             iswitness: Whether to attempt parsing as a SegWit transaction (default True)
@@ -9901,6 +9907,7 @@ class RPCServer:
             size, vsize, weight, locktime, vin, vout
         """
         from ouroboros.p2p_messages import TxMessage
+        from ouroboros.psbt import _tx_to_univ
 
         try:
             raw_bytes = bytes.fromhex(hexstring)
@@ -9913,8 +9920,8 @@ class RPCServer:
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to decode transaction: {e}") from None
 
-        # Use existing _tx_to_dict helper
-        return self._tx_to_dict(tx)
+        network = getattr(self.node, "network", "mainnet")
+        return _tx_to_univ(tx, network)
 
     async def rpc_decodescript(self, hexstring: str) -> dict[str, Any]:
         """
