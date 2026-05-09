@@ -78,6 +78,60 @@ class BTCAmount:
         return self._text
 
 
+def _is_multisig(script: bytes) -> tuple[int, int, list[bytes]] | None:
+    """Return (m, n, pubkeys) if script is a standard m-of-n multisig, else None.
+
+    Mirrors Bitcoin Core's Solver() check for TX_MULTISIG (script/solver.cpp).
+    Pattern: OP_m [<pubkey>...] OP_n OP_CHECKMULTISIG
+    where 1 <= m <= n <= 16 and each pubkey is 33 (compressed) or 65 (uncompressed) bytes.
+    """
+    if not script or len(script) < 3:
+        return None
+    # Must end with OP_CHECKMULTISIG (0xae)
+    if script[-1] != 0xae:
+        return None
+    # m = first byte (OP_1..OP_16 = 0x51..0x60)
+    m_op = script[0]
+    if not (0x51 <= m_op <= 0x60):
+        return None
+    m = m_op - 0x50
+
+    # Parse pubkeys
+    i = 1
+    pubkeys: list[bytes] = []
+    while i < len(script) - 2:  # -2 for OP_n and OP_CHECKMULTISIG
+        push_op = script[i]
+        if push_op == 0x21:  # push 33 bytes (compressed)
+            if i + 34 > len(script):
+                return None
+            pubkeys.append(script[i + 1:i + 34])
+            i += 34
+        elif push_op == 0x41:  # push 65 bytes (uncompressed)
+            if i + 66 > len(script):
+                return None
+            pubkeys.append(script[i + 1:i + 66])
+            i += 66
+        else:
+            break
+
+    if not pubkeys:
+        return None
+
+    # n = next byte (OP_1..OP_16 = 0x51..0x60), then OP_CHECKMULTISIG
+    if i + 2 != len(script):
+        return None
+    n_op = script[i]
+    if not (0x51 <= n_op <= 0x60):
+        return None
+    n = n_op - 0x50
+
+    # Validate: m <= n, pubkey count == n
+    if m > n or len(pubkeys) != n:
+        return None
+
+    return m, n, pubkeys
+
+
 def _spk_type(script: bytes) -> str:
     """Classify a scriptPubKey — mirrors ``_get_script_type`` in rpc.py."""
     if not isinstance(script, bytes):
@@ -103,6 +157,8 @@ def _spk_type(script: bytes) -> str:
         return "pubkey"
     if n > 0 and script[0] == 0x6a:
         return "nulldata"
+    if _is_multisig(script) is not None:
+        return "multisig"
     return "nonstandard"
 
 
@@ -198,8 +254,10 @@ def _spk_asm(script: bytes) -> str:
             out.append("0")
         elif part == "OP_1NEGATE":
             out.append("-1")
-        elif len(part) == 4 and part[:3] == "OP_" and part[3:].isdigit():
-            # OP_1 … OP_16
+        elif part.startswith("OP_") and part[3:].isdigit():
+            # OP_1 … OP_16 — matches both single-digit (OP_1..OP_9) and
+            # two-digit (OP_10..OP_16) opcode names from disassemble_script.
+            # Core's ScriptToAsmStr emits these as bare numbers (core_io.cpp).
             num = int(part[3:])
             if 1 <= num <= 16:
                 out.append(str(num))
@@ -310,6 +368,7 @@ def _infer_descriptor(script: bytes, address: str | None) -> str:
     (script/descriptor.cpp:2897).
 
     For ``OP_1 <32-byte push>`` (witness_v1_taproot): ``rawtr(<x-only-hex>)#<csum>``
+    For m-of-n multisig: ``multi(m,pk1,pk2,...)#<csum>``  (Core emits this for bare multisig)
     For other address-encodable scripts: ``addr(<address>)#<checksum>``
     Otherwise: ``raw(<hex>)#<checksum>``
 
@@ -322,6 +381,12 @@ def _infer_descriptor(script: bytes, address: str | None) -> str:
     if len(script) == 34 and script[0] == 0x51 and script[1] == 0x20:
         xonly_hex = script[2:].hex()
         payload = f"rawtr({xonly_hex})"
+    elif (ms := _is_multisig(script)) is not None:
+        # Bare m-of-n multisig: Core InferDescriptor emits multi(m,pk1,pk2,...).
+        # Reference: bitcoin-core/src/script/descriptor.cpp InferDescriptor → TX_MULTISIG.
+        m, _n, pubkeys = ms
+        pks_hex = ",".join(pk.hex() for pk in pubkeys)
+        payload = f"multi({m},{pks_hex})"
     elif address is not None:
         payload = f"addr({address})"
     else:
@@ -349,8 +414,9 @@ def _build_spk_json(script: bytes, network: str) -> dict[str, Any]:
         "hex": script.hex(),
         "type": spk_type,
     }
-    # Core suppresses "address" for bare-pubkey outputs (type == "pubkey")
-    if address is not None and spk_type != "pubkey":
+    # Core suppresses "address" for bare-pubkey and bare-multisig outputs.
+    # Reference: bitcoin-core/src/rpc/util.cpp ScriptPubKeyToUniv suppression.
+    if address is not None and spk_type not in ("pubkey", "multisig", "nonstandard"):
         result["address"] = address
     return result
 

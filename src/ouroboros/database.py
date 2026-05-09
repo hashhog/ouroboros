@@ -413,6 +413,35 @@ class BlockchainDatabase:
             'is_coinbase': getattr(py_utxo, 'is_coinbase', False),
         }
 
+    def get_utxo_or_spent(self, txid: bytes, vout: int) -> dict[str, Any] | None:
+        """Fetch a UTXO by outpoint from either the live chainstate or the spent-record
+        store (SPENT_CF). Used by rpc_getblock verbosity>=2 to compute transaction fees
+        for historical blocks whose inputs have already been spent.
+
+        Returns None if the outpoint is not found in either location.
+        Falls back to ``get_utxo`` if the Rust layer does not yet expose
+        ``get_utxo_or_spent`` (older builds).
+        """
+        if len(txid) != 32:
+            raise ValueError("Transaction ID must be 32 bytes")
+
+        if hasattr(self._db, 'get_utxo_or_spent'):
+            py_utxo = self._db.get_utxo_or_spent(txid, vout)
+        else:
+            py_utxo = self._db.get_utxo(txid, vout)
+
+        if py_utxo is None:
+            return None
+
+        return {
+            'txid': py_utxo.txid,
+            'vout': py_utxo.vout,
+            'value': py_utxo.value,
+            'script_pubkey': bytes(py_utxo.script_pubkey),
+            'height': getattr(py_utxo, 'height', None),
+            'is_coinbase': getattr(py_utxo, 'is_coinbase', False),
+        }
+
     def utxo_count(self) -> int:
         """Return the number of UTXOs currently in the chainstate.
 

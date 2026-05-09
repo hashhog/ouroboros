@@ -630,6 +630,151 @@ def _message_hash(message: str) -> bytes:
     return _dsha256(payload)
 
 
+def _parse_block_txs(raw: bytes):
+    """Parse transactions from a raw Bitcoin block preserving witness data.
+
+    Bitcoin block wire format:
+      - 80-byte header
+      - varint: tx count
+      - N transactions in consensus (witness) serialization
+
+    Returns a list of ``Transaction`` objects (from ``ouroboros.database``)
+    with ``has_witness`` and ``TxIn.witness`` correctly populated.
+
+    Used by ``rpc_getblock`` verbosity>=2 to work around the Rust ``PyTxIn``
+    stub not exposing witness items.
+
+    Reference: bitcoin-core/src/primitives/block.h Block::Unserialize,
+               bitcoin-core/src/primitives/transaction.h CMutableTransaction.
+    """
+    import io as _io
+    import struct as _struct
+    import hashlib as _hashlib
+    from ouroboros.database import Transaction as _Tx, TxIn as _TxIn, TxOut as _TxOut
+
+    def _read_cs(f):
+        """Read a Bitcoin CompactSize (varint) from file-like f."""
+        b = f.read(1)
+        if not b:
+            raise ValueError("Unexpected EOF reading CompactSize")
+        n = b[0]
+        if n < 0xfd:
+            return n
+        if n == 0xfd:
+            return _struct.unpack("<H", f.read(2))[0]
+        if n == 0xfe:
+            return _struct.unpack("<I", f.read(4))[0]
+        return _struct.unpack("<Q", f.read(8))[0]
+
+    f = _io.BytesIO(raw)
+    # Skip 80-byte block header.
+    f.read(80)
+
+    n_tx = _read_cs(f)
+    txs = []
+
+    for _ in range(n_tx):
+        tx_start = f.tell()
+        version = _struct.unpack("<i", f.read(4))[0]
+
+        # Detect SegWit marker.
+        peek = f.read(1)
+        has_witness = False
+        if peek == b"\x00":
+            flag = f.read(1)
+            has_witness = (flag == b"\x01")
+        else:
+            f.seek(-1, _io.SEEK_CUR)
+
+        n_in = _read_cs(f)
+        inputs: list[_TxIn] = []
+        for _ in range(n_in):
+            prev_txid = f.read(32)
+            prev_vout = _struct.unpack("<I", f.read(4))[0]
+            script_len = _read_cs(f)
+            script_sig = f.read(script_len)
+            sequence = _struct.unpack("<I", f.read(4))[0]
+            inputs.append(_TxIn(prev_txid, prev_vout, script_sig, sequence))
+
+        n_out = _read_cs(f)
+        outputs: list[_TxOut] = []
+        for _ in range(n_out):
+            value = _struct.unpack("<q", f.read(8))[0]
+            spk_len = _read_cs(f)
+            script_pubkey = f.read(spk_len)
+            outputs.append(_TxOut(value, script_pubkey))
+
+        if has_witness:
+            for inp in inputs:
+                n_items = _read_cs(f)
+                witness: list[bytes] = []
+                for _ in range(n_items):
+                    item_len = _read_cs(f)
+                    witness.append(f.read(item_len))
+                inp.witness = witness if witness else None
+
+        locktime = _struct.unpack("<I", f.read(4))[0]
+        tx_end = f.tell()
+
+        # txid = SHA256D of the *stripped* (non-witness) serialization.
+        if has_witness:
+            stripped = bytearray()
+            stripped += version.to_bytes(4, "little", signed=True)
+            # Encode input count
+            n = len(inputs)
+            if n < 0xfd:
+                stripped += bytes([n])
+            elif n <= 0xffff:
+                stripped += b"\xfd" + n.to_bytes(2, "little")
+            else:
+                stripped += b"\xfe" + n.to_bytes(4, "little")
+            for inp in inputs:
+                stripped += inp.prev_txid
+                stripped += inp.prev_vout.to_bytes(4, "little")
+                sl = len(inp.script_sig)
+                if sl < 0xfd:
+                    stripped += bytes([sl])
+                elif sl <= 0xffff:
+                    stripped += b"\xfd" + sl.to_bytes(2, "little")
+                else:
+                    stripped += b"\xfe" + sl.to_bytes(4, "little")
+                stripped += inp.script_sig
+                stripped += inp.sequence.to_bytes(4, "little")
+            n = len(outputs)
+            if n < 0xfd:
+                stripped += bytes([n])
+            elif n <= 0xffff:
+                stripped += b"\xfd" + n.to_bytes(2, "little")
+            else:
+                stripped += b"\xfe" + n.to_bytes(4, "little")
+            for out in outputs:
+                stripped += out.value.to_bytes(8, "little", signed=True)
+                sl = len(out.script_pubkey)
+                if sl < 0xfd:
+                    stripped += bytes([sl])
+                elif sl <= 0xffff:
+                    stripped += b"\xfd" + sl.to_bytes(2, "little")
+                else:
+                    stripped += b"\xfe" + sl.to_bytes(4, "little")
+                stripped += out.script_pubkey
+            stripped += locktime.to_bytes(4, "little")
+            txid = _hashlib.sha256(_hashlib.sha256(bytes(stripped)).digest()).digest()
+        else:
+            tx_bytes = raw[tx_start:tx_end]
+            txid = _hashlib.sha256(_hashlib.sha256(tx_bytes).digest()).digest()
+
+        txs.append(_Tx(
+            txid=txid,
+            version=version,
+            locktime=locktime,
+            inputs=inputs,
+            outputs=outputs,
+            has_witness=has_witness,
+        ))
+
+    return txs
+
+
 class RPCServer:
     """Bitcoin JSON-RPC server"""
 
@@ -1480,8 +1625,17 @@ class RPCServer:
         if not block:
             raise HTTPException(status_code=404, detail="Block not found")
 
+        # Fetch raw block bytes (witness-preserving) once; used for verbosity=0
+        # hex, verbosity>=1 block-level size/weight, and verbosity>=2 per-tx hex.
+        raw_block_bytes: bytes | None = await asyncio.to_thread(
+            self.node.db.get_block_bytes, block_hash
+        )
+
         if verbosity == 0:
-            # Return serialized block (hex)
+            # Return serialized block (hex) — use raw bytes if available so
+            # witness data is preserved; fall back to stripped serialization.
+            if raw_block_bytes is not None:
+                return raw_block_bytes.hex()
             try:
                 return block.serialize().hex()
             except Exception:
@@ -1513,19 +1667,22 @@ class RPCServer:
         # block.serialize() uses stripped tx serialization (no witness).
         strippedsize = len(block.serialize())
 
-        if hasattr(block, 'transactions') and block.transactions:
-            # Compute total (with-witness) block size:
-            # header(80) + varint(tx_count) + sum of per-tx total sizes.
+        # size = full block size including witness data.
+        # If raw bytes are available (they include header + witness-serialised txs)
+        # use len(raw_block_bytes) directly — that is the true on-wire size.
+        # Fall back to strippedsize when raw bytes aren't available.
+        if raw_block_bytes is not None:
+            size = len(raw_block_bytes)
+        elif hasattr(block, 'transactions') and block.transactions:
             from ouroboros.p2p_messages import encode_varint
             hdr_varint = 80 + len(encode_varint(len(block.transactions)))
             total_tx_size = sum(
                 len(tx.serialize_with_witness()) for tx in block.transactions
             )
             size = hdr_varint + total_tx_size
-            weight = strippedsize * 3 + size
         else:
             size = strippedsize
-            weight = size * 4
+        weight = strippedsize * 3 + size
 
         # Calculate target from bits
         bits = block.bits
@@ -1556,7 +1713,7 @@ class RPCServer:
             "nonce": block.nonce,
             "bits": f"{block.bits:08x}",
             "target": target_hex,
-            "difficulty": self.node.get_difficulty(block.bits),
+            "difficulty": (lambda d: _CoreFloat(d) if isinstance(d, float) else d)(self.node.get_difficulty(block.bits)),
             "chainwork": self.node.get_chainwork_at_height(block_height) if block_height is not None else "0" * 64,
             "nTx": n_tx,
         }
@@ -1571,9 +1728,20 @@ class RPCServer:
             if next_hash:
                 result["nextblockhash"] = next_hash
 
-        # Build coinbase_tx from first transaction's first input (Core 27+ field)
+        # Build coinbase_tx from first transaction's first input (Core 27+ field).
+        # Use witness_txs[0] if already parsed (verbosity >= 2 path), else parse
+        # raw bytes now so we can include the coinbase witness nonce.
         if hasattr(block, 'transactions') and block.transactions:
-            cb = block.transactions[0]
+            # Try to get coinbase from witness-preserving parse.
+            _cb_witness_tx = None
+            if raw_block_bytes is not None:
+                try:
+                    _parsed = _parse_block_txs(raw_block_bytes)
+                    if _parsed:
+                        _cb_witness_tx = _parsed[0]
+                except Exception:
+                    pass
+            cb = _cb_witness_tx if _cb_witness_tx is not None else block.transactions[0]
             cb_inp = cb.inputs[0] if cb.inputs else None
             cb_script = cb_inp.script_sig if cb_inp else b''
             cb_script_hex = cb_script.hex() if isinstance(cb_script, bytes) else str(cb_script)
@@ -1599,43 +1767,96 @@ class RPCServer:
                 for tx in block.transactions
             ] if hasattr(block, 'transactions') and block.transactions else []
         elif verbosity >= 2:
-            # Full transaction details
-            if hasattr(block, 'transactions') and block.transactions:
-                tx_list = []
-                for tx in block.transactions:
-                    tx_dict = self._tx_to_dict(tx)
+            # Full transaction details — Core-byte-identity (W59).
+            #
+            # The Rust PyTxIn does not expose witness data, so the Block
+            # object produced by _py_block_to_block has has_witness=False on
+            # every Transaction and no TxIn.witness items.  That causes five
+            # cascading divergences vs Bitcoin Core 31.99:
+            #   1. hash field = txid instead of wtxid for SegWit txs
+            #   2. size = stripped size instead of full witness size
+            #   3. vsize/weight computed from stripped size
+            #   4. vin missing txinwitness items
+            #   5. coinbase vin using scriptSig/txid/vout instead of coinbase/sequence
+            # Additionally, hex is missing and scriptPubKey lacks address+desc.
+            #
+            # Fix: parse the raw block bytes (which preserve witness data) using
+            # psbt._deserialize_tx_full for each transaction, then emit via
+            # psbt._tx_to_univ (which uses the correct coinbase/scriptSig vin
+            # format, emits txinwitness, and uses _build_spk_json for
+            # address+desc).  Append the per-tx `hex` field (witness-serialized
+            # raw bytes in hex) as required by Core verbosity=2.
+            #
+            # Reference: bitcoin-core/src/rpc/blockchain.cpp::blockToJSON,
+            #            bitcoin-core/src/core_io.cpp::TxToUniv.
+            from ouroboros.psbt import _tx_to_univ as _psbt_tx_to_univ
+            from ouroboros.psbt import _deserialize_tx_full
 
-                    # Calculate fee for non-coinbase transactions
+            network = getattr(self.node, "network", "mainnet")
+
+            # Parse transactions from raw bytes to preserve witness data.
+            # Fall back gracefully to the stripped Block if raw bytes unavailable.
+            witness_txs: list | None = None
+            if raw_block_bytes is not None:
+                try:
+                    witness_txs = _parse_block_txs(raw_block_bytes)
+                except Exception:
+                    witness_txs = None
+
+            if hasattr(block, 'transactions') and block.transactions:
+                # Use witness-preserving txs if available, else stripped fallback.
+                txs_for_encoding = (
+                    witness_txs
+                    if witness_txs is not None and len(witness_txs) == len(block.transactions)
+                    else block.transactions
+                )
+
+                tx_list = []
+                for i, tx in enumerate(txs_for_encoding):
+                    tx_dict = _psbt_tx_to_univ(tx, network)
+
+                    # Add hex field (witness-serialized bytes in hex).
+                    # Core's TxToUniv include_hex=True path (core_io.cpp:490).
+                    tx_dict["hex"] = tx.serialize_with_witness().hex()
+
+                    # Fee for non-coinbase transactions.
+                    # Use get_utxo_or_spent so that historical blocks whose
+                    # inputs have already been spent (removed from the live UTXO
+                    # set) can still yield fee data from SPENT_CF undo records.
                     if not tx.is_coinbase:
-                        fee = 0
                         input_total = 0
                         for tx_in in tx.inputs:
-                            utxo = await asyncio.to_thread(self.node.db.get_utxo, tx_in.prev_txid, tx_in.prev_vout)
+                            utxo = await asyncio.to_thread(
+                                self.node.db.get_utxo_or_spent,
+                                tx_in.prev_txid, tx_in.prev_vout
+                            )
                             if utxo:
                                 input_total += utxo['value']
                         output_total = sum(o.value for o in tx.outputs)
-                        fee = max(0, input_total - output_total)
-                        tx_dict["fee"] = fee / 1e8  # BTC
+                        fee_sats = max(0, input_total - output_total)
+                        if fee_sats > 0:
+                            # Use BTCAmount to match Core's ValueFromAmount
+                            # fixed-decimal format: %d.%08d (e.g. 0.00003700
+                            # not 0.000037). BTCAmount is serialized by
+                            # _BTCEncoder via _BTCJsonResponse.
+                            from ouroboros.psbt import BTCAmount as _BTCAmount
+                            tx_dict["fee"] = _BTCAmount(fee_sats)
 
                     if verbosity >= 3:
-                        # Include prevout information for each input
+                        # Include prevout information for each input (verbosity=3).
                         vin_with_prevout = []
-                        for i, tx_in in enumerate(tx.inputs):
-                            vin_dict = self._vin_to_dict(tx_in, i, tx)
+                        for j, tx_in in enumerate(tx.inputs):
+                            vin_dict = tx_dict["vin"][j] if j < len(tx_dict["vin"]) else {}
 
                             if not tx.is_coinbase:
-                                # Add prevout info
                                 utxo = await asyncio.to_thread(self.node.db.get_utxo, tx_in.prev_txid, tx_in.prev_vout)
                                 if utxo:
+                                    from ouroboros.psbt import _build_spk_json
                                     vin_dict["prevout"] = {
-                                        "generated": False,  # TODO: check if coinbase output
+                                        "generated": False,
                                         "height": utxo.get('height', 0),
                                         "value": utxo['value'] / 1e8,
-                                        "scriptPubKey": {
-                                            "asm": disassemble_script(utxo['script_pubkey']),
-                                            "hex": utxo['script_pubkey'].hex() if isinstance(utxo['script_pubkey'], bytes) else str(utxo['script_pubkey']),
-                                            "type": self._get_script_type(utxo['script_pubkey']),
-                                        }
+                                        "scriptPubKey": _build_spk_json(utxo['script_pubkey'], network),
                                     }
                             vin_with_prevout.append(vin_dict)
 
