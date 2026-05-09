@@ -210,6 +210,100 @@ def _spk_asm(script: bytes) -> str:
     return " ".join(out)
 
 
+_SIGHASH_DECODE_MAP: dict[int, str] = {
+    0x01: "ALL",
+    0x02: "NONE",
+    0x03: "SINGLE",
+    0x81: "ALL|ANYONECANPAY",
+    0x82: "NONE|ANYONECANPAY",
+    0x83: "SINGLE|ANYONECANPAY",
+}
+
+
+def _script_asm_sighash(script: bytes) -> str:
+    """Disassemble a scriptSig with sighash-type decode annotations.
+
+    Mirrors Bitcoin Core's ``ScriptToAsmStr(script, fAttemptSighashDecode=true)``
+    (core_io.cpp:357).  Like ``_spk_asm`` but also appends ``[<SIGHASH>]``
+    to any pushed data whose last byte is a recognized sighash type (same
+    table as SighashToStr — see mapSigHashTypes in core_io.cpp:334).
+
+    Used for ``final_scriptSig.asm`` in decodepsbt (rawtransaction.cpp:1201).
+    """
+    if not script:
+        return ""
+
+    parts: list[str] = []
+    i = 0
+    n = len(script)
+
+    while i < n:
+        op = script[i]; i += 1
+
+        # ── OP_0 → "0" ──────────────────────────────────────────────────
+        if op == 0x00:
+            parts.append("0")
+            continue
+
+        # ── Small-number opcodes ─────────────────────────────────────────
+        if op == 0x4f:  # OP_1NEGATE
+            parts.append("-1")
+            continue
+        if 0x51 <= op <= 0x60:  # OP_1 … OP_16
+            parts.append(str(op - 0x50))
+            continue
+
+        # ── Data push opcodes 0x01–0x4e ──────────────────────────────────
+        data: bytes | None = None
+        if 0x01 <= op <= 0x4b:
+            size = op
+            if i + size > n:
+                break
+            data = script[i:i + size]; i += size
+        elif op == 0x4c:  # PUSHDATA1
+            if i >= n:
+                break
+            size = script[i]; i += 1
+            if i + size > n:
+                break
+            data = script[i:i + size]; i += size
+        elif op == 0x4d:  # PUSHDATA2
+            if i + 2 > n:
+                break
+            size = int.from_bytes(script[i:i + 2], "little"); i += 2
+            if i + size > n:
+                break
+            data = script[i:i + size]; i += size
+        elif op == 0x4e:  # PUSHDATA4
+            if i + 4 > n:
+                break
+            size = int.from_bytes(script[i:i + 4], "little"); i += 4
+            if i + size > n:
+                break
+            data = script[i:i + size]; i += size
+
+        if data is not None:
+            # Attempt sighash decode: if data looks like a DER signature
+            # (starts with 0x30, length > 4) and the last byte is a known
+            # sighash type, strip the last byte and annotate with [TYPE].
+            # Mirrors Core's ScriptToAsmStr fAttemptSighashDecode path
+            # (core_io.cpp:376-390): CheckSignatureEncoding + vch.pop_back().
+            sighash_suffix = ""
+            display_data = data
+            if (len(data) > 4 and data[0] == 0x30
+                    and data[-1] in _SIGHASH_DECODE_MAP):
+                sighash_suffix = "[" + _SIGHASH_DECODE_MAP[data[-1]] + "]"
+                display_data = data[:-1]  # strip sighash byte before hex
+            parts.append(display_data.hex() + sighash_suffix)
+            continue
+
+        # ── All other opcodes ─────────────────────────────────────────────
+        from ouroboros.script import _get_opcode_name
+        parts.append(_get_opcode_name(op))
+
+    return " ".join(parts)
+
+
 def _infer_descriptor(script: bytes, address: str | None) -> str:
     """Build a BIP-380 descriptor string for a scriptPubKey, mirroring
     Bitcoin Core's no-provider ``InferDescriptor`` fallback path
@@ -524,6 +618,158 @@ def _deserialize_tx(raw: bytes) -> Transaction:
         txid=txid, version=version, locktime=locktime,
         inputs=inputs, outputs=outputs
     )
+
+
+def _deserialize_tx_full(raw: bytes) -> Transaction:
+    """Deserialize a transaction from the full Bitcoin wire format, including
+    optional SegWit marker+flag and witness data.
+
+    Used by the W53 ``non_witness_utxo`` TxToUniv builder: the PSBT
+    NON_WITNESS_UTXO field stores the *full* serialization of the previous
+    transaction (witness data included when the prev-tx is SegWit).
+
+    Returns a Transaction with ``has_witness=True`` and ``TxIn.witness``
+    populated when the marker bytes ``0x00 0x01`` are present.
+    """
+    f = io.BytesIO(raw)
+    version = struct.unpack("<i", f.read(4))[0]
+
+    # Peek at the next byte.  SegWit transactions start with marker=0x00.
+    peek = f.read(1)
+    has_witness = False
+    if peek == b"\x00":
+        # Consume the flag byte (must be 0x01 per BIP 141).
+        flag = f.read(1)
+        has_witness = (flag == b"\x01")
+    else:
+        # Non-SegWit: back up one byte.
+        f.seek(-1, io.SEEK_CUR)
+
+    n_in = _read_compact_size(f)
+    inputs: list[TxIn] = []
+    for _ in range(n_in):
+        prev_txid = f.read(32)
+        prev_vout = struct.unpack("<I", f.read(4))[0]
+        script_len = _read_compact_size(f)
+        script_sig = f.read(script_len)
+        sequence = struct.unpack("<I", f.read(4))[0]
+        inputs.append(TxIn(prev_txid, prev_vout, script_sig, sequence))
+
+    n_out = _read_compact_size(f)
+    outputs: list[TxOut] = []
+    for _ in range(n_out):
+        value = struct.unpack("<q", f.read(8))[0]
+        spk_len = _read_compact_size(f)
+        script_pubkey = f.read(spk_len)
+        outputs.append(TxOut(value, script_pubkey))
+
+    # Witness stacks (one per input, even if empty).
+    if has_witness:
+        for inp in inputs:
+            n_items = _read_compact_size(f)
+            witness: list[bytes] = []
+            for _ in range(n_items):
+                item_len = _read_compact_size(f)
+                witness.append(f.read(item_len))
+            inp.witness = witness if witness else None
+
+    locktime = struct.unpack("<I", f.read(4))[0]
+
+    # txid = SHA256D of the *stripped* (non-witness) serialization.
+    # wtxid = SHA256D of the full witness serialization.
+    if has_witness:
+        # Re-serialize without witness to compute txid.
+        stripped = bytearray()
+        stripped += version.to_bytes(4, "little", signed=True)
+        stripped += _write_compact_size(len(inputs))
+        for inp in inputs:
+            stripped += inp.prev_txid
+            stripped += inp.prev_vout.to_bytes(4, "little")
+            stripped += _write_compact_size(len(inp.script_sig))
+            stripped += inp.script_sig
+            stripped += inp.sequence.to_bytes(4, "little")
+        stripped += _write_compact_size(len(outputs))
+        for out in outputs:
+            stripped += out.value.to_bytes(8, "little", signed=True)
+            stripped += _write_compact_size(len(out.script_pubkey))
+            stripped += out.script_pubkey
+        stripped += locktime.to_bytes(4, "little")
+        txid = hashlib.sha256(hashlib.sha256(bytes(stripped)).digest()).digest()
+    else:
+        txid = hashlib.sha256(hashlib.sha256(raw).digest()).digest()
+
+    return Transaction(
+        txid=txid, version=version, locktime=locktime,
+        inputs=inputs, outputs=outputs, has_witness=has_witness,
+    )
+
+
+def _tx_to_univ(tx: Transaction, network: str) -> dict[str, Any]:
+    """Build a TxToUniv-style dict from a Transaction object.
+
+    Mirrors Bitcoin Core's ``TxToUniv`` (core_io.cpp) with
+    ``include_hex=False``.  Used by the W53 ``non_witness_utxo`` emitter
+    in ``PSBT.decode()``.
+
+    Fields emitted: ``txid``, ``hash``, ``version``, ``size``, ``vsize``,
+    ``weight``, ``locktime``, ``vin[]``, ``vout[]``.  No ``hex`` field
+    (Core omits it in decodepsbt's non_witness_utxo sub-object).
+    """
+    txid_hex = tx.txid[::-1].hex()
+
+    # hash (wtxid) — for SegWit txs this differs from txid.
+    if tx.has_witness:
+        wtxid = tx.get_wtxid()[::-1].hex()
+    else:
+        wtxid = txid_hex
+
+    # size = full wire-format size (with witness), matching Core's ComputeTotalSize().
+    tx_size = len(tx.serialize_with_witness())
+    tx_weight = tx.get_weight()
+    tx_vsize = tx.get_vsize()
+
+    vin_list = []
+    for inp in tx.inputs:
+        if inp.prev_txid == bytes(32) and inp.prev_vout == 0xFFFFFFFF:
+            # Coinbase
+            entry: dict[str, Any] = {
+                "coinbase": inp.script_sig.hex(),
+                "sequence": inp.sequence,
+            }
+        else:
+            entry = {
+                "txid": inp.prev_txid[::-1].hex(),
+                "vout": inp.prev_vout,
+                "scriptSig": {
+                    "asm": _script_asm_sighash(inp.script_sig) if inp.script_sig else "",
+                    "hex": inp.script_sig.hex() if inp.script_sig else "",
+                },
+            }
+            if inp.witness:
+                entry["txinwitness"] = [w.hex() for w in inp.witness]
+            entry["sequence"] = inp.sequence
+        vin_list.append(entry)
+
+    vout_list = [
+        {
+            "value": BTCAmount(out.value),
+            "n": i,
+            "scriptPubKey": _build_spk_json(out.script_pubkey, network),
+        }
+        for i, out in enumerate(tx.outputs)
+    ]
+
+    return {
+        "txid": txid_hex,
+        "hash": wtxid,
+        "version": tx.version,
+        "size": tx_size,
+        "vsize": tx_vsize,
+        "weight": tx_weight,
+        "locktime": tx.locktime,
+        "vin": vin_list,
+        "vout": vout_list,
+    }
 
 
 def _serialize_tx_with_witness(tx: Transaction) -> bytes:
@@ -1872,9 +2118,14 @@ class PSBT:
                 }
 
             if psbt_in.non_witness_utxo is not None:
-                info["non_witness_utxo"] = {
-                    "hex": psbt_in.non_witness_utxo.hex(),
-                }
+                try:
+                    _nwu_tx = _deserialize_tx_full(psbt_in.non_witness_utxo)
+                    info["non_witness_utxo"] = _tx_to_univ(_nwu_tx, network)
+                except Exception:
+                    # Fallback: raw hex (should not happen for valid PSBTs).
+                    info["non_witness_utxo"] = {
+                        "hex": psbt_in.non_witness_utxo.hex(),
+                    }
 
             if psbt_in.partial_sigs:
                 info["partial_signatures"] = {
@@ -1882,19 +2133,34 @@ class PSBT:
                 }
 
             if psbt_in.sighash_type is not None:
-                sighash_names = {
-                    1: "ALL", 2: "NONE", 3: "SINGLE",
-                    0x81: "ALL|ANYONECANPAY", 0x82: "NONE|ANYONECANPAY",
-                    0x83: "SINGLE|ANYONECANPAY", 0: "DEFAULT",
+                # Mirrors Core's SighashToStr (core_io.cpp:334-348).
+                # Unknown types emit empty string "".  0 ("DEFAULT") is
+                # NOT in Core's table — it emits "" for any type not listed.
+                _sighash_map = {
+                    0x01: "ALL",
+                    0x02: "NONE",
+                    0x03: "SINGLE",
+                    0x81: "ALL|ANYONECANPAY",
+                    0x82: "NONE|ANYONECANPAY",
+                    0x83: "SINGLE|ANYONECANPAY",
                 }
-                info["sighash"] = sighash_names.get(psbt_in.sighash_type, str(psbt_in.sighash_type))
-                info["sighash_type"] = psbt_in.sighash_type
+                info["sighash"] = _sighash_map.get(psbt_in.sighash_type, "")
 
             if psbt_in.redeem_script is not None:
-                info["redeem_script"] = {"hex": psbt_in.redeem_script.hex()}
+                # ScriptToUniv with include_address=False → {asm, hex, type}.
+                info["redeem_script"] = {
+                    "asm": _spk_asm(psbt_in.redeem_script),
+                    "hex": psbt_in.redeem_script.hex(),
+                    "type": _spk_type(psbt_in.redeem_script),
+                }
 
             if psbt_in.witness_script is not None:
-                info["witness_script"] = {"hex": psbt_in.witness_script.hex()}
+                # Same ScriptToUniv shape.
+                info["witness_script"] = {
+                    "asm": _spk_asm(psbt_in.witness_script),
+                    "hex": psbt_in.witness_script.hex(),
+                    "type": _spk_type(psbt_in.witness_script),
+                }
 
             if psbt_in.bip32_derivations:
                 info["bip32_derivs"] = [
@@ -1907,7 +2173,12 @@ class PSBT:
                 ]
 
             if psbt_in.final_script_sig is not None:
-                info["final_scriptSig"] = {"hex": psbt_in.final_script_sig.hex()}
+                # Core emits {asm, hex} with ScriptToAsmStr(fAttemptSighashDecode=true)
+                # which annotates DER signatures with [ALL]/[NONE]/[SINGLE] etc.
+                info["final_scriptSig"] = {
+                    "asm": _script_asm_sighash(psbt_in.final_script_sig),
+                    "hex": psbt_in.final_script_sig.hex(),
+                }
 
             if psbt_in.final_script_witness is not None:
                 info["final_scriptwitness"] = [item.hex() for item in psbt_in.final_script_witness]
@@ -1968,17 +2239,33 @@ class PSBT:
         return result
 
     def _compute_fee(self) -> int | None:
-        """Compute transaction fee from UTXO information."""
+        """Compute transaction fee from UTXO information.
+
+        W53: handles non_witness_utxo by deserializing the raw bytes and
+        looking up the prevout value from the unsigned tx's vin[i].prevout.n.
+        Mirrors Core's fee calculation in decodepsbt (rawtransaction.cpp:1147).
+        """
         if self.tx is None:
             return None
 
         total_in = 0
-        for psbt_in in self.inputs:
+        for i, psbt_in in enumerate(self.inputs):
             if psbt_in.witness_utxo is not None:
                 total_in += psbt_in.witness_utxo[0]
             elif psbt_in.non_witness_utxo is not None:
-                # Would need to parse the tx to get the value
-                return None
+                try:
+                    nwu_tx = _deserialize_tx_full(psbt_in.non_witness_utxo)
+                    # Prevout index comes from the unsigned tx's vin.
+                    if i < len(self.tx.inputs):
+                        prevout_idx = self.tx.inputs[i].prev_vout
+                        if prevout_idx < len(nwu_tx.outputs):
+                            total_in += nwu_tx.outputs[prevout_idx].value
+                        else:
+                            return None
+                    else:
+                        return None
+                except Exception:
+                    return None
             else:
                 return None
 
