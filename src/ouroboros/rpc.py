@@ -375,17 +375,36 @@ class JSONRPCResponse(BaseModel):
 # All other RPC responses are unaffected — _BTCEncoder falls through to the
 # standard encoder for every type except BTCAmount.
 
+class _CoreFloat:
+    """Sentinel for a float that must be serialized with ``%.16g`` precision.
+
+    Bitcoin Core's UniValue serializer uses ``std::setprecision(16) << val``
+    (equivalent to ``%.16g``) for double values.  Python's json module uses
+    ``repr(float)`` which emits 17 significant digits in some cases.  This
+    sentinel lets ``_BTCEncoder`` emit the correct 16-digit form.
+
+    Usage: wrap difficulty (and other Core double fields) in _CoreFloat(val)
+    before putting them in the result dict.
+    """
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+        self.text = f"{value:.16g}"
+
+
 class _BTCEncoder(json.JSONEncoder):
-    """JSON encoder that emits ``BTCAmount`` objects as raw decimal tokens.
+    """JSON encoder that emits ``BTCAmount`` and ``_CoreFloat`` as raw tokens.
 
     All other types are handled by the standard encoder, so this class is
     safe to use as a drop-in replacement for ``json.JSONEncoder``.
     """
 
     def iterencode(self, obj: Any, _one_shot: bool = False):  # type: ignore[override]
-        """Recursively walk ``obj`` and emit correct tokens for ``BTCAmount``."""
+        """Recursively walk ``obj`` and emit correct tokens for sentinels."""
         from ouroboros.psbt import BTCAmount  # lazy import to avoid circular
         if isinstance(obj, BTCAmount):
+            yield obj.text
+        elif isinstance(obj, _CoreFloat):
             yield obj.text
         elif isinstance(obj, dict):
             yield "{"
@@ -2444,8 +2463,8 @@ class RPCServer:
         try:
             # JSON-RPC convention: hashes are display-order (big-endian) hex.
             # Internal storage uses little-endian uint256 keying. Reverse the
-            # bytes so the lookup hits the BLOCKS_CF entry written by
-            # connect_block_from_bytes (which uses the internal byte order).
+            # bytes so the lookup hits the BLOCKS_CF / HEADERS_CF entry written
+            # by connect_block_from_bytes (which uses the internal byte order).
             # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
             block_hash = bytes.fromhex(blockhash)[::-1]
             if len(block_hash) != 32:
@@ -2455,20 +2474,75 @@ class RPCServer:
 
             block = await asyncio.to_thread(self.node.db.get_block, block_hash)
 
+            # ------------------------------------------------------------------
+            # HEADERS_CF fallback: when the full block body is absent (e.g.
+            # because an assumeutxo snapshot load gapped BLOCKS_CF for heights
+            # between genesis sync and the snapshot base), try the lightweight
+            # header-only store populated by connect_block_from_bytes and by
+            # the migration helper (populate_corpus_headers.py).
+            # ------------------------------------------------------------------
+            raw_header_bytes: bytes | None = None
+            raw_n_tx: int = 0
+            raw_chainwork: bytes | None = None  # 32 bytes BE chainwork if stored
+            raw_stored_height: int | None = None  # height stored in HEADERS_CF
+            raw_stored_mediantime: int | None = None  # mediantime stored in HEADERS_CF
+            raw_stored_nexthash: bytes | None = None  # nexthash in internal order
             if not block:
+                try:
+                    raw = await asyncio.to_thread(
+                        self.node.db._db.get_raw_header_with_chainwork, block_hash
+                    )
+                    if raw is not None:
+                        raw_header_bytes, raw_n_tx, raw_chainwork, raw_h, raw_mt, raw_nh = raw
+                        if isinstance(raw_header_bytes, (bytes, bytearray, memoryview)):
+                            raw_header_bytes = bytes(raw_header_bytes)
+                        if isinstance(raw_chainwork, (bytes, bytearray, memoryview)):
+                            raw_chainwork = bytes(raw_chainwork)
+                        if raw_h and raw_h > 0:
+                            raw_stored_height = int(raw_h)
+                        if raw_mt and raw_mt > 0:
+                            raw_stored_mediantime = int(raw_mt)
+                        if raw_nh and any(b != 0 for b in raw_nh):
+                            raw_stored_nexthash = bytes(raw_nh)
+                except Exception as _e:
+                    raw_header_bytes = None
+
+            if not block and raw_header_bytes is None:
                 raise HTTPException(status_code=404, detail="Block not found")
 
+            # Parse 80-byte wire-format header into field variables.
+            # Wire format: version(4B sLE) prev_hash(32B) merkle(32B) time(4B LE) bits(4B LE) nonce(4B LE)
+            import struct as _struct
+            if raw_header_bytes is not None and block is None:
+                # Header-only path: parse the 80-byte header.
+                h = raw_header_bytes
+                hdr_version  = _struct.unpack_from('<i', h, 0)[0]   # signed 32-bit
+                hdr_prev     = h[4:36]                                # internal byte order
+                hdr_merkle   = h[36:68]                               # internal byte order
+                hdr_time     = _struct.unpack_from('<I', h, 68)[0]
+                hdr_bits     = _struct.unpack_from('<I', h, 72)[0]
+                hdr_nonce    = _struct.unpack_from('<I', h, 76)[0]
+                hdr_n_tx     = raw_n_tx
+            else:
+                # Full-block path: extract fields from the PyBlock object.
+                hdr_version  = block.version
+                hdr_prev     = block.prev_blockhash if isinstance(block.prev_blockhash, bytes) else bytes(block.prev_blockhash)
+                hdr_merkle   = block.merkle_root    if isinstance(block.merkle_root, bytes) else bytes(block.merkle_root)
+                hdr_time     = block.timestamp
+                hdr_bits     = block.bits
+                hdr_nonce    = block.nonce
+                hdr_n_tx     = len(block.transactions) if hasattr(block, 'transactions') and block.transactions else 0
+                raw_header_bytes = (
+                    _struct.pack('<i', hdr_version) +
+                    hdr_prev + hdr_merkle +
+                    _struct.pack('<I', hdr_time) +
+                    _struct.pack('<I', hdr_bits) +
+                    _struct.pack('<I', hdr_nonce)
+                )
+
             if not verbose:
-                # Return hex-encoded header (80 bytes)
-                # Serialize block header
-                header_data = bytearray()
-                header_data.extend(block.version.to_bytes(4, 'little', signed=True))
-                header_data.extend(block.prev_blockhash[::-1])  # Reverse for wire format
-                header_data.extend(block.merkle_root[::-1])
-                header_data.extend(block.timestamp.to_bytes(4, 'little'))
-                header_data.extend(block.bits.to_bytes(4, 'little'))
-                header_data.extend(block.nonce.to_bytes(4, 'little'))
-                return header_data.hex()
+                # Return hex-encoded header (80 bytes).
+                return raw_header_bytes.hex()
 
             # Return verbose JSON.
             #
@@ -2482,19 +2556,36 @@ class RPCServer:
             # ``pblockindex->nHeight``.
             block_height = await asyncio.to_thread(self._get_block_height, self.node.db, block_hash)
 
+            # HEADERS_CF fallback height: for gap blocks not in BLOCK_INDEX_CF
+            # (absent after an assumeutxo snapshot load), use the height that
+            # was stored in the HEADERS_CF extended record by the migration.
+            if block_height is None and raw_stored_height is not None:
+                block_height = raw_stored_height
+
             # Get confirmations
             # -1 if block is not on the main chain
             confirmations = -1
             best_hash, best_height = self.node.db.get_best_block()
             if block_height is not None:
-                # Check if this block is on the active chain
+                # Check if this block is on the active chain.
+                # Primary path: BLOCK_INDEX_CF has the hash at this height.
+                # Fallback for gap blocks (not in BLOCK_INDEX_CF after a snapshot
+                # load): if the height came from the HEADERS_CF migration record
+                # (which was seeded from bitcoin-core, a fully-synced node), treat
+                # the block as on the main chain. The block WAS on Core's main
+                # chain at migration time, and we have no contradicting evidence.
                 active_hash = await asyncio.to_thread(self.node.db.get_block_hash_by_height, block_height)
                 if active_hash == block_hash:
                     confirmations = max(0, best_height - block_height + 1)
-                # else confirmations stays -1
+                elif active_hash is None and raw_stored_height is not None and raw_stored_height == block_height:
+                    # Gap block: height came from HEADERS_CF (Core-seeded), not BLOCK_INDEX_CF.
+                    # Trust it as on the main chain.
+                    confirmations = max(0, best_height - block_height + 1)
 
-            # Calculate target from bits
-            bits = block.bits
+            # Calculate target from bits.
+            # Reference: Bitcoin Core src/rpc/blockchain.cpp GetBlockProof() /
+            # blockheaderToJSON — DeriveTarget() applied to bits field.
+            bits = hdr_bits
             mantissa = bits & 0x007FFFFF
             exponent = (bits >> 24) & 0xFF
             if exponent <= 3:
@@ -2503,35 +2594,69 @@ class RPCServer:
                 target_int = mantissa << (8 * (exponent - 3))
             target_hex = f"{target_int:064x}"
 
-            # Number of transactions
-            n_tx = len(block.transactions) if hasattr(block, 'transactions') and block.transactions else 0
+            # Chainwork: prefer persisted value from BLOCK_INDEX_CF metadata.
+            # For gap blocks (absent from BLOCK_INDEX_CF after a snapshot load),
+            # fall back to the chainwork stored in HEADERS_CF by the migration.
+            chainwork_str: str = "0" * 64
+            if block_height is not None:
+                chainwork_str = self.node.get_chainwork_at_height(block_height)
+            if (chainwork_str == "0" * 64 and raw_chainwork is not None
+                    and any(b != 0 for b in raw_chainwork)):
+                chainwork_str = raw_chainwork.hex()
+
+            # Mediantime: prefer live computation from BLOCK_INDEX_CF metadata.
+            # For gap blocks, fall back to stored mediantime from HEADERS_CF.
+            mediantime_val: int = hdr_time  # last resort: use block's own timestamp
+            if block_height is not None:
+                computed_mt = self.node.get_median_time(block_height)
+                # get_median_time returns current time as fallback when no data found;
+                # only use it if it's in a plausible range (< current - 1 year).
+                import time as _time
+                if computed_mt < _time.time() - 86400:
+                    mediantime_val = computed_mt
+                elif raw_stored_mediantime:
+                    mediantime_val = raw_stored_mediantime
+            elif raw_stored_mediantime:
+                mediantime_val = raw_stored_mediantime
+
+            # Difficulty: use %.16g precision to match Bitcoin Core's UniValue
+            # serializer (std::setprecision(16) << val). For whole-number values
+            # (e.g. genesis difficulty=1), return int to avoid "1.0" vs "1".
+            _raw_diff = self.node.get_difficulty(hdr_bits)
+            difficulty_val: Any = _CoreFloat(_raw_diff) if isinstance(_raw_diff, float) else _raw_diff
 
             result: dict[str, Any] = {
                 "hash": blockhash,
                 "confirmations": confirmations,
                 "height": block_height if block_height is not None else 0,
-                "version": block.version,
-                "versionHex": f"{block.version:08x}",
-                "merkleroot": block.merkle_root[::-1].hex() if isinstance(block.merkle_root, bytes) else str(block.merkle_root),
-                "time": block.timestamp,
-                "mediantime": self.node.get_median_time(block_height) if block_height is not None else block.timestamp,
-                "nonce": block.nonce,
-                "bits": f"{block.bits:08x}",
+                "version": hdr_version,
+                "versionHex": f"{hdr_version & 0xFFFFFFFF:08x}",
+                "merkleroot": hdr_merkle[::-1].hex(),
+                "time": hdr_time,
+                "mediantime": mediantime_val,
+                "nonce": hdr_nonce,
+                "bits": f"{hdr_bits:08x}",
                 "target": target_hex,
-                "difficulty": self.node.get_difficulty(block.bits),
-                "chainwork": self.node.get_chainwork_at_height(block_height) if block_height is not None else "0" * 64,
-                "nTx": n_tx,
+                "difficulty": difficulty_val,
+                "chainwork": chainwork_str,
+                "nTx": hdr_n_tx,
             }
 
-            # Previous block hash (not present for genesis)
-            if block.prev_blockhash and block.prev_blockhash != bytes(32):
-                result["previousblockhash"] = block.prev_blockhash[::-1].hex()
+            # Previous block hash (not present for genesis — all-zero prev).
+            if hdr_prev and hdr_prev != bytes(32):
+                result["previousblockhash"] = hdr_prev[::-1].hex()
 
-            # Next block hash (not present for tip)
+            # Next block hash (not present for tip).
+            # Primary: BLOCK_INDEX_CF lookup at height+1.
+            # Fallback: nexthash stored in HEADERS_CF extended record.
             if block_height is not None:
                 next_hash = await self._get_next_block_hash(block_height)
                 if next_hash:
                     result["nextblockhash"] = next_hash
+                elif raw_stored_nexthash is not None:
+                    # Gap block: use the nexthash from HEADERS_CF (stored in
+                    # internal byte order → reverse for display).
+                    result["nextblockhash"] = raw_stored_nexthash[::-1].hex()
 
             return result
 
@@ -8581,8 +8706,11 @@ class RPCServer:
             next_hash = await asyncio.to_thread(self.node.db.get_block_hash_by_height, height + 1)
             if next_hash is None:
                 return None  # At tip, no next block
+            # get_block_hash_by_height returns internal byte order (little-endian);
+            # display format requires reversal to big-endian.
+            # Reference: Bitcoin Core src/rpc/blockchain.cpp blockheaderToJSON → hashNext.GetHex().
             if isinstance(next_hash, bytes):
-                return next_hash.hex()
+                return next_hash[::-1].hex()
             return str(next_hash)
         except Exception as e:
             logger.debug(f"Error getting next block hash for height {height}: {e}")
