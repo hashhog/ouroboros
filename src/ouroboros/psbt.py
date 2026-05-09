@@ -309,11 +309,20 @@ def _infer_descriptor(script: bytes, address: str | None) -> str:
     Bitcoin Core's no-provider ``InferDescriptor`` fallback path
     (script/descriptor.cpp:2897).
 
-    For address-encodable scripts: ``addr(<address>)#<checksum>``
+    For ``OP_1 <32-byte push>`` (witness_v1_taproot): ``rawtr(<x-only-hex>)#<csum>``
+    For other address-encodable scripts: ``addr(<address>)#<checksum>``
     Otherwise: ``raw(<hex>)#<checksum>``
+
+    CRITICAL: Core emits ``rawtr(...)`` for taproot SPKs even though the
+    address is still emitted in the sibling ``address`` field.  Using
+    ``addr(...)`` here diverges from Core's InferDescriptor.
     """
     from ouroboros.descriptors import add_checksum
-    if address is not None:
+    # witness_v1_taproot: OP_1 (0x51) + 0x20 + <32 bytes>
+    if len(script) == 34 and script[0] == 0x51 and script[1] == 0x20:
+        xonly_hex = script[2:].hex()
+        payload = f"rawtr({xonly_hex})"
+    elif address is not None:
         payload = f"addr({address})"
     else:
         payload = f"raw({script.hex()})"
@@ -841,11 +850,20 @@ class KeyOriginInfo:
         return cls(fingerprint=fingerprint, path=path)
 
     def to_string(self) -> str:
-        """Convert to human-readable path string."""
-        parts = [self.fingerprint.hex()]
+        """Convert to human-readable path string.
+
+        Matches Bitcoin Core's WriteHDKeypath format: ``m/86h/1h/0h/1/0``.
+        Empty path returns ``"m"``.
+        Hardened steps use ``h`` suffix (not ``'``) to match Core output.
+        The fingerprint is NOT included — callers emit it as a separate
+        ``master_fingerprint`` field (rawtransaction.cpp:1293,1412,1444).
+        """
+        if not self.path:
+            return "m"
+        parts = ["m"]
         for idx in self.path:
             if idx >= 0x80000000:
-                parts.append(f"{idx - 0x80000000}'")
+                parts.append(f"{idx - 0x80000000}h")
             else:
                 parts.append(str(idx))
         return "/".join(parts)
@@ -1128,6 +1146,10 @@ class PSBTOutput:
     tap_tree: list[tuple[int, int, bytes]] | None = None  # [(depth, leaf_ver, script), ...]
     tap_bip32_derivations: dict[bytes, tuple[list[bytes], KeyOriginInfo]] = field(default_factory=dict)
 
+    # MuSig2 fields (BIP-327, PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS 0x08)
+    # agg_pubkey -> [participant_pubkeys]
+    musig2_participants: dict[bytes, list[bytes]] = field(default_factory=dict)
+
     # Unknown fields
     unknown: dict[bytes, bytes] = field(default_factory=dict)
 
@@ -1209,6 +1231,12 @@ class PSBTOutput:
                 leaf_hashes = [f.read(32) for _ in range(n_hashes)]
                 origin = KeyOriginInfo.deserialize(f.read())
                 out.tap_bip32_derivations[key_data] = (leaf_hashes, origin)
+            elif kt == PSBTOutputType.MUSIG2_PARTICIPANT_PUBKEYS:
+                # BIP-327: key_data = 33-byte aggregate pubkey,
+                # value = concatenated 33-byte participant pubkeys.
+                agg = key_data  # 33 bytes
+                parts = [val[i:i+33] for i in range(0, len(val), 33) if len(val[i:i+33]) == 33]
+                out.musig2_participants[agg] = parts
             else:
                 out.unknown[key] = val
         return out
@@ -2183,15 +2211,56 @@ class PSBT:
             if psbt_in.final_script_witness is not None:
                 info["final_scriptwitness"] = [item.hex() for item in psbt_in.final_script_witness]
 
-            # Taproot fields
+            # BIP-371 Taproot input fields (rawtransaction.cpp:1249-1313)
+            # All fields are conditional: emit ONLY when the PSBT field is non-empty.
             if psbt_in.tap_key_sig is not None:
-                info["tap_key_sig"] = psbt_in.tap_key_sig.hex()
+                info["taproot_key_path_sig"] = psbt_in.tap_key_sig.hex()
+
+            if psbt_in.tap_script_sigs:
+                info["taproot_script_path_sigs"] = [
+                    {
+                        "pubkey": xonly.hex(),
+                        "leaf_hash": leaf_hash.hex(),
+                        "sig": sig.hex(),
+                    }
+                    for (xonly, leaf_hash), sig in psbt_in.tap_script_sigs.items()
+                ]
+
+            if psbt_in.tap_leaf_scripts:
+                # Core groups by (script, leaf_ver), collecting all control
+                # blocks that share that leaf.  Use an ordered dict to preserve
+                # insertion order (which is the PSBT wire order).
+                _leaf_map: dict[tuple[bytes, int], list[bytes]] = {}
+                for ctrl_block, (script, leaf_ver) in psbt_in.tap_leaf_scripts.items():
+                    key = (script, leaf_ver)
+                    if key not in _leaf_map:
+                        _leaf_map[key] = []
+                    _leaf_map[key].append(ctrl_block)
+                info["taproot_scripts"] = [
+                    {
+                        "script": script.hex(),
+                        "leaf_ver": leaf_ver,
+                        "control_blocks": [cb.hex() for cb in ctrl_blocks],
+                    }
+                    for (script, leaf_ver), ctrl_blocks in _leaf_map.items()
+                ]
+
+            if psbt_in.tap_bip32_derivations:
+                info["taproot_bip32_derivs"] = [
+                    {
+                        "pubkey": xonly.hex(),
+                        "master_fingerprint": origin.fingerprint.hex(),
+                        "path": origin.to_string(),
+                        "leaf_hashes": [lh.hex() for lh in leaf_hashes],
+                    }
+                    for xonly, (leaf_hashes, origin) in psbt_in.tap_bip32_derivations.items()
+                ]
 
             if psbt_in.tap_internal_key is not None:
-                info["tap_internal_key"] = psbt_in.tap_internal_key.hex()
+                info["taproot_internal_key"] = psbt_in.tap_internal_key.hex()
 
             if psbt_in.tap_merkle_root is not None:
-                info["tap_merkle_root"] = psbt_in.tap_merkle_root.hex()
+                info["taproot_merkle_root"] = psbt_in.tap_merkle_root.hex()
 
             result["inputs"].append(info)
 
@@ -2216,13 +2285,35 @@ class PSBT:
                     for pk, origin in psbt_out.bip32_derivations.items()
                 ]
 
+            # MuSig2 output fields (rawtransaction.cpp:1456-1473)
+            if psbt_out.musig2_participants:
+                info["musig2_participant_pubkeys"] = [
+                    {
+                        "aggregate_pubkey": agg.hex(),
+                        "participant_pubkeys": [p.hex() for p in parts],
+                    }
+                    for agg, parts in psbt_out.musig2_participants.items()
+                ]
+
+            # BIP-371 Taproot output fields (rawtransaction.cpp:1419-1453)
             if psbt_out.tap_internal_key is not None:
-                info["tap_internal_key"] = psbt_out.tap_internal_key.hex()
+                info["taproot_internal_key"] = psbt_out.tap_internal_key.hex()
 
             if psbt_out.tap_tree is not None:
-                info["tap_tree"] = [
+                info["taproot_tree"] = [
                     {"depth": d, "leaf_ver": lv, "script": s.hex()}
                     for d, lv, s in psbt_out.tap_tree
+                ]
+
+            if psbt_out.tap_bip32_derivations:
+                info["taproot_bip32_derivs"] = [
+                    {
+                        "pubkey": xonly.hex(),
+                        "master_fingerprint": origin.fingerprint.hex(),
+                        "path": origin.to_string(),
+                        "leaf_hashes": [lh.hex() for lh in leaf_hashes],
+                    }
+                    for xonly, (leaf_hashes, origin) in psbt_out.tap_bip32_derivations.items()
                 ]
 
             result["outputs"].append(info)
