@@ -361,6 +361,79 @@ class JSONRPCResponse(BaseModel):
     id: int | str | None = None
 
 
+# ---------------------------------------------------------------------------
+# W51 decodepsbt: Core-byte-identity JSON encoder
+# ---------------------------------------------------------------------------
+# Python's stdlib json serializes float(1.0) as "1.0", but Bitcoin Core's
+# ValueFromAmount (core_io.cpp) always emits "%d.%08d" (e.g. "1.00000000").
+# The psbt.BTCAmount sentinel class carries the correctly-formatted decimal
+# text.  _BTCEncoder intercepts BTCAmount objects during JSON serialization
+# and emits them as raw (unquoted) number tokens.
+#
+# _BTCJsonResponse is a JSONResponse subclass that uses _BTCEncoder so that
+# decodepsbt results round-trip through jq with the Core-exact decimal form.
+# All other RPC responses are unaffected — _BTCEncoder falls through to the
+# standard encoder for every type except BTCAmount.
+
+class _BTCEncoder(json.JSONEncoder):
+    """JSON encoder that emits ``BTCAmount`` objects as raw decimal tokens.
+
+    All other types are handled by the standard encoder, so this class is
+    safe to use as a drop-in replacement for ``json.JSONEncoder``.
+    """
+
+    def iterencode(self, obj: Any, _one_shot: bool = False):  # type: ignore[override]
+        """Recursively walk ``obj`` and emit correct tokens for ``BTCAmount``."""
+        from ouroboros.psbt import BTCAmount  # lazy import to avoid circular
+        if isinstance(obj, BTCAmount):
+            yield obj.text
+        elif isinstance(obj, dict):
+            yield "{"
+            first = True
+            for k, v in obj.items():
+                if not first:
+                    yield ","
+                first = False
+                yield json.dumps(k, ensure_ascii=False)
+                yield ":"
+                yield from self.iterencode(v)
+            yield "}"
+        elif isinstance(obj, list):
+            yield "["
+            first = True
+            for item in obj:
+                if not first:
+                    yield ","
+                first = False
+                yield from self.iterencode(item)
+            yield "]"
+        elif obj is None:
+            yield "null"
+        elif isinstance(obj, bool):
+            yield "true" if obj else "false"
+        elif isinstance(obj, int):
+            yield str(obj)
+        elif isinstance(obj, float):
+            # Preserve standard float repr (non-BTC floats in RPC responses).
+            yield repr(obj)
+        elif isinstance(obj, str):
+            yield json.dumps(obj, ensure_ascii=False)
+        else:
+            # Fall back to stdlib for any other type (Decimal, custom models…)
+            yield from super().iterencode(obj, _one_shot)
+
+
+class _BTCJsonResponse(JSONResponse):
+    """JSONResponse that uses ``_BTCEncoder`` for serialization.
+
+    Used only for ``decodepsbt`` so that ``BTCAmount`` values are emitted
+    as raw decimal number tokens instead of Python's ``1.0``.
+    """
+
+    def render(self, content: Any) -> bytes:
+        return "".join(_BTCEncoder().iterencode(content)).encode("utf-8")
+
+
 
 # ---------------------------------------------------------------------------
 # Partial Merkle tree helpers (CMerkleBlock serialization / deserialization)
@@ -826,12 +899,12 @@ class RPCServer:
                             responses.append(response)
 
                 # Return array of responses
-                return JSONResponse(content=responses)
+                return _BTCJsonResponse(content=responses)
 
             # Handle single request (object)
             elif isinstance(request_data, dict):
                 response = await self._execute_single_rpc(request_data, wallet_name)
-                return JSONResponse(content=response)
+                return _BTCJsonResponse(content=response)
 
             # Invalid request type
             else:
@@ -3097,6 +3170,13 @@ class RPCServer:
     async def rpc_decodepsbt(self, psbt_base64: str) -> dict[str, Any]:
         """
         Decode a base64-encoded PSBT into a human-readable dict.
+
+        W51: output is byte-identical to Bitcoin Core 31.99 for the two
+        empty-aux corpus entries (valid-1in-2out-no-aux,
+        creator-result-2in-2out-empty).  Amount fields use ``BTCAmount``
+        so they serialise as Core's fixed ``%d.%08d`` form (``1.00000000``
+        not ``1.0``); ``_BTCJsonResponse`` in the outer RPC dispatch emits
+        them as raw numeric tokens.
         """
         import base64 as b64
 
@@ -3116,7 +3196,8 @@ class RPCServer:
                 error={"code": -22, "message": f"TX decode failed: {exc}"},
                 id=None,
             )
-        return psbt.decode()
+        network = getattr(self.node, "network", "mainnet")
+        return psbt.decode(network=network)
 
     async def rpc_combinepsbt(self, psbts: list[str]) -> str:
         """
