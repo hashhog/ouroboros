@@ -691,6 +691,55 @@ def is_pay_to_anchor_program(version: int, program: bytes) -> bool:
     )
 
 
+def _is_push_only_from(script: bytes, start: int) -> bool:
+    """Return True iff every opcode from `start` is a valid push op.
+
+    Mirrors Bitcoin Core's CScript::IsPushOnly / GetScriptOp semantics:
+    returns False if a push opcode's data length extends past end-of-script,
+    or if a non-push opcode (>= OP_16+1 == 0x61) is encountered.
+
+    Reference: Bitcoin Core script/script.h CScript::IsPushOnly (line ~436),
+    script/solver.cpp Solver() nulldata branch (line ~185).
+    """
+    i = start
+    n = len(script)
+    while i < n:
+        op = script[i]
+        i += 1
+        # Non-push opcode (OP_16 is 0x60, everything above is non-push)
+        if op > 0x60:
+            return False
+        # Inline data push: 0x01–0x4b bytes of data follow
+        if 0x01 <= op <= 0x4b:
+            i += op
+            if i > n:
+                return False
+        elif op == 0x4c:  # OP_PUSHDATA1: next byte is length
+            if i >= n:
+                return False
+            length = script[i]
+            i += 1 + length
+            if i > n:
+                return False
+        elif op == 0x4d:  # OP_PUSHDATA2: next 2 bytes are length (LE)
+            if i + 2 > n:
+                return False
+            length = script[i] | (script[i + 1] << 8)
+            i += 2 + length
+            if i > n:
+                return False
+        elif op == 0x4e:  # OP_PUSHDATA4: next 4 bytes are length (LE)
+            if i + 4 > n:
+                return False
+            length = (script[i] | (script[i + 1] << 8) |
+                      (script[i + 2] << 16) | (script[i + 3] << 24))
+            i += 4 + length
+            if i > n:
+                return False
+        # else: OP_0 (0x00) or OP_1–OP_16 (0x51–0x60) — no data, OK
+    return True
+
+
 def _is_standard_output_type(script_pubkey: bytes) -> bool:
     """Check if a scriptPubKey is a standard output type.
 
@@ -701,7 +750,7 @@ def _is_standard_output_type(script_pubkey: bytes) -> bool:
     - P2WSH: OP_0 <32 bytes> (34 bytes)
     - P2TR: OP_1 <32 bytes> (34 bytes)
     - P2A: OP_1 <2 bytes> (4 bytes)
-    - OP_RETURN: OP_RETURN ... (any length)
+    - OP_RETURN: OP_RETURN ... (any length) — only if tail is push-only
     - Bare multisig (rare but standard)
 
     Reference: Bitcoin Core script/solver.cpp Solver()
@@ -709,9 +758,13 @@ def _is_standard_output_type(script_pubkey: bytes) -> bool:
     if not script_pubkey:
         return False
 
-    # OP_RETURN is standard (unspendable)
+    # OP_RETURN is standard (nulldata) — but only if the tail bytes are all
+    # valid push opcodes. A truncated push (e.g. 6a 09 dead beef — PUSH9 with
+    # only 4 data bytes) makes this nonstandard.
+    # Reference: Bitcoin Core script/solver.cpp Solver() ~line 185:
+    #   if (IsPushOnly(script.begin()+1, script.end())) return TX_NULL_DATA;
     if script_pubkey[0] == 0x6a:
-        return True
+        return _is_push_only_from(script_pubkey, 1)
 
     # P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
     if (len(script_pubkey) == 25 and script_pubkey[0] == 0x76 and
@@ -856,6 +909,14 @@ def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
 
     if tx_size < MIN_STANDARD_TX_NONWITNESS_SIZE:
         return False, f"Transaction too small: {tx_size} < {MIN_STANDARD_TX_NONWITNESS_SIZE}"
+
+    # Check that every output has a standard script type.
+    # Reference: Bitcoin Core policy/policy.cpp IsStandardTx() — iterates
+    # outputs and calls IsStandard(txout.scriptPubKey, ...) for each one.
+    # Non-standard types (e.g. OP_RETURN with truncated push) are rejected.
+    for idx, out in enumerate(tx.outputs):
+        if not _is_standard_output_type(out.script_pubkey):
+            return False, f"Output {idx} has non-standard script type"
 
     # Check for dust outputs — v3 transactions use ephemeral dust rules
     # instead of the normal dust rejection (checked later in package
