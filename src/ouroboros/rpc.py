@@ -9927,106 +9927,269 @@ class RPCServer:
         """
         Decode a hex-encoded script.
 
-        Reference: Bitcoin Core rpc/rawtransaction.cpp decodescript
+        Reference: Bitcoin Core rpc/rawtransaction.cpp decodescript (line 450).
 
-        Args:
-            hexstring: The hex-encoded script
-
-        Returns:
-            JSON object with: asm, type, p2sh (if applicable), segwit info
+        Shape: {asm, desc, type, address?, p2sh?, segwit?}
+        Top-level has NO hex field (Core's ScriptToUniv include_hex=false).
+        p2sh emitted when can_wrap=true (Core lines 529-530).
+        segwit emitted when can_wrap AND can_wrap_P2WSH (Core lines 561-576).
+        segwit inner shape: {asm, desc, hex, type, address?, p2sh-segwit}
+          (Core's ScriptToUniv include_hex=true on the inner script).
         """
+        import hashlib
+        import base58
+        import bech32 as _bech32_mod
+        from ouroboros.psbt import (
+            _build_spk_json,
+            _spk_type,
+            _spk_to_address,
+            _spk_asm,
+            _infer_descriptor,
+        )
+        from ouroboros.descriptors import add_checksum
+
         try:
             script_bytes = bytes.fromhex(hexstring)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid hex string: {e}") from None
 
-        # Disassemble script to human-readable ASM
-        asm = disassemble_script(script_bytes)
+        network = getattr(self.node, "network", "mainnet")
+        is_mainnet = (network == "mainnet")
+        is_regtest = (network in ("regtest", "signet"))
+        p2sh_ver = b"\x05" if is_mainnet else b"\xc4"
+        bech32_hrp = "bc" if is_mainnet else ("bcrt" if is_regtest else "tb")
 
-        # Classify script type
-        script_type = self._classify_script(script_bytes)
+        def _is_push_only(script: bytes, start: int = 0) -> bool:
+            """Return True iff every opcode from `start` is a valid push op.
 
+            Mirrors Bitcoin Core's CScript::IsPushOnly / GetScriptOp semantics:
+            returns False if a push opcode's length extends past end-of-script.
+            """
+            i = start
+            n = len(script)
+            while i < n:
+                op = script[i]; i += 1
+                if op > 0x60:  # above OP_16 — not a push opcode
+                    return False
+                # Data pushes 0x01–0x4b
+                if 0x01 <= op <= 0x4b:
+                    i += op
+                    if i > n:
+                        return False
+                elif op == 0x4c:  # PUSHDATA1
+                    if i >= n:
+                        return False
+                    i += 1 + script[i]
+                    if i > n:
+                        return False
+                elif op == 0x4d:  # PUSHDATA2
+                    if i + 2 > n:
+                        return False
+                    size = int.from_bytes(script[i:i+2], "little"); i += 2 + size
+                    if i > n:
+                        return False
+                elif op == 0x4e:  # PUSHDATA4
+                    if i + 4 > n:
+                        return False
+                    size = int.from_bytes(script[i:i+4], "little"); i += 4 + size
+                    if i > n:
+                        return False
+                # OP_0 (0x00), OP_1NEGATE (0x4f), OP_1–OP_16 (0x51–0x60) → valid push
+            return True
+
+        # Build base object via shared helper: {asm, desc, hex, type, address?}
+        spk_json = _build_spk_json(script_bytes, network)
+        script_type = spk_json["type"]
+
+        # Core's Solver() classifies OP_RETURN as NULL_DATA only when the
+        # bytes after OP_RETURN are all valid push ops (IsPushOnly check).
+        # If the tail is malformed (truncated push), Solver returns NONSTANDARD.
+        # Mirror that: reclassify "nulldata" → "nonstandard" if not push-only.
+        if script_type == "nulldata" and not _is_push_only(script_bytes, start=1):
+            script_type = "nonstandard"
+
+        # Top-level result: NO hex field (Core decodescript omits it)
         result: dict[str, Any] = {
-            "asm": asm,
+            "asm": spk_json["asm"],
+            "desc": spk_json["desc"],
             "type": script_type,
-            "hex": hexstring,
+        }
+        if "address" in spk_json:
+            result["address"] = spk_json["address"]
+
+        # ── Core's can_wrap gate ─────────────────────────────────────────────
+        # Types that CAN be wrapped: pubkey, pubkeyhash, multisig, nonstandard,
+        # witness_v0_keyhash, witness_v0_scripthash.
+        # Types that cannot: nulldata, scripthash, witness_v1_taproot,
+        # witness_unknown, anchor.
+        # Also fails if: IsUnspendable (starts with OP_RETURN 0x6a or OP_0 with
+        # zero payload), invalid ops, or contains OP_CHECKSIGADD (0xba) /
+        # OP_SUCCESS opcodes.
+        _CAN_WRAP_TYPES = {
+            "pubkey", "pubkeyhash", "multisig", "nonstandard",
+            "witness_v0_keyhash", "witness_v0_scripthash",
         }
 
-        # For P2PK, extract pubkey
-        if script_type == "pubkey":
-            # Format: <pubkey> OP_CHECKSIG
-            if len(script_bytes) >= 35 and script_bytes[-1] == 0xac:
-                pubkey_len = script_bytes[0]
-                if pubkey_len in (33, 65) and len(script_bytes) == pubkey_len + 2:
-                    result["pubkey"] = script_bytes[1:1 + pubkey_len].hex()
+        def _has_valid_ops(script: bytes) -> bool:
+            """Walk script bytecode; return False on truncated push or unknown op > 0xb9 non-success range."""
+            i = 0
+            n = len(script)
+            while i < n:
+                op = script[i]; i += 1
+                if 0x01 <= op <= 0x4b:
+                    i += op
+                    if i > n:
+                        return False
+                elif op == 0x4c:  # PUSHDATA1
+                    if i >= n:
+                        return False
+                    i += 1 + script[i]
+                    if i > n:
+                        return False
+                elif op == 0x4d:  # PUSHDATA2
+                    if i + 2 > n:
+                        return False
+                    size = int.from_bytes(script[i:i+2], "little"); i += 2 + size
+                    if i > n:
+                        return False
+                elif op == 0x4e:  # PUSHDATA4
+                    if i + 4 > n:
+                        return False
+                    size = int.from_bytes(script[i:i+4], "little"); i += 4 + size
+                    if i > n:
+                        return False
+            return True
 
-        # For P2PKH, extract address
-        if script_type == "pubkeyhash" and len(script_bytes) == 25:
-            import hashlib
+        def _is_unspendable(script: bytes) -> bool:
+            """True if script starts with OP_RETURN (0x6a) or is too large."""
+            if len(script) > 10_000:
+                return True
+            return len(script) > 0 and script[0] == 0x6a
 
-            import base58
-            pubkey_hash = script_bytes[3:23]
-            network = getattr(self.node, 'network', 'mainnet')
-            version = b"\x00" if network == "mainnet" else b"\x6f"
-            result["address"] = base58.b58encode_check(version + pubkey_hash).decode()
+        # OP_SUCCESS opcodes per BIP-342 / Core IsOpSuccess:
+        # 80 (0x50=OP_RESERVED treated as success in tapscript context, but
+        # Core's IsOpSuccess list is: 80, 98, 126-129, 131-134, 137-138, 141-143, 187-254)
+        _OP_SUCCESS = (
+            {80, 98}
+            | set(range(126, 130))
+            | set(range(131, 135))
+            | {137, 138}
+            | set(range(141, 144))
+            | set(range(187, 255))
+        )
+        OP_CHECKSIGADD = 0xba
 
-        # For P2SH, extract script hash and compute P2SH address
-        if script_type == "scripthash" and len(script_bytes) == 23:
-            import base58
-            script_hash = script_bytes[2:22]
-            network = getattr(self.node, 'network', 'mainnet')
-            version = b"\x05" if network == "mainnet" else b"\xc4"
-            result["address"] = base58.b58encode_check(version + script_hash).decode()
+        def _has_checksigadd_or_success(script: bytes) -> bool:
+            """True if script contains OP_CHECKSIGADD or any OP_SUCCESS opcode."""
+            i = 0
+            n = len(script)
+            while i < n:
+                op = script[i]; i += 1
+                if op == OP_CHECKSIGADD or op in _OP_SUCCESS:
+                    return True
+                # Skip push data to avoid false positives in push payloads
+                if 0x01 <= op <= 0x4b:
+                    i += op
+                elif op == 0x4c:
+                    if i < n:
+                        i += 1 + script[i]
+                elif op == 0x4d:
+                    if i + 2 <= n:
+                        size = int.from_bytes(script[i:i+2], "little"); i += 2 + size
+                elif op == 0x4e:
+                    if i + 4 <= n:
+                        size = int.from_bytes(script[i:i+4], "little"); i += 4 + size
+            return False
 
-        # For witness programs, extract address
-        if script_type in ("witness_v0_keyhash", "witness_v0_scripthash", "witness_v1_taproot"):
-            import bech32
-            network = getattr(self.node, 'network', 'mainnet')
-            hrp = "bc" if network == "mainnet" else "tb"
-            version = script_bytes[0]
-            if version == 0x00:
-                # OP_0 for witness v0
-                version = 0
-            elif version == 0x51:
-                # OP_1 for witness v1 (taproot)
-                version = 1
-            else:
-                version = version - 0x50  # OP_1 through OP_16
-            program = script_bytes[2:]
-            converted = bech32.convertbits(program, 8, 5)
-            if converted:
-                if version == 0:
-                    result["address"] = bech32.bech32_encode(hrp, [version] + converted)
-                else:
-                    # bech32m for version 1+
-                    from ouroboros.address import _bech32m_encode
-                    result["address"] = _bech32m_encode(hrp, version, program)
+        can_wrap = (
+            script_type in _CAN_WRAP_TYPES
+            and _has_valid_ops(script_bytes)
+            and not _is_unspendable(script_bytes)
+            and not _has_checksigadd_or_success(script_bytes)
+        )
 
-        # Compute P2SH-wrapped address for this script (if it were used as redeem script)
-        if len(script_bytes) > 0:
-            import hashlib
-
-            import base58
-            script_hash = hashlib.new(
+        if can_wrap:
+            # p2sh = Hash160(script) as P2SH address (script used as redeemScript)
+            script_hash160 = hashlib.new(
                 "ripemd160", hashlib.sha256(script_bytes).digest()
             ).digest()
-            network = getattr(self.node, 'network', 'mainnet')
-            version = b"\x05" if network == "mainnet" else b"\xc4"
-            result["p2sh"] = base58.b58encode_check(version + script_hash).decode()
+            result["p2sh"] = base58.b58encode_check(p2sh_ver + script_hash160).decode()
 
-            # Compute segwit address if this script were used as witness script
-            # (P2WSH address for this script)
-            script_sha256 = hashlib.sha256(script_bytes).digest()
-            hrp = "bc" if network == "mainnet" else "tb"
-            converted = bech32.convertbits(script_sha256, 8, 5)
-            if converted:
-                result["segwit"] = {
-                    "asm": f"0 {script_sha256.hex()}",
-                    "hex": f"0020{script_sha256.hex()}",
-                    "address": bech32.bech32_encode(hrp, [0] + converted),
-                    "type": "witness_v0_scripthash",
-                    "p2sh-segwit": result["p2sh"],  # This script as P2SH
+            # ── Core's can_wrap_P2WSH gate ───────────────────────────────────
+            # Allowed: pubkey (compressed only), pubkeyhash, nonstandard, multisig (compressed only).
+            # Not allowed: witness_v0_keyhash, witness_v0_scripthash (already segwit).
+            _CAN_WRAP_P2WSH_TYPES = {"pubkey", "pubkeyhash", "nonstandard", "multisig"}
+
+            def _pubkeys_all_compressed(script: bytes, stype: str) -> bool:
+                """For pubkey/multisig, verify all public keys in the script are compressed."""
+                if stype == "pubkey":
+                    # <len> <pubkey> OP_CHECKSIG
+                    if len(script) >= 2:
+                        pk_len = script[0]
+                        if pk_len == 33 and len(script) == 35:
+                            return True  # compressed
+                        if pk_len == 65 and len(script) == 67:
+                            return False  # uncompressed
+                    return False
+                if stype == "multisig":
+                    # OP_M [<len> <pubkey>]... OP_N OP_CHECKMULTISIG
+                    i = 1  # skip OP_M
+                    while i < len(script) - 2:
+                        pk_len = script[i]; i += 1
+                        if pk_len == 0:
+                            break
+                        if i + pk_len > len(script):
+                            break
+                        if pk_len != 33:
+                            return False  # uncompressed pubkey
+                        i += pk_len
+                    return True
+                return True
+
+            can_wrap_p2wsh = (
+                script_type in _CAN_WRAP_P2WSH_TYPES
+                and _pubkeys_all_compressed(script_bytes, script_type)
+            )
+
+            if can_wrap_p2wsh:
+                # Build the inner segwit script
+                if script_type == "pubkey":
+                    # P2WPKH: OP_0 <Hash160(pubkey)>
+                    pk_len = script_bytes[0]
+                    pubkey_bytes = script_bytes[1:1 + pk_len]
+                    pk_hash160 = hashlib.new(
+                        "ripemd160", hashlib.sha256(pubkey_bytes).digest()
+                    ).digest()
+                    seg_script = b"\x00\x14" + pk_hash160
+                elif script_type == "pubkeyhash":
+                    # P2WPKH: OP_0 <20-byte hash> (extracted from P2PKH script)
+                    pk_hash160 = script_bytes[3:23]
+                    seg_script = b"\x00\x14" + pk_hash160
+                else:
+                    # P2WSH: OP_0 <SHA256(script)>
+                    script_sha256 = hashlib.sha256(script_bytes).digest()
+                    seg_script = b"\x00\x20" + script_sha256
+
+                # Build inner segwit object using _build_spk_json
+                # (which returns {asm, desc, hex, type, address?})
+                seg_spk = _build_spk_json(seg_script, network)
+                # Inner segwit DOES include hex (Core include_hex=true)
+                seg_result: dict[str, Any] = {
+                    "asm": seg_spk["asm"],
+                    "desc": seg_spk["desc"],
+                    "hex": seg_spk["hex"],
+                    "type": seg_spk["type"],
                 }
+                if "address" in seg_spk:
+                    seg_result["address"] = seg_spk["address"]
+
+                # p2sh-segwit: P2SH wrapping the segwit script
+                seg_hash160 = hashlib.new(
+                    "ripemd160", hashlib.sha256(seg_script).digest()
+                ).digest()
+                seg_result["p2sh-segwit"] = base58.b58encode_check(p2sh_ver + seg_hash160).decode()
+
+                result["segwit"] = seg_result
 
         return result
 
