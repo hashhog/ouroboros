@@ -1364,6 +1364,51 @@ class BitcoinNode:
 
         return work
 
+    @property
+    def _chainwork_snapshot_offset(self) -> int:
+        """Return the chainwork correction offset for snapshot-loaded datadirs.
+
+        When a node is bootstrapped from an assumeutxo snapshot, blocks
+        connected after the snapshot start accumulate chainwork relative to 0
+        instead of relative to the snapshot height's correct chainwork. This
+        method computes the correction needed: the correct cumulative chainwork
+        at the snapshot height (from Core's hardcoded assumeutxo data).
+
+        Returns 0 if no snapshot was loaded or if the snapshot's chainwork is
+        not available.
+        """
+        if not hasattr(self, "_chainwork_offset_cache"):
+            self._chainwork_offset_cache = 0
+            try:
+                from ouroboros.snapshot import get_assumeutxo_params
+                network = getattr(self, "network", "mainnet")
+                params = get_assumeutxo_params(network)
+                for data in params:
+                    if data.chainwork_hex is None:
+                        continue
+                    # Check if the snapshot at this height was loaded by
+                    # looking for a gap below the first stored block.
+                    # We detect this by checking if height+1 is available
+                    # but height is not (i.e., the snapshot boundary).
+                    snap_h = data.height
+                    # The first IBD block is snap_h+1 (or later after restarts).
+                    # We check: stored chainwork at snap_h+1 should be about
+                    # one block's work; if it's that small we know the snapshot
+                    # base chainwork wasn't added.
+                    stored_at_first = self.db.get_chainwork_by_height(snap_h + 1)
+                    if stored_at_first <= 0:
+                        continue
+                    # The correct chainwork at snap_h:
+                    correct_snap = int(data.chainwork_hex, 16)
+                    # If the stored value at snap_h+1 is much smaller than
+                    # correct_snap, we know the offset is needed.
+                    if stored_at_first < correct_snap:
+                        self._chainwork_offset_cache = correct_snap
+                        break
+            except Exception:
+                pass
+        return self._chainwork_offset_cache
+
     def _calculate_chainwork_at_height(self, height: int) -> int:
         """Calculate cumulative chainwork up to height."""
         if not self.db:
@@ -1373,7 +1418,13 @@ class BitcoinNode:
             # Prefer persisted chainwork from Rust BlockMetadata (computed during sync)
             persisted_chainwork = self.db.get_chainwork_by_height(height)
             if persisted_chainwork > 0:
-                return persisted_chainwork
+                # Apply snapshot correction offset if needed.  When a node was
+                # bootstrapped from an assumeutxo snapshot, the stored chainwork
+                # was computed from 0 (not from the snapshot height's cumulative
+                # work). The offset corrects this by adding the canonical
+                # chainwork at the snapshot height to every stored value.
+                offset = self._chainwork_snapshot_offset
+                return persisted_chainwork + offset
 
             # Fallback: compute and cache (for blocks synced before chainwork persistence)
             block = self.db.get_block_by_height(height)

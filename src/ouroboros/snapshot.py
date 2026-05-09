@@ -147,12 +147,20 @@ class AssumeutxoData:
     in that case the post-snapshot prev-block fallback is unavailable
     and the validator must wait until headers/blocks for the prev
     height arrive via the network.
+
+    ``chainwork_hex`` is the 64-character hex representation of the
+    cumulative chainwork at the snapshot block (Bitcoin Core format).
+    Used to correct chainwork values for blocks connected after the
+    snapshot, which would otherwise be anchored to 0 instead of the
+    correct cumulative work from genesis.  Source: ``getblockheader
+    <hash>`` against any fully-synced Bitcoin Core node.
     """
     height: int
     block_hash: bytes  # 32 bytes, internal byte order
     hash_serialized: bytes  # 32-byte commitment from Core's coinstats
     chain_tx_count: int
     base_header: bytes | None = None  # 80-byte serialized header, internal byte order
+    chainwork_hex: str | None = None  # 64-char hex chainwork at the snapshot height
 
     def block_hash_hex(self) -> str:
         """Get block hash as hex string (big-endian display format)."""
@@ -275,6 +283,11 @@ _MAINNET_ASSUMEUTXO: list[AssumeutxoData] = [
         base_header=bytes.fromhex(
             "00c0052004696a958e42cc3604094d8cb7edff7ce3f7df03e6d600000000000000000000a86bcf724ea11137002a564c761911343722766b19c268eb56ea2e58c1e4b20f5a4cd66984060217a0a5fbad"
         ),
+        # Cumulative chainwork at h=944183 from Bitcoin Core 31.99 (mainnet).
+        # Source: getblockheader 0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817
+        # This value is used to correct chainwork for blocks connected after a
+        # snapshot load at this height (which would otherwise start from 0).
+        chainwork_hex="00000000000000000000000000000000000000011de68a167d5dad115a96be80",
     ),
 ]
 

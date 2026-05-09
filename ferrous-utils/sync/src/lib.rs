@@ -3123,6 +3123,43 @@ impl PyBlockchainDB {
         }
     }
 
+    /// Look up a UTXO from either the live chainstate (CHAINSTATE_CF) or the
+    /// spent-record store (SPENT_CF).
+    ///
+    /// Used by ``rpc_getblock`` verbosity≥2 to compute transaction fees for
+    /// historical blocks where inputs have already been spent (and thus removed
+    /// from the live UTXO set). Returns the UTXO if found in either location;
+    /// returns ``None`` if the outpoint is unknown.
+    fn get_utxo_or_spent(&self, txid: &[u8], vout: u32) -> PyResult<Option<PyUTXO>> {
+        if txid.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Transaction ID must be 32 bytes"
+            ));
+        }
+
+        let mut txid_bytes = [0u8; 32];
+        txid_bytes.copy_from_slice(txid);
+        let bitcoin_txid = bitcoin::Txid::from_byte_array(txid_bytes);
+        let outpoint = bitcoin::OutPoint { txid: bitcoin_txid, vout };
+
+        // 1. Try live chainstate first (cheaper — UTXO may still be unspent).
+        if let Ok(Some(utxo)) = self.db.get_utxo(&outpoint) {
+            return Ok(Some(PyUTXO::from(&utxo)));
+        }
+
+        // 2. Fall back to SPENT_CF (spent UTXOs retained for reorg undo).
+        match self.db.get_spent_utxo(&outpoint) {
+            Ok(Some((_spending_txid, utxo))) => Ok(Some(PyUTXO::from(&utxo))),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                // Non-fatal: SPENT_CF lookup failure should not crash the RPC.
+                // Swallow the error and report the UTXO as not found.
+                let _ = e;
+                Ok(None)
+            }
+        }
+    }
+
     /// Batch-get multiple UTXOs in a single FFI call.
     ///
     /// Takes a list of (txid_bytes, vout) pairs and returns a list of
