@@ -2679,36 +2679,43 @@ def disassemble_script(script: bytes) -> str:
             # Direct push
             data_len = opcode
             if i + data_len > len(script):
+                asm_parts.append("[error]")
                 break
             data = script[i:i+data_len]
             asm_parts.append(data.hex())
             i += data_len
         elif opcode == 0x4c:  # OP_PUSHDATA1
             if i >= len(script):
+                asm_parts.append("[error]")
                 break
             data_len = script[i]
             i += 1
             if i + data_len > len(script):
+                asm_parts.append("[error]")
                 break
             data = script[i:i+data_len]
             asm_parts.append(data.hex())
             i += data_len
         elif opcode == 0x4d:  # OP_PUSHDATA2
             if i + 1 >= len(script):
+                asm_parts.append("[error]")
                 break
             data_len = int.from_bytes(script[i:i+2], 'little')
             i += 2
             if i + data_len > len(script):
+                asm_parts.append("[error]")
                 break
             data = script[i:i+data_len]
             asm_parts.append(data.hex())
             i += data_len
         elif opcode == 0x4e:  # OP_PUSHDATA4
             if i + 3 >= len(script):
+                asm_parts.append("[error]")
                 break
             data_len = int.from_bytes(script[i:i+4], 'little')
             i += 4
             if i + data_len > len(script):
+                asm_parts.append("[error]")
                 break
             data = script[i:i+data_len]
             asm_parts.append(data.hex())
