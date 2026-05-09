@@ -2947,7 +2947,130 @@ impl PyBlockchainDB {
             )
         })
     }
-    
+
+    /// Retrieve the raw 80-byte block header and nTx count from HEADERS_CF.
+    ///
+    /// Returns ``(header_bytes, n_tx)`` where ``header_bytes`` is the 80-byte
+    /// serialized header in wire order (version||prev||merkle||time||bits||nonce)
+    /// and ``n_tx`` is the transaction count (0 if only the header was stored,
+    /// not the full block).  Returns ``None`` if the hash is not in HEADERS_CF.
+    fn get_raw_header(&self, block_hash: &[u8]) -> PyResult<Option<(Vec<u8>, u32)>> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+        match self.db.get_raw_header(&hash_bytes) {
+            Ok(Some((header, n_tx))) => Ok(Some((header.to_vec(), n_tx))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )),
+        }
+    }
+
+    /// Store a raw 80-byte block header plus nTx count in HEADERS_CF.
+    ///
+    /// ``header_bytes`` must be exactly 80 bytes in wire order.
+    /// ``n_tx`` is the transaction count (use 0 if unknown).
+    fn store_raw_header(&self, block_hash: &[u8], header_bytes: &[u8], n_tx: u32) -> PyResult<()> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+        if header_bytes.len() != 80 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Header bytes must be 80 bytes"
+            ));
+        }
+        let mut hash_arr = [0u8; 32];
+        hash_arr.copy_from_slice(block_hash);
+        let mut header_arr = [0u8; 80];
+        header_arr.copy_from_slice(header_bytes);
+        self.db.store_raw_header(&hash_arr, &header_arr, n_tx).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
+
+    /// Store a raw 80-byte block header + nTx + chainwork + height + mediantime + nexthash.
+    ///
+    /// Extended 156-byte format (backward compatible with 84-byte readers).
+    /// ``chainwork_bytes`` must be 32 bytes big-endian (same as Core's JSON output).
+    /// ``nexthash_bytes`` must be 32 bytes in display byte order (big-endian / display hex);
+    ///   use all-zero bytes to indicate the block is the tip (no next block).
+    fn store_raw_header_with_chainwork(
+        &self,
+        block_hash: &[u8],
+        header_bytes: &[u8],
+        n_tx: u32,
+        chainwork_bytes: &[u8],
+        height: u32,
+        mediantime: u32,
+        nexthash_bytes: &[u8],
+    ) -> PyResult<()> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+        if header_bytes.len() != 80 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Header bytes must be 80 bytes"
+            ));
+        }
+        if chainwork_bytes.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Chainwork bytes must be 32 bytes"
+            ));
+        }
+        if nexthash_bytes.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Nexthash bytes must be 32 bytes"
+            ));
+        }
+        let mut hash_arr = [0u8; 32];
+        hash_arr.copy_from_slice(block_hash);
+        let mut header_arr = [0u8; 80];
+        header_arr.copy_from_slice(header_bytes);
+        let mut cw_arr = [0u8; 32];
+        cw_arr.copy_from_slice(chainwork_bytes);
+        let mut nh_arr = [0u8; 32];
+        nh_arr.copy_from_slice(nexthash_bytes);
+        self.db.store_raw_header_with_chainwork(&hash_arr, &header_arr, n_tx, &cw_arr, height, mediantime, &nh_arr).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
+
+    /// Retrieve raw header + nTx + chainwork + height + mediantime + nexthash from HEADERS_CF.
+    ///
+    /// Returns ``(header_bytes, n_tx, chainwork_bytes, height, mediantime, nexthash_bytes)`` or ``None``.
+    /// All zeros in ``nexthash_bytes`` means tip (no next block) or not stored.
+    fn get_raw_header_with_chainwork(&self, block_hash: &[u8]) -> PyResult<Option<(Vec<u8>, u32, Vec<u8>, u32, u32, Vec<u8>)>> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+        match self.db.get_raw_header_with_chainwork(&hash_bytes) {
+            Ok(Some((header, n_tx, chainwork, height, mediantime, nexthash))) => {
+                Ok(Some((header.to_vec(), n_tx, chainwork.to_vec(), height, mediantime, nexthash.to_vec())))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )),
+        }
+    }
+
     /// Get the median-time-past for a given height (11-block median timestamp).
     /// Uses lightweight block metadata instead of deserializing full blocks.
     fn get_median_time_past(&self, height: u32) -> PyResult<Option<u32>> {
@@ -3540,6 +3663,23 @@ impl PyBlockchainDB {
         self.db.store_block_metadata_batch(&mut batch, height, &block_hash, &metadata)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
+        // Store 80-byte header in HEADERS_CF for `getblockheader` lookups.
+        // This allows `getblockheader` to serve blocks that were removed from
+        // BLOCKS_CF by a prune or whose full block body is otherwise absent
+        // (e.g. after a snapshot load that gaps BLOCKS_CF).
+        {
+            use bitcoin::consensus::Encodable;
+            let mut header_buf = Vec::with_capacity(80);
+            inner.header.consensus_encode(&mut header_buf).ok();
+            if header_buf.len() == 80 {
+                let mut header_arr = [0u8; 80];
+                header_arr.copy_from_slice(&header_buf);
+                let n_tx = inner.txdata.len() as u32;
+                self.db.store_raw_header_batch(&mut batch, &block_hash, &header_arr, n_tx)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+            }
+        }
+
         // Update chain tip + delete marker
         self.db.update_best_block_batch(&mut batch, &block_hash, height)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
@@ -4093,6 +4233,20 @@ impl PyBlockchainDB {
             let metadata = BlockMetadata::new(height, chainwork, timestamp);
             self.db.store_block_metadata_batch(&mut batch, height, &block_hash, &metadata)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+            // Store 80-byte header in HEADERS_CF.
+            {
+                use bitcoin::consensus::Encodable;
+                let mut header_buf = Vec::with_capacity(80);
+                inner.header.consensus_encode(&mut header_buf).ok();
+                if header_buf.len() == 80 {
+                    let mut header_arr = [0u8; 80];
+                    header_arr.copy_from_slice(&header_buf);
+                    let n_tx = inner.txdata.len() as u32;
+                    self.db.store_raw_header_batch(&mut batch, &block_hash, &header_arr, n_tx)
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+                }
+            }
 
             // Track for the next iteration's prevhash check.
             prev_tip_hash = block_hash;

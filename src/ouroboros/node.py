@@ -1253,8 +1253,14 @@ class BitcoinNode:
         """Return True when the node has completed initial block synchronisation."""
         return self.synced
 
-    def _bits_to_difficulty(self, bits: int) -> float:
-        """Convert compact target (bits) to difficulty."""
+    def _bits_to_difficulty(self, bits: int) -> float | int:
+        """Convert compact target (bits) to difficulty.
+
+        Returns an int when the difficulty is a whole number (e.g. genesis = 1),
+        matching Bitcoin Core's JSON output which uses C++ double → UniValue
+        serialization that emits ``1`` not ``1.0`` for integral values.
+        Reference: bitcoin-core/src/rpc/blockchain.cpp GetDifficulty.
+        """
         n_shift = (bits >> 24) & 0xFF
         mantissa = bits & 0x00FFFFFF
 
@@ -1270,6 +1276,10 @@ class BitcoinNode:
             d_diff /= 256.0
             n_shift -= 1
 
+        # Return int when the value has no fractional part, mirroring Core's
+        # double → JSON serialization which outputs "1" not "1.0".
+        if d_diff == int(d_diff):
+            return int(d_diff)
         return d_diff
 
     def get_current_difficulty(self) -> float:
@@ -1413,17 +1423,21 @@ class BitcoinNode:
             return 0
 
     def get_chainwork(self) -> str:
-        """Return cumulative chain work at the tip as a hex string."""
+        """Return cumulative chain work at the tip as a 64-char lowercase hex string.
+
+        Bitcoin Core format: 64 lowercase hex characters, zero-padded, no "0x" prefix.
+        Reference: bitcoin-core/src/rpc/blockchain.cpp GetBlockchainInfo.
+        """
         if not self.db:
-            return "0x0"
+            return "0" * 64
 
         try:
             _, best_height = self.db.get_best_block()
             chainwork = self._calculate_chainwork_at_height(best_height)
-            return f"0x{chainwork:x}"
+            return f"{chainwork:064x}"
         except Exception as e:
             logger.error(f"Error getting chainwork: {e}", exc_info=True)
-            return "0x0"
+            return "0" * 64
 
     def get_confirmations(self, height: int) -> int:
         """Return the number of confirmations for a block at *height*."""
@@ -1441,16 +1455,20 @@ class BitcoinNode:
         return self._bits_to_difficulty(bits)
 
     def get_chainwork_at_height(self, height: int) -> str:
-        """Return cumulative chain work up to *height* as a hex string."""
+        """Return cumulative chain work up to *height* as a 64-char lowercase hex string.
+
+        Bitcoin Core format: 64 lowercase hex characters, zero-padded, no "0x" prefix.
+        Reference: bitcoin-core/src/rpc/blockchain.cpp GetBlockchainInfo / getblockheader.
+        """
         if not self.db:
-            return "0x0"
+            return "0" * 64
 
         try:
             chainwork = self._calculate_chainwork_at_height(height)
-            return f"0x{chainwork:x}"
+            return f"{chainwork:064x}"
         except Exception as e:
             logger.error(f"Error getting chainwork at height {height}: {e}", exc_info=True)
-            return "0x0"
+            return "0" * 64
 
     async def run(self) -> None:
         """Start the node and block until shutdown (convenience wrapper for ``start()``)."""

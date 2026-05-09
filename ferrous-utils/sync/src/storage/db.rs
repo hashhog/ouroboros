@@ -14,8 +14,8 @@ use common::{
 
 use crate::storage::schema::{
     decode_height, encode_block_hash, encode_height, encode_outpoint,
-    get_column_families, meta_keys, BLOCK_INDEX_CF, BLOCKS_CF, CHAINSTATE_CF, META_CF, SPENT_CF,
-    TX_INDEX_CF, UNDO_CF,
+    get_column_families, meta_keys, BLOCK_INDEX_CF, BLOCKS_CF, CHAINSTATE_CF, HEADERS_CF, META_CF,
+    SPENT_CF, TX_INDEX_CF, UNDO_CF,
 };
 use crate::storage::undo::{BlockUndo, Coin, TxUndo};
 
@@ -218,6 +218,147 @@ impl BlockchainDB {
             }
         }
         Ok(None)
+    }
+
+    // ========== Header Store Methods (HEADERS_CF) ==========
+
+    /// Store a raw 80-byte block header plus nTx count in HEADERS_CF.
+    ///
+    /// Key: block_hash (32 bytes, internal byte order)
+    /// Value: [80-byte header][4-byte nTx u32 LE]
+    ///
+    /// nTx should be the actual transaction count when the full block is available,
+    /// or 0 when only the header is available (e.g. from headers-first sync).
+    pub fn store_raw_header(&self, hash: &[u8; 32], header_bytes: &[u8; 80], n_tx: u32) -> Result<()> {
+        let cf = self.db.cf_handle(HEADERS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(HEADERS_CF.to_string()))?;
+        let mut value = Vec::with_capacity(84);
+        value.extend_from_slice(header_bytes);
+        value.extend_from_slice(&n_tx.to_le_bytes());
+        self.db.put_cf(cf, hash, value)?;
+        Ok(())
+    }
+
+    /// Store a raw 80-byte block header plus nTx count in HEADERS_CF (batch variant).
+    pub fn store_raw_header_batch(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        hash: &[u8; 32],
+        header_bytes: &[u8; 80],
+        n_tx: u32,
+    ) -> Result<()> {
+        let cf = self.db.cf_handle(HEADERS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(HEADERS_CF.to_string()))?;
+        let mut value = Vec::with_capacity(84);
+        value.extend_from_slice(header_bytes);
+        value.extend_from_slice(&n_tx.to_le_bytes());
+        batch.put_cf(cf, hash, value);
+        Ok(())
+    }
+
+    /// Store a raw 80-byte block header + nTx, chainwork, height, mediantime, nexthash in HEADERS_CF.
+    ///
+    /// Extended format:
+    ///   [80-byte header][4-byte nTx u32 LE][32-byte chainwork BE]
+    ///   [4-byte height u32 LE][4-byte mediantime u32 LE][32-byte nexthash internal order]
+    /// Total: 156 bytes. Compatible with the 84-byte format: old readers see the same header+nTx.
+    /// nexthash is all-zeros to indicate no next block (tip).
+    pub fn store_raw_header_with_chainwork(
+        &self,
+        hash: &[u8; 32],
+        header_bytes: &[u8; 80],
+        n_tx: u32,
+        chainwork: &[u8; 32],
+        height: u32,
+        mediantime: u32,
+        nexthash: &[u8; 32],
+    ) -> Result<()> {
+        let cf = self.db.cf_handle(HEADERS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(HEADERS_CF.to_string()))?;
+        let mut value = Vec::with_capacity(156);
+        value.extend_from_slice(header_bytes);
+        value.extend_from_slice(&n_tx.to_le_bytes());
+        value.extend_from_slice(chainwork);
+        value.extend_from_slice(&height.to_le_bytes());
+        value.extend_from_slice(&mediantime.to_le_bytes());
+        value.extend_from_slice(nexthash);
+        self.db.put_cf(cf, hash, value)?;
+        Ok(())
+    }
+
+    /// Retrieve raw header bytes + nTx from HEADERS_CF.
+    ///
+    /// Returns `Some(([u8; 80], u32))` where the first element is the 80-byte
+    /// serialized header and the second is the transaction count (0 if unknown).
+    /// Returns `None` if the hash is not in HEADERS_CF.
+    pub fn get_raw_header(&self, hash: &[u8; 32]) -> Result<Option<([u8; 80], u32)>> {
+        let cf = self.db.cf_handle(HEADERS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(HEADERS_CF.to_string()))?;
+        match self.db.get_cf(cf, hash)? {
+            Some(data) if data.len() >= 80 => {
+                let mut header = [0u8; 80];
+                header.copy_from_slice(&data[0..80]);
+                let n_tx = if data.len() >= 84 {
+                    u32::from_le_bytes([data[80], data[81], data[82], data[83]])
+                } else {
+                    0
+                };
+                Ok(Some((header, n_tx)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Retrieve raw header + nTx + chainwork + height + mediantime + nexthash from HEADERS_CF.
+    ///
+    /// Returns `Some(([u8; 80], u32, [u8; 32], u32, u32, [u8; 32]))` where elements are:
+    ///   - 80-byte serialized header
+    ///   - transaction count (0 if unknown)
+    ///   - chainwork as 32-byte big-endian (all zeros if not stored)
+    ///   - block height (0 if not stored)
+    ///   - mediantime (0 if not stored)
+    ///   - nexthash in internal byte order (all zeros if tip or not stored)
+    /// Returns `None` if the hash is not in HEADERS_CF.
+    pub fn get_raw_header_with_chainwork(&self, hash: &[u8; 32]) -> Result<Option<([u8; 80], u32, [u8; 32], u32, u32, [u8; 32])>> {
+        let cf = self.db.cf_handle(HEADERS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(HEADERS_CF.to_string()))?;
+        match self.db.get_cf(cf, hash)? {
+            Some(data) if data.len() >= 80 => {
+                let mut header = [0u8; 80];
+                header.copy_from_slice(&data[0..80]);
+                let n_tx = if data.len() >= 84 {
+                    u32::from_le_bytes([data[80], data[81], data[82], data[83]])
+                } else {
+                    0
+                };
+                let chainwork = if data.len() >= 116 {
+                    let mut cw = [0u8; 32];
+                    cw.copy_from_slice(&data[84..116]);
+                    cw
+                } else {
+                    [0u8; 32]
+                };
+                let height = if data.len() >= 120 {
+                    u32::from_le_bytes([data[116], data[117], data[118], data[119]])
+                } else {
+                    0
+                };
+                let mediantime = if data.len() >= 124 {
+                    u32::from_le_bytes([data[120], data[121], data[122], data[123]])
+                } else {
+                    0
+                };
+                let nexthash = if data.len() >= 156 {
+                    let mut nh = [0u8; 32];
+                    nh.copy_from_slice(&data[124..156]);
+                    nh
+                } else {
+                    [0u8; 32]
+                };
+                Ok(Some((header, n_tx, chainwork, height, mediantime, nexthash)))
+            }
+            _ => Ok(None),
+        }
     }
 
     // ========== Transaction Index Methods ==========
