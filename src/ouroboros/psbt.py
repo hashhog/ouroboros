@@ -195,7 +195,49 @@ def _read_kv_pairs(f: io.BytesIO) -> dict[bytes, bytes]:
     return pairs
 
 
-def _write_kv_pairs(pairs: dict[bytes, bytes]) -> bytes:
+def _input_map_sort_key(key: bytes) -> tuple[int, bytes, bytes]:
+    """Canonical sort key for a per-input PSBT map entry.
+
+    Bitcoin Core's per-input map is a struct of typed sub-maps; for
+    PARTIAL_SIG, that sub-map is ``std::map<CKeyID, SigPair>`` where
+    ``CKeyID = HASH160(pubkey)`` and the wire key is the pubkey itself
+    (`psbt.h` ``PSBTInput::Serialize`` walks ``partial_sigs`` in
+    ``std::map`` order, i.e. sorted by CKeyID). When two PSBTs are
+    combined whose ``partial_sigs`` were inserted in different orders,
+    a naive lexicographic sort by raw wire-key (= pubkey) does NOT
+    reproduce Core's emission order — the canonical order is by
+    ``HASH160(pubkey)``.
+
+    We sort by ``(type_byte, canonical_suffix, raw_suffix)``:
+      - ``type_byte`` first preserves grouping by PSBT_IN_* type so the
+        wire still goes WITNESS_UTXO, PARTIAL_SIG, SIGHASH_TYPE, ... in
+        ascending type order (matches Core's hand-written serialize).
+      - For ``PARTIAL_SIG`` (type 0x02), ``canonical_suffix`` is
+        ``HASH160(pubkey)`` so emission is byte-identical to Core's
+        ``std::map<CKeyID, SigPair>`` walk.
+      - For all other types, ``canonical_suffix == raw_suffix`` (lex
+        order on the wire-key suffix, which matches Core's
+        ``std::map<CPubKey, ...>`` for BIP32_DERIVATION, etc.).
+      - ``raw_suffix`` is the final tiebreaker so the sort stays total
+        even on the (theoretically-impossible) HASH160 collision.
+
+    This is the W46 fix; see also W43-3 (script-order finalize) — that
+    fix targets sig-assembly order in scriptSig/witness, this targets
+    wire-order in partial_sigs map emission. Different concerns, both
+    needed for combinepsbt byte-identity.
+    """
+    if not key:
+        return (0, b"", b"")
+    type_byte = key[0]
+    suffix = key[1:]
+    if type_byte == PSBTInputType.PARTIAL_SIG and len(suffix) in (33, 65):
+        # HASH160(pubkey) = RIPEMD160(SHA256(pubkey)). Mirrors CKeyID.
+        canonical = hashlib.new("ripemd160", hashlib.sha256(suffix).digest()).digest()
+        return (type_byte, canonical, suffix)
+    return (type_byte, suffix, suffix)
+
+
+def _write_kv_pairs(pairs: dict[bytes, bytes], input_map: bool = False) -> bytes:
     """Write key-value pairs with separator.
 
     Keys are emitted in ascending lexicographic order. BIP-174 does not
@@ -203,9 +245,18 @@ def _write_kv_pairs(pairs: dict[bytes, bytes]) -> bytes:
     (see `psbt.h` per-map serialization), and round-trip byte-identity
     against third-party PSBTs that arrived in non-insertion order is only
     guaranteed if we re-sort on the way out.
+
+    For per-input maps, pass ``input_map=True`` to apply the canonical
+    sort that matches Core's ``std::map<CKeyID, SigPair>`` order for
+    ``partial_sigs`` (sorted by HASH160(pubkey), not raw pubkey bytes).
+    See ``_input_map_sort_key``.
     """
     out = bytearray()
-    for key in sorted(pairs.keys()):
+    if input_map:
+        ordered_keys = sorted(pairs.keys(), key=_input_map_sort_key)
+    else:
+        ordered_keys = sorted(pairs.keys())
+    for key in ordered_keys:
         val = pairs[key]
         out += _write_compact_size(len(key))
         out += key
@@ -888,9 +939,12 @@ class PSBT:
         global_kv.update(self.unknown_global)
         out += _write_kv_pairs(global_kv)
 
-        # Per-input maps
+        # Per-input maps. ``input_map=True`` enables the W46 canonical
+        # sort that walks PARTIAL_SIG entries in HASH160(pubkey) order
+        # (Core's ``std::map<CKeyID, SigPair>``), giving byte-identical
+        # combinepsbt output regardless of insertion order.
         for psbt_in in self.inputs:
-            out += _write_kv_pairs(psbt_in.to_kv())
+            out += _write_kv_pairs(psbt_in.to_kv(), input_map=True)
 
         # Per-output maps
         for psbt_out in self.outputs:
