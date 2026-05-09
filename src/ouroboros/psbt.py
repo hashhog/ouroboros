@@ -740,11 +740,13 @@ def _tx_to_univ(tx: Transaction, network: str) -> dict[str, Any]:
     vin_list = []
     for inp in tx.inputs:
         if inp.prev_txid == bytes(32) and inp.prev_vout == 0xFFFFFFFF:
-            # Coinbase
+            # Coinbase — mirrors Core TxToUniv: {coinbase, txinwitness?, sequence}
             entry: dict[str, Any] = {
                 "coinbase": inp.script_sig.hex(),
-                "sequence": inp.sequence,
             }
+            if inp.witness:
+                entry["txinwitness"] = [w.hex() for w in inp.witness]
+            entry["sequence"] = inp.sequence
         else:
             entry = {
                 "txid": inp.prev_txid[::-1].hex(),
