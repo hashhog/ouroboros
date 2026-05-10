@@ -3794,7 +3794,9 @@ class RPCServer:
             if not isinstance(txid_hex, str):
                 raise HTTPException(status_code=400, detail="Input txid must be a string")
             try:
-                txid_bytes = bytes.fromhex(txid_hex)
+                # JSON-RPC: txids arrive in display order (BE hex);
+                # TxIn.prev_txid is internal LE. Reverse at the boundary. W69.
+                txid_bytes = bytes.fromhex(txid_hex)[::-1]
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=f"Invalid txid: {exc}") from None
             if len(txid_bytes) != 32:
@@ -3920,7 +3922,10 @@ class RPCServer:
             # Pull eligible UTXOs (already filters out lockunspent locks).
             avail = wallet._collect_utxos() if hasattr(wallet, "_collect_utxos") else []
             # Skip any UTXO that's already been listed as a manual input.
-            manual_keys = {(bytes(t.prev_txid).hex(), int(t.prev_vout)) for t in manual_inputs}
+            # manual_inputs have prev_txid in internal LE byte order; avail
+            # UTXOs have txid as display-order (BE) hex from Rust PyUTXO.
+            # Compare in display-order (BE) to keep the dedup correct. W69.
+            manual_keys = {(bytes(t.prev_txid)[::-1].hex(), int(t.prev_vout)) for t in manual_inputs}
             eligible = [
                 u for u in avail
                 if (
@@ -3960,8 +3965,10 @@ class RPCServer:
         all_inputs = list(manual_inputs)
         all_meta = list(manual_meta)
         for u in selected_extra:
+            # u["txid"] is display-order (BE) hex from Rust PyUTXO.txid.
+            # TxIn.prev_txid must be internal LE — reverse at the boundary. W69.
             txid_bytes = (
-                bytes.fromhex(u["txid"]) if isinstance(u["txid"], str) else bytes(u["txid"])
+                bytes.fromhex(u["txid"])[::-1] if isinstance(u["txid"], str) else bytes(u["txid"])
             )
             all_inputs.append(TxIn(
                 prev_txid=txid_bytes,
@@ -4640,10 +4647,12 @@ class RPCServer:
                     if total_sigops + tx_sigops_cost > MAX_BLOCK_SIGOPS_COST:
                         continue  # tx would push block over sigops limit — skip
 
+                    # JSON-RPC convention: txids in template responses are
+                    # display-order (BE). t is internal LE. Reverse. W69.
                     txs.append({
                         "data": raw.hex(),
-                        "txid": t.hex(),
-                        "hash": t.hex(),
+                        "txid": t[::-1].hex(),
+                        "hash": t[::-1].hex(),
                         "fee": e.fee,
                         "sigops": tx_sigops_cost,
                         "weight": tw,
@@ -4660,7 +4669,9 @@ class RPCServer:
         # wtxids: coinbase is 32 zero-bytes, then each selected tx's wtxid.
         wtxids: list[bytes] = [bytes(32)]  # coinbase placeholder
         for tx_entry in txs:
-            entry_txid = bytes.fromhex(tx_entry["txid"])
+            # tx_entry["txid"] is now display-order (BE); snap_txs keys are
+            # internal LE. Reverse to recover the LE key. W69.
+            entry_txid = bytes.fromhex(tx_entry["txid"])[::-1]
             entry_obj = snap_txs.get(entry_txid)
             if entry_obj:
                 wtxids.append(entry_obj.tx.get_wtxid())
@@ -6727,18 +6738,20 @@ class RPCServer:
         """Return all in-mempool ancestors of a transaction."""
         if not hasattr(self.node, "mempool") or self.node.mempool is None:
             return [] if not verbose else {}
-        txid_bytes = bytes.fromhex(txid)
+        # JSON-RPC convention: txids arrive in display order (big-endian hex).
+        # Internal mempool keys are little-endian (internal byte order). W69.
+        txid_bytes = bytes.fromhex(txid)[::-1]
         tx = self.node.mempool.get_transaction(txid_bytes)
         if tx is None:
             raise ValueError(f"Transaction not in mempool: {txid}")
         ancestors = self.node.mempool._get_ancestors(tx)
         if not verbose:
-            return [a.hex() for a in ancestors]
+            return [a[::-1].hex() for a in ancestors]
         result: dict[str, Any] = {}
         for a_txid in ancestors:
             entry = self.node.mempool.get_transaction_entry(a_txid)
             if entry is not None:
-                result[a_txid.hex()] = self._format_mempool_entry(entry, a_txid)
+                result[a_txid[::-1].hex()] = self._format_mempool_entry(entry, a_txid)
         return result
 
     async def rpc_getmempooldescendants(
@@ -6747,18 +6760,20 @@ class RPCServer:
         """Return all in-mempool descendants of a transaction."""
         if not hasattr(self.node, "mempool") or self.node.mempool is None:
             return [] if not verbose else {}
-        txid_bytes = bytes.fromhex(txid)
+        # JSON-RPC convention: txids arrive in display order (big-endian hex).
+        # Internal mempool keys are little-endian (internal byte order). W69.
+        txid_bytes = bytes.fromhex(txid)[::-1]
         if txid_bytes not in self.node.mempool.transactions:
             raise ValueError(f"Transaction not in mempool: {txid}")
         descendants = self.node.mempool._collect_descendants(txid_bytes)
         descendants.discard(txid_bytes)
         if not verbose:
-            return [d.hex() for d in descendants]
+            return [d[::-1].hex() for d in descendants]
         result: dict[str, Any] = {}
         for d_txid in descendants:
             entry = self.node.mempool.get_transaction_entry(d_txid)
             if entry is not None:
-                result[d_txid.hex()] = self._format_mempool_entry(entry, d_txid)
+                result[d_txid[::-1].hex()] = self._format_mempool_entry(entry, d_txid)
         return result
 
     async def rpc_createrawtransaction(
@@ -6770,7 +6785,9 @@ class RPCServer:
         from ouroboros.database import TxIn, TxOut
         tx_inputs = []
         for inp in inputs:
-            txid_bytes = bytes.fromhex(inp['txid'])
+            # JSON-RPC convention: txids arrive in display order (big-endian
+            # hex); wire format stores prev_txid in little-endian. W69.
+            txid_bytes = bytes.fromhex(inp['txid'])[::-1]
             tx_inputs.append(TxIn(
                 prev_txid=txid_bytes,
                 prev_vout=inp['vout'],
@@ -6868,7 +6885,10 @@ class RPCServer:
         prev_scripts: dict[tuple, dict] = {}
         if prevtxs:
             for p in prevtxs:
-                txid_bytes = bytes.fromhex(p["txid"])
+                # JSON-RPC: user supplies txid in display order (BE hex).
+                # prev_lookup is keyed by (inp.prev_txid, vout) where
+                # inp.prev_txid is internal LE — reverse to match. W69.
+                txid_bytes = bytes.fromhex(p["txid"])[::-1]
                 vout = p["vout"]
                 spk = bytes.fromhex(p["scriptPubKey"])
                 amount = int(float(p.get("amount", 0)) * 1e8)
@@ -7022,7 +7042,7 @@ class RPCServer:
             amount = all_amounts[idx]
             if not spk:
                 errors.append({
-                    "txid": inp.prev_txid.hex(),
+                    "txid": inp.prev_txid[::-1].hex(),
                     "vout": inp.prev_vout,
                     "error": "Input not found or not provided",
                 })
@@ -7036,7 +7056,7 @@ class RPCServer:
                     key = keys_by_h160.get(h160)
                     if not key:
                         errors.append({
-                            "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                            "txid": inp.prev_txid[::-1].hex(), "vout": inp.prev_vout,
                             "error": "No matching key for P2PKH",
                         })
                         continue
@@ -7053,7 +7073,7 @@ class RPCServer:
                     key = keys_by_h160.get(h160)
                     if not key:
                         errors.append({
-                            "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                            "txid": inp.prev_txid[::-1].hex(), "vout": inp.prev_vout,
                             "error": "No matching key for P2WPKH",
                         })
                         continue
@@ -7100,7 +7120,7 @@ class RPCServer:
                                 )
                             except ValueError as ve:
                                 errors.append({
-                                    "txid": inp.prev_txid.hex(),
+                                    "txid": inp.prev_txid[::-1].hex(),
                                     "vout": inp.prev_vout,
                                     "error": str(ve),
                                 })
@@ -7113,7 +7133,7 @@ class RPCServer:
                             # mark partial.
                             if not sigs:
                                 errors.append({
-                                    "txid": inp.prev_txid.hex(),
+                                    "txid": inp.prev_txid[::-1].hex(),
                                     "vout": inp.prev_vout,
                                     "error": "P2SH-P2WSH: no matching keys for witnessScript",
                                 })
@@ -7148,7 +7168,7 @@ class RPCServer:
                     if not signed and explicit_redeem_script is not None:
                         if _hash160(explicit_redeem_script) == spk[2:22]:
                             errors.append({
-                                "txid": inp.prev_txid.hex(),
+                                "txid": inp.prev_txid[::-1].hex(),
                                 "vout": inp.prev_vout,
                                 "error": "Legacy P2SH redeemScript signing not supported (only P2SH-P2WPKH and P2SH-P2WSH wraps)",
                             })
@@ -7156,7 +7176,7 @@ class RPCServer:
 
                     if not signed:
                         errors.append({
-                            "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                            "txid": inp.prev_txid[::-1].hex(), "vout": inp.prev_vout,
                             "error": "No matching key for P2SH-P2WPKH (P2SH-P2WSH requires witnessScript in prevtxs)",
                         })
 
@@ -7166,7 +7186,7 @@ class RPCServer:
                     key = keys_by_pubkey.get(x_only)
                     if not key:
                         errors.append({
-                            "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                            "txid": inp.prev_txid[::-1].hex(), "vout": inp.prev_vout,
                             "error": "No matching key for P2TR",
                         })
                         continue
@@ -7184,7 +7204,7 @@ class RPCServer:
                         )
                     except Exception as e:
                         errors.append({
-                            "txid": inp.prev_txid.hex(),
+                            "txid": inp.prev_txid[::-1].hex(),
                             "vout": inp.prev_vout,
                             "error": f"P2TR key tweak failed: {e}",
                         })
@@ -7198,7 +7218,7 @@ class RPCServer:
                             raw_sig = CPrivKey(tweaked_secret).sign_schnorr(sh)
                         except Exception:
                             errors.append({
-                                "txid": inp.prev_txid.hex(),
+                                "txid": inp.prev_txid[::-1].hex(),
                                 "vout": inp.prev_vout,
                                 "error": "Schnorr signing not available",
                             })
@@ -7217,14 +7237,14 @@ class RPCServer:
                     witness_script = extras.get("witness_script")
                     if witness_script is None:
                         errors.append({
-                            "txid": inp.prev_txid.hex(),
+                            "txid": inp.prev_txid[::-1].hex(),
                             "vout": inp.prev_vout,
                             "error": "P2WSH input missing witnessScript in prevtxs",
                         })
                         continue
                     if hashlib.sha256(witness_script).digest() != spk[2:34]:
                         errors.append({
-                            "txid": inp.prev_txid.hex(),
+                            "txid": inp.prev_txid[::-1].hex(),
                             "vout": inp.prev_vout,
                             "error": "P2WSH witnessScript does not hash to scriptPubKey",
                         })
@@ -7249,7 +7269,7 @@ class RPCServer:
                         )
                     except ValueError as ve:
                         errors.append({
-                            "txid": inp.prev_txid.hex(),
+                            "txid": inp.prev_txid[::-1].hex(),
                             "vout": inp.prev_vout,
                             "error": str(ve),
                         })
@@ -7258,20 +7278,20 @@ class RPCServer:
                     tx.has_witness = True
                     if not sigs:
                         errors.append({
-                            "txid": inp.prev_txid.hex(),
+                            "txid": inp.prev_txid[::-1].hex(),
                             "vout": inp.prev_vout,
                             "error": "P2WSH: no matching keys for witnessScript",
                         })
 
                 else:
                     errors.append({
-                        "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                        "txid": inp.prev_txid[::-1].hex(), "vout": inp.prev_vout,
                         "error": f"Unsupported script type (len={len(spk)})",
                     })
 
             except Exception as e:
                 errors.append({
-                    "txid": inp.prev_txid.hex(), "vout": inp.prev_vout,
+                    "txid": inp.prev_txid[::-1].hex(), "vout": inp.prev_vout,
                     "error": str(e),
                 })
 
@@ -7297,8 +7317,10 @@ class RPCServer:
                 _, best_height = self.node.db.get_best_block()
                 valid, error = self.node.validator.validate_transaction(
                     tx, best_height + 1)
+                # JSON-RPC convention: txids in responses are display-order
+                # (BE). get_txid() returns LE (internal). Reverse for JSON. W69.
                 results.append({
-                    "txid": tx.get_txid().hex(),
+                    "txid": tx.get_txid()[::-1].hex(),
                     "allowed": valid,
                     "reject-reason": error if not valid else None,
                 })
@@ -7368,9 +7390,11 @@ class RPCServer:
 
         # Build per-transaction results from the mempool entries that were
         # just inserted by validate_package.
+        # JSON-RPC convention: txids in responses are display-order (BE).
+        # get_txid() returns LE (internal byte order). Reverse for JSON. W69.
         tx_results: dict[str, Any] = {}
         for tx in txs:
-            txid_hex = tx.get_txid().hex()
+            txid_hex = tx.get_txid()[::-1].hex()
             entry = self.node.mempool.get_transaction_entry(tx.get_txid())
             if entry is not None:
                 tx_results[txid_hex] = {
@@ -7410,7 +7434,9 @@ class RPCServer:
         """Get detailed information about a wallet transaction."""
         if not hasattr(self.node, 'db') or not self.node.db:
             raise ValueError("No database available")
-        txid_bytes = bytes.fromhex(txid)
+        # JSON-RPC convention: txids arrive in display order (big-endian hex).
+        # DB keys use internal little-endian. W69.
+        txid_bytes = bytes.fromhex(txid)[::-1]
         tx = self.node.db.get_transaction(txid_bytes)
         if tx is None:
             raise ValueError(f"Transaction not found: {txid}")
@@ -8316,8 +8342,10 @@ class RPCServer:
 
         fee_rate = int(fee_rate)
 
-        # Get original fee before bumping
-        txid_bytes = bytes.fromhex(txid)
+        # Get original fee before bumping.
+        # JSON-RPC convention: txids arrive in display order (BE hex).
+        # Mempool keys are internal LE. Reverse at the boundary. W69.
+        txid_bytes = bytes.fromhex(txid)[::-1]
         orig_entry = self.node.mempool.get_transaction_entry(txid_bytes)
         if orig_entry is None:
             raise HTTPException(
@@ -8334,10 +8362,11 @@ class RPCServer:
                 "wallet may lack keys or funds, or mempool rejected the replacement",
             )
 
-        # Get the new entry fee
-        new_entry = self.node.mempool.get_transaction_entry(
-            bytes.fromhex(new_txid)
-        )
+        # wallet.bump_fee returns LE hex (internal). Convert for RPC output
+        # and for mempool lookup (both need LE bytes). W69.
+        new_txid_bytes = bytes.fromhex(new_txid)  # already LE
+        new_txid_display = new_txid_bytes[::-1].hex()  # BE for JSON output
+        new_entry = self.node.mempool.get_transaction_entry(new_txid_bytes)
         new_fee_btc = new_entry.fee / 1e8 if new_entry else 0
 
         # Broadcast inv to peers
@@ -8345,7 +8374,7 @@ class RPCServer:
             from ouroboros.p2p_messages import INV_TYPE_TX, InvMessage
 
             inv = InvMessage(
-                inventory=[(INV_TYPE_TX, bytes.fromhex(new_txid))]
+                inventory=[(INV_TYPE_TX, new_txid_bytes)]
             )
             inv_msg = inv.to_network_message(self.node.network)
             if hasattr(self.node, "peer_manager") and self.node.peer_manager:
@@ -8354,7 +8383,7 @@ class RPCServer:
             pass  # best-effort broadcast
 
         return {
-            "txid": new_txid,
+            "txid": new_txid_display,
             "origfee": orig_fee_btc,
             "fee": new_fee_btc,
             "errors": [],
@@ -8401,8 +8430,10 @@ class RPCServer:
 
         fee_rate = int(fee_rate)
 
-        # Get original fee before bumping
-        txid_bytes = bytes.fromhex(txid)
+        # Get original fee before bumping.
+        # JSON-RPC convention: txids arrive in display order (BE hex).
+        # Mempool keys are internal LE. Reverse at the boundary. W69.
+        txid_bytes = bytes.fromhex(txid)[::-1]
         orig_entry = self.node.mempool.get_transaction_entry(txid_bytes)
         if orig_entry is None:
             raise HTTPException(
@@ -8446,10 +8477,11 @@ class RPCServer:
         mempool = self.node.mempool
 
         # -- depends: unconfirmed parents of this tx -----------------------
+        # inp.prev_txid is internal LE; JSON-RPC emits display-order (BE). W69.
         depends: list[str] = []
         for inp in entry.tx.inputs:
             if inp.prev_txid in mempool.transactions:
-                depends.append(inp.prev_txid.hex())
+                depends.append(inp.prev_txid[::-1].hex())
 
         # -- spentby: unconfirmed children spending this tx's outputs ------
         spentby: list[str] = []
@@ -8458,7 +8490,7 @@ class RPCServer:
                 continue
             for inp in other_entry.tx.inputs:
                 if inp.prev_txid == txid_bytes:
-                    spentby.append(other_txid.hex())
+                    spentby.append(other_txid[::-1].hex())
                     break  # one match per child tx is enough
 
         # -- weight / vsize ------------------------------------------------
@@ -8508,7 +8540,9 @@ class RPCServer:
         """Return mempool data for a given transaction."""
         if not hasattr(self.node, "mempool") or self.node.mempool is None:
             raise ValueError("No mempool available")
-        txid_bytes = bytes.fromhex(txid)
+        # JSON-RPC convention: txids arrive in display order (big-endian hex).
+        # Internal mempool keys are little-endian (internal byte order). W69.
+        txid_bytes = bytes.fromhex(txid)[::-1]
         entry = self.node.mempool.get_transaction_entry(txid_bytes)
         if entry is None:
             raise ValueError(f"Transaction not in mempool: {txid}")
@@ -11160,7 +11194,9 @@ class RPCServer:
 
         # Sign each input
         for i, tx_in in enumerate(tx.inputs):
-            prev_txid_hex = tx_in.prev_txid.hex()
+            # tx_in.prev_txid is internal LE; convert to display-order (BE)
+            # for prevtxs_map lookup and for JSON error emission. W69.
+            prev_txid_hex = tx_in.prev_txid[::-1].hex()
             prev_vout = tx_in.prev_vout
 
             # Skip if already signed (has witness or non-empty scriptSig)

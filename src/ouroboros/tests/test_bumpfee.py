@@ -421,8 +421,9 @@ class TestBumpFee(unittest.TestCase):
                     Transaction=Transaction, TxIn=TxIn, TxOut=TxOut
                 ),
             }):
+                # bump_fee expects display-order (BE) txid. W69.
                 result = await self.wallet.bump_fee(
-                    orig_tx.txid.hex(), new_fee_rate=20
+                    orig_tx.txid[::-1].hex(), new_fee_rate=20
                 )
             return result
 
@@ -450,8 +451,9 @@ class TestBumpFee(unittest.TestCase):
                     Transaction=Transaction, TxIn=TxIn, TxOut=TxOut
                 ),
             }):
+                # bump_fee expects display-order (BE) txid. W69.
                 return await self.wallet.bump_fee(
-                    orig_tx.txid.hex(), new_fee_rate=20
+                    orig_tx.txid[::-1].hex(), new_fee_rate=20
                 )
 
         result = asyncio.run(run())
@@ -496,8 +498,9 @@ class TestBumpFee(unittest.TestCase):
                     Transaction=Transaction, TxIn=TxIn, TxOut=TxOut
                 ),
             }):
+                # bump_fee expects display-order (BE) txid. W69.
                 return await self.wallet.bump_fee(
-                    orig_tx.txid.hex(), new_fee_rate=20, sign=False
+                    orig_tx.txid[::-1].hex(), new_fee_rate=20, sign=False
                 )
 
         result = asyncio.run(run())
@@ -521,8 +524,9 @@ class TestBumpFee(unittest.TestCase):
                     Transaction=Transaction, TxIn=TxIn, TxOut=TxOut
                 ),
             }):
+                # bump_fee expects display-order (BE) txid. W69.
                 new_txid = await self.wallet.bump_fee(
-                    orig_tx.txid.hex(), new_fee_rate=50
+                    orig_tx.txid[::-1].hex(), new_fee_rate=50
                 )
             return new_txid
 
@@ -560,8 +564,9 @@ class TestBumpFee(unittest.TestCase):
                     Transaction=Transaction, TxIn=TxIn, TxOut=TxOut
                 ),
             }):
+                # bump_fee expects display-order (BE) txid. W69.
                 return await self.wallet.bump_fee(
-                    orig_tx.txid.hex(), new_fee_rate=20
+                    orig_tx.txid[::-1].hex(), new_fee_rate=20
                 )
 
         new_txid = asyncio.run(run())

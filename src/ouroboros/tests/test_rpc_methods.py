@@ -664,8 +664,9 @@ class TestSubmitPackage(unittest.TestCase):
             # Should have results for both transactions
             self.assertEqual(len(tx_results), 2)
 
-            parent_txid = parent.get_txid().hex()
-            child_txid = child.get_txid().hex()
+            # submitpackage emits display-order (BE) txids. W69.
+            parent_txid = parent.get_txid()[::-1].hex()
+            child_txid = child.get_txid()[::-1].hex()
 
             self.assertIn(parent_txid, tx_results)
             self.assertIn(child_txid, tx_results)
