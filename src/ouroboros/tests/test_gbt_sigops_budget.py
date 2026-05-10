@@ -184,7 +184,8 @@ class TestGBTSigopsBudget(unittest.TestCase):
         snap_fee_rate = [txid_a, txid_b, txid_c, txid_big]
 
         result = _run_template(snap_txs, snap_fee_rate)
-        included_ids = {bytes.fromhex(t["txid"]) for t in result["transactions"]}
+        # t["txid"] is display-order (BE) hex; internal txids are LE — reverse. W69.
+        included_ids = {bytes.fromhex(t["txid"])[::-1] for t in result["transactions"]}
 
         self.assertIn(txid_a, included_ids, "tx_a (25 checksigs) should be included")
         self.assertIn(txid_b, included_ids, "tx_b (25 checksigs) should be included")
@@ -219,7 +220,8 @@ class TestGBTSigopsBudget(unittest.TestCase):
         snap_fee_rate = [txid_fits, txid_over]
 
         result = _run_template(snap_txs, snap_fee_rate)
-        included_ids = {bytes.fromhex(t["txid"]) for t in result["transactions"]}
+        # t["txid"] is display-order (BE) hex; internal txids are LE — reverse. W69.
+        included_ids = {bytes.fromhex(t["txid"])[::-1] for t in result["transactions"]}
 
         self.assertIn(txid_fits, included_ids,
                       "first tx (79,996 sigop cost) should fit")

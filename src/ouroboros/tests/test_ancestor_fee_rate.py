@@ -181,7 +181,8 @@ class TestAncestorFeeRateOrdering(unittest.TestCase):
             self._build_scenario()
         )
         result = self._run_template(snap_txs, snap_fee_rate)
-        tx_order = [bytes.fromhex(t["txid"]) for t in result["transactions"]]
+        # t["txid"] is display-order (BE) hex; internal txids are LE — reverse. W69.
+        tx_order = [bytes.fromhex(t["txid"])[::-1] for t in result["transactions"]]
 
         # All three transactions should be present
         self.assertIn(parent_txid, tx_order,
@@ -304,7 +305,8 @@ class TestAncestorFeeRateOrdering(unittest.TestCase):
         snap_fee_rate = [gp_txid, parent_txid, standalone_txid, child_txid]
 
         result = self._run_template(snap_txs, snap_fee_rate)
-        tx_order = [bytes.fromhex(t["txid"]) for t in result["transactions"]]
+        # t["txid"] is display-order (BE) hex; internal txids are LE — reverse. W69.
+        tx_order = [bytes.fromhex(t["txid"])[::-1] for t in result["transactions"]]
 
         gp_idx = tx_order.index(gp_txid)
         parent_idx = tx_order.index(parent_txid)
