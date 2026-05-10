@@ -25,6 +25,8 @@ OutPoint = tuple[bytes, int]
 # Policy constants
 MAX_STANDARD_TX_WEIGHT = 400_000
 MIN_STANDARD_TX_NONWITNESS_SIZE = 65
+MAX_STANDARD_SCRIPTSIG_SIZE = 1650  # Bitcoin Core policy/policy.h MAX_STANDARD_SCRIPTSIG_SIZE
+MAX_OP_RETURN_RELAY = 100_000  # MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR (100 kB, policy/policy.h)
 MAX_ANCESTOR_COUNT = 25
 MAX_DESCENDANT_COUNT = 25
 MAX_ANCESTOR_SIZE_KVB = 101
@@ -897,30 +899,73 @@ def _check_ephemeral_dust(
 
 
 def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
+    """Check transaction standardness against Bitcoin Core policy gates.
+
+    Mirrors Bitcoin Core policy/policy.cpp IsStandardTx() and the
+    additional pre-checks in validation.cpp AcceptToMemoryPoolWorker().
+
+    Gates (in Core order):
+      1. Version ∈ [1, TX_MAX_STANDARD_VERSION]
+      2. Weight ≤ MAX_STANDARD_TX_WEIGHT (400 000 WU)
+      3. Non-witness size ≥ MIN_STANDARD_TX_NONWITNESS_SIZE (65 bytes)
+         — CVE-2017-12842 mitigation (validation.cpp:813)
+      4. Per-input: scriptSig size ≤ MAX_STANDARD_SCRIPTSIG_SIZE (1650 B)
+      5. Per-input: scriptSig is push-only
+      6. Per-output: scriptPubKey is a standard type
+      7. Cumulative OP_RETURN (nulldata) payload ≤ MAX_OP_RETURN_RELAY bytes
+      8. Dust check (skipped for v3 which uses ephemeral-dust rules)
+    """
     if tx.version < 1 or tx.version > TX_MAX_STANDARD_VERSION:
         return False, f"Non-standard version: {tx.version}"
 
-    tx_bytes = tx.serialize()
-    tx_size = len(tx_bytes)
-    # Weight approximation: non-witness size * 3 + total size
-    tx_weight = tx_size * 4  # conservative upper bound
+    # Gate 2: weight.  Use the real BIP-141 weight formula (stripped_size × 3 +
+    # total_size) rather than the previous stripped_size × 4 approximation,
+    # which over-counts for segwit transactions and incorrectly rejects large
+    # segwit txs that Core accepts.
+    # Reference: Bitcoin Core policy/policy.cpp IsStandardTx() ~line 111-115.
+    tx_weight = tx.get_weight()
     if tx_weight > MAX_STANDARD_TX_WEIGHT:
         return False, f"Transaction weight {tx_weight} exceeds {MAX_STANDARD_TX_WEIGHT}"
 
+    # Gate 3: minimum non-witness size (CVE-2017-12842).
+    # tx.serialize() returns stripped (no-witness) bytes, matching TX_NO_WITNESS.
+    # Reference: Bitcoin Core validation.cpp:813.
+    tx_size = len(tx.serialize())
     if tx_size < MIN_STANDARD_TX_NONWITNESS_SIZE:
         return False, f"Transaction too small: {tx_size} < {MIN_STANDARD_TX_NONWITNESS_SIZE}"
 
-    # Check that every output has a standard script type.
-    # Reference: Bitcoin Core policy/policy.cpp IsStandardTx() — iterates
-    # outputs and calls IsStandard(txout.scriptPubKey, ...) for each one.
-    # Non-standard types (e.g. OP_RETURN with truncated push) are rejected.
+    # Gates 4 + 5: per-input scriptSig checks.
+    # Reference: Bitcoin Core policy/policy.cpp IsStandardTx() ~line 117-135:
+    #   if (txin.scriptSig.size() > MAX_STANDARD_SCRIPTSIG_SIZE) → "scriptsig-size"
+    #   if (!txin.scriptSig.IsPushOnly())                        → "scriptsig-not-pushonly"
+    for idx, tx_in in enumerate(tx.inputs):
+        if len(tx_in.script_sig) > MAX_STANDARD_SCRIPTSIG_SIZE:
+            return False, f"Input {idx} scriptSig size {len(tx_in.script_sig)} exceeds {MAX_STANDARD_SCRIPTSIG_SIZE} (scriptsig-size)"
+        if tx_in.script_sig and not _is_push_only_from(tx_in.script_sig, 0):
+            return False, f"Input {idx} scriptSig is not push-only (scriptsig-not-pushonly)"
+
+    # Gates 6 + 7: per-output type + cumulative datacarrier limit.
+    # Reference: Bitcoin Core policy/policy.cpp IsStandardTx() ~line 137-156:
+    #   IsStandard(txout.scriptPubKey, whichType) → "scriptpubkey"
+    #   NULL_DATA cumulative size > max_datacarrier_bytes → "datacarrier"
+    # MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR = 100 000 bytes.
+    datacarrier_bytes_used = 0
     for idx, out in enumerate(tx.outputs):
         if not _is_standard_output_type(out.script_pubkey):
-            return False, f"Output {idx} has non-standard script type"
+            return False, f"Output {idx} has non-standard script type (scriptpubkey)"
+        # Track cumulative OP_RETURN payload bytes.
+        if out.script_pubkey and out.script_pubkey[0] == 0x6a:
+            datacarrier_bytes_used += len(out.script_pubkey)
+            if datacarrier_bytes_used > MAX_OP_RETURN_RELAY:
+                return False, (
+                    f"Total OP_RETURN data {datacarrier_bytes_used} bytes exceeds "
+                    f"{MAX_OP_RETURN_RELAY} (datacarrier)"
+                )
 
-    # Check for dust outputs — v3 transactions use ephemeral dust rules
-    # instead of the normal dust rejection (checked later in package
-    # validation or individual-submission rejection).
+    # Gate 8: dust check for non-v3 transactions.
+    # v3 transactions use ephemeral dust rules checked separately in
+    # _add_transaction_inner (individual-submission rejection) or package
+    # validation.
     if tx.version != 3:
         dust_indices = _has_ephemeral_dust(tx)
         if dust_indices:
