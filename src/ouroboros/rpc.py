@@ -1970,18 +1970,28 @@ class RPCServer:
                         status_code=404,
                         detail="Block hash not found"
                     )
-                # Check if block has data
-                block_height = block.height if hasattr(block, 'height') else None
-                # Check if block is in active chain
+                # Resolve block height via chainstate index (NOT block.height —
+                # PyBlock doesn't carry a height field; getattr fallback always
+                # returns None, making in_active_chain false-negative).
+                # Mirrors getblockheader's _get_block_height() call.
+                block_height = await asyncio.to_thread(
+                    self._get_block_height, self.node.db, block_hash_bytes
+                )
+                # Check if block is in active chain using the same logic as
+                # getblockheader: compare hash-at-height vs supplied hash.
                 if block_height is not None:
                     try:
-                        active_hash = await asyncio.to_thread(self.node.db.get_block_hash_by_height, block_height)
+                        active_hash = await asyncio.to_thread(
+                            self.node.db.get_block_hash_by_height, block_height
+                        )
                         if active_hash is not None:
-                            in_active_chain = (active_hash == block_hash_bytes)
+                            in_active_chain = (bytes(active_hash) == block_hash_bytes)
                         else:
                             in_active_chain = False
                     except Exception:
-                        in_active_chain = None
+                        in_active_chain = False
+                else:
+                    in_active_chain = False
             else:
                 # Use the transaction index for O(1) lookup
                 if has_txindex:
@@ -2025,43 +2035,109 @@ class RPCServer:
 
         # 4. Return result based on verbosity
         if verbosity == 0:
+            # For raw hex, prefer witness-serialized bytes from raw block storage.
+            if not in_mempool and block is not None and block_hash_bytes is not None:
+                raw_block_bytes: bytes | None = await asyncio.to_thread(
+                    self.node.db.get_block_bytes, block_hash_bytes
+                )
+                if raw_block_bytes is not None:
+                    try:
+                        parsed_txs = _parse_block_txs(raw_block_bytes)
+                        for ptx in parsed_txs:
+                            if ptx.txid == tx_hash:
+                                return ptx.serialize_with_witness().hex()
+                    except Exception:
+                        pass
             return tx.serialize().hex()
 
-        # Verbose output (verbosity >= 1)
-        result = self._tx_to_dict(tx)
+        # Verbose output (verbosity >= 1).
+        #
+        # For confirmed txs, re-parse from raw block bytes so witness stacks are
+        # preserved — the Rust PyTxIn stub strips witness items (same issue fixed
+        # for getblock verbosity=2 in W59).
+        from ouroboros.psbt import _tx_to_univ as _psbt_tx_to_univ
+        from ouroboros.psbt import BTCAmount as _BTCAmount
+        from ouroboros.psbt import _build_spk_json as _psbt_build_spk_json
 
-        # Add hex-encoded raw transaction
-        result["hex"] = tx.serialize().hex()
+        network = getattr(self.node, "network", "mainnet")
 
-        # Add in_active_chain if explicit blockhash was provided
-        if explicit_blockhash and in_active_chain is not None:
-            result["in_active_chain"] = in_active_chain
+        # Attempt to get a witness-preserving copy of this tx.
+        witness_tx = tx  # fallback: stripped version from block.transactions
+        raw_block_bytes_v: bytes | None = None
+        if not in_mempool and block is not None and block_hash_bytes is not None:
+            try:
+                raw_block_bytes_v = await asyncio.to_thread(
+                    self.node.db.get_block_bytes, block_hash_bytes
+                )
+                if raw_block_bytes_v is not None:
+                    parsed_txs = _parse_block_txs(raw_block_bytes_v)
+                    for ptx in parsed_txs:
+                        if ptx.txid == tx_hash:
+                            witness_tx = ptx
+                            break
+            except Exception:
+                raw_block_bytes_v = None
 
-        # Add block context fields for confirmed transactions
+        # Build the base verbose dict using the shared _tx_to_univ helper
+        # (same path as decoderawtransaction + getblock verbosity=2).
+        # Reference: Bitcoin Core rpc/rawtransaction.cpp TxToUniv.
+        result = _psbt_tx_to_univ(witness_tx, network)
+
+        # hex field: witness-serialized (Core's CDataStream include_witness=true).
+        result["hex"] = witness_tx.serialize_with_witness().hex()
+
+        # in_active_chain: only present when blockhash was explicitly supplied.
+        # Reference: Bitcoin Core getrawtransaction, fVerbose && !hashBlock.IsNull().
+        if explicit_blockhash:
+            result["in_active_chain"] = bool(in_active_chain)
+
+        # Block-context fields for confirmed transactions.
         if not in_mempool and block is not None:
             if block_hash_bytes:
-                # block_hash_bytes is internal little-endian (either reversed
-                # from caller hex or from get_tx_index). Convert to display
-                # order for JSON-RPC output.
                 result["blockhash"] = block_hash_bytes[::-1].hex()
-            if block_height is not None:
-                result["confirmations"] = self._get_confirmations(block_height)
+            # Resolve block height if not already known.
+            effective_height = block_height
+            if effective_height is None:
+                effective_height = block.height if hasattr(block, 'height') else None
+            if effective_height is not None:
+                result["confirmations"] = self._get_confirmations(effective_height)
             else:
-                # Try to get height from block
-                bh = block.height if hasattr(block, 'height') else None
-                if bh is not None:
-                    result["confirmations"] = self._get_confirmations(bh)
-                else:
-                    result["confirmations"] = 0
+                result["confirmations"] = 0
             result["blocktime"] = block.timestamp
             result["time"] = block.timestamp
-        else:
-            # Mempool transaction - no confirmations
-            pass
 
-        # TODO: verbosity == 2 would include fee and prevout information
-        # This requires looking up the spent outputs for each input
-        # which needs undo data or UTXO lookups
+        # verbosity == 2: add fee at top level and prevout per non-coinbase input.
+        # Reference: Bitcoin Core getrawtransaction verbosity=2 path,
+        #            rpc/rawtransaction.cpp TxToUniv(tx, …, verbosity=2).
+        if verbosity >= 2 and not witness_tx.is_coinbase:
+            input_total_sats = 0
+            vin_list = result.get("vin", [])
+            for j, tx_in in enumerate(witness_tx.inputs):
+                utxo = await asyncio.to_thread(
+                    self.node.db.get_utxo_or_spent,
+                    tx_in.prev_txid, tx_in.prev_vout
+                )
+                if utxo is not None:
+                    input_total_sats += utxo['value']
+                    prevout_height = utxo.get('height', 0)
+                    prevout_value_sats = utxo['value']
+                    prevout_spk = utxo.get('script_pubkey', b'')
+                    prevout_generated = utxo.get('is_coinbase', False)
+
+                    prevout_dict = {
+                        "generated": bool(prevout_generated),
+                        "height": prevout_height,
+                        "value": _BTCAmount(prevout_value_sats),
+                        "scriptPubKey": _psbt_build_spk_json(prevout_spk, network),
+                    }
+                    if j < len(vin_list):
+                        vin_list[j]["prevout"] = prevout_dict
+
+            output_total_sats = sum(o.value for o in witness_tx.outputs)
+            fee_sats = max(0, input_total_sats - output_total_sats)
+            if fee_sats > 0:
+                # BTCAmount serialised by _BTCEncoder as fixed-decimal %d.%08d.
+                result["fee"] = _BTCAmount(fee_sats)
 
         return result
 
