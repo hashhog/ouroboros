@@ -4367,7 +4367,9 @@ class RPCServer:
         if computed_root != merkle_root_in_header:
             raise HTTPException(status_code=400, detail="Merkle root mismatch")
 
-        return [txid.hex() for txid in matched]
+        # matched hashes are in internal byte order (LE); RPC convention
+        # requires display order (BE / reversed).  Mirror Core's GetHex().
+        return [txid[::-1].hex() for txid in matched]
 
     async def rpc_getmininginfo(self) -> dict[str, Any]:
         """
