@@ -55,6 +55,17 @@ MAX_CLUSTER_COUNT = 100  # Maximum transactions per cluster
 # Ephemeral dust policy constants (Bitcoin Core policy/policy.h)
 MAX_DUST_OUTPUTS_PER_TX = 1  # Maximum number of dust outputs per transaction
 
+# Witness standardness constants (Bitcoin Core policy/policy.h + script/script.h + script/interpreter.h)
+MAX_STANDARD_P2WSH_SCRIPT_SIZE = 3600    # policy/policy.h
+MAX_STANDARD_P2WSH_STACK_ITEMS = 100     # policy/policy.h
+MAX_STANDARD_P2WSH_STACK_ITEM_SIZE = 80  # policy/policy.h
+MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE = 80  # policy/policy.h (BIP 342)
+WITNESS_V0_SCRIPTHASH_SIZE = 32          # script/interpreter.h
+WITNESS_V1_TAPROOT_SIZE = 32             # script/interpreter.h
+ANNEX_TAG = 0x50                         # script/script.h
+TAPROOT_LEAF_MASK = 0xfe                 # script/interpreter.h
+TAPROOT_LEAF_TAPSCRIPT = 0xc0            # script/interpreter.h (BIP 342 leaf version)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Cluster Mempool Implementation
@@ -974,6 +985,209 @@ def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
     return True, ""
 
 
+def _eval_script_sig_to_stack(script_sig: bytes) -> list[bytes] | None:
+    """Evaluate a scriptSig into its push-data stack (SCRIPT_VERIFY_NONE semantics).
+
+    Mirrors Bitcoin Core EvalScript(stack, scriptSig, SCRIPT_VERIFY_NONE, ...) as used
+    in IsWitnessStandard to extract the redeemScript from a P2SH input.  We do not
+    enforce push-only here — that is checked separately by _is_standard_tx gate 5.
+    Returns None if parsing fails (malformed script), otherwise the stack.
+
+    Reference: bitcoin-core/src/policy/policy.cpp IsWitnessStandard() line 293.
+    """
+    stack: list[bytes] = []
+    i = 0
+    n = len(script_sig)
+    while i < n:
+        op = script_sig[i]
+        i += 1
+        if op == 0x00:
+            # OP_0 — push empty bytes
+            stack.append(b"")
+        elif 0x01 <= op <= 0x4b:
+            # Inline push: op bytes of data
+            if i + op > n:
+                return None  # truncated
+            stack.append(script_sig[i:i + op])
+            i += op
+        elif op == 0x4c:  # OP_PUSHDATA1
+            if i >= n:
+                return None
+            length = script_sig[i]
+            i += 1
+            if i + length > n:
+                return None
+            stack.append(script_sig[i:i + length])
+            i += length
+        elif op == 0x4d:  # OP_PUSHDATA2
+            if i + 2 > n:
+                return None
+            length = script_sig[i] | (script_sig[i + 1] << 8)
+            i += 2
+            if i + length > n:
+                return None
+            stack.append(script_sig[i:i + length])
+            i += length
+        elif op == 0x4e:  # OP_PUSHDATA4
+            if i + 4 > n:
+                return None
+            length = (script_sig[i] | (script_sig[i + 1] << 8) |
+                      (script_sig[i + 2] << 16) | (script_sig[i + 3] << 24))
+            i += 4
+            if i + length > n:
+                return None
+            stack.append(script_sig[i:i + length])
+            i += length
+        elif 0x51 <= op <= 0x60:
+            # OP_1 through OP_16
+            stack.append(bytes([op - 0x50]))
+        elif op == 0x4f:
+            # OP_1NEGATE
+            stack.append(b"\x81")
+        else:
+            # Non-push opcode — skip (SCRIPT_VERIFY_NONE does not enforce push-only)
+            # We're just extracting the stack; these won't be present in well-formed P2SH.
+            pass
+    return stack
+
+
+def _get_witness_program(script_pubkey: bytes) -> tuple[int, bytes] | None:
+    """Extract (version, program) from a witness program scriptPubKey.
+
+    Returns None if script_pubkey is not a witness program (OP_0/OP_1–16 + 2–40 push).
+    Mirrors Bitcoin Core CScript::IsWitnessProgram().
+
+    Reference: bitcoin-core/src/script/script.cpp CScript::IsWitnessProgram().
+    """
+    if len(script_pubkey) < 4 or len(script_pubkey) > 42:
+        return None
+    version_opcode = script_pubkey[0]
+    if version_opcode == 0x00:
+        version = 0
+    elif 0x51 <= version_opcode <= 0x60:
+        version = version_opcode - 0x50
+    else:
+        return None
+    # Second byte must encode the program length
+    program_len = script_pubkey[1]
+    if program_len + 2 != len(script_pubkey):
+        return None
+    if program_len < 2 or program_len > 40:
+        return None
+    return version, script_pubkey[2:]
+
+
+def _is_witness_standard(
+    tx: "Transaction",
+    prevscripts: dict[int, bytes],
+) -> tuple[bool, str]:
+    """Check witness standardness for a transaction.
+
+    Mirrors Bitcoin Core IsWitnessStandard() (policy/policy.cpp lines 265-352).
+    `prevscripts` maps input index → scriptPubKey bytes for every input that has
+    a non-null witness.  Inputs absent from the map are assumed to have an empty
+    witness and are skipped.
+
+    Gates enforced (numbered as in the Bitcoin Core source):
+      G1  Coinbase exempt (line 267-268).
+      G2  Empty witness inputs are skipped (line 274-275).
+      G3  P2A input with any witness → "bad-witness-nonstandard" (line 283-285).
+      G4  P2SH-wrapped witness: eval scriptSig push-stack → top = redeemScript;
+          fail/empty stack → "bad-witness-nonstandard" (lines 288-299).
+      G5  Non-witness prevScript paired with non-empty witness →
+          "bad-witness-nonstandard" (lines 305-306).
+      G6  P2WSH (v0, 32-byte program) resource limits (lines 309-318):
+          - last stack item (witnessScript) ≤ 3600 bytes
+          - stack items excluding script ≤ 100
+          - each non-script item ≤ 80 bytes
+      G7  P2TR (v1, 32-byte program, NOT P2SH-wrapped) limits (lines 321-349):
+          - annex (stack[-1][0] == 0x50) present → "bad-witness-nonstandard"
+          - script-path: per tapscript-item size ≤ 80 bytes
+          - 0-item stack → "bad-witness-nonstandard" (consensus-invalid anyway)
+
+    Reference: bitcoin-core/src/policy/policy.cpp IsWitnessStandard() lines 265-352.
+    """
+    # G1: coinbase transactions are exempt (line 267-268)
+    if tx.is_coinbase:
+        return True, ""
+
+    for i, tx_in in enumerate(tx.inputs):
+        witness = tx_in.witness  # list[bytes] | None
+        # G2: skip inputs with empty/null witness (line 274-275)
+        if not witness:
+            continue
+
+        prev_script = prevscripts.get(i)
+        if prev_script is None:
+            # prevScript not provided — caller should provide it for all
+            # witness-bearing inputs; skip defensively rather than crash.
+            continue
+
+        # G3: P2A input with witness → witness stuffing (line 283-285)
+        if is_pay_to_anchor(prev_script):
+            return False, "bad-witness-nonstandard"
+
+        # G4: P2SH-wrapped witness path (lines 288-299)
+        p2sh = False
+        working_script = prev_script
+        if (len(prev_script) == 23 and prev_script[0] == 0xa9 and
+                prev_script[1] == 0x14 and prev_script[22] == 0x87):
+            # prevScript is P2SH — eval scriptSig push stack to get redeemScript
+            stack = _eval_script_sig_to_stack(tx_in.script_sig)
+            if stack is None or len(stack) == 0:
+                return False, "bad-witness-nonstandard"
+            working_script = stack[-1]  # redeemScript = top of scriptSig stack
+            p2sh = True
+
+        # G5: non-witness prevScript with non-empty witness (lines 305-306)
+        wp = _get_witness_program(working_script)
+        if wp is None:
+            return False, "bad-witness-nonstandard"
+
+        version, program = wp
+
+        # G6: P2WSH (v0, 32-byte program) resource limits (lines 309-318)
+        if version == 0 and len(program) == WITNESS_V0_SCRIPTHASH_SIZE:
+            # Last witness item is the witnessScript
+            witness_script = witness[-1]
+            if len(witness_script) > MAX_STANDARD_P2WSH_SCRIPT_SIZE:
+                return False, "bad-witness-nonstandard"
+            # Stack items excluding the script
+            stack_items = witness[:-1]
+            if len(stack_items) > MAX_STANDARD_P2WSH_STACK_ITEMS:
+                return False, "bad-witness-nonstandard"
+            for item in stack_items:
+                if len(item) > MAX_STANDARD_P2WSH_STACK_ITEM_SIZE:
+                    return False, "bad-witness-nonstandard"
+
+        # G7: P2TR (v1, 32-byte program, NOT P2SH-wrapped) limits (lines 321-349)
+        if version == 1 and len(program) == WITNESS_V1_TAPROOT_SIZE and not p2sh:
+            stack = list(witness)  # mutable copy; we pop from back
+            # Annex check: if stack[-1][0] == ANNEX_TAG and len >= 2 → reject
+            if len(stack) >= 2 and stack[-1] and stack[-1][0] == ANNEX_TAG:
+                return False, "bad-witness-nonstandard"
+            if len(stack) >= 2:
+                # Script-path spend: control block = stack[-1], script = stack[-2]
+                control_block = stack[-1]
+                stack.pop()
+                stack.pop()  # discard script
+                if not control_block:
+                    return False, "bad-witness-nonstandard"
+                if (control_block[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSCRIPT:
+                    # Leaf version 0xc0: BIP 342 tapscript stack item size limit
+                    for item in stack:
+                        if len(item) > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE:
+                            return False, "bad-witness-nonstandard"
+            elif len(stack) == 1:
+                # Key-path spend: single stack element, no policy limits
+                pass
+            else:
+                # 0 elements: consensus-invalid (line 346-348)
+                return False, "bad-witness-nonstandard"
+
+    return True, ""
+
+
 @dataclass
 class MempoolEntry:
     """Entry in the mempool"""
@@ -1274,6 +1488,30 @@ class Mempool:
         if missing_parents:
             self.orphan_pool.add(tx, missing_parents)
             return False, "orphan"
+
+        # Witness standardness check (policy, not consensus).
+        # Mirrors Bitcoin Core IsWitnessStandard() (policy/policy.cpp lines 265-352).
+        # Must run after the orphan check so all prevScripts are resolvable.
+        if self.require_standard:
+            prevscripts: dict[int, bytes] = {}
+            for idx, tx_in in enumerate(tx.inputs):
+                witness = tx_in.witness
+                if not witness:
+                    continue
+                # Resolve prevScript: chain UTXO first, then in-mempool parent.
+                utxo = self.validator.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                if utxo is not None:
+                    prevscripts[idx] = utxo["script_pubkey"]
+                else:
+                    parent_entry = self.transactions.get(tx_in.prev_txid)
+                    if parent_entry is not None:
+                        try:
+                            prevscripts[idx] = parent_entry.tx.outputs[tx_in.prev_vout].script_pubkey
+                        except IndexError:
+                            pass  # malformed parent; consensus check will catch it
+            is_ws, ws_reason = _is_witness_standard(tx, prevscripts)
+            if not is_ws:
+                return False, f"Non-standard transaction: {ws_reason}"
 
         # Validate transaction (consensus)
         valid, error = self.validator.validate_transaction(tx, height)
