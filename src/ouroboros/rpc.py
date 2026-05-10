@@ -7505,6 +7505,70 @@ class RPCServer:
         compact = header + sig_bytes[:64]
         return base64.b64encode(compact).decode("ascii")
 
+    async def rpc_signmessagewithprivkey(
+        self, privkey: str, message: str
+    ) -> str:
+        """Sign *message* with *privkey* (WIF-encoded), wallet-less variant.
+
+        Returns a base64-encoded 65-byte compact recoverable ECDSA signature,
+        byte-identical to Bitcoin Core's ``signmessagewithprivkey`` output.
+
+        Algorithm (matches bitcoin-core/src/rpc/signmessage.cpp):
+          1. Decode WIF: base58check → strip version byte → detect compressed
+             flag (trailing 0x01 on 34-byte payload = compressed key).
+          2. Build message hash: SHA256d(VarStr(MAGIC) || VarStr(message)).
+          3. Sign with secp256k1 RFC-6979 recoverable signature.
+          4. Pack as header(1) || r(32) || s(32), base64-encode.
+             header = 27 + recid + (4 if compressed else 0).
+        """
+        import base64
+        import base58 as _base58
+        from coincurve import PrivateKey as _PrivateKey
+
+        if not isinstance(privkey, str) or not isinstance(message, str):
+            raise HTTPException(
+                status_code=400,
+                detail="privkey and message must be strings",
+            )
+
+        # 1) WIF decode.
+        try:
+            decoded = _base58.b58decode_check(privkey)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid private key")
+
+        # decoded = version(1) + secret(32) [+ compressed_flag(1)]
+        payload = decoded[1:]   # strip version byte
+        if len(payload) == 33 and payload[-1] == 0x01:
+            compressed = True
+            secret = bytes(payload[:32])
+        elif len(payload) == 32:
+            compressed = False
+            secret = bytes(payload)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid private key")
+
+        # 2) Message hash.
+        msg_hash = _message_hash(message)
+
+        # 3) Sign (coincurve: r||s||recid, 65 bytes).
+        try:
+            key = _PrivateKey(secret)
+            sig_bytes = key.sign_recoverable(msg_hash, hasher=None)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Sign failed: {e}")
+
+        if len(sig_bytes) != 65:
+            raise HTTPException(
+                status_code=500, detail="Unexpected signature length"
+            )
+
+        # 4) Compact format: header || r || s.
+        recid = sig_bytes[64]
+        header = bytes([27 + recid + (4 if compressed else 0)])
+        compact = header + sig_bytes[:64]
+        return base64.b64encode(compact).decode("ascii")
+
     async def rpc_verifymessage(
         self, address: str, signature: str, message: str
     ) -> bool:
