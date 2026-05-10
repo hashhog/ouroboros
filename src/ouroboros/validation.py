@@ -804,12 +804,15 @@ class BlockValidator:
             tx_sigops_cost = 0
 
             # --- Legacy sigops (outputs + inputs) × WITNESS_SCALE_FACTOR ---
+            # Core's GetLegacySigOpCount() counts scriptSig sigops for ALL
+            # transactions including coinbase (Bitcoin Core consensus/tx_verify.cpp:112-124).
+            # The coinbase scriptSig rarely contains OP_CHECKSIG in practice,
+            # but we must count it to remain spec-compliant.
             legacy_sigops = 0
             for out in tx.outputs:
                 legacy_sigops += _count_legacy_sigops(out.script_pubkey)
-            if not tx.is_coinbase:
-                for inp in tx.inputs:
-                    legacy_sigops += _count_legacy_sigops(inp.script_sig)
+            for inp in tx.inputs:
+                legacy_sigops += _count_legacy_sigops(inp.script_sig)
             tx_sigops_cost += legacy_sigops * WITNESS_SCALE_FACTOR
 
             # --- P2SH sigops × WITNESS_SCALE_FACTOR ---

@@ -16,7 +16,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ouroboros.database import Transaction
-from ouroboros.validation import TransactionValidator
+from ouroboros.validation import (
+    TransactionValidator,
+    WITNESS_SCALE_FACTOR,
+    _count_legacy_sigops,
+    _count_witness_sigops,
+    _get_p2sh_sigops,
+    _get_last_push,
+    _is_p2sh,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +32,9 @@ OutPoint = tuple[bytes, int]
 
 # Policy constants
 MAX_STANDARD_TX_WEIGHT = 400_000
+# Maximum sigop cost for a single transaction in the mempool.
+# Reference: Bitcoin Core policy/policy.h MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST/5
+MAX_STANDARD_TX_SIGOPS_COST = 16_000
 MIN_STANDARD_TX_NONWITNESS_SIZE = 65
 MAX_STANDARD_SCRIPTSIG_SIZE = 1650  # Bitcoin Core policy/policy.h MAX_STANDARD_SCRIPTSIG_SIZE
 MAX_OP_RETURN_RELAY = 100_000  # MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR (100 kB, policy/policy.h)
@@ -909,6 +920,54 @@ def _check_ephemeral_dust(
     return True, ""
 
 
+def _compute_tx_sigop_cost(
+    tx: Transaction,
+    utxo_resolver,  # callable(prev_txid: bytes, prev_vout: int) -> dict | None
+) -> int:
+    """Compute the BIP141-weighted sigop cost for a single transaction.
+
+    Mirrors Bitcoin Core consensus/tx_verify.cpp GetTransactionSigOpCost():
+      cost = GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR
+           + GetP2SHSigOpCount(tx, inputs) * WITNESS_SCALE_FACTOR   [non-coinbase]
+           + CountWitnessSigOps(...)                                  [non-coinbase]
+
+    Legacy sigops use inaccurate counting (fAccurate=False); P2SH redeem scripts
+    and P2WSH witness scripts use accurate counting (fAccurate=True).
+
+    Reference: Bitcoin Core consensus/tx_verify.cpp:143-162
+    """
+    # Legacy sigops: all inputs + all outputs, inaccurate mode, × WITNESS_SCALE_FACTOR
+    legacy = 0
+    for out in tx.outputs:
+        legacy += _count_legacy_sigops(out.script_pubkey, accurate=False)
+    for inp in tx.inputs:
+        legacy += _count_legacy_sigops(inp.script_sig, accurate=False)
+    cost = legacy * WITNESS_SCALE_FACTOR
+
+    if tx.is_coinbase:
+        return cost  # P2SH and witness paths are skipped for coinbase (Core parity)
+
+    # P2SH + witness sigops (non-coinbase only)
+    for inp in tx.inputs:
+        utxo = utxo_resolver(inp.prev_txid, inp.prev_vout)
+        if utxo is None:
+            continue
+        prev_spk = bytes(utxo["script_pubkey"])
+
+        # P2SH sigops × WITNESS_SCALE_FACTOR
+        cost += _get_p2sh_sigops(inp.script_sig, prev_spk) * WITNESS_SCALE_FACTOR
+
+        # Witness sigops × 1 (BIP141 discount)
+        witness_spk = prev_spk
+        if _is_p2sh(prev_spk):
+            redeem = _get_last_push(inp.script_sig)
+            if redeem is not None:
+                witness_spk = redeem
+        cost += _count_witness_sigops(witness_spk, inp.witness)
+
+    return cost
+
+
 def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
     """Check transaction standardness against Bitcoin Core policy gates.
 
@@ -1512,6 +1571,30 @@ class Mempool:
             is_ws, ws_reason = _is_witness_standard(tx, prevscripts)
             if not is_ws:
                 return False, f"Non-standard transaction: {ws_reason}"
+
+        # Per-transaction sigop cost limit (mempool policy, not consensus).
+        # Reference: Bitcoin Core validation.cpp AcceptToMemoryPoolWorker:908-943
+        #   nSigOpsCost = GetTransactionSigOpCost(tx, m_view, STANDARD_SCRIPT_VERIFY_FLAGS)
+        #   if (nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST) → TX_NOT_STANDARD / bad-txns-too-many-sigops
+        # MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST / 5 = 80000 / 5 = 16000
+        # This is only enforced when standardness checks are active (require_standard).
+        if self.require_standard:
+            def _utxo_resolver(prev_txid: bytes, prev_vout: int):
+                utxo = self.validator.db.get_utxo(prev_txid, prev_vout)
+                if utxo is not None:
+                    return utxo
+                parent_entry = self.transactions.get(prev_txid)
+                if parent_entry is not None and prev_vout < len(parent_entry.tx.outputs):
+                    out = parent_entry.tx.outputs[prev_vout]
+                    return {"script_pubkey": out.script_pubkey}
+                return None
+
+            tx_sigop_cost = _compute_tx_sigop_cost(tx, _utxo_resolver)
+            if tx_sigop_cost > MAX_STANDARD_TX_SIGOPS_COST:
+                return False, (
+                    f"bad-txns-too-many-sigops: sigop cost {tx_sigop_cost} exceeds "
+                    f"MAX_STANDARD_TX_SIGOPS_COST ({MAX_STANDARD_TX_SIGOPS_COST})"
+                )
 
         # Validate transaction (consensus)
         valid, error = self.validator.validate_transaction(tx, height)
