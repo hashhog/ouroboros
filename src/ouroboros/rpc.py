@@ -9541,6 +9541,134 @@ class RPCServer:
     # Descriptor RPCs (BIP 380-386)
     # -------------------------------------------------------------------------
 
+    async def rpc_createmultisig(
+        self,
+        nrequired: int,
+        keys: list[str],
+        address_type: str = "legacy",
+    ) -> dict[str, Any]:
+        """
+        Create a multisig address from M-of-N compressed pubkeys.
+
+        Args:
+            nrequired:    Number of required signatures (M).
+            keys:         List of N hex-encoded compressed 33-byte pubkeys.
+            address_type: "legacy" (default) → P2SH base58check
+                          "bech32"            → P2WSH native segwit
+                          "p2sh-segwit"       → P2SH-wrapped P2WSH
+
+        Returns dict with keys:
+            address      — the multisig address string
+            redeemScript — hex of the raw multisig script
+            descriptor   — output descriptor with BIP-380 checksum
+
+        Reference: Bitcoin Core src/rpc/output_script.cpp createmultisig
+        """
+        import hashlib as _hashlib
+
+        import base58 as _base58
+        import bech32 as _bech32
+
+        from ouroboros.descriptors import add_checksum
+
+        # --- Validate inputs ---------------------------------------------------
+        if not isinstance(nrequired, int) or nrequired < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="nrequired must be a positive integer",
+            )
+        if not keys or not isinstance(keys, list):
+            raise HTTPException(
+                status_code=400,
+                detail="keys must be a non-empty list of pubkey hex strings",
+            )
+        n = len(keys)
+        if nrequired > n:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not enough keys supplied ({n} keys for {nrequired}-of-{n} multisig)",
+            )
+        if n > 16:
+            raise HTTPException(
+                status_code=400,
+                detail="Number of keys cannot exceed 16",
+            )
+        if address_type not in ("legacy", "bech32", "p2sh-segwit"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown address_type: {address_type!r}",
+            )
+
+        # Decode and validate each pubkey
+        pubkey_bytes: list[bytes] = []
+        for pk_hex in keys:
+            try:
+                pk = bytes.fromhex(pk_hex)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid hex pubkey: {pk_hex!r}",
+                ) from None
+            if len(pk) != 33 or pk[0] not in (0x02, 0x03):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Pubkey must be a 33-byte compressed point: {pk_hex!r}",
+                )
+            pubkey_bytes.append(pk)
+
+        # --- Build redeem script -----------------------------------------------
+        # OP_M  (0x50 + nrequired)
+        # for each pk: OP_DATA_33 (0x21) || <33-byte pk>
+        # OP_N  (0x50 + n)
+        # OP_CHECKMULTISIG (0xae)
+        redeem_script = bytes([0x50 + nrequired])
+        for pk in pubkey_bytes:
+            redeem_script += bytes([len(pk)]) + pk
+        redeem_script += bytes([0x50 + n, 0xae])
+
+        # --- Address-type helpers (inline, no external dependency) -------------
+        def _hash160(data: bytes) -> bytes:
+            return _hashlib.new(
+                "ripemd160", _hashlib.sha256(data).digest()
+            ).digest()
+
+        def _sha256(data: bytes) -> bytes:
+            return _hashlib.sha256(data).digest()
+
+        network = getattr(self.node, "network", "mainnet")
+        p2sh_version = b"\x05" if network == "mainnet" else b"\xc4"
+        hrp = "bc" if network == "mainnet" else "tb"
+
+        if address_type == "legacy":
+            # P2SH: HASH160(redeemScript)
+            h160 = _hash160(redeem_script)
+            address = _base58.b58encode_check(p2sh_version + h160).decode()
+            desc_inner = f"multi({nrequired},{','.join(keys)})"
+            descriptor = add_checksum(f"sh({desc_inner})")
+
+        elif address_type == "bech32":
+            # P2WSH: SHA256(redeemScript) as 32-byte witness program
+            witness_program = _sha256(redeem_script)
+            bits5 = _bech32.convertbits(witness_program, 8, 5)
+            address = _bech32.bech32_encode(hrp, [0] + bits5)
+            desc_inner = f"multi({nrequired},{','.join(keys)})"
+            descriptor = add_checksum(f"wsh({desc_inner})")
+
+        else:  # p2sh-segwit
+            # P2SH-P2WSH: P2SH of (OP_0 <32-byte SHA256(redeemScript)>)
+            witness_program = _sha256(redeem_script)
+            p2wsh_script = b"\x00\x20" + witness_program
+            h160 = _hash160(p2wsh_script)
+            address = _base58.b58encode_check(p2sh_version + h160).decode()
+            desc_inner = f"multi({nrequired},{','.join(keys)})"
+            descriptor = add_checksum(f"sh(wsh({desc_inner}))")
+
+        return {
+            "address": address,
+            "redeemScript": redeem_script.hex(),
+            "descriptor": descriptor,
+        }
+
     async def rpc_getdescriptorinfo(self, descriptor: str) -> dict[str, Any]:
         """
         Analyze a descriptor string and return information about it.
