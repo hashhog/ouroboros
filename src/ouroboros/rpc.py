@@ -3057,81 +3057,78 @@ class RPCServer:
         """
         Get UTXO information by outpoint.
 
-        Args:
-            txid: Transaction ID (hex string)
-            n: Output index (vout)
-            includemempool: If True, also check mempool
+        Returns the Bitcoin Core-compatible shape:
+          { bestblock, confirmations, value, scriptPubKey, coinbase }
+        where scriptPubKey follows ScriptToUniv: {asm, desc, hex, address?, type}.
+        value uses BTCAmount (Core's %d.%08d fixed-decimal).
+        bestblock is display-order (reversed) hex.
 
-        Returns:
-            Dictionary with UTXO information, or None if spent/not found
+        Returns null if the UTXO is spent or doesn't exist.
+
+        Reference: bitcoin-core/src/rpc/blockchain.cpp::rpc_gettxout (GetTxOut).
         """
+        from ouroboros.psbt import BTCAmount as _BTCAmount
+        from ouroboros.psbt import _build_spk_json
+
         try:
-            txid_bytes = bytes.fromhex(txid)
+            # JSON-RPC convention: txids arrive in display order (big-endian hex).
+            # Internal DB keys use little-endian (reversed) bytes.
+            # Reference: Bitcoin Core ParseHashV in src/rpc/util.cpp.
+            try:
+                txid_internal = bytes.fromhex(txid)[::-1]
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid transaction id") from None
+            if len(txid_internal) != 32:
+                raise HTTPException(status_code=400, detail="Invalid transaction id")
 
-            # First check mempool if enabled
-            if includemempool and hasattr(self.node, 'mempool') and self.node.mempool:
-                # Check if transaction is in mempool
-                if self.node.mempool.has_transaction(txid_bytes):
-                    tx = self.node.mempool.get_transaction(txid_bytes)
-                    if tx and n < len(tx.outputs):
-                        output = tx.outputs[n]
-                        script_pubkey_bytes = output.script_pubkey if isinstance(output.script_pubkey, bytes) else bytes(output.script_pubkey)
-                        best_hash = None
-                        if hasattr(self.node, 'db') and self.node.db:
-                            try:
-                                best_hash, _ = self.node.db.get_best_block()
-                                best_hash = best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash)
-                            except Exception:
-                                pass
-                        return {
-                            "bestblock": best_hash,
-                            "confirmations": 0,
-                            "value": output.value / 100000000.0,  # Convert to BTC
-                            "scriptPubKey": {
-                                "asm": disassemble_script(script_pubkey_bytes),
-                                "hex": output.script_pubkey.hex() if isinstance(output.script_pubkey, bytes) else str(output.script_pubkey),
-                                "type": self._get_script_type(output.script_pubkey)
-                            },
-                            "coinbase": tx.is_coinbase,
-                        }
+            network = getattr(self.node, "network", "mainnet")
 
-            # Check database (confirmed UTXOs)
             if not hasattr(self.node, 'db') or not self.node.db:
                 return None
 
-            utxo = await asyncio.to_thread(self.node.db.get_utxo, txid_bytes, n)
+            best_hash, best_height = self.node.db.get_best_block()
+            # best_hash is in internal (little-endian) byte order; reverse for display.
+            best_hash_display = (
+                best_hash[::-1].hex() if isinstance(best_hash, bytes) else str(best_hash)
+            )
+
+            # Check mempool first if enabled (unconfirmed outputs, confirmations=0).
+            if includemempool and hasattr(self.node, 'mempool') and self.node.mempool:
+                if self.node.mempool.has_transaction(txid_internal):
+                    tx = self.node.mempool.get_transaction(txid_internal)
+                    if tx and n < len(tx.outputs):
+                        output = tx.outputs[n]
+                        spk_bytes = (
+                            output.script_pubkey
+                            if isinstance(output.script_pubkey, bytes)
+                            else bytes(output.script_pubkey)
+                        )
+                        return {
+                            "bestblock": best_hash_display,
+                            "confirmations": 0,
+                            "value": _BTCAmount(output.value),
+                            "scriptPubKey": _build_spk_json(spk_bytes, network),
+                            "coinbase": bool(getattr(tx, 'is_coinbase', False)),
+                        }
+
+            # Query confirmed UTXO set.
+            utxo = await asyncio.to_thread(self.node.db.get_utxo, txid_internal, n)
             if not utxo:
                 return None
 
-            # Get block height for confirmations
-            # Try to find which block contains this transaction
-            block_height = 0  # Placeholder - would need transaction index
-            best_hash, best_height = self.node.db.get_best_block()
-            confirmations = max(0, best_height - block_height + 1) if block_height else 0
+            spk_bytes = bytes(utxo['script_pubkey'])
+            utxo_height = utxo.get('height') or 0
+            confirmations = max(1, best_height - utxo_height + 1) if utxo_height else 1
+            is_coinbase = bool(utxo.get('is_coinbase', False))
 
-            script_pubkey = utxo['script_pubkey']
-            if isinstance(script_pubkey, bytes):
-                script_hex = script_pubkey.hex()
-                script_pubkey_bytes = script_pubkey
-            else:
-                script_hex = str(script_pubkey)
-                script_pubkey_bytes = bytes(script_pubkey)
-
-            coinbase = self._is_coinbase_output(txid_bytes)
             return {
-                "bestblock": best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash),
+                "bestblock": best_hash_display,
                 "confirmations": confirmations,
-                "value": utxo['value'] / 100000000.0,  # Convert to BTC
-                "scriptPubKey": {
-                    "asm": disassemble_script(script_pubkey_bytes),
-                    "hex": script_hex,
-                    "type": self._get_script_type(script_pubkey)
-                },
-                "coinbase": coinbase,
+                "value": _BTCAmount(utxo['value']),
+                "scriptPubKey": _build_spk_json(spk_bytes, network),
+                "coinbase": is_coinbase,
             }
 
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid transaction ID: {e}") from None
         except HTTPException:
             raise
         except Exception as e:
