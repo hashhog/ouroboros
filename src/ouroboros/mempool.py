@@ -2637,19 +2637,23 @@ class Mempool:
     def signals_rbf(self, tx: Transaction) -> bool:
         """Check if a transaction signals opt-in RBF per BIP125.
 
-        A transaction signals RBF if any input has nSequence < 0xFFFFFFFE.
-        (SEQUENCE_FINAL - 1 = 0xFFFFFFFE, any value below that signals RBF)
+        A transaction signals RBF if any input has nSequence <= MAX_BIP125_RBF_SEQUENCE
+        (0xFFFFFFFD).  Inputs with nSequence 0xFFFFFFFE or 0xFFFFFFFF do NOT signal.
+        This allows opt-out of replacement while still using nLockTime
+        (nSequence = 0xFFFFFFFE).
 
         Reference: bitcoin/src/util/rbf.cpp SignalsOptInRBF()
+                   bitcoin/src/util/rbf.h MAX_BIP125_RBF_SEQUENCE = 0xFFFFFFFD
         """
-        return any(inp.sequence < 0xFFFFFFFE for inp in tx.inputs)
+        MAX_BIP125_RBF_SEQUENCE = 0xFFFFFFFD
+        return any(inp.sequence <= MAX_BIP125_RBF_SEQUENCE for inp in tx.inputs)
 
     def is_rbf_opt_in(self, txid: bytes) -> bool:
         """Check if a mempool transaction is replaceable.
 
         A tx is replaceable if:
         1. The transaction is a TRUC (v3) transaction (always replaceable), OR
-        2. The transaction itself signals RBF (any input sequence < 0xFFFFFFFE), OR
+        2. The transaction itself signals RBF (any input sequence <= 0xFFFFFFFD), OR
         3. Any of its unconfirmed ancestors signal RBF, OR
         4. Any of its unconfirmed ancestors is a TRUC (v3) transaction
 
@@ -2685,16 +2689,20 @@ class Mempool:
         """
         BIP 125 Replace-By-Fee.
 
-        Rules (following bitcoin/src/policy/rbf.cpp):
-        1. Every directly-conflicting tx must signal replaceability
-           (at least one input with sequence < 0xfffffffe) UNLESS
-           full_rbf is enabled (mempoolfullrbf=1).
-        2. The new tx may not spend any *new* unconfirmed inputs that
-           the original transactions did not already spend.
-        3. Total evictions (conflicts + descendants) <= 100.
-        4. New tx fee must strictly exceed the sum of all evicted fees.
-        5. New tx fee must also cover the incremental relay cost
-           (incrementalrelayfee * new_tx_vsize).
+        BIP 125 rules enforced (bitcoin/src/policy/rbf.cpp):
+        Gate 1 — SignalsOptInRBF: every directly-conflicting tx must signal
+          replaceability (any input nSequence <= 0xFFFFFFFD), or a mempool
+          ancestor must signal; unless full_rbf is enabled.
+        Gate 2 — Ancestor inheritance: is_rbf_opt_in() walks mempool ancestors.
+        Gate 3 — Rule #5 MAX_REPLACEMENT_CANDIDATES=100: the eviction set
+          (direct conflicts + all descendants) must not exceed 100 entries.
+        Gate 4 — Rule #2 HasNoNewUnconfirmed: the replacement must not spend
+          any unconfirmed inputs that were not already spent by the eviction set.
+        Gate 5 — EntriesAndTxidsDisjoint: the replacement's mempool ancestors
+          must not include any directly-conflicting transactions.
+        Gate 6 — Rule #3 PaysForRBF (absolute): replacement_fees >= original_fees.
+        Gate 7 — Rule #4 PaysForRBF (incremental): additional_fees >=
+          incrementalrelayfee * replacement_vsize.
 
         Returns (success, error_message).  On success the conflicts
         (and their descendants) are removed and the new tx is added.
@@ -2762,25 +2770,57 @@ class Mempool:
         for c_txid in conflicts:
             to_evict |= self._collect_descendants(c_txid)
 
-        # Rule 3: eviction count limit
+        # Gate 3 — Rule #5 MAX_REPLACEMENT_CANDIDATES: The eviction set
+        # (direct conflicts + all their descendants) must not exceed 100 entries.
+        # Core uses GetUniqueClusterCount(); without cluster mempool we count
+        # total evictees as a conservative bound (same limit, same intent).
+        # Reference: bitcoin/src/policy/rbf.cpp GetEntriesForConflicts() lines 68-75
         if len(to_evict) > self.MAX_REPLACEMENT_EVICTIONS:
             return False, (
-                f"Replacement would evict {len(to_evict)} txs "
-                f"(max {self.MAX_REPLACEMENT_EVICTIONS})"
+                f"Replacement would evict {len(to_evict)} txs; "
+                f"too many potential replacements (max {self.MAX_REPLACEMENT_EVICTIONS})"
             )
 
-        # Rule 2: new tx must not introduce new unconfirmed inputs
+        # Rule #2 (HasNoNewUnconfirmed): The replacement must not introduce any
+        # new unconfirmed inputs that were not already spent by the to-be-evicted
+        # transactions.  A "new unconfirmed input" is any input whose prev_txid is
+        # still in the mempool (i.e. unconfirmed) and is not an output being freed
+        # by the eviction set.
+        #
+        # Reference: BIP 125 Rule #2; bitcoin/src/validation.cpp ReplacementChecks()
         old_unconfirmed: set[OutPoint] = set()
-        for txid in to_evict:
-            entry = self.transactions[txid]
-            for inp in entry.tx.inputs:
+        for evict_txid in to_evict:
+            evict_entry = self.transactions[evict_txid]
+            for inp in evict_entry.tx.inputs:
                 op: OutPoint = (inp.prev_txid, inp.prev_vout)
+                # An input is "unconfirmed" if its parent is still in the mempool
+                # (and therefore not yet confirmed).  Note: if the parent is also
+                # in to_evict, it is being freed — those outputs become available.
                 if inp.prev_txid in self.transactions:
                     old_unconfirmed.add(op)
         for inp in new_tx.inputs:
             op = (inp.prev_txid, inp.prev_vout)
             if inp.prev_txid in self.transactions and op not in old_unconfirmed:
-                return False, "Replacement introduces new unconfirmed input"
+                return False, (
+                    f"Replacement {new_tx.get_txid().hex()[:16]}... introduces "
+                    f"new unconfirmed input ({inp.prev_txid.hex()[:16]}...:{inp.prev_vout})"
+                )
+
+        # EntriesAndTxidsDisjoint: the replacement tx must not spend an output of
+        # any transaction it is replacing (that would be a self-spending loop).
+        # Equivalently: the new tx's mempool ancestors must not include any of the
+        # direct conflicts.
+        #
+        # Reference: bitcoin/src/policy/rbf.cpp EntriesAndTxidsDisjoint()
+        #            bitcoin/src/validation.cpp:1356
+        new_tx_ancestors = self._get_ancestors(new_tx)
+        for anc_txid in new_tx_ancestors:
+            if anc_txid in conflicts:
+                anc_hex = anc_txid.hex()[:16]
+                return False, (
+                    f"Replacement {new_tx.get_txid().hex()[:16]}... spends "
+                    f"conflicting transaction {anc_hex}..."
+                )
 
         # Calculate new tx fee
         new_size = len(new_tx.serialize())
@@ -2795,22 +2835,27 @@ class Mempool:
         # Sum of fees from all evicted transactions
         old_fees = sum(self.transactions[t].fee for t in to_evict)
 
-        # Rule 4: strictly higher fee
-        if new_fee <= old_fees:
+        # Rule #3 (PaysForRBF, part 1): The replacement fees must be greater than
+        # or equal to fees of the transactions it replaces.
+        # Core: reject if replacement_fees < original_fees (i.e. allow equal fees).
+        # Reference: bitcoin/src/policy/rbf.cpp PaysForRBF() lines 107-111
+        if new_fee < old_fees:
             return False, (
-                f"Replacement fee {new_fee} does not exceed "
-                f"evicted fees {old_fees}"
+                f"Replacement fee {new_fee} sat is less than "
+                f"evicted fees {old_fees} sat"
             )
 
-        # Rule 5: covers incremental relay cost
-        # The additional fee must cover incrementalrelayfee * new_tx_size
-        # Reference: bitcoin/src/policy/rbf.cpp PaysForRBF()
+        # Rule #4 (PaysForRBF, part 2): The additional fees must pay for the
+        # replacement's own bandwidth at or above the incremental relay feerate.
+        # additional_fees = replacement_fees - original_fees
+        # additional_fees >= incrementalrelayfee * replacement_vsize / 1000
+        # Reference: bitcoin/src/policy/rbf.cpp PaysForRBF() lines 117-122
         incremental_fee_needed = (new_size * self.INCREMENTAL_RELAY_FEE) // 1000
         additional_fee = new_fee - old_fees
         if additional_fee < incremental_fee_needed:
             return False, (
                 f"Replacement does not cover incremental relay fee: "
-                f"additional {additional_fee} < required {incremental_fee_needed}"
+                f"additional {additional_fee} sat < required {incremental_fee_needed} sat"
             )
 
         # Rule 6 (cluster mempool): new linearization must be strictly better
