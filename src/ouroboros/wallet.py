@@ -1463,8 +1463,9 @@ class Wallet:
             logger.warning("bump_fee: database or mempool not available")
             return None
 
-        # 1. Look up the original tx in mempool
-        txid_bytes = bytes.fromhex(txid)
+        # 1. Look up the original tx in mempool.
+        # txid arrives in display order (BE hex); mempool keys are LE. W69.
+        txid_bytes = bytes.fromhex(txid)[::-1]
         entry = self.mempool.get_transaction_entry(txid_bytes)
         if entry is None:
             logger.warning("bump_fee: transaction %s not in mempool", txid)
