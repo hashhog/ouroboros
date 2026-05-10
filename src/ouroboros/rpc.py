@@ -4216,30 +4216,46 @@ class RPCServer:
     async def rpc_validateaddress(self, address: str) -> dict[str, Any]:
         """
         Validate a Bitcoin address and return information about it.
+        Reference: Bitcoin Core src/rpc/output_script.cpp (validateaddress) +
+                   src/rpc/util.cpp (DescribeAddressVisitor).
         """
         from ouroboros.address import address_to_script_pubkey
-
-        result: dict[str, Any] = {
-            "isvalid": False,
-            "address": address,
-        }
 
         network = getattr(self.node, 'network', 'mainnet')
 
         try:
             script_pubkey = address_to_script_pubkey(address, network=network)
         except Exception:
-            return result
-
-        result["isvalid"] = True
-        result["scriptPubKey"] = script_pubkey.hex()
+            # Core returns {isvalid:false, error_locations:[], error:"..."} with
+            # no "address" field when decoding fails.
+            return {
+                "isvalid": False,
+                "error_locations": [],
+                "error": "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
+            }
 
         script_type = self._get_script_type(script_pubkey)
-        result["isscript"] = script_type in ("scripthash", "witness_v0_scripthash")
-        result["iswitness"] = script_type.startswith("witness_")
+        is_witness = script_type.startswith("witness_")
 
-        if result["iswitness"]:
-            result["witness_version"] = script_pubkey[0] if script_pubkey[0] != 0 else 0
+        # Core's DescribeAddressVisitor sets isscript=true for:
+        #   ScriptHash (P2SH), WitnessV0ScriptHash (P2WSH), WitnessV1Taproot (P2TR),
+        #   PayToAnchor. isscript=false for PKHash (P2PKH) and WitnessV0KeyHash (P2WPKH).
+        is_script = script_type in ("scripthash", "witness_v0_scripthash", "witness_v1_taproot")
+
+        result: dict[str, Any] = {
+            "address": address,
+            "isvalid": True,
+            "scriptPubKey": script_pubkey.hex(),
+            "isscript": is_script,
+            "iswitness": is_witness,
+        }
+
+        if is_witness:
+            # Decode witness version from script opcode.
+            # OP_0 = 0x00 → version 0; OP_1..OP_16 = 0x51..0x60 → version 1..16.
+            raw_op = script_pubkey[0]
+            witness_version = 0 if raw_op == 0x00 else (raw_op - 0x50)
+            result["witness_version"] = witness_version
             result["witness_program"] = script_pubkey[2:].hex()
 
         return result
