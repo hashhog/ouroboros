@@ -435,6 +435,14 @@ class Descriptor:
             pub = self.keys[0].derive_pubkey(index)
             return _pubkey_to_p2tr(pub, network)
 
+        if dtype == "rawtr":
+            # BIP-386: rawtr(X-ONLY) — OP_1 <32-byte> with NO tweak.
+            # derive_pubkey() returns the raw 32-byte x-only key directly.
+            xonly = self.keys[0].derive_pubkey(index)
+            hrp = "bc" if network == "mainnet" else "tb"
+            from ouroboros.address import _bech32m_encode
+            return _bech32m_encode(hrp, 1, xonly)
+
         if dtype == "sh-wpkh":
             pub = self.keys[0].derive_pubkey(index)
             return _pubkey_to_p2sh_p2wpkh(pub, network)
