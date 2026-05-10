@@ -358,7 +358,8 @@ def _parse_key_expression(raw: str) -> KeyExpression:
         expr.ext_key = ExtendedPubKey.deserialize(ext_str)
         expr.is_private = ext_str.startswith(("xprv", "tprv"))
     else:
-        # Raw hex public key (compressed: 02/03 + 32 bytes = 66 hex)
+        # Raw hex public key: compressed (02/03 + 32 bytes = 66 hex chars) or
+        # x-only (32 bytes = 64 hex chars, used by rawtr()).
         hex_clean = s.strip()
         if len(hex_clean) == 66:
             try:
@@ -368,6 +369,13 @@ def _parse_key_expression(raw: str) -> KeyExpression:
                 expr.hex_pubkey = pubkey_bytes
             except ValueError:
                 raise ValueError(f"Invalid hex public key: {hex_clean}") from None
+        elif len(hex_clean) == 64:
+            # 32-byte x-only pubkey (rawtr() context)
+            try:
+                pubkey_bytes = bytes.fromhex(hex_clean)
+                expr.hex_pubkey = pubkey_bytes
+            except ValueError:
+                raise ValueError(f"Invalid x-only pubkey hex: {hex_clean}") from None
         else:
             raise ValueError(f"Cannot parse key expression: {raw}")
 
@@ -385,7 +393,7 @@ class Descriptor:
     descriptor_type: str          # "pk", "pkh", "wpkh", "tr", "sh-wpkh", "multi",
                                   # "sortedmulti", "wsh-multi", "wsh-sortedmulti",
                                   # "wsh-miniscript", "tr-script", "sh-multi",
-                                  # "sh-wsh-multi", "combo", "addr", "raw"
+                                  # "sh-wsh-multi", "combo", "addr", "raw", "rawtr"
     keys: list[KeyExpression] = field(default_factory=list)
     multisig_threshold: int = 0   # M in multi(M, ...)
     is_range: bool = False
@@ -1112,6 +1120,20 @@ def parse_descriptor(desc_str: str) -> Descriptor:
             )
         else:
             raise ValueError(f"Invalid tr() descriptor: {s}")
+
+    # -- rawtr(KEY) --------------------------------------------------------
+    # BIP-386: rawtr(X-ONLY-KEY) — Taproot key-path spend with a bare x-only
+    # pubkey (no tweak).  issolvable=true, isrange=false, hasprivatekeys=false.
+    if s.startswith("rawtr("):
+        paren_close = _find_matching_paren(s, 5)
+        key_str = s[6:paren_close]
+        key = _parse_key_expression(key_str)
+        return Descriptor(
+            descriptor_type="rawtr",
+            keys=[key],
+            is_range=key.is_range,
+            raw=canonical,
+        )
 
     # -- sortedmulti(M, KEY, KEY, ...) ------------------------------------
     if s.startswith("sortedmulti("):
