@@ -7,6 +7,7 @@ against its mempool, drastically reducing bandwidth at the chain tip.
 
 Reference: https://github.com/bitcoin/bips/blob/master/bip-0152.mediawiki
            bitcoin/src/blockencodings.cpp
+           bitcoin/src/net_processing.cpp
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import struct
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import TYPE_CHECKING
 
 from ouroboros.p2p_messages import decode_varint, encode_varint
@@ -21,6 +23,34 @@ from ouroboros.p2p_messages import decode_varint, encode_varint
 if TYPE_CHECKING:
     from ouroboros.database import Block, Transaction
     from ouroboros.mempool import Mempool
+
+# Bitcoin Core net_processing.cpp: static constexpr uint64_t CMPCTBLOCKS_VERSION{2};
+CMPCTBLOCKS_VERSION: int = 2
+
+# Bitcoin Core net_processing.cpp: MAX_CMPCTBLOCK_DEPTH = 5
+# Compact block announcements deeper than this are treated as plain headers.
+MAX_CMPCTBLOCK_DEPTH: int = 5
+
+# Bitcoin Core net_processing.cpp: MAX_BLOCKTXN_DEPTH = 10
+# Do not serve getblocktxn responses for blocks older than this depth.
+MAX_BLOCKTXN_DEPTH: int = 10
+
+# Bitcoin Core blockencodings.cpp (consensus/consensus.h):
+#   MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 4_000_000 / 40
+# Maximum number of transactions (short IDs + prefilled) in a valid cmpctblock.
+MAX_CMPCTBLOCK_TX_COUNT: int = 100_000  # 4_000_000 // 40
+
+# Bitcoin Core blockencodings.cpp: bucket-size limit used in InitData to
+# detect pathologically skewed short-id distributions (DoS protection).
+# P(max_bucket > 12) <= ~1e-6 per block transfer per peer.
+MAX_SHORT_ID_BUCKET_SIZE: int = 12
+
+
+class ReadStatus(IntEnum):
+    """Mirror of Bitcoin Core's ReadStatus_t (blockencodings.h)."""
+    OK = 0
+    INVALID = 1   # bogus cmpctblock — disconnect or ban
+    FAILED = 2    # reconstructed block mutation / short-ID collision
 
 
 def _siphash_2_4(key: bytes, data: bytes) -> int:
@@ -147,6 +177,73 @@ class CompactBlock:
     def siphash_key(self) -> bytes:
         return compute_siphash_key(self.header, self.nonce)
 
+    def validate(self) -> ReadStatus:
+        """
+        Validate the compact block structure before reconstruction.
+
+        Mirrors Bitcoin Core's PartiallyDownloadedBlock::InitData checks
+        (blockencodings.cpp lines 62-116).  In Core, PrefilledTransaction.index
+        stores the *differential* wire value.  Here .index stores the *absolute*
+        position (set by from_block() or deserialize()), so the gap checks are
+        expressed in terms of absolute indices.
+
+        Gates checked:
+        1. header must not be null-zeroed AND at least one of (short_ids,
+           prefilled_txs) must be non-empty.
+        2. Total tx count must not exceed 100 000
+           (MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT).
+        3. Prefilled tx absolute index must not overflow uint16_t (65535).
+        4. Prefilled tx absolute index must not jump beyond the available
+           shorttxid + prefilled slots (gap check): index <= shorttxids + i.
+        5. Short IDs must all be distinct (no duplicate short IDs).
+        6. No SipHash bucket may contain more than 12 entries (DoS gate).
+        """
+        # Gate 1 — header null / both lists empty
+        # Core's CBlockHeader::IsNull() checks nBits==0; an all-zero 80-byte
+        # header has nBits at offset 72 which will be zero.
+        null_header = (self.header == bytes(80))
+        if null_header or (not self.short_ids and not self.prefilled_txs):
+            return ReadStatus.INVALID
+
+        # Gate 2 — total tx count limit (blockencodings.cpp line 64)
+        total = len(self.short_ids) + len(self.prefilled_txs)
+        if total > MAX_CMPCTBLOCK_TX_COUNT:
+            return ReadStatus.INVALID
+
+        # Gates 3 & 4 — prefilled index overflow and gap check
+        # (blockencodings.cpp lines 73-86)
+        # .index is absolute; check each in order.
+        for i, pf in enumerate(self.prefilled_txs):
+            if pf.index > 0xFFFF:  # uint16_t overflow
+                return ReadStatus.INVALID
+            # Absolute position must not exceed available slots
+            # (shorttxids seen so far) + (prefilled seen so far).
+            if pf.index > len(self.short_ids) + i:
+                return ReadStatus.INVALID
+            # Indices must be strictly increasing
+            if i > 0 and pf.index <= self.prefilled_txs[i - 1].index:
+                return ReadStatus.INVALID
+
+        # Gates 5 & 6 — short ID uniqueness and bucket-size DoS protection
+        # (blockencodings.cpp lines 94-116)
+        # Core uses std::unordered_map with default load-factor 1.0 so the
+        # bucket count equals the number of short IDs. Bucket index =
+        # sid % bucket_count.  We replicate the same distribution.
+        n_sids = len(self.short_ids)
+        if n_sids > 0:
+            sid_map: dict[int, int] = {}
+            bucket_counts: dict[int, int] = {}
+            for sid in self.short_ids:
+                bucket = sid % n_sids
+                bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+                if bucket_counts[bucket] > MAX_SHORT_ID_BUCKET_SIZE:
+                    return ReadStatus.FAILED  # skewed distribution → DoS
+                if sid in sid_map:
+                    return ReadStatus.FAILED  # duplicate short ID
+                sid_map[sid] = sid  # value irrelevant; presence check only
+
+        return ReadStatus.OK
+
     def reconstruct(
         self, mempool: Mempool
     ) -> tuple[list[Transaction] | None, list[int]]:
@@ -156,26 +253,24 @@ class CompactBlock:
         *missing_indices* is empty; otherwise *txs* is None and
         *missing_indices* lists slots the caller should fetch via ``getblocktxn``.
 
-        Uses the mempool's match_compact_block method which handles short ID
-        collisions by marking both colliding transactions as unavailable
-        (following Bitcoin Core behavior).
+        Validates the compact block structure (mirroring InitData) before
+        attempting reconstruction.  Returns (None, []) on protocol violations.
         """
+        status = self.validate()
+        if status != ReadStatus.OK:
+            return None, []
+
         key = self.siphash_key()
 
         total_tx_count = len(self.short_ids) + len(self.prefilled_txs)
         txs: list[Transaction | None] = [None] * total_tx_count
 
-        # Place pre-filled transactions using differential encoding
-        # The index in PrefilledTransaction is relative to the last placed tx
-        offset = 0
+        # Place pre-filled transactions at their absolute indices.
+        # .index is the absolute position (set by from_block / deserialize).
         for pf in self.prefilled_txs:
-            abs_idx = pf.index + offset
-            if abs_idx >= total_tx_count:
-                return None, list(range(total_tx_count))
-            txs[abs_idx] = pf.tx
-            offset = abs_idx + 1
+            txs[pf.index] = pf.tx
 
-        # Use mempool's matching function (handles collisions properly)
+        # Use mempool's matching function (handles short-ID collisions)
         matched_txs, _ = mempool.match_compact_block(self.short_ids, key)
 
         # Fill remaining slots from matched mempool transactions
@@ -218,7 +313,13 @@ class CompactBlock:
 
     @classmethod
     def deserialize(cls, payload: bytes) -> CompactBlock:
-        """Deserialize from ``cmpctblock`` payload."""
+        """Deserialize from ``cmpctblock`` payload.
+
+        Raises ValueError on obviously malformed input (truncated wire data).
+        The deeper structural checks (index overflows, DoS gates) are performed
+        by validate() / reconstruct() so that the caller can apply the same
+        READ_STATUS_INVALID / READ_STATUS_FAILED distinction as Core.
+        """
         from ouroboros.p2p_messages import TxMessage
 
         if len(payload) < 88:
@@ -240,20 +341,34 @@ class CompactBlock:
 
         pf_count, consumed = decode_varint(payload, off)
         off += consumed
+
+        # Bitcoin Core CBlockHeaderAndShortTxIDs deserialization check
+        # (blockencodings.h SERIALIZE_METHODS, line 125):
+        #   if (obj.BlockTxCount() > std::numeric_limits<uint16_t>::max())
+        #       throw std::ios_base::failure("indexes overflowed 16 bits")
+        if sid_count + pf_count > 0xFFFF:
+            raise ValueError(
+                f"cmpctblock: BlockTxCount {sid_count + pf_count} overflows uint16_t"
+            )
+
         prefilled: list[PrefilledTransaction] = []
-        last_idx = -1
+        # Differential encoding: each stored diff is offset-from-last+1.
+        # last_abs tracks the last *absolute* position placed.
+        last_abs = -1
         for _ in range(pf_count):
             diff, consumed = decode_varint(payload, off)
             off += consumed
-            abs_idx = last_idx + 1 + diff
+            abs_idx = last_abs + 1 + diff
 
             tx_msg = TxMessage.from_payload(payload[off:])
             tx = tx_msg.transaction
             tx_len = len(tx.serialize_with_witness())
             off += tx_len
 
+            # Store the absolute position in .index (consistent with
+            # from_block() which stores 0 for the coinbase).
             prefilled.append(PrefilledTransaction(index=abs_idx, tx=tx))
-            last_idx = abs_idx
+            last_abs = abs_idx
 
         return cls(
             header=header, nonce=nonce,
