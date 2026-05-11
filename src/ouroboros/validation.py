@@ -17,7 +17,12 @@ from ouroboros.script import (
     get_flags_for_height,
 )
 from ouroboros.sig_cache import SigCache
-from ouroboros.consensus import BURIED_DEPLOYMENTS, BIP34_HASHES, BIP30_REPEAT_EXCEPTIONS
+from ouroboros.consensus import (
+    BURIED_DEPLOYMENTS,
+    BIP34_HASHES,
+    BIP30_REPEAT_EXCEPTIONS,
+    is_buried_deployment_active,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +502,21 @@ class BlockValidator:
         # 2. Compute median-time-past (needed for header validation and BIP 68)
         block_mtp = self.db.get_median_time_past(expected_height - 1) or 0
 
+        # 2b. Compute nLockTimeCutoff per Bitcoin Core validation.cpp:4135-4142.
+        #
+        # Before CSV (BIP-113) activation Core uses block.GetBlockTime() as the
+        # time comparison value in IsFinalTx().  After CSV activation it uses the
+        # median-time-past (MTP) of the previous block.
+        #
+        # Ref: Bitcoin Core validation.cpp:4135-4142
+        #   if (DeploymentActiveAfter(pindexPrev, Consensus::DEPLOYMENT_CSV))
+        #       enforce_locktime_median_time_past = true;
+        #   nLockTimeCutoff = enforce_locktime_median_time_past
+        #       ? pindexPrev->GetMedianTimePast()
+        #       : block.GetBlockTime();
+        csv_active = is_buried_deployment_active("csv", expected_height, self.network)
+        nLockTimeCutoff: int = block_mtp if csv_active else block.timestamp
+
         # 3. Validate header (including difficulty retarget)
         if not self._validate_header(block, prev_block, block_mtp, expected_height):
             return False, "Invalid header"
@@ -628,6 +648,12 @@ class BlockValidator:
         intra_block_utxos: dict[tuple[bytes, int], dict] = {}
         total_fees = 0
         for i, tx in enumerate(block.transactions):
+            # IsFinalTx check applies to ALL transactions including coinbase.
+            # Ref: Bitcoin Core validation.cpp:4144-4148 — iterates block.vtx
+            # (all txs) with nLockTimeCutoff, not just non-coinbase.
+            if not self.tx_validator._is_final_tx(tx, expected_height, nLockTimeCutoff):
+                return False, "bad-txns-nonfinal"
+
             if i == 0:  # Coinbase
                 if not self._validate_coinbase(tx, expected_height):
                     return False, "Invalid coinbase"
@@ -637,7 +663,7 @@ class BlockValidator:
                 # ~6000 extra individual FFI calls per block at height 800k).
                 tx_fees: list[int] = []
                 valid, error = self.tx_validator.validate_transaction(
-                    tx, expected_height, block_mtp,
+                    tx, expected_height, nLockTimeCutoff,
                     block_hash=block.hash,
                     intra_block_utxos=intra_block_utxos,
                     skip_scripts=skip_scripts,
