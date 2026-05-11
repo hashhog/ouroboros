@@ -1677,7 +1677,16 @@ class Mempool:
         # TRUC (v3 transaction) policy checks — must come before general
         # ancestor/descendant limits. This handles both v3 and non-v3 txs
         # (non-v3 txs are checked for spending from v3 parents).
-        truc_ok, truc_err, sibling_txid = self._check_truc_policy(tx)
+        # Pass the already-computed sigop_cost so the vsize used for TRUC limits
+        # matches Bitcoin Core's sigop-adjusted GetVirtualTransactionSize().
+        # Also build a direct_conflicts set (empty here since we handle the
+        # conflict path above via try_replace) to match Core's SingleTRUCChecks
+        # signature which uses it to avoid double-counting a sibling that is
+        # already going to be replaced by the incoming RBF tx.
+        # Reference: bitcoin-core/src/policy/truc_policy.cpp:171-261
+        truc_ok, truc_err, sibling_txid = self._check_truc_policy(
+            tx, sigop_cost=tx_sigop_cost, direct_conflicts=set()
+        )
         if not truc_ok:
             if sibling_txid is not None:
                 # Sibling eviction: try to replace the existing child
@@ -1933,104 +1942,164 @@ class Mempool:
         return tx.version == TRUC_VERSION
 
     def _check_truc_policy(
-        self, tx: Transaction
+        self,
+        tx: Transaction,
+        sigop_cost: int = 0,
+        direct_conflicts: set[bytes] | None = None,
     ) -> tuple[bool, str, bytes | None]:
         """Enforce TRUC policy for a transaction being added.
 
         This implements Bitcoin Core's SingleTRUCChecks (policy/truc_policy.cpp).
 
+        Args:
+            tx: The transaction being submitted.
+            sigop_cost: The BIP-141-weighted sigop cost of tx (from
+                _compute_tx_sigop_cost).  Used to compute the sigop-adjusted
+                virtual size that Core uses for all TRUC size limits.
+                Reference: truc_policy.cpp:200, kernel/mempool_entry.h:110-113.
+            direct_conflicts: Set of in-mempool txids that this tx conflicts
+                with (i.e., transactions that share at least one input with
+                tx).  Used to avoid double-counting a sibling that is already
+                going to be replaced via RBF.
+                Reference: truc_policy.cpp:240-242.
+
         Returns:
             (ok, error_message, sibling_txid)
             - ok: True if the transaction passes all TRUC checks
             - error_message: Error description if ok is False
-            - sibling_txid: If a v3 parent already has a child, returns that
-                           child's txid for potential sibling eviction. None otherwise.
+            - sibling_txid: If a v3 parent already has a child that can be
+                           considered for sibling eviction, returns that
+                           child's txid. None otherwise.
         """
-        tx_vsize = tx.get_vsize() if hasattr(tx, 'get_vsize') else len(tx.serialize())
+        if direct_conflicts is None:
+            direct_conflicts = set()
 
-        # Check v3/non-v3 inheritance rules first (applies to both v3 and non-v3)
+        # Sigop-adjusted virtual size — matches Core's SingleTRUCChecks int64_t vsize
+        # parameter which is pre-computed via GetVirtualTransactionSize(weight, sigop_cost).
+        # Reference: validation.cpp passes sigop_cost into SingleTRUCChecks.
+        tx_vsize = get_virtual_transaction_size(
+            tx.get_weight(), sigop_cost, DEFAULT_BYTES_PER_SIGOP
+        )
+
+        # Gate 1+2: TRUC/non-TRUC inheritance (both v3 and non-v3 txs).
+        # A v3 tx must only have v3 unconfirmed ancestors; a non-v3 tx must
+        # only have non-v3 unconfirmed ancestors.
+        # Reference: truc_policy.cpp:178-191
+        tx_is_v3 = self._is_truc(tx)
         for inp in tx.inputs:
             parent_entry = self.transactions.get(inp.prev_txid)
             if parent_entry is None:
-                continue  # parent is confirmed, no inheritance check needed
+                continue  # confirmed parent — no inheritance constraint
 
             parent_is_v3 = self._is_truc(parent_entry.tx)
-            tx_is_v3 = self._is_truc(tx)
 
             if tx_is_v3 and not parent_is_v3:
-                # v3 tx cannot spend from non-v3 unconfirmed parent
                 return False, (
                     f"version=3 tx cannot spend from non-version=3 tx "
-                    f"{inp.prev_txid.hex()[:16]}..."
+                    f"{inp.prev_txid.hex()}"
                 ), None
 
             if not tx_is_v3 and parent_is_v3:
-                # non-v3 tx cannot spend from v3 unconfirmed parent
                 return False, (
                     f"non-version=3 tx cannot spend from version=3 tx "
-                    f"{inp.prev_txid.hex()[:16]}..."
+                    f"{inp.prev_txid.hex()}"
                 ), None
 
-        # Remaining checks only apply to v3 transactions
-        if not self._is_truc(tx):
+        # Remaining gates only apply to v3 transactions.
+        # Reference: truc_policy.cpp:198
+        if not tx_is_v3:
             return True, "", None
 
-        # TRUC_MAX_VSIZE check (10,000 vbytes for any v3 tx)
+        # Gate 3: TRUC_MAX_VSIZE — any v3 tx must be <= 10,000 vbytes.
+        # Core uses sigop-adjusted vsize here.
+        # Reference: truc_policy.cpp:200-204
         if tx_vsize > TRUC_MAX_VSIZE:
             return False, (
                 f"version=3 tx is too big: {tx_vsize} > {TRUC_MAX_VSIZE} virtual bytes"
             ), None
 
+        # Gate 4: ancestor count limit — v3 tx may have at most 1 unconfirmed
+        # ancestor (TRUC_ANCESTOR_LIMIT=2 includes self).
+        # Reference: truc_policy.cpp:207-211
         ancestors = self._get_ancestors(tx)
-
-        # Ancestor limit check
         if len(ancestors) + 1 > TRUC_ANCESTOR_LIMIT:
-            return False, (
-                f"TRUC (v3) tx would have too many ancestors: "
-                f"{len(ancestors) + 1} > {TRUC_ANCESTOR_LIMIT}"
-            ), None
+            return False, "tx would have too many ancestors", None
 
-        # If there are mempool parents, additional checks apply
+        # Gates 5/6 only apply when there is at least one unconfirmed parent.
         if not ancestors:
             return True, "", None
 
-        # With an unconfirmed parent, check the parent's ancestor count too
+        # Extract the single unconfirmed parent (TRUC allows exactly one).
+        # We pick the first one via the ancestor set since the ancestor-limit
+        # check above guarantees there is exactly 1.
+        parent_entry = None
         for inp in tx.inputs:
-            parent_entry = self.transactions.get(inp.prev_txid)
-            if parent_entry is None:
-                continue
+            pe = self.transactions.get(inp.prev_txid)
+            if pe is not None:
+                parent_entry = pe
+                break
+        if parent_entry is None:
+            # Ancestors set is non-empty but no direct parent found — shouldn't happen.
+            return True, "", None
 
-            # Check that the parent doesn't already have too many ancestors
-            if parent_entry.ancestor_count + 1 > TRUC_ANCESTOR_LIMIT:
-                return False, (
-                    "TRUC (v3) tx would have too many ancestors"
-                ), None
+        # Gate 4b: the in-mempool parent itself must not already have an
+        # unconfirmed ancestor (that would put tx's ancestor count at 3).
+        # Core: pool.GetAncestorCount(mempool_parents[0]) + 1 > TRUC_ANCESTOR_LIMIT
+        # Reference: truc_policy.cpp:217-220
+        if parent_entry.ancestor_count + 1 > TRUC_ANCESTOR_LIMIT:
+            return False, "tx would have too many ancestors", None
 
-            # Child vsize limit: v3 child of unconfirmed parent must be <= 1000 vbytes
-            if tx_vsize > TRUC_CHILD_MAX_VSIZE:
-                return False, (
-                    f"version=3 child tx is too big: {tx_vsize} > "
-                    f"{TRUC_CHILD_MAX_VSIZE} virtual bytes"
-                ), None
+        # Gate 5: TRUC_CHILD_MAX_VSIZE — a v3 child of an unconfirmed v3
+        # parent must be <= 1,000 vbytes (sigop-adjusted).
+        # Reference: truc_policy.cpp:223-227
+        if tx_vsize > TRUC_CHILD_MAX_VSIZE:
+            return False, (
+                f"version=3 child tx is too big: {tx_vsize} > "
+                f"{TRUC_CHILD_MAX_VSIZE} virtual bytes"
+            ), None
 
-            # Descendant limit: v3 parent can have at most 1 child
-            existing_children = list(parent_entry.children)
-            if existing_children:
-                # Return sibling info for potential sibling eviction
-                # Only consider sibling eviction if there's exactly 1 child
-                # and that child has exactly 2 ancestors (parent + grandparent or
-                # just parent being the only unconfirmed ancestor)
-                if len(existing_children) == 1:
-                    sibling_txid = existing_children[0]
-                    sibling_entry = self.transactions.get(sibling_txid)
-                    if sibling_entry and sibling_entry.ancestor_count == 2:
-                        return False, (
-                            "tx would exceed descendant count limit"
-                        ), sibling_txid
-                # Otherwise just reject without sibling eviction option
-                return False, (
-                    "tx would exceed descendant count limit"
-                ), None
+        # Gate 6: descendant count limit — the parent may have at most 1
+        # unconfirmed child.  Core: pool.GetDescendantCount(parent)+1 > LIMIT.
+        # We use parent_entry.children (always up-to-date, even during sibling
+        # eviction where _skip_recount=True leaves descendant_count stale)
+        # rather than parent_entry.descendant_count for the primary gate.
+        # Reference: truc_policy.cpp:243-258
+        existing_children = list(parent_entry.children)
+        if existing_children:
+            # The parent already has a child. Check whether that child is
+            # going to be replaced by a direct conflict (RBF) — if so, we
+            # don't need sibling eviction.
+            # Reference: truc_policy.cpp:240-242 (child_will_be_replaced)
+            child_will_be_replaced = bool(
+                direct_conflicts.intersection(existing_children)
+            )
+            if child_will_be_replaced:
+                # The sibling conflict will be resolved by RBF; no limit violation.
+                return True, "", None
+
+            # Consider sibling eviction when the parent has exactly 1 child
+            # and that child has no descendants of its own (i.e., it is a
+            # simple 1-parent-1-child cluster).
+            # Core: consider_sibling_eviction =
+            #   GetDescendantCount(parent) == 2 && GetAncestorCount(sibling) == 2
+            # GetDescendantCount(parent)==2 means parent has exactly 1 child; we
+            # additionally verify via descendant_count (which may be stale during
+            # sibling eviction, but we have the children set as the source of truth).
+            # Reference: truc_policy.cpp:249-250
+            parent_desc_count = parent_entry.descendant_count  # includes self
+            consider_sibling_eviction = (
+                len(existing_children) == 1
+                and parent_desc_count == 2
+            )
+            if consider_sibling_eviction:
+                sibling_txid = existing_children[0]
+                sibling_entry = self.transactions.get(sibling_txid)
+                # Sibling must itself have exactly 1 ancestor (parent only) for
+                # the simple topology Core requires.
+                if sibling_entry and sibling_entry.ancestor_count == 2:
+                    return False, "tx would exceed descendant count limit", sibling_txid
+
+            return False, "tx would exceed descendant count limit", None
 
         return True, "", None
 
@@ -2045,7 +2114,7 @@ class Mempool:
         - If TRUC: verify parents (in mempool or package) are also TRUC
         - If non-TRUC: verify no TRUC parents (in mempool or package)
         - Check ancestor/descendant limits considering both mempool and package
-        - Check child vsize limits
+        - Check child vsize limits (sigop-adjusted, matching Core)
 
         Args:
             txs: List of transactions in topological order
@@ -2056,10 +2125,41 @@ class Mempool:
         # Build lookup for package txids and their versions
         package_txids = {tx.get_txid(): tx for tx in txs}
 
+        # Build a UTXO resolver that can look up script_pubkeys for sigop
+        # counting: checks package outputs first (topological), then mempool
+        # parents, then the chain UTXO set.
+        # We build package_outputs as we iterate in topological order below.
+        package_script_pubkeys: dict[tuple[bytes, int], bytes] = {}
+
         for tx in txs:
             txid = tx.get_txid()
             tx_is_v3 = self._is_truc(tx)
-            tx_vsize = tx.get_vsize() if hasattr(tx, 'get_vsize') else len(tx.serialize())
+
+            # Compute sigop-adjusted vsize for this tx.
+            # Core's PackageTRUCChecks receives pre-computed vsize per tx
+            # (validation.cpp passes it in); we compute it here inline.
+            # Reference: truc_policy.cpp:71-73 (vsize already checked by
+            # SingleTRUCChecks before PackageTRUCChecks is called), but
+            # PackageTRUCChecks re-checks to be safe.
+            def _pkg_utxo_resolver(prev_txid: bytes, prev_vout: int):
+                key = (prev_txid, prev_vout)
+                spk = package_script_pubkeys.get(key)
+                if spk is not None:
+                    return {"script_pubkey": spk}
+                mp_entry = self.transactions.get(prev_txid)
+                if mp_entry is not None and prev_vout < len(mp_entry.tx.outputs):
+                    return {"script_pubkey": mp_entry.tx.outputs[prev_vout].script_pubkey}
+                utxo = self.validator.db.get_utxo(prev_txid, prev_vout)
+                return utxo
+
+            tx_sigop_cost = _compute_tx_sigop_cost(tx, _pkg_utxo_resolver)
+            tx_vsize = get_virtual_transaction_size(
+                tx.get_weight(), tx_sigop_cost, DEFAULT_BYTES_PER_SIGOP
+            )
+
+            # Register this tx's outputs for children later in the package.
+            for vout, out in enumerate(tx.outputs):
+                package_script_pubkeys[(txid, vout)] = out.script_pubkey
 
             # Collect in-mempool and in-package parents (use sets to avoid
             # double-counting when multiple inputs spend from the same parent)
@@ -2069,104 +2169,114 @@ class Mempool:
             for inp in tx.inputs:
                 if inp.prev_txid in self.transactions:
                     mempool_parents.add(inp.prev_txid)
-                elif inp.prev_txid in package_txids:
+                elif inp.prev_txid in package_txids and inp.prev_txid != txid:
                     package_parents.add(inp.prev_txid)
 
-            # Check v3/non-v3 inheritance
             if tx_is_v3:
-                # v3 tx max vsize check
+                # Gate: TRUC_MAX_VSIZE for any v3 tx.
+                # Reference: truc_policy.cpp:71-73 (SingleTRUCChecks should have
+                # caught this; PackageTRUCChecks re-validates as a safety net).
                 if tx_vsize > TRUC_MAX_VSIZE:
                     return False, (
-                        f"version=3 tx {txid.hex()[:16]}... is too big: "
+                        f"version=3 tx {txid.hex()} is too big: "
                         f"{tx_vsize} > {TRUC_MAX_VSIZE} virtual bytes"
                     )
 
-                # Check ancestor limit
+                # Gate: ancestor count (mempool_parents + package_parents + self).
+                # Reference: truc_policy.cpp:76-79
                 total_ancestors = len(mempool_parents) + len(package_parents)
                 if total_ancestors + 1 > TRUC_ANCESTOR_LIMIT:
-                    return False, (
-                        f"tx {txid.hex()[:16]}... would have too many ancestors"
-                    )
+                    return False, f"tx {txid.hex()} would have too many ancestors"
 
-                # Check that mempool parent doesn't already have too many ancestors
+                # Gate: if a mempool parent exists, its own ancestor count must
+                # also leave room.
+                # Reference: truc_policy.cpp:81-85
                 for mp_txid in mempool_parents:
                     mp_entry = self.transactions.get(mp_txid)
                     if mp_entry:
+                        # mp_entry.ancestor_count includes the parent itself.
+                        # Adding in_package_parents and the child (1) must
+                        # not exceed the limit.
                         if mp_entry.ancestor_count + len(package_parents) + 1 > TRUC_ANCESTOR_LIMIT:
-                            return False, (
-                                f"tx {txid.hex()[:16]}... would have too many ancestors"
-                            )
+                            return False, f"tx {txid.hex()} would have too many ancestors"
 
-                # If has unconfirmed parent, check child-specific rules
-                has_parent = len(mempool_parents) + len(package_parents) > 0
+                has_parent = total_ancestors > 0
                 if has_parent:
-                    # Child vsize limit
+                    # Gate: TRUC_CHILD_MAX_VSIZE for a v3 child with an
+                    # unconfirmed parent (sigop-adjusted).
+                    # Reference: truc_policy.cpp:91-95
                     if tx_vsize > TRUC_CHILD_MAX_VSIZE:
                         return False, (
-                            f"version=3 child tx {txid.hex()[:16]}... is too big: "
+                            f"version=3 child tx {txid.hex()} is too big: "
                             f"{tx_vsize} > {TRUC_CHILD_MAX_VSIZE} virtual bytes"
                         )
 
-                    # Find the parent (exactly 1 should exist per TRUC rules)
-                    parent_txid = next(iter(mempool_parents)) if mempool_parents else next(iter(package_parents))
-
-                    # Check parent is also v3
-                    if parent_txid in self.transactions:
-                        parent_tx = self.transactions[parent_txid].tx
+                    # Identify the single parent (exactly 1 per ancestor-limit check).
+                    # Core picks the mempool parent first, then the package parent.
+                    # Reference: truc_policy.cpp:98-113
+                    if mempool_parents:
+                        parent_txid = next(iter(mempool_parents))
+                        parent_tx: Transaction | None = self.transactions[parent_txid].tx
                     else:
+                        parent_txid = next(iter(package_parents))
                         parent_tx = package_txids.get(parent_txid)
 
-                    if parent_tx and not self._is_truc(parent_tx):
+                    # Gate: parent must be TRUC.
+                    # Reference: truc_policy.cpp:116-119
+                    if parent_tx is not None and not self._is_truc(parent_tx):
                         return False, (
-                            f"version=3 tx {txid.hex()[:16]}... cannot spend from "
-                            f"non-version=3 tx {parent_txid.hex()[:16]}..."
+                            f"version=3 tx {txid.hex()} cannot spend from "
+                            f"non-version=3 tx {parent_txid.hex()}"
                         )
 
-                    # Check that no other tx in package also spends from this parent
+                    # Gate: no sibling allowed — no other tx in the package
+                    # may spend from the same parent.
+                    # Reference: truc_policy.cpp:122-134
                     for other_tx in txs:
-                        if other_tx.get_txid() == txid:
+                        other_txid = other_tx.get_txid()
+                        if other_txid == txid:
                             continue
                         for inp in other_tx.inputs:
                             if inp.prev_txid == parent_txid:
                                 return False, (
-                                    f"tx {parent_txid.hex()[:16]}... would exceed "
+                                    f"tx {parent_txid.hex()} would exceed "
                                     f"descendant count limit"
                                 )
-
-                    # Check that this tx doesn't have any children in the package
-                    for other_tx in txs:
-                        for inp in other_tx.inputs:
+                            # Gate: this tx cannot itself be a parent of another
+                            # tx in the package (no grandchild in package).
+                            # Reference: truc_policy.cpp:136-139
                             if inp.prev_txid == txid:
                                 return False, (
-                                    f"tx {other_tx.get_txid().hex()[:16]}... would "
-                                    f"have too many ancestors"
+                                    f"tx {other_txid.hex()} would have too many ancestors"
                                 )
 
-                    # Check that mempool parent doesn't already have a child
+                    # Gate: the mempool parent must not already have a descendant
+                    # (other than itself), since that would push it to 3.
+                    # Reference: truc_policy.cpp:144-147
                     if mempool_parents:
                         mp_txid = next(iter(mempool_parents))
                         mp_entry = self.transactions.get(mp_txid)
-                        if mp_entry and mp_entry.children:
+                        if mp_entry and mp_entry.descendant_count > 1:
                             return False, (
-                                f"tx {mp_txid.hex()[:16]}... would exceed "
-                                f"descendant count limit"
+                                f"tx {mp_txid.hex()} would exceed descendant count limit"
                             )
 
             else:
-                # Non-v3 tx cannot have v3 parents
+                # Non-v3 tx cannot have v3 parents (in mempool or package).
+                # Reference: truc_policy.cpp:150-167
                 for mp_txid in mempool_parents:
                     mp_entry = self.transactions.get(mp_txid)
                     if mp_entry and self._is_truc(mp_entry.tx):
                         return False, (
-                            f"non-version=3 tx {txid.hex()[:16]}... cannot spend from "
-                            f"version=3 tx {mp_txid.hex()[:16]}..."
+                            f"non-version=3 tx {txid.hex()} cannot spend from "
+                            f"version=3 tx {mp_txid.hex()}"
                         )
                 for pp_txid in package_parents:
                     pp_tx = package_txids.get(pp_txid)
                     if pp_tx and self._is_truc(pp_tx):
                         return False, (
-                            f"non-version=3 tx {txid.hex()[:16]}... cannot spend from "
-                            f"version=3 tx {pp_txid.hex()[:16]}..."
+                            f"non-version=3 tx {txid.hex()} cannot spend from "
+                            f"version=3 tx {pp_txid.hex()}"
                         )
 
         return True, ""
