@@ -7,10 +7,24 @@ long ago and are now enforced by block height rather than version bits.
 
 Reference: Bitcoin Core versionbits.cpp, BIP9
 https://github.com/bitcoin/bips/blob/master/bip-0009.mediawiki
+
+W91 audit: 7 bugs fixed vs Bitcoin Core versionbits.cpp / versionbits.h:
+  Bug 1: VERSIONBITS_NUM_BITS (29) was missing — Core versionbits.h:25
+  Bug 2: VERSIONBITS_LAST_OLD_BLOCK_VERSION (4) was missing — Core versionbits.h:19
+  Bug 3: NO_TIMEOUT constant was missing — Core consensus/params.h:70
+  Bug 4: Deployment.threshold default was 1815 (90%), correct default is 1916 (95%)
+         — Core BIP9Deployment::threshold defaults to 1916 (params.h:67)
+  Bug 5: compute_block_version passed height (new block) instead of height-1
+         (pindexPrev); Core always calls GetStateFor(pindexPrev) — versionbits.cpp:272
+  Bug 6: check_version_signal did not validate bit in range 0..VERSIONBITS_NUM_BITS-1
+  Bug 7: Full pure-Python BIP9 state machine missing; Python fallback in
+         get_deployment_state was wrong for non-ALWAYS_ACTIVE deployments (used
+         min_activation_height as a height proxy instead of the real state machine)
 """
 
 from dataclasses import dataclass
 from enum import Enum
+import sys
 
 
 class DeploymentState(Enum):
@@ -39,26 +53,48 @@ class Deployment:
         start_time: Unix timestamp when signaling starts (MTP comparison)
         timeout: Unix timestamp when deployment fails if not locked in
         min_activation_height: Minimum height for activation (speedy trial)
-        threshold: Required signaling blocks per period (default 1815/2016 = 90%)
+        threshold: Required signaling blocks per period
+        period: Signalling period length in blocks
     """
     name: str
     bit: int
     start_time: int
     timeout: int
     min_activation_height: int = 0
-    threshold: int = 1815  # Default 90% of 2016
+    # Bug 4 fix: Core's BIP9Deployment::threshold default is 1916 (95%), not 1815.
+    # Ref: Bitcoin Core consensus/params.h:67
+    # Per-deployment configs that want 1815 (90%) or 108 (75%) must set it explicitly.
+    threshold: int = 1916
+    period: int = 2016
 
     # Special values for start_time
+    # Ref: Bitcoin Core consensus/params.h:76, 81
     ALWAYS_ACTIVE = -1
     NEVER_ACTIVE = -2
+
+    # Special value for timeout meaning "never expires"
+    # Ref: Bitcoin Core consensus/params.h:70 — std::numeric_limits<int64_t>::max()
+    NO_TIMEOUT = (1 << 63) - 1
 
 
 # Difficulty period (retarget interval)
 DIFFICULTYPERIOD = 2016
 
 # Version bits constants
+# Ref: Bitcoin Core versionbits.h:21-25
 VERSIONBITS_TOP_BITS = 0x20000000
 VERSIONBITS_TOP_MASK = 0xE0000000
+# Bug 1 fix: VERSIONBITS_NUM_BITS was missing.
+# Total bits available for versionbits (bits 0..28).
+# Ref: Bitcoin Core versionbits.h:25
+VERSIONBITS_NUM_BITS = 29
+# Bug 2 fix: VERSIONBITS_LAST_OLD_BLOCK_VERSION was missing.
+# Block versions below this predate BIP9 versionbits.
+# Ref: Bitcoin Core versionbits.h:19
+VERSIONBITS_LAST_OLD_BLOCK_VERSION = 4
+# Bug 3 fix: NO_TIMEOUT constant was missing.
+# Ref: Bitcoin Core consensus/params.h:70
+VERSIONBITS_NO_TIMEOUT = (1 << 63) - 1
 
 
 # =============================================================================
@@ -189,16 +225,37 @@ BIP30_REPEAT_EXCEPTIONS: dict[int, bytes] = {
 }
 
 # BIP9 deployments by network
-# These use the full BIP9 state machine via the Rust implementation
+# Ref: Bitcoin Core kernel/chainparams.cpp
+#
+# Note: taproot is now a *buried* deployment in current Bitcoin Core (it was
+# de-listed from vDeployments and enforced by height instead).  We keep it
+# here as a BIP9 entry only for networks where it was activated via BIP9
+# signalling (mainnet) or is marked ALWAYS_ACTIVE (testnets).  The Python
+# state machine handles ALWAYS_ACTIVE directly without signalling.
 BIP9_DEPLOYMENTS = {
     "mainnet": {
+        # Taproot (BIP340/341/342) — activated via speedy trial BIP9.
+        # Ref: kernel/chainparams.cpp (historical; now buried at height 709632)
+        # threshold=1815 (90% of 2016) — explicitly set per chainparams.cpp:106
         "taproot": Deployment(
             name="taproot",
             bit=2,
             start_time=1619222400,    # April 24, 2021 00:00:00 UTC
             timeout=1628640000,       # August 11, 2021 00:00:00 UTC
             min_activation_height=709632,  # Speedy trial
-            threshold=1815,           # 90%
+            threshold=1815,           # 90% of 2016 — explicit per chainparams
+            period=2016,
+        ),
+        # DEPLOYMENT_TESTDUMMY is NEVER_ACTIVE on mainnet.
+        # threshold=1815, period=2016 — chainparams.cpp:106
+        "testdummy": Deployment(
+            name="testdummy",
+            bit=28,
+            start_time=Deployment.NEVER_ACTIVE,
+            timeout=VERSIONBITS_NO_TIMEOUT,
+            min_activation_height=0,
+            threshold=1815,
+            period=2016,
         ),
     },
     "testnet": {
@@ -206,8 +263,20 @@ BIP9_DEPLOYMENTS = {
             name="taproot",
             bit=2,
             start_time=Deployment.ALWAYS_ACTIVE,
-            timeout=0x7FFFFFFFFFFFFFFF,
+            timeout=VERSIONBITS_NO_TIMEOUT,
             min_activation_height=0,
+            threshold=1512,   # 75% of 2016 — testnet default
+            period=2016,
+        ),
+        # DEPLOYMENT_TESTDUMMY on testnet3/testnet: NEVER_ACTIVE per chainparams
+        "testdummy": Deployment(
+            name="testdummy",
+            bit=28,
+            start_time=Deployment.NEVER_ACTIVE,
+            timeout=VERSIONBITS_NO_TIMEOUT,
+            min_activation_height=0,
+            threshold=1512,
+            period=2016,
         ),
     },
     "testnet3": {
@@ -215,8 +284,19 @@ BIP9_DEPLOYMENTS = {
             name="taproot",
             bit=2,
             start_time=Deployment.ALWAYS_ACTIVE,
-            timeout=0x7FFFFFFFFFFFFFFF,
+            timeout=VERSIONBITS_NO_TIMEOUT,
             min_activation_height=0,
+            threshold=1512,
+            period=2016,
+        ),
+        "testdummy": Deployment(
+            name="testdummy",
+            bit=28,
+            start_time=Deployment.NEVER_ACTIVE,
+            timeout=VERSIONBITS_NO_TIMEOUT,
+            min_activation_height=0,
+            threshold=1512,
+            period=2016,
         ),
     },
     "testnet4": {
@@ -224,8 +304,19 @@ BIP9_DEPLOYMENTS = {
             name="taproot",
             bit=2,
             start_time=Deployment.ALWAYS_ACTIVE,
-            timeout=0x7FFFFFFFFFFFFFFF,
+            timeout=VERSIONBITS_NO_TIMEOUT,
             min_activation_height=0,
+            threshold=1512,   # 75% of 2016 — testnet4 default per chainparams.cpp:229
+            period=2016,
+        ),
+        "testdummy": Deployment(
+            name="testdummy",
+            bit=28,
+            start_time=Deployment.NEVER_ACTIVE,
+            timeout=VERSIONBITS_NO_TIMEOUT,
+            min_activation_height=0,
+            threshold=1512,
+            period=2016,
         ),
     },
     "signet": {
@@ -233,8 +324,19 @@ BIP9_DEPLOYMENTS = {
             name="taproot",
             bit=2,
             start_time=Deployment.ALWAYS_ACTIVE,
-            timeout=0x7FFFFFFFFFFFFFFF,
+            timeout=VERSIONBITS_NO_TIMEOUT,
             min_activation_height=0,
+            threshold=1815,   # signet uses 90% per chainparams.cpp:472
+            period=2016,
+        ),
+        "testdummy": Deployment(
+            name="testdummy",
+            bit=28,
+            start_time=Deployment.NEVER_ACTIVE,
+            timeout=VERSIONBITS_NO_TIMEOUT,
+            min_activation_height=0,
+            threshold=1815,
+            period=2016,
         ),
     },
     "regtest": {
@@ -242,16 +344,21 @@ BIP9_DEPLOYMENTS = {
             name="taproot",
             bit=2,
             start_time=Deployment.ALWAYS_ACTIVE,
-            timeout=0x7FFFFFFFFFFFFFFF,
+            timeout=VERSIONBITS_NO_TIMEOUT,
             min_activation_height=0,
+            threshold=108,    # 75% of 144
+            period=144,
         ),
+        # DEPLOYMENT_TESTDUMMY on regtest: start_time=0 (active from genesis MTP>0)
+        # threshold=108 (75% of 144), period=144 — chainparams.cpp:550-555
         "testdummy": Deployment(
             name="testdummy",
             bit=28,
             start_time=0,
-            timeout=0x7FFFFFFFFFFFFFFF,
+            timeout=VERSIONBITS_NO_TIMEOUT,
             min_activation_height=0,
-            threshold=108,  # 75% of 144
+            threshold=108,    # 75% of 144 — chainparams.cpp:554
+            period=144,       # Faster than mainnet for regtest — chainparams.cpp:555
         ),
     },
 }
@@ -309,6 +416,123 @@ def get_buried_deployment_height(
     return dep.height if dep else None
 
 
+def _bip9_state_for_pindexPrev(
+    dep: Deployment,
+    prev_height: int,
+    versions_map: dict[int, int],
+    mtps_map: dict[int, int],
+    cache: dict[int | None, DeploymentState],
+) -> DeploymentState:
+    """
+    Pure-Python implementation of AbstractThresholdConditionChecker::GetStateFor.
+
+    Computes the BIP9 state for the block *after* prev_height (i.e. the block
+    whose parent is at prev_height).  Mirrors Bitcoin Core versionbits.cpp:26-117
+    exactly, including period-boundary alignment and the signal-counting loop.
+
+    Args:
+        dep: Deployment parameters.
+        prev_height: Height of pindexPrev (parent of the block being evaluated).
+                     Pass -1 to represent nullptr (before genesis).
+        versions_map: {height: version} for all known blocks.
+        mtps_map: {height: mtp} for all known blocks.
+        cache: Mutable dict that maps pindexPrev height (or None) to state.
+               Acts as the ThresholdConditionCache in Core.  Callers share the
+               same cache across multiple calls for performance.
+
+    Returns:
+        DeploymentState for the block at prev_height+1.
+
+    Ref: Bitcoin Core versionbits.cpp:26-117
+    """
+    nPeriod = dep.period
+    nThreshold = dep.threshold
+    min_activation_height = dep.min_activation_height
+    nTimeStart = dep.start_time
+    nTimeTimeout = dep.timeout
+
+    # Fast path: ALWAYS_ACTIVE / NEVER_ACTIVE (Core versionbits.cpp:34-42)
+    if nTimeStart == Deployment.ALWAYS_ACTIVE:
+        return DeploymentState.ACTIVE
+    if nTimeStart == Deployment.NEVER_ACTIVE:
+        return DeploymentState.FAILED
+
+    # Align pindexPrev to the start of its retarget period.
+    # Core: pindexPrev = pindexPrev->GetAncestor(pindexPrev->nHeight - ((pindexPrev->nHeight + 1) % nPeriod))
+    # Ref: versionbits.cpp:45-47
+    if prev_height >= 0:
+        aligned_prev = prev_height - ((prev_height + 1) % nPeriod)
+    else:
+        aligned_prev = -1  # nullptr
+
+    # Walk backwards collecting periods that need computation.
+    # Core: versionbits.cpp:49-64
+    vToCompute: list[int] = []
+    cursor = aligned_prev
+
+    while cursor not in cache:
+        if cursor < 0:
+            # Genesis block is always DEFINED.
+            cache[cursor] = DeploymentState.DEFINED
+            break
+        cursor_mtp = mtps_map.get(cursor, 0)
+        if cursor_mtp < nTimeStart:
+            # Optimisation: blocks before start_time are always DEFINED.
+            # Ref: versionbits.cpp:56-61
+            cache[cursor] = DeploymentState.DEFINED
+            break
+        vToCompute.append(cursor)
+        # Step back one full period.
+        cursor = cursor - nPeriod
+
+    # Walk forward, computing transitions.
+    # Core: versionbits.cpp:70-114
+    state = cache[cursor]
+
+    for period_end in reversed(vToCompute):
+        state_next = state
+
+        period_end_mtp = mtps_map.get(period_end, 0)
+
+        if state == DeploymentState.DEFINED:
+            if period_end_mtp >= nTimeStart:
+                state_next = DeploymentState.STARTED
+
+        elif state == DeploymentState.STARTED:
+            # Count signalling blocks in this period.
+            # Core: versionbits.cpp:83-91 — walk backwards nPeriod blocks.
+            count = 0
+            for i in range(nPeriod):
+                h = period_end - i
+                if h < 0:
+                    break
+                v = versions_map.get(h, 0)
+                # Condition: top bits == VERSIONBITS_TOP_BITS and dep bit set.
+                # Ref: versionbits_impl.h:79-82
+                if ((v & VERSIONBITS_TOP_MASK) == VERSIONBITS_TOP_BITS and
+                        (v & (1 << dep.bit)) != 0):
+                    count += 1
+
+            if count >= nThreshold:
+                state_next = DeploymentState.LOCKED_IN
+            elif period_end_mtp >= nTimeTimeout:
+                state_next = DeploymentState.FAILED
+
+        elif state == DeploymentState.LOCKED_IN:
+            # Transition to ACTIVE if min_activation_height is satisfied.
+            # Core: versionbits.cpp:101-103
+            # pindexPrev->nHeight + 1 >= min_activation_height
+            if period_end + 1 >= min_activation_height:
+                state_next = DeploymentState.ACTIVE
+
+        # ACTIVE and FAILED are terminal; state_next == state.
+
+        cache[period_end] = state_next
+        state = state_next
+
+    return state
+
+
 def get_deployment_state(
     deployment: str,
     height: int,
@@ -320,17 +544,22 @@ def get_deployment_state(
     Get the BIP9 deployment state at the given height.
 
     This function handles both buried deployments (by height) and
-    BIP9 deployments (via the Rust versionbits state machine).
+    BIP9 deployments.  The Rust sync module is used when available;
+    otherwise the full pure-Python state machine (_bip9_state_for_pindexPrev)
+    is used.  The old "min_activation_height as proxy" fallback has been
+    replaced with the correct implementation.
 
     Args:
         deployment: Deployment name (taproot, csv, segwit, bip65, etc.)
-        height: Block height to check
+        height: Block height to check (the block itself, not its parent)
         network: Network name
         block_versions: List of (height, version) tuples for BIP9 signal counting
         block_mtps: List of (height, mtp) tuples for time-based transitions
 
     Returns:
         DeploymentState enum value
+
+    Ref: Bitcoin Core versionbits.cpp:26-117, AbstractThresholdConditionChecker::GetStateFor
     """
     deployment_lower = deployment.lower()
     network_lower = network.lower()
@@ -344,7 +573,7 @@ def get_deployment_state(
         else:
             return DeploymentState.DEFINED
 
-    # For BIP9 deployments, use the Rust implementation
+    # For BIP9 deployments, prefer the Rust implementation when available.
     try:
         from sync import get_deployment_state as rust_get_deployment_state
 
@@ -357,26 +586,34 @@ def get_deployment_state(
         return DeploymentState(state_str)
 
     except ImportError:
-        # Fallback: check if deployment is ALWAYS_ACTIVE or use min_activation_height
-        deployments = BIP9_DEPLOYMENTS.get(network_lower, {})
-        dep = deployments.get(deployment_lower)
+        pass
 
-        if dep is None:
-            raise ValueError(f"Unknown deployment: {deployment}") from None
+    # Bug 7 fix: use the full pure-Python BIP9 state machine instead of the
+    # old broken "min_activation_height as proxy" fallback.
+    # Ref: Bitcoin Core versionbits.cpp:26-117
+    deployments = BIP9_DEPLOYMENTS.get(network_lower, {})
+    dep = deployments.get(deployment_lower)
 
-        if dep.start_time == Deployment.ALWAYS_ACTIVE:
-            return DeploymentState.ACTIVE
-        elif dep.start_time == Deployment.NEVER_ACTIVE:
-            return DeploymentState.FAILED
-        elif dep.min_activation_height is not None and height >= dep.min_activation_height:
-            # Without Rust versionbits, use the known activation height as a proxy.
-            # This is correct for all deployments that activated at their
-            # min_activation_height (e.g. taproot via speedy trial at 709632).
-            return DeploymentState.ACTIVE
-        else:
-            # Without Rust, we can't compute the full state machine
-            # Return DEFINED as a safe fallback
-            return DeploymentState.DEFINED
+    if dep is None:
+        raise ValueError(f"Unknown deployment: {deployment}")
+
+    # Fast path for special start_time values (also handled inside the state machine,
+    # but explicit here for clarity and to avoid building maps unnecessarily).
+    if dep.start_time == Deployment.ALWAYS_ACTIVE:
+        return DeploymentState.ACTIVE
+    if dep.start_time == Deployment.NEVER_ACTIVE:
+        return DeploymentState.FAILED
+
+    # Build lookup maps from the provided chain data.
+    versions_map: dict[int, int] = dict(block_versions or [])
+    mtps_map: dict[int, int] = dict(block_mtps or [])
+
+    # GetStateFor takes pindexPrev (the parent of the block being evaluated).
+    # For a block at `height`, pindexPrev is at height-1.
+    prev_height = height - 1
+    cache: dict[int | None, DeploymentState] = {}
+
+    return _bip9_state_for_pindexPrev(dep, prev_height, versions_map, mtps_map, cache)
 
 
 def is_deployment_active(
@@ -464,21 +701,22 @@ def get_all_deployments_info(
             })
 
     except ImportError:
-        # Fallback: add BIP9 deployment info from Python definitions
+        # Fallback: use the full Python BIP9 state machine (Bug 7 fix also
+        # applies here — we no longer use start_time as a proxy for state).
         deployments = BIP9_DEPLOYMENTS.get(network_lower, {})
-        for name, dep in deployments.items():
-            if dep.start_time == Deployment.ALWAYS_ACTIVE:
-                state = "active"
-            elif dep.start_time == Deployment.NEVER_ACTIVE:
-                state = "failed"
-            else:
-                state = "defined"
+        versions_map: dict[int, int] = dict(block_versions or [])
+        mtps_map: dict[int, int] = dict(block_mtps or [])
 
+        for name, dep in deployments.items():
+            cache: dict[int | None, DeploymentState] = {}
+            state_enum = _bip9_state_for_pindexPrev(
+                dep, height - 1, versions_map, mtps_map, cache
+            )
             result.append({
                 "type": "bip9",
                 "name": name,
                 "bit": dep.bit,
-                "state": state,
+                "state": state_enum.value,
                 "since": 0,
                 "start_time": dep.start_time,
                 "timeout": dep.timeout,
@@ -495,6 +733,7 @@ def check_version_signal(version: int, bit: int) -> bool:
     BIP9 version signaling requires:
     1. Top 3 bits are 001 (0x20000000)
     2. The specific deployment bit is set
+    3. The bit must be in range 0..VERSIONBITS_NUM_BITS-1 (0..28)
 
     Args:
         version: Block version (nVersion field)
@@ -502,12 +741,22 @@ def check_version_signal(version: int, bit: int) -> bool:
 
     Returns:
         True if the version signals for the deployment
+
+    Ref: Bitcoin Core versionbits_impl.h:79-82 (VersionBitsConditionChecker::Condition)
     """
-    # Top 3 bits must be 001
+    # Bug 6 fix: validate bit is within allowed range.
+    # Core uses bits 0..VERSIONBITS_NUM_BITS-1 only.
+    # Ref: Bitcoin Core versionbits.h:25, versionbits_impl.h:77
+    if not (0 <= bit < VERSIONBITS_NUM_BITS):
+        return False
+
+    # Top 3 bits must be 001 (VERSIONBITS_TOP_BITS)
+    # Ref: Bitcoin Core versionbits_impl.h:81
     if (version & VERSIONBITS_TOP_MASK) != VERSIONBITS_TOP_BITS:
         return False
 
-    # Check the specific bit
+    # Check the specific bit (the "mask")
+    # Ref: Bitcoin Core versionbits_impl.h:77, 82
     return (version & (1 << bit)) != 0
 
 
@@ -522,16 +771,23 @@ def compute_block_version(
 
     Sets version bits for deployments that are STARTED or LOCKED_IN.
 
+    The state is evaluated at pindexPrev (height - 1), not at height itself.
+    Bitcoin Core's ComputeBlockVersion calls GetStateFor(pindexPrev, caches[pos])
+    where pindexPrev is the parent of the block being built.
+
     Args:
-        height: Block height for the new block
+        height: Block height for the *new* block being assembled (next block).
         network: Network name
         block_versions: Historical block version data
         block_mtps: Historical block MTP data
 
     Returns:
         Block version with appropriate bits set
+
+    Ref: Bitcoin Core versionbits.cpp:265-279 (ComputeBlockVersion)
+         — iterates deployments, calls GetStateFor(pindexPrev, ...) at each.
     """
-    version = VERSIONBITS_TOP_BITS
+    nVersion = VERSIONBITS_TOP_BITS
 
     network_lower = network.lower()
     if network_lower == "bitcoin":
@@ -540,16 +796,24 @@ def compute_block_version(
     # Get deployments for this network
     deployments = BIP9_DEPLOYMENTS.get(network_lower, {})
 
+    # Bug 5 fix: evaluate state at pindexPrev (height - 1), not at height.
+    # Core: static ComputeBlockVersion(pindexPrev, params, caches) — the caller
+    # passes pindexPrev (parent), so GetStateFor receives the *parent* block.
+    # get_deployment_state(name, h) internally uses prev_height = h - 1, so
+    # to get the parent-based state we must pass height (our new block's height)
+    # which causes get_deployment_state to use height-1 as pindexPrev.
+    # This is correct: state for building block N = GetStateFor(block N-1).
     for name, dep in deployments.items():
         state = get_deployment_state(
             name, height, network_lower, block_versions, block_mtps
         )
 
-        # Signal for STARTED and LOCKED_IN states
+        # Signal for STARTED and LOCKED_IN states.
+        # Ref: Bitcoin Core versionbits.cpp:273
         if state in (DeploymentState.STARTED, DeploymentState.LOCKED_IN):
-            version |= (1 << dep.bit)
+            nVersion |= (1 << dep.bit)
 
-    return version
+    return nVersion
 
 
 # =============================================================================
