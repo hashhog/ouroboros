@@ -263,6 +263,24 @@ if "sync" not in sys.modules:
     _mock.verify_block_checkpoint = _verify_block_checkpoint
     _mock.can_skip_scripts_for_block = _can_skip_scripts_for_block
     _mock.get_minimum_chain_work = _get_minimum_chain_work
+    # BIP-113 / IsFinalTx stub
+    # Mirrors Bitcoin Core's IsFinalTx() in consensus/tx_verify.cpp:17-37.
+    def _is_final_tx(locktime: int, sequences: list, block_height: int, block_mtp: int) -> bool:
+        """Stub matching sequence_lock::is_final_tx in the Rust crate."""
+        LOCKTIME_THRESHOLD = 500_000_000
+        SEQUENCE_FINAL = 0xFFFFFFFF
+        if locktime == 0:
+            return True
+        if all(s == SEQUENCE_FINAL for s in sequences):
+            return True
+        if locktime < LOCKTIME_THRESHOLD:
+            return locktime < block_height
+        else:
+            return locktime < block_mtp
+
+    _mock.is_final_tx = _is_final_tx
+    _mock.locktime_threshold = lambda: 500_000_000
+
     _mock.PySequenceLockConstants = _PySequenceLockConstants
     _mock.bip68_activation_height = _bip68_activation_height
     _mock.is_bip68_active = _is_bip68_active
