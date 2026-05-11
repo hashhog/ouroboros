@@ -70,6 +70,9 @@ POW_LIMIT_BITS_REGTEST = 0x207fffff
 # Ref: Bitcoin Core kernel/chainparams.cpp lines 99, 222, 321, 463, 546.
 _POW_ALLOW_MIN_DIFFICULTY_NETWORKS = {"testnet", "testnet3", "testnet4", "regtest"}
 MAX_TIMEWARP = 600  # BIP94: max seconds a diff-adjustment block can precede prev
+# Maximum seconds a block timestamp may exceed the current wall-clock time.
+# Ref: Bitcoin Core chain.h:29 — static constexpr int64_t MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60
+MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60  # 7200 seconds
 MAX_MONEY = 21_000_000 * 100_000_000  # 2,100,000,000,000,000 satoshis
 
 # --- Signet (BIP 325) ---
@@ -921,38 +924,83 @@ class BlockValidator:
         block_mtp: int = 0,
         height: int = 0,
     ) -> bool:
-        """Validate block header."""
-        # Block timestamp must exceed the median-time-past of previous 11 blocks
-        if block_mtp > 0 and block.timestamp <= block_mtp:
+        """Validate block header contextually (ContextualCheckBlockHeader analog).
+
+        Gates (mirrors Bitcoin Core validation.cpp:4080-4121):
+
+        1. bad-diffbits    — block.bits must equal GetNextWorkRequired().
+                             Ref: validation.cpp:4088-4089.
+        2. time-too-old    — block.timestamp must be strictly greater than MTP of
+                             the previous 11 blocks.
+                             Ref: validation.cpp:4092-4093, chain.h:233-245.
+        3. time-timewarp-attack — on testnet4 (enforce_BIP94=true), at each
+                             difficulty adjustment boundary the block timestamp
+                             must not precede the previous block by > MAX_TIMEWARP.
+                             Ref: validation.cpp:4097-4105, consensus/consensus.h:35.
+        4. time-too-new    — block.timestamp must not exceed now + MAX_FUTURE_BLOCK_TIME.
+                             Ref: validation.cpp:4108-4110, chain.h:29.
+        5. bad-version     — version < 2 after BIP34, < 3 after BIP66 (DERSIG),
+                             < 4 after BIP65 (CLTV).
+                             Ref: validation.cpp:4113-4118.
+        """
+        # 1. bad-diffbits: block.bits must match GetNextWorkRequired.
+        # Check bits is non-zero (cheaply filter obviously invalid before the
+        # more expensive _get_expected_bits call).
+        if block.bits == 0:
             return False
 
-        # BIP94 timewarp protection (testnet4 only):
-        # At difficulty adjustment boundaries, the block timestamp must not
+        # Verify difficulty retarget — block.bits must match expected value.
+        # Ref: validation.cpp:4088-4089 ("bad-diffbits").
+        if height > 0:
+            expected_bits = self._get_expected_bits(height, prev_block, block)
+            if expected_bits is not None and block.bits != expected_bits:
+                return False
+
+        # 2. time-too-old: timestamp must strictly exceed MTP of previous 11 blocks.
+        # Guard on height > 0: genesis (height 0) has no pindexPrev in Core,
+        # so the check is never reached for genesis.
+        # Bug-fix: was `block_mtp > 0` which incorrectly skips the check when
+        # MTP is legitimately 0.  Use `height > 0` (structural), not a runtime
+        # value guard.
+        # Ref: validation.cpp:4092-4093, chain.h:233-245.
+        if height > 0 and block.timestamp <= block_mtp:
+            return False
+
+        # 3. time-timewarp-attack: BIP94 (testnet4 enforce_BIP94=true).
+        # At difficulty adjustment boundaries the block timestamp must not
         # precede the previous block's timestamp by more than MAX_TIMEWARP (600s).
-        # Ref: Bitcoin Core validation.cpp:4146-4154.
+        # Ref: validation.cpp:4097-4105, consensus/consensus.h:35.
         if self.network == "testnet4" and height > 0:
             if height % DIFFICULTY_ADJUSTMENT_INTERVAL == 0:
                 if block.timestamp < prev_block.timestamp - MAX_TIMEWARP:
                     return False
 
-        # Check timestamp is not too far in the future (2 hours)
+        # 4. time-too-new: block timestamp must not exceed now + MAX_FUTURE_BLOCK_TIME.
+        # Ref: validation.cpp:4108-4110, chain.h:29 (MAX_FUTURE_BLOCK_TIME = 7200s).
         current_time = int(_time.time())
-        if block.timestamp > current_time + 2 * 3600:
+        if block.timestamp > current_time + MAX_FUTURE_BLOCK_TIME:
             return False
 
-        # Check version is valid
+        # 5. bad-version: reject blocks with outdated version numbers once the
+        # corresponding soft fork has activated.
+        #   - version < 2 after BIP34 (DEPLOYMENT_HEIGHTINCB) activation
+        #   - version < 3 after BIP66 (DEPLOYMENT_DERSIG) activation
+        #   - version < 4 after BIP65 (DEPLOYMENT_CLTV) activation
+        # Ref: validation.cpp:4113-4118.
+        if height > 0:
+            if (block.version < 2 and
+                    is_buried_deployment_active("bip34", height, self.network)):
+                return False
+            if (block.version < 3 and
+                    is_buried_deployment_active("bip66", height, self.network)):
+                return False
+            if (block.version < 4 and
+                    is_buried_deployment_active("bip65", height, self.network)):
+                return False
+
+        # Check version is not negative or zero (minimum sanity check).
         if block.version < 1:
             return False
-
-        # Check bits is valid (difficulty target)
-        if block.bits == 0:
-            return False
-
-        # Verify difficulty retarget — block.bits must match expected value
-        if height > 0:
-            expected_bits = self._get_expected_bits(height, prev_block, block)
-            if expected_bits is not None and block.bits != expected_bits:
-                return False
 
         # Proof-of-work: block hash must meet difficulty target.
         # Mirrors Bitcoin Core pow.cpp::CheckProofOfWorkImpl / DeriveTarget:
