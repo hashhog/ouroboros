@@ -1426,16 +1426,32 @@ class BlockSync:
         state = self._presync_states.get(key)
         if state is not None:
             return state
-        # Build a fresh state.  ``chain_start_hash`` = our current best
-        # block hash; ``chain_start_time`` = our tip's MTP (best
-        # available proxy here is current wall-clock — Rust uses it
-        # only to bound max commitments, not for any chain math).
+        # Build a fresh state.
+        # chain_start = our current best block (genesis fork point).
+        # chain_start_height / chain_start_bits are now forwarded so the
+        # Rust state machine initialises commitment slots and difficulty
+        # checks correctly when we are not syncing from genesis.
+        # Bug 1/2/3/4/5 fix: pass height + bits, not just hash + time.
+        # Core: HeadersSyncState ctor (headerssync.cpp:17-46).
         try:
-            best_hash, _ = self.db.get_best_block()
+            best_hash, best_height = self.db.get_best_block()
         except Exception:
             best_hash = b"\x00" * 32
+            best_height = 0
         if not isinstance(best_hash, (bytes, bytearray)) or len(best_hash) != 32:
             best_hash = b"\x00" * 32
+            best_height = 0
+        # Retrieve the nBits stored for the tip header so the presync
+        # machine can seed its prev_bits correctly.
+        best_bits: int = 0
+        try:
+            if hasattr(self.db, "get_block_bits"):
+                best_bits = int(self.db.get_block_bits(best_hash) or 0)
+            elif hasattr(self.db, "get_block_metadata_by_hash"):
+                meta = self.db.get_block_metadata_by_hash(best_hash)
+                best_bits = int(getattr(meta, "bits", 0) or 0) if meta else 0
+        except Exception:
+            best_bits = 0
         try:
             mtp = int(self.db.get_median_time_past()) if hasattr(self.db, "get_median_time_past") else 0
         except Exception:
@@ -1444,7 +1460,13 @@ class BlockSync:
             mtp = int(time.time())
         network = self.peer_manager.network if hasattr(self.peer_manager, "network") else "mainnet"
         try:
-            state = cls(network, bytes(best_hash), int(mtp))
+            state = cls(
+                network,
+                bytes(best_hash),
+                int(mtp),
+                int(best_height),
+                int(best_bits),
+            )
         except Exception as e:
             logger.debug(f"PyHeadersSyncState init failed ({network}): {e}")
             return None
@@ -1667,6 +1689,16 @@ class BlockSync:
             # ``Final``); failure does NOT roll back the per-header
             # accept already done — the PoW gate above is the
             # consensus-relevant gate, the presync is anti-DoS only.
+            # Track whether the presync state machine requested an
+            # additional GETHEADERS even though this message was not full.
+            # This happens on PRESYNC→REDOWNLOAD transition: the state
+            # machine signals request_more=True regardless of message size
+            # so that we re-request headers from the chain start for the
+            # redownload pass.  Mirrors Core's ProcessNextHeaders logic:
+            #   if (full_headers_message || state == REDOWNLOAD) request_more = true
+            # headerssync.cpp:85-89.
+            _presync_request_more: bool = False
+
             if presync_feed:
                 presync = self._get_presync_state(peer)
                 if presync is not None:
@@ -1681,6 +1713,15 @@ class BlockSync:
                                 f"{peer.host}:{peer.port}: {result.error}"
                             )
                             self._drop_presync_state(peer)
+                        else:
+                            # Bug 6 fix: honour request_more from the state
+                            # machine even when the message is not full.
+                            # When PRESYNC transitions to REDOWNLOAD on a
+                            # sub-2000-header batch the Rust side sets
+                            # request_more=True; we must propagate that so
+                            # the continuation GETHEADERS fires.
+                            # Core: headerssync.cpp:85-89.
+                            _presync_request_more = bool(result.request_more)
                     except Exception as e:
                         # Defense-in-depth only: a Rust-side error here
                         # must not break header sync.  Log + drop the
@@ -1700,13 +1741,13 @@ class BlockSync:
                 # Kick off block downloads for the next window.
                 await self._request_next_blocks()
 
-                # If we received a full batch (2000 headers), ask for more.
-                # Only send continuation when we actually accepted new headers;
-                # otherwise duplicate responses (from sync_loop's periodic
-                # getheaders) each spawn their own continuation, creating an
-                # exponential flood of redundant requests that drowns out the
-                # one legitimate continuation.
-                if len(headers_msg.headers) >= 2000:
+                # Ask for more headers when:
+                #   (a) full batch (2000 headers) — more likely available, OR
+                #   (b) presync state machine flagged request_more — signals
+                #       a PRESYNC→REDOWNLOAD transition that requires a
+                #       continuation even on a sub-2000 batch.
+                # Core: ProcessNextHeaders request_more logic — headerssync.cpp:84-89.
+                if len(headers_msg.headers) >= 2000 or _presync_request_more:
                     # Send continuation to the SAME peer (which is the sync
                     # peer).  This ensures sequential header batches from one
                     # peer, avoiding out-of-order interleaving.
