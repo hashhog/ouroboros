@@ -981,76 +981,95 @@ class BlockValidator:
     def _validate_witness_commitment(
         self, block: Block, height: int
     ) -> tuple[bool, str]:
-        """Validate the SegWit witness commitment in the coinbase."""
+        """Validate the SegWit witness commitment in the coinbase.
+
+        Mirrors Bitcoin Core CheckWitnessMalleation() in validation.cpp:3870.
+
+        Gates (in Core order):
+          G1  SegWit active → look for commitment in last matching coinbase output.
+          G2  Commitment found → nonce size: coinbase scriptWitness must be exactly
+              one 32-byte stack item ("bad-witness-nonce-size").
+          G3  Commitment found → SHA256d(witness_root || nonce) must match the
+              32 bytes at scriptPubKey[6..38] ("bad-witness-merkle-match").
+          G4  Commitment found AND all gates pass → return OK (skip G5).
+          G5  SegWit active but NO commitment found OR SegWit inactive →
+              any tx with witness data → "unexpected-witness".
+        """
         activation = self._SEGWIT_ACTIVATION.get(self.network, 481_824)
-        if height < activation:
-            return True, ""
+        segwit_active = height >= activation
 
-        has_witness = any(tx.has_witness for tx in block.transactions)
-        commitment = self._find_witness_commitment(block.transactions[0])
+        if segwit_active:
+            # G1: locate the witness commitment (last output in coinbase that
+            # matches OP_RETURN 0x24 0xaa21a9ed; -1 if absent).
+            commitment = self._find_witness_commitment(block.transactions[0])
 
-        if has_witness and commitment is None:
-            logger.error(
-                "[diag] _validate_witness_commitment FAIL h=%d: has_witness=True but "
-                "no OP_RETURN+0xaa21a9ed commitment found in coinbase outputs "
-                "(coinbase has %d outputs)",
-                height,
-                len(block.transactions[0].outputs),
-            )
-            return False, "Block has witness data but no witness commitment"
+            if commitment is not None:
+                # G2: coinbase scriptWitness must be exactly one 32-byte item.
+                # Core ref: validation.cpp:3880-3885
+                coinbase_input = block.transactions[0].inputs[0]
+                witness = coinbase_input.witness or []
+                if len(witness) != 1 or len(witness[0]) != 32:
+                    logger.error(
+                        "[diag] _validate_witness_commitment FAIL h=%d: coinbase witness "
+                        "len=%d (expected 1), item0_len=%d (expected 32)",
+                        height,
+                        len(witness),
+                        len(witness[0]) if witness else -1,
+                    )
+                    return False, "bad-witness-nonce-size"
 
-        if commitment is not None and has_witness:
-            # Coinbase must have exactly one 32-byte witness item (the nonce)
-            coinbase_input = block.transactions[0].inputs[0]
-            witness = coinbase_input.witness or []
-            if len(witness) != 1 or len(witness[0]) != 32:
-                logger.error(
-                    "[diag] _validate_witness_commitment FAIL h=%d: coinbase witness "
-                    "len=%d (expected 1), item0_len=%d (expected 32)",
-                    height,
-                    len(witness),
-                    len(witness[0]) if witness else -1,
-                )
-                return False, "Coinbase witness nonce must be a single 32-byte item"
+                # G3: SHA256d(witness_root || nonce) must equal the committed value.
+                # Core ref: validation.cpp:3890-3898
+                nonce = witness[0]
+                witness_root = self._calculate_witness_merkle_root(block)
+                expected_commitment = hashlib.sha256(
+                    hashlib.sha256(witness_root + nonce).digest()
+                ).digest()
+                if expected_commitment != commitment:
+                    wtxids_preview = [
+                        bytes(32).hex() if i == 0
+                        else block.transactions[i].get_wtxid().hex()
+                        for i in range(min(5, len(block.transactions)))
+                    ]
+                    witness_summary = []
+                    for i, tx in enumerate(block.transactions[:5]):
+                        if tx.has_witness:
+                            per_input = [
+                                f"items={len(tin.witness or [])} "
+                                f"bytes={sum(len(w) for w in (tin.witness or []))}"
+                                for tin in tx.inputs
+                            ]
+                            witness_summary.append(f"tx{i}:[{','.join(per_input)}]")
+                        else:
+                            witness_summary.append(f"tx{i}:none")
+                    logger.error(
+                        "[diag] _validate_witness_commitment FAIL h=%d: "
+                        "commitment_in_coinbase=%s computed=%s witness_root=%s "
+                        "nonce=%s n_tx=%d wtxids[:5]=%s witness[:5]=%s",
+                        height,
+                        commitment.hex(),
+                        expected_commitment.hex(),
+                        witness_root.hex(),
+                        nonce.hex(),
+                        len(block.transactions),
+                        wtxids_preview,
+                        witness_summary,
+                    )
+                    return False, "bad-witness-merkle-match"
 
-            nonce = witness[0]
-            witness_root = self._calculate_witness_merkle_root(block)
-            expected = hashlib.sha256(
-                hashlib.sha256(witness_root + nonce).digest()
-            ).digest()
-            if expected != commitment:
-                # Diagnostic: dump expected vs computed and the first few wtxids/witness
-                # summaries so the next IBD pass surfaces the actual divergence.
-                wtxids_preview = [
-                    bytes(32).hex() if i == 0 else block.transactions[i].get_wtxid().hex()
-                    for i in range(min(5, len(block.transactions)))
-                ]
-                witness_summary = []
-                for i, tx in enumerate(block.transactions[:5]):
-                    if tx.has_witness:
-                        per_input = []
-                        for tin in tx.inputs:
-                            wlist = tin.witness or []
-                            per_input.append(
-                                f"items={len(wlist)} bytes={sum(len(w) for w in wlist)}"
-                            )
-                        witness_summary.append(f"tx{i}:[{','.join(per_input)}]")
-                    else:
-                        witness_summary.append(f"tx{i}:none")
-                logger.error(
-                    "[diag] _validate_witness_commitment FAIL h=%d: "
-                    "commitment_in_coinbase=%s computed=%s witness_root=%s "
-                    "nonce=%s n_tx=%d wtxids[:5]=%s witness[:5]=%s",
-                    height,
-                    commitment.hex(),
-                    expected.hex(),
-                    witness_root.hex(),
-                    nonce.hex(),
-                    len(block.transactions),
-                    wtxids_preview,
-                    witness_summary,
-                )
-                return False, "Witness commitment mismatch"
+                # G4: commitment present and valid — return OK.
+                # Core ref: validation.cpp:3900-3902
+                return True, ""
+
+            # G5 (segwit active, no commitment): fall through to unexpected-witness
+            # check below.  Core ref: validation.cpp:3905-3913.
+
+        # G5: no commitment found (or SegWit not yet active) — reject any block
+        # that carries witness data.  Core rejects with "unexpected-witness".
+        # Core ref: validation.cpp:3905-3913
+        for tx in block.transactions:
+            if tx.has_witness:
+                return False, "unexpected-witness"
 
         return True, ""
 
