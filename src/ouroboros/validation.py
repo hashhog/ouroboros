@@ -1491,7 +1491,33 @@ class BlockValidator:
         return total_output <= expected_amount
 
     def _calculate_block_subsidy(self, height: int) -> int:
-        halvings = height // 210000
+        """Compute block subsidy in satoshis at *height*.
+
+        Mirrors Bitcoin Core ``GetBlockSubsidy`` (validation.cpp:1839-…):
+
+            int halvings = nHeight / consensusParams.nSubsidyHalvingInterval;
+            if (halvings >= 64) return 0;
+            CAmount nSubsidy = 50 * COIN;
+            nSubsidy >>= halvings;
+
+        ``nSubsidyHalvingInterval`` is **per-network**: 210_000 on
+        mainnet / testnet / testnet4 / signet, but **150 on regtest**
+        (``kernel/chainparams.cpp:535``).
+
+        W93 fix: prior implementation hardcoded 210_000 for every network,
+        which over-estimates the regtest subsidy after the 150-block
+        halving and could let a coinbase pay too much (``bad-cb-amount``
+        consensus split vs Core on regtest functional tests).
+        """
+        # Regtest is the only network with a non-default halving interval.
+        # Hardcoded here to avoid a new chain_params import cycle —
+        # `self.network` is the network string passed to the validator.
+        # Use getattr() so call sites that bypass __init__ (e.g. tests
+        # that do ``BlockValidator.__new__(BlockValidator)._calculate_block_subsidy``)
+        # still get the canonical mainnet behaviour.
+        network = getattr(self, "network", "mainnet")
+        interval = 150 if network == "regtest" else 210_000
+        halvings = height // interval
         if halvings >= 64:
             return 0
         return 50 * 100_000_000 >> halvings
