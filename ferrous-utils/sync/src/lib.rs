@@ -1212,9 +1212,21 @@ impl PyHeadersSyncState {
     /// # Arguments
     /// * `network` - Network name ("mainnet", "testnet", etc.)
     /// * `chain_start_hash` - 32-byte hash of the block we're syncing from
+    /// * `chain_start_height` - Height of chain_start block (Core: chain_start.nHeight)
+    /// * `chain_start_bits` - nBits of chain_start block (Core: chain_start.nBits)
     /// * `chain_start_time` - Median time past of chain_start
+    ///
+    /// `chain_start_height` and `chain_start_bits` default to 0 for
+    /// backwards-compatible genesis-sync callers.
     #[new]
-    fn new(network: String, chain_start_hash: Vec<u8>, chain_start_time: u32) -> PyResult<Self> {
+    #[pyo3(signature = (network, chain_start_hash, chain_start_time, chain_start_height=0, chain_start_bits=0))]
+    fn new(
+        network: String,
+        chain_start_hash: Vec<u8>,
+        chain_start_time: u32,
+        chain_start_height: u32,
+        chain_start_bits: u32,
+    ) -> PyResult<Self> {
         if chain_start_hash.len() != 32 {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "chain_start_hash must be 32 bytes",
@@ -1238,7 +1250,13 @@ impl PyHeadersSyncState {
         hash.copy_from_slice(&chain_start_hash);
 
         Ok(Self {
-            inner: HeadersSyncState::new(network_enum, hash, chain_start_time),
+            inner: HeadersSyncState::new(
+                network_enum,
+                hash,
+                chain_start_height,
+                chain_start_bits,
+                chain_start_time,
+            ),
         })
     }
 
