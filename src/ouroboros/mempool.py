@@ -1661,8 +1661,20 @@ class Mempool:
                     f"MAX_STANDARD_TX_SIGOPS_COST ({MAX_STANDARD_TX_SIGOPS_COST})"
                 )
 
-        # Validate transaction (consensus)
-        valid, error = self.validator.validate_transaction(tx, height)
+        # Validate transaction (consensus).
+        # BIP-113: after CSV activation the locktime cutoff for mempool acceptance
+        # is the MTP of the chain tip (Core validation.cpp:152-166).
+        # Before CSV Core uses the tip's nTime; after CSV it uses MTP.
+        # We always use MTP here (conservative: MTP <= nTime, so any tx passing
+        # MTP also passes nTime) — matches Core's AcceptToMemoryPool path which
+        # calls IsFinalTx with active_chain_tip.GetMedianTimePast() regardless
+        # of CSV activation (validation.cpp:164).  That is, Core uses MTP for
+        # mempool acceptance unconditionally (not gated on CSV).
+        try:
+            mempool_mtp: int = self.validator.db.get_median_time_past(height) or 0
+        except Exception:
+            mempool_mtp = 0
+        valid, error = self.validator.validate_transaction(tx, height, mempool_mtp)
         if not valid:
             return False, error
 
@@ -4000,11 +4012,17 @@ class Mempool:
                 f"(need {DEFAULT_MIN_RELAY_TX_FEE / 1000:.2f} sat/vB)"
             )
 
-        # Consensus-validate each transaction
+        # Consensus-validate each transaction.
+        # BIP-113: use MTP of current tip as locktime cutoff (same as
+        # AcceptToMemoryPool in Core validation.cpp:164).
+        try:
+            pkg_mtp: int = self.validator.db.get_median_time_past(height) or 0
+        except Exception:
+            pkg_mtp = 0
         # Build a set of txids available in the package so the validator
         # doesn't reject child txs for missing parents.
         for tx in txs:
-            valid, error = self.validator.validate_transaction(tx, height)
+            valid, error = self.validator.validate_transaction(tx, height, pkg_mtp)
             if not valid:
                 return False, f"Package tx {tx.get_txid().hex()[:16]}... invalid: {error}"
 
