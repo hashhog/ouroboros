@@ -1652,23 +1652,41 @@ class TransactionValidator:
 
     @staticmethod
     def _is_final_tx(tx: Transaction, block_height: int, block_mtp: int) -> bool:
+        # Prefer the Rust is_final_tx implementation when available — it has
+        # no special-case fallbacks and mirrors Core's IsFinalTx exactly.
+        # Ref: Bitcoin Core consensus/tx_verify.cpp:17-37
+        try:
+            from sync import is_final_tx as _rust_is_final_tx
+            sequences = [inp.sequence for inp in tx.inputs]
+            return _rust_is_final_tx(tx.locktime, sequences, block_height, block_mtp)
+        except ImportError:
+            pass
+
+        # Pure-Python fallback (used only when Rust sync module unavailable).
+        # Mirrors Core IsFinalTx exactly — no silent-accept on missing MTP.
+        # Ref: Bitcoin Core consensus/tx_verify.cpp:17-37
         LOCKTIME_THRESHOLD = 500_000_000
 
         if tx.locktime == 0:
             return True
 
-        # All inputs final → tx is final regardless of locktime
+        # All inputs SEQUENCE_FINAL (0xffffffff) → nLockTime is disabled
+        # Ref: Core tx_verify.cpp:32-35 (the last for-loop)
         if all(inp.sequence == 0xFFFFFFFF for inp in tx.inputs):
             return True
 
         # Determine the comparison value based on locktime type
         if tx.locktime < LOCKTIME_THRESHOLD:
-            # Height-based locktime
+            # Height-based locktime: final when locktime < block_height
             return tx.locktime < block_height
         else:
-            # Time-based locktime — compare against MTP (BIP 113)
+            # Time-based locktime (BIP 113): final when locktime < MTP of prev block
+            # block_mtp == 0 only at genesis (height 0, no prev block).  For
+            # genesis the coinbase locktime is always 0 (handled above), so
+            # block_mtp == 0 here means MTP is truly unavailable.  Reject
+            # rather than silently accept — better to surface the caller bug.
             if block_mtp <= 0:
-                return True  # no MTP available, cannot enforce
+                return False  # BIP-113: MTP unavailable → cannot confirm finality
             return tx.locktime < block_mtp
 
     def _check_structure(self, tx: Transaction) -> bool:
@@ -1922,8 +1940,13 @@ class TransactionValidator:
             from sync import is_bip68_active
             enforce_bip68 = is_bip68_active(block_height, network)
         except ImportError:
-            # Fall back to Python implementation if Rust module unavailable
-            enforce_bip68 = block_height >= 419328  # mainnet CSV height
+            # Pure-Python fallback: use the buried-deployment table so that
+            # non-mainnet networks (testnet4/regtest/signet, active from
+            # genesis) get the correct activation height rather than the
+            # hardcoded mainnet value 419328.
+            # Ref: Bitcoin Core kernel/chainparams.cpp CSV heights
+            from ouroboros.consensus import is_buried_deployment_active
+            enforce_bip68 = is_buried_deployment_active("csv", block_height, network)
 
         if not enforce_bip68:
             return True
@@ -1989,13 +2012,37 @@ class TransactionValidator:
                 enforce_bip68,
             )
         except (ImportError, NameError):
-            # Fall back to Python implementation
-            return self._check_sequence_locks_py(tx, block_height, block_mtp)
+            # Fall back to Python implementation, passing intra_block_utxos so
+            # transactions that spend outputs of earlier txs in the same block
+            # can be resolved (previously the fallback re-fetched from DB only,
+            # causing false "UTXO not found" failures for intra-block deps).
+            return self._check_sequence_locks_py(
+                tx, block_height, block_mtp, intra_block_utxos=intra_block_utxos
+            )
 
     def _check_sequence_locks_py(
-        self, tx: Transaction, block_height: int, block_mtp: int
+        self,
+        tx: Transaction,
+        block_height: int,
+        block_mtp: int,
+        intra_block_utxos: dict | None = None,
     ) -> bool:
-        """Pure-Python fallback for BIP 68 sequence lock checking."""
+        """Pure-Python fallback for BIP 68 sequence lock checking.
+
+        Parameters
+        ----------
+        tx:
+            The transaction being validated.
+        block_height:
+            Height of the block that would contain *tx*.
+        block_mtp:
+            Median-time-past of block.pprev — the *previous* block's MTP.
+            Ref: Bitcoin Core EvaluateSequenceLocks / BIP 113.
+        intra_block_utxos:
+            Outputs created by earlier transactions in the same block.
+            Required to resolve inputs that spend intra-block outputs;
+            without this, such inputs would falsely fail with "UTXO not found".
+        """
         if tx.version < 2:
             return True
 
@@ -2004,7 +2051,11 @@ class TransactionValidator:
             if inp.sequence & self.SEQUENCE_DISABLE:
                 continue
 
+            # Look up UTXO in the persistent set first, then overlay
+            # intra-block outputs (same lookup order as validate_transaction).
             utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
+            if utxo is None and intra_block_utxos:
+                utxo = intra_block_utxos.get((inp.prev_txid, inp.prev_vout))
             if utxo is None:
                 return False
 
@@ -2018,15 +2069,26 @@ class TransactionValidator:
                 continue
 
             if inp.sequence & self.SEQUENCE_TYPE:
-                # Time-based: units of 512 seconds
+                # Time-based lock: lock_value units of 512 seconds each.
+                # min_time = coin_time + (lock_value * 512) - 1
+                # Fail if block_mtp <= min_time, i.e. block_mtp - coin_time < lock * 512
+                # Ref: Bitcoin Core tx_verify.cpp:88, EvaluateSequenceLocks:101
                 required = (inp.sequence & self.SEQUENCE_MASK) * 512
                 utxo_mtp = self.db.get_median_time_past(max(utxo_height - 1, 0))
                 if utxo_mtp is None:
+                    # No MTP available for coin block — cannot verify time-based
+                    # lock.  Treat as 0 (same as the Rust path's None→0 fallback)
+                    # so the lock is effectively skipped.  The BIP-68 stopgap
+                    # (OUROBOROS_BIP68_STOPGAP=1) is the recommended guard for
+                    # post-snapshot nodes.
                     continue
                 if block_mtp - utxo_mtp < required:
                     return False
             else:
-                # Height-based
+                # Height-based lock: depth must be >= lock_value.
+                # min_height = utxo_height + lock_value - 1
+                # Fail if block_height <= min_height, i.e. depth < lock_value
+                # Ref: Bitcoin Core tx_verify.cpp:90, EvaluateSequenceLocks:101
                 required = inp.sequence & self.SEQUENCE_MASK
                 depth = block_height - utxo_height
                 if depth < required:
