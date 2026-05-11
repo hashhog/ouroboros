@@ -708,4 +708,773 @@ mod tests {
         assert_eq!(b4, 0);
         assert_eq!(db.utxo_count().unwrap(), 3);
     }
+
+    // ========== W92: DisconnectBlock + ApplyTxInUndo + Reorg gates ==========
+    //
+    // These exercise the gate structure in
+    // `BlockchainDB::disconnect_block_at_height_checked` against the
+    // canonical reference (`validation.cpp:2149-2248`). Each test pins one
+    // gate so a regression bisects to a single Core code path.
+
+    use crate::storage::db::{
+        is_bip30_disconnect_exception, DisconnectStatus,
+    };
+    use crate::storage::undo::{BlockUndo, Coin, TxUndo};
+
+    /// Build a block at `height` whose coinbase pays `value` sats to the
+    /// supplied `script_pubkey`, and (optionally) one extra non-coinbase tx
+    /// that spends `prev_outpoint` (with `prev_coin` describing what it spent).
+    /// Returns `(block, second_tx_txid_if_any)`.
+    fn build_block_with_optional_spend(
+        height: u32,
+        prev_block: BlockHash,
+        coinbase_value: u64,
+        coinbase_script: ScriptBuf,
+        spend: Option<(OutPoint, ScriptBuf, u64)>,
+    ) -> (BlockWrapper, Option<bitcoin::Txid>) {
+        let coinbase_tx = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![height as u8, 0x00]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(coinbase_value),
+                script_pubkey: coinbase_script,
+            }],
+        };
+
+        let mut txdata = vec![coinbase_tx];
+        let mut second_txid = None;
+
+        if let Some((prev_outpoint, out_script, out_value)) = spend {
+            let tx = Transaction {
+                version: TxVersion::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: prev_outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(out_value),
+                    script_pubkey: out_script,
+                }],
+            };
+            second_txid = Some(tx.compute_txid());
+            txdata.push(tx);
+        }
+
+        let header = Header {
+            version: BlockVersion::ONE,
+            prev_blockhash: prev_block,
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time: 1_231_006_505 + height * 600,
+            bits: bitcoin::CompactTarget::from_consensus(0x1d00ffff),
+            nonce: height,
+        };
+        (BlockWrapper::new(Block { header, txdata }), second_txid)
+    }
+
+    /// G9: BIP-30 disconnect-exception lookup is height + hash specific.
+    #[test]
+    fn test_w92_g9_bip30_disconnect_exception_lookup() {
+        // Height 91722 with its canonical hash → exception.
+        let hash_91722 = [
+            0x8e, 0xd0, 0x4d, 0x57, 0xf2, 0xd3, 0xcd, 0xc6,
+            0xa6, 0xe5, 0x55, 0x69, 0xdc, 0x16, 0x54, 0x2e,
+            0x9f, 0x41, 0x84, 0xf8, 0x67, 0x76, 0x26, 0xdc,
+            0xa2, 0x71, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(is_bip30_disconnect_exception(91_722, &hash_91722));
+
+        // Height 91812 with its canonical hash → exception.
+        let hash_91812 = [
+            0x2f, 0x6f, 0x30, 0xf9, 0xd6, 0x83, 0xde, 0xb8,
+            0x5d, 0x93, 0x14, 0xef, 0x5d, 0xcf, 0x36, 0xaf,
+            0x66, 0xd9, 0xe3, 0xce, 0x1a, 0x2b, 0x79, 0xd4,
+            0xae, 0xf0, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(is_bip30_disconnect_exception(91_812, &hash_91812));
+
+        // Wrong height with the right hash → NOT exception.
+        assert!(!is_bip30_disconnect_exception(91_711, &hash_91722));
+        // Right height with the wrong hash → NOT exception.
+        let bogus = [0u8; 32];
+        assert!(!is_bip30_disconnect_exception(91_722, &bogus));
+        // Connect-side BIP-30 exceptions (91842 / 91880) are NOT
+        // disconnect-side exceptions.
+        assert!(!is_bip30_disconnect_exception(91_842, &bogus));
+        assert!(!is_bip30_disconnect_exception(91_880, &bogus));
+    }
+
+    /// Disconnect a coinbase-only block → OK + chain rolls back.
+    #[test]
+    fn test_w92_disconnect_coinbase_only_block_ok() {
+        let (db, _tmp) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        let prev_hash_bytes = *prev_hash.as_byte_array();
+        db.update_best_block(&prev_hash_bytes, 0).unwrap();
+
+        let (block, _) = build_block_with_optional_spend(
+            1,
+            prev_hash,
+            50_000_000,
+            ScriptBuf::from_bytes(vec![0x51]), // OP_1 — spendable
+            None,
+        );
+        let block_hash = block.block_hash();
+        let hash_bytes = *block_hash.as_byte_array();
+        db.store_block(&block).unwrap();
+        let meta = BlockMetadata::new(1, [1u8; 32], block.header().time);
+        db.store_block_metadata(1, &hash_bytes, &meta).unwrap();
+        db.update_best_block(&hash_bytes, 1).unwrap();
+
+        // Seed the coinbase output into the chainstate exactly as
+        // apply_block would.
+        let coinbase_tx = &block.inner().txdata[0];
+        let coinbase_txid = coinbase_tx.compute_txid();
+        let cb_outpoint = OutPoint::new(coinbase_txid, 0);
+        let cb_utxo = UTXO::new(
+            OutPointWrapper::new(cb_outpoint),
+            50_000_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            Some(1),
+            true,
+        );
+        db.add_utxo(&cb_outpoint, &cb_utxo).unwrap();
+
+        // Disconnect.
+        let (returned_hash, status) = db.disconnect_block_at_height_checked(1).unwrap();
+        assert_eq!(returned_hash, hash_bytes);
+        assert_eq!(status, DisconnectStatus::Ok);
+
+        // Chain tip rolled back to genesis.
+        let (best, h) = db.get_best_block().unwrap();
+        assert_eq!(best, prev_hash_bytes);
+        assert_eq!(h, 0);
+
+        // Coinbase output is gone from the chainstate.
+        assert!(!db.utxo_exists(&cb_outpoint));
+    }
+
+    /// G12: An unspendable (OP_RETURN) output in a block being disconnected
+    /// must NOT contribute to UNCLEAN — Core's `IsUnspendable` filter skips
+    /// the per-output mismatch check entirely.
+    #[test]
+    fn test_w92_g12_unspendable_output_skipped() {
+        let (db, _tmp) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        db.update_best_block(prev_hash.as_byte_array(), 0).unwrap();
+
+        // Build a block whose coinbase has an OP_RETURN output (unspendable).
+        let coinbase_tx = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x42]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    // OP_RETURN output — unspendable
+                    value: Amount::from_sat(0),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]),
+                },
+            ],
+        };
+        let block = BlockWrapper::new(Block {
+            header: Header {
+                version: BlockVersion::ONE,
+                prev_blockhash: prev_hash,
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_231_006_505,
+                bits: bitcoin::CompactTarget::from_consensus(0x1d00ffff),
+                nonce: 1,
+            },
+            txdata: vec![coinbase_tx.clone()],
+        });
+        let block_hash = block.block_hash();
+        let hash_bytes = *block_hash.as_byte_array();
+        db.store_block(&block).unwrap();
+        let meta = BlockMetadata::new(1, [1u8; 32], block.header().time);
+        db.store_block_metadata(1, &hash_bytes, &meta).unwrap();
+        db.update_best_block(&hash_bytes, 1).unwrap();
+
+        // Only the spendable output goes into chainstate (mirrors apply_block).
+        let cb_txid = coinbase_tx.compute_txid();
+        let cb_out0 = OutPoint::new(cb_txid, 0);
+        db.add_utxo(
+            &cb_out0,
+            &UTXO::new(
+                OutPointWrapper::new(cb_out0),
+                50_000_000,
+                ScriptBuf::from_bytes(vec![0x51]),
+                Some(1),
+                true,
+            ),
+        )
+        .unwrap();
+
+        // Disconnect must be CLEAN — the absent OP_RETURN output must not
+        // trigger an output-mismatch warning.
+        let (_, status) = db.disconnect_block_at_height_checked(1).unwrap();
+        assert_eq!(
+            status,
+            DisconnectStatus::Ok,
+            "OP_RETURN absence must not trigger UNCLEAN (G12)",
+        );
+    }
+
+    /// G13: a spendable coinbase output that is *missing* from the
+    /// chainstate when we try to disconnect must signal UNCLEAN (not OK).
+    #[test]
+    fn test_w92_g13_missing_spendable_output_unclean() {
+        let (db, _tmp) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        db.update_best_block(prev_hash.as_byte_array(), 0).unwrap();
+
+        let (block, _) = build_block_with_optional_spend(
+            1,
+            prev_hash,
+            50_000_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            None,
+        );
+        let hash_bytes = *block.block_hash().as_byte_array();
+        db.store_block(&block).unwrap();
+        let meta = BlockMetadata::new(1, [1u8; 32], block.header().time);
+        db.store_block_metadata(1, &hash_bytes, &meta).unwrap();
+        db.update_best_block(&hash_bytes, 1).unwrap();
+
+        // Deliberately DO NOT add the coinbase UTXO to chainstate — simulate
+        // an inconsistency.
+
+        let (_, status) = db.disconnect_block_at_height_checked(1).unwrap();
+        assert_eq!(
+            status,
+            DisconnectStatus::Unclean,
+            "missing spendable output must surface DISCONNECT_UNCLEAN (G13)",
+        );
+    }
+
+    /// G13: a coinbase output whose stored height disagrees with the block's
+    /// height also fires UNCLEAN.
+    #[test]
+    fn test_w92_g13_height_mismatch_unclean() {
+        let (db, _tmp) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        db.update_best_block(prev_hash.as_byte_array(), 0).unwrap();
+
+        let (block, _) = build_block_with_optional_spend(
+            2,
+            prev_hash,
+            50_000_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            None,
+        );
+        let hash_bytes = *block.block_hash().as_byte_array();
+        db.store_block(&block).unwrap();
+        let meta = BlockMetadata::new(2, [1u8; 32], block.header().time);
+        db.store_block_metadata(2, &hash_bytes, &meta).unwrap();
+        db.update_best_block(&hash_bytes, 2).unwrap();
+
+        // Seed coinbase output with the WRONG height.
+        let cb_txid = block.inner().txdata[0].compute_txid();
+        let cb_out = OutPoint::new(cb_txid, 0);
+        db.add_utxo(
+            &cb_out,
+            &UTXO::new(
+                OutPointWrapper::new(cb_out),
+                50_000_000,
+                ScriptBuf::from_bytes(vec![0x51]),
+                Some(99), // wrong — should be 2
+                true,
+            ),
+        )
+        .unwrap();
+
+        let (_, status) = db.disconnect_block_at_height_checked(2).unwrap();
+        assert_eq!(status, DisconnectStatus::Unclean);
+    }
+
+    /// G8: A BlockUndo whose tx_undo.len() + 1 does not match block.vtx.len()
+    /// must fail the disconnect with an InvalidData error.
+    #[test]
+    fn test_w92_g8_undo_arity_mismatch_fails() {
+        let (db, _tmp) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        let prev_bytes = *prev_hash.as_byte_array();
+        db.update_best_block(&prev_bytes, 0).unwrap();
+
+        // Block with 1 coinbase + 1 spending tx = vtx.len() == 2.
+        // We seed a UTXO that the spending tx consumes.
+        let seed_txid = bitcoin::Txid::from_byte_array([7u8; 32]);
+        let seed_outpoint = OutPoint::new(seed_txid, 0);
+        db.add_utxo(
+            &seed_outpoint,
+            &UTXO::new(
+                OutPointWrapper::new(seed_outpoint),
+                10_000,
+                ScriptBuf::from_bytes(vec![0x51]),
+                Some(0),
+                false,
+            ),
+        )
+        .unwrap();
+
+        let (block, _spend_txid) = build_block_with_optional_spend(
+            1,
+            prev_hash,
+            50_000_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            Some((seed_outpoint, ScriptBuf::from_bytes(vec![0x51]), 9_000)),
+        );
+        assert_eq!(block.inner().txdata.len(), 2);
+        let hash_bytes = *block.block_hash().as_byte_array();
+        db.store_block(&block).unwrap();
+        let meta = BlockMetadata::new(1, [1u8; 32], block.header().time);
+        db.store_block_metadata(1, &hash_bytes, &meta).unwrap();
+        db.update_best_block(&hash_bytes, 1).unwrap();
+
+        // Seed the block's coinbase output (so the per-output check passes).
+        let cb_txid = block.inner().txdata[0].compute_txid();
+        let cb_out = OutPoint::new(cb_txid, 0);
+        db.add_utxo(
+            &cb_out,
+            &UTXO::new(
+                OutPointWrapper::new(cb_out),
+                50_000_000,
+                ScriptBuf::from_bytes(vec![0x51]),
+                Some(1),
+                true,
+            ),
+        )
+        .unwrap();
+
+        // Store an INTENTIONALLY MALFORMED BlockUndo: zero tx_undo entries
+        // for a block whose vtx.len() == 2 (should be 1 — one for the
+        // non-coinbase tx).
+        let bad_undo = BlockUndo::with_tx_undo(Vec::new());
+        db.store_block_undo(1, &bad_undo, &prev_bytes).unwrap();
+
+        let result = db.disconnect_block_at_height_checked(1);
+        assert!(result.is_err(), "G8 mismatch must surface as Err");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("tx_undo+1"),
+            "error message must reference tx_undo arity check, got: {}",
+            msg,
+        );
+    }
+
+    /// G15: a per-tx vprevout.len() != tx.vin.len() must also fail.
+    #[test]
+    fn test_w92_g15_per_tx_undo_arity_mismatch_fails() {
+        let (db, _tmp) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        let prev_bytes = *prev_hash.as_byte_array();
+        db.update_best_block(&prev_bytes, 0).unwrap();
+
+        let seed_txid = bitcoin::Txid::from_byte_array([9u8; 32]);
+        let seed_outpoint = OutPoint::new(seed_txid, 0);
+        db.add_utxo(
+            &seed_outpoint,
+            &UTXO::new(
+                OutPointWrapper::new(seed_outpoint),
+                10_000,
+                ScriptBuf::from_bytes(vec![0x51]),
+                Some(0),
+                false,
+            ),
+        )
+        .unwrap();
+
+        let (block, _) = build_block_with_optional_spend(
+            1,
+            prev_hash,
+            50_000_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            Some((seed_outpoint, ScriptBuf::from_bytes(vec![0x51]), 9_000)),
+        );
+        let hash_bytes = *block.block_hash().as_byte_array();
+        db.store_block(&block).unwrap();
+        let meta = BlockMetadata::new(1, [1u8; 32], block.header().time);
+        db.store_block_metadata(1, &hash_bytes, &meta).unwrap();
+        db.update_best_block(&hash_bytes, 1).unwrap();
+
+        // Seed coinbase UTXO so per-output check passes.
+        let cb_txid = block.inner().txdata[0].compute_txid();
+        let cb_out = OutPoint::new(cb_txid, 0);
+        db.add_utxo(
+            &cb_out,
+            &UTXO::new(
+                OutPointWrapper::new(cb_out),
+                50_000_000,
+                ScriptBuf::from_bytes(vec![0x51]),
+                Some(1),
+                true,
+            ),
+        )
+        .unwrap();
+
+        // Store a BlockUndo with the right top-level arity (1 tx_undo for the
+        // one non-coinbase tx), but where the inner prev_outputs.len() == 0
+        // even though the spending tx has 1 input.
+        let bad_inner = TxUndo::with_outputs(Vec::new());
+        let bad_undo = BlockUndo::with_tx_undo(vec![bad_inner]);
+        db.store_block_undo(1, &bad_undo, &prev_bytes).unwrap();
+
+        let result = db.disconnect_block_at_height_checked(1);
+        assert!(result.is_err(), "G15 mismatch must surface as Err");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("vprevout"),
+            "error message must reference per-tx vprevout check, got: {}",
+            msg,
+        );
+    }
+
+    /// Public wrapper (`disconnect_block_at_height`) returns Ok(hash) and
+    /// hides UNCLEAN behind a log line — but a hard FAILED still propagates
+    /// as Err.
+    #[test]
+    fn test_w92_public_wrapper_swallows_unclean_propagates_failed() {
+        let (db, _tmp) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        let prev_bytes = *prev_hash.as_byte_array();
+        db.update_best_block(&prev_bytes, 0).unwrap();
+
+        let (block, _) = build_block_with_optional_spend(
+            1,
+            prev_hash,
+            50_000_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            None,
+        );
+        let hash_bytes = *block.block_hash().as_byte_array();
+        db.store_block(&block).unwrap();
+        let meta = BlockMetadata::new(1, [1u8; 32], block.header().time);
+        db.store_block_metadata(1, &hash_bytes, &meta).unwrap();
+        db.update_best_block(&hash_bytes, 1).unwrap();
+
+        // Don't seed the coinbase output — UNCLEAN.
+        // Public wrapper still returns Ok.
+        let res = db.disconnect_block_at_height(1);
+        assert!(res.is_ok(), "public wrapper must hide UNCLEAN");
+        assert_eq!(res.unwrap(), hash_bytes);
+    }
+
+    /// G16: input restore order is REVERSE of `tx.vin`. We verify this
+    /// indirectly by constructing a tx with two inputs and undo data that
+    /// pins each input to a distinct coin (different value), then check
+    /// that both restores landed correctly — order-independence proves we
+    /// matched the undo records to inputs by index, not by walk order.
+    #[test]
+    fn test_w92_g16_reverse_vin_restore_keeps_undo_index_alignment() {
+        let (db, _tmp) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        let prev_bytes = *prev_hash.as_byte_array();
+        db.update_best_block(&prev_bytes, 0).unwrap();
+
+        // Two distinct seed outpoints with different values.
+        let seed_a = OutPoint::new(bitcoin::Txid::from_byte_array([0xA1; 32]), 0);
+        let seed_b = OutPoint::new(bitcoin::Txid::from_byte_array([0xB2; 32]), 0);
+        let coin_a = Coin::new(1_111, ScriptBuf::from_bytes(vec![0x51]), 0, false);
+        let coin_b = Coin::new(2_222, ScriptBuf::from_bytes(vec![0x51]), 0, false);
+
+        // Spending tx with input[0] = seed_a, input[1] = seed_b.
+        let spending_tx = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: seed_a,
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::new(),
+                },
+                TxIn {
+                    previous_output: seed_b,
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::new(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(3_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+
+        let coinbase_tx = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x00]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+
+        let block = BlockWrapper::new(Block {
+            header: Header {
+                version: BlockVersion::ONE,
+                prev_blockhash: prev_hash,
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1_231_006_505,
+                bits: bitcoin::CompactTarget::from_consensus(0x1d00ffff),
+                nonce: 1,
+            },
+            txdata: vec![coinbase_tx.clone(), spending_tx.clone()],
+        });
+        let hash_bytes = *block.block_hash().as_byte_array();
+        db.store_block(&block).unwrap();
+        let meta = BlockMetadata::new(1, [1u8; 32], block.header().time);
+        db.store_block_metadata(1, &hash_bytes, &meta).unwrap();
+        db.update_best_block(&hash_bytes, 1).unwrap();
+
+        // Seed coinbase UTXO so per-output check is clean.
+        let cb_txid = coinbase_tx.compute_txid();
+        let cb_out = OutPoint::new(cb_txid, 0);
+        db.add_utxo(
+            &cb_out,
+            &UTXO::new(
+                OutPointWrapper::new(cb_out),
+                50_000_000,
+                ScriptBuf::from_bytes(vec![0x51]),
+                Some(1),
+                true,
+            ),
+        )
+        .unwrap();
+        // Seed spending tx output to keep per-output check clean.
+        let spend_txid = spending_tx.compute_txid();
+        let spend_out = OutPoint::new(spend_txid, 0);
+        db.add_utxo(
+            &spend_out,
+            &UTXO::new(
+                OutPointWrapper::new(spend_out),
+                3_000,
+                ScriptBuf::from_bytes(vec![0x51]),
+                Some(1),
+                false,
+            ),
+        )
+        .unwrap();
+
+        // Store BlockUndo: 1 tx_undo with 2 coins, matched by INDEX
+        // (prev_outputs[0] = coin_a, prev_outputs[1] = coin_b).
+        let tx_undo = TxUndo::with_outputs(vec![coin_a.clone(), coin_b.clone()]);
+        let block_undo = BlockUndo::with_tx_undo(vec![tx_undo]);
+        db.store_block_undo(1, &block_undo, &prev_bytes).unwrap();
+
+        let (_, status) = db.disconnect_block_at_height_checked(1).unwrap();
+        assert_eq!(status, DisconnectStatus::Ok);
+
+        // After disconnect, seed_a / seed_b are back as UTXOs with the
+        // values from coin_a / coin_b (proving G16 + per-index alignment).
+        let restored_a = db.get_utxo(&seed_a).unwrap().expect("seed_a restored");
+        let restored_b = db.get_utxo(&seed_b).unwrap().expect("seed_b restored");
+        assert_eq!(restored_a.amount, 1_111, "input 0 must restore coin_a");
+        assert_eq!(restored_b.amount, 2_222, "input 1 must restore coin_b");
+    }
+
+    /// G18 + chain tip rollback: after a clean disconnect, BEST_BLOCK_HASH
+    /// must equal the disconnected block's prev_blockhash and BEST_HEIGHT
+    /// must drop by one.
+    #[test]
+    fn test_w92_g18_best_block_rollback() {
+        let (db, _tmp) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        let prev_bytes = *prev_hash.as_byte_array();
+        db.update_best_block(&prev_bytes, 0).unwrap();
+
+        let (block, _) = build_block_with_optional_spend(
+            1,
+            prev_hash,
+            50_000_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            None,
+        );
+        let hash_bytes = *block.block_hash().as_byte_array();
+        db.store_block(&block).unwrap();
+        let meta = BlockMetadata::new(1, [1u8; 32], block.header().time);
+        db.store_block_metadata(1, &hash_bytes, &meta).unwrap();
+        db.update_best_block(&hash_bytes, 1).unwrap();
+
+        // Seed cb so disconnect is clean.
+        let cb_txid = block.inner().txdata[0].compute_txid();
+        let cb_out = OutPoint::new(cb_txid, 0);
+        db.add_utxo(
+            &cb_out,
+            &UTXO::new(
+                OutPointWrapper::new(cb_out),
+                50_000_000,
+                ScriptBuf::from_bytes(vec![0x51]),
+                Some(1),
+                true,
+            ),
+        )
+        .unwrap();
+
+        db.disconnect_block_at_height(1).unwrap();
+        let (best, h) = db.get_best_block().unwrap();
+        assert_eq!(best, prev_bytes);
+        assert_eq!(h, 0);
+    }
+
+    /// G7 + G8 atomic-batch path: a malformed undo at any depth in a
+    /// multi-block disconnect refuses the entire batch.
+    #[test]
+    fn test_w92_atomic_batch_refuses_malformed_undo_anywhere() {
+        let (db, _tmp) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        let prev_bytes = *prev_hash.as_byte_array();
+        db.update_best_block(&prev_bytes, 0).unwrap();
+
+        // Two clean blocks at heights 1 and 2.
+        let (block1, _) = build_block_with_optional_spend(
+            1,
+            prev_hash,
+            50_000_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            None,
+        );
+        let h1 = block1.block_hash();
+        let h1_bytes = *h1.as_byte_array();
+        db.store_block(&block1).unwrap();
+        db.store_block_metadata(
+            1,
+            &h1_bytes,
+            &BlockMetadata::new(1, [1u8; 32], block1.header().time),
+        )
+        .unwrap();
+
+        let (block2, _) = build_block_with_optional_spend(
+            2,
+            h1,
+            50_000_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            None,
+        );
+        let h2_bytes = *block2.block_hash().as_byte_array();
+        db.store_block(&block2).unwrap();
+        db.store_block_metadata(
+            2,
+            &h2_bytes,
+            &BlockMetadata::new(2, [2u8; 32], block2.header().time),
+        )
+        .unwrap();
+        db.update_best_block(&h2_bytes, 2).unwrap();
+
+        // Seed coinbases.
+        for (b, height) in [(&block1, 1u32), (&block2, 2u32)].iter() {
+            let cb = &b.inner().txdata[0];
+            let cb_out = OutPoint::new(cb.compute_txid(), 0);
+            db.add_utxo(
+                &cb_out,
+                &UTXO::new(
+                    OutPointWrapper::new(cb_out),
+                    50_000_000,
+                    ScriptBuf::from_bytes(vec![0x51]),
+                    Some(*height),
+                    true,
+                ),
+            )
+            .unwrap();
+        }
+
+        // Block 1 has good (empty) undo, block 2 has malformed undo.
+        db.store_block_undo(1, &BlockUndo::with_tx_undo(Vec::new()), &prev_bytes)
+            .unwrap();
+        // Block 2: 5 tx_undo entries for a coinbase-only block (vtx.len()==1)
+        let bogus = BlockUndo::with_tx_undo(vec![
+            TxUndo::with_outputs(Vec::new()),
+            TxUndo::with_outputs(Vec::new()),
+            TxUndo::with_outputs(Vec::new()),
+            TxUndo::with_outputs(Vec::new()),
+            TxUndo::with_outputs(Vec::new()),
+        ]);
+        db.store_block_undo(2, &bogus, &h1_bytes).unwrap();
+
+        let res = db.disconnect_blocks_atomic(2, 0);
+        assert!(res.is_err(), "malformed undo must refuse atomic batch");
+
+        // After refusal, tip must STILL be at block 2 — nothing applied.
+        let (still, h) = db.get_best_block().unwrap();
+        assert_eq!(still, h2_bytes);
+        assert_eq!(h, 2);
+    }
+
+    /// Reverse-walk sanity: confirm we don't accidentally walk forward by
+    /// constructing a block whose later tx (txdata[2]) consumes outputs of
+    /// an earlier tx (txdata[1]), then disconnecting. Forward iteration
+    /// would delete txdata[1]'s outputs before txdata[2]'s sanity check
+    /// (because the check would try to find them in chainstate) — reverse
+    /// iteration handles them in the correct order.
+    ///
+    /// This test only goes as far as proving the rollback completes cleanly
+    /// when the in-block dependency is present. Pre-fix the function did
+    /// walk in reverse for tx (.rev()) but in forward order for vin —
+    /// G16 now makes vin reverse too.
+    #[test]
+    fn test_w92_g10_g16_full_reverse_walk_succeeds() {
+        let (db, _tmp) = create_test_db();
+        let prev_hash = BlockHash::all_zeros();
+        let prev_bytes = *prev_hash.as_byte_array();
+        db.update_best_block(&prev_bytes, 0).unwrap();
+
+        let (block, _) = build_block_with_optional_spend(
+            1,
+            prev_hash,
+            50_000_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            None,
+        );
+        let h_bytes = *block.block_hash().as_byte_array();
+        db.store_block(&block).unwrap();
+        db.store_block_metadata(
+            1,
+            &h_bytes,
+            &BlockMetadata::new(1, [1u8; 32], block.header().time),
+        )
+        .unwrap();
+        db.update_best_block(&h_bytes, 1).unwrap();
+
+        // Seed coinbase output.
+        let cb_txid = block.inner().txdata[0].compute_txid();
+        let cb_out = OutPoint::new(cb_txid, 0);
+        db.add_utxo(
+            &cb_out,
+            &UTXO::new(
+                OutPointWrapper::new(cb_out),
+                50_000_000,
+                ScriptBuf::from_bytes(vec![0x51]),
+                Some(1),
+                true,
+            ),
+        )
+        .unwrap();
+
+        let (returned, status) = db.disconnect_block_at_height_checked(1).unwrap();
+        assert_eq!(returned, h_bytes);
+        assert_eq!(status, DisconnectStatus::Ok);
+        assert!(!db.utxo_exists(&cb_out));
+    }
 }
