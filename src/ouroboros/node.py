@@ -1013,6 +1013,24 @@ class BitcoinNode:
         # constructor in start() leaves block_filter_index = None when the
         # flag is off, in which case we skip handler registration entirely
         # so peers do not see NODE_COMPACT_FILTERS or any cfilter response).
+        def _peer_disconnect(peer_obj, reason: str) -> None:
+            """Disconnect a peer for BIP-157 protocol violation.
+
+            Mirrors Bitcoin Core PrepareBlockFilterRequest which sets
+            ``node.fDisconnect = true`` for all protocol errors:
+            unsupported filter type, unknown stop_hash, out-of-range
+            heights.  See net_processing.cpp:3268-3303.
+            """
+            logger.debug(
+                f"Disconnecting peer {peer_obj.host}:{peer_obj.port} "
+                f"(BIP-157 violation: {reason})"
+            )
+            if hasattr(peer_obj, 'disconnect'):
+                try:
+                    peer_obj.disconnect()
+                except Exception:
+                    pass
+
         def _make_getcfilters_handler(peer):
             async def handler(msg):
                 try:
@@ -1029,14 +1047,30 @@ class BitcoinNode:
 
                     req = GetCFiltersMessage.from_payload(msg.payload)
                     network = getattr(peer, 'network', 'mainnet')
+                    # Core: disconnect peer for unsupported filter type
+                    # (net_processing.cpp:3268-3276).
                     if req.filter_type != BASIC_FILTER_TYPE:
-                        return  # Core silently ignores unsupported types
+                        _peer_disconnect(peer, f"unsupported filter_type={req.filter_type}")
+                        return
                     stop_block = self.db.get_block(req.stop_hash)
+                    # Core: disconnect if stop_hash unknown (net_processing.cpp:3283-3288).
                     if stop_block is None or stop_block.height is None:
+                        _peer_disconnect(peer, f"unknown stop_hash={req.stop_hash.hex()}")
                         return
                     stop_height = stop_block.height
-                    if (req.start_height > stop_height
-                            or stop_height - req.start_height + 1 > MAX_GETCFILTERS_SIZE):
+                    # Core: disconnect for out-of-range / too-large requests
+                    # (net_processing.cpp:3292-3303).
+                    if req.start_height > stop_height:
+                        _peer_disconnect(
+                            peer,
+                            f"start_height={req.start_height} > stop_height={stop_height}",
+                        )
+                        return
+                    if stop_height - req.start_height >= MAX_GETCFILTERS_SIZE:
+                        _peer_disconnect(
+                            peer,
+                            f"range {stop_height - req.start_height + 1} > MAX_GETCFILTERS_SIZE",
+                        )
                         return
                     bfi = self.block_filter_index
                     for h in range(req.start_height, stop_height + 1):
@@ -1092,14 +1126,30 @@ class BitcoinNode:
 
                     req = GetCFHeadersMessage.from_payload(msg.payload)
                     network = getattr(peer, 'network', 'mainnet')
+                    # Core: disconnect peer for unsupported filter type
+                    # (net_processing.cpp:3268-3276).
                     if req.filter_type != BASIC_FILTER_TYPE:
+                        _peer_disconnect(peer, f"unsupported filter_type={req.filter_type}")
                         return
                     stop_block = self.db.get_block(req.stop_hash)
+                    # Core: disconnect if stop_hash unknown (net_processing.cpp:3283-3288).
                     if stop_block is None or stop_block.height is None:
+                        _peer_disconnect(peer, f"unknown stop_hash={req.stop_hash.hex()}")
                         return
                     stop_height = stop_block.height
-                    if (req.start_height > stop_height
-                            or stop_height - req.start_height + 1 > MAX_GETCFHEADERS_SIZE):
+                    # Core: disconnect for out-of-range / too-large requests
+                    # (net_processing.cpp:3292-3303).
+                    if req.start_height > stop_height:
+                        _peer_disconnect(
+                            peer,
+                            f"start_height={req.start_height} > stop_height={stop_height}",
+                        )
+                        return
+                    if stop_height - req.start_height >= MAX_GETCFHEADERS_SIZE:
+                        _peer_disconnect(
+                            peer,
+                            f"range {stop_height - req.start_height + 1} > MAX_GETCFHEADERS_SIZE",
+                        )
                         return
                     bfi = self.block_filter_index
 
@@ -1164,10 +1214,16 @@ class BitcoinNode:
 
                     req = GetCFCheckptMessage.from_payload(msg.payload)
                     network = getattr(peer, 'network', 'mainnet')
+                    # Core: disconnect peer for unsupported filter type
+                    # (net_processing.cpp:3268-3276).
                     if req.filter_type != BASIC_FILTER_TYPE:
+                        _peer_disconnect(peer, f"unsupported filter_type={req.filter_type}")
                         return
                     stop_block = self.db.get_block(req.stop_hash)
+                    # Core: disconnect if stop_hash unknown (net_processing.cpp:3283-3288).
+                    # getcfcheckpt uses max_height_diff=UINT32_MAX so no range limit.
                     if stop_block is None or stop_block.height is None:
+                        _peer_disconnect(peer, f"unknown stop_hash={req.stop_hash.hex()}")
                         return
                     stop_height = stop_block.height
                     bfi = self.block_filter_index
