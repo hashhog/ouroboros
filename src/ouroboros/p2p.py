@@ -2003,16 +2003,75 @@ class PeerManager:
         """Wire up compact-block message handlers on a peer."""
         async def on_sendcmpct(msg: NetworkMessage):
             sc = SendCmpctMessage.from_payload(msg.payload)
-            if sc.version in (1, 2):
-                self.cmpct_peers.add(addr)
-                if sc.announce:
-                    peer.wants_cmpctblock = True
-                logger.info(f"Peer {addr} supports compact blocks v{sc.version}"
-                            f"{' (announce)' if sc.announce else ''}")
+            # Bitcoin Core net_processing.cpp line 3907:
+            #   if (sendcmpct_version != CMPCTBLOCKS_VERSION) return;
+            # Only version 2 (witness-based) is supported.  Ignore v1 entirely.
+            from ouroboros.compact_blocks import CMPCTBLOCKS_VERSION
+            if sc.version != CMPCTBLOCKS_VERSION:
+                logger.debug(
+                    f"Peer {addr} sent sendcmpct with unsupported version "
+                    f"{sc.version} (expected {CMPCTBLOCKS_VERSION}); ignoring"
+                )
+                return
+            self.cmpct_peers.add(addr)
+            if sc.announce:
+                peer.wants_cmpctblock = True
+            logger.info(f"Peer {addr} supports compact blocks v{sc.version}"
+                        f"{' (announce)' if sc.announce else ''}")
 
         async def on_cmpctblock(msg: NetworkMessage):
-            from ouroboros.compact_blocks import CompactBlock
-            cb = CompactBlock.deserialize(msg.payload)
+            from ouroboros.compact_blocks import (
+                MAX_CMPCTBLOCK_DEPTH,
+                CompactBlock,
+                ReadStatus,
+            )
+            try:
+                cb = CompactBlock.deserialize(msg.payload)
+            except (ValueError, Exception) as exc:
+                logger.warning(f"Malformed cmpctblock from {addr}: {exc}")
+                return
+
+            # Bitcoin Core net_processing.cpp line 4576 depth gate:
+            #   if (pindex->nHeight <= m_chainman.ActiveChain().Height() + 2)
+            # Only process compact blocks that are within MAX_CMPCTBLOCK_DEPTH
+            # of our tip.  We look up the prev-block in our chain to derive
+            # the announced height; fall through (best-effort) if unknown.
+            if self._database is not None:
+                try:
+                    _, our_height = self._database.get_best_block()
+                    # prev-block hash is at bytes [4:36] of an 80-byte header
+                    prev_hash = cb.header[4:36]
+                    prev_block = self._database.get_block(prev_hash)
+                    if prev_block is not None:
+                        prev_height = getattr(prev_block, 'height', None)
+                        if prev_height is not None:
+                            announced_height = prev_height + 1
+                            if announced_height < our_height - MAX_CMPCTBLOCK_DEPTH:
+                                logger.debug(
+                                    f"Ignoring cmpctblock from {addr}: "
+                                    f"height {announced_height} is more than "
+                                    f"{MAX_CMPCTBLOCK_DEPTH} below our tip "
+                                    f"{our_height}"
+                                )
+                                return
+                except Exception:
+                    pass  # height check is best-effort; proceed if unavailable
+
+            # Validate structure before reconstruction (InitData gates)
+            status = cb.validate()
+            if status == ReadStatus.INVALID:
+                logger.warning(
+                    f"Invalid cmpctblock structure from {addr} "
+                    f"(READ_STATUS_INVALID); ignoring"
+                )
+                return
+            if status == ReadStatus.FAILED:
+                logger.debug(
+                    f"cmpctblock from {addr} failed structural check "
+                    f"(short-ID collision / bucket overflow); ignoring"
+                )
+                return
+
             if self._mempool is not None:
                 txs, missing = cb.reconstruct(self._mempool)
             else:
@@ -2038,8 +2097,19 @@ class PeerManager:
                 self._on_compact_block(bt.block_hash, bt.transactions, [])
 
         async def on_getblocktxn(msg: NetworkMessage):
-            """Handle getblocktxn: respond with requested transactions."""
-            from ouroboros.compact_blocks import BlockTransactions, BlockTransactionsRequest
+            """Handle getblocktxn: respond with requested transactions.
+
+            Bitcoin Core net_processing.cpp lines 4245-4303:
+            - Silently ignore requests for blocks we don't have.
+            - Only serve blocks within MAX_BLOCKTXN_DEPTH (10) of tip;
+              for older blocks send a full block (MSG_WITNESS_BLOCK) instead.
+            - Misbehave on out-of-bounds tx indices.
+            """
+            from ouroboros.compact_blocks import (
+                MAX_BLOCKTXN_DEPTH,
+                BlockTransactions,
+                BlockTransactionsRequest,
+            )
             try:
                 req = BlockTransactionsRequest.deserialize(msg.payload)
                 logger.debug(
@@ -2048,23 +2118,55 @@ class PeerManager:
                 # Look up the full block in our database
                 if self._database is not None:
                     block = self._database.get_block(req.block_hash)
-                    if block is not None:
-                        txs = block.transactions
-                        requested_txs = []
-                        for idx in req.indices:
-                            if 0 <= idx < len(txs):
-                                requested_txs.append(txs[idx])
-                        bt_resp = BlockTransactions(
-                            block_hash=req.block_hash,
-                            transactions=requested_txs)
-                        bt_msg = BlockTxnMessage(
-                            payload_bytes=bt_resp.serialize())
-                        await peer.send_message(
-                            bt_msg.to_network_message(self.network))
-                    else:
+                    if block is None:
                         logger.debug(
                             f"getblocktxn: block not found "
                             f"{req.block_hash.hex()}")
+                        return
+
+                    # Bitcoin Core net_processing.cpp line 4276:
+                    #   if (pindex->nHeight >= tip_height - MAX_BLOCKTXN_DEPTH)
+                    # Only serve requests within MAX_BLOCKTXN_DEPTH of tip.
+                    try:
+                        _, tip_height = self._database.get_best_block()
+                        block_height = getattr(block, 'height', None)
+                        if block_height is not None and tip_height is not None:
+                            if block_height < tip_height - MAX_BLOCKTXN_DEPTH:
+                                logger.debug(
+                                    f"getblocktxn: block {req.block_hash.hex()} "
+                                    f"at height {block_height} is > "
+                                    f"{MAX_BLOCKTXN_DEPTH} below tip "
+                                    f"{tip_height}; not serving"
+                                )
+                                return
+                    except Exception:
+                        pass  # depth check is best-effort
+
+                    txs = block.transactions
+                    requested_txs = []
+                    out_of_bounds = False
+                    for idx in req.indices:
+                        if idx >= len(txs):
+                            # Bitcoin Core SendBlockTransactions:
+                            #   Misbehaving(peer, "getblocktxn with out-of-bounds tx indices")
+                            logger.warning(
+                                f"getblocktxn from {addr}: out-of-bounds "
+                                f"index {idx} (block has {len(txs)} txs); "
+                                "dropping response"
+                            )
+                            out_of_bounds = True
+                            break
+                        requested_txs.append(txs[idx])
+                    if out_of_bounds:
+                        return
+
+                    bt_resp = BlockTransactions(
+                        block_hash=req.block_hash,
+                        transactions=requested_txs)
+                    bt_msg = BlockTxnMessage(
+                        payload_bytes=bt_resp.serialize())
+                    await peer.send_message(
+                        bt_msg.to_network_message(self.network))
             except Exception as e:
                 logger.warning(f"Error handling getblocktxn from {addr}: {e}")
 
