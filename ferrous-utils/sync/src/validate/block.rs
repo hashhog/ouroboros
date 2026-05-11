@@ -827,29 +827,47 @@ impl BlockValidator {
     ///
     /// The block index entry (height → hash + metadata) and the block body in
     /// BLOCKS_CF are **not** removed — callers may choose to keep or prune them.
+    ///
+    /// W92 audit (validation.cpp:2149-2248): this helper mirrors the gate
+    /// structure of the primary `BlockchainDB::disconnect_block_at_height_checked`
+    /// path. Gates engaged here: G10 reverse-iterate txs, G12 IsUnspendable
+    /// filter, G14 skip coinbase, G16 reverse-iterate vin. Gates G1/G8/G9/G11/
+    /// G13/G15/G19 (UNCLEAN/FAILED signaling, BIP-30 exceptions, per-tx undo
+    /// arity, per-output mismatch check) live in the primary path because
+    /// this helper is invoked via the validator pipeline and signals errors
+    /// up the stack rather than enforcing chainstate invariants directly.
     pub fn disconnect_block(&self, block: &BlockWrapper, height: u32) -> Result<()> {
         let inner = block.inner();
 
-        // Process transactions in reverse order (last tx first)
+        // Process transactions in reverse order (G10).
         for tx in inner.txdata.iter().rev() {
             let txid = tx.compute_txid();
+            let is_coinbase = tx.is_coinbase();
 
-            // 1. Remove outputs (UTXOs created by this block)
-            for vout in 0..tx.output.len() {
+            // 1. Remove outputs created by this block (G12: skip unspendable).
+            for (vout, output) in tx.output.iter().enumerate() {
+                if is_unspendable_script(output.script_pubkey.as_bytes()) {
+                    // Unspendable outputs were never written into the
+                    // chainstate (see apply_block above) — skip the delete
+                    // to avoid spurious tombstones. Mirrors Core's
+                    // `!scriptPubKey.IsUnspendable()` gate.
+                    continue;
+                }
                 let outpoint = OutPointWrapper::from_txid_vout(txid, vout as u32);
                 self.db.delete_utxo(outpoint.inner())?;
             }
 
-            // 2. Restore inputs (UTXOs spent by this block)
-            if !tx.is_coinbase() {
-                for input in &tx.input {
+            // 2. Restore inputs (G14: skip coinbase, G16: reverse-iterate vin).
+            if !is_coinbase {
+                for input_idx in (0..tx.input.len()).rev() {
+                    let input = &tx.input[input_idx];
                     let outpoint = OutPointWrapper::new(input.previous_output);
-                    // Read undo record from SPENT_CF
+                    // Read undo record from SPENT_CF.
                     match self.db.get_spent_utxo(outpoint.inner())? {
                         Some((_spending_txid, utxo)) => {
-                            // Restore the UTXO to chainstate
+                            // Restore the UTXO to chainstate.
                             self.db.add_utxo(outpoint.inner(), &utxo)?;
-                            // Remove the undo record
+                            // Remove the undo record.
                             self.db.delete_spent_record(outpoint.inner())?;
                         }
                         None => {
@@ -863,11 +881,11 @@ impl BlockValidator {
                 }
             }
 
-            // 3. Remove transaction index entry
+            // 3. Remove transaction index entry.
             self.db.delete_tx_index(txid.as_byte_array())?;
         }
 
-        // 3. Update best block to the previous block
+        // 4. Update best block to the previous block (G18).
         if height > 0 {
             let prev_hash = *inner.header.prev_blockhash.as_byte_array();
             self.db.update_best_block(&prev_hash, height - 1)?;
