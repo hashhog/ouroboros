@@ -128,6 +128,66 @@ BURIED_DEPLOYMENTS = {
     },
 }
 
+# =============================================================================
+# BIP30 / BIP34 canonical-chain hashes
+# =============================================================================
+# Bitcoin Core validation.cpp:2460-2462:
+#   CBlockIndex* pindexBIP34height = pindex->pprev->GetAncestor(params.GetConsensus().BIP34Height);
+#   fEnforceBIP30 = fEnforceBIP30 && (!pindexBIP34height ||
+#       !(pindexBIP34height->GetBlockHash() == params.GetConsensus().BIP34Hash));
+#
+# The BIP30 check can be skipped once BIP34 is provably active on the
+# canonical chain — verified by confirming the block at BIP34Height has
+# the expected hash.  If BIP34Hash is all-zeros (testnet4 / signet /
+# regtest), the hash comparison always fails, so BIP30 is always enforced
+# on those networks (which is correct: they have no 91842/91880 exceptions
+# either, so every block must be checked).
+#
+# Ref: Bitcoin Core kernel/chainparams.cpp
+BIP34_HASHES: dict[str, bytes] = {
+    # mainnet: block 227931 hash (big-endian display form, stored as bytes)
+    # Ref: kernel/chainparams.cpp:90
+    "mainnet": bytes.fromhex(
+        "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
+    ),
+    # testnet3: block 21111 hash
+    # Ref: kernel/chainparams.cpp:213
+    "testnet": bytes.fromhex(
+        "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
+    ),
+    "testnet3": bytes.fromhex(
+        "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
+    ),
+    # testnet4 / signet / regtest: BIP34Hash = uint256{} (all zeros).
+    # The zero hash will never match a real block hash, so
+    # fEnforceBIP30 stays True on these networks — BIP30 is always enforced.
+    # Ref: kernel/chainparams.cpp:312, 456, 537
+    "testnet4": bytes(32),
+    "signet": bytes(32),
+    "regtest": bytes(32),
+}
+
+# =============================================================================
+# BIP30 "repeat" block exceptions (IsBIP30Repeat in validation.cpp:6189-6193)
+# =============================================================================
+# Two historical mainnet blocks contain coinbase transactions that duplicate
+# an earlier block's coinbase.  Bitcoin Core exempts these blocks from the
+# BIP30 UTXO-collision check.  The exception is keyed by *both* height AND
+# block hash — a fork block at the same height does NOT get the exception.
+#
+# Block hashes are stored as 32-byte little-endian (internal byte order,
+# matching get_txid() / block.hash throughout ouroboros).
+#
+# Ref: Bitcoin Core validation.cpp:6189-6193
+BIP30_REPEAT_EXCEPTIONS: dict[int, bytes] = {
+    91842: bytes.fromhex(
+        "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
+    ),
+    91880: bytes.fromhex(
+        "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"
+    ),
+}
+
 # BIP9 deployments by network
 # These use the full BIP9 state machine via the Rust implementation
 BIP9_DEPLOYMENTS = {
