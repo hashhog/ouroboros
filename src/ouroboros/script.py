@@ -352,6 +352,23 @@ def _check_der_signature(sig: bytes) -> bool:
     return True
 
 
+# SIGHASH_ANYONECANPAY bitmask, matches Bitcoin Core src/script/script.h
+SIGHASH_ANYONECANPAY = 0x80
+
+
+def _is_defined_hashtype(sig: bytes) -> bool:
+    """Return True iff the signature's hashtype byte is in the valid range.
+
+    Mirrors Bitcoin Core IsDefinedHashtypeSignature (interpreter.cpp:190-199).
+    Strips SIGHASH_ANYONECANPAY (0x80) before the range check; all other
+    reserved bits (5-6) must be zero.  Valid base types: 1=ALL, 2=NONE, 3=SINGLE.
+    """
+    if not sig:
+        return False
+    nHashType = sig[-1] & (~SIGHASH_ANYONECANPAY & 0xFF)
+    return 1 <= nHashType <= 3
+
+
 def _check_low_s(sig_without_hashtype: bytes) -> bool:
     if len(sig_without_hashtype) < 6:
         return True
@@ -574,15 +591,24 @@ class ScriptInterpreter:
         )
         if not sig:
             return False
-        sighash_type = sig[-1]
         der_sig = sig[:-1]
-        if (flags & SCRIPT_VERIFY_DERSIG) and not _check_der_signature(sig):
+        # DER check fires when DERSIG | LOW_S | STRICTENC is set
+        # (Core CheckSignatureEncoding, interpreter.cpp:207).
+        if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
             return False
         if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
             return False
+        # STRICTENC: hashtype bits 5-6 must be zero (mask ~ANYONECANPAY only).
+        if (flags & SCRIPT_VERIFY_STRICTENC) and not _is_defined_hashtype(sig):
+            return False
+        # STRICTENC: pubkey must be valid compressed or uncompressed encoding.
+        if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
+            return False
+        sighash_type = sig[-1]
         msg = self._compute_segwit_v0_sighash(
             tx, input_index, script_code, amount, sighash_type)
         if not self._verify_ecdsa_signature(msg, der_sig, pubkey):
+            # NULLFAIL: non-empty sig must not be present on failure.
             if flags & SCRIPT_VERIFY_NULLFAIL:
                 return False
             return False
@@ -1250,16 +1276,16 @@ class ScriptInterpreter:
                 # Legacy / SegWit v0 ECDSA CHECKSIG
                 # Check signature encoding BEFORE checking for empty sig/pubkey
                 # (Bitcoin Core checks DERSIG/STRICTENC first)
+                # Core CheckSignatureEncoding: DER check fires when any of
+                # DERSIG | LOW_S | STRICTENC is set (interpreter.cpp:207).
                 if sig:
-                    if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
+                    if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
                         raise ValueError("Non-DER signature")
                     der_sig_check = sig[:-1]
                     if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig_check):
                         raise ValueError("Non-low-S signature")
-                    if (flags & SCRIPT_VERIFY_STRICTENC):
-                        ht = sig[-1] & 0x1f
-                        if ht < 1 or ht > 3:
-                            raise ValueError("STRICTENC: undefined hashtype")
+                    if (flags & SCRIPT_VERIFY_STRICTENC) and not _is_defined_hashtype(sig):
+                        raise ValueError("STRICTENC: undefined hashtype")
                 if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
                     raise ValueError("STRICTENC: invalid pubkey encoding")
                 if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
@@ -1338,16 +1364,16 @@ class ScriptInterpreter:
                     continue
 
                 # Legacy / SegWit v0 ECDSA CHECKSIGVERIFY
-                # Check encoding first (Bitcoin Core order)
+                # Check encoding first (Bitcoin Core order).
+                # Core CheckSignatureEncoding: DER check fires when any of
+                # DERSIG | LOW_S | STRICTENC is set (interpreter.cpp:207).
                 if sig:
-                    if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
+                    if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
                         raise ValueError("Non-DER signature")
                     if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(sig[:-1]):
                         raise ValueError("Non-low-S signature")
-                    if (flags & SCRIPT_VERIFY_STRICTENC):
-                        ht = sig[-1] & 0x1f
-                        if ht < 1 or ht > 3:
-                            raise ValueError("STRICTENC: undefined hashtype")
+                    if (flags & SCRIPT_VERIFY_STRICTENC) and not _is_defined_hashtype(sig):
+                        raise ValueError("STRICTENC: undefined hashtype")
                 if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
                     raise ValueError("STRICTENC: invalid pubkey encoding")
                 if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
@@ -1901,17 +1927,19 @@ class ScriptInterpreter:
                 key_idx += 1
                 continue
 
-            if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
+            # Core CheckSignatureEncoding: DER check fires when any of
+            # DERSIG | LOW_S | STRICTENC is set (interpreter.cpp:207).
+            if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
                 raise ValueError("Non-DER signature")
             der_sig = sig[:-1]
             if (flags & SCRIPT_VERIFY_LOW_S) and not _check_low_s(der_sig):
                 raise ValueError("Non-low-S signature")
+            # STRICTENC hashtype: strip ANYONECANPAY (0x80) only; bits 5-6
+            # must be zero (Core IsDefinedHashtypeSignature, interpreter.cpp:190-199).
+            if (flags & SCRIPT_VERIFY_STRICTENC) and not _is_defined_hashtype(sig):
+                raise ValueError("STRICTENC: undefined hashtype")
             if (flags & SCRIPT_VERIFY_STRICTENC) and not _check_pubkey_encoding(pubkey):
                 raise ValueError("STRICTENC: invalid pubkey encoding")
-            if (flags & SCRIPT_VERIFY_STRICTENC) and len(sig) > 0:
-                ht = sig[-1] & 0x1f
-                if ht < 1 or ht > 3:
-                    raise ValueError("STRICTENC: undefined hashtype")
             if is_witness_v0 and (flags & SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) and not _check_compressed_pubkey(pubkey):
                 raise ValueError("WITNESS_PUBKEYTYPE: uncompressed pubkey in witness v0")
 
