@@ -3618,7 +3618,9 @@ impl PyBlockchainDB {
         let spent_cf = raw_db.cf_handle(SPENT_CF)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("spent CF not found"))?;
 
-        // Collect all input outpoint keys (skip coinbase)
+        // Collect all input outpoint keys (skip coinbase). We keep the
+        // (key, spending_txid, tx_pos) triple so we can resolve spends
+        // per-tx in order below.
         let mut input_keys: Vec<[u8; 36]> = Vec::new();
         let mut input_spending_txids: Vec<[u8; 32]> = Vec::new();
         for tx in inner.txdata.iter() {
@@ -3634,8 +3636,8 @@ impl PyBlockchainDB {
             }
         }
 
-        // MultiGet all spent UTXOs in a single RocksDB call
-        let utxo_values: Vec<_> = if !input_keys.is_empty() {
+        // MultiGet all spent UTXOs in a single RocksDB call.
+        let utxo_values_disk: Vec<_> = if !input_keys.is_empty() {
             let cf_keys: Vec<_> = input_keys.iter()
                 .map(|k| (&*chainstate_cf, k.as_slice()))
                 .collect();
@@ -3644,38 +3646,87 @@ impl PyBlockchainDB {
             Vec::new()
         };
 
-        // --- Phase 2: Process spends using pre-fetched data ---
-        for (idx, (key, spending_txid)) in input_keys.iter().zip(input_spending_txids.iter()).enumerate() {
-            // Delete from chainstate
-            batch.delete_cf(&chainstate_cf, key);
-
-            // Store undo record if UTXO was found
-            match &utxo_values[idx] {
-                Ok(Some(utxo_bytes)) => {
-                    let mut undo_value = Vec::with_capacity(32 + utxo_bytes.len());
-                    undo_value.extend_from_slice(spending_txid);
-                    undo_value.extend_from_slice(utxo_bytes);
-                    batch.put_cf(&spent_cf, key, &undo_value);
-                }
-                _ => {} // UTXO not found — skip undo (early blocks may have missing UTXOs)
-            }
-        }
-
-        // --- Phase 3: Add outputs + tx index ---
+        // --- Phases 2+3 (interleaved): for each tx in order
+        //   (a) resolve spends against the intra-block overlay first,
+        //       falling back to the prefetched on-disk values,
+        //   (b) queue the chainstate delete + SPENT_CF undo record,
+        //   (c) add the tx's outputs to the chainstate and to the
+        //       intra-block overlay so later txs can spend them.
         //
-        // Special case: genesis block coinbase is unspendable per Core
-        // (validation.cpp:2337-2343), so we never add height-0 outputs
-        // to the chainstate.  Tx index is still maintained so genesis
-        // coinbase txid lookups continue to work.
+        // W93 BUG FIX (Bug C — intra-block undo loss): the prior
+        // implementation collected all spends from on-disk only, then
+        // added all outputs at the end. A tx N spending an output of an
+        // earlier tx M (M<N) in the same block missed the on-disk lookup
+        // (M's outputs weren't on disk yet), so no SPENT_CF undo record
+        // was written. On reorg-driven disconnect, that UTXO could not
+        // be restored and the chainstate silently drifted from Core.
+        // Reference: Bitcoin Core validation.cpp `UpdateCoins` /
+        // `Chainstate::ConnectBlock` per-tx loop (lines 2524-2601).
+        //
+        // We honour the genesis special-case (height 0): coinbase outputs
+        // are unspendable per Core (validation.cpp:2337-2343) and are
+        // never written into the chainstate. The intra-block overlay
+        // mirrors that — outputs at height 0 are not registered.
         let store_utxos = height > 0;
+        let mut in_block_added: std::collections::HashMap<[u8; 36], Vec<u8>> =
+            std::collections::HashMap::new();
+
+        // Walk inputs in the same order they were collected above
+        // (skip-coinbase, then per non-coinbase tx, then per input).
+        // `input_cursor` advances across the flat input list.
+        let mut input_cursor: usize = 0;
         for (tx_pos, tx) in inner.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
+            let txid_bytes = *txid.as_byte_array();
 
+            // (a)+(b) — spends, per tx, in order.
+            if !tx.is_coinbase() {
+                for _input in &tx.input {
+                    let key = &input_keys[input_cursor];
+                    let spending_txid = &input_spending_txids[input_cursor];
+
+                    // Resolve UTXO bytes: overlay first, then on-disk
+                    // prefetch (same precedence as `connect_blocks_atomic`).
+                    let utxo_bytes: Option<Vec<u8>> = if let Some(b) =
+                        in_block_added.remove(key)
+                    {
+                        // Intra-block spend: drop the to-be-added overlay
+                        // entry so we don't write it to the chainstate
+                        // either (it's effectively spent within this block).
+                        Some(b)
+                    } else {
+                        match &utxo_values_disk[input_cursor] {
+                            Ok(Some(disk_bytes)) => Some(disk_bytes.clone()),
+                            _ => None,
+                        }
+                    };
+
+                    // Queue chainstate delete unconditionally — the prior
+                    // multi_get_cf result may not see overlay-only UTXOs,
+                    // but it's harmless to issue a delete against a key
+                    // that doesn't exist on disk.
+                    batch.delete_cf(&chainstate_cf, key);
+
+                    if let Some(bytes) = utxo_bytes {
+                        let mut undo_value = Vec::with_capacity(32 + bytes.len());
+                        undo_value.extend_from_slice(spending_txid);
+                        undo_value.extend_from_slice(&bytes);
+                        batch.put_cf(&spent_cf, key, &undo_value);
+                    }
+                    // Note: an outpoint with no on-disk hit AND no overlay
+                    // hit indicates an early-IBD missing UTXO (the same
+                    // tolerated gap as the original implementation).
+
+                    input_cursor += 1;
+                }
+            }
+
+            // (c) — add this tx's outputs (when not genesis) and tx index.
             if store_utxos {
                 for (vout, output) in tx.output.iter().enumerate() {
                     // Skip provably unspendable outputs (OP_RETURN /
                     // oversize script) — see `is_unspendable_script` /
-                    // Core's `CScript::IsUnspendable`.  Required for
+                    // Core's `CScript::IsUnspendable`. Required for
                     // byte-identical `dumptxoutset`.
                     if crate::validate::block::is_unspendable_script(
                         output.script_pubkey.as_bytes(),
@@ -3690,14 +3741,24 @@ impl PyBlockchainDB {
                         Some(height),
                         tx.is_coinbase(),
                     );
-                    self.db.add_utxo_batch(&mut batch, outpoint.inner(), &utxo)
+
+                    // Serialize once so we can reuse the bytes for both
+                    // the WriteBatch and the intra-block overlay.
+                    use common::BitcoinSerialize;
+                    let utxo_serialized = utxo.bitcoin_serialize()
                         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+                    let key = encode_outpoint(&txid_bytes, vout as u32);
+                    batch.put_cf(&chainstate_cf, &key, &utxo_serialized);
+                    in_block_added.insert(key, utxo_serialized);
                 }
             }
 
-            self.db.store_tx_index_batch(&mut batch, txid.as_byte_array(), &block_hash, height, tx_pos as u32)
+            self.db.store_tx_index_batch(&mut batch, &txid_bytes, &block_hash, height, tx_pos as u32)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
         }
+        // Sanity: we should have consumed every collected input key.
+        debug_assert_eq!(input_cursor, input_keys.len());
 
         // Store block body + metadata
         self.db.store_block_batch(&mut batch, &block)

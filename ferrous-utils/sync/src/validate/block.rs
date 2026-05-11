@@ -475,30 +475,114 @@ impl BlockValidator {
     /// BIP30 duplicate-txid prohibition.
     ///
     /// Rejects a block that contains a tx whose txid already has any unspent
-    /// outputs in the UTXO set. Enforcement rules (mirror of Python
-    /// `validation.py:336-354` and Bitcoin Core `IsBIP30Repeat`):
+    /// outputs in the UTXO set. Mirrors Bitcoin Core `Chainstate::ConnectBlock`
+    /// (`validation.cpp:2392-2476`) + `IsBIP30Repeat` (`validation.cpp:6189-6193`):
     ///
-    /// - Heights 91_842 and 91_880 are the two historical grandfathered
-    ///   duplicates — never enforce.
-    /// - Within `[BIP34, BIP30_RECHECK)` = `[227_931, 1_983_702)` BIP34 coinbase
-    ///   height encoding guarantees uniqueness, so the check is skipped as a
-    ///   performance optimisation.
-    /// - Everywhere else on mainnet the check is enforced.
+    /// - **G(A) IsBIP30Repeat** — Mainnet blocks 91_842 / 91_880 are the two
+    ///   historical grandfathered duplicate-coinbase blocks. The exemption
+    ///   is keyed by **both height and hash** so that a fork block at the
+    ///   same height does NOT inherit the exemption.
+    /// - **G(B) BIP34 suppression** — Once BIP34 is active and the block at
+    ///   the activation height matches `BIP34Hash`, coinbase uniqueness is
+    ///   guaranteed by construction, so the UTXO scan can be skipped. For
+    ///   testnet4 / signet / regtest, `BIP34Hash` is `uint256{}` (all zeros)
+    ///   which can never match a real block hash, so BIP30 is ALWAYS
+    ///   enforced on those networks.
+    /// - **G(C) BIP34_IMPLIES_BIP30_LIMIT (1_983_702)** — Above this height
+    ///   BIP30 is re-enabled on every chain, because pre-BIP34 coinbases
+    ///   exist whose indicated heights reach this far.
     ///
-    /// Non-mainnet networks never enforce.
+    /// W93 fixes:
+    ///   * Bug A — was `if self.network != Network::Bitcoin { return Ok(()); }`
+    ///     which incorrectly skipped BIP30 on testnet4/signet/regtest, where
+    ///     Core enforces it because `BIP34Hash = uint256{}`. Now per-network.
+    ///   * Bug B — was a height-only window check, ignoring the canonical
+    ///     ancestor hash. Now consults the on-disk ancestor at `BIP34Height`
+    ///     and only suppresses BIP30 when it matches the canonical hash.
+    ///   * Bug C — `BIP34_IMPLIES_BIP30_LIMIT` is enforced on every network
+    ///     (Core gates by height, not by net).
     fn check_bip30(&self, block: &Block, height: u32) -> Result<()> {
-        if self.network != Network::Bitcoin {
-            return Ok(());
-        }
-        if height == 91_842 || height == 91_880 {
-            return Ok(());
-        }
-        const BIP34_HEIGHT: u32 = 227_931;
+        // G(C) — BIP34_IMPLIES_BIP30_LIMIT is a global height gate. Above it
+        // BIP30 is re-enabled regardless of network or BIP34 status.
         const BIP30_RECHECK_HEIGHT: u32 = 1_983_702;
-        if height >= BIP34_HEIGHT && height < BIP30_RECHECK_HEIGHT {
+
+        // BIP30 canonical-hash tables (internal LE byte order). Stored as
+        // hex strings so we can fall back to runtime decoding without a
+        // hex_literal dep. Decoding here is one-shot and cheap.
+        const BIP30_REPEAT_HASH_91842: &str =
+            "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec";
+        const BIP30_REPEAT_HASH_91880: &str =
+            "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721";
+        const BIP34_HASH_MAINNET: &str =
+            "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8";
+        const BIP34_HASH_TESTNET3: &str =
+            "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8";
+
+        fn decode_hash(s: &str) -> [u8; 32] {
+            let bytes = hex::decode(s).expect("compile-time hex constant decodes");
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes);
+            out
+        }
+
+        // G(A) — IsBIP30Repeat. Keyed on (height, block_hash). Only the two
+        // canonical mainnet duplicates are exempt; a fork at the same height
+        // is NOT.
+        let block_hash = *block.block_hash().as_byte_array();
+        if self.network == Network::Bitcoin && height < BIP30_RECHECK_HEIGHT
+            && (height == 91_842 || height == 91_880)
+        {
+            let canonical = if height == 91_842 {
+                decode_hash(BIP30_REPEAT_HASH_91842)
+            } else {
+                decode_hash(BIP30_REPEAT_HASH_91880)
+            };
+            if block_hash == canonical {
+                return Ok(());
+            }
+            // Fall through — a fork at this height must be checked.
+        }
+
+        // G(B) — BIP34 suppression. Only applies between BIP34 activation
+        // and BIP30_RECHECK, AND only when the ancestor at the BIP34 height
+        // has the canonical hash.
+        let bip34_height = crate::chain_params::bip_activation_heights(self.network).0;
+        let bip34_canonical_hash: Option<[u8; 32]> = match self.network {
+            Network::Bitcoin => Some(decode_hash(BIP34_HASH_MAINNET)),
+            Network::Testnet => Some(decode_hash(BIP34_HASH_TESTNET3)),
+            // testnet4 / signet / regtest: BIP34Hash = uint256{}. No
+            // canonical-hash match is ever possible — BIP30 stays enforced.
+            // Reference: bitcoin-core/src/kernel/chainparams.cpp:312, 456, 537
+            _ => None,
+        };
+
+        let suppress_by_bip34 = if height < BIP30_RECHECK_HEIGHT
+            && height >= bip34_height
+        {
+            match bip34_canonical_hash {
+                Some(expected) => {
+                    // Look up the block on the canonical chain at the BIP34
+                    // height; only suppress when it matches the canonical
+                    // hash. (Core: `pindexBIP34height->GetBlockHash() == BIP34Hash`.)
+                    match self.db.get_block_by_height(bip34_height) {
+                        Ok(Some(bw)) => {
+                            *bw.block_hash().as_byte_array() == expected
+                        }
+                        // DB miss → conservatively keep enforcing BIP30.
+                        _ => false,
+                    }
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+
+        if suppress_by_bip34 {
             return Ok(());
         }
 
+        // Enforce BIP30.
         for tx in &block.txdata {
             let txid = tx.compute_txid();
             for vout in 0..tx.output.len() as u32 {
@@ -688,11 +772,20 @@ impl BlockValidator {
     /// Calculate block subsidy for a given height
     ///
     /// Bitcoin subsidy starts at 50 BTC = 5_000_000_000 satoshis and halves
-    /// every 210,000 blocks.
-    /// Reference: Bitcoin Core validation.cpp::GetBlockSubsidy — nSubsidy = 50 * COIN
-    /// where COIN = 100_000_000 (src/consensus/amount.h).
+    /// every `consensusParams.nSubsidyHalvingInterval` blocks. The interval
+    /// is **per-network**: 210_000 on mainnet/testnet/testnet4/signet, but
+    /// **150 on regtest** (`kernel/chainparams.cpp:535`).
+    ///
+    /// W93 fix: prior implementation hardcoded 210_000, which silently
+    /// over-estimated the regtest subsidy after the 150-block halving and
+    /// would let a coinbase pay too much (a `bad-cb-amount` consensus split
+    /// vs Core on regtest functional tests).
+    ///
+    /// Reference: Bitcoin Core validation.cpp::GetBlockSubsidy
+    /// (`nSubsidy = 50 * COIN; nSubsidy >>= halvings;`).
     pub fn calculate_block_subsidy(&self, height: u32) -> u64 {
-        let halvings = height / 210_000;
+        let interval = crate::chain_params::subsidy_halving_interval(self.network);
+        let halvings = height / interval;
         if halvings >= 64 {
             return 0;
         }
@@ -1008,6 +1101,63 @@ mod tests {
 
         // After 64 halvings: 0
         assert_eq!(validator.calculate_block_subsidy(64 * 210_000), 0);
+    }
+
+    /// W93 — Regression test for the network-aware halving interval.
+    ///
+    /// Pre-fix the implementation hardcoded 210_000 for every network,
+    /// which over-estimates the regtest subsidy after the 150-block
+    /// halving and would cause a `bad-cb-amount` consensus split vs Core
+    /// on regtest functional tests.
+    /// Reference: `kernel/chainparams.cpp:535` (regtest interval = 150).
+    #[test]
+    fn test_calculate_block_subsidy_regtest_uses_short_interval() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Regtest);
+
+        // Pre-halving (height < 150): full 50 BTC.
+        assert_eq!(validator.calculate_block_subsidy(0), 5_000_000_000);
+        assert_eq!(validator.calculate_block_subsidy(149), 5_000_000_000);
+
+        // First halving fires at height 150 on regtest.
+        assert_eq!(validator.calculate_block_subsidy(150), 2_500_000_000);
+        assert_eq!(validator.calculate_block_subsidy(299), 2_500_000_000);
+
+        // Second halving at height 300.
+        assert_eq!(validator.calculate_block_subsidy(300), 1_250_000_000);
+        assert_eq!(validator.calculate_block_subsidy(449), 1_250_000_000);
+
+        // Third halving at 450.
+        assert_eq!(validator.calculate_block_subsidy(450), 625_000_000);
+
+        // 64 halvings → 0.
+        assert_eq!(validator.calculate_block_subsidy(64 * 150), 0);
+        assert_eq!(validator.calculate_block_subsidy(10_000_000), 0);
+    }
+
+    /// W93 — Regtest and mainnet must diverge starting at height 150.
+    #[test]
+    fn test_calculate_block_subsidy_regtest_diverges_from_mainnet() {
+        let (_temp_dir, db) = create_test_db();
+        let mainnet_v = BlockValidator::new(db.clone(), Network::Bitcoin);
+        let regtest_v = BlockValidator::new(db, Network::Regtest);
+
+        // At height 150 regtest is past its first halving, mainnet is not.
+        assert_eq!(mainnet_v.calculate_block_subsidy(150), 5_000_000_000);
+        assert_eq!(regtest_v.calculate_block_subsidy(150), 2_500_000_000);
+        assert_ne!(
+            mainnet_v.calculate_block_subsidy(150),
+            regtest_v.calculate_block_subsidy(150),
+        );
+
+        // testnet4 and signet share the mainnet interval (210_000).
+        let signet_v = BlockValidator::new(
+            BlockchainDB::open(
+                TempDir::new("bitcoin_block_test_signet").unwrap().path().to_str().unwrap(),
+            ).unwrap().into(),
+            Network::Signet,
+        );
+        assert_eq!(signet_v.calculate_block_subsidy(150), 5_000_000_000);
     }
 
     #[test]
