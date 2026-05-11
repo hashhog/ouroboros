@@ -47,6 +47,13 @@ MAX_ANCESTOR_SIZE_KVB = 101
 MAX_DESCENDANT_SIZE_KVB = 101
 DUST_RELAY_TX_FEE = 3000  # sat/kB
 DEFAULT_MIN_RELAY_TX_FEE = 1000  # sat/kvB
+# DEFAULT_INCREMENTAL_RELAY_FEE — sat/kvB (policy/policy.h:48)
+# This is the minimum fee increment for relay and for trimming.  Bitcoin Core
+# sets this to 100 sat/kvB (NOT 1000).  A higher value incorrectly tightens
+# RBF gate 4 and inflates the rolling minimum fee after trim.
+DEFAULT_INCREMENTAL_RELAY_FEE = 100  # sat/kvB (Core DEFAULT_INCREMENTAL_RELAY_FEE)
+# Rolling fee halflife — seconds (txmempool.h:212)
+ROLLING_FEE_HALFLIFE = 60 * 60 * 12  # 12 hours = 43200 s
 MEMPOOL_EXPIRY_HOURS = 336  # 14 days
 TX_MAX_STANDARD_VERSION = 3
 
@@ -1470,6 +1477,16 @@ class Mempool:
         # Reference: Bitcoin Core txmempool.h m_sequence_number
         self._mempool_sequence: int = 0
 
+        # Rolling minimum fee rate state (txmempool.h:195-197 + txmempool.cpp:829-859)
+        # After TrimToSize evicts transactions the rolling minimum rises to
+        # evicted_feerate + INCREMENTAL_RELAY_FEE so that evicted txs cannot
+        # immediately re-enter.  It decays exponentially with halflife 12 h.
+        # blockSinceLastRollingFeeBump is set True on each block; when True the
+        # fee can decay; when False (eviction just happened) it is locked.
+        self._rolling_minimum_fee_rate: float = 0.0   # sat/kvB as float
+        self._last_rolling_fee_update: float = time.time()
+        self._block_since_last_rolling_fee_bump: bool = False
+
         # Reentrant lock for snapshot isolation (e.g. getblocktemplate).
         # RLock because _resolve_orphans -> add_transaction recurses.
         self._lock = threading.RLock()
@@ -1499,6 +1516,65 @@ class Mempool:
         seq = self._mempool_sequence
         self._mempool_sequence += 1
         return seq
+
+    # ── Rolling Minimum Fee Rate (txmempool.cpp:829-859) ─────────────────────
+
+    def get_min_fee(self) -> float:
+        """Return the current rolling minimum fee rate in sat/kvB.
+
+        Mirrors Bitcoin Core CTxMemPool::GetMinFee(sizelimit).
+        Reference: txmempool.cpp:829-851.
+
+        The fee decays exponentially when a block has been seen since the last
+        bump (blockSinceLastRollingFeeBump=True).  Halflife is accelerated to
+        ROLLING_FEE_HALFLIFE/4 when mempool < sizelimit/4, and to
+        ROLLING_FEE_HALFLIFE/2 when mempool < sizelimit/2.
+
+        Returns 0.0 when the rolling rate has decayed below
+        incremental_relay_feerate/2, otherwise returns
+        max(rolling_rate, INCREMENTAL_RELAY_FEE).
+        """
+        with self._lock:
+            return self._get_min_fee_inner()
+
+    def _get_min_fee_inner(self) -> float:
+        """Unlocked implementation of get_min_fee."""
+        if not self._block_since_last_rolling_fee_bump or self._rolling_minimum_fee_rate == 0.0:
+            return self._rolling_minimum_fee_rate
+
+        now = time.time()
+        if now > self._last_rolling_fee_update + 10:
+            halflife = ROLLING_FEE_HALFLIFE
+            usage = self.current_size
+            sizelimit = self.max_size
+            if usage < sizelimit / 4:
+                halflife /= 4
+            elif usage < sizelimit / 2:
+                halflife /= 2
+
+            elapsed = now - self._last_rolling_fee_update
+            self._rolling_minimum_fee_rate = (
+                self._rolling_minimum_fee_rate / (2.0 ** (elapsed / halflife))
+            )
+            self._last_rolling_fee_update = now
+
+            # Below half the incremental relay fee → treat as zero
+            if self._rolling_minimum_fee_rate < DEFAULT_INCREMENTAL_RELAY_FEE / 2.0:
+                self._rolling_minimum_fee_rate = 0.0
+                return 0.0
+
+        return max(self._rolling_minimum_fee_rate, float(DEFAULT_INCREMENTAL_RELAY_FEE))
+
+    def _track_package_removed(self, fee_per_kvb: float) -> None:
+        """Track the fee rate of an evicted package (txmempool.cpp:853-859).
+
+        Bumps rolling_minimum_fee_rate to *fee_per_kvb* if it is higher than
+        the current value, and clears block_since_last_rolling_fee_bump so the
+        rate is locked (not decaying) until the next block.
+        """
+        if fee_per_kvb > self._rolling_minimum_fee_rate:
+            self._rolling_minimum_fee_rate = fee_per_kvb
+            self._block_since_last_rolling_fee_bump = False
 
     def snapshot(self) -> tuple[list[bytes], dict[bytes, "MempoolEntry"]]:
         """Take a consistent snapshot of the mempool for template construction.
@@ -1782,6 +1858,22 @@ class Mempool:
         min_relay = (tx_vsize * DEFAULT_MIN_RELAY_TX_FEE) // 1000
         if fee < min_relay:
             return False, f"Below minimum relay fee: {fee} < {min_relay}"
+
+        # Rolling minimum fee check (txmempool.cpp GetMinFee gate).
+        # After TrimToSize evicts transactions the rolling min fee rises so
+        # that evicted txs cannot immediately re-enter.  Core checks:
+        #   if (pool.GetMinFee().GetFeePerK() > minRelayTxFee.GetFeePerK())
+        #       if (ws.m_modified_fees < pool.GetMinFee().GetFee(ws.m_vsize))
+        #           return state.Invalid(...)
+        # Reference: validation.cpp AcceptToMemoryPoolWorker (fee-filter gate).
+        rolling_min_kvb = self._get_min_fee_inner()  # sat/kvB
+        if rolling_min_kvb > DEFAULT_MIN_RELAY_TX_FEE:
+            rolling_min_fee = (tx_vsize * rolling_min_kvb) // 1000
+            if fee < rolling_min_fee:
+                return False, (
+                    f"Insufficient fee: {fee} sat < rolling minimum "
+                    f"{rolling_min_fee} sat (min rate {rolling_min_kvb:.1f} sat/kvB)"
+                )
 
         # Compute direct parents (mempool txs this tx spends from)
         direct_parents: set[bytes] = set()
@@ -2487,19 +2579,35 @@ class Mempool:
     def _expire_old_transactions_inner(self, current_time: float | None = None) -> int:
         now = current_time or time.time()
         cutoff = now - (MEMPOOL_EXPIRY_HOURS * 3600)
-        expired = [
+
+        # Collect directly-expired transactions (those added before cutoff).
+        directly_expired = [
             txid for txid, entry in self.transactions.items()
             if entry.time_added < cutoff
         ]
-        for txid in expired:
-            self.remove_transaction(txid)
-        if expired:
-            logger.info(f"Expired {len(expired)} old mempool transactions")
+
+        # Expand to full descendant closure — mirrors Bitcoin Core Expire()
+        # which calls CalculateDescendants on each expired entry before removal
+        # (txmempool.cpp:822-825).  Without this, a child of an expired parent
+        # would be left orphaned in the pool with a dangling input pointer.
+        stage: set[bytes] = set()
+        for txid in directly_expired:
+            stage |= self._collect_descendants(txid)
+
+        for txid in list(stage):
+            self._remove_transaction_inner(txid, _reason="expiry")
+
+        removed_count = len(stage)
+        if removed_count > 0:
+            logger.info(
+                f"Expired {removed_count} mempool transactions "
+                f"({len(directly_expired)} direct + {removed_count - len(directly_expired)} descendants)"
+            )
 
         # Also expire old orphans
         self.orphan_pool.expire()
 
-        return len(expired)
+        return removed_count
 
     def remove_transaction(
         self,
@@ -2651,6 +2759,13 @@ class Mempool:
                 f"Removed {len(removed_ids)} transactions from mempool "
                 f"(included in block)"
             )
+
+        # After each block, reset the rolling fee timestamp and allow decay.
+        # Mirrors Bitcoin Core CTxMemPool::removeForBlock() lines 426-427:
+        #   lastRollingFeeUpdate = GetTime();
+        #   blockSinceLastRollingFeeBump = true;
+        self._last_rolling_fee_update = time.time()
+        self._block_since_last_rolling_fee_bump = True
 
     def get_transaction(self, txid: bytes) -> Transaction | None:
         """
@@ -2819,7 +2934,7 @@ class Mempool:
 
     # BIP 125 Replace-By-Fee #
 
-    INCREMENTAL_RELAY_FEE = 1000  # sat/kvB
+    INCREMENTAL_RELAY_FEE = DEFAULT_INCREMENTAL_RELAY_FEE  # 100 sat/kvB (Core DEFAULT_INCREMENTAL_RELAY_FEE)
     MAX_REPLACEMENT_EVICTIONS = 100
 
     def _check_cluster_rbf(
@@ -3252,10 +3367,17 @@ class Mempool:
         (groups of transactions that would be mined together) rather than
         individual transactions. This maintains linearization invariants.
 
-        Reference: Bitcoin Core txgraph.h - GetWorstMainChunk()
+        After each chunk is removed, trackPackageRemoved is called so that the
+        rolling minimum fee rate rises to (evicted_chunk_feerate +
+        INCREMENTAL_RELAY_FEE), preventing the evicted transactions from
+        immediately re-entering the pool.
+
+        Reference: Bitcoin Core txmempool.cpp:861-911 TrimToSize() +
+                   txmempool.cpp:853-859 trackPackageRemoved().
         """
         freed = 0
         evicted_count = 0
+        max_fee_rate_removed: float = 0.0
 
         # Evict entire chunks (lowest feerate first)
         while self.transactions and freed < needed_space:
@@ -3265,6 +3387,20 @@ class Mempool:
 
             chunk, _cluster_id = worst
             chunk_size = chunk.total_size
+
+            # Compute the chunk feerate in sat/kvB for trackPackageRemoved.
+            # Core: removed = CFeeRate(feerate.fee, feerate.size)
+            #       removed += m_opts.incremental_relay_feerate
+            #       trackPackageRemoved(removed)
+            chunk_fee_per_kvb: float = 0.0
+            if chunk.total_size > 0:
+                # chunk.fee_rate is sat/vB; convert to sat/kvB
+                chunk_fee_per_kvb = chunk.fee_rate * 1000.0
+            # Add incremental relay fee (Core: removed += incremental_relay_feerate)
+            removed_fee_per_kvb = chunk_fee_per_kvb + DEFAULT_INCREMENTAL_RELAY_FEE
+            self._track_package_removed(removed_fee_per_kvb)
+            if removed_fee_per_kvb > max_fee_rate_removed:
+                max_fee_rate_removed = removed_fee_per_kvb
 
             # Evict all transactions in this chunk
             # Must remove in reverse topological order (children before parents)
@@ -3279,7 +3415,7 @@ class Mempool:
 
             for txid in chunk_txids:
                 if txid in self.transactions:
-                    self.remove_transaction(txid, _reason="evicted")
+                    self._remove_transaction_inner(txid, _reason="evicted")
                     evicted_count += 1
 
             freed += chunk_size
@@ -3287,7 +3423,8 @@ class Mempool:
         if evicted_count > 0:
             logger.info(
                 f"Evicted {evicted_count} transactions (chunk-based) to free "
-                f"{freed} bytes (needed: {needed_space})"
+                f"{freed} bytes (needed: {needed_space}); "
+                f"rolling min fee bumped to {max_fee_rate_removed:.1f} sat/kvB"
             )
 
     def clear(self) -> None:
