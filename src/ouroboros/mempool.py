@@ -19,6 +19,9 @@ from ouroboros.database import Transaction
 from ouroboros.validation import (
     TransactionValidator,
     WITNESS_SCALE_FACTOR,
+    DEFAULT_BYTES_PER_SIGOP,
+    get_sigops_adjusted_weight,
+    get_virtual_transaction_size,
     _count_legacy_sigops,
     _count_witness_sigops,
     _get_p2sh_sigops,
@@ -1278,13 +1281,24 @@ def _is_witness_standard(
 
 @dataclass
 class MempoolEntry:
-    """Entry in the mempool"""
+    """Entry in the mempool.
+
+    Tracks both raw byte size (for mempool byte-budget accounting) and the
+    sigop-adjusted virtual size (vsize) used for fee-rate checks, TRUC limits,
+    and RPC reporting — matching Bitcoin Core's CTxMemPoolEntry::GetTxSize().
+
+    Reference: bitcoin-core/src/kernel/mempool_entry.h:110-113
+        int32_t GetTxSize() const {
+            return GetVirtualTransactionSize(nTxWeight, sigOpCost, ::nBytesPerSigOp);
+        }
+    """
     tx: Transaction
     fee: int
-    fee_rate: float  # sat/vbyte
-    size: int
+    fee_rate: float  # sat/vbyte (computed from sigop-adjusted vsize)
+    size: int        # stripped (no-witness) byte count — for mempool byte budget
     time_added: float
     height_added: int
+    sigop_cost: int = 0  # BIP-141-weighted sigop cost (set at admission time)
     ancestor_count: int = 1
     ancestor_size: int = 0
     descendant_count: int = 1
@@ -1297,6 +1311,25 @@ class MempoolEntry:
     # Reference: Bitcoin Core policy/ephemeral_policy.cpp
     has_ephemeral_dust: bool = False
     ephemeral_child: bytes | None = None  # txid of child spending our dust
+
+    @property
+    def vsize(self) -> int:
+        """Sigop-adjusted virtual size in bytes.
+
+        Mirrors Bitcoin Core CTxMemPoolEntry::GetTxSize():
+            GetVirtualTransactionSize(nTxWeight, sigOpCost, ::nBytesPerSigOp)
+
+        This is the effective size used for:
+          - fee-rate calculation and relay checks
+          - TRUC (v3) size limits
+          - RPC `sendrawtransaction` / `testmempoolaccept` vsize field
+          - ancestor/descendant size accounting (ideally; see inline comment)
+
+        Reference: bitcoin-core/src/kernel/mempool_entry.h:110-113,
+                   bitcoin-core/src/policy/policy.cpp:395-403.
+        """
+        weight = self.tx.get_weight()
+        return get_virtual_transaction_size(weight, self.sigop_cost, DEFAULT_BYTES_PER_SIGOP)
 
 
 # Orphan transaction pool
@@ -1607,6 +1640,9 @@ class Mempool:
         #   if (nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST) → TX_NOT_STANDARD / bad-txns-too-many-sigops
         # MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST / 5 = 80000 / 5 = 16000
         # This is only enforced when standardness checks are active (require_standard).
+        # We also save tx_sigop_cost for later use in MempoolEntry (sigop-adjusted vsize).
+        # When require_standard is False, default to 0 (no sigop adjustment).
+        tx_sigop_cost = 0
         if self.require_standard:
             def _utxo_resolver(prev_txid: bytes, prev_vout: int):
                 utxo = self.validator.db.get_utxo(prev_txid, prev_vout)
@@ -1650,7 +1686,18 @@ class Mempool:
 
         # Ancestor/descendant limits (Bitcoin Core: CalculateMemPoolAncestors)
         ancestors = self._get_ancestors(tx)
+        # Stripped non-witness byte count: used for raw byte-budget accounting
+        # (mempool max_size, ancestor_size, descendant_size stored on entries).
+        # These track actual RAM / disk byte consumption, not fee-rate vsize.
         tx_size = len(tx.serialize())
+        # tx_sigop_cost was computed above (in the require_standard block); it is
+        # 0 when standardness checks are disabled.  Derive the sigop-adjusted
+        # vsize for fee-rate and relay-fee checks, matching Core:
+        #   ws.m_vsize = ws.m_tx_handle->GetTxSize()
+        #              = GetVirtualTransactionSize(weight, sigOpCost, nBytesPerSigOp)
+        # Reference: bitcoin-core/src/validation.cpp:932,
+        #            bitcoin-core/src/kernel/mempool_entry.h:110-113
+        tx_vsize = get_virtual_transaction_size(tx.get_weight(), tx_sigop_cost, DEFAULT_BYTES_PER_SIGOP)
 
         # Check ancestor count limit
         if len(ancestors) + 1 > MAX_ANCESTOR_COUNT:
@@ -1703,11 +1750,15 @@ class Mempool:
         if fee < 0:
             return False, "Negative fee"
 
-        fee_rate = fee / tx_size if tx_size > 0 else 0
-        # print(f'fee_rate={fee_rate}, target={min_relay}')
+        # fee_rate uses the sigop-adjusted vsize, matching Core's CFeeRate which
+        # calls GetTxSize() = GetVirtualTransactionSize(weight, sigopCost, nBytesPerSigOp).
+        # Reference: bitcoin-core/src/validation.cpp:993
+        #   CFeeRate newFeeRate(ws.m_modified_fees, ws.m_vsize);
+        fee_rate = fee / tx_vsize if tx_vsize > 0 else 0
 
-        # Minimum relay fee
-        min_relay = (tx_size * DEFAULT_MIN_RELAY_TX_FEE) // 1000
+        # Minimum relay fee check uses vsize (same source as fee_rate).
+        # DEFAULT_MIN_RELAY_TX_FEE is in sat/kB; convert to sat for this tx.
+        min_relay = (tx_vsize * DEFAULT_MIN_RELAY_TX_FEE) // 1000
         if fee < min_relay:
             return False, f"Below minimum relay fee: {fee} < {min_relay}"
 
@@ -1725,6 +1776,7 @@ class Mempool:
             size=tx_size,
             time_added=time.time(),
             height_added=height,
+            sigop_cost=tx_sigop_cost,
             ancestor_count=len(ancestors) + 1,
             ancestor_size=ancestor_size + tx_size,
             parents=direct_parents,

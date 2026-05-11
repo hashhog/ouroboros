@@ -35,10 +35,15 @@ SIG_CACHE = SigCache(max_entries=50_000)
 COINBASE_MATURITY = 100
 
 # Block limits
+# References: bitcoin-core/src/consensus/consensus.h:15-24
 MAX_BLOCK_WEIGHT = 4_000_000
 MAX_BLOCK_SIGOPS_COST = 80_000
 MAX_TX_SIGOPS_COST = 16_000
 WITNESS_SCALE_FACTOR = 4
+# MIN_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 60 (consensus.h:23)
+MIN_TRANSACTION_WEIGHT = 240
+# MIN_SERIALIZABLE_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 10 (consensus.h:24)
+MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 40
 
 # Difficulty / PoW constants #
 DIFFICULTY_ADJUSTMENT_INTERVAL = 2016
@@ -299,6 +304,59 @@ def _get_p2sh_sigops(script_sig: bytes, prev_script_pubkey: bytes) -> int:
     # Bitcoin Core), where multisig counts actual keys instead of 20.
     # Ref: Bitcoin Core script/script.cpp CScript::GetSigOpCount(const CScript&)
     return _count_legacy_sigops(redeem_script, accurate=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BIP-141 weight / vsize utilities
+# References:
+#   bitcoin-core/src/policy/policy.cpp:390-407
+#   bitcoin-core/src/policy/policy.h:182-198
+#   bitcoin-core/src/consensus/validation.h:132-144
+# ─────────────────────────────────────────────────────────────────────────────
+
+# DEFAULT_BYTES_PER_SIGOP (policy/policy.h:50): the sigop→byte exchange rate
+# used when computing the sigop-adjusted vsize for mempool fee-rate checks.
+# A tx with high sigop cost is treated as heavier than its raw byte weight.
+DEFAULT_BYTES_PER_SIGOP = 20
+
+
+def get_sigops_adjusted_weight(weight: int, sigop_cost: int, bytes_per_sigop: int = DEFAULT_BYTES_PER_SIGOP) -> int:
+    """Return the sigop-adjusted weight unit count.
+
+    Mirrors Bitcoin Core policy/policy.cpp GetSigOpsAdjustedWeight():
+        return std::max(weight, sigop_cost * bytes_per_sigop);
+
+    Args:
+        weight: BIP-141 weight units (stripped_size * 3 + total_size).
+        sigop_cost: BIP-141-weighted sigop cost of the transaction.
+        bytes_per_sigop: Exchange rate, default DEFAULT_BYTES_PER_SIGOP (20).
+
+    Returns:
+        int: max(weight, sigop_cost * bytes_per_sigop).
+    """
+    return max(weight, sigop_cost * bytes_per_sigop)
+
+
+def get_virtual_transaction_size(weight: int, sigop_cost: int = 0, bytes_per_sigop: int = DEFAULT_BYTES_PER_SIGOP) -> int:
+    """Compute the virtual transaction size (vsize) in bytes.
+
+    Mirrors Bitcoin Core policy/policy.cpp GetVirtualTransactionSize():
+        return (GetSigOpsAdjustedWeight(weight, sigop_cost, bytes_per_sigop)
+                + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR;
+
+    When sigop_cost=0 and bytes_per_sigop=0 (or default 20 with sigop_cost=0),
+    this reduces to ceil(weight / 4) — the plain BIP-141 vsize.
+
+    Args:
+        weight: BIP-141 weight units.
+        sigop_cost: BIP-141-weighted sigop cost (0 for consensus weight only).
+        bytes_per_sigop: Exchange rate, default DEFAULT_BYTES_PER_SIGOP (20).
+
+    Returns:
+        int: ceil(sigop_adjusted_weight / WITNESS_SCALE_FACTOR).
+    """
+    adj = get_sigops_adjusted_weight(weight, sigop_cost, bytes_per_sigop)
+    return (adj + WITNESS_SCALE_FACTOR - 1) // WITNESS_SCALE_FACTOR
 
 
 class BlockValidator:
@@ -794,7 +852,40 @@ class BlockValidator:
 
     # Block weight / sigops
     def _validate_block_limits(self, block: Block) -> tuple[bool, str]:
-        """Validate block weight and sigops cost limits."""
+        """Validate block weight and sigops cost limits.
+
+        Includes the two early-exit size checks from Bitcoin Core CheckBlock()
+        (validation.cpp:3947) that fire before per-transaction accounting:
+
+          1. block.vtx.empty() → bad-blk-length  (checked in validate_block)
+          2. block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+          3. GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+
+        These catch malicious blocks with pathological tx counts or stripped
+        serialization before the more expensive per-tx weight summation.
+        Reference: bitcoin-core/src/validation.cpp:3947
+        """
+        # Early check 1: tx count overflow guard
+        # `block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT`
+        # A block with > 1,000,000 transactions would be invalid even if each
+        # transaction were the minimum possible 1 byte (which is impossible,
+        # but this is a cheap pre-filter).
+        if len(block.transactions) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT:
+            return False, (
+                f"bad-blk-length: tx count {len(block.transactions)} × "
+                f"{WITNESS_SCALE_FACTOR} exceeds MAX_BLOCK_WEIGHT"
+            )
+
+        # Early check 2: stripped (no-witness) block serialization guard.
+        # Approximation: sum the stripped size of all transactions.  Core
+        # uses TX_NO_WITNESS serializer on the whole block.
+        stripped_block_size = sum(len(tx.serialize()) for tx in block.transactions)
+        if stripped_block_size * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT:
+            return False, (
+                f"bad-blk-length: stripped block size {stripped_block_size} × "
+                f"{WITNESS_SCALE_FACTOR} exceeds MAX_BLOCK_WEIGHT"
+            )
+
         total_weight = 0
         total_sigops_cost = 0
 
