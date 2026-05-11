@@ -74,6 +74,7 @@ def bip22_result_string(error: str) -> str:
     # Already-canonical strings pass through unchanged
     if s in ("duplicate", "inconclusive", "duplicate-invalid",
              "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
+             "bad-witness-nonce-size", "unexpected-witness",
              "bad-cb-amount", "bad-blk-sigops", "bad-cb-height",
              "bad-txns-nonfinal", "bad-txns-duplicate", "rejected",
              "block-script-verify-flag-failed",
