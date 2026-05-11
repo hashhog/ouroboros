@@ -823,6 +823,11 @@ class BlockValidator:
                 if not valid:
                     return False, f"Transaction {i} invalid: {error}"
                 total_fees += tx_fees[0] if tx_fees else 0
+                # Accumulated block fee must stay in MoneyRange.
+                # Ref: Bitcoin Core validation.cpp:2543-2547
+                #   ("bad-txns-accumulated-fee-outofrange")
+                if total_fees < 0 or total_fees > MAX_MONEY:
+                    return False, "bad-txns-accumulated-fee-outofrange"
 
             # Register this tx's outputs in the intra-block view for
             # subsequent transactions.
@@ -1834,15 +1839,32 @@ class TransactionValidator:
             utxo = input_utxos[i]
 
             # Coinbase maturity: coinbase outputs need COINBASE_MATURITY confirmations
+            # Ref: Bitcoin Core consensus/tx_verify.cpp:179-182
+            #   ("bad-txns-premature-spend-of-coinbase")
+            # If utxo_height is None (e.g. pre-snapshot coins), treat it as 0
+            # so the depth check is conservative rather than silently skipping.
             utxo_height = utxo.get('height')
             is_coinbase_utxo = utxo.get('is_coinbase', False)
-            if is_coinbase_utxo and utxo_height is not None:
-                depth = height - utxo_height
+            if is_coinbase_utxo:
+                coin_height = utxo_height if utxo_height is not None else 0
+                depth = height - coin_height
                 if depth < COINBASE_MATURITY:
                     return False, (
-                        f"Coinbase maturity not met for input {i}: "
-                        f"depth {depth} < {COINBASE_MATURITY}"
+                        f"bad-txns-premature-spend-of-coinbase: "
+                        f"tried to spend coinbase at depth {depth}"
                     )
+
+            # Per-coin MoneyRange check.
+            # Ref: Bitcoin Core consensus/tx_verify.cpp:185-188
+            #   ("bad-txns-inputvalues-outofrange")
+            # A coin value out of range in the UTXO set indicates database
+            # corruption; reject the tx rather than silently trusting it.
+            coin_value = utxo['value']
+            if coin_value < 0 or coin_value > MAX_MONEY:
+                return False, "bad-txns-inputvalues-outofrange"
+            total_input += coin_value
+            if total_input < 0 or total_input > MAX_MONEY:
+                return False, "bad-txns-inputvalues-outofrange"
 
             # Verify signatures with proper flags (skip during assume-valid IBD)
             if not skip_scripts:
@@ -1851,14 +1873,18 @@ class TransactionValidator:
                 ):
                     return False, f"Invalid signature for input {i}"
 
-            total_input += utxo['value']
-
         # 4. Check amounts (consensus: inputs must cover outputs)
-        if total_input > MAX_MONEY:
-            return False, f"Total input {total_input} exceeds MAX_MONEY"
+        # Ref: Bitcoin Core consensus/tx_verify.cpp:195-199
+        #   ("bad-txns-in-belowout")
         total_output = sum(out.value for out in tx.outputs)
         if total_input < total_output:
-            return False, f"Outputs exceed inputs: {total_output} > {total_input}"
+            return False, f"bad-txns-in-belowout: value in ({total_input}) < value out ({total_output})"
+
+        # Fee MoneyRange check.
+        # Ref: Bitcoin Core consensus/tx_verify.cpp:202-209 ("bad-txns-fee-outofrange")
+        txfee = total_input - total_output
+        if txfee < 0 or txfee > MAX_MONEY:
+            return False, "bad-txns-fee-outofrange"
 
         # 5. BIP 68 relative lock-time
         if not self.check_sequence_locks(tx, height, block_mtp, network=self.network, intra_block_utxos=intra_block_utxos):
@@ -1868,7 +1894,7 @@ class TransactionValidator:
         # need to re-fetch UTXOs via _calculate_tx_fee (~6000 redundant
         # per-input FFI calls per block).
         if fees_out is not None:
-            fees_out.append(total_input - total_output)
+            fees_out.append(txfee)
         return True, ""
 
     @staticmethod
@@ -1911,7 +1937,11 @@ class TransactionValidator:
             return tx.locktime < block_mtp
 
     def _check_structure(self, tx: Transaction) -> bool:
-        """Check basic transaction structure"""
+        """Check basic transaction structure.
+
+        Mirrors Bitcoin Core consensus/tx_check.cpp::CheckTransaction.
+        Ref: tx_check.cpp:11-59.
+        """
         # Tx version is NOT a consensus check per Bitcoin Core
         # (consensus/tx_check.cpp::CheckTransaction has no nVersion check —
         # the version is mempool/relay policy only, enforced by
@@ -1922,15 +1952,24 @@ class TransactionValidator:
         # is consensus-valid.
 
         # Check we have at least one input (unless coinbase)
+        # Ref: tx_check.cpp:14-16 ("bad-txns-vin-empty")
         if len(tx.inputs) == 0:
             return False
 
         # Check we have at least one output
+        # Ref: tx_check.cpp:17-18 ("bad-txns-vout-empty")
         if len(tx.outputs) == 0:
             return False
 
         # Check locktime is valid
         if tx.locktime < 0 or tx.locktime > 0xffffffff:
+            return False
+
+        # Oversize check (non-witness serialized size).
+        # Ref: tx_check.cpp:19-21 ("bad-txns-oversize"):
+        #   GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+        # Transaction.serialize() returns the non-witness form.
+        if len(tx.serialize()) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT:
             return False
 
         # Check all outputs have valid values and total doesn't overflow.
@@ -1939,6 +1978,8 @@ class TransactionValidator:
         # integer with the high bit set.  Reinterpret as signed before the negative check
         # so we produce the correct BIP-22 error string.
         # Mirrors Bitcoin Core consensus/tx_check.cpp::CheckTransaction (negative first).
+        # Ref: tx_check.cpp:27-33 (CVE-2010-5139: "bad-txns-vout-negative",
+        #      "bad-txns-vout-toolarge", "bad-txns-txouttotal-toolarge").
         INT64_MAX = 0x7FFFFFFFFFFFFFFF
         total_out = 0
         for out in tx.outputs:
@@ -1952,12 +1993,23 @@ class TransactionValidator:
                 return False
 
         # Check for duplicate inputs (CVE-2018-17144)
+        # Ref: tx_check.cpp:36-44 ("bad-txns-inputs-duplicate")
         seen_inputs = set()
         for tx_in in tx.inputs:
             outpoint = (tx_in.prev_txid, tx_in.prev_vout)
             if outpoint in seen_inputs:
                 return False
             seen_inputs.add(outpoint)
+
+        # For non-coinbase transactions, no input may reference a null prevout.
+        # Ref: tx_check.cpp:52-57 ("bad-txns-prevout-null")
+        # Coinbase transactions are identified by is_coinbase flag; the
+        # null-prevout check only applies to non-coinbase txs.
+        if not tx.is_coinbase:
+            _null_txid = bytes(32)
+            for tx_in in tx.inputs:
+                if tx_in.prev_txid == _null_txid and tx_in.prev_vout == 0xFFFFFFFF:
+                    return False
 
         return True
 
