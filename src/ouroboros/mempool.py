@@ -60,8 +60,16 @@ TX_V3_MAX_VSIZE = TRUC_MAX_VSIZE  # alias used in RBF checks
 MAX_PACKAGE_COUNT = 25
 MAX_PACKAGE_WEIGHT = 404_000  # weight units
 
-# Cluster mempool limits (Bitcoin Core cluster_linearize.h / txgraph.h)
-MAX_CLUSTER_COUNT = 100  # Maximum transactions per cluster
+# Cluster mempool limits (Bitcoin Core policy/policy.h + kernel/mempool_limits.h)
+# DEFAULT_CLUSTER_LIMIT = 64  (policy/policy.h:72)
+# DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101  (policy/policy.h:74)
+MAX_CLUSTER_COUNT = 64        # Maximum transactions per cluster (was 100 — WRONG)
+MAX_CLUSTER_SIZE_VBYTES = 101_000  # Maximum virtual bytes per cluster (101 kvB)
+
+# Extra descendant tx size limit for package validation (Bitcoin Core policy/policy.h:90)
+# EXTRA_DESCENDANT_TX_SIZE_LIMIT = 10000 weight units; governs the one-extra-tx package
+# relaxation. Currently informational — kept here to match Core's constant namespace.
+EXTRA_DESCENDANT_TX_SIZE_LIMIT = 10_000
 
 # Ephemeral dust policy constants (Bitcoin Core policy/policy.h)
 MAX_DUST_OUTPUTS_PER_TX = 1  # Maximum number of dust outputs per transaction
@@ -610,7 +618,11 @@ class ClusterManager:
         return all_chunks
 
     def check_cluster_limit(self, txid: bytes) -> tuple[bool, str]:
-        """Check if adding a transaction would exceed cluster size limit.
+        """Check if a transaction (already in self.transactions) exceeds cluster limits.
+
+        Enforces both limits from Bitcoin Core policy/policy.h:
+          - MAX_CLUSTER_COUNT = 64 transactions
+          - MAX_CLUSTER_SIZE_VBYTES = 101,000 virtual bytes
 
         Returns (ok, error_message).
         """
@@ -618,6 +630,7 @@ class ClusterManager:
             return True, ""
 
         entry = self.transactions[txid]
+        tx_vbytes = entry.size
 
         # Find which clusters our parents and children belong to
         neighbor_cluster_ids: set[int] = set()
@@ -632,17 +645,33 @@ class ClusterManager:
             # New singleton cluster - always OK
             return True, ""
 
-        # Calculate total size of merged cluster
-        total_size = 1  # The new transaction
+        # Gate 1: count
+        total_count = 1  # The new transaction
         for cid in neighbor_cluster_ids:
             cluster = self._clusters.get(cid)
             if cluster:
-                total_size += cluster.size()
+                total_count += cluster.size()
 
-        if total_size > MAX_CLUSTER_COUNT:
+        if total_count > MAX_CLUSTER_COUNT:
             return False, (
-                f"Transaction would create cluster of size {total_size} "
+                f"Transaction would create cluster of {total_count} txs "
                 f"exceeding limit {MAX_CLUSTER_COUNT}"
+            )
+
+        # Gate 2: vbyte size
+        total_vbytes = tx_vbytes
+        for cid in neighbor_cluster_ids:
+            cluster = self._clusters.get(cid)
+            if cluster:
+                for ctxid in cluster.txids:
+                    e = self.transactions.get(ctxid)
+                    if e is not None:
+                        total_vbytes += e.size
+
+        if total_vbytes > MAX_CLUSTER_SIZE_VBYTES:
+            return False, (
+                f"Transaction would create cluster of {total_vbytes} vbytes "
+                f"exceeding limit {MAX_CLUSTER_SIZE_VBYTES}"
             )
 
         return True, ""
@@ -1783,13 +1812,23 @@ class Mempool:
         return result
 
     def _check_cluster_limit(self, tx: Transaction) -> tuple[bool, str]:
-        """Check if adding a transaction would exceed cluster size limit.
+        """Check if adding a transaction would exceed cluster limits.
 
-        The cluster limit (MAX_CLUSTER_COUNT = 100) prevents clusters from
-        growing too large, which would make linearization expensive.
+        Bitcoin Core enforces two independent cluster limits
+        (kernel/mempool_limits.h MemPoolLimits / txmempool.cpp:179-181):
+          1. cluster_count  <= DEFAULT_CLUSTER_LIMIT = 64 transactions
+          2. cluster_size   <= DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000 vbytes
 
-        Reference: Bitcoin Core txgraph.h - max_cluster_count
+        Both are checked before admitting a new transaction.  A single
+        transaction that would merge several existing clusters is evaluated
+        against the *merged* total.
+
+        Reference: Bitcoin Core txmempool.cpp:179-181, policy/policy.h:72-74,
+                   kernel/mempool_limits.h
         """
+        # Determine the vsize of the incoming tx (virtual bytes = ceil(weight/4))
+        tx_vsize = tx.get_vsize() if hasattr(tx, "get_vsize") else len(tx.serialize())
+
         # Find all clusters that would be merged by this transaction
         neighbor_cluster_ids: set[int] = set()
         for inp in tx.inputs:
@@ -1797,24 +1836,40 @@ class Mempool:
             if cid is not None:
                 neighbor_cluster_ids.add(cid)
 
-        # Also check children (txs spending from us) - but the tx isn't
-        # in mempool yet so it won't have children yet. Skip this for now.
-
         if not neighbor_cluster_ids:
-            # New singleton cluster - always OK
+            # New singleton cluster — always OK for count/size gates
             return True, ""
 
-        # Calculate total size of merged cluster
-        total_size = 1  # The new transaction
+        # Gate 1: count — total transactions in the merged cluster
+        total_count = 1  # the new transaction itself
         for cid in neighbor_cluster_ids:
             cluster = self._cluster_manager._clusters.get(cid)
             if cluster:
-                total_size += cluster.size()
+                total_count += cluster.size()
 
-        if total_size > MAX_CLUSTER_COUNT:
+        if total_count > MAX_CLUSTER_COUNT:
             return False, (
-                f"Transaction would create cluster of size {total_size} "
-                f"exceeding limit {MAX_CLUSTER_COUNT}"
+                f"Transaction would create cluster of {total_count} txs "
+                f"exceeding limit {MAX_CLUSTER_COUNT} "
+                f"(policy/policy.h DEFAULT_CLUSTER_LIMIT)"
+            )
+
+        # Gate 2: vbyte size — total virtual bytes in the merged cluster
+        # Sum the stored .size field for each txid across all neighbor clusters.
+        total_vbytes = tx_vsize
+        for cid in neighbor_cluster_ids:
+            cluster = self._cluster_manager._clusters.get(cid)
+            if cluster:
+                for txid in cluster.txids:
+                    entry = self._cluster_manager.transactions.get(txid)
+                    if entry is not None:
+                        total_vbytes += entry.size
+
+        if total_vbytes > MAX_CLUSTER_SIZE_VBYTES:
+            return False, (
+                f"Transaction would create cluster of {total_vbytes} vbytes "
+                f"exceeding limit {MAX_CLUSTER_SIZE_VBYTES} "
+                f"(policy/policy.h DEFAULT_CLUSTER_SIZE_LIMIT_KVB)"
             )
 
         return True, ""
