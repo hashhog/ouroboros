@@ -17,7 +17,7 @@ from ouroboros.script import (
     get_flags_for_height,
 )
 from ouroboros.sig_cache import SigCache
-from ouroboros.consensus import BURIED_DEPLOYMENTS
+from ouroboros.consensus import BURIED_DEPLOYMENTS, BIP34_HASHES, BIP30_REPEAT_EXCEPTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -520,26 +520,79 @@ class BlockValidator:
         if not valid:
             return False, error
 
-        # 7. BIP30: reject duplicate txids against unspent outputs
-        #    Two historical exceptions on mainnet at heights 91842 and 91880
-        #    (IsBIP30Repeat in Bitcoin Core's validation.cpp). These blocks
-        #    contain coinbase txids that duplicate earlier blocks' coinbases.
-        #    After BIP34 activation (height 227,931), coinbase txids include the
-        #    block height, making duplicates impossible until height 1,983,702.
-        _BIP34_HEIGHT = 227_931
+        # 7. BIP30: reject duplicate txids against unspent outputs.
+        #
+        # Reference: Bitcoin Core validation.cpp:2392-2476 (ConnectBlock).
+        #
+        # Gate A — IsBIP30Repeat (validation.cpp:6189-6193):
+        #   Two historical mainnet blocks (91842 and 91880) are exempted from
+        #   the BIP30 check because they ARE the duplicate coinbase blocks.
+        #   The exemption is keyed by BOTH height AND block hash — a fork at
+        #   the same height does NOT receive the exception.
+        #
+        # Gate B — BIP34 suppresses BIP30 for the canonical chain:
+        #   Once BIP34 is active and the block at the BIP34 activation height
+        #   matches the canonical hash, coinbase uniqueness is guaranteed by
+        #   construction, so the UTXO-collision scan can be skipped.
+        #   Verified via: pindexBIP34height->GetBlockHash() == BIP34Hash.
+        #   For testnet4/signet/regtest BIP34Hash is all-zeros, which can never
+        #   match a real block hash, so BIP30 is always enforced on those nets.
+        #   (validation.cpp:2459-2462)
+        #
+        # Gate C — BIP34_IMPLIES_BIP30_LIMIT (1,983,702):
+        #   Above this height, even if BIP34 suppressed BIP30 earlier, we must
+        #   re-enable BIP30 because pre-BIP34 coinbases exist with indicated
+        #   heights that reach this far.  (validation.cpp:2430, 2467)
+        #
+        # Error code matches Core: "bad-txns-BIP30" (validation.cpp:2471).
+
         _BIP30_RECHECK_HEIGHT = 1_983_702
-        enforce_bip30 = expected_height not in (91842, 91880)
-        if enforce_bip30 and _BIP34_HEIGHT <= expected_height < _BIP30_RECHECK_HEIGHT:
-            enforce_bip30 = False
+
+        # Gate A: IsBIP30Repeat — must match both height and hash.
+        block_hash_bytes = (
+            block.hash if isinstance(block.hash, bytes) else bytes.fromhex(block.hash)
+        )
+        repeat_hash = BIP30_REPEAT_EXCEPTIONS.get(expected_height)
+        enforce_bip30 = (repeat_hash is None) or (block_hash_bytes != repeat_hash)
+
+        # Gate B: BIP34 suppresses BIP30 if we are on the canonical chain.
+        if enforce_bip30:
+            bip34_dep = BURIED_DEPLOYMENTS.get(self.network, {}).get("bip34")
+            bip34_height = bip34_dep.height if bip34_dep is not None else 227_931
+            bip34_canon_hash = BIP34_HASHES.get(self.network, bytes(32))
+            # We can skip BIP30 only when:
+            #   (a) we are at or above the BIP34 activation height, AND
+            #   (b) the block stored at BIP34Height has the canonical hash.
+            # Condition (b) is approximated here by checking whether our
+            # ancestor's hash record matches — the database callback
+            # db.get_block_hash_at_height provides this lookup.
+            # If the DB cannot supply the hash, we conservatively keep BIP30.
+            if expected_height >= bip34_height:
+                ancestor_hash: bytes | None = None
+                if hasattr(self.db, "get_block_hash_at_height"):
+                    try:
+                        ancestor_hash = self.db.get_block_hash_at_height(bip34_height)
+                    except Exception:
+                        ancestor_hash = None
+                # Only suppress BIP30 when the canonical hash is non-zero AND
+                # the stored ancestor hash matches it.
+                if (
+                    bip34_canon_hash != bytes(32)
+                    and ancestor_hash is not None
+                    and ancestor_hash == bip34_canon_hash
+                ):
+                    enforce_bip30 = False
+
+        # Gate C: always re-enable BIP30 at height >= 1,983,702.
+        if expected_height >= _BIP30_RECHECK_HEIGHT:
+            enforce_bip30 = True
+
         if enforce_bip30:
             for tx in block.transactions:
                 txid = tx.get_txid()
                 for vout_idx in range(len(tx.outputs)):
                     if self.db.get_utxo(txid, vout_idx) is not None:
-                        return False, (
-                            f"BIP30: duplicate txid {txid.hex()} with "
-                            f"unspent output at vout {vout_idx}"
-                        )
+                        return False, "bad-txns-BIP30"
 
         # 8. Validate coinbase position and uniqueness
         if not block.transactions:
