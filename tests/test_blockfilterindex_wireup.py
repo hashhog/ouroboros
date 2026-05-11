@@ -142,12 +142,20 @@ class TestPersistentBlockFilterIndexAddBlock(unittest.TestCase):
             b0 = _make_block(0, h0, bytes(32))
             filt0, hdr0 = idx.add_block(b0, height=0)
 
-            # File-backed storage should have written the filter.
-            filter_file = os.path.join(tmp, "blockfilter", "filters", h0.hex())
+            # File-backed storage uses a sharded layout:
+            # filters/<aa>/<hash>.flt  (sharded by first byte hex of hash)
+            # headers/<aa>/<hash>.hdr
+            # height/<8-digit>.h
+            shard = h0[:1].hex()  # "aa"
+            filter_file = os.path.join(
+                tmp, "blockfilter", "filters", shard, h0.hex() + ".flt"
+            )
             self.assertTrue(os.path.exists(filter_file), filter_file)
-            header_file = os.path.join(tmp, "blockfilter", "headers", h0.hex())
+            header_file = os.path.join(
+                tmp, "blockfilter", "headers", shard, h0.hex() + ".hdr"
+            )
             self.assertTrue(os.path.exists(header_file))
-            height_file = os.path.join(tmp, "blockfilter", "height", "00000000")
+            height_file = os.path.join(tmp, "blockfilter", "height", "00000000.h")
             self.assertTrue(os.path.exists(height_file))
 
             # Re-open a second instance — entries persist across restarts.

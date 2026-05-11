@@ -326,12 +326,16 @@ def collect_block_scripts(
     """
     Collect the scriptPubKeys that go into a basic block filter.
 
-    Per BIP 158 the *basic* filter includes:
+    Per BIP 158 and Bitcoin Core ``BasicFilterElements``
+    (``blockfilter.cpp:187-209``) the *basic* filter includes:
+
     - The scriptPubKey of every output in the block, **except** OP_RETURN
       outputs and empty scripts.
     - The scriptPubKey of every output *spent* by the block's inputs,
-      **except** the coinbase input (which has no real prevout).  Requires
-      UTXO data (via *db*) to look up the prevout scripts.
+      **except** the coinbase input (which has no real prevout).  Only
+      **empty** scripts are excluded from spent prevouts — OP_RETURN scripts
+      in spent prevouts ARE included.  Requires UTXO data (via *db*) to
+      look up the prevout scripts.
 
     Duplicate scripts are kept (deduplication happens during GCS hashing
     via the ``set`` built into ``build_basic_filter``).
@@ -353,7 +357,10 @@ def collect_block_scripts(
                 utxo = db.get_utxo(inp.prev_txid, inp.prev_vout)
                 if utxo is not None:
                     spk = utxo['script_pubkey']
-                    if spk and not _is_op_return(spk):
+                    # BUG FIX: Core only excludes *empty* scripts from spent
+                    # prevouts — NOT OP_RETURN.  OP_RETURN exclusion applies
+                    # only to block outputs.  See blockfilter.cpp:200-208.
+                    if spk:
                         scripts.append(bytes(spk))
 
     return scripts
