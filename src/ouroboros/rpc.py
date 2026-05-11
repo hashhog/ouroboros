@@ -4426,7 +4426,7 @@ class RPCServer:
         """
         Construct a block template for mining (BIP 22 / BIP 23).
 
-        Selects mempool transactions by fee rate (greedy), builds a
+        Selects mempool transactions by ancestor fee rate (greedy), builds a
         coinbase, computes the merkle root, and returns the template
         for external miners.
 
@@ -4435,14 +4435,48 @@ class RPCServer:
           are excluded from the template.
 
         Coinbase requirements (for miners using this template):
-        - Coinbase nSequence: 0xFFFFFFFF (SEQUENCE_FINAL)
-        - Coinbase nLockTime: 0
+        - Coinbase nSequence: 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL — enforces nLockTime)
+          Reference: bitcoin-core/src/node/miner.cpp:171
+          CTxIn::MAX_SEQUENCE_NONFINAL = SEQUENCE_FINAL - 1 = 0xFFFFFFFE
+        - Coinbase nLockTime: next_height - 1  (BIP-34 compatible locktime)
+          Reference: bitcoin-core/src/node/miner.cpp:196
         - Witness commitment: OP_RETURN <0xaa21a9ed><32-byte-commitment>
           in the last output, where commitment = SHA256d(witness_root || nonce)
           and nonce is 32 zero bytes (coinbase witness item).
+
+        W87 audit fixes (12 bugs vs Core miner.cpp):
+        B1:  previousblockhash was LE; must be reversed to display order (BE).
+        B2:  coinbasetxn.sequence was 0xFFFFFFFF (SEQUENCE_FINAL); must be
+             0xFFFFFFFE (MAX_SEQUENCE_NONFINAL) so nLockTime is enforced.
+        B3:  coinbasetxn.locktime was 0; must be next_height - 1 (miner.cpp:196).
+        B4:  reserved weight was 4000; DEFAULT_BLOCK_RESERVED_WEIGHT = 8000 (policy.h:27).
+        B5:  no MAX_CONSECUTIVE_FAILURES (1000) early-exit gate (miner.cpp:284-316).
+        B6:  weight computed as e.size * 4 (stripped bytes × 4); must use
+             e.tx.get_weight() = stripped*3 + total (BIP-141 / miner.cpp:267).
+        B7:  block version used previous block's version; must increment for
+             version-bits signalling (miner.cpp:140); use node.get_next_block_version
+             when available, fall back to prev_version | 0x20000000.
+        B8:  bits used previous block's bits; must call GetNextWorkRequired
+             equivalent; use node.get_next_bits when available, else carry forward.
+        B9:  curtime was int(time.time()); must be max(MTP+1, now) per UpdateTime
+             (miner.cpp:52-55).
+        B10: sigops gate used >; must be >= (miner.cpp:244
+             TestChunkBlockLimits).
+        B11: per-tx hash field was txid; must be wtxid (rpc/mining.cpp:915).
+        B12: per-tx depends field missing (rpc/mining.cpp:917-923).
         """
         import hashlib as _hl
         import time as _time
+
+        # W87 constants matching bitcoin-core/src/node/miner.cpp +
+        # bitcoin-core/src/policy/policy.h
+        MAX_BLOCK_WEIGHT = 4_000_000          # consensus/consensus.h MAX_BLOCK_WEIGHT
+        MAX_BLOCK_SIGOPS_COST = 80_000        # consensus/consensus.h
+        BLOCK_RESERVED_WEIGHT = 8_000         # policy.h DEFAULT_BLOCK_RESERVED_WEIGHT (B4)
+        MAX_CONSECUTIVE_FAILURES = 1_000      # miner.cpp:284 (B5)
+        BLOCK_FULL_ENOUGH_DELTA = 4_000       # miner.cpp:285 BLOCK_FULL_ENOUGH_WEIGHT_DELTA
+        # Effective tx budget: MAX_BLOCK_WEIGHT - BLOCK_RESERVED_WEIGHT
+        WEIGHT_BUDGET = MAX_BLOCK_WEIGHT - BLOCK_RESERVED_WEIGHT  # 3_992_000
 
         db = getattr(self.node, "db", None)
         if db is None:
@@ -4457,8 +4491,10 @@ class RPCServer:
 
         next_height = best_height + 1
 
-        # Get MTP for time-based locktime checks (BIP 113)
-        block_mtp = db.get_median_time_past(best_height) or 0
+        # Get MTP for time-based locktime checks (BIP 113).
+        # m_lock_time_cutoff = pindexPrev->GetMedianTimePast() — miner.cpp:148.
+        _raw_mtp = db.get_median_time_past(best_height)
+        block_mtp = int(_raw_mtp) if isinstance(_raw_mtp, (int, float)) else 0
 
         # Try to use Rust is_final_tx for locktime checking
         try:
@@ -4468,28 +4504,31 @@ class RPCServer:
             use_rust_final = False
 
         def _is_tx_final(tx) -> bool:
-            """Check if transaction is final for inclusion in next block."""
+            """IsFinalTx analog (consensus/tx_verify.cpp:17).
+
+            Returns True if the transaction is final for inclusion in the next
+            block at next_height with MTP = block_mtp.
+            """
             sequences = [inp.sequence for inp in tx.inputs]
             if use_rust_final:
                 return rust_is_final_tx(tx.locktime, sequences, next_height, block_mtp)
-            else:
-                # Python fallback
-                LOCKTIME_THRESHOLD = 500_000_000
-                if tx.locktime == 0:
-                    return True
-                if all(seq == 0xFFFFFFFF for seq in sequences):
-                    return True
-                if tx.locktime < LOCKTIME_THRESHOLD:
-                    return tx.locktime < next_height
-                else:
-                    return tx.locktime < block_mtp
+            # Python fallback mirroring Core IsFinalTx exactly:
+            #   if nLockTime == 0 → final
+            #   if nLockTime < threshold → compare to nBlockHeight
+            #   else → compare to nBlockTime (MTP)
+            #   if all sequences are SEQUENCE_FINAL (0xFFFFFFFF) → final
+            LOCKTIME_THRESHOLD = 500_000_000
+            if tx.locktime == 0:
+                return True
+            lock_cmp = next_height if tx.locktime < LOCKTIME_THRESHOLD else block_mtp
+            if tx.locktime < lock_cmp:
+                return True
+            # Even if locktime is not satisfied, final if all inputs are SEQUENCE_FINAL
+            return all(seq == 0xFFFFFFFF for seq in sequences)
 
-        # gather transactions from mempool (dependency-aware)
-        MAX_BLOCK_WEIGHT = 4_000_000
-        MAX_BLOCK_SIGOPS_COST = 80_000
         txs: list[dict[str, Any]] = []
         total_fees = 0
-        total_weight = 0
+        total_weight = 0         # tracks tx weight only (reserved weight is implicit)
         total_sigops = 0
 
         if mempool:
@@ -4508,6 +4547,10 @@ class RPCServer:
                 parents[txid_key] = tx_parents
 
             included: set = set()
+
+            # Map from internal-LE txid to 1-based template index (for BIP-22
+            # "depends" field).  Populated as txs are added.
+            txid_to_template_index: dict[bytes, int] = {}
 
             def _collect_ancestors(txid: bytes, already: set) -> list[bytes]:
                 needed = []
@@ -4536,9 +4579,9 @@ class RPCServer:
                             remaining.remove(t)
                 return ordered
 
-            # Compute ancestor fee rate for each mempool entry
+            # Compute ancestor fee rate for each mempool entry.
             # ancestor_fee_rate = (entry.fee + sum(ancestor fees))
-            #                   / (entry.size + sum(ancestor sizes))
+            #                   / (entry.vsize + sum(ancestor vsizes))
             # Reference: Bitcoin Core BlockAssembler::addPackageTransactions()
             ancestor_fee_rates: dict[bytes, float] = {}
             for txid_key, entry in snap_txs.items():
@@ -4568,6 +4611,10 @@ class RPCServer:
                 reverse=True,
             )
 
+            # B5: consecutive-failures counter for near-full early exit
+            # (miner.cpp BlockAssembler::addChunks, lines 284-316).
+            n_consecutive_failed = 0
+
             for entry_txid in sorted_by_ancestor_fee_rate:
                 if entry_txid in included:
                     continue
@@ -4590,21 +4637,35 @@ class RPCServer:
                         batch_valid = False
                         break
                 if not batch_valid:
+                    n_consecutive_failed += 1
+                    if (n_consecutive_failed > MAX_CONSECUTIVE_FAILURES and
+                            total_weight + BLOCK_FULL_ENOUGH_DELTA > WEIGHT_BUDGET):
+                        break
                     continue
 
+                # B6: use BIP-141 weight, not stripped_bytes * 4.
+                # e.tx.get_weight() = stripped*3 + total (correct for segwit).
                 batch_weight = sum(
-                    snap_txs[t].size * 4
+                    snap_txs[t].tx.get_weight()
                     for t in batch
                     if t in snap_txs
                 )
-                if total_weight + batch_weight > MAX_BLOCK_WEIGHT - 4000:
-                    continue  # skip — batch doesn't fit
+                # B4: compare against WEIGHT_BUDGET (reserves 8000 for coinbase/header).
+                # Core: nBlockWeight + chunk_feerate.size >= m_options.nBlockMaxWeight
+                if total_weight + batch_weight >= WEIGHT_BUDGET:
+                    n_consecutive_failed += 1
+                    if (n_consecutive_failed > MAX_CONSECUTIVE_FAILURES and
+                            total_weight + BLOCK_FULL_ENOUGH_DELTA > WEIGHT_BUDGET):
+                        break
+                    continue
 
                 for t in batch:
                     e = snap_txs.get(t)
                     if e is None or t in included:
                         continue
-                    tw = e.size * 4
+
+                    # B6: correct BIP-141 weight (miner.cpp AddToBlock:267)
+                    tw = e.tx.get_weight()
                     raw = e.tx.serialize()
 
                     tx_sigops_cost = 0
@@ -4643,17 +4704,32 @@ class RPCServer:
                             witness_spk, inp.witness
                         )
 
-                    # Enforce MAX_BLOCK_SIGOPS_COST budget (Core BlockAssembler parity).
-                    # Reference: bitcoin-core/src/node/miner.cpp TestChunkBlockLimits
-                    if total_sigops + tx_sigops_cost > MAX_BLOCK_SIGOPS_COST:
+                    # B10: sigops gate must use >= not > (miner.cpp:244
+                    # TestChunkBlockLimits: nBlockSigOpsCost + chunk >= MAX_BLOCK_SIGOPS_COST)
+                    if total_sigops + tx_sigops_cost >= MAX_BLOCK_SIGOPS_COST:
                         continue  # tx would push block over sigops limit — skip
+
+                    # B11: hash field must be wtxid (witness txid), not txid.
+                    # Reference: bitcoin-core/src/rpc/mining.cpp:915
+                    #   entry.pushKV("hash", tx.GetWitnessHash().GetHex())
+                    # get_wtxid() returns internal LE bytes; reverse to display order.
+                    wtxid_display = e.tx.get_wtxid()[::-1].hex()
+
+                    # B12: depends field — 1-based indices of in-template ancestors
+                    # Reference: bitcoin-core/src/rpc/mining.cpp:917-923
+                    dep_indices = []
+                    for inp in e.tx.inputs:
+                        idx = txid_to_template_index.get(inp.prev_txid)
+                        if idx is not None:
+                            dep_indices.append(idx)
 
                     # JSON-RPC convention: txids in template responses are
                     # display-order (BE). t is internal LE. Reverse. W69.
                     txs.append({
                         "data": raw.hex(),
                         "txid": t[::-1].hex(),
-                        "hash": t[::-1].hex(),
+                        "hash": wtxid_display,   # B11: wtxid, not txid
+                        "depends": dep_indices,  # B12: in-template parent indices
                         "fee": e.fee,
                         "sigops": tx_sigops_cost,
                         "weight": tw,
@@ -4662,6 +4738,10 @@ class RPCServer:
                     total_weight += tw
                     total_sigops += tx_sigops_cost
                     included.add(t)
+                    # Record 1-based template index for depends tracking
+                    txid_to_template_index[t] = len(txs)
+
+                n_consecutive_failed = 0  # reset on successful inclusion
         else:
             snap_txs = {}
 
@@ -4710,8 +4790,21 @@ class RPCServer:
             subsidy >>= halvings
         coinbase_value = subsidy + total_fees
 
-        # target / bits
-        bits = best_block.bits
+        # B8: bits should come from GetNextWorkRequired equivalent, not the
+        # previous block's bits.  At difficulty-adjustment boundaries (every
+        # 2016 blocks on mainnet) the bits change; carrying the previous
+        # block's bits produces an invalid template.
+        # Use node.get_next_bits() when available and returns an int; fall back
+        # to best_block.bits.  The isinstance(int) guard prevents MagicMock
+        # auto-attributes in unit tests from silently poisoning the value.
+        _next_bits = getattr(self.node, "get_next_bits", None)
+        if callable(_next_bits):
+            _bits_val = _next_bits(best_height)
+            bits = _bits_val if isinstance(_bits_val, int) else best_block.bits
+        else:
+            bits = best_block.bits
+
+        # target derived from bits (nBits compact format → 256-bit integer)
         n_shift = (bits >> 24) & 0xFF
         mantissa = bits & 0x007FFFFF
         if n_shift <= 3:
@@ -4720,33 +4813,60 @@ class RPCServer:
             target_int = mantissa << (8 * (n_shift - 3))
         target_hex = f"{target_int:064x}"
 
-        # Coinbase requirements:
-        # - nSequence: 0xFFFFFFFF (SEQUENCE_FINAL)
-        # - nLockTime: 0
-        # - witness: single 32-byte zero nonce
+        # B7: block version must be computed for the *next* block, not copied
+        # from the previous block.  Version-bits signalling (BIP9) requires
+        # the miner to set specific bits; using the prev block's version loses
+        # any bits that should be set (or cleared) for the new height.
+        # Reference: miner.cpp:140 ComputeBlockVersion(pindexPrev, consensusParams).
+        # Use node.get_next_block_version() when available and returns an int;
+        # fall back to best_block.version | 0x20000000 (BIP9 top-bits always set).
+        _next_version_fn = getattr(self.node, "get_next_block_version", None)
+        if callable(_next_version_fn):
+            _ver_val = _next_version_fn(best_height)
+            block_version = _ver_val if isinstance(_ver_val, int) else (best_block.version | 0x20000000)
+        else:
+            block_version = (best_block.version | 0x20000000)
+
+        # B9: curtime must be max(MTP+1, now) per Core's UpdateTime().
+        # Reference: miner.cpp:52-55
+        #   nNewTime = max(GetMinimumTime(pindexPrev, interval), NodeClock::now())
+        # Using raw time.time() can produce a timestamp below MTP+1 which
+        # miners would immediately have to increment, causing confusion.
+        mtp_plus_one = block_mtp + 1
+        curtime = max(mtp_plus_one, int(_time.time()))
+
         coinbase_aux = {
             "flags": "",  # extra nonce space in coinbase scriptSig
         }
 
         return {
-            "version": best_block.version,
-            "previousblockhash": best_hash.hex(),
+            # B7: next-block version (version-bits computed), not prev version
+            "version": block_version,
+            # B1: previousblockhash must be in display order (BE).
+            # Core: block.hashPrevBlock.GetHex() (rpc/mining.cpp:998).
+            "previousblockhash": best_hash[::-1].hex(),
             "transactions": txs,
             "coinbaseaux": coinbase_aux,
             "coinbasevalue": coinbase_value,
             "coinbasetxn": {
-                "locktime": 0,
-                "sequence": 0xFFFFFFFF,
+                # B3: locktime = next_height - 1 (miner.cpp:196)
+                "locktime": next_height - 1,
+                # B2: MAX_SEQUENCE_NONFINAL = 0xFFFFFFFE enforces nLockTime.
+                # Core: CTxIn::MAX_SEQUENCE_NONFINAL (miner.cpp:171).
+                # 0xFFFFFFFF (SEQUENCE_FINAL) would disable nLockTime enforcement.
+                "sequence": 0xFFFFFFFE,
             },
             "target": target_hex,
+            # B8: bits from GetNextWorkRequired (best_block.bits as fallback)
             "bits": f"{bits:08x}",
-            "curtime": int(_time.time()),
+            # B9: curtime = max(MTP+1, now)
+            "curtime": curtime,
             "height": next_height,
-            "mintime": self.node.get_median_time(best_height) + 1,
+            "mintime": mtp_plus_one,
             "mutable": ["time", "transactions", "prevblock"],
             "noncerange": "00000000ffffffff",
-            "sigoplimit": 80000,
-            "sizelimit": 4000000,
+            "sigoplimit": MAX_BLOCK_SIGOPS_COST,
+            "sizelimit": 4_000_000,
             "weightlimit": MAX_BLOCK_WEIGHT,
             "default_witness_commitment": default_witness_commitment,
         }
