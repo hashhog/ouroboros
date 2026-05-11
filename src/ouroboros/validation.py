@@ -54,8 +54,21 @@ MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 40
 DIFFICULTY_ADJUSTMENT_INTERVAL = 2016
 POW_TARGET_TIMESPAN = 14 * 24 * 60 * 60
 POW_TARGET_SPACING = 10 * 60
+# Per-network PoW limits (maximum target / minimum difficulty).
+# Ref: Bitcoin Core kernel/chainparams.cpp
+#   mainnet / testnet3 / testnet4: 0x00000000ffff...  → bits 0x1d00ffff
+#   signet:                        0x00000377ae00...  → stricter than mainnet
+#   regtest:                       0x7fffffff...      → bits 0x207fffff
 POW_LIMIT_MAINNET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
 POW_LIMIT_BITS_MAINNET = 0x1d00ffff
+POW_LIMIT_SIGNET = 0x00000377AE000000000000000000000000000000000000000000000000000000
+POW_LIMIT_BITS_SIGNET = 0x1e0377ae
+POW_LIMIT_REGTEST = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+POW_LIMIT_BITS_REGTEST = 0x207fffff
+# Networks where fPowAllowMinDifficultyBlocks = true (Core chainparams.cpp).
+# Mainnet: false, signet: false, regtest: true, testnet3/testnet4: true.
+# Ref: Bitcoin Core kernel/chainparams.cpp lines 99, 222, 321, 463, 546.
+_POW_ALLOW_MIN_DIFFICULTY_NETWORKS = {"testnet", "testnet3", "testnet4", "regtest"}
 MAX_TIMEWARP = 600  # BIP94: max seconds a diff-adjustment block can precede prev
 MAX_MONEY = 21_000_000 * 100_000_000  # 2,100,000,000,000,000 satoshis
 
@@ -103,15 +116,153 @@ def _encode_bip34_height(height: int) -> bytes:
 
 
 def _bits_to_target(bits: int) -> int:
+    """Convert compact nBits to a 256-bit target integer.
+
+    Mirrors arith_uint256::SetCompact (Bitcoin Core arith_uint256.cpp:176).
+    Returns 0 for negative or overflow inputs — callers that need the full
+    validity breakdown should use _bits_to_target_checked().
+    """
     mantissa = bits & 0x007FFFFF
     exponent = (bits >> 24) & 0xFF
 
-    if mantissa == 0:
+    # Strip the negative-sign flag from mantissa before computing the value
+    # (same shift-right path as SetCompact does for the word).
+    word = mantissa
+    if exponent <= 3:
+        word >>= 8 * (3 - exponent)
+    else:
+        word <<= 8 * (exponent - 3)
+
+    # Negative flag: sign bit in mantissa set AND word is non-zero.
+    # Ref: arith_uint256.cpp:188.
+    is_negative = (mantissa != 0) and ((bits & 0x00800000) != 0)
+    # Overflow flag: word is non-zero AND (exponent > 34, or mantissa > 0xff
+    # and exponent > 33, or mantissa > 0xffff and exponent > 32).
+    # Ref: arith_uint256.cpp:190-192.
+    is_overflow = (mantissa != 0) and (
+        (exponent > 34)
+        or (mantissa > 0xFF and exponent > 33)
+        or (mantissa > 0xFFFF and exponent > 32)
+    )
+
+    if is_negative or is_overflow:
         return 0
 
+    return word
+
+
+def _bits_to_target_checked(bits: int) -> tuple[int, bool, bool]:
+    """Convert compact nBits, returning (target, is_negative, is_overflow).
+
+    Ref: arith_uint256::SetCompact (Bitcoin Core arith_uint256.cpp:176-193).
+    Used by CheckProofOfWork / DeriveTarget to validate the nBits field.
+    """
+    mantissa = bits & 0x007FFFFF
+    exponent = (bits >> 24) & 0xFF
+
     if exponent <= 3:
-        return mantissa >> (8 * (3 - exponent))
-    return mantissa << (8 * (exponent - 3))
+        word = mantissa >> (8 * (3 - exponent))
+    else:
+        word = mantissa << (8 * (exponent - 3))
+
+    is_negative = (mantissa != 0) and ((bits & 0x00800000) != 0)
+    is_overflow = (mantissa != 0) and (
+        (exponent > 34)
+        or (mantissa > 0xFF and exponent > 33)
+        or (mantissa > 0xFFFF and exponent > 32)
+    )
+    return word, is_negative, is_overflow
+
+
+def _get_pow_limit(network: str) -> int:
+    """Return the proof-of-work limit (max target) for the given network.
+
+    Ref: Bitcoin Core kernel/chainparams.cpp — powLimit per network.
+    """
+    if network == "signet":
+        return POW_LIMIT_SIGNET
+    if network in ("regtest",):
+        return POW_LIMIT_REGTEST
+    # mainnet, testnet, testnet3, testnet4 all share the same powLimit.
+    return POW_LIMIT_MAINNET
+
+
+def _get_pow_limit_bits(network: str) -> int:
+    """Return the compact nBits encoding of the pow_limit for the network."""
+    if network == "signet":
+        return POW_LIMIT_BITS_SIGNET
+    if network in ("regtest",):
+        return POW_LIMIT_BITS_REGTEST
+    return POW_LIMIT_BITS_MAINNET
+
+
+def permitted_difficulty_transition(
+    network: str, height: int, old_bits: int, new_bits: int
+) -> bool:
+    """Check that a difficulty transition between two consecutive blocks is valid.
+
+    Mirrors Bitcoin Core PermittedDifficultyTransition() (pow.cpp:89-136).
+
+    Rules:
+    * On networks with fPowAllowMinDifficultyBlocks (testnet/testnet4/regtest):
+      always return True (any transition is permitted).
+    * At a difficulty adjustment boundary (height % 2016 == 0): new_bits must
+      be within the 4× / ¼× clamp of old_bits, after round-tripping through
+      compact form (as Core does).
+    * Otherwise: old_bits == new_bits required.
+
+    Args:
+        network:  Network name (mainnet, testnet, testnet3, testnet4, regtest,
+                  signet).
+        height:   Height of the *new* block being validated.
+        old_bits: nBits of the previous block.
+        new_bits: nBits of the new block.
+
+    Returns:
+        True if the transition is permitted.
+    """
+    # fPowAllowMinDifficultyBlocks: testnets allow any transition.
+    # Ref: pow.cpp:91.
+    if network in _POW_ALLOW_MIN_DIFFICULTY_NETWORKS:
+        return True
+
+    pow_limit = _get_pow_limit(network)
+
+    if height % DIFFICULTY_ADJUSTMENT_INTERVAL == 0:
+        smallest_timespan = POW_TARGET_TIMESPAN // 4
+        largest_timespan = POW_TARGET_TIMESPAN * 4
+
+        old_target = _bits_to_target(old_bits)
+        observed_new_target = _bits_to_target(new_bits)
+
+        # Calculate the largest difficulty value possible (easiest target).
+        # Ref: pow.cpp:101-108.
+        largest_difficulty_target = old_target * largest_timespan // POW_TARGET_TIMESPAN
+        if largest_difficulty_target > pow_limit:
+            largest_difficulty_target = pow_limit
+        # Round-trip through compact form to match Core's comparison.
+        # Ref: pow.cpp:113-115.
+        maximum_new_target = _bits_to_target(_target_to_bits(largest_difficulty_target))
+        if maximum_new_target < observed_new_target:
+            return False
+
+        # Calculate the smallest difficulty value possible (hardest target).
+        # Ref: pow.cpp:117-124.
+        smallest_difficulty_target = old_target * smallest_timespan // POW_TARGET_TIMESPAN
+        if smallest_difficulty_target > pow_limit:
+            smallest_difficulty_target = pow_limit
+        # Round-trip through compact form.
+        # Ref: pow.cpp:129-131.
+        minimum_new_target = _bits_to_target(_target_to_bits(smallest_difficulty_target))
+        if minimum_new_target > observed_new_target:
+            return False
+    else:
+        # Non-adjustment block: bits must be unchanged.
+        # Ref: pow.cpp:132-133.
+        if old_bits != new_bits:
+            return False
+
+    return True
 
 
 def _count_legacy_sigops(script: bytes, accurate: bool = False) -> int:
@@ -798,12 +949,19 @@ class BlockValidator:
             if expected_bits is not None and block.bits != expected_bits:
                 return False
 
-        # Proof-of-work: block hash must meet difficulty target
-        # Ref: bitcoin/src/pow.cpp CheckProofOfWork
+        # Proof-of-work: block hash must meet difficulty target.
+        # Mirrors Bitcoin Core pow.cpp::CheckProofOfWorkImpl / DeriveTarget:
+        #   1. Decode nBits; reject if negative, overflow, zero, or > powLimit.
+        #   2. Hash must be <= target.
+        # Ref: Bitcoin Core pow.cpp:146-170.
+        target, is_negative, is_overflow = _bits_to_target_checked(block.bits)
+        pow_limit = _get_pow_limit(self.network)
+        if is_negative or is_overflow or target == 0 or target > pow_limit:
+            return False
+
         header = block.serialize()[:80]
         block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()
         hash_as_int = int.from_bytes(block_hash, "little")
-        target = _bits_to_target(block.bits)
         if hash_as_int > target:
             return False
 
@@ -812,35 +970,68 @@ class BlockValidator:
     def _get_expected_bits(
         self, height: int, prev_block: Block, block: Block
     ) -> int | None:
-        """Calculate expected nBits for a block at *height*."""
-        # Regtest: no retargeting — always use regtest min-difficulty (0x207fffff)
+        """Calculate expected nBits for a block at *height*.
+
+        Mirrors Bitcoin Core GetNextWorkRequired() + CalculateNextWorkRequired()
+        in pow.cpp.
+
+        Args:
+            height:     Height of the block being validated (the new block).
+            prev_block: The block at height-1 (pindexLast in Core).
+            block:      The block being validated (only timestamp used).
+
+        Returns:
+            Expected nBits, or None if the ancestor block needed for the
+            calculation is unavailable (cannot verify at this time).
+        """
+        # fPowNoRetargeting: regtest always stays at the minimum difficulty.
+        # Ref: Bitcoin Core pow.cpp:52-53.
         if self.network == "regtest":
             return 0x207fffff
 
-        # Non-retarget block
+        # Per-network pow_limit in compact bits form.
+        pow_limit_bits = _get_pow_limit_bits(self.network)
+
+        # Non-retarget block (height is not a multiple of 2016).
+        # Ref: Bitcoin Core pow.cpp:20-38.
         if height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0:
-            # Testnet / testnet4 min-difficulty exception:
-            # If new block timestamp > prev + 20 minutes, allow min difficulty.
-            if self.network in ("testnet", "testnet3", "testnet4", "signet"):
+            # fPowAllowMinDifficultyBlocks: testnet / testnet4 min-difficulty
+            # exception.  If the new block's timestamp is more than 2×
+            # target-spacing (20 minutes) after the previous block, the block
+            # MUST use the minimum difficulty (pow_limit).
+            # Signet does NOT have this exception (fPowAllowMinDifficultyBlocks
+            # is false on signet — Bitcoin Core chainparams.cpp:463).
+            # Ref: Bitcoin Core pow.cpp:22-36.
+            if self.network in _POW_ALLOW_MIN_DIFFICULTY_NETWORKS:
                 if block.timestamp > prev_block.timestamp + POW_TARGET_SPACING * 2:
-                    return POW_LIMIT_BITS_MAINNET
+                    return pow_limit_bits
                 # Otherwise walk back to find last non-min-difficulty block.
-                # Track height manually since get_block() may not set it.
+                # Walk stops at: height 0, a retarget boundary, or a block
+                # with real difficulty.
+                # Ref: Bitcoin Core pow.cpp:31-36.
                 walk_height = height - 1
                 pindex = prev_block
                 while (
                     pindex
                     and walk_height > 0
                     and walk_height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0
-                    and pindex.bits == POW_LIMIT_BITS_MAINNET
+                    and pindex.bits == pow_limit_bits
                 ):
                     pindex = self.db.get_block(pindex.prev_blockhash)
                     walk_height -= 1
                 if pindex:
                     return pindex.bits
                 return prev_block.bits
+            # All other networks (mainnet, signet): return previous block's bits.
             return prev_block.bits
 
+        # Difficulty adjustment boundary (height % 2016 == 0).
+        # Go back by DifficultyAdjustmentInterval - 1 blocks from pindexLast
+        # (= the previous block, at height-1).
+        # nHeightFirst = pindexLast->nHeight - (DifficultyAdjustmentInterval()-1)
+        #              = (height-1) - (2016-1)
+        #              = height - 2016
+        # Ref: Bitcoin Core pow.cpp:42-47.
         first_height = height - DIFFICULTY_ADJUSTMENT_INTERVAL
         first_block = self.db.get_block_by_height(first_height)
         if first_block is None:
@@ -849,20 +1040,22 @@ class BlockValidator:
         actual_timespan = prev_block.timestamp - first_block.timestamp
 
         # Clamp to [targetTimespan/4 .. targetTimespan*4]
+        # Ref: Bitcoin Core pow.cpp:57-60.
         if actual_timespan < POW_TARGET_TIMESPAN // 4:
             actual_timespan = POW_TARGET_TIMESPAN // 4
         if actual_timespan > POW_TARGET_TIMESPAN * 4:
             actual_timespan = POW_TARGET_TIMESPAN * 4
 
-        # new_target = old_target * actual_timespan / target_timespan
         # BIP94 (testnet4): use nBits from the FIRST block of the current
-        # difficulty period (height - 2015) so that the real difficulty is
-        # always preserved — the first block cannot use the min-difficulty
-        # exception.
-        # Ref: Bitcoin Core pow.cpp:66-76 (enforce_BIP94 branch).
+        # difficulty period as the base, not the last block's nBits.
+        # The first block cannot use the min-difficulty exception, so this
+        # preserves the real difficulty and blocks the time-warp attack.
+        # nHeightFirst here matches the outer lookup above:
+        #   pindexLast->nHeight - (DifficultyAdjustmentInterval()-1)
+        #   = (height-1) - 2015 = height - 2016 = first_height
+        # Ref: Bitcoin Core pow.cpp:67-76 (enforce_BIP94 branch).
         if self.network == "testnet4":
-            period_start_height = height - (DIFFICULTY_ADJUSTMENT_INTERVAL - 1)
-            period_start_block = self.db.get_block_by_height(period_start_height)
+            period_start_block = self.db.get_block_by_height(first_height)
             if period_start_block is None:
                 return None
             old_target = _bits_to_target(period_start_block.bits)
@@ -870,9 +1063,11 @@ class BlockValidator:
             old_target = _bits_to_target(prev_block.bits)
         new_target = old_target * actual_timespan // POW_TARGET_TIMESPAN
 
-        # Clamp to proof-of-work limit
-        if new_target > POW_LIMIT_MAINNET:
-            new_target = POW_LIMIT_MAINNET
+        # Clamp to network-specific proof-of-work limit.
+        # Ref: Bitcoin Core pow.cpp:81-82.
+        pow_limit = _get_pow_limit(self.network)
+        if new_target > pow_limit:
+            new_target = pow_limit
 
         return _target_to_bits(new_target)
 
