@@ -389,10 +389,11 @@ class TestG11OrphanMax(unittest.TestCase):
         from unittest.mock import MagicMock
 
         pool = OrphanPool()
-        # Fill to cap
+        # Fill to cap — each mock needs both get_txid and get_wtxid (BIP-339: wtxid is primary key)
         for i in range(MAX_ORPHAN_TRANSACTIONS):
             tx = MagicMock()
             tx.get_txid.return_value = i.to_bytes(32, 'big')
+            tx.get_wtxid.return_value = i.to_bytes(32, 'big')
             pool.add(tx, set())
 
         self.assertEqual(pool.size(), MAX_ORPHAN_TRANSACTIONS)
@@ -400,6 +401,7 @@ class TestG11OrphanMax(unittest.TestCase):
         # Adding one more should evict one
         tx_extra = MagicMock()
         tx_extra.get_txid.return_value = (MAX_ORPHAN_TRANSACTIONS + 1).to_bytes(32, 'big')
+        tx_extra.get_wtxid.return_value = (MAX_ORPHAN_TRANSACTIONS + 1).to_bytes(32, 'big')
         pool.add(tx_extra, set())
 
         self.assertEqual(pool.size(), MAX_ORPHAN_TRANSACTIONS,
@@ -441,12 +443,14 @@ class TestG12OrphanExpiry(unittest.TestCase):
         pool = OrphanPool()
         tx = MagicMock()
         tx.get_txid.return_value = b'\xab' * 32
+        tx.get_wtxid.return_value = b'\xab' * 32  # BIP-339: orphans keyed by wtxid
         pool.add(tx, set())
 
-        # Manually back-date the expiry to simulate time passage
-        txid = b'\xab' * 32
-        entry = pool.orphans[txid]
-        pool.orphans[txid] = (entry[0], time.time() - 1, entry[2])
+        # Manually back-date the expiry to simulate time passage.
+        # Primary key is now wtxid, not txid.
+        wtxid = b'\xab' * 32
+        entry = pool.orphans[wtxid]
+        pool.orphans[wtxid] = (entry[0], time.time() - 1, entry[2])
 
         removed = pool.expire()
         self.assertEqual(removed, 1)
@@ -471,12 +475,15 @@ class TestG13OrphanRecursiveResolve(unittest.TestCase):
         grandchild_id = b'\x03' * 32
 
         # child waits on parent; grandchild waits on child
+        # BIP-339: orphan pool keyed by wtxid; mocks must expose get_wtxid()
         child_tx = MagicMock()
         child_tx.get_txid.return_value = child_id
+        child_tx.get_wtxid.return_value = child_id
         pool.add(child_tx, {parent_id})
 
         grandchild_tx = MagicMock()
         grandchild_tx.get_txid.return_value = grandchild_id
+        grandchild_tx.get_wtxid.return_value = grandchild_id
         pool.add(grandchild_tx, {child_id})
 
         self.assertEqual(pool.size(), 2)
@@ -491,15 +498,13 @@ class TestG13OrphanRecursiveResolve(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestG14WtxidKeyedOrphanPool(unittest.TestCase):
-    """G14: orphan pool keyed by txid, not wtxid.
+    """G14: orphan pool keyed by wtxid (BIP-339 / Core #22677).
 
-    Bitcoin Core (since #22677): the orphan pool uses wtxid as the key so
-    that two transactions with the same txid but different witnesses are
-    stored separately.  Ouroboros uses txid (get_txid()) as the key.
-    This opens the txid-orphan-pinning attack vector.
+    Bitcoin Core keys the orphan pool by wtxid so that two transactions with
+    the same txid but different witnesses are stored separately.  A secondary
+    txid→wtxid index allows child-lookup by txid (prevout resolution).
     """
 
-    @pytest.mark.xfail(reason="G14: orphan pool keyed by txid not wtxid; wtxid pinning possible")
     def test_orphan_pool_accepts_same_txid_different_wtxid(self):
         """Two txs with same txid but different witness should both be stored."""
         from ouroboros.mempool import OrphanPool
@@ -521,9 +526,88 @@ class TestG14WtxidKeyedOrphanPool(unittest.TestCase):
         pool.add(tx_a, {b'\x00' * 32})
         pool.add(tx_b, {b'\x00' * 32})
 
-        # Should store both; currently stores only one (txid collision)
+        # Both witnesses must be stored separately (keyed by wtxid)
         self.assertEqual(pool.size(), 2,
                          "Both witnesses should be stored (keyed by wtxid, not txid)")
+
+    def test_orphan_pool_secondary_txid_index(self):
+        """Secondary txid→wtxid index allows child-lookup by txid."""
+        from ouroboros.mempool import OrphanPool
+        from unittest.mock import MagicMock
+
+        pool = OrphanPool()
+        shared_txid = b'\xdd' * 32
+        wtxid_a = b'\x11' * 32
+        wtxid_b = b'\x22' * 32
+
+        tx_a = MagicMock()
+        tx_a.get_txid.return_value = shared_txid
+        tx_a.get_wtxid.return_value = wtxid_a
+
+        tx_b = MagicMock()
+        tx_b.get_txid.return_value = shared_txid
+        tx_b.get_wtxid.return_value = wtxid_b
+
+        pool.add(tx_a, {b'\x00' * 32})
+        pool.add(tx_b, {b'\x00' * 32})
+
+        # has() uses secondary txid index — both variants visible via txid
+        self.assertTrue(pool.has(shared_txid),
+                        "has(txid) should return True via secondary index")
+        # has_wtxid() checks primary key directly
+        self.assertTrue(pool.has_wtxid(wtxid_a))
+        self.assertTrue(pool.has_wtxid(wtxid_b))
+
+    def test_orphan_pool_dedup_same_wtxid(self):
+        """Adding the same wtxid twice should be a no-op (returns False)."""
+        from ouroboros.mempool import OrphanPool
+        from unittest.mock import MagicMock
+
+        pool = OrphanPool()
+        wtxid = b'\xff' * 32
+        txid = b'\xee' * 32
+
+        tx = MagicMock()
+        tx.get_txid.return_value = txid
+        tx.get_wtxid.return_value = wtxid
+
+        first = pool.add(tx, {b'\x00' * 32})
+        second = pool.add(tx, {b'\x00' * 32})
+
+        self.assertTrue(first, "first add should return True")
+        self.assertFalse(second, "duplicate wtxid add should return False")
+        self.assertEqual(pool.size(), 1)
+
+    def test_remove_cleans_secondary_index(self):
+        """remove() by wtxid should clean up the txid secondary index."""
+        from ouroboros.mempool import OrphanPool
+        from unittest.mock import MagicMock
+
+        pool = OrphanPool()
+        txid = b'\xaa' * 32
+        wtxid_a = b'\x11' * 32
+        wtxid_b = b'\x22' * 32
+
+        tx_a = MagicMock()
+        tx_a.get_txid.return_value = txid
+        tx_a.get_wtxid.return_value = wtxid_a
+
+        tx_b = MagicMock()
+        tx_b.get_txid.return_value = txid
+        tx_b.get_wtxid.return_value = wtxid_b
+
+        pool.add(tx_a, set())
+        pool.add(tx_b, set())
+        self.assertTrue(pool.has(txid))
+
+        pool.remove(wtxid_a)
+        # txid still present via wtxid_b
+        self.assertTrue(pool.has(txid))
+
+        pool.remove(wtxid_b)
+        # now txid index must be fully removed
+        self.assertFalse(pool.has(txid),
+                         "secondary txid index should be cleaned when last wtxid removed")
 
 
 # ---------------------------------------------------------------------------
@@ -870,12 +954,13 @@ class TestOrphanExpiryCalled(unittest.TestCase):
         pool = OrphanPool()
         tx = MagicMock()
         tx.get_txid.return_value = b'\xfe' * 32
+        tx.get_wtxid.return_value = b'\xfe' * 32  # BIP-339: orphans keyed by wtxid
         pool.add(tx, set())
 
-        # Back-date expiry to past
-        txid = b'\xfe' * 32
-        entry = pool.orphans[txid]
-        pool.orphans[txid] = (entry[0], time.time() - 1, entry[2])
+        # Back-date expiry to past. Primary key is wtxid, not txid.
+        wtxid = b'\xfe' * 32
+        entry = pool.orphans[wtxid]
+        pool.orphans[wtxid] = (entry[0], time.time() - 1, entry[2])
 
         count = pool.expire()
         self.assertEqual(count, 1)

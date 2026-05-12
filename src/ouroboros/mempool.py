@@ -1456,67 +1456,97 @@ class OrphanPool:
 
     When a transaction references UTXOs that are neither in the chain nor
     in the mempool, it is stored here until the missing parents arrive.
+
+    BIP-339 / Core #22677: primary key is wtxid so that two malleable
+    variants of the same txid (same non-witness data, different witness)
+    are stored separately.  A secondary txid→wtxid index lets callers
+    perform the child-lookup by txid (prevout resolution uses txid).
     """
 
     def __init__(self):
-        # orphan txid → (Transaction, expiry_time, set of missing parent txids)
+        # orphan wtxid → (Transaction, expiry_time, set of missing parent txids)
         self.orphans: dict[bytes, tuple[Transaction, float, set[bytes]]] = {}
-        # missing parent txid → set of orphan txids waiting on it
+        # secondary: txid → set of wtxids (one txid may have multiple witness variants)
+        self.txid_to_wtxids: dict[bytes, set[bytes]] = {}
+        # missing parent txid → set of orphan wtxids waiting on it
         self.by_parent: dict[bytes, set[bytes]] = {}
 
     def add(self, tx: Transaction, missing_parents: set[bytes]) -> bool:
-        """Add an orphan transaction.  Returns True if added."""
-        txid = tx.get_txid()
-        if txid in self.orphans:
+        """Add an orphan transaction.  Returns True if added.
+
+        Keyed by wtxid (BIP-339): two transactions with the same txid but
+        different witness data are stored as separate orphans.
+        """
+        wtxid = tx.get_wtxid()
+        if wtxid in self.orphans:
             return False
         if len(self.orphans) >= MAX_ORPHAN_TRANSACTIONS:
             self._evict_random()
         expiry = time.time() + ORPHAN_EXPIRY_SECONDS
-        self.orphans[txid] = (tx, expiry, missing_parents)
+        self.orphans[wtxid] = (tx, expiry, missing_parents)
+        txid = tx.get_txid()
+        self.txid_to_wtxids.setdefault(txid, set()).add(wtxid)
         for parent in missing_parents:
-            self.by_parent.setdefault(parent, set()).add(txid)
+            self.by_parent.setdefault(parent, set()).add(wtxid)
         logger.debug(
-            f"Added orphan tx {txid.hex()[:16]}... "
+            f"Added orphan tx wtxid={wtxid.hex()[:16]}... txid={txid.hex()[:16]}... "
             f"(missing {len(missing_parents)} parent(s), "
             f"pool size {len(self.orphans)})"
         )
         return True
 
-    def remove(self, txid: bytes) -> None:
-        """Remove an orphan by txid."""
-        entry = self.orphans.pop(txid, None)
+    def remove(self, wtxid: bytes) -> None:
+        """Remove an orphan by wtxid (primary key)."""
+        entry = self.orphans.pop(wtxid, None)
         if entry is None:
             return
-        _, _, missing = entry
+        tx, _, missing = entry
+        txid = tx.get_txid()
+        wtxid_set = self.txid_to_wtxids.get(txid)
+        if wtxid_set:
+            wtxid_set.discard(wtxid)
+            if not wtxid_set:
+                del self.txid_to_wtxids[txid]
         for parent in missing:
             s = self.by_parent.get(parent)
             if s:
-                s.discard(txid)
+                s.discard(wtxid)
                 if not s:
                     del self.by_parent[parent]
 
+    def remove_by_txid(self, txid: bytes) -> None:
+        """Remove all orphan entries with the given txid (secondary-index lookup)."""
+        wtxids = list(self.txid_to_wtxids.get(txid, set()))
+        for wtxid in wtxids:
+            self.remove(wtxid)
+
     def get_orphans_for_parent(self, parent_txid: bytes) -> list[Transaction]:
         """Return orphan txs that are waiting on *parent_txid*."""
-        orphan_ids = self.by_parent.get(parent_txid, set())
+        orphan_wtxids = self.by_parent.get(parent_txid, set())
         result = []
-        for oid in list(orphan_ids):
+        for oid in list(orphan_wtxids):
             entry = self.orphans.get(oid)
             if entry:
                 result.append(entry[0])
         return result
 
     def has(self, txid: bytes) -> bool:
-        return txid in self.orphans
+        """Check whether any orphan with the given txid is present (secondary index)."""
+        return txid in self.txid_to_wtxids
+
+    def has_wtxid(self, wtxid: bytes) -> bool:
+        """Check whether an orphan with the given wtxid is present (primary key)."""
+        return wtxid in self.orphans
 
     def expire(self) -> int:
         """Remove expired orphans.  Returns count removed."""
         now = time.time()
         expired = [
-            txid for txid, (_, exp, _) in self.orphans.items()
+            wtxid for wtxid, (_, exp, _) in self.orphans.items()
             if now >= exp
         ]
-        for txid in expired:
-            self.remove(txid)
+        for wtxid in expired:
+            self.remove(wtxid)
         if expired:
             logger.debug(f"Expired {len(expired)} orphan transaction(s)")
         return len(expired)
@@ -1528,7 +1558,7 @@ class OrphanPool:
         if not self.orphans:
             return
         victim = random.choice(list(self.orphans))
-        logger.debug(f"Evicting random orphan {victim.hex()[:16]}...")
+        logger.debug(f"Evicting random orphan wtxid={victim.hex()[:16]}...")
         self.remove(victim)
 
 
@@ -1820,8 +1850,9 @@ class Mempool:
         if txid in self.transactions:
             return False, "txn-same-nonwitness-data-in-mempool"
 
-        # Already known as orphan
-        if self.orphan_pool.has(txid):
+        # Already known as orphan — check by wtxid (primary key) so that
+        # two malleable variants of the same txid are not conflated.
+        if self.orphan_pool.has_wtxid(wtxid):
             return False, "Already in orphan pool"
 
         # Standardness checks (policy, not consensus)
@@ -2791,17 +2822,20 @@ class Mempool:
             ptxid = work_queue.pop(0)
             candidates = self.orphan_pool.get_orphans_for_parent(ptxid)
             for orphan_tx in candidates:
-                orphan_id = orphan_tx.get_txid()
-                # Remove from orphan pool first so add_transaction
-                # doesn't see it as "already in orphan pool"
-                self.orphan_pool.remove(orphan_id)
+                orphan_wtxid = orphan_tx.get_wtxid()
+                orphan_txid = orphan_tx.get_txid()
+                # Remove from orphan pool first (by wtxid, primary key) so
+                # add_transaction doesn't see it as "already in orphan pool"
+                self.orphan_pool.remove(orphan_wtxid)
                 ok, err = self.add_transaction(orphan_tx, height)
                 if ok:
                     accepted += 1
-                    # This newly-accepted tx may unblock more orphans
-                    work_queue.append(orphan_id)
+                    # This newly-accepted tx may unblock more orphans;
+                    # queue by txid since by_parent is indexed by txid
+                    work_queue.append(orphan_txid)
                     logger.info(
-                        f"Resolved orphan {orphan_id.hex()[:16]}... "
+                        f"Resolved orphan wtxid={orphan_wtxid.hex()[:16]}... "
+                        f"txid={orphan_txid.hex()[:16]}... "
                         f"(parent {ptxid.hex()[:16]}...)"
                     )
                 # If it fails for a non-orphan reason, it stays removed
