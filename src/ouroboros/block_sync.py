@@ -590,7 +590,11 @@ class BlockSync:
 
     def _make_headers_handler(self, peer: Peer):
         async def handler(msg: NetworkMessage):
-            await self.handle_headers(msg, peer)
+            # Raw P2P headers from a peer have NOT been cleared by the
+            # PRESYNC state machine yet — pass min_pow_checked=False so
+            # that handle_headers enforces the G8 nMinimumChainWork gate
+            # (Bitcoin Core validation.cpp:4229).
+            await self.handle_headers(msg, peer, min_pow_checked=False)
         return handler
 
     def _register_new_peers(self):
@@ -1557,7 +1561,29 @@ class BlockSync:
         """Read the per-peer counter (used by tests)."""
         return self._unconnecting_headers_count.get(self._peer_key(peer), 0)
 
-    async def handle_headers(self, msg: NetworkMessage, peer: Peer):
+    @staticmethod
+    def _bits_to_work(bits: int) -> int:
+        """Compute the proof-of-work contributed by a single block with *bits*.
+
+        work = 2^256 // (target + 1)
+
+        Mirrors the accumulation formula in database.py and Bitcoin Core's
+        ``GetBlockProof`` in ``chain.cpp``.  Used to check per-batch
+        cumulative work against ``nMinimumChainWork`` (G8 gate).
+        """
+        mantissa = bits & 0x007FFFFF
+        exponent = (bits >> 24) & 0xFF
+        if mantissa == 0:
+            return 0
+        if exponent <= 3:
+            target = mantissa >> (8 * (3 - exponent))
+        else:
+            target = mantissa << (8 * (exponent - 3))
+        if target <= 0:
+            return 0
+        return (2 ** 256) // (target + 1)
+
+    async def handle_headers(self, msg: NetworkMessage, peer: Peer, *, min_pow_checked: bool = True):
         """Handle headers message — headers-first sync.
 
         Validates that received headers form a chain connecting to our
@@ -1565,6 +1591,19 @@ class BlockSync:
         queues them for block download in a limited window.  This mirrors
         Bitcoin Core's approach in net_processing.cpp where block data is
         only requested after headers have been validated and connected.
+
+        ``min_pow_checked`` mirrors Bitcoin Core's ``min_pow_checked`` parameter
+        on ``AcceptBlockHeader`` / ``ProcessNewBlockHeaders``
+        (validation.cpp:4186, 4242).  When False (raw P2P headers from a peer
+        that has NOT been cleared by the PRESYNC state machine), this function
+        computes the cumulative chain work of the accepted batch and rejects the
+        entire batch with ``too-little-chainwork`` if it falls below
+        ``nMinimumChainWork``.  When True (PRESYNC or trusted paths), the check
+        is skipped.  Default is True for backward-compat with internal callers.
+
+        Core canonical: validation.cpp:4229
+            if (!min_pow_checked) return state.Invalid(BLOCK_HEADER_LOW_WORK,
+                                                       "too-little-chainwork");
         """
         try:
             headers_msg = HeadersMessage.from_payload(msg.payload)
@@ -1698,6 +1737,70 @@ class BlockSync:
                 expected_prev = block_hash
                 accepted += 1
                 presync_feed.append(header)
+
+            # G8 — nMinimumChainWork gate (Bitcoin Core validation.cpp:4229).
+            #
+            # When the caller has NOT already cleared this batch via the
+            # PRESYNC / headerssync state machine (``min_pow_checked=False``),
+            # compute the cumulative proof-of-work contributed by every header
+            # in the current validated-headers queue and reject the batch if it
+            # falls below ``nMinimumChainWork``.  This closes the dead-helper
+            # gap: ``validate_minimum_chain_work`` exists in the Rust
+            # ``PyChainParams`` / ``ferrous-utils/sync/src/validate/header.rs``
+            # but was never wired from Python; the equivalent Python path uses
+            # ``_sync_module.get_minimum_chain_work`` from config.py, which
+            # also delegates to the same Rust symbol.
+            #
+            # The check is placed AFTER the per-header PoW + chain-continuity
+            # loop so that we roll back only NEW headers (accepted in this
+            # batch) when the threshold isn't met — consistent with Core
+            # rejecting each header individually when min_pow_checked=False
+            # (the batch semantics here are equivalent: all-or-nothing per
+            # call, matching ``ProcessNewBlockHeaders``' early-exit semantics).
+            if accepted > 0 and not min_pow_checked and _has_sync_module:
+                try:
+                    min_work_hex = _sync_module.get_minimum_chain_work(
+                        self.peer_manager.network
+                        if hasattr(self.peer_manager, "network")
+                        else "mainnet"
+                    )
+                    min_work_int = int(min_work_hex, 16)
+                    if min_work_int > 0:
+                        # Accumulate work across ALL headers in the queue
+                        # (the current batch was appended above, so the tip
+                        # of the queue reflects the post-batch state).
+                        batch_work = sum(
+                            self._bits_to_work(int(hdr.bits))
+                            for _, hdr in self._validated_headers
+                        )
+                        if batch_work < min_work_int:
+                            # Roll back: remove the headers we just appended.
+                            del self._validated_headers[-accepted:]
+                            self._headers_pow_rejected += accepted
+                            logger.warning(
+                                f"Batch of {accepted} headers from "
+                                f"{peer.host}:{peer.port} rejected: "
+                                f"cumulative work {batch_work:#066x} < "
+                                f"nMinimumChainWork {min_work_int:#066x} "
+                                f"(too-little-chainwork; G8)"
+                            )
+                            peer.adjust_score(-20)
+                            if hasattr(self.peer_manager, "misbehaving"):
+                                addr = f"{peer.host}:{peer.port}"
+                                self.peer_manager.misbehaving(
+                                    addr, 20, "too-little-chainwork"
+                                )
+                            self._drop_presync_state(peer)
+                            return
+                except Exception as _e:
+                    # Defense-in-depth: a Rust-side error in
+                    # get_minimum_chain_work must NOT break header sync.
+                    # Log and continue — the presync state machine is the
+                    # primary anti-DoS defense; this gate is defense-in-depth.
+                    logger.debug(
+                        f"get_minimum_chain_work raised: {_e} — "
+                        f"skipping G8 check for this batch"
+                    )
 
             # Successful connecting batch resets the per-peer
             # unconnecting-headers counter (Core's
