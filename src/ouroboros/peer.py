@@ -580,14 +580,22 @@ class Peer:
             self.state = PeerState.CONNECTED
 
             # BIP 324 inbound classification: only when v2 is enabled.
-            # The 4-byte read is "destructive" (asyncio.StreamReader has
+            # The 16-byte read is "destructive" (asyncio.StreamReader has
             # no MSG_PEEK), so on the v1 path we wrap the reader with a
             # ``_PrefixedStreamReader`` that yields the consumed bytes
             # back ahead of the underlying socket data.
+            #
+            # Core uses V1_PREFIX_LEN=16: 4-byte network magic followed by
+            # "version\x00\x00\x00\x00\x00" (net.h:465, net.cpp:1091-1094).
+            # We MUST read all 16 bytes before deciding v1 vs v2 and before
+            # sending our own ellswift pubkey (BIP-324 MAYBE_V1 state).
             if self.transport_version >= 2:
+                # Build the expected 16-byte v1 prefix: magic (4) + command (12).
+                _magic_bytes = get_magic(self.network).to_bytes(4, "little")
+                _v1_prefix = _magic_bytes + b"version\x00\x00\x00\x00\x00"
                 try:
                     prefix = await asyncio.wait_for(
-                        self.reader.readexactly(4),
+                        self.reader.readexactly(16),
                         timeout=HANDSHAKE_TIMEOUT,
                     )
                 except (asyncio.IncompleteReadError, ConnectionResetError,
@@ -595,10 +603,9 @@ class Peer:
                     raise Exception(
                         f"inbound classify-read failed: {e}"
                     ) from e
-                expected_magic = get_magic(self.network).to_bytes(4, "little")
-                if prefix == expected_magic:
+                if prefix == _v1_prefix:
                     # v1: re-wrap reader so the v1 handshake sees the
-                    # consumed magic at the head of the stream.  Also
+                    # consumed bytes at the head of the stream.  Also
                     # downgrade transport_version so the version message
                     # we send back to the peer doesn't advertise
                     # NODE_P2P_V2 when the actual transport is v1.
@@ -608,9 +615,11 @@ class Peer:
                     self.transport_version = 1
                 else:
                     # v2: drive the responder handshake.  ``prefix`` is
-                    # the first 4 bytes of the peer's 64-byte ellswift
+                    # the first 16 bytes of the peer's 64-byte ellswift
                     # pubkey; ``_negotiate_v2_inbound`` reads the
-                    # remaining 60 itself.
+                    # remaining 48 itself.  Sending our pubkey is also
+                    # deferred into _negotiate_v2_inbound so it happens
+                    # only after the 16-byte decision (G20 fix).
                     await self._negotiate_v2_inbound(initial_prefix=prefix)
 
             # Inbound handshake: receive version first, then send ours
@@ -1013,9 +1022,11 @@ class Peer:
 
         Symmetric to :meth:`_negotiate_v2` but with ``initiator=False``;
         used by :meth:`accept_inbound` once the wire has been classified
-        as non-v1.  ``initial_prefix`` MUST be the 4 bytes already
+        as non-v1.  ``initial_prefix`` MUST be the 16 bytes already
         consumed by the classifier (head of the peer's 64-byte
-        ElligatorSwift pubkey).
+        ElligatorSwift pubkey).  Receiving and classifying 16 bytes before
+        sending our own pubkey mirrors Bitcoin Core's MAYBE_V1 state
+        (net.h:465 V1_PREFIX_LEN=16, net.cpp:1091-1101).
 
         Wire layout (responder side, per BIP 324 § "Wire format" and
         ``bitcoin-core/src/net.cpp`` V2Transport state machine):
@@ -1032,9 +1043,9 @@ class Peer:
         """
         if not self.reader or not self.writer:
             raise V2NegotiationFailed("Not connected")
-        if len(initial_prefix) != 4:
+        if len(initial_prefix) != 16:
             raise V2NegotiationFailed(
-                f"initial_prefix must be exactly 4 bytes, got {len(initial_prefix)}"
+                f"initial_prefix must be exactly 16 bytes, got {len(initial_prefix)}"
             )
 
         from ouroboros.transport_v2 import (
@@ -1048,16 +1059,16 @@ class Peer:
         handshake = V2Handshake(initiator=False, network=self.network)
 
         # 1. Finish reading the peer's 64-byte ellswift pubkey (we have
-        # 4 bytes from the classifier; read the remaining 60).
+        # 16 bytes from the classifier; read the remaining 48).
         try:
             tail = await asyncio.wait_for(
-                self.reader.readexactly(60),
+                self.reader.readexactly(48),
                 timeout=10.0,
             )
         except (asyncio.IncompleteReadError, ConnectionResetError,
                 BrokenPipeError, OSError, TimeoutError) as e:
             raise V2NegotiationFailed(
-                f"v2 read of remaining 60 bytes failed: {e}"
+                f"v2 read of remaining 48 bytes failed: {e}"
             ) from e
         remote_pubkey = initial_prefix + tail
         try:
