@@ -2172,16 +2172,55 @@ class ScriptInterpreter:
     def _verify_schnorr_signature(
         self, message_hash: bytes, signature: bytes, pubkey_x: bytes
     ) -> bool:
-        """Verify a BIP 340 Schnorr signature."""
-        if len(signature) != 64 or len(pubkey_x) != 32:
+        """Verify a BIP-340 Schnorr signature.
+
+        Reference:
+            secp256k1/src/modules/schnorrsig/main_impl.h:224-270
+                (``secp256k1_schnorrsig_verify``)
+            BIP-340 §"Verification"
+
+        Length gates per BIP-340:
+          * signature: exactly 64 bytes (r || s)
+          * pubkey:    exactly 32 bytes (x-only)
+          * message:   exactly 32 bytes (TapSighash digest)
+
+        The two underlying curve gates (``r < p`` for the field element and
+        ``s < n`` for the scalar) and ``R != infinity`` / ``has_even_y(R)``
+        are enforced inside libsecp256k1 (Rust fast path) or coincurve.
+
+        Notes:
+          * Calls the Rust accelerator ``crypto_verify_schnorr`` when present
+            — historical bug: the Python wrapper used to invoke
+            ``sync.verify_schnorr`` (wrong name → AttributeError) with the
+            args in (msg, sig, pk) order; the fallback silently masked
+            both, so the Rust fast path was dead. Fixed in W95.
+          * Catches ``ValueError`` so malformed-input rejections from the
+            Rust path map to ``False`` rather than raising — matches Core's
+            ``secp256k1_schnorrsig_verify`` returning 0 for any pre-check
+            failure (overflow, off-curve pubkey, …).
+        """
+        # BIP-340 length gates (all three must hold; defensive on msg too).
+        if len(signature) != 64:
+            return False
+        if len(pubkey_x) != 32:
+            return False
+        if len(message_hash) != 32:
             return False
 
+        # Fast path: rust-secp256k1 via the ferrous-utils ``sync`` module.
         try:
             import sync
-            return sync.verify_schnorr(message_hash, signature, pubkey_x)
+            return sync.crypto_verify_schnorr(
+                signature, pubkey_x, message_hash
+            )
         except (ImportError, AttributeError):
             pass
+        except ValueError:
+            # Malformed sig / pubkey / msg — Rust raises, but BIP-340 verify
+            # returns 0 in this case. Mirror that.
+            return False
 
+        # Fallback: pure-Python via coincurve.
         try:
             from coincurve import PublicKeyXOnly
             pk = PublicKeyXOnly(pubkey_x)
@@ -2413,26 +2452,25 @@ class ScriptInterpreter:
     def _taproot_tweak_pubkey(
         self, internal_key: bytes, tweak: bytes
     ) -> tuple[bytes, int] | None:
+        """Apply BIP-341 TapTweak to an x-only pubkey.
+
+        Returns ``(tweaked_pubkey_x, parity)`` or ``None`` on failure.
+
+        Note: the historical code had a second fallback to
+        ``sync.taproot_tweak_pubkey``, but ferrous-utils ``sync`` does not
+        export that symbol — the AttributeError was silently caught and the
+        function returned None, so the fallback was a no-op. Removed in W95
+        to make the data flow explicit.
+        """
         try:
             from coincurve import PublicKeyXOnly
             pk = PublicKeyXOnly(internal_key)
             pk.tweak_add(tweak)  # mutates in-place, sets pk.parity
             return pk.format(), int(pk.parity)
-        except (ImportError, AttributeError):
-            pass
+        except ImportError:
+            return None
         except Exception:
             return None
-
-        try:
-            import sync
-            result = sync.taproot_tweak_pubkey(internal_key, tweak)
-            return result
-        except (ImportError, AttributeError):
-            pass
-        except Exception:
-            return None
-
-        return None
 
     def _ser_script_size(self, script: bytes) -> bytes:
         n = len(script)

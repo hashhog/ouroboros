@@ -7330,20 +7330,21 @@ class RPCServer:
                             "error": f"P2TR key tweak failed: {e}",
                         })
                         continue
+                    # W95: drop dead ``_sync.sign_schnorr`` path — the
+                    # ferrous-utils ``sync`` module exposes verify-only
+                    # Schnorr primitives (no signing API). Calling coincurve
+                    # directly avoids a spurious AttributeError swallow on
+                    # every wallet-side P2TR sign.
                     try:
-                        import sync as _sync
-                        raw_sig = _sync.sign_schnorr(sh, tweaked_secret)
-                    except (ImportError, AttributeError):
-                        try:
-                            from coincurve import PrivateKey as CPrivKey
-                            raw_sig = CPrivKey(tweaked_secret).sign_schnorr(sh)
-                        except Exception:
-                            errors.append({
-                                "txid": inp.prev_txid[::-1].hex(),
-                                "vout": inp.prev_vout,
-                                "error": "Schnorr signing not available",
-                            })
-                            continue
+                        from coincurve import PrivateKey as CPrivKey
+                        raw_sig = CPrivKey(tweaked_secret).sign_schnorr(sh)
+                    except Exception:
+                        errors.append({
+                            "txid": inp.prev_txid[::-1].hex(),
+                            "vout": inp.prev_vout,
+                            "error": "Schnorr signing not available",
+                        })
+                        continue
                     if sighash_type != 0x00:
                         raw_sig += bytes([sighash_type])
                     inp.witness = [raw_sig]
@@ -9647,19 +9648,17 @@ class RPCServer:
                                 # Skip this input; PSBT remains unsigned
                                 # rather than producing an invalid sig.
                                 continue
+                            # W95: ferrous-utils ``sync`` exposes
+                            # verify-only Schnorr — call coincurve directly
+                            # for signing (the previous ``_sync.sign_schnorr``
+                            # path was dead via AttributeError fallback).
                             try:
-                                import sync as _sync
-                                raw_sig = _sync.sign_schnorr(
-                                    sh, tweaked_secret
-                                )
-                            except (ImportError, AttributeError):
-                                try:
-                                    from coincurve import PrivateKey as CPrivKey
-                                    raw_sig = CPrivKey(
-                                        tweaked_secret
-                                    ).sign_schnorr(sh)
-                                except Exception:
-                                    continue
+                                from coincurve import PrivateKey as CPrivKey
+                                raw_sig = CPrivKey(
+                                    tweaked_secret
+                                ).sign_schnorr(sh)
+                            except Exception:
+                                continue
                             if sighash_type != 0x00:
                                 raw_sig += bytes([sighash_type])
                             psbt_in.tap_key_sig = raw_sig
