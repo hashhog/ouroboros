@@ -312,34 +312,39 @@ class TestG8WtxidRelayHandlerNoop(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestG9TxRelayInvType(unittest.TestCase):
-    """G9: node.py tx handler relays accepted tx to all peers using
-    MSG_WITNESS_TX (0x40000001) regardless of peer.wtxid_relay setting.
-    BIP-339 peers expect MSG_WTX (type 5, wtxid).
-    BUG-G9: node.py:842 always uses MSG_WITNESS_TX — same INV sent to all
-    peers regardless of wtxid_relay. Core uses per-peer wtxid/txid choice.
+    """G9 FIXED: node.py tx handler now selects per-peer inv type.
 
-    Note: p2p.py TrickleQueue DOES implement per-peer type selection (line 339),
-    but this path bypasses the trickle queue entirely — TWO-PIPELINE divergence.
+    wtxid_relay=True  → MSG_WTX(5) + wtxid   (BIP-339)
+    wtxid_relay=False → MSG_TX(1)  + txid    (legacy)
+
+    Previously BUG-G9: node.py always used MSG_WITNESS_TX (0x40000001) for
+    every peer regardless of peer.wtxid_relay — a BIP-144 getdata flag that
+    is not a valid INV type; Core peers silently discarded every announcement.
+
+    Note: p2p.py TrickleQueue already implemented per-peer type selection
+    (line 339); this was a two-pipeline divergence — now both paths agree.
     """
 
-    def test_g9_direct_relay_always_msg_witness_tx(self):
+    def test_g9_direct_relay_uses_per_peer_wtxid_selection(self):
+        """FIXED: relay section uses MSG_WTX and checks wtxid_relay per peer."""
         import inspect
         from ouroboros import node as node_mod
         src = inspect.getsource(node_mod)
-        # The tx handler at ~line 842 directly broadcasts MSG_WITNESS_TX
-        self.assertIn("MSG_WITNESS_TX", src)
         # Find the relay section
         idx = src.find("Relay INV to all peers except the sender")
-        self.assertGreater(idx, 0)
-        snippet = src[idx:idx + 300]
-        self.assertIn("MSG_WITNESS_TX", snippet, (
-            "BUG-G9: Direct relay in tx handler uses MSG_WITNESS_TX to all peers, "
-            "ignoring peer.wtxid_relay. BIP-339 peers expect MSG_WTX (type 5). "
-            "This is the hot path — two-pipeline gap: TrickleQueue handles it "
-            "correctly but this path bypasses TrickleQueue entirely."
+        self.assertGreater(idx, 0, "relay section marker not found in node.py")
+        snippet = src[idx:idx + 1200]
+        self.assertIn("MSG_WTX", snippet, (
+            "FIX-G9: Direct relay must use MSG_WTX(5) for wtxid-relay peers "
+            "(BIP-339). Core protocol.h: MSG_WTX=5."
         ))
-        self.assertNotIn("MSG_WTX", snippet, (
-            "BUG-G9: No per-peer MSG_WTX vs MSG_WITNESS_TX selection in direct relay."
+        self.assertIn("wtxid_relay", snippet, (
+            "FIX-G9: Direct relay must check peer.wtxid_relay to select "
+            "MSG_WTX+wtxid vs MSG_TX+txid per peer."
+        ))
+        self.assertNotIn("MSG_WITNESS_TX", snippet, (
+            "FIX-G9: MSG_WITNESS_TX (0x40000001) is a BIP-144 getdata flag, "
+            "not a valid INV type. Must not appear in relay INV construction."
         ))
 
     def test_g9_trickle_queue_does_select_per_peer(self):
@@ -641,7 +646,7 @@ class TestG18DirectRelayBypassesTrickleQueue(unittest.TestCase):
             "delay, BIP-133 per-peer feefilter, and dedup logic are all bypassed."
         ))
         # The direct send_message call appears in the full handler
-        self.assertIn("send_message", src[idx:idx + 1300], (
+        self.assertIn("send_message", src[idx:idx + 1800], (
             "Confirmed: direct send_message call in relay path (no trickle queue)."
         ))
 
