@@ -75,39 +75,78 @@ import pytest
 # ---------------------------------------------------------------------------
 
 class TestG10PrivateKeyZeroize:
-    """G10: Verify that V2Handshake._private_key is NOT zeroized after ECDH.
+    """G10 (FIXED): V2Handshake._private_key and _aux_rand are zeroed and released
+    after ECDH completes in receive_remote_pubkey().
 
-    This test DOCUMENTS the current broken behaviour.  The correct fix is to
-    clear the private-key bytes once the shared secret is derived.
+    Fix: _private_key and _aux_rand are now bytearray (mutable); after
+    _derive_shared_secret() they are zeroed in-place and set to None.
+    Mirrors bitcoin-core/src/bip324.cpp:67-70 (memory_cleanse + m_key = CKey()).
     """
 
-    def test_private_key_persists_after_handshake(self):
-        """After receive_remote_pubkey, _private_key still holds the secret bytes."""
+    def test_private_key_is_none_after_handshake(self):
+        """After receive_remote_pubkey, _private_key must be None (zeroed + released)."""
         from ouroboros.transport_v2 import V2Handshake
 
         init = V2Handshake(initiator=True)
         resp = V2Handshake(initiator=False)
         init.receive_remote_pubkey(resp.local_pubkey_bytes)
 
-        # BUG-1: key is never zeroed — it should be b'\x00'*32 or del'd.
-        assert init._private_key != b"\x00" * 32, (
-            "BUG-1 regression: private key was zeroed (unexpected fix without test update)"
+        # G10 fix: key is cleared and released after ECDH.
+        assert init._private_key is None, (
+            "G10: _private_key must be None after receive_remote_pubkey "
+            "(should be zeroed via bytearray[:] = zeros then set to None)"
         )
-        assert len(init._private_key) == 32
-        # The key bytes are still the original secret scalar.
-        assert init._private_key != b""
 
-    def test_aux_rand_persists_after_handshake(self):
-        """_aux_rand (EllSwift randomisation) also persists — adds to the zeroize surface."""
+    def test_aux_rand_is_none_after_handshake(self):
+        """After receive_remote_pubkey, _aux_rand must be None (zeroed + released)."""
         from ouroboros.transport_v2 import V2Handshake
 
         init = V2Handshake(initiator=True)
         resp = V2Handshake(initiator=False)
         init.receive_remote_pubkey(resp.local_pubkey_bytes)
 
-        # BUG-1: _aux_rand should be cleared after the pubkey is published.
-        assert init._aux_rand != b"\x00" * 32 or True  # always present after init
-        assert len(init._aux_rand) == 32
+        # G10 fix: _aux_rand cleared alongside _private_key.
+        assert init._aux_rand is None, (
+            "G10: _aux_rand must be None after receive_remote_pubkey"
+        )
+
+    def test_shared_secret_still_usable_after_cleanse(self):
+        """After cleanse, shared_secret is still accessible (it's stored separately)."""
+        from ouroboros.transport_v2 import V2Handshake
+
+        init = V2Handshake(initiator=True)
+        resp = V2Handshake(initiator=False)
+        init.receive_remote_pubkey(resp.local_pubkey_bytes)
+        resp.receive_remote_pubkey(init.local_pubkey_bytes)
+
+        # shared_secret must be available for key derivation even after cleanse.
+        assert init._private_key is None
+        assert init._aux_rand is None
+        assert init.shared_secret is not None
+        assert len(init.shared_secret) == 32
+        # Both sides derive the same shared secret.
+        assert init.shared_secret == resp.shared_secret
+
+    def test_private_key_is_bytearray_before_handshake(self):
+        """_private_key must be bytearray (mutable) so it can be zeroed in-place."""
+        from ouroboros.transport_v2 import V2Handshake
+
+        h = V2Handshake(initiator=True)
+        # Before handshake, key is a bytearray — not immutable bytes.
+        assert isinstance(h._private_key, bytearray), (
+            "G10: _private_key must be bytearray (not bytes) to support in-place zeroing"
+        )
+        assert len(h._private_key) == 32
+
+    def test_aux_rand_is_bytearray_before_handshake(self):
+        """_aux_rand must be bytearray (mutable) so it can be zeroed in-place."""
+        from ouroboros.transport_v2 import V2Handshake
+
+        h = V2Handshake(initiator=True)
+        assert isinstance(h._aux_rand, bytearray), (
+            "G10: _aux_rand must be bytearray (not bytes)"
+        )
+        assert len(h._aux_rand) == 32
 
 
 # ---------------------------------------------------------------------------
