@@ -722,10 +722,11 @@ async def test_negotiate_v2_inbound_happy_path():
                     transport_version=2, inbound=True)
         peer.reader = reader
         peer.writer = writer
-        # Pre-read 4 bytes (the classifier in accept_inbound does this)
-        # and call _negotiate_v2_inbound directly so we exercise just
-        # the handshake without the full version/verack phase.
-        prefix = await reader.readexactly(4)
+        # Pre-read 16 bytes (the classifier in accept_inbound does this —
+        # V1_PREFIX_LEN=16 per net.h:465) and call _negotiate_v2_inbound
+        # directly so we exercise just the handshake without the full
+        # version/verack phase.
+        prefix = await reader.readexactly(16)
         await peer._negotiate_v2_inbound(initial_prefix=prefix)
         server_session["peer"] = peer
         server_done.set()
@@ -797,8 +798,8 @@ async def test_negotiate_v2_inbound_happy_path():
 
 @pytest.mark.asyncio
 async def test_negotiate_v2_inbound_rejects_short_prefix():
-    """Defensive: the responder must refuse to run with a non-4-byte
-    classifier prefix (programmer-error guard)."""
+    """Defensive: the responder must refuse to run with a non-16-byte
+    classifier prefix (programmer-error guard; V1_PREFIX_LEN=16)."""
     peer = Peer("127.0.0.1", 0, "regtest",
                 transport_version=2, inbound=True)
 
@@ -838,10 +839,11 @@ async def _make_local_pair_addr():  # pragma: no cover (helper for typing)
 async def test_accept_inbound_classifies_v1_magic_and_passes_prefix():
     """When ``transport_version=2`` is set on an inbound peer but the
     dialer sends a v1 VERSION header, the classifier must consume the
-    4-byte network magic, recognise it, and re-feed those bytes back
-    to the v1 path so the wrapped reader yields the full 24-byte
-    header to ``_inbound_handshake``.  We assert the prefix-injection
-    contract directly via ``_PrefixedStreamReader``."""
+    full 16-byte v1 prefix (magic + "version\\x00\\x00\\x00\\x00\\x00"),
+    recognise it, and re-feed those bytes back to the v1 path so the
+    wrapped reader yields the full 24-byte header to
+    ``_inbound_handshake``.  We assert the prefix-injection contract
+    directly via ``_PrefixedStreamReader``."""
     from ouroboros.peer import _PrefixedStreamReader
 
     port = _free_port()
@@ -850,7 +852,7 @@ async def test_accept_inbound_classifies_v1_magic_and_passes_prefix():
         # Send a v1 VERSION header + minimum-viable payload so the
         # peek+inject works end-to-end.  We don't assert handshake
         # success here — only that the classifier doesn't lose the
-        # 4-byte magic prefix.
+        # 16-byte v1 prefix.
         magic = get_magic("regtest").to_bytes(4, "little")
         writer.write(magic + b"version\x00\x00\x00\x00\x00")
         writer.write(struct.pack("<I", 0))  # length
@@ -867,15 +869,15 @@ async def test_accept_inbound_classifies_v1_magic_and_passes_prefix():
     server = await asyncio.start_server(server_handler, "127.0.0.1", port)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        # Manually run the classifier read step.
-        prefix = await reader.readexactly(4)
+        # Manually run the classifier read step (V1_PREFIX_LEN=16).
+        prefix = await reader.readexactly(16)
         wrapped = _PrefixedStreamReader(reader, prefix)
-        # First 4 bytes from the wrapper must be the magic prefix.
-        roundtrip = await wrapped.readexactly(4)
+        # First 16 bytes from the wrapper must be the v1 prefix.
+        roundtrip = await wrapped.readexactly(16)
         assert roundtrip == prefix
-        # Next read draws from the underlying socket.
-        cmd = await wrapped.readexactly(12)
-        assert cmd == b"version\x00\x00\x00\x00\x00"
+        # Next read draws from the underlying socket (length + checksum).
+        length_cs = await wrapped.readexactly(8)
+        assert length_cs == struct.pack("<I", 0) + b"\x5d\xf6\xe0\xe2"
         writer.close()
     finally:
         server.close()

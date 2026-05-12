@@ -432,82 +432,71 @@ class TestG24DoSLimit:
 # ---------------------------------------------------------------------------
 
 class TestG13G14ResponderClassification:
-    """BUG-7/BUG-8: Responder reads 4 bytes for v1/v2 classification (should be 16)."""
+    """G13/G14/G20 (FIXED): Responder now reads 16 bytes for v1/v2 classification.
 
-    def test_v1_prefix_len_definition(self):
-        """Document: Core uses V1_PREFIX_LEN=16, ouroboros uses 4."""
-        CORE_V1_PREFIX_LEN = 16   # net.h:465
-        OUROBOROS_PEEK_LEN = 4    # peer.py:565
+    Fix: accept_inbound reads V1_PREFIX_LEN=16 bytes (4B magic +
+    "version\\x00\\x00\\x00\\x00\\x00") before deciding v1 vs v2, and defers
+    sending the responder ellswift pubkey until after the 16-byte decision.
+    Mirrors Bitcoin Core net.h:465 (V1_PREFIX_LEN=16) and net.cpp:1091-1101.
+    """
 
-        assert OUROBOROS_PEEK_LEN < CORE_V1_PREFIX_LEN, (
-            "BUG-7 would be fixed if ouroboros reads 16 bytes"
-        )
-
-    def test_four_byte_magic_suffices_for_mainnet_probability(self):
-        """4-byte classification has 2^-32 false-match probability — very low but nonzero."""
-        CORE_V1_PREFIX_LEN = 16
-        OUROBOROS_PEEK_LEN = 4
-
-        # Probability of a random v2 pubkey matching v1 prefix.
-        false_match_4b = 2 ** (-8 * OUROBOROS_PEEK_LEN)
-        false_match_16b = 2 ** (-8 * CORE_V1_PREFIX_LEN)
-
-        assert false_match_4b > false_match_16b, (
-            "4-byte classification is more likely to false-match than 16-byte"
-        )
-        # 4-byte match is astronomically rare but not spec-compliant.
-        assert false_match_4b < 1e-8
-
-    @pytest.mark.asyncio
-    async def test_responder_sends_pubkey_after_only_4_bytes(self):
-        """BUG-8: Responder sends ellswift pubkey immediately after 4-byte peek.
-
-        Core waits for full 16-byte V1_PREFIX_LEN before sending anything.
-        ouroboros sends the pubkey right after classifying 4 bytes.
-        """
-        import asyncio
-        from ouroboros.transport_v2 import GARBAGE_TERMINATOR_LEN
-        from ouroboros.peer import Peer
-
-        port_holder = __import__("socket")
-        with port_holder.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-
-        bytes_seen_before_16 = []
-
-        async def capture_handler(reader, writer):
-            peer = Peer("127.0.0.1", 0, "regtest", transport_version=2, inbound=True)
-            peer.reader = reader
-            peer.writer = writer
-            # Feed only 4 non-magic bytes (simulating start of v2 ellswift pubkey).
-            # The responder should wait for 16 bytes before sending its pubkey.
-            prefix = bytes([0x00, 0x01, 0x02, 0x03])  # Not a network magic
-            # We can't intercept what the server sends; use a proxy instead.
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-        server = await asyncio.start_server(capture_handler, "127.0.0.1", port)
-        try:
-            reader, writer = await asyncio.open_connection("127.0.0.1", port)
-            # Server closed immediately — test is structural (document the peeling).
-            writer.close()
-        finally:
-            server.close()
-            await server.wait_closed()
-
-        # Structural assertion: ouroboros reads 4 bytes, not 16.
-        # This is verified by reading accept_inbound source directly.
+    def test_v1_prefix_len_is_now_16(self):
+        """G13/G14 fix: accept_inbound reads exactly 16 bytes (V1_PREFIX_LEN)."""
         import inspect
         from ouroboros import peer as peer_mod
         src = inspect.getsource(peer_mod.Peer.accept_inbound)
-        # Should read 4 bytes (current behavior).
-        assert "readexactly(4)" in src, "Classifier reads 4 bytes"
-        # BUG-8: it does NOT read the full 16 bytes.
-        assert "readexactly(16)" not in src, "BUG-8 present: not reading V1_PREFIX_LEN=16"
+        assert "readexactly(16)" in src, (
+            "G13/G14 fix: classifier must read 16 bytes (V1_PREFIX_LEN)"
+        )
+        assert "readexactly(4)" not in src, (
+            "Old 4-byte classifier must be removed"
+        )
+
+    def test_v1_prefix_compares_magic_plus_version_command(self):
+        """G14 fix: v1 comparison uses full 16-byte prefix (magic + 'version\\0\\0\\0\\0\\0')."""
+        import inspect
+        from ouroboros import peer as peer_mod
+        src = inspect.getsource(peer_mod.Peer.accept_inbound)
+        # The fix builds: magic_bytes + b"version\x00\x00\x00\x00\x00"
+        assert "version" in src, (
+            "G14 fix: v1 prefix must include 'version' command string"
+        )
+        assert "_v1_prefix" in src, (
+            "G14 fix: 16-byte _v1_prefix variable must be constructed"
+        )
+
+    def test_initial_prefix_in_negotiate_v2_inbound_is_16_bytes(self):
+        """G20 fix: _negotiate_v2_inbound validates initial_prefix == 16 bytes."""
+        import inspect
+        from ouroboros import peer as peer_mod
+        src = inspect.getsource(peer_mod.Peer._negotiate_v2_inbound)
+        assert "len(initial_prefix) != 16" in src, (
+            "G20 fix: _negotiate_v2_inbound must require 16-byte prefix"
+        )
+        assert "len(initial_prefix) != 4" not in src, (
+            "Old 4-byte guard must be removed"
+        )
+
+    def test_negotiate_v2_inbound_reads_48_remaining_bytes(self):
+        """G20 fix: after 16-byte prefix, read the remaining 48 bytes of ellswift pubkey."""
+        import inspect
+        from ouroboros import peer as peer_mod
+        src = inspect.getsource(peer_mod.Peer._negotiate_v2_inbound)
+        assert "readexactly(48)" in src, (
+            "G20 fix: must read 48 remaining bytes (64 - 16 = 48)"
+        )
+        assert "readexactly(60)" not in src, (
+            "Old 60-byte tail read must be removed"
+        )
+
+    def test_16_byte_v1_prefix_uniqueness(self):
+        """16-byte classification has 2^-128 false-match — far stricter than 4-byte."""
+        false_match_16b = 2 ** (-8 * 16)
+        false_match_4b = 2 ** (-8 * 4)
+        assert false_match_16b < false_match_4b, (
+            "16-byte classification must be strictly stricter than 4-byte"
+        )
+        assert false_match_16b < 1e-38, "False-match probability must be negligible"
 
 
 # ---------------------------------------------------------------------------
