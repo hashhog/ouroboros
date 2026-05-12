@@ -18,6 +18,13 @@ from typing import Any
 # Chain sections (Bitcoin-style: [main], [test], [testnet4], [regtest], [signet])
 CHAIN_SECTIONS = ('main', 'mainnet', 'test', 'testnet', 'testnet3', 'testnet4', 'regtest', 'signet')
 
+# Minimum number of blocks to keep in the block store / lookahead window.
+# Mirrors Bitcoin Core's MIN_BLOCKS_TO_KEEP (validation.cpp / validation.h).
+# Used by the fTooFarAhead gate: an unrequested block whose claimed height
+# exceeds (ActiveHeight + MIN_BLOCKS_TO_KEEP) is silently dropped without
+# buffering, preventing memory-DoS via large-height block spam.
+MIN_BLOCKS_TO_KEEP: int = 288
+
 
 def _ports_for_network(network: str) -> tuple:
     """Return (rpc_port, p2p_port) for a given network."""

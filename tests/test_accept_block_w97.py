@@ -604,18 +604,153 @@ class TestG19EarlyReturnGates:
     def test_g19b_fHasMoreOrSameWork_unrequested_gate(self):
         assert False, "G19b: fHasMoreOrSameWork gate absent"
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="W97 audit G19c (CRITICAL DOS): no fTooFarAhead = "
-        "nHeight > ActiveHeight + 288 gate. A peer can deliver a block "
-        "whose claimed height is millions above the active tip; "
-        "handle_block buffers it (block_sync.py:874-883) until "
-        "_max_ibd_buffer is reached. Core: validation.cpp:4348-4350 "
-        "rejects with no further validation. This is a real memory-DoS "
-        "vector — _max_ibd_buffer defaults to a multi-MB cap.",
-    )
-    def test_g19c_fTooFarAhead_gate(self):
-        assert False, "G19c: fTooFarAhead gate absent — DoS"
+    @pytest.mark.asyncio
+    async def test_g19c_unrequested_too_far_ahead_rejected(self):
+        """G19c — unrequested block with claimed height > tip + 288 is dropped.
+
+        A peer delivers an unrequested block whose slot in _validated_headers
+        is more than MIN_BLOCKS_TO_KEEP (288) above the active tip.  The
+        fTooFarAhead gate must drop it before it enters _ibd_block_buffer.
+        """
+        from ouroboros.config import MIN_BLOCKS_TO_KEEP
+
+        tip_height = 1000
+        bs = _make_block_sync(tip_height=tip_height)
+        peer = _make_peer()
+
+        # Build a chain of 290 headers starting from the tip so the final
+        # header sits at slot index 289 (height tip+290 > tip+288).
+        prev = b"\xaa" * 32
+        bs.db.get_best_block.return_value = (prev, tip_height)
+
+        headers = []
+        h = prev
+        for _ in range(MIN_BLOCKS_TO_KEEP + 2):  # 290 headers
+            hdr = _valid_header_extending(h)
+            hdr_hash = bs._header_to_block_hash(hdr)
+            bs._validated_headers.append((hdr_hash, hdr))
+            headers.append((hdr_hash, hdr))
+            h = hdr_hash
+
+        # The last header is at slot index 289 → claimed height = tip+290.
+        far_hash, _ = headers[-1]  # height = tip + 290
+        far_payload = b"\x00" * 80 + b"\x00" * 4  # minimal 84-byte payload
+
+        # Craft a payload that hashes to far_hash (cheat: pre-seed buffer
+        # so we can use the real hash).  Instead, build a synthetic payload
+        # whose double-sha256 equals far_hash by constructing 80 bytes that
+        # produce the expected hash when re-hashed — impractical. Instead,
+        # inject the block directly via a NetworkMessage with the correct hash
+        # by pre-seeding requested_blocks so we can clear it and mark as
+        # not-requested, then call handle_block directly.
+        #
+        # Practical approach: craft an 80-byte header whose dsha256 == far_hash
+        # is not feasible without mining.  Instead, patch the payload hash: use
+        # the actual 80-byte serialisation of the far header.
+        _, far_hdr = headers[-1]
+        raw_far = far_hdr.serialize()  # 80 bytes; dsha256 = far_hash
+        assert len(raw_far) == 80
+
+        from ouroboros.p2p_messages import NetworkMessage
+        msg = NetworkMessage(command="block", payload=raw_far, magic=0)
+
+        # Mark as NOT requested (was_requested == False).
+        assert far_hash not in bs.requested_blocks
+
+        buffer_before = len(bs._ibd_block_buffer)
+        await bs.handle_block(msg, peer)
+        buffer_after = len(bs._ibd_block_buffer)
+
+        assert buffer_after == buffer_before, (
+            f"G19c: unrequested block at height tip+{MIN_BLOCKS_TO_KEEP + 2} "
+            f"should be dropped by fTooFarAhead, but was buffered"
+        )
+
+    @pytest.mark.asyncio
+    async def test_g19c_unrequested_at_gate_accepted(self):
+        """G19c — unrequested block at exactly tip + MIN_BLOCKS_TO_KEEP (288)
+        is NOT dropped (boundary is exclusive: only > 288 is rejected).
+        """
+        from ouroboros.config import MIN_BLOCKS_TO_KEEP
+
+        tip_height = 1000
+        bs = _make_block_sync(tip_height=tip_height)
+        peer = _make_peer()
+
+        prev = b"\xbb" * 32
+        bs.db.get_best_block.return_value = (prev, tip_height)
+
+        headers = []
+        h = prev
+        for _ in range(MIN_BLOCKS_TO_KEEP):  # exactly 288 headers → height tip+288
+            hdr = _valid_header_extending(h)
+            hdr_hash = bs._header_to_block_hash(hdr)
+            bs._validated_headers.append((hdr_hash, hdr))
+            headers.append((hdr_hash, hdr))
+            h = hdr_hash
+
+        # Last header is at slot index 287 → claimed height = tip + 288 (not > 288).
+        gate_hash, gate_hdr = headers[-1]
+        raw_gate = gate_hdr.serialize()
+
+        from ouroboros.p2p_messages import NetworkMessage
+        msg = NetworkMessage(command="block", payload=raw_gate, magic=0)
+
+        assert gate_hash not in bs.requested_blocks
+
+        buffer_before = len(bs._ibd_block_buffer)
+        await bs.handle_block(msg, peer)
+        buffer_after = len(bs._ibd_block_buffer)
+
+        assert buffer_after == buffer_before + 1, (
+            f"G19c: unrequested block at exactly tip+{MIN_BLOCKS_TO_KEEP} "
+            f"should be accepted (boundary is exclusive '>'), but was dropped"
+        )
+
+    @pytest.mark.asyncio
+    async def test_g19c_requested_too_far_accepted(self):
+        """G19c — requested block beyond tip + 288 is NOT dropped.
+
+        The fTooFarAhead gate applies only to unrequested blocks (Core's
+        ``if (!fRequested)`` guard).  A block we explicitly fetched via
+        getdata must still be buffered regardless of claimed height.
+        """
+        from ouroboros.config import MIN_BLOCKS_TO_KEEP
+
+        tip_height = 1000
+        bs = _make_block_sync(tip_height=tip_height)
+        peer = _make_peer()
+
+        prev = b"\xcc" * 32
+        bs.db.get_best_block.return_value = (prev, tip_height)
+
+        headers = []
+        h = prev
+        for _ in range(MIN_BLOCKS_TO_KEEP + 2):  # 290 headers → height tip+290
+            hdr = _valid_header_extending(h)
+            hdr_hash = bs._header_to_block_hash(hdr)
+            bs._validated_headers.append((hdr_hash, hdr))
+            headers.append((hdr_hash, hdr))
+            h = hdr_hash
+
+        far_hash, far_hdr = headers[-1]
+        raw_far = far_hdr.serialize()
+
+        # Mark as REQUESTED — simulates the node having sent getdata for it.
+        import time as _time
+        bs.requested_blocks[far_hash] = _time.monotonic()
+
+        from ouroboros.p2p_messages import NetworkMessage
+        msg = NetworkMessage(command="block", payload=raw_far, magic=0)
+
+        buffer_before = len(bs._ibd_block_buffer)
+        await bs.handle_block(msg, peer)
+        buffer_after = len(bs._ibd_block_buffer)
+
+        assert buffer_after == buffer_before + 1, (
+            f"G19c: requested block at height tip+{MIN_BLOCKS_TO_KEEP + 2} "
+            f"must be buffered even when beyond the fTooFarAhead threshold"
+        )
 
     @pytest.mark.xfail(
         strict=False,
