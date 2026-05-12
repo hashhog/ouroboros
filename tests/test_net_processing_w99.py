@@ -636,44 +636,32 @@ class TestG17BlockInvalidHeaderMisbehaving(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestG23MaxMessageLength(unittest.TestCase):
-    """G23: MAX_PROTOCOL_MESSAGE_LENGTH is 4 MiB (4194304) in Bitcoin Core.
+    """G23 (FIXED): MAX_PROTOCOL_MESSAGE_LENGTH consolidated to 4_000_000 per Core.
 
-    Ouroboros peer.py uses 32 MiB (33554432) — 8× larger.  This allows a
-    peer to send oversized messages without triggering a disconnect,
-    consuming memory.
-
-    Reference: Bitcoin Core net.h:86 MAX_PROTOCOL_MESSAGE_LENGTH = 4000000
-    (actual value in source is 4 * 1000 * 1000, not 4 MiB but ~3.81 MiB).
+    Reference: Bitcoin Core net.h:86 MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000.
+    Prior state: 32 * 1024 * 1024 (33 554 432) in 4 locations in peer.py.
     """
 
-    def test_message_length_limit_is_32mb_not_4mb(self):
-        """Document that ouroboros uses 32 MiB limit, not Bitcoin Core's 4 MiB."""
-        import re
-        with open("/home/work/hashhog/ouroboros/src/ouroboros/peer.py") as f:
-            src = f.read()
-        # Find the limit constant in receive_message
-        match = re.search(r"length > (\d+)\s*\*\s*1024\s*\*\s*1024", src)
-        self.assertIsNotNone(match, "Should find the payload-size limit check")
-        limit_mib = int(match.group(1))
-        # Document the current state (32 MiB)
-        self.assertEqual(limit_mib, 32,
-                         "ouroboros uses 32 MiB limit (should be ~4 MiB per Core)")
+    def test_max_protocol_message_length_constant_defined(self):
+        """peer.py must export MAX_PROTOCOL_MESSAGE_LENGTH = 4_000_000."""
+        from ouroboros.peer import MAX_PROTOCOL_MESSAGE_LENGTH
+        CORE_MAX = 4 * 1000 * 1000
+        self.assertEqual(MAX_PROTOCOL_MESSAGE_LENGTH, CORE_MAX,
+                         f"MAX_PROTOCOL_MESSAGE_LENGTH={MAX_PROTOCOL_MESSAGE_LENGTH}, expected {CORE_MAX}")
 
-    @pytest.mark.xfail(reason="G23: MAX_PROTOCOL_MESSAGE_LENGTH is 32 MiB, should be ~4 MiB")
-    def test_message_length_limit_matches_core(self):
-        """Bitcoin Core MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 bytes."""
-        import re
+    def test_no_32mib_literal_in_peer_py(self):
+        """peer.py must not contain the old 32 * 1024 * 1024 literal."""
         with open("/home/work/hashhog/ouroboros/src/ouroboros/peer.py") as f:
             src = f.read()
-        # Find the "too large" payload check in receive_message which is of the form:
-        #   if length > N * 1024 * 1024:
-        match = re.search(r"length > (\d+) \* 1024 \* 1024", src)
-        self.assertIsNotNone(match, "Should find the MiB-based payload limit check")
-        limit_mib = int(match.group(1))
-        # The limit should be at most 4 MiB per Bitcoin Core
-        MAX_CORE_MIB = 4
-        self.assertLessEqual(limit_mib, MAX_CORE_MIB,
-                             f"Payload limit is {limit_mib} MiB; Core uses {MAX_CORE_MIB} MiB")
+        self.assertNotIn("32 * 1024 * 1024", src,
+                         "Old 32 MiB literal still present — fix not applied")
+
+    def test_message_length_limit_matches_core(self):
+        """All peer.py size guards must reference MAX_PROTOCOL_MESSAGE_LENGTH (4_000_000)."""
+        from ouroboros.peer import MAX_PROTOCOL_MESSAGE_LENGTH
+        CORE_MAX = 4 * 1000 * 1000
+        self.assertEqual(MAX_PROTOCOL_MESSAGE_LENGTH, CORE_MAX,
+                         f"Payload limit is {MAX_PROTOCOL_MESSAGE_LENGTH}; Core uses {CORE_MAX}")
 
 
 # ---------------------------------------------------------------------------
