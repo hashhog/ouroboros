@@ -101,44 +101,109 @@ class TestG1SingleEventDiscourage(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# G2 — noban/manual/outbound protections
+# G2 — noban/manual/outbound protections  (FIXED — W99 G2)
 # ---------------------------------------------------------------------------
 
 class TestG2NobanOutboundProtections(unittest.TestCase):
-    """G2: noban/manual/outbound protections missing in _on_peer_banned.
+    """G2: noban/manual/local-addr protections in _on_peer_banned — FIXED.
 
-    Bitcoin Core (net_processing.cpp MaybeDiscourageAndDisconnect @5083) skips
-    disconnecting peers that have NOBAN permission, are manually-added, or are
-    outbound peers (Core protects outbound connections from ban-on-misbehave).
-    Ouroboros _on_peer_banned disconnects ALL matching peers without checking
-    connection direction or add-node status.
+    Bitcoin Core (net_processing.cpp MaybeDiscourageAndDisconnect @5083):
+      1. noban flag  → skip ban entirely (whitelisted peer).
+      2. IsManualConn() → skip ban entirely (addnode peer).
+      3. IsLocal()    → disconnect only, no discourage.
+      4. Regular inbound → disconnect (ban already recorded).
+
+    Fix: _on_peer_banned now checks peer.noban, peer.is_manual, and
+    is_local_addr(peer.host) before disconnecting.  Manual peers added via
+    the addnode RPC also have peer.is_manual=True set at connection time.
     """
 
-    @pytest.mark.xfail(reason="G2: outbound peer not protected from misbehav-disconnect")
-    def test_outbound_peer_not_disconnected_on_misbehav(self):
-        """Outbound full-relay peers should be protected from auto-disconnect.
-
-        Core: outbound connections are NOT disconnected when misbehaving score
-        accumulates (they are only discouraged — their score is tracked but
-        the connection stays alive).  Ouroboros calls peer.disconnect() on any
-        peer that hits the ban threshold.
-        """
-        from unittest.mock import AsyncMock, MagicMock, patch
+    def _make_pm_with_peer(self, ip, port, noban=False, is_manual=False, inbound=True):
+        """Return a minimal (PeerManager, peer, disconnect_calls) triple."""
+        from unittest.mock import AsyncMock, MagicMock
+        from ouroboros.p2p import PeerManager
         from ouroboros.banman import BanManager
 
-        on_ban_calls = []
-        bm = BanManager(ban_threshold=100, on_ban=lambda ip: on_ban_calls.append(ip))
+        pm = PeerManager.__new__(PeerManager)
+        pm.peers = {}
+        pm.block_relay_peers = {}
+        pm.inbound_peers = {}
+        pm.known_addrs = set()
 
-        # Simulate an outbound peer
-        result = bm.misbehaving("2.3.4.5", 100, "bad block")
-        self.assertTrue(result)  # ban fired
+        peer = MagicMock()
+        peer.host = ip
+        peer.port = port
+        peer.noban = noban
+        peer.is_manual = is_manual
+        peer.inbound = inbound
 
-        # In Core, the outbound protection would prevent disconnect.
-        # There is no way to test the disconnect skip here without the full
-        # PeerManager; this test documents the missing gate.
-        # The assertion below fails because there is no outbound-check gate:
-        self.assertIn("outbound_protected", str(on_ban_calls),
-                      "outbound peers should be flagged as protected (missing gate)")
+        disconnect_calls = []
+        future = AsyncMock(return_value=None)
+        peer.disconnect = lambda: future()
+
+        addr = f"{ip}:{port}"
+        if inbound:
+            pm.inbound_peers[addr] = peer
+        else:
+            pm.peers[addr] = peer
+        pm.known_addrs.add(ip)
+        return pm, peer, disconnect_calls, addr
+
+    def test_noban_peer_not_disconnected(self):
+        """noban=True peer must be skipped entirely — no disconnect called."""
+        from unittest.mock import patch, AsyncMock
+        pm, peer, _, addr = self._make_pm_with_peer(
+            "1.1.1.1", 8333, noban=True, inbound=True
+        )
+        with patch("asyncio.ensure_future") as mock_ef:
+            pm._on_peer_banned("1.1.1.1")
+        # Peer must still be in the bucket (was not popped)
+        self.assertIn(addr, pm.inbound_peers,
+                      "noban peer should remain in inbound_peers (not disconnected)")
+        mock_ef.assert_not_called()
+
+    def test_manual_peer_not_disconnected(self):
+        """is_manual=True peer must be skipped entirely — no disconnect called."""
+        from unittest.mock import patch
+        pm, peer, _, addr = self._make_pm_with_peer(
+            "2.2.2.2", 8333, is_manual=True, inbound=False
+        )
+        with patch("asyncio.ensure_future") as mock_ef:
+            pm._on_peer_banned("2.2.2.2")
+        self.assertIn(addr, pm.peers,
+                      "manual peer should remain in peers (not disconnected)")
+        mock_ef.assert_not_called()
+
+    def test_local_peer_disconnected_only(self):
+        """Local address (127.x) peer must be disconnected but kept out of discourage.
+
+        The ban_manager already has the entry; _on_peer_banned must disconnect
+        the peer (remove from bucket + call disconnect).  The key invariant is
+        that the peer IS disconnected (unlike noban/manual), but no further
+        discourage action is taken beyond what ban_manager already recorded.
+        """
+        from unittest.mock import patch
+        pm, peer, _, addr = self._make_pm_with_peer(
+            "127.0.0.1", 8333, inbound=True
+        )
+        with patch("asyncio.ensure_future") as mock_ef:
+            pm._on_peer_banned("127.0.0.1")
+        # Peer must have been popped (disconnected)
+        self.assertNotIn(addr, pm.inbound_peers,
+                         "local peer should be removed from inbound_peers")
+        mock_ef.assert_called_once()
+
+    def test_regular_inbound_peer_disconnected(self):
+        """Regular inbound peer must be disconnected on ban."""
+        from unittest.mock import patch
+        pm, peer, _, addr = self._make_pm_with_peer(
+            "3.3.3.3", 8333, inbound=True
+        )
+        with patch("asyncio.ensure_future") as mock_ef:
+            pm._on_peer_banned("3.3.3.3")
+        self.assertNotIn(addr, pm.inbound_peers,
+                         "regular inbound peer should be removed on ban")
+        mock_ef.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

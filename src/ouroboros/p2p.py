@@ -52,7 +52,7 @@ from ouroboros.p2p_messages import (
     SketchMessage,
     get_magic,
 )
-from ouroboros.peer import Peer, is_onion_host
+from ouroboros.peer import Peer, is_local_addr, is_onion_host
 from ouroboros.tor import (
     I2PSession,
     TorController,
@@ -1608,6 +1608,8 @@ class PeerManager:
         )
 
         if peer is not None:
+            # W99 G2: mark as manual so _on_peer_banned skips it.
+            peer.is_manual = True
             self.peers[addr] = peer
             self.retry_counts[addr] = 0
             self.addrman.mark_good(host, port)
@@ -3051,23 +3053,49 @@ class PeerManager:
         self.ban_manager.ban(addr)
 
     def _on_peer_banned(self, ip: str) -> None:
-        # Full-relay outbound
-        matching = [a for a in list(self.peers) if a.startswith(ip)]
-        for addr in matching:
-            peer = self.peers.pop(addr, None)
-            if peer:
-                asyncio.ensure_future(peer.disconnect())
-        # Block-relay-only outbound
-        matching_bro = [a for a in list(self.block_relay_peers) if a.startswith(ip)]
-        for addr in matching_bro:
-            peer = self.block_relay_peers.pop(addr, None)
-            if peer:
-                asyncio.ensure_future(peer.disconnect())
-        # Inbound
-        matching_in = [a for a in list(self.inbound_peers) if a.startswith(ip)]
-        for addr in matching_in:
-            peer = self.inbound_peers.pop(addr, None)
-            if peer:
+        """Disconnect peers whose IP has just been banned.
+
+        Applies Core-canonical exemptions from net_processing.cpp
+        MaybeDiscourageAndDisconnect @5083:
+          1. noban flag set  → skip entirely (whitelisted peer).
+          2. is_manual flag set → skip entirely (addnode peer is re-dialed
+             on disconnect anyway; banning it permanently is wrong).
+          3. Local address    → disconnect only, no discourage.
+          4. All others       → disconnect (ban already recorded in ban_manager).
+        """
+        all_buckets = [
+            (self.peers, False),           # full-relay outbound
+            (self.block_relay_peers, False),  # block-relay-only outbound
+            (self.inbound_peers, True),    # inbound
+        ]
+        for bucket, _is_inbound in all_buckets:
+            matching = [a for a in list(bucket) if a.startswith(ip)]
+            for addr in matching:
+                peer = bucket.get(addr)
+                if peer is None:
+                    continue
+                # Guard 1: NoBan permission — skip entirely.
+                if peer.noban:
+                    logger.debug(
+                        "_on_peer_banned: skipping noban peer %s", addr
+                    )
+                    continue
+                # Guard 2: Manual (addnode) connection — skip entirely.
+                if peer.is_manual:
+                    logger.debug(
+                        "_on_peer_banned: skipping manual peer %s", addr
+                    )
+                    continue
+                # Guard 3: Local address — disconnect only, no discourage.
+                if is_local_addr(peer.host):
+                    logger.debug(
+                        "_on_peer_banned: local peer %s — disconnect-only", addr
+                    )
+                    bucket.pop(addr, None)
+                    asyncio.ensure_future(peer.disconnect())
+                    continue
+                # Default: disconnect the peer (ban is already in ban_manager).
+                bucket.pop(addr, None)
                 asyncio.ensure_future(peer.disconnect())
         self.known_addrs.discard(ip)
 

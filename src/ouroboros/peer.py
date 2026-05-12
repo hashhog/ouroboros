@@ -79,6 +79,18 @@ def is_onion_host(host: str) -> bool:
     return host.lower().endswith(".onion")
 
 
+def is_local_addr(host: str) -> bool:
+    """Return True if *host* is a local/loopback address.
+
+    Mirrors Bitcoin Core CNetAddr::IsLocal() which covers 127.0.0.0/8 and
+    ::1.  Used by _on_peer_banned to choose disconnect-only (no discourage)
+    for local addresses, matching Core MaybeDiscourageAndDisconnect @5083.
+    """
+    # Strip IPv6 bracket notation if present
+    clean = host.strip("[]")
+    return clean.startswith("127.") or clean == "::1" or clean == "localhost"
+
+
 def parse_proxy_addr(proxy_str: str) -> tuple[str, int]:
     """Parse a ``host:port`` proxy string and return ``(host, port)``; raises ValueError if invalid."""
     if not proxy_str:
@@ -317,6 +329,15 @@ class Peer:
         # Latch so that we only invoke the ban path once per Peer instance,
         # even if adjust_score is called repeatedly after the clamp.
         self._ban_recorded: bool = False
+        # W99 G2: noban/manual flags for Core-canonical ban exemptions.
+        # noban: peer has NoBan permission (e.g. whitelisted via -whitelist).
+        #        MaybeDiscourageAndDisconnect skips this peer entirely.
+        # is_manual: peer was added via addnode RPC / -addnode config.
+        #        Manual connections are never auto-banned (they are
+        #        reconnected on disconnect anyway).
+        # Reference: net_processing.cpp MaybeDiscourageAndDisconnect @5083.
+        self.noban: bool = False
+        self.is_manual: bool = False
         self.relay_type = (
             RelayType.FULL_RELAY if relay_txs else RelayType.BLOCK_RELAY_ONLY
         )
