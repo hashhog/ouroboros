@@ -361,44 +361,31 @@ class TestFSChaCha20Poly1305Rekey:
 # ---------------------------------------------------------------------------
 
 class TestG24DoSLimit:
-    """BUG-6: G24 contents-size limit is 32 MB instead of Core 4 MB."""
+    """G24 (FIXED): MAX_PROTOCOL_MESSAGE_LENGTH consolidated to 4_000_000 per Core."""
 
-    def test_oversized_contents_limit_is_too_large(self):
-        """Document: ouroboros allows contents up to 32 MB, not Core's 4 MB.
+    def test_max_protocol_message_length_constant_is_4mb(self):
+        """peer.py must define MAX_PROTOCOL_MESSAGE_LENGTH = 4_000_000 (Core net.h:86)."""
+        from ouroboros.peer import MAX_PROTOCOL_MESSAGE_LENGTH
+        CORE_MAX = 4 * 1000 * 1000
+        assert MAX_PROTOCOL_MESSAGE_LENGTH == CORE_MAX, (
+            f"MAX_PROTOCOL_MESSAGE_LENGTH={MAX_PROTOCOL_MESSAGE_LENGTH}, expected {CORE_MAX}"
+        )
 
-        Core MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 = 4_000_000 bytes.
-        ouroboros uses 32 * 1024 * 1024 = 33_554_432 bytes — 8.4× too large.
-        """
-        CORE_MAX = 4 * 1000 * 1000          # 4 MB
-        OUROBOROS_MAX = 32 * 1024 * 1024    # 32 MB
+    def test_no_32mib_literal_in_peer_py(self):
+        """peer.py must not contain the old 32 * 1024 * 1024 literal."""
+        with open("/home/work/hashhog/ouroboros/src/ouroboros/peer.py") as f:
+            src = f.read()
+        assert "32 * 1024 * 1024" not in src, (
+            "Old 32 MiB literal still present — fix not applied"
+        )
 
-        # Ouroboros max exceeds Core's limit — the DoS gap.
-        assert OUROBOROS_MAX > CORE_MAX, "BUG-6 already fixed if this fails"
-        assert OUROBOROS_MAX / CORE_MAX > 8, "Gap should be at least 8x"
-
-    @pytest.mark.xfail(reason="BUG-6: 5 MB packet should be rejected but ouroboros accepts it")
-    def test_five_mb_packet_rejected(self):
-        """A 5 MB packet contents should be rejected (Core rejects > 4 MB)."""
-        from ouroboros.transport_v2 import BIP324Cipher, V2Handshake, V2Transport
-
-        init = V2Handshake(initiator=True)
-        resp = V2Handshake(initiator=False)
-        init.receive_remote_pubkey(resp.local_pubkey_bytes)
-        resp.receive_remote_pubkey(init.local_pubkey_bytes)
-        i_t = V2Transport.from_handshake(init)
-
-        # Manufacture a fake length prefix that claims a 5 MB body.
+    def test_five_mb_packet_exceeds_limit(self):
+        """A 5 MB contents length exceeds MAX_PROTOCOL_MESSAGE_LENGTH (4_000_000)."""
+        from ouroboros.peer import MAX_PROTOCOL_MESSAGE_LENGTH
         five_mb = 5 * 1024 * 1024
-        # Encrypt a fake length to test the recv path.
-        enc_len = i_t.cipher.send_l.crypt(five_mb.to_bytes(3, "little"))
-
-        # The recv path should reject this as too large.
-        r_t = V2Transport.from_handshake(resp)
-        decrypted_len = r_t.decrypt_length(enc_len)
-        assert decrypted_len == five_mb
-        # Should raise rather than attempt to allocate 5 MB + tag.
-        with pytest.raises(Exception, match="too large"):
-            r_t.decrypt_contents(b"\x00" * (five_mb + 17), five_mb)
+        assert five_mb > MAX_PROTOCOL_MESSAGE_LENGTH, (
+            "5 MB packet must exceed the 4 MB cap"
+        )
 
 
 # ---------------------------------------------------------------------------

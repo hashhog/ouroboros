@@ -74,6 +74,10 @@ SOCKS5_ATYP_IPV6 = 0x04
 SOCKS5_REPLY_SUCCESS = 0x00
 
 
+# Bitcoin Core net.h:86 MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000
+MAX_PROTOCOL_MESSAGE_LENGTH = 4_000_000
+
+
 def is_onion_host(host: str) -> bool:
     """Return True if *host* is a Tor v3 .onion address."""
     return host.lower().endswith(".onion")
@@ -965,7 +969,7 @@ class Peer:
                     timeout=10.0,
                 )
                 contents_len = self._v2_transport.decrypt_length(enc_length)
-                if contents_len > 32 * 1024 * 1024:
+                if contents_len > MAX_PROTOCOL_MESSAGE_LENGTH:
                     raise V2NegotiationFailed(
                         f"v2 version-phase packet too large: {contents_len}"
                     )
@@ -1135,7 +1139,7 @@ class Peer:
                     timeout=10.0,
                 )
                 contents_len = self._v2_transport.decrypt_length(enc_length)
-                if contents_len > 32 * 1024 * 1024:
+                if contents_len > MAX_PROTOCOL_MESSAGE_LENGTH:
                     raise V2NegotiationFailed(
                         f"v2 version-phase packet too large: {contents_len}"
                     )
@@ -1472,7 +1476,7 @@ class Peer:
         # Read payload
         payload = b''
         if length > 0:
-            if length > 32 * 1024 * 1024:  # 32 MB limit
+            if length > MAX_PROTOCOL_MESSAGE_LENGTH:  # Core net.h MAX_PROTOCOL_MESSAGE_LENGTH
                 raise Exception(f"Payload too large: {length} bytes")
 
             payload = await asyncio.wait_for(
@@ -1531,7 +1535,7 @@ class Peer:
                     f"v2 length decrypt failed for {self.host}:{self.port}: {e}"
                 ) from e
 
-            if contents_len > 32 * 1024 * 1024:
+            if contents_len > MAX_PROTOCOL_MESSAGE_LENGTH:
                 raise Exception(f"v2 payload too large: {contents_len} bytes")
 
             # Read the AEAD-encrypted body: HEADER_LEN + contents_len + tag.
