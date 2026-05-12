@@ -81,23 +81,22 @@ class TestG1SingleEventDiscourage(unittest.TestCase):
         self.assertTrue(result, "score=100 event should return True (banned)")
         self.assertTrue(bm.is_banned("1.2.3.4"))
 
-    @pytest.mark.xfail(reason="G1: single large-score discourage below threshold missing")
     def test_single_large_score_discourages_even_below_ban_threshold(self):
         """Core 2022: a single score >= DISCOURAGEMENT_THRESHOLD discourages.
 
-        In Bitcoin Core MaybeDiscourageAndDisconnect: peers are flagged
-        'should_discourage' and disconnected even if the cumulative score
-        would not yet reach the ban threshold.  Ouroboros has no such
-        per-event gate; small individual scores accumulate without triggering
-        any per-event disconnect.
+        Fixed (W99 G1): BanManager now implements single-event discourage per
+        Bitcoin Core 2022 PR #25974.  Any event with score >=
+        BanManager.DISCOURAGEMENT_THRESHOLD (50) immediately sets
+        should_discourage=True and bans the peer, even if the cumulative
+        score has not yet reached ban_threshold (100).
         """
         from ouroboros.banman import BanManager
         bm = BanManager(ban_threshold=100)
-        # Score 50 in one event — Core would discourage; ouroboros does not
+        # Score 50 in one event — equals DISCOURAGEMENT_THRESHOLD → instant ban
         result = bm.misbehaving("1.2.3.5", 50, "headers dont connect")
-        # Ouroboros: result is False (score < threshold) — this is the bug
-        # Core: would set should_discourage=True and disconnect the peer
         self.assertTrue(result, "score=50 event SHOULD trigger discourage (Core 2022)")
+        self.assertTrue(bm.is_banned("1.2.3.5"),
+                        "peer should be in banned set after single-event discourage")
 
 
 # ---------------------------------------------------------------------------

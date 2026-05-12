@@ -51,7 +51,24 @@ class MisbehaviorRecord:
 
 
 class BanManager:
-    """Track peer misbehavior and enforce time-limited bans."""
+    """Track peer misbehavior and enforce time-limited bans.
+
+    Single-event discourage model (Bitcoin Core 2022, PR #25974):
+    Any misbehavior event whose individual score meets or exceeds
+    ``discouragement_threshold`` immediately triggers a ban/discourage,
+    regardless of the cumulative score.  This mirrors Core's
+    MaybeDiscourageAndDisconnect where a single Misbehaving() call sets
+    m_should_discourage=True and disconnects on the next loop iteration.
+
+    Low-severity events (score < discouragement_threshold) still accumulate
+    and trigger a ban only when the cumulative total reaches ``ban_threshold``.
+    """
+
+    # Per-event threshold: a single event with score >= this value triggers
+    # an immediate discourage/ban even if the cumulative score is below
+    # ban_threshold.  Matches the spirit of Core 2022 PR #25974 where any
+    # Misbehaving() call sets should_discourage=True.
+    DISCOURAGEMENT_THRESHOLD: int = 50
 
     def __init__(
         self,
@@ -74,7 +91,13 @@ class BanManager:
     # Public API
 
     def record_misbehavior(self, ip: str, score: int, reason: str) -> bool:
-        """Add *score* points for *ip*.  Ban if threshold is reached.
+        """Add *score* points for *ip*.  Ban if single-event or cumulative threshold reached.
+
+        Bitcoin Core 2022 (PR #25974) single-event discourage model:
+        if a single event score >= DISCOURAGEMENT_THRESHOLD the peer is
+        banned immediately (should_discourage=True), regardless of prior
+        cumulative score.  Cumulative ban still applies when total reaches
+        ban_threshold.
 
         Returns True if the peer was banned as a result of this call.
         """
@@ -88,7 +111,10 @@ class BanManager:
             ip, score, reason, rec.score,
         )
 
-        if rec.score >= self.ban_threshold:
+        # Single-event discourage: any event with score >= DISCOURAGEMENT_THRESHOLD
+        # triggers an immediate ban, mirroring Core's MaybeDiscourageAndDisconnect
+        # where a single Misbehaving() call sets m_should_discourage=True.
+        if score >= self.DISCOURAGEMENT_THRESHOLD or rec.score >= self.ban_threshold:
             self.ban(ip)
             return True
         return False
