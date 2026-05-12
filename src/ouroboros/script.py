@@ -53,6 +53,11 @@ SCRIPT_VERIFY_CONST_SCRIPTCODE = (1 << 16)
 SCRIPT_VERIFY_TAPROOT = (1 << 17)        # BIP 341
 SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION = (1 << 18)
 SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS = (1 << 19)
+# BIP 342: in tapscript, fail on non-32-byte pubkeys
+# (forward-compat with future Schnorr pubkey-versioning soft-forks).
+# Mirrors Core SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+# (interpreter.h:146). Policy-only.
+SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE = (1 << 20)
 
 # Flags that are active on mainnet after all softfork activations.
 # Used as the default for _execute_script so unit tests work without
@@ -78,6 +83,20 @@ MAX_STACK_SIZE = 1000
 MAX_SCRIPT_SIZE = 10000
 MAX_OPS_PER_SCRIPT = 201
 MAX_PUBKEYS_PER_MULTISIG = 20
+
+# BIP-341 Taproot control-block geometry
+# (bitcoin-core/src/script/interpreter.h:241-246).
+ANNEX_TAG = 0x50
+TAPROOT_LEAF_MASK = 0xfe
+TAPROOT_LEAF_TAPSCRIPT = 0xc0
+TAPROOT_CONTROL_BASE_SIZE = 33
+TAPROOT_CONTROL_NODE_SIZE = 32
+TAPROOT_CONTROL_MAX_NODE_COUNT = 128
+TAPROOT_CONTROL_MAX_SIZE = (
+    TAPROOT_CONTROL_BASE_SIZE
+    + TAPROOT_CONTROL_NODE_SIZE * TAPROOT_CONTROL_MAX_NODE_COUNT
+)  # 33 + 32*128 = 4129
+WITNESS_V1_TAPROOT_SIZE = 32
 
 # Softfork activation heights (mainnet)
 BIP16_ACTIVATION_HEIGHT = 173805
@@ -503,6 +522,7 @@ class ScriptInterpreter:
                         tx, input_index, version, program,
                         witness or [], flags, amount,
                         input_amounts, input_script_pubkeys,
+                        is_p2sh=True,
                     )
 
                 redeem_stack = self._execute_script(
@@ -549,8 +569,19 @@ class ScriptInterpreter:
         amount: int = 0,
         input_amounts: list[int] | None = None,
         input_script_pubkeys: list[bytes] | None = None,
+        is_p2sh: bool = False,
     ) -> bool:
-        """Verify a segregated witness program (BIP 141)."""
+        """Verify a segregated witness program (BIP 141).
+
+        ``is_p2sh`` is True when the witness program is reached via a P2SH
+        redeem-script (BIP-141 §"P2SH-of-witness-program"). Per
+        bitcoin-core/src/script/interpreter.cpp:1947, the BIP-341 Taproot
+        branch is gated on ``!is_p2sh`` — a v1/32B program inside a P2SH
+        wrap is NOT a Taproot output, and the forward-compat success path
+        applies instead (Core line 1996-1998). Pay-to-Anchor (BIP-431 / Core
+        line 1990) is similarly carved out before the DISCOURAGE check so
+        adversarial nodes can't reject standard P2A spends via policy.
+        """
         if version == 0:
             if len(program) == 20:
                 return self._verify_witness_v0_keyhash(
@@ -560,12 +591,27 @@ class ScriptInterpreter:
                     tx, input_index, program, witness, flags, amount)
             else:
                 return False
-        elif version == 1 and len(program) == 32:
+        # BIP-341 Taproot: v1, 32-byte program, NOT inside P2SH wrap.
+        # Mirrors Core interpreter.cpp:1947 (`!is_p2sh` gate).
+        elif (
+            version == 1
+            and len(program) == WITNESS_V1_TAPROOT_SIZE
+            and not is_p2sh
+        ):
             if flags & SCRIPT_VERIFY_TAPROOT:
                 spk = bytes([0x51, 0x20]) + program
                 return self.verify_taproot(
                     tx, input_index, witness, spk,
                     input_amounts, input_script_pubkeys, flags)
+            return True
+        # BIP-431 Pay-to-Anchor (v1, OP_PUSHBYTES_2 0x4e73). Always valid,
+        # bare only (Core interpreter.cpp:1990: `!is_p2sh && IsPayToAnchor`).
+        elif (
+            not is_p2sh
+            and version == 1
+            and len(program) == 2
+            and program == b"\x4e\x73"
+        ):
             return True
         elif flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM:
             return False
@@ -771,6 +817,30 @@ class ScriptInterpreter:
         # Bitcoin Core's pbegincodehash (interpreter.cpp).
         script_code_start = 0
 
+        # BIP-341/342 tapscript-only opcode position tracking (Core
+        # interpreter.cpp:432-434): ``opcode_pos`` is the 0-based index of
+        # the *current* opcode being executed; ``codesep_pos`` records the
+        # ``opcode_pos`` of the most recent OP_CODESEPARATOR (sentinel
+        # 0xFFFFFFFF = none seen yet), and is committed to the tapscript
+        # sighash via SignatureHashSchnorr's "Extension" block
+        # (interpreter.cpp:1564-1566).
+        opcode_pos = 0
+        codesep_pos = 0xFFFFFFFF
+
+        # Tapscript initial-stack constraints (interpreter.cpp:1855-1861):
+        #   * stack size must be <= MAX_STACK_SIZE (1000) BEFORE any push;
+        #   * every initial witness stack item must be <= MAX_SCRIPT_ELEMENT_SIZE (520).
+        # Core enforces these inside ExecuteWitnessScript right before
+        # EvalScript runs, so they fire for both tapscript and v0 P2WSH.
+        if is_tapscript or is_witness_v0:
+            if len(stack) > MAX_STACK_SIZE:
+                raise ValueError("Stack size exceeded (initial witness stack)")
+            for elem in stack:
+                if len(elem) > MAX_SCRIPT_ELEMENT_SIZE:
+                    raise ValueError(
+                        f"Witness stack item exceeds {MAX_SCRIPT_ELEMENT_SIZE} bytes"
+                    )
+
         # BIP-342 validation-weight budget (interpreter.cpp:1981):
         #   m_validation_weight_left = ::GetSerializeSize(witness.stack)
         #                              + VALIDATION_WEIGHT_OFFSET (50)
@@ -791,6 +861,14 @@ class ScriptInterpreter:
         while i < len(script):
             opcode = script[i]
             i += 1
+            # BIP-341/342: record the 0-based index of the opcode being
+            # processed (Core interpreter.cpp:433 — `++opcode_pos` at the
+            # top of the for-loop, so the first opcode sees pos=0).
+            # Push-data ops also advance, matching Core's unconditional
+            # increment.  `codesep_pos` snapshots this value when
+            # OP_CODESEPARATOR fires inside a tapscript.
+            current_opcode_pos = opcode_pos
+            opcode_pos += 1
 
             executing = not exec_stack or all(exec_stack)
 
@@ -1215,8 +1293,16 @@ class ScriptInterpreter:
             # OP_CODESEPARATOR (0xab)
             # CONST_SCRIPTCODE check has already been applied above the fExec
             # gate (Core interpreter.cpp:474-476); here we just update state.
+            #
+            # Tapscript: also snapshot the 0-based opcode index so the
+            # tapscript sighash extension block (interpreter.cpp:1564-1566)
+            # commits to the right position. Without this every
+            # CODESEPARATOR-using tapscript signed by the canonical bitcoin
+            # ref impl would fail verification against ouroboros.
             if opcode == 0xab:
                 script_code_start = i
+                if is_tapscript:
+                    codesep_pos = current_opcode_pos
                 continue
 
             # Signature verification #
@@ -1227,27 +1313,43 @@ class ScriptInterpreter:
                 sig = stack.pop()
 
                 if is_tapscript:
-                    # BIP 342 Schnorr CHECKSIG
-                    if not sig:
-                        stack.append(b"")
-                        continue
-                    # BIP-342 validation-weight budget: decrement BEFORE
-                    # pubkey inspection / Schnorr verify, gated on
-                    # non-empty sig. Mirrors Core's
-                    # `success = !sig.empty()` deduction at
-                    # interpreter.cpp:357-366. Per Core's comment,
-                    # "Passing with an upgradable public key version
-                    # is also counted", so the deduction fires for the
-                    # unknown-pubkey-type forward-compat path too.
-                    sigops_budget -= 50
-                    if sigops_budget < 0:
-                        raise ValueError("Tapscript sigops budget exceeded")
+                    # BIP 342 Schnorr CHECKSIG. Mirrors Core
+                    # interpreter.cpp:347-385 (EvalChecksigTapscript).
+                    #
+                    # Order (consensus-critical):
+                    #   1. success = !sig.empty()
+                    #   2. if success: budget -= 50 (abort on negative)
+                    #   3. if pubkey.empty(): TAPSCRIPT_EMPTY_PUBKEY  (ALWAYS)
+                    #   4. elif pubkey.size() == 32: Schnorr verify (only if success)
+                    #   5. else: DISCOURAGE_UPGRADABLE_PUBKEYTYPE check
+                    #
+                    # Notably step 3-5 fire even when sig is empty: an
+                    # empty signature does NOT short-circuit past the
+                    # empty-pubkey error or the upgradable-pubkey
+                    # discouragement.
+                    success = bool(sig)
+                    if success:
+                        sigops_budget -= 50
+                        if sigops_budget < 0:
+                            raise ValueError("Tapscript sigops budget exceeded")
+                    if len(pubkey) == 0:
+                        raise ValueError("OP_CHECKSIG: empty pubkey in tapscript")
                     if len(pubkey) != 32:
-                        # Unknown pubkey type in tapscript — succeed for
-                        # forward compatibility (len > 0 only)
-                        if len(pubkey) == 0:
-                            raise ValueError("OP_CHECKSIG: empty pubkey in tapscript")
-                        stack.append(b"\x01")
+                        # Unknown pubkey type — Core's "upgradable public
+                        # key version" branch (interpreter.cpp:373-382).
+                        if flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE:
+                            raise ValueError(
+                                "DISCOURAGE_UPGRADABLE_PUBKEYTYPE: "
+                                "non-32-byte pubkey in tapscript"
+                            )
+                        # Forward-compat: push true on non-empty sig (would
+                        # have been a real Schnorr success in a future
+                        # softfork), push false on empty sig (success=false).
+                        stack.append(b"\x01" if success else b"")
+                        continue
+                    if not success:
+                        # 32-byte pubkey, empty sig: push false, no crypto.
+                        stack.append(b"")
                         continue
                     sighash_type = 0x00
                     raw_sig = sig
@@ -1265,9 +1367,33 @@ class ScriptInterpreter:
                             input_script_pubkeys=input_script_pubkeys,
                             annex=annex, ext_flag=1,
                             tap_leaf_hash=leaf_hash,
+                            codesep_pos=codesep_pos,
                         )
                     else:
-                        sh = default_sighash
+                        # SIGHASH_DEFAULT: callers may pre-compute the
+                        # ext_flag=1 sighash without baking in the current
+                        # codesep_pos.  If the script has actually executed
+                        # an OP_CODESEPARATOR, recompute with the live pos
+                        # so the BIP-342 §"sighash" commitment matches Core
+                        # (interpreter.cpp:1565).
+                        if codesep_pos != 0xFFFFFFFF:
+                            sh = self._compute_taproot_sighash(
+                                tx, input_index, 0x00,
+                                input_amounts=input_amounts,
+                                input_script_pubkeys=input_script_pubkeys,
+                                annex=annex, ext_flag=1,
+                                tap_leaf_hash=leaf_hash,
+                                codesep_pos=codesep_pos,
+                            )
+                        else:
+                            sh = default_sighash
+                    # SCHNORR_SIG_HASHTYPE: invalid hashtype byte or
+                    # SIGHASH_SINGLE-out-of-range (Core
+                    # interpreter.cpp:1738) → script error.
+                    if sh is None:
+                        raise ValueError(
+                            "OP_CHECKSIG: invalid Schnorr sighash type"
+                        )
                     if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
                         raise ValueError("OP_CHECKSIG: Schnorr verification failed")
                     stack.append(b"\x01")
@@ -1333,17 +1459,40 @@ class ScriptInterpreter:
                 sig = stack.pop()
 
                 if is_tapscript:
-                    if not sig or len(pubkey) == 0:
-                        raise ValueError("OP_CHECKSIGVERIFY failed in tapscript")
-                    # BIP-342 validation-weight budget: see CHECKSIG above
-                    # for the ordering rationale. CHECKSIGVERIFY shares
-                    # the same EvalChecksigTapscript path in Core.
-                    sigops_budget -= 50
-                    if sigops_budget < 0:
-                        raise ValueError("Tapscript sigops budget exceeded")
+                    # BIP 342 CHECKSIGVERIFY = CHECKSIG + VERIFY.  Mirrors
+                    # Core's EvalChecksigTapscript path
+                    # (interpreter.cpp:347-385), then aborts if
+                    # success=false.  Same ordering rules as CHECKSIG above:
+                    # empty-pubkey error AND discourage-upgradable-pubkeytype
+                    # check both fire even with empty sig.
+                    success = bool(sig)
+                    if success:
+                        sigops_budget -= 50
+                        if sigops_budget < 0:
+                            raise ValueError("Tapscript sigops budget exceeded")
+                    if len(pubkey) == 0:
+                        raise ValueError(
+                            "OP_CHECKSIGVERIFY: empty pubkey in tapscript"
+                        )
                     if len(pubkey) != 32:
-                        # Unknown pubkey type — succeed for forward compat
+                        if flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE:
+                            raise ValueError(
+                                "DISCOURAGE_UPGRADABLE_PUBKEYTYPE: "
+                                "non-32-byte pubkey in tapscript"
+                            )
+                        # Forward-compat success — but CHECKSIGVERIFY still
+                        # demands the underlying success=true, so an empty
+                        # sig must fail here even with unknown pubkey type.
+                        if not success:
+                            raise ValueError(
+                                "OP_CHECKSIGVERIFY failed in tapscript "
+                                "(empty sig, upgradable pubkey)"
+                            )
                         continue
+                    if not success:
+                        raise ValueError(
+                            "OP_CHECKSIGVERIFY failed in tapscript (empty sig)"
+                        )
                     sighash_type = 0x00
                     raw_sig = sig
                     if len(sig) == 65:
@@ -1353,12 +1502,34 @@ class ScriptInterpreter:
                             raise ValueError("Explicit 0x00 sighash in tapscript")
                     elif len(sig) != 64:
                         raise ValueError("Invalid Schnorr sig length")
-                    sh = default_sighash if sighash_type == 0x00 else self._compute_taproot_sighash(
-                        tx, input_index, sighash_type,
-                        input_amounts=input_amounts,
-                        input_script_pubkeys=input_script_pubkeys,
-                        annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
-                    )
+                    if sighash_type == 0x00:
+                        # SIGHASH_DEFAULT: recompute on the fly if a
+                        # CODESEPARATOR has executed, so the position is
+                        # committed (Core interpreter.cpp:1565).  No-op
+                        # otherwise.
+                        if codesep_pos != 0xFFFFFFFF:
+                            sh = self._compute_taproot_sighash(
+                                tx, input_index, 0x00,
+                                input_amounts=input_amounts,
+                                input_script_pubkeys=input_script_pubkeys,
+                                annex=annex, ext_flag=1,
+                                tap_leaf_hash=leaf_hash,
+                                codesep_pos=codesep_pos,
+                            )
+                        else:
+                            sh = default_sighash
+                    else:
+                        sh = self._compute_taproot_sighash(
+                            tx, input_index, sighash_type,
+                            input_amounts=input_amounts,
+                            input_script_pubkeys=input_script_pubkeys,
+                            annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
+                            codesep_pos=codesep_pos,
+                        )
+                    if sh is None:
+                        raise ValueError(
+                            "OP_CHECKSIGVERIFY: invalid Schnorr sighash type"
+                        )
                     if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
                         raise ValueError("OP_CHECKSIGVERIFY: Schnorr failed")
                     continue
@@ -1406,28 +1577,40 @@ class ScriptInterpreter:
                 if len(stack) < 3:
                     raise ValueError("OP_CHECKSIGADD: stack underflow")
                 pubkey = stack.pop()
-                n = self._read_num(stack.pop())
+                # BIP-342: the `n` operand has a strict 4-byte numeric
+                # bound (interpreter.cpp:1086-1094 — `CScriptNum(..., 4)`
+                # constructor errors on >4 bytes).  Forwards-compatibility:
+                # future soft-forks may widen the type.
+                num_bytes = stack.pop()
+                if len(num_bytes) > 4:
+                    raise ValueError("OP_CHECKSIGADD: n is not a valid CScriptNum")
+                n = self._read_num(num_bytes)
                 sig = stack.pop()
-                if not sig:
-                    # Empty sig: push n unchanged. Empty sigs do NOT
-                    # consume the BIP-342 validation-weight budget —
-                    # Core only decrements when `success = !sig.empty()`
-                    # (interpreter.cpp:357-366).
-                    stack.append(self._encode_script_num(n))
-                    continue
+
+                # BIP 342 CHECKSIGADD shares EvalChecksigTapscript with
+                # CHECKSIG.  Same ordering rules — see CHECKSIG above for
+                # the comment-block.
+                success = bool(sig)
+                if success:
+                    sigops_budget -= 50
+                    if sigops_budget < 0:
+                        raise ValueError("Tapscript sigops budget exceeded")
                 if len(pubkey) == 0:
-                    raise ValueError("OP_CHECKSIGADD: empty pubkey")
-                # BIP-342 validation-weight budget: decrement BEFORE
-                # pubkey inspection / Schnorr verify, gated on non-empty
-                # sig (already established above). Per Core, the
-                # unknown-pubkey-type forward-compat success path also
-                # consumes budget.
-                sigops_budget -= 50
-                if sigops_budget < 0:
-                    raise ValueError("Tapscript sigops budget exceeded")
+                    raise ValueError("OP_CHECKSIGADD: empty pubkey in tapscript")
                 if len(pubkey) != 32:
-                    # Unknown pubkey type — succeed for forward compat
-                    stack.append(self._encode_script_num(n + 1))
+                    if flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE:
+                        raise ValueError(
+                            "DISCOURAGE_UPGRADABLE_PUBKEYTYPE: "
+                            "non-32-byte pubkey in tapscript"
+                        )
+                    # Forward-compat: push n+1 on non-empty sig (would have
+                    # been a real Schnorr success), n unchanged on empty sig.
+                    stack.append(
+                        self._encode_script_num(n + 1 if success else n)
+                    )
+                    continue
+                if not success:
+                    stack.append(self._encode_script_num(n))
                     continue
                 sighash_type = 0x00
                 raw_sig = sig
@@ -1438,12 +1621,30 @@ class ScriptInterpreter:
                         raise ValueError("Explicit 0x00 sighash in tapscript")
                 elif len(sig) != 64:
                     raise ValueError("Invalid Schnorr sig length")
-                sh = default_sighash if sighash_type == 0x00 else self._compute_taproot_sighash(
-                    tx, input_index, sighash_type,
-                    input_amounts=input_amounts,
-                    input_script_pubkeys=input_script_pubkeys,
-                    annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
-                )
+                if sighash_type == 0x00:
+                    if codesep_pos != 0xFFFFFFFF:
+                        sh = self._compute_taproot_sighash(
+                            tx, input_index, 0x00,
+                            input_amounts=input_amounts,
+                            input_script_pubkeys=input_script_pubkeys,
+                            annex=annex, ext_flag=1,
+                            tap_leaf_hash=leaf_hash,
+                            codesep_pos=codesep_pos,
+                        )
+                    else:
+                        sh = default_sighash
+                else:
+                    sh = self._compute_taproot_sighash(
+                        tx, input_index, sighash_type,
+                        input_amounts=input_amounts,
+                        input_script_pubkeys=input_script_pubkeys,
+                        annex=annex, ext_flag=1, tap_leaf_hash=leaf_hash,
+                        codesep_pos=codesep_pos,
+                    )
+                if sh is None:
+                    raise ValueError(
+                        "OP_CHECKSIGADD: invalid Schnorr sighash type"
+                    )
                 if not self._verify_schnorr_signature(sh, raw_sig, pubkey):
                     raise ValueError("OP_CHECKSIGADD: Schnorr failed")
                 stack.append(self._encode_script_num(n + 1))
@@ -2073,6 +2274,11 @@ class ScriptInterpreter:
             annex=annex,
             ext_flag=0,
         )
+        # Invalid hashtype byte or SIGHASH_SINGLE-out-of-range — Core
+        # would surface SCRIPT_ERR_SCHNORR_SIG_HASHTYPE; we treat as
+        # verification failure.
+        if sighash is None:
+            return False
         return self._verify_schnorr_signature(sighash, sig, output_pubkey)
 
     def _verify_taproot_scriptpath(
@@ -2100,7 +2306,17 @@ class ScriptInterpreter:
         tap_script = witness[-2]
         script_inputs = witness[:-2]
 
-        if len(control_block) < 33 or (len(control_block) - 33) % 32 != 0:
+        # BIP-341 control-block geometry (interpreter.cpp:1970):
+        #   size in [33, 33 + 32*128] = [33, 4129], with (size - 33) % 32 == 0.
+        # The upper bound enforces the 128-deep Merkle path limit; without
+        # it an attacker can craft an arbitrarily-large control block to
+        # burn validator CPU on the Merkle walk before the tweak check fails.
+        if (
+            len(control_block) < TAPROOT_CONTROL_BASE_SIZE
+            or len(control_block) > TAPROOT_CONTROL_MAX_SIZE
+            or ((len(control_block) - TAPROOT_CONTROL_BASE_SIZE)
+                % TAPROOT_CONTROL_NODE_SIZE) != 0
+        ):
             return False
 
         leaf_version = control_block[0] & 0xfe
@@ -2273,8 +2489,24 @@ class ScriptInterpreter:
         ext_flag: int = 0,
         tap_leaf_hash: bytes | None = None,
         codesep_pos: int = 0xFFFFFFFF,
-    ) -> bytes:
-        """Compute the signature hash for a Taproot spend (BIP 341 §4)."""
+    ) -> bytes | None:
+        """Compute the signature hash for a Taproot spend (BIP 341 §4).
+
+        Returns the 32-byte TapSighash digest, or ``None`` if the inputs
+        violate a BIP-341 §"Common signature message" constraint.  Mirrors
+        Core's ``SignatureHashSchnorr`` (interpreter.cpp:1483-1570), which
+        returns ``false`` rather than throwing so the caller can map it to
+        ``SCRIPT_ERR_SCHNORR_SIG_HASHTYPE``.
+        """
+        # BIP-341: valid hash_type values are SIGHASH_DEFAULT (0x00),
+        # SIGHASH_{ALL,NONE,SINGLE} (0x01..0x03), and their ANYONECANPAY
+        # variants (0x81..0x83). Any other byte is invalid and Core
+        # rejects via SCRIPT_ERR_SCHNORR_SIG_HASHTYPE
+        # (interpreter.cpp:1516).
+        if not (sighash_type <= 0x03
+                or (0x81 <= sighash_type <= 0x83)):
+            return None
+
         # Determine hash type components
         anyone_can_pay = (sighash_type & 0x80) != 0
         base_type = sighash_type & 0x03  # 0=default/all, 1=all, 2=none, 3=single
@@ -2366,12 +2598,21 @@ class ScriptInterpreter:
         if base_type == 2:  # SIGHASH_NONE
             pass
         elif base_type == 3:  # SIGHASH_SINGLE
-            if input_index < len(tx.outputs):
-                out = tx.outputs[input_index]
-                out_data = struct.pack('<q', out.value) + self._ser_script_size(out.script_pubkey) + out.script_pubkey
-                data.extend(hashlib.sha256(out_data).digest())
-            else:
-                data.extend(b'\x00' * 32)
+            # BIP-341: SIGHASH_SINGLE with in_pos >= vout.size() is invalid
+            # (Core interpreter.cpp:1550 returns false; not the legacy
+            # "uint256(1)" bug). Surface as None so the caller can flag
+            # SCRIPT_ERR_SCHNORR_SIG_HASHTYPE.  Note that legacy SegWit-v0
+            # SIGHASH_SINGLE-out-of-range *does* sign the all-ones hash for
+            # historical reasons, but Taproot picked the saner semantics.
+            if input_index >= len(tx.outputs):
+                return None
+            out = tx.outputs[input_index]
+            out_data = (
+                struct.pack('<q', out.value)
+                + self._ser_script_size(out.script_pubkey)
+                + out.script_pubkey
+            )
+            data.extend(hashlib.sha256(out_data).digest())
 
         # Extension (script path)
         if ext_flag == 1 and tap_leaf_hash:
