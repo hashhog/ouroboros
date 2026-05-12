@@ -10106,13 +10106,55 @@ class RPCServer:
                     ),
                 )
 
+            # BUG-1: headers-chain presence check.
+            # Mirrors Core ActivateSnapshot (validation.cpp:5611-5615):
+            #   snapshot_start_block = m_blockman.LookupBlockIndex(base_blockhash);
+            #   if (!snapshot_start_block)
+            #       return Error{"The base block header must appear in the headers chain. ..."}
+            db_node = getattr(self.node, "db", None)
+            if db_node is not None and hasattr(db_node, "has_block_hash"):
+                if not db_node.has_block_hash(metadata.base_blockhash):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"The base block header ({metadata.base_blockhash_hex()}) "
+                            "must appear in the headers chain. Make sure all headers "
+                            "are syncing, and call loadtxoutset again"
+                        ),
+                    )
+
+            # BUG-2: mempool-empty precondition.
+            # Mirrors Core ActivateSnapshot (validation.cpp:5626-5629):
+            #   auto mempool{CurrentChainstate().GetMempool()};
+            #   if (mempool && mempool->size() > 0)
+            #       return Error{"Can't activate a snapshot when mempool not empty"};
+            mempool_node = getattr(self.node, "mempool", None)
+            if mempool_node is not None and len(mempool_node) > 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Can't activate a snapshot when mempool not empty",
+                )
+
+            # Collect active tip chainwork for BUG-3 check inside load_snapshot.
+            # Pass 0 (no-op) if we cannot determine it.
+            active_chainwork: int | None = None
+            if db_node is not None and hasattr(db_node, "get_best_block"):
+                try:
+                    tip_hash, tip_height = db_node.get_best_block()
+                    if hasattr(db_node, "get_block_chainwork"):
+                        cw = db_node.get_block_chainwork(tip_hash, tip_height)
+                        if cw > 0:
+                            active_chainwork = cw
+                except Exception:
+                    pass
+
             # Load the snapshot
             def progress_callback(loaded: int, total: int):
                 pass  # Could emit progress via ZMQ or websockets
 
             await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: sm.load_snapshot(path, progress_callback),
+                lambda: sm.load_snapshot(path, progress_callback, active_chainwork=active_chainwork),
             )
 
             # Start background validation
