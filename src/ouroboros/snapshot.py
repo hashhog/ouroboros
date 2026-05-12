@@ -44,6 +44,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+# MoneyRange upper bound: 21M BTC in satoshis (amount.h:MAX_MONEY).
+# Mirrors bitcoin-core/src/consensus/amount.h:
+#   static constexpr CAmount MAX_MONEY = 21'000'000 * COIN;
+_MAX_MONEY = 21_000_000 * 100_000_000  # 2,100,000,000,000,000 sat
+
 from .muhash import MuHash3072, coin_element
 
 logger = logging.getLogger(__name__)
@@ -870,6 +875,7 @@ class SnapshotManager:
         snapshot_path: str,
         progress_callback: Callable[[int, int], None] | None = None,
         strict: bool = True,
+        active_chainwork: int | None = None,
     ) -> SnapshotMetadata:
         """
         Load a UTXO snapshot from a file.
@@ -892,6 +898,13 @@ class SnapshotManager:
 
         The MuHash3072 path is the gettxoutsetinfo digest, NOT what
         loadtxoutset enforces -- see compute_utxo_hash(hash_type=...).
+
+        ``active_chainwork`` is the cumulative chainwork (as an integer) of
+        the active chainstate tip at the time of the call.  When provided,
+        load_snapshot enforces BUG-3: the snapshot's chainwork must strictly
+        exceed the active tip (mirrors Core's PopulateAndValidateSnapshot
+        early-exit at validation.cpp:5787-5789).  Pass ``None`` (default) to
+        skip this check (e.g. when the active tip has no known chainwork).
         """
         with open(snapshot_path, "rb") as f:
             metadata = _read_metadata_header(f, self.network)
@@ -905,6 +918,23 @@ class SnapshotManager:
                 )
 
             height = au_data.height if au_data else 0
+
+            # BUG-3: chainwork-exceeds-active-chainstate guard.
+            # Mirrors Core PopulateAndValidateSnapshot:
+            #   if (!CBlockIndexWorkComparator()(ActiveTip(), snapshot_start_block))
+            #       return Error{"Work does not exceed active chainstate"};
+            # (validation.cpp:5787-5789, also repeated in ActivateSnapshot:5706-5708)
+            # We check this when the caller supplied the active tip's chainwork
+            # AND the snapshot's chainwork is known from chainparams.
+            if active_chainwork is not None and au_data is not None and au_data.chainwork_hex is not None:
+                snapshot_chainwork = int(au_data.chainwork_hex, 16)
+                if snapshot_chainwork <= active_chainwork:
+                    raise ValueError(
+                        f"Snapshot chainwork ({au_data.chainwork_hex}) does not exceed "
+                        f"active chainstate work ({active_chainwork:#066x}); "
+                        "refusing to load snapshot"
+                    )
+
             logger.info(
                 f"[snapshot] Loading snapshot at height {height} with {metadata.coins_count:,} coins"
             )
@@ -934,6 +964,29 @@ class SnapshotManager:
                     vout = _read_compact_size(f)
                     coin_height, is_coinbase, amount, script = deserialize_coin(f)
 
+                    # BUG-4: per-coin height bound check.
+                    # Mirrors Core PopulateAndValidateSnapshot:
+                    #   if (coin.nHeight > base_height) return Error{...}
+                    # (validation.cpp:5814-5819)
+                    # Only enforced when we know base_height (i.e. au_data is set).
+                    if au_data is not None and coin_height > height:
+                        raise ValueError(
+                            f"Bad snapshot data after deserializing "
+                            f"{metadata.coins_count - coins_left} coins: "
+                            f"coin.height={coin_height} > base_height={height}"
+                        )
+
+                    # BUG-5: per-coin MoneyRange check.
+                    # Mirrors Core PopulateAndValidateSnapshot:
+                    #   if (!MoneyRange(coin.out.nValue)) return Error{...}
+                    # (validation.cpp:5820-5823)
+                    if amount < 0 or amount > _MAX_MONEY:
+                        raise ValueError(
+                            f"Bad snapshot data after deserializing "
+                            f"{metadata.coins_count - coins_left} coins - "
+                            f"bad tx out value: {amount}"
+                        )
+
                     self.db.add_utxo_raw(
                         txid=txid,
                         vout=vout,
@@ -959,6 +1012,19 @@ class SnapshotManager:
 
                     if progress_callback and coins_loaded % 100_000 == 0:
                         progress_callback(coins_loaded, metadata.coins_count)
+
+            # BUG-6: trailing-bytes EOF check.
+            # Mirrors Core PopulateAndValidateSnapshot (validation.cpp:5872-5883):
+            #   std::byte left_over_byte;
+            #   try { coins_file >> left_over_byte; }
+            #   catch (const std::ios_base::failure&) { out_of_coins = true; }
+            #   if (!out_of_coins) return Error{"Bad snapshot - coins left over"};
+            leftover = f.read(1)
+            if leftover:
+                raise ValueError(
+                    f"Bad snapshot - coins left over after deserializing "
+                    f"{metadata.coins_count} coins"
+                )
 
         # Strict commitment check (validation.cpp:5912-5914). Only enforced
         # when chainparams ship a hash for this snapshot height.

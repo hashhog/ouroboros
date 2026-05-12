@@ -248,44 +248,140 @@ class TestG3_HashSerialized:
 class TestG4_LoadtxoutsetPreconditions:
     """G4 — loadtxoutset must fail on missing-header, non-empty-mempool, bad-chainwork."""
 
-    def test_headers_chain_precondition_missing(self):
-        """BUG-1: ouroboros does NOT check that base block header is in headers chain.
+    def test_headers_chain_precondition_present(self, tmp_path):
+        """BUG-1 fixed: rpc_loadtxoutset rejects when base_blockhash absent from headers chain.
 
-        Core requires: snapshot_start_block = LookupBlockIndex(base_blockhash)
-        If null, error: "The base block header must appear in the headers chain."
-        Ouroboros skips this — xfail.
+        Core: snapshot_start_block = LookupBlockIndex(base_blockhash);
+              if (!snapshot_start_block) return Error{
+                  "The base block header must appear in the headers chain. ..."}
+        (validation.cpp:5611-5615)
+
+        Fix: rpc_loadtxoutset checks db.has_block_hash(base_blockhash) and returns
+        HTTP 400 if False.
         """
-        # We can only probe the Python code path; we test that the
-        # SnapshotManager.load_snapshot proceeds even when the snapshot hash
-        # is not in any local block index.  (That check would belong in the
-        # RPC handler before calling load_snapshot.)
-        # This test documents the MISSING gate: xfail because the node would
-        # accept a snapshot even if headers haven't synced to that block.
-        pytest.xfail(
-            "BUG-1: headers-chain presence check absent from loadtxoutset/load_snapshot"
-        )
+        import asyncio
+        from fastapi import HTTPException
+        from ouroboros.rpc import RPCServer
+        from ouroboros.snapshot import get_assumeutxo_data, _write_metadata_header
 
-    def test_mempool_empty_precondition_missing(self):
-        """BUG-2: no mempool-empty check before loadtxoutset.
+        au = get_assumeutxo_data("mainnet", 840_000)
+        assert au is not None
+
+        # Build a header-only snapshot at the known mainnet 840k hash.
+        snap_path = str(tmp_path / "snap.dat")
+        with open(snap_path, "wb") as f:
+            _write_metadata_header(f, "mainnet", au.block_hash, 0)
+
+        # Mock DB: has_block_hash returns False (headers not yet synced).
+        mock_db = MagicMock()
+        mock_db.has_block_hash.return_value = False
+
+        # Mock mempool: empty.
+        mock_mempool = MagicMock()
+        mock_mempool.__len__ = MagicMock(return_value=0)
+
+        mock_node = MagicMock()
+        mock_node.network = "mainnet"
+        mock_node.db = mock_db
+        mock_node.mempool = mock_mempool
+        mock_node.snapshot_manager = SnapshotManager(MagicMock(), "mainnet", str(tmp_path))
+
+        rpc = RPCServer.__new__(RPCServer)
+        rpc.node = mock_node
+
+        async def _call():
+            return await rpc.rpc_loadtxoutset(snap_path)
+
+        with pytest.raises(HTTPException) as excinfo:
+            asyncio.run(_call())
+
+        assert excinfo.value.status_code == 400
+        assert "must appear in the headers chain" in excinfo.value.detail
+
+    def test_mempool_empty_precondition_present(self, tmp_path):
+        """BUG-2 fixed: rpc_loadtxoutset rejects when mempool is non-empty.
 
         Core: if (mempool && mempool->size() > 0)
                   return Error{"Can't activate a snapshot when mempool not empty"};
-        Ouroboros: no such check.
-        """
-        pytest.xfail(
-            "BUG-2: mempool-empty precondition missing from rpc_loadtxoutset"
-        )
+        (validation.cpp:5626-5629)
 
-    def test_chainwork_exceeds_active_tip_precondition_missing(self):
-        """BUG-3: no chainwork-vs-active-tip comparison before populate.
+        Fix: rpc_loadtxoutset checks len(self.node.mempool) > 0 and returns HTTP 400.
+        """
+        import asyncio
+        from fastapi import HTTPException
+        from ouroboros.rpc import RPCServer
+        from ouroboros.snapshot import get_assumeutxo_data, _write_metadata_header
+
+        au = get_assumeutxo_data("mainnet", 840_000)
+        assert au is not None
+
+        snap_path = str(tmp_path / "snap.dat")
+        with open(snap_path, "wb") as f:
+            _write_metadata_header(f, "mainnet", au.block_hash, 0)
+
+        # Mock DB: has_block_hash returns True (headers synced).
+        mock_db = MagicMock()
+        mock_db.has_block_hash.return_value = True
+
+        # Mock mempool: non-empty (1 transaction).
+        mock_mempool = MagicMock()
+        mock_mempool.__len__ = MagicMock(return_value=1)
+
+        mock_node = MagicMock()
+        mock_node.network = "mainnet"
+        mock_node.db = mock_db
+        mock_node.mempool = mock_mempool
+        mock_node.snapshot_manager = SnapshotManager(MagicMock(), "mainnet", str(tmp_path))
+
+        rpc = RPCServer.__new__(RPCServer)
+        rpc.node = mock_node
+
+        async def _call():
+            return await rpc.rpc_loadtxoutset(snap_path)
+
+        with pytest.raises(HTTPException) as excinfo:
+            asyncio.run(_call())
+
+        assert excinfo.value.status_code == 400
+        assert "mempool not empty" in excinfo.value.detail
+
+    def test_chainwork_exceeds_active_tip_precondition_present(self, tmp_path):
+        """BUG-3 fixed: load_snapshot raises when snapshot chainwork <= active chainwork.
 
         Core: if (!CBlockIndexWorkComparator()(ActiveTip(), snapshot_start_block))
                   return Error{"Work does not exceed active chainstate"};
-        Ouroboros: load proceeds unconditionally.
+        (validation.cpp:5787-5789)
+
+        Fix: load_snapshot accepts active_chainwork kwarg and raises ValueError when
+        snapshot_chainwork <= active_chainwork (both known).
         """
-        pytest.xfail(
-            "BUG-3: chainwork-exceeds-active-chainstate check missing from load_snapshot"
-        )
+        au = get_assumeutxo_data("mainnet", 944_183)
+        assert au is not None
+        assert au.chainwork_hex is not None  # this entry has chainwork_hex
+
+        snapshot_chainwork = int(au.chainwork_hex, 16)
+
+        # Simulate an active tip that already has MORE chainwork than the snapshot.
+        # This should be rejected: the snapshot does not extend the active chain.
+        active_chainwork_higher = snapshot_chainwork + 1
+
+        mock_db = MagicMock()
+        mock_db.add_utxo_raw = MagicMock()
+        mock_db.update_best_block = MagicMock()
+        sm = SnapshotManager(mock_db, "mainnet", str(tmp_path))
+
+        # Build a valid-format 0-coin snapshot at the 944183 hash.
+        from ouroboros.snapshot import _write_metadata_header
+        snap_path = str(tmp_path / "snap944183.dat")
+        with open(snap_path, "wb") as f:
+            _write_metadata_header(f, "mainnet", au.block_hash, 0)
+
+        with pytest.raises(ValueError, match="does not exceed"):
+            sm.load_snapshot(snap_path, strict=False, active_chainwork=active_chainwork_higher)
+
+        # Equal chainwork also fails (must strictly EXCEED).
+        with pytest.raises(ValueError, match="does not exceed"):
+            sm.load_snapshot(snap_path, strict=False, active_chainwork=snapshot_chainwork)
 
 
 # ---------------------------------------------------------------------------
@@ -316,18 +412,22 @@ class TestG8_PerCoinValidation:
             serialize_coin(buf, height, is_cb, amount, script)
         return buf.getvalue()
 
-    def test_coin_height_gt_base_height_not_rejected(self, tmp_path):
-        """BUG-4: coin_height > base_height is silently accepted.
+    def test_coin_height_gt_base_height_rejected(self, tmp_path):
+        """BUG-4 fixed: coin_height > base_height raises ValueError.
 
         Core: if (coin.nHeight > base_height) return Error{...}
-        Ouroboros: no such check.
+        (validation.cpp:5814-5819)
+
+        Fix: load_snapshot checks coin_height > height (base_height from au_data)
+        and raises ValueError when the condition holds and au_data is available.
         """
-        # Build a regtest snapshot (base_height unknown, but coin at height=1000
-        # is clearly higher than a genesis-era snapshot).
-        base_hash = b"\x00" * 31 + b"\x01"
+        # Use a mainnet snapshot hash so au_data is resolved and height is known.
+        au = get_assumeutxo_data("mainnet", 840_000)
+        assert au is not None
+        # base_height = 840_000; coin at height=840_001 must be rejected.
         snap_bytes = self._make_snapshot_bytes(
-            "regtest", base_hash,
-            [(b"\xaa" * 32, 0, 1000, False, 1000, b"\x51")]
+            "mainnet", au.block_hash,
+            [(b"\xaa" * 32, 0, au.height + 1, False, 1000, b"\x51")]
         )
         snap_path = str(tmp_path / "snap_bad_height.dat")
         with open(snap_path, "wb") as f:
@@ -336,34 +436,100 @@ class TestG8_PerCoinValidation:
         mock_db = MagicMock()
         mock_db.add_utxo_raw = MagicMock()
         mock_db.update_best_block = MagicMock()
-        sm = SnapshotManager(mock_db, "regtest", str(tmp_path))
+        sm = SnapshotManager(mock_db, "mainnet", str(tmp_path))
 
-        # Per Core semantics this should raise because coin.height > base_height.
-        # Ouroboros silently accepts it (loads the UTXO without error).
-        sm.load_snapshot(snap_path, strict=False)
-        # If we reach here, ouroboros accepted the bad coin — that's the bug.
-        pytest.xfail("BUG-4: coin.height > base_height check missing from load_snapshot")
+        with pytest.raises(ValueError, match="coin.height"):
+            sm.load_snapshot(snap_path, strict=False)
 
-    def test_moneyrange_not_checked_per_coin(self):
-        """BUG-5: MoneyRange not validated per coin during load.
+    def test_moneyrange_checked_per_coin(self, tmp_path):
+        """BUG-5 fixed: amount > MAX_MONEY raises ValueError.
 
         Core: if (!MoneyRange(coin.out.nValue)) return Error{...}
-        Ouroboros: no such check.
-        """
-        pytest.xfail(
-            "BUG-5: MoneyRange check missing for each coin in load_snapshot"
-        )
+        (validation.cpp:5820-5823)
+        MAX_MONEY = 21_000_000 * 100_000_000 sat (amount.h).
 
-    def test_eof_trailing_bytes_not_checked(self):
-        """BUG-6: trailing bytes after last coin are not detected.
-
-        Core reads one extra byte after coins loop; if it succeeds, returns Error
-        "Bad snapshot - coins left over after deserializing N coins".
-        Ouroboros closes the file immediately after the loop with no EOF check.
+        Fix: load_snapshot rejects any coin with amount < 0 or amount > MAX_MONEY.
         """
-        pytest.xfail(
-            "BUG-6: no trailing-bytes EOF check after coins loop in load_snapshot"
+        # We use regtest (no au_data, so height check is skipped) but
+        # MoneyRange is unconditional.
+        base_hash = b"\x00" * 31 + b"\x01"
+
+        # Build snapshot manually: we cannot use serialize_coin directly for an
+        # over-range amount because decompress_amount would need to decode the
+        # compressed form — so we encode a coin at height=0 with a valid
+        # compressed amount first, then manually patch the file to make the
+        # decompressed amount exceed MAX_MONEY.
+        #
+        # Simpler: set amount = 0 (valid) for the coin header but encode a
+        # specially crafted VARINT that decompresses to MAX_MONEY + 1.
+        # MAX_MONEY + 1 = 2_100_000_000_000_001 sat.
+        # compress_amount(2_100_000_000_000_001) — calculate it.
+        from ouroboros.snapshot import compress_amount, decompress_amount, write_varint, _MAX_MONEY
+
+        over_amount = _MAX_MONEY + 1  # one satoshi over the cap
+        compressed_over = compress_amount(over_amount)
+        assert decompress_amount(compressed_over) == over_amount
+
+        buf = io.BytesIO()
+        buf.write(SNAPSHOT_MAGIC)
+        buf.write(struct.pack("<H", SNAPSHOT_VERSION))
+        buf.write(NETWORK_MAGIC["regtest"])
+        buf.write(base_hash)
+        buf.write(struct.pack("<Q", 1))    # coins_count = 1
+        buf.write(b"\xaa" * 32)            # txid
+        _write_compact_size(buf, 1)        # coins_per_txid
+        _write_compact_size(buf, 0)        # vout
+        # code: height=0, coinbase=False -> code=0
+        write_varint(buf, 0)
+        # amount: VARINT(compress_amount(MAX_MONEY + 1))
+        write_varint(buf, compressed_over)
+        # script: raw byte 0x51 (OP_1) as length-1 raw script
+        # nSize = 1 + N_SPECIAL_SCRIPTS = 7
+        write_varint(buf, 7)
+        buf.write(b"\x51")
+
+        snap_path = str(tmp_path / "snap_over_money.dat")
+        with open(snap_path, "wb") as f:
+            f.write(buf.getvalue())
+
+        mock_db = MagicMock()
+        mock_db.add_utxo_raw = MagicMock()
+        mock_db.update_best_block = MagicMock()
+        sm = SnapshotManager(mock_db, "regtest", str(tmp_path))
+
+        with pytest.raises(ValueError, match="bad tx out value"):
+            sm.load_snapshot(snap_path, strict=False)
+
+    def test_eof_trailing_bytes_rejected(self, tmp_path):
+        """BUG-6 fixed: trailing bytes after last coin raise ValueError.
+
+        Core (validation.cpp:5872-5883):
+            try { coins_file >> left_over_byte; }
+            catch (std::ios_base::failure&) { out_of_coins = true; }
+            if (!out_of_coins) return Error{"Bad snapshot - coins left over ..."};
+
+        Fix: load_snapshot reads one extra byte after the coins loop and raises
+        ValueError if any data remains.
+        """
+        base_hash = b"\x00" * 31 + b"\x01"
+        snap_bytes = self._make_snapshot_bytes(
+            "regtest", base_hash,
+            [(b"\xaa" * 32, 0, 0, False, 1000, b"\x51")]
         )
+        # Append a trailing garbage byte.
+        snap_bytes += b"\xff"
+
+        snap_path = str(tmp_path / "snap_trailing.dat")
+        with open(snap_path, "wb") as f:
+            f.write(snap_bytes)
+
+        mock_db = MagicMock()
+        mock_db.add_utxo_raw = MagicMock()
+        mock_db.update_best_block = MagicMock()
+        sm = SnapshotManager(mock_db, "regtest", str(tmp_path))
+
+        with pytest.raises(ValueError, match="coins left over"):
+            sm.load_snapshot(snap_path, strict=False)
 
 
 # ---------------------------------------------------------------------------
