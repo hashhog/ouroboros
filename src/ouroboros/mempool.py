@@ -1734,10 +1734,20 @@ class Mempool:
                     "vsize": 0, "reject_reason": "coinbase",
                 }
             with self._lock:
-                if txid in self.transactions:
+                # BIP-339 two-step duplicate detection (mirrors _add_transaction_inner).
+                try:
+                    wtxid = tx.get_wtxid()
+                except Exception:
+                    wtxid = txid
+                if wtxid in self.wtxid_to_txid:
                     return {
                         "accepted": False, "txid": txid, "fee": 0,
                         "vsize": 0, "reject_reason": "txn-already-in-mempool",
+                    }
+                if txid in self.transactions:
+                    return {
+                        "accepted": False, "txid": txid, "fee": 0,
+                        "vsize": 0, "reject_reason": "txn-same-nonwitness-data-in-mempool",
                     }
                 if self.require_standard:
                     is_std, reason = _is_standard_tx(tx)
@@ -1793,9 +1803,22 @@ class Mempool:
         ):
             return False, "coinbase"
 
-        # Check if already in mempool
+        # Check if already in mempool — BIP-339 two-step duplicate detection.
+        # Core validation.cpp (PreChecks):
+        #   if (m_pool.exists(GenTxid::Wtxid(wtxid)))
+        #       return state.Invalid(... "txn-already-in-mempool");
+        #   else if (m_pool.exists(GenTxid::Txid(txid)))
+        #       return state.Invalid(... "txn-same-nonwitness-data-in-mempool");
+        # The split matters: same wtxid → same tx already accepted; same txid but
+        # different wtxid → a stripped/malleated variant is already in the pool.
+        try:
+            wtxid = tx.get_wtxid()
+        except Exception:
+            wtxid = txid
+        if wtxid in self.wtxid_to_txid:
+            return False, "txn-already-in-mempool"
         if txid in self.transactions:
-            return False, "Already in mempool"
+            return False, "txn-same-nonwitness-data-in-mempool"
 
         # Already known as orphan
         if self.orphan_pool.has(txid):
