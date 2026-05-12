@@ -54,7 +54,7 @@ class _AlwaysOkValidator:
     def __init__(self, db: _StubDB) -> None:
         self.db = db
 
-    def validate_transaction(self, tx, height):
+    def validate_transaction(self, tx, height, *args, **kwargs):
         return True, ""
 
 

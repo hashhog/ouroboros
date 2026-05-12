@@ -1850,14 +1850,27 @@ class TransactionValidator:
         intra_block_utxos: dict | None = None,
         skip_scripts: bool = False,
         fees_out: list | None = None,
+        extra_script_flags: int = 0,
     ) -> tuple[bool, str]:
         """Validate *tx* at *height* (structure, inputs, locktime, scripts); returns ``(ok, error_message)``.
 
         When *skip_scripts* is True (assume-valid during IBD), signature and
         script verification is skipped.  UTXO existence, amounts, coinbase
         maturity, locktime, and BIP 68 checks are still enforced.
+
+        *extra_script_flags* is OR'd into the consensus flag set before script
+        verification.  Mempool callers pass the policy-only delta returned by
+        ``get_standard_script_flags() & ~get_flags_for_height()`` so that the
+        STANDARD verification flags (NULLFAIL, LOW_S, CLEANSTACK, MINIMALDATA,
+        MINIMALIF, WITNESS_PUBKEYTYPE, DISCOURAGE_UPGRADABLE_NOPS, etc.) are
+        enforced for relay acceptance.  Block validation passes 0 here so only
+        consensus-mandatory flags are enforced.  Mirrors Bitcoin Core's split
+        between STANDARD_SCRIPT_VERIFY_FLAGS (PolicyScriptChecks) and the
+        per-height MANDATORY_SCRIPT_VERIFY_FLAGS (ConsensusScriptChecks /
+        CheckInputScripts in ConnectBlock).
         """
         flags = get_flags_for_height(height, block_hash, self.network)
+        flags |= int(extra_script_flags)
 
         # 1. Check structure
         if not self._check_structure(tx):

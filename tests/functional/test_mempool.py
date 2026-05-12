@@ -72,8 +72,18 @@ class TestStandardness:
         assert ok, f"v3 should be standard: {reason}"
 
     def test_dust_output(self):
-        tx = _make_tx(output_value=1)
-        ok, reason = _is_standard_tx(tx)
+        # Bitcoin Core policy.cpp:158-162 permits up to MAX_DUST_OUTPUTS_PER_TX
+        # (=1) dust outputs.  A single dust output must pass the IsStandardTx
+        # gate; the additional fee-paying-dust rule is enforced separately by
+        # PreCheckEphemeralTx (validation.cpp:935-938) after the fee is known.
+        # See W96 audit.
+        tx_one_dust = _make_tx(output_value=1)
+        ok, reason = _is_standard_tx(tx_one_dust)
+        assert ok, f"one dust output should pass IsStandardTx: {reason}"
+
+        # Two dust outputs must be rejected.
+        tx_two_dust = _make_tx(output_value=1, n_outputs=2)
+        ok, reason = _is_standard_tx(tx_two_dust)
         assert not ok
         assert "dust" in reason.lower()
 
@@ -1015,10 +1025,13 @@ class TestEphemeralDust:
     # ── Test 4: non-v3 tx with dust is still rejected normally ──────
 
     def test_non_v3_dust_still_rejected(self):
-        """Non-v3 transactions with dust outputs should still be rejected
-        by the normal standardness check (no ephemeral dust exemption).
+        """Non-v3 transactions with >1 dust outputs should be rejected by
+        the IsStandardTx gate (MAX_DUST_OUTPUTS_PER_TX=1).  Single-dust
+        non-v3 txs are admitted by IsStandardTx; the fee-paying-dust
+        ephemeral-dust rule is enforced elsewhere (PreCheckEphemeralTx).
+        Updated for W96 audit (was: ≥1 dust → reject).
         """
-        tx = _make_tx(version=2, output_value=0)
+        tx = _make_tx(version=2, output_value=0, n_outputs=2)
         ok, reason = _is_standard_tx(tx)
         assert not ok
         assert "dust" in reason.lower()

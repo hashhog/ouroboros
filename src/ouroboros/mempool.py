@@ -84,6 +84,12 @@ EXTRA_DESCENDANT_TX_SIZE_LIMIT = 10_000
 # Ephemeral dust policy constants (Bitcoin Core policy/policy.h)
 MAX_DUST_OUTPUTS_PER_TX = 1  # Maximum number of dust outputs per transaction
 
+# MAX_P2SH_SIGOPS — Bitcoin Core policy/policy.h:42
+# Maximum number of sigops allowed in a P2SH redeem script that is being spent.
+# A standard-relay rule (not consensus): a P2SH input whose redeem script
+# would execute more than 15 sigops is rejected as non-standard.
+MAX_P2SH_SIGOPS = 15
+
 # Witness standardness constants (Bitcoin Core policy/policy.h + script/script.h + script/interpreter.h)
 MAX_STANDARD_P2WSH_SCRIPT_SIZE = 3600    # policy/policy.h
 MAX_STANDARD_P2WSH_STACK_ITEMS = 100     # policy/policy.h
@@ -1007,6 +1013,98 @@ def _compute_tx_sigop_cost(
     return cost
 
 
+def _validate_inputs_standardness(
+    tx: Transaction,
+    prev_scripts: dict[int, bytes],
+) -> tuple[bool, str]:
+    """Validate that every input spends a STANDARD prevout type and, for
+    P2SH inputs, that the redeem script does not exceed MAX_P2SH_SIGOPS sigops.
+
+    Mirrors Bitcoin Core policy/policy.cpp ValidateInputsStandardness
+    (lines 214-263), which is called from PreChecks (validation.cpp:897) when
+    ``require_standard`` is on.  Coinbase txs are exempt.
+
+    Gates enforced (Core parity, in order):
+      G1  Every spent prevScript must be a standard output type (Solver result
+          != NONSTANDARD).  Rejects spending of arbitrary scripts and
+          witness_unknown (anything but P2PKH / P2SH / P2WPKH / P2WSH / P2TR /
+          P2A / bare-multisig / OP_RETURN).
+      G2  WITNESS_UNKNOWN inputs (witness version 2..16 / non-standard program
+          length) are rejected even though they may be IsStandard.
+      G3  For P2SH inputs, the redeem script (last push of the scriptSig)
+          must not have more than MAX_P2SH_SIGOPS=15 accurately-counted sigops.
+          Note: the redeem script *itself* is what's executed under P2SH
+          rules; counting must be accurate (per-opcode + CHECKMULTISIG-N).
+
+    Args:
+        tx: The transaction being submitted.
+        prev_scripts: Mapping of input-index → prevout scriptPubKey.  Inputs
+            without a mapping (e.g., orphans) are skipped — the caller is
+            responsible for orphan handling.
+
+    Returns:
+        (ok, error_message).  error_message follows Core's
+        "bad-txns-nonstandard-inputs" debug strings.
+    """
+    if tx.is_coinbase:
+        return True, ""
+
+    for idx, tx_in in enumerate(tx.inputs):
+        prev_spk = prev_scripts.get(idx)
+        if prev_spk is None:
+            # No prevout resolved — caller must reject this earlier.  Skip
+            # rather than mis-report a standardness error.
+            continue
+        prev_spk = bytes(prev_spk)
+
+        # G1: prevScript type must be standard.  We treat
+        # _is_standard_output_type() as the Solver-equivalent: it returns
+        # True iff the script matches a known standard pattern (P2PKH, P2SH,
+        # P2WPKH, P2WSH, P2TR, P2A, bare multisig, OP_RETURN).
+        if not _is_standard_output_type(prev_spk):
+            # G2 cousin: a witness program with version != 0/1 and a 2..40
+            # byte program is technically IsStandard returning WITNESS_UNKNOWN
+            # in Core, which is also rejected here.  Since
+            # _is_standard_output_type() already returns False for
+            # witness_unknown (only OP_0 and OP_1 witness-program versions
+            # pass), this branch handles both G1 and G2.
+            wp = _get_witness_program(prev_spk)
+            if wp is not None:
+                ver, _prog = wp
+                return False, (
+                    f"bad-txns-nonstandard-inputs: input {idx} witness "
+                    f"program is undefined (witness version {ver})"
+                )
+            return False, (
+                f"bad-txns-nonstandard-inputs: input {idx} script unknown"
+            )
+
+        # G3: P2SH redeem-script sigop limit.
+        # P2SH detection: 23 bytes, OP_HASH160 <20> OP_EQUAL.
+        if len(prev_spk) == 23 and prev_spk[0] == 0xa9 and prev_spk[22] == 0x87:
+            # Extract the redeem script: it's the last data push of scriptSig.
+            # Core uses EvalScript(stack, scriptSig, SCRIPT_VERIFY_NONE) to
+            # derive the full stack; we just take the last push, which is
+            # what Core does anyway for the redeem script.
+            redeem = _get_last_push(tx_in.script_sig)
+            if redeem is None:
+                return False, (
+                    f"bad-txns-nonstandard-inputs: input {idx} P2SH "
+                    f"redeemscript missing"
+                )
+            # Count sigops in the redeem script accurately (CHECKMULTISIG
+            # counts as N when preceded by OP_1..OP_16, else 20).
+            redeem_sigops = _count_legacy_sigops(redeem, accurate=True)
+            if redeem_sigops > MAX_P2SH_SIGOPS:
+                return False, (
+                    f"bad-txns-nonstandard-inputs: input {idx} P2SH "
+                    f"redeemscript sigops {redeem_sigops} > "
+                    f"{MAX_P2SH_SIGOPS} (MAX_P2SH_SIGOPS)"
+                )
+
+    return True, ""
+
+
 def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
     """Check transaction standardness against Bitcoin Core policy gates.
 
@@ -1071,14 +1169,23 @@ def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
                     f"{MAX_OP_RETURN_RELAY} (datacarrier)"
                 )
 
-    # Gate 8: dust check for non-v3 transactions.
-    # v3 transactions use ephemeral dust rules checked separately in
-    # _add_transaction_inner (individual-submission rejection) or package
-    # validation.
+    # Gate 8: dust output cap.
+    # Reference: Bitcoin Core policy/policy.cpp IsStandardTx() lines 158-162:
+    #   if (GetDust(tx, dust_relay_fee).size() > MAX_DUST_OUTPUTS_PER_TX) → "dust"
+    # MAX_DUST_OUTPUTS_PER_TX = 1.  Up to one dust output is allowed at this
+    # gate; the additional rule that a fee-paying tx may not have any dust
+    # output is enforced separately by PreCheckEphemeralTx after the fee is
+    # known (called from _add_transaction_inner).  v3 transactions submitted
+    # individually are rejected earlier in _add_transaction_inner.
+    # Prior to this fix this gate rejected any tx with one or more dust
+    # outputs, which is stricter than Core (Core allows exactly one).
     if tx.version != 3:
         dust_indices = _has_ephemeral_dust(tx)
-        if dust_indices:
-            return False, f"Transaction has {len(dust_indices)} dust output(s)"
+        if len(dust_indices) > MAX_DUST_OUTPUTS_PER_TX:
+            return False, (
+                f"dust: {len(dust_indices)} dust output(s) exceeds "
+                f"MAX_DUST_OUTPUTS_PER_TX ({MAX_DUST_OUTPUTS_PER_TX})"
+            )
 
     return True, ""
 
@@ -1611,7 +1718,21 @@ class Mempool:
         txid = tx.get_txid()
 
         if test_accept:
-            # Dry-run: check if it would be accepted without modifying state
+            # Dry-run: check if it would be accepted without modifying state.
+            # Coinbase txs are never accepted into the mempool, regardless of
+            # other gates — mirrors Core PreChecks (validation.cpp:802-804).
+            # We use Core's definition (prev_txid is null AND prev_vout ==
+            # 0xFFFFFFFF) rather than Transaction.is_coinbase to avoid false
+            # positives on test fixtures that use zero-prefixed txids.
+            if (
+                len(tx.inputs) == 1
+                and tx.inputs[0].prev_txid == bytes(32)
+                and tx.inputs[0].prev_vout == 0xFFFFFFFF
+            ):
+                return {
+                    "accepted": False, "txid": txid, "fee": 0,
+                    "vsize": 0, "reject_reason": "coinbase",
+                }
             with self._lock:
                 if txid in self.transactions:
                     return {
@@ -1650,6 +1771,28 @@ class Mempool:
         """Unlocked implementation of add_transaction."""
         txid = tx.get_txid()
 
+        # Coinbase rejection — a coinbase tx is only valid inside a block, never
+        # as a loose mempool tx.  Mirrors Bitcoin Core PreChecks (validation.cpp
+        # lines 802-804):
+        #   if (tx.IsCoinBase())
+        #       return state.Invalid(TX_CONSENSUS, "coinbase");
+        # Without this gate, a malicious peer could replay block coinbases into
+        # the mempool — they would not pass full consensus (no prior UTXO) but
+        # could still consume CPU / orphan-pool slots before being rejected
+        # downstream.
+        # Core's CTransaction::IsCoinBase() (primitives/transaction.h:323):
+        #   vin.size() == 1 && vin[0].prevout.IsNull()
+        # where COutPoint::IsNull() = (hash.IsNull() && n == 0xFFFFFFFF).  We
+        # check both prev_txid == null and prev_vout == 0xFFFFFFFF here rather
+        # than relying on Transaction.is_coinbase (which only checks prev_txid;
+        # see tests using zero txids that are NOT coinbases for that reason).
+        if (
+            len(tx.inputs) == 1
+            and tx.inputs[0].prev_txid == bytes(32)
+            and tx.inputs[0].prev_vout == 0xFFFFFFFF
+        ):
+            return False, "coinbase"
+
         # Check if already in mempool
         if txid in self.transactions:
             return False, "Already in mempool"
@@ -1686,16 +1829,13 @@ class Mempool:
             self.orphan_pool.add(tx, missing_parents)
             return False, "orphan"
 
-        # Witness standardness check (policy, not consensus).
-        # Mirrors Bitcoin Core IsWitnessStandard() (policy/policy.cpp lines 265-352).
-        # Must run after the orphan check so all prevScripts are resolvable.
+        # Build the prevScripts map once — used both by ValidateInputsStandardness
+        # and IsWitnessStandard.  Resolve from chain UTXO first, then in-mempool
+        # parents.  Must run after the orphan check so all prevScripts are
+        # resolvable.
         if self.require_standard:
             prevscripts: dict[int, bytes] = {}
             for idx, tx_in in enumerate(tx.inputs):
-                witness = tx_in.witness
-                if not witness:
-                    continue
-                # Resolve prevScript: chain UTXO first, then in-mempool parent.
                 utxo = self.validator.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
                 if utxo is not None:
                     prevscripts[idx] = utxo["script_pubkey"]
@@ -1706,9 +1846,21 @@ class Mempool:
                             prevscripts[idx] = parent_entry.tx.outputs[tx_in.prev_vout].script_pubkey
                         except IndexError:
                             pass  # malformed parent; consensus check will catch it
-            is_ws, ws_reason = _is_witness_standard(tx, prevscripts)
-            if not is_ws:
-                return False, f"Non-standard transaction: {ws_reason}"
+
+            # Input-side standardness — every prevout type must be standard
+            # and P2SH redeem scripts must respect MAX_P2SH_SIGOPS.  Mirrors
+            # Core's ValidateInputsStandardness (validation.cpp:897).
+            iv_ok, iv_reason = _validate_inputs_standardness(tx, prevscripts)
+            if not iv_ok:
+                return False, iv_reason
+
+            # IsWitnessStandard — mirrors Bitcoin Core IsWitnessStandard()
+            # (policy/policy.cpp lines 265-352).  Only invoked when the tx has
+            # witness data (Core: `tx.HasWitness() && require_standard`).
+            if any(tx_in.witness for tx_in in tx.inputs):
+                is_ws, ws_reason = _is_witness_standard(tx, prevscripts)
+                if not is_ws:
+                    return False, f"Non-standard transaction: {ws_reason}"
 
         # Per-transaction sigop cost limit (mempool policy, not consensus).
         # Reference: Bitcoin Core validation.cpp AcceptToMemoryPoolWorker:908-943
@@ -1737,20 +1889,67 @@ class Mempool:
                     f"MAX_STANDARD_TX_SIGOPS_COST ({MAX_STANDARD_TX_SIGOPS_COST})"
                 )
 
-        # Validate transaction (consensus).
-        # BIP-113: after CSV activation the locktime cutoff for mempool acceptance
-        # is the MTP of the chain tip (Core validation.cpp:152-166).
-        # Before CSV Core uses the tip's nTime; after CSV it uses MTP.
-        # We always use MTP here (conservative: MTP <= nTime, so any tx passing
-        # MTP also passes nTime) — matches Core's AcceptToMemoryPool path which
-        # calls IsFinalTx with active_chain_tip.GetMedianTimePast() regardless
-        # of CSV activation (validation.cpp:164).  That is, Core uses MTP for
-        # mempool acceptance unconditionally (not gated on CSV).
+        # Validate transaction (consensus + standard policy flags).
+        #
+        # Mempool holds txs for the NEXT block, so locktime / BIP-68 / BIP-65 /
+        # BIP-112 must be evaluated at height = tip_height + 1.  Mirrors Core's
+        # CheckFinalTxAtTip (validation.cpp:147-167):
+        #   const int nBlockHeight = active_chain_tip.nHeight + 1;
+        #   const int64_t nBlockTime = active_chain_tip.GetMedianTimePast();
+        # The MTP used by BIP-113 is the *tip's* MTP (i.e. the prev block of the
+        # next block), not the candidate's MTP.
+        #
+        # Prior to this fix the caller passed best_height (the tip height) which
+        # made every nLockTime / nSequence boundary tx evaluated 1 short.
+        # E.g. a tx with nLockTime == tip_height + 1 (i.e. valid in the very
+        # next block) was rejected as "not final".
+        next_height = height + 1
         try:
             mempool_mtp: int = self.validator.db.get_median_time_past(height) or 0
         except Exception:
             mempool_mtp = 0
-        valid, error = self.validator.validate_transaction(tx, height, mempool_mtp)
+
+        # STANDARD_SCRIPT_VERIFY_FLAGS — extra policy flags that mempool/relay
+        # enforces beyond the per-height consensus flags.  Mirrors Core's
+        # PolicyScriptChecks (validation.cpp:1135-1156) which calls
+        # CheckInputScripts with STANDARD_SCRIPT_VERIFY_FLAGS.  Block validation
+        # uses only the consensus flags via CheckInputScripts in ConnectBlock.
+        # Computed as the standard-set minus the consensus-set so we only OR in
+        # the policy-only delta (NULLFAIL, LOW_S, CLEANSTACK, SIGPUSHONLY,
+        # MINIMALDATA, MINIMALIF, WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE,
+        # DISCOURAGE_UPGRADABLE_NOPS, DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
+        # DISCOURAGE_OP_SUCCESS).
+        extra_flags = 0
+        if self.require_standard:
+            try:
+                from ouroboros.script import (
+                    get_flags_for_height as _consensus_flags,
+                    get_standard_script_flags as _standard_flags,
+                )
+                consensus = _consensus_flags(next_height, None, self.validator.network if hasattr(self.validator, "network") else "mainnet")
+                standard = _standard_flags(next_height, None, self.validator.network if hasattr(self.validator, "network") else "mainnet")
+                # Bitmask delta — only the standard-only bits.
+                extra_flags = (standard & ~consensus)
+            except Exception:
+                # Test doubles may not implement the script module; fall back
+                # to consensus-only verification (current behavior).
+                extra_flags = 0
+
+        try:
+            valid, error = self.validator.validate_transaction(
+                tx, next_height, mempool_mtp, extra_script_flags=extra_flags,
+            )
+        except TypeError:
+            # Older test doubles do not implement the extra_script_flags
+            # parameter — fall back through progressively simpler signatures.
+            try:
+                valid, error = self.validator.validate_transaction(
+                    tx, next_height, mempool_mtp,
+                )
+            except TypeError:
+                valid, error = self.validator.validate_transaction(
+                    tx, next_height,
+                )
         if not valid:
             return False, error
 
@@ -1846,6 +2045,21 @@ class Mempool:
 
         if fee < 0:
             return False, "Negative fee"
+
+        # PreCheckEphemeralTx — a non-zero-fee transaction may not have dust
+        # outputs (the dust output must be CPFP'd by a child in a package).
+        # Mirrors Bitcoin Core PreCheckEphemeralTx (policy/ephemeral_policy.cpp:23-31)
+        # which is called from PreChecks at validation.cpp:935-938.  Core gates
+        # this on require_standard; we match that.  Note that this is in addition
+        # to the IsStandardTx gate that already enforces MAX_DUST_OUTPUTS_PER_TX
+        # (≤ 1 dust output).  v3 txs with dust have already been rejected above.
+        if self.require_standard and fee != 0:
+            dust_indices = _has_ephemeral_dust(tx)
+            if dust_indices:
+                return False, (
+                    f"dust: tx with dust output at index(es) {dust_indices} "
+                    f"must be 0-fee (got {fee} sat)"
+                )
 
         # fee_rate uses the sigop-adjusted vsize, matching Core's CFeeRate which
         # calls GetTxSize() = GetVirtualTransactionSize(weight, sigopCost, nBytesPerSigOp).
