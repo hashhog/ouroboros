@@ -735,11 +735,21 @@ class V2Handshake:
     derive a 32-byte shared secret via ``secp256k1_ellswift_xdh`` with
     the BIP 324 hash function.  The shared secret feeds the BIP 324
     HKDF key schedule; see ``BIP324Cipher.from_secrets``.
+
+    Key material (``_private_key``, ``_aux_rand``) is stored as
+    ``bytearray`` so it can be zeroed in-place and released after the
+    ECDH completes.  This mirrors ``bitcoin-core/src/bip324.cpp:67-70``
+    (``memory_cleanse`` on ecdh_secret, hkdf_32_okm, hkdf, and m_key).
+    Python bytes are immutable and cannot be zeroed; bytearrays are not.
     """
     initiator: bool = True
     network: str = "mainnet"
-    _private_key: bytes = field(default_factory=_generate_secret_key)
-    _aux_rand: bytes = field(default_factory=lambda: os.urandom(32), repr=False)
+    _private_key: bytearray | None = field(
+        default_factory=lambda: bytearray(_generate_secret_key())
+    )
+    _aux_rand: bytearray | None = field(
+        default_factory=lambda: bytearray(os.urandom(32)), repr=False
+    )
     _local_eswift: bytes = field(default=b"", repr=False)
     _remote_eswift: bytes = field(default=b"", repr=False)
     _shared_secret: bytes | None = None
@@ -747,7 +757,7 @@ class V2Handshake:
     def __post_init__(self):
         if not self._local_eswift:
             self._local_eswift = secp256k1_ellswift_create(
-                self._private_key, self._aux_rand
+                bytes(self._private_key), bytes(self._aux_rand)
             )
 
     @property
@@ -761,14 +771,34 @@ class V2Handshake:
             raise ValueError("Remote ElligatorSwift key must be 64 bytes")
         self._remote_eswift = remote_eswift
         self._derive_shared_secret()
+        self._cleanse_key_material()
 
     def _derive_shared_secret(self) -> None:
         self._shared_secret = secp256k1_ellswift_xdh(
             self._local_eswift,
             self._remote_eswift,
-            self._private_key,
+            bytes(self._private_key),
             self.initiator,
         )
+
+    def _cleanse_key_material(self) -> None:
+        """Zero and release ephemeral private key and aux randomness.
+
+        Mirrors ``bitcoin-core/src/bip324.cpp:67-70``:
+        ``memory_cleanse(ecdh_secret), memory_cleanse(hkdf_32_okm),
+        memory_cleanse(&hkdf), m_key = CKey()``.
+
+        Python's allocator may have already copied the bytearray contents
+        into intermediate buffers during ECDH; this zeroing is best-effort
+        but substantially better than retaining the live secret on the heap
+        indefinitely.
+        """
+        if self._private_key is not None:
+            self._private_key[:] = b"\x00" * len(self._private_key)
+            self._private_key = None
+        if self._aux_rand is not None:
+            self._aux_rand[:] = b"\x00" * len(self._aux_rand)
+            self._aux_rand = None
 
     @property
     def shared_secret(self) -> bytes:
