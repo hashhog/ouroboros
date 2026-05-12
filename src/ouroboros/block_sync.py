@@ -368,6 +368,11 @@ class BlockSync:
         self._perm_rejected_order: list[bytes] = []
         self._perm_rejected_max: int = 10000
         self._blk_perm_rejected_dropped: int = 0
+        # Track which peer (as "host:port" string) delivered each buffered block
+        # so the drain loop can score Misbehaving(100) against the right peer when
+        # it finds BLOCK_MUTATED or BLOCK_INVALID_HEADER.  Entry cleared on
+        # successful connect or on permanent rejection.
+        self._block_source_peer_addr: dict[bytes, str] = {}
         # Fire WARN once per _wedge_warn_every if no-advance > _wedge_warn_after.
         self._wedge_warn_after: float = 300.0
         self._wedge_warn_every: float = 300.0
@@ -493,6 +498,7 @@ class BlockSync:
         self._ibd_block_buffer.clear()
         self.requested_blocks.clear()
         self._block_request_peer.clear()
+        self._block_source_peer_addr.clear()
         # Reset the header-sync stall timer so sync_loop picks a fresh
         # header sync peer immediately rather than waiting out the previous
         # peer's stall window.
@@ -908,6 +914,7 @@ class BlockSync:
             # actually needs to validate/connect this block.
             if len(self._ibd_block_buffer) < self._max_ibd_buffer:
                 self._ibd_block_buffer[block_hash] = (None, payload)
+                self._block_source_peer_addr[block_hash] = f"{peer.host}:{peer.port}"
                 self._blk_buffered += 1
             else:
                 self._blk_buffer_full += 1
@@ -987,6 +994,7 @@ class BlockSync:
             self._ibd_block_buffer.clear()
             self.requested_blocks.clear()
             self._block_request_peer.clear()
+            self._block_source_peer_addr.clear()
             self._header_sync_peer = None
             self._header_sync_time = 0.0
             self._w91_last_drain_exit_perf_ns = time.perf_counter_ns()
@@ -1270,7 +1278,26 @@ class BlockSync:
                     self._ibd_block_buffer[next_hash] = (block, raw_payload)
                 else:
                     self._mark_perm_rejected(next_hash)
+                    # G16/G17 (W99): Bitcoin Core's ProcessNewBlock calls
+                    # Misbehaving(100) for BLOCK_MUTATED (merkle tree with
+                    # duplicate txids) and BLOCK_INVALID_HEADER (bad PoW,
+                    # bad prev-hash, bad bits, etc.).  Score the delivering
+                    # peer so the ban manager can disconnect and ban it.
+                    # Ref: net_processing.cpp — ProcessNewBlock path.
+                    _misbehav_errors = ("Invalid merkle root", "Invalid header")
+                    if error.startswith(_misbehav_errors):
+                        _src_addr = self._block_source_peer_addr.get(next_hash)
+                        if _src_addr and hasattr(self.peer_manager, "misbehaving"):
+                            from ouroboros.banman import SCORE_INVALID_BLOCK
+                            self.peer_manager.misbehaving(
+                                _src_addr, SCORE_INVALID_BLOCK,
+                                f"BLOCK_MUTATED/INVALID_HEADER: {error[:80]}"
+                            )
+                    self._block_source_peer_addr.pop(next_hash, None)
                 break
+
+            # Clear peer-address tracking for successfully accepted block
+            self._block_source_peer_addr.pop(next_hash, None)
 
             # Connect block
             t_con = time.perf_counter_ns()

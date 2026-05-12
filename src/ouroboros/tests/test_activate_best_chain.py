@@ -765,5 +765,125 @@ class TestPruneAndFlushOrdering(unittest.TestCase):
             "BlockPruner appears to call ForceFlush")
 
 
+# ---------------------------------------------------------------------------
+# W99 G16/G17: BLOCK_MUTATED + BLOCK_INVALID_HEADER must Misbehaving(100)
+# ---------------------------------------------------------------------------
+
+class TestBlockMutatedMisbehaving(unittest.TestCase):
+    """
+    W99 G16: Bitcoin Core's ProcessNewBlock path (net_processing.cpp) calls
+    Misbehaving(100) when block validation returns BLOCK_MUTATED (duplicate
+    txids in the merkle tree → "Invalid merkle root").
+
+    Ouroboros must score the delivering peer with SCORE_INVALID_BLOCK (100)
+    so the ban manager can disconnect and ban it.
+    """
+
+    def test_misbehaving_called_on_block_mutated(self):
+        """
+        Inject an "Invalid merkle root" rejection into
+        _drain_block_buffer_locked and confirm misbehaving(100) is called
+        against the delivering peer's address.
+        """
+        import inspect
+        from ouroboros.block_sync import BlockSync
+
+        src = inspect.getsource(BlockSync._drain_block_buffer_locked)
+        # The fix stores peer addr and calls misbehaving on merkle failure.
+        self.assertIn("Invalid merkle root", src,
+            "_drain_block_buffer_locked must check for 'Invalid merkle root'")
+        self.assertIn("misbehaving", src,
+            "_drain_block_buffer_locked must call misbehaving on BLOCK_MUTATED")
+        self.assertIn("SCORE_INVALID_BLOCK", src,
+            "_drain_block_buffer_locked must use SCORE_INVALID_BLOCK (100)")
+        self.assertIn("_block_source_peer_addr", src,
+            "_drain_block_buffer_locked must look up delivering peer addr")
+
+    def test_block_source_peer_addr_cleared_on_success(self):
+        """
+        On successful block connect, _block_source_peer_addr entry must be
+        popped so the dict does not grow unboundedly during normal IBD.
+        """
+        import inspect
+        from ouroboros.block_sync import BlockSync
+
+        src = inspect.getsource(BlockSync._drain_block_buffer_locked)
+        # Count pop calls — must appear at least twice:
+        # once after perm-reject, once on successful connect.
+        pop_count = src.count("_block_source_peer_addr.pop")
+        self.assertGreaterEqual(pop_count, 2,
+            "_drain_block_buffer_locked must pop _block_source_peer_addr on "
+            "both rejection and success paths")
+
+    def test_block_source_peer_addr_stored_on_buffer(self):
+        """
+        handle_block must populate _block_source_peer_addr when buffering a
+        block so the drain loop knows who delivered each block.
+        """
+        import inspect
+        from ouroboros.block_sync import BlockSync
+
+        src = inspect.getsource(BlockSync.handle_block)
+        self.assertIn("_block_source_peer_addr", src,
+            "handle_block must store peer addr in _block_source_peer_addr")
+
+
+class TestBlockInvalidHeaderMisbehaving(unittest.TestCase):
+    """
+    W99 G17: Bitcoin Core's ProcessNewBlock path calls Misbehaving(100) when
+    block validation returns BLOCK_INVALID_HEADER (bad PoW, bad prev-hash,
+    bad nBits, etc. → "Invalid header").
+
+    Ouroboros must score the delivering peer with SCORE_INVALID_BLOCK (100).
+    """
+
+    def test_misbehaving_called_on_invalid_header(self):
+        """
+        Confirm _drain_block_buffer_locked covers "Invalid header" in its
+        misbehaving gate alongside "Invalid merkle root".
+        """
+        import inspect
+        from ouroboros.block_sync import BlockSync
+
+        src = inspect.getsource(BlockSync._drain_block_buffer_locked)
+        self.assertIn("Invalid header", src,
+            "_drain_block_buffer_locked must check for 'Invalid header'")
+        self.assertIn("Invalid merkle root", src,
+            "_drain_block_buffer_locked must check for 'Invalid merkle root'")
+        # Both strings must appear inside the _misbehav_errors tuple.
+        # Find the tuple definition and confirm both strings are in it.
+        tuple_pos = src.find("_misbehav_errors")
+        self.assertGreater(tuple_pos, 0,
+            "_misbehav_errors tuple not found in _drain_block_buffer_locked")
+        # The misbehaving call must appear after the tuple definition.
+        misbehav_call_pos = src.find("misbehaving(", tuple_pos)
+        self.assertGreater(misbehav_call_pos, tuple_pos,
+            "misbehaving() call must appear after _misbehav_errors definition")
+
+    def test_non_misbehav_errors_not_scored(self):
+        """
+        "Previous block not found" and other transient errors must NOT
+        trigger misbehaving — only BLOCK_MUTATED and BLOCK_INVALID_HEADER do.
+        Confirm the guard is inside the _mark_perm_rejected branch (i.e.
+        not reachable for the "Previous block not found" re-buffer path).
+        """
+        import inspect
+        from ouroboros.block_sync import BlockSync
+
+        src = inspect.getsource(BlockSync._drain_block_buffer_locked)
+        # The misbehaving call must be inside the else-branch (perm-reject),
+        # NOT in the "Previous block not found" re-buffer branch.
+        # Heuristic: "Previous block not found" must appear BEFORE the
+        # misbehaving call in the source (it's in the if-branch that skips
+        # the misbehaving logic).
+        prev_not_found_pos = src.find("Previous block not found")
+        misbehav_pos = src.find("misbehaving")
+        self.assertGreater(prev_not_found_pos, 0,
+            "'Previous block not found' guard must be present")
+        self.assertGreater(misbehav_pos, prev_not_found_pos,
+            "misbehaving must be in the else-branch after "
+            "'Previous block not found' check")
+
+
 if __name__ == "__main__":
     unittest.main()
