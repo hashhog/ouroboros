@@ -811,7 +811,8 @@ class BitcoinNode:
                     return
                 try:
                     from ouroboros.p2p_messages import (
-                        MSG_WITNESS_TX,
+                        INV_TYPE_TX,
+                        MSG_WTX,
                         InvMessage,
                         TxMessage,
                     )
@@ -830,18 +831,17 @@ class BitcoinNode:
                         )
                     elif success:
                         txid = tx.get_txid()
+                        wtxid = tx.get_wtxid()
                         logger.info(
                             f"Added transaction {txid.hex()[:16]}... to mempool"
                         )
                         if self.zmq_publisher:
                             self.zmq_publisher.notify_transaction(tx)
 
-                        # Relay INV to all peers except the sender
+                        # Relay INV to all peers except the sender.
+                        # BIP-339: wtxid-relay peers get MSG_WTX(5)+wtxid;
+                        # legacy peers get MSG_TX(1)+txid.
                         if hasattr(self, "peer_manager") and self.peer_manager:
-                            inv = InvMessage(
-                                inventory=[(MSG_WITNESS_TX, txid)]
-                            )
-                            inv_msg = inv.to_network_message(self.network)
                             # Convert mempool fee rate (sat/vB) to sat/kB for
                             # comparison against BIP 133 feefilter values.
                             entry = self.mempool.transactions.get(txid)
@@ -855,7 +855,17 @@ class BitcoinNode:
                                     if p.peer_feefilter > tx_feerate_per_kb:
                                         continue
                                     try:
-                                        await p.send_message(inv_msg)
+                                        if getattr(p, "wtxid_relay", False):
+                                            inv = InvMessage(
+                                                inventory=[(MSG_WTX, wtxid)]
+                                            )
+                                        else:
+                                            inv = InvMessage(
+                                                inventory=[(INV_TYPE_TX, txid)]
+                                            )
+                                        await p.send_message(
+                                            inv.to_network_message(self.network)
+                                        )
                                     except Exception:
                                         pass
                     else:
