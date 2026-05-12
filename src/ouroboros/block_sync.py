@@ -102,6 +102,7 @@ from ouroboros.p2p_messages import (
     InvMessage,
     NetworkMessage,
 )
+from ouroboros.config import MIN_BLOCKS_TO_KEEP
 from ouroboros.peer import Peer
 from ouroboros.validation import SIG_CACHE, BlockValidator
 
@@ -866,6 +867,36 @@ class BlockSync:
                 )
                 peer.adjust_score(-5)
                 return
+
+            # G19c fTooFarAhead gate (Bitcoin Core validation.cpp:4325-4350):
+            # Unrequested blocks claiming a height more than MIN_BLOCKS_TO_KEEP
+            # (288) above the active tip are silently dropped.  Without this
+            # gate a peer can fill _ibd_block_buffer with blocks at heights
+            # millions above tip, wasting memory and CPU.
+            # Only applied to unrequested blocks — requested blocks (those we
+            # explicitly fetched via getdata) are always buffered regardless of
+            # their position relative to tip, mirroring Core's `if (!fRequested)`
+            # guard condition.
+            if not was_requested:
+                _, active_height = self.db.get_best_block()
+                # Determine the claimed height from the validated-header queue.
+                # Slot 0 is tip+1, slot 1 is tip+2, etc.
+                claimed_height: int | None = None
+                for _idx, (_bh, _) in enumerate(self._validated_headers):
+                    if _bh == block_hash:
+                        claimed_height = active_height + 1 + _idx
+                        break
+                if (
+                    claimed_height is not None
+                    and claimed_height > active_height + MIN_BLOCKS_TO_KEEP
+                ):
+                    logger.debug(
+                        f"fTooFarAhead: dropping unrequested block "
+                        f"{block_hash.hex()[:16]}... claimed_height={claimed_height} "
+                        f"active_height={active_height} limit={active_height + MIN_BLOCKS_TO_KEEP} "
+                        f"from {peer.host}:{peer.port}"
+                    )
+                    return
 
             # Buffer the raw payload (keyed by hash) for sequential
             # processing.  `None` sentinel means "not yet deserialized" —
