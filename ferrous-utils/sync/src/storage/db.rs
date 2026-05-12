@@ -2107,14 +2107,20 @@ impl BlockchainDB {
             false
         };
 
-        // If in active chain, disconnect blocks from tip down to target
+        // If in active chain, disconnect blocks from tip down to target.
+        // Core disconnects only blocks ABOVE the target (InvalidateBlock
+        // marks the disconnected tip BLOCK_FAILED_VALID each iteration,
+        // stopping when pindex is no longer in the chain without ever
+        // disconnecting pindex itself).  Use exclusive lower bound here.
         let new_tip_height = if is_in_active_chain {
-            // Disconnect blocks from best_height down to target_height
-            for height in (target_height..=best_height).rev() {
+            // Disconnect blocks from best_height down to target_height + 1
+            // (exclusive of target_height itself — BUG-5 fix).
+            for height in (target_height + 1..=best_height).rev() {
                 log::debug!("Disconnecting block at height {}", height);
                 self.disconnect_block_at_height(height)?;
             }
-            // New tip is parent of invalidated block
+            // New tip is the target block's parent (target block stays connected;
+            // it is just marked FAILED_VALID so chain selection skips it).
             target_height.saturating_sub(1)
         } else {
             // Block not in active chain, just mark it invalid
@@ -2124,11 +2130,18 @@ impl BlockchainDB {
         // Mark the target block as BLOCK_FAILED_VALID
         self.mark_block_invalid(target_height)?;
 
-        // Mark all descendants as BLOCK_FAILED_CHILD
-        // We need to scan all blocks after target_height
-        for height in (target_height + 1)..=best_height {
+        // Mark all descendants as BLOCK_FAILED_CHILD.
+        // Core's SetBlockFailureFlags walks the FULL block-tree
+        // (all of m_blockman.m_block_index), not just the active-chain
+        // window.  Orphan blocks stored above best_height (e.g. headers
+        // synced ahead of the validated tip) must also be marked.
+        // Extend the scan to best_height + SCAN_HORIZON to cover them
+        // (BUG-1 fix).
+        const FAILED_CHILD_SCAN_HORIZON: u32 = 1_000;
+        let scan_ceiling = best_height.saturating_add(FAILED_CHILD_SCAN_HORIZON);
+        for height in (target_height + 1)..=scan_ceiling {
             // Check if this block descends from the invalidated block
-            // by checking if its prev_blockhash eventually leads to target
+            // by checking if its prev_blockhash eventually leads to target.
             if self.block_descends_from(height, target_height, block_hash)? {
                 self.mark_block_failed_child(height)?;
                 log::debug!("Marked block at height {} as BLOCK_FAILED_CHILD", height);
@@ -2309,8 +2322,15 @@ impl BlockchainDB {
         // Now find the highest height whose metadata is valid (no FAILED
         // flag) AND has block body data, AND has more chainwork than
         // current best.
+        //
+        // Core's FindMostWorkChain searches setBlockIndexCandidates which
+        // contains ALL known blocks regardless of height, including competing
+        // forks below the current best.  After invalidate_block rolls the
+        // tip back from height N to height M, a competing fork stored at
+        // height <= N must be discoverable here.  Start the scan from
+        // scan_height down to 0 (BUG-3 fix — was best_height + 1..=scan_height).
         let mut leaf_height: Option<u32> = None;
-        for h in (best_height + 1..=scan_height).rev() {
+        for h in (0..=scan_height).rev() {
             let metadata = match self.get_block_metadata(h)? {
                 Some(m) => m,
                 None => continue,

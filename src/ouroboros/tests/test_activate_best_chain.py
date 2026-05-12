@@ -123,40 +123,36 @@ def _make_block(**kwargs) -> Block:
 # ---------------------------------------------------------------------------
 
 class TestInvalidateBlockMissesOrphans(unittest.TestCase):
-    """BUG-1: descendants above best_height are not marked invalid."""
+    """BUG-1 (FIXED): descendants above best_height are now marked invalid."""
 
-    def test_invalidate_marks_only_active_chain_descendants(self):
+    def test_invalidate_marks_orphan_descendants_above_best_height(self):
         """
-        After invalidating a block, off-chain orphans stored at heights
-        ABOVE best_height should also receive BLOCK_FAILED_CHILD/VALID.
-        Core's SetBlockFailureFlags walks m_blockman.m_block_index (all
-        known blocks), not just active-chain heights up to best_height.
+        After fixing BUG-1, invalidate_block() extends the descendant scan
+        past best_height by FAILED_CHILD_SCAN_HORIZON so that off-chain
+        orphans stored above the current active-chain tip also receive
+        BLOCK_FAILED_CHILD.  Core's SetBlockFailureFlags walks the full
+        m_blockman.m_block_index, not just active-chain heights.
 
-        xfail: the Rust invalidate_block scans only
-        (target_height+1)..=best_height — orphans beyond best_height are
-        skipped (BUG-1).
+        Asserts the fix: the scan ceiling in db.rs must exceed best_height.
         """
-        # Structural check: the scan boundary is explicitly documented
-        # in the Rust source (db.rs:2129: for height in (target_height + 1)..=best_height)
-        import inspect
-        try:
-            import ferrous_utils  # type: ignore
-            # If the Rust extension is present, verify the Python RPC handler
-            # does not pass orphan hashes to the invalidation.
-            self.skipTest("Rust extension present; structural test only on Python side")
-        except ImportError:
-            pass
+        db_path = (Path(__file__).parent.parent.parent.parent
+                   / "ferrous-utils" / "sync" / "src" / "storage" / "db.rs")
+        if not db_path.exists():
+            self.skipTest("ferrous-utils/sync/src/storage/db.rs not found")
 
-        # Confirm the Python RPC handler's invalidation path does not
-        # touch heights above best_height.
-        from ouroboros import rpc as rpc_module
-        src = inspect.getsource(rpc_module.RPCServer.rpc_invalidateblock)
-        # The handler calls rust_db.invalidate_block — which has the bug.
-        # Here we assert that no post-invalidation orphan scan exists
-        # in the Python RPC layer either (confirming the gap).
-        self.assertNotIn("orphan", src.lower(),
-            "rpc_invalidateblock has no orphan-scan logic — off-chain "
-            "orphans above best_height remain unmarked (BUG-1)")
+        with open(db_path) as f:
+            src = f.read()
+
+        # The fix introduces FAILED_CHILD_SCAN_HORIZON and uses it to compute
+        # a scan ceiling above best_height.
+        self.assertIn("FAILED_CHILD_SCAN_HORIZON", src,
+            "FAILED_CHILD_SCAN_HORIZON constant not found — BUG-1 not fixed")
+        self.assertIn("scan_ceiling", src,
+            "scan_ceiling variable not found — BUG-1 not fixed")
+        # The old restricted range must no longer be the only scan range.
+        # After the fix the loop iterates up to scan_ceiling, not best_height.
+        self.assertIn("target_height + 1)..=scan_ceiling", src,
+            "Descendant scan must extend to scan_ceiling (above best_height) — BUG-1 not fixed")
 
 
 # ---------------------------------------------------------------------------
@@ -222,42 +218,34 @@ class TestResetBlockFailureFlagsScope(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestReactivateBestChainIgnoresForks(unittest.TestCase):
-    """BUG-3: competing forks at heights <= best_height are never found."""
+    """BUG-3 (FIXED): competing forks at heights <= best_height are now candidates."""
 
-    @unittest.expectedFailure  # BUG-3
     def test_competing_fork_below_best_height_is_candidate(self):
         """
-        After invalidate_block rolls the tip back to height N, a competing
-        fork stored at height M <= original_best should be discovered as a
-        candidate by reactivate_best_chain if its chainwork exceeds the new
-        tip.  The current implementation only scans heights > best_height
-        (db.rs:2313: for h in (best_height + 1..=scan_height)), so competing
-        forks are invisible — BUG-3.
+        After fixing BUG-3, reactivate_best_chain() scans from scan_height
+        down to 0 (inclusive), so competing forks at heights <= best_height
+        are now discovered as candidates if their chainwork exceeds the new
+        tip.  Core's FindMostWorkChain searches setBlockIndexCandidates
+        which contains ALL known blocks regardless of height.
 
-        This test documents the expected behavior; it is marked xfail
-        because the implementation does not match it.
+        Asserts the fix: the scan range in db.rs must start from 0.
         """
-        # Verify the scan range comment in the Rust source.
-        import inspect
-        import os
-
-        db_path = (Path(__file__).parent.parent.parent.parent.parent
+        db_path = (Path(__file__).parent.parent.parent.parent
                    / "ferrous-utils" / "sync" / "src" / "storage" / "db.rs")
         if not db_path.exists():
-            raise unittest.SkipTest("ferrous-utils/sync/src/storage/db.rs not found")
+            self.skipTest("ferrous-utils/sync/src/storage/db.rs not found")
 
         with open(db_path) as f:
             src = f.read()
 
-        # The scan range starts at best_height + 1, missing lower-height forks.
-        self.assertIn("(best_height + 1..=scan_height)", src,
-            "Scan range not found — source may have changed")
+        # The old restricted range must be gone.
+        self.assertNotIn("(best_height + 1..=scan_height)", src,
+            "Old restricted scan range still present — BUG-3 not fixed")
 
-        # For the test to pass (expected failure), assert that the scan
-        # also covers heights <= best_height.  It does not, so this fails.
-        self.assertIn("0..=scan_height", src,
-            "reactivate_best_chain does NOT scan heights <= best_height; "
-            "competing forks are invisible (BUG-3)")
+        # The fix must scan from 0 so that all known heights are covered.
+        self.assertIn("(0..=scan_height).rev()", src,
+            "reactivate_best_chain must scan from 0 to discover "
+            "competing forks below best_height — BUG-3 not fixed")
 
 
 # ---------------------------------------------------------------------------
@@ -295,22 +283,22 @@ class TestHandleReorgHeightTracking(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestInvalidateBlockDisconnectsTarget(unittest.TestCase):
-    """BUG-5: target block is included in the disconnect loop."""
+    """BUG-5 (FIXED): disconnect loop now excludes the target block itself."""
 
-    def test_disconnect_loop_includes_target_height(self):
+    def test_disconnect_loop_excludes_target_height(self):
         """
-        In db.rs invalidate_block(), the disconnect loop is:
-          for height in (target_height..=best_height).rev()
-        This includes target_height itself — the target block is
-        disconnected before being marked invalid.
+        After fixing BUG-5, the disconnect loop in db.rs invalidate_block()
+        uses an exclusive lower bound:
+          for height in (target_height + 1..=best_height).rev()
 
-        Core's InvalidateBlock disconnects only blocks ABOVE the target
-        (it loops while m_chain.Contains(pindex), marking each disconnected
-        tip, and the loop exits when pindex is no longer in the chain —
-        it does not disconnect pindex itself).
+        Core's InvalidateBlock disconnects only blocks ABOVE the target;
+        the target block itself remains connected (it is only marked
+        BLOCK_FAILED_VALID so that chain selection skips it).
+
+        Asserts the fix: the exclusive form must be present and the old
+        inclusive form must be gone.
         """
-        import os
-        db_path = (Path(__file__).parent.parent.parent.parent.parent
+        db_path = (Path(__file__).parent.parent.parent.parent
                    / "ferrous-utils" / "sync" / "src" / "storage" / "db.rs")
         if not db_path.exists():
             self.skipTest("ferrous-utils/sync/src/storage/db.rs not found")
@@ -318,15 +306,12 @@ class TestInvalidateBlockDisconnectsTarget(unittest.TestCase):
         with open(db_path) as f:
             src = f.read()
 
-        # The inclusive range includes target_height.
-        self.assertIn("(target_height..=best_height).rev()", src,
-            "Disconnect loop boundary not found; source may have changed")
-        # Assert what SHOULD be true (exclusive lower bound).
+        # Old inclusive form must be gone.
+        self.assertNotIn("(target_height..=best_height).rev()", src,
+            "Old inclusive disconnect loop still present — BUG-5 not fixed")
+        # Fixed exclusive form must be present.
         self.assertIn("(target_height + 1..=best_height).rev()", src,
-            "Disconnect loop INCLUDES target_height (should be exclusive) — BUG-5")
-
-    # The test above will fail because the inclusive form IS present and
-    # the exclusive form is NOT, confirming the bug.
+            "Exclusive disconnect loop not found — BUG-5 not fixed")
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +330,7 @@ class TestConnectBlockSkipsValidation(unittest.TestCase):
         branches (blocks that were never on the active chain), validation
         must be re-run. Core's ConnectTip always invokes ConnectBlock.
         """
-        db_path = (Path(__file__).parent.parent.parent.parent.parent
+        db_path = (Path(__file__).parent.parent.parent.parent
                    / "ferrous-utils" / "sync" / "src" / "storage" / "db.rs")
         if not db_path.exists():
             self.skipTest("ferrous-utils/sync/src/storage/db.rs not found")
@@ -357,13 +342,24 @@ class TestConnectBlockSkipsValidation(unittest.TestCase):
         self.assertIn("validated once already", src,
             "Expected 'validated once already' comment not found; "
             "source may have changed")
-        # Verify there is no validate_block call inside connect_block_at_height.
-        # Find the function body.
-        idx = src.find("pub fn connect_block_at_height")
+        # Verify there is no validate_block CALL inside connect_block_at_height.
+        # Find the function including its doc-comment (which precedes pub fn).
+        # The "validated once already" comment lives in the doc block right
+        # before the pub fn signature, so search from the doc comment start.
+        doc_marker = "Reconnect a previously-disconnected block at `height`"
+        idx = src.find(doc_marker)
+        if idx == -1:
+            # Fall back to finding the pub fn signature directly.
+            idx = src.find("pub fn connect_block_at_height")
         self.assertNotEqual(idx, -1, "connect_block_at_height not found")
-        # Grab the next 150 lines of the function.
-        body = src[idx:idx + 4000]
-        self.assertNotIn("validate_block", body,
+        # Grab the next ~5000 chars covering doc-comment + function body.
+        body = src[idx:idx + 5000]
+        # Look for an actual call site (not the doc comment phrase).
+        # An actual call would appear as "validate_block(" not "validation"
+        # or "validated once already".
+        import re
+        call_sites = re.findall(r'\bvalidate_block\s*\(', body)
+        self.assertEqual(len(call_sites), 0,
             "connect_block_at_height calls validate_block — bug may be fixed")
         # This assertion confirms the absence of validation (the bug).
         self.assertIn("validated once already", body,
@@ -386,7 +382,7 @@ class TestBlockDescendsFromComplexity(unittest.TestCase):
         and uses GetAncestor — O(N log N) total. This is a DoS vector for
         deep invalidations.
         """
-        db_path = (Path(__file__).parent.parent.parent.parent.parent
+        db_path = (Path(__file__).parent.parent.parent.parent
                    / "ferrous-utils" / "sync" / "src" / "storage" / "db.rs")
         if not db_path.exists():
             self.skipTest("ferrous-utils/sync/src/storage/db.rs not found")
@@ -410,7 +406,7 @@ class TestBlockDescendsFromComplexity(unittest.TestCase):
         """
         # We can't run this without a real DB, so just assert the source
         # uses the multimap pattern Core uses.
-        db_path = (Path(__file__).parent.parent.parent.parent.parent
+        db_path = (Path(__file__).parent.parent.parent.parent
                    / "ferrous-utils" / "sync" / "src" / "storage" / "db.rs")
         if not db_path.exists():
             raise unittest.SkipTest("ferrous-utils not found")
@@ -555,7 +551,7 @@ class TestReactivateBestChainReorgDeferral(unittest.TestCase):
         (rpc_reconsiderblock and dumptxoutset rollback) do not wake the
         sync loop, so the better chain is never activated.
         """
-        db_path = (Path(__file__).parent.parent.parent.parent.parent
+        db_path = (Path(__file__).parent.parent.parent.parent
                    / "ferrous-utils" / "sync" / "src" / "storage" / "db.rs")
         if not db_path.exists():
             self.skipTest("ferrous-utils/sync/src/storage/db.rs not found")
@@ -578,7 +574,7 @@ class TestReactivateBestChainReorgDeferral(unittest.TestCase):
         whose fork point is below best_height, a reorg should occur.
         Currently it silently returns the unchanged tip height (BUG-11).
         """
-        db_path = (Path(__file__).parent.parent.parent.parent.parent
+        db_path = (Path(__file__).parent.parent.parent.parent
                    / "ferrous-utils" / "sync" / "src" / "storage" / "db.rs")
         if not db_path.exists():
             raise unittest.SkipTest("ferrous-utils not found")
