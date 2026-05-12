@@ -316,34 +316,129 @@ class TestG7ContextualCheckBlockHeader:
 
 
 class TestG8MinimumChainWork:
-    """G8 — min_pow_checked → 'too-little-chainwork' / BLOCK_HEADER_LOW_WORK."""
+    """G8 — min_pow_checked → 'too-little-chainwork' / BLOCK_HEADER_LOW_WORK.
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="W97 audit G8 (CRITICAL DOS): Python handle_headers does NOT "
-        "enforce nMinimumChainWork. validate_minimum_chain_work exists in "
-        "Rust (ferrous-utils/sync/src/validate/header.rs:361) and is "
-        "advertised in config.py:444, but is NEVER called from Python. "
-        "PyHeadersSyncState (block_sync.py:1701) tracks cumulative work "
-        "but its result.success boolean drops the presync state rather than "
-        "rejecting individual headers below threshold. A peer can therefore "
-        "feed up to 50,000 well-formed-PoW low-work headers (mainnet "
-        "starting bits) and have all of them appended to _validated_headers "
-        "and forwarded to other peers via header-announce. Core's "
-        "AcceptBlockHeader returns BLOCK_HEADER_LOW_WORK and 'too-little-"
-        "chainwork' at validation.cpp:4223-4225.",
-    )
-    def test_minimum_chain_work_enforced_in_handle_headers(self):
-        assert False, "G8: nMinimumChainWork not wired into Python header path"
+    Fix: handle_headers now accepts ``min_pow_checked`` (default True).
+    The raw P2P handler (_make_headers_handler) passes ``min_pow_checked=False``
+    so G8 fires for un-presync'd headers.  The check accumulates work from
+    ``bits`` across the validated-headers queue and rejects batches below
+    ``nMinimumChainWork`` (``_sync_module.get_minimum_chain_work``).
+
+    Core canonical: validation.cpp:4229
+        if (!min_pow_checked) return state.Invalid(BLOCK_HEADER_LOW_WORK,
+                                                   "too-little-chainwork");
+    """
+
+    @pytest.mark.asyncio
+    async def test_low_work_batch_rejected_when_min_pow_checked_false(self):
+        """When ``min_pow_checked=False``, a batch of regtest-bits headers
+        (bits=0x207fffff, near-zero work) must be rejected with a
+        misbehaviour call and the headers must NOT be queued.
+
+        The conftest mock returns ``get_minimum_chain_work("mainnet")`` as
+        the mainnet minimum (a large hex value), so any regtest-work batch
+        falls below the threshold.
+        """
+        tip = b"\x11" * 32
+        # Use mainnet network so the minimum chain work is nonzero
+        bs = _make_block_sync(tip_hash=tip, tip_height=100, network="mainnet")
+        peer = _make_peer()
+
+        h1 = _valid_header_extending(tip, bits=REGTEST_BITS)
+
+        msg = NetworkMessage(
+            command="headers",
+            payload=HeadersMessage(headers=[h1]).serialize_payload(),
+            magic=0,
+        )
+        await bs.handle_headers(msg, peer, min_pow_checked=False)
+
+        # G8: low-work batch must be rejected and NOT queued.
+        assert len(bs._validated_headers) == 0, (
+            "G8: low-work header must not be queued when min_pow_checked=False"
+        )
+        # Misbehaviour must fire.
+        peer.adjust_score.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_low_work_batch_accepted_when_min_pow_checked_true(self):
+        """When ``min_pow_checked=True`` (PRESYNC path), the G8 work check
+        is bypassed and regtest-bits headers ARE queued — the presync state
+        machine is the primary anti-DoS defense on that path.
+
+        Core equivalent: ``ProcessNewBlockHeaders(..., min_pow_checked=true)``
+        (net_processing.cpp:3082) after PRESYNC has validated cumulative work.
+        """
+        tip = b"\x11" * 32
+        bs = _make_block_sync(tip_hash=tip, tip_height=100, network="mainnet")
+        peer = _make_peer()
+
+        h1 = _valid_header_extending(tip, bits=REGTEST_BITS)
+
+        msg = NetworkMessage(
+            command="headers",
+            payload=HeadersMessage(headers=[h1]).serialize_payload(),
+            magic=0,
+        )
+        await bs.handle_headers(msg, peer, min_pow_checked=True)
+
+        # PRESYNC path: header must be queued regardless of work.
+        assert len(bs._validated_headers) == 1, (
+            "G8: min_pow_checked=True must bypass the work gate and queue the header"
+        )
+
+    @pytest.mark.asyncio
+    async def test_regtest_low_work_passes_on_regtest_network(self):
+        """On regtest the minimum chain work is 0 (all-zeros hex), so the G8
+        gate does NOT reject any batch — every regtest PoW header passes.
+
+        This covers the regtest smoke-harness / test-suite use-case where
+        ``min_pow_checked=False`` is passed but the network has
+        nMinimumChainWork == 0.
+        """
+        tip = b"\x11" * 32
+        bs = _make_block_sync(tip_hash=tip, tip_height=0, network="regtest")
+        peer = _make_peer()
+
+        h1 = _valid_header_extending(tip, bits=REGTEST_BITS)
+
+        msg = NetworkMessage(
+            command="headers",
+            payload=HeadersMessage(headers=[h1]).serialize_payload(),
+            magic=0,
+        )
+        await bs.handle_headers(msg, peer, min_pow_checked=False)
+
+        # regtest nMinimumChainWork == 0: gate is a no-op, header is queued.
+        assert len(bs._validated_headers) == 1, (
+            "G8: regtest has nMinimumChainWork=0, no batch should be rejected"
+        )
 
     def test_rust_minimum_chain_work_helper_exists(self):
-        """The Rust helper is defined; the bug is that it's not wired from
-        Python.  Test pins down the API surface so it isn't accidentally
-        removed before the wiring lands."""
+        """The Rust helper ``validate_minimum_chain_work`` exists in
+        ``ferrous-utils/sync/src/validate/header.rs:361`` and the Python
+        bridge ``ChainParams.get_minimum_chain_work`` delegates to the same
+        Rust symbol via ``_sync_module.get_minimum_chain_work``.
+        This test pins the API surface so it isn't accidentally removed.
+        """
         import inspect
         from ouroboros.config import ChainParams
         src = inspect.getsource(ChainParams.get_minimum_chain_work)
         assert "minimum_chain_work" in src
+
+    def test_make_headers_handler_passes_min_pow_checked_false(self):
+        """The raw P2P handler created by ``_make_headers_handler`` must
+        call ``handle_headers`` with ``min_pow_checked=False``.
+
+        This pins the wiring so a future refactor cannot silently revert
+        to the dead-helper state (bug: always True / omitted).
+        """
+        import inspect
+        src = inspect.getsource(BlockSync._make_headers_handler)
+        assert "min_pow_checked=False" in src, (
+            "G8: _make_headers_handler must pass min_pow_checked=False "
+            "so the G8 nMinimumChainWork gate fires for raw P2P headers"
+        )
 
 
 class TestG9AddToBlockIndex:
