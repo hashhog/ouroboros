@@ -76,7 +76,7 @@ class _StubValidator:
     def __init__(self, utxos: dict):
         self.db = _StubDB(utxos)
 
-    def validate_transaction(self, tx, height, block_mtp=0):
+    def validate_transaction(self, tx, height, block_mtp=0, **kwargs):
         return True, ""
 
 
