@@ -512,5 +512,155 @@ class TestOrderingRegression:
         assert ok, f"unexpected reject: {reason}"
 
 
+# ---------------------------------------------------------------------------
+# G14, G15 — BIP-339 wtxid/txid duplicate-detection split (W96)
+# ---------------------------------------------------------------------------
+
+
+def _make_segwit_tx(
+    txid: bytes,
+    inputs: list,
+    outputs: list,
+    *,
+    witness_item: bytes = b"\x51",
+) -> Transaction:
+    """Build a segwit Transaction with a single witness stack item."""
+    import hashlib
+
+    tx_inputs = [
+        TxIn(
+            prev_txid=pt,
+            prev_vout=pv,
+            script_sig=ss,
+            sequence=seq,
+            witness=[witness_item],
+        )
+        for pt, pv, ss, seq in inputs
+    ]
+    tx_outputs = [TxOut(value=v, script_pubkey=spk) for v, spk in outputs]
+    tx = Transaction(
+        txid=txid,
+        version=2,
+        locktime=0,
+        inputs=tx_inputs,
+        outputs=tx_outputs,
+        has_witness=True,
+    )
+    # Recompute txid from the *non-witness* serialisation so txid != wtxid.
+    body = tx.serialize()
+    tx.txid = hashlib.sha256(hashlib.sha256(body).digest()).digest()
+    return tx
+
+
+class TestWtxidDuplicateDetection:
+    """BIP-339 two-step duplicate check (W96 fix).
+
+    Bitcoin Core PreChecks (validation.cpp):
+        if (m_pool.exists(GenTxid::Wtxid(wtxid)))
+            return state.Invalid(... "txn-already-in-mempool");
+        else if (m_pool.exists(GenTxid::Txid(txid)))
+            return state.Invalid(... "txn-same-nonwitness-data-in-mempool");
+
+    Before this fix ouroboros collapsed both to a single txid check returning
+    "Already in mempool" — the wtxid-first path was absent.
+    """
+
+    def _pool_with_utxo(self, seed: int = 70) -> tuple["Mempool", bytes, bytes]:
+        utxo_id = _txid(seed)
+        utxos = {
+            (utxo_id, 0): {
+                "value": 1_000_000,
+                "script_pubkey": _p2pkh(),
+                "height": 50,
+                "is_coinbase": False,
+            }
+        }
+        pool = _pool(utxos=utxos, mtp=1_700_000_000, require_standard=False)
+        return pool, utxo_id
+
+    def test_exact_wtxid_match_returns_txn_already_in_mempool(self) -> None:
+        """Re-submitting the same segwit tx (same wtxid) must yield
+        'txn-already-in-mempool', not any other string."""
+        pool, utxo_id = self._pool_with_utxo(70)
+
+        tx = _make_segwit_tx(
+            _txid(70),
+            inputs=[(utxo_id, 0, b"\x00" * 64, 0xFFFFFFFD)],
+            outputs=[(900_000, _p2pkh(seed=11))],
+        )
+        ok, _ = pool.add_transaction(tx, height=200)
+        assert ok, "first insertion must succeed"
+
+        ok2, reason2 = pool.add_transaction(tx, height=200)
+        assert not ok2
+        assert reason2 == "txn-already-in-mempool", (
+            f"expected 'txn-already-in-mempool', got {reason2!r}"
+        )
+
+    def test_same_txid_different_witness_returns_same_nonwitness_data(self) -> None:
+        """A tx with the same txid but different witness (different wtxid)
+        must yield 'txn-same-nonwitness-data-in-mempool'."""
+        import hashlib
+
+        pool, utxo_id = self._pool_with_utxo(71)
+
+        # tx_a: segwit with witness_item = b'\x51'
+        tx_a = _make_segwit_tx(
+            _txid(71),
+            inputs=[(utxo_id, 0, b"\x00" * 64, 0xFFFFFFFD)],
+            outputs=[(900_000, _p2pkh(seed=12))],
+            witness_item=b"\x51",
+        )
+        ok, _ = pool.add_transaction(tx_a, height=200)
+        assert ok, "first insertion must succeed"
+
+        # tx_b: same non-witness bytes (same txid) but different witness data.
+        # Construct by copying tx_a then overriding the witness item so that
+        # wtxid differs.  We must also recompute tx.txid to keep it matching
+        # the non-witness serialisation (get_txid() uses serialize(), not
+        # serialize_with_witness(), so txid is unchanged by the witness swap).
+        tx_b = _make_segwit_tx(
+            _txid(71),
+            inputs=[(utxo_id, 0, b"\x00" * 64, 0xFFFFFFFD)],
+            outputs=[(900_000, _p2pkh(seed=12))],
+            witness_item=b"\x52",  # different witness stack item → different wtxid
+        )
+        # Force tx_b's txid to equal tx_a's txid (same non-witness data).
+        tx_b.txid = tx_a.txid
+
+        # Confirm wtxids actually differ.
+        assert tx_a.get_wtxid() != tx_b.get_wtxid(), (
+            "test precondition: wtxids must differ"
+        )
+        assert tx_a.get_txid() == tx_b.get_txid(), (
+            "test precondition: txids must match"
+        )
+
+        ok2, reason2 = pool.add_transaction(tx_b, height=200)
+        assert not ok2
+        assert reason2 == "txn-same-nonwitness-data-in-mempool", (
+            f"expected 'txn-same-nonwitness-data-in-mempool', got {reason2!r}"
+        )
+
+    def test_test_accept_exact_wtxid_returns_txn_already_in_mempool(self) -> None:
+        """accept_to_memory_pool(test_accept=True) must also apply the
+        wtxid-first duplicate check."""
+        pool, utxo_id = self._pool_with_utxo(72)
+
+        tx = _make_segwit_tx(
+            _txid(72),
+            inputs=[(utxo_id, 0, b"\x00" * 64, 0xFFFFFFFD)],
+            outputs=[(900_000, _p2pkh(seed=13))],
+        )
+        ok, _ = pool.add_transaction(tx, height=200)
+        assert ok
+
+        result = pool.accept_to_memory_pool(tx, height=200, test_accept=True)
+        assert result["accepted"] is False
+        assert result["reject_reason"] == "txn-already-in-mempool", (
+            f"expected 'txn-already-in-mempool', got {result['reject_reason']!r}"
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
