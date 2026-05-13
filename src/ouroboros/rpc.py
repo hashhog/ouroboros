@@ -4839,9 +4839,46 @@ class RPCServer:
             "flags": "",  # extra nonce space in coinbase scriptSig
         }
 
+        # BIP-23 capabilities field: at minimum ["proposal"]
+        # Reference: bitcoin-core/src/rpc/mining.cpp:895, 948
+        gbt_capabilities = ["proposal"]
+
+        # BIP-9/BIP-22 rules field: active soft-fork rules the miner must
+        # acknowledge.  "!" prefix means the rule is mandatory (miner must
+        # understand it).  For post-segwit blocks always include csv, !segwit,
+        # and taproot.  Reference: mining.cpp:950-963.
+        # - "csv"     — BIP-68/112/113 sequence-lock CSV (always active)
+        # - "!segwit" — BIP-141 SegWit (mandatory; "!" = consensus-critical)
+        # - "taproot" — BIP-341/342 Taproot (active on mainnet/testnet4)
+        gbt_rules = ["csv", "!segwit", "taproot"]
+        network = getattr(self.node, "network", "mainnet")
+        if network == "signet":
+            gbt_rules.append("!signet")
+
+        # BIP-9 vbavailable: deployments in STARTED or LOCKED_IN state that
+        # miners can signal for.  In ouroboros's simplified model there are no
+        # actively-signalling version-bit deployments beyond what is already in
+        # the rules list, so this is an empty dict.  A full implementation would
+        # query the versionbits cache here.
+        # Reference: mining.cpp:965-983  GBTStatus signalling/locked_in maps.
+        gbt_vbavailable: dict = {}
+
+        # BIP-23 vbrequired: bitmask of version bits the miner MUST set.
+        # Always 0 for current deployments.
+        # Reference: mining.cpp:996  result.pushKV("vbrequired", 0)
+        gbt_vbrequired = 0
+
         return {
+            # BIP-23: capabilities field (W108 G4 fix)
+            "capabilities": gbt_capabilities,
             # B7: next-block version (version-bits computed), not prev version
             "version": block_version,
+            # BIP-9/BIP-23: rules field (W108 G4+G24 fix)
+            "rules": gbt_rules,
+            # BIP-9: vbavailable field (W108 G4 fix)
+            "vbavailable": gbt_vbavailable,
+            # BIP-23: vbrequired field (W108 G4 fix)
+            "vbrequired": gbt_vbrequired,
             # B1: previousblockhash must be in display order (BE).
             # Core: block.hashPrevBlock.GetHex() (rpc/mining.cpp:998).
             "previousblockhash": best_hash[::-1].hex(),
