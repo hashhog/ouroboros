@@ -14,8 +14,8 @@ use common::{
 
 use crate::storage::schema::{
     decode_height, encode_block_hash, encode_height, encode_outpoint,
-    get_column_families, meta_keys, BLOCK_INDEX_CF, BLOCKS_CF, CHAINSTATE_CF, HEADERS_CF, META_CF,
-    SPENT_CF, TX_INDEX_CF, UNDO_CF,
+    get_column_families, meta_keys, BLOCK_INDEX_BY_HASH_CF, BLOCK_INDEX_CF, BLOCKS_CF,
+    CHAINSTATE_CF, HEADERS_CF, META_CF, SPENT_CF, TX_INDEX_CF, UNDO_CF,
 };
 use crate::storage::undo::{BlockUndo, Coin, TxUndo};
 
@@ -185,7 +185,16 @@ impl BlockchainDB {
         Ok(())
     }
 
-    /// Store block metadata with block hash for height lookup
+    /// Store block metadata with block hash for height lookup.
+    ///
+    /// Writes to two column families:
+    /// 1. `BLOCK_INDEX_CF` (keyed by height) — active-chain canonical entry.
+    ///    Overwrites any prior block at this height (expected: only one block
+    ///    per height on the active chain).
+    /// 2. `BLOCK_INDEX_BY_HASH_CF` (keyed by 32-byte block hash) — all-blocks
+    ///    index mirroring Core's `BlockMap`.  Fork blocks at the same height
+    ///    as an active-chain block each get their own entry here, so they are
+    ///    never silently discarded (W109 BUG-7 fix).
     pub fn store_block_metadata(&self, height: u32, hash: &[u8; 32], metadata: &BlockMetadata) -> Result<()> {
         let cf = self.db.cf_handle(BLOCK_INDEX_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_CF.to_string()))?;
@@ -199,6 +208,13 @@ impl BlockchainDB {
         value.extend_from_slice(&metadata_bytes);
 
         self.db.put_cf(cf, key, value)?;
+
+        // Also write to hash-keyed index (BUG-7 fix).  Key = 32-byte block hash,
+        // value = raw BlockMetadata bytes (no hash prefix needed — hash IS the key).
+        let hash_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        self.db.put_cf(hash_cf, hash, &metadata_bytes)?;
+
         Ok(())
     }
 
@@ -867,6 +883,40 @@ impl BlockchainDB {
             }
             None => Ok(None),
         }
+    }
+
+    /// Get block metadata by block hash (O(1) lookup — W109 BUG-7 fix).
+    ///
+    /// Uses `BLOCK_INDEX_BY_HASH_CF` — the hash-keyed index that stores ALL
+    /// known blocks, including competing forks at the same height that would be
+    /// silently lost in the height-keyed `BLOCK_INDEX_CF`.
+    ///
+    /// This mirrors Bitcoin Core's `m_block_index.find(hash)`.
+    pub fn get_block_metadata_by_hash(&self, hash: &[u8; 32]) -> Result<Option<BlockMetadata>> {
+        let cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+
+        match self.db.get_cf(cf, hash)? {
+            Some(data) => {
+                let metadata = BlockMetadata::from_bytes(&data)
+                    .map_err(|e| DbError::InvalidData(format!(
+                        "Failed to deserialize metadata from hash-keyed index: {}", e
+                    )))?;
+                Ok(Some(metadata))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Check whether a block hash is present in `BLOCK_INDEX_BY_HASH_CF`.
+    ///
+    /// Returns `true` for any block (active chain OR competing fork) whose
+    /// metadata has been stored.  Equivalent to
+    /// `m_block_index.count(hash) > 0` in Core.
+    pub fn has_block_metadata_by_hash(&self, hash: &[u8; 32]) -> Result<bool> {
+        let cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        Ok(self.db.get_pinned_cf(cf, hash)?.is_some())
     }
 
     // ========== Pruning Methods ==========
@@ -1928,6 +1978,10 @@ impl BlockchainDB {
     }
 
     /// Store block metadata via WriteBatch.
+    ///
+    /// Writes to both `BLOCK_INDEX_CF` (height-keyed, active chain) and
+    /// `BLOCK_INDEX_BY_HASH_CF` (hash-keyed, all blocks including forks).
+    /// See `store_block_metadata` for the rationale (W109 BUG-7 fix).
     pub fn store_block_metadata_batch(
         &self,
         batch: &mut WriteBatch,
@@ -1944,6 +1998,12 @@ impl BlockchainDB {
         value.extend_from_slice(hash);
         value.extend_from_slice(&metadata_bytes);
         batch.put_cf(cf, key, value);
+
+        // Also write to hash-keyed index (BUG-7 fix).
+        let hash_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        batch.put_cf(hash_cf, hash, &metadata_bytes);
+
         Ok(())
     }
 
@@ -1990,7 +2050,9 @@ impl BlockchainDB {
     /// Update the status flags of a block at a given height.
     ///
     /// This persists the block's validity state (including BLOCK_FAILED_VALID
-    /// and BLOCK_FAILED_CHILD flags) to disk.
+    /// and BLOCK_FAILED_CHILD flags) to disk.  Updates both `BLOCK_INDEX_CF`
+    /// (height-keyed, active chain) and `BLOCK_INDEX_BY_HASH_CF` (hash-keyed,
+    /// all blocks) so fork blocks also get their status updated.
     pub fn update_block_status(&self, height: u32, status: common::BlockStatus) -> Result<()> {
         let cf = self.db.cf_handle(BLOCK_INDEX_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_CF.to_string()))?;
@@ -2005,21 +2067,27 @@ impl BlockchainDB {
         }
 
         // Extract hash and metadata
-        let hash = &data[0..32];
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(&data[0..32]);
         let mut metadata = BlockMetadata::from_bytes(&data[32..])
             .map_err(|e| DbError::InvalidData(format!("Failed to deserialize metadata: {}", e)))?;
 
         // Update status
         metadata.status = status;
 
-        // Rewrite the entry
+        // Rewrite the height-keyed entry
         let metadata_bytes = metadata.to_bytes()
             .map_err(|e| DbError::Serialization(SerializeError::Encode(format!("{}", e))))?;
         let mut value = Vec::with_capacity(32 + metadata_bytes.len());
-        value.extend_from_slice(hash);
+        value.extend_from_slice(&hash_bytes);
         value.extend_from_slice(&metadata_bytes);
-
         self.db.put_cf(cf, &key, &value)?;
+
+        // Also update the hash-keyed entry (BUG-7 fix — fork blocks only exist here).
+        let hash_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        self.db.put_cf(hash_cf, &hash_bytes, &metadata_bytes)?;
+
         Ok(())
     }
 

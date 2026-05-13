@@ -265,56 +265,120 @@ class TestW109_G6_MissingnSequenceId(unittest.TestCase):
 
 class TestW109_G7_BlockIndexKeyedByHeightNotHashSideBranchLoss(unittest.TestCase):
     """
-    BUG-7 (P0/C-DIV TWO-PIPELINE): BLOCK_INDEX_CF keyed by height (4-byte LE),
-    not by block hash as in Core's BlockMap.
+    BUG-7 (P0/C-DIV TWO-PIPELINE) — FIXED.
 
-    Core (blockstorage.h:135):
-        using BlockMap = std::unordered_map<uint256, CBlockIndex, BlockHasher>;
-    The in-memory map is keyed by block *hash*, allowing multiple blocks at the
-    same height (competing forks) to coexist.
+    FIX: Added BLOCK_INDEX_BY_HASH_CF (hash-keyed, 32-byte key) alongside the
+    existing height-keyed BLOCK_INDEX_CF.  Every call to store_block_metadata /
+    store_block_metadata_batch now writes to BOTH column families.  Fork blocks
+    at the same height no longer overwrite each other in the hash-keyed index.
 
-    ouroboros Rust (storage/schema.rs:330-332, db.rs:189-201):
-        BLOCK_INDEX_CF key = encode_height(height) = height.to_le_bytes() (4 bytes).
-    A new block at height H overwrites the BLOCK_INDEX_CF entry for that height,
-    silently discarding the previously stored fork-branch block.
+    Core reference: `BlockMap = std::unordered_map<uint256, CBlockIndex>` in
+    blockstorage.h:135 — keyed by block hash, not height.
 
-    TWO-PIPELINE GAP:
-    - Pipeline A (BlockchainDB): stores blocks by hash in BLOCKS_CF but indexes
-      them by height in BLOCK_INDEX_CF. Side-chain blocks stored in BLOCKS_CF via
-      submitblock are unreachable from the height index.
-    - Pipeline B (BlockStore): stores blocks in blk*.dat files indexed by hash
-      (BLOCKPOS_CF). Side-chain blocks ARE indexable by hash here — but Pipeline B
-      is never wired into the main sync loop.
-
-    CONSENSUS-DIVERGENT for invalidateblock + reconsider: if a side-chain block
-    was submitted via submitblock and later invalidateblock + reconsider is called,
-    the block's metadata may have been overwritten; reconsider cannot find it.
-
-    Fix: add hash → BlockMetadata index (BLOCK_INDEX_BY_HASH_CF) alongside the
-    height index, so fork branches are not lost.
+    Tests below verify:
+    1. BLOCK_INDEX_BY_HASH_CF constant is exported from the schema module.
+    2. Two blocks at the same height can both be retrieved by hash from a live DB.
+    3. The height-keyed BLOCK_INDEX_CF still returns the LAST written block
+       (active-chain semantics unchanged).
+    4. has_block_metadata_by_hash returns True for both fork blocks.
     """
 
-    def test_block_index_key_is_height_not_hash(self):
-        """BLOCK_INDEX_CF key is 4-byte height, not 32-byte hash."""
-        # encode_height produces 4 bytes; Core's BlockMap uses 32-byte hash
-        height = 100
-        encoded = height.to_bytes(4, "little")
-        self.assertEqual(len(encoded), 4, "height key is 4 bytes")
-        self.assertNotEqual(len(encoded), 32, "BUG-7: height key != 32-byte hash key")
+    def test_block_index_by_hash_cf_constant_exported(self):
+        """BLOCK_INDEX_BY_HASH_CF = 'block_index_by_hash' is present in schema."""
+        try:
+            import sync as _sync
+            # The constant is not directly exported but the CF must be
+            # created when the DB is opened.  Verify indirectly via the
+            # has_block_metadata_by_hash method being present on PyBlockchainDB.
+            self.assertTrue(
+                hasattr(_sync.PyBlockchainDB, "has_block_metadata_by_hash"),
+                "has_block_metadata_by_hash must exist on PyBlockchainDB (BUG-7 fix)",
+            )
+            self.assertTrue(
+                hasattr(_sync.PyBlockchainDB, "get_block_metadata_by_hash"),
+                "get_block_metadata_by_hash must exist on PyBlockchainDB (BUG-7 fix)",
+            )
+        except ImportError:
+            self.skipTest("sync module not importable in this environment")
 
-    def test_two_blocks_at_same_height_cannot_both_be_indexed(self):
-        """Storing a second block at height H overwrites first in height-keyed index."""
-        # Simulate two different block hashes at height 100
-        hash_a = bytes(range(32))
-        hash_b = bytes(reversed(range(32)))
-        height = 100
-        # In a height-keyed dict only one entry per height is possible
-        index: dict[bytes, bytes] = {}
-        key = height.to_bytes(4, "little")
-        index[key] = hash_a  # store block A
-        index[key] = hash_b  # store block B — A is silently lost
-        self.assertEqual(index[key], hash_b)
-        self.assertNotIn(hash_a, index.values(), "BUG-7: fork block A overwritten by B")
+    def test_two_fork_blocks_at_same_height_coexist_in_hash_index(self):
+        """Two distinct blocks at height H can both be retrieved by hash (BUG-7 fix)."""
+        import tempfile
+        import os
+        try:
+            import sync as _sync
+        except ImportError:
+            self.skipTest("sync module not importable in this environment")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = _sync.PyBlockchainDB(tmpdir)
+
+            # Use store_block_metadata to write two fake blocks at height 100
+            # with different hashes.  The hash-keyed index must retain both.
+            height = 100
+            # Fake chainwork: 32 bytes big-endian
+            chainwork_a = (1).to_bytes(32, "big")
+            chainwork_b = (2).to_bytes(32, "big")
+            timestamp = 1_700_000_000
+            # Block hash A: all 0xAA
+            hash_a = bytes([0xAA] * 32)
+            # Block hash B: all 0xBB
+            hash_b = bytes([0xBB] * 32)
+
+            # Write block A at height 100
+            db.store_block_metadata_raw(height, hash_a, height, chainwork_a, timestamp)
+            # Write block B at height 100 — in old code this overwrote A's entry
+            db.store_block_metadata_raw(height, hash_b, height, chainwork_b, timestamp)
+
+            # Hash-keyed index: BOTH A and B must be present
+            self.assertTrue(
+                db.has_block_metadata_by_hash(hash_a),
+                "BUG-7 REGRESSION: fork block A not found in hash-keyed index after B was stored",
+            )
+            self.assertTrue(
+                db.has_block_metadata_by_hash(hash_b),
+                "block B should be in hash-keyed index",
+            )
+
+            # Metadata for A must be retrievable by hash
+            meta_a = db.get_block_metadata_by_hash(hash_a)
+            self.assertIsNotNone(meta_a, "get_block_metadata_by_hash(hash_a) must return data")
+            # meta_a = (height, chainwork_bytes, timestamp, status_bits)
+            self.assertEqual(meta_a[0], height, "metadata height for A must match")
+
+            # Metadata for B also retrievable
+            meta_b = db.get_block_metadata_by_hash(hash_b)
+            self.assertIsNotNone(meta_b, "get_block_metadata_by_hash(hash_b) must return data")
+            self.assertEqual(meta_b[0], height, "metadata height for B must match")
+
+            # Height-keyed index returns the LAST written block (B) — active-chain
+            # semantics unchanged.
+            hash_at_height = db.get_block_hash_by_height(height)
+            self.assertEqual(
+                bytes(hash_at_height) if hash_at_height else None,
+                hash_b,
+                "height-keyed index should contain the last written block (B)",
+            )
+
+    def test_unknown_hash_returns_none_from_hash_index(self):
+        """has_block_metadata_by_hash returns False for an unknown hash."""
+        import tempfile
+        try:
+            import sync as _sync
+        except ImportError:
+            self.skipTest("sync module not importable in this environment")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = _sync.PyBlockchainDB(tmpdir)
+            unknown_hash = bytes([0xFF] * 32)
+            self.assertFalse(
+                db.has_block_metadata_by_hash(unknown_hash),
+                "has_block_metadata_by_hash must return False for unknown hash",
+            )
+            self.assertIsNone(
+                db.get_block_metadata_by_hash(unknown_hash),
+                "get_block_metadata_by_hash must return None for unknown hash",
+            )
 
 
 class TestW109_G8_RaiseValidityAbsent(unittest.TestCase):
