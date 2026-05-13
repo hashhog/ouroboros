@@ -2747,13 +2747,21 @@ class Mempool:
         )
 
     def _update_descendants_after_removal(
-        self, removed_txid: bytes, former_children: set[bytes] | None = None
+        self,
+        removed_txid: bytes,
+        former_children: set[bytes] | None = None,
+        former_parents: set[bytes] | None = None,
     ) -> None:
         """After removing *removed_txid*, fix ancestor/descendant counts.
 
         Args:
             removed_txid: The txid that was just removed.
             former_children: The children set of the removed entry (if available).
+            former_parents: The parents set of the removed entry (if available).
+                Required to correctly decrement ancestor descendant_count when
+                removing a leaf (no children).  Without it, affected_ancestors
+                is populated only from children — which is empty for leaves —
+                so the parent's descendant_count is never decremented (W106 G6).
         """
         # Find direct children of removed tx. Use former_children if provided,
         # otherwise scan transactions (slower fallback for compatibility).
@@ -2798,6 +2806,18 @@ class Mempool:
             child_entry = self.transactions.get(child_txid)
             if child_entry:
                 affected_ancestors |= self._get_ancestors(child_entry.tx)
+
+        # BUG-G6 fix: when removed_txid was a leaf (no children), the loop
+        # above never runs and affected_ancestors stays empty, so the parent's
+        # descendant_count is never decremented.  Seed affected_ancestors with
+        # the direct parents of the removed tx (and their transitive ancestors)
+        # so their descendant counts are always recalculated.
+        if former_parents:
+            for par_txid in former_parents:
+                if par_txid in self.transactions:
+                    affected_ancestors.add(par_txid)
+                    par_entry = self.transactions[par_txid]
+                    affected_ancestors |= self._get_ancestors(par_entry.tx)
 
         for anc_txid in affected_ancestors:
             if anc_txid in self.transactions:
@@ -2908,8 +2928,9 @@ class Mempool:
         entry = self.transactions[txid]
         self.current_size -= entry.size
 
-        # Save children for recounting (before we modify links)
+        # Save children and parents for recounting (before we modify links)
         former_children = set(entry.children)
+        former_parents = set(entry.parents)
 
         # Ephemeral dust policy: if this tx is the child that spends an
         # ephemeral dust parent's output, the parent must also be evicted.
@@ -2975,7 +2996,7 @@ class Mempool:
                 logger.warning(f"on_tx_removed callback error: {e}")
 
         if not _skip_recount:
-            self._update_descendants_after_removal(txid, former_children)
+            self._update_descendants_after_removal(txid, former_children, former_parents)
 
         # Evict ephemeral dust parents (after this tx is fully removed)
         # This must happen after the main removal to avoid modifying entry.parents
