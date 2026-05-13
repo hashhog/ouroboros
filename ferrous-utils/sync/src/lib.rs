@@ -16,7 +16,7 @@ use bitcoin::hashes::Hash;
 use pyo3::prelude::*;
 use tokio::sync::Mutex;
 
-use common::{OutPointWrapper, UTXO, BlockWrapper, BlockHeaderWrapper, BlockMetadata};
+use common::{OutPointWrapper, UTXO, BlockWrapper, BlockHeaderWrapper, BlockMetadata, BlockStatus};
 use common::verify_ecdsa_signature_der;
 // Hardware-accelerated crypto
 use common::crypto::sha256::{
@@ -3874,7 +3874,11 @@ impl PyBlockchainDB {
                 .unwrap_or([0u8; 32])
         };
         let chainwork = crate::chainwork::compute_chainwork(&prev_chainwork, bits);
-        let metadata = BlockMetadata::new(height, chainwork, timestamp);
+        // FIX-33 (W109 BUG-22): set BLOCK_HAVE_DATA — block body is now in BLOCKS_CF.
+        // Mirrors Core: validation.cpp:3784 pindexNew->nStatus |= BLOCK_HAVE_DATA.
+        let mut status = BlockStatus::new();
+        status.set_has_data();
+        let metadata = BlockMetadata::with_status(height, chainwork, timestamp, status);
         self.db.store_block_metadata_batch(&mut batch, height, &block_hash, &metadata)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
@@ -4445,7 +4449,11 @@ impl PyBlockchainDB {
                     .unwrap_or([0u8; 32])
             };
             let chainwork = crate::chainwork::compute_chainwork(&prev_chainwork, bits);
-            let metadata = BlockMetadata::new(height, chainwork, timestamp);
+            // FIX-33 (W109 BUG-22): set BLOCK_HAVE_DATA — block body now in BLOCKS_CF.
+            // Mirrors Core: validation.cpp:3784 pindexNew->nStatus |= BLOCK_HAVE_DATA.
+            let mut status = BlockStatus::new();
+            status.set_has_data();
+            let metadata = BlockMetadata::with_status(height, chainwork, timestamp, status);
             self.db.store_block_metadata_batch(&mut batch, height, &block_hash, &metadata)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 

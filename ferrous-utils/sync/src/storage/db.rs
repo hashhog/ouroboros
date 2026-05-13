@@ -1179,6 +1179,15 @@ impl BlockchainDB {
         value.extend_from_slice(&checksum);
 
         self.db.put_cf(cf, key, value)?;
+
+        // FIX-33 (W109 BUG-22): set BLOCK_HAVE_UNDO now that undo data is in UNDO_CF.
+        // Mirrors Core: blockstorage.cpp:1029 block.nStatus |= BLOCK_HAVE_UNDO.
+        // Read-modify-write: OR in BLOCK_HAVE_UNDO without clobbering other flags.
+        if let Ok(Some(mut metadata)) = self.get_block_metadata(height) {
+            metadata.status.set_has_undo();
+            let _ = self.update_block_status(height, metadata.status);
+        }
+
         Ok(())
     }
 
