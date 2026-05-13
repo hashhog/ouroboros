@@ -185,6 +185,92 @@ def get_network_group(host: str, network_id: int = NET_IPV4) -> str:
     return host
 
 
+def is_routable(host: str, network_id: int = NET_IPV4) -> bool:
+    """Return True iff the address is publicly routable.
+
+    Mirrors Bitcoin Core's CNetAddr::IsRoutable() in netaddress.cpp:
+        return IsValid() && !(IsRFC1918() || IsRFC2544() || IsRFC3927() ||
+               IsRFC4862() || IsRFC6598() || IsRFC5737() || IsRFC4193() ||
+               IsRFC4843() || IsRFC7343() || IsLocal() || IsInternal());
+
+    Non-IPv4/IPv6 network types (Tor v3, I2P, CJDNS) are considered routable
+    if the address is non-empty (the equivalent of IsValid() for those types).
+    """
+    # Non-IP network types: routable if host is non-empty
+    if network_id in (NET_TORV3, NET_I2P, NET_CJDNS):
+        return bool(host)
+
+    if not host:
+        return False
+
+    if network_id == NET_IPV4 or (network_id not in (NET_IPV6,) and ":" not in host):
+        # --- IPv4 checks ---
+        parts = host.split(".")
+        if len(parts) != 4:
+            return False
+        try:
+            octets = [int(p) for p in parts]
+        except ValueError:
+            return False
+        if any(o < 0 or o > 255 for o in octets):
+            return False
+        a, b = octets[0], octets[1]
+
+        # IsLocal: 0.0.0.0/8 (unspecified) and 127.0.0.0/8 (loopback)
+        if a == 0 or a == 127:
+            return False
+        # IsRFC1918: 10/8, 172.16-31/12, 192.168/16
+        if a == 10:
+            return False
+        if a == 172 and 16 <= b <= 31:
+            return False
+        if a == 192 and b == 168:
+            return False
+        # IsRFC2544: 198.18-19/15 (benchmarking)
+        if a == 198 and (b == 18 or b == 19):
+            return False
+        # IsRFC3927: 169.254/16 (link-local)
+        if a == 169 and b == 254:
+            return False
+        # IsRFC6598: 100.64-127/10 (shared address space)
+        if a == 100 and 64 <= b <= 127:
+            return False
+        # IsRFC5737: 192.0.2/24, 198.51.100/24, 203.0.113/24 (documentation)
+        if a == 192 and b == 0 and octets[2] == 2:
+            return False
+        if a == 198 and b == 51 and octets[2] == 100:
+            return False
+        if a == 203 and b == 0 and octets[2] == 113:
+            return False
+        return True
+
+    # --- IPv6 checks ---
+    try:
+        import ipaddress
+        addr6 = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+
+    # IsLocal: ::1/128 loopback
+    if addr6.is_loopback:
+        return False
+    # IsRFC4862: fe80::/64 link-local (IPv6 equivalent of RFC3927)
+    if addr6.is_link_local:
+        return False
+    # IsRFC4193: fc00::/7 unique local (ULA)
+    if addr6.is_private:
+        return False
+    # IsRFC4843/IsRFC7343: 2001:0010::/28 and 2001:0020::/28 (ORCHID)
+    packed = addr6.packed
+    if packed[0] == 0x20 and packed[1] == 0x01 and packed[2] == 0x00:
+        if (packed[3] & 0xF0) in (0x10, 0x20):
+            return False
+    # Unspecified ::
+    if addr6 == ipaddress.ip_address("::"):
+        return False
+    return True
+
+
 def _hash_for_bucket(key: bytes, *args) -> int:
     """Compute hash for bucket assignment using SHA256."""
     h = hashlib.sha256(key)
@@ -351,6 +437,14 @@ class AddressManager:
         Returns:
             True if inserted (new address), False if updated existing.
         """
+        # Reject non-routable addresses (Core: AddSingle returns false if
+        # !addr.IsRoutable()).  This blocks loopback, RFC-1918, link-local,
+        # unspecified, and other non-public address ranges from polluting the
+        # address table.  Reference: bitcoin-core/src/addrman.cpp:534 and
+        # netaddress.cpp:462 CNetAddr::IsRoutable().
+        if not is_routable(host, network_id):
+            return False
+
         addr_key = f"{host}:{port}"
         source_group = get_network_group(source.split(":")[0] if source else "")
 

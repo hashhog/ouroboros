@@ -143,30 +143,53 @@ class TestG2BucketMultiplicity(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestG3RoutabilityGate(unittest.TestCase):
     """
-    BUG-3: ouroboros AddressManager.add() has NO IsRoutable() check.
+    FIXED (W104): AddressManager.add() now rejects non-routable addresses via
+    is_routable() matching Core's CNetAddr::IsRoutable() (netaddress.cpp:462).
     Core's AddSingle() at addrman.cpp:534 returns false immediately if
-    addr.IsRoutable() is false.
-    This allows loopback (127.0.0.1), RFC-1918 (192.168.x.x, 10.x.x.x),
-    and unspecified addresses to be stored in the address table.
+    addr.IsRoutable() is false.  The fix blocks loopback (127.0.0.1), RFC-1918
+    (10/8, 172.16-31/12, 192.168/16), link-local (169.254/16), unspecified
+    (0.0.0.0), and other non-public ranges from polluting the address table.
     """
 
-    def test_loopback_address_accepted(self):
-        # BUG-3: 127.0.0.1 should be rejected by IsRoutable but is accepted
+    def test_loopback_address_rejected(self):
+        # FIXED: 127.0.0.1 fails IsRoutable and is now rejected
         am = AddressManager()
         result = am.add("127.0.0.1", 8333, timestamp=time.time())
-        self.assertTrue(result, "BUG-3: loopback should fail IsRoutable and be rejected")
+        self.assertFalse(result, "127.0.0.1 (loopback) must be rejected by IsRoutable")
+        self.assertIsNone(am.get_addr_info("127.0.0.1", 8333))
 
-    def test_private_rfc1918_accepted(self):
-        # BUG-3: 192.168.1.1 should be rejected
+    def test_private_rfc1918_rejected(self):
+        # FIXED: 192.168.1.1 is RFC-1918 and must be rejected
         am = AddressManager()
         result = am.add("192.168.1.1", 8333, timestamp=time.time())
-        self.assertTrue(result, "BUG-3: RFC-1918 private address should be rejected")
+        self.assertFalse(result, "192.168.1.1 (RFC-1918) must be rejected by IsRoutable")
+        self.assertIsNone(am.get_addr_info("192.168.1.1", 8333))
 
-    def test_unspecified_zero_accepted(self):
-        # BUG-3: 0.0.0.0 should be rejected
+    def test_unspecified_zero_rejected(self):
+        # FIXED: 0.0.0.0 (unspecified) must be rejected
         am = AddressManager()
         result = am.add("0.0.0.0", 8333, timestamp=time.time())
-        self.assertTrue(result, "BUG-3: unspecified (0.0.0.0) should be rejected")
+        self.assertFalse(result, "0.0.0.0 (unspecified) must be rejected by IsRoutable")
+        self.assertIsNone(am.get_addr_info("0.0.0.0", 8333))
+
+    def test_routable_address_still_accepted(self):
+        # Sanity: a routable address must still be accepted
+        am = AddressManager()
+        result = am.add("1.2.3.4", 8333, timestamp=time.time())
+        self.assertTrue(result, "1.2.3.4 is routable and must be accepted")
+        self.assertIsNotNone(am.get_addr_info("1.2.3.4", 8333))
+
+    def test_rfc1918_10_block_rejected(self):
+        # FIXED: 10.0.0.1 is RFC-1918 (10/8)
+        am = AddressManager()
+        result = am.add("10.0.0.1", 8333, timestamp=time.time())
+        self.assertFalse(result, "10.0.0.1 (RFC-1918 10/8) must be rejected")
+
+    def test_rfc3927_link_local_rejected(self):
+        # FIXED: 169.254.1.1 is RFC-3927 link-local
+        am = AddressManager()
+        result = am.add("169.254.1.1", 8333, timestamp=time.time())
+        self.assertFalse(result, "169.254.1.1 (RFC-3927 link-local) must be rejected")
 
 
 # ---------------------------------------------------------------------------
