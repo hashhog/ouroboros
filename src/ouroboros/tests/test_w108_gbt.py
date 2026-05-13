@@ -178,31 +178,41 @@ class TestG3ProposalMode(unittest.TestCase):
 # Ouroboros: none of these fields are present in the response
 # ---------------------------------------------------------------------------
 class TestG4GBTBip9Fields(unittest.TestCase):
-    """BUG: BIP-9/BIP-23 fields (rules, vbavailable, capabilities, vbrequired) absent."""
+    """FIXED (W108 G4): BIP-9/BIP-23 fields rules, vbavailable, capabilities, vbrequired now present."""
 
     def setUp(self):
         self.rpc = _make_rpc()
         self.result = _run_gbt(self.rpc)
 
-    def test_rules_field_absent(self):
+    def test_rules_field_present(self):
         # Core always includes at least ["csv", "!segwit", "taproot"].
-        self.assertNotIn("rules", self.result,
-                         "rules field is absent — add it with at least csv/segwit/taproot")
+        self.assertIn("rules", self.result,
+                      "rules field must be present in GBT response (BIP-9/BIP-23)")
+        rules = self.result["rules"]
+        self.assertIn("csv", rules, "rules must include 'csv'")
+        self.assertIn("!segwit", rules, "rules must include '!segwit' (mandatory segwit marker)")
+        self.assertIn("taproot", rules, "rules must include 'taproot'")
 
-    def test_vbavailable_field_absent(self):
+    def test_vbavailable_field_present(self):
         # Core: set of pending versionbit deployments.
-        self.assertNotIn("vbavailable", self.result,
-                         "vbavailable field is absent — BIP-9 signalling broken")
+        self.assertIn("vbavailable", self.result,
+                      "vbavailable field must be present — BIP-9 signalling")
+        self.assertIsInstance(self.result["vbavailable"], dict,
+                              "vbavailable must be a dict (deployment_name → bit)")
 
-    def test_capabilities_field_absent(self):
+    def test_capabilities_field_present(self):
         # Core: at minimum ["proposal"].
-        self.assertNotIn("capabilities", self.result,
-                         "capabilities field is absent — miners can't use proposal mode")
+        self.assertIn("capabilities", self.result,
+                      "capabilities field must be present — BIP-23 mining capabilities")
+        self.assertIn("proposal", self.result["capabilities"],
+                      "capabilities must include 'proposal' per BIP-23")
 
-    def test_vbrequired_field_absent(self):
+    def test_vbrequired_field_present(self):
         # Core always emits vbrequired (usually 0).
-        self.assertNotIn("vbrequired", self.result,
-                         "vbrequired field is absent — BIP-23 mandates this field")
+        self.assertIn("vbrequired", self.result,
+                      "vbrequired field must be present — BIP-23 mandates this field")
+        self.assertEqual(self.result["vbrequired"], 0,
+                         "vbrequired should be 0 for current deployments")
 
 
 # ---------------------------------------------------------------------------
@@ -709,13 +719,18 @@ class TestG23RustFinalTxTypeMismatch(unittest.TestCase):
 # Ouroboros response has no rules field at all.
 # ---------------------------------------------------------------------------
 class TestG24RulesFieldMissingSegwitTaproot(unittest.TestCase):
-    """BUG: GBT rules field absent — segwit/taproot activation not signalled to miners."""
+    """FIXED (W108 G24): GBT rules field present with segwit/taproot markers."""
 
-    def test_rules_field_not_in_response(self):
+    def test_rules_field_in_response(self):
         rpc = _make_rpc()
         result = _run_gbt(rpc)
-        self.assertNotIn("rules", result,
-                         "GBT rules field must include segwit/taproot markers for miners")
+        self.assertIn("rules", result,
+                      "GBT rules field must be present with segwit/taproot markers for miners")
+        rules = result["rules"]
+        self.assertIn("!segwit", rules,
+                      "rules must include '!segwit' — mandatory SegWit activation marker")
+        self.assertIn("taproot", rules,
+                      "rules must include 'taproot' — Taproot activation marker")
 
 
 # ---------------------------------------------------------------------------
