@@ -870,6 +870,7 @@ class PeerManager:
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer
             self._register_compact_handlers(peer, addr)
+            self._register_bloom_handlers(peer, addr)
             self._register_addr_handlers(peer, addr)
             asyncio.ensure_future(self.negotiate_compact_blocks(peer))
             # Negotiate Erlay for inbound peers
@@ -1000,6 +1001,7 @@ class PeerManager:
                 group = self._netgroup(host)
                 self._outbound_netgroups.add(group)
                 self._register_compact_handlers(peer, addr)
+                self._register_bloom_handlers(peer, addr)
                 # Fire outbound-peer hook so the node can attach tx /
                 # getdata / getheaders handlers to this anchor peer.
                 asyncio.ensure_future(self._fire_outbound_peer_callback(peer))
@@ -1234,6 +1236,7 @@ class PeerManager:
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer
             self._register_compact_handlers(peer, addr)
+            self._register_bloom_handlers(peer, addr)
             self._register_addr_handlers(peer, addr)
             asyncio.ensure_future(self.negotiate_compact_blocks(peer))
 
@@ -1553,6 +1556,7 @@ class PeerManager:
                 self.addrman.mark_good(host, port)
                 self._outbound_netgroups.add(group)  # track for diversity
                 self._register_compact_handlers(peer, addr)
+                self._register_bloom_handlers(peer, addr)
                 self._register_addr_handlers(peer, addr)
                 asyncio.ensure_future(self.negotiate_compact_blocks(peer))
                 # Request addresses from new outbound peers
@@ -1616,6 +1620,7 @@ class PeerManager:
             group = self._netgroup(host)
             self._outbound_netgroups.add(group)
             self._register_compact_handlers(peer, addr)
+            self._register_bloom_handlers(peer, addr)
             self._register_addr_handlers(peer, addr)
             asyncio.ensure_future(self.negotiate_compact_blocks(peer))
             asyncio.ensure_future(self._send_getaddr(peer))
@@ -1703,6 +1708,7 @@ class PeerManager:
                 # unsolicited cmpctblock messages) but do NOT send sendcmpct
                 # and do NOT register addr handlers or request addresses.
                 self._register_compact_handlers(peer, addr)
+                self._register_bloom_handlers(peer, addr)
                 # Explicitly skip: negotiate_compact_blocks, _register_addr_handlers, _send_getaddr
                 # Block-relay-only peers still benefit from the outbound
                 # callback so that getheaders/getdata for blocks works.
@@ -2243,6 +2249,87 @@ class PeerManager:
         peer.register_handler("sendaddrv2", on_sendaddrv2)
         peer.register_handler("notfound", on_notfound)
         peer.register_handler("mempool", on_mempool)
+
+    # BIP-111 bloom filter disconnect handlers
+
+    def _register_bloom_handlers(self, peer: Peer, addr: str) -> None:
+        """Register BIP-111 disconnect handlers for bloom filter messages.
+
+        Per BIP-111 and bitcoin-core/src/net_processing.cpp:4964-4990, when a
+        peer sends filterload, filteradd, or filterclear and we have NOT
+        advertised NODE_BLOOM, we MUST disconnect the peer.  We never
+        advertise NODE_BLOOM unless peer_bloom_filters=True (config default:
+        False) because we have no CBloomFilter implementation — advertising it
+        would be a protocol violation.
+
+        merkleblock is server→client (unusual as an inbound message); we log
+        and drop it without disconnecting, matching Core's ignore path for
+        unexpected server-side messages.
+        """
+        from ouroboros.p2p_messages import NODE_BLOOM
+
+        async def on_filterload(msg: NetworkMessage):
+            # BIP-111 / Core net_processing.cpp:4965:
+            #   if (!(peer.m_our_services & NODE_BLOOM)) { pfrom.fDisconnect = true; return; }
+            if not (peer.our_services & NODE_BLOOM):
+                logger.warning(
+                    f"BIP-111: disconnecting {addr} — sent filterload but "
+                    "NODE_BLOOM not advertised"
+                )
+                asyncio.ensure_future(peer.disconnect())
+                return
+            # NODE_BLOOM is advertised (peer_bloom_filters=True in config) but
+            # we have no CBloomFilter implementation.  Log and drop rather
+            # than crashing; this path is unreachable with the default config.
+            logger.warning(
+                f"filterload from {addr}: BIP-37 not implemented; "
+                "disconnecting (no CBloomFilter)"
+            )
+            asyncio.ensure_future(peer.disconnect())
+
+        async def on_filteradd(msg: NetworkMessage):
+            # BIP-111 / Core net_processing.cpp:4988-4990: same NODE_BLOOM gate.
+            if not (peer.our_services & NODE_BLOOM):
+                logger.warning(
+                    f"BIP-111: disconnecting {addr} — sent filteradd but "
+                    "NODE_BLOOM not advertised"
+                )
+                asyncio.ensure_future(peer.disconnect())
+                return
+            logger.warning(
+                f"filteradd from {addr}: BIP-37 not implemented; "
+                "disconnecting (no CBloomFilter)"
+            )
+            asyncio.ensure_future(peer.disconnect())
+
+        async def on_filterclear(msg: NetworkMessage):
+            # BIP-111 / Core net_processing.cpp:5016-5018: same NODE_BLOOM gate.
+            if not (peer.our_services & NODE_BLOOM):
+                logger.warning(
+                    f"BIP-111: disconnecting {addr} — sent filterclear but "
+                    "NODE_BLOOM not advertised"
+                )
+                asyncio.ensure_future(peer.disconnect())
+                return
+            logger.warning(
+                f"filterclear from {addr}: BIP-37 not implemented; "
+                "disconnecting (no CBloomFilter)"
+            )
+            asyncio.ensure_future(peer.disconnect())
+
+        async def on_merkleblock(msg: NetworkMessage):
+            # merkleblock is an outbound server→client message; receiving it
+            # inbound is unusual (e.g. a misbehaving peer or test harness).
+            # Core ignores it silently; we log at debug and drop.
+            logger.debug(
+                f"Received unexpected merkleblock from {addr}; dropping "
+                "(merkleblock is a server→client message)"
+            )
+
+        peer.register_handler("filterload", on_filterload)
+        peer.register_handler("filteradd", on_filteradd)
+        peer.register_handler("filterclear", on_filterclear)
+        peer.register_handler("merkleblock", on_merkleblock)
 
     # Address gossip (addr / addrv2 / getaddr)
 
