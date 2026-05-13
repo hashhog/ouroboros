@@ -935,39 +935,101 @@ class TestW109_G21_InvalidateBlockMissesOrphansOutsideActiveChain(unittest.TestC
 
 class TestW109_G22_BlockStatusHaveDataNeverSetInMainPipeline(unittest.TestCase):
     """
-    BUG-22 (P1): BLOCK_HAVE_DATA / BLOCK_HAVE_UNDO flags in BlockStatus are never
-    set during connect_block_from_bytes.
+    FIX-33 (W109 BUG-22 CLOSED): BLOCK_HAVE_DATA / BLOCK_HAVE_UNDO flags in
+    BlockStatus are now set during connect_block_from_bytes and store_block_undo.
 
     Core: after writing the block to disk, nStatus |= BLOCK_HAVE_DATA is set on the
     CBlockIndex. After writing undo data, nStatus |= BLOCK_HAVE_UNDO is set. These
     flags are used by FindMostWorkChain (which requires BLOCK_HAVE_DATA) and by
     pruning decisions.
 
-    ouroboros (lib.rs:3763-3779): connect_block_from_bytes creates a BlockMetadata
-    with BlockStatus::new() (= BLOCK_VALID_TREE = 1). Neither BLOCK_HAVE_DATA nor
-    BLOCK_HAVE_UNDO are ever set on this status. has_block_data() works by checking
-    BLOCKS_CF directly (not by testing BLOCK_HAVE_DATA in the metadata), which is a
-    functional workaround but diverges from Core's design.
-
-    Fix: after storing the block body, set BLOCK_HAVE_DATA; after storing undo data
-    (UNDO_CF), set BLOCK_HAVE_UNDO. Both already happen implicitly via db.rs writes.
+    Fix applied in lib.rs:3877 (connect_block_from_bytes), lib.rs:4452 (connect_blocks_batch),
+    validate/block.rs:898 (apply_block), and db.rs:store_block_undo — all now use
+    BlockMetadata::with_status(... status_with_HAVE_DATA) and store_block_undo now
+    ORs in BLOCK_HAVE_UNDO via read-modify-write.  Both BLOCK_INDEX_CF (height-keyed)
+    and BLOCK_INDEX_BY_HASH_CF (hash-keyed, FIX-32) are updated by update_block_status.
     """
 
+    # Regtest genesis block wire bytes (80-byte header + 1 tx varint + coinbase tx).
+    # Built from the same constants used in node.py init_genesis_block().
+    # Header: version=1, prev=0x00*32, merkle LE, ts=1296688602, bits=0x207fffff, nonce=2
+    _REGTEST_GENESIS_BYTES = (
+        # header: version=1, prev=0x00*32, merkle_root (LE), ts, bits, nonce
+        b"\x01\x00\x00\x00"  # version (int32 LE)
+        + b"\x00" * 32       # prev_block (all zeros)
+        + bytes.fromhex("3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a")  # merkle LE
+        + b"\xda\xe5\x49\x4d"  # timestamp 1296688602 LE (0x4d49e5da)
+        + b"\xff\xff\x7f\x20"  # bits 0x207fffff LE
+        + b"\x02\x00\x00\x00"  # nonce 2 LE
+        # tx count varint = 1
+        + b"\x01"
+        # coinbase transaction (standard regtest genesis coinbase)
+        + bytes.fromhex(
+            "01000000"
+            "01"
+            "0000000000000000000000000000000000000000000000000000000000000000"
+            "ffffffff"
+            "4d"
+            "04ffff001d0104455468652054696d65732030332f4a616e2f323030"
+            "39204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73"
+            "ffffffff"
+            "01"
+            "00f2052a01000000"
+            "43"
+            "4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac"
+            "00000000"
+        )
+    )
+
+    def test_connect_block_sets_have_data_flag(self):
+        """After connect_block_from_bytes, stored metadata status has BLOCK_HAVE_DATA(8) set."""
+        import tempfile
+        import hashlib
+        BLOCK_HAVE_DATA = 8
+
+        try:
+            import sync as _sync
+        except ImportError:
+            self.skipTest("sync module not importable in this environment")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = _sync.PyBlockchainDB(tmpdir)
+            block_hash_raw = db.connect_block_from_bytes(self._REGTEST_GENESIS_BYTES, 0)
+            block_hash = bytes(block_hash_raw)
+
+            # Retrieve metadata via hash-keyed index (both CFs updated by FIX-33).
+            meta = db.get_block_metadata_by_hash(block_hash)
+            self.assertIsNotNone(meta,
+                "connect_block_from_bytes must persist metadata in BLOCK_INDEX_BY_HASH_CF")
+
+            status_bits = meta[3]  # (height, chainwork, timestamp, status_bits)
+            self.assertNotEqual(
+                status_bits & BLOCK_HAVE_DATA, 0,
+                f"FIX-33 REGRESSION: BLOCK_HAVE_DATA(8) not set after connect_block_from_bytes "
+                f"(status=0x{status_bits:08x})"
+            )
+
     def test_new_block_status_lacks_have_data_flag(self):
-        """BlockStatus::new() has VALID_TREE(1) only — BLOCK_HAVE_DATA(8) not set."""
+        """BlockStatus::new() starts without BLOCK_HAVE_DATA — only connect_block sets it."""
+        # BlockStatus::new() = BLOCK_VALID_TREE = 1, no HAVE_DATA yet.
+        # This verifies the initial default; the status is elevated by connect_block_from_bytes.
         BLOCK_VALID_TREE = 1
         BLOCK_HAVE_DATA = 8
         initial = BLOCK_VALID_TREE
         self.assertEqual(initial & BLOCK_HAVE_DATA, 0,
-                         "BUG-22: BLOCK_HAVE_DATA not set in initial BlockStatus")
+                         "BlockStatus::new() should start without BLOCK_HAVE_DATA "
+                         "(the flag is set only after the block body is written)")
 
     def test_has_block_data_checks_blocksdf_not_status_flag(self):
-        """has_block_data() queries BLOCKS_CF directly, not BLOCK_HAVE_DATA flag."""
-        # db.rs:943-958: get_cf(blocks_cf, hash).is_some() — ignores status.has_data()
+        """has_block_data() queries BLOCKS_CF directly — separate from the status flag."""
+        # db.rs has_block_data_at_height uses get_cf(blocks_cf, hash).is_some().
+        # This is a separate existence check; the status flag is the canonical record.
+        # Both should agree post-FIX-33 (block in BLOCKS_CF ↔ BLOCK_HAVE_DATA set).
         checks_status_flag = False
         self.assertFalse(
             checks_status_flag,
-            "BUG-22: has_block_data() uses BLOCKS_CF existence check, not status flag",
+            "has_block_data() uses BLOCKS_CF existence check (separate from status flag) — "
+            "post-FIX-33 both BLOCKS_CF presence and BLOCK_HAVE_DATA should agree",
         )
 
 

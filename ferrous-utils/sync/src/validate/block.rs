@@ -8,7 +8,7 @@ use bitcoin::hashes::Hash;
 use thiserror::Error;
 
 use crate::storage::{BlockchainDB, DbError};
-use common::{BlockWrapper, BlockHeaderWrapper, BlockMetadata, TransactionWrapper, OutPointWrapper, UTXO};
+use common::{BlockWrapper, BlockHeaderWrapper, BlockMetadata, BlockStatus, TransactionWrapper, OutPointWrapper, UTXO};
 use crate::chainwork::compute_chainwork;
 use common::crypto::compute_merkle_root;
 
@@ -895,7 +895,12 @@ impl BlockValidator {
                 .unwrap_or([0u8; 32])
         };
         let chainwork = compute_chainwork(&prev_chainwork, bits);
-        let metadata = BlockMetadata::new(height, chainwork, timestamp);
+        // FIX-33 (W109 BUG-22): set BLOCK_HAVE_DATA now that the block body has
+        // been written to BLOCKS_CF via store_block_batch above.
+        // Mirrors Core: validation.cpp:3784 pindexNew->nStatus |= BLOCK_HAVE_DATA.
+        let mut status = BlockStatus::new();
+        status.set_has_data();
+        let metadata = BlockMetadata::with_status(height, chainwork, timestamp, status);
         self.db.store_block_metadata_batch(&mut batch, height, &block_hash, &metadata)?;
 
         // Phase 2: Update chain tip + delete marker
