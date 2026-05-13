@@ -87,6 +87,10 @@ def _record_cross_check(
 # the full 20s timeout window.
 MAX_BLOCKS_IN_FLIGHT_PER_PEER = 16
 
+# Bitcoin Core protocol.h:482: MAX_GETDATA_SZ = 1000.
+# Peers reject GETDATA messages containing more than 1000 inventory items.
+MAX_GETDATA_SZ = 1000
+
 from ouroboros.database import Block, BlockchainDatabase, Transaction
 from ouroboros.p2p_messages import (
     INV_TYPE_BLOCK,
@@ -783,15 +787,21 @@ class BlockSync:
                     logger.error(f"Failed to request blocks: {e}")
 
             if txs_to_request:
-                getdata = GetDataMessage(inventory=txs_to_request)
-                try:
-                    await peer.send_message(getdata.to_network_message(network))
-                    logger.debug(
-                        f"Requested {len(txs_to_request)} txs from "
-                        f"{peer.host}:{peer.port}"
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to request txs: {e}")
+                # Cap each GETDATA at MAX_GETDATA_SZ=1000 items (Core protocol.h:482).
+                # Peers reject GETDATA messages with more than 1000 inventory items.
+                for i in range(0, len(txs_to_request), MAX_GETDATA_SZ):
+                    batch = txs_to_request[i:i + MAX_GETDATA_SZ]
+                    getdata = GetDataMessage(inventory=batch)
+                    try:
+                        await peer.send_message(getdata.to_network_message(network))
+                        logger.debug(
+                            f"Requested {len(batch)} txs from "
+                            f"{peer.host}:{peer.port}"
+                            + (f" (batch {i // MAX_GETDATA_SZ + 1})" if len(txs_to_request) > MAX_GETDATA_SZ else "")
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to request txs: {e}")
+                        break
 
         except Exception as e:
             logger.error(f"Error handling inv from {peer.host}:{peer.port}: {e}")
