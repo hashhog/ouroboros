@@ -119,6 +119,116 @@ pub fn decode_varint(data: &[u8]) -> Result<(u64, usize), SerializeError> {
     }
 }
 
+/// Encode a u64 using Bitcoin Core's MSB-base-128 VarInt format (NOT CompactSize).
+///
+/// This is the format used in UTXO storage (coins.h, undo.h) — distinct from the
+/// CompactSize (0xfd/0xfe/0xff prefix) used in P2P messages.
+///
+/// Core test vectors from serialize.h comment block:
+///   0   -> [0x00]
+///   1   -> [0x01]
+///   127 -> [0x7F]
+///   128 -> [0x80, 0x00]
+///   255 -> [0x80, 0x7F]
+///   256 -> [0x81, 0x00]
+///   16383 -> [0xFE, 0x7F]
+///   16384 -> [0xFF, 0x00]
+///   16511 -> [0xFF, 0x7F]
+pub fn encode_corevarint(mut n: u64, buf: &mut Vec<u8>) {
+    // Build bytes in reverse (LSB-first) then reverse them — matching Core's WriteVarInt.
+    let mut tmp = [0u8; 10]; // u64 needs at most ceil(64/7)=10 bytes
+    let mut len: usize = 0;
+    loop {
+        // Low 7 bits, set continuation bit for all but the last byte (len==0 means last).
+        tmp[len] = (n & 0x7F) as u8 | if len > 0 { 0x80 } else { 0x00 };
+        if n <= 0x7F {
+            break;
+        }
+        n = (n >> 7) - 1;
+        len += 1;
+    }
+    // tmp[len] is the most-significant byte; write MSB-first.
+    for i in (0..=len).rev() {
+        buf.push(tmp[i]);
+    }
+}
+
+/// Decode a Bitcoin Core MSB-base-128 VarInt from bytes.
+///
+/// Returns `(value, bytes_consumed)` on success.
+pub fn decode_corevarint(data: &[u8]) -> Result<(u64, usize), SerializeError> {
+    let mut n: u64 = 0;
+    let mut i = 0;
+    loop {
+        if i >= data.len() {
+            return Err(SerializeError::InsufficientData);
+        }
+        let ch = data[i] as u64;
+        i += 1;
+        // Guard against overflow: Core checks n > (max >> 7).
+        if n > (u64::MAX >> 7) {
+            return Err(SerializeError::InvalidVarInt);
+        }
+        n = (n << 7) | (ch & 0x7F);
+        if ch & 0x80 != 0 {
+            // Continuation bit set — more bytes follow; apply the "+1" de-bias.
+            if n == u64::MAX {
+                return Err(SerializeError::InvalidVarInt);
+            }
+            n += 1;
+        } else {
+            return Ok((n, i));
+        }
+    }
+}
+
+/// Compress a satoshi amount using Bitcoin Core's CompressAmount algorithm (compressor.h).
+///
+/// This is used when serializing Coin values to UTXO storage.
+pub fn compress_amount(mut n: u64) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let mut e: u32 = 0;
+    while n % 10 == 0 && e < 9 {
+        n /= 10;
+        e += 1;
+    }
+    if e < 9 {
+        let d = (n % 10) as u64;
+        debug_assert!(d >= 1 && d <= 9);
+        n /= 10;
+        1 + (n * 9 + d - 1) * 10 + e as u64
+    } else {
+        1 + (n - 1) * 10 + 9
+    }
+}
+
+/// Decompress an amount encoded by `compress_amount` (Bitcoin Core's DecompressAmount).
+pub fn decompress_amount(mut x: u64) -> u64 {
+    if x == 0 {
+        return 0;
+    }
+    x -= 1;
+    let e = (x % 10) as u32;
+    x /= 10;
+    let n: u64;
+    if e < 9 {
+        let d = (x % 9) + 1;
+        x /= 9;
+        n = x * 10 + d;
+    } else {
+        n = x + 1;
+    }
+    let mut result = n;
+    let mut exp = e;
+    while exp > 0 {
+        result *= 10;
+        exp -= 1;
+    }
+    result
+}
+
 /// Trait for Bitcoin serialization
 pub trait BitcoinSerialize {
     /// Serialize the type to bytes using Bitcoin consensus encoding
@@ -448,6 +558,103 @@ mod tests {
         // Invalid encoding (value doesn't match prefix)
         assert!(decode_varint(&[0xfd, 0x00, 0x00]).is_err()); // 0 < 0xfd
         assert!(decode_varint(&[0xfe, 0xff, 0xff, 0x00, 0x00]).is_err()); // 0xffff < 0x10000
+    }
+
+    /// Test vectors from Bitcoin Core serialize.h comment block:
+    ///  0:[0x00], 1:[0x01], 127:[0x7F], 128:[0x80,0x00], 255:[0x80,0x7F],
+    ///  256:[0x81,0x00], 16383:[0xFE,0x7F], 16384:[0xFF,0x00], 16511:[0xFF,0x7F]
+    #[test]
+    fn test_encode_corevarint_core_vectors() {
+        let vectors: &[(u64, &[u8])] = &[
+            (0,     &[0x00]),
+            (1,     &[0x01]),
+            (127,   &[0x7F]),
+            (128,   &[0x80, 0x00]),
+            (255,   &[0x80, 0x7F]),
+            (256,   &[0x81, 0x00]),
+            (16383, &[0xFE, 0x7F]),
+            (16384, &[0xFF, 0x00]),
+            (16511, &[0xFF, 0x7F]),
+        ];
+        for &(n, expected) in vectors {
+            let mut buf = Vec::new();
+            encode_corevarint(n, &mut buf);
+            assert_eq!(buf.as_slice(), expected, "encode_corevarint({}) mismatch", n);
+        }
+    }
+
+    #[test]
+    fn test_decode_corevarint_core_vectors() {
+        let vectors: &[(u64, &[u8])] = &[
+            (0,     &[0x00]),
+            (1,     &[0x01]),
+            (127,   &[0x7F]),
+            (128,   &[0x80, 0x00]),
+            (255,   &[0x80, 0x7F]),
+            (256,   &[0x81, 0x00]),
+            (16383, &[0xFE, 0x7F]),
+            (16384, &[0xFF, 0x00]),
+            (16511, &[0xFF, 0x7F]),
+        ];
+        for &(expected_n, encoded) in vectors {
+            let (n, consumed) = decode_corevarint(encoded).unwrap();
+            assert_eq!(n, expected_n, "decode_corevarint({:?}) value mismatch", encoded);
+            assert_eq!(consumed, encoded.len(), "decode_corevarint({:?}) consumed mismatch", encoded);
+        }
+    }
+
+    #[test]
+    fn test_corevarint_roundtrip() {
+        let values: &[u64] = &[0, 1, 127, 128, 255, 256, 16383, 16384, 16511, 65535,
+                                100000, 0xffffffff, 0x100000000, 0xffffffffffffffff];
+        for &v in values {
+            let mut buf = Vec::new();
+            encode_corevarint(v, &mut buf);
+            let (decoded, consumed) = decode_corevarint(&buf).unwrap();
+            assert_eq!(decoded, v, "corevarint round-trip failed for {}", v);
+            assert_eq!(consumed, buf.len(), "corevarint consumed mismatch for {}", v);
+        }
+    }
+
+    /// VarInt(253) must differ from CompactSize(253): the bug from TP-1.
+    #[test]
+    fn test_corevarint_253_differs_from_compactsize_253() {
+        let mut vi = Vec::new();
+        encode_corevarint(253, &mut vi);
+        let cs = encode_varint(253);
+        // VarInt(253) = [0x80, 0x7d]; CompactSize(253) = [0xfd, 0xfd, 0x00]
+        assert_eq!(vi, vec![0x80, 0x7d], "VarInt(253) should be 807d");
+        assert_eq!(cs, vec![0xfd, 0xfd, 0x00], "CompactSize(253) should be fdfd00");
+        assert_ne!(vi, cs, "VarInt and CompactSize must differ for 253 (TP-1 fix verified)");
+    }
+
+    /// height=127 => code=254; the canonical TP-1 divergence point.
+    #[test]
+    fn test_corevarint_code_254_undo_format() {
+        // code = height*2 + is_coinbase = 127*2 + 0 = 254
+        let mut vi = Vec::new();
+        encode_corevarint(254, &mut vi);
+        let cs = encode_varint(254);
+        assert_eq!(vi, vec![0x80, 0x7e], "VarInt(254) should be 807e");
+        assert_eq!(cs, vec![0xfd, 0xfe, 0x00], "CompactSize(254) should be fdfe00");
+        assert_ne!(vi, cs);
+    }
+
+    #[test]
+    fn test_compress_decompress_amount_vectors() {
+        // 0 stays 0
+        assert_eq!(compress_amount(0), 0);
+        assert_eq!(decompress_amount(0), 0);
+        // 1 satoshi
+        assert_eq!(decompress_amount(compress_amount(1)), 1);
+        // 1 BTC = 100_000_000 sat
+        let c = compress_amount(100_000_000);
+        assert_eq!(decompress_amount(c), 100_000_000);
+        // Various round-trip values
+        for &v in &[1u64, 100, 999, 1000, 50_000_000, 21_000_000 * 100_000_000] {
+            assert_eq!(decompress_amount(compress_amount(v)), v,
+                       "compress_amount round-trip failed for {}", v);
+        }
     }
 
     #[test]

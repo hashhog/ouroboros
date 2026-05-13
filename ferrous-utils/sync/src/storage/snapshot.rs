@@ -323,22 +323,55 @@ fn write_compact_size<W: Write>(writer: &mut W, n: u64) -> io::Result<()> {
     }
 }
 
-/// Read a serialized Coin from the snapshot format
+/// Write a Core MSB-base-128 VarInt to a writer (matching coins.h VARINT macro).
 ///
-/// Format:
-/// - code byte: (height << 1) | is_coinbase
-/// - value: CompactSize (amount in satoshis)
-/// - script_pubkey: CompactSize length + bytes
+/// This is NOT CompactSize — it is the format used by coins.h Coin::Serialize
+/// and undo.h TxInUndoFormatter.
+fn write_corevarint<W: Write>(writer: &mut W, n: u64) -> io::Result<()> {
+    let mut buf = Vec::new();
+    common::encode_corevarint(n, &mut buf);
+    writer.write_all(&buf)
+}
+
+/// Read a Core MSB-base-128 VarInt from a reader.
+fn read_corevarint<R: Read>(reader: &mut R) -> io::Result<u64> {
+    let mut n: u64 = 0;
+    loop {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte)?;
+        let ch = byte[0] as u64;
+        if n > (u64::MAX >> 7) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "VarInt overflow"));
+        }
+        n = (n << 7) | (ch & 0x7F);
+        if ch & 0x80 != 0 {
+            if n == u64::MAX {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "VarInt overflow"));
+            }
+            n += 1;
+        } else {
+            return Ok(n);
+        }
+    }
+}
+
+/// Read a serialized Coin from the snapshot format.
+///
+/// Format matches Bitcoin Core's coins.h Coin::Serialize:
+/// - code: VARINT((height << 1) | is_coinbase)  — MSB-base-128 VarInt
+/// - value: VARINT(CompressAmount(value))         — VarInt of compressed amount
+/// - script_pubkey: CompactSize length + bytes    — script length stays CompactSize
 fn read_coin<R: Read>(reader: &mut R) -> io::Result<Coin> {
-    // Read code byte (height << 1 | is_coinbase)
-    let code = read_compact_size(reader)?;
+    // Read code using Core VarInt (TP-2a fix)
+    let code = read_corevarint(reader)?;
     let is_coinbase = (code & 1) != 0;
     let height = (code >> 1) as u32;
 
-    // Read value
-    let value = read_compact_size(reader)?;
+    // Read compressed value using Core VarInt, then decompress (TP-2b fix)
+    let compressed_value = read_corevarint(reader)?;
+    let value = common::decompress_amount(compressed_value);
 
-    // Read script length and script
+    // Read script length and script (script length uses CompactSize per snapshot format)
     let script_len = read_compact_size(reader)? as usize;
     let mut script_bytes = vec![0u8; script_len];
     reader.read_exact(&mut script_bytes)?;
@@ -346,16 +379,22 @@ fn read_coin<R: Read>(reader: &mut R) -> io::Result<Coin> {
     Ok(Coin::new(value, ScriptBuf::from_bytes(script_bytes), height, is_coinbase))
 }
 
-/// Write a serialized Coin in snapshot format
+/// Write a serialized Coin in snapshot format.
+///
+/// Format matches Bitcoin Core's coins.h Coin::Serialize:
+/// - code: VARINT((height << 1) | is_coinbase)  — MSB-base-128 VarInt
+/// - value: VARINT(CompressAmount(value))         — VarInt of compressed amount
+/// - script_pubkey: CompactSize length + bytes
 fn write_coin<W: Write>(writer: &mut W, coin: &Coin) -> io::Result<()> {
-    // Write code byte (height << 1 | is_coinbase)
+    // Write code using Core VarInt (TP-2a fix)
     let code = ((coin.height as u64) << 1) | (if coin.is_coinbase { 1 } else { 0 });
-    write_compact_size(writer, code)?;
+    write_corevarint(writer, code)?;
 
-    // Write value
-    write_compact_size(writer, coin.value)?;
+    // Write VARINT(CompressAmount(value)) — NOT raw CompactSize (TP-2b fix)
+    let compressed_value = common::compress_amount(coin.value);
+    write_corevarint(writer, compressed_value)?;
 
-    // Write script
+    // Write script (script length stays as CompactSize per snapshot format)
     let script_bytes = coin.script_pubkey.as_bytes();
     write_compact_size(writer, script_bytes.len() as u64)?;
     writer.write_all(script_bytes)?;
@@ -670,12 +709,85 @@ mod tests {
         write_coin(&mut buf, &coin).unwrap();
 
         let mut cursor = Cursor::new(&buf);
-        let read_coin = read_coin(&mut cursor).unwrap();
+        let read_coin_val = read_coin(&mut cursor).unwrap();
 
-        assert_eq!(coin.value, read_coin.value);
-        assert_eq!(coin.height, read_coin.height);
-        assert_eq!(coin.is_coinbase, read_coin.is_coinbase);
-        assert_eq!(coin.script_pubkey, read_coin.script_pubkey);
+        assert_eq!(coin.value, read_coin_val.value);
+        assert_eq!(coin.height, read_coin_val.height);
+        assert_eq!(coin.is_coinbase, read_coin_val.is_coinbase);
+        assert_eq!(coin.script_pubkey, read_coin_val.script_pubkey);
+    }
+
+    /// TP-2a fix: code for height=200, is_coinbase=false => code=400.
+    /// Core writes VarInt(400) = [0x82, 0x10]; old code wrote CompactSize(400) = [0xfd, 0x90, 0x01].
+    #[test]
+    fn test_write_coin_uses_corevarint_for_code() {
+        let coin = Coin::new(
+            1_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            200,   // height=200 => code=400
+            false,
+        );
+        let mut buf = Vec::new();
+        write_coin(&mut buf, &coin).unwrap();
+        // VarInt(400): first two bytes must be [0x82, 0x10]
+        assert_eq!(buf[0], 0x82,
+            "TP-2a fix: first byte of VarInt(400) must be 0x82, not 0xfd (CompactSize)");
+        assert_eq!(buf[1], 0x10,
+            "TP-2a fix: second byte of VarInt(400) must be 0x10");
+        // Old CompactSize would have written [0xfd, 0x90, 0x01]
+        assert_ne!(buf[0], 0xfd, "CompactSize prefix 0xfd must NOT appear for code=400");
+    }
+
+    /// TP-2b fix: value=100000 must be written as VARINT(CompressAmount(100000)), not raw CompactSize.
+    #[test]
+    fn test_write_coin_compresses_amount() {
+        let coin = Coin::new(
+            100_000,
+            ScriptBuf::from_bytes(vec![0x51]),
+            10,
+            false,
+        );
+        let mut buf = Vec::new();
+        write_coin(&mut buf, &coin).unwrap();
+
+        // Verify round-trip
+        let mut cursor = Cursor::new(&buf);
+        let decoded = read_coin(&mut cursor).unwrap();
+        assert_eq!(decoded.value, 100_000, "TP-2b: amount round-trip must be exact after compress/decompress");
+
+        // Verify: old code would write raw 100000=0x186a0 as CompactSize 0xfe prefix (5 bytes).
+        // After TP-2 fix the amount bytes should be much shorter (compressed form).
+        // Code for height=10, is_coinbase=false = 20 = 0x14 => 1 byte VarInt.
+        // The value bytes start at buf[1].
+        // CompressAmount(100_000) = some small value; verify it's NOT [0xfe, 0xa0, 0x86, 0x01, 0x00]
+        let raw_compactsize_100000 = vec![0xfe_u8, 0xa0, 0x86, 0x01, 0x00];
+        // slice buf starting from offset 1 to check the value encoding
+        let value_area = &buf[1..];
+        let is_raw_compactsize = value_area.len() >= 5
+            && value_area[0] == 0xfe
+            && value_area[1] == 0xa0
+            && value_area[2] == 0x86;
+        assert!(!is_raw_compactsize,
+            "TP-2b: amount must NOT be written as raw CompactSize(100000)=[0xfe,0xa0,0x86,0x01,0x00]");
+    }
+
+    #[test]
+    fn test_corevarint_roundtrip_in_snapshot() {
+        // Verify write_corevarint / read_corevarint agree with Core test vectors.
+        let vectors: &[(u64, &[u8])] = &[
+            (0,     &[0x00]),
+            (127,   &[0x7F]),
+            (128,   &[0x80, 0x00]),
+            (16384, &[0xFF, 0x00]),
+        ];
+        for &(n, expected) in vectors {
+            let mut buf = Vec::new();
+            write_corevarint(&mut buf, n).unwrap();
+            assert_eq!(buf.as_slice(), expected, "write_corevarint({}) mismatch", n);
+            let mut cursor = Cursor::new(&buf);
+            let decoded = read_corevarint(&mut cursor).unwrap();
+            assert_eq!(decoded, n, "read_corevarint({}) mismatch", n);
+        }
     }
 
     #[test]

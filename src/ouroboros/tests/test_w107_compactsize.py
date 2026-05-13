@@ -919,23 +919,30 @@ class TestG21_RustR2SnapshotMaxSize(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestG22_UndoRsUsesCompactSizeSource(unittest.TestCase):
-    """G22 (TP-1 source): undo.rs imports and uses CompactSize encode_varint from common."""
+    """G22 (TP-1 FIXED): undo.rs now uses Core VarInt (encode_corevarint) not CompactSize.
 
-    def test_undo_imports_common_encode_varint(self):
+    Before fix: undo.rs imported common::encode_varint (CompactSize 0xfd/0xfe/0xff prefix).
+    After fix: undo.rs imports common::decode_corevarint and calls common::encode_corevarint.
+    """
+
+    def test_undo_uses_corevarint_not_compactsize_FIXED(self):
+        """FIXED (TP-1): undo.rs uses encode_corevarint (Core VarInt), not encode_varint (CompactSize)."""
         import os
         src_path = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/storage/undo.rs"
         if not os.path.exists(src_path):
             self.skipTest("Rust source not available")
         with open(src_path) as f:
             src = f.read()
-        # undo.rs uses common::encode_varint (CompactSize) for UTXO code/value
-        self.assertIn("common::encode_varint", src,
-                      "undo.rs uses common::encode_varint (CompactSize) not VarInt")
-        # Coin::serialize uses encode_varint for code and value
-        self.assertIn("encode_varint(code", src,
-                      "undo.rs encodes code with CompactSize (BUG: should use VarInt)")
-        self.assertIn("encode_varint(self.value", src,
-                      "undo.rs encodes value with CompactSize (BUG: should use VarInt)")
+        # FIXED: undo.rs now imports decode_corevarint and uses encode_corevarint
+        self.assertIn("decode_corevarint", src,
+                      "FIXED: undo.rs should use decode_corevarint (Core VarInt)")
+        self.assertIn("encode_corevarint", src,
+                      "FIXED: undo.rs should use encode_corevarint (Core VarInt)")
+        # Must NOT use the old CompactSize path for coin fields
+        self.assertNotIn("encode_varint(code", src,
+                         "FIXED: undo.rs must NOT encode coin code with CompactSize encode_varint")
+        self.assertNotIn("encode_varint(self.value", src,
+                         "FIXED: undo.rs must NOT encode value with CompactSize encode_varint")
 
 
 # ---------------------------------------------------------------------------
@@ -943,9 +950,14 @@ class TestG22_UndoRsUsesCompactSizeSource(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestG23_SnapshotRsWriteCoinSource(unittest.TestCase):
-    """G23 (TP-2 source): snapshot.rs write_coin uses write_compact_size for code/value."""
+    """G23 (TP-2 FIXED): snapshot.rs write_coin now uses write_corevarint + compress_amount.
 
-    def test_snapshot_write_coin_uses_compact_size(self):
+    Before fix: write_coin used write_compact_size for code and raw value.
+    After fix: write_coin uses write_corevarint for code and VARINT(CompressAmount(value)).
+    """
+
+    def test_snapshot_write_coin_uses_corevarint_FIXED(self):
+        """FIXED (TP-2): write_coin uses Core VarInt for code and compressed amount."""
         import os
         src_path = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/storage/snapshot.rs"
         if not os.path.exists(src_path):
@@ -958,12 +970,17 @@ class TestG23_SnapshotRsWriteCoinSource(unittest.TestCase):
         end = src.find("\n}", start) + 2
         fn_body = src[start:end]
 
-        # write_coin should NOT use write_compact_size for code and value
-        # (it should use the VarInt format)
-        self.assertIn("write_compact_size(writer, code)", fn_body,
-                      "BUG (TP-2): write_coin uses CompactSize for code (should be VarInt)")
-        self.assertIn("write_compact_size(writer, coin.value)", fn_body,
-                      "BUG (TP-2): write_coin uses CompactSize for raw value (should be VarInt(CompressAmount))")
+        # FIXED: write_coin must use write_corevarint for code (not write_compact_size)
+        self.assertIn("write_corevarint(writer, code)", fn_body,
+                      "FIXED (TP-2a): write_coin must use write_corevarint for code")
+        # FIXED: write_coin must compress the amount before writing
+        self.assertIn("compress_amount", fn_body,
+                      "FIXED (TP-2b): write_coin must call compress_amount before encoding value")
+        # Must NOT use old bugs
+        self.assertNotIn("write_compact_size(writer, code)", fn_body,
+                         "FIXED: write_coin must NOT use write_compact_size for code")
+        self.assertNotIn("write_compact_size(writer, coin.value)", fn_body,
+                         "FIXED: write_coin must NOT write raw uncompressed value via CompactSize")
 
 
 # ---------------------------------------------------------------------------
