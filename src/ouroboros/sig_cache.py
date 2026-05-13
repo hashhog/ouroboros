@@ -4,19 +4,29 @@ Signature verification cache.
 Avoids redundant script verification during block connection and mempool acceptance.
 Successful verifications are cached; failures are never cached to ensure safety.
 
-Key format: (txid_hex, input_index, flags) where:
-  - txid_hex: the transaction id as a hex string
-  - input_index: which input was verified
-  - flags: script verification flags used
+Key format: SHA256(nonce || sighash || pubkey || sig || flags_le32)[:8]
+  - nonce:   32-byte random value generated at __init__ (per-process secret)
+  - sighash: the serialised sighash bytes covering this input
+  - pubkey:  the public key bytes
+  - sig:     the signature bytes
+  - flags:   script verification flags (little-endian uint32)
 
-Reference: bitcoin/src/script/sigcache.h
+The nonce prevents adversarial pre-image attacks: an attacker who can observe
+txids / input indices in the mempool cannot predict cache keys and craft
+collisions.
+
+Reference: bitcoin/src/script/sigcache.h — GetRandHash nonce + CSHA256 salted
+           ComputeEntryECDSA / ComputeEntrySchnorr
 """
 
+import hashlib
+import os
+import struct
 from collections import OrderedDict
 from threading import Lock
 
-# Type alias for cache keys
-CacheKey = tuple[str, int, int]  # (txid_hex, input_index, flags)
+# Type alias for the internal (hashed) cache key stored in the OrderedDict.
+CacheKey = bytes  # 8-byte prefix of SHA256(nonce||material)
 
 
 class SigCache:
@@ -24,8 +34,9 @@ class SigCache:
     Bounded LRU cache for successful script verifications.
 
     Only successful verifications are cached. The cache key includes
-    script verification flags because stricter flags (e.g. WITNESS)
-    may reject scripts that pass with looser flags.
+    the actual cryptographic material (sighash, pubkey, sig) plus the
+    script verification flags, all salted with a per-process random
+    nonce so that keys are unpredictable to external observers.
 
     Thread-safe via a lock around all mutations.
     """
@@ -39,20 +50,35 @@ class SigCache:
                          Default 50,000 matches Bitcoin Core's default.
         """
         self._max_entries = max_entries
+        # Per-process random nonce — prevents adversarial cache-key prediction.
+        # Mirrors Core's GetRandHash() call in SignatureCache constructor
+        # (sigcache.cpp:22-32).
+        self.nonce: bytes = os.urandom(32)
         self._cache: OrderedDict[CacheKey, bool] = OrderedDict()
         self._lock = Lock()
 
-    def lookup(self, key: CacheKey) -> bool:
+    def _make_key(self, sighash: bytes, pubkey: bytes, sig: bytes, flags: int) -> CacheKey:
+        """Derive the 8-byte cache key from cryptographic material."""
+        digest = hashlib.sha256(
+            self.nonce + sighash + pubkey + sig + struct.pack("<I", flags)
+        ).digest()
+        return digest[:8]
+
+    def lookup(self, sighash: bytes, pubkey: bytes, sig: bytes, flags: int) -> bool:
         """
         Check if a verification result is cached.
 
         Args:
-            key: Tuple of (txid_hex, input_index, flags)
+            sighash: Serialised sighash bytes for this input.
+            pubkey:  Public key bytes.
+            sig:     Signature bytes.
+            flags:   Script verification flags.
 
         Returns:
             True if the verification was previously cached as successful,
             False otherwise.
         """
+        key = self._make_key(sighash, pubkey, sig, flags)
         with self._lock:
             if key in self._cache:
                 # Move to end for LRU ordering
@@ -60,13 +86,17 @@ class SigCache:
                 return True
             return False
 
-    def insert(self, key: CacheKey) -> None:
+    def insert(self, sighash: bytes, pubkey: bytes, sig: bytes, flags: int) -> None:
         """
         Cache a successful verification.
 
         Args:
-            key: Tuple of (txid_hex, input_index, flags)
+            sighash: Serialised sighash bytes for this input.
+            pubkey:  Public key bytes.
+            sig:     Signature bytes.
+            flags:   Script verification flags.
         """
+        key = self._make_key(sighash, pubkey, sig, flags)
         with self._lock:
             if key in self._cache:
                 # Already cached, just move to end

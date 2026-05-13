@@ -316,152 +316,148 @@ class TestG6NoScriptExecutionCache(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# G7: Script-execution cache key wrong (txid+index+flags vs wtxhash+flags)
+# G7: SigCache key includes sighash+pubkey+sig (FIXED)
 # ---------------------------------------------------------------------------
 class TestG7CacheKeyWrong(unittest.TestCase):
     """
-    BUG-G7: SigCache key is (txid_hex, input_index, flags) — wrong granularity.
+    FIXED-G7: SigCache key now commits to (sighash, pubkey, sig, flags).
 
     Core SigCache (sigcache.h / sigcache.cpp):
       ComputeEntryECDSA: SHA256(nonce||'E'||0*31||sighash||pubkey||sig)
       ComputeEntrySchnorr: SHA256(nonce||hash||pubkey||sig)
-    Key commits to the SIGHASH of the specific input (not the txid) plus
-    the pubkey and signature bytes.  This means:
-      1. Same txid/input verified under different sighashes (e.g. different
-         SIGHASH_ANYONECANPAY permutations) gets separate cache entries.
-      2. Cache is correct across txid reuse.
 
-    ouroboros SigCache key: (txid_hex, input_index, flags)
-      — does NOT include the sighash, pubkey, or signature bytes.
-      — Two different signatures spending the same outpoint with the same flags
-        would collide, causing false cache hits.
-      — This is a CORRECTNESS BUG: a cached "valid" entry for input N can be
-        reused for a different signature on the same (txid, N) pair (e.g. after
-        a malleated tx replaces the original in a reorg).
+    After fix: ouroboros uses SHA256(nonce || sighash || pubkey || sig ||
+    flags_le32)[:8].  Two different (sig, pubkey) pairs on the same outpoint
+    produce distinct cache entries.
     """
 
-    def test_sig_cache_key_excludes_sighash(self):
-        """SigCache key uses txid+idx+flags, NOT sighash+pubkey+sig (Core format)."""
+    def test_different_sigs_produce_distinct_cache_entries(self):
+        """FIXED: distinct sig bytes → distinct cache entries (no false hit)."""
         cache = SigCache(max_entries=100)
-        # Core's key would include the actual sighash bytes — ouroboros key only
-        # uses (txid, input_index, flags).  Demonstrate this by inserting with
-        # the ouroboros key format.
-        txid = "a" * 64
-        key1 = (txid, 0, 0)
-        key2 = (txid, 0, 0)  # same key — same txid/idx/flags regardless of sig
-        cache.insert(key1)
-        # With Core's sighash-inclusive key, changing the sig changes the key.
-        # With ouroboros key, they are identical — false cache hit possible.
-        self.assertTrue(cache.lookup(key2),
-            "Both keys map to same cache entry despite potentially different sigs — "
-            "confirms G7: sighash not in key")
+        sighash = b"sighash_bytes_" + bytes(18)
+        pubkey  = b"pubkey_bytes__" + bytes(19)
+        sig_a   = b"sig_a_" + bytes(58)
+        sig_b   = b"sig_b_" + bytes(58)  # different signature
 
-    def test_key_structure_is_txid_index_flags(self):
-        """Verify key structure is (txid_hex, input_index, flags) — no sighash."""
+        cache.insert(sighash, pubkey, sig_a, 0)
+
+        # A different signature on the same outpoint must NOT hit the cache.
+        self.assertTrue(cache.lookup(sighash, pubkey, sig_a, 0),
+            "Same material should hit after insert")
+        self.assertFalse(cache.lookup(sighash, pubkey, sig_b, 0),
+            "G7 FIXED: different sig bytes must not produce a false cache hit")
+
+    def test_different_sighashes_produce_distinct_cache_entries(self):
+        """FIXED: distinct sighash bytes → distinct cache entries."""
         cache = SigCache(max_entries=10)
-        # If sighash were in the key, these would be different entries.
-        # They are the same because sighash is absent.
-        k1 = ("deadbeef" * 8, 0, 1)
-        k2 = ("deadbeef" * 8, 0, 1)
-        cache.insert(k1)
-        self.assertTrue(cache.lookup(k2),
-            "G7: key does not distinguish signatures — same txid+idx+flags hits")
+        pubkey = b"pk" + bytes(31)
+        sig    = b"sig" + bytes(61)
+        sh_a   = b"sighash_A" + bytes(23)
+        sh_b   = b"sighash_B" + bytes(23)
+
+        cache.insert(sh_a, pubkey, sig, 1)
+        self.assertTrue(cache.lookup(sh_a, pubkey, sig, 1))
+        self.assertFalse(cache.lookup(sh_b, pubkey, sig, 1),
+            "G7 FIXED: different sighash bytes must not hit same cache entry")
 
 
 # ---------------------------------------------------------------------------
-# G8: No salted/nonce SigCache key (Core: GetRandHash nonce + CSHA256)
+# G8: SigCache uses os.urandom(32) nonce (FIXED)
 # ---------------------------------------------------------------------------
 class TestG8NoSaltedNonce(unittest.TestCase):
     """
-    BUG-G8: SigCache key has no startup nonce / salted hasher.
+    FIXED-G8: SigCache.__init__ now generates a 32-byte random nonce via
+    os.urandom(32).  All cache entry hashes incorporate this nonce so that
+    an attacker who can observe txids / input indices cannot predict or
+    pre-compute cache keys.
 
-    Core (sigcache.cpp:22-32):
-      uint256 nonce = GetRandHash();
-      m_salted_hasher_ecdsa.Write(nonce.begin(), 32);
-      m_salted_hasher_ecdsa.Write(PADDING_ECDSA, 32);
-    All cache entry hashes are computed with a per-process random nonce that
-    an attacker cannot predict.  This prevents birthday attacks where an
-    adversary crafts a transaction whose signature pre-images collide with a
-    cached entry.
-
-    ouroboros SigCache: uses plain Python tuple as key.  No nonce, no hashing,
-    no CSHA256.  An attacker who can observe the txid and input index in the
-    mempool can trivially construct a cache key that will match.
+    Core equivalent: GetRandHash() nonce written into m_salted_hasher_ecdsa /
+    m_salted_hasher_schnorr at startup (sigcache.cpp:22-32).
     """
 
-    def test_no_nonce_in_sig_cache(self):
-        """SigCache.__init__ does not generate a random nonce."""
+    def test_nonce_present_in_sig_cache(self):
+        """SigCache.__init__ now generates a random nonce via os.urandom."""
         import inspect
         from ouroboros.sig_cache import SigCache as SC
         src = inspect.getsource(SC)
-        self.assertNotIn("GetRandHash", src)
-        self.assertNotIn("nonce", src,
-            "BUG-G8 present: SigCache has no nonce — trivially predictable keys")
-        self.assertNotIn("urandom", src)
-        self.assertNotIn("secrets.token", src)
-        self.assertNotIn("CSHA256", src)
-        # Cache key is a raw tuple — confirm
-        self.assertIn("OrderedDict", src)
+        self.assertIn("nonce", src,
+            "G8 FIXED: SigCache must have a nonce attribute")
+        self.assertIn("urandom", src,
+            "G8 FIXED: nonce must be generated with os.urandom")
+        # Key derivation must use SHA256, not a raw tuple
+        self.assertIn("sha256", src,
+            "G8 FIXED: key derivation must use hashlib.sha256")
 
-    def test_cache_key_is_plain_tuple(self):
-        """Cache uses plain tuple as key — no hashing."""
+    def test_cache_key_is_hashed_bytes_not_plain_tuple(self):
+        """Cache stores 8-byte hashed keys, not raw tuples."""
         cache = SigCache(max_entries=10)
-        # Direct inspection: internal dict keys are tuples
-        key = ("txid_hex_value", 0, 0)
-        cache.insert(key)
+        sighash = b"sh" + bytes(30)
+        pubkey  = b"pk" + bytes(31)
+        sig     = b"sg" + bytes(62)
+        cache.insert(sighash, pubkey, sig, 0)
         with cache._lock:
             stored_keys = list(cache._cache.keys())
-        self.assertEqual(stored_keys[0], key,
-            "G8: key stored as plain tuple — no hashing/nonce applied")
+        self.assertEqual(len(stored_keys), 1)
+        stored = stored_keys[0]
+        # Key must be bytes (the 8-byte hash prefix), not a plain tuple
+        self.assertIsInstance(stored, bytes,
+            "G8 FIXED: internal key must be bytes (SHA256 prefix), not a tuple")
+        self.assertEqual(len(stored), 8,
+            "G8 FIXED: internal key must be 8 bytes")
+
+    def test_two_caches_have_different_nonces(self):
+        """Each SigCache instance has its own distinct nonce."""
+        c1 = SigCache(max_entries=10)
+        c2 = SigCache(max_entries=10)
+        self.assertNotEqual(c1.nonce, c2.nonce,
+            "G8 FIXED: each SigCache instance must have a unique per-process nonce")
+        self.assertEqual(len(c1.nonce), 32,
+            "G8 FIXED: nonce must be 32 bytes")
 
 
 # ---------------------------------------------------------------------------
-# G9: SigCache key missing sighash component
+# G9: SigCache key commits to sighash + pubkey + sig (FIXED)
 # ---------------------------------------------------------------------------
 class TestG9CacheKeyMissingSighash(unittest.TestCase):
     """
-    BUG-G9: SigCache cache key omits the actual cryptographic input (sighash).
+    FIXED-G9: SigCache key now commits to the full cryptographic material:
+    sighash bytes, pubkey bytes, sig bytes, and flags — all salted with the
+    per-process nonce.
 
     Core ComputeEntryECDSA key covers: nonce || 'E' || zeros || sighash || pubkey || sig
     Core ComputeEntrySchnorr: nonce || hash || pubkey || sig
 
-    ouroboros key: (txid_hex, input_index, flags)
-      — sighash is not committed to in the key
-      — pubkey bytes not committed to
-      — sig bytes not committed to
-
-    This means two different (sig, pubkey) pairs on the same (txid, input_index, flags)
-    map to the same cache entry.  In the presence of signature malleability or
-    intentional key reuse, a successful verification result can be incorrectly
-    returned for a different (sig, pubkey) pair.  Severity: CONSENSUS-DIVERGENT
-    if an attacker can cause a cache hit for an actually-invalid signature.
+    After fix: no two distinct (sighash, pubkey, sig, flags) tuples share a
+    cache entry.  Adversarial cache poisoning via outpoint reuse is prevented.
     """
 
-    def test_false_cache_hit_with_different_sigs(self):
-        """Two different 'signatures' on same (txid, idx, flags) share a cache entry."""
+    def test_no_false_cache_hit_with_different_sigs(self):
+        """FIXED: a different sig on same outpoint does NOT produce a cache hit."""
         cache = SigCache(max_entries=100)
-        txid = "cafe" * 16
+        sighash = b"sighash_material" + bytes(16)
+        pubkey  = b"pubkey_material_" + bytes(17)
+        sig_a   = b"sig_a_material__" + bytes(48)
+        sig_b   = b"sig_b_material__" + bytes(48)  # different sig (e.g. malleated)
 
-        # Simulate: first signature for this input is verified and cached
-        key_first_sig = (txid, 0, 0)
-        cache.insert(key_first_sig)
+        cache.insert(sighash, pubkey, sig_a, 0)
 
-        # Now a different signature on the same input (e.g. after malleation)
-        # — with Core's sighash-based key these would be DIFFERENT entries.
-        # With ouroboros's key they are THE SAME entry — false cache hit.
-        key_different_sig = (txid, 0, 0)  # same (txid, idx, flags) regardless of sig
-        self.assertTrue(cache.lookup(key_different_sig),
-            "G9 CONFIRMED: Different signature looks like cache hit — sighash not in key")
+        self.assertTrue(cache.lookup(sighash, pubkey, sig_a, 0))
+        self.assertFalse(cache.lookup(sighash, pubkey, sig_b, 0),
+            "G9 FIXED: malleated sig must not produce a false cache hit")
 
-    def test_pubkey_not_in_key(self):
-        """Pubkey is not part of the cache key — different pubkeys collide."""
+    def test_different_pubkeys_do_not_collide(self):
+        """FIXED: different pubkeys on same outpoint produce distinct entries."""
         cache = SigCache(max_entries=100)
-        txid = "beef" * 16
-        # Both "pubkey A sig A" and "pubkey B sig B" map to same key
-        key = (txid, 0, 0x0001)
-        cache.insert(key)
-        self.assertTrue(cache.lookup(key),
-            "G9: pubkey not in key — different pubkeys collapse to same entry")
+        sighash = b"sighash_material" + bytes(16)
+        pk_a    = b"pubkey_a_material" + bytes(16)
+        pk_b    = b"pubkey_b_material" + bytes(16)
+        sig     = b"sig_material____" + bytes(48)
+
+        cache.insert(sighash, pk_a, sig, 0x0001)
+
+        self.assertTrue(cache.lookup(sighash, pk_a, sig, 0x0001))
+        self.assertFalse(cache.lookup(sighash, pk_b, sig, 0x0001),
+            "G9 FIXED: different pubkey must not collapse to same cache entry")
 
 
 # ---------------------------------------------------------------------------
@@ -904,8 +900,8 @@ class TestG19NoCacheResultsControl(unittest.TestCase):
         import inspect
         import ouroboros.validation as val_mod
         src = inspect.getsource(val_mod)
-        # insert is called after every successful verify
-        self.assertIn("SIG_CACHE.insert(cache_key)", src,
+        # insert is called after every successful verify (variable name post-fix)
+        self.assertIn("SIG_CACHE.insert(", src,
             "Expected unconditional insert in _verify_input_signature")
         # No fCacheResults gate
         self.assertNotIn("fCacheResults", src)
@@ -914,12 +910,14 @@ class TestG19NoCacheResultsControl(unittest.TestCase):
     def test_lookup_does_not_remove_entry(self):
         """lookup() does not erase the found entry (Core erases on !cacheFullScriptStore)."""
         cache = SigCache(max_entries=100)
-        key = ("txid", 0, 0)
-        cache.insert(key)
+        sh = b"sighash_g19__" + bytes(19)
+        pk = b"pubkey_g19___" + bytes(20)
+        sig = b"sig_g19______" + bytes(51)
+        cache.insert(sh, pk, sig, 0)
         # First lookup
-        self.assertTrue(cache.lookup(key))
+        self.assertTrue(cache.lookup(sh, pk, sig, 0))
         # Entry not erased — still present
-        self.assertTrue(cache.lookup(key),
+        self.assertTrue(cache.lookup(sh, pk, sig, 0),
             "G19: lookup does not remove entry (Core removes on !cacheFullScriptStore)")
 
 
@@ -1137,7 +1135,7 @@ class TestG25ClearNotWiredToReorg(unittest.TestCase):
         """SigCache.clear() exists."""
         cache = SigCache(max_entries=10)
         self.assertTrue(hasattr(cache, 'clear'))
-        cache.insert(("tx1", 0, 0))
+        cache.insert(b"sh_g25_" + bytes(25), b"pk_g25_" + bytes(26), b"sig_g25" + bytes(57), 0)
         cache.clear()
         self.assertEqual(len(cache), 0)
 
@@ -1383,9 +1381,11 @@ class TestSigCacheCorrectness(unittest.TestCase):
     def test_failure_not_cached(self):
         """Failed verifications are NOT inserted — only successes are cached."""
         cache = SigCache(max_entries=100)
-        key = ("txid", 0, 0)
+        sh  = b"sighash_fail_" + bytes(19)
+        pk  = b"pubkey_fail__" + bytes(20)
+        sig = b"sig_fail_____" + bytes(51)
         # Simulate a failed verification: we never call insert
-        self.assertFalse(cache.lookup(key))
+        self.assertFalse(cache.lookup(sh, pk, sig, 0))
         # Only after a successful verification would insert be called
         # This test confirms the contract: look up first, insert only on success
 
@@ -1393,13 +1393,15 @@ class TestSigCacheCorrectness(unittest.TestCase):
         """Different flags (consensus vs policy) create separate cache entries."""
         cache = SigCache(max_entries=100)
         from ouroboros.script import SCRIPT_VERIFY_P2SH, SCRIPT_VERIFY_WITNESS
-        txid = "0" * 64
+        sh  = b"sighash_flags" + bytes(19)
+        pk  = b"pubkey_flags_" + bytes(20)
+        sig = b"sig_flags____" + bytes(51)
         consensus_flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS
         policy_flags = consensus_flags | 0x8000  # additional policy bits
 
-        cache.insert((txid, 0, consensus_flags))
-        self.assertTrue(cache.lookup((txid, 0, consensus_flags)))
-        self.assertFalse(cache.lookup((txid, 0, policy_flags)),
+        cache.insert(sh, pk, sig, consensus_flags)
+        self.assertTrue(cache.lookup(sh, pk, sig, consensus_flags))
+        self.assertFalse(cache.lookup(sh, pk, sig, policy_flags),
             "Policy flags cache entry is separate from consensus flags entry")
 
     def test_cache_survives_threading(self):
@@ -1409,9 +1411,12 @@ class TestSigCacheCorrectness(unittest.TestCase):
 
         def worker(thread_id: int) -> None:
             for i in range(200):
-                key = (f"tx{thread_id}_{i}", i % 3, i % 5)
-                cache.insert(key)
-                result = cache.lookup(key)
+                sh  = f"sh_{thread_id}_{i}".encode().ljust(32, b'\x00')
+                pk  = f"pk_{thread_id}_{i}".encode().ljust(33, b'\x00')
+                sig = f"sig_{thread_id}_{i}".encode().ljust(64, b'\x00')
+                fl  = i % 5
+                cache.insert(sh, pk, sig, fl)
+                result = cache.lookup(sh, pk, sig, fl)
                 if not result:
                     errors.append(f"thread={thread_id} i={i} lookup after insert failed")
 
