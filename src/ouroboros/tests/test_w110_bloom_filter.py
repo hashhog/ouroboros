@@ -852,15 +852,15 @@ class TestG25_FilterloadMessage(unittest.TestCase):
             "G25: filterload absent from V2_MESSAGE_IDS — unexpected",
         )
 
-    def test_filterload_handler_not_registered(self):
-        """No on_filterload handler is registered in p2p.py."""
+    def test_filterload_handler_registered(self):
+        """FIX-36: on_filterload handler IS registered in p2p.py (BIP-111 disconnect)."""
         has_handler = (
             'register_handler("filterload"' in _P2P
             or "on_filterload" in _P2P
         )
-        self.assertFalse(
+        self.assertTrue(
             has_handler,
-            "G25: filterload handler found in p2p.py — update test",
+            "FIX-36: filterload handler absent from p2p.py — BIP-111 disconnect not wired",
         )
 
     def test_filterload_handler_not_in_node(self):
@@ -900,15 +900,15 @@ class TestG26_FilteraddMessage(unittest.TestCase):
     items, causing O(itemLen * nHashFuncs) hash overhead per insert.
     """
 
-    def test_filteradd_handler_absent(self):
-        """filteradd message handler absent from p2p.py."""
+    def test_filteradd_handler_registered(self):
+        """FIX-36: on_filteradd handler IS registered in p2p.py (BIP-111 disconnect)."""
         has_handler = (
             'register_handler("filteradd"' in _P2P
             or "on_filteradd" in _P2P
         )
-        self.assertFalse(
+        self.assertTrue(
             has_handler,
-            "G26: filteradd handler found in p2p.py — update test",
+            "FIX-36: filteradd handler absent from p2p.py — BIP-111 disconnect not wired",
         )
 
     def test_filteradd_520_byte_cap_absent(self):
@@ -943,15 +943,15 @@ class TestG27_FilterclearMessage(unittest.TestCase):
     is registered.
     """
 
-    def test_filterclear_handler_absent(self):
-        """filterclear message handler absent from p2p.py."""
+    def test_filterclear_handler_registered(self):
+        """FIX-36: on_filterclear handler IS registered in p2p.py (BIP-111 disconnect)."""
         has_handler = (
             'register_handler("filterclear"' in _P2P
             or "on_filterclear" in _P2P
         )
-        self.assertFalse(
+        self.assertTrue(
             has_handler,
-            "G27: filterclear handler found in p2p.py — update test",
+            "FIX-36: filterclear handler absent from p2p.py — BIP-111 disconnect not wired",
         )
 
 
@@ -1121,21 +1121,25 @@ class TestG30_NodeBloomAndBip111(unittest.TestCase):
             "G30: peer_bloom_filters flag absent from peer.py",
         )
 
-    def test_filterload_disconnect_on_no_bloom_absent(self):
+    def test_filterload_disconnect_on_no_bloom_present(self):
         """
-        BUG-30a (HIGH): No disconnect when filterload arrives without NODE_BLOOM.
+        FIX-36 (BUG-30a closed): BIP-111 disconnect path IS present.
 
-        Core disconnects a peer that sends filterload when NODE_BLOOM is not
-        advertised. Ouroboros has no filterload handler at all, so the peer is
-        silently tolerated — no disconnect occurs.
+        filterload/filteradd/filterclear handlers are now registered in
+        _register_bloom_handlers (p2p.py).  Each handler disconnects the peer
+        when NODE_BLOOM was not advertised, matching
+        bitcoin-core/src/net_processing.cpp:4965
+        `pfrom.fDisconnect = true` on no-NODE_BLOOM.
         """
-        has_disconnect = (
-            'register_handler("filterload"' in _P2P
-            or "fDisconnect" in _P2P
+        has_handler = 'register_handler("filterload"' in _P2P
+        has_disconnect = "peer.disconnect" in _P2P
+        self.assertTrue(
+            has_handler,
+            "FIX-36: filterload handler absent from p2p.py — BIP-111 disconnect not wired",
         )
-        self.assertFalse(
+        self.assertTrue(
             has_disconnect,
-            "G30: filterload disconnect path found — update test",
+            "FIX-36: peer.disconnect() call absent from p2p.py",
         )
 
     def test_per_peer_bloom_filter_state_absent(self):
@@ -1217,10 +1221,15 @@ class TestTwoPipelineAnalysis(unittest.TestCase):
             "Rust bloom.rs found unexpectedly — two-pipeline analysis needs update",
         )
 
-    def test_filterload_in_v2_message_ids_but_no_handler(self):
+    def test_filterload_in_v2_message_ids_and_handler_registered(self):
         """
-        Dead-helper: filterload/filterclear/filteradd are in V2_MESSAGE_IDS
-        but no handlers are registered anywhere.
+        FIX-36: filterload/filterclear/filteradd are in V2_MESSAGE_IDS AND
+        handlers ARE now registered in p2p.py (_register_bloom_handlers).
+
+        Previously these were dead-constants: names in the BIP-324 short-ID
+        table but no dispatch.  FIX-36 wires the BIP-111 disconnect path so
+        peers sending bloom messages when NODE_BLOOM is not advertised are
+        disconnected rather than silently tolerated.
         """
         from ouroboros.transport_v2 import V2_MESSAGE_IDS
         for msg_name in ("filterload", "filterclear", "filteradd"):
@@ -1229,13 +1238,27 @@ class TestTwoPipelineAnalysis(unittest.TestCase):
                 V2_MESSAGE_IDS,
                 f"Two-pipeline: {msg_name} absent from V2_MESSAGE_IDS",
             )
-        # None of these have registered handlers
+        # All three now have registered handlers in p2p.py
         for msg_name in ("filterload", "filterclear", "filteradd"):
-            has_handler = f'register_handler("{msg_name}"' in _P2P or f'register_handler("{msg_name}"' in _NODE
-            self.assertFalse(
+            has_handler = f'register_handler("{msg_name}"' in _P2P
+            self.assertTrue(
                 has_handler,
-                f"Two-pipeline: {msg_name} handler unexpectedly registered",
+                f"FIX-36: {msg_name} handler NOT registered in p2p.py",
             )
+
+    def test_merkleblock_handler_registered_log_and_drop(self):
+        """
+        FIX-36: merkleblock inbound handler IS registered in p2p.py.
+
+        merkleblock is a server→client message; receiving it inbound is
+        unusual.  The handler logs at debug and drops (no disconnect), matching
+        Core's silent-ignore path for unexpected server-side messages.
+        """
+        has_handler = 'register_handler("merkleblock"' in _P2P
+        self.assertTrue(
+            has_handler,
+            "FIX-36: merkleblock handler NOT registered in p2p.py",
+        )
 
     def test_inv_type_filtered_block_dead_constant(self):
         """
