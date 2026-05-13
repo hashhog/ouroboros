@@ -36,11 +36,14 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-use common::decode_varint;
+use common::decode_corevarint;
 
-/// Encode a u64 as a Bitcoin VarInt and append to the buffer.
-fn encode_varint(n: u64, buf: &mut Vec<u8>) {
-    buf.extend(common::encode_varint(n));
+/// Encode a u64 as Bitcoin Core's MSB-base-128 VarInt and append to the buffer.
+///
+/// This is the format used by Core's TxInUndoFormatter / Coin::Serialize (undo.h, coins.h),
+/// NOT the CompactSize (0xfd/0xfe/0xff prefix) used in P2P messages.
+fn encode_corevarint(n: u64, buf: &mut Vec<u8>) {
+    common::encode_corevarint(n, buf);
 }
 
 /// Error type for undo operations
@@ -93,28 +96,31 @@ impl Coin {
 
     /// Serialize the Coin to bytes.
     ///
-    /// Format matches Bitcoin Core's `TxInUndoFormatter`:
-    /// - VARINT(height * 2 + is_coinbase)
+    /// Format matches Bitcoin Core's `TxInUndoFormatter` (undo.h):
+    /// - VARINT(height * 2 + is_coinbase)   — MSB-base-128 VarInt (NOT CompactSize)
     /// - If height > 0: 1 byte dummy (0x00) for backward compatibility
-    /// - Compressed TxOut (value + script)
+    /// - Using<TxOutCompression>: VARINT(CompressAmount(value)) + compressed script
+    ///   (script compression is out of scope here; raw script is stored for now
+    ///    but code/value now use the correct Core VarInt encoding)
     pub fn serialize(&self) -> Vec<u8> {
         let mut data = Vec::new();
 
-        // Encode height and coinbase flag as a single varint
+        // Encode height and coinbase flag as a single Core VarInt
         let code = (self.height as u64) * 2 + if self.is_coinbase { 1 } else { 0 };
-        encode_varint(code, &mut data);
+        encode_corevarint(code, &mut data);
 
         // Compatibility byte for height > 0
         if self.height > 0 {
             data.push(0x00);
         }
 
-        // Encode value using varint
-        encode_varint(self.value, &mut data);
+        // Encode value as VARINT(CompressAmount(value)) — matching TxOutCompression.
+        let compressed_value = common::compress_amount(self.value);
+        encode_corevarint(compressed_value, &mut data);
 
-        // Encode script: length as varint + raw bytes
+        // Encode script: length as Core VarInt + raw bytes.
         let script_bytes = self.script_pubkey.as_bytes();
-        encode_varint(script_bytes.len() as u64, &mut data);
+        encode_corevarint(script_bytes.len() as u64, &mut data);
         data.extend_from_slice(script_bytes);
 
         data
@@ -124,8 +130,8 @@ impl Coin {
     pub fn deserialize(data: &[u8]) -> Result<(Self, usize)> {
         let mut offset = 0;
 
-        // Decode height and coinbase flag
-        let (code, consumed) = decode_varint(&data[offset..])
+        // Decode height and coinbase flag using Core VarInt
+        let (code, consumed) = decode_corevarint(&data[offset..])
             .map_err(|e| UndoError::InvalidFormat(format!("Failed to decode coin code: {}", e)))?;
         offset += consumed;
 
@@ -142,13 +148,14 @@ impl Coin {
             offset += 1;
         }
 
-        // Decode value
-        let (value, consumed) = decode_varint(&data[offset..])
+        // Decode value: VARINT(CompressAmount(value)) — decompress after decoding.
+        let (compressed_value, consumed) = decode_corevarint(&data[offset..])
             .map_err(|e| UndoError::InvalidFormat(format!("Failed to decode value: {}", e)))?;
         offset += consumed;
+        let value = common::decompress_amount(compressed_value);
 
-        // Decode script
-        let (script_len, consumed) = decode_varint(&data[offset..])
+        // Decode script length as Core VarInt
+        let (script_len, consumed) = decode_corevarint(&data[offset..])
             .map_err(|e| UndoError::InvalidFormat(format!("Failed to decode script length: {}", e)))?;
         offset += consumed;
 
@@ -198,8 +205,8 @@ impl TxUndo {
     pub fn serialize(&self) -> Vec<u8> {
         let mut data = Vec::new();
 
-        // Number of prev_outputs
-        encode_varint(self.prev_outputs.len() as u64, &mut data);
+        // Number of prev_outputs — Core VarInt
+        encode_corevarint(self.prev_outputs.len() as u64, &mut data);
 
         // Each prev_output
         for coin in &self.prev_outputs {
@@ -213,8 +220,8 @@ impl TxUndo {
     pub fn deserialize(data: &[u8]) -> Result<(Self, usize)> {
         let mut offset = 0;
 
-        // Number of prev_outputs
-        let (count, consumed) = decode_varint(&data[offset..])
+        // Number of prev_outputs — Core VarInt
+        let (count, consumed) = decode_corevarint(&data[offset..])
             .map_err(|e| UndoError::InvalidFormat(format!("Failed to decode tx undo count: {}", e)))?;
         offset += consumed;
 
@@ -259,8 +266,8 @@ impl BlockUndo {
     pub fn serialize(&self) -> Vec<u8> {
         let mut data = Vec::new();
 
-        // Number of tx_undo entries
-        encode_varint(self.tx_undo.len() as u64, &mut data);
+        // Number of tx_undo entries — Core VarInt
+        encode_corevarint(self.tx_undo.len() as u64, &mut data);
 
         // Each tx_undo
         for tx_undo in &self.tx_undo {
@@ -274,8 +281,8 @@ impl BlockUndo {
     pub fn deserialize(data: &[u8]) -> Result<(Self, usize)> {
         let mut offset = 0;
 
-        // Number of tx_undo entries
-        let (count, consumed) = decode_varint(&data[offset..])
+        // Number of tx_undo entries — Core VarInt
+        let (count, consumed) = decode_corevarint(&data[offset..])
             .map_err(|e| UndoError::InvalidFormat(format!("Failed to decode block undo count: {}", e)))?;
         offset += consumed;
 
@@ -438,6 +445,41 @@ mod tests {
             100,
             false,
         )
+    }
+
+    /// TP-1 fix: code for height=127, is_coinbase=false is 254.
+    /// Core writes VarInt(254) = [0x80, 0x7e]; old code wrote CompactSize(254) = [0xfd, 0xfe, 0x00].
+    #[test]
+    fn test_coin_serialize_uses_corevarint_not_compactsize() {
+        let coin = Coin::new(
+            1_000,  // small amount
+            ScriptBuf::from_bytes(vec![0x51]),
+            127,    // height=127 => code=254 — the canonical TP-1 divergence point
+            false,
+        );
+        let serialized = coin.serialize();
+        // First byte: VarInt(254) starts with 0x80 (continuation byte)
+        assert_eq!(
+            serialized[0], 0x80,
+            "TP-1 fix: first byte of VarInt(254) must be 0x80 (Core format), not 0xfd (CompactSize)"
+        );
+        assert_eq!(
+            serialized[1], 0x7e,
+            "TP-1 fix: second byte of VarInt(254) must be 0x7e"
+        );
+        // Old CompactSize would have written [0xfd, 0xfe, 0x00] — verify it is NOT that.
+        assert_ne!(serialized[0], 0xfd, "CompactSize prefix 0xfd must NOT appear for code=254");
+    }
+
+    /// VarInt(253) != CompactSize(253): canonical demonstration from audit test G11.
+    #[test]
+    fn test_corevarint_253_differs_from_compactsize() {
+        let mut vi = Vec::new();
+        encode_corevarint(253, &mut vi);
+        // Core's VarInt(253) = [0x80, 0x7d]
+        assert_eq!(vi, vec![0x80, 0x7d]);
+        // CompactSize(253) = [0xfd, 0xfd, 0x00] — must NOT equal
+        assert_ne!(vi, vec![0xfd_u8, 0xfd, 0x00]);
     }
 
     #[test]

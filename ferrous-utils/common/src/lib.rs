@@ -32,8 +32,9 @@ pub use crypto::bip324::{
 
 // Re-export serialization functions
 pub use serialize::{
-    decode_varint, deserialize_from_slice, encode_varint, serialize_to_vec, BitcoinDeserialize,
-    BitcoinSerialize, SerializeError,
+    compress_amount, decode_corevarint, decode_varint, decompress_amount, deserialize_from_slice,
+    encode_corevarint, encode_varint, serialize_to_vec, BitcoinDeserialize, BitcoinSerialize,
+    SerializeError,
 };
 
 // Re-export minisketch for BIP330 Erlay
