@@ -1104,10 +1104,9 @@ class TestTrickleQueueIntegration(unittest.TestCase):
 class TestOrphanPoolIntegration(unittest.TestCase):
     """OrphanPool correctness tests.
 
-    BUG-G15: OrphanPool.add() keys by tx.get_txid() (not wtxid) in this
-    branch.  Witness-malleated variants of the same txid collide.  The tests
-    below exercise the actual (txid-keyed) implementation and document the
-    missing BIP-339 features (has_wtxid, remove_by_txid) as bugs.
+    FIXED G15: OrphanPool.add() keys by tx.get_wtxid() (BIP-339).
+    Witness-malleated variants of the same txid are stored as separate orphans.
+    has_wtxid() and remove_by_txid() are both present and correct.
     """
 
     def _fake_tx(self, i):
@@ -1129,46 +1128,48 @@ class TestOrphanPoolIntegration(unittest.TestCase):
         self.assertEqual(len(orphans), 1)
 
     def test_remove_cleans_parent_index(self):
-        """Removing an orphan by txid cleans the by_parent index."""
+        """FIXED G15: OrphanPool keys by wtxid; remove_by_txid() cleans by_parent index."""
         from ouroboros.mempool import OrphanPool
         pool = OrphanPool()
         tx = self._fake_tx(1)
         parent_txid = _bytes32(999)
-        # add() stores keyed by tx.get_txid() (BUG-G15: should be wtxid)
         pool.add(tx, {parent_txid})
-        txid = tx.get_txid()
-        self.assertIn(txid, pool.orphans,
-                      "OrphanPool keys by txid (BUG-G15: should key by wtxid)")
-        pool.remove(txid)
+        wtxid = tx.get_wtxid()
+        # FIXED: primary key is wtxid (BIP-339), not txid
+        self.assertIn(wtxid, pool.orphans,
+                      "FIXED G15: OrphanPool keys by wtxid (BIP-339 correct)")
+        pool.remove_by_txid(tx.get_txid())
         orphans = pool.get_orphans_for_parent(parent_txid)
         self.assertEqual(len(orphans), 0)
         self.assertNotIn(parent_txid, pool.by_parent)
 
     def test_secondary_txid_index(self):
-        """BUG-G15: no has_wtxid() method — only txid lookup via has()."""
+        """FIXED G15: has_wtxid() present; has() works via secondary txid index."""
         from ouroboros.mempool import OrphanPool
         pool = OrphanPool()
         tx = self._fake_tx(5)
         pool.add(tx, set())
-        # Only txid lookup exists (no wtxid secondary index)
+        # FIXED: has() looks up by txid (secondary index)
         self.assertTrue(pool.has(tx.get_txid()),
-                        "OrphanPool.has() works by txid (the actual key)")
-        # BUG-G15: has_wtxid does not exist in this version
-        self.assertFalse(hasattr(pool, 'has_wtxid'),
-                         "BUG-G15: has_wtxid() absent — no wtxid secondary index")
+                        "FIXED G15: OrphanPool.has() works via txid secondary index")
+        # FIXED: has_wtxid() exists and works on primary key
+        self.assertTrue(hasattr(pool, 'has_wtxid'),
+                        "FIXED G15: has_wtxid() present — wtxid primary key supported")
+        self.assertTrue(pool.has_wtxid(tx.get_wtxid()),
+                        "FIXED G15: has_wtxid() correctly finds orphan by wtxid")
 
     def test_remove_by_txid(self):
-        """BUG-G15: remove_by_txid() method absent — only remove(txid) exists."""
+        """FIXED G15: remove_by_txid() present; removes all wtxid variants for a txid."""
         from ouroboros.mempool import OrphanPool
         pool = OrphanPool()
         tx = self._fake_tx(7)
         pool.add(tx, set())
-        # BUG-G15: remove_by_txid does not exist in this version
-        self.assertFalse(hasattr(pool, 'remove_by_txid'),
-                         "BUG-G15: remove_by_txid() absent")
-        # Baseline: remove(txid) does work
-        pool.remove(tx.get_txid())
-        self.assertFalse(pool.has(tx.get_txid()))
+        # FIXED: remove_by_txid() exists and removes entry via secondary index
+        self.assertTrue(hasattr(pool, 'remove_by_txid'),
+                        "FIXED G15: remove_by_txid() present — secondary-index removal")
+        pool.remove_by_txid(tx.get_txid())
+        self.assertFalse(pool.has(tx.get_txid()),
+                         "FIXED G15: remove_by_txid() correctly removes orphan")
 
 
 class TestInvMessageWireFormat(unittest.TestCase):
