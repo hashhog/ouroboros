@@ -527,7 +527,15 @@ def _write_compact_size(n: int) -> bytes:
     return b"\xff" + struct.pack("<Q", n)
 
 
+_MAX_COMPACT_SIZE = 0x02000000  # Bitcoin Core serialize.h MAX_SIZE
+
+
 def _read_compact_size(f: io.BytesIO) -> int:
+    """Read a CompactSize from *f*.
+
+    Rejects non-canonical encodings and values exceeding MAX_SIZE (0x02000000)
+    per Bitcoin Core serialize.h ReadCompactSize.
+    """
     b = f.read(1)
     if not b:
         raise ValueError("Unexpected end of data")
@@ -535,10 +543,20 @@ def _read_compact_size(f: io.BytesIO) -> int:
     if n < 0xFD:
         return n
     if n == 0xFD:
-        return struct.unpack("<H", f.read(2))[0]
-    if n == 0xFE:
-        return struct.unpack("<I", f.read(4))[0]
-    return struct.unpack("<Q", f.read(8))[0]
+        value = struct.unpack("<H", f.read(2))[0]
+        if value < 0xFD:
+            raise ValueError(f"Non-canonical CompactSize: 0xfd prefix with value {value} < 0xfd")
+    elif n == 0xFE:
+        value = struct.unpack("<I", f.read(4))[0]
+        if value < 0x10000:
+            raise ValueError(f"Non-canonical CompactSize: 0xfe prefix with value {value} < 0x10000")
+    else:
+        value = struct.unpack("<Q", f.read(8))[0]
+        if value < 0x100000000:
+            raise ValueError(f"Non-canonical CompactSize: 0xff prefix with value {value} < 0x100000000")
+    if value > _MAX_COMPACT_SIZE:
+        raise ValueError(f"CompactSize value {value} exceeds MAX_SIZE ({_MAX_COMPACT_SIZE})")
+    return value
 
 
 # =============================================================================
