@@ -145,78 +145,76 @@ class TestG5_NonCanonicalRejection(unittest.TestCase):
 
     # --- p2p_messages ---
     def test_p1_p2p_messages_decode_varint_rejects_non_canonical(self):
+        """FIXED: decode_varint rejects all non-canonical encodings."""
         from ouroboros.p2p_messages import decode_varint
-        # BUG: accepted — test asserts the BUG so it passes (regression guard)
-        for encoded, expected_val in _core_non_canonical_pairs():
-            try:
-                val, n = decode_varint(encoded, 0)
-                self.assertEqual(val, expected_val,
-                                 f"p2p_messages non-canonical accepted with value={val}")
-            except Exception:
-                pass  # if it raises, that is correct behavior; mark pass
+        self._assert_rejects_non_canonical(lambda b: decode_varint(b, 0), "p2p_messages")
 
     def test_p1_p2p_messages_decode_fd_non_canonical_accepted_BUG(self):
-        """BUG: decode_varint accepts 0xfd + value<253 instead of rejecting."""
+        """FIXED: decode_varint rejects 0xfd + value<253 (was accepted as BUG)."""
         from ouroboros.p2p_messages import decode_varint
-        val, n = decode_varint(bytes([0xfd, 0x01, 0x00]), 0)
-        # Currently returns 1 — WRONG; Core would reject this
-        self.assertEqual(val, 1,
-                         "BUG regression guard: decode_varint accepted non-canonical 0xfd+1")
-        # The fix is to add: if value < 0xfd: raise ValueError("non-canonical")
+        with self.assertRaises(ValueError,
+                               msg="FIXED: decode_varint must reject non-canonical 0xfd+1"):
+            decode_varint(bytes([0xfd, 0x01, 0x00]), 0)
 
     def test_p1_p2p_messages_decode_fe_non_canonical_accepted_BUG(self):
-        """BUG: decode_varint accepts 0xfe + value<0x10000 instead of rejecting."""
+        """FIXED: decode_varint rejects 0xfe + value<0x10000 (was accepted as BUG)."""
         from ouroboros.p2p_messages import decode_varint
-        val, n = decode_varint(bytes([0xfe]) + struct.pack('<I', 0xffff), 0)
-        self.assertEqual(val, 0xffff,
-                         "BUG regression guard: decode_varint accepted non-canonical 0xfe+0xffff")
+        with self.assertRaises(ValueError,
+                               msg="FIXED: decode_varint must reject non-canonical 0xfe+0xffff"):
+            decode_varint(bytes([0xfe]) + struct.pack('<I', 0xffff), 0)
 
     def test_p1_p2p_messages_decode_ff_non_canonical_accepted_BUG(self):
-        """BUG: decode_varint accepts 0xff + value<0x100000000 instead of rejecting."""
+        """FIXED: decode_varint rejects 0xff + value<0x100000000 (was accepted as BUG)."""
         from ouroboros.p2p_messages import decode_varint
-        val, n = decode_varint(bytes([0xff]) + struct.pack('<Q', 0xffffffff), 0)
-        self.assertEqual(val, 0xffffffff,
-                         "BUG regression guard: decode_varint accepted non-canonical 0xff+0xffffffff")
+        with self.assertRaises(ValueError,
+                               msg="FIXED: decode_varint must reject non-canonical 0xff+0xffffffff"):
+            decode_varint(bytes([0xff]) + struct.pack('<Q', 0xffffffff), 0)
 
     # --- blockfilter ---
     def test_p2_blockfilter_fd_non_canonical_BUG(self):
-        """BUG: _decode_compact_size accepts non-canonical 0xfd+1."""
+        """FIXED: _decode_compact_size rejects non-canonical 0xfd+1 (was accepted as BUG)."""
         from ouroboros.blockfilter import _decode_compact_size
-        val, n = _decode_compact_size(bytes([0xfd, 0x01, 0x00]))
-        self.assertEqual(val, 1, "BUG: blockfilter accepts non-canonical 0xfd+1")
+        with self.assertRaises(ValueError,
+                               msg="FIXED: blockfilter must reject non-canonical 0xfd+1"):
+            _decode_compact_size(bytes([0xfd, 0x01, 0x00]))
 
     def test_p2_blockfilter_fe_non_canonical_BUG(self):
-        """BUG: _decode_compact_size accepts non-canonical 0xfe+0xffff."""
+        """FIXED: _decode_compact_size rejects non-canonical 0xfe+0xffff (was accepted as BUG)."""
         from ouroboros.blockfilter import _decode_compact_size
-        val, n = _decode_compact_size(bytes([0xfe]) + struct.pack('<I', 0xffff))
-        self.assertEqual(val, 0xffff, "BUG: blockfilter accepts non-canonical 0xfe+0xffff")
+        with self.assertRaises(ValueError,
+                               msg="FIXED: blockfilter must reject non-canonical 0xfe+0xffff"):
+            _decode_compact_size(bytes([0xfe]) + struct.pack('<I', 0xffff))
 
     # --- snapshot ---
     def test_p3_snapshot_fd_non_canonical_BUG(self):
-        """BUG: snapshot _read_compact_size accepts non-canonical 0xfd+1."""
+        """FIXED: snapshot _read_compact_size rejects non-canonical 0xfd+1 (was accepted as BUG)."""
         from ouroboros.snapshot import _read_compact_size
-        val = _read_compact_size(io.BytesIO(bytes([0xfd, 0x01, 0x00])))
-        self.assertEqual(val, 1, "BUG: snapshot accepts non-canonical 0xfd+1")
+        with self.assertRaises((ValueError, EOFError),
+                               msg="FIXED: snapshot must reject non-canonical 0xfd+1"):
+            _read_compact_size(io.BytesIO(bytes([0xfd, 0x01, 0x00])))
 
     def test_p3_snapshot_fe_non_canonical_BUG(self):
-        """BUG: snapshot _read_compact_size accepts non-canonical 0xfe+0xffff."""
+        """FIXED: snapshot _read_compact_size rejects non-canonical 0xfe+0xffff (was accepted as BUG)."""
         from ouroboros.snapshot import _read_compact_size
-        val = _read_compact_size(io.BytesIO(bytes([0xfe]) + struct.pack('<I', 0xffff)))
-        self.assertEqual(val, 0xffff, "BUG: snapshot accepts non-canonical 0xfe+0xffff")
+        with self.assertRaises((ValueError, EOFError),
+                               msg="FIXED: snapshot must reject non-canonical 0xfe+0xffff"):
+            _read_compact_size(io.BytesIO(bytes([0xfe]) + struct.pack('<I', 0xffff)))
 
     # --- validation ---
     def test_p7_validation_fd_non_canonical_BUG(self):
-        """BUG: validation _read_compact_size accepts non-canonical 0xfd+1."""
+        """FIXED: validation _read_compact_size rejects non-canonical 0xfd+1 (was accepted as BUG)."""
         from ouroboros.validation import _read_compact_size
-        val, n = _read_compact_size(bytes([0xfd, 0x01, 0x00]))
-        self.assertEqual(val, 1, "BUG: validation accepts non-canonical 0xfd+1")
+        with self.assertRaises(ValueError,
+                               msg="FIXED: validation must reject non-canonical 0xfd+1"):
+            _read_compact_size(bytes([0xfd, 0x01, 0x00]))
 
     # --- psbt ---
     def test_p6_psbt_fd_non_canonical_BUG(self):
-        """BUG: psbt _read_compact_size accepts non-canonical 0xfd+1."""
+        """FIXED: psbt _read_compact_size rejects non-canonical 0xfd+1 (was accepted as BUG)."""
         from ouroboros.psbt import _read_compact_size
-        val = _read_compact_size(io.BytesIO(bytes([0xfd, 0x01, 0x00])))
-        self.assertEqual(val, 1, "BUG: psbt accepts non-canonical 0xfd+1")
+        with self.assertRaises(ValueError,
+                               msg="FIXED: psbt must reject non-canonical 0xfd+1"):
+            _read_compact_size(io.BytesIO(bytes([0xfd, 0x01, 0x00])))
 
 
 # ---------------------------------------------------------------------------
@@ -232,42 +230,41 @@ class TestG6_MaxSizeCheck(unittest.TestCase):
     """
 
     def test_p1_p2p_messages_no_max_size_check_BUG(self):
-        """BUG: decode_varint does not reject values > MAX_SIZE."""
+        """FIXED: decode_varint now rejects values > MAX_SIZE (was accepted as BUG)."""
         from ouroboros.p2p_messages import decode_varint
         for over in _over_max_size_values():
             encoded = bytes([0xfe]) + struct.pack('<I', over) if over <= 0xffffffff \
                 else bytes([0xff]) + struct.pack('<Q', over)
-            val, _ = decode_varint(encoded, 0)
-            self.assertEqual(val, over,
-                             f"BUG: p2p_messages accepts value {over} > MAX_SIZE")
+            with self.assertRaises(ValueError,
+                                   msg=f"FIXED: p2p_messages must reject value {over} > MAX_SIZE"):
+                decode_varint(encoded, 0)
 
     def test_p3_snapshot_no_max_size_check_BUG(self):
-        """BUG: snapshot _read_compact_size does not reject values > MAX_SIZE."""
+        """FIXED: snapshot _read_compact_size now rejects values > MAX_SIZE (was accepted as BUG)."""
         from ouroboros.snapshot import _read_compact_size
-        # Encode MAX_SIZE+1 as 5-byte 0xfe prefix
         n = MAX_SIZE + 1
         encoded = bytes([0xfe]) + struct.pack('<I', n)
-        val = _read_compact_size(io.BytesIO(encoded))
-        self.assertEqual(val, n,
-                         f"BUG: snapshot _read_compact_size accepts {n} > MAX_SIZE")
+        with self.assertRaises((ValueError, EOFError),
+                               msg=f"FIXED: snapshot _read_compact_size must reject {n} > MAX_SIZE"):
+            _read_compact_size(io.BytesIO(encoded))
 
     def test_p2_blockfilter_no_max_size_check_BUG(self):
-        """BUG: blockfilter _decode_compact_size does not reject values > MAX_SIZE."""
+        """FIXED: blockfilter _decode_compact_size now rejects values > MAX_SIZE (was accepted as BUG)."""
         from ouroboros.blockfilter import _decode_compact_size
         n = MAX_SIZE + 1
         encoded = bytes([0xfe]) + struct.pack('<I', n)
-        val, _ = _decode_compact_size(encoded)
-        self.assertEqual(val, n,
-                         f"BUG: blockfilter accepts {n} > MAX_SIZE")
+        with self.assertRaises(ValueError,
+                               msg=f"FIXED: blockfilter must reject {n} > MAX_SIZE"):
+            _decode_compact_size(encoded)
 
     def test_p7_validation_no_max_size_check_BUG(self):
-        """BUG: validation _read_compact_size does not reject values > MAX_SIZE."""
+        """FIXED: validation _read_compact_size now rejects values > MAX_SIZE (was accepted as BUG)."""
         from ouroboros.validation import _read_compact_size
         n = MAX_SIZE + 1
         encoded = bytes([0xfe]) + struct.pack('<I', n)
-        val, _ = _read_compact_size(encoded)
-        self.assertEqual(val, n,
-                         f"BUG: validation accepts {n} > MAX_SIZE")
+        with self.assertRaises(ValueError,
+                               msg=f"FIXED: validation must reject {n} > MAX_SIZE"):
+            _read_compact_size(encoded)
 
     def test_rust_r1_common_no_max_size_check_note(self):
         """Document: Rust common/serialize.rs decode_varint has no MAX_SIZE guard.
@@ -286,8 +283,9 @@ class TestG6_MaxSizeCheck(unittest.TestCase):
 class TestG7_DecodeRoundtrip(unittest.TestCase):
     """G7: encode then decode recovers the original value (round-trip)."""
 
-    TEST_VALS = [0, 1, 0xfc, 0xfd, 0xffff, 0x10000, 0xffffffff, 0x100000000,
-                 0xffffffffffffffff]
+    # Values within MAX_SIZE (0x02000000) are round-trippable.
+    # Values above MAX_SIZE can be encoded but decode now rejects them (TP-5 fix).
+    TEST_VALS = [0, 1, 0xfc, 0xfd, 0xffff, 0x10000, MAX_SIZE]
 
     def _check_roundtrip(self, encode_fn, decode_fn, label):
         for v in self.TEST_VALS:
@@ -450,12 +448,11 @@ class TestG10_ValidationTruncationBug(unittest.TestCase):
     """
 
     def test_validation_truncated_returns_zero_zero_BUG(self):
-        """BUG: empty stream returns (0,0) instead of raising."""
+        """FIXED: validation _read_compact_size now raises on truncated input (was returning (0,0))."""
         from ouroboros.validation import _read_compact_size
-        val, n = _read_compact_size(bytes(), 0)
-        # Documenting the BUG: returns (0, 0) silently
-        self.assertEqual(val, 0, "BUG: truncated stream returns val=0")
-        self.assertEqual(n, 0, "BUG: truncated stream returns consumed=0")
+        with self.assertRaises(ValueError,
+                               msg="FIXED: truncated stream must raise, not return (0,0)"):
+            _read_compact_size(bytes(), 0)
 
     def test_p1_p2p_raises_on_truncation(self):
         """p2p_messages raises ValueError on truncated stream (correct)."""
@@ -872,25 +869,22 @@ class TestG20_RustR2SnapshotNonCanonical(unittest.TestCase):
     """
 
     def test_rust_r2_source_lacks_non_canonical_check(self):
-        """Verify Rust snapshot.rs read_compact_size has NO non-canonical rejection."""
+        """FIXED: Rust snapshot.rs read_compact_size now has non-canonical rejection (TP-4 R2)."""
         import os
         src_path = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/storage/snapshot.rs"
         if not os.path.exists(src_path):
             self.skipTest("Rust source not available")
-        # Extract read_compact_size function
         with open(src_path) as f:
             src = f.read()
-        # Find the read_compact_size function body
-        start = src.find("fn read_compact_size<R: Read>")
-        end = src.find("\n}", start) + 2
-        fn_body = src[start:end]
-
-        # It should NOT have non-canonical checks (documenting the BUG)
-        self.assertNotIn("if n <", fn_body,
-                         "BUG documented: snapshot.rs read_compact_size lacks < threshold checks")
-        # Verify it does NOT have value validation in the 0xfd/0xfe arms
-        self.assertNotIn("0xfd", fn_body.split("0xfd =>")[1][:50] if "0xfd =>" in fn_body else "",
-                         "No validation after 0xfd read")
+        # FIXED: snapshot.rs now has non-canonical checks matching R1
+        self.assertIn("Non-canonical CompactSize", src,
+                      "FIXED: snapshot.rs read_compact_size must reject non-canonical encodings")
+        self.assertIn("if v < 0xfd", src,
+                      "FIXED: snapshot.rs must check v < 0xfd for 0xfd prefix")
+        self.assertIn("if v < 0x10000", src,
+                      "FIXED: snapshot.rs must check v < 0x10000 for 0xfe prefix")
+        self.assertIn("if v < 0x100000000", src,
+                      "FIXED: snapshot.rs must check v < 0x100000000 for 0xff prefix")
 
 
 # ---------------------------------------------------------------------------
@@ -901,17 +895,18 @@ class TestG21_RustR2SnapshotMaxSize(unittest.TestCase):
     """G21: Rust R2 snapshot.rs read_compact_size has no MAX_SIZE guard."""
 
     def test_rust_r2_source_lacks_max_size_check(self):
+        """FIXED: Rust snapshot.rs read_compact_size now enforces MAX_SIZE (TP-5 R2)."""
         import os
         src_path = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/storage/snapshot.rs"
         if not os.path.exists(src_path):
             self.skipTest("Rust source not available")
         with open(src_path) as f:
             src = f.read()
-        # Verify MAX_SIZE constant does not appear
-        self.assertNotIn("0x02000000", src,
-                         "BUG: snapshot.rs should check MAX_SIZE = 0x02000000 but does not")
-        self.assertNotIn("MAX_SIZE", src,
-                         "BUG: snapshot.rs should check MAX_SIZE but does not")
+        # FIXED: snapshot.rs now defines and checks MAX_SIZE
+        self.assertIn("0x02000000", src,
+                      "FIXED: snapshot.rs must define MAX_SIZE = 0x02000000")
+        self.assertIn("MAX_SIZE", src,
+                      "FIXED: snapshot.rs must check MAX_SIZE in read_compact_size")
 
 
 # ---------------------------------------------------------------------------
@@ -1104,17 +1099,24 @@ class TestG27_LittleEndian(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestG28_MaxValue(unittest.TestCase):
-    """G28: Encoding and decoding the maximum 64-bit value."""
+    """G28: encode_varint supports the full uint64 range; decode_varint enforces MAX_SIZE."""
 
-    def test_p1_max_uint64(self):
-        from ouroboros.p2p_messages import encode_varint, decode_varint
+    def test_p1_max_uint64_encode(self):
+        """encode_varint can encode the full uint64 max value (9-byte encoding)."""
+        from ouroboros.p2p_messages import encode_varint
         max_val = 0xffffffffffffffff
         encoded = encode_varint(max_val)
         self.assertEqual(len(encoded), 9, "Max uint64 should be 9 bytes")
         self.assertEqual(encoded[0], 0xff, "Max uint64 prefix should be 0xff")
-        val, n = decode_varint(encoded, 0)
-        self.assertEqual(val, max_val)
-        self.assertEqual(n, 9)
+
+    def test_p1_max_uint64_decode_rejected(self):
+        """decode_varint rejects 0xffffffffffffffff > MAX_SIZE (TP-5 fix)."""
+        from ouroboros.p2p_messages import encode_varint, decode_varint
+        max_val = 0xffffffffffffffff
+        encoded = encode_varint(max_val)
+        with self.assertRaises(ValueError,
+                               msg="decode_varint must reject max_uint64 > MAX_SIZE"):
+            decode_varint(encoded, 0)
 
 
 # ---------------------------------------------------------------------------

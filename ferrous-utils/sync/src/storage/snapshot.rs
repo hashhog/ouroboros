@@ -281,30 +281,66 @@ fn network_from_magic(magic: &[u8; 4]) -> Option<Network> {
     }
 }
 
-/// Read a CompactSize (variable-length integer) from a reader
+/// Maximum CompactSize value accepted (Bitcoin Core serialize.h MAX_SIZE).
+const MAX_SIZE: u64 = 0x02000000;
+
+/// Read a CompactSize (variable-length integer) from a reader.
+///
+/// Rejects non-canonical encodings ("non-canonical ReadCompactSize()") and values
+/// exceeding MAX_SIZE (0x02000000) per Bitcoin Core serialize.h.
 fn read_compact_size<R: Read>(reader: &mut R) -> io::Result<u64> {
     let mut first = [0u8; 1];
     reader.read_exact(&mut first)?;
     let n = first[0];
 
-    match n {
-        0..=0xfc => Ok(n as u64),
+    let value = match n {
+        0..=0xfc => n as u64,
         0xfd => {
             let mut buf = [0u8; 2];
             reader.read_exact(&mut buf)?;
-            Ok(u16::from_le_bytes(buf) as u64)
+            let v = u16::from_le_bytes(buf) as u64;
+            if v < 0xfd {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Non-canonical CompactSize: 0xfd prefix with value {} < 0xfd", v),
+                ));
+            }
+            v
         }
         0xfe => {
             let mut buf = [0u8; 4];
             reader.read_exact(&mut buf)?;
-            Ok(u32::from_le_bytes(buf) as u64)
+            let v = u32::from_le_bytes(buf) as u64;
+            if v < 0x10000 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Non-canonical CompactSize: 0xfe prefix with value {} < 0x10000", v),
+                ));
+            }
+            v
         }
         0xff => {
             let mut buf = [0u8; 8];
             reader.read_exact(&mut buf)?;
-            Ok(u64::from_le_bytes(buf))
+            let v = u64::from_le_bytes(buf);
+            if v < 0x100000000 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Non-canonical CompactSize: 0xff prefix with value {} < 0x100000000", v),
+                ));
+            }
+            v
         }
+    };
+
+    if value > MAX_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("CompactSize value {} exceeds MAX_SIZE ({})", value, MAX_SIZE),
+        ));
     }
+
+    Ok(value)
 }
 
 /// Write a CompactSize (variable-length integer) to a writer
@@ -684,7 +720,8 @@ mod tests {
 
     #[test]
     fn test_compact_size_read_write() {
-        let test_values = [0u64, 1, 252, 253, 0xffff, 0x10000, 0xffffffff, 0x100000000];
+        // Only values <= MAX_SIZE (0x02000000) are accepted by read_compact_size.
+        let test_values = [0u64, 1, 252, 253, 0xffff, 0x10000, MAX_SIZE];
 
         for value in test_values {
             let mut buf = Vec::new();
@@ -693,6 +730,56 @@ mod tests {
             let mut cursor = Cursor::new(&buf);
             let read_value = read_compact_size(&mut cursor).unwrap();
             assert_eq!(value, read_value, "Failed for value {}", value);
+        }
+    }
+
+    /// TP-4 fix: read_compact_size must reject non-canonical encodings.
+    #[test]
+    fn test_compact_size_rejects_non_canonical() {
+        // 0xfd prefix with value < 0xfd
+        let cases: &[&[u8]] = &[
+            &[0xfd, 0x00, 0x00],       // 0xfd prefix, value=0
+            &[0xfd, 0x01, 0x00],       // 0xfd prefix, value=1
+            &[0xfd, 0xfc, 0x00],       // 0xfd prefix, value=0xfc
+            &[0xfe, 0x00, 0x00, 0x01, 0x00],  // 0xfe prefix, value=0x10000 is canonical — skip
+        ];
+        let non_canonical: &[&[u8]] = &[
+            &[0xfd, 0x00, 0x00],
+            &[0xfd, 0x01, 0x00],
+            &[0xfd, 0xfc, 0x00],
+            &[0xfe, 0xff, 0xff, 0x00, 0x00],  // 0xfe prefix, value=0xffff < 0x10000
+            &[0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 0xff prefix, value=0
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00], // 0xff prefix, value=0xffffffff
+        ];
+        for encoded in non_canonical {
+            let mut cursor = Cursor::new(*encoded);
+            let result = read_compact_size(&mut cursor);
+            assert!(result.is_err(),
+                "Non-canonical encoding {:x?} should be rejected", encoded);
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string().contains("Non-canonical"),
+                "Error should mention Non-canonical, got: {}", err
+            );
+        }
+    }
+
+    /// TP-5 fix: read_compact_size must reject values > MAX_SIZE (0x02000000).
+    #[test]
+    fn test_compact_size_rejects_over_max_size() {
+        let over_max_values = [MAX_SIZE + 1, 0xffffffff, 0x10000000];
+        for v in over_max_values {
+            let mut buf = Vec::new();
+            write_compact_size(&mut buf, v).unwrap();
+            let mut cursor = Cursor::new(&buf);
+            let result = read_compact_size(&mut cursor);
+            assert!(result.is_err(),
+                "Value {} > MAX_SIZE should be rejected", v);
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string().contains("MAX_SIZE"),
+                "Error should mention MAX_SIZE, got: {}", err
+            );
         }
     }
 

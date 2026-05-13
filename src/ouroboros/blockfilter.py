@@ -69,16 +69,37 @@ def _encode_compact_size(n: int) -> bytes:
         return b'\xff' + struct.pack('<Q', n)
 
 
+_MAX_COMPACT_SIZE = 0x02000000  # Bitcoin Core serialize.h MAX_SIZE
+
+
 def _decode_compact_size(data: bytes, offset: int = 0) -> tuple[int, int]:
+    """Decode CompactSize from *data* at *offset*; returns (value, bytes_consumed).
+
+    Rejects non-canonical encodings and values exceeding MAX_SIZE (0x02000000).
+    """
     first = data[offset]
     if first < 0xFD:
-        return first, 1
+        value = first
+        bytes_consumed = 1
     elif first == 0xFD:
-        return struct.unpack_from('<H', data, offset + 1)[0], 3
+        value = struct.unpack_from('<H', data, offset + 1)[0]
+        if value < 0xFD:
+            raise ValueError(f"Non-canonical CompactSize: 0xfd prefix with value {value} < 0xfd")
+        bytes_consumed = 3
     elif first == 0xFE:
-        return struct.unpack_from('<I', data, offset + 1)[0], 5
+        value = struct.unpack_from('<I', data, offset + 1)[0]
+        if value < 0x10000:
+            raise ValueError(f"Non-canonical CompactSize: 0xfe prefix with value {value} < 0x10000")
+        bytes_consumed = 5
     else:
-        return struct.unpack_from('<Q', data, offset + 1)[0], 9
+        value = struct.unpack_from('<Q', data, offset + 1)[0]
+        if value < 0x100000000:
+            raise ValueError(f"Non-canonical CompactSize: 0xff prefix with value {value} < 0x100000000")
+        bytes_consumed = 9
+
+    if value > _MAX_COMPACT_SIZE:
+        raise ValueError(f"CompactSize value {value} exceeds MAX_SIZE ({_MAX_COMPACT_SIZE})")
+    return value, bytes_consumed
 
 
 # ---------------------------------------------------------------------------

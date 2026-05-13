@@ -75,30 +75,48 @@ def encode_varint(value: int) -> bytes:
         return struct.pack('<BQ', 0xff, value)
 
 
+_MAX_COMPACT_SIZE = 0x02000000  # Bitcoin Core serialize.h MAX_SIZE
+
+
 def decode_varint(data: bytes, offset: int = 0) -> tuple[int, int]:
-    """Decode variable-length integer, returns (value, bytes_consumed)"""
+    """Decode variable-length integer (CompactSize), returns (value, bytes_consumed).
+
+    Rejects non-canonical encodings (Core: "non-canonical ReadCompactSize()") and
+    values exceeding MAX_SIZE (0x02000000) per Bitcoin Core serialize.h.
+    """
     if offset >= len(data):
         raise ValueError("Not enough data for varint")
 
     first_byte = data[offset]
 
     if first_byte < 0xfd:
-        return first_byte, 1
+        value = first_byte
+        bytes_consumed = 1
     elif first_byte == 0xfd:
         if offset + 3 > len(data):
             raise ValueError("Not enough data for varint")
         value = struct.unpack('<H', data[offset + 1:offset + 3])[0]
-        return value, 3
+        if value < 0xfd:
+            raise ValueError(f"Non-canonical CompactSize: 0xfd prefix with value {value} < 0xfd")
+        bytes_consumed = 3
     elif first_byte == 0xfe:
         if offset + 5 > len(data):
             raise ValueError("Not enough data for varint")
         value = struct.unpack('<I', data[offset + 1:offset + 5])[0]
-        return value, 5
+        if value < 0x10000:
+            raise ValueError(f"Non-canonical CompactSize: 0xfe prefix with value {value} < 0x10000")
+        bytes_consumed = 5
     else:  # 0xff
         if offset + 9 > len(data):
             raise ValueError("Not enough data for varint")
         value = struct.unpack('<Q', data[offset + 1:offset + 9])[0]
-        return value, 9
+        if value < 0x100000000:
+            raise ValueError(f"Non-canonical CompactSize: 0xff prefix with value {value} < 0x100000000")
+        bytes_consumed = 9
+
+    if value > _MAX_COMPACT_SIZE:
+        raise ValueError(f"CompactSize value {value} exceeds MAX_SIZE ({_MAX_COMPACT_SIZE})")
+    return value, bytes_consumed
 
 
 def command_to_bytes(command: str) -> bytes:
