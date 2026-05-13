@@ -95,8 +95,49 @@ class AddrInfo:
     ref_count: int = 0           # number of new buckets containing this addr
 
     def get_key(self) -> str:
-        """Unique key for this address."""
+        """Unique key for this address (human-readable, used as dict key)."""
         return f"{self.host}:{self.port}"
+
+    def get_binary_key(self) -> bytes:
+        """18-byte binary key matching CService::GetKey() in Bitcoin Core.
+
+        Returns 16-byte IP representation (IPv4-in-IPv6 mapped for IPv4
+        addresses, raw 16-byte for IPv6) followed by 2 bytes of port
+        in big-endian order.  This is the input format Core uses when
+        computing bucket assignments in GetTriedBucket / GetNewBucket /
+        GetBucketPosition.
+
+        Reference: netaddress.cpp CNetAddr::GetAddrBytes() +
+                   CService::GetKey() (port / 0x100, port & 0xFF).
+        """
+        import ipaddress as _ipaddress
+        port_bytes = bytes([self.port >> 8, self.port & 0xFF])
+
+        if self.network_id == NET_IPV4:
+            # IPv4-in-IPv6 mapped address: 12-byte prefix + 4 IPv4 bytes
+            # Matches Core's IPV4_IN_IPV6_PREFIX + m_addr
+            IPV4_IN_IPV6_PREFIX = b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff"
+            try:
+                ipv4 = _ipaddress.IPv4Address(self.host)
+                return IPV4_IN_IPV6_PREFIX + ipv4.packed + port_bytes
+            except ValueError:
+                pass
+
+        if self.network_id == NET_IPV6:
+            try:
+                ipv6 = _ipaddress.IPv6Address(self.host)
+                return ipv6.packed + port_bytes
+            except ValueError:
+                pass
+
+        # For Tor v3, I2P, CJDNS and unknown network types use raw addr_bytes
+        # if available (16 bytes), else fall back to zero-padded 16 bytes.
+        if self.addr_bytes and len(self.addr_bytes) == 16:
+            return bytes(self.addr_bytes) + port_bytes
+
+        # Fallback: zero-pad to 16 bytes (matches Core's all-zeros serialisation
+        # for non-v1-compatible addresses in GetAddrBytes / SerializeV1Array).
+        return b"\x00" * 16 + port_bytes
 
     def is_onion(self) -> bool:
         """Return True if this is a Tor .onion address."""
@@ -272,16 +313,33 @@ def is_routable(host: str, network_id: int = NET_IPV4) -> bool:
 
 
 def _hash_for_bucket(key: bytes, *args) -> int:
-    """Compute hash for bucket assignment using SHA256."""
-    h = hashlib.sha256(key)
+    """Compute bucket-assignment hash matching Core's HashWriter::GetCheapHash().
+
+    Core uses double-SHA256 (HashWriter::GetHash = SHA256(SHA256(data))) and
+    returns the first 8 bytes as a little-endian uint64.  All inputs must be
+    raw bytes; integer arguments are serialised as 8-byte little-endian (matching
+    Core's Serialize for uint64_t / int).
+
+    Reference: hash.h HashWriter::GetCheapHash() and addrman.cpp
+    GetTriedBucket / GetNewBucket / GetBucketPosition.
+
+    BUG-18 fix: was single SHA-256; now double-SHA256.
+    BUG-19 fix: removed str branch — all inputs must be bytes or int; callers
+                must pass binary keys (e.g. AddrInfo.get_binary_key()) not
+                human-readable strings.
+    """
+    buf = key
     for arg in args:
-        if isinstance(arg, str):
-            h.update(arg.encode())
-        elif isinstance(arg, bytes):
-            h.update(arg)
+        if isinstance(arg, bytes):
+            buf += arg
         elif isinstance(arg, int):
-            h.update(arg.to_bytes(8, "little"))
-    return int.from_bytes(h.digest()[:8], "little")
+            buf += arg.to_bytes(8, "little")
+        else:
+            raise TypeError(
+                f"_hash_for_bucket: expected bytes or int, got {type(arg).__name__!r}"
+            )
+    digest = hashlib.sha256(hashlib.sha256(buf).digest()).digest()
+    return int.from_bytes(digest[:8], "little")
 
 
 class AddressManager:
@@ -330,38 +388,57 @@ class AddressManager:
     def _get_new_bucket(self, addr: AddrInfo, source_group: str) -> int:
         """Compute new table bucket for an address.
 
-        bucket = hash(key, addr_group, source_group) % 64
-                 then hash(key, source_group, bucket) % 256
+        Mirrors Core's CAddrInfo::GetNewBucket() in addrman.cpp:
+          hash1 = dSHA256(nKey || addr_group || source_group)
+          hash2 = dSHA256(nKey || source_group || hash1 % NEW_BUCKETS_PER_SOURCE_GROUP)
+          bucket = hash2 % NEW_BUCKET_COUNT
+
+        Group bytes are ASCII-encoded strings (e.g. b"1.2" for IPv4 /16 group),
+        matching the byte values returned by Core's NetGroupManager::GetGroup().
         """
         addr_group = get_network_group(addr.host, addr.network_id)
+        addr_group_b = addr_group.encode()
+        source_group_b = source_group.encode()
         hash1 = _hash_for_bucket(
-            self._key, addr_group, source_group
+            self._key, addr_group_b, source_group_b
         )
         hash2 = _hash_for_bucket(
-            self._key, source_group, hash1 % NEW_BUCKETS_PER_SOURCE_GROUP
+            self._key, source_group_b, hash1 % NEW_BUCKETS_PER_SOURCE_GROUP
         )
         return hash2 % NEW_BUCKET_COUNT
 
     def _get_tried_bucket(self, addr: AddrInfo) -> int:
         """Compute tried table bucket for an address.
 
-        bucket = hash(key, addr_group, hash(key, addr_key) % 8) % 64
+        Mirrors Core's CAddrInfo::GetTriedBucket() in addrman.cpp:
+          hash1 = dSHA256(nKey || CService::GetKey())
+          hash2 = dSHA256(nKey || addr_group || hash1 % TRIED_BUCKETS_PER_GROUP)
+          bucket = hash2 % TRIED_BUCKET_COUNT
+
+        BUG-19 fix: use get_binary_key() (18-byte binary) not get_key() (string).
         """
-        addr_key = addr.get_key()
+        addr_binary_key = addr.get_binary_key()
         addr_group = get_network_group(addr.host, addr.network_id)
-        hash1 = _hash_for_bucket(self._key, addr_key)
+        hash1 = _hash_for_bucket(self._key, addr_binary_key)
         hash2 = _hash_for_bucket(
-            self._key, addr_group, hash1 % TRIED_BUCKETS_PER_GROUP
+            self._key, addr_group.encode(), hash1 % TRIED_BUCKETS_PER_GROUP
         )
         return hash2 % TRIED_BUCKET_COUNT
 
     def _get_bucket_position(
         self, addr: AddrInfo, is_new: bool, bucket: int
     ) -> int:
-        """Compute position within a bucket."""
+        """Compute position within a bucket.
+
+        Mirrors Core's CAddrInfo::GetBucketPosition() in addrman.cpp:
+          hash = dSHA256(nKey || prefix || bucket || CService::GetKey())
+          pos  = hash % bucket_size
+
+        BUG-19 fix: use get_binary_key() (18-byte binary) not get_key() (string).
+        """
         prefix = b"N" if is_new else b"K"
         hash_val = _hash_for_bucket(
-            self._key, prefix, bucket, addr.get_key()
+            self._key, prefix, bucket, addr.get_binary_key()
         )
         size = NEW_BUCKET_SIZE if is_new else TRIED_BUCKET_SIZE
         return hash_val % size

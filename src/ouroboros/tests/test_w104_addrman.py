@@ -585,24 +585,42 @@ class TestG17TestWindow(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestG18BucketHash(unittest.TestCase):
     """
-    BUG-18: ouroboros _hash_for_bucket uses single SHA-256.
-    Core's GetTriedBucket/GetNewBucket/GetBucketPosition all call
-    (HashWriter{} << ...).GetCheapHash() which is double-SHA256
-    (HashWriter::GetCheapHash calls GetHash = double-SHA256 then LE64).
-    This makes ouroboros bucket assignments incompatible with Core's
-    deterministic scheme.
+    FIXED (W104 BUG-18): _hash_for_bucket now uses double-SHA256 matching
+    Core's HashWriter::GetCheapHash() = GetHash() (double-SHA256) then LE64.
+
+    Core: GetTriedBucket/GetNewBucket/GetBucketPosition all call
+      (HashWriter{} << ...).GetCheapHash()
+      where GetCheapHash = ReadLE64(GetHash()) and GetHash = double-SHA256.
+
+    Reference: src/hash.h HashWriter::GetCheapHash().
     """
 
-    def test_uses_sha256_not_double_sha256(self):
+    def test_uses_double_sha256(self):
+        # FIXED: _hash_for_bucket must use double-SHA256, not single
         from ouroboros.addrman import _hash_for_bucket
         import hashlib
         import inspect
         src = inspect.getsource(_hash_for_bucket)
-        # single SHA256 used
-        self.assertIn("hashlib.sha256", src, "BUG-18: should use double-SHA256 (GetCheapHash)")
-        # no double-sha256 call
-        self.assertNotIn("sha256d", src)
-        self.assertNotIn("double", src.lower())
+        # double-SHA256 pattern: sha256(sha256(...).digest())
+        self.assertIn("hashlib.sha256", src)
+        # Verify the function produces the same result as double-SHA256 manually
+        data = b"\x00" * 32 + b"\x01\x02\x03\x04"
+        expected = int.from_bytes(
+            hashlib.sha256(hashlib.sha256(data).digest()).digest()[:8], "little"
+        )
+        actual = _hash_for_bucket(b"\x00" * 32, b"\x01\x02\x03\x04")
+        self.assertEqual(actual, expected,
+                         "BUG-18 fixed: _hash_for_bucket must match double-SHA256 + LE64")
+
+    def test_double_sha256_differs_from_single(self):
+        # Regression guard: double-SHA256 must produce a different value than single
+        from ouroboros.addrman import _hash_for_bucket
+        import hashlib
+        data = b"test_key_for_bucket"
+        single = int.from_bytes(hashlib.sha256(data).digest()[:8], "little")
+        double_val = _hash_for_bucket(data)
+        self.assertNotEqual(double_val, single,
+                            "double-SHA256 must differ from single-SHA256")
 
 
 # ---------------------------------------------------------------------------
@@ -610,24 +628,75 @@ class TestG18BucketHash(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestG19HashInputSerialization(unittest.TestCase):
     """
-    BUG-19: ouroboros _hash_for_bucket uses get_key() which returns a
-    string like "1.2.3.4:8333" (UTF-8 encoded). Core's GetKey() returns
-    the raw 18-byte CService binary representation (16-byte IP + 2-byte port).
+    FIXED (W104 BUG-19): _hash_for_bucket no longer accepts string inputs.
+    AddrInfo.get_binary_key() now returns the 18-byte binary representation
+    matching CService::GetKey() = 16-byte IP (IPv4-mapped IPv6) + 2-byte port.
 
-    This produces different bucket assignments from Core and breaks
-    deterministic bucket calculation. The difference matters for
-    anti-eclipse bucket diversification.
+    Core's GetKey(): netaddress.cpp CService::GetKey()
+      key = GetAddrBytes()  // 16 bytes: IPv4-mapped for IPv4, raw IPv6
+      key.push_back(port / 0x100);  // big-endian port MSB
+      key.push_back(port & 0xFF);   // big-endian port LSB
+
+    For IPv4 1.2.3.4:8333 the binary key is:
+      00 00 00 00 00 00 00 00 00 00 FF FF 01 02 03 04  20 8D
+      (12-byte IPv4-in-IPv6 prefix) + (4-byte IPv4) + (port 8333 big-endian)
     """
 
-    def test_hash_uses_string_key(self):
+    def test_string_inputs_rejected(self):
+        # FIXED: _hash_for_bucket must raise TypeError for string inputs
         from ouroboros.addrman import _hash_for_bucket
-        import inspect
-        # _hash_for_bucket handles str args by calling .encode() internally
-        src = inspect.getsource(_hash_for_bucket)
-        # ouroboros converts str args via .encode() — meaning inputs are text strings
-        # not raw binary (as Core uses). Core passes CService.GetKey() = 18-byte binary.
-        self.assertIn("isinstance(arg, str)", src,
-                      "BUG-19: _hash_for_bucket must handle string (not binary) inputs — different from Core")
+        with self.assertRaises(TypeError):
+            _hash_for_bucket(b"\x00" * 32, "1.2.3.4:8333")
+
+    def test_get_binary_key_ipv4(self):
+        # FIXED: get_binary_key() returns 18-byte binary (16-byte IPv4-mapped + 2-byte port)
+        addr = AddrInfo(host="1.2.3.4", port=8333, network_id=NET_IPV4)
+        key = addr.get_binary_key()
+        self.assertEqual(len(key), 18,
+                         "BUG-19 fixed: get_binary_key must return 18 bytes")
+        # IPv4-in-IPv6 prefix: 10 zero bytes + 0xFF 0xFF
+        self.assertEqual(key[:12], b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff",
+                         "IPv4-in-IPv6 prefix incorrect")
+        # IPv4 octets
+        self.assertEqual(key[12:16], bytes([1, 2, 3, 4]),
+                         "IPv4 address bytes incorrect")
+        # Port 8333 big-endian: 8333 = 0x208D → 0x20, 0x8D
+        self.assertEqual(key[16:18], bytes([0x20, 0x8D]),
+                         "Port bytes incorrect (must be big-endian)")
+
+    def test_get_binary_key_ipv4_port_encoding(self):
+        # Port 8333 = 0x208D: MSB=0x20, LSB=0x8D
+        addr = AddrInfo(host="192.0.2.1", port=8333, network_id=NET_IPV4)
+        key = addr.get_binary_key()
+        self.assertEqual(key[16], 0x20)  # port >> 8
+        self.assertEqual(key[17], 0x8D)  # port & 0xFF
+
+    def test_get_binary_key_differs_from_string_key(self):
+        # The binary key must differ from the UTF-8 encoded string key
+        addr = AddrInfo(host="1.2.3.4", port=8333, network_id=NET_IPV4)
+        binary_key = addr.get_binary_key()
+        string_encoded = addr.get_key().encode()
+        self.assertNotEqual(binary_key, string_encoded,
+                            "binary key must differ from UTF-8 string key")
+
+    def test_bucket_functions_use_binary_key(self):
+        # Smoke: _get_tried_bucket and _get_bucket_position must not raise
+        # (they would raise TypeError if string inputs were still used)
+        am = AddressManager()
+        import time
+        am.add("1.2.3.4", 8333, timestamp=time.time())
+        info = am.get_addr_info("1.2.3.4", 8333)
+        self.assertIsNotNone(info)
+        # Force into tried table to exercise _get_tried_bucket
+        info.last_success = time.time()
+        info.last_attempt = time.time()
+        am._in_new.discard(info.get_key())
+        am._in_tried.add(info.get_key())
+        # These must not raise TypeError
+        tb = am._get_tried_bucket(info)
+        pos = am._get_bucket_position(info, is_new=False, bucket=tb)
+        self.assertIsInstance(tb, int)
+        self.assertIsInstance(pos, int)
 
 
 # ---------------------------------------------------------------------------
