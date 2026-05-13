@@ -18,14 +18,30 @@
 //! ```
 //!
 //! ## BLOCK_INDEX_CF
-//! Maps block height to block metadata for quick lookup by height.
+//! Maps block height to block metadata for the **active chain** — one entry
+//! per height, pointing at whichever block is currently on the best chain.
 //!
 //! **Key**: `height` (4 bytes, u32 little-endian)
-//! **Value**: Serialized `BlockMetadata` (height, chainwork, timestamp)
+//! **Value**: `[32-byte block hash][Serialized BlockMetadata]`
 //!
 //! **Example**:
 //! ```ignore
 //! // Key: encode_height(100) -> [0x64, 0x00, 0x00, 0x00]
+//! // Value: [32 bytes hash] ++ Serialized BlockMetadata { height: 100, ... }
+//! ```
+//!
+//! ## BLOCK_INDEX_BY_HASH_CF
+//! Maps **block hash** to block metadata — mirrors Bitcoin Core's
+//! `BlockMap = std::unordered_map<uint256, CBlockIndex>`.  All known blocks
+//! (active chain AND competing forks at the same height) have an entry here,
+//! so a fork block submitted via `submitblock` is never silently discarded.
+//!
+//! **Key**: `block_hash` (32 bytes, internal byte order)
+//! **Value**: Serialized `BlockMetadata` (44 bytes fixed-width)
+//!
+//! **Example**:
+//! ```ignore
+//! // Key: [32 bytes of block hash in internal byte order]
 //! // Value: Serialized BlockMetadata { height: 100, chainwork: [...], timestamp: ... }
 //! ```
 //!
@@ -79,8 +95,15 @@ use bitcoin::Txid;
 /// Column family name for storing full blocks
 pub const BLOCKS_CF: &str = "blocks";
 
-/// Column family name for block index (height -> BlockMetadata)
+/// Column family name for block index (height -> BlockMetadata) — active chain only.
 pub const BLOCK_INDEX_CF: &str = "block_index";
+
+/// Column family name for hash-keyed block index — all known blocks including
+/// competing forks.  Mirrors Core's `BlockMap = std::unordered_map<uint256, CBlockIndex>`.
+///
+/// Key:   block_hash (32 bytes, internal byte order)
+/// Value: Serialized `BlockMetadata` (44 bytes, same encoding as BlockMetadata::to_bytes())
+pub const BLOCK_INDEX_BY_HASH_CF: &str = "block_index_by_hash";
 
 /// Column family name for chainstate (UTXO set)
 pub const CHAINSTATE_CF: &str = "chainstate";
@@ -371,6 +394,7 @@ pub fn get_column_families() -> Vec<String> {
     vec![
         BLOCKS_CF.to_string(),
         BLOCK_INDEX_CF.to_string(),
+        BLOCK_INDEX_BY_HASH_CF.to_string(),
         CHAINSTATE_CF.to_string(),
         SPENT_CF.to_string(),
         META_CF.to_string(),
@@ -461,9 +485,10 @@ mod tests {
     #[test]
     fn test_column_families() {
         let cfs = get_column_families();
-        assert_eq!(cfs.len(), 7);
+        assert_eq!(cfs.len(), 9);
         assert!(cfs.contains(&BLOCKS_CF.to_string()));
         assert!(cfs.contains(&BLOCK_INDEX_CF.to_string()));
+        assert!(cfs.contains(&BLOCK_INDEX_BY_HASH_CF.to_string()));
         assert!(cfs.contains(&CHAINSTATE_CF.to_string()));
         assert!(cfs.contains(&SPENT_CF.to_string()));
         assert!(cfs.contains(&META_CF.to_string()));
