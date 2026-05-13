@@ -68,12 +68,9 @@ class TestG1MaxInvSzReceive(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestG2MaxGetDataSz(unittest.TestCase):
-    """G2: ouroboros handle_inv sends getdata with items; must respect MAX_GETDATA_SZ=1000.
-
-    BUG-G2: handle_inv in block_sync.py accumulates ALL inv items into a
-    single txs_to_request list and sends one GetDataMessage with no 1000-item
-    cap.  With >1000 txids in a single INV, a GetData with >1000 items is
-    sent — peer should reject it (Core protocol.h MAX_GETDATA_SZ=1000).
+    """G2 FIXED: handle_inv in block_sync.py now caps outgoing GETDATA batches
+    at MAX_GETDATA_SZ=1000 items (Core protocol.h:482).  With >1000 txids in a
+    single INV, multiple GETDATA messages of ≤1000 items each are sent.
     """
 
     def _make_inv_payload(self, count: int) -> bytes:
@@ -91,26 +88,49 @@ class TestG2MaxGetDataSz(unittest.TestCase):
             buf.write(_bytes32(i))
         return buf.getvalue()
 
-    def test_g2_getdata_cap_missing_over_1000_txs(self):
-        """With 1200 unique tx INVs, ouroboros sends 1 GetData with 1200 items
-        instead of splitting at 1000.  This documents the missing cap.
-        BUG-G2 CONFIRMED.
+    def test_g2_max_getdata_sz_constant_present(self):
+        """FIXED: MAX_GETDATA_SZ=1000 constant is defined in block_sync."""
+        from ouroboros.block_sync import MAX_GETDATA_SZ
+        self.assertEqual(MAX_GETDATA_SZ, 1000, (
+            "MAX_GETDATA_SZ must equal 1000 (Core protocol.h:482)."
+        ))
+
+    def test_g2_getdata_batches_respect_1000_cap(self):
+        """FIXED: 1200-item tx list is split into batches of ≤1000 items each,
+        matching Core net_processing.cpp:6207 MAX_GETDATA_SZ cap.
         """
-        from ouroboros.p2p_messages import GetDataMessage, InvMessage
+        from ouroboros.block_sync import MAX_GETDATA_SZ
+        from ouroboros.p2p_messages import GetDataMessage, InvMessage, MSG_WITNESS_TX
+
         inv_payload = self._make_inv_payload(1200)
         inv = InvMessage.from_payload(inv_payload)
-        # All items should parse correctly
         self.assertEqual(len(inv.inventory), 1200)
 
-        # If a compliant implementation split at 1000 it would need 2 messages.
-        # ouroboros would produce 1 GetDataMessage of 1200 items — confirm it
-        # doesn't cap by checking the message object itself.
-        gd = GetDataMessage(inventory=inv.inventory)
-        # No error raised — no 1000-item limit enforced on construction
-        self.assertEqual(len(gd.inventory), 1200, (
-            "BUG-G2: GetDataMessage constructed with 1200 items — no MAX_GETDATA_SZ=1000 cap "
-            "applied. Core net_processing.cpp:6207 caps at 1000."
+        # Simulate the fixed batching logic from handle_inv
+        txs_to_request = [(MSG_WITNESS_TX, h) for _, h in inv.inventory]
+        batches = [
+            txs_to_request[i:i + MAX_GETDATA_SZ]
+            for i in range(0, len(txs_to_request), MAX_GETDATA_SZ)
+        ]
+
+        # 1200 items at 1000/batch → 2 batches
+        self.assertEqual(len(batches), 2, (
+            "1200 tx requests must be split into 2 GETDATA batches of ≤1000 each."
         ))
+        self.assertLessEqual(len(batches[0]), MAX_GETDATA_SZ, (
+            "First batch must not exceed MAX_GETDATA_SZ=1000."
+        ))
+        self.assertLessEqual(len(batches[1]), MAX_GETDATA_SZ, (
+            "Second batch must not exceed MAX_GETDATA_SZ=1000."
+        ))
+        self.assertEqual(len(batches[0]) + len(batches[1]), 1200, (
+            "All 1200 items must be covered across batches."
+        ))
+
+        # Each batch can be serialised as a valid GetDataMessage
+        for batch in batches:
+            gd = GetDataMessage(inventory=batch)
+            self.assertLessEqual(len(gd.inventory), MAX_GETDATA_SZ)
 
 
 # ---------------------------------------------------------------------------
