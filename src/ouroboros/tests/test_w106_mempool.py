@@ -475,12 +475,12 @@ class TestG6DescendantCountOnRemoval(unittest.TestCase):
     """G6: Removing a child must decrement ancestor's descendant_count."""
 
     def test_descendant_count_decremented(self):
-        """BUG G6: _update_descendants_after_removal does not decrement parent's
-        descendant_count when a leaf child is removed.
+        """G6 fix: _update_descendants_after_removal correctly decrements
+        parent's descendant_count when a leaf child is removed.
 
-        When a leaf child (no grandchildren) is removed, former_children is empty.
-        The loop `for child_txid in children` never runs, so affected_ancestors
-        is empty, and the parent's descendant_count stays at 2 instead of 1.
+        Fix: _update_descendants_after_removal now seeds affected_ancestors
+        with former_parents of the removed tx so leaf removals decrement
+        ancestor descendant_count correctly (W106 BUG-G6).
         """
         mp, db = _make_mempool()
 
@@ -504,14 +504,11 @@ class TestG6DescendantCountOnRemoval(unittest.TestCase):
 
         mp.remove_transaction(c_id)
 
-        # After removal descendant_count should be back to 1 (self only).
-        # BUG: it remains 2 because _update_descendants_after_removal with empty
-        # former_children never recalculates ancestors' descendant_counts.
+        # After removal descendant_count must be back to 1 (self only).
         p_entry2 = mp.transactions.get(p_id)
-        if p_entry2:
-            # Demonstrate the bug: count stays at 2 instead of 1
-            self.assertEqual(p_entry2.descendant_count, 2,
-                             "BUG G6 CONFIRMED: descendant_count not decremented after leaf child removal — stays at 2")
+        self.assertIsNotNone(p_entry2, "parent must still be in mempool after leaf removal")
+        self.assertEqual(p_entry2.descendant_count, 1,
+                         "descendant_count must be decremented to 1 after leaf child removal")
 
 
 # ---------------------------------------------------------------------------
