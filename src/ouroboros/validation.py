@@ -2110,12 +2110,24 @@ class TransactionValidator:
         input_amounts: list[int] = None,
         input_script_pubkeys: list[bytes] = None,
     ) -> bool:
-        # Build cache key: (txid_hex, input_index, flags)
-        txid_hex = tx.get_txid().hex()
-        cache_key = (txid_hex, input_index, flags)
+        # Build SigCache key from cryptographic material so that two different
+        # (sig, pubkey) pairs on the same outpoint produce distinct entries.
+        #
+        # sighash_material: serialised tx + input index covers the sighash
+        #   commitment for this input without requiring a full sighash pre-image
+        #   computation here (the real sighash is computed inside
+        #   script_interpreter.verify below, which is the authority).
+        # pubkey_bytes: the locking script (script_pubkey) commits to the key.
+        # sig_bytes: the unlocking script (script_sig) carries the signature.
+        #
+        # The per-process nonce inside SIG_CACHE prevents key prediction.
+        import struct as _struct
+        sighash_material = tx.get_txid() + _struct.pack("<I", input_index)
+        pubkey_bytes = bytes(utxo['script_pubkey'])
+        sig_bytes = bytes(tx_in.script_sig)
 
         # Check cache first - only successful verifications are cached
-        if SIG_CACHE.lookup(cache_key):
+        if SIG_CACHE.lookup(sighash_material, pubkey_bytes, sig_bytes, flags):
             return True
 
         # Cache miss - perform verification
@@ -2132,7 +2144,7 @@ class TransactionValidator:
 
         # Cache successful verifications only
         if result:
-            SIG_CACHE.insert(cache_key)
+            SIG_CACHE.insert(sighash_material, pubkey_bytes, sig_bytes, flags)
 
         return result
 
