@@ -340,17 +340,44 @@ def _is_p2sh(script: bytes) -> bool:
     )
 
 
+_MAX_COMPACT_SIZE = 0x02000000  # Bitcoin Core serialize.h MAX_SIZE
+
+
 def _read_compact_size(data: bytes, offset: int = 0) -> tuple[int, int]:
+    """Decode CompactSize at *offset* in *data*; returns (value, bytes_consumed).
+
+    Raises ValueError on truncated input, non-canonical encodings, or values
+    exceeding MAX_SIZE (0x02000000) per Bitcoin Core serialize.h.
+    """
     if offset >= len(data):
-        return 0, 0
+        raise ValueError("Truncated CompactSize: no data at offset")
     first = data[offset]
     if first < 0xFD:
         return first, 1
     if first == 0xFD:
-        return int.from_bytes(data[offset + 1:offset + 3], "little"), 3
-    if first == 0xFE:
-        return int.from_bytes(data[offset + 1:offset + 5], "little"), 5
-    return int.from_bytes(data[offset + 1:offset + 9], "little"), 9
+        if offset + 3 > len(data):
+            raise ValueError("Truncated CompactSize<u16>")
+        value = int.from_bytes(data[offset + 1:offset + 3], "little")
+        if value < 0xFD:
+            raise ValueError(f"Non-canonical CompactSize: 0xfd prefix with value {value} < 0xfd")
+        bytes_consumed = 3
+    elif first == 0xFE:
+        if offset + 5 > len(data):
+            raise ValueError("Truncated CompactSize<u32>")
+        value = int.from_bytes(data[offset + 1:offset + 5], "little")
+        if value < 0x10000:
+            raise ValueError(f"Non-canonical CompactSize: 0xfe prefix with value {value} < 0x10000")
+        bytes_consumed = 5
+    else:
+        if offset + 9 > len(data):
+            raise ValueError("Truncated CompactSize<u64>")
+        value = int.from_bytes(data[offset + 1:offset + 9], "little")
+        if value < 0x100000000:
+            raise ValueError(f"Non-canonical CompactSize: 0xff prefix with value {value} < 0x100000000")
+        bytes_consumed = 9
+    if value > _MAX_COMPACT_SIZE:
+        raise ValueError(f"CompactSize value {value} exceeds MAX_SIZE ({_MAX_COMPACT_SIZE})")
+    return value, bytes_consumed
 
 
 def _get_last_push(script_sig: bytes) -> bytes | None:
