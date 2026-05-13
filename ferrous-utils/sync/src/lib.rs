@@ -2966,6 +2966,52 @@ impl PyBlockchainDB {
         })
     }
 
+    /// Look up block metadata by block hash (O(1)) from BLOCK_INDEX_BY_HASH_CF.
+    ///
+    /// Returns ``(height, chainwork_bytes, timestamp, status_bits)`` or ``None``.
+    ///
+    /// Unlike ``get_block_metadata`` (height-keyed, active chain only), this
+    /// method returns metadata for ANY known block including competing fork blocks
+    /// that were overwritten in the height-keyed index — the W109 BUG-7 fix.
+    fn get_block_metadata_by_hash(&self, block_hash: &[u8]) -> PyResult<Option<(u32, Vec<u8>, u32, u32)>> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+        match self.db.get_block_metadata_by_hash(&hash_bytes) {
+            Ok(Some(meta)) => Ok(Some((
+                meta.height,
+                meta.chainwork.to_vec(),
+                meta.timestamp,
+                meta.status.bits(),
+            ))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )),
+        }
+    }
+
+    /// Check whether any block with the given hash has metadata stored
+    /// (active chain OR competing fork).  O(1) lookup.
+    fn has_block_metadata_by_hash(&self, block_hash: &[u8]) -> PyResult<bool> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+        self.db.has_block_metadata_by_hash(&hash_bytes).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )
+        })
+    }
+
     /// Retrieve the raw 80-byte block header and nTx count from HEADERS_CF.
     ///
     /// Returns ``(header_bytes, n_tx)`` where ``header_bytes`` is the 80-byte
@@ -3213,6 +3259,59 @@ impl PyBlockchainDB {
         Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
             "store_block requires BlockWrapper reconstruction - use Rust API directly"
         ))
+    }
+
+    /// Store raw block metadata (height, chainwork, timestamp) keyed by block hash.
+    ///
+    /// Writes to BOTH `BLOCK_INDEX_CF` (height-keyed, active-chain) and
+    /// `BLOCK_INDEX_BY_HASH_CF` (hash-keyed, all known blocks including forks).
+    ///
+    /// Intended for testing and for genesis-block bootstrap.  Production code
+    /// should use `connect_block_from_bytes` which calls this internally.
+    ///
+    /// # Arguments
+    /// * `height`           — block height (u32)
+    /// * `block_hash`       — 32-byte block hash in internal byte order
+    /// * `metadata_height`  — height stored inside the BlockMetadata (should
+    ///                        equal `height`)
+    /// * `chainwork`        — 32-byte chainwork in big-endian order
+    /// * `timestamp`        — block header time (u32)
+    fn store_block_metadata_raw(
+        &self,
+        height: u32,
+        block_hash: &[u8],
+        metadata_height: u32,
+        chainwork: &[u8],
+        timestamp: u32,
+    ) -> PyResult<()> {
+        use common::BlockStatus;
+
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "block_hash must be 32 bytes"
+            ));
+        }
+        if chainwork.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "chainwork must be 32 bytes"
+            ));
+        }
+        let mut hash_arr = [0u8; 32];
+        hash_arr.copy_from_slice(block_hash);
+        let mut cw_arr = [0u8; 32];
+        cw_arr.copy_from_slice(chainwork);
+
+        let metadata = BlockMetadata::with_status(
+            metadata_height,
+            cw_arr,
+            timestamp,
+            BlockStatus::new(),
+        );
+        self.db.store_block_metadata(height, &hash_arr, &metadata).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("store_block_metadata_raw failed: {}", e)
+            )
+        })
     }
 
     /// Validate a block from raw wire-format bytes.
