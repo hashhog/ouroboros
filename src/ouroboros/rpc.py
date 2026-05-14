@@ -4129,15 +4129,18 @@ class RPCServer:
 
         Reference: bitcoin-core/src/rpc/fees.cpp estimaterawfee.
 
-        ouroboros's CBlockPolicyEstimator analog (``FeeEstimator``) tracks a
-        single horizon (no short/medium/long split) so the returned object
-        has a single ``"long"`` horizon.  The bucket output mirrors Core's
+        ouroboros now tracks three horizons (short / medium / long) mirroring
+        Core's shortStats / feeStats / longStats.  The returned object has
+        keys "short", "medium", and "long" (those whose period count covers
+        conf_target); the bucket output mirrors Core's
         ``buckets.pass`` / ``buckets.fail`` shape.
         """
         from ouroboros.fee_estimator import (
             FEE_RATE_BUCKETS,
-            DECAY_FACTOR,
-            SUCCESS_THRESHOLD,
+            DECAY,
+            SCALE,
+            PERIODS,
+            Horizon,
         )
 
         if not isinstance(conf_target, int) or conf_target < 1 or conf_target > 1008:
@@ -4151,75 +4154,91 @@ class RPCServer:
 
         fee_estimator = getattr(self.node, "fee_estimator", None)
         if fee_estimator is None:
-            return {
-                "long": {
-                    "decay": DECAY_FACTOR,
-                    "scale": 1,
+            result: dict[str, Any] = {}
+            for h in Horizon:
+                hname = h.name.lower()
+                result[hname] = {
+                    "decay": DECAY[h],
+                    "scale": SCALE[h],
                     "errors": ["Fee estimation not available"],
                 }
+            return result
+
+        result = {}
+
+        for h in Horizon:
+            hname = h.name.lower()
+            scale = SCALE[h]
+            periods = PERIODS[h]
+            max_blocks_h = periods * scale
+
+            # Only include horizons whose tracked range covers conf_target.
+            if conf_target > max_blocks_h:
+                # Still include horizon — show it with limited data note.
+                pass
+
+            # Convert conf_target to period for this horizon.
+            period = min(max(1, (conf_target + scale - 1) // scale), periods)
+
+            conf_arr = fee_estimator._conf[h]
+            total_arr = fee_estimator._total[h]
+
+            # Walk buckets low → high to find pass/fail bucket.
+            pass_idx: int | None = None
+            fail_idx: int | None = None
+            for i in range(len(FEE_RATE_BUCKETS)):
+                total_val = total_arr[i][period]
+                conf_val = conf_arr[i][period]
+                if total_val < 1.0:
+                    continue
+                ratio = conf_val / total_val
+                if ratio >= threshold:
+                    pass_idx = i
+                    break
+                fail_idx = i
+
+            def _bucket_dict(idx: int, p: int = period) -> dict:
+                start = FEE_RATE_BUCKETS[idx]
+                end = (
+                    FEE_RATE_BUCKETS[idx + 1]
+                    if idx + 1 < len(FEE_RATE_BUCKETS)
+                    else FEE_RATE_BUCKETS[-1]
+                )
+                total_v = total_arr[idx][p]
+                conf_v = conf_arr[idx][p]
+                return {
+                    "startrange": round(float(start), 2),
+                    "endrange": round(float(end), 2),
+                    "withintarget": round(conf_v, 2),
+                    "totalconfirmed": round(conf_v, 2),
+                    "inmempool": 0,
+                    "leftmempool": round(max(total_v - conf_v, 0.0), 2),
+                }
+
+            horizon_obj: dict[str, Any] = {
+                "decay": DECAY[h],
+                "scale": scale,
             }
 
-        # Clamp conf_target to what we actually track in the bucket arrays.
-        from ouroboros.fee_estimator import MAX_CONF_TARGET as _MCT
-        track_target = min(conf_target, _MCT)
+            if pass_idx is not None:
+                # sat/vB bucket boundary → BTC/kB feerate to mirror Core.
+                feerate_btc_kvb = float(FEE_RATE_BUCKETS[pass_idx]) * 1000 / 1e8
+                horizon_obj["feerate"] = feerate_btc_kvb
+                horizon_obj["pass"] = _bucket_dict(pass_idx)
+                if fail_idx is not None:
+                    horizon_obj["fail"] = _bucket_dict(fail_idx)
+            else:
+                # No bucket meets the threshold — emit fail (highest tracked
+                # bucket with any data) and an explanatory error string.
+                if fail_idx is not None:
+                    horizon_obj["fail"] = _bucket_dict(fail_idx)
+                horizon_obj["errors"] = [
+                    "Insufficient data or no feerate found which meets threshold"
+                ]
 
-        # Walk buckets low → high; first bucket whose success rate meets the
-        # threshold is the *pass* bucket.  The highest bucket below it that
-        # *fails* the threshold is the *fail* bucket.
-        pass_idx: int | None = None
-        fail_idx: int | None = None
-        for i in range(len(FEE_RATE_BUCKETS)):
-            total = fee_estimator.total[i][track_target]
-            conf = fee_estimator.confirmed[i][track_target]
-            if total < 1.0:
-                continue
-            ratio = conf / total if total > 0 else 0.0
-            if ratio >= threshold:
-                pass_idx = i
-                break
-            fail_idx = i
+            result[hname] = horizon_obj
 
-        def _bucket_dict(idx: int) -> dict:
-            start = FEE_RATE_BUCKETS[idx]
-            end = (
-                FEE_RATE_BUCKETS[idx + 1]
-                if idx + 1 < len(FEE_RATE_BUCKETS)
-                else FEE_RATE_BUCKETS[-1]
-            )
-            total = fee_estimator.total[idx][track_target]
-            conf = fee_estimator.confirmed[idx][track_target]
-            return {
-                "startrange": round(float(start), 2),
-                "endrange": round(float(end), 2),
-                # Match Core's "*100/100" rounding to 2 decimal places.
-                "withintarget": round(conf, 2),
-                "totalconfirmed": round(conf, 2),
-                "inmempool": 0,  # we don't track per-bucket mempool counts yet
-                "leftmempool": round(max(total - conf, 0.0), 2),
-            }
-
-        horizon: dict[str, Any] = {
-            "decay": DECAY_FACTOR,
-            "scale": 1,
-        }
-
-        if pass_idx is not None:
-            # sat/vB bucket boundary → BTC/kB feerate to mirror Core.
-            feerate_btc_kvb = float(FEE_RATE_BUCKETS[pass_idx]) * 1000 / 1e8
-            horizon["feerate"] = feerate_btc_kvb
-            horizon["pass"] = _bucket_dict(pass_idx)
-            if fail_idx is not None:
-                horizon["fail"] = _bucket_dict(fail_idx)
-        else:
-            # No bucket meets the threshold — emit fail (highest tracked
-            # bucket with any data) and an explanatory error string.
-            if fail_idx is not None:
-                horizon["fail"] = _bucket_dict(fail_idx)
-            horizon["errors"] = [
-                "Insufficient data or no feerate found which meets threshold"
-            ]
-
-        return {"long": horizon}
+        return result
 
     async def rpc_validateaddress(self, address: str) -> dict[str, Any]:
         """
