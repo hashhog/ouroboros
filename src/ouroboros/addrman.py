@@ -1015,6 +1015,56 @@ class AddressManager:
             counts[group] = counts.get(group, 0) + 1
         return counts
 
+    def asmap_health_check(self, top_n: int = 5) -> dict:
+        """Compute ASMap health statistics for the loaded address table.
+
+        Iterates over every address in the new + tried tables and looks up
+        each IPv4/IPv6 entry's ASN.  Returns a summary dict suitable for
+        startup logging and periodic monitoring.
+
+        Mirrors the kind of diagnostics Bitcoin Core emits on startup when
+        an asmap is loaded (src/addrman.cpp / src/init.cpp).
+
+        Args:
+            top_n: Number of top ASNs by address count to include in the
+                   ``top_asns`` list (default 5).
+
+        Returns:
+            dict with keys:
+              total_addrs  — total addresses across new + tried tables
+              mapped       — addresses that have a non-zero ASN mapping
+              unmapped     — addresses with ASN=0 (unknown or non-IP)
+              unique_asns  — number of distinct ASNs seen
+              top_asns     — list of up to ``top_n`` (asn, count) tuples,
+                             sorted by count descending
+              asmap_active — bool; True when an asmap is loaded
+        """
+        total = len(self._addrs)
+        mapped = 0
+        unmapped = 0
+        asn_counts: dict[int, int] = {}
+
+        if self._asmap:
+            for info in self._addrs.values():
+                asn = self.get_mapped_as(info.host, info.network_id)
+                if asn > 0:
+                    mapped += 1
+                    asn_counts[asn] = asn_counts.get(asn, 0) + 1
+                else:
+                    unmapped += 1
+        else:
+            unmapped = total
+
+        sorted_asns = sorted(asn_counts.items(), key=lambda kv: kv[1], reverse=True)
+        return {
+            "total_addrs": total,
+            "mapped": mapped,
+            "unmapped": unmapped,
+            "unique_asns": len(asn_counts),
+            "top_asns": sorted_asns[:top_n],
+            "asmap_active": bool(self._asmap),
+        }
+
     # Persistence
 
     def save(self) -> None:
