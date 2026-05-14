@@ -7599,14 +7599,18 @@ class RPCServer:
 
         # Build per-transaction results from the mempool entries that were
         # just inserted by validate_package.
-        # JSON-RPC convention: txids in responses are display-order (BE).
-        # get_txid() returns LE (internal byte order). Reverse for JSON. W69.
+        # JSON-RPC convention: txids/wtxids in responses are display-order (BE).
+        # get_txid()/get_wtxid() return LE (internal byte order); reverse for JSON.
+        # BUG-5 fix: Core keys tx-results by wtxid (GetWitnessHash().GetHex()),
+        # not txid — rpc/mempool.cpp:1464. For segwit txs (txid != wtxid) client
+        # tools keying by wtxid would otherwise get an empty miss.
         tx_results: dict[str, Any] = {}
         for tx in txs:
             txid_hex = tx.get_txid()[::-1].hex()
+            wtxid_hex = tx.get_wtxid()[::-1].hex()
             entry = self.node.mempool.get_transaction_entry(tx.get_txid())
             if entry is not None:
-                tx_results[txid_hex] = {
+                tx_results[wtxid_hex] = {
                     "txid": txid_hex,
                     "vsize": tx.get_vsize(),
                     "fees": {
@@ -7614,7 +7618,7 @@ class RPCServer:
                     },
                 }
             else:
-                tx_results[txid_hex] = {
+                tx_results[wtxid_hex] = {
                     "txid": txid_hex,
                     "vsize": tx.get_vsize(),
                     "fees": {"base": 0},
