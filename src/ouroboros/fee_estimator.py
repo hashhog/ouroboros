@@ -3,23 +3,24 @@ Fee estimation using exponential-decay fee rate buckets.
 
 Modelled on Bitcoin Core's ``CBlockPolicyEstimator`` (``policy/fees.cpp``).
 
-The estimator maintains ~40 fee-rate *buckets* on a logarithmic scale
-(1 – 10 000 sat/vB).  For every confirmed transaction whose fee we know
-(because it was in our mempool), the bucket corresponding to its fee rate
-is updated:
+Three horizons mirror Core's shortStats / feeStats / longStats:
 
-* ``confirmed[bucket][target]`` is incremented when the tx confirmed
-  within *target* blocks.
-* ``total[bucket][target]`` is incremented for every target from 1 up to
-  the actual number of blocks the tx waited – reflecting that it was
-  *unconfirmed* for those shorter windows.
+  SHORT  — decay 0.962,   scale 1,  12 periods  (tracks up to 12 blocks)
+  MEDIUM — decay 0.9952,  scale 2,  24 periods  (tracks up to 48 blocks)
+  LONG   — decay 0.99931, scale 24, 42 periods  (tracks up to 1008 blocks)
 
-All counters are subjected to an exponential decay (factor 0.998 per
-block), so recent data naturally outweighs stale observations.
+For every confirmed transaction whose fee we know (because it was in our
+mempool), the bucket corresponding to its fee rate is updated in all three
+horizons.  Each horizon uses its own scale when mapping ``blocks_to_confirm``
+to a period index.
+
+All counters are subjected to per-horizon exponential decay on each block,
+so recent data naturally outweighs stale observations.
 
 To produce an estimate for a given confirmation target *T* the estimator
-finds the lowest bucket where
-``confirmed[bucket][T] / total[bucket][T] >= SUCCESS_THRESHOLD`` (85 %).
+selects the appropriate horizon(s) and finds the lowest bucket where
+``confirmed[bucket][period] / total[bucket][period] >= SUCCESS_THRESHOLD``
+(85 %).
 
 A simple percentile-based fallback (the original implementation) is used
 when the bucket data is still sparse (< ``MIN_BUCKET_OBSERVATIONS``
@@ -37,6 +38,7 @@ import logging
 import os
 from collections import deque
 from dataclasses import dataclass
+from enum import IntEnum
 
 logger = logging.getLogger(__name__)
 
@@ -60,11 +62,42 @@ FEE_RATE_BUCKETS: list[float] = [
 
 NUM_BUCKETS = len(FEE_RATE_BUCKETS)
 
-#: Maximum confirmation target tracked in the bucket arrays.
-MAX_CONF_TARGET = 25
+#: Maximum confirmation target tracked across all horizons (LONG covers 1008).
+MAX_CONF_TARGET = 1008
 
-#: Per-block exponential decay factor applied to all counters.
-DECAY_FACTOR = 0.998
+
+class Horizon(IntEnum):
+    SHORT = 0
+    MEDIUM = 1
+    LONG = 2
+
+
+#: Per-horizon exponential decay factor applied to all counters each block.
+#: Mirrors Core's shortStats.decay / feeStats.decay / longStats.decay.
+DECAY: dict[Horizon, float] = {
+    Horizon.SHORT:  0.962,
+    Horizon.MEDIUM: 0.9952,
+    Horizon.LONG:   0.99931,
+}
+
+#: Block scale per horizon — one period = scale blocks.
+SCALE: dict[Horizon, int] = {
+    Horizon.SHORT:  1,
+    Horizon.MEDIUM: 2,
+    Horizon.LONG:   24,
+}
+
+#: Number of periods tracked per horizon.
+PERIODS: dict[Horizon, int] = {
+    Horizon.SHORT:  12,
+    Horizon.MEDIUM: 24,
+    Horizon.LONG:   42,
+}
+
+#: Backward-compat alias: the old single DECAY_FACTOR was 0.998 (between MED
+#: and LONG).  Code that still imports DECAY_FACTOR gets the LONG value; the
+#: constant is no longer used internally.
+DECAY_FACTOR: float = DECAY[Horizon.LONG]
 
 #: Minimum total observations across all buckets before the bucket estimator
 #: is preferred over the simple fallback.
@@ -115,18 +148,36 @@ class FeeEstimator:
     """
 
     def __init__(self, max_history: int = MAX_BLOCK_HISTORY):
-        # Bucket-based estimator state
-        # confirmed[bucket][target] – how many txs in this bucket confirmed
-        #   within exactly *target* blocks (after decay).
-        # total[bucket][target] – how many txs in this bucket were tracked
-        #   for this target window (confirmed OR still unconfirmed, after
-        #   decay).
-        self.confirmed: list[list[float]] = [
-            [0.0] * (MAX_CONF_TARGET + 1) for _ in range(NUM_BUCKETS)
-        ]
-        self.total: list[list[float]] = [
-            [0.0] * (MAX_CONF_TARGET + 1) for _ in range(NUM_BUCKETS)
-        ]
+        # Per-horizon bucket arrays.
+        # Each horizon h has arrays of shape [NUM_BUCKETS][PERIODS[h] + 1].
+        # confirmed_h[bucket][period] – how many txs confirmed within *period*
+        #   periods (after decay).
+        # total_h[bucket][period] – how many txs were tracked for this period
+        #   window (confirmed OR unconfirmed, after decay).
+        def _make_horizon(h: Horizon) -> list[list[float]]:
+            return [[0.0] * (PERIODS[h] + 1) for _ in range(NUM_BUCKETS)]
+
+        self.short_stats: list[list[float]] = _make_horizon(Horizon.SHORT)
+        self.short_totals: list[list[float]] = _make_horizon(Horizon.SHORT)
+
+        self.med_stats: list[list[float]] = _make_horizon(Horizon.MEDIUM)
+        self.med_totals: list[list[float]] = _make_horizon(Horizon.MEDIUM)
+
+        self.long_stats: list[list[float]] = _make_horizon(Horizon.LONG)
+        self.long_totals: list[list[float]] = _make_horizon(Horizon.LONG)
+
+        # Convenience mapping for internal loops.
+        self._conf: dict[Horizon, list[list[float]]] = {
+            Horizon.SHORT:  self.short_stats,
+            Horizon.MEDIUM: self.med_stats,
+            Horizon.LONG:   self.long_stats,
+        }
+        self._total: dict[Horizon, list[list[float]]] = {
+            Horizon.SHORT:  self.short_totals,
+            Horizon.MEDIUM: self.med_totals,
+            Horizon.LONG:   self.long_totals,
+        }
+
         # Running count of total observations fed into the bucket arrays
         # (before decay), used to decide whether we have enough data.
         self._total_observations: int = 0
@@ -196,12 +247,30 @@ class FeeEstimator:
     # ------------------------------------------------------------------
 
     def estimate_fee(self, conf_target: int = 6) -> float | None:
-        """Estimate fee rate in sat/vB for *conf_target*-block confirmation; returns None if data is sparse."""
+        """Estimate fee rate in sat/vB for *conf_target*-block confirmation.
+
+        Selects the tightest horizon that covers conf_target:
+          SHORT  if conf_target <= 12  (scale=1,  12 periods)
+          MEDIUM if conf_target <= 48  (scale=2,  24 periods → 48 blocks)
+          LONG   if conf_target <= 1008 (scale=24, 42 periods → 1008 blocks)
+
+        Returns None if data is sparse.
+        """
         conf_target = max(1, min(conf_target, MAX_CONF_TARGET))
+
+        # Select horizon based on target.
+        short_max = PERIODS[Horizon.SHORT] * SCALE[Horizon.SHORT]    # 12
+        med_max   = PERIODS[Horizon.MEDIUM] * SCALE[Horizon.MEDIUM]  # 48
+        if conf_target <= short_max:
+            horizon = Horizon.SHORT
+        elif conf_target <= med_max:
+            horizon = Horizon.MEDIUM
+        else:
+            horizon = Horizon.LONG
 
         # Try bucket-based estimation first.
         if self._total_observations >= MIN_BUCKET_OBSERVATIONS:
-            bucket_estimate = self._estimate_from_buckets(conf_target)
+            bucket_estimate = self._estimate_from_buckets(conf_target, horizon)
             if bucket_estimate is not None:
                 return bucket_estimate
 
@@ -235,14 +304,20 @@ class FeeEstimator:
                 ),
             })
 
-        # Per-bucket snapshot (confirmed / total for a few representative
-        # targets) — useful for debugging.
+        # Per-bucket snapshot — use LONG horizon for representative targets.
+        conf_arr = self._conf[Horizon.LONG]
+        total_arr = self._total[Horizon.LONG]
         bucket_snapshot: list[dict] = []
         for i, boundary in enumerate(FEE_RATE_BUCKETS):
             row = {"bucket_sat_vb": boundary}
             for t in (1, 3, 6, 12, 25):
-                total = self.total[i][t]
-                conf = self.confirmed[i][t]
+                # Convert block target → LONG period (clamp to tracked range).
+                period = min(
+                    max(1, t // SCALE[Horizon.LONG]),
+                    PERIODS[Horizon.LONG],
+                )
+                total = total_arr[i][period]
+                conf = conf_arr[i][period]
                 if total > 0:
                     row[f"target_{t}"] = round(conf / total, 3)
                 else:
@@ -257,41 +332,70 @@ class FeeEstimator:
     # ------------------------------------------------------------------
 
     def _apply_decay(self) -> None:
-        for i in range(NUM_BUCKETS):
-            for t in range(MAX_CONF_TARGET + 1):
-                self.confirmed[i][t] *= DECAY_FACTOR
-                self.total[i][t] *= DECAY_FACTOR
+        for h in Horizon:
+            d = DECAY[h]
+            conf_h = self._conf[h]
+            total_h = self._total[h]
+            periods = PERIODS[h]
+            for i in range(NUM_BUCKETS):
+                for t in range(periods + 1):
+                    conf_h[i][t] *= d
+                    total_h[i][t] *= d
 
     def _record_confirmation(self, fee_rate: float, blocks_to_confirm: int) -> None:
         bucket = _bucket_index(fee_rate)
         self._total_observations += 1
 
-        # Clamp to the range we track.
-        btc = min(blocks_to_confirm, MAX_CONF_TARGET)
+        for h in Horizon:
+            scale = SCALE[h]
+            periods = PERIODS[h]
+            conf_h = self._conf[h]
+            total_h = self._total[h]
 
-        # Targets where the tx was still unconfirmed (failed to confirm
-        # within that window).
-        for t in range(1, btc):
-            self.total[bucket][t] += 1.0
+            # Convert block count to this horizon's period index.
+            # A tx that confirmed in *blocks_to_confirm* blocks confirmed
+            # within ceil(blocks_to_confirm / scale) periods.
+            period = (blocks_to_confirm + scale - 1) // scale
+            # Clamp to the range we track.
+            period = min(period, periods)
 
-        # Targets where the tx *did* confirm within the window (success).
-        for t in range(btc, MAX_CONF_TARGET + 1):
-            self.confirmed[bucket][t] += 1.0
-            self.total[bucket][t] += 1.0
+            # Periods where the tx was still unconfirmed (failed to confirm
+            # within that shorter window).
+            for p in range(1, period):
+                total_h[bucket][p] += 1.0
 
-    def _estimate_from_buckets(self, conf_target: int) -> float | None:
+            # Periods where the tx *did* confirm within the window (success).
+            for p in range(period, periods + 1):
+                conf_h[bucket][p] += 1.0
+                total_h[bucket][p] += 1.0
+
+    def _estimate_from_buckets(self, conf_target: int, horizon: Horizon) -> float | None:
+        """Look up the lowest fee-rate bucket meeting SUCCESS_THRESHOLD for the
+        given *conf_target* blocks in the specified *horizon*.
+
+        *conf_target* is in blocks; it is converted to the horizon's period
+        index before indexing the arrays.
+        """
+        scale = SCALE[horizon]
+        periods = PERIODS[horizon]
+        conf_h = self._conf[horizon]
+        total_h = self._total[horizon]
+
+        # Convert block target to period index for this horizon.
+        period = min(max(1, (conf_target + scale - 1) // scale), periods)
+
         for i in range(NUM_BUCKETS):
-            total = self.total[i][conf_target]
+            total = total_h[i][period]
             if total < 2.0:
                 continue
-            prob = self.confirmed[i][conf_target] / total
+            prob = conf_h[i][period] / total
             if prob >= SUCCESS_THRESHOLD:
                 return max(float(FEE_RATE_BUCKETS[i]), 1.0)
 
         # If no bucket passes, recommend the highest bucket as a
         # conservative estimate – but only if we have *some* data there.
         for i in range(NUM_BUCKETS - 1, -1, -1):
-            total = self.total[i][conf_target]
+            total = total_h[i][period]
             if total >= 2.0:
                 return max(float(FEE_RATE_BUCKETS[i]), 1.0)
 
@@ -338,8 +442,12 @@ class FeeEstimator:
         state = {
             "version": 1,
             "total_observations": self._total_observations,
-            "confirmed": self.confirmed,
-            "total": self.total,
+            "short_confirmed": self.short_stats,
+            "short_total":     self.short_totals,
+            "med_confirmed":   self.med_stats,
+            "med_total":       self.med_totals,
+            "long_confirmed":  self.long_stats,
+            "long_total":      self.long_totals,
             "block_history": [
                 {
                     "height": b.height,
@@ -383,18 +491,36 @@ class FeeEstimator:
         try:
             self._total_observations = state["total_observations"]
 
-            # Restore bucket arrays (validate dimensions)
-            confirmed = state["confirmed"]
-            total = state["total"]
-            if (len(confirmed) == NUM_BUCKETS
-                    and len(total) == NUM_BUCKETS
-                    and all(len(row) == MAX_CONF_TARGET + 1 for row in confirmed)
-                    and all(len(row) == MAX_CONF_TARGET + 1 for row in total)):
-                self.confirmed = confirmed
-                self.total = total
-            else:
-                logger.warning("Fee estimator: dimension mismatch, ignoring")
-                return False
+            def _check_dims(arr: list, h: Horizon) -> bool:
+                return (
+                    len(arr) == NUM_BUCKETS
+                    and all(len(row) == PERIODS[h] + 1 for row in arr)
+                )
+
+            for key, attr_conf, attr_tot, h in (
+                ("short", "short_stats", "short_totals", Horizon.SHORT),
+                ("med",   "med_stats",   "med_totals",   Horizon.MEDIUM),
+                ("long",  "long_stats",  "long_totals",  Horizon.LONG),
+            ):
+                confirmed = state[f"{key}_confirmed"]
+                total     = state[f"{key}_total"]
+                if not (_check_dims(confirmed, h) and _check_dims(total, h)):
+                    logger.warning("Fee estimator: dimension mismatch (%s), ignoring", key)
+                    return False
+                setattr(self, attr_conf, confirmed)
+                setattr(self, attr_tot,  total)
+
+            # Keep the convenience dicts in sync.
+            self._conf = {
+                Horizon.SHORT:  self.short_stats,
+                Horizon.MEDIUM: self.med_stats,
+                Horizon.LONG:   self.long_stats,
+            }
+            self._total = {
+                Horizon.SHORT:  self.short_totals,
+                Horizon.MEDIUM: self.med_totals,
+                Horizon.LONG:   self.long_totals,
+            }
 
             # Restore block history
             self.block_history.clear()
