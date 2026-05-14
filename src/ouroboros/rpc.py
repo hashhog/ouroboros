@@ -2599,7 +2599,19 @@ class RPCServer:
         if hasattr(self.node, 'get_warnings'):
             warnings = self.node.get_warnings()
 
-        return {
+        # asmapversion — SHA-256 fingerprint of the loaded ASMap file.
+        # Core exposes this field in getnetworkinfo (rpc/net.cpp) when an
+        # asmap is active.  We always include it: empty string when no asmap
+        # is loaded (matching Core's behaviour of omitting when empty).
+        addrman = getattr(self.node, 'addr_manager', None) or \
+                  getattr(self.node, 'address_manager', None) or \
+                  (getattr(pm, 'addr_manager', None) if pm else None)
+        asmapversion = ""
+        if addrman is not None and hasattr(addrman, '_asmap') and addrman._asmap:
+            from ouroboros.asmap import asmap_version as _asmap_version
+            asmapversion = _asmap_version(addrman._asmap).hex()
+
+        result = {
             "version": 250000,  # Ouroboros version
             "subversion": "/Ouroboros:0.25.0/",
             "protocolversion": 70016,
@@ -2617,6 +2629,9 @@ class RPCServer:
             "localaddresses": local_addresses,
             "warnings": warnings,
         }
+        if asmapversion:
+            result["asmapversion"] = asmapversion
+        return result
 
     async def rpc_getrawmempool(self, verbose: bool = False) -> list[str] | dict[str, dict[str, Any]]:
         """
@@ -6211,6 +6226,22 @@ class RPCServer:
             banscore = getattr(peer, 'ban_score', 0)
             if banscore > 0:
                 info["banscore"] = banscore
+
+            # mapped_as — ASN for this peer's IP when an ASMap is loaded.
+            # Core exposes this as an optional field (rpc/net.cpp getpeerinfo).
+            # We emit it unconditionally as 0 when no asmap is active so
+            # cross-impl tooling can always count on the field being present.
+            peer_host = addr.split(":")[0] if addr else ""
+            peer_network_id = getattr(peer, 'network_id', 1)  # default IPv4
+            addrman = getattr(self.node, 'addr_manager', None) or \
+                      getattr(self.node, 'address_manager', None) or \
+                      (getattr(pm, 'addr_manager', None) if pm else None)
+            if addrman is not None and hasattr(addrman, 'get_mapped_as'):
+                mapped_as = addrman.get_mapped_as(peer_host, peer_network_id)
+            else:
+                mapped_as = 0
+            if mapped_as > 0:
+                info["mapped_as"] = mapped_as
 
             peers.append(info)
 

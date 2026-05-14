@@ -199,6 +199,13 @@ class NodeConfig:
             # getcfcheckpt/cfcheckpt).  When disabled (the default) the
             # node behaves identically to before this option was added.
             'blockfilterindex': '0',
+            # Path to an ASMap file for AS-number-based peer bucketing.
+            # Mirrors Bitcoin Core's -asmap option (init.cpp:1584).
+            # Empty string (the default) disables ASMap: addrman falls back
+            # to /16-prefix bucket grouping.  A non-empty value is treated
+            # as a filesystem path; relative paths are resolved relative to
+            # the datadir (Core parity, init.cpp:1591-1593).
+            'asmap': '',
         }
 
         if self.config_path.exists():
@@ -332,6 +339,9 @@ class NodeConfig:
             # filter index, serves BIP-157 P2P queries, and advertises
             # NODE_COMPACT_FILTERS in version handshakes.
             'blockfilterindex': self.getboolean('blockfilterindex'),
+            # ASMap file path (Core: -asmap).  Empty string disables ASMap.
+            # Relative paths are resolved relative to datadir at startup.
+            'asmap': self.get('asmap') or '',
         }
 
 
