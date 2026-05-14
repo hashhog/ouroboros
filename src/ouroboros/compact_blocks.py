@@ -289,6 +289,54 @@ class CompactBlock:
             return None, missing
         return txs, []  # type: ignore[return-value]
 
+    def reconstruct_partial(
+        self, mempool: Mempool
+    ) -> tuple[list, list[int]]:
+        """Reconstruct the tx list, returning partial state even when missing.
+
+        Unlike ``reconstruct()``, returns ``(partial_txs, missing_indices)``
+        where ``partial_txs`` is the full-length list with ``None`` entries
+        for unresolved slots.  The caller stores ``partial_txs`` and fills
+        it in when the ``blocktxn`` response arrives.
+
+        Returns ``(None, [])`` on protocol violations (invalid structure).
+
+        This mirrors Bitcoin Core's PartiallyDownloadedBlock::InitData +
+        FillBlock pattern (blockencodings.cpp) where the partial state is
+        retained between the cmpctblock receive and the blocktxn fill.
+        """
+        status = self.validate()
+        if status != ReadStatus.OK:
+            return None, []
+
+        key = self.siphash_key()
+
+        total_tx_count = len(self.short_ids) + len(self.prefilled_txs)
+        txs: list = [None] * total_tx_count
+
+        # Place pre-filled transactions at their absolute indices.
+        for pf in self.prefilled_txs:
+            txs[pf.index] = pf.tx
+
+        # Use mempool's matching function (handles short-ID collisions)
+        matched_txs, _ = mempool.match_compact_block(self.short_ids, key)
+
+        # Fill remaining slots from matched mempool transactions
+        sid_iter = iter(matched_txs)
+        missing: list[int] = []
+        for i in range(total_tx_count):
+            if txs[i] is not None:
+                continue
+            matched = next(sid_iter)
+            if matched is not None:
+                txs[i] = matched
+            else:
+                missing.append(i)
+
+        # Always return the partial list so the caller can merge the
+        # blocktxn response into it.
+        return txs, missing
+
     # Wire-format serialization / deserialization
 
     def serialize(self) -> bytes:
