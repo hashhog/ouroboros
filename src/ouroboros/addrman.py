@@ -349,11 +349,16 @@ class AddressManager:
     - Deterministic bucket assignment prevents manipulation
     - Source group tracking limits single-source influence
     - Network group diversification spreads across /16 ranges
+    - ASN-based grouping when an asmap is loaded (BUG-1..9 fix)
     """
 
-    def __init__(self, data_dir: str | None = None):
+    def __init__(self, data_dir: str | None = None, asmap: bytes = b""):
         # Secret key for deterministic bucket hashing (anti-manipulation)
         self._key: bytes = secrets.token_bytes(32)
+
+        # Loaded ASMap bytes; empty bytes = disabled (fall back to /16 grouping).
+        # Mirrors Bitcoin Core's NetGroupManager::m_asmap.
+        self._asmap: bytes = asmap
 
         # New table: bucket[i][j] = addr_key or None
         # 256 buckets x 64 entries
@@ -383,6 +388,58 @@ class AddressManager:
             self._filepath = os.path.join(data_dir, "peers.json")
             self._load()
 
+    # ASMap integration
+
+    def using_asmap(self) -> bool:
+        """Return True when an ASMap is loaded and active.
+
+        Mirrors Bitcoin Core's NetGroupManager::UsingASMap().
+        """
+        return bool(self._asmap)
+
+    def get_mapped_as(self, host: str, network_id: int) -> int:
+        """Look up the ASN for a host using the loaded ASMap.
+
+        Mirrors Bitcoin Core's NetGroupManager::GetMappedAS().
+
+        Returns the ASN (> 0) when a mapping exists, 0 otherwise
+        (including when no asmap is loaded, or for non-IP addresses).
+
+        Args:
+            host: Human-readable address string (IPv4, IPv6, .onion, etc.).
+            network_id: BIP155 network type (1=IPv4, 2=IPv6, others→0).
+        """
+        if not self._asmap:
+            return 0
+        from ouroboros.asmap import get_mapped_as as _get_mapped_as
+        return _get_mapped_as(self._asmap, host, network_id)
+
+    def _get_addr_group(self, host: str, network_id: int) -> bytes:
+        """Return the group bytes for addrman bucket computation.
+
+        When an ASMap is loaded: returns the 5-byte ASN group vector
+        (NET_IPV6 prefix + 4-byte little-endian ASN) for IPv4/IPv6
+        addresses where a mapping exists.  This makes IPv4 and IPv6
+        addresses in the same AS compete for the same buckets
+        (Core: netgroup.cpp GetGroup() with m_asmap active).
+
+        When no ASMap is loaded (or for non-IP addresses): returns the
+        ASCII-encoded /16 prefix string as bytes (existing behaviour).
+
+        Args:
+            host: Human-readable address string.
+            network_id: BIP155 network type.
+
+        Returns:
+            Group bytes for use in _hash_for_bucket().
+        """
+        if self._asmap and network_id in (NET_IPV4, NET_IPV6):
+            asn = self.get_mapped_as(host, network_id)
+            if asn > 0:
+                from ouroboros.asmap import asn_group_bytes
+                return asn_group_bytes(asn)
+        return get_network_group(host, network_id).encode()
+
     # Bucket computation
 
     def _get_new_bucket(self, addr: AddrInfo, source_group: str) -> int:
@@ -393,11 +450,11 @@ class AddressManager:
           hash2 = dSHA256(nKey || source_group || hash1 % NEW_BUCKETS_PER_SOURCE_GROUP)
           bucket = hash2 % NEW_BUCKET_COUNT
 
-        Group bytes are ASCII-encoded strings (e.g. b"1.2" for IPv4 /16 group),
-        matching the byte values returned by Core's NetGroupManager::GetGroup().
+        When an ASMap is loaded, addr_group is the 5-byte ASN vector
+        (NET_IPV6 + 4-byte little-endian ASN) instead of the ASCII /16
+        string.  This is the Core parity fix for BUG-11.
         """
-        addr_group = get_network_group(addr.host, addr.network_id)
-        addr_group_b = addr_group.encode()
+        addr_group_b = self._get_addr_group(addr.host, addr.network_id)
         source_group_b = source_group.encode()
         hash1 = _hash_for_bucket(
             self._key, addr_group_b, source_group_b
@@ -415,13 +472,15 @@ class AddressManager:
           hash2 = dSHA256(nKey || addr_group || hash1 % TRIED_BUCKETS_PER_GROUP)
           bucket = hash2 % TRIED_BUCKET_COUNT
 
+        When an ASMap is loaded, addr_group is the 5-byte ASN vector
+        (NET_IPV6 + 4-byte little-endian ASN) for Core parity (BUG-12 fix).
         BUG-19 fix: use get_binary_key() (18-byte binary) not get_key() (string).
         """
         addr_binary_key = addr.get_binary_key()
-        addr_group = get_network_group(addr.host, addr.network_id)
+        addr_group_b = self._get_addr_group(addr.host, addr.network_id)
         hash1 = _hash_for_bucket(self._key, addr_binary_key)
         hash2 = _hash_for_bucket(
-            self._key, addr_group.encode(), hash1 % TRIED_BUCKETS_PER_GROUP
+            self._key, addr_group_b, hash1 % TRIED_BUCKETS_PER_GROUP
         )
         return hash2 % TRIED_BUCKET_COUNT
 
