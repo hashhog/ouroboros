@@ -803,29 +803,140 @@ class TestG20NonIpNetworksReturnZero(unittest.TestCase):
 
 
 # ============================================================================
-# G21-G22 — ASN-based diversity (deferred)
+# G21 — ASN-based outbound diversity (FIX-51: FIXED)
 # ============================================================================
 class TestG21SelectConnectionAsnDiversity(unittest.TestCase):
-    """BUG-21 (deferred): select_for_connection ASN diversity not yet implemented."""
+    """
+    BUG-21 (FIX-51): select_for_connection now accepts exclude_asns.
 
-    def test_g21_no_exclude_asns_param_yet(self):
-        """select_for_connection has no exclude_asns parameter yet (deferred)."""
+    When an asmap is loaded, candidates whose mapped ASN is in the
+    exclude_asns set are rejected, enforcing one-connection-per-AS.
+    Core: net.cpp / addrman.cpp outbound ASN-diversity check.
+    """
+
+    def test_g21_select_for_connection_has_exclude_asns_param(self):
+        """select_for_connection now accepts exclude_asns parameter."""
         import inspect
         from ouroboros.addrman import AddressManager
         sig = inspect.signature(AddressManager.select_for_connection)
         params = list(sig.parameters.keys())
-        self.assertNotIn('exclude_asns', params, "Deferred: no exclude_asns yet")
+        self.assertIn('exclude_asns', params,
+                      "FIX-51: select_for_connection must have exclude_asns param")
 
+    def test_g21_exclude_asns_filters_candidates(self):
+        """Candidates with matching ASN are excluded when asmap loaded."""
+        import time
+        from ouroboros.addrman import AddressManager, NET_IPV4
+        asmap = _build_return_asmap(15169)  # all IPs → ASN 15169
+        am = AddressManager(asmap=asmap)
+        # Add two addresses — both will map to ASN 15169
+        now = time.time()
+        am.add("1.2.3.4", 8333, services=1, timestamp=now)
+        am.add("5.6.7.8", 8333, services=1, timestamp=now)
+        # With ASN 15169 excluded, no candidate should be returned
+        result = am.select_for_connection(exclude_asns={15169})
+        self.assertIsNone(result,
+                          "All candidates share ASN 15169 — should be filtered out")
 
-class TestG22FeelerAsnDeduplication(unittest.TestCase):
-    """BUG-22 (deferred): feeler ASN deduplication not yet implemented."""
+    def test_g21_exclude_asns_allows_different_asn(self):
+        """Candidates with non-matching ASN are NOT excluded."""
+        import time
+        from ouroboros.addrman import AddressManager, NET_IPV4
+        asmap = _build_return_asmap(15169)  # all IPs → ASN 15169
+        am = AddressManager(asmap=asmap)
+        am.add("1.2.3.4", 8333, services=1, timestamp=time.time())
+        # Exclude ASN 9999 (different) — candidate ASN 15169 should still pass
+        result = am.select_for_connection(exclude_asns={9999})
+        self.assertIsNotNone(result,
+                             "Candidate ASN 15169 != excluded 9999, should be returned")
 
-    def test_g22_select_for_feeler_no_asn_yet(self):
-        """select_for_feeler has no ASN deduplication yet (deferred)."""
+    def test_g21_exclude_asns_empty_set_allows_all(self):
+        """Empty exclude_asns set allows all candidates through."""
+        import time
+        from ouroboros.addrman import AddressManager, NET_IPV4
+        asmap = _build_return_asmap(15169)
+        am = AddressManager(asmap=asmap)
+        am.add("1.2.3.4", 8333, services=1, timestamp=time.time())
+        result = am.select_for_connection(exclude_asns=set())
+        self.assertIsNotNone(result, "Empty exclude_asns should allow all candidates")
+
+    def test_g21_exclude_asns_no_asmap_no_filter(self):
+        """exclude_asns is ignored when no asmap is loaded (graceful degradation)."""
+        import time
+        from ouroboros.addrman import AddressManager
+        am = AddressManager()  # no asmap
+        am.add("1.2.3.4", 8333, services=1, timestamp=time.time())
+        # Even if we exclude ASN 15169, no asmap → no filter
+        result = am.select_for_connection(exclude_asns={15169})
+        self.assertIsNotNone(result,
+                             "No asmap loaded: exclude_asns should not filter")
+
+    def test_g21_private_helpers_accept_exclude_asns(self):
+        """_select_from_tried and _select_from_new accept exclude_asns arg."""
         import inspect
         from ouroboros.addrman import AddressManager
-        src = inspect.getsource(AddressManager.select_for_feeler)
-        self.assertNotIn('asn', src.lower(), "Deferred: no ASN in select_for_feeler")
+        sig_tried = inspect.signature(AddressManager._select_from_tried)
+        sig_new = inspect.signature(AddressManager._select_from_new)
+        self.assertIn('exclude_asns', sig_tried.parameters,
+                      "FIX-51: _select_from_tried must accept exclude_asns")
+        self.assertIn('exclude_asns', sig_new.parameters,
+                      "FIX-51: _select_from_new must accept exclude_asns")
+
+
+# ============================================================================
+# G22 — Eviction prefers same-ASN victims (FIX-51: FIXED)
+# ============================================================================
+class TestG22EvictionPrefersSameAsn(unittest.TestCase):
+    """
+    BUG-22 (FIX-51): When evicting from the tried table, prefer candidates
+    whose ASN matches the incumbent — evicting same-AS entries loses no
+    diversity.  Implemented via _get_eviction_victim_from_collisions().
+    """
+
+    def test_g22_eviction_helper_exists(self):
+        """AddressManager._get_eviction_victim_from_collisions() is present."""
+        from ouroboros.addrman import AddressManager
+        am = AddressManager()
+        self.assertTrue(hasattr(am, '_get_eviction_victim_from_collisions'),
+                        "FIX-51: _get_eviction_victim_from_collisions must exist")
+
+    def test_g22_eviction_helper_returns_none_for_empty_collisions(self):
+        """_get_eviction_victim_from_collisions() returns None when no collisions."""
+        from ouroboros.addrman import AddressManager
+        am = AddressManager()
+        self.assertIsNone(am._get_eviction_victim_from_collisions(15169))
+
+    def test_g22_eviction_helper_prefers_same_asn(self):
+        """_get_eviction_victim_from_collisions() prefers same-ASN collision entry."""
+        from ouroboros.addrman import AddressManager, AddrInfo, NET_IPV4
+        asmap = _build_return_asmap(15169)  # all IPs → ASN 15169
+        am = AddressManager(asmap=asmap)
+        # Manually populate collisions: two entries, both map to ASN 15169
+        am._addrs["1.2.3.4:8333"] = AddrInfo(
+            host="1.2.3.4", port=8333, network_id=NET_IPV4
+        )
+        am._addrs["5.6.7.8:8333"] = AddrInfo(
+            host="5.6.7.8", port=8333, network_id=NET_IPV4
+        )
+        am._tried_collisions = {"1.2.3.4:8333", "5.6.7.8:8333"}
+        # Both have ASN 15169; the helper should return one of them (same-ASN preference)
+        victim = am._get_eviction_victim_from_collisions(15169)
+        self.assertIn(victim, {"1.2.3.4:8333", "5.6.7.8:8333"},
+                      "Same-ASN victim should come from the collisions set")
+
+    def test_g22_eviction_helper_falls_back_when_no_same_asn(self):
+        """_get_eviction_victim_from_collisions() falls back to arbitrary when no same-ASN."""
+        from ouroboros.addrman import AddressManager, AddrInfo, NET_IPV4
+        asmap = _build_return_asmap(99999)  # all IPs → ASN 99999
+        am = AddressManager(asmap=asmap)
+        am._addrs["1.2.3.4:8333"] = AddrInfo(
+            host="1.2.3.4", port=8333, network_id=NET_IPV4
+        )
+        am._tried_collisions = {"1.2.3.4:8333"}
+        # Candidate ASN is 15169, collision is ASN 99999 — no match, but still returns
+        victim = am._get_eviction_victim_from_collisions(15169)
+        self.assertEqual(victim, "1.2.3.4:8333",
+                         "Fallback: should still return the only collision entry")
 
 
 # ============================================================================

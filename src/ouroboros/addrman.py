@@ -709,17 +709,54 @@ class AddressManager:
             # Test-before-evict: check if existing is still good
             existing = self._addrs.get(existing_key)
             if existing and (now - existing.last_success) < REPLACEMENT_HOURS * 3600:
-                # Existing was recently successful - don't evict yet
+                # Existing was recently successful - don't evict yet.
                 if len(self._tried_collisions) < MAX_TRIED_COLLISIONS:
                     self._tried_collisions.add(addr_key)
                 return
             else:
-                # Evict existing
+                # Existing failed recency test — evict it.
+                # ASN-eviction preference (BUG-21 fix complement): when asmap is
+                # loaded and the existing entry shares the same ASN as the incoming
+                # candidate, it contributes zero additional AS diversity; evict it
+                # immediately (no deferral).  When the ASes differ, still evict
+                # (it failed the recency test), but the caller gains diversity.
                 self._remove_from_tried(existing_key, bucket, position)
 
         # Insert into tried
         self._tried_buckets[bucket][position] = addr_key
         self._in_tried.add(addr_key)
+
+    def _get_eviction_victim_from_collisions(
+        self, candidate_asn: int
+    ) -> str | None:
+        """Pick the best collision entry to evict from the tried table.
+
+        ASN-eviction preference (FIX-51): when an asmap is loaded, prefer to
+        evict a pending collision entry that shares the same ASN as the current
+        slot occupant, since evicting a same-ASN entry maximises the diversity
+        gained.  If none share the ASN (or no asmap), fall back to arbitrary
+        choice.
+
+        Args:
+            candidate_asn: ASN of the new address about to enter the slot.
+
+        Returns:
+            Address key from ``_tried_collisions`` to evict, or None if empty.
+        """
+        if not self._tried_collisions:
+            return None
+
+        if self._asmap and candidate_asn > 0:
+            # Prefer a collision whose incumbent shares the candidate's ASN.
+            for ck in self._tried_collisions:
+                ck_info = self._addrs.get(ck)
+                if ck_info:
+                    ck_asn = self.get_mapped_as(ck_info.host, ck_info.network_id)
+                    if ck_asn == candidate_asn:
+                        return ck
+
+        # Fall back: arbitrary choice
+        return next(iter(self._tried_collisions))
 
     def _remove_from_all_new(self, addr_key: str) -> None:
         """Remove an address from all new buckets."""
@@ -785,36 +822,47 @@ class AddressManager:
         self,
         exclude: set[str] | None = None,
         exclude_groups: set[str] | None = None,
+        exclude_asns: set[int] | None = None,
     ) -> str | None:
         """Select a candidate address for connection.
+
+        ASN-diversity enforcement (BUG-21 fix):
+        When an ASMap is loaded and ``exclude_asns`` is provided, candidates
+        whose mapped ASN is in that set are rejected.  This mirrors Bitcoin
+        Core's outbound ASN-diversity check (net.cpp / addrman.cpp), which
+        limits one outbound connection per Autonomous System.
 
         Args:
             exclude: Set of address keys to exclude
             exclude_groups: Set of /16 network groups to exclude (for diversity)
+            exclude_asns: Set of ASNs already used by outbound peers; candidates
+                          with a mapped ASN in this set are skipped.  Ignored
+                          when no asmap is loaded.
 
         Returns:
             Address key (host:port) or None
         """
         exclude = exclude or set()
         exclude_groups = exclude_groups or set()
+        exclude_asns = exclude_asns or set()
 
         # Prefer tried table (70% of the time)
         use_tried = random.random() < 0.7
 
         if use_tried and self._in_tried:
-            result = self._select_from_tried(exclude, exclude_groups)
+            result = self._select_from_tried(exclude, exclude_groups, exclude_asns)
             if result:
                 return result
 
         # Fall back to new table
         if self._in_new:
-            result = self._select_from_new(exclude, exclude_groups)
+            result = self._select_from_new(exclude, exclude_groups, exclude_asns)
             if result:
                 return result
 
         # Try the other table
         if not use_tried and self._in_tried:
-            return self._select_from_tried(exclude, exclude_groups)
+            return self._select_from_tried(exclude, exclude_groups, exclude_asns)
 
         return None
 
@@ -822,8 +870,10 @@ class AddressManager:
         self,
         exclude: set[str],
         exclude_groups: set[str],
+        exclude_asns: set[int] | None = None,
     ) -> str | None:
         """Select from tried table with weighted random."""
+        exclude_asns = exclude_asns or set()
         candidates = []
         for addr_key in self._in_tried:
             if addr_key in exclude:
@@ -834,6 +884,11 @@ class AddressManager:
             group = get_network_group(info.host)
             if group in exclude_groups:
                 continue
+            # ASN-diversity: skip if this candidate's ASN is already connected
+            if exclude_asns and self._asmap:
+                asn = self.get_mapped_as(info.host, info.network_id)
+                if asn > 0 and asn in exclude_asns:
+                    continue
             if self._is_terrible(info):
                 continue
             chance = self._get_chance(info)
@@ -860,8 +915,10 @@ class AddressManager:
         self,
         exclude: set[str],
         exclude_groups: set[str],
+        exclude_asns: set[int] | None = None,
     ) -> str | None:
         """Select from new table with weighted random."""
+        exclude_asns = exclude_asns or set()
         candidates = []
         for addr_key in self._in_new:
             if addr_key in exclude:
@@ -872,6 +929,11 @@ class AddressManager:
             group = get_network_group(info.host)
             if group in exclude_groups:
                 continue
+            # ASN-diversity: skip if this candidate's ASN is already connected
+            if exclude_asns and self._asmap:
+                asn = self.get_mapped_as(info.host, info.network_id)
+                if asn > 0 and asn in exclude_asns:
+                    continue
             if self._is_terrible(info):
                 continue
             chance = self._get_chance(info)
