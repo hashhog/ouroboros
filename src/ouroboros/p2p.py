@@ -565,6 +565,10 @@ class PeerManager:
         # Track outbound /16 groups for connection diversification
         self._outbound_netgroups: set[str] = set()
 
+        # Track outbound ASNs for ASN-diversity enforcement (FIX-51).
+        # Populated when addrman has an asmap loaded; empty otherwise.
+        self._outbound_asns: set[int] = set()
+
         # Track inbound /16 groups for reserved slot enforcement
         self._inbound_netgroups: dict[str, int] = {}  # group -> count
 
@@ -1383,12 +1387,25 @@ class PeerManager:
         return set(self.peers.keys()) | set(self.block_relay_peers.keys())
 
     def _update_outbound_netgroups(self) -> None:
-        """Rebuild the set of outbound network groups from current peers."""
+        """Rebuild the set of outbound network groups (and ASNs) from current peers."""
         self._outbound_netgroups = set()
+        self._outbound_asns = set()
         for peer in self.peers.values():
             self._outbound_netgroups.add(self._netgroup(peer.host))
+            if self.addrman.using_asmap():
+                asn = self.addrman.get_mapped_as(
+                    peer.host, getattr(peer, 'network_id', 1)
+                )
+                if asn > 0:
+                    self._outbound_asns.add(asn)
         for peer in self.block_relay_peers.values():
             self._outbound_netgroups.add(self._netgroup(peer.host))
+            if self.addrman.using_asmap():
+                asn = self.addrman.get_mapped_as(
+                    peer.host, getattr(peer, 'network_id', 1)
+                )
+                if asn > 0:
+                    self._outbound_asns.add(asn)
 
     # BIP 324 v2 transport fall-back tracking
     # See V2_FALLBACK_TTL.  A peer that failed the outbound v2
@@ -1508,11 +1525,12 @@ class PeerManager:
               len(self.peers) < min_peers:
             attempts += 1
 
-            # Use address manager with network group exclusion for diversity
+            # Use address manager with network group + ASN exclusion for diversity
             exclude = self._all_outbound_addrs() | set(self.inbound_peers.keys())
             addr = self.addrman.select_for_connection(
                 exclude=exclude,
                 exclude_groups=self._outbound_netgroups,
+                exclude_asns=self._outbound_asns,
             )
 
             # Fall back to known_addrs if addrman is empty
@@ -1561,7 +1579,12 @@ class PeerManager:
                 self.peers[addr] = peer
                 self.retry_counts[addr] = 0  # Reset retry count on success
                 self.addrman.mark_good(host, port)
-                self._outbound_netgroups.add(group)  # track for diversity
+                self._outbound_netgroups.add(group)  # track /16 diversity
+                # ASN-diversity tracking (FIX-51)
+                if self.addrman.using_asmap():
+                    asn = self.addrman.get_mapped_as(host, 1)  # default NET_IPV4
+                    if asn > 0:
+                        self._outbound_asns.add(asn)
                 self._register_compact_handlers(peer, addr)
                 self._register_bloom_handlers(peer, addr)
                 self._register_addr_handlers(peer, addr)
@@ -1660,11 +1683,12 @@ class PeerManager:
         while len(self.block_relay_peers) < self.max_block_relay_only and attempts < max_attempts:
             attempts += 1
 
-            # Use address manager with network group exclusion
+            # Use address manager with network group + ASN exclusion
             exclude = self._all_outbound_addrs() | set(self.inbound_peers.keys())
             addr = self.addrman.select_for_connection(
                 exclude=exclude,
                 exclude_groups=self._outbound_netgroups,
+                exclude_asns=self._outbound_asns,
             )
 
             # Fall back to known_addrs
@@ -1710,7 +1734,12 @@ class PeerManager:
                 self.block_relay_peers[addr] = peer
                 self.retry_counts[addr] = 0
                 self.addrman.mark_good(host, port)
-                self._outbound_netgroups.add(group)  # track for diversity
+                self._outbound_netgroups.add(group)  # track /16 diversity
+                # ASN-diversity tracking (FIX-51)
+                if self.addrman.using_asmap():
+                    asn = self.addrman.get_mapped_as(host, 1)  # default NET_IPV4
+                    if asn > 0:
+                        self._outbound_asns.add(asn)
                 # Register only the compact-block *receive* handlers (for
                 # unsolicited cmpctblock messages) but do NOT send sendcmpct
                 # and do NOT register addr handlers or request addresses.
