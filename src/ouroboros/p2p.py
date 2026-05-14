@@ -562,6 +562,10 @@ class PeerManager:
         self._feeler_peer: Peer | None = None
         self._next_feeler_time: float = 0.0
 
+        # ASMap health-check periodic task (FIX-52)
+        self._asmap_health_task: asyncio.Task | None = None
+        self._asmap_health_interval: int = 3600  # seconds (configurable)
+
         # Track outbound /16 groups for connection diversification
         self._outbound_netgroups: set[str] = set()
 
@@ -642,6 +646,20 @@ class PeerManager:
         # Start feeler connection loop (eclipse protection)
         self._feeler_task = asyncio.create_task(self._feeler_loop())
 
+        # Log initial ASMap health and start periodic health-check task (FIX-52)
+        if self.addrman.using_asmap():
+            hc = self.addrman.asmap_health_check()
+            logger.info(
+                "[asmap] Loaded: %d addrs, %d mapped, %d unmapped, %d unique ASNs. "
+                "Top ASNs: %s",
+                hc["total_addrs"],
+                hc["mapped"],
+                hc["unmapped"],
+                hc["unique_asns"],
+                hc["top_asns"],
+            )
+        self._asmap_health_task = asyncio.create_task(self._asmap_health_loop())
+
     async def stop(self):
         """Stop peer manager and disconnect all peers"""
         if not self.running:
@@ -685,6 +703,14 @@ class PeerManager:
             self._feeler_task.cancel()
             try:
                 await self._feeler_task
+            except asyncio.CancelledError:
+                pass
+
+        # Cancel ASMap health-check task (FIX-52)
+        if self._asmap_health_task:
+            self._asmap_health_task.cancel()
+            try:
+                await self._asmap_health_task
             except asyncio.CancelledError:
                 pass
 
@@ -1021,6 +1047,43 @@ class PeerManager:
                 self.addrman.mark_attempt(host, port)
 
     # Eclipse protection: feeler connections
+
+    async def _asmap_health_loop(self) -> None:
+        """Background loop that logs ASMap health statistics every hour (FIX-52).
+
+        Runs every ``self._asmap_health_interval`` seconds (default 3600).
+        When no asmap is loaded the loop sleeps but remains alive so it can
+        start reporting if an asmap is loaded at runtime in the future.
+
+        Mirrors the kind of periodic diagnostics Bitcoin Core would emit
+        for addrman / ASMap health monitoring.
+        """
+        try:
+            while self.running:
+                await asyncio.sleep(self._asmap_health_interval)
+                if not self.running:
+                    break
+                try:
+                    hc = self.addrman.asmap_health_check()
+                    if hc["asmap_active"]:
+                        logger.info(
+                            "[asmap] Health: %d addrs, %d mapped (%.1f%%), "
+                            "%d unmapped, %d unique ASNs. Top ASNs: %s",
+                            hc["total_addrs"],
+                            hc["mapped"],
+                            100.0 * hc["mapped"] / max(hc["total_addrs"], 1),
+                            hc["unmapped"],
+                            hc["unique_asns"],
+                            hc["top_asns"],
+                        )
+                    else:
+                        logger.debug("[asmap] No asmap loaded — health check skipped")
+                except Exception as e:
+                    logger.warning("[asmap] Health check error: %s", e)
+        except asyncio.CancelledError:
+            logger.debug("ASMap health loop cancelled")
+        except Exception as e:
+            logger.error("Error in ASMap health loop: %s", e)
 
     async def _feeler_loop(self) -> None:
         """Background loop that makes feeler connections to verify new addresses.
