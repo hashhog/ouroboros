@@ -542,20 +542,61 @@ class TestG9BucketHashingWithAsn(unittest.TestCase):
 # ============================================================================
 class TestG10RustPipelineAsmap(unittest.TestCase):
     """
-    BUG-10 (FIX-51 deferred): Rust PeerManager has no ASMap.
-    Verifying the baseline: Rust pipeline remains ASMap-free in this wave.
+    BUG-10 (FIX-52): Rust asmap module now exists at
+    ferrous-utils/sync/src/network/asmap.rs with interpret(),
+    sanity_check_asmap(), asmap_version(), asn_group_bytes(), and
+    get_mapped_as().
     """
 
-    def test_g10_rust_peer_manager_no_asmap(self):
-        """Rust peer_manager.rs has no asmap references (FIX-51 scope)."""
+    def test_g10_rust_asmap_module_exists(self):
+        """ferrous-utils/sync/src/network/asmap.rs exists (FIX-52)."""
+        import os
+        rust_asmap = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/network/asmap.rs"
+        self.assertTrue(os.path.exists(rust_asmap),
+                        "FIX-52: asmap.rs should be present in network/")
+
+    def test_g10_rust_asmap_has_interpret(self):
+        """asmap.rs exposes a public interpret() function."""
+        rust_asmap = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/network/asmap.rs"
+        with open(rust_asmap) as f:
+            src = f.read()
+        self.assertIn('pub fn interpret', src,
+                      "FIX-52: asmap.rs must have pub fn interpret()")
+
+    def test_g10_rust_asmap_has_sanity_check(self):
+        """asmap.rs exposes pub fn sanity_check_asmap()."""
+        rust_asmap = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/network/asmap.rs"
+        with open(rust_asmap) as f:
+            src = f.read()
+        self.assertIn('pub fn sanity_check_asmap', src,
+                      "FIX-52: asmap.rs must have sanity_check_asmap()")
+
+    def test_g10_rust_asmap_has_asmap_version(self):
+        """asmap.rs exposes pub fn asmap_version()."""
+        rust_asmap = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/network/asmap.rs"
+        with open(rust_asmap) as f:
+            src = f.read()
+        self.assertIn('pub fn asmap_version', src,
+                      "FIX-52: asmap.rs must have asmap_version()")
+
+    def test_g10_rust_asmap_size_guard(self):
+        """asmap.rs defines MAX_ASMAP_FILE_SIZE = 8 MiB."""
+        rust_asmap = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/network/asmap.rs"
+        with open(rust_asmap) as f:
+            src = f.read()
+        self.assertIn('MAX_ASMAP_FILE_SIZE', src,
+                      "FIX-52: asmap.rs must define MAX_ASMAP_FILE_SIZE")
+
+    def test_g10_rust_peer_manager_still_no_asmap(self):
+        """peer_manager.rs still has no asmap (ASMap lives in asmap.rs, not PeerManager)."""
         import os
         rust_pm = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/network/peer_manager.rs"
         if not os.path.exists(rust_pm):
             self.skipTest("Rust peer_manager.rs not found")
         with open(rust_pm) as f:
             src = f.read().lower()
-        self.assertNotIn('asmap', src, "FIX-51 scope: Rust PeerManager still lacks asmap")
-        self.assertNotIn('mapped_as', src, "FIX-51 scope: Rust PeerManager lacks get_mapped_as")
+        self.assertNotIn('asmap', src,
+                         "FIX-52: ASMap logic lives in asmap.rs, not peer_manager.rs")
 
 
 # ============================================================================
@@ -732,19 +773,99 @@ class TestG17GetNetworkInfoAsmapVersion(unittest.TestCase):
 
 
 # ============================================================================
-# G18 — ASMapHealthCheck (deferred)
+# G18 — ASMapHealthCheck (FIX-52: FIXED)
 # ============================================================================
 class TestG18AsmapHealthCheck(unittest.TestCase):
     """
-    BUG-18 (deferred): No ASMapHealthCheck yet.
+    BUG-18 (FIX-52): AddressManager.asmap_health_check() implemented.
+    Returns dict with total_addrs, mapped, unmapped, unique_asns, top_asns,
+    asmap_active.  PeerManager starts a 3600s periodic health-check task
+    and logs at startup when asmap is active.
     """
 
-    def test_g18_no_health_check_yet(self):
-        """AddressManager.asmap_health_check() not yet implemented."""
+    def test_g18_health_check_method_exists(self):
+        """AddressManager.asmap_health_check() is now present (FIX-52)."""
         from ouroboros.addrman import AddressManager
         am = AddressManager()
-        self.assertFalse(hasattr(am, 'asmap_health_check'),
-                         "Deferred: asmap_health_check not yet implemented")
+        self.assertTrue(hasattr(am, 'asmap_health_check'),
+                        "FIX-52: asmap_health_check() must be present")
+        self.assertTrue(callable(am.asmap_health_check))
+
+    def test_g18_health_check_returns_dict(self):
+        """asmap_health_check() returns a dict with expected keys."""
+        from ouroboros.addrman import AddressManager
+        am = AddressManager()
+        result = am.asmap_health_check()
+        for key in ('total_addrs', 'mapped', 'unmapped', 'unique_asns',
+                    'top_asns', 'asmap_active'):
+            self.assertIn(key, result, f"Missing key: {key}")
+
+    def test_g18_no_asmap_all_unmapped(self):
+        """Without asmap, all addrs are unmapped and asmap_active is False."""
+        import time
+        from ouroboros.addrman import AddressManager
+        am = AddressManager()
+        am.add("1.2.3.4", 8333, services=1, timestamp=time.time())
+        result = am.asmap_health_check()
+        self.assertFalse(result['asmap_active'])
+        self.assertEqual(result['mapped'], 0)
+        self.assertEqual(result['unmapped'], result['total_addrs'])
+        self.assertEqual(result['unique_asns'], 0)
+
+    def test_g18_with_asmap_counts_mapped(self):
+        """With asmap, mapped IPs increment mapped and unique_asns."""
+        import time
+        from ouroboros.addrman import AddressManager
+        asmap = _build_return_asmap(15169)
+        am = AddressManager(asmap=asmap)
+        am.add("1.2.3.4", 8333, services=1, timestamp=time.time())
+        am.add("8.8.8.8", 8333, services=1, timestamp=time.time())
+        result = am.asmap_health_check()
+        self.assertTrue(result['asmap_active'])
+        self.assertGreater(result['mapped'], 0)
+        self.assertEqual(result['unique_asns'], 1)  # all map to 15169
+
+    def test_g18_top_asns_sorted_by_count(self):
+        """top_asns is sorted descending by count."""
+        import time
+        from ouroboros.addrman import AddressManager
+        asmap = _build_return_asmap(15169)
+        am = AddressManager(asmap=asmap)
+        for i in range(3):
+            am.add(f"1.2.3.{i+1}", 8333, services=1, timestamp=time.time())
+        result = am.asmap_health_check(top_n=5)
+        top = result['top_asns']
+        self.assertIsInstance(top, list)
+        if len(top) > 1:
+            for j in range(len(top) - 1):
+                self.assertGreaterEqual(top[j][1], top[j + 1][1])
+
+    def test_g18_top_n_respected(self):
+        """top_asns respects the top_n argument."""
+        from ouroboros.addrman import AddressManager
+        am = AddressManager()
+        result = am.asmap_health_check(top_n=3)
+        self.assertLessEqual(len(result['top_asns']), 3)
+
+    def test_g18_p2p_has_health_loop(self):
+        """PeerManager exposes _asmap_health_task attribute and loop method."""
+        import inspect
+        from ouroboros.p2p import PeerManager
+        pm = PeerManager.__new__(PeerManager)  # don't call __init__
+        # Check the loop method exists
+        self.assertTrue(hasattr(PeerManager, '_asmap_health_loop'),
+                        "FIX-52: PeerManager must have _asmap_health_loop()")
+        src = inspect.getsource(PeerManager._asmap_health_loop)
+        self.assertIn('asmap_health_check', src,
+                      "FIX-52: _asmap_health_loop must call asmap_health_check()")
+
+    def test_g18_health_interval_is_3600(self):
+        """PeerManager source sets health interval to 3600s."""
+        import inspect
+        from ouroboros.p2p import PeerManager
+        src = inspect.getsource(PeerManager._asmap_health_loop)
+        self.assertIn('3600', inspect.getsource(PeerManager.__init__) + src,
+                      "FIX-52: 3600s interval should appear in health-check code")
 
 
 # ============================================================================
@@ -1056,10 +1177,43 @@ class TestG29StartupAsmapLoading(unittest.TestCase):
 
 
 class TestG30RustPeerManagerNoAsmap(unittest.TestCase):
-    """BUG-30 (FIX-51 deferred): Rust PeerManager ASMap."""
+    """BUG-30 (FIX-52): Rust asmap.rs module wired into network/mod.rs."""
 
-    def test_g30_rust_peer_manager_source_no_asmap(self):
-        """ferrous-utils peer_manager.rs has no asmap (FIX-51 scope)."""
+    def test_g30_rust_asmap_wired_in_network_mod(self):
+        """network/mod.rs exposes asmap module (FIX-52)."""
+        import os
+        path = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/network/mod.rs"
+        if not os.path.exists(path):
+            self.skipTest("network/mod.rs not found")
+        with open(path) as f:
+            src = f.read()
+        self.assertIn('asmap', src,
+                      "FIX-52: network/mod.rs should declare pub mod asmap")
+
+    def test_g30_rust_asmap_has_get_mapped_as(self):
+        """asmap.rs has pub fn get_mapped_as() (FIX-52)."""
+        import os
+        path = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/network/asmap.rs"
+        if not os.path.exists(path):
+            self.skipTest("asmap.rs not found")
+        with open(path) as f:
+            src = f.read()
+        self.assertIn('pub fn get_mapped_as', src,
+                      "FIX-52: asmap.rs must have pub fn get_mapped_as()")
+
+    def test_g30_rust_asmap_has_asn_group_bytes(self):
+        """asmap.rs has pub fn asn_group_bytes() (FIX-52)."""
+        import os
+        path = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/network/asmap.rs"
+        if not os.path.exists(path):
+            self.skipTest("asmap.rs not found")
+        with open(path) as f:
+            src = f.read()
+        self.assertIn('pub fn asn_group_bytes', src,
+                      "FIX-52: asmap.rs must have pub fn asn_group_bytes()")
+
+    def test_g30_rust_peer_manager_still_no_asmap_refs(self):
+        """peer_manager.rs still has no asmap references (ASMap in asmap.rs)."""
         import os
         path = "/home/work/hashhog/ouroboros/ferrous-utils/sync/src/network/peer_manager.rs"
         if not os.path.exists(path):
@@ -1067,7 +1221,7 @@ class TestG30RustPeerManagerNoAsmap(unittest.TestCase):
         with open(path) as f:
             src = f.read()
         self.assertNotIn('asmap', src.lower(),
-                         "FIX-51 scope: peer_manager.rs has no asmap")
+                         "FIX-52: ASMap logic in asmap.rs, not peer_manager.rs")
 
 
 # ============================================================================

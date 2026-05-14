@@ -5,6 +5,7 @@ pub mod peer;
 pub mod peer_manager;
 pub mod header_sync;
 pub mod block_sync;
+pub mod asmap;
 
 pub use messages::*;
 pub use peer::*;
