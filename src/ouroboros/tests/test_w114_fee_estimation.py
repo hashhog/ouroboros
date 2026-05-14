@@ -204,65 +204,59 @@ def _make_mempool(entries: dict):
 # ---------------------------------------------------------------------------
 
 class TestBug1SingleHorizon:
-    """BUG-1 (HIGH): ouroboros uses a single DECAY_FACTOR=0.998 instead of
-    Core's three horizons (SHORT=0.962, MED=0.9952, LONG=0.99931).
+    """BUG-1 (HIGH) — FIXED: ouroboros now has three TxConfirmStats horizons
+    (SHORT decay=0.962/scale=1/12 periods, MEDIUM decay=0.9952/scale=2/24 periods,
+    LONG decay=0.99931/scale=24/42 periods) mirroring Core's shortStats/feeStats/longStats.
     """
 
-    def test_single_decay_factor_not_core_short(self):
-        from ouroboros.fee_estimator import DECAY_FACTOR
-        CORE_SHORT_DECAY = 0.962
-        assert DECAY_FACTOR != pytest.approx(CORE_SHORT_DECAY, rel=1e-3), (
-            "Decay equals Core SHORT (0.962) — multi-horizon not implemented"
-        )
+    def test_three_decay_values_present(self):
+        """DECAY dict must contain all three Core decay factors."""
+        from ouroboros.fee_estimator import DECAY, Horizon
+        assert DECAY[Horizon.SHORT]  == pytest.approx(0.962,   rel=1e-4)
+        assert DECAY[Horizon.MEDIUM] == pytest.approx(0.9952,  rel=1e-4)
+        assert DECAY[Horizon.LONG]   == pytest.approx(0.99931, rel=1e-5)
 
-    def test_single_decay_factor_not_core_med(self):
-        from ouroboros.fee_estimator import DECAY_FACTOR
-        CORE_MED_DECAY = 0.9952
-        assert DECAY_FACTOR != pytest.approx(CORE_MED_DECAY, rel=1e-3), (
-            "Decay equals Core MED (0.9952) — multi-horizon not implemented"
-        )
+    def test_three_scale_values_present(self):
+        """SCALE dict must contain Core scale factors 1 / 2 / 24."""
+        from ouroboros.fee_estimator import SCALE, Horizon
+        assert SCALE[Horizon.SHORT]  == 1
+        assert SCALE[Horizon.MEDIUM] == 2
+        assert SCALE[Horizon.LONG]   == 24
 
-    def test_single_decay_factor_not_core_long(self):
-        from ouroboros.fee_estimator import DECAY_FACTOR
-        CORE_LONG_DECAY = 0.99931
-        assert DECAY_FACTOR != pytest.approx(CORE_LONG_DECAY, rel=1e-3), (
-            "Decay equals Core LONG (0.99931) — multi-horizon not implemented"
-        )
+    def test_three_period_values_present(self):
+        """PERIODS dict must contain Core period counts 12 / 24 / 42."""
+        from ouroboros.fee_estimator import PERIODS, Horizon
+        assert PERIODS[Horizon.SHORT]  == 12
+        assert PERIODS[Horizon.MEDIUM] == 24
+        assert PERIODS[Horizon.LONG]   == 42
 
-    def test_ouroboros_halflife_between_med_and_long(self):
-        """ouroboros DECAY_FACTOR=0.998 has ~346 block half-life; Core MED=144, LONG=1008."""
-        from ouroboros.fee_estimator import DECAY_FACTOR
-        halflife = math.log(0.5) / math.log(DECAY_FACTOR)
-        # Should be between Core MED (~144) and Core LONG (~1008)
-        assert 144 < halflife < 1008, (
-            f"Single-horizon half-life={halflife:.0f} blocks is not a Core horizon"
-        )
+    def test_long_horizon_tracks_1008_blocks(self):
+        """LONG: 42 periods × scale 24 = 1008 blocks (Core maximum)."""
+        from ouroboros.fee_estimator import PERIODS, SCALE, Horizon
+        assert PERIODS[Horizon.LONG] * SCALE[Horizon.LONG] == 1008
 
-    def test_estimator_has_no_short_stats_attribute(self, fresh_estimator):
-        """No shortStats / short_stats equivalent exists."""
-        assert not hasattr(fresh_estimator, "short_stats")
-        assert not hasattr(fresh_estimator, "shortStats")
+    def test_estimator_has_short_stats_attribute(self, fresh_estimator):
+        """short_stats attribute must exist after BUG-1 fix."""
+        assert hasattr(fresh_estimator, "short_stats")
+        assert hasattr(fresh_estimator, "short_totals")
 
-    def test_estimator_has_no_med_stats_attribute(self, fresh_estimator):
-        assert not hasattr(fresh_estimator, "med_stats")
-        assert not hasattr(fresh_estimator, "feeStats")
+    def test_estimator_has_med_stats_attribute(self, fresh_estimator):
+        """med_stats attribute must exist after BUG-1 fix."""
+        assert hasattr(fresh_estimator, "med_stats")
+        assert hasattr(fresh_estimator, "med_totals")
 
-    def test_estimator_has_no_long_stats_attribute(self, fresh_estimator):
-        assert not hasattr(fresh_estimator, "long_stats")
-        assert not hasattr(fresh_estimator, "longStats")
+    def test_estimator_has_long_stats_attribute(self, fresh_estimator):
+        """long_stats attribute must exist after BUG-1 fix."""
+        assert hasattr(fresh_estimator, "long_stats")
+        assert hasattr(fresh_estimator, "long_totals")
 
     @pytest.mark.asyncio
-    async def test_estimaterawfee_returns_only_long_horizon(self, rpc):
-        """estimaterawfee should return short/medium/long; returns only 'long'."""
+    async def test_estimaterawfee_returns_all_three_horizons(self, rpc):
+        """After BUG-1 fix, estimaterawfee returns short/medium/long keys."""
         result = await rpc.rpc_estimaterawfee(6)
-        # Core returns short/medium/long keys when target allows
-        assert "short" not in result, (
-            "'short' horizon missing — single-horizon estimator only"
-        )
-        assert "medium" not in result, (
-            "'medium' horizon missing — single-horizon estimator only"
-        )
-        assert "long" in result  # confirm only long key present
+        assert "short" in result,  "BUG-1 fix: 'short' horizon must be present"
+        assert "medium" in result, "BUG-1 fix: 'medium' horizon must be present"
+        assert "long" in result,   "BUG-1 fix: 'long' horizon must be present"
 
 
 # ---------------------------------------------------------------------------
@@ -270,12 +264,15 @@ class TestBug1SingleHorizon:
 # ---------------------------------------------------------------------------
 
 class TestBug2MaxConfTarget:
-    """BUG-2 (HIGH): ouroboros MAX_CONF_TARGET=25; Core LONG tracks 1008 blocks."""
+    """BUG-2 (HIGH) — FIXED: MAX_CONF_TARGET raised from 25 to 1008
+    (Core LONG horizon: 42 periods × scale 24 = 1008 blocks).
+    """
 
-    def test_max_conf_target_is_25(self):
+    def test_max_conf_target_is_1008(self):
+        """After BUG-2 fix, MAX_CONF_TARGET must equal 1008."""
         from ouroboros.fee_estimator import MAX_CONF_TARGET
-        assert MAX_CONF_TARGET == 25, (
-            f"MAX_CONF_TARGET={MAX_CONF_TARGET} — Core LONG tracks 1008"
+        assert MAX_CONF_TARGET == 1008, (
+            f"MAX_CONF_TARGET={MAX_CONF_TARGET} — expected 1008 (Core LONG)"
         )
 
     def test_core_long_tracks_1008(self):
@@ -284,29 +281,28 @@ class TestBug2MaxConfTarget:
         CORE_LONG_SCALE = 24
         assert CORE_LONG_PERIODS * CORE_LONG_SCALE == 1008
 
-    def test_estimate_fee_clamps_target_to_25(self, fresh_estimator):
-        """Calling estimate_fee with target=200 silently uses target=25."""
-        from ouroboros.fee_estimator import MAX_CONF_TARGET
-        # Inject data at target 25 (the max tracked)
-        fresh_estimator.total[10][MAX_CONF_TARGET] = 50.0
-        fresh_estimator.confirmed[10][MAX_CONF_TARGET] = 45.0
+    def test_estimate_fee_accepts_target_200_in_long_horizon(self, fresh_estimator):
+        """After BUG-2 fix, estimate_fee(200) uses the LONG horizon (not clamped to 25)."""
+        from ouroboros.fee_estimator import PERIODS, SCALE, Horizon
+        # LONG: scale=24, so period for 200 blocks = ceil(200/24) = 9
+        period = (200 + 24 - 1) // 24  # = 9
+        # Inject data at LONG period 9
+        fresh_estimator.long_totals[10][period] = 50.0
+        fresh_estimator.long_stats[10][period] = 45.0
         fresh_estimator._total_observations = 200
 
-        result_25 = fresh_estimator.estimate_fee(MAX_CONF_TARGET)
-        result_200 = fresh_estimator.estimate_fee(200)
-        # Both should return the same value because 200 is clamped to 25
-        # This exposes the silent clamping
-        assert result_200 == result_25, (
-            "estimate_fee(200) silently clamps to MAX_CONF_TARGET (BUG-2)"
+        result = fresh_estimator.estimate_fee(200)
+        assert result is not None, (
+            "BUG-2 fix: estimate_fee(200) should return a value from LONG horizon"
         )
 
     @pytest.mark.asyncio
-    async def test_estimatesmartfee_blocks_field_echoes_input_not_clamped(self, rpc):
-        """'blocks' in response echoes conf_target=200 even though estimate is for 25."""
-        result = await rpc.rpc_estimatesmartfee(conf_target=200)
-        # ouroboros returns "blocks": 200 even though internally clamped to 25
-        assert result.get("blocks") == 200, (
-            "BUG-2: 'blocks' should reflect returned target, not requested target"
+    async def test_estimatesmartfee_accepts_target_1008(self, rpc):
+        """After BUG-2 fix, rpc_estimatesmartfee accepts conf_target=1008."""
+        result = await rpc.rpc_estimatesmartfee(conf_target=1008)
+        # Should not error about out-of-range target
+        assert result.get("blocks") == 1008, (
+            "BUG-2 fix: conf_target=1008 should be accepted and echoed in 'blocks'"
         )
 
 
@@ -396,18 +392,17 @@ class TestBug4BlocksToConfirmOffByOne:
 
         # BUG: the tx is recorded with blocks_to_confirm=2 (101-100+1),
         # but Core would record btc=1 (101-100).
-        # Internally, total[bucket][1] should NOT have been incremented for btc=2:
-        # _record_confirmation(fee_rate, 2) sets total[b][1] += 1 (unconfirmed) and
-        # confirmed[b][2..25] += 1, total[b][2..25] += 1.
-        # For btc=1 (correct Core): total[b][1] += 1, confirmed[b][1..25] += 1.
+        # Check SHORT horizon (scale=1): period == btc.
+        # With bug (btc=2): short_stats[b][1] == 0 (not confirmed at period 1)
+        # With fix (btc=1): short_stats[b][1] > 0
         from ouroboros.fee_estimator import _bucket_index
         fee_rate = entry.fee / entry.size  # 40 sat/vB
         b = _bucket_index(fee_rate)
-        # With bug (btc=2): confirmed[b][1] == 0 (not confirmed at target 1)
-        # With fix (btc=1): confirmed[b][1] == 1
-        assert fresh_estimator.confirmed[b][1] == pytest.approx(0.0), (
+        # With off-by-one bug, btc=2, so SHORT period=2: confirmed at periods 2+
+        # but NOT at period 1.
+        assert fresh_estimator.short_stats[b][1] == pytest.approx(0.0), (
             "BUG-4: With off-by-one, tx confirmed at 101 should NOT appear as "
-            "confirmed at target=1 — this would be fixed by removing +1"
+            "confirmed at SHORT period=1 — this would be fixed by removing +1"
         )
 
     def test_core_formula_gives_btc1_for_next_block(self):
@@ -479,9 +474,9 @@ class TestBug6NoEvictionTracking:
 
     def test_estimates_ignore_evicted_tx_pressure(self, fresh_estimator):
         """Estimates do not account for txs that were evicted without confirming."""
-        # Inject 100% success rate in a bucket
-        fresh_estimator.total[5][6] = 10.0
-        fresh_estimator.confirmed[5][6] = 10.0
+        # target=6 → SHORT horizon (scale=1, period=6 since 6 <= 12)
+        fresh_estimator.short_totals[5][6] = 10.0
+        fresh_estimator.short_stats[5][6] = 10.0
         fresh_estimator._total_observations = 200
 
         est_before = fresh_estimator.estimate_fee(6)
@@ -526,9 +521,9 @@ class TestBug8EstimateModeIgnored:
     async def test_conservative_and_economical_return_same_feerate(self, rpc):
         """Both modes should differ (conservative uses higher threshold)."""
         fe = rpc.node.fee_estimator
-        # Inject moderate data so bucket estimator returns a result
-        fe.total[10][6] = 20.0
-        fe.confirmed[10][6] = 18.0  # 90% — passes SUCCESS_THRESHOLD but not DOUBLE
+        # target=6 → SHORT horizon (scale=1, period=6)
+        fe.short_totals[10][6] = 20.0
+        fe.short_stats[10][6] = 18.0  # 90% — passes SUCCESS_THRESHOLD but not DOUBLE
         fe._total_observations = 200
 
         result_eco = await rpc.rpc_estimatesmartfee(6, estimate_mode="economical")
@@ -593,8 +588,9 @@ class TestBug10NoBucketSufficientTxsGate:
 
     def test_two_observations_can_produce_estimate(self, fresh_estimator):
         """Core needs sufficientTxVal / (1-decay) ≈ 145+ txs; ouroboros uses 2."""
-        fresh_estimator.total[10][6] = 2.0
-        fresh_estimator.confirmed[10][6] = 2.0  # 100% from only 2 obs
+        # target=6 → SHORT horizon (scale=1, period=6 since 6 <= 12)
+        fresh_estimator.short_totals[10][6] = 2.0
+        fresh_estimator.short_stats[10][6] = 2.0  # 100% from only 2 obs
         fresh_estimator._total_observations = 200
 
         estimate = fresh_estimator.estimate_fee(6)
@@ -621,13 +617,20 @@ class TestBug11NoStaleFileCheck:
 
     def test_load_from_old_file_succeeds(self, fresh_estimator):
         """Core refuses files older than 60 hours; ouroboros loads them."""
-        from ouroboros.fee_estimator import MAX_CONF_TARGET, NUM_BUCKETS, FeeEstimator
+        from ouroboros.fee_estimator import NUM_BUCKETS, PERIODS, Horizon, FeeEstimator
+
+        def _blank(h):
+            return [[0.0] * (PERIODS[h] + 1) for _ in range(NUM_BUCKETS)]
 
         state = {
             "version": 1,
             "total_observations": 500,
-            "confirmed": [[0.0] * (MAX_CONF_TARGET + 1) for _ in range(NUM_BUCKETS)],
-            "total":     [[0.0] * (MAX_CONF_TARGET + 1) for _ in range(NUM_BUCKETS)],
+            "short_confirmed": _blank(Horizon.SHORT),
+            "short_total":     _blank(Horizon.SHORT),
+            "med_confirmed":   _blank(Horizon.MEDIUM),
+            "med_total":       _blank(Horizon.MEDIUM),
+            "long_confirmed":  _blank(Horizon.LONG),
+            "long_total":      _blank(Horizon.LONG),
             "block_history": [],
         }
 
@@ -698,8 +701,9 @@ class TestBug13ConfTarget1NotClamped:
 
     def test_estimate_fee_accepts_target_1(self, fresh_estimator):
         """estimate_fee(1) should return None (too low), not process normally."""
-        fresh_estimator.total[10][1] = 50.0
-        fresh_estimator.confirmed[10][1] = 45.0
+        # SHORT horizon scale=1, so period=1 for target=1
+        fresh_estimator.short_totals[10][1] = 50.0
+        fresh_estimator.short_stats[10][1] = 45.0
         fresh_estimator._total_observations = 200
         # Core would not produce an estimate at target=1; ouroboros does
         result = fresh_estimator.estimate_fee(1)
@@ -725,8 +729,9 @@ class TestBug14NoMinRelayFeeFloor:
         # Put a tiny fee_rate in a bucket: 0.5 sat/vB = 500 sat/kB
         # Force target 1 to see a tiny feerate
         from ouroboros.fee_estimator import _bucket_index
-        fe.total[0][1] = 50.0
-        fe.confirmed[0][1] = 45.0
+        # SHORT horizon scale=1, period=1 for target=1
+        fe.short_totals[0][1] = 50.0
+        fe.short_stats[0][1] = 45.0
         fe._total_observations = 200
 
         result = await rpc.rpc_estimatesmartfee(conf_target=1)
@@ -785,8 +790,9 @@ class TestCorrectBehaviour:
         assert result is None
 
     def test_estimate_fee_returns_value_with_sufficient_data(self, fresh_estimator):
-        fresh_estimator.total[10][6] = 50.0
-        fresh_estimator.confirmed[10][6] = 45.0
+        # target=6 → SHORT horizon (scale=1, period=6 since 6 <= 12)
+        fresh_estimator.short_totals[10][6] = 50.0
+        fresh_estimator.short_stats[10][6] = 45.0
         fresh_estimator._total_observations = 200
         result = fresh_estimator.estimate_fee(6)
         assert result is not None
@@ -799,17 +805,27 @@ class TestCorrectBehaviour:
         assert result == pytest.approx(10.0 * 1000 / 1e8)
 
     def test_decay_is_applied_per_block(self, fresh_estimator):
-        from ouroboros.fee_estimator import DECAY_FACTOR
-        fresh_estimator.confirmed[5][6] = 100.0
-        fresh_estimator.total[5][6] = 100.0
+        from ouroboros.fee_estimator import DECAY, Horizon
+        # Set values in each horizon and verify per-horizon decay is applied.
+        fresh_estimator.short_stats[5][6] = 100.0
+        fresh_estimator.short_totals[5][6] = 100.0
+        fresh_estimator.med_stats[5][6] = 100.0
+        fresh_estimator.med_totals[5][6] = 100.0
+        fresh_estimator.long_stats[5][6] = 100.0
+        fresh_estimator.long_totals[5][6] = 100.0
         # Simulate one block with no new data
         fresh_estimator._apply_decay()
-        assert fresh_estimator.confirmed[5][6] == pytest.approx(100.0 * DECAY_FACTOR)
-        assert fresh_estimator.total[5][6] == pytest.approx(100.0 * DECAY_FACTOR)
+        assert fresh_estimator.short_stats[5][6]  == pytest.approx(100.0 * DECAY[Horizon.SHORT])
+        assert fresh_estimator.short_totals[5][6] == pytest.approx(100.0 * DECAY[Horizon.SHORT])
+        assert fresh_estimator.med_stats[5][6]    == pytest.approx(100.0 * DECAY[Horizon.MEDIUM])
+        assert fresh_estimator.med_totals[5][6]   == pytest.approx(100.0 * DECAY[Horizon.MEDIUM])
+        assert fresh_estimator.long_stats[5][6]   == pytest.approx(100.0 * DECAY[Horizon.LONG])
+        assert fresh_estimator.long_totals[5][6]  == pytest.approx(100.0 * DECAY[Horizon.LONG])
 
     def test_save_and_load_roundtrip(self, fresh_estimator):
         fresh_estimator._total_observations = 42
-        fresh_estimator.confirmed[5][6] = 3.14
+        # Use period index 6 in MED horizon (24 periods, so index 6 is valid)
+        fresh_estimator.med_stats[5][6] = 3.14
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             path = f.name
         try:
@@ -818,7 +834,7 @@ class TestCorrectBehaviour:
             new_est = FeeEstimator()
             assert new_est.load_from_file(path)
             assert new_est._total_observations == 42
-            assert new_est.confirmed[5][6] == pytest.approx(3.14)
+            assert new_est.med_stats[5][6] == pytest.approx(3.14)
         finally:
             os.unlink(path)
 
@@ -849,8 +865,9 @@ class TestCorrectBehaviour:
     @pytest.mark.asyncio
     async def test_estimatesmartfee_returns_feerate_btc_per_kb(self, rpc):
         fe = rpc.node.fee_estimator
-        fe.total[10][6] = 50.0
-        fe.confirmed[10][6] = 45.0
+        # target=6 → SHORT horizon (scale=1, period=6)
+        fe.short_totals[10][6] = 50.0
+        fe.short_stats[10][6] = 45.0
         fe._total_observations = 200
         result = await rpc.rpc_estimatesmartfee(6)
         assert "feerate" in result
@@ -860,26 +877,34 @@ class TestCorrectBehaviour:
     @pytest.mark.asyncio
     async def test_estimaterawfee_valid_pass_bucket(self, rpc):
         fe = rpc.node.fee_estimator
-        fe.total[5][6] = 50.0
-        fe.confirmed[5][6] = 48.0
+        # target=6 → SHORT horizon (scale=1, period=6)
+        fe.short_totals[5][6] = 50.0
+        fe.short_stats[5][6] = 48.0
         result = await rpc.rpc_estimaterawfee(6, threshold=0.85)
-        assert "long" in result
-        h = result["long"]
+        assert "short" in result
+        h = result["short"]
         assert "pass" in h
         assert "feerate" in h
         assert "decay" in h
         assert "scale" in h
 
     @pytest.mark.asyncio
-    async def test_estimaterawfee_decay_value(self, rpc):
-        from ouroboros.fee_estimator import DECAY_FACTOR
+    async def test_estimaterawfee_decay_values_per_horizon(self, rpc):
+        """After BUG-1 fix, each horizon has its own decay value."""
+        from ouroboros.fee_estimator import DECAY, Horizon
         result = await rpc.rpc_estimaterawfee(6)
-        assert result["long"]["decay"] == pytest.approx(DECAY_FACTOR)
+        assert result["short"]["decay"]  == pytest.approx(DECAY[Horizon.SHORT])
+        assert result["medium"]["decay"] == pytest.approx(DECAY[Horizon.MEDIUM])
+        assert result["long"]["decay"]   == pytest.approx(DECAY[Horizon.LONG])
 
     @pytest.mark.asyncio
-    async def test_estimaterawfee_scale_is_1(self, rpc):
+    async def test_estimaterawfee_scale_values_per_horizon(self, rpc):
+        """After BUG-1 fix, LONG scale is 24 (not 1)."""
+        from ouroboros.fee_estimator import SCALE, Horizon
         result = await rpc.rpc_estimaterawfee(6)
-        assert result["long"]["scale"] == 1
+        assert result["short"]["scale"]  == SCALE[Horizon.SHORT]   # 1
+        assert result["medium"]["scale"] == SCALE[Horizon.MEDIUM]  # 2
+        assert result["long"]["scale"]   == SCALE[Horizon.LONG]    # 24
 
     def test_get_fee_summary_structure(self, fresh_estimator):
         summary = fresh_estimator.get_fee_summary()
@@ -905,12 +930,21 @@ class TestPersistence:
         assert "os.replace" in src
 
     def test_load_rejects_dimension_mismatch(self, fresh_estimator):
-        from ouroboros.fee_estimator import MAX_CONF_TARGET, NUM_BUCKETS
+        from ouroboros.fee_estimator import NUM_BUCKETS, PERIODS, Horizon
+        # Provide SHORT with wrong row count (NUM_BUCKETS - 1 instead of NUM_BUCKETS)
+        def _blank(h):
+            return [[0.0] * (PERIODS[h] + 1) for _ in range(NUM_BUCKETS)]
+
         bad_state = {
             "version": 1,
             "total_observations": 10,
-            "confirmed": [[0.0] * (MAX_CONF_TARGET + 1) for _ in range(NUM_BUCKETS - 1)],
-            "total":     [[0.0] * (MAX_CONF_TARGET + 1) for _ in range(NUM_BUCKETS - 1)],
+            # SHORT has wrong bucket count → dimension mismatch
+            "short_confirmed": [[0.0] * (PERIODS[Horizon.SHORT] + 1) for _ in range(NUM_BUCKETS - 1)],
+            "short_total":     [[0.0] * (PERIODS[Horizon.SHORT] + 1) for _ in range(NUM_BUCKETS - 1)],
+            "med_confirmed":   _blank(Horizon.MEDIUM),
+            "med_total":       _blank(Horizon.MEDIUM),
+            "long_confirmed":  _blank(Horizon.LONG),
+            "long_total":      _blank(Horizon.LONG),
             "block_history": [],
         }
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
