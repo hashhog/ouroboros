@@ -553,34 +553,32 @@ class TestG10TestMempoolAcceptMaxFeerate(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestG11SubmitPackageTxResultsKeyedByWtxid(unittest.TestCase):
-    """G11 BUG: submitpackage tx-results must be keyed by wtxid.
+    """G11 (FIX-53): submitpackage tx-results must be keyed by wtxid.
 
     Core (rpc/mempool.cpp:1464-1505):
       const auto wtxid_hex = tx->GetWitnessHash().GetHex();
       ...
       tx_result_map.pushKV(wtxid_hex, std::move(result_inner));
 
-    ouroboros (rpc.py:7606): txid_hex = tx.get_txid()[::-1].hex()
-    The map key is txid, not wtxid. This is a P0-CDIV on segwit transactions where
-    txid != wtxid — client tools keying by wtxid will find an empty result.
+    Fixed in FIX-53: rpc.py now uses tx.get_wtxid()[::-1].hex() as the map key,
+    matching Core. For segwit txs (txid != wtxid) client tools keying by wtxid
+    now find the correct result entry.
     """
 
-    def test_submitpackage_tx_results_keyed_by_txid_not_wtxid(self):
+    def test_submitpackage_tx_results_keyed_by_wtxid(self):
         import inspect
         try:
             from ouroboros.rpc import RPCServer
             src = inspect.getsource(RPCServer.rpc_submitpackage)
         except Exception:
             self.skipTest("Cannot import RPCServer")
-        # Bug: tx_results keyed by txid_hex (get_txid), not wtxid
-        keys_by_txid = "get_txid" in src and "tx_results[" in src
+        # Fix verified: tx_results keyed by wtxid_hex (get_wtxid), not txid alone.
         keys_by_wtxid = "get_wtxid" in src and "tx_results[" in src
-        bug_present = keys_by_txid and not keys_by_wtxid
         self.assertTrue(
-            bug_present,
-            "BUG CONFIRMED: submitpackage tx-results keyed by txid, not wtxid. "
+            keys_by_wtxid,
+            "FIX MISSING: submitpackage tx-results must be keyed by wtxid. "
             "Core rpc/mempool.cpp:1464: tx_result_map.pushKV(wtxid_hex, ...) "
-            "Segwit txs where txid!=wtxid will have wrong result key."
+            "Segwit txs where txid!=wtxid will have wrong result key without this fix."
         )
 
 
