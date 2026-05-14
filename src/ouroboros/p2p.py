@@ -516,6 +516,13 @@ class PeerManager:
         self._mempool = None
         self._on_compact_block = None
         self._database = None  # database for block lookups (getblocktxn)
+        # In-flight partial compact blocks: block_hash -> (CompactBlock, partial_txs)
+        # where partial_txs is a list with None slots for missing transactions.
+        # Populated by on_cmpctblock when some txs are absent from mempool;
+        # consumed and cleared by on_blocktxn after the round-trip completes.
+        # Mirrors Bitcoin Core's PartiallyDownloadedBlock per-peer state
+        # (blockencodings.h / net_processing.cpp ProcessMessage "blocktxn").
+        self._partial_cmpct_blocks: dict = {}  # bytes -> (CompactBlock, list)
 
         # BIP 330 Erlay reconciliation state
         self.erlay_enabled: bool = True  # whether we support Erlay
@@ -1990,10 +1997,18 @@ class PeerManager:
         self._database = database
 
     def set_compact_block_handler(self, handler) -> None:
-        """Register a callback for incoming compact blocks.
+        """Register a callback for fully-reconstructed compact blocks.
 
-        handler(block_hash: bytes, txs: Optional[List[Transaction]],
-                missing_indices: List[int]) -> None
+        handler(block_hash: bytes, header: bytes, txs: List[Transaction]) -> None
+
+        ``header`` is the 80-byte block header from the cmpctblock message.
+        ``txs`` is the complete ordered transaction list.
+
+        Called once the full transaction list is assembled — either
+        immediately when all short IDs matched the mempool, or after the
+        getblocktxn/blocktxn round-trip fills in the missing slots.
+        The handler should serialize header+txs into wire format and submit
+        the resulting bytes to the block sync pipeline.
         """
         self._on_compact_block = handler
 
@@ -2081,13 +2096,25 @@ class PeerManager:
                 return
 
             if self._mempool is not None:
-                txs, missing = cb.reconstruct(self._mempool)
+                partial_txs, missing = cb.reconstruct_partial(self._mempool)
             else:
-                txs, missing = None, list(range(
-                    len(cb.short_ids) + len(cb.prefilled_txs)))
-            if self._on_compact_block:
-                self._on_compact_block(cb.block_hash, txs, missing)
-            if missing:
+                # No mempool — all txs are missing; allocate empty slots
+                total = len(cb.short_ids) + len(cb.prefilled_txs)
+                partial_txs = [None] * total
+                # Pre-fill any prefilled txs even without a mempool
+                for pf in cb.prefilled_txs:
+                    partial_txs[pf.index] = pf.tx
+                missing = [i for i in range(total) if partial_txs[i] is None]
+
+            if not missing:
+                # All txs resolved immediately — fire the handler now.
+                if self._on_compact_block:
+                    self._on_compact_block(cb.block_hash, cb.header, partial_txs)
+            else:
+                # Store partial state for the getblocktxn round-trip.
+                # Keyed by block_hash; on_blocktxn will merge + fire handler.
+                # BUG-2 fix: mirrors Core's PartiallyDownloadedBlock (blockencodings.h)
+                self._partial_cmpct_blocks[cb.block_hash] = (cb, partial_txs)
                 from ouroboros.compact_blocks import BlockTransactionsRequest
                 req = BlockTransactionsRequest(
                     block_hash=cb.block_hash, indices=missing)
@@ -2100,9 +2127,64 @@ class PeerManager:
 
         async def on_blocktxn(msg: NetworkMessage):
             from ouroboros.compact_blocks import BlockTransactions
-            bt = BlockTransactions.deserialize(msg.payload)
+            try:
+                bt = BlockTransactions.deserialize(msg.payload)
+            except (ValueError, Exception) as exc:
+                logger.warning(f"Malformed blocktxn from {addr}: {exc}")
+                return
+
+            # Look up the in-flight partial block stored by on_cmpctblock.
+            partial_entry = self._partial_cmpct_blocks.pop(bt.block_hash, None)
+            if partial_entry is None:
+                logger.debug(
+                    f"blocktxn from {addr}: no matching in-flight cmpctblock "
+                    f"for {bt.block_hash.hex()[:16]}...; ignoring"
+                )
+                return
+
+            _cb, partial_txs = partial_entry
+
+            # Merge: fill None slots (in ascending index order) with the
+            # transactions from the blocktxn response.  Bitcoin Core
+            # PartiallyDownloadedBlock::FillBlock works the same way —
+            # missing indices were sent in order, so responses arrive
+            # in the same order.
+            received_iter = iter(bt.transactions)
+            try:
+                for i, tx in enumerate(partial_txs):
+                    if tx is None:
+                        partial_txs[i] = next(received_iter)
+            except StopIteration:
+                logger.warning(
+                    f"blocktxn from {addr}: fewer txs than expected for "
+                    f"{bt.block_hash.hex()[:16]}...; falling back to getdata"
+                )
+                # Fall back: request the full block via getdata
+                try:
+                    from ouroboros.p2p_messages import INV_TYPE_BLOCK, GetDataMessage
+                    getdata = GetDataMessage(inventory=[(INV_TYPE_BLOCK, bt.block_hash)])
+                    await peer.send_message(getdata.to_network_message(self.network))
+                except Exception as e:
+                    logger.warning(f"Failed to send getdata fallback: {e}")
+                return
+
+            # Verify all slots are filled
+            if any(tx is None for tx in partial_txs):
+                logger.warning(
+                    f"blocktxn from {addr}: unfilled tx slots after merge for "
+                    f"{bt.block_hash.hex()[:16]}...; falling back to getdata"
+                )
+                try:
+                    from ouroboros.p2p_messages import INV_TYPE_BLOCK, GetDataMessage
+                    getdata = GetDataMessage(inventory=[(INV_TYPE_BLOCK, bt.block_hash)])
+                    await peer.send_message(getdata.to_network_message(self.network))
+                except Exception as e:
+                    logger.warning(f"Failed to send getdata fallback: {e}")
+                return
+
+            # All txs assembled — fire the registered block handler.
             if self._on_compact_block:
-                self._on_compact_block(bt.block_hash, bt.transactions, [])
+                self._on_compact_block(bt.block_hash, _cb.header, partial_txs)
 
         async def on_getblocktxn(msg: NetworkMessage):
             """Handle getblocktxn: respond with requested transactions.

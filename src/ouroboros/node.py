@@ -352,6 +352,51 @@ class BitcoinNode:
             except Exception as e:
                 logger.warning(f"Block sync start error (node continues): {e}")
 
+            # BIP 152 (FIX-41 / W112 BUG-1): wire the compact block handler so
+            # that reconstructed blocks are submitted to the block sync pipeline.
+            # Without this call, _on_compact_block is permanently None and every
+            # compact block reconstruction result is silently discarded.
+            _block_sync_ref = self.block_sync
+            def _compact_block_handler(block_hash: bytes, header: bytes, txs: list) -> None:
+                """Serialize header + txs and feed into the block sync buffer."""
+                try:
+                    from ouroboros.p2p_messages import encode_varint
+                    # Assemble wire-format block: 80-byte header + varint tx count + txs
+                    raw = bytearray(header)
+                    raw.extend(encode_varint(len(txs)))
+                    for tx in txs:
+                        raw.extend(tx.serialize_with_witness())
+                    raw_bytes = bytes(raw)
+                    # Feed into the IBD buffer directly — bypasses the
+                    # duplicate-check / fTooFarAhead guard that apply to unsolicited
+                    # P2P blocks.  Compact blocks are always solicited (we sent
+                    # getblocktxn or received cmpctblock from a sendcmpct peer).
+                    if len(_block_sync_ref._ibd_block_buffer) < _block_sync_ref._max_ibd_buffer:
+                        _block_sync_ref._ibd_block_buffer[block_hash] = (None, raw_bytes)
+                        _block_sync_ref._blk_buffered += 1
+                        logger.debug(
+                            f"compact block buffered "
+                            f"{block_hash.hex()[:16]}... ({len(txs)} txs)"
+                        )
+                        # Schedule a drain — run on the event loop since
+                        # _compact_block_handler is called from a sync context.
+                        import asyncio
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                loop.create_task(_block_sync_ref._drain_block_buffer())
+                        except RuntimeError:
+                            pass
+                    else:
+                        logger.debug(
+                            f"compact block dropped (buffer full): "
+                            f"{block_hash.hex()[:16]}..."
+                        )
+                except Exception as e:
+                    logger.error(f"compact block handler error: {e}", exc_info=True)
+            self.peer_manager.set_compact_block_handler(_compact_block_handler)
+            logger.debug("BIP 152: compact block handler registered")
+
             # Start RPC server (with optional REST interface)
             rest_enabled = str(self.config.get('rest', '0')).lower() in ('1', 'true', 'yes', 'on')
             logger.info(f"RPC server listening on 127.0.0.1:{rpc_port}")
