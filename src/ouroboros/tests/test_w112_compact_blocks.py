@@ -726,62 +726,89 @@ class TestW112_G19_BlockTxnDeserialization(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# G20 — blocktxn: no partial block state tracking (BUG-2)
+# G20 — blocktxn: partial block state tracking present (FIX-41 BUG-2 closed)
 # ---------------------------------------------------------------------------
 class TestW112_G20_BlockTxnMissingPartialState(unittest.TestCase):
     """
-    BUG-2 (P1): on_blocktxn does not maintain partial block state.
+    BUG-2 (P1) FIXED (FIX-41): on_blocktxn now uses in-flight partial block state.
 
-    After sending getblocktxn (in response to a cmpctblock with missing txs),
-    the node receives a blocktxn with ONLY the missing transactions. To
-    assemble the full block, the node needs to merge these with:
-      - the prefilled transactions from the original cmpctblock
-      - the mempool-matched transactions for the short IDs it found
+    PeerManager._partial_cmpct_blocks is a dict[block_hash -> (CompactBlock, partial_txs)]
+    populated by on_cmpctblock when some txs are missing from the mempool.
+    on_blocktxn merges the received missing txs into the stored partial_txs list
+    and fires the registered handler with the complete tx list.
 
-    Bitcoin Core tracks this per-block partial state in
-    PartiallyDownloadedBlock (blockencodings.h), keyed by block hash.
-
-    Ouroboros on_blocktxn:
-        bt = BlockTransactions.deserialize(msg.payload)
-        if self._on_compact_block:
-            self._on_compact_block(bt.block_hash, bt.transactions, [])
-
-    There is no in-flight partial block store. The callback receives only
-    the missing transactions — insufficient to reconstruct the full block.
-
-    Fix: add a dict[block_hash -> PartialCmpctBlock] in PeerManager that
-    stores (prefilled_txs + matched_txs + missing_indices) from on_cmpctblock,
-    then on_blocktxn merges the received txs and fires the block callback
-    with the complete tx list.
+    Mirrors Bitcoin Core's PartiallyDownloadedBlock (blockencodings.h).
     """
 
-    def test_no_partial_block_state_in_peer_manager(self):
-        """PeerManager has no in-flight compact block store (documents BUG-2)."""
+    def test_partial_block_state_in_peer_manager(self):
+        """PeerManager has _partial_cmpct_blocks in-flight store (BUG-2 fix)."""
         import inspect
         from ouroboros import p2p
         src = inspect.getsource(p2p.PeerManager)
-        has_partial = (
-            '_partial_blocks' in src
-            or '_inflight_cmpct' in src
-            or '_pending_compact' in src
-            or 'PartiallyDownloadedBlock' in src
-            or '_cmpct_inflight' in src
-        )
-        self.assertFalse(has_partial,
-                         "BUG-2 fixed: partial block state tracking is now present")
+        has_partial = '_partial_cmpct_blocks' in src
+        self.assertTrue(has_partial,
+                        "BUG-2 regression: _partial_cmpct_blocks missing from PeerManager")
 
-    def test_on_blocktxn_calls_handler_with_partial_data(self):
-        """
-        Demonstrates that on_blocktxn fires the callback with only the
-        missing txs (not a fully assembled block).
-        """
+    def test_on_blocktxn_merges_partial_state(self):
+        """on_blocktxn looks up _partial_cmpct_blocks and merges before firing handler."""
         import inspect
         from ouroboros import p2p
         src = inspect.getsource(p2p.PeerManager._register_compact_handlers)
-        # The on_blocktxn function should merge with partial block state before calling handler
-        # Currently it calls the handler directly with bt.transactions
-        self.assertIn('bt.transactions', src,
-                      "on_blocktxn should pass bt.transactions to callback (no merge)")
+        self.assertIn('_partial_cmpct_blocks', src,
+                      "BUG-2 regression: on_blocktxn must look up _partial_cmpct_blocks")
+        # Verify it pops (consumes) the entry after merging
+        self.assertIn('.pop(', src,
+                      "BUG-2 regression: _partial_cmpct_blocks must be popped after merge")
+
+    def test_reconstruct_partial_returns_partial_on_missing(self):
+        """
+        CompactBlock.reconstruct_partial() returns (partial_txs, missing_indices)
+        even when some slots cannot be resolved from the mempool.
+        partial_txs has None entries for the missing slots.
+        """
+        from ouroboros.compact_blocks import CompactBlock
+
+        class MockTx:
+            def get_wtxid(self): return bytes(32)
+            def serialize_with_witness(self): return bytes(10)
+
+        class MockMempool:
+            def match_compact_block(self, short_ids, key):
+                # Return None for all (all missing)
+                return [None] * len(short_ids), list(range(len(short_ids)))
+
+        header = _make_header()
+        cb = CompactBlock(header=header, nonce=0,
+                          short_ids=[0x1, 0x2, 0x3], prefilled_txs=[])
+        partial_txs, missing = cb.reconstruct_partial(MockMempool())
+        # Must return a list (not None) even though all txs are missing
+        self.assertIsNotNone(partial_txs,
+                             "reconstruct_partial must return list even with missing txs")
+        self.assertEqual(len(partial_txs), 3)
+        self.assertEqual(len(missing), 3)
+        # All slots are None (unresolved)
+        self.assertTrue(all(tx is None for tx in partial_txs))
+
+    def test_reconstruct_partial_returns_complete_on_no_missing(self):
+        """reconstruct_partial returns (txs, []) when all txs resolved."""
+        from ouroboros.compact_blocks import CompactBlock, PrefilledTransaction
+
+        class MockTx:
+            def get_wtxid(self): return bytes(32)
+            def serialize_with_witness(self): return bytes(10)
+
+        class MockMempool:
+            def match_compact_block(self, short_ids, key):
+                return [MockTx() for _ in short_ids], []
+
+        header = _make_header()
+        pf = PrefilledTransaction(index=0, tx=MockTx())
+        cb = CompactBlock(header=header, nonce=0,
+                          short_ids=[0x1, 0x2], prefilled_txs=[pf])
+        partial_txs, missing = cb.reconstruct_partial(MockMempool())
+        self.assertEqual(missing, [])
+        self.assertEqual(len(partial_txs), 3)
+        self.assertTrue(all(tx is not None for tx in partial_txs))
 
 
 # ---------------------------------------------------------------------------
@@ -946,41 +973,35 @@ class TestW112_G25_DepthGateDirectionWrong(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# G26 — Compact block callback dead handler (BUG-1 — P0)
+# G26 — Compact block callback wired (FIX-41 BUG-1 closed)
 # ---------------------------------------------------------------------------
 class TestW112_G26_CompactBlockCallbackDeadHandler(unittest.TestCase):
     """
-    BUG-1 (P0-CDIV): set_compact_block_handler() is defined but never called.
+    BUG-1 (P0-CDIV) FIXED (FIX-41): set_compact_block_handler() is now called
+    from node.py after block_sync is initialised.
 
     _on_compact_block is initialized to None in PeerManager.__init__ and is
-    ONLY settable via set_compact_block_handler(). Since node.py and
-    block_sync.py never call set_compact_block_handler(), the handler
-    is always None.
-
-    Result: on_cmpctblock reconstructs the compact block correctly, but
-    the guard `if self._on_compact_block:` is always False — the
-    reconstructed block is silently discarded and never submitted to
-    the validator. Compact block reception produces zero benefit.
-
-    Fix: call peer_manager.set_compact_block_handler(handler) from
-    block_sync.py or node.py, where handler submits the full tx list
-    to the block validator.
+    set via set_compact_block_handler() in node.py. The handler serializes
+    the assembled header+txs and feeds them into block_sync._ibd_block_buffer
+    so the block is validated and connected normally.
     """
 
-    def test_set_compact_block_handler_never_called_in_node(self):
+    def test_set_compact_block_handler_called_in_node(self):
+        """node.py must call set_compact_block_handler (BUG-1 fix)."""
         with open('/home/work/hashhog/ouroboros/src/ouroboros/node.py') as f:
             content = f.read()
-        self.assertNotIn('set_compact_block_handler', content,
-                         "BUG-1 fixed: node.py now calls set_compact_block_handler")
+        self.assertIn('set_compact_block_handler', content,
+                      "BUG-1 regression: node.py must call set_compact_block_handler")
 
-    def test_set_compact_block_handler_never_called_in_block_sync(self):
-        with open('/home/work/hashhog/ouroboros/src/ouroboros/block_sync.py') as f:
+    def test_set_compact_block_handler_wires_into_block_sync_buffer(self):
+        """Handler feeds _ibd_block_buffer (submits to chain pipeline)."""
+        with open('/home/work/hashhog/ouroboros/src/ouroboros/node.py') as f:
             content = f.read()
-        self.assertNotIn('set_compact_block_handler', content,
-                         "BUG-1 fixed: block_sync.py now calls set_compact_block_handler")
+        self.assertIn('_ibd_block_buffer', content,
+                      "BUG-1 fix: handler must write to _ibd_block_buffer")
 
     def test_on_compact_block_initializes_to_none(self):
-        """_on_compact_block starts as None (proving the dead-handler default)."""
+        """_on_compact_block starts as None (set_compact_block_handler needed)."""
         import inspect
         from ouroboros import p2p
         src = inspect.getsource(p2p.PeerManager.__init__)
