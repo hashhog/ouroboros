@@ -2367,6 +2367,15 @@ class PeerManager:
             logger.debug(f"Peer {addr} supports wtxid relay")
 
         async def on_sendaddrv2(msg: NetworkMessage):
+            # W117 BUG-2 FIX: must set peer.addrv2 = True so subsequent address
+            # gossip can use the addrv2 wire format.  The handshake-time path
+            # (peer.py:775/1322) already does this, but BIP-155 permits
+            # sendaddrv2 anywhere before the first addr/addrv2 message and
+            # some peer implementations send it post-handshake.  Prior to the
+            # fix the handler just logged and left peer.addrv2 = False, so
+            # Tor v3 / I2P / CJDNS peers were silently downgraded to the
+            # legacy addr format.
+            peer.addrv2 = True
             logger.debug(f"Peer {addr} supports addrv2")
 
         async def on_notfound(msg: NetworkMessage):
