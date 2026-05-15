@@ -788,6 +788,8 @@ class RPCServer:
         rate_limit: bool = True,
         max_batch_size: int = 1000,
         enable_rest: bool = False,
+        tls_certfile: str | None = None,
+        tls_keyfile: str | None = None,
     ):
         """Initialize RPC server.
 
@@ -799,7 +801,25 @@ class RPCServer:
             rate_limit: Enable rate limiting
             max_batch_size: Maximum batch request size
             enable_rest: Enable REST interface (no auth required)
+            tls_certfile: Path to PEM-encoded TLS certificate (HTTPS).
+                Must be set together with ``tls_keyfile``. When both are
+                ``None`` the server listens over plain HTTP for backward
+                compatibility. Mirrors Bitcoin Core's ``-rpcssl`` /
+                ``-rpcsslcertificatechainfile`` family (httpserver.cpp).
+            tls_keyfile: Path to PEM-encoded TLS private key. Must be set
+                together with ``tls_certfile`` or startup fails with a
+                loud error (mismatch is never silent).
         """
+        if (tls_certfile is None) != (tls_keyfile is None):
+            # Both-or-neither.  Reject the mismatched case eagerly so
+            # operators see the misconfiguration immediately rather than
+            # silently falling back to HTTP (which would be a privacy /
+            # credential-exposure footgun if cookie auth is in use).
+            raise ValueError(
+                "tls_certfile and tls_keyfile must both be set or both be None "
+                f"(got certfile={tls_certfile!r}, keyfile={tls_keyfile!r})"
+            )
+
         self.node = node
         self.port = port
         self.username = username
@@ -807,6 +827,8 @@ class RPCServer:
         self.rate_limit_enabled = rate_limit
         self.max_batch_size = max_batch_size
         self.enable_rest = enable_rest
+        self.tls_certfile = tls_certfile
+        self.tls_keyfile = tls_keyfile
 
         self.app = FastAPI(title="Bitcoin Hybrid Node RPC")
 
@@ -1213,14 +1235,25 @@ class RPCServer:
                 )
                 return
 
-        config = uvicorn.Config(
-            self.app,
-            host="127.0.0.1",
-            port=self.port,
-            log_level="info"
-        )
+        # Build kwargs so HTTPS / HTTP share one Config call.  uvicorn reads
+        # ssl_certfile / ssl_keyfile via Python's ssl.SSLContext (its
+        # config.load_ssl_context()).  When both are unset uvicorn skips
+        # the TLS handshake entirely and serves plain HTTP, which preserves
+        # the historical default.
+        cfg_kwargs: dict[str, Any] = {
+            "host": "127.0.0.1",
+            "port": self.port,
+            "log_level": "info",
+        }
+        scheme = "http"
+        if self.tls_certfile and self.tls_keyfile:
+            cfg_kwargs["ssl_certfile"] = self.tls_certfile
+            cfg_kwargs["ssl_keyfile"] = self.tls_keyfile
+            scheme = "https"
+
+        config = uvicorn.Config(self.app, **cfg_kwargs)
         server = uvicorn.Server(config)
-        logger.info(f"Starting RPC server on 127.0.0.1:{self.port}")
+        logger.info(f"Starting RPC server on {scheme}://127.0.0.1:{self.port}")
         try:
             await server.serve()
         except SystemExit as e:

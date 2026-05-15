@@ -397,9 +397,17 @@ class BitcoinNode:
             self.peer_manager.set_compact_block_handler(_compact_block_handler)
             logger.debug("BIP 152: compact block handler registered")
 
-            # Start RPC server (with optional REST interface)
+            # Start RPC server (with optional REST interface and HTTPS/TLS)
             rest_enabled = str(self.config.get('rest', '0')).lower() in ('1', 'true', 'yes', 'on')
-            logger.info(f"RPC server listening on 127.0.0.1:{rpc_port}")
+            # TLS termination (W119 / FIX-64).  Operators may pass
+            # --rpc-tls-cert + --rpc-tls-key on the CLI (both-or-neither;
+            # mismatch raises in RPCServer.__init__).  When both are unset
+            # the server falls back to plain HTTP for backward compat with
+            # cookie / curl tooling that doesn't speak TLS.
+            tls_certfile = self.config.get('rpc_tls_cert') or None
+            tls_keyfile = self.config.get('rpc_tls_key') or None
+            scheme = "https" if (tls_certfile and tls_keyfile) else "http"
+            logger.info(f"RPC server listening on {scheme}://127.0.0.1:{rpc_port}")
             if rest_enabled:
                 logger.info("REST interface enabled at /rest/*")
             self.rpc_server = RPCServer(
@@ -409,6 +417,8 @@ class BitcoinNode:
                 password=self._rpc_password,
                 rate_limit=True,
                 enable_rest=rest_enabled,
+                tls_certfile=tls_certfile,
+                tls_keyfile=tls_keyfile,
             )
             async def _safe_rpc_start():
                 try:
