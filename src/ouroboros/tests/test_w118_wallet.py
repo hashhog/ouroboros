@@ -1187,23 +1187,76 @@ class TestG29CoinSelection:
         with pytest.raises(ValueError):
             select_coins(utxos, 1_000_000, fee_rate=1.0)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="BUG-3 (W88 anti-pattern): select_coins_knapsack and "
-               "select_coins_srd use `random` (Mersenne Twister), not a "
-               "cryptographic RNG. Same family of bug as W88 / FIX-45.",
-    )
     def test_coin_selection_uses_csprng(self):
-        """Coin selection must use a CSPRNG to prevent UTXO-clustering attacks."""
+        """Coin selection must use a CSPRNG to prevent UTXO-clustering attacks.
+
+        Regression guard for W118 BUG-3 / FIX-60 (W88 anti-pattern, 8th
+        instance — see FIX-45 for cross-impl precedent).
+
+        Source-grep: the wallet module must NOT use the predictable
+        `random` module for coin selection. It must use either
+        `secrets.SystemRandom` or `random.SystemRandom` (both wrap
+        `os.urandom`, the OS CSPRNG).
+        """
         import inspect
         from ouroboros import wallet as _w
         src = inspect.getsource(_w)
-        # Source must not import `random` for coin selection use; it should
-        # use `secrets.SystemRandom`, `os.urandom`-based shuffles, or
-        # `random.SystemRandom`.
+        # Either `import random` is absent entirely, or any retained
+        # use must be SystemRandom-backed.
         if "import random" in src:
-            # Then at least the uses must be SystemRandom
             assert "random.SystemRandom" in src or "secrets.SystemRandom" in src
+        # Stronger check: no bare `random.shuffle(` or `random.random(`
+        # calls anywhere in the source (these are the W88 fingerprints).
+        assert "random.shuffle(" not in src, (
+            "wallet.py contains random.shuffle(...) — must use "
+            "secrets.SystemRandom().shuffle() for coin selection (W88)"
+        )
+        # `random.random()` would also be a fingerprint; the existing
+        # legitimate use is `_CSPRNG.random()`.
+        # We tolerate the substring `random.random` only inside docstrings/
+        # comments; the call form `random.random(` is the smoking gun.
+        assert "random.random(" not in src, (
+            "wallet.py contains random.random(...) — must use "
+            "secrets.SystemRandom().random() for coin selection (W88)"
+        )
+
+    def test_coin_selection_rng_is_systemrandom(self):
+        """The module-level coin-selection RNG must be a CSPRNG (FIX-60)."""
+        import random as _stdlib_random
+        import secrets
+        from ouroboros import wallet as _w
+        # The module must expose a SystemRandom-backed RNG used by the
+        # coin-selection paths. `secrets.SystemRandom` is a subclass of
+        # `random.SystemRandom`, so isinstance() against either works.
+        rng = getattr(_w, "_CSPRNG", None)
+        assert rng is not None, (
+            "wallet module must expose a CSPRNG (e.g. _CSPRNG) for "
+            "coin selection (W118 BUG-3 / FIX-60)"
+        )
+        assert isinstance(rng, _stdlib_random.SystemRandom), (
+            f"coin-selection RNG must be SystemRandom-backed, got {type(rng)!r}"
+        )
+        # Defensive: also verify the secrets module path is the one used.
+        assert isinstance(rng, secrets.SystemRandom)
+
+    def test_coin_selection_varies_across_runs(self):
+        """Sanity: SRD selection varies across runs (uses CSPRNG-backed shuffle).
+
+        BnB is deterministic and Knapsack runs 1000 iterations and picks
+        the best, so the variance signal lives most cleanly in SRD's
+        single-random-draw shuffle. We invoke SRD directly to avoid
+        BnB/Knapsack masking RNG variance via min-waste convergence.
+        """
+        from ouroboros.wallet import select_coins_srd
+        utxos = self._utxos([3333, 5555, 7777, 9999, 11111, 13333, 17777, 23333])
+        seen: set[tuple[str, ...]] = set()
+        for _ in range(8):
+            sel = select_coins_srd(utxos, 17777, fee_rate=1.0)
+            assert sel is not None
+            seen.add(tuple(sorted(u["txid"] for u in sel)))
+        # With 8 trials over an 8-UTXO set we expect several distinct
+        # orderings; a deterministic RNG would yield exactly 1.
+        assert len(seen) >= 2, f"SRD coin selection deterministic across runs: {seen!r}"
 
 
 # ===========================================================================
