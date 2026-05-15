@@ -4448,12 +4448,31 @@ class Mempool:
             pkg_mtp: int = self.validator.db.get_median_time_past(height) or 0
         except Exception:
             pkg_mtp = 0
-        # Build a set of txids available in the package so the validator
-        # doesn't reject child txs for missing parents.
+        # Build a rolling intra_block_utxos view of package parent outputs so
+        # that child transactions can find outputs that are not yet in the UTXO
+        # DB.  Mirrors Core AcceptMultipleTransactions which builds a package
+        # UTXO view (CCoinsViewMemPool over the package) before calling
+        # AcceptToMemoryPool for each transaction.  Txs are in topological
+        # order (enforced above), so accumulating outputs tx-by-tx is safe.
+        pkg_utxo_view: dict = {}
         for tx in txs:
-            valid, error = self.validator.validate_transaction(tx, height, pkg_mtp)
+            txid = tx.get_txid()
+            valid, error = self.validator.validate_transaction(
+                tx, height, pkg_mtp,
+                intra_block_utxos=pkg_utxo_view if pkg_utxo_view else None,
+            )
             if not valid:
-                return False, f"Package tx {tx.get_txid().hex()[:16]}... invalid: {error}"
+                return False, f"Package tx {txid.hex()[:16]}... invalid: {error}"
+            # Register this tx's outputs so subsequent (child) txs can find them.
+            for vout_idx, out in enumerate(tx.outputs):
+                pkg_utxo_view[(txid, vout_idx)] = {
+                    'txid': txid,
+                    'vout': vout_idx,
+                    'value': out.value,
+                    'script_pubkey': out.script_pubkey,
+                    'height': height,
+                    'is_coinbase': False,
+                }
 
         # All checks passed — add transactions in topological order.
         # Use pre-computed per-tx fees; skip per-tx minimum fee check

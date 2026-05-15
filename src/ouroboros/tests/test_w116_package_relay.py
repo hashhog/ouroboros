@@ -188,7 +188,9 @@ class MockValidator:
         self.db = db
         self.network = network
 
-    def validate_transaction(self, tx, height, mtp=None, extra_script_flags=None):
+    def validate_transaction(self, tx, height, mtp=None, extra_script_flags=None,
+                             intra_block_utxos=None, block_hash=None,
+                             skip_scripts=False, fees_out=None):
         if tx.is_coinbase:
             return False, "coinbase"
         return True, ""
