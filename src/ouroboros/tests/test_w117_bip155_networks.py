@@ -1002,18 +1002,39 @@ class TestG30AddrV2RPC:
         src = inspect.getsource(Peer._handshake)
         assert "addrv2" in src and "True" in src
 
-    def test_on_sendaddrv2_post_handshake_does_not_update_flag(self):
-        """BUG-2: on_sendaddrv2 in _register_compact_handlers only logs, not updates peer.addrv2."""
+    def test_on_sendaddrv2_post_handshake_updates_flag_after_fix(self):
+        """BUG-2 / FIX-58: on_sendaddrv2 in _register_compact_handlers MUST
+        set peer.addrv2 = True.
+
+        Pre-FIX-58 the handler only logged a debug line and the flag stayed
+        False, silently downgrading Tor v3 / I2P / CJDNS peers to legacy
+        addr format.  This test was a "bug confirmed" guard at audit time
+        (W117) and was inverted by FIX-58 to act as a regression guard.
+        """
         import inspect
         from ouroboros.p2p import PeerManager
         # Find the on_sendaddrv2 closure in _register_compact_handlers
         src = inspect.getsource(PeerManager._register_compact_handlers)
-        # The handler only logs, does not set peer.addrv2 = True
         assert "on_sendaddrv2" in src
-        # This is the bug: the handler just logs
-        handler_section = src[src.find("on_sendaddrv2"):src.find("on_sendaddrv2") + 200]
-        assert "peer.addrv2" not in handler_section, \
-            "BUG-2 confirmed: on_sendaddrv2 does not update peer.addrv2 flag"
+        # Slice the on_sendaddrv2 closure body (next async def or fallback).
+        v2_start = src.find("async def on_sendaddrv2")
+        assert v2_start != -1, "on_sendaddrv2 closure not found"
+        next_def = src.find("async def ", v2_start + 1)
+        if next_def == -1:
+            next_def = len(src)
+        handler_section = src[v2_start:next_def]
+        # Strip comments so a historical-note comment doesn't satisfy the check.
+        non_comment_lines = []
+        for line in handler_section.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if " #" in line:
+                line = line.split(" #", 1)[0]
+            non_comment_lines.append(line)
+        code_only = "\n".join(non_comment_lines)
+        assert "peer.addrv2 = True" in code_only, \
+            "FIX-58: on_sendaddrv2 must set peer.addrv2 = True (BUG-2 closed)"
 
     def test_getaddr_always_sends_legacy_addr_bug(self):
         """BUG-6: on_getaddr always responds with legacy addr, not addrv2.
@@ -1272,3 +1293,153 @@ class TestW117Fix57OnAddrv2AttributeAccess:
         # Programmer-error class is not silently swallowed.
         assert ("AttributeError" in v2_src or "TypeError" in v2_src), \
             "Programmer-error class must be surfaced (not silently swallowed)"
+
+
+# ===========================================================================
+# W117 FIX-58: on_sendaddrv2 post-handshake handler sets peer.addrv2 = True
+# ===========================================================================
+
+class TestW117Fix58OnSendaddrv2SetsAddrv2Flag:
+    """W117 FIX-58: the on_sendaddrv2 handler registered via
+    _register_compact_handlers must set peer.addrv2 = True.
+
+    Closes BUG-2 (HIGH).  Pre-FIX-58 the handler only logged a debug line —
+    peer.addrv2 stayed False, and any subsequent address relay used the
+    legacy AddrMessage format even when the peer advertised BIP-155 support
+    after the handshake-completion window.  BIP-155 spec permits sendaddrv2
+    anywhere before the first addr/addrv2 message, so some peer
+    implementations send it post-VERACK.
+    """
+
+    @staticmethod
+    def _build_pm_and_handler():
+        """Construct a PeerManager + a Peer in post-VERACK state and pull
+        the registered on_sendaddrv2 handler off the peer.
+
+        Returns (pm, peer, on_sendaddrv2, asyncio_mod).
+        """
+        import asyncio
+        from ouroboros.p2p import PeerManager
+        from ouroboros.peer import Peer
+
+        pm = PeerManager(network="mainnet", listen=False)
+        peer = Peer(host="1.2.3.4", port=8333, network="mainnet")
+        # Simulate post-handshake state per BIP-155 "after VERACK".
+        peer.handshake_complete = True
+        peer._verack_received = True
+        peer._verack_sent = True
+        peer._version_received = True
+        peer._version_sent = True
+        # Make sure the flag starts false so the test exercises the
+        # transition.
+        peer.addrv2 = False
+
+        addr_key = "1.2.3.4:8333"
+        pm._register_compact_handlers(peer, addr_key)
+
+        on_sendaddrv2 = peer.message_handlers.get("sendaddrv2")
+        assert on_sendaddrv2 is not None, \
+            "sendaddrv2 handler must be registered by _register_compact_handlers"
+
+        return pm, peer, on_sendaddrv2, asyncio
+
+    def test_handler_sets_peer_addrv2_true(self):
+        """Dispatching sendaddrv2 to the post-handshake handler must set
+        peer.addrv2 = True (BUG-2 FIX-58).
+        """
+        from ouroboros.p2p_messages import SendAddrV2Message
+
+        pm, peer, on_sendaddrv2, asyncio_mod = self._build_pm_and_handler()
+        assert peer.addrv2 is False, "pre-condition: peer.addrv2 starts false"
+        assert peer.handshake_complete is True, \
+            "pre-condition: peer is in post-VERACK state"
+
+        net_msg = SendAddrV2Message().to_network_message("mainnet")
+        asyncio_mod.run(on_sendaddrv2(net_msg))
+
+        assert peer.addrv2 is True, (
+            "FIX-58: post-handshake on_sendaddrv2 must set peer.addrv2 = True; "
+            "pre-FIX-58 the handler only logged and the flag stayed False"
+        )
+
+    def test_handler_is_idempotent(self):
+        """Re-dispatching sendaddrv2 leaves peer.addrv2 = True (idempotent)."""
+        from ouroboros.p2p_messages import SendAddrV2Message
+
+        pm, peer, on_sendaddrv2, asyncio_mod = self._build_pm_and_handler()
+        net_msg = SendAddrV2Message().to_network_message("mainnet")
+        asyncio_mod.run(on_sendaddrv2(net_msg))
+        asyncio_mod.run(on_sendaddrv2(net_msg))
+        assert peer.addrv2 is True
+
+    def test_subsequent_address_relay_observes_addrv2_flag(self):
+        """After the handler runs, the peer.addrv2 flag is observable so
+        downstream address-relay logic can gate on it.
+
+        This is the wire-format-selection contract: address gossip code
+        chooses between AddrMessage (legacy) and AddrV2Message based on
+        peer.addrv2.  Pre-FIX-58 the flag stayed False post-handshake, so
+        Tor v3 / I2P / CJDNS peers were silently downgraded.
+        """
+        from ouroboros.p2p_messages import SendAddrV2Message
+
+        pm, peer, on_sendaddrv2, asyncio_mod = self._build_pm_and_handler()
+
+        net_msg = SendAddrV2Message().to_network_message("mainnet")
+        asyncio_mod.run(on_sendaddrv2(net_msg))
+
+        # The flag is the gate downstream code uses to pick wire format.
+        # Mirrors Core net_processing.cpp::RelayAddress and the
+        # m_wants_addrv2 branch in _PushAddress / on_getaddr.
+        assert peer.addrv2 is True, \
+            "addrv2 wire-format gate must be observable post-handshake"
+
+        # Cross-check: an addrv1-incompatible address (e.g. TorV3) requires
+        # peer.addrv2 == True to be relayable per BIP-155 (Core net_processing
+        # IsAddrCompatible() check at line ~1118).  This is the integration
+        # consequence FIX-58 unlocks.
+        from ouroboros.addrman import AddrInfo, NET_TORV3
+        torv3 = AddrInfo(
+            host="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion",
+            port=9735, network_id=NET_TORV3, addr_bytes=bytes(32),
+        )
+        # Pre-FIX-58 (peer.addrv2 = False) this peer could not have been
+        # selected as an addrv2 relay target — the gate would have closed.
+        peer_supports_addrv2_or_addrv1_compatible = (
+            peer.addrv2 or torv3.is_addrv1_compatible()
+        )
+        assert peer_supports_addrv2_or_addrv1_compatible, (
+            "FIX-58: post-handshake sendaddrv2 must enable addrv2 wire-format "
+            "selection for addrv1-incompatible (Tor v3 / I2P / CJDNS) peers"
+        )
+
+    def test_handler_source_contains_peer_addrv2_assignment(self):
+        """FIX-58: on_sendaddrv2 source must contain peer.addrv2 = True.
+
+        Source-level guard against regression (mirrors the FIX-57 source
+        check at TestW117Fix57OnAddrv2AttributeAccess).
+        """
+        import inspect
+        from ouroboros.p2p import PeerManager
+        src = inspect.getsource(PeerManager._register_compact_handlers)
+        v2_start = src.find("async def on_sendaddrv2")
+        assert v2_start != -1, "on_sendaddrv2 closure not found"
+        next_def = src.find("async def ", v2_start + 1)
+        if next_def == -1:
+            next_def = len(src)
+        v2_src = src[v2_start:next_def]
+
+        # Strip comments so a historical-note comment doesn't satisfy the
+        # check.
+        non_comment_lines = []
+        for line in v2_src.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if " #" in line:
+                line = line.split(" #", 1)[0]
+            non_comment_lines.append(line)
+        code_only = "\n".join(non_comment_lines)
+
+        assert "peer.addrv2 = True" in code_only, \
+            "FIX-58: on_sendaddrv2 must set peer.addrv2 = True in actual code"
