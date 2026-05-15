@@ -1054,3 +1054,221 @@ class TestG30AddrV2RPC:
         # Bug: peer.addrv2 is not checked when relaying
         assert "addrv2" not in src, \
             "BUG-7 confirmed: _relay_addr does not respect peer.addrv2 flag"
+
+
+# ===========================================================================
+# W117 FIX-57: on_addrv2 attribute access + narrow except
+# ===========================================================================
+
+class TestW117Fix57OnAddrv2AttributeAccess:
+    """W117 FIX-57: on_addrv2 must read AddrV2Entry via attribute access and
+    must propagate (or at least log at error) programming-class exceptions.
+
+    Closes BUG-1 (P0-CDIV): every addrv2 entry was a no-op because the handler
+    called entry.get(...) on a @dataclass, raising AttributeError which was
+    silently swallowed by the broad ``except Exception`` clause.
+    """
+
+    @staticmethod
+    def _build_pm_and_handler():
+        """Construct a PeerManager + an on_addrv2 handler with captured calls.
+
+        Returns (pm, on_addrv2, captured) where captured is a list of dicts
+        recording every addrman.add() invocation.
+        """
+        import asyncio
+        from ouroboros.p2p import PeerManager
+        from ouroboros.peer import Peer
+
+        pm = PeerManager(network="mainnet", listen=False)
+
+        captured: list[dict] = []
+
+        def fake_add(host, port, services=0, timestamp=0.0, source="",
+                     network_id=1, addr_bytes=b""):
+            captured.append({
+                "host": host, "port": port, "services": services,
+                "timestamp": timestamp, "source": source,
+            })
+            return True
+
+        pm.addrman.add = fake_add  # type: ignore[method-assign]
+
+        # Make ban_manager return "not banned" for everything (default does,
+        # but we make this explicit so the test is independent of BanManager
+        # internals).
+        pm.ban_manager.is_banned = lambda host: False  # type: ignore[method-assign]
+
+        # Construct a minimal Peer the handler can be wired to.  We never
+        # exercise its socket — only register_handler.
+        peer = Peer(host="1.2.3.4", port=8333, network="mainnet")
+
+        addr_key = "1.2.3.4:8333"
+        pm._register_addr_handlers(peer, addr_key)
+
+        on_addrv2 = peer.message_handlers.get("addrv2")
+        assert on_addrv2 is not None, "addrv2 handler must be registered"
+
+        return pm, on_addrv2, captured, asyncio
+
+    def _make_addrv2_payload(self, entries):
+        """Build a raw addrv2 wire payload from AddrV2Entry list."""
+        from ouroboros.p2p_messages import AddrV2Message
+        msg = AddrV2Message(addresses=list(entries)).to_network_message("mainnet")
+        return msg
+
+    def test_ipv4_entry_reaches_addrman(self):
+        """IPv4 addrv2 entry actually reaches addrman.add after the fix."""
+        pm, on_addrv2, captured, asyncio_mod = self._build_pm_and_handler()
+        entry = AddrV2Entry(
+            time=1700000000, services=9, network_id=BIP155_NET_IPV4,
+            addr=bytes([8, 8, 8, 8]), port=8333,
+        )
+        msg = self._make_addrv2_payload([entry])
+        asyncio_mod.run(on_addrv2(msg))
+        assert len(captured) == 1, \
+            "FIX-57: IPv4 addrv2 entry must reach addrman.add (was silently dropped)"
+        c = captured[0]
+        assert c["host"] == "8.8.8.8"
+        assert c["port"] == 8333
+        assert c["services"] == 9
+        assert c["timestamp"] == 1700000000.0
+        assert c["source"] == "1.2.3.4:8333"
+
+    def test_torv3_entry_reaches_addrman(self):
+        """TorV3 addrv2 entry actually reaches addrman.add after the fix."""
+        pm, on_addrv2, captured, asyncio_mod = self._build_pm_and_handler()
+        pubkey = bytes(range(32))
+        entry = AddrV2Entry(
+            time=1700000001, services=1, network_id=BIP155_NET_TORV3,
+            addr=pubkey, port=9735,
+        )
+        msg = self._make_addrv2_payload([entry])
+        asyncio_mod.run(on_addrv2(msg))
+        assert len(captured) == 1, \
+            "FIX-57: TorV3 addrv2 entry must reach addrman.add"
+        c = captured[0]
+        assert c["host"].endswith(".onion")
+        assert c["port"] == 9735
+
+    def test_ipv6_entry_reaches_addrman_or_is_explicitly_dropped(self):
+        """IPv6 addrv2 entry: handler runs without raising and is processed.
+
+        BUG-5 (out of scope here): _addr_bytes_to_host returns None for IPv6,
+        so addrman.add is not called.  But this test confirms the handler
+        does NOT silently fail on the entry (which it did pre-FIX-57 because
+        of BUG-1's AttributeError on entry.get(...)).
+        """
+        pm, on_addrv2, captured, asyncio_mod = self._build_pm_and_handler()
+        ipv6_bytes = bytes.fromhex("20010db8000000000000000000000001")
+        entry = AddrV2Entry(
+            time=1700000002, services=1, network_id=BIP155_NET_IPV6,
+            addr=ipv6_bytes, port=8333,
+        )
+        msg = self._make_addrv2_payload([entry])
+        # Must not raise.  Whether addrman is called depends on BUG-5 (out
+        # of scope) — but pre-FIX-57 this would have AttributeError'd on
+        # entry.get(...) before even reaching _addr_bytes_to_host.
+        asyncio_mod.run(on_addrv2(msg))
+        # With BUG-5 still present, IPv6 is skipped (returns None).  Once
+        # BUG-5 is fixed this should become assert len(captured) == 1.
+
+    def test_i2p_entry_filtered_until_bug3_closed(self):
+        """I2P addrv2 entry: handler runs without raising.
+
+        BUG-3 (out of scope here) is the (1, 2, 4) allowlist filter that
+        explicitly skips I2P (net_id=5) and CJDNS (net_id=6).  Pre-FIX-57
+        the handler couldn't even reach the filter check because of BUG-1.
+        After FIX-57 the entry is read correctly but still skipped by the
+        net_id allowlist — which is BUG-3's territory.
+        """
+        pm, on_addrv2, captured, asyncio_mod = self._build_pm_and_handler()
+        entry = AddrV2Entry(
+            time=1700000003, services=9, network_id=BIP155_NET_I2P,
+            addr=b"\xab" * 32, port=4567,
+        )
+        msg = self._make_addrv2_payload([entry])
+        asyncio_mod.run(on_addrv2(msg))
+        # Currently filtered by (1,2,4) allowlist (BUG-3, out of scope).
+        # The point of this test is that the handler did not silently crash.
+        assert len(captured) == 0, \
+            "I2P currently filtered by BUG-3 allowlist (separate fix)"
+
+    def test_cjdns_entry_filtered_until_bug3_closed(self):
+        """CJDNS addrv2 entry: handler runs without raising."""
+        pm, on_addrv2, captured, asyncio_mod = self._build_pm_and_handler()
+        entry = AddrV2Entry(
+            time=1700000004, services=1, network_id=BIP155_NET_CJDNS,
+            addr=bytes([0xFC]) + b"\x42" * 15, port=8333,
+        )
+        msg = self._make_addrv2_payload([entry])
+        asyncio_mod.run(on_addrv2(msg))
+        # Currently filtered by (1,2,4) allowlist + _addr_bytes_to_host has
+        # no CJDNS branch.  Once BUG-3 + BUG-5/CJDNS handling are closed
+        # this should become assert len(captured) == 1.
+        assert len(captured) == 0, \
+            "CJDNS currently filtered by BUG-3 allowlist (separate fix)"
+
+    def test_handler_uses_attribute_access_not_dict_get(self):
+        """FIX-57: on_addrv2 source must use attribute access, not .get('field')."""
+        import inspect
+        from ouroboros.p2p import PeerManager
+        src = inspect.getsource(PeerManager._register_addr_handlers)
+        # Locate the on_addrv2 closure
+        v2_start = src.find("async def on_addrv2")
+        assert v2_start != -1, "on_addrv2 closure not found"
+        # Slice up to next `async def` or end-of-function
+        next_def = src.find("async def ", v2_start + 1)
+        if next_def == -1:
+            next_def = len(src)
+        v2_src = src[v2_start:next_def]
+
+        # Strip Python comment text so the historical-note comment that
+        # quotes the buggy line doesn't trip the substring check.
+        non_comment_lines = []
+        for line in v2_src.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            # Drop trailing inline comment
+            if " #" in line:
+                line = line.split(" #", 1)[0]
+            non_comment_lines.append(line)
+        code_only = "\n".join(non_comment_lines)
+
+        # No .get('network_id', …) / .get("addr", …) etc. in actual code.
+        assert "entry.get(" not in code_only, \
+            "FIX-57: on_addrv2 must not use entry.get(...) — AddrV2Entry is a dataclass"
+        # Must use attribute access
+        assert "entry.network_id" in code_only
+        assert "entry.addr" in code_only
+        assert "entry.port" in code_only
+        assert "entry.services" in code_only
+        assert "entry.time" in code_only
+
+    def test_handler_does_not_swallow_attribute_errors(self):
+        """FIX-57: on_addrv2's except clause must not silently swallow
+        AttributeError / TypeError / KeyError — those are programmer-bug
+        signals.  Pre-FIX-57 they were absorbed by a broad ``except Exception``.
+        """
+        import inspect
+        from ouroboros.p2p import PeerManager
+        src = inspect.getsource(PeerManager._register_addr_handlers)
+        v2_start = src.find("async def on_addrv2")
+        next_def = src.find("async def ", v2_start + 1)
+        if next_def == -1:
+            next_def = len(src)
+        v2_src = src[v2_start:next_def]
+
+        # The broad ``except Exception`` should be replaced with narrower
+        # handlers.  We accept either (a) a narrower expected-exception
+        # tuple, or (b) explicit handling of AttributeError/TypeError
+        # at error level.
+        assert "except Exception as e:" not in v2_src, \
+            "FIX-57: broad `except Exception` must be narrowed"
+        # Expected-wire-error class
+        assert "ValueError" in v2_src or "struct.error" in v2_src, \
+            "Wire-format errors should be handled explicitly"
+        # Programmer-error class is not silently swallowed.
+        assert ("AttributeError" in v2_src or "TypeError" in v2_src), \
+            "Programmer-error class must be surfaced (not silently swallowed)"

@@ -19,6 +19,7 @@ import logging
 import os
 import random
 import socket
+import struct
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -2541,13 +2542,18 @@ class PeerManager:
                     return
                 added = 0
                 for entry in am.addresses:
-                    net_id = entry.get("network_id", 0)
+                    # AddrV2Entry is a @dataclass — use attribute access, not
+                    # dict-style .get().  Prior to W117 FIX-57 this was
+                    # entry.get("network_id", 0) which raised AttributeError
+                    # and was silently swallowed by the broad ``except`` below,
+                    # making every received addrv2 entry a no-op.
+                    net_id = entry.network_id
                     if net_id not in (1, 2, 4):
                         continue  # skip I2P/CJDNS for now (1=IPv4, 2=IPv6, 4=Tor v3)
-                    addr_bytes = entry.get("addr", b"")
-                    port = entry.get("port", 0)
-                    services = entry.get("services", 0)
-                    ts = entry.get("time", 0)
+                    addr_bytes = entry.addr
+                    port = entry.port
+                    services = entry.services
+                    ts = entry.time
                     host_str = self._addr_bytes_to_host(net_id, addr_bytes)
                     if host_str and not self.ban_manager.is_banned(host_str):
                         if self.addrman.add(
@@ -2561,8 +2567,20 @@ class PeerManager:
                 if added:
                     logger.debug(f"Learned {added} new addresses (v2) from {addr}")
                     self._relay_addr(msg, exclude=addr)
-            except Exception as e:
+            except (ValueError, struct.error) as e:
+                # Expected for malformed wire payloads (truncated, bad varint,
+                # oversize address).  ``AddrV2Message.from_payload`` raises
+                # ValueError; varint/struct unpacking can raise struct.error.
                 logger.debug(f"Error parsing addrv2 from {addr}: {e}")
+            except (AttributeError, KeyError, TypeError) as e:
+                # Programming-error class: must NOT be silently swallowed at
+                # debug level.  W117 BUG-1 was an AttributeError hidden by the
+                # previous broad ``except Exception`` clause.  Re-raising would
+                # tear down the peer handler; logging at error keeps the node
+                # alive but ensures these surface in production logs.
+                logger.error(
+                    f"on_addrv2 internal error from {addr}: {e}", exc_info=True
+                )
 
         async def on_getaddr(msg: NetworkMessage):
             try:
