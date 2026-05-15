@@ -19,7 +19,7 @@ import hmac
 import json
 import logging
 import os
-import random
+import secrets
 import struct
 import time
 from pathlib import Path
@@ -31,6 +31,22 @@ from coincurve import PrivateKey, PublicKey
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+# Cryptographically-secure RNG for coin-selection randomisation.
+#
+# Python's default ``random`` module uses the Mersenne Twister, which is
+# fully predictable after roughly 624 observed 32-bit outputs. Using it
+# for coin selection is the W88 anti-pattern: a chain-analysis adversary
+# who observes the wallet's UTXO usage history can predict which UTXOs
+# will be selected next, enabling UTXO-clustering / amount-correlation
+# attacks. Bitcoin Core uses ``FastRandomContext`` (seeded from the OS
+# CSPRNG) in ``wallet/coinselection.cpp`` and ``wallet/spend.cpp``.
+#
+# ``secrets.SystemRandom`` is a ``random.Random`` subclass that draws all
+# entropy from ``os.urandom`` (the OS CSPRNG), so the standard
+# ``shuffle`` / ``random`` API is preserved while the underlying source
+# is cryptographically secure.
+_CSPRNG = secrets.SystemRandom()
 
 # secp256k1 curve order
 SECP256K1_ORDER = (
@@ -251,10 +267,10 @@ def select_coins_knapsack(
         selected_value = 0
 
         shuffled = list(effective)
-        random.shuffle(shuffled)
+        _CSPRNG.shuffle(shuffled)
 
         for u, ev in shuffled:
-            if random.random() < 0.5:
+            if _CSPRNG.random() < 0.5:
                 selected.append(u)
                 selected_value += ev
                 if selected_value >= target:
@@ -284,7 +300,7 @@ def select_coins_srd(
     """
     input_fee = int(INPUT_VBYTES * fee_rate)
     pool = [u for u in utxos if u["value"] > input_fee]
-    random.shuffle(pool)
+    _CSPRNG.shuffle(pool)
 
     selected: list[dict] = []
     total = 0
