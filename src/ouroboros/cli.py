@@ -437,10 +437,35 @@ def sync(ctx, reset, limit):
         "chainstate and re-run IBD."
     ),
 )
+@click.option(
+    "--rpc-tls-cert",
+    "rpc_tls_cert",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help=(
+        "Path to a PEM-encoded TLS certificate (chain). When set together "
+        "with --rpc-tls-key the RPC server terminates HTTPS via uvicorn's "
+        "ssl_certfile/ssl_keyfile. Both-or-neither: passing only one is a "
+        "startup error. When neither is set the server listens over plain "
+        "HTTP (existing behaviour). Mirrors Bitcoin Core's "
+        "-rpcsslcertificatechainfile."
+    ),
+)
+@click.option(
+    "--rpc-tls-key",
+    "rpc_tls_key",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help=(
+        "Path to the PEM-encoded TLS private key matching --rpc-tls-cert. "
+        "See --rpc-tls-cert for usage; the two flags must be set together."
+    ),
+)
 @click.pass_context
 def start(
     ctx, rpc_port, p2p_port, listen, connect, force, v2transport,
     peerbloomfilters, blockfilterindex, cfilter, daemon, pid_path, reindex,
+    rpc_tls_cert, rpc_tls_key,
 ):
     """Start the Bitcoin node"""
     global _node, _cancelled, _pid_file
@@ -531,6 +556,18 @@ def start(
                     f"--cfilter must be 0 (off) or 1 (basic), got {cfilter}"
                 )
             config["blockfilterindex"] = bool(cfilter)
+
+        # FIX-64: HTTPS/TLS termination flags.  Reject mismatched pairs at
+        # the CLI layer so the operator sees a clean Click error rather than
+        # a downstream ValueError from RPCServer.__init__.  Both-or-neither.
+        if (rpc_tls_cert is None) != (rpc_tls_key is None):
+            raise click.BadParameter(
+                "--rpc-tls-cert and --rpc-tls-key must be provided together "
+                "(both or neither)."
+            )
+        if rpc_tls_cert and rpc_tls_key:
+            config["rpc_tls_cert"] = rpc_tls_cert
+            config["rpc_tls_key"] = rpc_tls_key
 
         # Daemonize BEFORE writing the PID file so the recorded PID is
         # the post-fork process (parity with Bitcoin Core).
