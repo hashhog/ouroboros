@@ -268,6 +268,13 @@ class TestG1ReceiverHTTPEndpoint:
     """BIP-78 §3: receiver MUST host an HTTP(S) endpoint accepting POST of an
     Original PSBT.  ouroboros has only two POST endpoints, both JSON-RPC."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-65: BIP-78 receiver endpoint landed; "
+        "rpc.py now registers POST /payjoin via payjoin.RECEIVER_PATH "
+        "and imports ouroboros.payjoin — this assertion is expected to "
+        "fail post-FIX-65 and the audit baseline should be updated.",
+    )
     def test_no_payjoin_route_registered_on_fastapi_app(self):
         # rpc.py source must reference some PayJoin route literal for any
         # implementation to exist.  None found ⇒ MISSING ENTIRELY.
@@ -307,6 +314,13 @@ class TestG2SenderHTTPClient:
         found, hits = _module_source_contains_payjoin(ob_wallet)
         assert not found, f"unexpected PayJoin tokens in wallet.py: {hits}"
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-65: psbt.py exports payjoin_decode_original_psbt / "
+        "validate_original_psbt_for_receiver / add_receiver_input_to_psbt "
+        "thin forwarders so dir(ouroboros.psbt) advertises the BIP-78 "
+        "receive-path surface (G4/G5/G7 wraparound).",
+    )
     def test_no_payjoin_http_client_call_sites_in_psbt(self):
         found, hits = _module_source_contains_payjoin(ob_psbt)
         assert not found, f"unexpected PayJoin tokens in psbt.py: {hits}"
@@ -343,6 +357,13 @@ class TestG4OriginalPSBTDeserialization:
     """BIP-78 §3.2: receiver MUST deserialize the sender's Original PSBT
     and validate per §"Receiver's Original PSBT checklist"."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-65: payjoin_decode_original_psbt now exported from "
+        "ouroboros.psbt as a thin forwarder onto "
+        "ouroboros.payjoin.decode_original_psbt; this is the BIP-78 "
+        "receive-path deserializer the audit was demanding.",
+    )
     def test_psbt_module_has_no_payjoin_aware_deserializer(self):
         # PSBT.deserialize exists and is correct in isolation; what is missing
         # is a wrapper that applies the BIP-78 receive-side checks.
@@ -370,6 +391,12 @@ class TestG5ReceiverValidation:
     """BIP-78 receiver checklist: inputs signed-but-not-finalized; no inputs
     reference receiver UTXOs; outputs include payment address ≥ amount."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-65: validate_original_psbt_for_receiver now exported "
+        "from ouroboros.psbt; applies the BIP-78 §3 checklist (witness/"
+        "non_witness_utxo present, every input signed, no input finalized).",
+    )
     def test_no_receiver_validator_function_anywhere(self):
         for mod in (ob_psbt, ob_wallet, ob_rpc):
             names = [n.lower() for n in dir(mod)]
@@ -385,6 +412,12 @@ class TestG6AdditionalFeeOutputIndex:
     """BIP-78 URI parameters: integer index into sender outputs from which
     receiver-added input fees may be subtracted."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-65: rpc.py docstring on _handle_payjoin_request now "
+        "documents the additionalfeeoutputindex query parameter; "
+        "payjoin.parse_request_params + apply_fee_adjustment handle it.",
+    )
     def test_no_additionalfeeoutputindex_parameter_anywhere(self):
         for mod in (ob_psbt, ob_wallet, ob_rpc, ob_rest):
             src = inspect.getsource(mod).lower()
@@ -400,6 +433,12 @@ class TestG6AdditionalFeeOutputIndex:
 class TestG7ReceiverInputContribution:
     """BIP-78 §3: receiver MAY add inputs of their own and re-sign."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-65: add_receiver_input_to_psbt now exported from "
+        "ouroboros.psbt; thin forwarder onto ouroboros.payjoin.add_receiver_input "
+        "which appends a CSPRNG-selected UTXO to the Original PSBT.",
+    )
     def test_no_add_receiver_inputs_helper(self):
         for mod in (ob_psbt, ob_wallet):
             names = [n.lower() for n in dir(mod)]
@@ -430,6 +469,12 @@ class TestG9ReceiverFeeAdjustment:
     """BIP-78 URI parameters: receiver may subtract up to N satoshis from
     output[additionalfeeoutputindex] to fund receiver-added inputs' fees."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-65: rpc.py docstring on _handle_payjoin_request now "
+        "documents the maxadditionalfeecontribution query parameter; "
+        "payjoin.parse_request_params + apply_fee_adjustment honor the cap.",
+    )
     def test_no_maxadditionalfeecontribution_anywhere(self):
         for mod in (ob_psbt, ob_wallet, ob_rpc):
             src = inspect.getsource(mod).lower()
@@ -566,6 +611,12 @@ class TestG17ErrorResponses:
                   "version-unsupported" | "original-psbt-rejected",
      "message": "..."} with HTTP 4xx/5xx."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-65: rpc.py docstring on _handle_payjoin_request lists "
+        "the four BIP-78 canonical error codes; "
+        "ouroboros.payjoin.PayJoinError emits the JSON wrapper.",
+    )
     def test_no_payjoin_error_codes_anywhere(self):
         codes = [
             "original-psbt-rejected",
@@ -799,6 +850,13 @@ class TestUniversalAbsence:
     ouroboros Python pipeline.  Future implementation work should make this
     test fail; until then it pins the audit finding."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-65: PayJoin receiver foundation landed — rpc.py and "
+        "psbt.py now carry payjoin tokens via the new ouroboros.payjoin "
+        "module imports and the psbt receive-path forwarders.  The "
+        "absence baseline is intentionally invalidated.",
+    )
     def test_no_payjoin_token_in_any_module(self):
         for mod in (ob_psbt, ob_wallet, ob_rpc, ob_rest):
             found, hits = _module_source_contains_payjoin(mod)
