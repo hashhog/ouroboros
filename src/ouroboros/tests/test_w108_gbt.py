@@ -340,32 +340,45 @@ class TestG10DeadHelperBitsVersion(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# G11 — prioritisetransaction is a no-op stub
-# Core: modifies mempool fee delta for priority ordering
-# Ouroboros: returns True without touching mempool
+# G11 — prioritisetransaction must apply delta to mempool (FIXED in FIX-72)
+# Core: modifies mempool fee delta for priority ordering (mining + RBF + RPC).
+# Ouroboros: rpc_prioritisetransaction now calls mempool.prioritise_transaction
+#            with the LE txid (W69 endian convention) and the delta_sats.
 # ---------------------------------------------------------------------------
 class TestG11PrioritiseTransactionStub(unittest.TestCase):
-    """BUG: prioritisetransaction is a stub — returns True without modifying mempool."""
+    """FIXED (FIX-72 / W120 BUG-3): prioritisetransaction now updates mempool."""
 
-    def test_stub_returns_true(self):
+    def test_handler_returns_true(self):
         rpc = _make_rpc()
+        # Provide a real prioritise_transaction stub so the handler can call it.
+        rpc.node.mempool.prioritise_transaction = MagicMock()
         result = asyncio.run(rpc.rpc_prioritisetransaction(
             txid="aa" * 32, dummy=0, fee_delta=10000
         ))
-        self.assertTrue(result, "prioritisetransaction returns True (no-op stub)")
+        self.assertTrue(result, "prioritisetransaction returns True on success")
 
-    def test_stub_does_not_modify_mempool(self):
+    def test_handler_calls_mempool_prioritise(self):
         rpc = _make_rpc()
-        # Check mempool fee-delta never updated
+        rpc.node.mempool.prioritise_transaction = MagicMock()
         asyncio.run(rpc.rpc_prioritisetransaction(
             txid="aa" * 32, dummy=0, fee_delta=50000
         ))
-        # If mempool was modified, PrioritiseTransaction would have been called.
-        rpc.node.mempool.prioritise_transaction = MagicMock()
-        self.assertFalse(
+        self.assertTrue(
             rpc.node.mempool.prioritise_transaction.called,
-            "prioritisetransaction did not update mempool fee delta"
+            "prioritisetransaction must apply delta to mempool (FIX-72)"
         )
+        # Argument check: txid is LE (display-order reversed) + delta is int.
+        (txid_arg, delta_arg), _ = rpc.node.mempool.prioritise_transaction.call_args
+        self.assertEqual(len(txid_arg), 32)
+        self.assertEqual(delta_arg, 50000)
+
+    def test_handler_rejects_nonzero_dummy(self):
+        rpc = _make_rpc()
+        rpc.node.mempool.prioritise_transaction = MagicMock()
+        with self.assertRaises(ValueError):
+            asyncio.run(rpc.rpc_prioritisetransaction(
+                txid="aa" * 32, dummy=1.0, fee_delta=10000
+            ))
 
 
 # ---------------------------------------------------------------------------

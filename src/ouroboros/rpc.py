@@ -4995,10 +4995,17 @@ class RPCServer:
                             remaining.remove(t)
                 return ordered
 
-            # Compute ancestor fee rate for each mempool entry.
-            # ancestor_fee_rate = (entry.fee + sum(ancestor fees))
+            # Compute ancestor fee rate for each mempool entry, honouring
+            # prioritisetransaction deltas (Core: BlockAssembler uses entry
+            # GetModifiedFee throughout; mining/miner.cpp + txmempool.cpp:1015).
+            # ancestor_fee_rate = (modified_fee + sum(ancestor modified fees))
             #                   / (entry.vsize + sum(ancestor vsizes))
             # Reference: Bitcoin Core BlockAssembler::addPackageTransactions()
+            map_deltas = getattr(mempool, "map_deltas", {})
+
+            def _mod_fee(t: bytes, e) -> int:
+                return int(e.fee) + int(map_deltas.get(t, 0))
+
             ancestor_fee_rates: dict[bytes, float] = {}
             for txid_key, entry in snap_txs.items():
                 # Collect full transitive ancestor set via BFS
@@ -5010,8 +5017,8 @@ class RPCServer:
                         continue
                     all_ancestors.add(anc)
                     queue.extend(parents.get(anc, set()))
-                ancestor_fee = entry.fee + sum(
-                    snap_txs[a].fee for a in all_ancestors
+                ancestor_fee = _mod_fee(txid_key, entry) + sum(
+                    _mod_fee(a, snap_txs[a]) for a in all_ancestors
                 )
                 ancestor_size = entry.size + sum(
                     snap_txs[a].size for a in all_ancestors
@@ -8647,8 +8654,76 @@ class RPCServer:
     async def rpc_prioritisetransaction(
         self, txid: str, dummy: float = 0, fee_delta: int = 0
     ) -> bool:
-        """Accept the transaction into mined blocks at higher/lower priority."""
+        """Accept the transaction into mined blocks at higher/lower priority.
+
+        Adds *fee_delta* satoshis (may be negative) to the priority-delta for
+        *txid*.  Subsequent fee comparisons — RBF Rule 3/4 admission, mining
+        selection, getmempoolentry — use Core's GetModifiedFee() = nFee +
+        nFeeDelta.  Deltas are accumulated (saturating int64) and survive
+        eviction; they are cleared on block confirmation and lost on restart
+        (in-memory mapDeltas only).
+
+        FIX-72 (W120 BUG-3).  Reference: bitcoin-core/src/rpc/mining.cpp:502
+        prioritisetransaction; src/txmempool.{cpp,h} PrioritiseTransaction.
+
+        Args:
+            txid: hex txid (JSON-RPC big-endian display order)
+            dummy: legacy positional priority param; MUST be zero or null
+            fee_delta: satoshis to add (or subtract, if negative)
+
+        Returns:
+            True on success.
+
+        Raises:
+            ValueError if dummy != 0 or fee_delta is not an integer.
+        """
+        if dummy not in (0, 0.0, None):
+            # Core: throw JSONRPCError(RPC_INVALID_PARAMETER, "Priority is no
+            # longer supported, dummy argument to prioritisetransaction must
+            # be 0.") — bitcoin-core/src/rpc/mining.cpp:530.
+            raise ValueError(
+                "Priority is no longer supported, dummy argument to "
+                "prioritisetransaction must be 0."
+            )
+        try:
+            delta_int = int(fee_delta)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid fee_delta: {fee_delta!r}") from exc
+
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
+            raise ValueError("No mempool available")
+
+        # JSON-RPC convention: txid arrives in display order (big-endian hex);
+        # internal mempool keys are little-endian.  W69 + getmempoolentry.
+        txid_bytes = bytes.fromhex(txid)[::-1]
+        if len(txid_bytes) != 32:
+            raise ValueError(f"txid must be 32 bytes: {txid}")
+
+        self.node.mempool.prioritise_transaction(txid_bytes, delta_int)
         return True
+
+    async def rpc_getprioritisedtransactions(self) -> dict[str, dict[str, Any]]:
+        """Return the map of user-set fee deltas keyed by display-order txid.
+
+        Mirrors Core RPC getprioritisedtransactions (rpc/mining.cpp:547).
+        Each value: {fee_delta: int, in_mempool: bool, modified_fee?: int}.
+        ``modified_fee`` is only present when ``in_mempool`` is true.
+
+        FIX-72 (W120 BUG-3) — companion RPC to prioritisetransaction.
+        """
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
+            raise ValueError("No mempool available")
+        out: dict[str, dict[str, Any]] = {}
+        for entry in self.node.mempool.get_prioritised_transactions():
+            display_txid = entry["txid"][::-1].hex()
+            inner: dict[str, Any] = {
+                "fee_delta": entry["fee_delta"],
+                "in_mempool": entry["in_mempool"],
+            }
+            if entry["in_mempool"] and entry["modified_fee"] is not None:
+                inner["modified_fee"] = entry["modified_fee"]
+            out[display_txid] = inner
+        return out
 
     async def rpc_generatetoaddress(
         self, nblocks: int, address: str, maxtries: int = 1000000
@@ -9093,32 +9168,43 @@ class RPCServer:
         vsize = (weight + 3) // 4
 
         # -- ancestor / descendant fees ------------------------------------
-        ancestor_fees = entry.fee
+        # Use Core GetModifiedFee semantics for fees.modified / ancestorfees /
+        # descendantfees so that prioritisetransaction is reflected (FIX-72).
+        map_deltas = getattr(mempool, "map_deltas", {})
+
+        def _mod_fee(t: bytes, e) -> int:
+            return int(e.fee) + int(map_deltas.get(t, 0))
+
+        own_modified_fee = _mod_fee(txid_bytes, entry)
+
+        ancestor_fees = own_modified_fee
         for a_txid in mempool._get_ancestors(entry.tx):
             a_entry = mempool.transactions.get(a_txid)
             if a_entry is not None:
-                ancestor_fees += a_entry.fee
+                ancestor_fees += _mod_fee(a_txid, a_entry)
 
-        descendant_fees = entry.fee
+        descendant_fees = own_modified_fee
         for d_txid in mempool._collect_descendants(txid_bytes):
             if d_txid == txid_bytes:
                 continue
             d_entry = mempool.transactions.get(d_txid)
             if d_entry is not None:
-                descendant_fees += d_entry.fee
+                descendant_fees += _mod_fee(d_txid, d_entry)
 
         base_fee_btc = entry.fee / 1e8
+        modified_fee_btc = own_modified_fee / 1e8
 
         return {
             "fees": {
                 "base": base_fee_btc,
-                "modified": base_fee_btc,
+                "modified": modified_fee_btc,
                 "ancestor": ancestor_fees / 1e8,
                 "descendant": descendant_fees / 1e8,
             },
             "vsize": vsize,
             "weight": weight,
             "fee": base_fee_btc,
+            "modifiedfee": modified_fee_btc,
             "time": int(entry.time_added),
             "height": entry.height_added,
             "descendantcount": entry.descendant_count,
