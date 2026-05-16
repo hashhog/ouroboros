@@ -37,6 +37,55 @@ from ouroboros.zmq_notifier import ZMQNotifier
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# BIP-157 stop-hash ancestor walk (FIX-75 / W121 #3 — P2P-handler side of the
+# universal "active-chain walk vs stop-hash ancestor" pattern, follow-on to
+# FIX-74 a4cebff which closed the reorg-bookkeeping side).
+# ---------------------------------------------------------------------------
+# Mirrors Bitcoin Core ``CBlockIndex::GetAncestor(int height)`` from
+# src/chain.{cpp,h}: walks ``pprev`` back from the index until it reaches the
+# requested height.  In ouroboros the "pprev" link is ``block.prev_blockhash``
+# resolved via ``db.get_block(hash)``.  Compact filters are indexed by block
+# hash regardless of fork membership, so a getcfilters/getcfheaders/getcfcheckpt
+# probe with an orphan stop_hash must walk *that fork*, not the active chain
+# (see net_processing.cpp ``PrepareBlockFilterRequest`` /
+# ``ProcessGetCFilters`` / ``ProcessGetCFHeaders`` — no ``chain.Contains``
+# check; LookupBlockIndex by hash then GetAncestor walks pprev).
+def _get_ancestor(db, block, target_height: int):
+    """Return the ancestor of ``block`` at ``target_height``, or ``None``.
+
+    Walks ``prev_blockhash`` pointers via ``db.get_block`` until the height
+    matches.  Returns ``None`` if:
+      - ``block`` is ``None`` or has no known height,
+      - ``target_height`` is negative or greater than ``block.height``,
+      - the chain walk runs off the end (db inconsistency / pruned).
+
+    Crucially: this does NOT consult ``db.get_block_by_height`` — that walks
+    the *active* chain and would silently serve active-chain filters for a
+    stale-fork stop_hash (signed-but-lying response; see W121 #3).  Match
+    Core's behavior: serve the fork the peer asked about.
+    """
+    if block is None:
+        return None
+    if block.height is None:
+        return None
+    if target_height < 0 or target_height > block.height:
+        return None
+    cur = block
+    # Bounded by block.height - target_height iterations; cap at a generous
+    # upper bound to avoid infinite loops if the db ever returns a cycle.
+    max_steps = block.height - target_height + 1
+    steps = 0
+    while cur is not None and cur.height is not None and cur.height > target_height:
+        if steps > max_steps:
+            return None
+        cur = db.get_block(cur.prev_blockhash)
+        steps += 1
+    if cur is None or cur.height != target_height:
+        return None
+    return cur
+
+
 class BitcoinNode:
     """Main Bitcoin full node"""
 
@@ -1150,22 +1199,36 @@ class BitcoinNode:
                         )
                         return
                     bfi = self.block_filter_index
+                    # FIX-75 / W121 #3: walk from stop_block via prev_blockhash
+                    # (Core CBlockIndex::GetAncestor) rather than
+                    # db.get_block_by_height which walks the active chain.
+                    # Compact filters are indexed by block hash regardless of
+                    # fork membership; an orphan stop_hash gets the filters
+                    # from its fork, not the active-chain block at the same
+                    # height.  See net_processing.cpp PrepareBlockFilterRequest
+                    # — no chain.Contains check.
                     for h in range(req.start_height, stop_height + 1):
-                        block_hash: bytes | None = None
+                        ancestor = _get_ancestor(self.db, stop_block, h)
+                        if ancestor is None:
+                            # Mirror Core: abort the entire response on any
+                            # ancestor-walk failure (LookupFilterRange returns
+                            # false → handler returns silently).
+                            return
+                        block_hash = ancestor.hash
                         filter_bytes: bytes | None = None
                         if bfi is not None:
-                            block_hash = bfi.get_block_hash_by_height(h)
-                            if block_hash is not None:
-                                filter_bytes = bfi.get_filter(block_hash)
-                        if block_hash is None:
-                            blk = self.db.get_block_by_height(h)
-                            if blk is None:
-                                continue
-                            block_hash = blk.hash
+                            filter_bytes = bfi.get_filter(block_hash)
                         if filter_bytes is None:
                             blk = self.db.get_block(block_hash)
                             if blk is None:
-                                continue
+                                # Core: LookupFilterRange returns false on
+                                # first miss; handler aborts whole response
+                                # (net_processing.cpp:3333-3337) — abort
+                                # cleanly, do not emit a partial cfilter
+                                # stream.  (FIX-75 incidental closure of
+                                # W121 BUG-3 from the stop-hash-ancestor
+                                # refactor.)
+                                return
                             filter_bytes = await asyncio.to_thread(
                                 build_basic_filter, blk, self.db,
                             )
@@ -1230,18 +1293,20 @@ class BitcoinNode:
                         return
                     bfi = self.block_filter_index
 
-                    # Resolve previous filter header.  start_height==0 →
-                    # all-zeros (genesis prev), else look up the header
-                    # at start_height-1 from the index when available.
+                    # FIX-75 / W121 #3: resolve the previous-filter-header
+                    # block via the ancestor walk anchored at stop_block, NOT
+                    # via db.get_block_by_height (which walks the active
+                    # chain).  When the peer's stop_hash is on a stale fork,
+                    # the prev block at (start_height - 1) on that fork can
+                    # differ from the active-chain block at the same height;
+                    # serving the active-chain prev_filter_header would
+                    # produce a signed-but-lying response.
                     prev_filter_header = b'\x00' * 32
                     if req.start_height > 0:
-                        prev_hash = None
-                        if bfi is not None:
-                            prev_hash = bfi.get_block_hash_by_height(req.start_height - 1)
-                        if prev_hash is None:
-                            prev_blk = self.db.get_block_by_height(req.start_height - 1)
-                            if prev_blk is not None:
-                                prev_hash = prev_blk.hash
+                        prev_ancestor = _get_ancestor(
+                            self.db, stop_block, req.start_height - 1,
+                        )
+                        prev_hash = prev_ancestor.hash if prev_ancestor is not None else None
                         if prev_hash is not None and bfi is not None:
                             ph = bfi.get_header(prev_hash)
                             if ph is not None:
@@ -1249,13 +1314,21 @@ class BitcoinNode:
 
                     filter_hashes: list[bytes] = []
                     for h in range(req.start_height, stop_height + 1):
+                        # FIX-75 / W121 #3: walk from stop_block via
+                        # prev_blockhash rather than active-chain
+                        # get_block_by_height.  See _get_ancestor docstring.
+                        ancestor = _get_ancestor(self.db, stop_block, h)
+                        if ancestor is None:
+                            # Core: LookupFilterHashesRange returns false on
+                            # any miss; handler returns silently
+                            # (net_processing.cpp:3371-3376).
+                            return
+                        block_hash = ancestor.hash
                         filt: bytes | None = None
                         if bfi is not None:
-                            block_hash = bfi.get_block_hash_by_height(h)
-                            if block_hash is not None:
-                                filt = bfi.get_filter(block_hash)
+                            filt = bfi.get_filter(block_hash)
                         if filt is None:
-                            blk = self.db.get_block_by_height(h)
+                            blk = self.db.get_block(block_hash)
                             if blk is None:
                                 return
                             filt = await asyncio.to_thread(
@@ -1305,16 +1378,22 @@ class BitcoinNode:
                     stop_height = stop_block.height
                     bfi = self.block_filter_index
 
+                    # FIX-75 / W121 #3: walk from stop_block via prev_blockhash
+                    # rather than bfi.get_block_hash_by_height (active-chain
+                    # mapping).  Checkpoints must come from the stop_hash's
+                    # fork, not the active chain — see net_processing.cpp
+                    # ProcessGetCFCheckPt which calls LookupFilterHeader on
+                    # stop_index->GetAncestor(...).
                     headers: list[bytes] = []
                     n_checkpoints = stop_height // CFCHECKPT_INTERVAL
                     for i in range(1, n_checkpoints + 1):
                         h = i * CFCHECKPT_INTERVAL
                         if bfi is None:
                             return
-                        block_hash = bfi.get_block_hash_by_height(h)
-                        if block_hash is None:
+                        ancestor = _get_ancestor(self.db, stop_block, h)
+                        if ancestor is None:
                             return
-                        ph = bfi.get_header(block_hash)
+                        ph = bfi.get_header(ancestor.hash)
                         if ph is None:
                             return
                         headers.append(ph)
