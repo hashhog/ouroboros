@@ -489,12 +489,19 @@ class TestG10SenderAntiSnoopOutputs:
     """payjoin.org §sender-validates: sender MUST verify the receiver did not
     add UTXOs that de-anonymize the proposal."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-66: ouroboros.payjoin now exports validate_payjoin_response "
+        "(plus the 5 sub-validators G10-G14); rpc_sendpayjoinrequest invokes "
+        "it on every receiver response before broadcasting.",
+    )
     def test_no_anti_snoop_validator(self):
-        for mod in (ob_psbt, ob_wallet):
-            names = [n.lower() for n in dir(mod)]
-            assert not any("anti_snoop" in n for n in names)
-            assert not any("uih" in n for n in names)
-            assert not any("validate_payjoin_response" in n for n in names)
+        # Sentinel kept on the audit modules; the new helpers live in
+        # ouroboros.payjoin which is now imported by rpc.py so the
+        # validate_payjoin_response token appears in rpc.py's source.
+        import ouroboros.payjoin as ob_payjoin
+        names = [n.lower() for n in dir(ob_payjoin)]
+        assert "validate_payjoin_response" not in names
 
 
 # ---------------------------------------------------------------------------
@@ -506,13 +513,15 @@ class TestG11ScriptSigUniformity:
     (e.g., legacy P2PKH when sender is P2WPKH) the tx leaks the receiver's
     address type.  Sender MUST reject."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-66: ouroboros.payjoin.validate_scriptsig_uniformity now "
+        "enforces UIH-1; classify_script_type covers P2PKH/P2SH/P2WPKH/P2WSH/P2TR.",
+    )
     def test_no_scriptsig_type_uniformity_check(self):
-        # Searching by phrase; type-uniformity logic does not exist for any
-        # purpose in the codebase.
-        for mod in (ob_psbt, ob_wallet):
-            src = inspect.getsource(mod).lower()
-            assert "scriptsig_type_uniform" not in src
-            assert "input_type_match" not in src
+        import ouroboros.payjoin as ob_payjoin
+        src = inspect.getsource(ob_payjoin)
+        assert "validate_scriptsig_uniformity" not in src
 
 
 # ---------------------------------------------------------------------------
@@ -523,11 +532,16 @@ class TestG12NoNewInputsWithoutOutputMod:
     """UIH-2: if receiver added inputs but did NOT alter outputs, the proposal
     leaks the receiver's deposit address.  Sender MUST reject."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-66: ouroboros.payjoin.validate_inputs_imply_outputs_changed "
+        "enforces UIH-2; sender RPC pipeline calls it via validate_payjoin_response.",
+    )
     def test_no_uih2_validator(self):
-        for mod in (ob_psbt, ob_wallet):
-            src = inspect.getsource(mod).lower()
-            assert "uih2" not in src
-            assert "uih_2" not in src
+        import ouroboros.payjoin as ob_payjoin
+        src = inspect.getsource(ob_payjoin).lower()
+        assert "uih-2" not in src
+        assert "uih_2" not in src
 
 
 # ---------------------------------------------------------------------------
@@ -538,12 +552,17 @@ class TestG13SenderMaxFeeEnforcement:
     """Sender sent maxadditionalfeecontribution; sender MUST reject proposals
     where the deducted amount exceeds that cap."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-66: ouroboros.payjoin.validate_max_fee_contribution enforces "
+        "the cap; rpc_sendpayjoinrequest forwards "
+        "maxadditionalfeecontribution + additionalfeeoutputindex into it.",
+    )
     def test_no_max_fee_contribution_enforcement(self):
-        for mod in (ob_psbt, ob_wallet):
-            src = inspect.getsource(mod).lower()
-            # The string itself, in any context.
-            assert "max_additional_fee_contribution" not in src
-            assert "max_fee_contribution" not in src
+        import ouroboros.payjoin as ob_payjoin
+        src = inspect.getsource(ob_payjoin).lower()
+        assert "max_fee_contribution" not in src
+        assert "validate_max_fee_contribution" not in src
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +573,12 @@ class TestG14SenderDisableOutputSubstitution:
     """If sender sets pjos=1, sender MUST verify the receiver did not modify
     outputs."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-66: ouroboros.payjoin.validate_disable_output_substitution "
+        "enforces pjos=1 on the sender's side; rpc_sendpayjoinrequest exposes "
+        "the disableoutputsubstitution parameter so callers can pin pjos=1.",
+    )
     def test_no_disable_output_substitution_enforcement(self):
         for mod in (ob_psbt, ob_wallet, ob_rpc):
             src = inspect.getsource(mod).lower()
@@ -569,14 +594,16 @@ class TestG15SenderMinFeeRate:
     """BIP-78 URI parameters: sender SHOULD include minfeerate so receiver
     doesn't fall below the sender's preferred fee rate."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-66: ouroboros.payjoin.build_sender_query propagates "
+        "minfeerate on the outbound POST; rpc_sendpayjoinrequest accepts "
+        "the parameter and forwards it through the httpx params= mapping.",
+    )
     def test_no_minfeerate_payjoin_call_site(self):
-        for mod in (ob_psbt, ob_wallet, ob_rpc):
-            src = inspect.getsource(mod).lower()
-            # We can't assert minfeerate is missing globally (it appears in
-            # generic fee-estimation contexts), but the PayJoin-tagged
-            # transmission of it definitely is.
-            assert "payjoin_minfeerate" not in src
-            assert "pj_minfeerate" not in src
+        import ouroboros.payjoin as ob_payjoin
+        src = inspect.getsource(ob_payjoin).lower()
+        assert "minfeerate" not in src
 
 
 # ---------------------------------------------------------------------------
@@ -717,11 +744,16 @@ class TestG22SenderFallback:
     """If receiver endpoint unreachable or returns `unavailable`, sender
     MUST broadcast Original PSBT as a normal tx."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-66: ouroboros.payjoin.broadcast_original_psbt_fallback "
+        "finalises and broadcasts the Original PSBT; rpc_sendpayjoinrequest "
+        "exercises the fallback on receiver `unavailable` and on network errors.",
+    )
     def test_no_payjoin_fallback_helper(self):
-        for mod in (ob_psbt, ob_wallet, ob_rpc):
-            names = [n.lower() for n in dir(mod)]
-            assert not any("payjoin_fallback" in n for n in names)
-            assert not any("broadcast_original_psbt" in n for n in names)
+        import ouroboros.payjoin as ob_payjoin
+        names = [n.lower() for n in dir(ob_payjoin)]
+        assert not any("broadcast_original_psbt" in n for n in names)
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +807,12 @@ class TestG25TorOnionReceiver:
 class TestG26GetPayjoinRequestRPC:
     """Helper sender-side RPC: emits an Original PSBT and an upload-URL."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-66: RPCServer.rpc_getpayjoinrequest now builds a BIP-78 "
+        "Original PSBT (signed-not-finalized, witness_utxo populated) for "
+        "the sender to POST to a PayJoin receiver endpoint.",
+    )
     def test_no_getpayjoinrequest_method(self):
         names = [n.lower() for n in dir(ob_rpc)]
         assert not any("getpayjoinrequest" in n for n in names)
@@ -790,6 +828,13 @@ class TestG26GetPayjoinRequestRPC:
 class TestG27SendPayjoinRequestRPC:
     """Terminal sender-side RPC: POST, validate response, sign, broadcast."""
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="FIX-66: RPCServer.rpc_sendpayjoinrequest now POSTs via httpx, "
+        "applies the 6 anti-snoop validators G10-G14, broadcasts on success, "
+        "and falls back to broadcasting the Original PSBT on receiver "
+        "`unavailable` or network error (G22 fallback).",
+    )
     def test_no_sendpayjoinrequest_method(self):
         names = [n.lower() for n in dir(ob_rpc)]
         assert not any("sendpayjoinrequest" in n for n in names)
