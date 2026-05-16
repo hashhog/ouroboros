@@ -2938,6 +2938,17 @@ class BlockSync:
             # Reference: ferrous-utils/sync/src/storage/db.rs:1061
             # (disconnect_block_at_height) and src/lib.rs:4122 (PyO3
             # binding).
+            #
+            # FIX-74 / W121 BUG-1: after each Rust disconnect we also call
+            # ``block_filter_index.remove(block_hash, height)`` so the
+            # BIP-157/158 index follows the active chain.  Without this hook
+            # the orphan-tip's (filter, header) entries stayed cached, the
+            # filter header chain still pointed at the orphan tip, and every
+            # subsequent ``add_block`` chained from the wrong prev_header —
+            # permanently diverging from any honest peer's filter chain.
+            # Mirrors Bitcoin Core's BlockFilterIndex::CustomRewind via the
+            # CValidationInterface BlockDisconnected callback
+            # (src/index/blockfilterindex.cpp + src/index/base.cpp).
             # ----------------------------------------------------------
             disconnect_height = common_ancestor_height + len(blocks_to_disconnect)
             for curr_hash, _curr_block, _ in reversed(blocks_to_disconnect):
@@ -2952,6 +2963,42 @@ class BlockSync:
                         f"(hash {curr_hash.hex()[:16]}...): {e}"
                     )
                     return False
+
+                # FIX-74 / W121 BUG-1: remove the disconnected block from
+                # the BIP-157/158 filter index.  Non-fatal: an index fault
+                # must never abort the reorg (matches the linear-connect
+                # hook's "log and continue" policy at line ~1370).
+                # Activates FIX-71's best_indexed_height rollback machinery
+                # (wired into PersistentBlockFilterIndex.remove() but never
+                # called pre-FIX-74 because the reorg loop didn't hook it).
+                if self.block_filter_index is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self.block_filter_index.remove,
+                            curr_hash,
+                            disconnect_height,
+                        )
+                    except TypeError:
+                        # In-memory BlockFilterIndex.remove() does not take
+                        # a height kwarg; it rolls back best_indexed_height
+                        # internally via the _height_to_hash mapping.
+                        try:
+                            await asyncio.to_thread(
+                                self.block_filter_index.remove, curr_hash
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"block_filter_index.remove failed at "
+                                f"height {disconnect_height} "
+                                f"(hash {curr_hash.hex()[:16]}...): {e}"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"block_filter_index.remove failed at "
+                            f"height {disconnect_height} "
+                            f"(hash {curr_hash.hex()[:16]}...): {e}"
+                        )
+
                 disconnect_height -= 1
 
             # Sanity: tip should now be at the common ancestor height.
@@ -2964,12 +3011,46 @@ class BlockSync:
                 )
                 return False
 
+            # FIX-74 / W121 BUG-1: rebase the filter header chain on the
+            # common ancestor's filter header so subsequent ``add_block``
+            # calls compute ``H_new = dSHA256(filter_hash_new || H_ancestor)``
+            # — matching the active chain.  When the index has no header for
+            # the common ancestor (e.g. it pre-dates the index, or genesis),
+            # fall back to all-zeros, which is the canonical Core "genesis
+            # prev" sentinel.  Non-fatal on lookup error: a stale tip_header
+            # at worst forks the filter chain (BUG-1 worst case) but never
+            # breaks consensus.
+            if self.block_filter_index is not None:
+                try:
+                    ancestor_header = self.block_filter_index.get_header(
+                        common_ancestor
+                    )
+                    if ancestor_header is None:
+                        ancestor_header = b"\x00" * 32
+                    await asyncio.to_thread(
+                        self.block_filter_index.set_tip_header, ancestor_header
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"block_filter_index.set_tip_header rollback "
+                        f"failed at common ancestor "
+                        f"{common_ancestor.hex()[:16]}...: {e}"
+                    )
+
             # ----------------------------------------------------------
             # Connect side: fork point + 1 → new tip.  Feed the raw
             # block bytes (witnesses included) into the Rust connect
             # path so that SPENT_CF undo records are written for the new
             # chain — required for a clean disconnect if we re-reorg
             # later.
+            #
+            # FIX-74 / W121 BUG-2: after each successful connect we also
+            # call ``block_filter_index.add_block(block, height)`` so the
+            # index re-builds filters along the new active chain.  This
+            # mirrors the linear connect hook at line ~1362 and Core's
+            # BlockFilterIndex::CustomAppend via the BlockConnected
+            # callback (src/index/blockfilterindex.cpp +
+            # src/index/base.cpp).
             # ----------------------------------------------------------
             for new_hash, new_block_obj, _new_height in blocks_to_connect:
                 connect_height = self.db.get_best_block()[1] + 1
@@ -3025,6 +3106,25 @@ class BlockSync:
                         f"at height {connect_height} during reorg: {e}"
                     )
                     return False
+
+                # FIX-74 / W121 BUG-2: re-index the newly connected block
+                # in the BIP-157/158 filter index.  Mirrors the off-thread
+                # hook from the linear connect path at line ~1362.  Errors
+                # are non-fatal so an index fault never aborts the reorg.
+                if self.block_filter_index is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self.block_filter_index.add_block,
+                            new_block_obj,
+                            connect_height,
+                            self.db,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"block_filter_index.add_block failed at "
+                            f"height {connect_height} during reorg "
+                            f"(hash {new_hash.hex()[:16]}...): {e}"
+                        )
 
                 # Remove transactions now in block from mempool.
                 if self.mempool:
