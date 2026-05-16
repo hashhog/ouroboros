@@ -27,6 +27,9 @@ Findings summary (P0/P1 bugs; full per-gate table below):
   BUG-3 (P1-CDIV): PaysForRBF uses MempoolEntry.fee (raw fee), not modified
          fee (fee + nFeeDelta from PrioritiseTransaction). prioritisetransaction
          is unimplemented — feeDelta is zero everywhere (mempool.py:3848).
+         FIXED in FIX-72: Mempool.prioritise_transaction / get_modified_fee
+         wired into PaysForRBF, _check_cluster_rbf, getmempoolentry,
+         getblocktemplate.
   BUG-4 (P1-CDIV): DiagramCheck _check_cluster_rbf uses `new_rate < old_rate`
          (allows equal rates) but Core requires `std::is_gt(new, old)` →
          strictly-greater. ouroboros accepts replacements Core would reject.
@@ -47,7 +50,7 @@ Comment-as-confession sites carried forward into W120:
     mempool we count total evictees as a conservative bound"
   - mempool.py:3296 "Simple check: the new fee rate must be >= old fee rate /
     This is a simplified version of the full diagram comparison"
-  - mempool.py:3848 "we don't track prioritise-tx deltas yet"
+  - mempool.py:3848 "we don't track prioritise-tx deltas yet" (FIX-72 — closed)
 
 All tests run offline (no live network, no RocksDB).
 """
@@ -599,24 +602,24 @@ class TestG14EntriesAndTxidsDisjoint(unittest.TestCase):
 # G15 — BUG-3 (P1-CDIV): modified-fee handling for prioritisetransaction
 # Core: ReplacementChecks uses CTxMemPoolEntry::GetModifiedFee()
 #   = nFee + nFeeDelta where nFeeDelta is prioritisetransaction's delta.
-# ouroboros: try_replace uses entry.fee (raw fee). prioritisetransaction
-#   is unimplemented — see mempool.py:3848 "we don't track prioritise-tx deltas".
-#   A user-prioritised victim looks cheap to the RBF gate and can be replaced
-#   for less than the operator intended; conversely a prioritised replacement
-#   appears too cheap.
-# Status: BUG-3 — MISSING (will land alongside prioritisetransaction).
+# Status: FIXED in FIX-72 — Mempool now exposes prioritise_transaction,
+#   get_modified_fee, get_prioritised_transactions, and clear_prioritisation;
+#   try_replace and _check_cluster_rbf consult mapDeltas via get_modified_fee.
+#   See src/ouroboros/tests/test_w120_fix72_priority.py for full coverage.
 # ===========================================================================
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG-3: PaysForRBF uses raw fee, not modified fee (fee + nFeeDelta). "
-    "prioritisetransaction is unimplemented (mempool.py:3848)."
-))
 class TestG15ModifiedFeesUsedInRBF(unittest.TestCase):
     def test_prioritise_delta_applied_in_rbf(self):
         from ouroboros.mempool import Mempool
-        # MempoolEntry must expose a modified-fee accessor; until then xfail.
+        # Modified-fee accessors + delta map must be present.
         self.assertTrue(hasattr(Mempool, "prioritise_transaction"),
                         "Need prioritisetransaction + modified-fee accounting")
+        self.assertTrue(hasattr(Mempool, "get_modified_fee"),
+                        "Need GetModifiedFee equivalent")
+        self.assertTrue(hasattr(Mempool, "clear_prioritisation"),
+                        "Need ClearPrioritisation equivalent")
+        self.assertTrue(hasattr(Mempool, "get_prioritised_transactions"),
+                        "Need GetPrioritisedTransactions equivalent")
 
 
 # ===========================================================================
