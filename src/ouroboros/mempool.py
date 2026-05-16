@@ -1634,6 +1634,15 @@ class Mempool:
         # Cluster mempool manager
         self._cluster_manager = ClusterManager(self.transactions)
 
+        # mapDeltas — per-tx fee-priority delta set by prioritisetransaction.
+        # txid -> nFeeDelta (satoshis, may be negative).  NOT persisted across
+        # restart (matches Core: txmempool.h:299 std::map<Txid, CAmount> in RAM).
+        # All fee comparisons that drive mining selection, RBF Rule 3/4 admission,
+        # and mempool min-fee use get_modified_fee(entry) = entry.fee + delta.
+        # Reference: bitcoin-core/src/txmempool.{h,cpp} PrioritiseTransaction,
+        #            mapDeltas, ApplyDelta, GetModifiedFee.
+        self.map_deltas: dict[bytes, int] = {}
+
     def __len__(self) -> int:
         """Return the number of transactions in the mempool."""
         return len(self.transactions)
@@ -1723,6 +1732,141 @@ class Mempool:
             fee_rate_copy = list(self.by_fee_rate)
             txs_copy = dict(self.transactions)
         return fee_rate_copy, txs_copy
+
+    # ── PrioritiseTransaction / mapDeltas / modified-fee accounting ─────────
+    # Core:
+    #   bitcoin-core/src/txmempool.{h,cpp} CTxMemPool::PrioritiseTransaction,
+    #   ApplyDelta, ClearPrioritisation, GetPrioritisedTransactions, mapDeltas.
+    #   bitcoin-core/src/kernel/mempool_entry.h GetModifiedFee = m_modified_fee.
+    # Delta is in-memory only (not persisted across restart) and is consulted
+    # everywhere Core uses GetModifiedFee():
+    #   - RBF Rule 3/4 PaysForRBF gates (policy/rbf.cpp lines 107-122),
+    #   - admission rolling-min-fee + min-relay gates,
+    #   - mining selection (by_fee_rate sort effectively uses raw fee_rate;
+    #     get_modified_fee_rate() returns the priority-adjusted rate),
+    #   - getmempoolentry / getrawmempool RPC `fees.modified` field,
+    #   - getprioritisedtransactions RPC.
+    #
+    # Saturating add semantics match Core (txmempool.cpp:635 SaturatingAdd).
+    # A delta of zero removes the entry from map_deltas (Core also erases the
+    # entry when the resulting accumulated delta == 0; txmempool.cpp:644-646).
+
+    _DELTA_MAX = (1 << 63) - 1
+    _DELTA_MIN = -(1 << 63)
+
+    @staticmethod
+    def _saturating_add(a: int, b: int) -> int:
+        """Saturating int64 add (mirrors Core util::SaturatingAdd)."""
+        s = a + b
+        if s > Mempool._DELTA_MAX:
+            return Mempool._DELTA_MAX
+        if s < Mempool._DELTA_MIN:
+            return Mempool._DELTA_MIN
+        return s
+
+    def prioritise_transaction(self, txid: bytes, delta_sats: int) -> None:
+        """Apply a fee-priority delta for *txid* (Core: PrioritiseTransaction).
+
+        Accumulates onto any existing delta (saturating int64 add).  Calling
+        with ``delta_sats == 0`` is a no-op unless the resulting accumulated
+        delta becomes zero, in which case the entry is removed (matches Core
+        txmempool.cpp:644-653).
+
+        ``txid`` may name a transaction not currently in the mempool: Core
+        stores the delta anyway so that if the tx later arrives it will be
+        prioritised.  We follow the same semantics.
+
+        Reference: bitcoin-core/src/txmempool.cpp:630-655.
+        """
+        with self._lock:
+            current = self.map_deltas.get(txid, 0)
+            new_delta = self._saturating_add(current, int(delta_sats))
+            if new_delta == 0:
+                self.map_deltas.pop(txid, None)
+                logger.info(
+                    "PrioritiseTransaction: %s (%sin mempool) delta cleared",
+                    txid[::-1].hex(),
+                    "" if txid in self.transactions else "not ",
+                )
+            else:
+                self.map_deltas[txid] = new_delta
+                logger.info(
+                    "PrioritiseTransaction: %s (%sin mempool) fee += %d, new delta=%d",
+                    txid[::-1].hex(),
+                    "" if txid in self.transactions else "not ",
+                    int(delta_sats),
+                    new_delta,
+                )
+
+    def get_modified_fee(self, txid_or_entry) -> int:
+        """Return entry.fee + map_deltas[txid] (Core CTxMemPoolEntry::GetModifiedFee).
+
+        Accepts either a txid (bytes) or a MempoolEntry.  Used by RBF Rule 3/4,
+        mining selection, and getmempoolentry RPC.
+        """
+        if isinstance(txid_or_entry, (bytes, bytearray, memoryview)):
+            txid = bytes(txid_or_entry)
+            entry = self.transactions.get(txid)
+            if entry is None:
+                return 0
+        else:
+            entry = txid_or_entry
+            txid = entry.tx.get_txid()
+        return int(entry.fee) + int(self.map_deltas.get(txid, 0))
+
+    def get_modified_fee_rate(self, txid_or_entry) -> float:
+        """Return modified fee rate in sat/vB (modified_fee / vsize).
+
+        Used by mining selection to honour prioritisetransaction without
+        re-sorting the entire by_fee_rate list on every delta change.
+        Reference: Core CompareTxIterByModifiedFeeRate / DescendantScoreCompare.
+        """
+        if isinstance(txid_or_entry, (bytes, bytearray, memoryview)):
+            txid = bytes(txid_or_entry)
+            entry = self.transactions.get(txid)
+            if entry is None:
+                return 0.0
+        else:
+            entry = txid_or_entry
+            txid = entry.tx.get_txid()
+        modified = int(entry.fee) + int(self.map_deltas.get(txid, 0))
+        size = entry.size if entry.size > 0 else 1
+        return modified / size
+
+    def clear_prioritisation(self, txid: bytes) -> None:
+        """Drop *txid*'s entry from map_deltas (Core ClearPrioritisation).
+
+        Called when a tx confirms in a block (removeForBlock clears delta —
+        txmempool.cpp:420) and when a tx is removed for being conflicted with
+        a new block-included tx (removeConflicts — txmempool.cpp:398).  Other
+        removal reasons (REPLACED, SIZELIMIT, EXPIRY, REORG) preserve the
+        delta so the tx is re-prioritised if it re-enters.
+        """
+        with self._lock:
+            self.map_deltas.pop(txid, None)
+
+    def get_prioritised_transactions(self) -> list[dict]:
+        """Return per-tx delta info for the getprioritisedtransactions RPC.
+
+        Mirrors Core CTxMemPool::GetPrioritisedTransactions (txmempool.cpp:673).
+        Each entry: {txid: bytes, fee_delta: int, in_mempool: bool,
+                     modified_fee: int|None}.
+        """
+        with self._lock:
+            result = []
+            for txid, delta in self.map_deltas.items():
+                entry = self.transactions.get(txid)
+                in_mempool = entry is not None
+                modified_fee = (
+                    int(entry.fee) + int(delta) if in_mempool else None
+                )
+                result.append({
+                    "txid": txid,
+                    "fee_delta": int(delta),
+                    "in_mempool": in_mempool,
+                    "modified_fee": modified_fee,
+                })
+            return result
 
     def add_transaction(self, tx: Transaction, height: int) -> tuple[bool, str]:
         """Validate and add *tx* to the mempool at *height*; returns ``(ok, error_message)``."""
@@ -3031,6 +3175,10 @@ class Mempool:
                 if txid in self.transactions:
                     self.remove_transaction(txid, _skip_recount=True)
                     removed_ids.append(txid)
+                # ClearPrioritisation on block confirm (matches Core
+                # removeForBlock — txmempool.cpp:420). Delta is dropped for
+                # every block-included tx whether or not it was in mempool.
+                self.map_deltas.pop(txid, None)
 
         # Single-pass recount for all remaining affected transactions
         if removed_ids:
@@ -3272,7 +3420,9 @@ class Mempool:
         # This is approximate: we simulate adding the new tx after eviction
         new_size = len(new_tx.serialize())
 
-        # Calculate total old fee/size from affected clusters
+        # Calculate total old MODIFIED fee/size from affected clusters
+        # (FIX-72) — diagram comparisons must honour prioritisetransaction so
+        # that a user-prioritised victim looks expensive to the RBF gate.
         old_total_fee = 0
         old_total_size = 0
         for cid in affected_cluster_ids:
@@ -3281,11 +3431,16 @@ class Mempool:
                 for txid in cluster.txids:
                     entry = self.transactions.get(txid)
                     if entry:
-                        old_total_fee += entry.fee
+                        old_total_fee += self.get_modified_fee(entry)
                         old_total_size += entry.size
 
-        # Calculate new total after eviction + addition
-        evicted_fee = sum(self.transactions[t].fee for t in to_evict if t in self.transactions)
+        # Calculate new total after eviction + addition (use MODIFIED fee on
+        # the evicted side; new_fee already includes the replacement's delta).
+        evicted_fee = sum(
+            self.get_modified_fee(t)
+            for t in to_evict
+            if t in self.transactions
+        )
         evicted_size = sum(self.transactions[t].size for t in to_evict if t in self.transactions)
 
         new_total_fee = old_total_fee - evicted_fee + new_fee
@@ -3551,16 +3706,28 @@ class Mempool:
         total_output = sum(out.value for out in new_tx.outputs)
         new_fee = total_input - total_output
 
-        # Sum of fees from all evicted transactions
-        old_fees = sum(self.transactions[t].fee for t in to_evict)
+        # Modified-fee accounting (FIX-72): Core ReplacementChecks uses
+        # CTxMemPoolEntry::GetModifiedFee() = nFee + nFeeDelta everywhere
+        # (rbf.cpp:74, 107-111, 117-122).  Apply pending prioritisetransaction
+        # delta to the replacement and to each evicted entry so that operator
+        # priority is honoured on both sides of the comparison.
+        # Reference: bitcoin-core/src/policy/rbf.cpp PaysForRBF;
+        #            bitcoin-core/src/kernel/mempool_entry.h GetModifiedFee.
+        new_txid_for_delta = new_tx.get_txid()
+        new_fee_modified = new_fee + int(self.map_deltas.get(new_txid_for_delta, 0))
+        # Sum of MODIFIED fees from all evicted transactions
+        old_fees = sum(
+            self.get_modified_fee(t) for t in to_evict
+        )
 
         # Rule #3 (PaysForRBF, part 1): The replacement fees must be greater than
         # or equal to fees of the transactions it replaces.
         # Core: reject if replacement_fees < original_fees (i.e. allow equal fees).
         # Reference: bitcoin/src/policy/rbf.cpp PaysForRBF() lines 107-111
-        if new_fee < old_fees:
+        # Uses MODIFIED fees on both sides (Core: GetModifiedFee()).
+        if new_fee_modified < old_fees:
             return False, (
-                f"Replacement fee {new_fee} sat is less than "
+                f"Replacement fee {new_fee_modified} sat is less than "
                 f"evicted fees {old_fees} sat"
             )
 
@@ -3569,8 +3736,9 @@ class Mempool:
         # additional_fees = replacement_fees - original_fees
         # additional_fees >= incrementalrelayfee * replacement_vsize / 1000
         # Reference: bitcoin/src/policy/rbf.cpp PaysForRBF() lines 117-122
+        # Uses MODIFIED fees on both sides.
         incremental_fee_needed = (new_size * self.INCREMENTAL_RELAY_FEE) // 1000
-        additional_fee = new_fee - old_fees
+        additional_fee = new_fee_modified - old_fees
         if additional_fee < incremental_fee_needed:
             return False, (
                 f"Replacement does not cover incremental relay fee: "
@@ -3580,7 +3748,10 @@ class Mempool:
         # Rule 6 (cluster mempool): new linearization must be strictly better
         # The new tx must improve the feerate diagram of the affected cluster(s).
         # Reference: Bitcoin Core txgraph.h - GetMainStagingDiagrams()
-        cluster_ok, cluster_err = self._check_cluster_rbf(new_tx, to_evict, new_fee)
+        # Pass the MODIFIED fee so diagram comparisons honour prioritisation.
+        cluster_ok, cluster_err = self._check_cluster_rbf(
+            new_tx, to_evict, new_fee_modified
+        )
         if not cluster_ok:
             return False, cluster_err
 
@@ -3837,16 +4008,23 @@ class Mempool:
 
         # Build the obfuscated payload first; the version + xor-key header
         # is written in plaintext after the payload is XORed.
+        #
+        # Note (FIX-72, W120 BUG-3): mapDeltas is held in RAM only and is
+        # intentionally NOT serialised to disk; deltas are lost on restart.
+        # This is the documented project semantics — see CLAUDE.md / W120
+        # audit memory.  Core does persist mapDeltas (node/mempool_persist.cpp:
+        # 199, 203); a future "delta-persistence" wave would extend this dump.
+        # We continue to emit nFeeDelta=0 in the per-tx body so the file
+        # remains Core-readable as a v2 mempool.dat without prioritisation.
         body = bytearray()
         body.extend(struct.pack("<Q", count))  # uint64 mempool_transactions_to_write
         for entry in self.transactions.values():
             raw = entry.tx.serialize_with_witness()
             body.extend(raw)
             body.extend(struct.pack("<q", int(entry.time_added)))  # int64 nTime
-            # nFeeDelta: prioritise-tx delta in Core; we don't track per-tx
-            # priority, so write zero (matches "no PrioritiseTransaction").
+            # nFeeDelta: written as zero — see comment above.
             body.extend(struct.pack("<q", 0))  # int64 nFeeDelta
-        # mapDeltas — empty (we don't track prioritise-tx deltas yet)
+        # mapDeltas — written empty; see in-memory-only note above.
         self._write_compact_size(body, 0)
         # unbroadcast_txids — empty (we don't track unbroadcast set yet)
         self._write_compact_size(body, 0)
