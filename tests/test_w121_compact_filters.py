@@ -442,48 +442,214 @@ def test_g28_getcfheaders_no_zero_fallback_for_prev_header():
 
 # ===========================================================================
 # G29 — NODE_COMPACT_FILTERS must not advertise until index synced (BUG-5)
+# FIX-71 — landed 2026-05-16.  Audit flips xfail → PASS.
 # ===========================================================================
 
-@pytest.mark.xfail(strict=True, reason="BUG-5: NODE_COMPACT_FILTERS advertised on index OPEN, not on index SYNCED")
 def test_g29_index_synced_gate_before_node_compact_filters_advertised():
     """
+    FIX-71 / W121 BUG-5 (closed 2026-05-16).
+
     Bitcoin Core's BlockFilterIndex inherits BaseIndex which only signals
     "ready" once the index thread has caught up to ActiveChain().Tip()
-    (see index/base.cpp ThreadSync + BaseIndex::Start, and the
-    init.cpp StartBlockFilterIndexes path that registers the index
-    asynchronously). NODE_COMPACT_FILTERS is set in init.cpp
-    `nLocalServices` immediately, but the SERVICE BIT is what Core
-    advertises in version; in practice the index thread blocks any
-    inbound getcfilters response while it's still backfilling because
-    LookupFilterRange returns false for un-indexed heights.
+    (see ``src/index/base.cpp`` ThreadSync + ``BaseIndex::IsSynced`` and
+    the ``src/init.cpp`` ``StartBlockFilterIndexes`` path that registers
+    the index asynchronously).  Pre-FIX-71 ouroboros set
+    ``node_compact_filters=True`` the moment ``PersistentBlockFilterIndex``
+    opened, regardless of whether the index had caught up.  Mid-IBD peers
+    querying that node received zero-prev-header cfheaders (BUG-4
+    collateral) — a light client cross-checking against another peer
+    saw a fork.
 
-    Ouroboros lets the handler fall back to on-fly construction for
-    un-indexed heights AND uses zero-fallback for prev_filter_header
-    (BUG-4). Combined, a fresh node that opens an empty index serves
-    *invalid* (zero-anchored) filter headers to light clients
-    immediately at handshake.
-
-    The fix is a sync gate: track block_filter_index.best_indexed_height
-    and only set node_compact_filters=True once it ≥ active chain tip,
-    OR only advertise the service bit after the first add_block call
-    succeeds at the current tip.
+    The fix exposes ``is_synced(chain_tip_height)`` +
+    ``best_indexed_height`` on both ``BlockFilterIndex`` (in-memory) and
+    ``PersistentBlockFilterIndex``.  ``Peer._should_advertise_node_compact_filters``
+    re-evaluates the gate at every version handshake (the
+    ``node_compact_filters`` parameter now accepts a callable; the
+    production wiring in ``node.py`` passes a closure that consults
+    ``block_filter_index.is_synced(active_chain_tip_height())``).
     """
-    # Probe the PersistentBlockFilterIndex API for a sync-state property.
-    has_sync_property = any(
-        hasattr(PersistentBlockFilterIndex, attr)
-        for attr in (
-            "is_synced",
-            "best_indexed_height",
-            "synced",
-            "is_caught_up",
-        )
+    # The two API surfaces the sync gate depends on must exist.
+    assert hasattr(PersistentBlockFilterIndex, "is_synced"), (
+        "PersistentBlockFilterIndex.is_synced missing — sync gate cannot "
+        "evaluate at handshake time."
     )
-    assert has_sync_property, (
-        "PersistentBlockFilterIndex exposes no is_synced / best_indexed_height "
-        "property; node.py cannot gate NODE_COMPACT_FILTERS advertisement on "
-        "index-caught-up. A fresh node serves zero-prev-header cfheaders "
-        "(see BUG-4) the moment it advertises NODE_COMPACT_FILTERS."
+    assert hasattr(PersistentBlockFilterIndex, "best_indexed_height"), (
+        "PersistentBlockFilterIndex.best_indexed_height missing — sync "
+        "gate has no monotonic height to compare against the chain tip."
     )
+    # Same on the in-memory fallback (used in tests and as the disabled
+    # fallback inside PersistentBlockFilterIndex).
+    assert hasattr(BlockFilterIndex, "is_synced")
+    assert hasattr(BlockFilterIndex, "best_indexed_height")
+
+
+# ===========================================================================
+# G29 positive tests (FIX-71)
+# ===========================================================================
+# These directly exercise the three states the sync gate must
+# distinguish: pre-sync, synced, and reorg-rolled-back.
+# ===========================================================================
+
+def _fake_block(block_hash: bytes, height: int):
+    """Build a minimal stand-in for a Block compatible with index.add_block."""
+    class _FakeBlock:
+        def __init__(self, h: bytes, ht: int):
+            self.hash = h
+            self.height = ht
+            self.transactions = []
+    return _FakeBlock(block_hash, height)
+
+
+def test_g29_fix71_test_a_pre_sync_bit_not_advertised():
+    """A fresh index (best_indexed_height=None) is NOT synced.
+
+    A node whose handshake gate consults ``is_synced(tip)`` must
+    therefore WITHHOLD NODE_COMPACT_FILTERS until at least one block has
+    been indexed.
+    """
+    idx = BlockFilterIndex()
+    # Mimic node._compact_filters_advertised when the chain has blocks
+    # but the index hasn't caught up (the worst case: peers expect us to
+    # serve compact filters because the bit was set, but we can't).
+    assert idx.best_indexed_height is None
+    assert idx.is_synced(chain_tip_height=100) is False
+    assert idx.is_synced(chain_tip_height=0) is False
+    # Negative / None tip => not synced (chain not initialised yet).
+    assert idx.is_synced(chain_tip_height=None) is False
+    assert idx.is_synced(chain_tip_height=-1) is False
+
+
+def test_g29_fix71_test_b_synced_bit_is_advertised():
+    """When best_indexed_height ≥ chain tip, the gate flips on.
+
+    Pre-FIX-71 the gate was a static bool captured at peer construction;
+    even with the index opened, the bit was already advertised before any
+    block was indexed.  Post-FIX-71 the gate only flips on once the
+    index actually catches up to the chain tip.
+    """
+    idx = BlockFilterIndex()
+
+    # Index 5 blocks at heights 0..4.
+    for h in range(5):
+        idx.add_block(_fake_block(bytes([h + 1]) * 32, h))
+
+    assert idx.best_indexed_height == 4
+    # Synced when the chain tip is at or below best_indexed_height.
+    assert idx.is_synced(chain_tip_height=4) is True
+    assert idx.is_synced(chain_tip_height=3) is True
+    # NOT synced when the chain tip moves ahead of the index.
+    assert idx.is_synced(chain_tip_height=5) is False
+    assert idx.is_synced(chain_tip_height=100) is False
+
+
+def test_g29_fix71_test_c_reorg_invalidates_sync_bit_temporarily_withdrawn():
+    """A reorg disconnect must roll back best_indexed_height so the bit
+    is temporarily UN-advertised.
+
+    Sequence:
+      1. Index heights 0..4 → synced for chain_tip=4.
+      2. Reorg disconnects height 4 (remove + tip_header rollback).
+      3. best_indexed_height now == 3 → NOT synced for chain_tip=4
+         (peers asking for filter @ 4 would get nothing; the bit must
+         be withdrawn until the new chain re-connects past 4).
+      4. Re-add a NEW block at height 4 on the new chain → synced again.
+    """
+    idx = BlockFilterIndex()
+    hashes = [bytes([h + 1]) * 32 for h in range(5)]
+    for h in range(5):
+        idx.add_block(_fake_block(hashes[h], h))
+    assert idx.best_indexed_height == 4
+    assert idx.is_synced(chain_tip_height=4) is True
+
+    # Reorg disconnect of the tip (height 4).
+    idx.remove(hashes[4])
+    assert idx.best_indexed_height == 3
+    # While the new chain is still being connected, the bit MUST NOT
+    # be advertised: a light client querying us at height 4 would get
+    # nothing (or worse, the orphan-chain entry if we hadn't removed it).
+    assert idx.is_synced(chain_tip_height=4) is False
+
+    # Re-connect the new chain at height 4 with a different hash.
+    new_hash_4 = b"\xff" * 32
+    idx.add_block(_fake_block(new_hash_4, 4))
+    assert idx.best_indexed_height == 4
+    assert idx.is_synced(chain_tip_height=4) is True
+
+
+def test_g29_fix71_test_d_persistent_index_sync_gate_survives_restart(tmp_path):
+    """best_indexed_height persists across PersistentBlockFilterIndex restarts.
+
+    A node that finishes IBD, indexes the full chain, and restarts must
+    immediately advertise NODE_COMPACT_FILTERS — without this
+    persistence the first run after restart would re-traverse the full
+    "I haven't indexed anything yet" → "catching up" → "synced" cycle,
+    which would temporarily withdraw the bit even though the on-disk
+    data is fully up-to-date.
+    """
+    data_dir = str(tmp_path / "pbi")
+
+    idx1 = PersistentBlockFilterIndex(data_dir=data_dir, enabled=True)
+    # Fresh datadir → no observed blocks.
+    assert idx1.best_indexed_height is None
+    assert idx1.is_synced(chain_tip_height=0) is False
+
+    # Index blocks 0..2.
+    hashes = [bytes([h + 1]) * 32 for h in range(3)]
+    for h in range(3):
+        idx1.add_block(_fake_block(hashes[h], h))
+    assert idx1.best_indexed_height == 2
+    assert idx1.is_synced(chain_tip_height=2) is True
+
+    # Reopen — best_indexed_height must survive.
+    idx2 = PersistentBlockFilterIndex(data_dir=data_dir, enabled=True)
+    assert idx2.best_indexed_height == 2, (
+        "Sync-gate height did not survive PersistentBlockFilterIndex "
+        "restart; the node would temporarily withdraw "
+        "NODE_COMPACT_FILTERS after every restart even with a fully "
+        "indexed on-disk store."
+    )
+    assert idx2.is_synced(chain_tip_height=2) is True
+    assert idx2.is_synced(chain_tip_height=3) is False  # chain advanced
+
+
+def test_g29_fix71_test_e_peer_handshake_predicate_is_callable():
+    """Peer accepts a callable as node_compact_filters; predicate is
+    re-evaluated at handshake time (FIX-71 / W121 BUG-5).
+
+    Regression guard against the captured-bool form that caused the
+    original bug.  We don't actually run a handshake here — that needs
+    a live socket — but we verify the predicate plumbing by toggling a
+    closure-captured flag and confirming
+    Peer._should_advertise_node_compact_filters reflects it.
+    """
+    from ouroboros.peer import Peer
+
+    state = {"synced": False}
+
+    def gate() -> bool:
+        return state["synced"]
+
+    p = Peer(
+        host="127.0.0.1",
+        port=18333,
+        network="mainnet",
+        node_compact_filters=gate,
+    )
+    # Pre-sync.
+    assert p._should_advertise_node_compact_filters() is False
+    # Flip the gate — the next handshake (or any re-eval) must see True.
+    state["synced"] = True
+    assert p._should_advertise_node_compact_filters() is True
+    # A callable that raises must NOT crash the handshake.
+    def boom() -> bool:
+        raise RuntimeError("intentional test failure")
+    p.node_compact_filters = boom
+    assert p._should_advertise_node_compact_filters() is False
+    # And the legacy bool path still works.
+    p.node_compact_filters = True
+    assert p._should_advertise_node_compact_filters() is True
+    p.node_compact_filters = False
+    assert p._should_advertise_node_compact_filters() is False
 
 
 # ===========================================================================

@@ -291,7 +291,8 @@ class BitcoinNode:
                     )
                     logger.info(
                         "BIP 157/158 block filter index: enabled "
-                        "(NODE_COMPACT_FILTERS will be advertised)"
+                        "(NODE_COMPACT_FILTERS advertisement is gated on "
+                        "index-synced-to-tip; see FIX-71 / W121 BUG-5)"
                     )
                 except Exception as e:
                     logger.warning(
@@ -304,6 +305,17 @@ class BitcoinNode:
                 logger.info(
                     "BIP 157/158 block filter index: disabled (Core parity default)"
                 )
+            # FIX-71 / W121 BUG-5: pass a callable that re-evaluates the
+            # NODE_COMPACT_FILTERS gate on every handshake.  The
+            # predicate is two-part, matching Bitcoin Core's
+            # ``init.cpp`` + ``BaseIndex::IsSynced`` semantics:
+            #   1. ``-blockfilterindex`` enabled, AND
+            #   2. ``BlockFilterIndex.is_synced(active_chain_tip_height)``.
+            # When the index is mid-IBD (or rewinding through a reorg)
+            # the callable returns False so the bit stays UN-advertised
+            # — peers that try to query compact filters from us in that
+            # window would otherwise receive zero-anchored cfheaders
+            # (BUG-4 collateral).
             self.peer_manager = PeerManager(
                 self.network,
                 max_peers=max_peers,
@@ -311,7 +323,7 @@ class BitcoinNode:
                 transport_version=p2p_transport,
                 listen=bool(listen_enabled),
                 peer_bloom_filters=peer_bloom_filters,
-                node_compact_filters=block_filter_index_enabled,
+                node_compact_filters=self._compact_filters_advertised,
             )
             # BIP 152: Provide mempool and database for compact block relay
             self.peer_manager.set_mempool(self.mempool)
@@ -1373,6 +1385,55 @@ class BitcoinNode:
     def is_synced(self) -> bool:
         """Return True when the node has completed initial block synchronisation."""
         return self.synced
+
+    def _active_chain_tip_height(self) -> int | None:
+        """Return the active chain tip height, or ``None`` if unknown.
+
+        Used by the NODE_COMPACT_FILTERS sync gate (FIX-71).  We prefer
+        the database's best-block height because it reflects the
+        connected chain; the sync_manager's notion of "synced" is a
+        higher-level "caught up to network tip" check that we don't want
+        to entangle here.
+        """
+        try:
+            if self.db is None:
+                return None
+            _, height = self.db.get_best_block()
+            if height is None:
+                return None
+            return int(height)
+        except Exception:
+            return None
+
+    def _compact_filters_advertised(self) -> bool:
+        """NODE_COMPACT_FILTERS service-bit predicate (FIX-71 / W121 BUG-5).
+
+        Mirrors Bitcoin Core ``init.cpp`` (``-blockfilterindex`` flag) +
+        ``BaseIndex::IsSynced`` (``m_synced`` reaches True only when the
+        index thread has caught up to the active chain tip).
+
+        Returns False when:
+          - ``-blockfilterindex`` is disabled (no index in memory),
+          - the index has never observed a block (fresh datadir),
+          - the index's best_indexed_height < active chain tip
+            (mid-IBD or rewinding through a reorg).
+
+        Invoked by ``Peer._should_advertise_node_compact_filters`` on
+        every version handshake (outbound dial + inbound accept), so a
+        peer that was constructed before sync correctly observes the
+        flipped state once the index catches up.
+        """
+        bfi = self.block_filter_index
+        if bfi is None:
+            return False
+        tip_height = self._active_chain_tip_height()
+        if tip_height is None:
+            return False
+        try:
+            return bool(bfi.is_synced(tip_height))
+        except Exception:
+            # Defensive: never raise out of a handshake-time predicate.
+            return False
 
     def _bits_to_difficulty(self, bits: int) -> float | int:
         """Convert compact target (bits) to difficulty.

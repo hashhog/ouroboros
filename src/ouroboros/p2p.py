@@ -434,7 +434,7 @@ class PeerManager:
         torcontrol: str | None = None,
         torpassword: str | None = None,
         peer_bloom_filters: bool = False,
-        node_compact_filters: bool = False,
+        node_compact_filters: "bool | Callable[[], bool]" = False,
         node_network_limited: bool = False,
     ):
         """Initialize peer manager."""
@@ -453,10 +453,14 @@ class PeerManager:
         # version handshakes (inbound + outbound) and BIP-35 MEMPOOL gate
         # see a consistent value.
         self.peer_bloom_filters = peer_bloom_filters
-        # BIP 157 NODE_COMPACT_FILTERS advertisement (Core parity:
-        # -blockfilterindex, default false).  Forwarded to every Peer so
-        # the version handshakes advertise the bit only when the index is
-        # actually enabled at the node level.
+        # BIP 157 NODE_COMPACT_FILTERS advertisement gate (Core parity:
+        # ``-blockfilterindex AND BaseIndex::IsSynced``).  FIX-71 / W121
+        # BUG-5: accept either a static bool (legacy callers) OR a
+        # callable ``() -> bool`` re-evaluated on every handshake.  The
+        # node.py constructor passes a closure that consults
+        # ``block_filter_index.is_synced(active_chain_tip_height())``
+        # so a mid-IBD peer correctly observes the flipped state once
+        # the index catches up.
         self.node_compact_filters = node_compact_filters
         # BIP-159 NODE_NETWORK_LIMITED advertisement (Core parity:
         # `IsPruneMode()` gate in init.cpp).  Set when prune mode is on
