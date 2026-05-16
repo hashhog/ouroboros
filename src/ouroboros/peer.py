@@ -294,7 +294,7 @@ class Peer:
         proxy: str | None = None,
         ban_manager: "BanManager | None" = None,
         peer_bloom_filters: bool = False,
-        node_compact_filters: bool = False,
+        node_compact_filters: "bool | Callable[[], bool]" = False,
         node_network_limited: bool = False,
     ):
         """Initialize peer connection."""
@@ -312,11 +312,17 @@ class Peer:
         # MEMPOOL requests; when False (the Core-parity default) we do
         # neither.
         self.peer_bloom_filters = peer_bloom_filters
-        # BIP 157 NODE_COMPACT_FILTERS advertisement toggle.  Mirrors
-        # Bitcoin Core's -blockfilterindex option (default false).  When
-        # True we OR NODE_COMPACT_FILTERS (1<<6) into the advertised
-        # services in our `version` message; the actual P2P serving is
-        # gated on the same flag in node._register_handlers.
+        # BIP 157 NODE_COMPACT_FILTERS advertisement gate.  Mirrors
+        # Bitcoin Core's two-part predicate from ``init.cpp``: the
+        # service bit is set ONLY when ``-blockfilterindex`` is enabled
+        # AND the BlockFilterIndex thread has caught up to the active
+        # chain tip (``BaseIndex::IsSynced``).  Before FIX-71 this was a
+        # static bool captured at peer construction; that caused
+        # ouroboros to advertise the bit pre-sync (W121 BUG-5).  We now
+        # accept either a static bool (legacy callers / direct tests)
+        # OR a callable ``() -> bool`` which is re-evaluated on every
+        # version handshake (the actual sender path consults
+        # :meth:`_should_advertise_node_compact_filters`).
         self.node_compact_filters = node_compact_filters
         # BIP-159 NODE_NETWORK_LIMITED advertisement toggle.  Set when
         # prune mode is on (`prune > 0` in node config).  When True we
@@ -442,6 +448,41 @@ class Peer:
         # Set once per peer when VERSION arrives; stays constant over the connection.
         # Matches Bitcoin Core CNode::nTimeOffset semantics (seconds).
         self.time_offset: int = 0
+
+    def _should_advertise_node_compact_filters(self) -> bool:
+        """Re-evaluate NODE_COMPACT_FILTERS advertisement (FIX-71 / W121 BUG-5).
+
+        Bitcoin Core gates the bit on ``-blockfilterindex`` AND
+        ``BaseIndex::IsSynced`` together (``init.cpp`` + ``base.cpp``).
+        Mid-IBD nodes that advertise the bit pre-sync return invalid
+        cfheaders (zero-anchored prev_filter_header, missing heights)
+        and are effectively lying peers from a light-client's POV.
+
+        We accept either a static bool (legacy callers, tests that
+        explicitly want a fixed-on advertisement) OR a callable
+        ``() -> bool`` (the production path, where the node passes a
+        closure that consults ``block_filter_index.is_synced(tip)``).
+        The callable is invoked **at handshake time**, not at peer
+        construction, so a peer that was constructed mid-IBD will
+        correctly observe the flipped state once the index catches up.
+
+        If the callable raises we fall back to False (don't advertise) —
+        that's the safer side of the failure mode.
+        """
+        gate = self.node_compact_filters
+        if callable(gate):
+            try:
+                return bool(gate())
+            except Exception as exc:
+                # Best-effort: never let a buggy closure block handshake.
+                # Log at debug because this can be very noisy under tests.
+                logger.debug(
+                    "node_compact_filters callable raised %r; "
+                    "withholding NODE_COMPACT_FILTERS bit",
+                    exc,
+                )
+                return False
+        return bool(gate)
 
     async def connect(self, start_height: int = 0, retry: bool = True) -> bool:
         """Connect to the peer, complete the version handshake, and start background tasks."""
@@ -709,7 +750,10 @@ class Peer:
         our_services = NODE_NETWORK | NODE_WITNESS
         if self.peer_bloom_filters:
             our_services |= NODE_BLOOM
-        if self.node_compact_filters:
+        # FIX-71 / W121 BUG-5: NODE_COMPACT_FILTERS is gated on
+        # ``-blockfilterindex AND index-synced'' at handshake time, not
+        # at peer construction.  See _should_advertise_node_compact_filters.
+        if self._should_advertise_node_compact_filters():
             our_services |= NODE_COMPACT_FILTERS
         # BIP-159: signal limited-archive serving when prune mode is on.
         if self.node_network_limited:
@@ -1223,7 +1267,10 @@ class Peer:
         our_services = NODE_NETWORK | NODE_WITNESS
         if self.peer_bloom_filters:
             our_services |= NODE_BLOOM
-        if self.node_compact_filters:
+        # FIX-71 / W121 BUG-5: NODE_COMPACT_FILTERS is gated on
+        # ``-blockfilterindex AND index-synced'' at handshake time, not
+        # at peer construction.  See _should_advertise_node_compact_filters.
+        if self._should_advertise_node_compact_filters():
             our_services |= NODE_COMPACT_FILTERS
         # BIP-159: signal limited-archive serving when prune mode is on.
         if self.node_network_limited:
@@ -1370,12 +1417,13 @@ class Peer:
     def _create_network_address(self, host: str, port: int) -> NetworkAddress:
         """Create network address from host and port."""
         # NODE_BLOOM advertised iff peer_bloom_filters enabled (Core parity).
-        # NODE_COMPACT_FILTERS advertised iff blockfilterindex enabled.
+        # NODE_COMPACT_FILTERS advertised iff -blockfilterindex AND
+        # BlockFilterIndex.is_synced() (FIX-71 / W121 BUG-5).
         # NODE_NETWORK_LIMITED advertised iff prune mode is on (BIP-159).
         our_services = NODE_NETWORK | NODE_WITNESS
         if self.peer_bloom_filters:
             our_services |= NODE_BLOOM
-        if self.node_compact_filters:
+        if self._should_advertise_node_compact_filters():
             our_services |= NODE_COMPACT_FILTERS
         if self.node_network_limited:
             our_services |= NODE_NETWORK_LIMITED

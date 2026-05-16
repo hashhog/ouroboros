@@ -457,6 +457,14 @@ class BlockFilterIndex:
         self._height_to_hash: dict[int, bytes] = {}
         # The most-recently-indexed filter header (for chaining)
         self._tip_header: bytes = b'\x00' * 32
+        # Best (highest) height the index has connected.  None means the
+        # index has never observed a block.  Reorg disconnect / remove
+        # rolls this back to ``height - 1`` so a peer-facing sync-gate
+        # check correctly reports "not synced" until re-connect catches up.
+        # Mirrors Bitcoin Core's ``BaseIndex::m_synced`` semantics, except
+        # we expose the indexed height rather than just a bool — the bool
+        # is derived by comparing against the chain tip at query time.
+        self._best_indexed_height: int | None = None
 
     # -- public API --
 
@@ -479,6 +487,13 @@ class BlockFilterIndex:
         self._headers[block_hash] = fheader
         if block.height is not None:
             self._height_to_hash[block.height] = block_hash
+            # Track best indexed height monotonically (largest height
+            # ever connected).  Reorg disconnect / remove rolls back.
+            if (
+                self._best_indexed_height is None
+                or block.height > self._best_indexed_height
+            ):
+                self._best_indexed_height = block.height
         self._tip_header = fheader
 
         return filt, fheader
@@ -511,7 +526,10 @@ class BlockFilterIndex:
         """
         Remove a filter entry (used during disconnect_block for reorgs).
 
-        Returns True if the entry was found and removed.
+        Returns True if the entry was found and removed.  Best-indexed
+        height is rolled back to ``max(remaining heights)`` (or ``None``
+        if nothing remains) so :meth:`is_synced` re-reports "not synced"
+        until the new chain re-connects past the removed height.
         """
         found = block_hash in self._filters
         self._filters.pop(block_hash, None)
@@ -524,11 +542,54 @@ class BlockFilterIndex:
         for h in heights_to_remove:
             del self._height_to_hash[h]
 
+        # Roll back best_indexed_height if we removed the previous max.
+        if heights_to_remove and self._best_indexed_height in heights_to_remove:
+            if self._height_to_hash:
+                self._best_indexed_height = max(self._height_to_hash.keys())
+            else:
+                self._best_indexed_height = None
+
         return found
 
     def set_tip_header(self, prev_header: bytes) -> None:
         """Set the tip header (used after reorg to restore previous state)."""
         self._tip_header = prev_header
+
+    @property
+    def best_indexed_height(self) -> int | None:
+        """Highest height ever connected (or ``None`` if never indexed).
+
+        Returned to the sync-gate so we can compare against the chain tip
+        without leaking internal storage details.  Reorg disconnect rolls
+        this back via :meth:`remove`.
+        """
+        return self._best_indexed_height
+
+    def is_synced(self, chain_tip_height: int | None) -> bool:
+        """True iff the index has caught up to the active chain tip.
+
+        Bitcoin Core gates NODE_COMPACT_FILTERS advertisement on
+        ``BaseIndex::IsSynced`` which is True only when the index thread
+        has reached the active chain tip
+        (see ``src/index/base.cpp:145`` and the ``m_synced`` machinery).
+
+        Inputs:
+          - ``chain_tip_height``: the active chain's best height.  If the
+            node hasn't initialised the chain yet (e.g. very early
+            startup), pass ``None`` and we return False — we don't
+            advertise compact-filter capability when we don't even know
+            where the tip is.
+        """
+        if chain_tip_height is None or chain_tip_height < 0:
+            return False
+        if self._best_indexed_height is None:
+            # Index has never observed a block.  The only way this can be
+            # "synced" is if the chain tip is at height 0 (genesis-only,
+            # which is itself an edge case — Core only advertises after
+            # the index has indexed something).  Be strict here: report
+            # not-synced until the genesis has been explicitly added.
+            return False
+        return self._best_indexed_height >= chain_tip_height
 
     # -- BIP 157 helper API --
 
@@ -621,6 +682,12 @@ class PersistentBlockFilterIndex:
         self._filter_cache: OrderedDict[bytes, bytes] = OrderedDict()
         self._header_cache: OrderedDict[bytes, bytes] = OrderedDict()
         self._height_cache: OrderedDict[int, bytes] = OrderedDict()
+        # Best (highest) height ever indexed.  Loaded from
+        # meta/best_indexed_height on open so the sync-gate survives
+        # restarts.  None means the index has never observed a block.
+        # Updated under self._lock from add() / remove() / set_tip_header
+        # so concurrent readers see a consistent view.
+        self._best_indexed_height: int | None = None
 
         if not enabled:
             # Use in-memory fallback when disabled
@@ -649,6 +716,13 @@ class PersistentBlockFilterIndex:
 
             self._db = True
             self._memory_index = None
+
+            # Restore the persisted best_indexed_height (if any) so the
+            # sync-gate survives restarts.  Absence of the file is normal
+            # for a fresh datadir AND for legacy datadirs that pre-date
+            # FIX-71; in both cases the sync-gate starts at None and
+            # advances on the next add_block call.
+            self._best_indexed_height = self._load_best_indexed_height()
         except ImportError:
             # Fall back to in-memory when filesystem init fails for any
             # reason (e.g. read-only datadir in some CI sandboxes).
@@ -685,6 +759,47 @@ class PersistentBlockFilterIndex:
                     )
             except OSError:
                 pass
+
+    # ------------------------------------------------------------------
+    # best_indexed_height persistence (FIX-71: NODE_COMPACT_FILTERS gate)
+    # ------------------------------------------------------------------
+
+    def _best_indexed_height_path(self) -> str:
+        return os.path.join(self._meta_path, "best_indexed_height")
+
+    def _load_best_indexed_height(self) -> int | None:
+        """Restore the persisted best-indexed height from disk, or None."""
+        try:
+            with open(self._best_indexed_height_path(), 'rb') as f:
+                raw = f.read().decode("utf-8", errors="ignore").strip()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+        if not raw or raw == "none":
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    def _persist_best_indexed_height(self) -> None:
+        """Persist current best_indexed_height atomically (must hold lock)."""
+        if self._memory_index is not None:
+            return
+        try:
+            value = (
+                "none" if self._best_indexed_height is None
+                else str(int(self._best_indexed_height))
+            )
+            self._atomic_write(
+                self._best_indexed_height_path(),
+                value.encode("utf-8"),
+            )
+        except OSError:
+            # Best-effort: failure to persist degrades to restart-rebuild
+            # of the sync-gate, not data loss.
+            pass
 
     # ------------------------------------------------------------------
     # Internal helpers — atomic IO + cache management
@@ -829,6 +944,15 @@ class PersistentBlockFilterIndex:
             if block.height is not None:
                 self._atomic_write(self._height_path_for(block.height), block_hash)
                 self._cache_put(self._height_cache, block.height, block_hash)
+                # Advance best_indexed_height monotonically (FIX-71).
+                # On reorg disconnect we roll back via remove(); here we
+                # only ever move forward.
+                if (
+                    self._best_indexed_height is None
+                    or block.height > self._best_indexed_height
+                ):
+                    self._best_indexed_height = block.height
+                    self._persist_best_indexed_height()
 
             self._set_tip_header(fheader)
 
@@ -938,6 +1062,11 @@ class PersistentBlockFilterIndex:
         need reorg-aware tip rollback should use :meth:`set_tip_header`
         explicitly with the previous header.  Phase 2 will record undo
         deltas alongside the undo CF for true atomic disconnect.
+
+        FIX-71: When ``height`` is supplied and matches the current
+        best_indexed_height, the sync-gate is rolled back to ``height - 1``
+        so NODE_COMPACT_FILTERS advertisement is temporarily withdrawn
+        until the new chain re-connects past this point.
         """
         if self._memory_index is not None:
             return self._memory_index.remove(block_hash)
@@ -962,6 +1091,16 @@ class PersistentBlockFilterIndex:
                 except FileNotFoundError:
                     pass
                 self._height_cache.pop(height, None)
+                # Roll back best_indexed_height if we removed the
+                # previous tip; sync-gate is now "not synced" until a
+                # subsequent add_block at height >= the new chain tip.
+                if (
+                    self._best_indexed_height is not None
+                    and height >= self._best_indexed_height
+                ):
+                    new_best = height - 1 if height > 0 else None
+                    self._best_indexed_height = new_best
+                    self._persist_best_indexed_height()
 
             self._filter_cache.pop(block_hash, None)
             self._header_cache.pop(block_hash, None)
@@ -975,6 +1114,42 @@ class PersistentBlockFilterIndex:
             return
         with self._lock:
             self._set_tip_header(prev_header)
+
+    @property
+    def best_indexed_height(self) -> int | None:
+        """Highest height ever connected (or ``None`` if never indexed).
+
+        FIX-71 — surface to the NODE_COMPACT_FILTERS sync-gate.  Reads are
+        lock-free because Python int writes are atomic and a stale value
+        only delays advertisement by at most one block (the next caller
+        will re-evaluate).
+        """
+        if self._memory_index is not None:
+            return self._memory_index.best_indexed_height
+        return self._best_indexed_height
+
+    def is_synced(self, chain_tip_height: int | None) -> bool:
+        """True iff the index has caught up to the active chain tip.
+
+        Mirrors Bitcoin Core ``BaseIndex::IsSynced`` (``src/index/base.cpp``
+        ``m_synced`` flag).  Used by node.py to gate
+        NODE_COMPACT_FILTERS service-bit advertisement at every version
+        handshake.
+
+        Returns False when:
+          - ``chain_tip_height`` is None or negative (chain not yet
+            initialised — Core also does not advertise in this state),
+          - index has never observed a block,
+          - best_indexed_height < chain_tip_height (index lagging IBD
+            or rolling back through a reorg).
+        """
+        if self._memory_index is not None:
+            return self._memory_index.is_synced(chain_tip_height)
+        if chain_tip_height is None or chain_tip_height < 0:
+            return False
+        if self._best_indexed_height is None:
+            return False
+        return self._best_indexed_height >= chain_tip_height
 
     # -- BIP 157 helper API --
 
