@@ -3408,6 +3408,262 @@ class RPCServer:
         txid = await self.rpc_sendrawtransaction(raw_hex)
         return txid
 
+    async def rpc_getpayjoinrequest(
+        self,
+        address: str,
+        amount: float,
+        fee_rate: float | None = None,
+        change_position: int | None = None,
+    ) -> dict[str, Any]:
+        """BIP-78 sender helper: build an Original PSBT for a PayJoin POST.
+
+        This is the sender-side counterpart to :meth:`rpc_sendtoaddress` —
+        instead of finalising and broadcasting, we return a PSBT that the
+        operator can POST (via :meth:`rpc_sendpayjoinrequest`) to a BIP-78
+        receiver endpoint.
+
+        The returned PSBT has:
+          * Every wallet-owned input signed (partial_sigs set) so the BIP-78
+            receiver checklist accepts it (BIP-78 §3 — sender PSBT MUST be
+            signed but NOT finalized).
+          * witness_utxo on every input so the receiver can audit prevouts.
+          * Two outputs: ``[payment_to_address, change_to_sender]``.
+
+        Args:
+          address:          receiver's payment address (BIP-21 / on-chain).
+          amount:           BTC amount (decimal, like sendtoaddress).
+          fee_rate:         sat/vB fee rate; defaults to fee estimator.
+          change_position:  reserved — currently always trails the payment
+                            output at index 1.  Accepted for API parity
+                            with Bitcoin Core's ``walletcreatefundedpsbt``.
+
+        Returns:
+          ``{"psbt": "<base64>", "amount_sat": <int>, "fee_rate": <int>,
+             "payment_output_index": 0, "change_output_index": 1}``
+
+        References:
+          BIP-78 §"Sender" (https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki)
+          payjoin.org §"Building the Original PSBT"
+        """
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="No wallet loaded")
+        amount_sat = int(round(amount * 1e8))
+        if amount_sat <= 0:
+            raise HTTPException(status_code=400, detail="Invalid amount")
+
+        if fee_rate is None:
+            fee_estimator = getattr(self.node, "fee_estimator", None)
+            if fee_estimator is not None:
+                fee_rate = fee_estimator.estimate_fee(6)
+            if fee_rate is None:
+                fee_rate = 2
+
+        raw_hex = await wallet.send_transaction(
+            address, amount_sat, int(fee_rate)
+        )
+
+        # Re-build the PSBT from the signed raw tx so we can hand back a
+        # BIP-78-compliant Original PSBT (signed-but-not-finalized).
+        from ouroboros.address import address_to_script_pubkey
+        from ouroboros.psbt import PSBT, PSBT_VERSION_0
+        from ouroboros.p2p_messages import TxMessage
+        from ouroboros.wallet import _hash160 as _h160_local
+
+        raw_bytes = bytes.fromhex(raw_hex)
+        tx = TxMessage.from_payload(raw_bytes).transaction
+
+        # Strip witnesses (BIP-78 needs partial_sigs not finalized inputs).
+        # We carry the sender's signatures into PSBTInput.partial_sigs and
+        # leave script_sig empty so receiver-side ``is_finalized()`` is
+        # False.
+        unsigned_inputs = []
+        partial_sigs_per_input = []
+        amounts_per_input = []
+        spk_per_input = []
+        for inp in tx.inputs:
+            # ouroboros.database.TxIn has 0+ witness items; sender signed
+            # P2WPKH so witness = [sig, pubkey].
+            sig = inp.witness[0] if inp.witness else b""
+            pubkey = inp.witness[1] if len(inp.witness) > 1 else b""
+            partial_sigs_per_input.append((pubkey, sig))
+            # Find the matching wallet UTXO to grab amount + scriptPubKey.
+            # _collect_utxos() returns {txid, vout, value, script_pubkey, ...}.
+            wallet_utxos = wallet._collect_utxos()
+            matched = None
+            # display-order txid for matching
+            prev_txid_display = inp.prev_txid[::-1].hex()
+            for u in wallet_utxos:
+                if u["txid"] == prev_txid_display and int(u["vout"]) == int(inp.prev_vout):
+                    matched = u
+                    break
+            if matched is None:
+                amounts_per_input.append(0)
+                spk_per_input.append(b"")
+            else:
+                amounts_per_input.append(int(matched["value"]))
+                spk = matched["script_pubkey"]
+                if isinstance(spk, str):
+                    spk = bytes.fromhex(spk)
+                spk_per_input.append(spk)
+            # Blank witness on the PSBT-level tx — it is "unsigned".
+            inp.witness = []
+            unsigned_inputs.append(inp)
+
+        psbt = PSBT.from_transaction(tx, version=PSBT_VERSION_0)
+        for i, psbt_in in enumerate(psbt.inputs):
+            pubkey, sig = partial_sigs_per_input[i]
+            if sig and pubkey:
+                psbt_in.partial_sigs[pubkey] = sig
+            if amounts_per_input[i] and spk_per_input[i]:
+                psbt_in.witness_utxo = (amounts_per_input[i], spk_per_input[i])
+            psbt_in.sighash_type = 0x01  # SIGHASH_ALL
+
+        return {
+            "psbt": psbt.to_base64(),
+            "amount_sat": amount_sat,
+            "fee_rate": int(fee_rate),
+            "payment_output_index": 0,
+            "change_output_index": 1 if len(tx.outputs) > 1 else None,
+        }
+
+    async def rpc_sendpayjoinrequest(
+        self,
+        endpoint_url: str,
+        psbt: str,
+        additionalfeeoutputindex: int | None = None,
+        maxadditionalfeecontribution: int | None = None,
+        minfeerate: float | None = None,
+        disableoutputsubstitution: bool = False,
+        broadcast: bool = True,
+    ) -> dict[str, Any]:
+        """BIP-78 terminal sender RPC: POST + anti-snoop + broadcast.
+
+        End-to-end sender flow:
+
+          1. Decode the ``psbt`` argument (base64 Original PSBT from
+             :meth:`rpc_getpayjoinrequest`).
+          2. POST it to ``endpoint_url`` via ``httpx`` with TLS
+             verification enabled (G24).  Query string carries
+             ``v=1``, plus any of ``additionalfeeoutputindex /
+             maxadditionalfeecontribution / minfeerate /
+             disableoutputsubstitution`` the caller supplied.
+          3. On transient ``unavailable`` from the receiver or any
+             network error, fall back to broadcasting the Original
+             PSBT (G22).
+          4. On success, validate the receiver's proposal with all
+             six anti-snoop validators (G10–G15).  Any failure is
+             surfaced to the caller as HTTP 400 — the operator MUST
+             review before manually re-trying.
+          5. When ``broadcast=True``, sign the receiver's contributed
+             input(s) — receiver already signed its own input but the
+             sender side may need to refresh sighashes — and submit
+             to the network via :meth:`rpc_sendrawtransaction`.  When
+             ``broadcast=False`` the modified PSBT is returned for
+             out-of-band finalization.
+
+        Returns:
+          ``{"status": "payjoined"|"fallback"|"validated",
+             "txid": <hex>|None,
+             "psbt": <base64>|None,
+             "fallback_reason": <str>|None}``
+
+        References:
+          BIP-78 §sender + §"Receiver Error"
+          payjoin.org §"Sender's validation checklist"
+        """
+        from ouroboros import payjoin as _payjoin
+        from ouroboros.psbt import PSBT
+
+        try:
+            original = PSBT.from_base64(psbt)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid base64 PSBT: {exc}"
+            )
+
+        resp = _payjoin.send_payjoin_request(
+            endpoint_url,
+            original,
+            additionalfeeoutputindex=additionalfeeoutputindex,
+            maxadditionalfeecontribution=maxadditionalfeecontribution,
+            minfeerate=minfeerate,
+            disableoutputsubstitution=disableoutputsubstitution,
+        )
+
+        if resp.error is not None and resp.is_transient:
+            # G22 fallback: broadcast the Original PSBT as a normal tx.
+            if not broadcast:
+                return {
+                    "status": "fallback",
+                    "txid": None,
+                    "psbt": original.to_base64(),
+                    "fallback_reason": resp.error.message,
+                }
+            raw_hex = _payjoin._finalize_psbt_to_raw_hex(original)
+            if raw_hex is None:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"PayJoin receiver unavailable ({resp.error.message}); "
+                        "Original PSBT also could not be finalized for fallback"
+                    ),
+                )
+            txid = await self.rpc_sendrawtransaction(raw_hex)
+            return {
+                "status": "fallback",
+                "txid": txid,
+                "psbt": None,
+                "fallback_reason": resp.error.message,
+            }
+        if resp.error is not None:
+            # Non-transient errors (original-psbt-rejected, not-enough-money,
+            # version-unsupported) surface as 4xx — the operator must adjust.
+            raise HTTPException(
+                status_code=resp.error.http_status,
+                detail=f"PayJoin receiver error [{resp.error.code}]: {resp.error.message}",
+            )
+
+        assert resp.psbt is not None
+        proposal = resp.psbt
+        try:
+            _payjoin.validate_payjoin_response(
+                original,
+                proposal,
+                additionalfeeoutputindex=additionalfeeoutputindex,
+                maxadditionalfeecontribution=maxadditionalfeecontribution,
+                disable_output_substitution=disableoutputsubstitution,
+            )
+        except _payjoin.PayJoinError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Receiver proposal failed anti-snoop validation: {exc.message}",
+            )
+
+        if not broadcast:
+            return {
+                "status": "validated",
+                "txid": None,
+                "psbt": proposal.to_base64(),
+                "fallback_reason": None,
+            }
+        # Sign-and-broadcast path: finalise + submit.  Sender already
+        # signed sender inputs in step 1; receiver signed its inputs in
+        # step 2.  Finalise pulls everything together.
+        raw_hex = _payjoin._finalize_psbt_to_raw_hex(proposal)
+        if raw_hex is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Could not finalise PayJoin proposal for broadcast",
+            )
+        txid = await self.rpc_sendrawtransaction(raw_hex)
+        return {
+            "status": "payjoined",
+            "txid": txid,
+            "psbt": proposal.to_base64(),
+            "fallback_reason": None,
+        }
+
     async def rpc_sethdseed(self, seed_hex: str = None) -> dict[str, Any]:
         """
         Initialise the wallet in HD (BIP 32 / BIP 44) mode.

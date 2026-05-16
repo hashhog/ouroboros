@@ -1,14 +1,18 @@
-"""BIP-78 PayJoin (Pay-to-EndPoint) receiver-side implementation.
+"""BIP-78 PayJoin (Pay-to-EndPoint) receiver + sender implementation.
 
 Reference: https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki
            https://payjoin.org / btcpayserver/payjoin (Rust + Python reference)
 
-This module implements the *receiver* side of the BIP-78 simple PayJoin
-protocol.  The receiver hosts an HTTP(S) endpoint that accepts an Original
-PSBT from the sender, validates it per the BIP-78 "Receiver's Original PSBT
-checklist", adds at least one of its own UTXOs to break the
-common-input-ownership heuristic, signs only its newly-added inputs, and
-returns the resulting PSBT for the sender to co-sign and broadcast.
+This module implements both the *receiver* and *sender* halves of the
+BIP-78 simple PayJoin protocol.  The receiver hosts an HTTP(S) endpoint
+that accepts an Original PSBT from the sender, validates it per the
+BIP-78 "Receiver's Original PSBT checklist", adds at least one of its
+own UTXOs to break the common-input-ownership heuristic, signs only its
+newly-added inputs, and returns the resulting PSBT for the sender to
+co-sign and broadcast.  The sender constructs an Original PSBT, POSTs it
+to the receiver's URL, validates the response per the BIP-78 anti-snoop
+checklist (UIH-1 / UIH-2 / fee caps / output substitution), and falls
+back to broadcasting the Original PSBT when the receiver is unreachable.
 
 Scope (FIX-65 — RECEIVER FOUNDATION):
 
@@ -26,19 +30,23 @@ Scope (FIX-65 — RECEIVER FOUNDATION):
   * BIP-78 §"Receiver Error" — four canonical error codes returned as
     ``{"errorCode": ..., "message": ...}`` with HTTP 4xx/5xx.
 
-OUT OF SCOPE (intentionally left for future fix waves):
+Scope added by FIX-66 — SENDER + ANTI-SNOOP:
 
-  * Sender side (getpayjoinrequest / sendpayjoinrequest RPCs) — G26 / G27.
-  * Output substitution (default ``disableoutputsubstitution`` flag is
-    honored by NOT substituting when set) — G8 / G14.
-  * Replay protection / TTL — G18 / G30.
-  * Double-broadcast watcher — G19.
-  * BIP-21 ``pj=`` / ``pjos=`` URI carriage — already done in
-    ouroboros.bip21 (FIX-62).
+  * ``send_payjoin_request`` — HTTP(S) POST via ``httpx`` honoring the BIP-78
+    ``Content-Type: text/plain`` rule, with TLS certificate validation
+    enabled by default (G24).
+  * Anti-snoop validators G10–G15 covering UIH-1 / UIH-2, scriptSig type
+    uniformity, fee-contribution cap enforcement, ``pjos`` (disable output
+    substitution) handling, and ``minfeerate`` propagation.
+  * G22 fallback: when the receiver returns a transient error or is
+    unreachable, the sender falls back to broadcasting the Original PSBT
+    after signing+finalizing it locally.
+  * ``getpayjoinrequest`` / ``sendpayjoinrequest`` RPC bindings live in
+    :mod:`ouroboros.rpc` (G26 / G27 audit closures).
 
 Cross-pipeline note: ouroboros's Rust side (ferrous-utils/) has no wallet
-logic per the W119 audit, so PayJoin receiver lives only in the Python
-pipeline.  Single-pipeline by design.
+logic per the W119 audit, so PayJoin lives only in the Python pipeline.
+Single-pipeline by design.
 """
 
 from __future__ import annotations
@@ -585,6 +593,758 @@ def _sign_receiver_input(psbt: PSBT, key: WalletKey, _payment_idx: int) -> None:
     psbt_in.sighash_type = sighash_type
 
 
+# ---------------------------------------------------------------------------
+# Sender side — HTTP client + anti-snoop validation (FIX-66)
+# ---------------------------------------------------------------------------
+#
+# The sender half of BIP-78 mirrors the receiver section above:
+#
+#   * ``send_payjoin_request`` — POST the Original PSBT to the receiver URL,
+#     parse the response either as a modified PSBT (200) or as the BIP-78
+#     ``{"errorCode": ..., "message": ...}`` JSON wrapper (4xx/5xx).  HTTPS
+#     certificate validation is on by default (G24).
+#   * 6 anti-snoop validators (G10–G15) the sender applies to the receiver's
+#     proposal before signing+broadcasting.  Each is independent and surfaces
+#     a single failure dimension so unit tests can pin one heuristic at a
+#     time:
+#
+#       G10  validate_response_outputs                  — sender outputs preserved
+#       G11  validate_scriptsig_uniformity              — UIH-1
+#       G12  validate_inputs_imply_outputs_changed      — UIH-2
+#       G13  validate_max_fee_contribution              — fee cap enforced
+#       G14  validate_disable_output_substitution       — pjos=1 enforcement
+#       G15  build_sender_query                         — minfeerate propagation
+#
+#   * ``broadcast_original_psbt_fallback`` — G22 fallback path when the
+#     receiver is unreachable or returns ``unavailable``.
+
+
+# Default timeout for the sender's HTTP POST (seconds).  BIP-78 does not
+# prescribe a value; payjoin.org reference clients use ~30s.  We pick a
+# conservative 30s ceiling — large enough for Tor v3 round-trips but
+# small enough that an indefinitely-hanging receiver triggers the G22
+# fallback in a bounded wall-clock window.
+DEFAULT_SENDER_TIMEOUT_SEC = 30.0
+
+
+def build_sender_query(
+    *,
+    version: int = 1,
+    additionalfeeoutputindex: Optional[int] = None,
+    maxadditionalfeecontribution: Optional[int] = None,
+    minfeerate: Optional[float] = None,
+    disableoutputsubstitution: Optional[bool] = None,
+) -> dict[str, str]:
+    """Assemble the BIP-78 sender-side query string for the receiver POST.
+
+    Every parameter is optional except ``version``, which defaults to 1
+    (BIP-78 §protocol — the only stable version today; v2 lives in BIP-77
+    and is not implemented here).
+
+    The ``additionalfeeoutputindex`` and ``maxadditionalfeecontribution``
+    pair MUST be set together or left both unset; the helper enforces
+    that invariant up-front so a half-set query never leaves the sender.
+
+    ``minfeerate`` carries the sender's preferred fee rate (sat/vB) and
+    closes the G15 audit gap.
+
+    ``disableoutputsubstitution`` is propagated as ``"0"`` or ``"1"`` per
+    BIP-21/BIP-78; when None the parameter is omitted (receiver default).
+    """
+    if version not in SUPPORTED_VERSIONS:
+        raise ValueError(
+            f"build_sender_query: unsupported BIP-78 version {version}; "
+            f"this build supports {SUPPORTED_VERSIONS}"
+        )
+
+    # Pair invariant (BIP-78 §URI parameters): both or neither.
+    have_idx = additionalfeeoutputindex is not None
+    have_max = maxadditionalfeecontribution is not None
+    if have_idx != have_max:
+        raise ValueError(
+            "build_sender_query: additionalfeeoutputindex and "
+            "maxadditionalfeecontribution must be set together"
+        )
+    if have_idx and (
+        additionalfeeoutputindex < 0 or maxadditionalfeecontribution < 0
+    ):
+        raise ValueError(
+            "build_sender_query: fee-adjustment params must be non-negative"
+        )
+    if minfeerate is not None and minfeerate < 0:
+        raise ValueError("build_sender_query: minfeerate must be non-negative")
+
+    query: dict[str, str] = {"v": str(version)}
+    if have_idx:
+        query["additionalfeeoutputindex"] = str(additionalfeeoutputindex)
+        query["maxadditionalfeecontribution"] = str(maxadditionalfeecontribution)
+    if minfeerate is not None:
+        query["minfeerate"] = str(minfeerate)
+    if disableoutputsubstitution is not None:
+        query["disableoutputsubstitution"] = "1" if disableoutputsubstitution else "0"
+    return query
+
+
+@dataclass
+class SenderResponse:
+    """Parsed receiver response to a BIP-78 sender POST.
+
+    Either ``psbt`` is set (the receiver returned a modified PSBT for
+    sender co-signing — happy path) OR ``error`` is set (the receiver
+    returned the canonical ``{"errorCode": ..., "message": ...}`` JSON
+    wrapper at a 4xx/5xx status).  Exactly one of the two is non-None.
+    """
+
+    psbt: Optional[PSBT] = None
+    error: Optional[PayJoinError] = None
+
+    @property
+    def is_success(self) -> bool:
+        return self.psbt is not None
+
+    @property
+    def is_transient(self) -> bool:
+        """Receiver-side errors that warrant the G22 fallback path.
+
+        BIP-78 §"Receiver Error" lists ``unavailable`` as transient; the
+        sender SHOULD fall back to broadcasting the Original PSBT when
+        the receiver is offline or hits an internal hiccup.  Network
+        errors raised before any HTTP response also fall here.
+        """
+        if self.error is None:
+            return False
+        return self.error.code == ERR_UNAVAILABLE
+
+
+def _parse_receiver_response_body(
+    status_code: int,
+    body_text: str,
+    content_type: str,
+) -> SenderResponse:
+    """Decode the receiver's HTTP body into a :class:`SenderResponse`.
+
+    Split out from ``send_payjoin_request`` so tests can drive the
+    decoder without standing up an HTTP server (this is the heart of G17
+    error-shape validation on the sender side too).
+    """
+    if 200 <= status_code < 300:
+        try:
+            psbt = PSBT.from_base64(body_text.strip())
+        except Exception as exc:
+            # Receiver said 200 but body isn't a PSBT — treat as transient
+            # so the sender falls back rather than dropping funds on the floor.
+            err = err_unavailable(
+                f"Receiver returned 200 but body is not a PSBT: {exc}"
+            )
+            return SenderResponse(error=err)
+        return SenderResponse(psbt=psbt)
+
+    # 4xx / 5xx — try to parse the BIP-78 JSON error wrapper.
+    import json
+
+    try:
+        payload = json.loads(body_text)
+    except Exception:
+        # Non-JSON body at error status — bucket as unavailable so the
+        # sender can fall back.  ``original-psbt-rejected`` would imply
+        # the sender's PSBT was bad, which we can't verify from a
+        # non-JSON body.
+        err = err_unavailable(
+            f"Receiver returned HTTP {status_code} with non-JSON body"
+        )
+        return SenderResponse(error=err)
+    code = payload.get("errorCode") if isinstance(payload, dict) else None
+    message = (
+        payload.get("message")
+        if isinstance(payload, dict) and isinstance(payload.get("message"), str)
+        else "Receiver error"
+    )
+    if code == ERR_UNAVAILABLE:
+        return SenderResponse(error=err_unavailable(message))
+    if code == ERR_NOT_ENOUGH_MONEY:
+        return SenderResponse(error=err_not_enough_money(message))
+    if code == ERR_VERSION_UNSUPPORTED:
+        return SenderResponse(error=err_version_unsupported(message))
+    if code == ERR_ORIGINAL_PSBT_REJECTED:
+        return SenderResponse(error=err_original_psbt_rejected(message))
+    # Unknown errorCode (BIP-78-compliant servers SHOULD use one of the
+    # canonical 4) — bucket as unavailable so the sender falls back.
+    return SenderResponse(
+        error=err_unavailable(
+            f"Receiver returned unknown errorCode={code!r} at HTTP {status_code}"
+        )
+    )
+
+
+def send_payjoin_request(
+    endpoint_url: str,
+    original_psbt: PSBT,
+    *,
+    version: int = 1,
+    additionalfeeoutputindex: Optional[int] = None,
+    maxadditionalfeecontribution: Optional[int] = None,
+    minfeerate: Optional[float] = None,
+    disableoutputsubstitution: Optional[bool] = None,
+    timeout: float = DEFAULT_SENDER_TIMEOUT_SEC,
+    verify: bool = True,
+    transport: Any = None,
+) -> SenderResponse:
+    """POST an Original PSBT to the receiver's BIP-78 endpoint via httpx.
+
+    Args:
+      endpoint_url:           full URL of the receiver's POST endpoint.
+                              MUST use ``https://`` for clearnet (BIP-78
+                              §endpoint); ``http://`` is allowed for
+                              regtest / .onion (the ``.onion`` scheme is
+                              encrypted at the Tor layer so plain HTTP
+                              is acceptable).
+      original_psbt:          sender's Original PSBT.  Will be serialized
+                              to base64 and sent as ``text/plain`` per
+                              BIP-78.
+      version:                BIP-78 protocol version (only ``1`` today).
+      additionalfeeoutputindex / maxadditionalfeecontribution:
+                              optional pair per BIP-78 §URI parameters.
+                              Receiver MAY subtract up to
+                              ``maxadditionalfeecontribution`` satoshis
+                              from output at this index.
+      minfeerate:             sender's preferred fee rate (sat/vB).
+                              Optional — closes the G15 audit gap by
+                              propagating it on the wire.
+      disableoutputsubstitution:
+                              when True (pjos=1), the receiver MUST NOT
+                              modify the sender's outputs (BIP-78 §URI
+                              parameters / payjoin.org).
+      timeout:                seconds before httpx raises a timeout that
+                              the caller surfaces as ``unavailable``
+                              triggering the G22 fallback.
+      verify:                 httpx TLS-cert verification.  Default
+                              ``True`` per G24.  Tests stand this down
+                              via ``False``; production callers MUST
+                              leave it True for clearnet endpoints.
+      transport:              optional ``httpx.BaseTransport`` injected
+                              for tests so we can speak to an in-memory
+                              ASGI app without standing up a real socket.
+
+    Returns:
+      :class:`SenderResponse` carrying either the receiver-modified PSBT
+      (happy path) or a :class:`PayJoinError` for one of the BIP-78
+      canonical 4 codes.  Caller is responsible for invoking the anti-
+      snoop validators G10–G15 on the returned PSBT before broadcasting.
+    """
+    if version not in SUPPORTED_VERSIONS:
+        raise ValueError(
+            f"send_payjoin_request: BIP-78 version {version} not supported"
+        )
+
+    body = original_psbt.to_base64()
+    query = build_sender_query(
+        version=version,
+        additionalfeeoutputindex=additionalfeeoutputindex,
+        maxadditionalfeecontribution=maxadditionalfeecontribution,
+        minfeerate=minfeerate,
+        disableoutputsubstitution=disableoutputsubstitution,
+    )
+
+    # Lazy import so the rest of the module is usable without httpx
+    # installed.  httpx is a hard dep per pyproject.toml as of FIX-65.
+    import httpx
+
+    client_kwargs: dict[str, Any] = {"timeout": timeout, "verify": verify}
+    if transport is not None:
+        client_kwargs["transport"] = transport
+
+    try:
+        with httpx.Client(**client_kwargs) as client:
+            resp = client.post(
+                endpoint_url,
+                content=body,
+                params=query,
+                headers={"Content-Type": "text/plain"},
+            )
+    except httpx.TimeoutException as exc:
+        return SenderResponse(
+            error=err_unavailable(f"Receiver POST timed out: {exc}")
+        )
+    except httpx.ConnectError as exc:
+        return SenderResponse(
+            error=err_unavailable(f"Receiver endpoint unreachable: {exc}")
+        )
+    except httpx.HTTPError as exc:
+        return SenderResponse(
+            error=err_unavailable(f"Receiver POST failed: {exc}")
+        )
+
+    content_type = resp.headers.get("content-type", "")
+    return _parse_receiver_response_body(
+        status_code=resp.status_code,
+        body_text=resp.text,
+        content_type=content_type,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sender-side anti-snoop validators (G10 – G15)
+# ---------------------------------------------------------------------------
+#
+# Each validator raises :class:`PayJoinError` (``original-psbt-rejected``)
+# when the receiver's proposal fails the corresponding BIP-78 sender check.
+# The caller MUST invoke all six before signing-and-broadcasting.
+
+
+def _scripts_present(psbt: PSBT) -> list[bytes]:
+    """Return witness/legacy scriptPubKey for every input in the PSBT.
+
+    Used by UIH-1 (G11) and the response-output preservation check (G10).
+    Falls back through (witness_utxo, non_witness_utxo[prev_vout]) so the
+    caller does not need to know which UTXO carrier the input uses.
+    """
+    out: list[bytes] = []
+    for psbt_in, _tx_in in zip(psbt.inputs, psbt.tx.inputs if psbt.tx else []):
+        if psbt_in.witness_utxo is not None:
+            _amt, spk = psbt_in.witness_utxo
+            out.append(bytes(spk))
+            continue
+        if psbt_in.non_witness_utxo is not None:
+            # non_witness_utxo carries the full prev-tx; extract the spk
+            # at the matching vout.
+            try:
+                prev_tx = psbt_in.non_witness_utxo
+                vout_idx = _tx_in.prev_vout if _tx_in is not None else 0
+                spk = prev_tx.outputs[vout_idx].script_pubkey
+                out.append(bytes(spk))
+                continue
+            except Exception:
+                pass
+        out.append(b"")  # unknown — the validator will flag this as a mismatch
+    return out
+
+
+def _classify_script_type(spk: bytes) -> str:
+    """Return a coarse script-type tag for UIH-1 uniformity comparison.
+
+    The granularity matches BIP-78 §sender-validates: legacy P2PKH,
+    P2SH, P2WPKH, P2WSH, P2TR, plus an ``unknown`` bucket.  Mixing any
+    two is forbidden — the receiver MUST contribute an input of the
+    same script type as the sender's inputs.
+    """
+    if len(spk) == 25 and spk[0:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":
+        return "p2pkh"
+    if len(spk) == 23 and spk[0:2] == b"\xa9\x14" and spk[22:23] == b"\x87":
+        return "p2sh"
+    if len(spk) == 22 and spk[0:2] == b"\x00\x14":
+        return "p2wpkh"
+    if len(spk) == 34 and spk[0:2] == b"\x00\x20":
+        return "p2wsh"
+    if len(spk) == 34 and spk[0:2] == b"\x51\x20":
+        return "p2tr"
+    return "unknown"
+
+
+def validate_response_outputs(
+    original: PSBT,
+    proposal: PSBT,
+    *,
+    disable_output_substitution: bool = False,
+) -> None:
+    """G10 / BUG-9 — anti-snoop output verification.
+
+    Per payjoin.org §sender-validates and BIP-78 §"Receiver's response
+    checklist":
+
+      * Every sender output script MUST appear in the proposal (the
+        receiver may have re-ordered them but MUST NOT delete them).
+      * When ``disable_output_substitution`` is True, output amounts and
+        scripts MUST match exactly (modulo fee adjustment which a
+        ``maxadditionalfeecontribution``-bounded subtract on a single
+        designated output is allowed — that's G13's domain, not G10).
+      * The number of outputs MUST NOT shrink (a missing output would
+        steal funds).
+
+    Raises ``original-psbt-rejected`` on violation — this is a UIH-leak
+    or fund-loss path, never a transient.
+    """
+    if original.tx is None or proposal.tx is None:
+        raise err_original_psbt_rejected(
+            "G10: PSBT(s) missing unsigned tx for output verification"
+        )
+
+    original_outputs = original.tx.outputs
+    proposal_outputs = proposal.tx.outputs
+
+    if len(proposal_outputs) < len(original_outputs):
+        raise err_original_psbt_rejected(
+            f"G10: proposal has fewer outputs ({len(proposal_outputs)}) "
+            f"than original ({len(original_outputs)}) — receiver dropped one"
+        )
+
+    # Every original output script MUST still be present.
+    proposal_scripts = [bytes(o.script_pubkey) for o in proposal_outputs]
+    for i, o in enumerate(original_outputs):
+        spk = bytes(o.script_pubkey)
+        if spk not in proposal_scripts:
+            raise err_original_psbt_rejected(
+                f"G10: sender output[{i}] script not present in receiver's "
+                "proposal — would steal funds"
+            )
+
+    if disable_output_substitution:
+        # Strict match: same count, same scripts in some order, same
+        # amounts in aggregate (fee adjustment is handled at G13).
+        if len(proposal_outputs) != len(original_outputs):
+            raise err_original_psbt_rejected(
+                "G10/G14: disableoutputsubstitution=1 but proposal added outputs"
+            )
+        for i, o in enumerate(original_outputs):
+            if bytes(o.script_pubkey) not in proposal_scripts:
+                raise err_original_psbt_rejected(
+                    f"G10/G14: disableoutputsubstitution=1 but sender output[{i}] "
+                    "script removed/substituted"
+                )
+
+
+def validate_scriptsig_uniformity(
+    original: PSBT, proposal: PSBT
+) -> None:
+    """G11 / BUG-10 — UIH-1 scriptSig-type uniformity.
+
+    All inputs in the final transaction MUST have the same script type
+    as the sender's inputs.  If the receiver contributes a legacy P2PKH
+    input when the sender pays from P2WPKH, the resulting tx is
+    self-evidently a PayJoin (uniformity heuristic UIH-1).
+
+    Raises ``original-psbt-rejected`` on mixed script types.
+    """
+    if original.tx is None or proposal.tx is None:
+        raise err_original_psbt_rejected(
+            "G11: PSBT(s) missing unsigned tx for UIH-1 check"
+        )
+
+    sender_scripts = _scripts_present(original)
+    proposal_scripts = _scripts_present(proposal)
+    sender_types = {_classify_script_type(s) for s in sender_scripts if s}
+    proposal_types = {_classify_script_type(s) for s in proposal_scripts if s}
+
+    if not sender_types:
+        raise err_original_psbt_rejected(
+            "G11: sender PSBT has no inspectable input script types"
+        )
+    if "unknown" in proposal_types:
+        raise err_original_psbt_rejected(
+            "G11: proposal contains an input of unknown script type"
+        )
+    # Receiver's contributed types MUST be a subset of sender's types.
+    extra = proposal_types - sender_types
+    if extra:
+        raise err_original_psbt_rejected(
+            f"G11: receiver added input(s) of mismatched script type(s): "
+            f"sender={sorted(sender_types)} proposal_extras={sorted(extra)}"
+        )
+
+
+def validate_inputs_imply_outputs_changed(
+    original: PSBT, proposal: PSBT
+) -> None:
+    """G12 / BUG-11 — UIH-2: new inputs without output modification.
+
+    payjoin.org §sender-validates / UIH-2: if the receiver added inputs
+    but did NOT alter outputs (in count or aggregate amount), the
+    proposal de-anonymizes the receiver's deposit address (the receiver
+    paid themselves and added an input — the chain analyst infers which
+    output is the receiver's).
+
+    Raises ``original-psbt-rejected`` on the UIH-2 leak.
+    """
+    if original.tx is None or proposal.tx is None:
+        raise err_original_psbt_rejected(
+            "G12: PSBT(s) missing unsigned tx for UIH-2 check"
+        )
+
+    new_inputs = len(proposal.tx.inputs) - len(original.tx.inputs)
+    if new_inputs <= 0:
+        # Receiver didn't add inputs — UIH-2 doesn't apply.
+        return
+
+    # Outputs MUST have changed (count or aggregate value) when inputs
+    # are added; otherwise we have a UIH-2 leak.
+    orig_total = sum(o.value for o in original.tx.outputs)
+    prop_total = sum(o.value for o in proposal.tx.outputs)
+    orig_count = len(original.tx.outputs)
+    prop_count = len(proposal.tx.outputs)
+
+    same_count = orig_count == prop_count
+    same_total = orig_total == prop_total
+    if same_count and same_total:
+        # Outputs are visually identical despite added inputs.  This is
+        # the canonical UIH-2 pattern.
+        orig_scripts = [bytes(o.script_pubkey) for o in original.tx.outputs]
+        prop_scripts = [bytes(o.script_pubkey) for o in proposal.tx.outputs]
+        if orig_scripts == prop_scripts:
+            raise err_original_psbt_rejected(
+                "G12/UIH-2: receiver added input(s) without modifying any "
+                "output — leaks receiver's deposit address"
+            )
+
+
+def validate_max_fee_contribution(
+    original: PSBT,
+    proposal: PSBT,
+    *,
+    additionalfeeoutputindex: Optional[int],
+    maxadditionalfeecontribution: Optional[int],
+) -> None:
+    """G13 / BUG-12 — sender max-fee enforcement.
+
+    The sender sent ``maxadditionalfeecontribution`` on the wire; the
+    proposal MUST NOT subtract more than that from the designated
+    output.  If the receiver subtracted more (or subtracted from a
+    different output, or subtracted without permission), reject.
+
+    Raises ``original-psbt-rejected`` on cap violation.
+    """
+    if original.tx is None or proposal.tx is None:
+        raise err_original_psbt_rejected(
+            "G13: PSBT(s) missing unsigned tx for fee-cap check"
+        )
+
+    if additionalfeeoutputindex is None or maxadditionalfeecontribution is None:
+        # Sender did NOT opt in to fee adjustment — receiver MUST not have
+        # touched any output amount.
+        for i, (o_in, o_out) in enumerate(
+            zip(original.tx.outputs, proposal.tx.outputs)
+        ):
+            if bytes(o_in.script_pubkey) == bytes(o_out.script_pubkey):
+                if o_in.value != o_out.value:
+                    raise err_original_psbt_rejected(
+                        f"G13: sender did not authorize fee adjustment but "
+                        f"output[{i}] amount changed "
+                        f"({o_in.value} -> {o_out.value})"
+                    )
+        return
+
+    if additionalfeeoutputindex < 0 or additionalfeeoutputindex >= len(
+        original.tx.outputs
+    ):
+        raise err_original_psbt_rejected(
+            f"G13: additionalfeeoutputindex {additionalfeeoutputindex} "
+            f"out of range for original tx ({len(original.tx.outputs)} outputs)"
+        )
+
+    # Locate the designated output by script.  After re-ordering by the
+    # receiver, the designated output may not still be at the same index
+    # so we look up by scriptPubKey.
+    designated_script = bytes(
+        original.tx.outputs[additionalfeeoutputindex].script_pubkey
+    )
+    designated_original_value = original.tx.outputs[
+        additionalfeeoutputindex
+    ].value
+    designated_proposal_value: Optional[int] = None
+    for o in proposal.tx.outputs:
+        if bytes(o.script_pubkey) == designated_script:
+            designated_proposal_value = o.value
+            break
+    if designated_proposal_value is None:
+        raise err_original_psbt_rejected(
+            "G13: designated fee output not present in proposal"
+        )
+
+    subtracted = designated_original_value - designated_proposal_value
+    if subtracted < 0:
+        raise err_original_psbt_rejected(
+            f"G13: receiver INCREASED designated output amount by "
+            f"{-subtracted} (theft)"
+        )
+    if subtracted > maxadditionalfeecontribution:
+        raise err_original_psbt_rejected(
+            f"G13: receiver subtracted {subtracted} sat from designated "
+            f"output but cap was {maxadditionalfeecontribution}"
+        )
+
+    # Other outputs MUST be unchanged — receiver can only adjust the
+    # designated output's amount.
+    for i, (o_in, o_out) in enumerate(
+        zip(original.tx.outputs, proposal.tx.outputs)
+    ):
+        if bytes(o_in.script_pubkey) == bytes(o_out.script_pubkey):
+            if (
+                bytes(o_in.script_pubkey) != designated_script
+                and o_in.value != o_out.value
+            ):
+                raise err_original_psbt_rejected(
+                    f"G13: receiver modified non-designated output[{i}] "
+                    f"({o_in.value} -> {o_out.value})"
+                )
+
+
+def validate_disable_output_substitution(
+    original: PSBT,
+    proposal: PSBT,
+    *,
+    disable_output_substitution: bool,
+) -> None:
+    """G14 / BUG-13 — sender ``pjos=1`` enforcement.
+
+    When the sender set ``pjos=1`` (disableoutputsubstitution), the
+    receiver MUST NOT add, remove, or change any of the sender's
+    outputs (BIP-78 §URI parameters).  This is a strict structural
+    check that complements G10 (which is one-sided: sender outputs
+    must be present).
+
+    Raises ``original-psbt-rejected`` on violation.  When the flag is
+    not set, this validator is a no-op (the spec permits output
+    substitution by default).
+    """
+    if not disable_output_substitution:
+        return
+
+    if original.tx is None or proposal.tx is None:
+        raise err_original_psbt_rejected(
+            "G14: PSBT(s) missing unsigned tx for pjos=1 check"
+        )
+
+    if len(proposal.tx.outputs) != len(original.tx.outputs):
+        raise err_original_psbt_rejected(
+            f"G14: pjos=1 but output count changed "
+            f"({len(original.tx.outputs)} -> {len(proposal.tx.outputs)})"
+        )
+
+    # Sets must match (BIP-78 allows reordering even under pjos=1; the
+    # invariant is the *set* of (script, value) pairs).  Fee adjustment
+    # via the additionalfeeoutputindex/maxadditionalfeecontribution path
+    # is G13's domain and is *not* permitted under pjos=1 — the spec
+    # treats pjos=1 as a stronger constraint than fee-adjust opt-in.
+    original_set = sorted(
+        (bytes(o.script_pubkey), o.value) for o in original.tx.outputs
+    )
+    proposal_set = sorted(
+        (bytes(o.script_pubkey), o.value) for o in proposal.tx.outputs
+    )
+    if original_set != proposal_set:
+        raise err_original_psbt_rejected(
+            "G14: pjos=1 but receiver modified outputs (script/amount mismatch)"
+        )
+
+
+def validate_payjoin_response(
+    original: PSBT,
+    proposal: PSBT,
+    *,
+    additionalfeeoutputindex: Optional[int] = None,
+    maxadditionalfeecontribution: Optional[int] = None,
+    disable_output_substitution: bool = False,
+) -> None:
+    """Run all 6 anti-snoop validators G10–G15 against the proposal.
+
+    Convenience wrapper the sender RPC uses immediately after receiving
+    the receiver's response and before signing+broadcasting.  Each
+    validator raises on its own dimension so the caller can rely on the
+    first failure being the most specific one.
+
+    G15 lives at the *outbound* side — the sender SHOULD have already
+    sent ``minfeerate`` in the query string via ``build_sender_query``.
+    Here we treat G15 as a no-op on the response (BIP-78 has no
+    receiver-echoed minfeerate to validate).
+    """
+    # Sender input preservation is implied by G10 + UIH-2 + the input-
+    # uniformity check; we also verify the sender's inputs are still
+    # present (count >= original) as a defense in depth.
+    if (
+        proposal.tx is not None
+        and original.tx is not None
+        and len(proposal.tx.inputs) < len(original.tx.inputs)
+    ):
+        raise err_original_psbt_rejected(
+            "validate_payjoin_response: proposal removed sender inputs"
+        )
+    validate_response_outputs(
+        original,
+        proposal,
+        disable_output_substitution=disable_output_substitution,
+    )
+    validate_scriptsig_uniformity(original, proposal)
+    validate_inputs_imply_outputs_changed(original, proposal)
+    validate_max_fee_contribution(
+        original,
+        proposal,
+        additionalfeeoutputindex=additionalfeeoutputindex,
+        maxadditionalfeecontribution=maxadditionalfeecontribution,
+    )
+    validate_disable_output_substitution(
+        original,
+        proposal,
+        disable_output_substitution=disable_output_substitution,
+    )
+
+
+# ---------------------------------------------------------------------------
+# G22 / BUG-21 — sender fallback path
+# ---------------------------------------------------------------------------
+
+
+def broadcast_original_psbt_fallback(
+    original_psbt: PSBT,
+    broadcast_callback: Any,
+) -> str:
+    """Fall back to broadcasting the Original PSBT as a normal transaction.
+
+    Per BIP-78 §"Receiver Error" / payjoin.org §sender-fallback: when
+    the receiver returns ``unavailable`` (or is unreachable), the sender
+    MUST be able to broadcast the Original PSBT as a normal transaction
+    so the payment still goes through (the sender already signed every
+    input — the PSBT just needs finalization).
+
+    Args:
+      original_psbt:  the PSBT the sender originally POSTed (NOT the
+                      receiver-modified proposal — we explicitly do
+                      NOT broadcast a proposal that may carry
+                      receiver-controlled inputs).
+      broadcast_callback:  a callable ``f(raw_hex: str) -> txid_str``
+                      that finalises and submits the tx.  Injected so
+                      the caller chooses ``sendrawtransaction`` vs
+                      any in-memory broadcaster.
+
+    Returns the txid the broadcast callback emitted.
+    """
+    raw_hex = _finalize_psbt_to_raw_hex(original_psbt)
+    if raw_hex is None:
+        raise err_unavailable(
+            "G22 fallback: could not extract raw transaction from Original PSBT"
+        )
+    return broadcast_callback(raw_hex)
+
+
+def _finalize_psbt_to_raw_hex(psbt: PSBT) -> Optional[str]:
+    """Finalize a PSBT and serialize to raw transaction hex.
+
+    Single helper shared by the G22 fallback path and the sender RPC's
+    happy-path broadcast.  Tries the public PSBT API
+    (``finalize()`` + ``extract_transaction()`` + serialize-with-witness)
+    and returns None on any structural failure so callers can decide
+    whether to raise or substitute.
+    """
+    try:
+        psbt.finalize()
+    except Exception:
+        return None
+    if not psbt.is_finalized():
+        return None
+    try:
+        from ouroboros.psbt import _serialize_tx_with_witness
+
+        tx = psbt.extract_transaction()
+        return _serialize_tx_with_witness(tx).hex()
+    except Exception:
+        # Fallback for variants that surface a ``serialize_with_witness``
+        # method on the extracted tx directly.
+        try:
+            tx = psbt.extract_transaction()
+            if hasattr(tx, "serialize_with_witness"):
+                return tx.serialize_with_witness().hex()
+        except Exception:
+            return None
+    return None
+
+
 __all__ = [
     "RECEIVER_PATH",
     "ERR_UNAVAILABLE",
@@ -593,9 +1353,11 @@ __all__ = [
     "ERR_ORIGINAL_PSBT_REJECTED",
     "SUPPORTED_VERSIONS",
     "MAX_BODY_BYTES",
+    "DEFAULT_SENDER_TIMEOUT_SEC",
     "PayJoinError",
     "PayJoinRequestParams",
     "ReceiverContext",
+    "SenderResponse",
     "err_unavailable",
     "err_not_enough_money",
     "err_version_unsupported",
@@ -608,4 +1370,14 @@ __all__ = [
     "add_receiver_input",
     "apply_fee_adjustment",
     "process_payjoin_request",
+    # FIX-66 sender + anti-snoop:
+    "build_sender_query",
+    "send_payjoin_request",
+    "validate_response_outputs",
+    "validate_scriptsig_uniformity",
+    "validate_inputs_imply_outputs_changed",
+    "validate_max_fee_contribution",
+    "validate_disable_output_substitution",
+    "validate_payjoin_response",
+    "broadcast_original_psbt_fallback",
 ]
