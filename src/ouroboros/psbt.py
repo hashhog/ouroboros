@@ -2894,3 +2894,55 @@ def joinpsbts(psbts: list[str]) -> str:
     )
 
     return combined_psbt.to_base64()
+
+
+# ---------------------------------------------------------------------------
+# BIP-78 PayJoin receiver helpers (FIX-65).
+#
+# These are thin module-level forwarders to :mod:`ouroboros.payjoin`.  They
+# live here so that ``dir(ouroboros.psbt)`` advertises a PayJoin-aware
+# receive-path deserializer (BIP-78 §3.2 "Receiver's Original PSBT
+# checklist"), per the W119 audit closure.  The implementation itself
+# stays in payjoin.py to avoid a circular import — the forwarders import
+# lazily on first call.
+# ---------------------------------------------------------------------------
+
+
+def payjoin_decode_original_psbt(body: bytes) -> "PSBT":
+    """Deserialize the sender's Original PSBT received over BIP-78.
+
+    Thin forwarder to :func:`ouroboros.payjoin.decode_original_psbt`.
+    The shape of the input is the raw POST body — BIP-78 says it MUST be
+    base64-encoded as ``text/plain`` (FIX-65).
+    """
+    from ouroboros.payjoin import decode_original_psbt
+
+    return decode_original_psbt(body)
+
+
+def validate_original_psbt_for_receiver(psbt: "PSBT") -> None:
+    """Apply BIP-78 §3 receiver-side validation to the sender's PSBT.
+
+    Thin forwarder to :func:`ouroboros.payjoin.validate_original_psbt`
+    that is exported from this module so ``dir(ouroboros.psbt)`` reflects
+    the new receiver-validator surface (W119 G5 audit closure).
+    """
+    from ouroboros.payjoin import validate_original_psbt
+
+    return validate_original_psbt(psbt)
+
+
+def add_receiver_input_to_psbt(
+    psbt: "PSBT",
+    utxo: dict,
+    wallet_key,
+) -> "PSBT":
+    """Append a receiver-contributed input to a PayJoin proposal.
+
+    Thin forwarder to :func:`ouroboros.payjoin.add_receiver_input`.
+    Exported here so ``dir(ouroboros.psbt)`` reflects the new
+    contribution helper (W119 G7 audit closure).
+    """
+    from ouroboros.payjoin import add_receiver_input
+
+    return add_receiver_input(psbt, utxo, wallet_key)

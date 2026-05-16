@@ -1165,6 +1165,23 @@ class RPCServer:
             """
             return await self.rpc_getblockfilter(blockhash, filtertype)
 
+        # BIP-78 PayJoin receiver endpoint (FIX-65).
+        #
+        # The sender POSTs a base64 Original PSBT to ``payjoin.RECEIVER_PATH``
+        # along with optional BIP-78 query parameters: ``v=1``,
+        # ``additionalfeeoutputindex``, ``maxadditionalfeecontribution``,
+        # ``minfeerate``.  The receiver validates, adds a CSPRNG-selected
+        # contribution UTXO, signs only that input, and returns the modified
+        # PSBT (base64, text/plain).  Errors are emitted as the four BIP-78
+        # canonical codes ("unavailable", "not-enough-money",
+        # "version-unsupported", "original-psbt-rejected") in a
+        # ``{"errorCode": ..., "message": ...}`` JSON wrapper.
+        from ouroboros import payjoin as _payjoin_mod
+
+        @self.app.post(_payjoin_mod.RECEIVER_PATH)
+        async def handle_payjoin_post(http_request: Request):
+            return await self._handle_payjoin_request(http_request)
+
     def _register_rest_interface(self):
         """Register REST interface endpoints (no authentication required)."""
         from ouroboros.rest import RESTInterface
@@ -11695,6 +11712,125 @@ class RPCServer:
             return b'\xfe' + value.to_bytes(4, 'little')
         else:
             return b'\xff' + value.to_bytes(8, 'little')
+
+    async def _handle_payjoin_request(self, http_request: Request):
+        """Receive a BIP-78 Original PSBT and return the receiver-modified PSBT.
+
+        End-to-end flow:
+
+          1. Read raw POST body (base64-encoded PSBT per BIP-78
+             "text/plain encoded as base64").
+          2. Parse the query-string parameters (``v=1``,
+             ``additionalfeeoutputindex``, ``maxadditionalfeecontribution``,
+             ``minfeerate``; output-substitution-disable flag is parsed
+             by the payjoin module but not advertised here).
+          3. Build a :class:`payjoin.ReceiverContext` from the wallet:
+             list of spendable UTXOs, key lookup by scriptPubKey, the
+             receiver's expected payment scriptPubKey, and minimum
+             amount.
+          4. Delegate to :func:`payjoin.process_payjoin_request` which
+             validates, contributes a CSPRNG-selected UTXO, signs, and
+             returns the base64 PSBT body.
+          5. On :class:`payjoin.PayJoinError`, return the canonical
+             ``{"errorCode": ..., "message": ...}`` JSON wrapper with
+             the BIP-78 4xx/5xx HTTP status.  Codes: ``unavailable``,
+             ``not-enough-money``, ``version-unsupported``,
+             ``original-psbt-rejected``.
+
+        Authentication is intentionally NOT required: BIP-78 receivers
+        are publicly addressable by design (the URL is shared via a
+        BIP-21 ``pj=`` parameter to senders the operator may never
+        otherwise interact with).  Receivers SHOULD front-end this
+        endpoint with HTTPS or a Tor v3 hidden service per BIP-78
+        §endpoint; FIX-64 wired uvicorn ssl_certfile / ssl_keyfile for
+        the HTTPS half.
+        """
+        from ouroboros import payjoin as _payjoin
+
+        body = await http_request.body()
+        # FastAPI gives us a starlette QueryParams (multi-dict).  Flatten
+        # to a plain dict for the parser; PayJoin parameters are not
+        # multi-valued.
+        query = {k: v for k, v in http_request.query_params.items()}
+
+        wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            err = _payjoin.err_unavailable(
+                "Receiver wallet not loaded; cannot honor PayJoin request"
+            )
+            return JSONResponse(err.to_json(), status_code=err.http_status)
+
+        # Resolve the receiver's payment scriptPubKey.  Two ways the
+        # operator can configure this:
+        #   (a) explicit ``payjoin_receive_script`` set on the node, or
+        #   (b) fall back to a freshly-derived receive address.
+        receiver_script = getattr(self.node, "payjoin_receive_script", None)
+        if receiver_script is None:
+            try:
+                # Fall back: any wallet key's P2WPKH script.
+                first_key_info = wallet.keys[0]
+                from ouroboros.wallet import WalletKey, _hash160 as _h160
+                first_key = WalletKey.from_wif(
+                    first_key_info["wif"],
+                    getattr(self.node, "network", "mainnet"),
+                )
+                receiver_script = b"\x00\x14" + _h160(first_key.pubkey)
+            except Exception:
+                err = _payjoin.err_unavailable(
+                    "Receiver has no configured payment scriptPubKey"
+                )
+                return JSONResponse(err.to_json(), status_code=err.http_status)
+
+        # Minimum amount the receiver expects (the sender must include
+        # at least this much in the payment output).  Operator-supplied;
+        # default 0 means "any amount is fine".
+        min_amount = int(getattr(self.node, "payjoin_min_amount", 0))
+
+        # UTXO lister and key lookup — both are closures over the live
+        # wallet so each request sees up-to-date state.
+        def list_utxos():
+            try:
+                return wallet._collect_utxos()
+            except AttributeError:
+                return []
+
+        def get_key_for_script(spk: bytes):
+            # P2WPKH: scriptPubKey = OP_0 <20> <pubkey_hash>
+            if len(spk) == 22 and spk[0:2] == b"\x00\x14":
+                target_h160 = spk[2:]
+                from ouroboros.wallet import WalletKey, _hash160 as _h160
+                network = getattr(self.node, "network", "mainnet")
+                for ki in wallet.keys:
+                    try:
+                        k = WalletKey.from_wif(ki["wif"], network)
+                        if _h160(k.pubkey) == target_h160:
+                            return k
+                    except Exception:
+                        continue
+            return None
+
+        ctx = _payjoin.ReceiverContext(
+            list_utxos=list_utxos,
+            get_key_for_script=get_key_for_script,
+            receiver_script=receiver_script,
+            min_amount=min_amount,
+        )
+
+        try:
+            body_out = _payjoin.process_payjoin_request(body, query, ctx)
+        except _payjoin.PayJoinError as exc:
+            return JSONResponse(exc.to_json(), status_code=exc.http_status)
+        except Exception as exc:
+            # Receiver-internal bug: surface as ``unavailable`` per BIP-78
+            # §"Receiver Error" so the sender knows it can fall back to
+            # broadcasting the Original PSBT directly.  Log full
+            # traceback for the operator.
+            logger.exception("PayJoin receiver internal error: %s", exc)
+            err = _payjoin.err_unavailable("Receiver internal error")
+            return JSONResponse(err.to_json(), status_code=err.http_status)
+
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(body_out.decode("ascii"), media_type="text/plain")
 
     def get_app(self) -> FastAPI:
         """Get the FastAPI application"""
