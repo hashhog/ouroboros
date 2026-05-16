@@ -42,10 +42,12 @@ Audit summary (30 gates):
     G24 BIP-158 genesis-block test vector (filter hex)                      PASS
     G25 Reorg disconnect rolls back index (remove filter + tip header)      FIX-74 PASS
     G26 Reorg connect re-runs add_block for new chain                       FIX-74 PASS
-    G27 cfilter handler aborts on any missing height (no partial response)  BUG-3 BROKEN
+    G27 cfilter handler aborts on any missing height (no partial response)  FIX-75 PASS
     G28 cfheaders prev_header lookup failure → no response (not zeros)      BUG-4 BROKEN
     G29 Index-not-synced gate before advertising NODE_COMPACT_FILTERS       BUG-5 MISSING
     G30 Rust pipeline parity (ferrous-utils BIP-157/158)                    TP-1 MISSING
+    G31 P2P handlers walk stop_hash ancestor (not active chain)             FIX-75 PASS
+    G32 P2P handlers never call get_block_by_height (forward-regression)    FIX-75 PASS
 
 Bugs (5 single-impl + 1 two-pipeline gap):
 
@@ -74,6 +76,28 @@ Bugs (5 single-impl + 1 two-pipeline gap):
     stream missing some heights — peer sees wrong count and may treat
     as DoS / silent corruption. Should mirror Core: abort the entire
     response (no cfilter messages emitted) on any miss.
+    [CLOSED by FIX-75: the stop-hash-ancestor refactor replaced the
+    per-height active-chain lookup with _get_ancestor() + return-on-miss;
+    the `continue` is gone — see test_g27 audit-flip.]
+
+  BUG-6 [P0-PRIVACY/P1-CDIV] BIP-157 handlers walk active chain not stop_hash
+    Pre-FIX-75: node.py:_make_getcfilters/cfheaders/cfcheckpt_handler all
+    resolved stop_hash via db.get_block (correct) but then iterated via
+    db.get_block_by_height (which walks the ACTIVE chain).  When the peer's
+    stop_hash points at a stale/orphan block, the handler signed and
+    returned filters from the active chain at the same heights — a
+    signed-but-lying response.
+    Security impact (Core net_processing.cpp PrepareBlockFilterRequest
+    deliberately serves stale-fork filters by walking stop_index->
+    GetAncestor; no chain.Contains check): light clients querying with
+    orphan stop_hash get an active-chain stream and the response leaks
+    which fork the peer is monitoring (privacy DoS).
+    [CLOSED by FIX-75 (2026-05-16): added module-level _get_ancestor()
+    mirroring CBlockIndex::GetAncestor; all 3 handlers walk from
+    stop_block via prev_blockhash.  Forward-regression guard in
+    test_fix75_test_e asserts the 3 handlers never call
+    get_block_by_height.  Universal W121 #3 finding — beamchain
+    counterpart's audit lens.]
 
   BUG-4 [P1] getcfheaders falls back to all-zeros prev_filter_header
     node.py:1224-1236: if start_height > 0 and bfi cannot resolve the
@@ -363,20 +387,20 @@ def test_g26_reorg_connect_reindexes_new_chain():
 # G27 — getcfilters must abort entire response on missing height (BUG-3, BROKEN)
 # ===========================================================================
 
-@pytest.mark.xfail(strict=True, reason="BUG-3: getcfilters uses `continue` instead of aborting on missing block")
 def test_g27_getcfilters_aborts_on_missing_height():
     """
     Core's ProcessGetCFilters calls LookupFilterRange which returns false
     on the first missing filter; the handler then logs and returns
     WITHOUT sending any cfilter messages (net_processing.cpp:3333-3337).
 
-    Ouroboros uses `continue` (node.py:1151) which silently skips the
-    missing height and continues sending cfilters for later heights —
-    the peer receives a stream that's inconsistent with their request
-    and may flag DoS / treat as silent corruption.
+    Pre-FIX-75: ouroboros used `continue` in the per-height loop, silently
+    skipping missing heights and sending a wire-inconsistent partial
+    cfilter stream.
 
-    Test: scan the source for the broken `continue` pattern. Fix is to
-    abort the loop entirely (raise / break + don't send anything).
+    FIX-75 (2026-05-16) / W121 BUG-3 closed as a natural consequence of
+    the stop-hash-ancestor refactor (W121 #3): the per-height loop now
+    aborts via `return` on any ancestor-walk or block-storage miss, so
+    a partial cfilter stream is never emitted.  Audit-flip: xfail → PASS.
     """
     from pathlib import Path
     src = Path(__file__).parent.parent / "src" / "ouroboros" / "node.py"
@@ -1032,3 +1056,490 @@ def test_g24_bip158_genesis_filter_hex_constant():
     """
     assert BASIC_FILTER_TYPE == 0
     assert GCS_P == 19 and GCS_M == 784931
+
+
+# ===========================================================================
+# FIX-75 — BIP-157 P2P stop-hash ancestor walk (W121 #3 BUG-6 closure)
+# ===========================================================================
+# Audit follow-on to FIX-74 a4cebff which closed the reorg-bookkeeping side
+# of the "active-chain walk vs stop-hash ancestor" universal pattern.
+# Pre-FIX-75: the 3 BIP-157 P2P handlers in node.py
+# (_make_getcfilters/cfheaders/cfcheckpt_handler) resolved stop_hash via
+# self.db.get_block(req.stop_hash) — correctly returning the stop block on
+# any fork — but then iterated via self.db.get_block_by_height(h) which
+# walks the *active* chain.  When the peer's stop_hash was on a stale/
+# orphan fork, the handler signed and returned filters from the active
+# chain at the same heights, producing a signed-but-lying response that
+# leaks which fork the peer is interested in.
+# Core's behavior (net_processing.cpp ProcessGetCFilters / ProcessGetCFHeaders
+# / ProcessGetCFCheckPt): LookupBlockIndex(stop_hash) then
+# stop_index->GetAncestor(h) for each requested height.  Critically NO
+# chain.Contains(stop_index) check — compact filters are indexed by block
+# hash regardless of fork membership.
+# ===========================================================================
+
+
+class _FakeOrphanBlock:
+    """Minimal block stub used by the FIX-75 ancestor-walk tests.
+
+    Mirrors the shape that ``BlockchainDatabase.get_block`` returns: hash,
+    prev_blockhash, and height.  No serialization / transaction data needed
+    because the FIX-75 code path only reads these three fields when walking
+    the prev_blockhash chain.
+    """
+
+    __slots__ = ("hash", "prev_blockhash", "height")
+
+    def __init__(self, h: bytes, prev: bytes, height: int):
+        self.hash = h
+        self.prev_blockhash = prev
+        self.height = height
+
+
+class _FakeForkedDB:
+    """Two-fork DB stub.
+
+    Chain layout (heights 0..2):
+        height 0: G  (genesis / common ancestor)
+        height 1: A1 (active chain)            height 1: B1 (orphan fork)
+        height 2: A2 (active chain tip)        height 2: B2 (orphan fork tip)
+
+    ``get_block_by_height`` returns the ACTIVE chain (A0/A1/A2).
+    ``get_block(hash)`` returns whichever block was stored for that hash
+    (both forks visible).  The ancestor walk inside FIX-75 uses
+    ``get_block(prev_blockhash)`` only, so it must reconstruct the orphan
+    chain B0→B1→B2 from the orphan-tip stop_hash, NEVER touching the
+    active chain.
+    """
+
+    def __init__(self):
+        self.G = _FakeOrphanBlock(b"\x00" * 31 + b"G", bytes(32), 0)
+        self.A1 = _FakeOrphanBlock(b"\x00" * 31 + b"\xa1", self.G.hash, 1)
+        self.A2 = _FakeOrphanBlock(b"\x00" * 31 + b"\xa2", self.A1.hash, 2)
+        self.B1 = _FakeOrphanBlock(b"\x00" * 31 + b"\xb1", self.G.hash, 1)
+        self.B2 = _FakeOrphanBlock(b"\x00" * 31 + b"\xb2", self.B1.hash, 2)
+        self._by_hash = {
+            self.G.hash: self.G,
+            self.A1.hash: self.A1,
+            self.A2.hash: self.A2,
+            self.B1.hash: self.B1,
+            self.B2.hash: self.B2,
+        }
+        # ACTIVE chain only — orphans not reachable via get_block_by_height.
+        self._by_height = {0: self.G, 1: self.A1, 2: self.A2}
+
+    def get_block(self, h):
+        return self._by_hash.get(h)
+
+    def get_block_by_height(self, ht):
+        # This MUST NOT be called by the FIX-75 handler path — see
+        # test_fix75_test_e_forward_regression_no_get_block_by_height.
+        return self._by_height.get(ht)
+
+
+def test_fix75_test_a_get_ancestor_walks_orphan_fork():
+    """A: starting at the orphan-tip B2 (height 2), _get_ancestor walks
+    via prev_blockhash and returns B1 at height 1, B2 at height 2, G at
+    height 0 — NEVER A1 or A2.
+    """
+    from ouroboros.node import _get_ancestor
+
+    db = _FakeForkedDB()
+
+    # height 2 from B2 -> B2 itself
+    h2 = _get_ancestor(db, db.B2, 2)
+    assert h2 is db.B2
+    # height 1 from B2 -> B1 (the orphan-fork parent), NOT A1
+    h1 = _get_ancestor(db, db.B2, 1)
+    assert h1 is db.B1
+    assert h1 is not db.A1, (
+        "FIX-75 BUG-6: ancestor walk returned active-chain block A1 for "
+        "orphan stop_hash=B2 — signed-but-lying response."
+    )
+    # height 0 from B2 -> G (common ancestor)
+    h0 = _get_ancestor(db, db.B2, 0)
+    assert h0 is db.G
+
+
+def test_fix75_test_b_get_ancestor_height_above_block():
+    """B: target_height > block.height returns None.
+
+    Mirrors Core CBlockIndex::GetAncestor: returns nullptr if the index is
+    at a lower height than the requested ancestor (chain.h:153-160).
+    """
+    from ouroboros.node import _get_ancestor
+
+    db = _FakeForkedDB()
+    # Requesting height 5 from B2 (height 2) -> None
+    assert _get_ancestor(db, db.B2, 5) is None
+
+
+def test_fix75_test_c_get_ancestor_negative_height_or_none_block():
+    """C: defensive — negative height, None block, and None height all
+    return None without raising.
+    """
+    from ouroboros.node import _get_ancestor
+
+    db = _FakeForkedDB()
+    assert _get_ancestor(db, db.B2, -1) is None
+    assert _get_ancestor(db, None, 0) is None
+    # Synthesize a block with height=None (occurs in some db paths)
+    orphan = _FakeOrphanBlock(b"\xee" * 32, bytes(32), 0)
+    orphan.height = None
+    assert _get_ancestor(db, orphan, 0) is None
+
+
+def test_fix75_test_d_get_ancestor_broken_chain_returns_none():
+    """D: if the prev_blockhash chain runs off the end (db inconsistency,
+    pruned block), _get_ancestor returns None rather than infinite-looping
+    or raising.
+    """
+    from ouroboros.node import _get_ancestor
+
+    # Block at height 3 whose prev_blockhash points at a non-existent hash.
+    db = _FakeForkedDB()
+    broken = _FakeOrphanBlock(b"\xcd" * 32, b"\xab" * 32, 3)
+    db._by_hash[broken.hash] = broken
+    # Requesting height 0 should fail cleanly (chain broken at step 1).
+    result = _get_ancestor(db, broken, 0)
+    assert result is None
+
+
+def test_fix75_test_e_forward_regression_no_get_block_by_height_in_handlers():
+    """E: forward-regression source guard.
+
+    The 3 BIP-157 P2P handlers — _make_getcfilters_handler /
+    _make_getcfheaders_handler / _make_getcfcheckpt_handler — must NOT
+    call self.db.get_block_by_height(...) anywhere in their bodies.  That
+    function walks the ACTIVE chain and is the source of the W121 #3
+    signed-but-lying response.  All per-height lookups must go through
+    _get_ancestor(self.db, stop_block, h) instead.
+
+    Pre-FIX-75 there were 3 occurrences (one per handler).  Post-FIX-75
+    there are zero call sites (the only remaining references are comments
+    documenting why the lookup was replaced — these are filtered out
+    here by stripping ``#`` lines before the substring check).
+    """
+    from pathlib import Path
+    src = Path(__file__).parent.parent / "src" / "ouroboros" / "node.py"
+    text = src.read_text(encoding="utf-8")
+
+    for handler_name, next_marker in [
+        ("_make_getcfilters_handler", "_make_getcfheaders_handler"),
+        ("_make_getcfheaders_handler", "_make_getcfcheckpt_handler"),
+        # cfcheckpt is the last of the three; bound on the registration
+        # site which closes the BIP-157 block.
+        ("_make_getcfcheckpt_handler", "# Register cfilter handlers"),
+    ]:
+        start = text.find(f"def {handler_name}")
+        end = text.find(next_marker, start)
+        assert start != -1, f"handler {handler_name} not found"
+        assert end != -1, f"next marker after {handler_name} not found"
+        body = text[start:end]
+        # Strip comments so we only assert on call sites (the fix
+        # commentary references get_block_by_height legitimately to
+        # explain why it was replaced).
+        non_comment = "\n".join(
+            line for line in body.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "get_block_by_height" not in non_comment, (
+            f"FIX-75 BUG-6 forward-regression: {handler_name} still calls "
+            f"db.get_block_by_height — must walk stop-hash ancestor via "
+            f"_get_ancestor(self.db, stop_block, h) instead.  See Bitcoin "
+            f"Core net_processing.cpp PrepareBlockFilterRequest + "
+            f"CBlockIndex::GetAncestor (chain.cpp)."
+        )
+
+
+def test_fix75_test_f_handler_uses_get_ancestor_in_all_three():
+    """F: positive companion to test E.  The 3 P2P handlers must contain
+    a call to _get_ancestor — pinning the new code path so a future
+    drive-by refactor can't silently swap it back to get_block_by_height
+    without flipping this assertion AND the forward-regression guard
+    above.
+    """
+    from pathlib import Path
+    src = Path(__file__).parent.parent / "src" / "ouroboros" / "node.py"
+    text = src.read_text(encoding="utf-8")
+
+    for handler_name, next_marker in [
+        ("_make_getcfilters_handler", "_make_getcfheaders_handler"),
+        ("_make_getcfheaders_handler", "_make_getcfcheckpt_handler"),
+        ("_make_getcfcheckpt_handler", "# Register cfilter handlers"),
+    ]:
+        start = text.find(f"def {handler_name}")
+        end = text.find(next_marker, start)
+        body = text[start:end]
+        assert "_get_ancestor" in body, (
+            f"FIX-75: {handler_name} does not call _get_ancestor — "
+            f"stop-hash-ancestor walk is the W121 #3 fix.  See FIX-75 "
+            f"audit-flip G31."
+        )
+
+
+def test_fix75_test_g_handler_aborts_on_range_violations_unchanged():
+    """G: regression — the Misbehaving-disconnect range guards (G13/G14/
+    G15/G16) still fire after FIX-75.  The refactor must not have
+    accidentally swallowed a peer-disconnect branch.
+    """
+    from pathlib import Path
+    src = Path(__file__).parent.parent / "src" / "ouroboros" / "node.py"
+    text = src.read_text(encoding="utf-8")
+
+    # All 3 handlers retain _peer_disconnect(... unknown stop_hash ...).
+    for handler_name in (
+        "_make_getcfilters_handler",
+        "_make_getcfheaders_handler",
+        "_make_getcfcheckpt_handler",
+    ):
+        start = text.find(f"def {handler_name}")
+        # Look at ~120 lines beyond the def for the guards.
+        body = text[start:start + 6000]
+        assert "_peer_disconnect" in body, (
+            f"FIX-75 regression: {handler_name} lost peer-disconnect calls"
+        )
+        assert "unknown stop_hash" in body, (
+            f"FIX-75 regression: {handler_name} lost the unknown-stop_hash "
+            f"disconnect branch (G13)"
+        )
+
+    # cfilters + cfheaders retain the range cap (G15/G16); cfcheckpt does NOT
+    # have a range cap (G17 — UINT32_MAX in Core).
+    cfilters_start = text.find("def _make_getcfilters_handler")
+    cfheaders_start = text.find("def _make_getcfheaders_handler")
+    cfcheckpt_start = text.find("def _make_getcfcheckpt_handler")
+    cfilters_body = text[cfilters_start:cfheaders_start]
+    cfheaders_body = text[cfheaders_start:cfcheckpt_start]
+    assert "MAX_GETCFILTERS_SIZE" in cfilters_body
+    assert "MAX_GETCFHEADERS_SIZE" in cfheaders_body
+
+
+def test_fix75_test_h_handler_invocation_orphan_stop_hash():
+    """H: end-to-end behavioral test.  Build a BitcoinNode-equivalent harness
+    with the forked DB, instantiate the cfilters handler factory, invoke
+    it with an orphan stop_hash, and verify the emitted CFilterMessage(s)
+    reference orphan-fork block hashes (NOT active-chain hashes).
+
+    This is the "signed-but-lying response" guard: peer sends getcfilters
+    with stop_hash=B2 (orphan tip), and pre-FIX-75 the response listed
+    A1/A2 hashes.  Post-FIX-75 the response lists B1/B2 hashes.
+    """
+    import asyncio
+
+    from ouroboros.node import BitcoinNode
+    from ouroboros.blockfilter import BlockFilterIndex
+    from ouroboros.p2p_messages import (
+        GetCFiltersMessage,
+        CFilterMessage,
+    )
+
+    db = _FakeForkedDB()
+
+    # Pre-seed an in-memory filter index for BOTH forks so the handler
+    # has filter bytes to emit; the test focuses on which block_hash the
+    # handler picks for each height, not on filter byte equality.
+    bfi = BlockFilterIndex()
+    # Stash pre-computed bytes per block hash so the handler's bfi.get_filter
+    # path returns deterministic values without rebuilding from a real
+    # block (which would require full transactions).
+    bfi._filters = {
+        db.G.hash: b"\x00",
+        db.A1.hash: b"\xa1",
+        db.A2.hash: b"\xa2",
+        db.B1.hash: b"\xb1",
+        db.B2.hash: b"\xb2",
+    }
+    bfi._headers = {h: b"\x00" * 32 for h in bfi._filters}
+    # height->hash for the ACTIVE chain (mirrors the W121 BUG-6 trap —
+    # the handler must NOT consult this even though it's present).
+    bfi._height_to_hash = {0: db.G.hash, 1: db.A1.hash, 2: db.A2.hash}
+
+    # Build a stub node that exposes just enough surface for
+    # _register_handlers to attach the cfilters handler to a fake peer.
+    class _StubPeer:
+        host = "fake"
+        port = 0
+        network = "mainnet"
+
+        def __init__(self):
+            self.handlers = {}
+            self.sent: list = []
+
+        def register_handler(self, name, fn):
+            self.handlers[name] = fn
+
+        async def send_message(self, msg):
+            self.sent.append(msg)
+
+    class _StubPeerManager:
+        def __init__(self, peers):
+            self._peers = peers
+            self._inbound_cb = None
+            self._outbound_cb = None
+
+        def get_all_ready_peers(self):
+            return self._peers
+
+        def set_inbound_peer_handler(self, cb):
+            self._inbound_cb = cb
+
+        def set_outbound_peer_handler(self, cb):
+            self._outbound_cb = cb
+
+    peer = _StubPeer()
+    pm = _StubPeerManager([peer])
+
+    # Minimum-viable node — bypass __init__ to skip config-file loading.
+    node = BitcoinNode.__new__(BitcoinNode)
+    node.db = db
+    node.block_filter_index = bfi
+    node.peer_manager = pm
+    node.mempool = None  # tx-handler factory needs this attribute set
+
+    # Register handlers — registers our handler factory on the stub peer.
+    node._register_handlers()
+
+    handler = peer.handlers.get("getcfilters")
+    assert handler is not None, "FIX-75 harness: getcfilters handler not registered"
+
+    # Build a wire request for stop_hash=B2 (orphan tip), heights 0..2.
+    # GetCFiltersMessage payload: filter_type(1) + start_height(4 LE) +
+    # stop_hash(32 LE).
+    req = GetCFiltersMessage(
+        filter_type=0,
+        start_height=0,
+        stop_hash=db.B2.hash,
+    )
+    msg = req.to_network_message("mainnet")
+
+    asyncio.run(handler(msg))
+
+    # 3 CFilterMessages emitted, in height order 0..2, each referencing
+    # the orphan-fork block hash (G/B1/B2).
+    assert len(peer.sent) == 3, (
+        f"FIX-75: expected 3 cfilter messages for heights 0..2, got "
+        f"{len(peer.sent)}"
+    )
+    decoded = [CFilterMessage.from_payload(m.payload) for m in peer.sent]
+    sent_hashes = [d.block_hash for d in decoded]
+
+    expected_orphan = [db.G.hash, db.B1.hash, db.B2.hash]
+    active_chain = [db.G.hash, db.A1.hash, db.A2.hash]
+    assert sent_hashes == expected_orphan, (
+        "FIX-75 BUG-6: handler returned active-chain block hashes for "
+        "orphan stop_hash — signed-but-lying response.  "
+        f"got={sent_hashes!r} active={active_chain!r} expected={expected_orphan!r}"
+    )
+
+
+def test_fix75_two_pipeline_guard_rust_has_no_compact_filter_p2p():
+    """FIX-75 must live entirely in the Python pipeline.  The Rust crate
+    (ferrous-utils/sync) must remain free of any BIP-157 P2P / GetCFilters
+    handling — any drift here would mean the fix has bled across the
+    pipeline boundary.
+
+    Matches the FIX-74 two-pipeline guard.  Counterpart to G30 (the wider
+    two-pipeline gap which expects ZERO Rust filter code overall — still
+    xfail until Phase 2).
+    """
+    from pathlib import Path
+
+    rust_root = Path(__file__).parent.parent / "ferrous-utils" / "sync" / "src"
+    forbidden = (
+        "GetCFilters",
+        "GetCFHeaders",
+        "GetCFCheckpt",
+        "_get_ancestor",
+    )
+
+    if not rust_root.exists():
+        return  # submodule not populated — trivially true
+
+    offenders: list[str] = []
+    for path in rust_root.rglob("*.rs"):
+        try:
+            txt = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for needle in forbidden:
+            if needle in txt:
+                offenders.append(f"{path}: {needle}")
+
+    assert not offenders, (
+        f"FIX-75 two-pipeline guard: ferrous-utils/sync/src must contain "
+        f"NO BIP-157 P2P handler / ancestor-walk code — fix bled across "
+        f"pipeline boundary at: {offenders[:5]}"
+    )
+
+
+def test_fix75_test_i_handler_aborts_on_unknown_stop_hash():
+    """I: regression — handler still disconnects peer when stop_hash is
+    unknown (G13).  FIX-75's refactor must not have swallowed the
+    PrepareBlockFilterRequest validation step.
+    """
+    import asyncio
+
+    from ouroboros.node import BitcoinNode
+    from ouroboros.blockfilter import BlockFilterIndex
+    from ouroboros.p2p_messages import GetCFiltersMessage
+
+    db = _FakeForkedDB()
+    bfi = BlockFilterIndex()
+    bfi._filters = {db.G.hash: b"\x00"}
+    bfi._headers = {db.G.hash: b"\x00" * 32}
+    bfi._height_to_hash = {0: db.G.hash}
+
+    class _StubPeer:
+        host = "fake"
+        port = 0
+        network = "mainnet"
+
+        def __init__(self):
+            self.handlers = {}
+            self.sent: list = []
+            self.disconnected = False
+
+        def register_handler(self, name, fn):
+            self.handlers[name] = fn
+
+        async def send_message(self, msg):
+            self.sent.append(msg)
+
+        def disconnect(self):
+            self.disconnected = True
+
+    class _StubPeerManager:
+        def __init__(self, peers):
+            self._peers = peers
+
+        def get_all_ready_peers(self):
+            return self._peers
+
+        def set_inbound_peer_handler(self, cb):
+            pass
+
+        def set_outbound_peer_handler(self, cb):
+            pass
+
+    peer = _StubPeer()
+    pm = _StubPeerManager([peer])
+
+    node = BitcoinNode.__new__(BitcoinNode)
+    node.db = db
+    node.block_filter_index = bfi
+    node.peer_manager = pm
+    node.mempool = None
+    node._register_handlers()
+
+    handler = peer.handlers["getcfilters"]
+    bad_stop = b"\xff" * 32  # never seen
+    req = GetCFiltersMessage(filter_type=0, start_height=0, stop_hash=bad_stop)
+    msg = req.to_network_message("mainnet")
+    asyncio.run(handler(msg))
+
+    assert peer.sent == [], "FIX-75: handler emitted filters for unknown stop_hash"
+    assert peer.disconnected, (
+        "FIX-75: handler did not disconnect peer on unknown stop_hash "
+        "(G13 regression)"
+    )
