@@ -40,8 +40,8 @@ Audit summary (30 gates):
     G22 NODE_COMPACT_FILTERS = 1 << 6 = 0x40                                PASS
     G23 NODE_COMPACT_FILTERS advertised only when --blockfilterindex=1      PASS
     G24 BIP-158 genesis-block test vector (filter hex)                      PASS
-    G25 Reorg disconnect rolls back index (remove filter + tip header)      BUG-1 MISSING
-    G26 Reorg connect re-runs add_block for new chain                       BUG-2 MISSING
+    G25 Reorg disconnect rolls back index (remove filter + tip header)      FIX-74 PASS
+    G26 Reorg connect re-runs add_block for new chain                       FIX-74 PASS
     G27 cfilter handler aborts on any missing height (no partial response)  BUG-3 BROKEN
     G28 cfheaders prev_header lookup failure → no response (not zeros)      BUG-4 BROKEN
     G29 Index-not-synced gate before advertising NODE_COMPACT_FILTERS       BUG-5 MISSING
@@ -273,10 +273,10 @@ def test_index_inmemory_smoke():
 
 
 # ===========================================================================
-# G25 — Reorg disconnect must remove indexed filters (BUG-1, MISSING)
+# G25 — Reorg disconnect must remove indexed filters (BUG-1)
+# FIX-74 — landed 2026-05-16.  Audit flips xfail -> PASS.
 # ===========================================================================
 
-@pytest.mark.xfail(strict=True, reason="BUG-1: reorg disconnect never calls block_filter_index.remove()")
 def test_g25_reorg_disconnect_rolls_back_filter_index():
     """
     Core requires the filter index to follow the active chain. On a reorg,
@@ -284,28 +284,27 @@ def test_g25_reorg_disconnect_rolls_back_filter_index():
     via CValidationInterface (see index/blockfilterindex.cpp) and rolls
     back its summary.
 
-    Ouroboros block_sync.py reorg path (lines 2942-2955) calls
-    self.db.disconnect_block but NEVER block_filter_index.remove(),
-    leaving stale filter entries that chain to the now-orphan tip.
-
-    The fix is a hook in the reorg disconnect loop:
-        if self.block_filter_index is not None:
-            await asyncio.to_thread(
-                self.block_filter_index.remove,
-                curr_hash, height
-            )
-        # plus a tip_header rollback to common_ancestor's filter header
+    FIX-74 / W121 BUG-1 (closed 2026-05-16): the reorg disconnect loop now
+    calls ``block_filter_index.remove(curr_hash, height)`` after each Rust
+    ``db.disconnect_block``, and ``set_tip_header(common_ancestor_header)``
+    once disconnect completes — so subsequent ``add_block`` calls compute
+    the new filter chain from the correct prev_header.  This activates the
+    FIX-71 best_indexed_height rollback machinery, which had been wired
+    into ``PersistentBlockFilterIndex.remove()`` but never called because
+    the reorg path didn't hook it.
     """
     reorg_section = _reorg_section_of_block_sync()
-    # The disconnect loop must call block_filter_index.remove() (or set
-    # tip_header back to the common ancestor's filter header — either
-    # path keeps the filter index consistent with the active chain).
-    assert "block_filter_index.remove" in reorg_section or (
-        "block_filter_index.set_tip_header" in reorg_section
-    ), (
-        "reorg disconnect loop does not call block_filter_index.remove() "
-        "or set_tip_header(); filter index will diverge from active chain "
-        "after any reorg, and the tip_header still chains to the orphan tip."
+    # The disconnect loop must call block_filter_index.remove() AND set
+    # tip_header back to the common ancestor's filter header to keep the
+    # filter index consistent with the active chain.
+    assert "block_filter_index.remove" in reorg_section, (
+        "reorg disconnect loop must call block_filter_index.remove() — "
+        "FIX-74 hook missing."
+    )
+    assert "block_filter_index.set_tip_header" in reorg_section, (
+        "reorg disconnect loop must rebase filter header chain on the "
+        "common ancestor via block_filter_index.set_tip_header() — "
+        "FIX-74 hook missing."
     )
 
 
@@ -330,20 +329,27 @@ def _reorg_section_of_block_sync() -> str:
 
 
 # ===========================================================================
-# G26 — Reorg connect must re-index new chain (BUG-2, MISSING)
+# G26 — Reorg connect must re-index new chain (BUG-2)
+# FIX-74 — landed 2026-05-16.  Audit flips xfail -> PASS.
 # ===========================================================================
 
-@pytest.mark.xfail(strict=True, reason="BUG-2: reorg connect-side never re-runs block_filter_index.add_block()")
 def test_g26_reorg_connect_reindexes_new_chain():
     """
     Symmetric to G25: when a reorg connects the new chain, each newly
     connected block must be passed to block_filter_index.add_block so
-    the index follows the active chain. block_sync.py:2974-3027 misses
-    this — only the linear connect path at line 1362 does it.
+    the index follows the active chain.
+
+    FIX-74 / W121 BUG-2 (closed 2026-05-16): the reorg connect loop now
+    hooks ``block_filter_index.add_block(new_block_obj, connect_height,
+    self.db)`` after each successful ``db.connect_block_from_bytes``.
+    Mirrors the linear connect path at block_sync.py:~1362 and Core's
+    BlockFilterIndex::CustomAppend via the CValidationInterface
+    BlockConnected callback (src/index/blockfilterindex.cpp +
+    src/index/base.cpp).
     """
     reorg_section = _reorg_section_of_block_sync()
     # Within the reorg section ONLY, the connect loop must hook the
-    # filter index. The linear path at line 1365 is outside this slice.
+    # filter index. The linear path at line ~1362 is outside this slice.
     assert "block_filter_index" in reorg_section and (
         ".add_block" in reorg_section or ".add(" in reorg_section
     ), (
@@ -650,6 +656,302 @@ def test_g29_fix71_test_e_peer_handshake_predicate_is_callable():
     assert p._should_advertise_node_compact_filters() is True
     p.node_compact_filters = False
     assert p._should_advertise_node_compact_filters() is False
+
+
+# ===========================================================================
+# G25 / G26 / G29 behavioral tests (FIX-74)
+# ===========================================================================
+# These exercise the reorg-hook path end-to-end against an in-memory
+# BlockFilterIndex by directly invoking ``BlockSync._handle_reorg`` with
+# stub db / mempool collaborators.  They are deliberately structural —
+# we do not stand up a full Rust DB here (covered by
+# tests/test_reorg_handle_rust_path.py + tests/test_reorg_atomic_*.py);
+# instead we pin the filter-index side of the reorg contract.
+# ===========================================================================
+
+
+def _build_fix74_harness():
+    """Return ``(BlockSync, fake_db, idx, blocks)`` wired together.
+
+    The fake_db pre-loads:
+        height 0  -> A0 (common ancestor)
+        height 1  -> A1 (current chain tip; will be disconnected)
+    The "new chain" produces:
+        height 1  -> B1 (new tip)
+
+    The harness exercises the FIX-74 hooks (remove + set_tip_header +
+    add_block) without depending on the Rust extension.  Sequence kept
+    deliberately small (1 disconnect + 1 connect) so the test stays
+    fast; the underlying machinery is the same for any depth.
+    """
+    import asyncio  # noqa: F401  (re-export so callers can asyncio.run)
+    from ouroboros.block_sync import BlockSync
+    from ouroboros.blockfilter import BlockFilterIndex
+
+    class _FakeBlock:
+        def __init__(self, h: bytes, prev: bytes, height: int):
+            self.hash = h
+            self.prev_blockhash = prev
+            self.height = height
+            self.transactions = []
+            # Non-empty placeholder so the connect path's "no raw bytes"
+            # guard doesn't fail before the FIX-74 hook runs.  The bytes
+            # are never decoded — connect_block_from_bytes on _FakeDB is
+            # a no-op.
+            self.raw_payload = b"\x00" * 80
+
+    A0 = _FakeBlock(b"\x10" * 32, bytes(32), 0)
+    A1 = _FakeBlock(b"\x11" * 32, A0.hash, 1)
+    B1 = _FakeBlock(b"\x21" * 32, A0.hash, 1)
+
+    class _FakeDB:
+        """Minimal storage interface used by ``_handle_reorg``.
+
+        Tracks current best tip + hash->block map; ``disconnect_block`` /
+        ``connect_block_from_bytes`` are no-ops that walk the chain ptr
+        without touching real UTXO state.  Block lookups follow whichever
+        chain the test has currently switched to (toggled by the harness).
+        """
+
+        def __init__(self):
+            self._blocks_by_hash = {A0.hash: A0, A1.hash: A1, B1.hash: B1}
+            # _height_to_block reflects the *current* active chain.
+            self._height_to_block = {0: A0, 1: A1}
+            self._tip = (A1.hash, 1)
+
+        def get_block(self, h):
+            return self._blocks_by_hash.get(h)
+
+        def get_block_by_height(self, ht):
+            return self._height_to_block.get(ht)
+
+        def get_best_block(self):
+            return self._tip
+
+        def disconnect_block(self, height):
+            # Roll the tip pointer back without touching the UTXO state.
+            self._tip = (self._height_to_block[height - 1].hash, height - 1)
+            self._height_to_block.pop(height, None)
+
+        def connect_block_from_bytes(self, raw, height):
+            # Pick whichever new-chain block corresponds to the height
+            # — by harness contract, only B1 is connect-target post-reorg.
+            new = B1
+            self._blocks_by_hash[new.hash] = new
+            self._height_to_block[height] = new
+            self._tip = (new.hash, height)
+
+        # Linear-connect path stubs (unused in this harness)
+        def update_best_block(self, h, ht):
+            self._tip = (h, ht)
+
+    class _FakeMempool:
+        def remove_block_transactions(self, _block):
+            return None
+
+        def add_transaction(self, _tx, _height):
+            return True, ""
+
+    class _FakeValidator:
+        def validate_block(self, _block):
+            return True, None
+
+        def apply_block(self, _block):
+            return None
+
+    class _FakePeerManager:
+        pass
+
+    idx = BlockFilterIndex()
+    # Pre-seed the index for the original chain: A0 at height 0 (genesis
+    # filter chains from zero prev_header), A1 at height 1 chaining from
+    # A0's filter header.
+    idx.add_block(A0, height=0)
+    idx.add_block(A1, height=1)
+
+    sync = BlockSync(
+        db=_FakeDB(),
+        validator=_FakeValidator(),
+        peer_manager=_FakePeerManager(),
+        mempool=_FakeMempool(),
+        fee_estimator=None,
+        block_filter_index=idx,
+    )
+
+    return sync, idx, A0, A1, B1
+
+
+def test_fix74_test_a_reorg_removes_disconnected_filters():
+    """Test A (G25 behavioral): one-block reorg disconnects the old tip
+    and the filter index drops its (filter, header) entry.
+
+    Before FIX-74: index kept stale A1 entry; ``get_filter(A1.hash)``
+    returned the orphan-chain filter.  After FIX-74: A1's entries are
+    removed; ``best_indexed_height`` rolled back to the common ancestor.
+    """
+    import asyncio
+
+    sync, idx, A0, A1, B1 = _build_fix74_harness()
+
+    # Pre-reorg: both blocks indexed.
+    assert idx.get_filter(A1.hash) is not None
+    assert idx.get_filter(A0.hash) is not None
+    assert idx.best_indexed_height == 1
+
+    # Run the reorg: A0 (common) -> B1 (new tip).
+    ok = asyncio.run(sync._handle_reorg(B1, B1.hash))
+    assert ok is True
+
+    # Post-reorg: A1 entry removed; A0 still present; B1 added.
+    assert idx.get_filter(A1.hash) is None, (
+        "FIX-74 BUG-1: reorg disconnect failed to remove stale filter "
+        "for the orphaned tip — index will diverge from active chain."
+    )
+    assert idx.get_filter(A0.hash) is not None
+    assert idx.get_filter(B1.hash) is not None
+    assert idx.best_indexed_height == 1
+
+
+def test_fix74_test_b_reorg_reindexes_new_chain():
+    """Test B (G26 behavioral): the new-chain tip is added to the filter
+    index after the reorg connects it.
+
+    Before FIX-74: the connect loop only updated the UTXO state and the
+    index never saw B1.  After FIX-74: B1 has a filter + chained
+    filter_header in the index.
+    """
+    import asyncio
+
+    sync, idx, A0, A1, B1 = _build_fix74_harness()
+
+    assert idx.get_filter(B1.hash) is None
+    assert idx.get_header(B1.hash) is None
+
+    ok = asyncio.run(sync._handle_reorg(B1, B1.hash))
+    assert ok is True
+
+    assert idx.get_filter(B1.hash) is not None, (
+        "FIX-74 BUG-2: reorg connect failed to re-index new-chain tip "
+        "— getcfilters/getcfheaders for B1.hash will miss the cache."
+    )
+    assert idx.get_header(B1.hash) is not None
+    # Height mapping reflects the new chain.
+    assert idx.get_block_hash_by_height(1) == B1.hash
+
+
+def test_fix74_test_c_filter_header_chain_rolls_back_to_common_ancestor():
+    """Test C: after the disconnect+connect, the filter header for B1 is
+    computed from A0's filter header — not from the stale A1 header that
+    would have leaked through pre-FIX-74.
+
+    Direct mathematical check: compute_filter_header(B1_filter, A0_header)
+    must equal idx.get_header(B1.hash).  This is the canonical fork
+    detector — a light client cross-checking us against another peer
+    would see exactly this header.
+    """
+    import asyncio
+    from ouroboros.blockfilter import (
+        compute_filter_header,
+        build_basic_filter,
+    )
+
+    sync, idx, A0, A1, B1 = _build_fix74_harness()
+
+    a0_header = idx.get_header(A0.hash)
+    assert a0_header is not None
+
+    ok = asyncio.run(sync._handle_reorg(B1, B1.hash))
+    assert ok is True
+
+    b1_filter = idx.get_filter(B1.hash)
+    b1_header = idx.get_header(B1.hash)
+    assert b1_filter is not None and b1_header is not None
+
+    expected = compute_filter_header(b1_filter, a0_header)
+    assert b1_header == expected, (
+        "FIX-74 BUG-1 collateral: B1 filter header was computed from "
+        "the stale A1 tip header instead of the common-ancestor A0 "
+        "header; the filter header chain forks from any honest peer."
+    )
+
+    # And the index's tip header advanced to B1's header (the new tip).
+    assert idx.tip_header == b1_header
+
+
+def test_fix74_test_d_sync_gate_advertisement_through_reorg():
+    """Test D: FIX-71 sync gate continues to behave correctly through a
+    reorg now that the FIX-71 rollback machinery actually fires.
+
+    Sequence:
+      1. Pre-reorg: best_indexed_height == 1, is_synced(chain_tip=1) True
+      2. Run reorg — disconnect removes A1 (height=1), best_indexed_height
+         temporarily rolls back to 0 inside the loop, then re-advances to
+         1 when B1 is re-added.  We only observe the post-reorg state
+         here (the in-flight state is hidden inside ``_handle_reorg``),
+         but the relevant guard is that the gate stays correct at the
+         endpoint.
+      3. Post-reorg: best_indexed_height == 1, is_synced(chain_tip=1)
+         True; AND the height mapping points at B1, not the orphan A1.
+    """
+    import asyncio
+
+    sync, idx, A0, A1, B1 = _build_fix74_harness()
+
+    # FIX-71 invariant — pre-reorg.
+    assert idx.best_indexed_height == 1
+    assert idx.is_synced(chain_tip_height=1) is True
+
+    ok = asyncio.run(sync._handle_reorg(B1, B1.hash))
+    assert ok is True
+
+    # FIX-71 invariant — post-reorg.  Re-added B1 advances the gate back.
+    assert idx.best_indexed_height == 1
+    assert idx.is_synced(chain_tip_height=1) is True
+    # The height-mapping no longer points at the orphan A1 hash.
+    assert idx.get_block_hash_by_height(1) == B1.hash
+    assert idx.get_block_hash_by_height(1) != A1.hash
+
+
+# ===========================================================================
+# Two-pipeline guard (FIX-74)
+# ===========================================================================
+# Matches the FIX-72 pattern: assert that ferrous-utils carries zero
+# block_filter_index code so this fix doesn't accidentally tilt the
+# two-pipeline gap.  Counterpart to G30 — G30 expects ZERO Rust filter
+# code (currently xfail); this guard pins the FIX-74-specific surface.
+# ===========================================================================
+
+def test_fix74_two_pipeline_guard_rust_has_no_block_filter_index():
+    """FIX-74 lives entirely in the Python pipeline.  The Rust crate
+    (ferrous-utils/sync) must not be touched — any block_filter_index
+    references there would mean the fix has bled across the pipeline
+    boundary.
+    """
+    from pathlib import Path
+
+    rust_root = Path(__file__).parent.parent / "ferrous-utils" / "sync" / "src"
+    forbidden = ("block_filter_index", "BlockFilterIndex")
+
+    if not rust_root.exists():
+        # Fresh checkout without the submodule populated — guard is
+        # trivially true.
+        return
+
+    offenders: list[str] = []
+    for path in rust_root.rglob("*.rs"):
+        try:
+            txt = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for needle in forbidden:
+            if needle in txt:
+                offenders.append(f"{path}: {needle}")
+
+    assert not offenders, (
+        f"FIX-74 two-pipeline guard: ferrous-utils/sync/src must contain "
+        f"NO block_filter_index references — fix bled across pipeline "
+        f"boundary at: {offenders[:5]}"
+    )
 
 
 # ===========================================================================
