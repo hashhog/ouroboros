@@ -1301,16 +1301,52 @@ class BitcoinNode:
                     # differ from the active-chain block at the same height;
                     # serving the active-chain prev_filter_header would
                     # produce a signed-but-lying response.
+                    #
+                    # FIX-79 / W121 BUG-4 (G28): when start_height > 0 and we
+                    # cannot look up the prev block's filter header (either
+                    # the ancestor walk fails, or bfi.get_header() returns
+                    # None because the block was removed from the index by
+                    # FIX-74's reorg-disconnect hook), do NOT fall back to
+                    # the all-zeros sentinel — that would produce a wire-
+                    # valid cfheaders message rooted at a fake genesis,
+                    # indistinguishable on the wire from an honest response
+                    # until a light client cross-checks against another peer.
+                    # Mirrors Bitcoin Core's ProcessGetCFHeaders behavior
+                    # (net_processing.cpp:3361-3369): on LookupFilterHeader
+                    # failure, log and return WITHOUT sending a response.
+                    # The peer will time out and retry — typically from
+                    # another peer who has the orphan block indexed.
                     prev_filter_header = b'\x00' * 32
                     if req.start_height > 0:
                         prev_ancestor = _get_ancestor(
                             self.db, stop_block, req.start_height - 1,
                         )
-                        prev_hash = prev_ancestor.hash if prev_ancestor is not None else None
-                        if prev_hash is not None and bfi is not None:
-                            ph = bfi.get_header(prev_hash)
-                            if ph is not None:
-                                prev_filter_header = ph
+                        if prev_ancestor is None or bfi is None:
+                            # prev_filter_header is None — abort getcfheaders
+                            # without sending a response (Core parity).
+                            logger.debug(
+                                f"getcfheaders: no prev_filter_header for "
+                                f"start_height={req.start_height} on fork "
+                                f"stop_hash={req.stop_hash.hex()[:16]}... — "
+                                f"ancestor walk failed; not responding"
+                            )
+                            return
+                        ph = bfi.get_header(prev_ancestor.hash)
+                        if ph is None:
+                            # prev_filter_header is None — bfi.get_header miss
+                            # on the orphan-fork prev block.  Abort without
+                            # zero-fallback (Core ProcessGetCFHeaders +
+                            # LookupFilterHeader at net_processing.cpp:3365).
+                            logger.debug(
+                                f"getcfheaders: no prev_filter_header for "
+                                f"prev_block="
+                                f"{prev_ancestor.hash.hex()[:16]}... at "
+                                f"height={req.start_height - 1} — bfi "
+                                f"index miss (orphan fork or unsynced); "
+                                f"not responding"
+                            )
+                            return
+                        prev_filter_header = ph
 
                     filter_hashes: list[bytes] = []
                     for h in range(req.start_height, stop_height + 1):
