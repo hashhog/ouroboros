@@ -1635,8 +1635,11 @@ class Mempool:
         self._cluster_manager = ClusterManager(self.transactions)
 
         # mapDeltas — per-tx fee-priority delta set by prioritisetransaction.
-        # txid -> nFeeDelta (satoshis, may be negative).  NOT persisted across
-        # restart (matches Core: txmempool.h:299 std::map<Txid, CAmount> in RAM).
+        # txid -> nFeeDelta (satoshis, may be negative).  Persisted across
+        # restart via mempool.dat dump/load (FIX-76, Core parity:
+        # node/mempool_persist.cpp:101+166-203).  In-mempool entries are
+        # written via the per-tx nFeeDelta field; standalone deltas (for
+        # txids not currently in the mempool) ride along in the tail block.
         # All fee comparisons that drive mining selection, RBF Rule 3/4 admission,
         # and mempool min-fee use get_modified_fee(entry) = entry.fee + delta.
         # Reference: bitcoin-core/src/txmempool.{h,cpp} PrioritiseTransaction,
@@ -1738,8 +1741,8 @@ class Mempool:
     #   bitcoin-core/src/txmempool.{h,cpp} CTxMemPool::PrioritiseTransaction,
     #   ApplyDelta, ClearPrioritisation, GetPrioritisedTransactions, mapDeltas.
     #   bitcoin-core/src/kernel/mempool_entry.h GetModifiedFee = m_modified_fee.
-    # Delta is in-memory only (not persisted across restart) and is consulted
-    # everywhere Core uses GetModifiedFee():
+    # Delta is consulted everywhere Core uses GetModifiedFee() and persists
+    # across restart via dump_to_file/load_from_file (FIX-76, Core parity):
     #   - RBF Rule 3/4 PaysForRBF gates (policy/rbf.cpp lines 107-122),
     #   - admission rolling-min-fee + min-relay gates,
     #   - mining selection (by_fee_rate sort effectively uses raw fee_rate;
@@ -3994,11 +3997,14 @@ class Mempool:
         XOR-obfuscation key, matching ``persist_v1_dat = false`` in Core.
         ``use_xor=False`` writes version 1 (plaintext); useful for tests.
 
-        Returns the number of transactions written (0 if mempool is empty,
-        in which case any stale file at *filepath* is removed).
+        Returns the number of transactions written (0 if mempool is empty
+        AND no standalone deltas exist, in which case any stale file at
+        *filepath* is removed).  Note: when ``map_deltas`` is non-empty even
+        if ``transactions`` is empty, the file IS written so deltas persist
+        across restart (FIX-76, Core parity).
         """
         count = len(self.transactions)
-        if count == 0:
+        if count == 0 and not self.map_deltas:
             # Remove stale file
             try:
                 os.remove(filepath)
@@ -4009,23 +4015,37 @@ class Mempool:
         # Build the obfuscated payload first; the version + xor-key header
         # is written in plaintext after the payload is XORed.
         #
-        # Note (FIX-72, W120 BUG-3): mapDeltas is held in RAM only and is
-        # intentionally NOT serialised to disk; deltas are lost on restart.
-        # This is the documented project semantics — see CLAUDE.md / W120
-        # audit memory.  Core does persist mapDeltas (node/mempool_persist.cpp:
-        # 199, 203); a future "delta-persistence" wave would extend this dump.
-        # We continue to emit nFeeDelta=0 in the per-tx body so the file
-        # remains Core-readable as a v2 mempool.dat without prioritisation.
+        # FIX-76 (W120 brief-error closure for FIX-72): mapDeltas is now
+        # persisted across restart, matching Core
+        # (node/mempool_persist.cpp:101+166-203).  In-mempool entries write
+        # their delta in the per-tx nFeeDelta field.  Remaining standalone
+        # deltas (for txids NOT currently in the mempool) ride along in the
+        # mapDeltas tail block, exactly as Core does (deltas erased from the
+        # working set after the per-tx loop, see line 200 in
+        # mempool_persist.cpp).
         body = bytearray()
         body.extend(struct.pack("<Q", count))  # uint64 mempool_transactions_to_write
+        # Snapshot under-lock once; we then mutate the LOCAL copy as we walk
+        # entries so the post-loop tail block only contains standalone deltas.
+        with self._lock:
+            map_deltas_remaining = dict(self.map_deltas)
         for entry in self.transactions.values():
             raw = entry.tx.serialize_with_witness()
             body.extend(raw)
             body.extend(struct.pack("<q", int(entry.time_added)))  # int64 nTime
-            # nFeeDelta: written as zero — see comment above.
-            body.extend(struct.pack("<q", 0))  # int64 nFeeDelta
-        # mapDeltas — written empty; see in-memory-only note above.
-        self._write_compact_size(body, 0)
+            # nFeeDelta for in-mempool entry — pulled from map_deltas.
+            txid = entry.tx.get_txid()
+            n_fee_delta = int(map_deltas_remaining.pop(txid, 0))
+            body.extend(struct.pack("<q", n_fee_delta))  # int64 nFeeDelta
+        # mapDeltas tail — standalone deltas for txids NOT in mempool entries.
+        # Core layout: compact_size count, then per entry: byte[32] txid + int64.
+        self._write_compact_size(body, len(map_deltas_remaining))
+        for txid, delta in map_deltas_remaining.items():
+            if len(txid) != 32:
+                # Defensive: skip malformed entries rather than corrupt the file.
+                continue
+            body.extend(txid)
+            body.extend(struct.pack("<q", int(delta)))
         # unbroadcast_txids — empty (we don't track unbroadcast set yet)
         self._write_compact_size(body, 0)
 
@@ -4118,6 +4138,11 @@ class Mempool:
         auto-detected and converted: txs are re-loaded from the old layout
         and the file is rewritten in Core format on next dump.
 
+        FIX-76: prioritisation deltas (mapDeltas) are restored on load,
+        both per-entry (nFeeDelta in tx record) and standalone (tail block
+        for txids not currently in the mempool).  Matches Core
+        node/mempool_persist.cpp:99-102 + 125-132.
+
         Returns the number of transactions successfully loaded.
         """
         from ouroboros.p2p_messages import TxMessage
@@ -4201,7 +4226,7 @@ class Mempool:
                     break
                 n_time = struct.unpack_from("<q", body, offset)[0]
                 offset += 8
-                _n_fee_delta = struct.unpack_from("<q", body, offset)[0]
+                n_fee_delta = struct.unpack_from("<q", body, offset)[0]
                 offset += 8
 
                 tx = tx_msg.transaction
@@ -4210,18 +4235,36 @@ class Mempool:
                     txid = tx.get_txid()
                     if txid in self.transactions:
                         self.transactions[txid].time_added = float(n_time)
+                    # FIX-76: restore per-tx nFeeDelta into map_deltas (Core
+                    # parity: mempool_persist.cpp:99-102 PrioritiseTransaction
+                    # for every recovered entry with non-zero delta).
+                    if n_fee_delta != 0:
+                        self.prioritise_transaction(tx.get_txid(), int(n_fee_delta))
                     loaded += 1
                 else:
                     skipped += 1
+                    # Even on validation failure, Core honours the on-disk
+                    # delta for that txid (so if the tx is later re-broadcast
+                    # it picks up its prioritisation).  Mirror that here.
+                    if n_fee_delta != 0:
+                        self.prioritise_transaction(tx.get_txid(), int(n_fee_delta))
 
-            # mapDeltas + unbroadcast_txids — parse and discard for now.
+            # mapDeltas tail + unbroadcast_txids.
+            # FIX-76 (W120 brief-error closure for FIX-72): standalone deltas
+            # — i.e. txids in mapDeltas that are NOT in the dumped tx set —
+            # are restored.  Matches Core (mempool_persist.cpp:125-132).
             try:
                 if offset < len(body):
                     map_count, offset = self._read_compact_size(body, offset)
                     for _ in range(map_count):
                         if offset + 32 + 8 > len(body):
                             break
-                        offset += 32 + 8  # txid + int64 delta
+                        txid_bytes = body[offset:offset + 32]
+                        offset += 32
+                        delta = struct.unpack_from("<q", body, offset)[0]
+                        offset += 8
+                        if int(delta) != 0:
+                            self.prioritise_transaction(bytes(txid_bytes), int(delta))
                 if offset < len(body):
                     ub_count, offset = self._read_compact_size(body, offset)
                     for _ in range(ub_count):
