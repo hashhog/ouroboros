@@ -424,12 +424,14 @@ def test_g27_getcfilters_aborts_on_missing_height():
 
 
 # ===========================================================================
-# G28 — getcfheaders prev_header zero-fallback is wire-incompat (BUG-4, BROKEN)
+# G28 — getcfheaders prev_header zero-fallback is wire-incompat (BUG-4)
+# FIX-79 — landed 2026-05-16.  Audit flips xfail → PASS.
 # ===========================================================================
 
-@pytest.mark.xfail(strict=True, reason="BUG-4: getcfheaders silently uses all-zero prev_filter_header when index lookup fails")
 def test_g28_getcfheaders_no_zero_fallback_for_prev_header():
     """
+    FIX-79 / W121 BUG-4 (closed 2026-05-16).
+
     Core's ProcessGetCFHeaders calls LookupFilterHeader on the
     (start_height - 1) block and aborts the response if the lookup
     fails (net_processing.cpp:3361-3370). It NEVER falls back to
@@ -437,13 +439,18 @@ def test_g28_getcfheaders_no_zero_fallback_for_prev_header():
     to a fake genesis, indistinguishable on the wire from an honest
     one until a light client cross-checks against another peer.
 
-    Ouroboros node.py:1224 starts `prev_filter_header = b'\\x00' * 32`
-    and only updates it if the index has the stored header. On miss
-    (index not synced past start_height-1, or block absent), the
-    response is sent with zeros.
+    Pre-FIX-79 ouroboros node.py started ``prev_filter_header =
+    b'\\x00' * 32`` and only updated it if the index had the stored
+    header. On miss (index not synced past start_height-1, or block
+    absent because FIX-74 removed it during reorg-disconnect), the
+    response was sent with zeros — "signed-but-lying".
 
-    Fix: after the lookup chain, if `prev_filter_header` is still the
-    sentinel zeros AND start_height > 0, abort without sending.
+    FIX-79: after the ancestor-walk + bfi lookup chain, if
+    ``prev_filter_header`` cannot be resolved AND start_height > 0,
+    return without sending.  Peer will time out and retry, ideally
+    from another peer who has the orphan block indexed (Core does
+    not store per-fork filter headers either; LookupFilterHeader is
+    keyed by block hash but the index is keyed by block-disk-position).
     """
     from pathlib import Path
     src = Path(__file__).parent.parent / "src" / "ouroboros" / "node.py"
@@ -1542,4 +1549,457 @@ def test_fix75_test_i_handler_aborts_on_unknown_stop_hash():
     assert peer.disconnected, (
         "FIX-75: handler did not disconnect peer on unknown stop_hash "
         "(G13 regression)"
+    )
+
+
+# ===========================================================================
+# FIX-79 — cfheaders no longer falls back to zero prev_filter_header on
+# orphan-fork ancestors (W121 BUG-4 / G28 closure)
+# ===========================================================================
+# Per FIX-75 commit body OOS note: "W121 BUG-4 (G28) cfheaders
+# prev_filter_header zero-fallback remains xfail — the ancestor walk now
+# resolves the correct orphan-fork prev_hash, BUT bfi.get_header() on an
+# orphan block returns None and the response still falls back to zeros
+# (separate fix needed)."
+#
+# FIX-79 adopts Approach B (defensive return-without-sending), matching
+# Core's exact behavior in ProcessGetCFHeaders at net_processing.cpp:3361-
+# 3370: LookupFilterHeader failure → log and return.  This is the same
+# pattern already used by the ouroboros cfcheckpt handler at
+# node.py:1396-1399 (post-FIX-75) — FIX-79 brings cfheaders into line with
+# its sibling handler.
+#
+# Storage refactor (Approach A: per-hash secondary index, or Approach C:
+# recompute on-the-fly) is deferred — Core itself returns silently from
+# LookupFilterHeader when the block is not in the active-chain index, so
+# parity is achieved without storage churn.
+# ===========================================================================
+
+
+def test_fix79_test_a_handler_aborts_on_orphan_prev_block_miss():
+    """A: behavioral — getcfheaders with start_height > 0 on an orphan-tip
+    stop_hash, where the orphan-fork prev block at (start_height - 1) is
+    NOT in the filter index (the post-FIX-74 state after reorg-disconnect
+    removed it).  Handler must NOT send a zero-anchored cfheaders.
+
+    This is the "signed-but-lying" guard for the previous_filter_header
+    field: pre-FIX-79 the handler emitted a CFHeadersMessage with
+    previous_filter_header=b'\\x00'*32; post-FIX-79 the handler returns
+    silently and the peer sees nothing (will time out and retry).
+    """
+    import asyncio
+
+    from ouroboros.node import BitcoinNode
+    from ouroboros.blockfilter import BlockFilterIndex
+    from ouroboros.p2p_messages import GetCFHeadersMessage
+
+    db = _FakeForkedDB()
+
+    # Pre-seed the filter index for the ACTIVE-CHAIN blocks only.  The
+    # orphan-fork blocks B1/B2 are visible via db.get_block() but NOT
+    # present in the filter index (mirrors the post-FIX-74 reorg state).
+    bfi = BlockFilterIndex()
+    bfi._filters = {
+        db.G.hash: b"\x00",
+        db.A1.hash: b"\xa1",
+        db.A2.hash: b"\xa2",
+        # NOTE: B1 / B2 deliberately absent — this is the orphan-after-
+        # reorg-disconnect scenario.
+    }
+    bfi._headers = {
+        db.G.hash: b"\x11" * 32,
+        db.A1.hash: b"\x22" * 32,
+        db.A2.hash: b"\x33" * 32,
+        # NOTE: B1 / B2 deliberately absent.
+    }
+    bfi._height_to_hash = {0: db.G.hash, 1: db.A1.hash, 2: db.A2.hash}
+
+    class _StubPeer:
+        host = "fake"
+        port = 0
+        network = "mainnet"
+
+        def __init__(self):
+            self.handlers = {}
+            self.sent: list = []
+            self.disconnected = False
+
+        def register_handler(self, name, fn):
+            self.handlers[name] = fn
+
+        async def send_message(self, msg):
+            self.sent.append(msg)
+
+        def disconnect(self):
+            self.disconnected = True
+
+    class _StubPeerManager:
+        def __init__(self, peers):
+            self._peers = peers
+
+        def get_all_ready_peers(self):
+            return self._peers
+
+        def set_inbound_peer_handler(self, cb):
+            pass
+
+        def set_outbound_peer_handler(self, cb):
+            pass
+
+    peer = _StubPeer()
+    pm = _StubPeerManager([peer])
+
+    node = BitcoinNode.__new__(BitcoinNode)
+    node.db = db
+    node.block_filter_index = bfi
+    node.peer_manager = pm
+    node.mempool = None
+    node._register_handlers()
+
+    handler = peer.handlers.get("getcfheaders")
+    assert handler is not None, "FIX-79 harness: getcfheaders handler not registered"
+
+    # Request: stop_hash=B2 (orphan tip), start_height=2 (so prev block is
+    # at height 1 → B1, which is NOT in the filter index).
+    req = GetCFHeadersMessage(
+        filter_type=0,
+        start_height=2,
+        stop_hash=db.B2.hash,
+    )
+    msg = req.to_network_message("mainnet")
+    asyncio.run(handler(msg))
+
+    # Pre-FIX-79: handler would have emitted a CFHeadersMessage with
+    # previous_filter_header=b'\x00'*32.  Post-FIX-79: silent return.
+    assert peer.sent == [], (
+        "FIX-79 BUG-4: handler emitted a cfheaders response for an "
+        "orphan-fork stop_hash where bfi.get_header(prev_block) returned "
+        "None — would be a signed-but-lying response rooted at the all-"
+        f"zeros sentinel.  Sent: {peer.sent!r}"
+    )
+    # We do NOT disconnect the peer here — Core only disconnects for
+    # protocol-violation paths (unknown stop_hash, out-of-range, etc.).
+    # An index miss on our side is not the peer's fault.
+    assert not peer.disconnected, (
+        "FIX-79: handler should NOT disconnect peer on our-side index "
+        "miss — Core just returns silently (net_processing.cpp:3365-3369)"
+    )
+
+
+def test_fix79_test_b_handler_aborts_on_broken_ancestor_walk():
+    """B: behavioral — getcfheaders where stop_block has no path back to
+    (start_height - 1) because the db chain is broken (e.g. the prev
+    block is missing entirely).  Handler must not zero-anchor.
+    """
+    import asyncio
+
+    from ouroboros.node import BitcoinNode
+    from ouroboros.blockfilter import BlockFilterIndex
+    from ouroboros.p2p_messages import GetCFHeadersMessage
+
+    # Build a single-block "chain" where stop_block has height 5 but
+    # prev_blockhash points at a hash the db doesn't know.  The ancestor
+    # walk from height 5 → 4 will return None.
+    G = _FakeOrphanBlock(b"\x00" * 31 + b"G", bytes(32), 0)
+    stop = _FakeOrphanBlock(
+        b"\xab" * 32, b"\xcd" * 32, 5
+    )
+
+    class _BrokenDB:
+        def __init__(self):
+            self._by_hash = {G.hash: G, stop.hash: stop}
+
+        def get_block(self, h):
+            return self._by_hash.get(h)
+
+        def get_block_by_height(self, ht):
+            return G if ht == 0 else None
+
+    db = _BrokenDB()
+    bfi = BlockFilterIndex()
+    bfi._filters = {G.hash: b"\x00"}
+    bfi._headers = {G.hash: b"\x00" * 32}
+    bfi._height_to_hash = {0: G.hash}
+
+    class _StubPeer:
+        host = "fake"
+        port = 0
+        network = "mainnet"
+
+        def __init__(self):
+            self.handlers = {}
+            self.sent: list = []
+            self.disconnected = False
+
+        def register_handler(self, name, fn):
+            self.handlers[name] = fn
+
+        async def send_message(self, msg):
+            self.sent.append(msg)
+
+        def disconnect(self):
+            self.disconnected = True
+
+    class _StubPeerManager:
+        def __init__(self, peers):
+            self._peers = peers
+
+        def get_all_ready_peers(self):
+            return self._peers
+
+        def set_inbound_peer_handler(self, cb):
+            pass
+
+        def set_outbound_peer_handler(self, cb):
+            pass
+
+    peer = _StubPeer()
+    pm = _StubPeerManager([peer])
+
+    node = BitcoinNode.__new__(BitcoinNode)
+    node.db = db
+    node.block_filter_index = bfi
+    node.peer_manager = pm
+    node.mempool = None
+    node._register_handlers()
+
+    handler = peer.handlers["getcfheaders"]
+    req = GetCFHeadersMessage(
+        filter_type=0,
+        start_height=5,
+        stop_hash=stop.hash,
+    )
+    msg = req.to_network_message("mainnet")
+    asyncio.run(handler(msg))
+
+    assert peer.sent == [], (
+        "FIX-79: handler emitted cfheaders despite ancestor walk failing "
+        "to resolve prev_block at start_height - 1"
+    )
+
+
+def test_fix79_test_c_handler_emits_response_when_prev_header_resolvable():
+    """C: forward regression — when the orphan-fork prev block IS in the
+    filter index (e.g. before reorg-disconnect removed it), the handler
+    MUST still emit a cfheaders response with the correct prev_header
+    (not zeros, not nothing).
+    """
+    import asyncio
+
+    from ouroboros.node import BitcoinNode
+    from ouroboros.blockfilter import BlockFilterIndex
+    from ouroboros.p2p_messages import (
+        GetCFHeadersMessage,
+        CFHeadersMessage,
+    )
+
+    db = _FakeForkedDB()
+
+    # Pre-seed the filter index for BOTH forks so the handler has every
+    # header it needs.  This is the "pre-reorg-disconnect" state.
+    bfi = BlockFilterIndex()
+    bfi._filters = {
+        db.G.hash: b"\x00",
+        db.A1.hash: b"\xa1",
+        db.A2.hash: b"\xa2",
+        db.B1.hash: b"\xb1",
+        db.B2.hash: b"\xb2",
+    }
+    bfi._headers = {
+        db.G.hash: b"\x11" * 32,
+        db.A1.hash: b"\x22" * 32,
+        db.A2.hash: b"\x33" * 32,
+        db.B1.hash: b"\x44" * 32,
+        db.B2.hash: b"\x55" * 32,
+    }
+    bfi._height_to_hash = {0: db.G.hash, 1: db.A1.hash, 2: db.A2.hash}
+
+    class _StubPeer:
+        host = "fake"
+        port = 0
+        network = "mainnet"
+
+        def __init__(self):
+            self.handlers = {}
+            self.sent: list = []
+
+        def register_handler(self, name, fn):
+            self.handlers[name] = fn
+
+        async def send_message(self, msg):
+            self.sent.append(msg)
+
+    class _StubPeerManager:
+        def __init__(self, peers):
+            self._peers = peers
+
+        def get_all_ready_peers(self):
+            return self._peers
+
+        def set_inbound_peer_handler(self, cb):
+            pass
+
+        def set_outbound_peer_handler(self, cb):
+            pass
+
+    peer = _StubPeer()
+    pm = _StubPeerManager([peer])
+
+    node = BitcoinNode.__new__(BitcoinNode)
+    node.db = db
+    node.block_filter_index = bfi
+    node.peer_manager = pm
+    node.mempool = None
+    node._register_handlers()
+
+    handler = peer.handlers["getcfheaders"]
+    # start_height=2 on orphan tip B2: prev block is B1 (orphan), which
+    # IS indexed → handler must emit with prev_filter_header = B1's header.
+    req = GetCFHeadersMessage(
+        filter_type=0,
+        start_height=2,
+        stop_hash=db.B2.hash,
+    )
+    msg = req.to_network_message("mainnet")
+    asyncio.run(handler(msg))
+
+    assert len(peer.sent) == 1, (
+        f"FIX-79: handler should have emitted exactly 1 cfheaders msg "
+        f"when prev_block is indexed; got {len(peer.sent)}"
+    )
+    decoded = CFHeadersMessage.from_payload(peer.sent[0].payload)
+    assert decoded.previous_filter_header == b"\x44" * 32, (
+        f"FIX-79: previous_filter_header should be B1's stored header "
+        f"(b'\\x44'*32), got {decoded.previous_filter_header!r}"
+    )
+    assert decoded.previous_filter_header != b"\x00" * 32, (
+        "FIX-79: previous_filter_header is all-zeros — handler still "
+        "falling back to zero sentinel"
+    )
+
+
+def test_fix79_test_d_handler_genesis_start_still_uses_zero_prev_header():
+    """D: forward regression — when start_height == 0, the previous-header
+    field is by-definition the all-zeros sentinel (no block precedes
+    genesis).  The FIX-79 abort branch is gated on start_height > 0, so
+    this path must still emit a cfheaders with zero prev_header.
+    """
+    import asyncio
+
+    from ouroboros.node import BitcoinNode
+    from ouroboros.blockfilter import BlockFilterIndex
+    from ouroboros.p2p_messages import (
+        GetCFHeadersMessage,
+        CFHeadersMessage,
+    )
+
+    db = _FakeForkedDB()
+    bfi = BlockFilterIndex()
+    bfi._filters = {
+        db.G.hash: b"\x00",
+        db.A1.hash: b"\xa1",
+        db.A2.hash: b"\xa2",
+    }
+    bfi._headers = {
+        db.G.hash: b"\x11" * 32,
+        db.A1.hash: b"\x22" * 32,
+        db.A2.hash: b"\x33" * 32,
+    }
+    bfi._height_to_hash = {0: db.G.hash, 1: db.A1.hash, 2: db.A2.hash}
+
+    class _StubPeer:
+        host = "fake"
+        port = 0
+        network = "mainnet"
+
+        def __init__(self):
+            self.handlers = {}
+            self.sent: list = []
+
+        def register_handler(self, name, fn):
+            self.handlers[name] = fn
+
+        async def send_message(self, msg):
+            self.sent.append(msg)
+
+    class _StubPeerManager:
+        def __init__(self, peers):
+            self._peers = peers
+
+        def get_all_ready_peers(self):
+            return self._peers
+
+        def set_inbound_peer_handler(self, cb):
+            pass
+
+        def set_outbound_peer_handler(self, cb):
+            pass
+
+    peer = _StubPeer()
+    pm = _StubPeerManager([peer])
+
+    node = BitcoinNode.__new__(BitcoinNode)
+    node.db = db
+    node.block_filter_index = bfi
+    node.peer_manager = pm
+    node.mempool = None
+    node._register_handlers()
+
+    handler = peer.handlers["getcfheaders"]
+    req = GetCFHeadersMessage(
+        filter_type=0,
+        start_height=0,
+        stop_hash=db.A2.hash,
+    )
+    msg = req.to_network_message("mainnet")
+    asyncio.run(handler(msg))
+
+    assert len(peer.sent) == 1, (
+        f"FIX-79: genesis-rooted cfheaders should still emit; "
+        f"got {len(peer.sent)} responses"
+    )
+    decoded = CFHeadersMessage.from_payload(peer.sent[0].payload)
+    assert decoded.previous_filter_header == b"\x00" * 32, (
+        "FIX-79: start_height == 0 must keep zero-sentinel prev_header "
+        "(no block precedes genesis); FIX-79 must not over-fire here"
+    )
+
+
+def test_fix79_two_pipeline_guard_rust_has_no_cfheaders_handler():
+    """FIX-79 must live entirely in the Python pipeline.  The Rust crate
+    (ferrous-utils/sync) must remain free of any cfheaders / prev_filter
+    handling — any drift here would mean the fix has bled across the
+    pipeline boundary.
+
+    Mirrors the FIX-74 + FIX-75 two-pipeline guards.  Counterpart to G30.
+    """
+    from pathlib import Path
+
+    rust_root = Path(__file__).parent.parent / "ferrous-utils" / "sync" / "src"
+    forbidden = (
+        "GetCFHeaders",
+        "CFHeaders",
+        "prev_filter_header",
+        "previous_filter_header",
+        "LookupFilterHeader",
+        "block_filter_index",
+    )
+
+    if not rust_root.exists():
+        return  # submodule not populated — trivially true
+
+    offenders: list[str] = []
+    for path in rust_root.rglob("*.rs"):
+        try:
+            txt = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for needle in forbidden:
+            if needle in txt:
+                offenders.append(f"{path}: {needle}")
+
+    assert not offenders, (
+        f"FIX-79 two-pipeline guard: ferrous-utils/sync/src must contain "
+        f"NO cfheaders / prev_filter_header / block_filter_index code — "
+        f"fix bled across pipeline boundary at: {offenders[:5]}"
     )
