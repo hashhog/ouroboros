@@ -289,6 +289,68 @@ class TestObfuscation(unittest.TestCase):
         self.assertEqual(bytes(payload), original)
 
 
+class TestMapDeltasPersistence(unittest.TestCase):
+    """FIX-76: mapDeltas persists across dump → load (Core parity).
+
+    Reference: bitcoin-core/src/node/mempool_persist.cpp:101+166-203.  The
+    earlier FIX-72 commit incorrectly documented map_deltas as in-memory
+    only — Core actually persists both the per-tx nFeeDelta inside each
+    record AND a standalone mapDeltas tail block for txids not in the
+    mempool entry set.
+    """
+
+    def _setup(self):
+        db = _StubDB()
+        mp = Mempool(_AlwaysOkValidator(db), require_standard=False)
+        tx = _make_tx(11, db)
+        ok, _ = mp.add_transaction(tx, height=100)
+        self.assertTrue(ok)
+        # The real (post-load) txid is what mp uses internally too,
+        # because _make_tx assigns its real double-SHA256 to tx.txid.
+        return mp, db, tx
+
+    def test_in_mempool_delta_round_trip(self):
+        mp, db, tx = self._setup()
+        real_txid = tx.get_txid()
+        mp.prioritise_transaction(real_txid, 7_777)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mempool.dat")
+            self.assertEqual(mp.dump_to_file(path, use_xor=False), 1)
+            mp2 = Mempool(_AlwaysOkValidator(db), require_standard=False)
+            loaded = mp2.load_from_file(path, height=100)
+            self.assertEqual(loaded, 1)
+            self.assertIn(real_txid, mp2.map_deltas)
+            self.assertEqual(mp2.map_deltas[real_txid], 7_777)
+
+    def test_standalone_delta_round_trip(self):
+        mp, db, _ = self._setup()
+        absent = bytes(range(32))  # txid not in mempool
+        mp.prioritise_transaction(absent, -123_456)
+        self.assertNotIn(absent, mp.transactions)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mempool.dat")
+            mp.dump_to_file(path, use_xor=False)
+            mp2 = Mempool(_AlwaysOkValidator(db), require_standard=False)
+            mp2.load_from_file(path, height=100)
+            self.assertIn(absent, mp2.map_deltas)
+            self.assertEqual(mp2.map_deltas[absent], -123_456)
+            self.assertNotIn(absent, mp2.transactions)
+
+    def test_xor_dump_preserves_deltas(self):
+        """Both halves of the delta tail survive v2 (XOR-obfuscated) dump."""
+        mp, db, tx = self._setup()
+        mp.prioritise_transaction(tx.get_txid(), 42)
+        absent = b"\xCC" * 32
+        mp.prioritise_transaction(absent, 99)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "mempool.dat")
+            mp.dump_to_file(path, use_xor=True)
+            mp2 = Mempool(_AlwaysOkValidator(db), require_standard=False)
+            mp2.load_from_file(path, height=100)
+            self.assertEqual(mp2.map_deltas.get(tx.get_txid()), 42)
+            self.assertEqual(mp2.map_deltas.get(absent), 99)
+
+
 class TestLegacyMigration(unittest.TestCase):
     """The pre-Core ouroboros dump format is read once and discarded."""
 

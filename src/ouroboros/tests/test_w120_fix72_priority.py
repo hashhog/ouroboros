@@ -10,8 +10,9 @@ Verifies:
   6. delta of zero (after accumulation) erases the map_deltas entry.
   7. delta survives normal removal (eviction/expiry).
   8. delta is cleared on block confirmation (Core removeForBlock parity).
-  9. delta is NOT persisted across mempool.dump_to_file / load_from_file
-     (in-memory-only semantics; matches project policy in CLAUDE.md).
+  9. delta IS persisted across mempool.dump_to_file / load_from_file
+     (FIX-76 — Core parity, node/mempool_persist.cpp:101+166-203 —
+     supersedes the FIX-72 brief's incorrect "in-memory only" claim).
  10. rpc_prioritisetransaction wires through (endian + dummy gating).
  11. rpc_getprioritisedtransactions emits Core-shape map.
  12. getmempoolentry RPC reflects modified fee in fees.modified.
@@ -400,14 +401,19 @@ class TestDeltaLifecycle(unittest.TestCase):
         mp.clear_prioritisation(_bytes32(60))
         self.assertNotIn(_bytes32(60), mp.map_deltas)
 
-    def test_delta_lost_on_dump_load_roundtrip(self):
-        """Delta is in-memory only (project policy, see CLAUDE.md).
+    def test_delta_persisted_across_dump_load_roundtrip(self):
+        """Delta survives a mempool.dat dump → reload (FIX-76).
 
-        Core does persist mapDeltas (node/mempool_persist.cpp:166-203); this
-        test asserts the documented project-level divergence: ouroboros's
-        mempool.dat is byte-compatible with Core but writes zero deltas, so a
-        dump/load roundtrip wipes them.  Changing this behaviour requires a
-        new wave.
+        FIX-72 originally documented map_deltas as intentionally in-memory
+        only, but the FIX-72 brief was wrong about Core: Core DOES persist
+        mapDeltas (node/mempool_persist.cpp:101+166-203).  FIX-76 brings
+        ouroboros to Core parity: in-mempool entries persist via the per-tx
+        nFeeDelta field, standalone deltas via the tail block.
+
+        Note: the test scaffold's synthetic ``_txid`` override survives in
+        the live Transaction object but NOT through serialize → deserialize.
+        After load, mp2's entry txid is the genuine double-SHA256 of the
+        serialized body — which is the txid we look up.
         """
         from ouroboros.mempool import Mempool
         mp, db = _make_mempool()
@@ -429,9 +435,132 @@ class TestDeltaLifecycle(unittest.TestCase):
                           require_standard=False)
             mp2.validator.db = db  # share UTXOs for re-admission
             mp2.load_from_file(path, height=101)
-            # Delta is NOT restored.
-            self.assertNotIn(txid, mp2.map_deltas,
-                             "mapDeltas must NOT be persisted (project policy)")
+            # Exactly one entry was reloaded — its real txid is the lookup
+            # key in mp2.map_deltas (production-equivalent semantics).
+            self.assertEqual(len(mp2.transactions), 1)
+            real_txid = next(iter(mp2.transactions.keys()))
+            # Delta IS restored (FIX-76 — Core parity).
+            self.assertIn(
+                real_txid, mp2.map_deltas,
+                "mapDeltas must be persisted (FIX-76, Core parity)",
+            )
+            self.assertEqual(mp2.map_deltas[real_txid], 7_777)
+
+    def test_standalone_delta_persisted_via_tail_block(self):
+        """Delta for a txid NOT in mempool persists via the tail block.
+
+        Matches Core (mempool_persist.cpp:125-132 LoadMempool):
+            std::map<Txid, CAmount> mapDeltas;
+            file >> mapDeltas;
+            for (const auto& i : mapDeltas) pool.PrioritiseTransaction(...);
+        """
+        from ouroboros.mempool import Mempool
+        mp, db = _make_mempool()
+        # First add a real tx so the dump runs (mempool needs ≥1 entry OR a
+        # delta to skip the empty early-return).
+        _add_tx_with_input(
+            mp, db, parent_txid=_bytes32(72), tx_id=_bytes32(73),
+            parent_value=1_000_000, fee=1_000,
+        )
+        # Standalone delta for a txid that is NOT in mempool.
+        absent_txid = _bytes32(0xABCDEF)
+        mp.prioritise_transaction(absent_txid, -4_242)
+        self.assertNotIn(absent_txid, mp.transactions)
+        self.assertEqual(mp.map_deltas[absent_txid], -4_242)
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "mempool.dat")
+            mp.dump_to_file(path, use_xor=False)
+
+            mp2 = Mempool(validator=mp.validator, full_rbf=True,
+                          require_standard=False)
+            mp2.validator.db = db
+            mp2.load_from_file(path, height=101)
+            self.assertIn(absent_txid, mp2.map_deltas)
+            self.assertEqual(mp2.map_deltas[absent_txid], -4_242)
+            self.assertNotIn(
+                absent_txid, mp2.transactions,
+                "Standalone delta should NOT introduce a mempool entry"
+            )
+
+    def test_empty_map_deltas_survives_dump_load(self):
+        """Mempool with zero deltas dumps + loads cleanly (no crash)."""
+        from ouroboros.mempool import Mempool
+        mp, db = _make_mempool()
+        _add_tx_with_input(
+            mp, db, parent_txid=_bytes32(74), tx_id=_bytes32(75),
+            parent_value=1_000_000, fee=1_000,
+        )
+        self.assertEqual(mp.map_deltas, {})
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "mempool.dat")
+            mp.dump_to_file(path, use_xor=False)
+            mp2 = Mempool(validator=mp.validator, full_rbf=True,
+                          require_standard=False)
+            mp2.validator.db = db
+            mp2.load_from_file(path, height=101)
+            self.assertEqual(mp2.map_deltas, {})
+            self.assertEqual(len(mp2.transactions), 1)
+
+    def test_mixed_in_mempool_and_standalone_deltas_roundtrip(self):
+        """Both kinds of delta on the same dump roundtrip back."""
+        from ouroboros.mempool import Mempool
+        mp, db = _make_mempool()
+        tx = _add_tx_with_input(
+            mp, db, parent_txid=_bytes32(76), tx_id=_bytes32(77),
+            parent_value=1_000_000, fee=1_000,
+        )
+        in_pool_txid = tx.get_txid()
+        mp.prioritise_transaction(in_pool_txid, 11_111)
+        absent_a = _bytes32(0xAAAA)
+        absent_b = _bytes32(0xBBBB)
+        mp.prioritise_transaction(absent_a, 22_222)
+        mp.prioritise_transaction(absent_b, -33_333)
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "mempool.dat")
+            mp.dump_to_file(path, use_xor=False)
+            mp2 = Mempool(validator=mp.validator, full_rbf=True,
+                          require_standard=False)
+            mp2.validator.db = db
+            mp2.load_from_file(path, height=101)
+            # In-mempool entry has its real (serialize-derived) txid after
+            # reload; the synthetic ``_txid`` injection doesn't survive the
+            # serialize → deserialize round-trip.
+            self.assertEqual(len(mp2.transactions), 1)
+            real_in_pool_txid = next(iter(mp2.transactions.keys()))
+            self.assertEqual(mp2.map_deltas[real_in_pool_txid], 11_111)
+            # Standalone deltas survive byte-for-byte (no serialization
+            # involved on the txid bytes — they're written as-is).
+            self.assertEqual(mp2.map_deltas[absent_a], 22_222)
+            self.assertEqual(mp2.map_deltas[absent_b], -33_333)
+
+    def test_old_format_file_without_tail_loads_cleanly(self):
+        """Pre-FIX-76 dumps wrote tail count=0; current code must still load them.
+
+        Backward-compat: a v1 (no XOR) dump written before FIX-76 with no
+        per-tx delta + empty mapDeltas tail must load without raising.
+        """
+        from ouroboros.mempool import Mempool
+        # Build a minimal v1 mempool.dat by hand:
+        # uint64 version=1, uint64 tx_count=0, compact_size 0 (mapDeltas),
+        # compact_size 0 (unbroadcast).
+        blob = bytearray()
+        blob.extend(struct.pack("<Q", 1))  # version
+        blob.extend(struct.pack("<Q", 0))  # tx_count
+        blob.append(0)                     # compact_size mapDeltas_count=0
+        blob.append(0)                     # compact_size unbroadcast_count=0
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "mempool.dat")
+            with open(path, "wb") as f:
+                f.write(bytes(blob))
+
+            mp = Mempool(validator=MockValidator(MockDB()),
+                         full_rbf=True, require_standard=False)
+            n = mp.load_from_file(path, height=101)
+            self.assertEqual(n, 0)
+            self.assertEqual(mp.map_deltas, {})
 
 
 # ===========================================================================
@@ -588,6 +717,47 @@ class TestSourceRegressionGuards(unittest.TestCase):
             self.assertTrue(hasattr(Mempool, name) or name == "map_deltas",
                             f"Mempool must expose {name}")
 
+    def test_dump_to_file_writes_n_fee_delta_from_map_deltas(self):
+        """FIX-76 source guard: dump_to_file no longer writes literal nFeeDelta=0.
+
+        The pre-FIX-76 anti-pattern wrote ``struct.pack("<q", 0)`` for every
+        per-tx nFeeDelta and a zero-length mapDeltas tail.  Make sure the new
+        dump path consults ``map_deltas`` for both halves.
+        """
+        from ouroboros.mempool import Mempool
+        src = inspect.getsource(Mempool.dump_to_file)
+        # The persisted-delta path must mention map_deltas.
+        self.assertIn(
+            "map_deltas", src,
+            "dump_to_file must consult map_deltas (FIX-76)",
+        )
+        # The pre-FIX-76 stub literal must be gone.
+        self.assertNotIn(
+            'body.extend(struct.pack("<q", 0))  # int64 nFeeDelta',
+            src,
+            "dump_to_file no longer writes literal nFeeDelta=0 (FIX-76)",
+        )
+
+    def test_load_from_file_restores_deltas(self):
+        """FIX-76 source guard: load_from_file restores both kinds of delta.
+
+        The pre-FIX-76 load path parsed the tail and DISCARDED deltas via a
+        bare ``offset += 32 + 8`` loop with no PrioritiseTransaction call.
+        After FIX-76 the loop must call ``prioritise_transaction`` for both
+        per-entry and standalone deltas.
+        """
+        from ouroboros.mempool import Mempool
+        src = inspect.getsource(Mempool.load_from_file)
+        self.assertIn(
+            "prioritise_transaction", src,
+            "load_from_file must replay deltas via prioritise_transaction (FIX-76)",
+        )
+        # Per-entry nFeeDelta must be consumed not just skipped.
+        self.assertNotIn(
+            "_n_fee_delta", src,
+            "load_from_file should USE nFeeDelta, not throw it away (FIX-76)",
+        )
+
 
 # ===========================================================================
 # Section 6 — two-pipeline guard (Rust ferrous-utils still has no RBF)
@@ -620,6 +790,30 @@ class TestTwoPipelineGuard(unittest.TestCase):
             hits, 0,
             "Rust pipeline currently has no priority/RBF; if this changes, "
             "GetModifiedFee semantics MUST be honoured there too (FIX-72)",
+        )
+
+    def test_rust_pipeline_has_no_mempool_persist_code(self):
+        """FIX-76: persistence code stays Python-only.
+
+        ferrous-utils (Rust) must not touch mempool.dat or mapDeltas
+        persistence — Python-side owns dump_to_file/load_from_file.  If a
+        future wave adds Rust-side mempool persistence, BOTH halves of the
+        delta tail must be honoured (per-tx nFeeDelta + standalone tail).
+        """
+        rust_root = src_dir.parent / "ferrous-utils" / "sync" / "src"
+        if not rust_root.exists():
+            self.skipTest("Rust pipeline not present in this checkout")
+        hits = []
+        for path in rust_root.rglob("*.rs"):
+            content = path.read_text(errors="ignore")
+            for needle in ("mempool.dat", "DumpMempool", "LoadMempool",
+                           "nFeeDelta", "fee_delta", "map_deltas"):
+                if needle in content:
+                    hits.append((path.name, needle))
+        self.assertEqual(
+            hits, [],
+            f"Rust pipeline must remain mempool-persistence-free (FIX-76); "
+            f"hits: {hits}",
         )
 
 
