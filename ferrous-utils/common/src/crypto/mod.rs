@@ -25,7 +25,9 @@ pub fn verify_ecdsa_signature(
     pubkey: &[u8],
     msg: &[u8],
 ) -> Result<bool, Secp256k1Error> {
-    let secp = Secp256k1::verification_only();
+    let mut secp = Secp256k1::verification_only();
+    // Side-channel blinding per Core key.cpp:572-587 (W159 BUG-3)
+    secp::randomize_context(&mut secp);
 
     // Parse public key
     let pubkey = PublicKey::from_slice(pubkey)?;
@@ -63,7 +65,9 @@ pub fn verify_ecdsa_signature_der(
     pubkey: &[u8],
     msg: &[u8],
 ) -> Result<bool, Secp256k1Error> {
-    let secp = Secp256k1::verification_only();
+    let mut secp = Secp256k1::verification_only();
+    // Side-channel blinding per Core key.cpp:572-587 (W159 BUG-3)
+    secp::randomize_context(&mut secp);
     let pubkey = PublicKey::from_slice(pubkey)?;
     let signature = Signature::from_der(der_sig)?;
 

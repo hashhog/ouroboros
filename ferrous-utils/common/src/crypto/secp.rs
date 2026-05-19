@@ -7,9 +7,10 @@
 //
 // Reference: Bitcoin Core's libsecp256k1
 
+use rand::RngCore;
 use secp256k1::{
-    ecdsa::Signature as EcdsaSignature, schnorr::Signature as SchnorrSignature, Error, Message,
-    PublicKey, Secp256k1, XOnlyPublicKey,
+    ecdsa::Signature as EcdsaSignature, schnorr::Signature as SchnorrSignature, Context, Error,
+    Message, PublicKey, Secp256k1, XOnlyPublicKey,
 };
 use std::sync::OnceLock;
 
@@ -17,9 +18,28 @@ use std::sync::OnceLock;
 /// This amortizes the cost of computing pre-computed tables across all verifications
 static SECP_CTX: OnceLock<Secp256k1<secp256k1::All>> = OnceLock::new();
 
-/// Get the global secp256k1 context
+/// Apply `secp256k1_context_randomize` with 32 fresh OS-random bytes.
+///
+/// Per Bitcoin Core (`key.cpp:572-587`) and libsecp256k1
+/// (`include/secp256k1.h:286-290`), every context_create call should be
+/// followed by a randomize call to enable side-channel blinding. Cost is
+/// negligible; defense is real (DPA / timing variance on scalar mul).
+///
+/// Helper is `pub(crate)` so other crypto modules (`mod.rs`, `bip324.rs`)
+/// can apply the same hardening to per-call contexts.
+pub(crate) fn randomize_context<C: Context>(ctx: &mut Secp256k1<C>) {
+    let mut seed = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut seed);
+    ctx.seeded_randomize(&seed);
+}
+
+/// Get the global secp256k1 context (lazily initialized + randomized).
 fn get_context() -> &'static Secp256k1<secp256k1::All> {
-    SECP_CTX.get_or_init(Secp256k1::new)
+    SECP_CTX.get_or_init(|| {
+        let mut ctx = Secp256k1::new();
+        randomize_context(&mut ctx);
+        ctx
+    })
 }
 
 /// Verify an ECDSA signature (compact 64-byte format)
