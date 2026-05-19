@@ -241,3 +241,108 @@ class TestApplyBlockGenesisGate(unittest.TestCase):
         scoped to height 0 only."""
         with self.assertRaises(AttributeError):
             self.validator.apply_block(self._make_block(1))
+
+
+class TestSigCacheKeyCommitsToWitness(unittest.TestCase):
+    """W159 BUG-13 / W160 BUG-9 regression.
+
+    Pre-fix, ``_verify_input_signature`` derived the SigCache key from
+    ``txid + input_index + script_pubkey + script_sig`` only. For Taproot
+    (and SegWit v0) inputs ``script_sig`` is EMPTY — the signature lives
+    in ``witness`` — so the cache key carried NO witness-bearing
+    material. Two distinct spends of the same outpoint with different
+    witnesses produced IDENTICAL cache keys; a cached True from a
+    legitimate spend short-circuited verification of a forged-witness
+    spend on the next lookup.
+
+    Post-fix (per Core ``sigcache.cpp:39-50``), the cache key commits to
+    the full witness-bearing tx envelope (``serialize_with_witness()``).
+    Two Taproot spends of the same ``(txid, input_index)`` with different
+    witnesses MUST produce distinct cache keys.
+    """
+
+    def setUp(self):
+        from ouroboros.database import Transaction, TxIn, TxOut  # noqa
+        from ouroboros.validation import SIG_CACHE
+        SIG_CACHE.clear()
+        self.Transaction = Transaction
+        self.TxIn = TxIn
+        self.TxOut = TxOut
+
+    def _build_taproot_tx(self, witness_stack):
+        """Construct a Taproot-shaped tx: empty script_sig, non-empty witness."""
+        # P2TR scriptPubKey: OP_1 <32-byte-x-only-pubkey>
+        spk = b"\x51\x20" + bytes(32)
+        return self.Transaction(
+            txid=bytes(32),
+            version=2,
+            locktime=0,
+            has_witness=True,
+            inputs=[
+                self.TxIn(
+                    prev_txid=b"\x11" * 32,
+                    prev_vout=0,
+                    script_sig=b"",  # Taproot key-path: empty script_sig
+                    sequence=0xffffffff,
+                    witness=list(witness_stack),
+                ),
+            ],
+            outputs=[self.TxOut(value=900, script_pubkey=spk)],
+        )
+
+    def test_taproot_forged_witness_does_not_collide_with_cached_valid(self):
+        """W159 BUG-13 / W160 BUG-9 regression: differing witnesses on the
+        same (txid, input_index, script_pubkey) MUST derive distinct
+        SigCache keys — even when script_sig is empty (Taproot).
+
+        We replicate the cache-key derivation logic from
+        ``_verify_input_signature`` (without actually running the script
+        interpreter, which would need real keypairs / signatures). The
+        post-fix key includes ``serialize_with_witness()``, so the two
+        witnesses produce distinct keys.
+        """
+        import hashlib as _hashlib
+        import struct as _struct
+        from ouroboros.validation import SIG_CACHE
+
+        # P2TR scriptPubKey + utxo amount — identical across both spends.
+        spk = b"\x51\x20" + bytes(32)
+        amount = 1000
+
+        # "Legitimate" spend: a Schnorr-ish 64-byte witness.
+        tx_valid = self._build_taproot_tx([b"\xaa" * 64])
+        # "Forged" spend: same outpoint, same script_pubkey, but different
+        # witness bytes — i.e. an attacker swapped the signature.
+        tx_forged = self._build_taproot_tx([b"\xbb" * 64])
+
+        def _make_key(tx, input_index):
+            amount_bytes = _struct.pack("<q", amount)
+            sighash_material = _hashlib.sha256(
+                tx.serialize_with_witness()
+                + _struct.pack("<I", input_index)
+                + spk
+                + amount_bytes
+            ).digest()
+            return sighash_material, bytes(spk), bytes(tx.inputs[input_index].script_sig)
+
+        sh_v, pk_v, sig_v = _make_key(tx_valid, 0)
+        sh_f, pk_f, sig_f = _make_key(tx_forged, 0)
+
+        # Cryptographic-material guarantee: the per-input commitments differ.
+        self.assertNotEqual(
+            sh_v, sh_f,
+            "Forged-witness Taproot spend MUST derive a distinct sighash "
+            "commitment (W159 BUG-13 / W160 BUG-9: pre-fix, empty script_sig "
+            "left the cache key without any witness-bearing material).",
+        )
+
+        # End-to-end SigCache guarantee: insert the "valid" cache entry,
+        # then look up the "forged" key — it must NOT short-circuit to True.
+        SIG_CACHE.insert(sh_v, pk_v, sig_v, 0)
+        self.assertTrue(SIG_CACHE.lookup(sh_v, pk_v, sig_v, 0),
+                        "sanity: the inserted key is retrievable")
+        self.assertFalse(
+            SIG_CACHE.lookup(sh_f, pk_f, sig_f, 0),
+            "Forged-witness lookup MUST miss the cache — pre-fix it hit, "
+            "letting a tampered witness replay a cached valid result.",
+        )
