@@ -162,7 +162,9 @@ impl EllSwiftPubKey {
     /// Generates a 64-byte representation that encodes the public key
     /// in a way that's indistinguishable from random bytes.
     pub fn from_secret_key(secret_key: &SecretKey, entropy: &[u8; 32]) -> Self {
-        let secp = Secp256k1::new();
+        let mut secp = Secp256k1::new();
+        // Side-channel blinding per Core key.cpp:572-587 (W159 BUG-3)
+        super::secp::randomize_context(&mut secp);
         let pubkey = PublicKey::from_secret_key(&secp, secret_key);
         let serialized = pubkey.serialize();
 
