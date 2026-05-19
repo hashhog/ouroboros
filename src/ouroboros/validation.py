@@ -2137,21 +2137,48 @@ class TransactionValidator:
         input_amounts: list[int] = None,
         input_script_pubkeys: list[bytes] = None,
     ) -> bool:
-        # Build SigCache key from cryptographic material so that two different
-        # (sig, pubkey) pairs on the same outpoint produce distinct entries.
+        # Build SigCache key from a true sighash-class commitment so that
+        # forged-witness spends (e.g. Taproot key-path with empty script_sig)
+        # cannot replay a cached valid-verification result.
         #
-        # sighash_material: serialised tx + input index covers the sighash
-        #   commitment for this input without requiring a full sighash pre-image
-        #   computation here (the real sighash is computed inside
-        #   script_interpreter.verify below, which is the authority).
-        # pubkey_bytes: the locking script (script_pubkey) commits to the key.
-        # sig_bytes: the unlocking script (script_sig) carries the signature.
+        # Per Core sigcache.cpp:39-50, the cache key is hashed over the actual
+        # 32-byte sighash + pubkey + sig. ouroboros previously keyed on
+        # (txid + input_index + script_pubkey + script_sig) which omits ALL
+        # witness data; for SegWit / Taproot inputs `script_sig` is empty so
+        # the cache key carried no witness-bearing material at all and any
+        # forged-witness spend on the same (txid, input_index, flags) tuple
+        # replayed the cached True. W159 BUG-13 / W160 BUG-9.
+        #
+        # Since the script interpreter computes the *actual* sighash inside
+        # each CHECKSIG op (and a single script may invoke multiple sighash
+        # types), we cannot extract one canonical "sighash" at the input level.
+        # Instead we build a 32-byte commitment that covers every byte the
+        # interpreter could possibly hash into a sighash:
+        #   - serialize_with_witness(): full BIP141 wire bytes — commits to
+        #     every input's outpoint+script_sig+witness+sequence, every
+        #     output, version, locktime. Any forged-witness spend changes
+        #     this serialisation and therefore changes the commitment.
+        #   - input_index: identifies WHICH input this verification covers.
+        #   - script_pubkey + amount: the prevout binding, BIP143-essential.
+        #   - flags: script-verify flags affect the sighash via sig_version.
+        # Two distinct sighashes that the interpreter would compute over this
+        # input therefore cannot collide on the cache key — the wire bytes
+        # they hash over differ.
         #
         # The per-process nonce inside SIG_CACHE prevents key prediction.
         import struct as _struct
-        sighash_material = tx.get_txid() + _struct.pack("<I", input_index)
         pubkey_bytes = bytes(utxo['script_pubkey'])
         sig_bytes = bytes(tx_in.script_sig)
+        # Sighash commitment: hash of the full witness-bearing tx envelope
+        # plus the per-input prevout binding. This is what the script
+        # interpreter would feed (in pieces) into every CHECKSIG it runs.
+        amount_bytes = _struct.pack("<q", int(utxo['value']))
+        sighash_material = hashlib.sha256(
+            tx.serialize_with_witness()
+            + _struct.pack("<I", input_index)
+            + pubkey_bytes
+            + amount_bytes
+        ).digest()
 
         # Check cache first - only successful verifications are cached
         if SIG_CACHE.lookup(sighash_material, pubkey_bytes, sig_bytes, flags):
