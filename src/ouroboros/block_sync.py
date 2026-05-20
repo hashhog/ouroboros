@@ -1633,10 +1633,14 @@ class BlockSync:
         on ``AcceptBlockHeader`` / ``ProcessNewBlockHeaders``
         (validation.cpp:4186, 4242).  When False (raw P2P headers from a peer
         that has NOT been cleared by the PRESYNC state machine), this function
-        computes the cumulative chain work of the accepted batch and rejects the
-        entire batch with ``too-little-chainwork`` if it falls below
-        ``nMinimumChainWork``.  When True (PRESYNC or trusted paths), the check
-        is skipped.  Default is True for backward-compat with internal callers.
+        computes the TOTAL chain work of the candidate chain — the cumulative
+        work already stored at our DB tip PLUS the work of every queued header
+        — and rejects the batch with ``too-little-chainwork`` if that total
+        falls below ``nMinimumChainWork``.  The base term is essential: without
+        it the check measures only the in-flight header window and rejects
+        every batch once the node is past genesis.  When True (PRESYNC or
+        trusted paths), the check is skipped.  Default is True for
+        backward-compat with internal callers.
 
         Core canonical: validation.cpp:4229
             if (!min_pow_checked) return state.Invalid(BLOCK_HEADER_LOW_WORK,
@@ -1803,13 +1807,46 @@ class BlockSync:
                     )
                     min_work_int = int(min_work_hex, 16)
                     if min_work_int > 0:
-                        # Accumulate work across ALL headers in the queue
-                        # (the current batch was appended above, so the tip
-                        # of the queue reflects the post-batch state).
-                        batch_work = sum(
+                        # Compute the TOTAL chain work of the candidate chain,
+                        # exactly as Bitcoin Core does in
+                        # net_processing.cpp::TryLowWorkHeadersSync:
+                        #     total_work = chain_start_header.nChainWork
+                        #                  + CalculateClaimedHeadersWork(headers)
+                        # i.e. the work of the block the new headers fork
+                        # FROM, plus the work of the new headers themselves.
+                        #
+                        # `_validated_headers` only holds headers not yet
+                        # downloaded as blocks; it always connects to our
+                        # active DB tip (enforced by the `expected_prev`
+                        # anchor + per-header chain-continuity check above).
+                        # The base term is therefore the cumulative chain
+                        # work already stored at the DB tip.  Omitting it —
+                        # the pre-fix behaviour — measured only the work of
+                        # the few thousand in-flight headers and rejected
+                        # EVERY batch with `too-little-chainwork` once the
+                        # node was past genesis, wedging sync indefinitely
+                        # (mainnet stall at h=948464, 2026-05-19).
+                        base_chain_work = 0
+                        try:
+                            _, _db_tip_height = self.db.get_best_block()
+                            _base = self.db.get_chainwork_by_height(
+                                _db_tip_height
+                            )
+                            # Coerce defensively: an older Rust build (or a
+                            # test stub) may return a non-int.  Falling back
+                            # to a 0 base only makes the gate STRICTER, never
+                            # weaker, so it is always safe.
+                            base_chain_work = int(_base) if _base else 0
+                        except Exception as _e:
+                            logger.debug(
+                                f"G8: could not read DB-tip chainwork "
+                                f"({_e}); using 0 base"
+                            )
+                        headers_work = sum(
                             self._bits_to_work(int(hdr.bits))
                             for _, hdr in self._validated_headers
                         )
+                        batch_work = base_chain_work + headers_work
                         if batch_work < min_work_int:
                             # Roll back: remove the headers we just appended.
                             del self._validated_headers[-accepted:]
@@ -1817,8 +1854,10 @@ class BlockSync:
                             logger.warning(
                                 f"Batch of {accepted} headers from "
                                 f"{peer.host}:{peer.port} rejected: "
-                                f"cumulative work {batch_work:#066x} < "
-                                f"nMinimumChainWork {min_work_int:#066x} "
+                                f"cumulative work {batch_work:#066x} "
+                                f"(base {base_chain_work:#066x} + headers "
+                                f"{headers_work:#066x}) < nMinimumChainWork "
+                                f"{min_work_int:#066x} "
                                 f"(too-little-chainwork; G8)"
                             )
                             peer.adjust_score(-20)

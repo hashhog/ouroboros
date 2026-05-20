@@ -412,3 +412,188 @@ def test_unconnecting_headers_per_peer_independent():
     assert not bs._note_unconnecting_headers(peer_b)
     # Peer A's 11th note trips.
     assert bs._note_unconnecting_headers(peer_a)
+
+
+# ---------------------------------------------------------------------------
+# G8 — nMinimumChainWork gate (total-chain-work, not header-window-only)
+# ---------------------------------------------------------------------------
+#
+# Regression for the mainnet stall at h=948464 (2026-05-19).  The G8 gate
+# in handle_headers (min_pow_checked=False path) compared
+# nMinimumChainWork against the cumulative work of ONLY the in-flight
+# `_validated_headers` queue — a few thousand recent headers.  Past
+# genesis that sum is always far below nMinimumChainWork, so EVERY raw
+# P2P headers batch was rejected `too-little-chainwork`, the serving peer
+# was banned, and the node could never advance its tip.
+#
+# Bitcoin Core (net_processing.cpp::TryLowWorkHeadersSync) computes
+#     total_work = chain_start_header.nChainWork
+#                  + CalculateClaimedHeadersWork(headers)
+# i.e. the work of the block the headers fork FROM plus the new headers.
+# The fix adds that base term: the cumulative chain work already stored
+# at our DB tip (the block the `_validated_headers` queue connects to).
+
+import sync as _sync_for_test  # noqa: E402  module-level import is fine here
+
+_MIN_CHAIN_WORK_MAINNET = int(
+    _sync_for_test.get_minimum_chain_work("mainnet"), 16
+)
+
+
+def _real_block_one():
+    """Bitcoin mainnet block #1 header — has genuinely valid PoW.
+
+    Reused from the PoW tests above.  Its single-block work is ~2**32
+    (bits=0x1d00ffff), which is *vastly* below nMinimumChainWork — so a
+    one-header batch only passes the G8 gate when the DB-tip base term is
+    counted.
+    """
+    genesis_be = bytes.fromhex(
+        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    )
+    merkle_be = bytes.fromhex(
+        "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098"
+    )
+    return BlockHeader(
+        version=1,
+        prev_blockhash=genesis_be[::-1],
+        merkle_root=merkle_be[::-1],
+        timestamp=1_231_469_665,
+        bits=0x1D00FFFF,
+        nonce=2_573_394_689,
+    )
+
+
+@pytest.mark.asyncio
+async def test_g8_accepts_batch_when_db_tip_chainwork_above_minimum(monkeypatch):
+    """A short, low-work header batch extending a deep chain is ACCEPTED.
+
+    This is the exact mainnet-stall scenario: the node is past genesis
+    with a DB-tip chain work already well above nMinimumChainWork, and a
+    peer sends a small batch of fresh headers.  The G8 gate must count
+    the DB-tip work as the base and let the batch through.
+
+    Pre-fix: rejected (`too-little-chainwork`) — the base term was
+    omitted, so only the ~2**32 work of block #1 was measured.
+    """
+    genesis_be = bytes.fromhex(
+        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    )
+    genesis_le = genesis_be[::-1]
+    bs = _make_block_sync(tip_hash=genesis_le, tip_height=0)
+
+    # DB tip already carries MORE work than nMinimumChainWork — mirrors a
+    # node deep into the chain (live node at h=948464 had chainwork
+    # 0x125fa2f56... vs nMinimumChainWork 0x1128750f8...).
+    db_tip_chainwork = _MIN_CHAIN_WORK_MAINNET + (1 << 80)
+    bs.db.get_chainwork_by_height = MagicMock(return_value=db_tip_chainwork)
+
+    block1 = _real_block_one()
+    assert BlockSync._header_meets_pow(block1) is True
+
+    headers_msg = HeadersMessage(headers=[block1])
+    msg = MagicMock()
+    msg.payload = headers_msg.serialize_payload()
+
+    peer = _make_peer()
+    bs._header_sync_peer = peer
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(bs, "_request_next_blocks", _noop)
+    # Isolate the G8 gate from the presync defense-in-depth layer.
+    monkeypatch.setattr(bs, "_get_presync_state", lambda _peer: None)
+
+    # min_pow_checked=False → the raw-P2P G8 gate runs.
+    await bs.handle_headers(msg, peer, min_pow_checked=False)
+
+    # The header passed the gate and was appended.
+    assert len(bs._validated_headers) == 1
+    assert bs._validated_headers[0][1] == block1
+    # No too-little-chainwork rejection.
+    assert bs._headers_pow_rejected == 0
+    bs.peer_manager.misbehaving.assert_not_called()
+    # The DB-tip chainwork was actually consulted (the fix's base term).
+    bs.db.get_chainwork_by_height.assert_called_with(0)
+
+
+@pytest.mark.asyncio
+async def test_g8_rejects_batch_when_total_work_below_minimum(monkeypatch):
+    """A low-work batch forking a zero-work base is REJECTED.
+
+    When the base chain work is 0 (e.g. genuinely syncing from genesis)
+    and the header batch alone does not reach nMinimumChainWork, the G8
+    gate must still reject — proving the gate is real, not disabled by
+    the fix.
+    """
+    genesis_be = bytes.fromhex(
+        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    )
+    genesis_le = genesis_be[::-1]
+    bs = _make_block_sync(tip_hash=genesis_le, tip_height=0)
+
+    # Base chain work 0 — the batch must stand on its own work (~2**32),
+    # which is far below nMinimumChainWork.
+    bs.db.get_chainwork_by_height = MagicMock(return_value=0)
+
+    block1 = _real_block_one()
+    headers_msg = HeadersMessage(headers=[block1])
+    msg = MagicMock()
+    msg.payload = headers_msg.serialize_payload()
+
+    peer = _make_peer()
+    bs._header_sync_peer = peer
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(bs, "_request_next_blocks", _noop)
+    monkeypatch.setattr(bs, "_get_presync_state", lambda _peer: None)
+
+    await bs.handle_headers(msg, peer, min_pow_checked=False)
+
+    # The batch was rolled back — too-little-chainwork.
+    assert bs._validated_headers == []
+    assert bs._headers_pow_rejected == 1
+    bs.peer_manager.misbehaving.assert_called_once()
+    args, _kw = bs.peer_manager.misbehaving.call_args
+    assert args[2] == "too-little-chainwork"
+
+
+@pytest.mark.asyncio
+async def test_g8_skipped_when_min_pow_checked_true(monkeypatch):
+    """The G8 gate is bypassed for trusted / presync-cleared batches.
+
+    With min_pow_checked=True the cumulative-work check must not run, so
+    even a tiny batch off a zero-work base is accepted.  This guards the
+    Core-parity contract: G8 is the anti-DoS gate for *raw* P2P headers
+    only (validation.cpp:4229).
+    """
+    genesis_be = bytes.fromhex(
+        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    )
+    genesis_le = genesis_be[::-1]
+    bs = _make_block_sync(tip_hash=genesis_le, tip_height=0)
+    bs.db.get_chainwork_by_height = MagicMock(return_value=0)
+
+    block1 = _real_block_one()
+    headers_msg = HeadersMessage(headers=[block1])
+    msg = MagicMock()
+    msg.payload = headers_msg.serialize_payload()
+
+    peer = _make_peer()
+    bs._header_sync_peer = peer
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(bs, "_request_next_blocks", _noop)
+    monkeypatch.setattr(bs, "_get_presync_state", lambda _peer: None)
+
+    # Default min_pow_checked=True → G8 skipped.
+    await bs.handle_headers(msg, peer)
+
+    assert len(bs._validated_headers) == 1
+    assert bs._headers_pow_rejected == 0
+    bs.peer_manager.misbehaving.assert_not_called()
