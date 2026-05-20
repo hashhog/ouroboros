@@ -729,6 +729,35 @@ class BlockchainDatabase:
             return 0
         return int.from_bytes(cw_bytes, "big")
 
+    def store_block_metadata_persistent(
+        self, height: int, block_hash: bytes, chainwork: int, timestamp: int
+    ) -> None:
+        """Persist BlockMetadata (height, chainwork, timestamp) for *block_hash*.
+
+        Writes through to the Rust ``store_block_metadata_raw``, which lands
+        the row in BOTH the height-keyed ``BLOCK_INDEX_CF`` and the
+        hash-keyed ``BLOCK_INDEX_BY_HASH_CF``.  Unlike ``store_block_chainwork``
+        (in-memory cache only) this survives a restart and is what
+        ``get_chainwork_by_height`` reads back.
+
+        Used by the assumeUTXO snapshot loader so the snapshot block carries
+        its true cumulative chainwork — without it, the first block connected
+        above the snapshot reads a missing ``prev_chainwork`` and the whole
+        post-snapshot chain accumulates work from 0 (see snapshot.py).
+
+        ``chainwork`` is a non-negative integer; it is stored as 32-byte
+        big-endian (Bitcoin Core display order), matching the encoding
+        ``connect_block_from_bytes`` uses.
+        """
+        if len(block_hash) != 32:
+            raise ValueError("Block hash must be 32 bytes")
+        if chainwork < 0:
+            raise ValueError("chainwork must be non-negative")
+        cw_bytes = int(chainwork).to_bytes(32, "big")
+        self._db.store_block_metadata_raw(
+            height, block_hash, height, cw_bytes, timestamp
+        )
+
     def store_block_chainwork(self, block_hash: bytes, chainwork: int) -> None:
         """Cache chainwork for *block_hash* in memory (fallback when Rust metadata is unavailable)."""
         if not hasattr(self, "_chainwork_cache"):

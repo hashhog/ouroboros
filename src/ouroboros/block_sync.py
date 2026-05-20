@@ -1620,6 +1620,36 @@ class BlockSync:
             return 0
         return (2 ** 256) // (target + 1)
 
+    def _snapshot_chainwork_offset(self) -> int:
+        """Cached assumeUTXO chainwork correction offset for the G8 gate.
+
+        A datadir bootstrapped from an assumeUTXO snapshot before the
+        snapshot loader persisted the snapshot block's BlockMetadata has
+        every post-snapshot block's stored chainwork accumulated from 0.
+        ``get_chainwork_by_height`` therefore returns a value ~32x below
+        the true cumulative work, so the raw DB-tip base understates the
+        chain and the G8 nMinimumChainWork gate rejects every honest
+        mainnet headers batch (the too-little-chainwork brick,
+        2026-05-19).  This returns the canonical snapshot-height chainwork
+        to add back; it returns 0 for a correctly built datadir.
+
+        The result is cached: detection reads the DB once, and the value
+        is stable for the process lifetime (the snapshot height does not
+        change).  Mirrors ``Node._chainwork_snapshot_offset`` so the RPC
+        chainwork display and this gate agree on the corrected total.
+        """
+        if not hasattr(self, "_snapshot_offset_cache"):
+            from ouroboros.snapshot import detect_snapshot_chainwork_offset
+            network = (
+                self.peer_manager.network
+                if hasattr(self.peer_manager, "network")
+                else "mainnet"
+            )
+            self._snapshot_offset_cache = detect_snapshot_chainwork_offset(
+                self.db, network
+            )
+        return self._snapshot_offset_cache
+
     async def handle_headers(self, msg: NetworkMessage, peer: Peer, *, min_pow_checked: bool = True):
         """Handle headers message — headers-first sync.
 
@@ -1837,6 +1867,30 @@ class BlockSync:
                             # to a 0 base only makes the gate STRICTER, never
                             # weaker, so it is always safe.
                             base_chain_work = int(_base) if _base else 0
+                            # Snapshot-offset correction.  A datadir
+                            # bootstrapped from an assumeUTXO snapshot
+                            # BEFORE the snapshot loader persisted the
+                            # snapshot block's BlockMetadata has every
+                            # post-snapshot block's stored chainwork
+                            # accumulated from 0 — ~32x too small — so
+                            # this raw `base` understates the true
+                            # cumulative work and the gate below rejects
+                            # every honest mainnet batch (the
+                            # too-little-chainwork brick, 2026-05-19).
+                            # `detect_snapshot_chainwork_offset` returns
+                            # the canonical snapshot-height chainwork to
+                            # add back; it returns 0 for a correctly
+                            # built datadir, so adding it is always safe
+                            # and never weakens the gate.
+                            try:
+                                base_chain_work += (
+                                    self._snapshot_chainwork_offset()
+                                )
+                            except Exception as _oe:
+                                logger.debug(
+                                    f"G8: snapshot-offset detect failed "
+                                    f"({_oe}); using uncorrected base"
+                                )
                         except Exception as _e:
                             logger.debug(
                                 f"G8: could not read DB-tip chainwork "
