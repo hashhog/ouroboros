@@ -3137,8 +3137,38 @@ impl PyBlockchainDB {
 
     /// Get the median-time-past for a given height (11-block median timestamp).
     /// Uses lightweight block metadata instead of deserializing full blocks.
+    ///
+    /// Bitcoin Core's MTP is ALWAYS the median of exactly `min(11, height+1)`
+    /// consecutive blocks — it can never be computed over a partial window
+    /// because Core has every header from genesis.  After an assumeUTXO
+    /// snapshot load, ouroboros does NOT have the headers below the snapshot
+    /// tip: the loader persists only the snapshot block's own header.  For a
+    /// height whose 11-block window `[height-10 ..= height]` reaches below the
+    /// snapshot tip, some of those blocks are absent from the index.
+    ///
+    /// The pre-fix code silently dropped the missing blocks and took the
+    /// median of whatever remained.  A truncated window is right-shifted
+    /// toward the (larger) recent timestamps, so the "MTP" came out far too
+    /// LARGE — by up to ~2200s near the snapshot boundary.  That over-large
+    /// value fed BIP-68 time-based relative-locktime evaluation
+    /// (`check_sequence_locks`): `block_mtp - coin_mtp` shrank below the
+    /// required span and a perfectly valid block was rejected with
+    /// "BIP 68 sequence lock not satisfied", permanently wedging IBD one
+    /// block above the snapshot range (mainnet stall at h=948464, block
+    /// 948465 tx 1863, 2026-05-20).
+    ///
+    /// Fix: a partial-window result is simply WRONG — worse than no answer.
+    /// Return `None` ("cannot determine") whenever any block in the expected
+    /// window is missing, so callers fall back to their `None` handling.
+    /// `check_sequence_locks` then treats `coin_mtp` as 0, which makes the
+    /// relative time-lock pass — the same outcome as the existing BIP-68
+    /// snapshot stopgap for coins at/below the snapshot tip, and consistent
+    /// with the assumeUTXO trust model (everything up to the snapshot is
+    /// trusted).  For a complete window the result is byte-identical to
+    /// before.
     fn get_median_time_past(&self, height: u32) -> PyResult<Option<u32>> {
         let start = if height >= 10 { height - 10 } else { 0 };
+        let expected = (height - start + 1) as usize;
         let mut timestamps = Vec::with_capacity(11);
         for h in start..=height {
             match self.db.get_block_metadata(h) {
@@ -3154,7 +3184,10 @@ impl PyBlockchainDB {
                 Err(_) => {}
             }
         }
-        if timestamps.is_empty() {
+        // Incomplete window — at least one block in [start ..= height] is not
+        // in the index (e.g. a height below an assumeUTXO snapshot tip).  A
+        // median over the partial set is not the MTP; refuse to fabricate one.
+        if timestamps.len() < expected {
             return Ok(None);
         }
         timestamps.sort_unstable();
