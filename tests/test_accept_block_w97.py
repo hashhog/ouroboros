@@ -332,16 +332,29 @@ class TestG8MinimumChainWork:
     @pytest.mark.asyncio
     async def test_low_work_batch_rejected_when_min_pow_checked_false(self):
         """When ``min_pow_checked=False``, a batch of regtest-bits headers
-        (bits=0x207fffff, near-zero work) must be rejected with a
-        misbehaviour call and the headers must NOT be queued.
+        (bits=0x207fffff, near-zero work) forking a ZERO-work base must be
+        rejected with a misbehaviour call and the headers must NOT be
+        queued.
 
         The conftest mock returns ``get_minimum_chain_work("mainnet")`` as
         the mainnet minimum (a large hex value), so any regtest-work batch
         falls below the threshold.
+
+        Note: the G8 gate computes TOTAL chain work — the DB-tip base plus
+        the queued headers — exactly as Bitcoin Core's
+        ``chain_start_header.nChainWork + CalculateClaimedHeadersWork``.
+        This test stubs the DB-tip chainwork to 0 so the low-work batch
+        genuinely has too little total work.  (See
+        test_g8_accepts_batch_when_db_tip_chainwork_above_minimum in
+        tests/test_handle_headers_pow.py for the complementary case where
+        a deep DB tip lets a short batch through — the mainnet-stall
+        regression fixed 2026-05-19.)
         """
         tip = b"\x11" * 32
         # Use mainnet network so the minimum chain work is nonzero
         bs = _make_block_sync(tip_hash=tip, tip_height=100, network="mainnet")
+        # Zero-work base: the batch must stand on its own (near-zero) work.
+        bs.db.get_chainwork_by_height = MagicMock(return_value=0)
         peer = _make_peer()
 
         h1 = _valid_header_extending(tip, bits=REGTEST_BITS)
@@ -398,6 +411,10 @@ class TestG8MinimumChainWork:
         """
         tip = b"\x11" * 32
         bs = _make_block_sync(tip_hash=tip, tip_height=0, network="regtest")
+        # Stub the DB-tip base term (regtest nMinimumChainWork is 0 so the
+        # gate short-circuits before reading this, but keep the fixture
+        # arithmetic-safe regardless of evaluation order).
+        bs.db.get_chainwork_by_height = MagicMock(return_value=0)
         peer = _make_peer()
 
         h1 = _valid_header_extending(tip, bits=REGTEST_BITS)
