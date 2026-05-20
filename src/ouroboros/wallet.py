@@ -53,6 +53,40 @@ SECP256K1_ORDER = (
     0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 )
 
+# BIP-32 hardened-index threshold (children >= 2^31 are hardened).
+_BIP32_HARDENED_BIT = 0x80000000
+# Maximum representable BIP-32 child index (32-bit field).
+_BIP32_MAX_INDEX = 0x100000000  # exclusive upper bound (2**32)
+# Maximum representable BIP-32 depth byte (one octet in the xprv/xpub layout).
+_BIP32_MAX_DEPTH = 0xFF
+
+
+class BIP32MaxDepthError(ValueError):
+    """Raised when child derivation would push the depth byte past 0xFF.
+
+    Bitcoin Core (`bitcoin-core/src/key.cpp:483`) refuses to derive when
+    ``nDepth == std::numeric_limits<unsigned char>::max()``. Ouroboros
+    historically deferred the failure to ``_serialize_extended`` (BUG-5
+    in W161 audit) — this class is raised eagerly inside
+    :meth:`HDKey.derive_child` and :meth:`ExtendedPubKey.derive_child`
+    so callers see the failure before any partial state escapes.
+    """
+
+
+class BIP32IndexExhaustedError(ValueError):
+    """Raised when BIP-32 retry-on-invalid-IL exhausts the available range.
+
+    BIP-32 spec §"Child key derivation" mandates: "In case parse256(IL) >= n
+    or k_i == 0, the resulting key is invalid, and one should proceed with
+    the next value for i." Ouroboros honours this by retrying internally
+    (BUG-1 / BUG-3 in W161 audit). The retry must never cross the
+    hardened/non-hardened boundary (a normal index incrementing past
+    2**31 would silently change soft to hard), and must never wrap past
+    2**32. This exception fires in the (cryptographically impossible
+    in practice) edge case where the entire remaining sub-range is
+    exhausted.
+    """
+
 
 class AddressInfo(BaseModel):
     """Address information model."""
@@ -628,29 +662,72 @@ class HDKey:
     # child derivation
 
     def derive_child(self, index: int, hardened: bool = False) -> "HDKey":
-        """Derive a child extended key at *index*."""
-        if hardened:
-            index |= 0x80000000
-        if index & 0x80000000:
-            data = b"\x00" + self.private_key + index.to_bytes(4, "big")
-        else:
-            data = self.public_key + index.to_bytes(4, "big")
+        """Derive a child extended key at *index*.
 
-        hmac_result = hmac.new(self.chain_code, data, hashlib.sha512).digest()
-        il = int.from_bytes(hmac_result[:32], "big")
-        if il >= SECP256K1_ORDER:
-            raise ValueError("Derived key is out of range")
-        child_int = (il + int.from_bytes(self.private_key, "big")) % SECP256K1_ORDER
-        if child_int == 0:
-            raise ValueError("Derived key is zero")
-        child_key = child_int.to_bytes(32, "big")
-        return HDKey(
-            private_key=child_key,
-            chain_code=hmac_result[32:],
-            depth=self.depth + 1,
-            parent_fingerprint=self.fingerprint,
-            child_index=index,
-            network=self.network,
+        Implements the BIP-32 spec retry rule: if ``parse256(IL) >= n``
+        or the resulting child key is zero, the function transparently
+        retries at ``index + 1`` (BUG-1 in W161 audit). The hardened bit
+        is never crossed by this retry — a non-hardened index that would
+        increment past ``2**31`` raises :class:`BIP32IndexExhaustedError`
+        rather than silently switching to hardened derivation.
+
+        Refuses to derive when the resulting depth byte would overflow
+        the BIP-32 single-octet field (BUG-5 in W161 audit), surfacing
+        :class:`BIP32MaxDepthError` before any partial state is built.
+        Mirrors `bitcoin-core/src/key.cpp::CExtKey::Derive` lines 482-489.
+        """
+        # BUG-5 guard: refuse depth overflow up front, matching Core
+        # ``if (nDepth == std::numeric_limits<unsigned char>::max()) return false;``
+        if self.depth >= _BIP32_MAX_DEPTH:
+            raise BIP32MaxDepthError(
+                f"BIP-32 depth byte would overflow (current depth={self.depth})"
+            )
+        if hardened:
+            index |= _BIP32_HARDENED_BIT
+        if index < 0 or index >= _BIP32_MAX_INDEX:
+            raise ValueError(f"BIP-32 child index out of range: {index}")
+
+        # Cache the initial hardened-ness so the retry loop cannot cross
+        # the soft/hard boundary while incrementing on IL>=n / k_i==0.
+        is_hardened = bool(index & _BIP32_HARDENED_BIT)
+        # Upper bound (exclusive) for the retry range, anchored to the
+        # same half (hardened or non-hardened) as the initial index.
+        retry_ceiling = _BIP32_MAX_INDEX if is_hardened else _BIP32_HARDENED_BIT
+
+        current_index = index
+        # BUG-1 spec mandate: retry-with-next-index on invalid IL / zero
+        # child. Bounded by the same hardened/non-hardened half.
+        while current_index < retry_ceiling:
+            if is_hardened:
+                data = b"\x00" + self.private_key + current_index.to_bytes(4, "big")
+            else:
+                data = self.public_key + current_index.to_bytes(4, "big")
+
+            hmac_result = hmac.new(self.chain_code, data, hashlib.sha512).digest()
+            il = int.from_bytes(hmac_result[:32], "big")
+            if il >= SECP256K1_ORDER:
+                current_index += 1
+                continue
+            child_int = (
+                il + int.from_bytes(self.private_key, "big")
+            ) % SECP256K1_ORDER
+            if child_int == 0:
+                current_index += 1
+                continue
+            child_key = child_int.to_bytes(32, "big")
+            return HDKey(
+                private_key=child_key,
+                chain_code=hmac_result[32:],
+                depth=self.depth + 1,
+                parent_fingerprint=self.fingerprint,
+                child_index=current_index,
+                network=self.network,
+            )
+
+        raise BIP32IndexExhaustedError(
+            "BIP-32 retry exhausted the "
+            f"{'hardened' if is_hardened else 'non-hardened'} child range "
+            f"starting at index {index}"
         )
 
     # path derivation
@@ -683,6 +760,17 @@ class HDKey:
         return self._serialize_extended(ver, self.public_key)
 
     def _serialize_extended(self, version: int, key_data: bytes) -> str:
+        # Defence-in-depth (BUG-5): refuse to emit an xprv/xpub whose
+        # depth byte would not fit. ``HDKey.derive_child`` enforces this
+        # eagerly, but ``HDKey.from_xprv`` and direct construction can
+        # in principle install a depth > 0xFF, so we re-check here to
+        # avoid the historical ``ValueError: bytes must be in range``
+        # crash leaking out of base58 encoding.
+        if not 0 <= self.depth <= _BIP32_MAX_DEPTH:
+            raise BIP32MaxDepthError(
+                f"BIP-32 depth byte out of range: {self.depth} "
+                f"(expected 0..{_BIP32_MAX_DEPTH})"
+            )
         payload = struct.pack(">I", version)
         payload += bytes([self.depth])
         payload += self.parent_fingerprint

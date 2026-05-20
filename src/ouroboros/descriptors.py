@@ -67,6 +67,21 @@ SECP256K1_ORDER = (
     0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 )
 
+# BIP-32 hardened-index threshold (children >= 2^31 are hardened).
+# Public CKD never crosses this — see :meth:`ExtendedPubKey.derive_child`.
+_BIP32_HARDENED_BIT = 0x80000000
+# Maximum representable BIP-32 depth byte (single octet in xprv/xpub layout).
+_BIP32_MAX_DEPTH = 0xFF
+
+# Re-export BIP-32 exceptions from :mod:`ouroboros.wallet` so callers
+# can ``except BIP32MaxDepthError`` regardless of whether they touched
+# the private or public extended-key path. The wallet module owns the
+# canonical definitions; importing here keeps the type identity stable.
+from ouroboros.wallet import (  # noqa: E402  (intentional late import)
+    BIP32IndexExhaustedError,
+    BIP32MaxDepthError,
+)
+
 # BIP 32 version bytes
 _XPUB_MAINNET = 0x0488B21E
 _XPRV_MAINNET = 0x0488ADE4
@@ -186,24 +201,66 @@ class ExtendedPubKey:
     # -- child derivation (public only — normal indices) -------------------
 
     def derive_child(self, index: int) -> ExtendedPubKey:
-        """Derive a normal (non-hardened) child extended public key."""
-        if index & 0x80000000:
-            raise ValueError("Cannot derive hardened child from public key")
-        data = self.public_key + index.to_bytes(4, "big")
-        I = hmac.new(self.chain_code, data, hashlib.sha512).digest()  # noqa: E741
-        il = int.from_bytes(I[:32], "big")
-        if il >= SECP256K1_ORDER:
-            raise ValueError("Derived key out of range")
-        # Point addition: child_pub = parse(IL) * G + parent_pub
-        parent = PublicKey(self.public_key)
-        child_pub = parent.add(I[:32])
-        return ExtendedPubKey(
-            public_key=child_pub.format(compressed=True),
-            chain_code=I[32:],
-            depth=self.depth + 1,
-            parent_fingerprint=self.fingerprint,
-            child_index=index,
-            network=self.network,
+        """Derive a normal (non-hardened) child extended public key.
+
+        Implements the BIP-32 spec retry rule (BUG-3 in W161 audit): if
+        ``parse256(IL) >= n`` or the resulting child point is invalid
+        (``coincurve`` raises ``ValueError`` for point-at-infinity), the
+        function transparently retries at ``index + 1``. Retry is bounded
+        by the hardened threshold — public CKD cannot enter the hardened
+        half (Core: `pubkey.cpp:415` asserts the bit is clear).
+
+        Refuses to derive when the resulting depth byte would overflow
+        the BIP-32 single-octet field (BUG-5 in W161 audit), surfacing
+        :class:`BIP32MaxDepthError` before any partial state is built.
+        Mirrors `bitcoin-core/src/pubkey.cpp::CExtPubKey::Derive`.
+        """
+        # BUG-5 guard: refuse depth overflow up front, matching Core
+        # ``if (nDepth == std::numeric_limits<unsigned char>::max()) return false;``
+        if self.depth >= _BIP32_MAX_DEPTH:
+            raise BIP32MaxDepthError(
+                f"BIP-32 depth byte would overflow (current depth={self.depth})"
+            )
+        if index < 0 or index >= _BIP32_HARDENED_BIT:
+            # Hardened CKD is mathematically impossible from a public key
+            # (requires the parent private key). Reject before we waste
+            # an HMAC round.
+            raise ValueError(
+                f"Cannot derive hardened child from public key (index={index})"
+            )
+
+        current_index = index
+        # BUG-3 spec mandate: retry-with-next-index on invalid IL / point
+        # at infinity. Bounded by the hardened half (current_index < 2**31).
+        while current_index < _BIP32_HARDENED_BIT:
+            data = self.public_key + current_index.to_bytes(4, "big")
+            I = hmac.new(self.chain_code, data, hashlib.sha512).digest()  # noqa: E741
+            il = int.from_bytes(I[:32], "big")
+            if il >= SECP256K1_ORDER:
+                current_index += 1
+                continue
+            # Point addition: child_pub = parse(IL) * G + parent_pub.
+            # libsecp256k1 (via coincurve) raises ValueError when the sum
+            # is the point at infinity — the only other BIP-32 invalidity
+            # condition for the public branch.
+            parent = PublicKey(self.public_key)
+            try:
+                child_pub = parent.add(I[:32])
+            except ValueError:
+                current_index += 1
+                continue
+            return ExtendedPubKey(
+                public_key=child_pub.format(compressed=True),
+                chain_code=I[32:],
+                depth=self.depth + 1,
+                parent_fingerprint=self.fingerprint,
+                child_index=current_index,
+                network=self.network,
+            )
+
+        raise BIP32IndexExhaustedError(
+            "BIP-32 retry exhausted the non-hardened public child range "
+            f"starting at index {index}"
         )
 
     def derive_path(self, path: str) -> ExtendedPubKey:
@@ -224,6 +281,15 @@ class ExtendedPubKey:
 
     def serialize(self) -> str:
         """Base58check-encoded xpub / tpub string."""
+        # Defence-in-depth (BUG-5): refuse to emit an xpub whose depth
+        # byte would not fit. ``derive_child`` enforces this eagerly,
+        # but direct construction or ``deserialize`` of an attacker-crafted
+        # input could install a depth > 0xFF.
+        if not 0 <= self.depth <= _BIP32_MAX_DEPTH:
+            raise BIP32MaxDepthError(
+                f"BIP-32 depth byte out of range: {self.depth} "
+                f"(expected 0..{_BIP32_MAX_DEPTH})"
+            )
         ver = _XPUB_MAINNET if self.network == "mainnet" else _XPUB_TESTNET
         payload = struct.pack(">I", ver)
         payload += bytes([self.depth])
