@@ -836,12 +836,19 @@ class TestG28_MTPFewBlocksAtLowHeights(unittest.TestCase):
     """G28: MTP at height < 10 uses fewer than 11 blocks (truncated window)."""
 
     def test_python_fallback_range_clamped_at_zero(self):
-        # database.py:654 — `range(max(0, height - 10), height + 1)`.
-        # At height=3 this yields range(0, 4) = [0,1,2,3] → 4 blocks.
+        # database.py get_median_time_past — the slow fallback iterates the
+        # window [start .. height] where `start = max(0, height - 10)`, so
+        # at height=3 the window is [0,1,2,3] → 4 blocks (clamped at 0).
+        # The window start is bound to a `start` local rather than inlined
+        # since the 2026-05-20 partial-window fix, which also needs the
+        # start to size the completeness check; assert the semantics, not a
+        # literal expression.
         database_py = Path(__file__).resolve().parent.parent / "database.py"
         src = database_py.read_text()
-        self.assertIn("range(max(0, height - 10), height + 1)", src,
-                      "MTP slow-fallback must clamp range start to 0.")
+        self.assertIn("start = max(0, height - 10)", src,
+                      "MTP slow-fallback must clamp the window start to 0.")
+        self.assertIn("range(start, height + 1)", src,
+                      "MTP slow-fallback must iterate [start .. height].")
 
 
 class TestG29_MTPIncludesCurrentBlock(unittest.TestCase):

@@ -642,23 +642,71 @@ class BlockchainDatabase:
 
         Uses the Rust backend's lightweight metadata lookup when available,
         falling back to full block deserialization otherwise.
+
+        Returns ``None`` when the 11-block window ``[height-10 .. height]``
+        is incomplete — i.e. at least one of those blocks is not in the
+        index.  Bitcoin Core always has every header from genesis, so its
+        MTP is ALWAYS the median of exactly ``min(11, height+1)`` blocks;
+        a partial-window median is not the MTP and must not be returned.
+
+        After an assumeUTXO snapshot load ouroboros only persists the
+        snapshot block's own header — the 10 headers below the snapshot tip
+        are absent.  For a height whose window reaches below the snapshot
+        tip the pre-fix code (both here and in the Rust fast path) silently
+        dropped the missing blocks and took the median of whatever remained.
+        A truncated window is right-shifted toward the larger recent
+        timestamps, so the computed "MTP" came out far too LARGE (by up to
+        ~2200s near the boundary).  That over-large value fed BIP-68
+        time-based relative-locktime evaluation and rejected valid blocks
+        with "BIP 68 sequence lock not satisfied", permanently wedging IBD
+        one block above the snapshot range (mainnet stall at h=948464,
+        block 948465, 2026-05-20).
+
+        Returning ``None`` here makes ``check_sequence_locks`` treat the
+        coin time as 0, which lets the relative time-lock pass — the same
+        outcome as the BIP-68 snapshot stopgap and consistent with the
+        assumeUTXO trust model.  This wrapper enforces window-completeness
+        itself rather than trusting the Rust return value, so the fix is
+        effective even before the Rust extension is rebuilt.
         """
-        # Fast path: Rust computes MTP from block metadata (no full block deser)
+        start = max(0, height - 10)
+        expected = height - start + 1
+
+        # Fast path: Rust computes MTP from block metadata (no full block
+        # deser).  Only trust the Rust value when the window is provably
+        # complete — an older Rust build computes a partial-window median.
         if hasattr(self._db, 'get_median_time_past'):
             result = self._db.get_median_time_past(height)
-            if result is not None:
+            if result is not None and self._mtp_window_complete(start, height):
                 return result
 
-        # Slow fallback: deserialize full blocks
+        # Slow fallback: deserialize full blocks.
         timestamps = []
-        for h in range(max(0, height - 10), height + 1):
+        for h in range(start, height + 1):
             block = self.get_block_by_height(h)
             if block is not None:
                 timestamps.append(block.timestamp)
-        if not timestamps:
+        # Incomplete window — refuse to fabricate an MTP from a partial set.
+        if len(timestamps) < expected:
             return None
         timestamps.sort()
         return timestamps[len(timestamps) // 2]
+
+    def _mtp_window_complete(self, start: int, height: int) -> bool:
+        """True iff every block in ``[start .. height]`` is in the index.
+
+        Used to decide whether the Rust ``get_median_time_past`` fast-path
+        result can be trusted: an older Rust build silently medians a
+        partial window.  Probes the cheap height->hash index rather than
+        deserializing blocks.
+        """
+        for h in range(start, height + 1):
+            try:
+                if self.get_block_hash_by_height(h) is None:
+                    return False
+            except Exception:
+                return False
+        return True
 
     def get_balance(self, address: str, network: str = "mainnet") -> int:
         """Return total balance in satoshis for *address* (sum of matching UTXOs)."""
