@@ -376,6 +376,55 @@ def get_available_snapshot_heights(network: str) -> list[int]:
     return [data.height for data in get_assumeutxo_params(network)]
 
 
+def detect_snapshot_chainwork_offset(db, network: str) -> int:
+    """Return the chainwork correction offset for a snapshot-loaded datadir.
+
+    When a node was bootstrapped from an assumeUTXO snapshot **before** the
+    snapshot loader learned to persist the snapshot block's BlockMetadata,
+    every block connected above the snapshot height accumulated chainwork
+    relative to 0 instead of relative to the snapshot's true cumulative
+    work.  This function detects that on-disk corruption and returns the
+    additive correction (the snapshot height's canonical chainwork from
+    Core's hardcoded assumeUTXO data).
+
+    Detection: read the stored chainwork at ``snap_h + 1``.  If a snapshot
+    was loaded and its base was applied, that value is already at least the
+    snapshot's chainwork.  If the snapshot base was NOT applied, the stored
+    value is only ~one block of work — far below the snapshot chainwork —
+    so the offset is required.
+
+    Returns 0 when no snapshot was loaded, when the datadir is already
+    correct (snapshot base present), or when the snapshot's chainwork is
+    unknown.  Adding 0 is always safe.
+
+    Shared by ``Node._chainwork_snapshot_offset`` (RPC chainwork display)
+    and ``BlockSync``'s G8 nMinimumChainWork gate so both evaluate the
+    same corrected total — see snapshot.py ``load_snapshot`` for the
+    root-cause fix that makes this offset unnecessary for new datadirs.
+    """
+    try:
+        for data in get_assumeutxo_params(network):
+            if data.chainwork_hex is None:
+                continue
+            snap_h = data.height
+            stored_at_first = db.get_chainwork_by_height(snap_h + 1)
+            if stored_at_first <= 0:
+                # No block above this snapshot height stored yet — either
+                # this snapshot was not the one loaded, or sync has not
+                # progressed past it.  Nothing to correct.
+                continue
+            correct_snap = int(data.chainwork_hex, 16)
+            # If the stored value already meets/exceeds the snapshot's
+            # chainwork, the base was applied correctly — no offset.
+            if stored_at_first < correct_snap:
+                return correct_snap
+    except Exception:
+        # Defense-in-depth: a detection failure must never break sync.
+        # Returning 0 only makes the G8 gate stricter, never weaker.
+        pass
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CompactSize (Bitcoin protocol) -- used for vout and coins_per_txid.
 # ---------------------------------------------------------------------------
@@ -1075,6 +1124,52 @@ class SnapshotManager:
         # loop).  See AssumeutxoData.base_header for the rationale.
         if au_data is not None and au_data.base_header is not None:
             self.write_snapshot_base_blockheader(au_data.base_header)
+
+        # Persist the snapshot block's BlockMetadata — height, true
+        # cumulative chainwork, and header timestamp.  This is the
+        # ROOT-CAUSE fix for the "too-little-chainwork; G8" mainnet brick
+        # (2026-05-19).  ``connect_block_from_bytes`` derives every block's
+        # chainwork as ``compute_chainwork(prev_block_metadata.chainwork,
+        # bits)`` and falls back to a 0 base when the parent's metadata is
+        # absent (lib.rs:3868-3876).  After a snapshot load the snapshot
+        # block had NO metadata row, so block ``height+1`` read a 0 base
+        # and the whole post-snapshot chain accumulated work from 0 —
+        # ~32x below reality — making the G8 nMinimumChainWork gate reject
+        # every mainnet headers batch and ban honest peers.  Writing the
+        # snapshot block's metadata here anchors the accumulation at the
+        # correct value (Core's hardcoded ``chainwork_hex``), so every
+        # block connected above the snapshot stores correct chainwork and
+        # no after-the-fact correction offset is needed.
+        if (
+            au_data is not None
+            and au_data.chainwork_hex is not None
+            and au_data.base_header is not None
+        ):
+            try:
+                snapshot_chainwork = int(au_data.chainwork_hex, 16)
+                # base_header layout: version(4) prev(32) merkle(32)
+                # time(4) bits(4) nonce(4); time is at byte offset 68.
+                snapshot_timestamp = struct.unpack_from(
+                    "<I", au_data.base_header, 68
+                )[0]
+                self.db.store_block_metadata_persistent(
+                    height,
+                    metadata.base_blockhash,
+                    snapshot_chainwork,
+                    snapshot_timestamp,
+                )
+                logger.info(
+                    f"[snapshot] Persisted snapshot block metadata at "
+                    f"height {height}: chainwork={au_data.chainwork_hex}"
+                )
+            except Exception as e:
+                # Non-fatal: the node still functions, but the G8 gate
+                # offset fallback in BlockSync will be needed.  Log loudly
+                # so the gap is visible.
+                logger.error(
+                    f"[snapshot] Failed to persist snapshot block "
+                    f"chainwork metadata at height {height}: {e}"
+                )
 
         self.snapshot_loaded = True
         self.snapshot_height = height

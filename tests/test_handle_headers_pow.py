@@ -485,8 +485,22 @@ async def test_g8_accepts_batch_when_db_tip_chainwork_above_minimum(monkeypatch)
     # DB tip already carries MORE work than nMinimumChainWork — mirrors a
     # node deep into the chain (live node at h=948464 had chainwork
     # 0x125fa2f56... vs nMinimumChainWork 0x1128750f8...).
+    #
+    # get_chainwork_by_height is also probed by the snapshot-offset
+    # detector at snap_h+1 (944184 on mainnet).  Returning a very large
+    # value there (>= the snapshot's own chainwork) models a CORRECTLY
+    # built datadir whose snapshot base was applied, so the detector
+    # returns a zero offset and this test isolates the plain DB-tip base
+    # term.  The DB tip itself is at height 0 (genesis) in this fixture.
     db_tip_chainwork = _MIN_CHAIN_WORK_MAINNET + (1 << 80)
-    bs.db.get_chainwork_by_height = MagicMock(return_value=db_tip_chainwork)
+
+    def _chainwork_by_height(height: int) -> int:
+        # snap_h+1 probe: report ample work → snapshot base already applied.
+        if height >= 944_184:
+            return 1 << 120
+        return db_tip_chainwork
+
+    bs.db.get_chainwork_by_height = MagicMock(side_effect=_chainwork_by_height)
 
     block1 = _real_block_one()
     assert BlockSync._header_meets_pow(block1) is True
@@ -515,7 +529,10 @@ async def test_g8_accepts_batch_when_db_tip_chainwork_above_minimum(monkeypatch)
     assert bs._headers_pow_rejected == 0
     bs.peer_manager.misbehaving.assert_not_called()
     # The DB-tip chainwork was actually consulted (the fix's base term).
-    bs.db.get_chainwork_by_height.assert_called_with(0)
+    # assert_any_call (not assert_called_with): the snapshot-offset
+    # detector also probes get_chainwork_by_height at snap_h+1, so the
+    # height-0 base read is not necessarily the final call.
+    bs.db.get_chainwork_by_height.assert_any_call(0)
 
 
 @pytest.mark.asyncio
@@ -597,3 +614,72 @@ async def test_g8_skipped_when_min_pow_checked_true(monkeypatch):
     assert len(bs._validated_headers) == 1
     assert bs._headers_pow_rejected == 0
     bs.peer_manager.misbehaving.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_g8_applies_snapshot_offset_for_corrupt_datadir(monkeypatch):
+    """G8 un-bricks an assumeUTXO datadir whose snapshot base was dropped.
+
+    Incident (2026-05-19): a mainnet node bootstrapped from the h=944183
+    assumeUTXO snapshot never persisted the snapshot block's chainwork, so
+    every post-snapshot block accumulated work from 0.  ``get_chainwork_by_
+    height`` then returned a DB-tip base ~32x too small, and the G8 gate
+    rejected EVERY honest headers batch with ``too-little-chainwork``.
+
+    The G8 gate now adds ``detect_snapshot_chainwork_offset``'s correction:
+    the snapshot height's canonical chainwork.  With it, the corrected
+    base + headers clears nMinimumChainWork and the batch is accepted.
+    """
+    from ouroboros.snapshot import get_assumeutxo_data
+
+    genesis_be = bytes.fromhex(
+        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    )
+    genesis_le = genesis_be[::-1]
+    bs = _make_block_sync(tip_hash=genesis_le, tip_height=0)
+
+    au = get_assumeutxo_data("mainnet", 944_183)
+    assert au is not None and au.chainwork_hex is not None
+    snapshot_chainwork = int(au.chainwork_hex, 16)
+
+    # Model the corrupt datadir: the stored DB-tip base is far below
+    # nMinimumChainWork (post-snapshot blocks accumulated from 0).  The
+    # snapshot-offset detector probes snap_h+1 and also sees a tiny value,
+    # so it returns the snapshot's canonical chainwork as the offset.
+    # Derive `tiny_base` relative to nMinimumChainWork so the test holds
+    # whether the real Rust constant or a conftest stub value is in play;
+    # the snapshot chainwork (h=944183) always far exceeds nMinimumChainWork.
+    tiny_base = _MIN_CHAIN_WORK_MAINNET // 32  # ~the incident's ~32x deficit
+
+    def _chainwork_by_height(height: int) -> int:
+        return tiny_base
+
+    bs.db.get_chainwork_by_height = MagicMock(side_effect=_chainwork_by_height)
+    # Pre-fix sanity: the raw base alone could never clear the gate.
+    assert tiny_base < _MIN_CHAIN_WORK_MAINNET
+    # Post-fix: base + snapshot offset comfortably exceeds the minimum.
+    assert snapshot_chainwork > _MIN_CHAIN_WORK_MAINNET
+    assert tiny_base + snapshot_chainwork > _MIN_CHAIN_WORK_MAINNET
+
+    block1 = _real_block_one()
+    headers_msg = HeadersMessage(headers=[block1])
+    msg = MagicMock()
+    msg.payload = headers_msg.serialize_payload()
+
+    peer = _make_peer()
+    bs._header_sync_peer = peer
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(bs, "_request_next_blocks", _noop)
+    monkeypatch.setattr(bs, "_get_presync_state", lambda _peer: None)
+
+    await bs.handle_headers(msg, peer, min_pow_checked=False)
+
+    # The batch passed G8 — the snapshot offset rescued the corrupt base.
+    assert len(bs._validated_headers) == 1
+    assert bs._headers_pow_rejected == 0
+    bs.peer_manager.misbehaving.assert_not_called()
+    # The snapshot-offset detector probed snap_h+1 (944184).
+    bs.db.get_chainwork_by_height.assert_any_call(944_184)
