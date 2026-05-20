@@ -1675,35 +1675,11 @@ class BitcoinNode:
         not available.
         """
         if not hasattr(self, "_chainwork_offset_cache"):
-            self._chainwork_offset_cache = 0
-            try:
-                from ouroboros.snapshot import get_assumeutxo_params
-                network = getattr(self, "network", "mainnet")
-                params = get_assumeutxo_params(network)
-                for data in params:
-                    if data.chainwork_hex is None:
-                        continue
-                    # Check if the snapshot at this height was loaded by
-                    # looking for a gap below the first stored block.
-                    # We detect this by checking if height+1 is available
-                    # but height is not (i.e., the snapshot boundary).
-                    snap_h = data.height
-                    # The first IBD block is snap_h+1 (or later after restarts).
-                    # We check: stored chainwork at snap_h+1 should be about
-                    # one block's work; if it's that small we know the snapshot
-                    # base chainwork wasn't added.
-                    stored_at_first = self.db.get_chainwork_by_height(snap_h + 1)
-                    if stored_at_first <= 0:
-                        continue
-                    # The correct chainwork at snap_h:
-                    correct_snap = int(data.chainwork_hex, 16)
-                    # If the stored value at snap_h+1 is much smaller than
-                    # correct_snap, we know the offset is needed.
-                    if stored_at_first < correct_snap:
-                        self._chainwork_offset_cache = correct_snap
-                        break
-            except Exception:
-                pass
+            from ouroboros.snapshot import detect_snapshot_chainwork_offset
+            network = getattr(self, "network", "mainnet")
+            self._chainwork_offset_cache = detect_snapshot_chainwork_offset(
+                self.db, network
+            )
         return self._chainwork_offset_cache
 
     def _calculate_chainwork_at_height(self, height: int) -> int:
