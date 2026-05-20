@@ -147,5 +147,124 @@ class TestMedianTime(unittest.TestCase):
         self.assertEqual(median_time, expected_median)
 
 
+class _StubPyBlock:
+    """Minimal PyBlock-shaped stub for ``BlockchainDatabase._py_block_to_block``."""
+
+    def __init__(self, timestamp, height):
+        self.version = 1
+        self.prev_blockhash = bytes(32)
+        self.merkle_root = bytes(32)
+        self.timestamp = timestamp
+        self.bits = 0x1D00FFFF
+        self.nonce = 0
+        self.transactions = []
+        self.hash = bytes([height & 0xFF] * 32)
+        self.height = height
+
+
+class _SnapshotBoundaryDB:
+    """Stub Rust ``_db`` simulating the post-assumeUTXO state.
+
+    After an assumeUTXO snapshot load at ``snapshot_height`` ouroboros only
+    persists the snapshot block's own header — heights below it are absent
+    from the block index.  ``get_block_by_height`` /
+    ``get_block_hash_by_height`` therefore return ``None`` for any height
+    ``< snapshot_height``; ``get_block_hash_by_height`` returns a hash for
+    heights ``>= snapshot_height``.
+
+    ``get_median_time_past`` here models a Rust extension that has NOT yet
+    been rebuilt with the partial-window fix — it medians whatever blocks
+    it can see, exactly the buggy behaviour the Python wrapper must guard
+    against.
+    """
+
+    def __init__(self, snapshot_height, timestamps):
+        # timestamps: dict height -> block timestamp, for present blocks.
+        self._snapshot_height = snapshot_height
+        self._timestamps = timestamps
+
+    def get_block_hash_by_height(self, height):
+        if height < self._snapshot_height:
+            return None
+        return bytes([height & 0xFF] * 32)
+
+    def get_block_by_height(self, height):
+        # Slow-fallback path: return a duck-typed PyBlock for present heights
+        # (``_py_block_to_block`` reads these header fields + ``transactions``).
+        if height not in self._timestamps:
+            return None
+        return _StubPyBlock(self._timestamps[height], height)
+
+    def get_median_time_past(self, height):
+        # Buggy old-Rust behaviour: median of only the visible subset.
+        start = max(0, height - 10)
+        seen = [self._timestamps[h] for h in range(start, height + 1)
+                if h in self._timestamps]
+        if not seen:
+            return None
+        seen.sort()
+        return seen[len(seen) // 2]
+
+
+class TestMedianTimePartialWindow(unittest.TestCase):
+    """Regression: get_median_time_past must NOT fabricate an MTP from a
+    partial 11-block window (mainnet stall at h=948464, 2026-05-20).
+
+    A truncated window — caused by missing pre-assumeUTXO-snapshot headers
+    — is right-shifted toward the larger recent timestamps, yielding an
+    MTP that is far too LARGE.  That over-large value fed BIP-68 time-based
+    relative-locktime evaluation and rejected a valid block.  The fix
+    returns ``None`` for an incomplete window so BIP-68 falls back to a
+    coin time of 0 (lock satisfied), matching the assumeUTXO trust model.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        # BlockchainDatabase opens a real RocksDB; we only need the wrapper
+        # methods, so swap ._db for the stub immediately after construction.
+        self.db = BlockchainDatabase(self.temp_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_incomplete_window_returns_none(self):
+        """Window straddling a snapshot boundary -> None, not a wrong median."""
+        snap_h = 944183
+        # Heights 944183..944200 present; everything below the snapshot absent.
+        ts = {h: 1775650000 + (h - 944183) * 600 for h in range(944183, 944201)}
+        self.db._db = _SnapshotBoundaryDB(snap_h, ts)
+        # height 944190 -> window [944180..944190]; 944180..944182 missing.
+        self.assertIsNone(
+            self.db.get_median_time_past(944190),
+            "partial-window MTP must be None, never a fabricated median",
+        )
+        # The snapshot tip itself: window [944173..944183], only 944183 present.
+        self.assertIsNone(self.db.get_median_time_past(snap_h))
+
+    def test_complete_window_returns_median(self):
+        """A fully-populated 11-block window returns the true median."""
+        # Heights 944183..944300 all present.
+        ts = {h: 1775650000 + (h - 944183) * 600 for h in range(944183, 944301)}
+        self.db._db = _SnapshotBoundaryDB(944183, ts)
+        # height 944250 -> window [944240..944250], all present, median index 5.
+        window = sorted(ts[h] for h in range(944240, 944251))
+        self.assertEqual(
+            self.db.get_median_time_past(944250),
+            window[len(window) // 2],
+        )
+
+    def test_partial_window_does_not_overstate_mtp(self):
+        """The buggy path would return a value LARGER than the true MTP."""
+        ts = {h: 1775650000 + (h - 944183) * 600 for h in range(944183, 944201)}
+        # The buggy old-Rust median of the visible subset for height 944190:
+        buggy = _SnapshotBoundaryDB(944183, ts).get_median_time_past(944190)
+        # The true MTP would include the (smaller) 944180..944182 timestamps;
+        # the buggy partial-window value is strictly larger — exactly the
+        # over-statement that broke BIP-68.  The fixed wrapper rejects it.
+        self.assertIsNotNone(buggy)
+        self.db._db = _SnapshotBoundaryDB(944183, ts)
+        self.assertIsNone(self.db.get_median_time_past(944190))
+
+
 if __name__ == '__main__':
     unittest.main()
