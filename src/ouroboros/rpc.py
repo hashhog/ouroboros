@@ -2510,8 +2510,18 @@ class RPCServer:
                        f"exceeds maxfeerate {maxfeerate:.8f} BTC/kvB"
             )
 
-        # 5. Submit to mempool — runs all policy and consensus checks
-        success, error = self.node.mempool.add_transaction(tx, best_height)
+        # 5. Submit to mempool — runs all policy and consensus checks.
+        # Off-load to a worker thread: ATMP performs synchronous script
+        # verification + UTXO lookups + RBF descendant-graph walks that can
+        # take tens of milliseconds to several seconds.  Running them on the
+        # FastAPI event loop blocks every concurrent RPC handler and the
+        # P2P listener loop, the same shape as camlcoin #134's Lwt-main-
+        # thread starvation (closed by 815c31e / 2db21c9).  The Mempool
+        # uses a re-entrant lock around the critical section so dispatching
+        # via to_thread from multiple coroutines is safe.
+        success, error = await asyncio.to_thread(
+            self.node.mempool.add_transaction, tx, best_height,
+        )
 
         if not success:
             # Map common errors to Bitcoin Core-style reject reasons
