@@ -643,12 +643,21 @@ class BlockSync:
                 # Check if we're behind
                 best_hash, best_height = self.db.get_best_block()
 
-                # Detect reorgs
+                # Detect reorgs.  Off-load the two full-block FFI
+                # deserializes so a tip flip in the sync_loop tick does
+                # not stall the event loop for the ~1-2 ms × block_size
+                # PyO3 round-trip — the sync_loop sleeps only 1 s between
+                # ticks during IBD, so even one stalled tick visibly
+                # extends the RPC latency tail.
                 if self.last_best_hash and self.last_best_hash != best_hash:
                     # Check if this is a reorg
-                    current_block = self.db.get_block(best_hash)
+                    current_block = await asyncio.to_thread(
+                        self.db.get_block, best_hash,
+                    )
                     if current_block:
-                        prev_block = self.db.get_block(current_block.prev_blockhash)
+                        prev_block = await asyncio.to_thread(
+                            self.db.get_block, current_block.prev_blockhash,
+                        )
                         if prev_block and prev_block.height and best_height:
                             if prev_block.height < best_height - 1:
                                 logger.warning(
@@ -2286,7 +2295,14 @@ class BlockSync:
                 logger.debug(f"Failed to announce block to {p.host}:{p.port}: {e}")
 
     async def _process_orphans(self, applied_block_hash: bytes) -> None:
-        """Process orphan blocks that may now have their parent in our chain."""
+        """Process orphan blocks that may now have their parent in our chain.
+
+        ``validator.validate_block`` and ``validator.apply_block`` are
+        synchronous and CPU-heavy (per-input script verification + UTXO
+        mutation in the legacy Python path).  Run them in a worker
+        thread so the event loop is not blocked for the orphan-drain
+        window, mirroring the off-load done on the IBD drain path.
+        """
         to_process = [
             (h, b) for h, b in self.orphan_blocks.items()
             if b.prev_blockhash == applied_block_hash
@@ -2295,7 +2311,9 @@ class BlockSync:
         for block_hash, block in to_process:
             del self.orphan_blocks[block_hash]
 
-            valid, error = self.validator.validate_block(block)
+            valid, error = await asyncio.to_thread(
+                self.validator.validate_block, block,
+            )
             if not valid:
                 logger.warning(f"Orphan block {block_hash.hex()[:16]}... invalid: {error}")
                 continue
@@ -2310,7 +2328,7 @@ class BlockSync:
                 else:
                     await self._process_orphans(block_hash)
             else:
-                self.validator.apply_block(block)
+                await asyncio.to_thread(self.validator.apply_block, block)
                 block_height = block.height if hasattr(block, 'height') and block.height else 0
                 logger.info(f"✓ Connected orphan block {block_height}: {block_hash.hex()[:16]}...")
 
@@ -2939,13 +2957,16 @@ class BlockSync:
             new_chain: list[tuple[bytes, Block, int]] = []
 
             # Build current chain back to reasonable depth (e.g., 100 blocks)
-            # Also track heights for transaction search
+            # Also track heights for transaction search.  Each get_block
+            # call deserializes a full ~1 MB block over PyO3; the chain
+            # walk can do up to 100 of them.  Off-load to a worker thread
+            # so the asyncio loop stays responsive during the walk.
             temp_hash = current_hash
             temp_height = current_height
             for _ in range(100):
                 if temp_hash is None:
                     break
-                block = self.db.get_block(temp_hash)
+                block = await asyncio.to_thread(self.db.get_block, temp_hash)
                 if not block:
                     break
                 # Store with height for easier lookup
@@ -2965,7 +2986,7 @@ class BlockSync:
                 if temp_hash == new_chain_tip and new_block.hash == new_chain_tip:
                     block = new_block
                 else:
-                    block = self.db.get_block(temp_hash)
+                    block = await asyncio.to_thread(self.db.get_block, temp_hash)
                 if not block:
                     logger.warning(
                         f"Block {temp_hash.hex()[:16]}... not in database, cannot complete reorg"
@@ -3263,6 +3284,12 @@ class BlockSync:
             # IsFinalTx, BIP-68 SequenceLocks, standardness, double-spend
             # against new-chain UTXOs), so this is policy-correct against
             # the new tip.
+            #
+            # Off-load each ATMP via asyncio.to_thread: with up to ~200
+            # tx per block × tens of blocks on a deep reorg, doing the
+            # refill on the event loop would freeze RPC + P2P dispatch
+            # for the entire refill window.  Mirrors the off-load done
+            # in node._make_tx_handler / rpc_sendrawtransaction.
             # ----------------------------------------------------------
             if self.mempool:
                 for _, curr_block, _ in reversed(blocks_to_disconnect):
@@ -3270,7 +3297,9 @@ class BlockSync:
                         if tx.is_coinbase:
                             continue
                         try:
-                            success, reason = self.mempool.add_transaction(tx, final_height)
+                            success, reason = await asyncio.to_thread(
+                                self.mempool.add_transaction, tx, final_height,
+                            )
                             if success:
                                 logger.debug(
                                     f"Re-added tx {tx.get_txid().hex()[:16]}... to mempool"

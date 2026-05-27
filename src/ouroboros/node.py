@@ -937,7 +937,22 @@ class BitcoinNode:
                     tx = tx_msg.transaction
 
                     _, height = self.db.get_best_block()
-                    success, error = self.mempool.add_transaction(tx, height)
+                    # Off-load ATMP to a worker thread so the asyncio event
+                    # loop stays responsive while script verification + UTXO
+                    # lookups + ancestor/descendant graph walks run.  Without
+                    # this, every inbound TxMsg blocks the loop for the
+                    # ~50ms-3s duration of ``mempool.add_transaction`` —
+                    # under a steady tx flood the LISTEN backlog on the RPC
+                    # port (8359) fills up and the node appears unresponsive
+                    # to curl/getblockcount even though it is alive.
+                    # Mirrors camlcoin's #134/#135 fix (Validation_worker
+                    # Domain for post-IBD blocks + Lwt.pause around ATMP).
+                    # The Mempool already uses a re-entrant lock around the
+                    # critical section, so dispatching from multiple worker
+                    # threads is safe (only one ATMP can execute at a time).
+                    success, error = await asyncio.to_thread(
+                        self.mempool.add_transaction, tx, height,
+                    )
 
                     if error == "orphan":
                         txid = tx.get_txid()
@@ -1045,7 +1060,16 @@ class BitcoinNode:
                             else:
                                 not_found.append((inv_type, inv_hash))
                         elif inv_type in (INV_TYPE_BLOCK, MSG_WITNESS_BLOCK):
-                            block = self.db.get_block(inv_hash)
+                            # Off-load the full-block FFI deserialize
+                            # (~1 MB PyO3 round-trip per call) to a worker
+                            # thread.  Otherwise a peer requesting a
+                            # batch of recent blocks holds the asyncio
+                            # loop for hundreds of ms per block, starving
+                            # RPC + other peer dispatch (the camlcoin
+                            # #134 pattern in the block-serving direction).
+                            block = await asyncio.to_thread(
+                                self.db.get_block, inv_hash,
+                            )
                             if block is not None and prune_horizon >= 0:
                                 # Decline pre-prune-horizon blocks per BIP-159.
                                 bh = getattr(block, 'height', None)
@@ -1087,18 +1111,31 @@ class BitcoinNode:
 
                     # Find the fork point: walk through the locator hashes
                     # and find the first one we have in our chain.
+                    # Off-load each FFI get_block to a worker thread —
+                    # a long locator can otherwise stall the loop for
+                    # tens of ms per probe.
                     start_height = 0
                     for locator_hash in getheaders.locator_hashes:
-                        block = self.db.get_block(locator_hash)
+                        block = await asyncio.to_thread(
+                            self.db.get_block, locator_hash,
+                        )
                         if block is not None:
                             start_height = (block.height if block.height else 0) + 1
                             break
 
                     # Collect up to 2000 headers starting from start_height.
+                    # Each db.get_block_by_height call is a full Rust-side
+                    # block materialise + PyO3 deserialise; serving the
+                    # max 2000-block batch synchronously holds the event
+                    # loop for several seconds and is the most expensive
+                    # single P2P handler.  Run inside a worker thread so
+                    # RPC + other peer dispatch continues meanwhile.
                     _, best_height = self.db.get_best_block()
                     headers = []
                     for h in range(start_height, min(start_height + 2000, best_height + 1)):
-                        block = self.db.get_block_by_height(h)
+                        block = await asyncio.to_thread(
+                            self.db.get_block_by_height, h,
+                        )
                         if block is None:
                             break
                         header = BlockHeader(
