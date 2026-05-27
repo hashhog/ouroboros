@@ -631,7 +631,17 @@ class BlockchainDatabase:
         return self._cached_tip
 
     def update_best_block(self, block_hash: bytes, height: int) -> None:
-        """Update the chain tip pointer (used during reorg)."""
+        """Update the chain tip pointer (used during reorg / snapshot load).
+
+        Atomic: BEST_BLOCK_HASH and BEST_HEIGHT land together via a single
+        WriteBatch on the Rust side (see ``storage/db.rs::update_best_block``).
+        Pre-fix the two puts were independent and could tear under SIGKILL,
+        leaving META_CF in a (hash=new, height=old) or (hash=old, height=new)
+        intermediate state. Callers that already hold a batch (the connect /
+        disconnect / loadSnapshot Rust paths) keep using
+        ``update_best_block_batch`` so the tip update fuses with the rest of
+        their write set. See CORE-PARITY-AUDIT/_chainstate-atomicity-family-2026-05-26.md.
+        """
         if len(block_hash) != 32:
             raise ValueError("Block hash must be 32 bytes")
         self._db.update_best_block(block_hash, height)
