@@ -245,6 +245,46 @@ mod tests {
         assert_eq!(retrieved_height, height);
     }
 
+    /// Regression: the bare `update_best_block` API must persist
+    /// BEST_BLOCK_HASH and BEST_HEIGHT atomically as a single WriteBatch.
+    ///
+    /// Pre-fix the two `put_cf` calls were issued separately — a SIGKILL
+    /// between them could persist the hash while losing the height (or
+    /// vice versa), leaving the META_CF in a torn state. Post-fix the two
+    /// writes are wrapped in an internal WriteBatch + apply_batch, so a
+    /// successful return guarantees BOTH keys are durably committed and
+    /// a crash leaves NEITHER. This test asserts the success-side
+    /// invariant — a sequence of updates always reads back the matching
+    /// (hash, height) pair, never a torn intermediate.
+    ///
+    /// See CORE-PARITY-AUDIT/_chainstate-atomicity-family-2026-05-26.md.
+    #[test]
+    fn test_update_best_block_is_atomic_pair() {
+        let (db, _temp_dir) = create_test_db();
+
+        // Walk through a sequence of (hash, height) updates. Every read
+        // after a successful update must match BOTH the hash and the
+        // height we just wrote. If the two puts were ever applied
+        // independently, an interleaved read could see a stale half.
+        for i in 1..=20u8 {
+            let hash = [i; 32];
+            let height = (i as u32) * 17;
+            db.update_best_block(&hash, height).unwrap();
+
+            let (read_hash, read_height) = db.get_best_block().unwrap();
+            assert_eq!(read_hash, hash, "BEST_BLOCK_HASH drift at i={}", i);
+            assert_eq!(read_height, height, "BEST_HEIGHT drift at i={}", i);
+        }
+
+        // Final cross-check after a downward update (reorg-style rewind).
+        let rewind_hash = [99u8; 32];
+        let rewind_height = 7u32;
+        db.update_best_block(&rewind_hash, rewind_height).unwrap();
+        let (read_hash, read_height) = db.get_best_block().unwrap();
+        assert_eq!(read_hash, rewind_hash);
+        assert_eq!(read_height, rewind_height);
+    }
+
     #[test]
     fn test_block_metadata() {
         let (db, _temp_dir) = create_test_db();

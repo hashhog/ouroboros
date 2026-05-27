@@ -839,19 +839,29 @@ impl BlockchainDB {
         Ok((hash, height))
     }
 
-    /// Update the best block hash and height
+    /// Update the best block hash and height **atomically**.
+    ///
+    /// Internally builds a single-shot WriteBatch containing both
+    /// `BEST_BLOCK_HASH` and `BEST_HEIGHT` puts and commits via
+    /// `apply_batch`, so the pair lands or fails together. Prior to the
+    /// 2026-05-27 chainstate-atomicity sweep (family doc
+    /// `_chainstate-atomicity-family-2026-05-26.md`) this helper issued two
+    /// separate `put_cf` calls — a SIGKILL between them could persist the
+    /// hash while losing the height (or vice versa), leaving the meta CF
+    /// in a torn state for the next process to read.
+    ///
+    /// Callers that ALREADY hold a `WriteBatch` (e.g. `connect_block_from_bytes`,
+    /// `disconnect_block_at_height_checked`, `loadSnapshot`) should keep
+    /// using `update_best_block_batch` so the tip update participates in
+    /// the same atomic commit as the rest of the chainstate mutation. This
+    /// bare API is for genesis init, header-sync reorg rewind, snapshot
+    /// load final tip, and `recover_from_crash` fallback — paths that only
+    /// touch the META_CF tip and do not need to be fused with a larger
+    /// write set.
     pub fn update_best_block(&self, hash: &[u8; 32], height: u32) -> Result<()> {
-        let cf = self.db.cf_handle(META_CF)
-            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
-
-        // Store block hash
-        self.db.put_cf(cf, meta_keys::BEST_BLOCK_HASH, hash)?;
-
-        // Store height
-        let height_bytes = encode_height(height);
-        self.db.put_cf(cf, meta_keys::BEST_HEIGHT, height_bytes)?;
-
-        Ok(())
+        let mut batch = self.create_batch();
+        self.update_best_block_batch(&mut batch, hash, height)?;
+        self.apply_batch(batch)
     }
 
     /// Get chainwork at a given height (from block metadata).
