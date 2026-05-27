@@ -3020,51 +3020,80 @@ class BlockSync:
             )
 
             # ----------------------------------------------------------
-            # Disconnect side: tip → fork point.  Each call to
-            # ``self.db.disconnect_block(height)`` is a single Rust write
-            # batch that:
-            #   • removes outputs created by the block from CHAINSTATE_CF
-            #   • restores spent inputs from SPENT_CF/UNDO_CF (full Coin
-            #     including height + is_coinbase)
-            #   • rolls BEST_BLOCK_HASH / BEST_HEIGHT back one step
-            # so the loop below leaves the chain tip at common_ancestor.
-            # Reference: ferrous-utils/sync/src/storage/db.rs:1061
-            # (disconnect_block_at_height) and src/lib.rs:4122 (PyO3
-            # binding).
+            # Disconnect side: tip → fork point.
             #
-            # FIX-74 / W121 BUG-1: after each Rust disconnect we also call
-            # ``block_filter_index.remove(block_hash, height)`` so the
-            # BIP-157/158 index follows the active chain.  Without this hook
-            # the orphan-tip's (filter, header) entries stayed cached, the
-            # filter header chain still pointed at the orphan tip, and every
-            # subsequent ``add_block`` chained from the wrong prev_header —
-            # permanently diverging from any honest peer's filter chain.
-            # Mirrors Bitcoin Core's BlockFilterIndex::CustomRewind via the
-            # CValidationInterface BlockDisconnected callback
-            # (src/index/blockfilterindex.cpp + src/index/base.cpp).
+            # ATOMICITY (CORE-PARITY-AUDIT/_chainstate-atomicity-family-
+            # 2026-05-26.md): the chainstate disconnect now runs as a
+            # SINGLE Rust ``WriteBatch`` via ``db.disconnect_blocks_atomic``
+            # (matches the submitblock-driven reorg in ``rpc.py``).  Per-
+            # block ``db.disconnect_block`` is NOT atomic — it issues N×
+            # delete + M× put + 2× best-block-pointer puts as separate
+            # RocksDB writes, with no HEAD_BLOCKS recovery marker.  A
+            # process kill mid-disconnect (multi-block reorg or even a
+            # single block with many txs) left CHAINSTATE_CF / SPENT_CF /
+            # TX_INDEX_CF / META_CF in an inconsistent intermediate state
+            # with no marker for ``recover_from_crash`` to detect.
+            # Reference: storage/db.rs::disconnect_block_at_height_checked
+            # (~300 LOC of separate writes) vs disconnect_blocks_atomic
+            # (single batch).
+            #
+            # FIX-74 / W121 BUG-1: filter-index removal runs AFTER the
+            # atomic chainstate disconnect lands.  Filter-index updates
+            # were always best-effort (errors logged, never aborting the
+            # reorg); preserving them in a separate post-disconnect loop
+            # keeps the same hook semantics while making the chainstate
+            # half atomic.  Mirrors Bitcoin Core's BlockFilterIndex::
+            # CustomRewind via the CValidationInterface BlockDisconnected
+            # callback (src/index/blockfilterindex.cpp + src/index/base.cpp).
             # ----------------------------------------------------------
-            disconnect_height = common_ancestor_height + len(blocks_to_disconnect)
-            for curr_hash, _curr_block, _ in reversed(blocks_to_disconnect):
-                logger.debug(
-                    f"Disconnecting block {curr_hash.hex()[:16]}... at height {disconnect_height}"
-                )
+            tip_height_at_disconnect = (
+                common_ancestor_height + len(blocks_to_disconnect)
+            )
+            if hasattr(self.db, "disconnect_blocks_atomic") and blocks_to_disconnect:
                 try:
-                    await asyncio.to_thread(self.db.disconnect_block, disconnect_height)
+                    await asyncio.to_thread(
+                        self.db.disconnect_blocks_atomic,
+                        tip_height_at_disconnect,
+                        common_ancestor_height,
+                    )
                 except Exception as e:
                     logger.error(
-                        f"Failed to disconnect block at height {disconnect_height} "
-                        f"(hash {curr_hash.hex()[:16]}...): {e}"
+                        f"Reorg disconnect_blocks_atomic("
+                        f"{tip_height_at_disconnect}→{common_ancestor_height}) "
+                        f"failed: {e}"
                     )
                     return False
+            else:
+                # Compatibility fallback: older Rust extensions without the
+                # atomic helper retain the pre-Pattern-D per-block path
+                # (per-block-non-atomic, multi-block sequential).
+                disconnect_height = tip_height_at_disconnect
+                for curr_hash, _curr_block, _ in reversed(blocks_to_disconnect):
+                    logger.debug(
+                        f"Disconnecting block {curr_hash.hex()[:16]}... at height {disconnect_height}"
+                    )
+                    try:
+                        await asyncio.to_thread(
+                            self.db.disconnect_block, disconnect_height
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to disconnect block at height {disconnect_height} "
+                            f"(hash {curr_hash.hex()[:16]}...): {e}"
+                        )
+                        return False
+                    disconnect_height -= 1
 
-                # FIX-74 / W121 BUG-1: remove the disconnected block from
-                # the BIP-157/158 filter index.  Non-fatal: an index fault
-                # must never abort the reorg (matches the linear-connect
-                # hook's "log and continue" policy at line ~1370).
-                # Activates FIX-71's best_indexed_height rollback machinery
-                # (wired into PersistentBlockFilterIndex.remove() but never
-                # called pre-FIX-74 because the reorg loop didn't hook it).
-                if self.block_filter_index is not None:
+            # FIX-74 / W121 BUG-1: remove each disconnected block from the
+            # BIP-157/158 filter index.  Non-fatal: an index fault must
+            # never abort the reorg (matches the linear-connect hook's
+            # "log and continue" policy at line ~1370).  Activates
+            # FIX-71's best_indexed_height rollback machinery (wired into
+            # PersistentBlockFilterIndex.remove() but never called pre-
+            # FIX-74 because the reorg loop didn't hook it).
+            if self.block_filter_index is not None:
+                disconnect_height = tip_height_at_disconnect
+                for curr_hash, _curr_block, _ in reversed(blocks_to_disconnect):
                     try:
                         await asyncio.to_thread(
                             self.block_filter_index.remove,
@@ -3091,8 +3120,7 @@ class BlockSync:
                             f"height {disconnect_height} "
                             f"(hash {curr_hash.hex()[:16]}...): {e}"
                         )
-
-                disconnect_height -= 1
+                    disconnect_height -= 1
 
             # Sanity: tip should now be at the common ancestor height.
             tip_hash, tip_height = self.db.get_best_block()
