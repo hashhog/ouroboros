@@ -1449,6 +1449,40 @@ impl BlockchainDB {
         // Accumulator for DISCONNECT_UNCLEAN signal.
         let mut f_clean = true;
 
+        // FIX-B (2026-05-27): single WriteBatch for the entire disconnect.
+        //
+        // Pre-fix this method issued O(2N+3M+3) separate `put_cf`/`delete_cf`
+        // calls (chainstate + spent CF + tx_index + undo + best_block_hash +
+        // best_height as two separate puts) with NO atomicity barrier. A
+        // SIGKILL anywhere in the loop left CHAINSTATE_CF / SPENT_CF /
+        // TX_INDEX_CF / META_CF in inconsistent intermediate state and
+        // `recover_from_crash` had no marker to detect it. Now every
+        // mutation accumulates into one `WriteBatch`; the final
+        // `apply_batch` commits all writes atomically. See
+        // `CORE-PARITY-AUDIT/_chainstate-atomicity-family-2026-05-26.md`
+        // row 8 and FIX-A (block_sync.py:_handle_reorg ouroboros 7853a8a).
+        let mut batch = self.create_batch();
+
+        // HEAD_BLOCKS marker — mirror connect_block_from_bytes pattern.
+        // Marker is written + deleted inside the same atomic batch, so it
+        // never persists across a successful commit (RocksDB WriteBatch is
+        // all-or-nothing). Acts as a defensive sentinel against any future
+        // code path that splits the disconnect across multiple batches.
+        // We record the OLD tip (block being disconnected) as the "in-flight"
+        // target so the existing `recover_from_crash` -> disconnect path
+        // would re-attempt the same disconnect on resurrection (idempotent).
+        let old_tip_hash = block_hash;
+        let old_tip_height = height;
+        let new_tip_hash = prev_block_hash;
+        let new_tip_height = height.saturating_sub(1);
+        self.write_head_blocks_batch(
+            &mut batch,
+            &old_tip_hash,
+            old_tip_height,
+            &new_tip_hash,
+            new_tip_height,
+        )?;
+
         // Process transactions in reverse order (G10).
         for (tx_idx, tx) in inner.txdata.iter().enumerate().rev() {
             let txid = tx.compute_txid();
@@ -1475,7 +1509,7 @@ impl BlockchainDB {
                     // mismatch signal because Core wouldn't have surfaced
                     // one either.
                     let outpoint = bitcoin::OutPoint { txid, vout: vout as u32 };
-                    let _ = self.delete_utxo(&outpoint);
+                    let _ = self.delete_utxo_batch(&mut batch, &outpoint);
                     continue;
                 }
 
@@ -1483,8 +1517,12 @@ impl BlockchainDB {
 
                 // G13: Read-then-delete (Core's SpendCoin) and verify the
                 // stored coin matches what the block claims it produced.
+                // The read remains uncached (against on-disk state, NOT
+                // against the WriteBatch) — every disconnect deals with a
+                // distinct outpoint, so the in-batch overlay can't change
+                // the answer for this key.
                 let existing = self.get_utxo(&outpoint)?;
-                self.delete_utxo(&outpoint)?;
+                self.delete_utxo_batch(&mut batch, &outpoint)?;
 
                 let matches = match existing {
                     None => false,
@@ -1570,6 +1608,10 @@ impl BlockchainDB {
                                 // already in the cache as unspent that's an
                                 // UNCLEAN signal AND we still write (with
                                 // `possible_overwrite = true`).
+                                // The probe is against on-disk state — fine
+                                // because the WriteBatch only deletes coins
+                                // CREATED by this block (different outpoints
+                                // from the ones we're restoring).
                                 let overwriting = self.utxo_exists(&outpoint);
                                 if overwriting {
                                     log::warn!(
@@ -1587,7 +1629,7 @@ impl BlockchainDB {
                                     Some(coin.height),
                                     coin.is_coinbase,
                                 );
-                                self.add_utxo(&outpoint, &utxo)?;
+                                self.add_utxo_batch(&mut batch, &outpoint, &utxo)?;
                                 true
                             } else {
                                 false
@@ -1600,7 +1642,9 @@ impl BlockchainDB {
                     };
 
                     if !restored {
-                        // Fall back to SPENT_CF.
+                        // Fall back to SPENT_CF. The read is against on-disk
+                        // state (written by the original connect_block call);
+                        // we only QUEUE the chainstate put here.
                         if let Some((_spending_txid, utxo)) = self.get_spent_utxo(&outpoint)? {
                             // G1 + G5 on the fallback path too.
                             if self.utxo_exists(&outpoint) {
@@ -1611,7 +1655,7 @@ impl BlockchainDB {
                                 );
                                 f_clean = false;
                             }
-                            self.add_utxo(&outpoint, &utxo)?;
+                            self.add_utxo_batch(&mut batch, &outpoint, &utxo)?;
                         } else {
                             // Core's `ApplyTxInUndo` would have returned
                             // DISCONNECT_FAILED via the AccessByTxid fall-
@@ -1635,7 +1679,7 @@ impl BlockchainDB {
                     }
 
                     // Clean up SPENT_CF record (always — restored or not).
-                    self.delete_spent_record(&outpoint)?;
+                    self.delete_spent_record_batch(&mut batch, &outpoint)?;
                 }
             }
 
@@ -1653,17 +1697,30 @@ impl BlockchainDB {
             // touched UTXOs + UNDO_CF, leaving the txindex stale on
             // submitblock-driven reorgs (Pattern C, txindex-revert-on-
             // reorg corpus, 2026-05-05).
-            self.delete_tx_index(txid.as_byte_array())?;
+            self.delete_tx_index_batch(&mut batch, txid.as_byte_array())?;
         }
 
         // Delete the undo data.
-        let _ = self.delete_block_undo(height);
+        self.delete_block_undo_batch(&mut batch, height)?;
 
         // G18: update chain tip to previous block (Core's
         // `view.SetBestBlock(pindex->pprev->GetBlockHash())`).
+        // Batched: best_block_hash + best_height now land together —
+        // pre-fix they were two separate non-atomic put_cf calls and could
+        // diverge under a SIGKILL between them.
         if height > 0 {
-            self.update_best_block(&prev_block_hash, height - 1)?;
+            self.update_best_block_batch(&mut batch, &prev_block_hash, height - 1)?;
         }
+
+        // Delete the HEAD_BLOCKS marker — paired with the write above.
+        // Both ops are in the same batch, so on a successful commit the
+        // marker never appears on disk; on a failed commit nothing at all
+        // is written.
+        self.delete_head_blocks_batch(&mut batch)?;
+
+        // Single atomic commit — either every mutation above lands or none
+        // does. This is the atomicity guarantee the audit calls for.
+        self.apply_batch(batch)?;
 
         // G19: DISCONNECT_OK vs DISCONNECT_UNCLEAN.
         let status = if f_clean {
@@ -2051,6 +2108,53 @@ impl BlockchainDB {
         let cf = self.db.cf_handle(META_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
         batch.delete_cf(cf, meta_keys::HEAD_BLOCKS);
+        Ok(())
+    }
+
+    /// Delete a UTXO from chainstate via WriteBatch (no individual write,
+    /// no SPENT_CF undo record). Mirrors `delete_utxo` but accumulates
+    /// the delete onto a caller-managed batch for single-atomic-commit
+    /// disconnect-path use (see `disconnect_block_at_height_checked`).
+    pub fn delete_utxo_batch(&self, batch: &mut WriteBatch, outpoint: &OutPoint) -> Result<()> {
+        let txid_bytes = *outpoint.txid.as_byte_array();
+        let key = encode_outpoint(&txid_bytes, outpoint.vout);
+        let cf = self.db.cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+        batch.delete_cf(cf, &key);
+        Ok(())
+    }
+
+    /// Delete a SPENT_CF undo record via WriteBatch (no individual write).
+    /// Mirrors `delete_spent_record` but accumulates onto a caller-managed
+    /// batch — used in the disconnect path after an input is restored
+    /// from either UNDO_CF or SPENT_CF.
+    pub fn delete_spent_record_batch(&self, batch: &mut WriteBatch, outpoint: &OutPoint) -> Result<()> {
+        let txid_bytes = *outpoint.txid.as_byte_array();
+        let key = encode_outpoint(&txid_bytes, outpoint.vout);
+        let cf = self.db.cf_handle(SPENT_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(SPENT_CF.to_string()))?;
+        batch.delete_cf(cf, &key);
+        Ok(())
+    }
+
+    /// Delete a TX_INDEX_CF entry via WriteBatch (no individual write).
+    /// Mirrors `delete_tx_index` — used in the disconnect path to revert
+    /// Pattern C txindex rows for transactions in the disconnected block.
+    pub fn delete_tx_index_batch(&self, batch: &mut WriteBatch, txid: &[u8; 32]) -> Result<()> {
+        let cf = self.db.cf_handle(TX_INDEX_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(TX_INDEX_CF.to_string()))?;
+        batch.delete_cf(cf, txid);
+        Ok(())
+    }
+
+    /// Delete UNDO_CF entry for a block via WriteBatch (no individual write).
+    /// Mirrors `delete_block_undo` — used at the end of the disconnect
+    /// path to drop the undo record once the block has been rolled back.
+    pub fn delete_block_undo_batch(&self, batch: &mut WriteBatch, height: u32) -> Result<()> {
+        let cf = self.db.cf_handle(UNDO_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(UNDO_CF.to_string()))?;
+        let key = encode_height(height);
+        batch.delete_cf(cf, &key);
         Ok(())
     }
 
