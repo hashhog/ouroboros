@@ -21,7 +21,7 @@ import random
 import socket
 import struct
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 
 from ouroboros.addrman import AddressManager, get_network_group
@@ -170,6 +170,20 @@ INVENTORY_BROADCAST_TARGET = int(
 # Maximum inventory items per transmission
 INVENTORY_BROADCAST_MAX = 1000
 
+# Bounded cap on the per-peer "already-known" inv filter.  Bitcoin Core uses
+# a CRollingBloomFilter sized for INVENTORY_RELAY_MAX (50 000) entries to
+# remember which txids/wtxids it has already announced to or received from
+# a given peer; ours is an exact set with FIFO eviction so we keep the same
+# 50 000-entry working set without the false-positive bloom mechanics.
+#
+# Without this cap the set grew unbounded for the peer's lifetime — on
+# mainnet at ~5 tx/s sustained that is ~432 000 entries/day/peer × 32 bytes
+# + Python set overhead (~110 B/entry effective).  Across 10 peers that is
+# ~475 MB/day of net retained RSS, and is the leading suspect behind the
+# 2026-05-27 ouroboros wedge (PID 1771536: RSS 58 GB / swap 89 GB / load 99
+# after a multi-day run).  See ouroboros task #146.
+KNOWN_FILTER_MAX_ENTRIES = 50_000
+
 
 @dataclass
 class TrickleEntry:
@@ -222,9 +236,17 @@ class TrickleQueue:
         # Map wtxid -> TrickleEntry for fee information (BIP133 feefilter)
         self.wtxid_to_entry: dict[bytes, TrickleEntry] = {}
 
-        # Bloom filter to track already-announced txs (like m_tx_inventory_known_filter)
-        # For simplicity, use a set here; Bitcoin Core uses CRollingBloomFilter
-        self.known_filter: set[bytes] = set()
+        # Filter to track already-announced txs (like Core m_tx_inventory_known_filter).
+        # Core uses a CRollingBloomFilter; we use an OrderedDict as a bounded
+        # FIFO set — same semantics for the duplicate-suppression use case,
+        # capped at KNOWN_FILTER_MAX_ENTRIES so a long-lived peer cannot grow
+        # the set unbounded (ouroboros #146 memleak root cause: this set was a
+        # plain `set[bytes]` and was the dominant source of RSS growth on the
+        # mainnet wedge).  Access goes through `known_filter_contains` /
+        # `known_filter_add` so the eviction is enforced consistently; legacy
+        # readers can still iterate `.known_filter` for diagnostic prints.
+        self.known_filter: OrderedDict[bytes, None] = OrderedDict()
+        self._known_filter_max = KNOWN_FILTER_MAX_ENTRIES
 
         # Next scheduled send time
         self.next_send_time: float = 0.0
@@ -234,6 +256,21 @@ class TrickleQueue:
             INBOUND_INVENTORY_BROADCAST_INTERVAL if is_inbound
             else OUTBOUND_INVENTORY_BROADCAST_INTERVAL
         )
+
+    def _known_filter_add(self, inv_hash: bytes) -> None:
+        """Insert *inv_hash* into the bounded known-filter, evicting the
+        oldest entry once the FIFO is full.  Re-inserting an existing entry
+        refreshes its position (LRU-on-touch), which keeps the most-recently
+        seen txids around the longest — matching the intent of Core's
+        rolling bloom filter without the FP rate.
+        """
+        if inv_hash in self.known_filter:
+            self.known_filter.move_to_end(inv_hash)
+            return
+        if len(self.known_filter) >= self._known_filter_max:
+            # FIFO eviction: drop the oldest inserted entry.
+            self.known_filter.popitem(last=False)
+        self.known_filter[inv_hash] = None
 
     def add_tx(
         self,
@@ -271,7 +308,7 @@ class TrickleQueue:
     def mark_known(self, txid: bytes, wtxid: bytes) -> None:
         """Mark a transaction as known to this peer (received from them)."""
         inv_hash = wtxid if self.wtxid_relay else txid
-        self.known_filter.add(inv_hash)
+        self._known_filter_add(inv_hash)
         # Remove from pending if queued
         self.pending_wtxids.discard(wtxid)
         self.wtxid_to_txid.pop(wtxid, None)
@@ -350,7 +387,7 @@ class TrickleQueue:
                 continue
 
             inv_items.append((inv_type, inv_hash))
-            self.known_filter.add(inv_hash)
+            self._known_filter_add(inv_hash)
             to_remove.append(wtxid)
 
         # Remove sent items from pending set
@@ -1845,6 +1882,76 @@ class PeerManager:
 
         return elapsed >= backoff_time
 
+    def _cleanup_peer_state(self, addr: str) -> None:
+        """Drop all per-addr state we accumulated for *addr*.
+
+        Called from ``maintain_connections`` after the peer has been popped
+        from the active connection dicts.  Pre-#146 these caches were never
+        cleaned and grew unbounded over the process lifetime; on a
+        multi-week mainnet run this contributed (with the much-larger
+        ``TrickleQueue.known_filter`` leak) to the wedge of PID 1771536.
+
+        Notes per-bucket:
+          - ``_trickle_queues``: per-peer inv announcement queue (the
+            largest single retention item; its ``known_filter`` is the #146
+            primary leak).  Already dropped at the dict pop sites above —
+            keeping the explicit cleanup here too so this helper is the
+            single source of truth.
+          - ``_erlay_*``: BIP 330 reconciliation state (set + Minisketch
+            instance per peer).
+          - ``cmpct_peers`` / ``_package_peers``: capability flags.
+          - ``_addr_relay_counts`` / ``_addr_relay_day``: per-peer addr
+            relay rate-limit accounting.
+          - ``retry_counts`` / ``last_retry_time``: outbound dialer
+            back-off counters.  Kept across short disconnect/reconnect
+            windows by design (we want repeated failures to apply
+            exponential back-off) but a peer we have NOT seen for the
+            full back-off window is no different from an unknown one;
+            dropping the entry on disconnect simply resets the back-off.
+            That is a behaviour change from the pre-fix code, but the
+            previous behaviour was a leak (the dict grew once per
+            unique addr we ever attempted) and the actual eviction
+            criterion lives in ``known_addrs.discard`` above this anyway.
+          - ``_v1_only_addrs``: BIP 324 v1-fallback TTL is checked in
+            ``_addr_is_v1_only``; we leave it intact across disconnects
+            so a v2-negotiation failure latches for ``V2_FALLBACK_TTL``
+            even if the peer briefly reconnects on v1.
+          - ``sync_manager._peer_sync_states`` / ``_peer_block_times``:
+            cleaned via ``sync_manager.cleanup_peer`` (a no-op when
+            sync_manager is not wired in).
+          - ``block_sync._unconnecting_headers_count`` /
+            ``_presync_states`` / ``_peer_handlers``: cleaned via
+            ``block_sync.cleanup_peer`` (also a no-op if absent).
+        """
+        self._trickle_queues.pop(addr, None)
+        self._erlay_peers.pop(addr, None)
+        self._erlay_local_salts.pop(addr, None)
+        self._erlay_pending_recon.pop(addr, None)
+        self.cmpct_peers.discard(addr)
+        self._package_peers.discard(addr)
+        self._addr_relay_counts.pop(addr, None)
+        self._addr_relay_day.pop(addr, None)
+        self.retry_counts.pop(addr, None)
+        self.last_retry_time.pop(addr, None)
+
+        # Sync manager: present on the node-level wiring; absent in unit tests
+        # that construct a bare PeerManager.  cleanup_peer is the dedicated
+        # entry point and is a documented no-op for unknown addrs.
+        sync_mgr = getattr(self, "sync_manager", None)
+        if sync_mgr is not None and hasattr(sync_mgr, "cleanup_peer"):
+            try:
+                sync_mgr.cleanup_peer(addr)
+            except Exception:
+                logger.debug("sync_manager.cleanup_peer raised for %s", addr, exc_info=True)
+
+        # Block sync: same pattern.
+        blk_sync = getattr(self, "block_sync", None)
+        if blk_sync is not None and hasattr(blk_sync, "cleanup_peer"):
+            try:
+                blk_sync.cleanup_peer(addr)
+            except Exception:
+                logger.debug("block_sync.cleanup_peer raised for %s", addr, exc_info=True)
+
     async def maintain_connections(self, start_height: int):
         """Maintain peer connections and eclipse protections."""
         while self.running:
@@ -1856,7 +1963,7 @@ class PeerManager:
                 ]
                 for addr in disconnected:
                     peer = self.peers.pop(addr)
-                    self._trickle_queues.pop(addr, None)  # cleanup trickle queue
+                    self._cleanup_peer_state(addr)
                     # Update outbound netgroups tracking
                     group = self._netgroup(peer.host)
                     self._update_outbound_netgroups()
@@ -1869,6 +1976,7 @@ class PeerManager:
                 ]
                 for addr in disconnected_bro:
                     peer = self.block_relay_peers.pop(addr)
+                    self._cleanup_peer_state(addr)
                     # Update outbound netgroups tracking
                     self._update_outbound_netgroups()
                     logger.info(f"Removed disconnected block-relay-only peer {addr}")
@@ -1880,7 +1988,7 @@ class PeerManager:
                 ]
                 for addr in disconnected_in:
                     peer = self.inbound_peers.pop(addr)
-                    self._trickle_queues.pop(addr, None)  # cleanup trickle queue
+                    self._cleanup_peer_state(addr)
                     # Update inbound netgroups tracking
                     group = self._netgroup(peer.host)
                     if group in self._inbound_netgroups:

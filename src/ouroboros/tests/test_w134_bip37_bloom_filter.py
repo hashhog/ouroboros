@@ -257,41 +257,42 @@ def test_g7_bloom_update_enum_present() -> None:
 # ===========================================================================
 
 
-def test_g8_known_filter_is_unbounded_set_bug8() -> None:
-    """G8 BUG-8 (P1): TrickleQueue.known_filter is a plain ``set`` with no
-    rotation. Core uses CRollingBloomFilter(50000, 0.000001) at
-    net_processing.cpp:303. Comment at p2p.py:225 explicitly admits the
-    simplification.
+def test_g8_known_filter_is_bounded_post_fix() -> None:
+    """G8 BUG-8 (P1) — FIXED in ouroboros #146 (2026-05-27).
+
+    TrickleQueue.known_filter was a plain ``set[bytes]`` with no rotation —
+    the dominant suspect behind the wedge on PID 1771536 (RSS 58 GB /
+    swap 89 GB).  It is now an OrderedDict-backed FIFO capped at
+    KNOWN_FILTER_MAX_ENTRIES (50 000), matching the Core
+    CRollingBloomFilter(50000, 0.000001) sizing without the FP-rate
+    machinery.  This test pins the cap is wired so a future refactor
+    cannot silently reintroduce the unbounded form.
     """
-    # The comment is the smoking gun.
     assert "m_tx_inventory_known_filter" in _P2P, (
         "G8: reference comment to Core's known_filter missing — has the "
         "comment been removed? Verify TrickleQueue.known_filter still exists."
     )
-    assert "known_filter: set[bytes]" in _P2P, (
-        "G8: TrickleQueue.known_filter is NOT a set — has BUG-8 been fixed?"
+    assert "KNOWN_FILTER_MAX_ENTRIES" in _P2P, (
+        "G8: KNOWN_FILTER_MAX_ENTRIES cap missing — has the bound been removed?"
     )
-    # No actual CRollingBloomFilter class definition (the comment at p2p.py:226
-    # mentions it as Core's choice, but no class implementation exists).
-    assert re.search(r"^class\s+C?RollingBloomFilter\b", _P2P, re.M) is None, (
-        "G8: CRollingBloomFilter class defined in p2p.py — update test."
+    assert "self._known_filter_max" in _P2P, (
+        "G8: per-queue cap field _known_filter_max missing."
+    )
+    assert "OrderedDict" in _P2P, (
+        "G8: known_filter no longer uses OrderedDict — has the cap been removed?"
     )
 
 
-@pytest.mark.xfail(
-    reason="W134 BUG-8 (P1): TrickleQueue.known_filter has no upper bound. "
-           "Core CRollingBloomFilter(50000, 0.000001) — 50k cap. Long-running "
-           "ouroboros peer leaks per-txid memory until restart.",
-    strict=True,
-)
 def test_g8_known_filter_has_size_bound() -> None:
     # Look for any actual size-cap behaviour (a call site that bounds the
-    # set, or a class that does it). Skip comment-only mentions.
-    # We assert TRUE if the bound exists — xfail expects FALSE.
+    # set, or a class that does it).  Fixed in ouroboros #146 via
+    # OrderedDict + KNOWN_FILTER_MAX_ENTRIES eviction in _known_filter_add.
     has_cap = (
-        "TX_INVENTORY_KNOWN_FILTER_MAX_SIZE" in _P2P
+        "KNOWN_FILTER_MAX_ENTRIES" in _P2P
+        or "_known_filter_add" in _P2P
         or "self.known_filter.clear" in _P2P
         or "known_filter.discard" in _P2P
+        or "known_filter.popitem" in _P2P
         or "class RollingBloomFilter" in _P2P
         or "class CRollingBloomFilter" in _P2P
         or "from ouroboros.bloom import" in _P2P
