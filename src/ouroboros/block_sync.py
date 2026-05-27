@@ -588,6 +588,59 @@ class BlockSync:
         if peer in self._peer_handlers:
             del self._peer_handlers[peer]
 
+    def cleanup_peer(self, addr: str) -> None:
+        """Drop all per-peer state associated with *addr* ("host:port").
+
+        Called from ``PeerManager._cleanup_peer_state`` on disconnect.
+        Before ouroboros #146 every per-peer map here grew unbounded over
+        the process lifetime (no disconnect callback fired into block_sync),
+        which combined with the much-larger ``TrickleQueue.known_filter``
+        leak to wedge PID 1771536 (RSS 58 GB / swap 89 GB).
+
+        The single largest item is ``_peer_handlers[peer]``, whose values
+        are closures over both ``peer`` and ``self`` — leaving them in the
+        dict keeps the *entire* zombie Peer alive (including its socket
+        readers, BIP-324 transport state, message buffers, ...).
+        """
+        # ``_peer_handlers`` is keyed by Peer object, not addr string.  Match
+        # by host:port — the same shape ``_peer_key`` uses.
+        peers_to_drop = [
+            p for p in list(self._peer_handlers.keys())
+            if f"{getattr(p, 'host', '?')}:{getattr(p, 'port', '?')}" == addr
+        ]
+        for p in peers_to_drop:
+            self._peer_handlers.pop(p, None)
+
+        self._unconnecting_headers_count.pop(addr, None)
+
+        # ``_block_request_peer`` is keyed by block-hash but holds Peer
+        # values, so a disconnected peer still mid-request stays alive
+        # through this dict until the request times out or completes.
+        # Drop any entries pointing at the disconnected peer so the Peer
+        # object can be GC'd promptly; the next sync_loop tick will
+        # re-request these blocks from a live peer via the timeout path.
+        hashes_to_drop = [
+            bh for bh, p in list(self._block_request_peer.items())
+            if p is not None
+            and f"{getattr(p, 'host', '?')}:{getattr(p, 'port', '?')}" == addr
+        ]
+        for bh in hashes_to_drop:
+            self._block_request_peer.pop(bh, None)
+            # Drop the source-addr breadcrumb too so the next delivery
+            # of the same block from a different peer is not credited
+            # to the disconnected one.
+            self._block_source_peer_addr.pop(bh, None)
+
+        # ``_presync_states`` is keyed by (host, port) tuple.  Split and pop.
+        if ":" in addr:
+            host, port_str = addr.rsplit(":", 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                port = None
+            if port is not None:
+                self._presync_states.pop((host, port), None)
+
     def _make_inv_handler(self, peer: Peer):
         async def handler(msg: NetworkMessage):
             await self.handle_inv(msg, peer)

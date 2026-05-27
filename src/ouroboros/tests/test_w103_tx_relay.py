@@ -406,17 +406,23 @@ class TestG10TrickleQueue(unittest.TestCase):
         src = inspect.getsource(p2p.TrickleQueue.schedule_next_send)
         self.assertIn("expovariate", src)
 
-    def test_g10_bloom_filter_uses_plain_set(self):
-        """BUG-G10 (minor): known_filter is a Python set, not a rolling Bloom
-        filter.  Bitcoin Core uses CRollingBloomFilter which has bounded
-        memory (~300 KB).  A plain set grows unbounded.  Low severity."""
-        from ouroboros.p2p import TrickleQueue
+    def test_g10_bloom_filter_uses_bounded_ordered_dict(self):
+        """BUG-G10 — FIXED in ouroboros #146 (2026-05-27).
+
+        known_filter was a plain ``set[bytes]`` (unbounded; Core uses
+        CRollingBloomFilter with bounded ~300 KB memory).  The unbounded
+        form was the primary suspect behind the 2026-05-27 mainnet wedge
+        (PID 1771536 — RSS 58 GB / swap 89 GB).  It is now an
+        OrderedDict-backed FIFO capped at KNOWN_FILTER_MAX_ENTRIES.
+        """
+        from collections import OrderedDict
+        from ouroboros.p2p import KNOWN_FILTER_MAX_ENTRIES, TrickleQueue
         q = TrickleQueue()
-        self.assertIsInstance(q.known_filter, set, (
-            "BUG-G10 minor: known_filter is a plain set (unbounded). "
-            "Core uses CRollingBloomFilter with bounded memory. "
-            "In a long-running node this set grows indefinitely."
+        self.assertIsInstance(q.known_filter, OrderedDict, (
+            "G10: known_filter must be an OrderedDict-backed bounded FIFO; "
+            "got %r" % type(q.known_filter)
         ))
+        self.assertEqual(q._known_filter_max, KNOWN_FILTER_MAX_ENTRIES)
 
 
 # ---------------------------------------------------------------------------
