@@ -187,6 +187,85 @@ class TestTrickleQueueBatching:
         assert result is False
 
 
+class TestKnownFilterBound:
+    """Regression tests for ouroboros #146 — TrickleQueue.known_filter was
+    a plain unbounded set, the suspected primary driver of the 2026-05-27
+    mainnet wedge (PID 1771536: RSS 58 GB / swap 89 GB / load 99).
+    The bound is now a FIFO of KNOWN_FILTER_MAX_ENTRIES (50 000).
+    """
+
+    def test_known_filter_caps_at_max(self):
+        """Beyond KNOWN_FILTER_MAX_ENTRIES the filter evicts FIFO so RSS
+        does not grow per-peer-per-tx forever."""
+        from ouroboros.p2p import KNOWN_FILTER_MAX_ENTRIES
+
+        # Use a smaller cap for the test to keep runtime bounded.  We mutate
+        # the per-instance _known_filter_max so we still exercise the same
+        # eviction code path that fires with the production cap.
+        queue = TrickleQueue(is_inbound=False, wtxid_relay=True)
+        queue._known_filter_max = 100
+
+        # Insert 250 distinct wtxids — well above the per-instance cap.
+        for i in range(250):
+            wtxid = i.to_bytes(32, "little")
+            queue._known_filter_add(wtxid)
+
+        # Cap enforced.
+        assert len(queue.known_filter) == 100, (
+            f"known_filter not capped: len={len(queue.known_filter)} > 100"
+        )
+
+        # FIFO eviction: the most-recently inserted entry is still present,
+        # the oldest is gone.
+        newest = (249).to_bytes(32, "little")
+        oldest = (0).to_bytes(32, "little")
+        assert newest in queue.known_filter
+        assert oldest not in queue.known_filter
+
+        # The production cap is the Bitcoin Core-parity value.
+        assert KNOWN_FILTER_MAX_ENTRIES == 50_000
+
+    def test_known_filter_reinsert_is_lru_touch(self):
+        """Re-inserting an existing entry refreshes its position so the
+        most-recently seen wtxids survive eviction the longest."""
+        queue = TrickleQueue(is_inbound=False, wtxid_relay=True)
+        queue._known_filter_max = 3
+
+        a = b"\xaa" * 32
+        b = b"\xbb" * 32
+        c = b"\xcc" * 32
+        d = b"\xdd" * 32
+
+        queue._known_filter_add(a)
+        queue._known_filter_add(b)
+        queue._known_filter_add(c)
+        # Re-insert `a` — it should be moved to the end and survive.
+        queue._known_filter_add(a)
+        # Now insert `d`, which should evict `b` (the oldest remaining).
+        queue._known_filter_add(d)
+
+        assert a in queue.known_filter
+        assert c in queue.known_filter
+        assert d in queue.known_filter
+        assert b not in queue.known_filter
+        assert len(queue.known_filter) == 3
+
+    def test_add_tx_path_respects_cap(self):
+        """The full add_tx → get_invs_to_send round-trip must bound the
+        known_filter under sustained tx flooding."""
+        queue = TrickleQueue(is_inbound=False, wtxid_relay=True)
+        queue._known_filter_max = 50
+
+        # Push 200 distinct txs through the queue.  Each one will be
+        # announced once (since the queue is empty between iterations).
+        for i in range(200):
+            wtxid = i.to_bytes(32, "little")
+            queue.add_tx(wtxid, wtxid)
+            queue.get_invs_to_send(max_count=10)
+
+        assert len(queue.known_filter) <= 50
+
+
 class TestPoissonDelay:
     """Tests for Poisson-distributed delays."""
 

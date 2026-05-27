@@ -408,6 +408,14 @@ class BitcoinNode:
                 fee_estimator=self.fee_estimator,
                 block_filter_index=self.block_filter_index,
             )
+            # Reverse wiring: PeerManager._cleanup_peer_state delegates
+            # per-peer state cleanup on disconnect to block_sync.cleanup_peer
+            # (and sync_manager.cleanup_peer when present).  Pre-#146 this
+            # back-edge was missing, so block_sync._peer_handlers retained
+            # the closures (and therefore the entire Peer instance, with
+            # its socket buffers + BIP-324 transport state) for every peer
+            # that ever disconnected.
+            self.peer_manager.block_sync = self.block_sync
             try:
                 await self.block_sync.start()
             except Exception as e:
