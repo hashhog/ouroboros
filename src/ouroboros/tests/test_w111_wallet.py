@@ -396,14 +396,111 @@ class TestG5ExtendedPubKey:
 # ===========================================================================
 
 class TestG6HdPaths:
-    """G6: BIP-44/84 path structure and coin-type selection."""
+    """G6: BIP-43/44/49/84/86 path-dispatch structure and coin-type selection.
 
-    def test_keypool_uses_bip84_path(self):
-        """KeyPool._derive_key_at_path must use m/84'/coin'/0'/change/index."""
+    Before the W161 BUG-6/7/8 fix this class contained a single greenwash
+    test (``test_keypool_uses_bip84_path``) that asserted *every* address
+    type derived under BIP-84 — pinning the bug as the expected behaviour.
+    It has been replaced by per-purpose dispatch tests below.
+    """
+
+    def test_keypool_default_purpose_is_bip84(self):
+        """Calling _derive_key_at_path with no explicit purpose stays on BIP-84.
+
+        BIP-84 remains the default so callers that predate per-purpose
+        dispatch (the legacy ``_rebuild_pools``, old wallet files) keep
+        their historical derivation path. Explicit purpose codes are used
+        for new BIP-44/49/86 derivations.
+        """
         seed = os.urandom(32)
+        master = HDKey.from_seed(seed, "mainnet")
+        manual_bip84 = master.derive_path("m/84'/0'/0'/0/0")
         pool = KeyPool(seed, "mainnet")
-        key = pool._derive_key_at_path(False, 0)  # external, index 0
+        key = pool._derive_key_at_path(False, 0)  # default purpose == 84
         assert isinstance(key, WalletKey)
+        assert key.pubkey == manual_bip84.public_key
+
+    def test_keypool_purpose_dispatch_bip44(self):
+        """legacy address type must derive at m/44'/coin'/0'/change/index (BIP-44)."""
+        seed = bytes.fromhex(_TV1_SEED_HEX)
+        master = HDKey.from_seed(seed, "mainnet")
+        expected = master.derive_path("m/44'/0'/0'/0/0")
+        pool = KeyPool(seed, "mainnet", pool_size=2)
+        derived = pool._derive_key_at_path(False, 0, purpose=44)
+        assert derived.pubkey == expected.public_key
+
+    def test_keypool_purpose_dispatch_bip49(self):
+        """p2sh-segwit address type must derive at m/49'/coin'/0'/change/index (BIP-49)."""
+        seed = bytes.fromhex(_TV1_SEED_HEX)
+        master = HDKey.from_seed(seed, "mainnet")
+        expected = master.derive_path("m/49'/0'/0'/0/0")
+        pool = KeyPool(seed, "mainnet", pool_size=2)
+        derived = pool._derive_key_at_path(False, 0, purpose=49)
+        assert derived.pubkey == expected.public_key
+
+    def test_keypool_purpose_dispatch_bip86(self):
+        """bech32m address type must derive at m/86'/coin'/0'/change/index (BIP-86)."""
+        seed = bytes.fromhex(_TV1_SEED_HEX)
+        master = HDKey.from_seed(seed, "mainnet")
+        expected = master.derive_path("m/86'/0'/0'/0/0")
+        pool = KeyPool(seed, "mainnet", pool_size=2)
+        derived = pool._derive_key_at_path(False, 0, purpose=86)
+        assert derived.pubkey == expected.public_key
+
+    def test_get_new_address_dispatches_per_purpose(self):
+        """getnewaddress must route to the spec-correct purpose for each type."""
+        from ouroboros.wallet import (
+            PURPOSE_FOR_ADDRESS_TYPE,
+            purpose_for_address_type,
+        )
+
+        seed = bytes.fromhex(_TV1_SEED_HEX)
+        master = HDKey.from_seed(seed, "mainnet")
+        # Expected first receive address under each BIP
+        cases = {
+            "legacy":      master.derive_path("m/44'/0'/0'/0/0").to_wallet_key().get_p2pkh_address(),
+            "p2sh-segwit": master.derive_path("m/49'/0'/0'/0/0").to_wallet_key().get_p2sh_p2wpkh_address(),
+            "bech32":      master.derive_path("m/84'/0'/0'/0/0").to_wallet_key().get_p2wpkh_address(),
+            "bech32m":     master.derive_path("m/86'/0'/0'/0/0").to_wallet_key().get_p2tr_address(),
+        }
+        assert set(cases) == set(PURPOSE_FOR_ADDRESS_TYPE)
+
+        for address_type, expected_addr in cases.items():
+            pool = KeyPool(seed, "mainnet", pool_size=2)
+            addr, idx = pool.get_new_address(
+                is_change=False, address_type=address_type,
+            )
+            assert idx == 0
+            assert addr == expected_addr, (
+                f"address_type={address_type!r} (BIP-{purpose_for_address_type(address_type)}) "
+                f"derived {addr!r} but spec-correct address is {expected_addr!r}"
+            )
+
+    def test_each_purpose_has_independent_index_space(self):
+        """Two getnewaddress calls of different types both return index 0.
+
+        Per-purpose sub-pools must not share index state — calling
+        getnewaddress legacy then getnewaddress bech32 should yield
+        m/44'/.../0 and m/84'/.../0 respectively (not /0 and /1).
+        """
+        seed = bytes.fromhex(_TV1_SEED_HEX)
+        pool = KeyPool(seed, "mainnet", pool_size=2)
+        _, legacy_idx = pool.get_new_address(is_change=False, address_type="legacy")
+        _, bech32_idx = pool.get_new_address(is_change=False, address_type="bech32")
+        assert legacy_idx == 0
+        assert bech32_idx == 0
+
+    def test_purpose_dispatch_testnet_uses_coin_type_1(self):
+        """Each BIP path under testnet must use coin_type=1 per SLIP-44."""
+        seed = bytes.fromhex(_TV1_SEED_HEX)
+        master = HDKey.from_seed(seed, "testnet")
+        pool = KeyPool(seed, "testnet", pool_size=2)
+        for purpose in (44, 49, 84, 86):
+            expected = master.derive_path(f"m/{purpose}'/1'/0'/0/0")
+            derived = pool._derive_key_at_path(False, 0, purpose=purpose)
+            assert derived.pubkey == expected.public_key, (
+                f"BIP-{purpose} on testnet must use coin_type=1, got drift"
+            )
 
     def test_keypool_coin_type_mainnet(self):
         """Mainnet coin_type must be 0."""
