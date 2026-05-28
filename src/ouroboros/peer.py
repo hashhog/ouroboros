@@ -296,6 +296,7 @@ class Peer:
         peer_bloom_filters: bool = False,
         node_compact_filters: "bool | Callable[[], bool]" = False,
         node_network_limited: bool = False,
+        on_disconnect: "Callable[[str], None] | None" = None,
     ):
         """Initialize peer connection."""
         self.host = host
@@ -339,6 +340,21 @@ class Peer:
         # Latch so that we only invoke the ban path once per Peer instance,
         # even if adjust_score is called repeatedly after the clamp.
         self._ban_recorded: bool = False
+        # Disconnect callback wired by PeerManager so that per-peer state
+        # cleanup fires deterministically *at the disconnect event*, not
+        # via a 30 s poll in maintain_connections.  Pre-2026-05-28 the
+        # cleanup was poll-based and fired for ~0.07% of disconnects
+        # (1 of 1497 in the wedge of PID 1252927); the bulk of zombie
+        # Peer state stayed live and drove the 65 GB RSS leak.  See
+        # CORE-PARITY-AUDIT/_ouroboros-down-20260528-2026-05-28.md.
+        # Signature: ``on_disconnect(addr: str) -> None`` where
+        # ``addr == f"{self.host}:{self.port}"``.  Synchronous; callback
+        # exceptions are caught and logged so a buggy cleanup never
+        # blocks socket teardown.
+        self._on_disconnect: "Callable[[str], None] | None" = on_disconnect
+        # Latch so the disconnect callback fires at most once per Peer
+        # instance even if disconnect() is invoked repeatedly.
+        self._on_disconnect_fired: bool = False
         # W99 G2: noban/manual flags for Core-canonical ban exemptions.
         # noban: peer has NoBan permission (e.g. whitelisted via -whitelist).
         #        MaybeDiscourageAndDisconnect skips this peer entirely.
@@ -1828,6 +1844,31 @@ class Peer:
 
         self.reader = None
         self.writer = None
+
+        # Event-driven per-peer cleanup hook.  Fires exactly once per Peer
+        # instance after the socket is torn down.  PeerManager wires this
+        # to ``_handle_peer_disconnected(addr)`` which (a) pops the peer
+        # from whichever of ``peers`` / ``block_relay_peers`` /
+        # ``inbound_peers`` holds it and (b) calls ``_cleanup_peer_state``
+        # to drop the per-addr caches (trickle queue, erlay state, sync
+        # bookkeeping, block_sync handler closures, ...).  Before this
+        # hook the cleanup ran only when ``maintain_connections`` polled
+        # every 30 s and observed ``is_connected() == False``; the audit
+        # of 2026-05-28 measured the poll catching only 1 of 1497
+        # disconnects in a 16 h window, with the rest leaking ~6-10 GB
+        # of zombie Peer + transport-buffer state.
+        if self._on_disconnect is not None and not self._on_disconnect_fired:
+            self._on_disconnect_fired = True
+            cb = self._on_disconnect
+            addr = f"{self.host}:{self.port}"
+            try:
+                cb(addr)
+            except Exception as exc:
+                # Cleanup must never block teardown.  Log loudly so the
+                # operator notices but let the socket teardown finish.
+                logger.error(
+                    "on_disconnect callback raised for %s: %r", addr, exc
+                )
 
     def _generate_nonce(self) -> int:
         return random.randint(0, 2**64 - 1)

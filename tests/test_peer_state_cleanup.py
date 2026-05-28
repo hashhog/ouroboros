@@ -137,3 +137,189 @@ def test_block_sync_cleanup_peer_handles_malformed_addr():
     bs = BlockSync(db=Mock(), validator=Mock(), peer_manager=Mock())
     bs.cleanup_peer("not-an-addr")
     bs.cleanup_peer("192.0.2.5:not-a-port")
+
+
+# ---------------------------------------------------------------------------
+# 2026-05-28: event-driven cleanup trigger regression tests.
+#
+# Background — Peer.disconnect() now invokes an on_disconnect callback
+# wired by PeerManager that runs _cleanup_peer_state synchronously at
+# the disconnect event.  Before this change the only cleanup trigger
+# was the 30 s maintain_connections poll, which observed 1 of 1497
+# disconnects in the 2026-05-28 wedge of PID 1252927 (~0.07 % hit rate).
+# These tests pin the new event-driven path so a refactor cannot
+# silently regress back to poll-only.
+# ---------------------------------------------------------------------------
+
+
+async def test_peer_disconnect_fires_on_disconnect_callback_exactly_once():
+    """``Peer.disconnect`` must invoke ``on_disconnect(addr)`` exactly once,
+    even if disconnect() is called multiple times.  This is the contract
+    PeerManager relies on for event-driven cleanup; if disconnect double-fires
+    the callback we'd risk double-clean state we just re-populated on reconnect.
+    """
+    calls: list[str] = []
+
+    def cb(addr: str) -> None:
+        calls.append(addr)
+
+    peer = Peer("203.0.113.42", 18333, "regtest", on_disconnect=cb)
+
+    await peer.disconnect()
+    # Second call is a no-op per the existing latch (_disconnect_started)
+    # and must not re-fire the callback.
+    await peer.disconnect()
+
+    assert calls == ["203.0.113.42:18333"]
+
+
+async def test_peer_disconnect_swallows_callback_exception():
+    """A buggy cleanup callback MUST NOT block socket teardown.
+    Without this guarantee, a single transient cleanup failure could
+    leave a peer half-disconnected with sockets still open.
+    """
+
+    def cb(addr: str) -> None:
+        raise RuntimeError("simulated cleanup bug")
+
+    peer = Peer("203.0.113.43", 18333, "regtest", on_disconnect=cb)
+    # Must not raise.
+    await peer.disconnect()
+    from ouroboros.peer import PeerState
+    assert peer.state == PeerState.DISCONNECTED
+
+
+async def test_peer_manager_event_driven_cleanup_drops_state_on_disconnect(
+    peer_manager,
+):
+    """End-to-end: a Peer constructed by PeerManager must, on disconnect,
+    pop itself from the inbound bucket AND drop all per-addr state via the
+    event-driven hook — without any poll-loop tick.
+    """
+    addr = "198.51.100.99:8333"
+    host, port = "198.51.100.99", 8333
+
+    # Construct the peer the way PeerManager does in _handle_inbound_connection,
+    # wiring the on_disconnect callback into the manager.
+    peer = Peer(
+        host, port, "regtest",
+        inbound=True,
+        on_disconnect=peer_manager._handle_peer_disconnected,
+    )
+
+    # Place into the inbound bucket and seed all per-addr caches.
+    peer_manager.inbound_peers[addr] = peer
+    _seed_per_peer_state(peer_manager, addr)
+
+    await peer.disconnect()
+
+    # Bucket: removed by the event-driven hook (no maintain_connections poll
+    # ran here — the cleanup happened synchronously inside disconnect()).
+    assert addr not in peer_manager.inbound_peers
+
+    # Per-addr caches: all dropped via _cleanup_peer_state.
+    assert addr not in peer_manager._trickle_queues
+    assert addr not in peer_manager._erlay_peers
+    assert addr not in peer_manager._erlay_local_salts
+    assert addr not in peer_manager._erlay_pending_recon
+    assert addr not in peer_manager.cmpct_peers
+    assert addr not in peer_manager._package_peers
+    assert addr not in peer_manager._addr_relay_counts
+    assert addr not in peer_manager._addr_relay_day
+    assert addr not in peer_manager.retry_counts
+    assert addr not in peer_manager.last_retry_time
+
+
+async def test_peer_manager_event_driven_cleanup_fires_exactly_once(peer_manager):
+    """Idempotence: calling disconnect twice must drive the cleanup exactly
+    once, not twice — otherwise the cleanup could clobber state set up by
+    a reconnect under the same addr that raced in between calls.
+    """
+    addr = "198.51.100.77:8333"
+    host, port = "198.51.100.77", 8333
+
+    cleanup_calls: list[str] = []
+    original_cleanup = peer_manager._cleanup_peer_state
+
+    def counting_cleanup(a: str) -> None:
+        cleanup_calls.append(a)
+        original_cleanup(a)
+
+    peer_manager._cleanup_peer_state = counting_cleanup  # type: ignore[method-assign]
+
+    peer = Peer(
+        host, port, "regtest",
+        inbound=True,
+        on_disconnect=peer_manager._handle_peer_disconnected,
+    )
+    peer_manager.inbound_peers[addr] = peer
+
+    await peer.disconnect()
+    await peer.disconnect()  # second call no-ops
+
+    assert cleanup_calls == [addr]
+
+
+async def test_event_driven_cleanup_handles_peer_not_in_any_bucket(peer_manager):
+    """A Peer whose addr was already popped from the bucket (e.g. by
+    _on_peer_banned or _evict_inbound_peer, both of which pop BEFORE
+    scheduling disconnect) must still trigger the per-addr cleanup —
+    the bucket pop is best-effort, the state cleanup is what matters.
+    """
+    addr = "198.51.100.55:8333"
+    host, port = "198.51.100.55", 8333
+
+    # Seed per-addr state but DO NOT add to any bucket; this simulates the
+    # bucket-already-popped path.
+    _seed_per_peer_state(peer_manager, addr)
+
+    peer = Peer(
+        host, port, "regtest",
+        inbound=True,
+        on_disconnect=peer_manager._handle_peer_disconnected,
+    )
+    # NOTE: peer was never added to peer_manager.inbound_peers.
+
+    await peer.disconnect()
+
+    # Cleanup still ran — the bucket pop was a no-op but the state cleanup
+    # fired anyway.
+    assert addr not in peer_manager._trickle_queues
+    assert addr not in peer_manager._erlay_peers
+
+
+async def test_event_driven_cleanup_delegates_to_block_sync(peer_manager):
+    """The event-driven cleanup must reach BlockSync.cleanup_peer too
+    — that's where _peer_handlers (the closure-retention hazard that
+    caused the ~6-10 GB leak in PID 1252927) lives.
+    """
+    addr = "198.51.100.88:8333"
+    host, port = "198.51.100.88", 8333
+
+    observed: list[str] = []
+
+    class _FakeBlockSync:
+        def cleanup_peer(self, a: str) -> None:
+            observed.append(a)
+
+    peer_manager.block_sync = _FakeBlockSync()
+
+    peer = Peer(
+        host, port, "regtest",
+        inbound=True,
+        on_disconnect=peer_manager._handle_peer_disconnected,
+    )
+    peer_manager.inbound_peers[addr] = peer
+
+    await peer.disconnect()
+
+    assert observed == [addr]
+
+
+async def test_peer_disconnect_without_callback_is_noop():
+    """Backwards compatibility: a Peer constructed without on_disconnect
+    must disconnect cleanly without invoking any callback (unit tests
+    that build a bare Peer relied on this for years).
+    """
+    peer = Peer("203.0.113.1", 8333, "regtest")  # no on_disconnect
+    await peer.disconnect()  # must not raise
