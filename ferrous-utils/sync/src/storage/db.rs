@@ -1110,15 +1110,129 @@ impl BlockchainDB {
         }
     }
 
+    /// Write the SNAPSHOT_LOAD_IN_PROGRESS marker (FIX-D, chainstate
+    /// atomicity family 2026-05-26).
+    ///
+    /// Must be called before `loadtxoutset` begins writing per-coin UTXOs,
+    /// so that a crash mid-load can be detected on next open and the
+    /// partially-loaded chainstate cleared.
+    ///
+    /// Value layout: `[32-byte base_blockhash][4-byte base_height]` (36 bytes).
+    pub fn write_snapshot_load_marker(
+        &self,
+        base_blockhash: &[u8; 32],
+        base_height: u32,
+    ) -> Result<()> {
+        let cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        let mut value = Vec::with_capacity(36);
+        value.extend_from_slice(base_blockhash);
+        value.extend_from_slice(&base_height.to_le_bytes());
+        self.db.put_cf(cf, meta_keys::SNAPSHOT_LOAD_IN_PROGRESS, &value)?;
+        Ok(())
+    }
+
+    /// Accumulate a delete of SNAPSHOT_LOAD_IN_PROGRESS onto a WriteBatch.
+    /// Used by `snapshot_load_commit` so the marker deletion lands atomically
+    /// with the final tip + metadata update.
+    pub fn delete_snapshot_load_marker_batch(&self, batch: &mut WriteBatch) -> Result<()> {
+        let cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        batch.delete_cf(cf, meta_keys::SNAPSHOT_LOAD_IN_PROGRESS);
+        Ok(())
+    }
+
+    /// Read the SNAPSHOT_LOAD_IN_PROGRESS marker if present.
+    ///
+    /// Returns `Some((base_blockhash, base_height))` when a snapshot load
+    /// was interrupted, or `None` if there is no in-progress marker.
+    pub fn get_snapshot_load_marker(&self) -> Result<Option<([u8; 32], u32)>> {
+        let cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        match self.db.get_cf(cf, meta_keys::SNAPSHOT_LOAD_IN_PROGRESS)? {
+            Some(data) => {
+                if data.len() != 36 {
+                    return Err(DbError::InvalidData(format!(
+                        "SNAPSHOT_LOAD_IN_PROGRESS data wrong length: {} bytes (expected 36)",
+                        data.len(),
+                    )));
+                }
+                let mut base_blockhash = [0u8; 32];
+                base_blockhash.copy_from_slice(&data[0..32]);
+                let base_height =
+                    u32::from_le_bytes(data[32..36].try_into().unwrap());
+                Ok(Some((base_blockhash, base_height)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Check for and recover from a mid-apply crash.
     ///
-    /// Called during database open.  If HEAD_BLOCKS exists, a crash happened
-    /// between Phase 1 (UTXO mutations started) and Phase 2 (chain tip
-    /// updated).  We disconnect the partially-applied block to restore the
-    /// UTXO set to the old tip, then delete the marker.
+    /// Called during database open.  Two recovery paths are handled:
+    ///
+    /// 1. `SNAPSHOT_LOAD_IN_PROGRESS` marker (FIX-D) — the previous process
+    ///    crashed during `loadtxoutset` between `snapshot_load_begin` and
+    ///    `snapshot_load_commit`. The chainstate now contains a mix of
+    ///    partial-snapshot and partial-old UTXOs that cannot be safely
+    ///    recovered (the per-coin chunks have half-overwritten the chainstate
+    ///    with no per-block undo records to replay). We `clear_chainstate()`,
+    ///    reset the best-block pointer to all-zeros, and delete the marker.
+    ///    The operator must re-run `loadtxoutset` from the snapshot file to
+    ///    restore the chainstate.
+    ///
+    /// 2. `HEAD_BLOCKS` marker — the previous process crashed during
+    ///    `apply_block` between Phase 1 (UTXO mutations started) and Phase 2
+    ///    (chain tip updated). We disconnect the partially-applied block to
+    ///    restore the UTXO set to the old tip, then delete the marker.
+    ///
+    /// If both markers are present (impossible by construction, but defended
+    /// against), the snapshot marker takes precedence — a partial snapshot
+    /// load corrupts the chainstate so badly that the HEAD_BLOCKS path
+    /// cannot meaningfully recover on top.
     ///
     /// Returns `true` if a recovery was performed, `false` otherwise.
     pub fn recover_from_crash(&self) -> Result<bool> {
+        // ---------- Snapshot-load recovery (FIX-D) ----------
+        if let Some((base_blockhash, base_height)) =
+            self.get_snapshot_load_marker()?
+        {
+            let mut display_hash = base_blockhash;
+            display_hash.reverse();
+            log::error!(
+                "SNAPSHOT_LOAD_IN_PROGRESS marker found — crash detected \
+                 during loadtxoutset at base_height={}, base_blockhash={}. \
+                 Chainstate contains a mix of partial-snapshot and \
+                 partial-old UTXOs; clearing chainstate and resetting tip. \
+                 Operator must re-run `loadtxoutset` from the snapshot file.",
+                base_height,
+                hex::encode(display_hash),
+            );
+
+            self.clear_chainstate()?;
+            // Reset best-block to all-zeros so callers see a clean slate
+            // and don't try to validate blocks above a missing UTXO set.
+            self.update_best_block(&[0u8; 32], 0)?;
+
+            // Delete the marker in its own write so a follow-on
+            // HEAD_BLOCKS check still runs.
+            let cf = self.db.cf_handle(META_CF)
+                .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+            self.db.delete_cf(cf, meta_keys::SNAPSHOT_LOAD_IN_PROGRESS)?;
+
+            log::warn!(
+                "Snapshot-load crash recovery complete. Chainstate \
+                 cleared; tip reset to genesis-sentinel. Re-run \
+                 loadtxoutset to restore the snapshot.",
+            );
+            // Also clear any stale HEAD_BLOCKS — it cannot be honored
+            // against a cleared chainstate.
+            if self.get_head_blocks()?.is_some() {
+                self.delete_head_blocks()?;
+            }
+            return Ok(true);
+        }
+
         let head = match self.get_head_blocks()? {
             Some(h) => h,
             None => return Ok(false),
