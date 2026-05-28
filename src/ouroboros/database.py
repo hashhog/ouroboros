@@ -523,6 +523,138 @@ class BlockchainDatabase:
             bool(is_coinbase),
         )
 
+    # ------------------------------------------------------------------
+    # Atomic snapshot-load primitives (FIX-D, chainstate atomicity family
+    # 2026-05-26).  See snapshot.py::load_snapshot for the call protocol.
+    #
+    # All three methods passthrough to PyBlockchainDB; the cached tip
+    # ``self._cached_tip`` is invalidated where appropriate so subsequent
+    # ``get_best_block()`` calls re-read from Rust.
+    # ------------------------------------------------------------------
+
+    def snapshot_load_begin(self, base_blockhash: bytes, base_height: int) -> None:
+        """Phase 1 of an atomic snapshot load.
+
+        Clears the chainstate (the snapshot is the authoritative new UTXO
+        set) and writes the ``SNAPSHOT_LOAD_IN_PROGRESS`` marker to META_CF.
+        After this returns, a crash leaves the chainstate empty + marker
+        set; the next-boot ``recover_from_crash`` clears any partial state
+        and instructs the operator to re-run ``loadtxoutset``.
+
+        Raises ``NotImplementedError`` if the Rust extension is older than
+        FIX-D (no ``snapshot_load_begin`` symbol).
+        """
+        if len(base_blockhash) != 32:
+            raise ValueError("base_blockhash must be 32 bytes")
+        if not hasattr(self._db, "snapshot_load_begin"):
+            raise NotImplementedError(
+                "Rust extension does not expose snapshot_load_begin; "
+                "rebuild the ferrous-utils/sync extension (FIX-D)"
+            )
+        self._db.snapshot_load_begin(bytes(base_blockhash), int(base_height))
+        # Tip will be reset to all-zeros / 0 during recovery; invalidate cache.
+        self._cached_tip = None
+
+    def snapshot_load_chunk(
+        self,
+        coins: list[tuple[bytes, int, int, bytes, int, bool]],
+    ) -> None:
+        """Phase 2 of an atomic snapshot load — apply N coins in one batch.
+
+        ``coins`` is a list of ``(txid, vout, amount, script_pubkey, height,
+        is_coinbase)`` tuples.  All N puts land together or none of them do;
+        on RocksDB failure the entire chunk is rejected and the caller can
+        retry.  Pre-FIX-D the loader did N individual ``add_utxo_raw`` calls,
+        so partial chunks were the norm on any error.
+
+        Raises ``ValueError`` if any txid is not 32 bytes (the entire chunk
+        is rejected — no partial commit).
+        Raises ``NotImplementedError`` if the Rust extension is older than
+        FIX-D.
+        """
+        if not hasattr(self._db, "snapshot_load_chunk"):
+            raise NotImplementedError(
+                "Rust extension does not expose snapshot_load_chunk; "
+                "rebuild the ferrous-utils/sync extension (FIX-D)"
+            )
+        # Normalise to the exact tuple shape pyo3 expects; this also raises
+        # cleanly if any field is wrong before crossing the FFI boundary.
+        normalised: list[tuple[bytes, int, int, bytes, int, bool]] = []
+        for i, c in enumerate(coins):
+            txid, vout, amount, script_pubkey, height, is_coinbase = c
+            if len(txid) != 32:
+                raise ValueError(
+                    f"snapshot_load_chunk: coin {i} txid is {len(txid)} bytes "
+                    "(expected 32)"
+                )
+            normalised.append((
+                bytes(txid),
+                int(vout),
+                int(amount),
+                bytes(script_pubkey),
+                int(height),
+                bool(is_coinbase),
+            ))
+        self._db.snapshot_load_chunk(normalised)
+
+    def snapshot_load_commit(
+        self,
+        base_blockhash: bytes,
+        base_height: int,
+        chainwork_be: bytes | None = None,
+        timestamp: int | None = None,
+    ) -> None:
+        """Phase 3 of an atomic snapshot load — final commit batch.
+
+        Single atomic ``WriteBatch`` containing:
+          - ``update_best_block_batch(base_blockhash, base_height)``
+            (tip pointer, atomic pair via FIX-C)
+          - ``store_block_metadata_batch`` for the snapshot block, when
+            ``chainwork_be`` (32-byte big-endian) AND ``timestamp`` are
+            provided (assumeUTXO entries in chainparams ship these;
+            testnet-only entries may not)
+          - delete of the ``SNAPSHOT_LOAD_IN_PROGRESS`` marker
+
+        After this commits, the tip + chainwork metadata + cleared marker
+        are all consistent and durable.  ``recover_from_crash`` on a
+        subsequent boot takes the no-op fast path.
+
+        Raises ``ValueError`` if ``base_blockhash`` is not 32 bytes or
+        ``chainwork_be`` (when provided) is not 32 bytes.
+        Raises ``NotImplementedError`` if the Rust extension is older than
+        FIX-D.
+        """
+        if len(base_blockhash) != 32:
+            raise ValueError("base_blockhash must be 32 bytes")
+        if chainwork_be is not None and len(chainwork_be) != 32:
+            raise ValueError(
+                f"chainwork_be must be 32 bytes (got {len(chainwork_be)})"
+            )
+        if not hasattr(self._db, "snapshot_load_commit"):
+            raise NotImplementedError(
+                "Rust extension does not expose snapshot_load_commit; "
+                "rebuild the ferrous-utils/sync extension (FIX-D)"
+            )
+        cw = bytes(chainwork_be) if chainwork_be is not None else None
+        ts = int(timestamp) if timestamp is not None else None
+        self._db.snapshot_load_commit(
+            bytes(base_blockhash), int(base_height), cw, ts,
+        )
+        # Tip just moved; refresh the cache.
+        self._cached_tip = (bytes(base_blockhash), int(base_height))
+
+    def has_snapshot_load_marker(self) -> bool:
+        """True iff a SNAPSHOT_LOAD_IN_PROGRESS marker is set in META_CF.
+
+        Useful for tests and operator diagnostics.  Production callers rely
+        on ``recover_from_crash`` instead.  Falls back to ``False`` when
+        the Rust extension is older than FIX-D so callers that pre-flight
+        this don't need to special-case absent attributes.
+        """
+        if not hasattr(self._db, "has_snapshot_load_marker"):
+            return False
+        return bool(self._db.has_snapshot_load_marker())
+
     def get_utxo_batch(self, outpoints: list[tuple[bytes, int]]) -> list[dict[str, Any] | None]:
         """Batch-fetch UTXOs for a list of (txid, vout) pairs in one FFI call.
 

@@ -177,6 +177,26 @@ pub mod meta_keys {
     /// If this key exists on startup, a crash occurred mid-apply and the
     /// database must be rolled back to `old_tip_hash` / `old_tip_height`.
     pub const HEAD_BLOCKS: &[u8] = b"head_blocks";
+
+    /// Marker for assumeUTXO snapshot load in progress (FIX-D, chainstate
+    /// atomicity family 2026-05-26).
+    ///
+    /// Written by `snapshot_load_begin` BEFORE per-coin UTXO writes begin,
+    /// deleted by `snapshot_load_commit` AFTER the final tip + metadata
+    /// batch lands. Distinct from `HEAD_BLOCKS` because the recovery action
+    /// is different: a partial snapshot load cannot be "rolled back" to a
+    /// prior tip (the per-coin chunks have already half-overwritten the
+    /// chainstate), so recovery must `clear_chainstate()` entirely. The
+    /// snapshot can then be re-loaded from the source file by the operator.
+    ///
+    /// Value format: `[32-byte base_blockhash][4-byte base_height]` (36 bytes).
+    ///
+    /// If this key exists on startup, the previous process crashed during
+    /// `loadtxoutset` and the chainstate is in a mixed
+    /// partial-snapshot / partial-old state. `recover_from_crash` clears
+    /// the chainstate, deletes this marker, and logs loudly so the
+    /// operator knows to re-run `loadtxoutset`.
+    pub const SNAPSHOT_LOAD_IN_PROGRESS: &[u8] = b"snapshot_load_in_progress";
 }
 
 /// Encode a block hash as a 32-byte key
@@ -501,5 +521,10 @@ mod tests {
         assert_eq!(meta_keys::BEST_BLOCK_HASH, b"best_block_hash");
         assert_eq!(meta_keys::BEST_HEIGHT, b"best_height");
         assert_eq!(meta_keys::CHAINSTATE_VERSION, b"chainstate_version");
+        assert_eq!(meta_keys::HEAD_BLOCKS, b"head_blocks");
+        assert_eq!(
+            meta_keys::SNAPSHOT_LOAD_IN_PROGRESS,
+            b"snapshot_load_in_progress",
+        );
     }
 }
