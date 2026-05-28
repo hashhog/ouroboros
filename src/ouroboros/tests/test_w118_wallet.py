@@ -682,6 +682,63 @@ class TestG12BipPathConventions:
         wk = leaf.to_wallet_key()
         assert wk.get_p2wpkh_address().startswith("bc1q")
 
+    def test_bip44_path_format(self):
+        """legacy → m/44'/0'/0'/0/0 → P2PKH base58 (mainnet `1` prefix)."""
+        m = HDKey.from_seed(bytes.fromhex(_TV1_SEED_HEX))
+        leaf = m.derive_path("m/44'/0'/0'/0/0")
+        wk = leaf.to_wallet_key()
+        assert wk.get_p2pkh_address().startswith("1")
+
+    def test_bip49_path_format(self):
+        """p2sh-segwit → m/49'/0'/0'/0/0 → P2SH base58 (mainnet `3` prefix)."""
+        m = HDKey.from_seed(bytes.fromhex(_TV1_SEED_HEX))
+        leaf = m.derive_path("m/49'/0'/0'/0/0")
+        wk = leaf.to_wallet_key()
+        assert wk.get_p2sh_p2wpkh_address().startswith("3")
+
+    def test_bip86_path_format(self):
+        """bech32m → m/86'/0'/0'/0/0 → P2TR bech32m (`bc1p` prefix)."""
+        m = HDKey.from_seed(bytes.fromhex(_TV1_SEED_HEX))
+        leaf = m.derive_path("m/86'/0'/0'/0/0")
+        wk = leaf.to_wallet_key()
+        assert wk.get_p2tr_address().startswith("bc1p")
+
+    def test_keypool_dispatches_each_address_type_to_correct_bip(self):
+        """W161 BUG-6/7/8 regression: each address_type must derive at its own BIP path.
+
+        Before this fix, ouroboros derived every address type from
+        ``m/84'/...`` (hardcoded BIP-84) regardless of whether the caller
+        asked for ``legacy`` (BIP-44), ``p2sh-segwit`` (BIP-49), or
+        ``bech32m`` (BIP-86). That broke recovery — funds sent to a
+        ``getnewaddress legacy`` P2PKH could not be recovered by any
+        BIP-44-compliant external wallet from the same mnemonic.
+        """
+        seed = bytes.fromhex(_TV1_SEED_HEX)
+        master = HDKey.from_seed(seed, "mainnet")
+        expected = {
+            "legacy": master.derive_path(
+                "m/44'/0'/0'/0/0"
+            ).to_wallet_key().get_p2pkh_address(),
+            "p2sh-segwit": master.derive_path(
+                "m/49'/0'/0'/0/0"
+            ).to_wallet_key().get_p2sh_p2wpkh_address(),
+            "bech32": master.derive_path(
+                "m/84'/0'/0'/0/0"
+            ).to_wallet_key().get_p2wpkh_address(),
+            "bech32m": master.derive_path(
+                "m/86'/0'/0'/0/0"
+            ).to_wallet_key().get_p2tr_address(),
+        }
+        for address_type, want in expected.items():
+            pool = KeyPool(seed, "mainnet", pool_size=2)
+            addr, idx = pool.get_new_address(
+                is_change=False, address_type=address_type,
+            )
+            assert idx == 0
+            assert addr == want, (
+                f"{address_type!r} derived {addr!r} but spec-correct {want!r}"
+            )
+
     def test_keypool_uses_testnet_coin_type(self):
         """KeyPool initialised on testnet uses coin_type=1, not 0."""
         seed = bytes.fromhex(_TV1_SEED_HEX)
@@ -692,6 +749,12 @@ class TestG12BipPathConventions:
         seed = bytes.fromhex(_TV1_SEED_HEX)
         pool = KeyPool(seed, "mainnet", pool_size=2)
         assert pool.coin_type == 0
+
+    def test_keypool_uses_regtest_coin_type(self):
+        """Regtest must use coin_type=1 per SLIP-44 + Core chainparams default."""
+        seed = bytes.fromhex(_TV1_SEED_HEX)
+        pool = KeyPool(seed, "regtest", pool_size=2)
+        assert pool.coin_type == 1
 
     def test_keypool_receive_change_distinct(self):
         """Receive (m/.../.../0/n) and change (m/.../.../1/n) paths differ."""
