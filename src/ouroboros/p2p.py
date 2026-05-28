@@ -945,7 +945,8 @@ class PeerManager:
                     ban_manager=self.ban_manager,
                     peer_bloom_filters=self.peer_bloom_filters,
                     node_compact_filters=self.node_compact_filters,
-                    node_network_limited=self.node_network_limited)
+                    node_network_limited=self.node_network_limited,
+                    on_disconnect=self._handle_peer_disconnected)
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer
             self._register_compact_handlers(peer, addr)
@@ -1348,7 +1349,8 @@ class PeerManager:
                     ban_manager=self.ban_manager,
                     peer_bloom_filters=self.peer_bloom_filters,
                     node_compact_filters=self.node_compact_filters,
-                    node_network_limited=self.node_network_limited)
+                    node_network_limited=self.node_network_limited,
+                    on_disconnect=self._handle_peer_disconnected)
         if await peer.accept_inbound(reader, writer, self._start_height):
             self.inbound_peers[addr] = peer
             self._register_compact_handlers(peer, addr)
@@ -1584,6 +1586,7 @@ class PeerManager:
             peer_bloom_filters=self.peer_bloom_filters,
             node_compact_filters=self.node_compact_filters,
             node_network_limited=self.node_network_limited,
+            on_disconnect=self._handle_peer_disconnected,
         )
         ok = await peer.connect(start_height, retry=retry)
         if ok:
@@ -1604,6 +1607,7 @@ class PeerManager:
                 peer_bloom_filters=self.peer_bloom_filters,
                 node_compact_filters=self.node_compact_filters,
                 node_network_limited=self.node_network_limited,
+                on_disconnect=self._handle_peer_disconnected,
             )
             if await v1_peer.connect(start_height, retry=retry):
                 return v1_peer
@@ -1882,12 +1886,102 @@ class PeerManager:
 
         return elapsed >= backoff_time
 
+    def _handle_peer_disconnected(self, addr: str) -> None:
+        """Event-driven cleanup hook wired into :meth:`Peer.disconnect`.
+
+        Fires exactly once per Peer instance, at the disconnect event,
+        and drives the same cleanup that ``maintain_connections`` runs
+        on its 30 s poll — except now it runs *every* disconnect, not
+        the ~0.07 % the poll happens to catch.
+
+        Background — 2026-05-28 incident
+        --------------------------------
+        Pre-fix, ``_cleanup_peer_state`` was only invoked from inside
+        the ``maintain_connections`` loop, which polls every 30 s and
+        scans for peers whose ``is_connected()`` returns False.  In
+        practice the vast majority of disconnects clear the peer from
+        the bucket faster than the next poll tick (socket close →
+        ``self.state = DISCONNECTED`` is immediate; the bucket entry
+        survives only if some other code path leaves it dangling).  The
+        wedge of PID 1252927 captured 1497 ``Disconnecting from`` log
+        events against just 1 ``Removed disconnected`` event in the
+        same 16 h window — a 0.07 % cleanup hit rate.  The result was
+        191 zombie Peer instances (~6-10 GB of transport state + recv
+        buffers + ``block_sync._peer_handlers`` closure retentions)
+        that drove the 65 GB RSS leak and required an operator restart.
+
+        Forwarding it through a synchronous callback on the Peer means
+        the cleanup is deterministic per disconnect and independent of
+        the poll cadence.  The poll path in ``maintain_connections`` is
+        kept as a safety-net for any rare path that closes a socket
+        without going through ``Peer.disconnect`` (e.g. ``connect``
+        failures that leave a half-initialised Peer in a bucket); it
+        becomes a slow GC instead of the primary trigger.
+
+        ``addr`` is the same ``host:port`` string the buckets are
+        keyed on.  We pop the peer from whichever bucket holds it
+        (a Peer lives in at most one of full-relay / block-relay /
+        inbound) so the addr key is removed in lockstep with the
+        cleanup; otherwise the per-addr cleanup would race with the
+        poll and risk a re-add by a reconnect under the same addr.
+        """
+        # Pop from whichever bucket holds the addr.  At most one will
+        # match in practice — Peer instances are never multi-bucket —
+        # but checking all three is cheap and resilient to future
+        # bucketing changes.
+        popped_peer = None
+        if addr in self.peers:
+            popped_peer = self.peers.pop(addr)
+            try:
+                self._update_outbound_netgroups()
+            except Exception:
+                logger.debug(
+                    "_update_outbound_netgroups raised on full-relay disconnect of %s",
+                    addr, exc_info=True,
+                )
+        elif addr in self.block_relay_peers:
+            popped_peer = self.block_relay_peers.pop(addr)
+            try:
+                self._update_outbound_netgroups()
+            except Exception:
+                logger.debug(
+                    "_update_outbound_netgroups raised on block-relay disconnect of %s",
+                    addr, exc_info=True,
+                )
+        elif addr in self.inbound_peers:
+            popped_peer = self.inbound_peers.pop(addr)
+            # Mirror the inbound netgroup decrement that
+            # maintain_connections used to do.
+            try:
+                host = addr.rsplit(":", 1)[0]
+                group = self._netgroup(host)
+                if group in self._inbound_netgroups:
+                    self._inbound_netgroups[group] -= 1
+                    if self._inbound_netgroups[group] <= 0:
+                        del self._inbound_netgroups[group]
+            except Exception:
+                logger.debug(
+                    "inbound netgroup decrement raised on disconnect of %s",
+                    addr, exc_info=True,
+                )
+
+        # Always drop the per-addr caches.  Safe to call even when the
+        # peer was not in any bucket (the maps tolerate unknown keys).
+        self._cleanup_peer_state(addr)
+
+        if popped_peer is not None:
+            logger.info(
+                "Removed disconnected peer %s (event-driven cleanup)", addr
+            )
+
     def _cleanup_peer_state(self, addr: str) -> None:
         """Drop all per-addr state we accumulated for *addr*.
 
-        Called from ``maintain_connections`` after the peer has been popped
-        from the active connection dicts.  Pre-#146 these caches were never
-        cleaned and grew unbounded over the process lifetime; on a
+        Called from :meth:`_handle_peer_disconnected` (event-driven, fires
+        at the moment ``Peer.disconnect`` completes) and from
+        ``maintain_connections`` (poll-based safety net for any rare path
+        that bypasses ``Peer.disconnect``).  Pre-#146 these caches were
+        never cleaned and grew unbounded over the process lifetime; on a
         multi-week mainnet run this contributed (with the much-larger
         ``TrickleQueue.known_filter`` leak) to the wedge of PID 1771536.
 
@@ -1953,10 +2047,28 @@ class PeerManager:
                 logger.debug("block_sync.cleanup_peer raised for %s", addr, exc_info=True)
 
     async def maintain_connections(self, start_height: int):
-        """Maintain peer connections and eclipse protections."""
+        """Maintain peer connections and eclipse protections.
+
+        The disconnected-peer sweeps below are a *safety net* — the
+        primary cleanup path is the event-driven
+        :meth:`_handle_peer_disconnected` hook wired into
+        :meth:`Peer.disconnect` (2026-05-28 fix; see
+        CORE-PARITY-AUDIT/_ouroboros-down-20260528-2026-05-28.md).  Pre-fix
+        this loop was the only cleanup trigger and caught only 1 of 1497
+        disconnects in the wedge of PID 1252927 (~0.07 % hit rate).
+
+        These sweeps are retained to catch any peer that ends up in a
+        bucket without ever passing through ``Peer.disconnect`` — e.g.
+        partially-initialised peers from a half-completed connect that
+        crash before the disconnect path runs, or future code paths that
+        synchronously drop the socket.  They run every 30 s and SHOULD
+        normally find an empty list; observability of "stale entries
+        cleaned by the poll sweep" is a regression signal that some new
+        code path is bypassing ``Peer.disconnect``.
+        """
         while self.running:
             try:
-                # Remove disconnected full-relay outbound peers
+                # Remove disconnected full-relay outbound peers (SAFETY NET)
                 disconnected = [
                     a for a, p in list(self.peers.items())
                     if not p.is_connected()
@@ -1967,9 +2079,13 @@ class PeerManager:
                     # Update outbound netgroups tracking
                     group = self._netgroup(peer.host)
                     self._update_outbound_netgroups()
-                    logger.info(f"Removed disconnected full-relay peer {addr}")
+                    logger.warning(
+                        "Poll sweep cleaned stale full-relay peer %s — "
+                        "event-driven disconnect path was bypassed",
+                        addr,
+                    )
 
-                # Remove disconnected block-relay-only outbound peers
+                # Remove disconnected block-relay-only outbound peers (SAFETY NET)
                 disconnected_bro = [
                     a for a, p in list(self.block_relay_peers.items())
                     if not p.is_connected()
@@ -1979,9 +2095,13 @@ class PeerManager:
                     self._cleanup_peer_state(addr)
                     # Update outbound netgroups tracking
                     self._update_outbound_netgroups()
-                    logger.info(f"Removed disconnected block-relay-only peer {addr}")
+                    logger.warning(
+                        "Poll sweep cleaned stale block-relay peer %s — "
+                        "event-driven disconnect path was bypassed",
+                        addr,
+                    )
 
-                # Remove disconnected inbound peers
+                # Remove disconnected inbound peers (SAFETY NET)
                 disconnected_in = [
                     a for a, p in list(self.inbound_peers.items())
                     if not p.is_connected()
@@ -1995,7 +2115,11 @@ class PeerManager:
                         self._inbound_netgroups[group] -= 1
                         if self._inbound_netgroups[group] <= 0:
                             del self._inbound_netgroups[group]
-                    logger.info(f"Removed disconnected inbound peer {addr}")
+                    logger.warning(
+                        "Poll sweep cleaned stale inbound peer %s — "
+                        "event-driven disconnect path was bypassed",
+                        addr,
+                    )
 
                 # Re-seed from DNS when we have no peers and no known
                 # addresses — mirrors Bitcoin Core's ThreadDNSAddressSeed
