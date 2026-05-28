@@ -1,12 +1,21 @@
 """
 Bitcoin wallet: key management, address derivation, coin selection, and transaction signing.
 
-Supports P2WPKH (bech32) and P2PKH (legacy) addresses. Keys are stored
-as WIF in a JSON wallet file under {data_dir}/wallets/{name}.json.
+Supports P2PKH (legacy), P2SH-P2WPKH (p2sh-segwit), P2WPKH (bech32),
+and P2TR keypath (bech32m) addresses. Keys are stored as WIF in a JSON
+wallet file under {data_dir}/wallets/{name}.json.
 
-BIP 32 hierarchical deterministic (HD) derivation and BIP 44/84
-derivation paths are supported when the wallet is initialised from
-a seed via ``Wallet.init_hd()``.
+BIP-32 hierarchical-deterministic (HD) derivation is supported when the
+wallet is initialised from a seed via ``Wallet.init_hd()``. The BIP-43
+purpose code is dispatched from the requested address type per spec:
+
+  - legacy        → BIP-44   m/44'/coin'/0'/change/index
+  - p2sh-segwit   → BIP-49   m/49'/coin'/0'/change/index
+  - bech32        → BIP-84   m/84'/coin'/0'/change/index
+  - bech32m       → BIP-86   m/86'/coin'/0'/change/index
+
+coin_type follows SLIP-44: 0 on mainnet, 1 on every non-mainnet chain
+(testnet / testnet4 / signet / regtest).
 
 Output descriptor support (BIP 380–386) allows importing descriptors
 such as ``wpkh(xpub.../0/*)``, ``pkh(...)``, ``tr(...)``, ``sh(wpkh(...))``,
@@ -415,17 +424,79 @@ def select_coins(
     return best[0], best[1], best[2]
 
 
+# ---------------------------------------------------------------------------
+# BIP-43 purpose-code dispatch
+# ---------------------------------------------------------------------------
+#
+# Each on-disk address type lives under a *different* BIP-43 purpose so that
+# external wallets following BIP-44 / BIP-49 / BIP-84 / BIP-86 can recover
+# the same funds from the same mnemonic. Historically W161 BUG-6/7/8 found
+# that ouroboros derived *every* address type at ``m/84'/...``, so a user
+# calling ``getnewaddress legacy`` would receive a P2PKH whose privkey lives
+# at the BIP-84 (not BIP-44) path — unrecoverable by any spec-compliant
+# external wallet.
+#
+# Reference:
+#   - BIP-43 purpose-code dispatch:
+#       https://github.com/bitcoin/bips/blob/master/bip-0043.mediawiki
+#   - BIP-44 / BIP-49 / BIP-84 / BIP-86 paths.
+#   - SLIP-44 coin types (mainnet BTC=0, testnet BTC=1, regtest treated as
+#     testnet=1 to match Bitcoin Core's chainparams default).
+#       https://github.com/satoshilabs/slips/blob/master/slip-0044.md
+PURPOSE_FOR_ADDRESS_TYPE: dict[str, int] = {
+    "legacy": 44,        # BIP-44   m/44'/coin'/0'/change/index   → P2PKH
+    "p2sh-segwit": 49,   # BIP-49   m/49'/coin'/0'/change/index   → P2SH-P2WPKH
+    "bech32": 84,        # BIP-84   m/84'/coin'/0'/change/index   → P2WPKH
+    "bech32m": 86,       # BIP-86   m/86'/coin'/0'/change/index   → P2TR keypath
+}
+
+# Default address type when the caller is silent. Matches Bitcoin Core's
+# ``-addresstype=bech32`` default and the prior ouroboros behaviour.
+DEFAULT_ADDRESS_TYPE: str = "bech32"
+
+
+def purpose_for_address_type(address_type: str) -> int:
+    """Map an address-type string to its BIP-43 purpose code.
+
+    Falls back to BIP-84 for unknown types to preserve the historical
+    "bech32 by default" behaviour rather than raising mid-derivation.
+    """
+    return PURPOSE_FOR_ADDRESS_TYPE.get(address_type, 84)
+
+
+def coin_type_for_network(network: str) -> int:
+    """SLIP-44 coin type per network.
+
+    - mainnet → 0 (Bitcoin)
+    - testnet / testnet4 / signet / regtest → 1 (Testnet (all coins))
+
+    Bitcoin Core uses coin_type=1 for every non-mainnet chain by SLIP-44
+    convention; mismatching this would break recovery on every other wallet.
+    """
+    return 0 if network == "mainnet" else 1
+
+
 class KeyPool:
     """
-    BIP32/BIP84 HD key pool with pre-generated keys for receive and change paths.
+    BIP-32 HD key pool with per-purpose pre-generated keys.
 
-    Maintains separate pools for:
-      - Receive (external): m/84'/coin'/0'/0/index
-      - Change (internal):  m/84'/coin'/0'/1/index
+    Maintains independent sub-pools keyed on (purpose, is_change) so that
+    BIP-44 (P2PKH), BIP-49 (P2SH-P2WPKH), BIP-84 (P2WPKH), and BIP-86
+    (P2TR) addresses each derive at their spec-mandated path:
 
-    Pre-generates keys (default 1000) and auto-refills when pool drops below threshold.
+      - BIP-44: m/44'/coin'/0'/change/index  (legacy / P2PKH)
+      - BIP-49: m/49'/coin'/0'/change/index  (p2sh-segwit)
+      - BIP-84: m/84'/coin'/0'/change/index  (bech32 / P2WPKH)
+      - BIP-86: m/86'/coin'/0'/change/index  (bech32m / P2TR keypath)
 
-    Reference: Bitcoin Core wallet/scriptpubkeyman.cpp TopUp(), GetNewDestination()
+    Pre-generates keys (default 1000) and auto-refills when pool drops below
+    threshold. The BIP-84 sub-pool is exposed via the legacy attributes
+    ``_receive_pool``/``_change_pool``/``_used_*_indices``/``_next_*_index``
+    so older callers and tests continue to work; new code should use
+    :meth:`get_new_address` with the ``address_type`` argument.
+
+    Reference: Bitcoin Core wallet/scriptpubkeyman.cpp TopUp(),
+    GetNewDestination(); BIPs 32/43/44/49/84/86.
     """
 
     DEFAULT_POOL_SIZE = 1000
@@ -441,23 +512,80 @@ class KeyPool:
         self.network = network
         self.pool_size = pool_size
 
-        # BIP84 coin type: 0 for mainnet, 1 for testnet/regtest
-        self.coin_type = 0 if network == "mainnet" else 1
+        # SLIP-44 coin type: 0 for mainnet, 1 for every other chain.
+        self.coin_type = coin_type_for_network(network)
 
-        # Key pools: list of (index, WalletKey) tuples
-        self._receive_pool: list[tuple[int, WalletKey]] = []
-        self._change_pool: list[tuple[int, WalletKey]] = []
-
-        # Indices for next key derivation
-        self._next_receive_index: int = 0
-        self._next_change_index: int = 0
-
-        # Track used indices for address lookup
-        self._used_receive_indices: set = set()
-        self._used_change_indices: set = set()
+        # Per-(purpose, is_change) state. Keys are (purpose:int, is_change:bool).
+        # Each entry is a list of (index, WalletKey) tuples. The BIP-84
+        # entries are aliased to the legacy ``_receive_pool``/``_change_pool``
+        # attributes below for backward compatibility.
+        self._pools: dict[tuple[int, bool], list[tuple[int, WalletKey]]] = {}
+        self._next_indices: dict[tuple[int, bool], int] = {}
+        self._used_indices: dict[tuple[int, bool], set[int]] = {}
+        for purpose in PURPOSE_FOR_ADDRESS_TYPE.values():
+            for is_change in (False, True):
+                self._pools[(purpose, is_change)] = []
+                self._next_indices[(purpose, is_change)] = 0
+                self._used_indices[(purpose, is_change)] = set()
 
         # Master key derived once
         self._master: HDKey | None = None
+
+    # ------------------------------------------------------------------
+    # Legacy BIP-84-only attribute shims.
+    #
+    # Older callers (and tests in test_w111_wallet) reach into
+    # ``_receive_pool`` / ``_change_pool`` / ``_used_*_indices`` directly.
+    # They predate per-purpose sub-pools and assume "the pool" == BIP-84.
+    # Map those names to the BIP-84 sub-pool so legacy code keeps working.
+    # ------------------------------------------------------------------
+    @property
+    def _receive_pool(self) -> list[tuple[int, "WalletKey"]]:
+        return self._pools[(84, False)]
+
+    @_receive_pool.setter
+    def _receive_pool(self, value: list[tuple[int, "WalletKey"]]) -> None:
+        self._pools[(84, False)] = value
+
+    @property
+    def _change_pool(self) -> list[tuple[int, "WalletKey"]]:
+        return self._pools[(84, True)]
+
+    @_change_pool.setter
+    def _change_pool(self, value: list[tuple[int, "WalletKey"]]) -> None:
+        self._pools[(84, True)] = value
+
+    @property
+    def _next_receive_index(self) -> int:
+        return self._next_indices[(84, False)]
+
+    @_next_receive_index.setter
+    def _next_receive_index(self, value: int) -> None:
+        self._next_indices[(84, False)] = value
+
+    @property
+    def _next_change_index(self) -> int:
+        return self._next_indices[(84, True)]
+
+    @_next_change_index.setter
+    def _next_change_index(self, value: int) -> None:
+        self._next_indices[(84, True)] = value
+
+    @property
+    def _used_receive_indices(self) -> set[int]:
+        return self._used_indices[(84, False)]
+
+    @_used_receive_indices.setter
+    def _used_receive_indices(self, value: set[int]) -> None:
+        self._used_indices[(84, False)] = set(value)
+
+    @property
+    def _used_change_indices(self) -> set[int]:
+        return self._used_indices[(84, True)]
+
+    @_used_change_indices.setter
+    def _used_change_indices(self, value: set[int]) -> None:
+        self._used_indices[(84, True)] = set(value)
 
     @property
     def master(self) -> "HDKey":
@@ -466,51 +594,73 @@ class KeyPool:
             self._master = HDKey.from_seed(self.seed, self.network)
         return self._master
 
-    def _derive_key_at_path(self, is_change: bool, index: int) -> "WalletKey":
-        """Derive a key at the BIP84 path: m/84'/coin'/0'/change/index."""
+    @staticmethod
+    def path_for(purpose: int, coin_type: int, is_change: bool, index: int) -> str:
+        """Return the BIP-43/44 derivation path string for the given params."""
         change_flag = 1 if is_change else 0
-        path = f"m/84'/{self.coin_type}'/0'/{change_flag}/{index}"
+        return f"m/{purpose}'/{coin_type}'/0'/{change_flag}/{index}"
+
+    def _derive_key_at_path(
+        self,
+        is_change: bool,
+        index: int,
+        purpose: int = 84,
+    ) -> "WalletKey":
+        """Derive a key at the BIP-43 path: m/<purpose>'/coin'/0'/change/index.
+
+        The default ``purpose=84`` preserves the historical contract of
+        callers that predate per-purpose dispatch (``_rebuild_pools`` from
+        old wallet files, the legacy receive-key tests in W111). New code
+        should pass an explicit purpose code corresponding to the requested
+        address type.
+        """
+        path = self.path_for(purpose, self.coin_type, is_change, index)
         hd_key = self.master.derive_path(path)
         return hd_key.to_wallet_key()
 
-    def _refill_pool(self, is_change: bool) -> None:
-        """Pre-generate keys to fill the pool up to pool_size."""
-        pool = self._change_pool if is_change else self._receive_pool
-        next_idx = self._next_change_index if is_change else self._next_receive_index
-        used_indices = self._used_change_indices if is_change else self._used_receive_indices
+    def _refill_pool(self, is_change: bool, purpose: int = 84) -> None:
+        """Pre-generate keys to fill the (purpose, is_change) pool up to pool_size."""
+        key_tuple = (purpose, is_change)
+        pool = self._pools[key_tuple]
+        next_idx = self._next_indices[key_tuple]
+        used_indices = self._used_indices[key_tuple]
 
         # Calculate how many keys to generate
         current_unused = len([k for k in pool if k[0] not in used_indices])
         needed = self.pool_size - current_unused
 
         for _ in range(max(0, needed)):
-            key = self._derive_key_at_path(is_change, next_idx)
+            key = self._derive_key_at_path(is_change, next_idx, purpose=purpose)
             pool.append((next_idx, key))
             next_idx += 1
 
-        if is_change:
-            self._next_change_index = next_idx
-        else:
-            self._next_receive_index = next_idx
+        self._next_indices[key_tuple] = next_idx
 
     def get_new_address(
         self,
         is_change: bool = False,
-        address_type: str = "bech32",
+        address_type: str = DEFAULT_ADDRESS_TYPE,
     ) -> tuple[str, int]:
         """
-        Get the next unused address from the pool.
+        Get the next unused address from the (address-type-specific) pool.
 
-        Returns (address, index).
-        Refills pool if below threshold.
+        Each address_type uses its own BIP-43 sub-pool: ``legacy`` derives at
+        ``m/44'/...``, ``p2sh-segwit`` at ``m/49'/...``, ``bech32`` at
+        ``m/84'/...``, and ``bech32m`` at ``m/86'/...``. Indices are tracked
+        per (purpose, is_change) so different address types never overlap.
+
+        Returns (address, index). Refills pool if below threshold.
         """
-        pool = self._change_pool if is_change else self._receive_pool
-        used_indices = self._used_change_indices if is_change else self._used_receive_indices
+        purpose = purpose_for_address_type(address_type)
+        key_tuple = (purpose, is_change)
+        pool = self._pools[key_tuple]
+        used_indices = self._used_indices[key_tuple]
 
         # Refill if needed
         unused_count = len([k for k in pool if k[0] not in used_indices])
         if unused_count < self.REFILL_THRESHOLD:
-            self._refill_pool(is_change)
+            self._refill_pool(is_change, purpose=purpose)
+            pool = self._pools[key_tuple]
 
         # Find next unused key
         for idx, key in pool:
@@ -527,12 +677,17 @@ class KeyPool:
                 return (addr, idx)
 
         # Pool exhausted; generate one more
-        self._refill_pool(is_change)
+        self._refill_pool(is_change, purpose=purpose)
         return self.get_new_address(is_change, address_type)
 
-    def get_key_at_index(self, index: int, is_change: bool = False) -> "WalletKey":
-        """Get or derive the key at a specific index."""
-        pool = self._change_pool if is_change else self._receive_pool
+    def get_key_at_index(
+        self,
+        index: int,
+        is_change: bool = False,
+        purpose: int = 84,
+    ) -> "WalletKey":
+        """Get or derive the key at a specific (purpose, is_change, index)."""
+        pool = self._pools[(purpose, is_change)]
 
         # Check if already in pool
         for idx, key in pool:
@@ -540,34 +695,62 @@ class KeyPool:
                 return key
 
         # Derive on demand
-        return self._derive_key_at_path(is_change, index)
+        return self._derive_key_at_path(is_change, index, purpose=purpose)
 
     def get_all_keys(self, include_change: bool = True) -> list["WalletKey"]:
-        """Return all keys in the pool (used for address scanning)."""
-        keys = [k for _, k in self._receive_pool]
-        if include_change:
-            keys.extend(k for _, k in self._change_pool)
+        """Return all keys across every (purpose, is_change) sub-pool.
+
+        Used for address scanning — a single wallet that has called both
+        ``getnewaddress legacy`` and ``getnewaddress bech32`` will have
+        produced keys under both BIP-44 and BIP-84, and the UTXO scanner
+        must consider all of them.
+        """
+        keys: list["WalletKey"] = []
+        for (_purpose, change_flag), pool in self._pools.items():
+            if not include_change and change_flag:
+                continue
+            keys.extend(k for _, k in pool)
         return keys
 
     def top_up(self) -> int:
-        """Ensure both pools are filled; returns total keys generated."""
-        before_receive = len(self._receive_pool)
-        before_change = len(self._change_pool)
-        self._refill_pool(False)
-        self._refill_pool(True)
-        return (len(self._receive_pool) - before_receive) + (len(self._change_pool) - before_change)
+        """Ensure every (purpose, is_change) sub-pool is filled.
+
+        Returns the total number of keys generated across all sub-pools.
+        """
+        before_total = sum(len(pool) for pool in self._pools.values())
+        for (purpose, is_change) in self._pools:
+            self._refill_pool(is_change, purpose=purpose)
+        after_total = sum(len(pool) for pool in self._pools.values())
+        return after_total - before_total
 
     def to_dict(self) -> dict:
-        """Serialize key pool state for persistence."""
+        """Serialize key pool state for persistence.
+
+        Persists the per-(purpose, is_change) index/used-set mapping in
+        addition to the legacy BIP-84 ``next_receive_index`` /
+        ``next_change_index`` / ``used_*_indices`` keys so wallets written
+        before the BIP-43 dispatch fix still load correctly.
+        """
+        purpose_state: dict[str, dict[str, list[int] | int]] = {}
+        for (purpose, is_change), next_idx in self._next_indices.items():
+            slot = "change" if is_change else "receive"
+            purpose_state.setdefault(str(purpose), {})[f"next_{slot}_index"] = next_idx
+            purpose_state[str(purpose)][f"used_{slot}_indices"] = list(
+                self._used_indices[(purpose, is_change)]
+            )
+
         return {
             "seed_hex": self.seed.hex(),
             "network": self.network,
             "pool_size": self.pool_size,
             "coin_type": self.coin_type,
-            "next_receive_index": self._next_receive_index,
-            "next_change_index": self._next_change_index,
-            "used_receive_indices": list(self._used_receive_indices),
-            "used_change_indices": list(self._used_change_indices),
+            # Legacy BIP-84-only keys (kept for backwards-compatible load).
+            "next_receive_index": self._next_indices[(84, False)],
+            "next_change_index": self._next_indices[(84, True)],
+            "used_receive_indices": list(self._used_indices[(84, False)]),
+            "used_change_indices": list(self._used_indices[(84, True)]),
+            # Per-purpose state (BIP-43 dispatch fix).
+            "purpose_state": purpose_state,
         }
 
     @classmethod
@@ -579,24 +762,34 @@ class KeyPool:
             pool_size=data.get("pool_size", cls.DEFAULT_POOL_SIZE),
         )
         pool.coin_type = data.get("coin_type", pool.coin_type)
-        pool._next_receive_index = data.get("next_receive_index", 0)
-        pool._next_change_index = data.get("next_change_index", 0)
-        pool._used_receive_indices = set(data.get("used_receive_indices", []))
-        pool._used_change_indices = set(data.get("used_change_indices", []))
+
+        # Load legacy BIP-84-only fields first so pre-fix wallets restore.
+        pool._next_indices[(84, False)] = data.get("next_receive_index", 0)
+        pool._next_indices[(84, True)] = data.get("next_change_index", 0)
+        pool._used_indices[(84, False)] = set(data.get("used_receive_indices", []))
+        pool._used_indices[(84, True)] = set(data.get("used_change_indices", []))
+
+        # Overlay per-purpose state if present (post-fix wallets).
+        for purpose_str, state in data.get("purpose_state", {}).items():
+            purpose = int(purpose_str)
+            for is_change, slot in ((False, "receive"), (True, "change")):
+                if f"next_{slot}_index" in state:
+                    pool._next_indices[(purpose, is_change)] = state[f"next_{slot}_index"]
+                if f"used_{slot}_indices" in state:
+                    pool._used_indices[(purpose, is_change)] = set(state[f"used_{slot}_indices"])
+
         # Rebuild pools up to the next indices
         pool._rebuild_pools()
         return pool
 
     def _rebuild_pools(self) -> None:
-        """Rebuild key pools from indices (called after deserialize)."""
-        self._receive_pool = []
-        self._change_pool = []
-        for i in range(self._next_receive_index):
-            key = self._derive_key_at_path(False, i)
-            self._receive_pool.append((i, key))
-        for i in range(self._next_change_index):
-            key = self._derive_key_at_path(True, i)
-            self._change_pool.append((i, key))
+        """Rebuild every (purpose, is_change) sub-pool from indices (post-deserialize)."""
+        for (purpose, is_change), next_idx in self._next_indices.items():
+            rebuilt: list[tuple[int, WalletKey]] = []
+            for i in range(next_idx):
+                key = self._derive_key_at_path(is_change, i, purpose=purpose)
+                rebuilt.append((i, key))
+            self._pools[(purpose, is_change)] = rebuilt
 
 
 class HDKey:
@@ -1346,34 +1539,42 @@ class Wallet:
     async def generate_new_address(
         self,
         label: str | None = None,
-        address_type: str = "bech32",
+        address_type: str = DEFAULT_ADDRESS_TYPE,
     ) -> str:
         """
         Generate a new receiving address from the key pool.
 
         Args:
             label: Optional label for the address
-            address_type: One of "bech32" (P2WPKH), "p2sh-segwit" (P2SH-P2WPKH),
-                          "bech32m" (P2TR), or "legacy" (P2PKH)
+            address_type: One of "bech32" (P2WPKH, BIP-84), "p2sh-segwit"
+                          (P2SH-P2WPKH, BIP-49), "bech32m" (P2TR, BIP-86),
+                          or "legacy" (P2PKH, BIP-44). Address-type → BIP-43
+                          purpose dispatch is per spec; see
+                          :data:`PURPOSE_FOR_ADDRESS_TYPE`.
 
         Returns:
             The new address string
 
         Reference: Bitcoin Core wallet/scriptpubkeyman.cpp GetNewDestination()
         """
-        # Use key pool if available (BIP84 HD wallet)
+        # Use key pool if available (HD wallet)
         if self._key_pool is not None:
+            purpose = purpose_for_address_type(address_type)
             addr, index = self._key_pool.get_new_address(
                 is_change=False,
                 address_type=address_type,
             )
             # Also store in keys list for compatibility
-            key = self._key_pool.get_key_at_index(index, is_change=False)
+            key = self._key_pool.get_key_at_index(
+                index, is_change=False, purpose=purpose,
+            )
             self.keys.append({
                 "wif": key.to_wif(),
                 "label": label or "",
                 "created": int(time.time()),
-                "hd_path": f"m/84'/{self._key_pool.coin_type}'/0'/0/{index}",
+                "hd_path": KeyPool.path_for(
+                    purpose, self._key_pool.coin_type, False, index,
+                ),
             })
             self._save()
             logger.info(f"Generated new address {addr} (pool index {index})")
@@ -1408,11 +1609,14 @@ class Wallet:
         logger.info(f"Generated new address {addr}")
         return addr
 
-    async def get_change_address(self, address_type: str = "bech32") -> str:
+    async def get_change_address(self, address_type: str = DEFAULT_ADDRESS_TYPE) -> str:
         """
         Generate a new change (internal) address from the key pool.
 
-        Change addresses use the BIP84 internal path: m/84'/coin'/0'/1/index
+        Change addresses use the per-purpose internal path
+        ``m/<purpose>'/coin'/0'/1/index``, where the purpose is dispatched
+        from ``address_type`` per BIP-43/44/49/84/86. Hardcoding to BIP-84
+        for non-bech32 change outputs was W161 BUG-6.
 
         Reference: Bitcoin Core wallet/scriptpubkeyman.cpp GetReservedDestination()
         """
@@ -1525,9 +1729,24 @@ class Wallet:
         return results
 
     async def generate_address_of_type(
-        self, address_type: str = "bech32", label: str | None = None
+        self, address_type: str = DEFAULT_ADDRESS_TYPE, label: str | None = None
     ) -> str:
-        """Generate address of given type: bech32, legacy, p2sh-segwit, bech32m."""
+        """Generate address of given type: bech32, legacy, p2sh-segwit, bech32m.
+
+        When a key pool is configured (the normal HD path), defers to
+        :meth:`generate_new_address` so the BIP-43 purpose dispatch is
+        applied (legacy→44, p2sh-segwit→49, bech32→84, bech32m→86).
+        Otherwise falls back to the legacy ``_hd_base_path`` for callers
+        that have an old single-path HD seed but no key pool.
+        """
+        # Prefer the keypool path so the BIP-43 dispatch (W161 BUG-6/7/8)
+        # applies. ``generate_new_address`` already writes the right
+        # ``hd_path`` into ``self.keys`` for each purpose.
+        if self._key_pool is not None:
+            return await self.generate_new_address(
+                label=label, address_type=address_type,
+            )
+
         if self._hd_seed is not None:
             path = f"{self._hd_base_path}/{self._hd_next_index}"
             hd = HDKey.from_seed(self._hd_seed, self.network).derive_path(path)
