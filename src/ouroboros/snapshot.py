@@ -971,6 +971,21 @@ class SnapshotManager:
         exceed the active tip (mirrors Core's PopulateAndValidateSnapshot
         early-exit at validation.cpp:5787-5789).  Pass ``None`` (default) to
         skip this check (e.g. when the active tip has no known chainwork).
+
+        Atomicity (FIX-D, chainstate atomicity family 2026-05-26):
+        the load now uses the three-step `snapshot_load_begin` /
+        `snapshot_load_chunk` / `snapshot_load_commit` protocol when the
+        Rust extension exposes it (current ferrous-utils builds do).
+        Begin writes the SNAPSHOT_LOAD_IN_PROGRESS marker to META_CF;
+        chunks apply 10K coins per RocksDB WriteBatch; commit fuses the
+        final tip update + block-metadata write + marker delete into one
+        atomic batch.  On crash mid-load, next-boot `recover_from_crash`
+        detects the marker, clears the partial chainstate, resets the tip
+        to genesis-sentinel, and instructs the operator to re-run
+        `loadtxoutset`.  Older extensions without the FFI symbols fall
+        back to the legacy per-coin path (non-atomic) so the upgrade is
+        rolling-safe.  See CORE-PARITY-AUDIT/_chainstate-atomicity-family-
+        2026-05-26.md.
         """
         with open(snapshot_path, "rb") as f:
             metadata = _read_metadata_header(f, self.network)
@@ -1005,6 +1020,29 @@ class SnapshotManager:
                 f"[snapshot] Loading snapshot at height {height} with {metadata.coins_count:,} coins"
             )
 
+            # ----------------------------------------------------------
+            # FIX-D (chainstate atomicity family 2026-05-26): begin the
+            # atomic snapshot-load protocol.  This clears the chainstate
+            # and writes the SNAPSHOT_LOAD_IN_PROGRESS marker BEFORE any
+            # per-coin chunk is written.  On crash mid-load, next-boot
+            # `recover_from_crash` detects the marker, clears the
+            # partial chainstate, resets the tip to genesis, and instructs
+            # the operator to re-run `loadtxoutset`.
+            #
+            # Older Rust extensions without FIX-D fall back to the legacy
+            # per-coin path (no atomicity guarantees) — preserves existing
+            # operator workflows during the rolling upgrade window.
+            # ----------------------------------------------------------
+            use_atomic_load = hasattr(self.db, "snapshot_load_begin")
+            if use_atomic_load:
+                self.db.snapshot_load_begin(metadata.base_blockhash, height)
+            else:
+                logger.warning(
+                    "[snapshot] Rust extension lacks snapshot_load_begin "
+                    "(pre-FIX-D); falling back to per-coin loader — "
+                    "load is NOT crash-safe"
+                )
+
             # Streaming SHA256d (HashWriter) over coins as we deserialize
             # them. Mirrors Core's HASH_SERIALIZED path through
             # ApplyCoinHash (kernel/coinstats.cpp:53-56), which is what
@@ -1013,71 +1051,122 @@ class SnapshotManager:
             # same order Core's CCoinsViewCursor walks.
             hasher = HashWriter()
 
+            # Per-chunk batch buffer.  10K coins keeps the WriteBatch
+            # memory bounded (~1-2 MB at typical mainnet-coin sizes), well
+            # under the per-batch threshold rocksdb starts paying for
+            # internal sorting, while still cutting Python→Rust FFI
+            # round-trips by 10000x vs the per-coin path.  Matches the
+            # operator-only Rust bulk-loader chunk size (10K coins per
+            # `apply_batch`).
+            _CHUNK_SIZE = 10_000
+            chunk_buffer: list[
+                tuple[bytes, int, int, bytes, int, bool]
+            ] = []
+
+            def _flush_chunk() -> None:
+                if not chunk_buffer:
+                    return
+                if use_atomic_load:
+                    self.db.snapshot_load_chunk(chunk_buffer)
+                else:
+                    # Legacy per-coin path (pre-FIX-D extensions only).
+                    for (
+                        c_txid,
+                        c_vout,
+                        c_amount,
+                        c_script,
+                        c_height,
+                        c_is_cb,
+                    ) in chunk_buffer:
+                        self.db.add_utxo_raw(
+                            txid=c_txid,
+                            vout=c_vout,
+                            amount=c_amount,
+                            script_pubkey=c_script,
+                            height=c_height,
+                            is_coinbase=c_is_cb,
+                        )
+                chunk_buffer.clear()
+
             coins_left = metadata.coins_count
             coins_loaded = 0
-            while coins_left > 0:
-                txid = f.read(32)
-                if len(txid) != 32:
-                    raise ValueError("Truncated snapshot: missing txid")
+            try:
+                while coins_left > 0:
+                    txid = f.read(32)
+                    if len(txid) != 32:
+                        raise ValueError("Truncated snapshot: missing txid")
 
-                coins_per_txid = _read_compact_size(f)
-                if coins_per_txid == 0 or coins_per_txid > coins_left:
-                    raise ValueError(
-                        f"Invalid coins_per_txid={coins_per_txid} (coins_left={coins_left})"
-                    )
-
-                for _ in range(coins_per_txid):
-                    vout = _read_compact_size(f)
-                    coin_height, is_coinbase, amount, script = deserialize_coin(f)
-
-                    # BUG-4: per-coin height bound check.
-                    # Mirrors Core PopulateAndValidateSnapshot:
-                    #   if (coin.nHeight > base_height) return Error{...}
-                    # (validation.cpp:5814-5819)
-                    # Only enforced when we know base_height (i.e. au_data is set).
-                    if au_data is not None and coin_height > height:
+                    coins_per_txid = _read_compact_size(f)
+                    if coins_per_txid == 0 or coins_per_txid > coins_left:
                         raise ValueError(
-                            f"Bad snapshot data after deserializing "
-                            f"{metadata.coins_count - coins_left} coins: "
-                            f"coin.height={coin_height} > base_height={height}"
+                            f"Invalid coins_per_txid={coins_per_txid} (coins_left={coins_left})"
                         )
 
-                    # BUG-5: per-coin MoneyRange check.
-                    # Mirrors Core PopulateAndValidateSnapshot:
-                    #   if (!MoneyRange(coin.out.nValue)) return Error{...}
-                    # (validation.cpp:5820-5823)
-                    if amount < 0 or amount > _MAX_MONEY:
-                        raise ValueError(
-                            f"Bad snapshot data after deserializing "
-                            f"{metadata.coins_count - coins_left} coins - "
-                            f"bad tx out value: {amount}"
+                    for _ in range(coins_per_txid):
+                        vout = _read_compact_size(f)
+                        coin_height, is_coinbase, amount, script = deserialize_coin(f)
+
+                        # BUG-4: per-coin height bound check.
+                        # Mirrors Core PopulateAndValidateSnapshot:
+                        #   if (coin.nHeight > base_height) return Error{...}
+                        # (validation.cpp:5814-5819)
+                        # Only enforced when we know base_height (i.e. au_data is set).
+                        if au_data is not None and coin_height > height:
+                            raise ValueError(
+                                f"Bad snapshot data after deserializing "
+                                f"{metadata.coins_count - coins_left} coins: "
+                                f"coin.height={coin_height} > base_height={height}"
+                            )
+
+                        # BUG-5: per-coin MoneyRange check.
+                        # Mirrors Core PopulateAndValidateSnapshot:
+                        #   if (!MoneyRange(coin.out.nValue)) return Error{...}
+                        # (validation.cpp:5820-5823)
+                        if amount < 0 or amount > _MAX_MONEY:
+                            raise ValueError(
+                                f"Bad snapshot data after deserializing "
+                                f"{metadata.coins_count - coins_left} coins - "
+                                f"bad tx out value: {amount}"
+                            )
+
+                        chunk_buffer.append((
+                            txid, vout, amount, script, coin_height, is_coinbase,
+                        ))
+                        if len(chunk_buffer) >= _CHUNK_SIZE:
+                            _flush_chunk()
+
+                        hasher.update(
+                            coin_element(
+                                txid=txid,
+                                vout=vout,
+                                height=coin_height,
+                                is_coinbase=is_coinbase,
+                                amount=amount,
+                                script_pubkey=script,
+                            )
                         )
 
-                    self.db.add_utxo_raw(
-                        txid=txid,
-                        vout=vout,
-                        amount=amount,
-                        script_pubkey=script,
-                        height=coin_height,
-                        is_coinbase=is_coinbase,
+                        coins_left -= 1
+                        coins_loaded += 1
+
+                        if progress_callback and coins_loaded % 100_000 == 0:
+                            progress_callback(coins_loaded, metadata.coins_count)
+
+                # Flush any tail residue (<_CHUNK_SIZE coins remaining).
+                _flush_chunk()
+            except Exception:
+                # Bail out cleanly.  The SNAPSHOT_LOAD_IN_PROGRESS marker
+                # is intentionally NOT deleted here — the chainstate may
+                # be partially populated and we want next-boot
+                # `recover_from_crash` to detect this and clear it.  The
+                # operator can also immediately re-run `loadtxoutset` and
+                # the marker will be overwritten by `snapshot_load_begin`.
+                if use_atomic_load:
+                    logger.error(
+                        "[snapshot] Load failed mid-stream; chainstate left "
+                        "marked SNAPSHOT_LOAD_IN_PROGRESS for crash recovery"
                     )
-
-                    hasher.update(
-                        coin_element(
-                            txid=txid,
-                            vout=vout,
-                            height=coin_height,
-                            is_coinbase=is_coinbase,
-                            amount=amount,
-                            script_pubkey=script,
-                        )
-                    )
-
-                    coins_left -= 1
-                    coins_loaded += 1
-
-                    if progress_callback and coins_loaded % 100_000 == 0:
-                        progress_callback(coins_loaded, metadata.coins_count)
+                raise
 
             # BUG-6: trailing-bytes EOF check.
             # Mirrors Core PopulateAndValidateSnapshot (validation.cpp:5872-5883):
@@ -1112,64 +1201,103 @@ class SnapshotManager:
                 f"{metadata.base_blockhash_hex()}; skipping commitment check"
             )
 
-        # Update database best block to snapshot tip.
-        self.db.update_best_block(metadata.base_blockhash, height)
+        # ------------------------------------------------------------------
+        # FIX-D: write sibling files BEFORE the final commit.  They are not
+        # in RocksDB so they can't share the atomic batch, but if a crash
+        # happens between writing them and `snapshot_load_commit`, the next
+        # boot's `recover_from_crash` clears the chainstate (because the
+        # marker is still present) and the sibling files become harmless
+        # leftovers that will be overwritten on the next successful load.
+        # The inverse ordering — commit first, then sibling files — would
+        # leave a window where the chainstate / tip are committed but the
+        # sibling files are missing, which causes the FIRST post-snapshot
+        # block validation to fail with "Previous block not found".
+        # ------------------------------------------------------------------
         self.write_snapshot_base_blockhash(metadata.base_blockhash)
-
-        # Persist the 80-byte header for the snapshot tip if chainparams
-        # has it (mainnet entries do; testnet entries may not).  Without
-        # this, the FIRST block above the snapshot tip cannot be validated
-        # (its prev_block lookup returns None and validate_block rejects
-        # it with "Previous block not found", forcing an infinite retry
-        # loop).  See AssumeutxoData.base_header for the rationale.
         if au_data is not None and au_data.base_header is not None:
+            # Persist the 80-byte header for the snapshot tip if chainparams
+            # has it (mainnet entries do; testnet entries may not).  Without
+            # this, the FIRST block above the snapshot tip cannot be
+            # validated (its prev_block lookup returns None and
+            # validate_block rejects it with "Previous block not found",
+            # forcing an infinite retry loop).  See
+            # AssumeutxoData.base_header for the rationale.
             self.write_snapshot_base_blockheader(au_data.base_header)
 
-        # Persist the snapshot block's BlockMetadata — height, true
-        # cumulative chainwork, and header timestamp.  This is the
-        # ROOT-CAUSE fix for the "too-little-chainwork; G8" mainnet brick
-        # (2026-05-19).  ``connect_block_from_bytes`` derives every block's
-        # chainwork as ``compute_chainwork(prev_block_metadata.chainwork,
-        # bits)`` and falls back to a 0 base when the parent's metadata is
-        # absent (lib.rs:3868-3876).  After a snapshot load the snapshot
-        # block had NO metadata row, so block ``height+1`` read a 0 base
-        # and the whole post-snapshot chain accumulated work from 0 —
-        # ~32x below reality — making the G8 nMinimumChainWork gate reject
-        # every mainnet headers batch and ban honest peers.  Writing the
-        # snapshot block's metadata here anchors the accumulation at the
-        # correct value (Core's hardcoded ``chainwork_hex``), so every
-        # block connected above the snapshot stores correct chainwork and
-        # no after-the-fact correction offset is needed.
+        # ------------------------------------------------------------------
+        # FIX-D: final atomic commit batch.
+        # Single RocksDB WriteBatch fuses:
+        #   - update_best_block(base_blockhash, base_height)
+        #   - store_block_metadata_batch (if chainwork_hex + base_header
+        #     present in chainparams — anchors the G8 chainwork accumulator;
+        #     see the long comment below for why this matters)
+        #   - delete SNAPSHOT_LOAD_IN_PROGRESS marker
+        #
+        # Pre-FIX-D these were three independent writes (tip put, optional
+        # metadata put, no marker at all) — a crash between any pair left
+        # the chainstate at the new snapshot tip with no chainwork anchor,
+        # or the old tip with the snapshot already loaded, depending on
+        # ordering.  Post-FIX-D either all three land or none of them do.
+        #
+        # ROOT-CAUSE context for the chainwork persist: the "too-little-
+        # chainwork; G8" mainnet brick (2026-05-19) was caused by the
+        # snapshot block having NO metadata row, so block ``height+1`` read
+        # a 0 base from ``compute_chainwork`` and the whole post-snapshot
+        # chain accumulated work from 0 — ~32x below reality — making the
+        # G8 nMinimumChainWork gate reject every mainnet headers batch and
+        # ban honest peers.  Writing the snapshot block's metadata fixes
+        # that; fusing it into the commit batch makes the fix atomic with
+        # the tip update.
+        # ------------------------------------------------------------------
+        chainwork_be: bytes | None = None
+        snapshot_timestamp: int | None = None
         if (
             au_data is not None
             and au_data.chainwork_hex is not None
             and au_data.base_header is not None
         ):
-            try:
-                snapshot_chainwork = int(au_data.chainwork_hex, 16)
-                # base_header layout: version(4) prev(32) merkle(32)
-                # time(4) bits(4) nonce(4); time is at byte offset 68.
-                snapshot_timestamp = struct.unpack_from(
-                    "<I", au_data.base_header, 68
-                )[0]
-                self.db.store_block_metadata_persistent(
-                    height,
-                    metadata.base_blockhash,
-                    snapshot_chainwork,
-                    snapshot_timestamp,
-                )
+            snapshot_chainwork = int(au_data.chainwork_hex, 16)
+            chainwork_be = snapshot_chainwork.to_bytes(32, "big")
+            # base_header layout: version(4) prev(32) merkle(32)
+            # time(4) bits(4) nonce(4); time is at byte offset 68.
+            snapshot_timestamp = struct.unpack_from(
+                "<I", au_data.base_header, 68
+            )[0]
+
+        if use_atomic_load:
+            self.db.snapshot_load_commit(
+                metadata.base_blockhash,
+                height,
+                chainwork_be=chainwork_be,
+                timestamp=snapshot_timestamp,
+            )
+            if chainwork_be is not None:
                 logger.info(
                     f"[snapshot] Persisted snapshot block metadata at "
                     f"height {height}: chainwork={au_data.chainwork_hex}"
                 )
-            except Exception as e:
-                # Non-fatal: the node still functions, but the G8 gate
-                # offset fallback in BlockSync will be needed.  Log loudly
-                # so the gap is visible.
-                logger.error(
-                    f"[snapshot] Failed to persist snapshot block "
-                    f"chainwork metadata at height {height}: {e}"
-                )
+        else:
+            # Legacy non-atomic path for pre-FIX-D extensions only.  This
+            # branch retains the pre-FIX-D ordering exactly so behaviour
+            # is identical on old extensions.
+            self.db.update_best_block(metadata.base_blockhash, height)
+            if chainwork_be is not None:
+                try:
+                    self.db.store_block_metadata_persistent(
+                        height,
+                        metadata.base_blockhash,
+                        int(au_data.chainwork_hex, 16),
+                        snapshot_timestamp,
+                    )
+                    logger.info(
+                        f"[snapshot] Persisted snapshot block metadata at "
+                        f"height {height}: chainwork={au_data.chainwork_hex}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[snapshot] Failed to persist snapshot block "
+                        f"chainwork metadata at height {height}: {e}"
+                    )
 
         self.snapshot_loaded = True
         self.snapshot_height = height

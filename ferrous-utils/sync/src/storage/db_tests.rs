@@ -1517,4 +1517,103 @@ mod tests {
         assert_eq!(status, DisconnectStatus::Ok);
         assert!(!db.utxo_exists(&cb_out));
     }
+
+    // ========== Snapshot-load atomicity (FIX-D, 2026-05-26) ==========
+
+    /// Writing the SNAPSHOT_LOAD_IN_PROGRESS marker and reading it back
+    /// must produce the exact 32-byte hash + height pair we put in, and
+    /// deleting the marker via the batch helper must remove it.
+    #[test]
+    fn test_snapshot_load_marker_round_trip() {
+        let (db, _temp_dir) = create_test_db();
+        assert!(db.get_snapshot_load_marker().unwrap().is_none());
+
+        let base_hash = [0xAB; 32];
+        let base_height: u32 = 840_000;
+        db.write_snapshot_load_marker(&base_hash, base_height).unwrap();
+
+        let read = db.get_snapshot_load_marker().unwrap().unwrap();
+        assert_eq!(read.0, base_hash);
+        assert_eq!(read.1, base_height);
+
+        // Delete via batch helper (mirrors snapshot_load_commit path).
+        let mut batch = db.create_batch();
+        db.delete_snapshot_load_marker_batch(&mut batch).unwrap();
+        db.apply_batch(batch).unwrap();
+        assert!(db.get_snapshot_load_marker().unwrap().is_none());
+    }
+
+    /// `recover_from_crash` MUST detect a SNAPSHOT_LOAD_IN_PROGRESS marker,
+    /// clear the (potentially partial) chainstate, and reset the tip pointer
+    /// to all-zeros. The marker must be deleted so subsequent boots don't
+    /// re-trigger.
+    #[test]
+    fn test_recover_from_crash_handles_snapshot_marker() {
+        let (db, _temp_dir) = create_test_db();
+
+        // Simulate a partial snapshot load: write some UTXOs, then set the
+        // marker but never reach `snapshot_load_commit`.
+        for i in 0..5u8 {
+            let txid = bitcoin::Txid::from_byte_array([i; 32]);
+            let (op, utxo) = create_test_utxo(txid, 0, 1_000 * (i as u64 + 1), Some(840_000));
+            db.add_utxo(&op, &utxo).unwrap();
+        }
+        // Also seed an old tip pointer to verify it gets reset.
+        let old_hash = [0x77u8; 32];
+        db.update_best_block(&old_hash, 700_000).unwrap();
+
+        let base_hash = [0xCD; 32];
+        let base_height: u32 = 840_000;
+        db.write_snapshot_load_marker(&base_hash, base_height).unwrap();
+        assert!(db.get_snapshot_load_marker().unwrap().is_some());
+
+        let recovered = db.recover_from_crash().unwrap();
+        assert!(recovered, "recover_from_crash must report it did work");
+        assert!(
+            db.get_snapshot_load_marker().unwrap().is_none(),
+            "marker must be deleted after recovery",
+        );
+
+        // Chainstate must be empty.
+        let count = db.utxo_count().unwrap();
+        assert_eq!(count, 0, "chainstate should be cleared by snapshot recovery");
+
+        // Tip must be reset to all-zeros / height 0 so callers see a clean
+        // slate and the operator knows to re-run loadtxoutset.
+        let (tip_hash, tip_height) = db.get_best_block().unwrap();
+        assert_eq!(tip_hash, [0u8; 32]);
+        assert_eq!(tip_height, 0);
+
+        // Idempotent: second call sees nothing to do.
+        let recovered_again = db.recover_from_crash().unwrap();
+        assert!(!recovered_again);
+    }
+
+    /// A snapshot-load marker MUST take precedence over a stale HEAD_BLOCKS
+    /// marker if both are present (defended-against impossible state). The
+    /// HEAD_BLOCKS marker cannot meaningfully recover on top of a cleared
+    /// chainstate, so it must also be dropped during snapshot recovery.
+    #[test]
+    fn test_recover_from_crash_snapshot_marker_clears_stale_head_blocks() {
+        let (db, _temp_dir) = create_test_db();
+
+        // Stale HEAD_BLOCKS row from a prior aborted apply.
+        let old_tip = [0x11u8; 32];
+        let new_block = [0x22u8; 32];
+        db.write_head_blocks(&old_tip, 100, &new_block, 101).unwrap();
+
+        // Snapshot in progress (this wins).
+        db.write_snapshot_load_marker(&[0x33u8; 32], 840_000).unwrap();
+
+        let recovered = db.recover_from_crash().unwrap();
+        assert!(recovered);
+
+        // Both markers gone.
+        assert!(db.get_snapshot_load_marker().unwrap().is_none());
+        assert!(db.get_head_blocks().unwrap().is_none());
+
+        let (tip_hash, tip_height) = db.get_best_block().unwrap();
+        assert_eq!(tip_hash, [0u8; 32]);
+        assert_eq!(tip_height, 0);
+    }
 }

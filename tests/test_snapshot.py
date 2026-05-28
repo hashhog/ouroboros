@@ -1426,3 +1426,297 @@ def test_chainstate_skips_op_return(tmp_path) -> None:
     coin = utxos[0]
     assert bytes(coin.script_pubkey) == p2wsh_script
     assert int(coin.amount) == p2wsh_value
+
+
+# ===========================================================================
+# FIX-D atomic snapshot load (chainstate atomicity family 2026-05-26)
+# ===========================================================================
+#
+# Verifies the three-phase `snapshot_load_begin / chunk / commit` protocol
+# behaves atomically against crashes mid-load.  Uses a tracking stub DB that
+# records every call so the test can simulate a SIGKILL between phases and
+# assert the recovery action without needing a real RocksDB instance.
+#
+# A separate set of tests against the live Rust extension is in
+# `src/ouroboros/tests/db_tests.rs::test_snapshot_load_marker_round_trip`
+# and `::test_recover_from_crash_handles_snapshot_marker`.
+
+
+class _AtomicTrackingStubDB(_StubDB):
+    """Stub DB that records the call sequence of the atomic protocol.
+
+    Mirrors the `PyBlockchainDB` surface the loader cares about:
+    - `snapshot_load_begin(base_blockhash, base_height)` — clears UTXOs +
+      sets the in-progress marker
+    - `snapshot_load_chunk(coins)` — appends coins
+    - `snapshot_load_commit(base_blockhash, base_height, chainwork_be,
+      timestamp)` — sets the tip and clears the marker
+
+    Includes a `crash_after_chunk` knob so a test can simulate a SIGKILL
+    after N applied chunks, leaving the marker set.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[str] = []
+        self.in_progress_marker: tuple[bytes, int] | None = None
+        self.chunks_seen: int = 0
+        self.coins_applied_total: int = 0
+        self.commit_chainwork_be: bytes | None = None
+        self.commit_timestamp: int | None = None
+        self.crash_after_chunk: int | None = None
+
+    def snapshot_load_begin(self, base_blockhash: bytes, base_height: int) -> None:
+        self.calls.append("begin")
+        # Phase 1 clears the chainstate authoritatively.
+        self.utxos.clear()
+        self.in_progress_marker = (bytes(base_blockhash), int(base_height))
+
+    def snapshot_load_chunk(self, coins) -> None:
+        self.calls.append("chunk")
+        for (txid, vout, amount, script_pubkey, height, is_coinbase) in coins:
+            self.utxos.append(_UTXOEntry(
+                txid=bytes(txid),
+                vout=int(vout),
+                amount=int(amount),
+                script_pubkey=bytes(script_pubkey),
+                height=int(height),
+                is_coinbase=bool(is_coinbase),
+            ))
+            self.coins_applied_total += 1
+        self.chunks_seen += 1
+        # Optionally simulate a SIGKILL after N chunks.
+        if self.crash_after_chunk is not None and self.chunks_seen >= self.crash_after_chunk:
+            raise RuntimeError("simulated SIGKILL mid-load")
+
+    def snapshot_load_commit(
+        self,
+        base_blockhash: bytes,
+        base_height: int,
+        chainwork_be: bytes | None = None,
+        timestamp: int | None = None,
+    ) -> None:
+        self.calls.append("commit")
+        self.best_hash = bytes(base_blockhash)
+        self.best_height = int(base_height)
+        self.commit_chainwork_be = (
+            bytes(chainwork_be) if chainwork_be is not None else None
+        )
+        self.commit_timestamp = (
+            int(timestamp) if timestamp is not None else None
+        )
+        # Phase 3 deletes the marker.
+        self.in_progress_marker = None
+
+
+def _build_strict_snapshot(tmp_path, n_coins: int = 50) -> tuple[Any, _StubDB]:
+    """Build a real snapshot file at mainnet@840k with `n_coins` coins.
+
+    Returns ``(snap_path, src_db)``.  The src DB is the one that emitted
+    the snapshot; the caller is expected to load it into a separate
+    destination DB.  Patches the chainparams SHA256d commitment so the
+    strict gate matches the synthetic UTXO set (the published mainnet
+    commitment is over the real ~190M-coin set, not our fixture).
+    """
+    from ouroboros import snapshot as _snapshot_mod
+    from ouroboros.muhash import coin_element
+
+    au = get_assumeutxo_data("mainnet", 840_000)
+    assert au is not None
+
+    src = _StubDB()
+    src.best_hash = au.block_hash
+    src.best_height = au.height
+    for i in range(n_coins):
+        src.utxos.append(_UTXOEntry(
+            txid=bytes([i & 0xFF]) + b"\xAA" * 31,
+            vout=i & 0x3,
+            amount=1_000 * (i + 1),
+            script_pubkey=_p2pkh(bytes([i & 0xFF]) * 20),
+            height=200_000 + i,
+            is_coinbase=False,
+        ))
+
+    snap_path = tmp_path / "fix_d.dat"
+    SnapshotManager(src, "mainnet", str(tmp_path / "src")).dump_snapshot(str(snap_path))
+
+    # Pre-compute the SHA256d over the SAME UTXOs (sorted) and patch
+    # chainparams so the strict gate accepts our synthetic file.
+    sorted_utxos = sorted(src.utxos, key=lambda u: (u.txid, u.vout))
+    hasher = snapshot.HashWriter()
+    for u in sorted_utxos:
+        hasher.update(coin_element(
+            txid=u.txid, vout=u.vout, height=u.height,
+            is_coinbase=u.is_coinbase, amount=u.amount,
+            script_pubkey=u.script_pubkey,
+        ))
+    return snap_path, src, hasher.digest(), au
+
+
+def test_load_snapshot_happy_path_uses_atomic_protocol(tmp_path, monkeypatch) -> None:
+    """Happy-path: load completes → calls begin, ≥1 chunk(s), commit, in
+    exactly that order.  The in-progress marker is None at the end and
+    the tip pointer is the snapshot base.
+    """
+    from ouroboros import snapshot as _snapshot_mod
+
+    snap_path, _src, expected_digest, au = _build_strict_snapshot(tmp_path)
+
+    patched = _snapshot_mod.AssumeutxoData(
+        height=au.height,
+        block_hash=au.block_hash,
+        hash_serialized=expected_digest,
+        chain_tx_count=au.chain_tx_count,
+        base_header=au.base_header,
+        chainwork_hex=au.chainwork_hex,
+    )
+    monkeypatch.setattr(
+        _snapshot_mod, "get_assumeutxo_by_hash",
+        lambda network, h: patched if h == au.block_hash else None,
+    )
+
+    dst = _AtomicTrackingStubDB()
+    sm = SnapshotManager(dst, "mainnet", str(tmp_path / "dst"))
+    sm.load_snapshot(str(snap_path), strict=True)
+
+    # Order: begin → chunk(s) → commit.
+    assert dst.calls[0] == "begin", f"first call must be begin, got {dst.calls[0]}"
+    assert dst.calls[-1] == "commit", f"last call must be commit, got {dst.calls[-1]}"
+    # Every intermediate call is a chunk.
+    middle = dst.calls[1:-1]
+    assert all(c == "chunk" for c in middle), f"middle calls must all be chunk: {middle}"
+    assert dst.chunks_seen >= 1
+    assert dst.coins_applied_total == 50
+
+    # Marker is cleared.
+    assert dst.in_progress_marker is None
+
+    # Tip moved to snapshot base.
+    assert dst.best_hash == au.block_hash
+    assert dst.best_height == au.height
+
+    # Chainwork + timestamp passed through to commit when chainparams ship them.
+    if au.chainwork_hex is not None and au.base_header is not None:
+        assert dst.commit_chainwork_be is not None
+        assert int.from_bytes(dst.commit_chainwork_be, "big") == int(au.chainwork_hex, 16)
+        assert dst.commit_timestamp is not None
+
+
+def test_load_snapshot_crash_mid_chunk_leaves_marker(tmp_path, monkeypatch) -> None:
+    """Simulated SIGKILL during chunk application MUST NOT call commit and
+    MUST leave the in-progress marker set so next-boot `recover_from_crash`
+    can detect the partial load and clear the chainstate.
+    """
+    from ouroboros import snapshot as _snapshot_mod
+
+    snap_path, _src, expected_digest, au = _build_strict_snapshot(tmp_path)
+
+    patched = _snapshot_mod.AssumeutxoData(
+        height=au.height,
+        block_hash=au.block_hash,
+        hash_serialized=expected_digest,
+        chain_tx_count=au.chain_tx_count,
+        base_header=au.base_header,
+        chainwork_hex=au.chainwork_hex,
+    )
+    monkeypatch.setattr(
+        _snapshot_mod, "get_assumeutxo_by_hash",
+        lambda network, h: patched if h == au.block_hash else None,
+    )
+
+    dst = _AtomicTrackingStubDB()
+    dst.crash_after_chunk = 1  # crash on first chunk
+
+    sm = SnapshotManager(dst, "mainnet", str(tmp_path / "dst"))
+    with pytest.raises(RuntimeError, match="simulated SIGKILL"):
+        sm.load_snapshot(str(snap_path), strict=True)
+
+    # Begin and at least one chunk happened.
+    assert "begin" in dst.calls
+    assert "chunk" in dst.calls
+
+    # CRITICAL: commit must NOT have run.
+    assert "commit" not in dst.calls, \
+        "commit must not run when chunk application throws"
+
+    # CRITICAL: marker must STILL be set so next-boot recovery clears it.
+    assert dst.in_progress_marker is not None, \
+        "in-progress marker must persist on crash so recover_from_crash sees it"
+    assert dst.in_progress_marker[0] == au.block_hash
+    assert dst.in_progress_marker[1] == au.height
+
+    # Tip must NOT have advanced to the snapshot base.
+    assert dst.best_hash != au.block_hash or dst.best_height != au.height
+
+
+def test_load_snapshot_chunks_sized_for_bounded_memory(tmp_path, monkeypatch) -> None:
+    """The loader buffers up to 10K coins per chunk before calling
+    snapshot_load_chunk, keeping per-batch memory bounded on multi-billion-
+    coin snapshots.
+    """
+    from ouroboros import snapshot as _snapshot_mod
+
+    snap_path, _src, expected_digest, au = _build_strict_snapshot(tmp_path, n_coins=50)
+    patched = _snapshot_mod.AssumeutxoData(
+        height=au.height,
+        block_hash=au.block_hash,
+        hash_serialized=expected_digest,
+        chain_tx_count=au.chain_tx_count,
+        base_header=au.base_header,
+        chainwork_hex=au.chainwork_hex,
+    )
+    monkeypatch.setattr(
+        _snapshot_mod, "get_assumeutxo_by_hash",
+        lambda network, h: patched if h == au.block_hash else None,
+    )
+
+    captured_chunk_sizes: list[int] = []
+
+    class _SizeRecordingDB(_AtomicTrackingStubDB):
+        def snapshot_load_chunk(self, coins) -> None:
+            captured_chunk_sizes.append(len(coins))
+            super().snapshot_load_chunk(coins)
+
+    dst = _SizeRecordingDB()
+    sm = SnapshotManager(dst, "mainnet", str(tmp_path / "dst"))
+    sm.load_snapshot(str(snap_path), strict=True)
+
+    # Every chunk fits in <= the loader's _CHUNK_SIZE (10K).
+    assert all(s <= 10_000 for s in captured_chunk_sizes), \
+        f"chunk size exceeds 10K bound: {captured_chunk_sizes}"
+    # The 50-coin fixture fits in one chunk; the bound is what matters
+    # for the multi-billion case.
+    assert sum(captured_chunk_sizes) == 50
+
+
+def test_load_snapshot_falls_back_for_pre_fix_d_stub(tmp_path, monkeypatch) -> None:
+    """A stub DB without the atomic-protocol methods must still load via
+    the legacy per-coin path.  Backwards-compat guard so the snapshot
+    loader keeps working during a rolling upgrade where the Python
+    package is upgraded before the Rust extension is.
+    """
+    from ouroboros import snapshot as _snapshot_mod
+
+    snap_path, _src, expected_digest, au = _build_strict_snapshot(tmp_path, n_coins=10)
+    patched = _snapshot_mod.AssumeutxoData(
+        height=au.height,
+        block_hash=au.block_hash,
+        hash_serialized=expected_digest,
+        chain_tx_count=au.chain_tx_count,
+        base_header=au.base_header,
+        chainwork_hex=au.chainwork_hex,
+    )
+    monkeypatch.setattr(
+        _snapshot_mod, "get_assumeutxo_by_hash",
+        lambda network, h: patched if h == au.block_hash else None,
+    )
+
+    # _StubDB lacks snapshot_load_begin → hasattr → False → legacy path.
+    dst = _StubDB()
+    assert not hasattr(dst, "snapshot_load_begin")
+    sm = SnapshotManager(dst, "mainnet", str(tmp_path / "dst"))
+    sm.load_snapshot(str(snap_path), strict=True)
+    # Legacy path: tip + UTXOs land via add_utxo_raw + update_best_block.
+    assert dst.best_hash == au.block_hash
+    assert dst.best_height == au.height
+    assert len(dst.utxos) == 10

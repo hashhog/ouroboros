@@ -5397,6 +5397,242 @@ impl PyBlockchainDB {
         })
     }
 
+    // ========== Atomic snapshot-load primitives (FIX-D, 2026-05-26) ==========
+    //
+    // Used by `SnapshotManager.load_snapshot` to make `loadtxoutset` crash-
+    // safe.  Before FIX-D, the Python loader did per-coin direct `put_cf`
+    // followed by a separate `update_best_block` and sibling-file writes —
+    // a SIGKILL mid-load left a mix of partial-snapshot and partial-old
+    // UTXOs with the old tip pointer still on disk and no marker for
+    // `recover_from_crash` to detect.
+    //
+    // The new three-step protocol is:
+    //
+    //   1. `snapshot_load_begin(base_blockhash, base_height)` — clears the
+    //      chainstate (the snapshot is the authoritative new UTXO set) and
+    //      writes the `SNAPSHOT_LOAD_IN_PROGRESS` marker to META_CF. After
+    //      this returns, a crash leaves the chainstate empty + marker set;
+    //      next-boot `recover_from_crash` notices the marker and resets the
+    //      tip to genesis so the operator can re-run `loadtxoutset`.
+    //
+    //   2. `snapshot_load_chunk(coins)` — applies a batch of N coins in a
+    //      single `WriteBatch.apply_batch`. Called repeatedly with chunks
+    //      of ~10K coins to keep batch memory bounded on multi-billion-coin
+    //      snapshots.
+    //
+    //   3. `snapshot_load_commit(base_blockhash, base_height, chainwork,
+    //      timestamp)` — final atomic batch: best_block update + optional
+    //      block-metadata write + delete of the `SNAPSHOT_LOAD_IN_PROGRESS`
+    //      marker.  After this commits, the chainstate / tip / metadata
+    //      are all consistent and the load is durable.
+
+    /// Phase 1 of an atomic snapshot load.
+    ///
+    /// Clears the chainstate, writes the `SNAPSHOT_LOAD_IN_PROGRESS` marker
+    /// to META_CF. Done as two writes (delete_range + put) — the marker
+    /// MUST land before any per-coin chunk writes so a crash between Phase 1
+    /// and Phase 2 is detectable. Returns an error if `base_blockhash` is
+    /// not exactly 32 bytes.
+    fn snapshot_load_begin(
+        &self,
+        base_blockhash: &[u8],
+        base_height: u32,
+    ) -> PyResult<()> {
+        if base_blockhash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "base_blockhash must be 32 bytes",
+            ));
+        }
+        let mut hash_arr = [0u8; 32];
+        hash_arr.copy_from_slice(base_blockhash);
+
+        self.db.clear_chainstate().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("snapshot_load_begin: clear_chainstate failed: {}", e),
+            )
+        })?;
+
+        self.db
+            .write_snapshot_load_marker(&hash_arr, base_height)
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("snapshot_load_begin: write marker failed: {}", e),
+                )
+            })?;
+
+        Ok(())
+    }
+
+    /// Phase 2 of an atomic snapshot load — apply a chunk of N coins in
+    /// a single `WriteBatch`.
+    ///
+    /// `coins` is `Vec<(txid_32, vout, amount, script_pubkey, height, is_coinbase)>`.
+    /// All N puts land together (or none of them do); on RocksDB failure the
+    /// chunk is rejected as a unit and the caller can retry. Pre-FIX-D the
+    /// loader did N individual `put_cf` calls so partial chunks were the
+    /// norm on any error.
+    ///
+    /// Returns an error if any `txid` is not 32 bytes (the entire chunk is
+    /// rejected — no partial commit).
+    fn snapshot_load_chunk(
+        &self,
+        coins: Vec<(Vec<u8>, u32, u64, Vec<u8>, u32, bool)>,
+    ) -> PyResult<()> {
+        // Validate upfront so a bad coin in the middle doesn't leave
+        // already-staged coins lingering in the local batch we never apply.
+        for (i, (txid, _vout, _amount, _script, _height, _is_coinbase)) in
+            coins.iter().enumerate()
+        {
+            if txid.len() != 32 {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!(
+                        "snapshot_load_chunk: coin {} has txid of length {} (expected 32)",
+                        i,
+                        txid.len(),
+                    ),
+                ));
+            }
+        }
+
+        let mut batch = self.db.create_batch();
+        for (txid, vout, amount, script_pubkey, height, is_coinbase) in coins {
+            let mut txid_arr = [0u8; 32];
+            txid_arr.copy_from_slice(&txid);
+            let bitcoin_txid = bitcoin::Txid::from_byte_array(txid_arr);
+            let outpoint = bitcoin::OutPoint { txid: bitcoin_txid, vout };
+            let script = bitcoin::ScriptBuf::from_bytes(script_pubkey);
+            let utxo = UTXO::new(
+                OutPointWrapper::new(outpoint),
+                amount,
+                script,
+                Some(height),
+                is_coinbase,
+            );
+            self.db
+                .add_utxo_batch(&mut batch, &outpoint, &utxo)
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        format!("snapshot_load_chunk: add_utxo_batch failed: {}", e),
+                    )
+                })?;
+        }
+
+        self.db.apply_batch(batch).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("snapshot_load_chunk: apply_batch failed: {}", e),
+            )
+        })
+    }
+
+    /// Phase 3 of an atomic snapshot load — final commit batch.
+    ///
+    /// Single atomic `WriteBatch` containing:
+    /// - `update_best_block_batch(base_blockhash, base_height)` — tip pointer
+    /// - `store_block_metadata_batch(base_height, base_blockhash, BlockMetadata)`
+    ///   when `chainwork_be` + `timestamp` are provided (assumeUTXO entries
+    ///   in chainparams ship this; testnet-only entries may not)
+    /// - `delete_snapshot_load_marker_batch()` — closes the in-progress marker
+    ///
+    /// After this commits, the chainstate is consistent and the load is
+    /// durable. `recover_from_crash` on a subsequent boot finds no marker
+    /// and takes the no-op fast path.
+    ///
+    /// Returns an error if `base_blockhash` is not 32 bytes or `chainwork_be`
+    /// (when provided) is not 32 bytes.
+    #[pyo3(signature = (base_blockhash, base_height, chainwork_be = None, timestamp = None))]
+    fn snapshot_load_commit(
+        &self,
+        base_blockhash: &[u8],
+        base_height: u32,
+        chainwork_be: Option<Vec<u8>>,
+        timestamp: Option<u32>,
+    ) -> PyResult<()> {
+        if base_blockhash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "base_blockhash must be 32 bytes",
+            ));
+        }
+        let mut hash_arr = [0u8; 32];
+        hash_arr.copy_from_slice(base_blockhash);
+
+        let mut batch = self.db.create_batch();
+
+        // Tip pointer (atomic pair via update_best_block_batch — FIX-C).
+        self.db
+            .update_best_block_batch(&mut batch, &hash_arr, base_height)
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("snapshot_load_commit: update_best_block_batch failed: {}", e),
+                )
+            })?;
+
+        // Block-metadata row (optional — only when chainparams ship the
+        // chainwork + the snapshot header timestamp).  Fuses into the same
+        // batch as the tip update so the G8 chainwork anchor (snapshot.py
+        // doc comment) is durable iff the tip is.
+        if let (Some(cw_bytes), Some(ts)) = (chainwork_be, timestamp) {
+            if cw_bytes.len() != 32 {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!(
+                        "chainwork_be must be 32 bytes (got {})",
+                        cw_bytes.len(),
+                    ),
+                ));
+            }
+            let mut cw_arr = [0u8; 32];
+            cw_arr.copy_from_slice(&cw_bytes);
+            let metadata = BlockMetadata::new(base_height, cw_arr, ts);
+            self.db
+                .store_block_metadata_batch(
+                    &mut batch,
+                    base_height,
+                    &hash_arr,
+                    &metadata,
+                )
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        format!(
+                            "snapshot_load_commit: store_block_metadata_batch failed: {}",
+                            e,
+                        ),
+                    )
+                })?;
+        }
+
+        // Marker delete — last so recover_from_crash sees it only after
+        // every above mutation lands.
+        self.db
+            .delete_snapshot_load_marker_batch(&mut batch)
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!(
+                        "snapshot_load_commit: delete_snapshot_load_marker_batch failed: {}",
+                        e,
+                    ),
+                )
+            })?;
+
+        self.db.apply_batch(batch).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("snapshot_load_commit: apply_batch failed: {}", e),
+            )
+        })
+    }
+
+    /// True if a `SNAPSHOT_LOAD_IN_PROGRESS` marker is currently set in
+    /// META_CF.  Useful for tests and operator diagnostics; production
+    /// callers use `recover_from_crash` instead.
+    fn has_snapshot_load_marker(&self) -> PyResult<bool> {
+        self.db
+            .get_snapshot_load_marker()
+            .map(|m| m.is_some())
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("has_snapshot_load_marker: {}", e),
+                )
+            })
+    }
+
     /// Context manager support for transactions
     fn __enter__(&self) -> PyResult<Self> {
         Ok(self.clone())
