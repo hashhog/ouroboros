@@ -2115,11 +2115,21 @@ class TransactionValidator:
                 return False
             seen_inputs.add(outpoint)
 
-        # For non-coinbase transactions, no input may reference a null prevout.
-        # Ref: tx_check.cpp:52-57 ("bad-txns-prevout-null")
-        # Coinbase transactions are identified by is_coinbase flag; the
-        # null-prevout check only applies to non-coinbase txs.
-        if not tx.is_coinbase:
+        # Coinbase vs non-coinbase prevout rules.
+        # Ref: tx_check.cpp:47-57. Core's if/else: a coinbase tx must have a
+        # scriptSig (coinbase data) of length in [2, 100] inclusive
+        # ("bad-cb-length"); a non-coinbase tx may not reference a null prevout
+        # ("bad-txns-prevout-null"). Coinbase identity matches the rest of this
+        # method (tx.is_coinbase: single input with an all-zero prev_txid).
+        if tx.is_coinbase:
+            # The coinbase scriptSig length must be 2..100 inclusive.
+            # Ref: tx_check.cpp:49-50 ("bad-cb-length"):
+            #   tx.vin[0].scriptSig.size() < 2 || > 100
+            cb_script_len = len(tx.inputs[0].script_sig)
+            if cb_script_len < 2 or cb_script_len > 100:
+                return False
+        else:
+            # Ref: tx_check.cpp:54-56 ("bad-txns-prevout-null")
             _null_txid = bytes(32)
             for tx_in in tx.inputs:
                 if tx_in.prev_txid == _null_txid and tx_in.prev_vout == 0xFFFFFFFF:
