@@ -216,7 +216,10 @@ class Transaction:
         Used for wtxid: SHA256D of this equals witness txid for SegWit txs.
         """
         data = bytearray()
-        data.extend(self.version.to_bytes(4, 'little', signed=True))
+        # Tx version is uint32 on the wire (Core CTransaction::version);
+        # write UNSIGNED to match serialize() so a negative-looking version
+        # (e.g. 0xFFFFFFFF) round-trips byte-identically here and there.
+        data.extend(self.version.to_bytes(4, 'little'))
         if self.has_witness:
             data.extend(b'\x00\x01')  # marker, flag
         data.extend(self._encode_varint(len(self.inputs)))
