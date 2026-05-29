@@ -483,10 +483,14 @@ class TxMessage:
 
         offset = 0
 
-        # Parse version (4 bytes)
+        # Parse version (4 bytes).  Core treats CTransaction::version as a
+        # uint32_t on the wire (primitives/transaction.h), so read it
+        # UNSIGNED and keep it consistent with serialize() — otherwise a
+        # negative version (e.g. 0xFFFFFFFF) round-trips to -1 and crashes
+        # the unsigned serializer used to compute the txid below.
         if len(payload) < 4:
             raise ValueError("Payload too short for version")
-        version = int.from_bytes(payload[offset:offset+4], byteorder='little', signed=True)
+        version = int.from_bytes(payload[offset:offset+4], byteorder='little', signed=False)
         offset += 4
 
         # Check for segwit flag (0x00, 0x01)

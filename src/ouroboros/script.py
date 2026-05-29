@@ -1436,7 +1436,13 @@ class ScriptInterpreter:
                     else:
                         # FindAndDelete: remove the signature from script
                         # code before hashing (legacy consensus rule).
-                        cleaned = self._find_and_delete(script_code, sig)
+                        # SCRIPT_VERIFY_CONST_SCRIPTCODE: if the signature is
+                        # actually present in the scriptCode, reject — the
+                        # scriptCode is supposed to be constant under the
+                        # signature (Core interpreter.cpp:330-332).
+                        cleaned, fad_found = self._find_and_delete_count(script_code, sig)
+                        if fad_found > 0 and (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE):
+                            raise ValueError("CONST_SCRIPTCODE: sig found in scriptCode (FindAndDelete)")
                         msg = self._calculate_signature_hash(
                             tx, input_index, cleaned, sighash_type)
                     ok = self._verify_ecdsa_signature(msg, der_sig, pubkey)
@@ -1559,7 +1565,11 @@ class ScriptInterpreter:
                         msg = self._compute_segwit_v0_sighash(
                             tx, input_index, script_code, witness_amount, sighash_type)
                     else:
-                        cleaned = self._find_and_delete(script_code, sig)
+                        # SCRIPT_VERIFY_CONST_SCRIPTCODE: reject if the sig is
+                        # present in scriptCode (Core interpreter.cpp:330-332).
+                        cleaned, fad_found = self._find_and_delete_count(script_code, sig)
+                        if fad_found > 0 and (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE):
+                            raise ValueError("CONST_SCRIPTCODE: sig found in scriptCode (FindAndDelete)")
                         msg = self._calculate_signature_hash(
                             tx, input_index, cleaned, sighash_type)
                     if not self._verify_ecdsa_signature(msg, der_sig, pubkey):
@@ -1843,6 +1853,11 @@ class ScriptInterpreter:
 
     @staticmethod
     def _find_and_delete(script: bytes, sig: bytes) -> bytes:
+        cleaned, _ = ScriptInterpreter._find_and_delete_count(script, sig)
+        return cleaned
+
+    @staticmethod
+    def _find_and_delete_count(script: bytes, sig: bytes) -> tuple[bytes, int]:
         # Build the serialized push of the signature
         sig_len = len(sig)
         if sig_len < 0x4C:
@@ -1854,11 +1869,13 @@ class ScriptInterpreter:
         else:
             needle = b"\x4e" + sig_len.to_bytes(4, "little") + sig
 
-        # Remove all occurrences
+        # Remove all occurrences, counting how many were removed.
         result = script
+        found = 0
         while needle in result:
             result = result.replace(needle, b"", 1)
-        return result
+            found += 1
+        return result, found
 
     def _calculate_signature_hash(
         self,
@@ -2110,11 +2127,15 @@ class ScriptInterpreter:
         script_code = script_pubkey
 
         # FindAndDelete: remove all signatures from script_code before hashing
-        # (only for legacy, not witness v0).
+        # (only for legacy, not witness v0).  Core does this per-signature and,
+        # with SCRIPT_VERIFY_CONST_SCRIPTCODE, rejects if any sig is actually
+        # present in scriptCode (interpreter.cpp:1142-1149).
         if not is_witness_v0:
             for sig in sigs:
                 if sig:
-                    script_code = self._find_and_delete(script_code, sig)
+                    script_code, fad_found = self._find_and_delete_count(script_code, sig)
+                    if fad_found > 0 and (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE):
+                        raise ValueError("CONST_SCRIPTCODE: sig found in scriptCode (FindAndDelete)")
 
         sig_idx = 0
         key_idx = 0
