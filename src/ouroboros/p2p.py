@@ -473,8 +473,22 @@ class PeerManager:
         peer_bloom_filters: bool = False,
         node_compact_filters: "bool | Callable[[], bool]" = False,
         node_network_limited: bool = False,
+        connect_addrs: "list[tuple[str, int]] | None" = None,
+        dns_seed: bool = True,
     ):
-        """Initialize peer manager."""
+        """Initialize peer manager.
+
+        Args (Core-parity peer-pinning, mirrors clearbit peer.zig:7009/7050):
+            connect_addrs: when non-empty, ``-connect`` semantics apply — the
+                manager dials ONLY these pinned peers and disables DNS-seed
+                resolution, addrman/auto-outbound dialing (full-relay +
+                block-relay-only + anchor + feeler).  Independent of the older
+                peer-rotation behaviour.
+            dns_seed: independent ``-dnsseed``/``-nodnsseed`` control.  When
+                False, DNS-seed resolution is suppressed even without
+                ``-connect`` (mirrors clearbit ``--nodnsseed``).  ``-connect``
+                forces this off regardless (Core's implied ``-dnsseed=0``).
+        """
         self.network = network
         self.max_peers = max_peers
         self.max_block_relay_only = max_block_relay_only
@@ -628,8 +642,23 @@ class PeerManager:
         self._i2p_address: str | None = None
         self._i2p_accept_task: asyncio.Task | None = None
 
-        # Persistent --connect peers that should be reconnected when lost
-        self._connect_addrs: list[tuple[str, int]] = []
+        # Persistent --connect peers that should be reconnected when lost.
+        # Seeded from the constructor (Core/clearbit -connect parity) so the
+        # gating decision in start()/maintain_connections() can see the pins
+        # BEFORE the auto-discover/auto-fill paths run.  node.py also appends
+        # to this list, so we copy rather than alias the caller's list.
+        self._connect_addrs: list[tuple[str, int]] = list(connect_addrs or [])
+
+        # -connect mode: a non-empty pin list disables DNS-seed resolution
+        # and all addrman/auto-outbound dialing.  Latched once at construction
+        # (the pins are fixed for the node's lifetime).  Mirrors clearbit
+        # peer.zig:7009 (connect branch skips dnsSeeds) + :7050 (outbound-fill
+        # gated on connect_address == null).
+        self._connect_only: bool = bool(self._connect_addrs)
+
+        # -dnsseed / -nodnsseed.  -connect implies -dnsseed=0 (Core init.cpp);
+        # otherwise honour the independent flag.
+        self._dns_seed_enabled: bool = bool(dns_seed) and not self._connect_only
 
     async def start(self, start_height: int = 0, p2p_port: int = 0):
         """
@@ -659,17 +688,40 @@ class PeerManager:
             if self.i2psam:
                 await self._start_i2p_session(p2p_port)
 
-        # Discover peers from DNS seeds
-        await self.discover_peers()
+        if self._connect_only:
+            # Core/clearbit -connect: dial ONLY the pinned peers.  No DNS
+            # seeding, no anchors, no addrman-driven auto-outbound fill, no
+            # block-relay-only or feeler dialing (clearbit peer.zig:7009 takes
+            # the dedicated connect branch that skips dnsSeeds(); :7050 gates
+            # maintainOutbound() on connect_address == null).  The pinned
+            # peers stay reconnected via the _connect_addrs loop in
+            # maintain_connections().
+            logger.info(
+                "-connect mode: pinning to %d peer(s); DNS seeding + "
+                "auto-outbound disabled",
+                len(self._connect_addrs),
+            )
+            for host, port in self._connect_addrs:
+                try:
+                    logger.info(f"Connecting to pinned peer {host}:{port}")
+                    await self.connect_to_node(host, port)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to connect to pinned peer {host}:{port}: {e}"
+                    )
+        else:
+            # Discover peers from DNS seeds (suppressed when -nodnsseed; the
+            # gate lives inside discover_peers()).
+            await self.discover_peers()
 
-        # Connect to anchor peers first (eclipse protection)
-        await self._connect_anchor_peers(start_height)
+            # Connect to anchor peers first (eclipse protection)
+            await self._connect_anchor_peers(start_height)
 
-        # Connect to full-relay outbound peers
-        await self.connect_to_peers(start_height)
+            # Connect to full-relay outbound peers
+            await self.connect_to_peers(start_height)
 
-        # Connect to block-relay-only outbound peers
-        await self._connect_block_relay_peers(start_height)
+            # Connect to block-relay-only outbound peers
+            await self._connect_block_relay_peers(start_height)
 
         # Start maintenance task
         self._maintenance_task = asyncio.create_task(
@@ -685,8 +737,11 @@ class PeerManager:
         # Start transaction trickle loop
         self._trickle_task = asyncio.create_task(self._trickle_loop())
 
-        # Start feeler connection loop (eclipse protection)
-        self._feeler_task = asyncio.create_task(self._feeler_loop())
+        # Start feeler connection loop (eclipse protection).  Feelers dial
+        # addrman-selected addresses, which is exactly the auto-outbound
+        # behaviour -connect disables — skip the loop entirely when pinned.
+        if not self._connect_only:
+            self._feeler_task = asyncio.create_task(self._feeler_loop())
 
         # Log initial ASMap health and start periodic health-check task (FIX-52)
         if self.addrman.using_asmap():
@@ -1403,6 +1458,18 @@ class PeerManager:
 
     async def discover_peers(self):
         """Discover peers from DNS seeds"""
+        # -connect / -nodnsseed: never resolve DNS seeds.  Guarding here (not
+        # only at the call sites) makes the suppression robust against any
+        # future re-seed path — e.g. the addrman-empty re-seed in
+        # maintain_connections().  Mirrors clearbit's dnsSeeds() being skipped
+        # on the connect branch (peer.zig:7009) and the independent
+        # --nodnsseed setting dns_seed=false.
+        if not self._dns_seed_enabled:
+            logger.info(
+                "DNS seed discovery disabled (%s)",
+                "-connect mode" if self._connect_only else "-nodnsseed",
+            )
+            return
         logger.info("Discovering peers from DNS seeds...")
 
         seeds = (
@@ -2124,8 +2191,15 @@ class PeerManager:
                 # Re-seed from DNS when we have no peers and no known
                 # addresses — mirrors Bitcoin Core's ThreadDNSAddressSeed
                 # which re-queries seeds when the address manager is empty.
+                # Skipped under -connect (discover_peers() also self-gates, but
+                # we short-circuit here to avoid the misleading "re-seeding"
+                # log line every 30 s while pinned).
                 total_outbound = len(self.peers) + len(self.block_relay_peers)
-                if total_outbound == 0 and not self.known_addrs:
+                if (
+                    not self._connect_only
+                    and total_outbound == 0
+                    and not self.known_addrs
+                ):
                     logger.info(
                         "No connected peers and address pool is empty, "
                         "re-seeding from DNS..."
@@ -2147,13 +2221,18 @@ class PeerManager:
                         except Exception as e:
                             logger.warning(f"Failed to reconnect to {addr}: {e}")
 
-                # Refill full-relay outbound slots
-                if len(self.peers) < self.max_peers:
-                    await self.connect_to_peers(start_height)
+                # Refill outbound slots from addrman — the auto-outbound
+                # behaviour -connect disables (clearbit peer.zig:7050 gates
+                # maintainOutbound on connect_address == null).  Under -connect
+                # the only reconnection is the pinned-peer loop above.
+                if not self._connect_only:
+                    # Refill full-relay outbound slots
+                    if len(self.peers) < self.max_peers:
+                        await self.connect_to_peers(start_height)
 
-                # Refill block-relay-only outbound slots
-                if len(self.block_relay_peers) < self.max_block_relay_only:
-                    await self._connect_block_relay_peers(start_height)
+                    # Refill block-relay-only outbound slots
+                    if len(self.block_relay_peers) < self.max_block_relay_only:
+                        await self._connect_block_relay_peers(start_height)
 
                 # Health check all peers (outbound + block-relay-only + inbound)
                 all_peers = (
