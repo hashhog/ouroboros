@@ -820,12 +820,34 @@ class BlockchainDatabase:
         # Fast path: Rust computes MTP from block metadata (no full block
         # deser).  Only trust the Rust value when the window is provably
         # complete — an older Rust build computes a partial-window median.
+        window_complete = self._mtp_window_complete(start, height)
         if hasattr(self._db, 'get_median_time_past'):
             result = self._db.get_median_time_past(height)
-            if result is not None and self._mtp_window_complete(start, height):
+            if result is not None and window_complete:
                 return result
 
-        # Slow fallback: deserialize full blocks.
+        # Window incomplete — refuse to fabricate an MTP from a partial set,
+        # and DO NOT fall through to the deserializing slow path.  After an
+        # assumeUTXO snapshot the 10 blocks below the snapshot base are not
+        # in the index, so a window that dips below the base can never be
+        # completed; deserializing the 1-2 present multi-MB blocks here once
+        # per input of every v2+ tx (5767 txs in block 944186) is what
+        # wedged forward-sync at the snapshot boundary — handle_block's
+        # validation worker spun in get_block_by_height -> _py_block_to_block
+        # and never finished a single block (the "block downloads timeout"
+        # Known Issue surfaced by --connect to a single fast loopback peer).
+        # The cheap height->hash probe in _mtp_window_complete already tells
+        # us the window can't be completed, so bail here with None (coin
+        # time 0 -> relative time-locks pass, consistent with the assumeUTXO
+        # trust model and the BIP-68 snapshot stopgap) without touching a
+        # single block body.
+        if not window_complete:
+            return None
+
+        # Slow fallback (window provably complete but Rust fast path absent
+        # or returned None): deserialize full blocks.  Reached only on a
+        # genesis-IBD node lacking the Rust metadata MTP, never across the
+        # snapshot boundary.
         timestamps = []
         for h in range(start, height + 1):
             block = self.get_block_by_height(h)
