@@ -365,7 +365,16 @@ def sync(ctx, reset, limit):
 @click.option("--rpc-port", default=8332, type=int, help="RPC server port")
 @click.option("--p2p-port", default=8333, type=int, help="P2P network port")
 @click.option("--listen/--nolisten", default=True, help="Accept inbound P2P connections")
-@click.option("--connect", multiple=True, help="Connect to specific peer(s) host:port (can repeat)")
+@click.option("--connect", multiple=True, help="Connect to ONLY these peer(s) host:port (repeatable). Implies -nodnsseed and disables addrman/auto-outbound dialing (Bitcoin Core -connect semantics).")
+@click.option(
+    "--dnsseed/--nodnsseed",
+    default=None,
+    help=(
+        "Query DNS seeds to bootstrap peers (default: from config; config "
+        "default is on). --nodnsseed suppresses DNS seeding only. --connect "
+        "forces this off regardless (Core -connect implies -dnsseed=0)."
+    ),
+)
 @click.option("--force", is_flag=True, default=False, help="Skip sync check prompt")
 @click.option(
     "--v2transport/--nov2transport",
@@ -463,7 +472,7 @@ def sync(ctx, reset, limit):
 )
 @click.pass_context
 def start(
-    ctx, rpc_port, p2p_port, listen, connect, force, v2transport,
+    ctx, rpc_port, p2p_port, listen, connect, dnsseed, force, v2transport,
     peerbloomfilters, blockfilterindex, cfilter, daemon, pid_path, reindex,
     rpc_tls_cert, rpc_tls_key,
 ):
@@ -531,6 +540,11 @@ def start(
         }
         if connect:
             config["connect"] = list(connect)
+        # --dnsseed/--nodnsseed: only override the conf-file value when the
+        # operator explicitly passed the flag (Click leaves it None otherwise).
+        # -connect forces DNS off downstream regardless of this value.
+        if dnsseed is not None:
+            config["dnsseed"] = bool(dnsseed)
         # Only override the conf-file value when the operator explicitly
         # passed --v2transport / --nov2transport.  Click leaves the option
         # at None when the flag was omitted so the conf file's value
@@ -739,6 +753,7 @@ def import_utxo(ctx, snapshot_path, batch_size):
 
     from ouroboros.snapshot import (
         NETWORK_MAGIC,
+        SnapshotManager,
         get_assumeutxo_by_hash,
         read_snapshot_metadata,
     )
@@ -786,9 +801,16 @@ def import_utxo(ctx, snapshot_path, batch_size):
             console.print("[yellow]Aborted.[/yellow]")
             return
 
-    # Open DB and delegate to Rust.
+    # Open DB and delegate to Rust.  Use the Python BlockchainDatabase
+    # wrapper (it holds the single PyBlockchainDB handle internally as
+    # ``._db``) so we can drive both the Rust import AND the Python-side
+    # snapshot-base index persist over ONE RocksDB handle — a second
+    # PyBlockchainDB over the same datadir would deadlock on the
+    # single-writer lock.
+    from ouroboros.database import BlockchainDatabase
+
     try:
-        db = sync.PyBlockchainDB(data_dir)
+        db = BlockchainDatabase(data_dir)
     except Exception as e:
         console.print(f"[red]Failed to open database: {e}[/red]")
         sys.exit(1)
@@ -798,7 +820,7 @@ def import_utxo(ctx, snapshot_path, batch_size):
 
     start_time = time.time()
     try:
-        block_hash_hex, height, loaded = db.import_core_snapshot(
+        block_hash_hex, height, loaded = db._db.import_core_snapshot(
             snapshot_path, block_height, expected_magic_arg, batch_size
         )
     except KeyboardInterrupt:
@@ -807,6 +829,32 @@ def import_utxo(ctx, snapshot_path, batch_size):
     except Exception as e:
         console.print(f"[red]Import failed: {e}[/red]")
         sys.exit(1)
+
+    # The Rust import writes only the UTXO set + tip pointer.  Persist the
+    # snapshot base block index (sibling header files + BLOCK_INDEX
+    # metadata row) so the FIRST block above the snapshot (height+1) has a
+    # connectable parent — without this the forward-sync rejects it with
+    # "Previous block not found" forever.  This mirrors the Python
+    # loadtxoutset commit path; see SnapshotManager.persist_snapshot_base_index.
+    try:
+        sm = SnapshotManager(db, network, data_dir)
+        persisted = sm.persist_snapshot_base_index(metadata.base_blockhash)
+        if persisted:
+            console.print(
+                "  [dim]Snapshot base index persisted "
+                f"(height {height}) — forward-sync can connect {height + 1}.[/dim]"
+            )
+        else:
+            console.print(
+                "  [yellow]No base header in chainparams for this snapshot; "
+                "the base header must be supplied by header-sync before the "
+                "first post-snapshot block can connect.[/yellow]"
+            )
+    except Exception as e:
+        console.print(
+            f"  [yellow]Warning: failed to persist snapshot base index: {e}[/yellow]\n"
+            "  [yellow]The first post-snapshot block may fail to connect.[/yellow]"
+        )
 
     elapsed = time.time() - start_time
     rate = loaded / max(elapsed, 0.001)

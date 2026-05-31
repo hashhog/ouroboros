@@ -731,10 +731,34 @@ class BlockSync:
                     self._header_sync_peer = None  # Peer disconnected
 
                 if self._header_sync_peer and (now - self._header_sync_time > self._header_sync_stall_timeout):
-                    # Sync peer stalled — switch to a different one
-                    logger.info(f"Header sync peer {self._header_sync_peer.host} stalled, switching")
-                    # Score misbehavior for stalling block downloads (+50)
-                    if self.peer_manager:
+                    # Sync peer stalled — switch to a different one.
+                    # Core-parity NoBan exemption: a manually-pinned peer
+                    # (-connect / -addnode) is NEVER discouraged or banned for
+                    # stalling (net_processing.cpp MaybeDiscourageAndDisconnect:
+                    # peers with NetPermissionFlags::NoBan are exempt; -connect
+                    # implies that protection).  Scoring +50 here bans the peer
+                    # at the DISCOURAGEMENT_THRESHOLD, and under -connect that is
+                    # the ONLY peer — the ban then blocks every reconnect
+                    # (connect_to_node refuses a banned addr), wedging the sync
+                    # permanently with no alternative peer to "switch" to.  A
+                    # slow loopback block fetch from a busy archival Core is not
+                    # misbehaviour.  Skip the score for pinned peers; just rotate
+                    # the designated sync peer (which re-selects the same pinned
+                    # peer and resets the stall timer, giving the download more
+                    # time).
+                    is_pinned = bool(
+                        getattr(self.peer_manager, "_connect_only", False)
+                        or getattr(self._header_sync_peer, "is_manual", False)
+                        or getattr(self._header_sync_peer, "noban", False)
+                    )
+                    logger.info(
+                        "Header sync peer %s stalled, switching%s",
+                        self._header_sync_peer.host,
+                        " (pinned -connect peer: NoBan, not scored)" if is_pinned else "",
+                    )
+                    # Score misbehavior for stalling block downloads (+50) —
+                    # only for non-pinned peers.
+                    if self.peer_manager and not is_pinned:
                         from ouroboros.banman import SCORE_BLOCK_DOWNLOAD_STALL
                         self.peer_manager.misbehaving(
                             self._header_sync_peer.host, SCORE_BLOCK_DOWNLOAD_STALL,
@@ -1578,6 +1602,7 @@ class BlockSync:
         # Retrieve the nBits stored for the tip header so the presync
         # machine can seed its prev_bits correctly.
         best_bits: int = 0
+        network = self.peer_manager.network if hasattr(self.peer_manager, "network") else "mainnet"
         try:
             if hasattr(self.db, "get_block_bits"):
                 best_bits = int(self.db.get_block_bits(best_hash) or 0)
@@ -1586,13 +1611,75 @@ class BlockSync:
                 best_bits = int(getattr(meta, "bits", 0) or 0) if meta else 0
         except Exception:
             best_bits = 0
+        # SNAPSHOT BOOTSTRAP: after an assumeUTXO import the tip header's nBits
+        # is not reachable via the metadata lookups above — the import / base-
+        # index persist writes only height + chainwork + timestamp
+        # (store_block_metadata_persistent has no bits field), and the Python
+        # BlockchainDatabase exposes no get_block_bits, so best_bits resolves to
+        # 0 for the snapshot base AND for the first blocks connected above it.
+        # Seeding the presync state with prev_bits=0 makes the Rust
+        # HeadersSyncState reject the FIRST real headers batch with "Invalid
+        # difficulty transition at height tip+1: 0 -> <real bits>" (a non-
+        # boundary height demands unchanged bits, and 0 != <real bits>),
+        # starving the block downloader of headers and wedging forward-sync a
+        # few blocks above the base.  Bitcoin Core never hits this: its
+        # HeadersSyncState ctor seeds chain_start from a real CBlockIndex
+        # carrying the tip's nBits (headerssync.cpp:17-46).
+        #
+        # Recover the real prev_bits, in priority order:
+        #   1. the tip block's own header bits (offset 72 of the stored bytes /
+        #      Block.bits) — works for any block connected above the base that
+        #      has a body (e.g. tip 944185 on a restart);
+        #   2. the assumeUTXO base_header (offset 72) keyed by the tip hash —
+        #      needed when the tip IS the snapshot base (944183), which has no
+        #      block body in BLOCKS_CF, only the persisted base header.
+        # Snapshot-bootstrap-scoped (only fires when best_bits would otherwise
+        # be 0); default-preserving for normal sync, where best_bits already
+        # resolves to the tip header's real value above.
+        if best_bits == 0:
+            recovered_bits = 0
+            recovered_src = ""
+            # 1. Tip block header bits (block above the base, has a body).
+            try:
+                if hasattr(self.db, "get_block_bytes"):
+                    raw = self.db.get_block_bytes(bytes(best_hash))
+                    if raw is not None and len(raw) >= 80:
+                        recovered_bits = int.from_bytes(raw[72:76], "little")
+                        recovered_src = "tip block header"
+                if recovered_bits == 0 and hasattr(self.db, "get_block"):
+                    blk = self.db.get_block(bytes(best_hash))
+                    b = int(getattr(blk, "bits", 0) or 0) if blk else 0
+                    if b > 0:
+                        recovered_bits = b
+                        recovered_src = "tip Block.bits"
+            except Exception:
+                recovered_bits = 0
+            # 2. assumeUTXO base_header (tip == snapshot base, no body).
+            if recovered_bits == 0:
+                try:
+                    from ouroboros.snapshot import get_assumeutxo_by_hash
+                    au = get_assumeutxo_by_hash(network, bytes(best_hash))
+                    if au is not None and au.base_header is not None \
+                            and len(au.base_header) == 80:
+                        b = int.from_bytes(au.base_header[72:76], "little")
+                        if b > 0:
+                            recovered_bits = b
+                            recovered_src = "assumeUTXO base header"
+                except Exception:
+                    recovered_bits = 0
+            if recovered_bits > 0:
+                best_bits = recovered_bits
+                logger.info(
+                    "[snapshot] Seeded presync prev_bits from %s: height=%d "
+                    "bits=%#010x (no nBits in base-index metadata)",
+                    recovered_src, int(best_height), recovered_bits,
+                )
         try:
             mtp = int(self.db.get_median_time_past()) if hasattr(self.db, "get_median_time_past") else 0
         except Exception:
             mtp = 0
         if mtp <= 0:
             mtp = int(time.time())
-        network = self.peer_manager.network if hasattr(self.peer_manager, "network") else "mainnet"
         try:
             state = cls(
                 network,

@@ -645,12 +645,200 @@ class BlockValidator:
             height=snap_height,
         )
 
-    def validate_block(self, block: Block, known_height: int = 0) -> tuple[bool, str]:
+    def _snapshot_base_blockheader_ts(self) -> int | None:
+        """Timestamp of the assumeUTXO snapshot base block, or None.
+
+        Reads the persisted 80-byte base header (bytes [68:72] little-endian)
+        when present; falls back to the hardcoded chainparams
+        ``AssumeutxoData.base_header`` resolved via the on-disk
+        ``base_blockhash``.  The result is the snapshot base block's own
+        ``time`` field, which is the conservative upper bound used as the
+        MTP proxy for the heights immediately above the snapshot (see
+        ``_snapshot_base_mtp_fallback``).
+        """
+        sm = self.snapshot_manager
+        if sm is None:
+            return None
+        # Preferred source: the persisted 80-byte header sibling file.
+        try:
+            header = sm.read_snapshot_base_blockheader()
+        except Exception:
+            header = None
+        if header is not None and len(header) == 80:
+            ts = int.from_bytes(header[68:72], "little")
+            if ts > 0:
+                return ts
+        # Fallback source: hardcoded chainparams base_header (resolved by
+        # the on-disk base_blockhash via the assumeUTXO table).  Needed when
+        # the snapshot was loaded by an older build that did not persist the
+        # header sibling file but the chainparams entry carries base_header.
+        try:
+            base_hash = sm.read_snapshot_base_blockhash()
+        except Exception:
+            base_hash = None
+        if not base_hash:
+            return None
+        try:
+            from ouroboros.snapshot import get_assumeutxo_by_hash
+            au = get_assumeutxo_by_hash(self.network, base_hash)
+        except Exception:
+            au = None
+        if au is None or getattr(au, "base_header", None) is None:
+            return None
+        bh = au.base_header
+        if bh is None or len(bh) != 80:
+            return None
+        ts = int.from_bytes(bh[68:72], "little")
+        return ts if ts > 0 else None
+
+    def _resolve_snapshot_height(self) -> int | None:
+        """Height of the assumeUTXO snapshot base block, or None.
+
+        Mirrors the height resolution already used by
+        ``_synthesize_snapshot_prev_block`` (which trusts
+        ``SnapshotManager.snapshot_height`` and falls back to the DB best
+        block when the manager's in-memory field is unset -- e.g. the
+        process restarted and ``load_snapshot`` has not been re-driven, in
+        which case the DB tip IS the snapshot base until the first
+        post-snapshot block connects).
+
+        This helper was referenced by ``_snapshot_base_mtp_fallback`` (the
+        broadened MTP-window band) but never defined, so every attempt to
+        connect the first block above the snapshot (mainnet 944184) raised
+        ``AttributeError`` inside ``validate_block`` and the block was
+        dropped -- wedging forward-sync at the snapshot base (944183).
+        """
+        sm = self.snapshot_manager
+        if sm is None:
+            return None
+        snap_height = getattr(sm, "snapshot_height", None)
+        if isinstance(snap_height, int) and snap_height > 0:
+            return snap_height
+        # Manager field unset (post-restart, pre-reload): the DB tip is the
+        # snapshot base until the first post-snapshot block connects.
+        try:
+            _, tip_height = self.db.get_best_block()
+        except Exception:
+            return None
+        if isinstance(tip_height, int) and tip_height > 0:
+            return tip_height
+        return None
+
+    def _snapshot_base_mtp_fallback(
+        self, prev_block: "Block", expected_height: int
+    ) -> int | None:
+        """MTP fallback for the first blocks above an assumeUTXO snapshot.
+
+        ``get_median_time_past`` returns None when the 11-block window dips
+        below the snapshot base (those pre-snapshot blocks were never
+        downloaded).  In that case Bitcoin Core would still have the real
+        MTP because it ships the full header chain back to genesis (headers
+        are tiny and synced before the snapshot load); ouroboros only
+        persists the single base header.  We approximate the prev block's
+        MTP with the snapshot base block's own timestamp, which is a tight
+        upper bound on the real MTP (the median of the 11 headers ending at
+        any height ``<= base`` is ``<=`` the base header's own time, because
+        Bitcoin block times are very close together near the tip and the
+        base time dominates a window mostly below it).  This keeps
+        genuinely-final time-locked transactions final (matching Core's
+        accept) and is consistent with the assumeUTXO trust model: the
+        snapshot block and everything below it is assumed-valid until
+        background validation backfills.
+
+        The window for ``prev_height`` is incomplete-below-base whenever
+        ``prev_height - 10 < base_height`` -- i.e. for ``prev_height`` in
+        ``[base_height .. base_height + 10]``, which is block heights
+        ``[base+1 .. base+11]`` (mainnet 944184..944194 for the 944183
+        snapshot).  The earlier narrow fix only fired when ``prev`` WAS the
+        base (height base+1 only), which advanced past 944184 but then
+        stalled at 944185: heights 944185..944194 still have windows that
+        reach below 944183 (944173..944183 have no per-height index
+        metadata), so ``get_median_time_past`` still returned None -> 0 ->
+        ``bad-txns-nonfinal`` on the next time-locked tx.  We now fire for
+        the whole ``[base+1 .. base+11]`` band; once enough real
+        post-base blocks connect the window completes on its own,
+        ``get_median_time_past`` returns a real value, and this path is
+        never taken.
+
+        Returns the base block timestamp when ``prev_height`` falls in the
+        incomplete-window band above the snapshot base, else None (the
+        caller then falls back to 0 -- the historical behaviour for any
+        other incomplete-window cause).
+        """
+        sm = self.snapshot_manager
+        if sm is None:
+            return None
+
+        base_height = self._resolve_snapshot_height()
+        if base_height is None:
+            return None
+
+        # Determine prev_height.  Prefer the height carried on the prev block
+        # (the synthetic snapshot-base prev block sets it; real connected
+        # blocks carry it too); fall back to expected_height - 1.
+        prev_height = getattr(prev_block, "height", None)
+        if not isinstance(prev_height, int):
+            prev_height = expected_height - 1
+
+        # Only fire inside the incomplete-window band above the snapshot
+        # base: prev_height in [base .. base+10].  Below the base we have no
+        # business validating (assume-valid region); above base+10 the
+        # 11-block window [prev-10 .. prev] is fully populated by real
+        # post-base blocks, so get_median_time_past returns a real value and
+        # this fallback must not mask it.
+        if prev_height < base_height or prev_height > base_height + 10:
+            return None
+
+        base_ts = self._snapshot_base_blockheader_ts()
+        # When prev IS the base and we couldn't read the header timestamp,
+        # the synthetic prev block's own timestamp is the base timestamp.
+        if base_ts is None and prev_height == base_height:
+            prev_ts = getattr(prev_block, "timestamp", None)
+            if isinstance(prev_ts, int) and prev_ts > 0:
+                base_ts = prev_ts
+        if base_ts is None or base_ts <= 0:
+            return None
+
+        logger.info(
+            "[snapshot-mtp] MTP window for height %d incomplete below "
+            "snapshot base %d; using base block timestamp %d as "
+            "nLockTimeCutoff MTP (assumeUTXO fallback)",
+            prev_height,
+            base_height,
+            base_ts,
+        )
+        return base_ts
+
+    def validate_block(
+        self,
+        block: Block,
+        known_height: int = 0,
+        skip_pow: bool = False,
+        force_check_scripts: bool = False,
+    ) -> tuple[bool, str]:
         """Fully validate *block* (header, merkle root, weight, scripts); returns ``(ok, error_message)``.
 
         *known_height*: if >0, use this as the block's height instead of
         deriving it from the previous block in the DB.  This avoids
         incorrect height=1 when the DB doesn't store height on Block objects.
+
+        *skip_pow*: when True, skip ONLY the proof-of-work hash<=target gate in
+        the header check (every other header rule — bad-diffbits, time-too-old,
+        time-too-new, bad-version, the nBits range/overflow decode — still
+        runs).  This is a faithful parity with Bitcoin Core's
+        ``CheckBlock(..., fCheckPOW)`` / ``CheckBlockHeader(..., fCheckPOW)``
+        gate (validation.cpp: CheckBlockHeader takes ``fCheckPOW`` and only
+        calls ``CheckProofOfWork`` when it is true; ConnectBlock revalidation of
+        an already-PoW-checked block passes ``fCheckPOW=false``).  Default
+        False preserves the current production behaviour (PoW always checked).
+
+        *force_check_scripts*: when True, override the assume-valid /
+        checkpoint script-skip heuristic and ALWAYS run full script
+        verification regardless of height.  Default False preserves the current
+        production behaviour (script skip governed by
+        ``sync.can_skip_scripts_for_block``).  Used by the differential
+        validate-only checkblock harness so a dead script-gate cannot mask a
+        consensus divergence below the assume-valid cut.
         """
         # 1. Get previous block.
         #
@@ -681,7 +869,41 @@ class BlockValidator:
             expected_height = (prev_height or 0) + 1
 
         # 2. Compute median-time-past (needed for header validation and BIP 68)
-        block_mtp = self.db.get_median_time_past(expected_height - 1) or 0
+        #
+        # ``get_median_time_past`` returns None when the 11-block window
+        # [h-10 .. h] is incomplete.  After an assumeUTXO snapshot load that
+        # is exactly the situation for the FIRST block above the snapshot:
+        # only the snapshot base block (h=snap) is in the index; the 10
+        # blocks below it were never downloaded, so the window for h=snap is
+        # incomplete and MTP comes back None -> 0.
+        #
+        # MTP == 0 is catastrophic for the nLockTimeCutoff finality check: a
+        # transaction with a time-based nLockTime (>= LOCKTIME_THRESHOLD) is
+        # final iff its locktime < MTP.  With MTP == 0 every such tx looks
+        # non-final, so the first post-snapshot block that carries a
+        # time-locked tx (mainnet 944184 carries two — locktimes 538446226
+        # and 500196371) is rejected forever with "bad-txns-nonfinal",
+        # wedging IBD one block above the snapshot.
+        #
+        # Bitcoin Core never hits this because its assumeUTXO snapshot ships
+        # with the full header chain back to genesis (headers are tiny and
+        # synced before the snapshot load), so its 11-header MTP window is
+        # always complete.  ouroboros only persists the single base header,
+        # so we approximate: when the window dips below the snapshot base and
+        # the prev block IS that base, use the base block's own timestamp as
+        # the MTP fallback.  The base block's timestamp is a tight upper
+        # bound on the real MTP (real MTP = median of the 11 headers ending
+        # at the base, which is <= the base header's own time), so it keeps
+        # genuinely-final time-locked txs final (matching Core's accept) and
+        # is consistent with the assumeUTXO trust model: the snapshot block
+        # and everything below it is assumed-valid until background
+        # validation backfills.  Cross-checked against Core: at h=944183 the
+        # real MTP is 1775650208 and the base timestamp is 1775651930 (gap
+        # 1722s); both time-locked txs in 944184 are final under either, and
+        # zero txs sit in the [realMTP, baseTime) over-accept window.
+        block_mtp = self.db.get_median_time_past(expected_height - 1)
+        if block_mtp is None:
+            block_mtp = self._snapshot_base_mtp_fallback(prev_block, expected_height) or 0
 
         # 2b. Compute nLockTimeCutoff per Bitcoin Core validation.cpp:4135-4142.
         #
@@ -699,7 +921,9 @@ class BlockValidator:
         nLockTimeCutoff: int = block_mtp if csv_active else block.timestamp
 
         # 3. Validate header (including difficulty retarget)
-        if not self._validate_header(block, prev_block, block_mtp, expected_height):
+        if not self._validate_header(
+            block, prev_block, block_mtp, expected_height, skip_pow=skip_pow
+        ):
             return False, "Invalid header"
 
         # 4. Verify merkle root
@@ -809,7 +1033,11 @@ class BlockValidator:
         # merkle root already verified above — script verification is the
         # dominant cost and can be safely skipped.
         skip_scripts = False
-        if _has_sync_module:
+        if force_check_scripts:
+            # Differential validate-only harness: never skip scripts, regardless
+            # of the assume-valid / checkpoint cut, so the script gate is live.
+            skip_scripts = False
+        elif _has_sync_module:
             try:
                 block_hash_bytes = block.hash if isinstance(block.hash, bytes) else bytes.fromhex(block.hash)
                 skip_scripts = _sync_module.can_skip_scripts_for_block(
@@ -950,6 +1178,7 @@ class BlockValidator:
         prev_block: Block,
         block_mtp: int = 0,
         height: int = 0,
+        skip_pow: bool = False,
     ) -> bool:
         """Validate block header contextually (ContextualCheckBlockHeader analog).
 
@@ -1039,11 +1268,19 @@ class BlockValidator:
         if is_negative or is_overflow or target == 0 or target > pow_limit:
             return False
 
-        header = block.serialize()[:80]
-        block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()
-        hash_as_int = int.from_bytes(block_hash, "little")
-        if hash_as_int > target:
-            return False
+        # The hash<=target comparison is the actual proof-of-work gate. Bitcoin
+        # Core threads an fCheckPOW flag through CheckBlockHeader and only calls
+        # CheckProofOfWork when it is true (validation.cpp CheckBlockHeader;
+        # ConnectBlock revalidation passes fCheckPOW=false). skip_pow mirrors
+        # fCheckPOW=false: the nBits range/overflow decode above still runs (so a
+        # malformed-bits block is still rejected), only the hash comparison is
+        # skipped. Default skip_pow=False keeps PoW always checked in production.
+        if not skip_pow:
+            header = block.serialize()[:80]
+            block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()
+            hash_as_int = int.from_bytes(block_hash, "little")
+            if hash_as_int > target:
+                return False
 
         return True
 

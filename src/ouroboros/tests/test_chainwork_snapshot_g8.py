@@ -266,8 +266,73 @@ def test_no_offset_for_correct_datadir() -> None:
 
 
 def test_no_offset_when_no_block_above_snapshot() -> None:
-    """No correction when sync has not progressed past the snapshot height."""
-    db = _FakeDB({})  # nothing stored
+    """No correction when sync has not progressed past the snapshot height
+    AND we cannot establish the tip height (legacy _FakeDB has no
+    get_best_block, so the detector falls through to the Case-2 snap_h+1
+    probe, which sees nothing stored)."""
+    db = _FakeDB({})  # nothing stored, no get_best_block
+    assert detect_snapshot_chainwork_offset(db, "mainnet") == 0
+
+
+class _FreshSnapshotDB(_FakeDB):
+    """assumeUTXO datadir freshly bootstrapped via the Rust import-utxo CLI.
+
+    The Rust ``import_core_snapshot`` sets the chain tip to the snapshot
+    height with ``update_best_block`` but NEVER persists a BLOCK_INDEX_CF
+    metadata row for the snapshot block — so every height (including the
+    snapshot height itself) reads chainwork 0, and there is NO block above
+    the snapshot yet because forward-sync has not started.  This is the
+    exact on-disk state behind the 2026-05-29 phaseb snapshot-confirm
+    DIVERGENCE: the node held at 944183, every headers batch was rejected
+    ``too-little-chainwork; G8``, and every honest peer that served headers
+    was banned until the addrman drained to 0 connections.
+    """
+
+    def __init__(self, tip_height: int, chainwork_by_height: dict[int, int]):
+        super().__init__(chainwork_by_height)
+        self._tip_height = tip_height
+
+    def get_best_block(self):
+        return (b"\x00" * 32, self._tip_height)
+
+
+def test_offset_detected_on_fresh_import_utxo_bootstrap() -> None:
+    """Case 1 regression: tip == snap_h, NO metadata anywhere.
+
+    Before the fix the detector probed only ``snap_h + 1`` — which does not
+    exist on a fresh bootstrap (it is the very block we are about to
+    forward-sync) — saw 0, and returned a 0 offset.  The G8 gate then ran
+    with base==0 and rejected every honest headers batch, banning the peer
+    that served them.  After the fix, a tip sitting exactly at the snapshot
+    height with chainwork 0 there yields the canonical snapshot chainwork as
+    the offset, so the G8 base term is non-zero and headers connect.
+    """
+    au = get_assumeutxo_data("mainnet", 944_183)
+    assert au is not None and au.chainwork_hex is not None
+    snap_h = au.height
+    correct_snap_work = int(au.chainwork_hex, 16)
+
+    # Rust import-utxo state: tip at snap_h, no metadata row at any height.
+    db = _FreshSnapshotDB(tip_height=snap_h, chainwork_by_height={})
+    offset = detect_snapshot_chainwork_offset(db, "mainnet")
+    assert offset == correct_snap_work, (
+        f"fresh-bootstrap offset {offset:#x} should equal snapshot "
+        f"chainwork {correct_snap_work:#x} (was 0 pre-fix → G8 brick)"
+    )
+
+
+def test_no_offset_on_fresh_bootstrap_with_correct_base_metadata() -> None:
+    """Case 1, correct datadir: the Python load_snapshot path DID persist
+    the snapshot block's chainwork at snap_h, so no offset is needed even
+    though the tip sits exactly at the snapshot height."""
+    au = get_assumeutxo_data("mainnet", 944_183)
+    assert au is not None and au.chainwork_hex is not None
+    snap_h = au.height
+    correct_snap_work = int(au.chainwork_hex, 16)
+
+    db = _FreshSnapshotDB(
+        tip_height=snap_h, chainwork_by_height={snap_h: correct_snap_work}
+    )
     assert detect_snapshot_chainwork_offset(db, "mainnet") == 0
 
 

@@ -387,15 +387,32 @@ def detect_snapshot_chainwork_offset(db, network: str) -> int:
     additive correction (the snapshot height's canonical chainwork from
     Core's hardcoded assumeUTXO data).
 
-    Detection: read the stored chainwork at ``snap_h + 1``.  If a snapshot
-    was loaded and its base was applied, that value is already at least the
-    snapshot's chainwork.  If the snapshot base was NOT applied, the stored
-    value is only ~one block of work — far below the snapshot chainwork —
-    so the offset is required.
+    Detection (two cases — the FRESH-SNAPSHOT case is the one that the
+    Rust ``import-utxo`` CLI path leaves uncorrected):
+
+      1. FRESH BOOTSTRAP (DB tip == snap_h, no block above yet).  The
+         operator-only Rust ``import-utxo`` CLI path sets the
+         chain tip to ``snap_h`` via ``update_best_block`` but NEVER writes
+         a BLOCK_INDEX_CF metadata row for the snapshot block, so the
+         snapshot height carries chainwork 0.  We cannot read ``snap_h + 1``
+         (the very block we are trying to forward-sync does not exist yet),
+         so the old ``snap_h + 1`` probe always saw 0 and returned a 0
+         offset — leaving the G8 gate with base==0 and rejecting EVERY
+         honest headers batch as ``too-little-chainwork`` (and banning the
+         peer that served them).  When the DB tip is exactly a known
+         snapshot height and the stored chainwork there is below the
+         canonical value, the offset IS required.
+
+      2. POST-SNAPSHOT (a block above ``snap_h`` exists).  If that block's
+         stored chainwork was accumulated from 0 (legacy datadir that
+         loaded a snapshot before the loader persisted the base metadata),
+         it is far below the snapshot's true chainwork and the offset is
+         required.  If it already meets/exceeds the snapshot chainwork the
+         base was applied correctly — no offset.
 
     Returns 0 when no snapshot was loaded, when the datadir is already
     correct (snapshot base present), or when the snapshot's chainwork is
-    unknown.  Adding 0 is always safe.
+    unknown.  Adding 0 is always safe — it only makes the gate STRICTER.
 
     Shared by ``Node._chainwork_snapshot_offset`` (RPC chainwork display)
     and ``BlockSync``'s G8 nMinimumChainWork gate so both evaluate the
@@ -403,17 +420,37 @@ def detect_snapshot_chainwork_offset(db, network: str) -> int:
     root-cause fix that makes this offset unnecessary for new datadirs.
     """
     try:
+        try:
+            _, tip_height = db.get_best_block()
+        except Exception:
+            tip_height = -1
         for data in get_assumeutxo_params(network):
             if data.chainwork_hex is None:
                 continue
             snap_h = data.height
+            correct_snap = int(data.chainwork_hex, 16)
+
+            # Case 1: fresh bootstrap — tip sits exactly at this snapshot
+            # height (no block above downloaded yet).  Probe the snapshot
+            # height itself; if its stored chainwork is below the canonical
+            # snapshot chainwork the snapshot loader did not persist the
+            # base metadata (the Rust import-utxo path), so the offset is
+            # required for the G8 base term to be non-zero.
+            if isinstance(tip_height, int) and tip_height == snap_h:
+                stored_at_base = db.get_chainwork_by_height(snap_h)
+                if stored_at_base < correct_snap:
+                    return correct_snap
+                # Base metadata present + correct: no offset needed.
+                return 0
+
+            # Case 2: a block above the snapshot height exists.  Use the
+            # original snap_h + 1 probe.
             stored_at_first = db.get_chainwork_by_height(snap_h + 1)
             if stored_at_first <= 0:
                 # No block above this snapshot height stored yet — either
                 # this snapshot was not the one loaded, or sync has not
-                # progressed past it.  Nothing to correct.
+                # progressed past it.  Nothing to correct here.
                 continue
-            correct_snap = int(data.chainwork_hex, 16)
             # If the stored value already meets/exceeds the snapshot's
             # chainwork, the base was applied correctly — no offset.
             if stored_at_first < correct_snap:
@@ -935,6 +972,92 @@ class SnapshotManager:
         snapshot_dir = self.get_snapshot_chainstate_dir()
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         (snapshot_dir / "base_blockheader").write_bytes(header)
+
+    def persist_snapshot_base_index(self, base_blockhash: bytes) -> bool:
+        """Make the snapshot base block a *connectable parent* on disk.
+
+        After a UTXO snapshot is loaded, the tip pointer (BEST_BLOCK_HASH /
+        BEST_HEIGHT) points at the snapshot base (e.g. height 944183) but
+        nothing has written the base block's *index* — so the FIRST block
+        above the snapshot (944184) has no parent to connect onto and is
+        rejected with ``"Previous block not found"`` forever.
+
+        Bitcoin Core represents the snapshot base as an in-memory
+        ``CBlockIndex`` recovered from the header-sync that runs before the
+        snapshot load.  We have no full block body for the base (the snapshot
+        wire format carries only the UTXO set + base_blockhash), so we
+        persist the two artifacts the connect path actually reads:
+
+          1. The sibling files ``base_blockhash`` + ``base_blockheader``
+             (80-byte header) under ``chainstate_snapshot/``.  These let
+             ``BlockValidator._synthesize_snapshot_prev_block`` reconstruct a
+             header-only prev ``Block`` for the merkle/difficulty/MTP checks
+             without a block body — the Python validator path used for blocks
+             ABOVE the last checkpoint (944184 is above mainnet's 850000
+             checkpoint, so it is always Python-validated, never the Rust
+             ``get_block_by_height`` fast path which would need a body).
+
+          2. The persistent BLOCK_INDEX metadata row (height + cumulative
+             chainwork + timestamp) via ``store_block_metadata_persistent``,
+             so the post-snapshot chain accumulates chainwork from the
+             snapshot's true value (anchoring the G8 nMinimumChainWork gate)
+             rather than from 0.
+
+        This mirrors exactly what the Python ``load_txoutset`` commit path
+        already does; the operator-only Rust ``import-utxo`` CLI path writes
+        only the UTXO set + tip pointer and skips both, which is the
+        second-pass root cause of the 944184 forward-sync failure.
+
+        Idempotent: safe to call again on an already-bootstrapped datadir.
+        Returns True when the base header (and thus the connectable prev
+        block) was persisted; False when chainparams ship no ``base_header``
+        for this snapshot (e.g. testnet entries) — in which case the caller
+        must keep header-syncing the base from peers instead.
+        """
+        au_data = get_assumeutxo_by_hash(self.network, base_blockhash)
+        if au_data is None or au_data.base_header is None:
+            logger.warning(
+                "[snapshot] No base_header in chainparams for "
+                f"{base_blockhash[::-1].hex()}; cannot persist a connectable "
+                "snapshot base index. The first post-snapshot block will "
+                "rely on header-sync to supply the base header."
+            )
+            return False
+
+        height = au_data.height
+
+        # 1. Sibling files — these are what the validator's synthetic
+        #    prev-block path reads (BLOCKS_CF has no body for the base).
+        self.write_snapshot_base_blockhash(base_blockhash)
+        self.write_snapshot_base_blockheader(au_data.base_header)
+
+        # 2. Persistent BLOCK_INDEX metadata row (chainwork + timestamp), so
+        #    the chainwork accumulator and per-height index are anchored.
+        if au_data.chainwork_hex is not None:
+            try:
+                snapshot_timestamp = struct.unpack_from(
+                    "<I", au_data.base_header, 68
+                )[0]
+                self.db.store_block_metadata_persistent(
+                    height,
+                    base_blockhash,
+                    int(au_data.chainwork_hex, 16),
+                    snapshot_timestamp,
+                )
+                logger.info(
+                    "[snapshot] Persisted snapshot base block index at "
+                    f"height {height}: chainwork={au_data.chainwork_hex}"
+                )
+            except Exception as e:
+                # Non-fatal: the sibling files alone already make the base a
+                # connectable parent for the Python validator.  Without the
+                # metadata row the G8 chainwork gate still self-corrects via
+                # detect_snapshot_chainwork_offset.
+                logger.error(
+                    "[snapshot] Failed to persist snapshot base block "
+                    f"metadata at height {height}: {e}"
+                )
+        return True
 
     def load_snapshot(
         self,
