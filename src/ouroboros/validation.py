@@ -815,6 +815,7 @@ class BlockValidator:
         known_height: int = 0,
         skip_pow: bool = False,
         force_check_scripts: bool = False,
+        current_time: int = 0,
     ) -> tuple[bool, str]:
         """Fully validate *block* (header, merkle root, weight, scripts); returns ``(ok, error_message)``.
 
@@ -839,6 +840,17 @@ class BlockValidator:
         ``sync.can_skip_scripts_for_block``).  Used by the differential
         validate-only checkblock harness so a dead script-gate cannot mask a
         consensus divergence below the assume-valid cut.
+
+        *current_time*: when > 0, use this Unix timestamp as the "now" the
+        time-too-new gate compares against, instead of the wall-clock
+        ``time.time()``.  Default 0 (the sentinel) preserves the current
+        production behaviour BYTE-FOR-BYTE — the wall clock is read exactly as
+        before.  This is a faithful parity with Bitcoin Core's
+        ``NodeClock::now()`` (validation.cpp:4108), which is the system clock in
+        production but is injectable/mockable in Core's tests
+        (``SetMockTime``).  Used by the differential header-level reject harness
+        so the time-too-new boundary (``> now + MAX_FUTURE_BLOCK_TIME``) can be
+        probed deterministically without depending on the test machine's clock.
         """
         # 1. Get previous block.
         #
@@ -922,7 +934,8 @@ class BlockValidator:
 
         # 3. Validate header (including difficulty retarget)
         if not self._validate_header(
-            block, prev_block, block_mtp, expected_height, skip_pow=skip_pow
+            block, prev_block, block_mtp, expected_height, skip_pow=skip_pow,
+            current_time=current_time,
         ):
             return False, "Invalid header"
 
@@ -1179,6 +1192,7 @@ class BlockValidator:
         block_mtp: int = 0,
         height: int = 0,
         skip_pow: bool = False,
+        current_time: int = 0,
     ) -> bool:
         """Validate block header contextually (ContextualCheckBlockHeader analog).
 
@@ -1233,8 +1247,13 @@ class BlockValidator:
 
         # 4. time-too-new: block timestamp must not exceed now + MAX_FUTURE_BLOCK_TIME.
         # Ref: validation.cpp:4108-4110, chain.h:29 (MAX_FUTURE_BLOCK_TIME = 7200s).
-        current_time = int(_time.time())
-        if block.timestamp > current_time + MAX_FUTURE_BLOCK_TIME:
+        # Core compares against NodeClock::now() (the wall clock in production,
+        # but injectable via SetMockTime in tests). The *current_time* parameter
+        # mirrors that: when > 0 it overrides the wall clock for deterministic
+        # testing; the default sentinel 0 reads time.time() exactly as before,
+        # so production behaviour is byte-identical (default-preserving).
+        now = current_time if current_time > 0 else int(_time.time())
+        if block.timestamp > now + MAX_FUTURE_BLOCK_TIME:
             return False
 
         # 5. bad-version: reject blocks with outdated version numbers once the
