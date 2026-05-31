@@ -194,6 +194,16 @@ class BitcoinNode:
             # Initialize snapshot manager for assumeUTXO
             self.snapshot_manager = SnapshotManager(self.db, self.network, self.data_dir)
 
+            # Self-heal a snapshot-bootstrapped datadir whose base block index
+            # was never persisted (the Rust ``import-utxo`` CLI path writes only
+            # the UTXO set + tip pointer; older builds did too).  If the tip
+            # sits exactly at a known snapshot height, the snapshot base has no
+            # full block body in BLOCKS_CF, and the sibling header files are
+            # missing, persist them now — otherwise the FIRST block above the
+            # snapshot fails forever with "Previous block not found".  Cheap,
+            # idempotent, and avoids forcing a full UTXO re-import.
+            self._heal_snapshot_base_index()
+
             # Check for assumeutxo option and load snapshot if specified
             assumeutxo_path = self.config.get('assumeutxo')
             if assumeutxo_path:
@@ -365,6 +375,31 @@ class BitcoinNode:
             # — peers that try to query compact filters from us in that
             # window would otherwise receive zero-anchored cfheaders
             # (BUG-4 collateral).
+            # Core/clearbit -connect peer-pinning + independent -dnsseed.
+            # Parse the --connect list here so the PeerManager learns the pins
+            # at construction time (before start() runs its discover/auto-fill
+            # paths).  A non-empty list switches the manager into connect-only
+            # mode: dial ONLY these peers, no DNS seeding, no auto-outbound.
+            connect_addrs: list[tuple[str, int]] = []
+            for addr_str in self.config.get('connect', []) or []:
+                try:
+                    if ':' in addr_str:
+                        host, port_s = addr_str.rsplit(':', 1)
+                        cport = int(port_s)
+                    else:
+                        host = addr_str
+                        cport = 8333
+                    connect_addrs.append((host, cport))
+                except Exception as e:
+                    logger.warning(f"Ignoring malformed --connect {addr_str!r}: {e}")
+            # -dnsseed / -nodnsseed (default on).  Independent suppression of
+            # DNS-seed resolution; -connect forces it off regardless inside
+            # PeerManager.  Accept bool or "0"/"false" string from conf/CLI.
+            dns_raw = self.config.get('dnsseed', True)
+            if isinstance(dns_raw, str):
+                dns_seed_enabled = dns_raw.lower() in ("1", "true", "yes", "on")
+            else:
+                dns_seed_enabled = bool(dns_raw)
             self.peer_manager = PeerManager(
                 self.network,
                 max_peers=max_peers,
@@ -373,30 +408,20 @@ class BitcoinNode:
                 listen=bool(listen_enabled),
                 peer_bloom_filters=peer_bloom_filters,
                 node_compact_filters=self._compact_filters_advertised,
+                connect_addrs=connect_addrs,
+                dns_seed=dns_seed_enabled,
             )
             # BIP 152: Provide mempool and database for compact block relay
             self.peer_manager.set_mempool(self.mempool)
             self.peer_manager.set_database(self.db)
             try:
+                # PeerManager.start() now handles the --connect pins itself
+                # (dials only them, skips DNS + auto-outbound) because the pin
+                # list was passed at construction.  No post-start dialing loop
+                # is needed; the pins reconnect via maintain_connections().
                 await self.peer_manager.start(best_height, p2p_port=p2p_port)
             except Exception as e:
                 logger.warning(f"Peer manager start error (node continues): {e}")
-            # Connect to explicitly specified peers (--connect flag)
-            connect_peers = self.config.get('connect', [])
-            for addr_str in connect_peers:
-                try:
-                    if ':' in addr_str:
-                        host, port_s = addr_str.rsplit(':', 1)
-                        cport = int(port_s)
-                    else:
-                        host = addr_str
-                        cport = 8333
-                    # Register for automatic reconnection
-                    self.peer_manager._connect_addrs.append((host, cport))
-                    logger.info(f"Connecting to specified peer {host}:{cport}")
-                    await self.peer_manager.connect_to_node(host, cport)
-                except Exception as e:
-                    logger.warning(f"Failed to connect to specified peer {addr_str}: {e}")
             peer_count = len(self.peer_manager.get_all_ready_peers()) if self.peer_manager else 0
             logger.info(f"Peer manager started ({peer_count} peers)")
 
@@ -702,6 +727,64 @@ class BitcoinNode:
 
         except Exception as e:
             logger.error(f"Error in periodic tasks: {e}", exc_info=True)
+
+    def _heal_snapshot_base_index(self) -> None:
+        """Persist a missing snapshot-base block index on a bootstrapped datadir.
+
+        See the call site in ``start()``.  This recovers datadirs that were
+        bootstrapped by the Rust ``import-utxo`` CLI (or an older loader) which
+        wrote only the UTXO set + tip pointer but not the snapshot base's
+        connectable index — leaving the first post-snapshot block to be
+        rejected with "Previous block not found" indefinitely.
+        """
+        from ouroboros.snapshot import get_available_snapshot_heights
+
+        try:
+            tip_hash, tip_height = self.db.get_best_block()
+        except Exception:
+            # Empty DB (genesis bootstrap) — nothing to heal.
+            return
+
+        if tip_height not in get_available_snapshot_heights(self.network):
+            return  # Tip is not a known snapshot height; normal IBD/synced node.
+
+        # If the sibling files already exist the base is already connectable.
+        if self.snapshot_manager.has_snapshot_chainstate():
+            return
+
+        # If the base block has a full body in BLOCKS_CF this is a normally
+        # synced node that merely happens to be paused at a snapshot height —
+        # don't synthesize anything.
+        try:
+            if self.db.get_block(tip_hash) is not None:
+                return
+        except Exception:
+            pass
+
+        logger.warning(
+            "[snapshot] Datadir tip is at snapshot height %d but the snapshot "
+            "base index is missing (import-utxo / legacy loader). Persisting "
+            "base header + chainwork now so the first post-snapshot block can "
+            "connect.",
+            tip_height,
+        )
+        try:
+            healed = self.snapshot_manager.persist_snapshot_base_index(tip_hash)
+            if healed:
+                # Reflect the recovered state on the manager so RPC/validation
+                # treat this as a loaded snapshot.
+                self.snapshot_manager.snapshot_loaded = True
+                self.snapshot_manager.snapshot_height = tip_height
+                self.snapshot_manager.snapshot_hash = tip_hash
+                logger.info(
+                    "[snapshot] Snapshot base index healed at height %d.",
+                    tip_height,
+                )
+        except Exception as e:
+            logger.error(
+                "[snapshot] Failed to heal snapshot base index at height %d: %s",
+                tip_height, e,
+            )
 
     async def _load_snapshot_if_needed(self, snapshot_path: str) -> None:
         """Load a UTXO snapshot if specified via -assumeutxo option.
