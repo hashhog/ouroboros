@@ -2227,16 +2227,72 @@ class BlockSync:
         cap_buffer = max(0, buffer_target - buffer_used - in_flight)
         throttled_by_buffer = cap_buffer < cap_inflight
 
-        available = min(cap_inflight, cap_buffer)
-        if available == 0:
-            return
+        # W100: the head-of-window slots (first HEAD_OF_WINDOW headers not
+        # yet on the active chain, starting at tip+1) MUST bypass cap_buffer
+        # -- bounded only by cap_inflight and the per-peer cap, exactly as
+        # this function's W93 comment above always CLAIMED but never
+        # implemented. Without this, once in_flight drains to 0 while the
+        # buffer sits at buffer_target (received blocks self-remove from
+        # requested_blocks at handle_block but stay in the buffer),
+        # cap_buffer == 0 and the one block that would let the drain advance
+        # -- tip+1 -- is never re-requested by EITHER path (_handle_timeouts
+        # only iterates requested_blocks, which is empty). Deadlock. This is
+        # Core-faithful: Core (FindNextBlocks) always fetches the window-head
+        # block, gated only by in-flight count, never by a receive buffer,
+        # and SKIPS blocks it already has data for (net_processing.cpp
+        # :1506-1511) -- which is why the HEAD pass below also skips slots
+        # already sitting in _ibd_block_buffer.
+        # Same head_set primitive as _handle_timeouts -- get_block_hash_by_height,
+        # NOT has_block_hash, so orphaned blocks don't make us skip the
+        # genuine head (the 938231 wedge guard).
+        HEAD_OF_WINDOW = 8
+        head_set: set[bytes] = set()
+        for i, (bh, _) in enumerate(self._validated_headers):
+            if self.db.get_block_hash_by_height(current_height + 1 + i) == bh:
+                continue
+            head_set.add(bh)
+            if len(head_set) >= HEAD_OF_WINDOW:
+                break
 
         to_request: list[tuple[int, bytes]] = []
-        for i in range(start, min(start + available, len(self._validated_headers))):
+        seen: set[bytes] = set()
+        # HEAD pass: head-of-window slots bypass cap_buffer, capped only by
+        # cap_inflight (and the per-peer cap, applied in distribution below).
+        # Skip slots already in requested_blocks (in flight) or already in
+        # _ibd_block_buffer (received out of order, awaiting drain) -- Core
+        # FindNextBlocks does not re-fetch data it already holds. tip+1 in
+        # the wedge is, by definition, NOT in the buffer (that is the
+        # deadlock), so it survives this skip and is requested.
+        head_budget = cap_inflight
+        for i in range(start, len(self._validated_headers)):
+            if head_budget <= 0:
+                break
             block_hash, _ = self._validated_headers[i]
-            if block_hash in self.requested_blocks:
+            if block_hash not in head_set:
+                continue
+            if (block_hash in self.requested_blocks
+                    or block_hash in seen
+                    or block_hash in self._ibd_block_buffer):
                 continue
             to_request.append((MSG_WITNESS_BLOCK, block_hash))
+            seen.add(block_hash)
+            head_budget -= 1
+
+        # TAIL pass: NEW far-ahead requests stay throttled by cap_buffer.
+        # Budget is what's left of cap_inflight after the head pass, clamped
+        # by cap_buffer (the W93 throttle) -- this is the W85 over-fetch
+        # guard, unchanged for speculative tail fetches.
+        tail_budget = min(cap_inflight - len(to_request), cap_buffer)
+        if tail_budget > 0:
+            for i in range(start, len(self._validated_headers)):
+                if tail_budget <= 0:
+                    break
+                block_hash, _ = self._validated_headers[i]
+                if block_hash in self.requested_blocks or block_hash in seen:
+                    continue
+                to_request.append((MSG_WITNESS_BLOCK, block_hash))
+                seen.add(block_hash)
+                tail_budget -= 1
 
         if not to_request:
             return
