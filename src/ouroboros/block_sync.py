@@ -1008,17 +1008,101 @@ class BlockSync:
             # processing.  `None` sentinel means "not yet deserialized" —
             # the drainer will deserialize lazily in a worker thread when it
             # actually needs to validate/connect this block.
-            if len(self._ibd_block_buffer) < self._max_ibd_buffer:
+            # W101: asymmetric, head-reserving admission.  W100 made the
+            # REQUEST side always re-fetch the head-of-window (tip+1..
+            # tip+HEAD_OF_WINDOW, _request_next_blocks); this is its
+            # RECEIVE-side complement.  The old flat `len < _max_ibd_buffer`
+            # cap let the 256 in-flight far-ahead arrivals fill the buffer
+            # (buffer_target 768 + max_in_flight 256 == _max_ibd_buffer 1024
+            # exactly) leaving ZERO room to ADMIT tip+1, which the drain
+            # (_drain_block_buffer_locked) needs in slot 0 to advance at all
+            # -- the 946044 buffer-admission deadlock (W101).  Fix: reserve
+            # HEAD_OF_WINDOW slots for the head-of-window so a contiguous-
+            # from-tip block is ALWAYS admittable, evicting the FARTHEST-
+            # height resident if at the hard cap.  Core never gates the
+            # connect-frontier block on a receive buffer (it spills to disk);
+            # this restores that invariant for our bounded RAM buffer.  Never
+            # drop a head-ward block to keep a farther one (the W85 invariant).
+            # HEAD_OF_WINDOW MUST match _request_next_blocks / _handle_timeouts
+            # -- a divergence silently reclassifies tip+1 as far-ahead at one
+            # site and re-opens the wedge.
+            HEAD_OF_WINDOW = 8  # MUST match _request_next_blocks / _handle_timeouts
+            buf_len = len(self._ibd_block_buffer)
+            if buf_len < self._max_ibd_buffer - HEAD_OF_WINDOW:
+                # Common case: ample room.  Admit anything (far-ahead or head).
+                # No is-head probe -- the hot path stays free of
+                # get_block_hash_by_height calls and scans.
                 self._ibd_block_buffer[block_hash] = (None, payload)
                 self._block_source_peer_addr[block_hash] = f"{peer.host}:{peer.port}"
                 self._blk_buffered += 1
             else:
-                self._blk_buffer_full += 1
-                logger.debug(
-                    f"IBD buffer full ({self._max_ibd_buffer}), dropping "
-                    f"{block_hash.hex()[:16]}..."
-                )
-                return
+                # Near-full (top HEAD_OF_WINDOW slots): only the head-of-window
+                # may use the reserved slots.  Build head_set with the SAME
+                # cheap primitive _request_next_blocks / _handle_timeouts use --
+                # get_block_hash_by_height(tip+1+i)==bh (returns None for
+                # unconnected heights, NOT has_block_hash, so rollback-orphans
+                # don't shadow the genuine head; the 938231 guard).  Guarded to
+                # run ONLY when near-full, so the uncongested path never pays.
+                _, _active_height = self.db.get_best_block()
+                head_set: set[bytes] = set()
+                for _i, (_bh, _) in enumerate(self._validated_headers):
+                    if self.db.get_block_hash_by_height(_active_height + 1 + _i) == _bh:
+                        continue
+                    head_set.add(_bh)
+                    if len(head_set) >= HEAD_OF_WINDOW:
+                        break
+                is_head = block_hash in head_set
+                if is_head and buf_len < self._max_ibd_buffer:
+                    # Head-of-window into one of the reserved slots.
+                    self._ibd_block_buffer[block_hash] = (None, payload)
+                    self._block_source_peer_addr[block_hash] = f"{peer.host}:{peer.port}"
+                    self._blk_buffered += 1
+                elif is_head:
+                    # Hard cap AND this is the head-of-window: evict the
+                    # FARTHEST-height resident far-ahead block to make room.
+                    # Slot index in _validated_headers == height-above-tip
+                    # (slot 0 == tip+1 by the anchored-queue invariant), so the
+                    # resident with the LARGEST slot index is the farthest.
+                    # Walk from the TAIL downward and take the first resident
+                    # not in head_set -- O(distance from tail to first far-ahead
+                    # resident), typically O(1).  The evicted block stays in
+                    # _validated_headers and is re-fetchable later via the TAIL
+                    # pass once the buffer drops below buffer_target, so eviction
+                    # only costs a re-download of an already-speculative block --
+                    # never a head-ward one (W82/W85-safe).
+                    evict_hash: bytes | None = None
+                    for _i in range(len(self._validated_headers) - 1, -1, -1):
+                        _bh = self._validated_headers[_i][0]
+                        if _bh in self._ibd_block_buffer and _bh not in head_set:
+                            evict_hash = _bh
+                            break
+                    if evict_hash is not None:
+                        del self._ibd_block_buffer[evict_hash]
+                        self._block_source_peer_addr.pop(evict_hash, None)
+                        self._blk_buffer_full += 1  # count the eviction-drop
+                        self._ibd_block_buffer[block_hash] = (None, payload)
+                        self._block_source_peer_addr[block_hash] = f"{peer.host}:{peer.port}"
+                        self._blk_buffered += 1
+                    else:
+                        # No far-ahead resident to evict (buffer is ALL
+                        # head-of-window) -- admit anyway.  The head set is
+                        # bounded at HEAD_OF_WINDOW, so this can over-fill by at
+                        # most HEAD_OF_WINDOW slots, and it IS the contiguous
+                        # prefix so it drains immediately at the drain below.
+                        self._ibd_block_buffer[block_hash] = (None, payload)
+                        self._block_source_peer_addr[block_hash] = f"{peer.host}:{peer.port}"
+                        self._blk_buffered += 1
+                else:
+                    # Far-ahead block while in the reserved band -- drop it.
+                    # It is re-requestable via the TAIL pass and is NOT the
+                    # block the drain is waiting for.
+                    self._blk_buffer_full += 1
+                    logger.debug(
+                        f"IBD buffer near-full ({buf_len}/{self._max_ibd_buffer}, "
+                        f"head reserve={HEAD_OF_WINDOW}), dropping far-ahead "
+                        f"{block_hash.hex()[:16]}..."
+                    )
+                    return
 
             # Try to drain buffered blocks in chain order.
             connected = await self._drain_block_buffer()
