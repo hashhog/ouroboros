@@ -21,7 +21,7 @@ import random
 import socket
 import struct
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 
 from ouroboros.addrman import AddressManager, get_network_group
@@ -183,6 +183,44 @@ INVENTORY_BROADCAST_MAX = 1000
 # 2026-05-27 ouroboros wedge (PID 1771536: RSS 58 GB / swap 89 GB / load 99
 # after a multi-day run).  See ouroboros task #146.
 KNOWN_FILTER_MAX_ENTRIES = 50_000
+
+# In-flight BIP-152 partial-compact-block bounds.
+#
+# ``PeerManager._partial_cmpct_blocks`` retains a full block's worth of
+# deserialized Transaction objects for every cmpctblock whose
+# getblocktxn→blocktxn round-trip has not yet completed.  Bitcoin Core's
+# analogous ``PartiallyDownloadedBlock`` is PER-PEER state (CNodeState /
+# mapBlocksInFlight), torn down by FinalizeNode on disconnect and bounded by
+# MAX_BLOCKS_IN_TRANSIT_PER_PEER.  ouroboros's port made it a global
+# hash-keyed dict with no owner, no cap and no TTL — the 2026-06-02 OOM
+# driver (RSS 93.8 GB after a multi-day at-tip run).  These two constants
+# restore the per-peer cap and the never-answered TTL sweep; the
+# per-peer-attribution + disconnect cleanup restores the FinalizeNode bound.
+#
+# MAX_CMPCT_IN_FLIGHT_PER_PEER mirrors Core's MAX_BLOCKS_IN_TRANSIT_PER_PEER
+# (net_processing.cpp = 16).  PARTIAL_CMPCT_TTL is well past a normal
+# round-trip (Core's getblocktxn round-trips complete in well under a
+# second on the at-tip HB path); an entry older than this is treated as a
+# never-answered orphan and reclaimed (the existing getdata fallback
+# re-fetches the block as a full block if it is still wanted).
+MAX_CMPCT_IN_FLIGHT_PER_PEER = 16
+PARTIAL_CMPCT_TTL = 60.0  # seconds (GETBLOCKTXN_TIMEOUT)
+
+# Bound on ``PeerManager.known_addrs``.  addrman itself is hard-bounded by
+# its fixed bucket count, but this parallel "every host:port ever gossiped"
+# set has no cap and grows even when addrman dedupes/rejects an address
+# (the ``.add()`` calls sit OUTSIDE the ``addrman.add()`` guard).  Capped as
+# a FIFO (insertion-ordered dict) so a long-lived node cannot accrete the
+# full cardinality of all addresses ever seen (~125 k unique/day on mainnet).
+KNOWN_ADDRS_MAX_ENTRIES = 100_000
+
+# Bound on BanManager misbehaviour-score retention.  A score record whose
+# last event is older than this is reclaimed by the periodic sweep, and each
+# record's ``events`` list is capped to a small ring.  Mirrors the spirit of
+# Core's DEFAULT_MISBEHAVING_BANTIME — a long-idle below-threshold misbehaver
+# should not retain state forever.
+SCORE_RECORD_TTL = 86_400.0      # seconds (24 h) — see banman.SCORE_RECORD_TTL
+SCORE_EVENTS_MAX = 20            # cap per-record events ring
 
 
 @dataclass
@@ -523,7 +561,16 @@ class PeerManager:
         self.peers: dict[str, Peer] = {}  # addr -> Peer (full-relay outbound)
         self.block_relay_peers: dict[str, Peer] = {}  # addr -> Peer (block-relay-only outbound)
         self.inbound_peers: dict[str, Peer] = {}  # addr -> Peer (inbound)
+        # Parallel "every host:port ever gossiped" set.  Kept as a set so
+        # the existing set-difference / membership / discard call sites are
+        # untouched, but bounded as a FIFO via the companion insertion-order
+        # deque ``_known_addrs_order`` (see ``_add_known_addr``).  Without the
+        # cap this grew unbounded toward the cardinality of all addresses
+        # ever seen — a slow contributor to the at-tip RSS climb (it grows
+        # even when addrman dedupes, because the .add() sites sit outside the
+        # addrman.add() guard).
         self.known_addrs: set[str] = set()
+        self._known_addrs_order: deque[str] = deque()
 
         self.ban_manager = BanManager(
             data_dir=data_dir,
@@ -572,13 +619,25 @@ class PeerManager:
         self._mempool = None
         self._on_compact_block = None
         self._database = None  # database for block lookups (getblocktxn)
-        # In-flight partial compact blocks: block_hash -> (CompactBlock, partial_txs)
-        # where partial_txs is a list with None slots for missing transactions.
+        # In-flight partial compact blocks:
+        #   block_hash -> (addr, CompactBlock, partial_txs, monotonic_ts)
+        # where partial_txs is a list with None slots for missing transactions,
+        # ``addr`` is the announcing peer (for per-peer attribution + cleanup)
+        # and ``monotonic_ts`` is the insertion time (for the TTL sweep).
         # Populated by on_cmpctblock when some txs are absent from mempool;
         # consumed and cleared by on_blocktxn after the round-trip completes.
-        # Mirrors Bitcoin Core's PartiallyDownloadedBlock per-peer state
-        # (blockencodings.h / net_processing.cpp ProcessMessage "blocktxn").
-        self._partial_cmpct_blocks: dict = {}  # bytes -> (CompactBlock, list)
+        #
+        # Mirrors Bitcoin Core's PartiallyDownloadedBlock — which is PER-PEER
+        # state (CNodeState / mapBlocksInFlight), torn down by FinalizeNode on
+        # disconnect and bounded by MAX_BLOCKS_IN_TRANSIT_PER_PEER.  The three
+        # Core bounds the original port dropped are restored here:
+        #   1. per-peer attribution + drop-on-disconnect (_cleanup_peer_state),
+        #   2. per-peer in-flight cap (MAX_CMPCT_IN_FLIGHT_PER_PEER) on insert,
+        #   3. TTL sweep of never-answered entries (_sweep_partial_cmpct_blocks,
+        #      driven from maintain_connections).
+        # Without these the dict leaked a full block of Transaction objects per
+        # orphaned cmpctblock round-trip — the 2026-06-02 93.8 GB OOM driver.
+        self._partial_cmpct_blocks: dict = {}  # bytes -> (str, CompactBlock, list, float)
 
         # BIP 330 Erlay reconciliation state
         self.erlay_enabled: bool = True  # whether we support Erlay
@@ -1521,7 +1580,7 @@ class PeerManager:
                 ip = addr_info[4][0]
                 addr = f"{ip}:{port}"
                 if not self.ban_manager.is_banned(addr):
-                    self.known_addrs.add(addr)
+                    self._add_known_addr(addr)
                     self.addrman.add(ip, port, source=seed)
                     count += 1
 
@@ -2041,6 +2100,26 @@ class PeerManager:
                 "Removed disconnected peer %s (event-driven cleanup)", addr
             )
 
+    def _add_known_addr(self, addr: str) -> None:
+        """Insert *addr* into ``known_addrs`` with a FIFO cap.
+
+        ``known_addrs`` is a parallel record of every host:port ever
+        gossiped; addrman is bucket-bounded but this set was not.  Capped at
+        ``KNOWN_ADDRS_MAX_ENTRIES`` via the companion insertion-order deque,
+        evicting the oldest still-resident entry when full.  Idempotent —
+        re-adding an existing addr does not change ordering or grow the set.
+        """
+        if addr in self.known_addrs:
+            return
+        self.known_addrs.add(addr)
+        self._known_addrs_order.append(addr)
+        while len(self.known_addrs) > KNOWN_ADDRS_MAX_ENTRIES:
+            oldest = self._known_addrs_order.popleft()
+            # Only discard if it is still resident — a .discard() elsewhere
+            # (ban / connect-failure) may have already removed it, leaving a
+            # stale order entry that we skip here.
+            self.known_addrs.discard(oldest)
+
     def _cleanup_peer_state(self, addr: str) -> None:
         """Drop all per-addr state we accumulated for *addr*.
 
@@ -2083,6 +2162,12 @@ class PeerManager:
           - ``block_sync._unconnecting_headers_count`` /
             ``_presync_states`` / ``_peer_handlers``: cleaned via
             ``block_sync.cleanup_peer`` (also a no-op if absent).
+          - ``_partial_cmpct_blocks``: in-flight BIP-152 partial blocks
+            announced by this peer.  A disconnected peer can no longer send
+            the awaited ``blocktxn``, so the entries would leak forever.
+            Dropping them here restores Bitcoin Core's FinalizeNode teardown
+            (the entry was hash-keyed in the original port, so we filter by
+            the announcing addr stored in the tuple).
         """
         self._trickle_queues.pop(addr, None)
         self._erlay_peers.pop(addr, None)
@@ -2094,6 +2179,21 @@ class PeerManager:
         self._addr_relay_day.pop(addr, None)
         self.retry_counts.pop(addr, None)
         self.last_retry_time.pop(addr, None)
+
+        # Drop every in-flight partial compact block this peer announced —
+        # it can no longer answer the getblocktxn, so the retained block of
+        # Transaction objects would leak forever (Core's FinalizeNode bound).
+        stale_cmpct = [
+            h for h, entry in self._partial_cmpct_blocks.items()
+            if entry[0] == addr
+        ]
+        for h in stale_cmpct:
+            self._partial_cmpct_blocks.pop(h, None)
+        if stale_cmpct:
+            logger.debug(
+                "Dropped %d in-flight partial cmpctblock(s) for disconnected "
+                "peer %s", len(stale_cmpct), addr,
+            )
 
         # Sync manager: present on the node-level wiring; absent in unit tests
         # that construct a bare PeerManager.  cleanup_peer is the dedicated
@@ -2112,6 +2212,60 @@ class PeerManager:
                 blk_sync.cleanup_peer(addr)
             except Exception:
                 logger.debug("block_sync.cleanup_peer raised for %s", addr, exc_info=True)
+
+    async def _sweep_partial_cmpct_blocks(self) -> int:
+        """Reclaim never-answered in-flight partial compact blocks.
+
+        A peer that announces a cmpctblock and never sends the matching
+        ``blocktxn`` (without disconnecting) would otherwise leak its full
+        block of Transaction objects forever — disconnect-cleanup never
+        fires for it.  This sweep, driven from :meth:`maintain_connections`,
+        drops any entry older than ``PARTIAL_CMPCT_TTL`` and — to preserve
+        liveness — re-requests the block as a plain full block via getdata
+        (the same fallback :meth:`on_blocktxn` already uses).  Reclaiming a
+        timed-out entry never changes which block connects; the getdata
+        re-fetch supersedes it if the block is still wanted.
+
+        Returns the number of entries swept (useful for tests / telemetry).
+        """
+        if not self._partial_cmpct_blocks:
+            return 0
+        now = time.monotonic()
+        expired = [
+            (h, entry[0])  # (block_hash, announcing addr)
+            for h, entry in self._partial_cmpct_blocks.items()
+            if now - entry[3] > PARTIAL_CMPCT_TTL
+        ]
+        for h, _addr in expired:
+            self._partial_cmpct_blocks.pop(h, None)
+        if not expired:
+            return 0
+        logger.debug(
+            "TTL-swept %d never-answered partial cmpctblock(s) (> %.0fs)",
+            len(expired), PARTIAL_CMPCT_TTL,
+        )
+        # Liveness: re-request each swept block as a full block from any
+        # ready peer so a stuck round-trip still resolves.  Best-effort —
+        # a failed send just means the next inv/announce re-triggers it.
+        try:
+            from ouroboros.p2p_messages import INV_TYPE_BLOCK, GetDataMessage
+            ready = self.get_all_ready_peers()
+            if ready:
+                target = ready[0]
+                for h, _addr in expired:
+                    try:
+                        getdata = GetDataMessage(inventory=[(INV_TYPE_BLOCK, h)])
+                        await target.send_message(
+                            getdata.to_network_message(self.network))
+                    except Exception:
+                        logger.debug(
+                            "getdata fallback for TTL-swept cmpctblock %s "
+                            "failed", h.hex()[:16], exc_info=True,
+                        )
+        except Exception:
+            logger.debug("partial-cmpct TTL getdata fallback raised",
+                         exc_info=True)
+        return len(expired)
 
     async def maintain_connections(self, start_height: int):
         """Maintain peer connections and eclipse protections.
@@ -2250,6 +2404,26 @@ class PeerManager:
 
                 # Update feefilter for full-relay peers only (skip block-relay-only)
                 await self._broadcast_feefilter()
+
+                # Reclaim never-answered in-flight partial compact blocks
+                # (TTL sweep) — closes the 2026-06-02 RSS-leak driver for the
+                # case where a peer announces a cmpctblock and silently never
+                # sends the matching blocktxn without disconnecting.
+                try:
+                    await self._sweep_partial_cmpct_blocks()
+                except Exception:
+                    logger.debug("partial-cmpct sweep raised", exc_info=True)
+
+                # Prune stale ban/misbehaviour state.  sweep_expired drops
+                # expired bans AND idle below-threshold score records (and
+                # caps their per-record events ring) — it had NO periodic
+                # caller before this, so scores grew unbounded under inbound
+                # misbehaviour churn.
+                try:
+                    self.ban_manager.sweep_expired()
+                except Exception:
+                    logger.debug("ban_manager.sweep_expired raised",
+                                 exc_info=True)
 
                 # Wait before next maintenance
                 await asyncio.sleep(30)
@@ -2519,10 +2693,50 @@ class PeerManager:
                 if self._on_compact_block:
                     self._on_compact_block(cb.block_hash, cb.header, partial_txs)
             else:
+                # Per-peer in-flight cap (Core MAX_BLOCKS_IN_TRANSIT_PER_PEER):
+                # before storing a new partial block, count this peer's
+                # existing in-flight entries.  At/over the cap, evict THIS
+                # peer's oldest entry (by insertion time) so a single peer can
+                # never retain more than MAX_CMPCT_IN_FLIGHT_PER_PEER blocks
+                # of Transaction objects.  The evicted block is not lost — it
+                # is re-requested as a full block via getdata below, mirroring
+                # on_blocktxn's existing fallback.
+                peer_entries = [
+                    (h, e[3]) for h, e in self._partial_cmpct_blocks.items()
+                    if e[0] == addr
+                ]
+                if len(peer_entries) >= MAX_CMPCT_IN_FLIGHT_PER_PEER:
+                    oldest_hash = min(peer_entries, key=lambda x: x[1])[0]
+                    self._partial_cmpct_blocks.pop(oldest_hash, None)
+                    logger.debug(
+                        "Peer %s at compact-block in-flight cap (%d); evicted "
+                        "oldest %s, falling back to full-block getdata",
+                        addr, MAX_CMPCT_IN_FLIGHT_PER_PEER,
+                        oldest_hash.hex()[:16],
+                    )
+                    try:
+                        from ouroboros.p2p_messages import (
+                            INV_TYPE_BLOCK, GetDataMessage,
+                        )
+                        getdata = GetDataMessage(
+                            inventory=[(INV_TYPE_BLOCK, oldest_hash)])
+                        await peer.send_message(
+                            getdata.to_network_message(self.network))
+                    except Exception as e:
+                        logger.debug(
+                            "getdata fallback for evicted cmpctblock failed: "
+                            "%s", e,
+                        )
+
                 # Store partial state for the getblocktxn round-trip.
                 # Keyed by block_hash; on_blocktxn will merge + fire handler.
                 # BUG-2 fix: mirrors Core's PartiallyDownloadedBlock (blockencodings.h)
-                self._partial_cmpct_blocks[cb.block_hash] = (cb, partial_txs)
+                # The entry is (announcing addr, CompactBlock, partial_txs,
+                # monotonic insertion-time) so it can be attributed for
+                # disconnect cleanup + the per-peer cap + the TTL sweep.
+                self._partial_cmpct_blocks[cb.block_hash] = (
+                    addr, cb, partial_txs, time.monotonic(),
+                )
                 from ouroboros.compact_blocks import BlockTransactionsRequest
                 req = BlockTransactionsRequest(
                     block_hash=cb.block_hash, indices=missing)
@@ -2550,7 +2764,8 @@ class PeerManager:
                 )
                 return
 
-            _cb, partial_txs = partial_entry
+            # Entry is (announcing addr, CompactBlock, partial_txs, ts).
+            _entry_addr, _cb, partial_txs, _ts = partial_entry
 
             # Merge: fill None slots (in ascending index order) with the
             # transactions from the blocktxn response.  Bitcoin Core
@@ -2851,7 +3066,7 @@ class PeerManager:
                             source=addr,
                         ):
                             added += 1
-                        self.known_addrs.add(f"{host_str}:{net_addr.port}")
+                        self._add_known_addr(f"{host_str}:{net_addr.port}")
                 if added:
                     logger.debug(f"Learned {added} new addresses from {addr}")
                     # Relay to 1-2 random peers
@@ -2887,7 +3102,7 @@ class PeerManager:
                             source=addr,
                         ):
                             added += 1
-                        self.known_addrs.add(f"{host_str}:{port}")
+                        self._add_known_addr(f"{host_str}:{port}")
                 if added:
                     logger.debug(f"Learned {added} new addresses (v2) from {addr}")
                     self._relay_addr(msg, exclude=addr)
@@ -3749,7 +3964,7 @@ class PeerManager:
             addr: Peer address (host:port)
         """
         if not self.ban_manager.is_banned(addr):
-            self.known_addrs.add(addr)
+            self._add_known_addr(addr)
             logger.debug(f"Added peer address: {addr}")
 
     # --- Transaction Trickling (Privacy-Preserving Relay) ---
