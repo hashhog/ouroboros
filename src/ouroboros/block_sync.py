@@ -503,6 +503,11 @@ class BlockSync:
         self.requested_blocks.clear()
         self._block_request_peer.clear()
         self._block_source_peer_addr.clear()
+        # _w77_first_request_time is the request→connect latency telemetry
+        # dict; it pops only on a successful active-chain connect, so a bulk
+        # queue-drop here would otherwise orphan every in-flight entry.
+        # Clear it alongside the sibling maps (telemetry-only, safe to reset).
+        self._w77_first_request_time.clear()
         # Reset the header-sync stall timer so sync_loop picks a fresh
         # header sync peer immediately rather than waiting out the previous
         # peer's stall window.
@@ -1175,6 +1180,9 @@ class BlockSync:
             self.requested_blocks.clear()
             self._block_request_peer.clear()
             self._block_source_peer_addr.clear()
+            # Telemetry-only request→connect latency dict; clear with the
+            # sibling maps so a bulk queue-drop doesn't orphan its entries.
+            self._w77_first_request_time.clear()
             self._header_sync_peer = None
             self._header_sync_time = 0.0
             self._w91_last_drain_exit_perf_ns = time.perf_counter_ns()

@@ -41,6 +41,17 @@ SCORE_INVALID_TX_HIGH = SCORE_INVALID_TX
 SCORE_INVALID_TX_LOW = 1
 SCORE_UNSOLICITED_BLOCK = SCORE_UNREQUESTED_DATA
 
+# Retention bounds for the misbehaviour-score table.  Without these the
+# ``scores`` dict grows one entry per unique below-threshold misbehaving IP
+# (and each record's ``events`` list grows one string per event) with no
+# expiry — a slow unbounded leak under inbound churn from peers that
+# reconnect under new ephemeral ports.  A score record whose last event is
+# older than ``SCORE_RECORD_TTL`` is reclaimed by ``sweep_expired``; each
+# record's ``events`` is capped to the most recent ``SCORE_EVENTS_MAX``.
+# Mirrors the spirit of Core's DEFAULT_MISBEHAVING_BANTIME (24 h).
+SCORE_RECORD_TTL = 86400.0  # seconds (24 h)
+SCORE_EVENTS_MAX = 20
+
 
 @dataclass
 class MisbehaviorRecord:
@@ -104,6 +115,10 @@ class BanManager:
         rec = self.scores.setdefault(ip, MisbehaviorRecord())
         rec.score += score
         rec.events.append(reason)
+        # Cap the per-record events ring so a single long-lived misbehaving
+        # IP cannot accrete an unbounded list of reason strings.
+        if len(rec.events) > SCORE_EVENTS_MAX:
+            del rec.events[:-SCORE_EVENTS_MAX]
         rec.last_event = time.time()
 
         logger.debug(
@@ -241,13 +256,41 @@ class BanManager:
         return result
 
     def sweep_expired(self) -> int:
-        """Remove expired bans and return how many were removed."""
+        """Remove expired bans + stale score records; return how many bans were removed.
+
+        Prunes two structures:
+          - ``banned``: drop entries whose ban window has elapsed (as before).
+          - ``scores``: drop misbehaviour-score records whose last event is
+            older than ``SCORE_RECORD_TTL``.  Without this the score table
+            grew one entry per unique below-threshold misbehaving IP forever
+            (it is never cleared on disconnect) — a slow unbounded leak under
+            inbound churn.  A genuine repeat-offender re-arms its record on the
+            next event, so reclaiming an idle one is harmless.
+
+        Must be driven by a periodic caller (the PeerManager maintenance loop
+        wires this in); it had none before, so neither structure self-pruned.
+
+        Returns the number of *bans* removed (unchanged from the prior
+        contract; the score reclaim is incidental hygiene).
+        """
         now = time.time()
         expired = [ip for ip, t in self.banned.items() if t <= now]
         for ip in expired:
             del self.banned[ip]
         if expired and self._data_dir:
             self._save_bans()
+
+        # Reclaim idle below-threshold score records.
+        stale_scores = [
+            ip for ip, rec in self.scores.items()
+            if now - rec.last_event > SCORE_RECORD_TTL
+        ]
+        for ip in stale_scores:
+            del self.scores[ip]
+        if stale_scores:
+            logger.debug("Swept %d stale misbehaviour-score record(s)",
+                         len(stale_scores))
+
         return len(expired)
 
     # --- Persistence ---
