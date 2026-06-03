@@ -7207,6 +7207,209 @@ class RPCServer:
 
         return result
 
+    async def rpc_scantxoutset(
+        self,
+        action: str = "start",
+        scanobjects: list[Any] | None = None,
+    ) -> Any:
+        """Scan the unspent transaction output set for matching scriptPubKeys.
+
+        Mirrors Bitcoin Core's ``scantxoutset`` RPC
+        (rpc/blockchain.cpp::scantxoutset). Iterates the live chainstate and
+        collects every UTXO whose scriptPubKey matches one of the supplied
+        scan objects.
+
+        Supported scan-object forms (the two simplest descriptors):
+          - ``addr(<address>)`` — match outputs paying to the address's
+            scriptPubKey (decoded via ``address_to_script_pubkey``).
+          - ``raw(<scriptPubKey-hex>)`` — match outputs with exactly this
+            scriptPubKey.
+          - ``pkh(<hex-pubkey>)`` / ``wpkh(<hex-pubkey>)`` /
+            ``tr(<hex-xonly-pubkey>)`` — single-key descriptors (bonus;
+            xpub-range descriptors are out of scope).
+          - a bare hex string is also accepted as a raw scriptPubKey, matching
+            Core's ``raw()`` shorthand for the diff-test harness.
+
+        Actions:
+          - ``start`` (default) — perform the scan; ``scanobjects`` required.
+          - ``abort`` / ``status`` — no background scan is tracked here, so
+            these return ``False`` (no scan in progress), matching Core's
+            return when nothing is running.
+
+        Returns (for ``start``):
+            ``{"success", "txouts", "height", "bestblock", "unspents":
+            [{"txid","vout","scriptPubKey","desc","amount","coinbase",
+            "height"}...], "total_amount"}``.
+        """
+        action = (action or "start").lower()
+
+        if action in ("abort", "status"):
+            # No long-running background scan is tracked in this minimal
+            # implementation; Core returns false from abort/status when no
+            # scan is in progress. Mirror that.
+            return False
+        if action != "start":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid action '{action}'",
+            )
+
+        if not scanobjects:
+            raise HTTPException(
+                status_code=400,
+                detail="scanobjects argument is required for the start action",
+            )
+
+        if not hasattr(self.node, "db") or not self.node.db:
+            return {
+                "success": True,
+                "txouts": 0,
+                "height": 0,
+                "bestblock": "",
+                "unspents": [],
+                "total_amount": 0.0,
+            }
+
+        network = getattr(self.node, "network", "mainnet")
+
+        # Resolve every scan object to a (scriptPubKey -> descriptor-string)
+        # entry. ``needles`` maps the raw scriptPubKey bytes to the inferred
+        # descriptor string echoed back in each matched unspent.
+        needles: dict[bytes, str] = self._scantxoutset_resolve(scanobjects, network)
+
+        best_hash_internal, best_height = self.node.db.get_best_block()
+
+        def _scan() -> dict[str, Any]:
+            """Single-pass UTXO walk on a worker thread (large chainstates
+            must not stall the asyncio event loop)."""
+            from decimal import Decimal
+
+            txouts = 0
+            total_in = 0
+            unspents: list[dict[str, Any]] = []
+            for utxo in self.node.db.iter_utxos():
+                txouts += 1
+                spk = bytes(utxo.script_pubkey)
+                desc = needles.get(spk)
+                if desc is None:
+                    continue
+                amount = int(utxo.amount)
+                total_in += amount
+                # iter_utxos yields txid in internal (little-endian) byte
+                # order; JSON-RPC reports it in display order (reversed hex),
+                # matching rpc_gettxout / Core's COutPoint::hash.GetHex().
+                txid_display = bytes(utxo.txid)[::-1].hex()
+                coin_height = int(utxo.height) if utxo.height is not None else 0
+                unspents.append({
+                    "txid": txid_display,
+                    "vout": int(utxo.vout),
+                    "scriptPubKey": spk.hex(),
+                    "desc": desc,
+                    "amount": float(Decimal(amount) / Decimal(100_000_000)),
+                    "coinbase": bool(utxo.is_coinbase),
+                    "height": coin_height,
+                })
+            return {
+                "txouts": txouts,
+                "total_amount": float(Decimal(total_in) / Decimal(100_000_000)),
+                "unspents": unspents,
+            }
+
+        stats = await asyncio.to_thread(_scan)
+
+        # Core's uint256.GetHex() emits big-endian display hex; flip the
+        # internal tip hash to match.
+        bestblock_hex = (
+            best_hash_internal[::-1].hex()
+            if isinstance(best_hash_internal, (bytes, bytearray))
+            else ""
+        )
+
+        return {
+            "success": True,
+            "txouts": stats["txouts"],
+            "height": int(best_height),
+            "bestblock": bestblock_hex,
+            "unspents": stats["unspents"],
+            "total_amount": stats["total_amount"],
+        }
+
+    def _scantxoutset_resolve(
+        self, scanobjects: list[Any], network: str
+    ) -> dict[bytes, str]:
+        """Resolve scan objects to a ``{scriptPubKey: descriptor-string}`` map.
+
+        Supports ``addr()``, ``raw()``, and the single-key descriptors
+        ``pkh()``/``wpkh()``/``tr()`` plus a bare-hex shorthand for raw
+        scripts. Raises HTTPException(400) on unparseable / unsupported
+        objects, matching Core's RPC_INVALID_PARAMETER behaviour.
+        """
+        from ouroboros.address import address_to_script_pubkey
+
+        def _hash160(data: bytes) -> bytes:
+            import hashlib
+
+            sha = hashlib.sha256(data).digest()
+            ripe = hashlib.new("ripemd160")
+            ripe.update(sha)
+            return ripe.digest()
+
+        needles: dict[bytes, str] = {}
+        for obj in scanobjects:
+            # Core also accepts {"desc": "...", "range": ...} objects; this
+            # minimal impl handles the string form (and pulls "desc" out of a
+            # dict for convenience).
+            if isinstance(obj, dict):
+                spec = obj.get("desc")
+            else:
+                spec = obj
+            if not isinstance(spec, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Scan object must be a descriptor string",
+                )
+            spec = spec.strip()
+            # Strip a trailing descriptor checksum (#xxxxxxxx) if present.
+            if "#" in spec:
+                spec = spec.split("#", 1)[0]
+
+            spk: bytes
+            desc: str = spec
+            try:
+                if spec.startswith("addr(") and spec.endswith(")"):
+                    addr = spec[len("addr("):-1]
+                    spk = address_to_script_pubkey(addr, network)
+                elif spec.startswith("raw(") and spec.endswith(")"):
+                    spk = bytes.fromhex(spec[len("raw("):-1])
+                elif spec.startswith("pkh(") and spec.endswith(")"):
+                    pub = bytes.fromhex(spec[len("pkh("):-1])
+                    spk = b"\x76\xa9\x14" + _hash160(pub) + b"\x88\xac"
+                elif spec.startswith("wpkh(") and spec.endswith(")"):
+                    pub = bytes.fromhex(spec[len("wpkh("):-1])
+                    spk = b"\x00\x14" + _hash160(pub)
+                elif spec.startswith("tr(") and spec.endswith(")"):
+                    # Minimal: treat the inner hex as a 32-byte x-only output
+                    # key (no script-path tweak). Full BIP-341 tweaking is a
+                    # follow-up; key-path tr() with an already-tweaked key is
+                    # the common UTXO-scan case.
+                    xonly = bytes.fromhex(spec[len("tr("):-1])
+                    if len(xonly) != 32:
+                        raise ValueError("tr() expects a 32-byte x-only key")
+                    spk = b"\x51\x20" + xonly
+                else:
+                    # Bare-hex shorthand for a raw scriptPubKey.
+                    spk = bytes.fromhex(spec)
+            except HTTPException:
+                raise
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported or invalid scan object '{spec}': {exc}",
+                ) from None
+
+            needles.setdefault(spk, desc)
+        return needles
+
     async def rpc_verifychain(self, checklevel: int = 3, nblocks: int = 6) -> bool:
         """Verify the blockchain database.
 
