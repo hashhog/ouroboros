@@ -7916,19 +7916,43 @@ class RPCServer:
         self, rawtxs: list[str], maxfeerate: float = 0.10
     ) -> list[dict[str, Any]]:
         """Test whether raw transactions would be accepted to mempool."""
-        results = []
+        # Resolve the *transaction* validator robustly.  ``self.node.validator``
+        # is a ``BlockValidator`` (no ``validate_transaction`` method) and on a
+        # fresh/idle node may even be ``None`` -- calling through it raised an
+        # AttributeError that leaked into the reject-reason.  The single-tx
+        # mempool validator is the ``TransactionValidator`` wired at node init
+        # (``node.tx_validator``); the mempool holds the same instance and the
+        # BlockValidator owns an equivalent one.  Prefer them in that order so
+        # the call always lands on something with ``validate_transaction``.
+        tx_validator = (
+            getattr(self.node, "tx_validator", None)
+            or getattr(getattr(self.node, "mempool", None), "validator", None)
+            or getattr(getattr(self.node, "validator", None), "tx_validator", None)
+        )
+        results: list[dict[str, Any]] = []
         for raw in rawtxs:
             try:
                 from ouroboros.p2p_messages import TxMessage
                 tx_msg = TxMessage.from_payload(bytes.fromhex(raw))
                 tx = tx_msg.transaction
-                _, best_height = self.node.db.get_best_block()
-                valid, error = self.node.validator.validate_transaction(
-                    tx, best_height + 1)
                 # JSON-RPC convention: txids in responses are display-order
                 # (BE). get_txid() returns LE (internal). Reverse for JSON. W69.
+                txid_be = tx.get_txid()[::-1].hex()
+                if tx_validator is None or getattr(self.node, "db", None) is None:
+                    # Node not far enough through init to validate -- return a
+                    # clean structured reject rather than a NoneType/attribute
+                    # error.
+                    results.append({
+                        "txid": txid_be,
+                        "allowed": False,
+                        "reject-reason": "node-not-ready",
+                    })
+                    continue
+                _, best_height = self.node.db.get_best_block()
+                valid, error = tx_validator.validate_transaction(
+                    tx, best_height + 1)
                 results.append({
-                    "txid": tx.get_txid()[::-1].hex(),
+                    "txid": txid_be,
                     "allowed": valid,
                     "reject-reason": error if not valid else None,
                 })
