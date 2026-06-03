@@ -9006,12 +9006,26 @@ class RPCServer:
             subsidy = (50 * 100_000_000) >> halvings if halvings < 64 else 0
 
             # --- Coinbase transaction ---
-            # BIP34: height in scriptSig
-            height_bytes = _st.pack("<q", next_height)
-            # Trim trailing zero bytes but keep at least 1
-            while len(height_bytes) > 1 and height_bytes[-1] == 0:
-                height_bytes = height_bytes[:-1]
-            coinbase_script = bytes([len(height_bytes)]) + height_bytes
+            # BIP34: height in scriptSig. Must be the byte-exact canonical
+            # CScript() << nHeight encoding that the validator enforces
+            # (validation.py:_encode_bip34_height / Core script.h:433-448):
+            #   0      -> OP_0 (0x00)
+            #   1..16  -> OP_1..OP_16 (0x51..0x60, single-byte opcode, NO len prefix)
+            #   else   -> length-prefixed minimal sign-magnitude CScriptNum.
+            # The previous ad-hoc pack("<q") + trim + length-prefix produced
+            # "01 01" for height 1 (vs the expected single byte 0x51), which
+            # the node's own BIP34 check rejected with bad-cb-height.
+            from ouroboros.validation import _encode_bip34_height
+            coinbase_script = _encode_bip34_height(next_height)
+            # The consensus rule requires the coinbase scriptSig to be
+            # 2-100 bytes (Core: CheckTransaction / IsCoinBase length check,
+            # mirrored in ferrous-utils transaction.rs:517-521). The canonical
+            # BIP34 push for heights 1..16 is a single OP_N opcode (1 byte),
+            # so — exactly as Core miners do — we append an arbitrary
+            # "extra-nonce" tag after the height push to clear the 2-byte
+            # minimum. The BIP34 validator only checks the height *prefix*,
+            # so trailing bytes are consensus-irrelevant.
+            coinbase_script = coinbase_script + b"\x00" + b"/ouroboros/"
 
             coinbase_in = _TxIn(
                 prev_txid=bytes(32),
@@ -9085,9 +9099,15 @@ class RPCServer:
             # For regtest, bits stays at minimum difficulty
             bits = 0x207FFFFF
 
-            # prev_blockhash is stored in internal byte order; wire format
-            # needs little-endian (reversed display order).
-            prev_hash_wire = best_hash[::-1]
+            # db.get_best_block() already returns the hash in internal
+            # (little-endian) byte order, which IS the wire byte order for
+            # the header prev_blockhash field. (Display/RPC order is the
+            # reverse — see getbestblockhash, which does best_hash[::-1].)
+            # The previous code reversed it again here, producing a header
+            # whose prev_blockhash was byte-swapped vs the real tip, which
+            # the Rust header validator rejected as "Previous block hash
+            # mismatch". Use best_hash as-is.
+            prev_hash_wire = best_hash
 
             timestamp = max(int(_time.time()), (self.node.get_median_time(best_height) or 0) + 1)
 
