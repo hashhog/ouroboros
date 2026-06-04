@@ -9005,6 +9005,29 @@ class RPCServer:
             halvings = next_height // halving_interval
             subsidy = (50 * 100_000_000) >> halvings if halvings < 64 else 0
 
+            # --- Mempool transactions ---
+            # A wallet-native spend only confirms if the miner actually puts
+            # the signed mempool tx into the block it produces.  Previously
+            # this RPC mined coinbase-ONLY blocks, so a sendrawtransaction'd
+            # spend sat in the mempool forever and never confirmed.  Mirror
+            # Core's BlockAssembler: drain the mempool (here: the whole pool,
+            # which on regtest is small) into the block, sum the input fees,
+            # and pay them to the coinbase along with the subsidy.
+            #   coinbase reward = subsidy + sum(mempool fees)
+            # Reference: Bitcoin Core node/miner.cpp BlockAssembler::CreateNewBlock.
+            mempool_txs: list = []   # list[Transaction]
+            mempool_fees = 0
+            _mp = getattr(self.node, "mempool", None)
+            if _mp is not None and len(_mp) > 0:
+                # Snapshot the entries; entry.tx is a fully-built Transaction
+                # (witness included), entry.fee its absolute fee in sats.
+                for _entry in list(_mp.transactions.values()):
+                    _etx = getattr(_entry, "tx", None)
+                    if _etx is None:
+                        continue
+                    mempool_txs.append(_etx)
+                    mempool_fees += int(getattr(_entry, "fee", 0) or 0)
+
             # --- Coinbase transaction ---
             # BIP34: height in scriptSig. Must be the byte-exact canonical
             # CScript() << nHeight encoding that the validator enforces
@@ -9035,16 +9058,34 @@ class RPCServer:
                 witness=[bytes(32)],  # SegWit nonce (32 zero bytes)
             )
 
-            # Witness commitment (even with 0 non-coinbase txs we include it
-            # so that the block is valid SegWit).
-            witness_root = bytes(32)  # only coinbase -> wtxid is 0x00*32
+            # Witness commitment.  The witness merkle root is computed over the
+            # wtxids of EVERY tx in the block, with the coinbase's wtxid forced
+            # to 0x00*32 (BIP-141).  With mempool txs present this is no longer
+            # a constant — compute it over [0x00*32] + [tx.get_wtxid()...].
+            # Reference: Bitcoin Core validation.cpp BlockWitnessMerkleRoot +
+            # GenerateCoinbaseCommitment.
+            def _merkle_root(hashes: list[bytes]) -> bytes:
+                if not hashes:
+                    return bytes(32)
+                layer = list(hashes)
+                while len(layer) > 1:
+                    if len(layer) % 2 == 1:
+                        layer.append(layer[-1])
+                    layer = [
+                        _hl.sha256(_hl.sha256(layer[i] + layer[i + 1]).digest()).digest()
+                        for i in range(0, len(layer), 2)
+                    ]
+                return layer[0]
+
+            wtxids = [bytes(32)] + [t.get_wtxid() for t in mempool_txs]
+            witness_root = _merkle_root(wtxids)
             witness_nonce = bytes(32)
             commitment = _hl.sha256(
                 _hl.sha256(witness_root + witness_nonce).digest()
             ).digest()
             witness_commitment_spk = bytes.fromhex("6a24aa21a9ed") + commitment
 
-            coinbase_out_reward = _TxOut(value=subsidy, script_pubkey=output_spk)
+            coinbase_out_reward = _TxOut(value=subsidy + mempool_fees, script_pubkey=output_spk)
             coinbase_out_commitment = _TxOut(value=0, script_pubkey=witness_commitment_spk)
 
             # Build coinbase as raw bytes (with witness) for correct txid/wtxid.
@@ -9092,8 +9133,13 @@ class RPCServer:
 
             cb_txid = _hl.sha256(_hl.sha256(bytes(cb_no_witness)).digest()).digest()
 
-            # --- Merkle root (single tx) ---
-            merkle_root = cb_txid  # only coinbase
+            # --- Merkle root (coinbase + mempool txs) ---
+            # Core computes the block merkle root over the (non-witness) txids
+            # in block order.  ``Transaction.get_txid()`` returns the internal
+            # (wire) byte order hash, which is exactly what the merkle tree
+            # consumes.
+            txids = [cb_txid] + [t.get_txid() for t in mempool_txs]
+            merkle_root = _merkle_root(txids)
 
             # --- Block header ---
             # For regtest, bits stays at minimum difficulty
@@ -9143,10 +9189,15 @@ class RPCServer:
                 )
 
             # --- Assemble full block bytes ---
+            # tx count = coinbase + every mempool tx, each serialized with its
+            # witness (Core wire format). Order MUST match the merkle/witness
+            # roots computed above (coinbase first, then mempool order).
             block_data = bytearray()
             block_data.extend(header)
-            block_data.extend(encode_varint(1))  # 1 transaction
+            block_data.extend(encode_varint(1 + len(mempool_txs)))
             block_data.extend(cb_bytes)
+            for _mtx in mempool_txs:
+                block_data.extend(_mtx.serialize_with_witness())
 
             block_bytes = bytes(block_data)
 
@@ -11955,26 +12006,31 @@ class RPCServer:
             except Exception:
                 continue
 
-        # Sum UTXOs for all addresses
-        for addr in addresses:
-            if hasattr(wallet.db, 'get_utxos_for_address'):
-                utxos = wallet.db.get_utxos_for_address(addr, wallet.network)
-                for utxo in utxos:
-                    # Check confirmations
-                    utxo_height = utxo.get('height', 0)
-                    if utxo_height == 0:
-                        # Unconfirmed (mempool)
-                        confs = 0
-                    else:
-                        confs = max(0, best_height - utxo_height + 1)
+        # Maturity threshold for coinbase outputs (Core COINBASE_MATURITY).
+        COINBASE_MATURITY = 100
 
-                    if confs >= minconf:
-                        total_balance += utxo.get('value', 0)
-            elif hasattr(wallet.db, 'get_balance'):
-                # Fallback to simple balance query
-                balance = wallet.db.get_balance(addr, wallet.network)
-                if minconf == 0:
-                    total_balance += balance
+        # Sum UTXOs for all addresses, enforcing both confirmation count and
+        # coinbase maturity. Iterating list_unspent_by_address (which now reads
+        # the REAL chainstate and carries height + is_coinbase per coin) lets us
+        # exclude immature coinbase exactly as Core's available-balance does.
+        # Reference: Bitcoin Core wallet GetBalance / IsImmatureCoinBase.
+        for addr in addresses:
+            try:
+                utxos = wallet.db.list_unspent_by_address(addr, wallet.network)
+            except Exception:
+                continue
+            for utxo in utxos:
+                utxo_height = utxo.get('height', 0) or 0
+                if utxo_height == 0:
+                    confs = 0
+                else:
+                    confs = max(0, best_height - utxo_height + 1)
+                if confs < minconf:
+                    continue
+                # Immature coinbase is excluded from the spendable balance.
+                if utxo.get('is_coinbase', False) and confs < (COINBASE_MATURITY + 1):
+                    continue
+                total_balance += utxo.get('value', 0)
 
         # Convert satoshis to BTC
         return total_balance / 100_000_000

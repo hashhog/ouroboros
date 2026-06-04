@@ -1665,15 +1665,54 @@ class Wallet:
         logger.info(f"Key pool refilled with {generated} new keys")
         return generated
 
+    # Coinbase maturity (Core consensus.h COINBASE_MATURITY). A coinbase UTXO
+    # mined at ``coin_height`` is spendable only once it has 100 confirmations.
+    # Core's wallet treats a coin as mature when
+    #   GetDepthInMainChain() = tip - coin_height + 1 >= COINBASE_MATURITY + 1,
+    # i.e. coin_height <= tip - COINBASE_MATURITY. At tip 101 only the height-1
+    # coinbase qualifies (50 BTC), matching the reference spend cell.
+    COINBASE_MATURITY = 100
+
+    def _tip_height(self) -> int:
+        if self.db is None:
+            return 0
+        try:
+            _, h = self.db.get_best_block()
+            return int(h)
+        except Exception:
+            return 0
+
+    def _is_spendable_utxo(self, u: dict, tip_height: int) -> bool:
+        """Return True unless *u* is an immature coinbase output.
+
+        Mirrors Bitcoin Core's CWalletTx::IsImmatureCoinBase /
+        GetBlocksToMaturity. Non-coinbase coins are always spendable once
+        in the chainstate; coinbase coins need COINBASE_MATURITY confirmations.
+        """
+        if not u.get("is_coinbase", False):
+            return True
+        coin_height = u.get("height", 0) or 0
+        # confirmations = tip - coin_height + 1; mature when >= MATURITY + 1.
+        return (tip_height - coin_height + 1) >= (self.COINBASE_MATURITY + 1)
+
     async def get_balance(self, address: str | None = None) -> int:
         if self.db is None:
             return 0
+        tip = self._tip_height()
         if address:
-            return self.db.get_balance(address, self.network)
+            return sum(
+                u["value"]
+                for u in self.db.list_unspent_by_address(address, self.network)
+                if self._is_spendable_utxo(u, tip)
+            )
         total = 0
         for kd in self.keys:
             k = self._get_wallet_key(kd)
-            total += self.db.get_balance(k.get_p2wpkh_address(), self.network)
+            for u in self.db.list_unspent_by_address(
+                k.get_p2wpkh_address(), self.network
+            ):
+                if self._is_spendable_utxo(u, tip):
+                    total += u["value"]
         return total
 
     async def get_addresses(self) -> list[AddressInfo]:
@@ -2258,11 +2297,18 @@ class Wallet:
     def _collect_utxos(self) -> list[dict]:
         if self.db is None:
             return []
+        tip = self._tip_height()
         utxos: list[dict] = []
         for kd in self.keys:
             k = self._get_wallet_key(kd)
             addr = k.get_p2wpkh_address()
             for u in self.db.list_unspent_by_address(addr, self.network):
+                # Skip immature coinbase: selecting one would build a tx the
+                # node rejects as bad-txns-premature-spend-of-coinbase.
+                # Reference: Bitcoin Core wallet/spend.cpp AvailableCoins()
+                # only offers coins with GetBlocksToMaturity() == 0.
+                if not self._is_spendable_utxo(u, tip):
+                    continue
                 # Honor lockunspent — skip coins the user has explicitly locked.
                 # Reference: Bitcoin Core wallet/spend.cpp AvailableCoins().
                 txid_field = u.get("txid", "")
@@ -2433,7 +2479,16 @@ class Wallet:
         # Use sequence 0xFFFFFFFD to signal RBF and enable locktime
         inputs: list[TxIn] = []
         for utxo in selected:
-            txid_bytes = bytes.fromhex(utxo["txid"]) if isinstance(utxo["txid"], str) else utxo["txid"]
+            # ``utxo["txid"]`` is the display (big-endian) hex from the DB
+            # layer (Core/JSON convention).  The wire ``prev_txid`` must be
+            # internal (little-endian) byte order, so reverse the decoded
+            # bytes.  (Previously this consumed the txid as-is, which only
+            # ever "worked" because the demo UTXO stub never matched a real
+            # coin and the spend path was unreachable.)
+            if isinstance(utxo["txid"], str):
+                txid_bytes = bytes.fromhex(utxo["txid"])[::-1]
+            else:
+                txid_bytes = bytes(utxo["txid"])
             inputs.append(TxIn(
                 prev_txid=txid_bytes,
                 prev_vout=utxo["vout"],
