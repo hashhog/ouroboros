@@ -3345,24 +3345,49 @@ class RPCServer:
         network = getattr(self.node, 'network', 'mainnet')
         result = []
 
-        if addresses:
-            for addr in addresses:
-                try:
-                    utxos = self.node.db.list_unspent_by_address(addr, network)
-                    for u in utxos:
-                        result.append({
-                            "txid": u["txid"],
-                            "vout": u["vout"],
-                            "scriptPubKey": u["script_pubkey"].hex(),
-                            "amount": u["value"] / 100_000_000.0,
-                            "confirmations": 1,  # In chainstate = confirmed
-                            "spendable": True,
-                        })
-                except ValueError:
-                    continue  # Skip invalid addresses
-        else:
-            # No address filter: would need to iterate all (expensive). Return empty for now.
-            pass
+        # With no explicit address filter, enumerate the wallet's own
+        # addresses (all four script types per key in self.keys), mirroring
+        # Bitcoin Core's listunspent default of "all wallet UTXOs". This also
+        # lets a freshly-rescanned wallet surface the coins it just adopted.
+        if not addresses:
+            wallet = self._get_wallet_for_rpc()
+            if wallet is None:
+                wallet = getattr(self.node, "wallet", None)
+            scanned: set[str] = set()
+            if wallet is not None:
+                from ouroboros.wallet import WalletKey
+                for kd in getattr(wallet, "keys", []):
+                    try:
+                        k = WalletKey.from_wif(kd["wif"], network)
+                    except Exception:
+                        continue
+                    for a in (
+                        k.get_p2wpkh_address(),
+                        k.get_p2pkh_address(),
+                        k.get_p2sh_p2wpkh_address(),
+                    ):
+                        scanned.add(a)
+                    try:
+                        scanned.add(k.get_p2tr_address())
+                    except Exception:
+                        pass
+            addresses = list(scanned)
+
+        for addr in addresses:
+            try:
+                utxos = self.node.db.list_unspent_by_address(addr, network)
+                for u in utxos:
+                    result.append({
+                        "txid": u["txid"],
+                        "vout": u["vout"],
+                        "address": addr,
+                        "scriptPubKey": u["script_pubkey"].hex(),
+                        "amount": u["value"] / 100_000_000.0,
+                        "confirmations": 1,  # In chainstate = confirmed
+                        "spendable": True,
+                    })
+            except ValueError:
+                continue  # Skip invalid addresses
 
         return result
 
@@ -8350,18 +8375,91 @@ class RPCServer:
             raise ValueError(f"Invalid or non-wallet transaction id: {txid}")
         return entry
 
-    async def rpc_importprivkey(self, privkey: str, label: str = "", rescan: bool = True) -> None:
-        """Import a private key into the wallet."""
-        if not hasattr(self.node, 'wallet') or not self.node.wallet:
+    async def rpc_importprivkey(
+        self, privkey: str, label: str = "", rescan: bool = True
+    ) -> None:
+        """Import a WIF private key into the wallet and (optionally) rescan.
+
+        Decodes the WIF, adds the key (and thereby its addresses/scripts) to
+        the wallet, and — when ``rescan`` is true — scans the existing chain so
+        any funds already paid to that key are credited into the wallet's
+        balance / listunspent / history. Returns null on success, matching
+        Bitcoin Core importprivkey.
+
+        Reference: bitcoin-core/src/wallet/rpc/backup.cpp importprivkey ->
+        CWallet::ImportPrivKeys + ScanForWalletTransactions.
+        """
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
             raise ValueError("No wallet loaded")
+
         from ouroboros.wallet import WalletKey
-        key = WalletKey.from_wif(privkey, self.node.network)
-        self.node.wallet.keys.append({
-            "wif": key.to_wif(),
-            "label": label,
-            "created": int(time.time()),
-        })
-        self.node.wallet._save()
+        try:
+            key = WalletKey.from_wif(privkey, self.node.network)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid private key encoding: {exc}"
+            ) from None
+
+        wif = key.to_wif()
+        # Idempotent: don't duplicate a key already in the wallet.
+        if not any(kd.get("wif") == wif for kd in wallet.keys):
+            wallet.keys.append({
+                "wif": wif,
+                "label": label,
+                "created": int(time.time()),
+            })
+            wallet._save()
+
+        # Rescan the existing chain so this key's already-confirmed funds show
+        # up. The imported key's four scripts are now in ``self.keys`` /
+        # ``_owned_script_set``, so scan_block_connect credits them; the
+        # chainstate balance scan over ``self.keys`` then reports them.
+        if rescan:
+            try:
+                await asyncio.to_thread(wallet.rescan_chain, 0, None)
+            except Exception:
+                wallet.rescan_chain(0, None)
+
+    async def rpc_rescanblockchain(
+        self,
+        start_height: int = 0,
+        stop_height: int | None = None,
+    ) -> dict[str, Any]:
+        """Rescan the local block chain for wallet-related transactions.
+
+        Walks blocks ``[start_height .. stop_height]`` (stop_height defaults to
+        the chain tip), crediting every output paying a script this wallet can
+        derive into the wallet's UTXO view + history. The wallet rescan
+        counterpart of the forward block-connect scan — distinct from
+        scantxoutset, which scans the chain-level UTXO set and bypasses the
+        wallet entirely.
+
+        Returns ``{"start_height": <int>, "stop_height": <int>}``, matching
+        Bitcoin Core. Reference: bitcoin-core/src/wallet/rpc/transactions.cpp
+        rescanblockchain -> CWallet::ScanForWalletTransactions.
+        """
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="No wallet loaded")
+        if getattr(wallet, "db", None) is None:
+            raise HTTPException(status_code=500, detail="Wallet database not available")
+
+        try:
+            result = await asyncio.to_thread(
+                wallet.rescan_chain, int(start_height),
+                None if stop_height is None else int(stop_height),
+            )
+        except Exception:
+            result = wallet.rescan_chain(
+                int(start_height),
+                None if stop_height is None else int(stop_height),
+            )
+        return result
 
     async def rpc_dumpprivkey(self, address: str) -> str:
         """Reveal the private key for an address."""
