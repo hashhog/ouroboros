@@ -901,20 +901,42 @@ class BlockchainDatabase:
         return list(self._iter_matching_utxos(script_pubkey))
 
     def _iter_matching_utxos(self, script_pubkey: bytes):
+        # Walk the REAL chainstate UTXO set (``iter_utxos`` reads
+        # CHAINSTATE_CF), not the demo-only ``get_utxos`` stub which returned
+        # three hardcoded example coins and therefore never matched a wallet
+        # address — that stub left getbalance/listunspent permanently 0/[]
+        # even though scantxoutset (which already iterates the real set) saw
+        # the coins.  Mirrors Bitcoin Core's CCoinsViewCursor walk.
+        #
+        # ``iter_utxos`` falls back gracefully (yields nothing) when the Rust
+        # extension predates it.  Each PyUTXO exposes ``txid`` as a *display*
+        # (reversed) hex string — the JSON/Core convention — plus ``height``
+        # and ``is_coinbase`` so callers can enforce coinbase maturity.
+        iter_fn = getattr(self._db, "iter_utxos", None)
+        if iter_fn is None:
+            return
         try:
-            py_utxos = self._db.get_utxos()
-        except AttributeError:
+            py_utxos = iter_fn()
+        except Exception:
             return
         for py_utxo in py_utxos:
             spk = bytes(py_utxo.script_pubkey)
-            if spk == script_pubkey:
-                txid_hex = py_utxo.txid if isinstance(py_utxo.txid, str) else py_utxo.txid.hex()
-                yield {
-                    "txid": txid_hex,
-                    "vout": py_utxo.vout,
-                    "value": py_utxo.value,
-                    "script_pubkey": spk,
-                }
+            if spk != script_pubkey:
+                continue
+            # PyUTXO.txid is the display (big-endian) hex string produced by
+            # Txid::to_string(); keep it in that form so listunspent/getbalance
+            # report Core-order txids. Spenders reverse it for the wire.
+            raw_txid = py_utxo.txid
+            txid_hex = raw_txid if isinstance(raw_txid, str) else bytes(raw_txid)[::-1].hex()
+            height = getattr(py_utxo, "height", None)
+            yield {
+                "txid": txid_hex,
+                "vout": int(py_utxo.vout),
+                "value": int(getattr(py_utxo, "amount", py_utxo.value)),
+                "script_pubkey": spk,
+                "height": int(height) if height is not None else 0,
+                "is_coinbase": bool(getattr(py_utxo, "is_coinbase", False)),
+            }
 
     def get_block_hash_by_height(self, height: int) -> bytes | None:
         """Return the 32-byte block hash at *height*, or None if not found."""
