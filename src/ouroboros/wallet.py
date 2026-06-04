@@ -1813,6 +1813,196 @@ class Wallet:
                 pass
         return out
 
+    # --- Chain rescan (Core CWallet::ScanForWalletTransactions) -------------
+    # Reference: bitcoin-core/src/wallet/wallet.cpp ScanForWalletTransactions
+    # and wallet/rpc/transactions.cpp rescanblockchain. The backward counterpart
+    # of the block-connect scan (scan_block_connect): walk an EXISTING height
+    # range, find outputs paying scripts this wallet can DERIVE (not just keys
+    # it has already handed out), adopt those keys so the global-chainstate
+    # balance/listunspent scan finds them, and build the history records.
+
+    # How many indices per (purpose, is_change) sub-pool to probe during a
+    # rescan. Covers the highest already-used index plus this much look-ahead,
+    # mirroring Bitcoin Core's keypool gap-limit. Bounded so a Python rescan of
+    # a fresh wallet stays fast: 4 purposes x 2 (receive/change) x this many
+    # key derivations. 200 comfortably covers any hand-issued address in a test
+    # or light wallet while keeping a regtest rescan sub-second.
+    RESCAN_GAP_LIMIT = 200
+
+    def _rescan_candidate_scripts(self) -> dict[bytes, dict]:
+        """Map every script_pubkey this wallet can DERIVE -> its key metadata.
+
+        Unlike :meth:`_owned_script_set` (which only covers keys already in
+        ``self.keys``), this enumerates the HD key pool across every
+        (purpose, is_change) sub-pool and derives ``RESCAN_GAP_LIMIT`` extra
+        indices of look-ahead, so a freshly-restored wallet that has never
+        called ``getnewaddress`` still rediscovers the funds at the addresses
+        the same seed produced. Each value is::
+
+            {"key": WalletKey, "purpose": int, "is_change": bool,
+             "index": int, "address": str, "address_type": str}
+
+        keyed by the canonical script_pubkey for that purpose's address type.
+        Returns an empty map for non-HD (imported-only) wallets — those are
+        already fully covered by ``self.keys`` + ``_owned_script_set``.
+        """
+        from ouroboros.address import address_to_script_pubkey
+
+        # purpose-code -> (address_type, key.address-method-name)
+        purpose_meta = {
+            44: ("legacy", "get_p2pkh_address"),
+            49: ("p2sh-segwit", "get_p2sh_p2wpkh_address"),
+            84: ("bech32", "get_p2wpkh_address"),
+            86: ("bech32m", "get_p2tr_address"),
+        }
+
+        out: dict[bytes, dict] = {}
+        kp = self._key_pool
+        if kp is None:
+            return out
+
+        for (purpose, is_change) in list(kp._pools.keys()):
+            meta = purpose_meta.get(purpose)
+            if meta is None:
+                continue
+            address_type, addr_method = meta
+            # Probe from index 0 up to the highest already-used index plus a
+            # bounded gap-limit look-ahead. ``_used_indices`` tracks the
+            # addresses actually handed out (empty on a fresh restore), so a
+            # restored-but-unused wallet still probes the full gap-limit window.
+            used = kp._used_indices.get((purpose, is_change), set())
+            top_used = max(used) if used else 0
+            hi = top_used + self.RESCAN_GAP_LIMIT
+            for index in range(0, hi):
+                try:
+                    k = kp.get_key_at_index(
+                        index, is_change=is_change, purpose=purpose
+                    )
+                    addr = getattr(k, addr_method)()
+                    spk = address_to_script_pubkey(addr, self.network)
+                except Exception:
+                    continue
+                # First writer wins; receive sub-pools are enumerated before
+                # change for the same purpose, matching get_new_address order.
+                out.setdefault(spk, {
+                    "key": k,
+                    "purpose": purpose,
+                    "is_change": is_change,
+                    "index": index,
+                    "address": addr,
+                    "address_type": address_type,
+                })
+        return out
+
+    def _adopt_key(self, info: dict) -> bool:
+        """Adopt a derived key discovered during a rescan into ``self.keys``.
+
+        Adds the key's WIF to ``self.keys`` (so the chainstate balance /
+        listunspent scan, which iterates ``self.keys``, credits it) and marks
+        the corresponding key-pool index used so the address is not later
+        re-handed-out by ``getnewaddress``. Idempotent — a WIF already present
+        is not duplicated. Returns True iff a new key was added.
+
+        Mirrors Bitcoin Core CWallet::MarkReserveKeysAsUsed during a rescan.
+        """
+        k = info["key"]
+        try:
+            wif = k.to_wif()
+        except Exception:
+            return False
+        for kd in self.keys:
+            if kd.get("wif") == wif:
+                added = False
+                break
+        else:
+            self.keys.append({
+                "wif": wif,
+                "label": "",
+                "created": int(time.time()),
+                "hd_path": KeyPool.path_for(
+                    info["purpose"], self._key_pool.coin_type,
+                    info["is_change"], info["index"],
+                ) if self._key_pool is not None else None,
+            })
+            added = True
+        # Mark the pool index used regardless, so the address won't be re-issued.
+        kp = self._key_pool
+        if kp is not None:
+            try:
+                kp._used_indices.setdefault(
+                    (info["purpose"], info["is_change"]), set()
+                ).add(int(info["index"]))
+                # Advance next_index past the discovered index so look-ahead
+                # stays ahead of used addresses (Core keypool top-up).
+                cur = kp._next_indices.get((info["purpose"], info["is_change"]), 0)
+                if info["index"] >= cur:
+                    kp._next_indices[(info["purpose"], info["is_change"])] = \
+                        int(info["index"]) + 1
+            except Exception:
+                pass
+        return added
+
+    def rescan_chain(
+        self, start_height: int = 0, stop_height: int | None = None
+    ) -> dict:
+        """Scan the EXISTING chain ``[start_height .. stop_height]`` for funds.
+
+        For every block in the range, classify each output against the scripts
+        this wallet can derive (key pool + gap-limit look-ahead). When an output
+        pays a derivable script, adopt that key into ``self.keys`` so the
+        chainstate balance scan credits it, then record the wallet-history
+        entry via :meth:`scan_block_connect`. Persists once at the end.
+
+        Returns ``{"start_height": s, "stop_height": e}`` (Core rescanblockchain
+        shape). Reference: bitcoin-core CWallet::ScanForWalletTransactions +
+        wallet/rpc/transactions.cpp rescanblockchain.
+        """
+        if self.db is None:
+            return {"start_height": int(start_height), "stop_height": int(start_height)}
+
+        tip = self._tip_height()
+        start = max(0, int(start_height))
+        stop = tip if stop_height is None else min(int(stop_height), tip)
+        if stop < start:
+            stop = start
+
+        candidates = self._rescan_candidate_scripts()
+        owned_keys_changed = False
+
+        for height in range(start, stop + 1):
+            try:
+                block = self.db.get_block_by_height(height)
+            except Exception:
+                block = None
+            if block is None:
+                continue
+
+            # 1. Adopt any derivable key funded by an output in this block, so
+            #    the chainstate balance/listunspent scan (over self.keys) sees
+            #    it. We must adopt BEFORE the history scan so scan_block_connect
+            #    (which reads _owned_script_set over self.keys) classifies the
+            #    output as a credit.
+            for tx in getattr(block, "transactions", None) or []:
+                for out in tx.outputs:
+                    info = candidates.get(bytes(out.script_pubkey))
+                    if info is not None:
+                        if self._adopt_key(info):
+                            owned_keys_changed = True
+
+            # 2. Build the history records for this block (idempotent per txid).
+            try:
+                self.scan_block_connect(block, height)
+            except Exception:
+                pass
+
+        if owned_keys_changed:
+            try:
+                self._save()
+            except Exception:
+                pass
+
+        return {"start_height": start, "stop_height": stop}
+
     def scan_block_connect(self, block, height: int) -> None:
         """Record wallet-relevant txs from a freshly-connected *block*.
 
