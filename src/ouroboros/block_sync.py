@@ -12,7 +12,7 @@ import os
 import random
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable
 from typing import Optional
 
@@ -90,6 +90,33 @@ MAX_BLOCKS_IN_FLIGHT_PER_PEER = 16
 # Bitcoin Core protocol.h:482: MAX_GETDATA_SZ = 1000.
 # Peers reject GETDATA messages containing more than 1000 inventory items.
 MAX_GETDATA_SZ = 1000
+
+# Maximum number of re-request cycles a single block-download may incur in
+# ``_handle_timeouts`` before it is permanently abandoned (dropped from the
+# in-flight maps + perm-rejected) instead of being re-requested forever.
+#
+# Without this bound the at-tip RSS leak (2026-06-02/03 OOMs) accrued: peers
+# at tip announce stale / competing / fork block hashes via ``inv`` that we
+# dutifully request, but which never become part of our active chain and so
+# never reach the ``handle_block`` -> connect path that pops them.
+# ``_handle_timeouts`` re-armed ``requested_blocks`` / ``_block_request_peer``
+# every cycle indefinitely (it only drops entries in the no-peers branch),
+# and ``_w77_first_request_time`` was never touched by the timeout path at
+# all — so every unique never-connecting requested hash leaked one entry in
+# each of the three maps forever, and ``_block_request_peer`` holds live Peer
+# references, keeping zombie Peers (transport buffers, BIP-324 state) alive.
+# Core bounds this implicitly: a stalling block-download triggers
+# BLOCK_DOWNLOAD_TIMEOUT_BASE disconnection of the peer and mapBlocksInFlight
+# is torn down on FinalizeNode; there is no unbounded retain-and-retry queue.
+BLOCK_REQUEST_MAX_ATTEMPTS = 10
+
+# Hard cap on the ``_w77_first_request_time`` telemetry map.  It is
+# diagnostic-only (request->connect latency rollup) and must NEVER be
+# load-bearing for memory.  FIFO-evict the oldest entry past this cap.  This
+# is a belt-and-braces backstop in addition to the per-hash cleanup the
+# abandon / perm-reject paths now perform — the dict can never outgrow this
+# regardless of any future path that forgets to clean an entry.
+W77_FIRST_REQUEST_MAX_ENTRIES = 20_000
 
 from ouroboros.database import Block, BlockchainDatabase, Transaction
 from ouroboros.p2p_messages import (
@@ -205,6 +232,18 @@ class BlockSync:
         self._w77_latency_sum_s: float = 0.0
         self._w77_latency_max_s: float = 0.0
         self._w77_first_request_time: dict[bytes, float] = {}
+        # Insertion-order FIFO companion for the hard cap on the telemetry map.
+        self._w77_first_request_order: deque[bytes] = deque()
+
+        # Per-block re-request attempt counter (block_hash -> int).  Bumped on
+        # every re-request in _handle_timeouts; a block that exceeds
+        # BLOCK_REQUEST_MAX_ATTEMPTS is permanently abandoned (see
+        # _abandon_block_request) rather than re-requested forever.  This is
+        # what bounds requested_blocks / _block_request_peer for blocks a peer
+        # announced but no peer will ever deliver into our active chain (stale
+        # / fork / competing tips at the at-tip churn path — the 2026-06-02/03
+        # OOM driver).  Cleared in lockstep with the in-flight maps.
+        self._block_request_attempts: dict[bytes, int] = {}
 
         # W95 — recent-block-size EMA (MB), used by _handle_timeouts to
         # scale the general block-download timeout with payload size.
@@ -404,7 +443,17 @@ class BlockSync:
     def _mark_perm_rejected(self, block_hash: bytes) -> None:
         """Add *block_hash* to the permanent-reject set, evicting the oldest
         entry once the set is full.  Idempotent: re-adding an existing hash
-        does not advance the FIFO position."""
+        does not advance the FIFO position.
+
+        Also drops the hash from every block-request bookkeeping map: a
+        perm-rejected block was delivered, validated-invalid, and will never
+        reach the ``handle_block`` -> connect path that pops these.  Before
+        this cleanup the ``_w77_first_request_time`` entry in particular
+        leaked permanently (it is only popped by ``_w77_record_connect`` on a
+        successful active-chain connect) — one leaked entry per perm-rejected
+        block, an at-tip RSS-leak contributor.
+        """
+        self._abandon_block_request(block_hash)
         if block_hash in self._perm_rejected_blocks:
             return
         if len(self._perm_rejected_order) >= self._perm_rejected_max:
@@ -412,6 +461,42 @@ class BlockSync:
             self._perm_rejected_blocks.discard(evicted)
         self._perm_rejected_blocks.add(block_hash)
         self._perm_rejected_order.append(block_hash)
+
+    def _record_first_request_time(self, block_hash: bytes, now: float) -> None:
+        """Record the original request time for *block_hash* with a hard FIFO
+        cap on ``_w77_first_request_time``.
+
+        ``_w77_first_request_time`` is request->connect latency telemetry; it
+        is only popped on a successful connect (``_w77_record_connect``), so a
+        requested-but-never-connecting block (stale / fork / competing tip
+        announced at the at-tip churn path) would otherwise leak its entry
+        forever.  The per-hash cleanup in ``_abandon_block_request`` handles
+        the common cases; this cap is the unconditional backstop that bounds
+        the map regardless of any future path that forgets to clean up.
+        """
+        if block_hash in self._w77_first_request_time:
+            return
+        self._w77_first_request_time[block_hash] = now
+        self._w77_first_request_order.append(block_hash)
+        while len(self._w77_first_request_time) > W77_FIRST_REQUEST_MAX_ENTRIES:
+            oldest = self._w77_first_request_order.popleft()
+            self._w77_first_request_time.pop(oldest, None)
+
+    def _abandon_block_request(self, block_hash: bytes) -> None:
+        """Drop *block_hash* from every in-flight block-request map.
+
+        Used when a requested block leaves the "wanted" state without a
+        successful connect: permanent rejection, or exhausting
+        ``BLOCK_REQUEST_MAX_ATTEMPTS`` re-request cycles for a block no peer
+        will deliver into our active chain.  Keeps ``requested_blocks``,
+        ``_block_request_peer`` (which holds live Peer references — leaking it
+        pins zombie Peers), ``_w77_first_request_time`` and the attempt
+        counter bounded.  Idempotent; safe on unknown hashes.
+        """
+        self.requested_blocks.pop(block_hash, None)
+        self._block_request_peer.pop(block_hash, None)
+        self._w77_first_request_time.pop(block_hash, None)
+        self._block_request_attempts.pop(block_hash, None)
 
     # BIP34 activation height (mainnet).  Below this height the coinbase
     # scriptSig is unconstrained; above it the first push must encode the
@@ -508,6 +593,8 @@ class BlockSync:
         # queue-drop here would otherwise orphan every in-flight entry.
         # Clear it alongside the sibling maps (telemetry-only, safe to reset).
         self._w77_first_request_time.clear()
+        self._w77_first_request_order.clear()
+        self._block_request_attempts.clear()
         # Reset the header-sync stall timer so sync_loop picks a fresh
         # header sync peer immediately rather than waiting out the previous
         # peer's stall window.
@@ -829,10 +916,25 @@ class BlockSync:
                         # This is critical for receiving blocks from mining
                         # peers promptly (e.g., regtest mesh tests) rather
                         # than waiting for the full headers-first round-trip.
-                        if inv_hash not in self.requested_blocks:
+                        #
+                        # Bound the inv-triggered request path: skip hashes we
+                        # already perm-rejected, and honour the global
+                        # in-flight cap.  Without the cap a peer (or peers) at
+                        # tip announcing many stale / fork / competing block
+                        # hashes via inv could push requested_blocks /
+                        # _block_request_peer / _w77_first_request_time
+                        # arbitrarily high — none of those announces become
+                        # part of our active chain, so they never reach the
+                        # connect path that pops them (at-tip RSS-leak path,
+                        # 2026-06-02/03 OOMs).
+                        if (
+                            inv_hash not in self.requested_blocks
+                            and inv_hash not in self._perm_rejected_blocks
+                            and len(self.requested_blocks) < self._max_blocks_in_flight
+                        ):
                             blocks_to_request.append((MSG_WITNESS_BLOCK, inv_hash))
                             self.requested_blocks[inv_hash] = now
-                            self._w77_first_request_time.setdefault(inv_hash, now)
+                            self._record_first_request_time(inv_hash, now)
 
                 elif inv_type in (INV_TYPE_TX, MSG_WITNESS_TX, MSG_WTX):
                     # Request transactions we don't already have
@@ -1183,6 +1285,8 @@ class BlockSync:
             # Telemetry-only request→connect latency dict; clear with the
             # sibling maps so a bulk queue-drop doesn't orphan its entries.
             self._w77_first_request_time.clear()
+            self._w77_first_request_order.clear()
+            self._block_request_attempts.clear()
             self._header_sync_peer = None
             self._header_sync_time = 0.0
             self._w91_last_drain_exit_perf_ns = time.perf_counter_ns()
@@ -2417,7 +2521,7 @@ class BlockSync:
         now = time.time()
         for _, bh in assigned:
             self.requested_blocks[bh] = now
-            self._w77_first_request_time.setdefault(bh, now)
+            self._record_first_request_time(bh, now)
 
         for target_peer, items in per_peer.items():
             if not items:
@@ -2967,6 +3071,10 @@ class BlockSync:
         as 0 so a missing baseline is not counted as infinite latency.
         """
         first_req = self._w77_first_request_time.pop(block_hash, None)
+        # The block connected to the active chain — its in-flight bookkeeping
+        # is done.  Drop the attempt counter so it cannot accrete across the
+        # process lifetime (it is bumped per timeout in _handle_timeouts).
+        self._block_request_attempts.pop(block_hash, None)
         if first_req is not None:
             lat_s = connect_time - first_req
             if lat_s < 0:
@@ -3088,6 +3196,46 @@ class BlockSync:
         if not timed_out:
             return
 
+        # Bound the retry queue: count a re-request attempt for every timed-out
+        # block and PERMANENTLY ABANDON any GENERAL-timeout block that has
+        # exceeded BLOCK_REQUEST_MAX_ATTEMPTS.  Head-of-window blocks (tip+1
+        # region) are exempt — those are on the active chain and must keep
+        # being retried or sync wedges; abandoning the head is never correct.
+        # General timeouts are off-active-chain announces (stale / fork /
+        # competing tips a peer threw at us via inv): a peer announced them,
+        # no peer delivers them into our chain, and pre-fix they were
+        # re-requested forever, leaking one entry each in requested_blocks /
+        # _block_request_peer / _w77_first_request_time (the at-tip RSS leak).
+        # Perm-reject the abandoned hash so a redelivery / re-announce does not
+        # re-open the same in-flight slot.
+        head_set_for_attempts = set(head_timed_out)
+        abandoned: list[bytes] = []
+        for block_hash in timed_out:
+            n = self._block_request_attempts.get(block_hash, 0) + 1
+            self._block_request_attempts[block_hash] = n
+            if (
+                block_hash not in head_set_for_attempts
+                and n > BLOCK_REQUEST_MAX_ATTEMPTS
+            ):
+                abandoned.append(block_hash)
+        if abandoned:
+            ab_set = set(abandoned)
+            timed_out = [h for h in timed_out if h not in ab_set]
+            general_timed_out = [h for h in general_timed_out if h not in ab_set]
+            for block_hash in abandoned:
+                # _mark_perm_rejected calls _abandon_block_request, which drops
+                # the hash from all four in-flight maps.
+                self._mark_perm_rejected(block_hash)
+            logger.warning(
+                "Abandoned %d block request(s) after %d failed attempts "
+                "(off-active-chain announces never delivered) — dropped from "
+                "in-flight maps + perm-rejected",
+                len(abandoned), BLOCK_REQUEST_MAX_ATTEMPTS,
+            )
+
+        if not timed_out:
+            return
+
         # Get all connected peers once for the whole batch
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             all_peers = [p for p in self.peer_manager.get_all_ready_peers()
@@ -3126,6 +3274,11 @@ class BlockSync:
             for block_hash in timed_out:
                 del self.requested_blocks[block_hash]
                 self._block_request_peer.pop(block_hash, None)
+                # Re-queue resets the retry budget; drop the attempt counter so
+                # it cannot orphan-accrete across repeated no-peer windows.
+                # _w77_first_request_time is left as the latency baseline (it is
+                # FIFO-capped by _record_first_request_time as a backstop).
+                self._block_request_attempts.pop(block_hash, None)
             return
 
         logger.warning(
