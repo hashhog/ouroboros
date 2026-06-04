@@ -176,6 +176,62 @@ def address_to_script_pubkey(address: str, network: str = "mainnet") -> bytes:
     raise ValueError(f"Unsupported address version: {version}")
 
 
+def _network_hrp(network: str) -> str:
+    if network == "mainnet":
+        return "bc"
+    if network == "regtest":
+        return "bcrt"
+    return "tb"  # testnet / testnet4 / signet
+
+
+def script_pubkey_to_address(script_pubkey: bytes, network: str = "mainnet") -> str | None:
+    """Decode a standard scriptPubKey to its address, or None if non-standard.
+
+    Mirrors Bitcoin Core's ExtractDestination + EncodeDestination for the
+    standard output types: P2PKH, P2SH, P2WPKH, P2WSH, and witness v1..v16
+    (P2TR / future). Returns None for unspendable / non-standard scripts
+    (e.g. OP_RETURN, bare multisig) — the caller treats that as "no address".
+    """
+    import base58
+    import bech32 as _b32
+
+    spk = bytes(script_pubkey)
+
+    # P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    if (len(spk) == 25 and spk[0:3] == _P2PKH_PREFIX and spk[23:25] == _P2PKH_SUFFIX):
+        version = 0x00 if network == "mainnet" else 0x6f
+        return base58.b58encode_check(bytes([version]) + spk[3:23]).decode()
+
+    # P2SH: OP_HASH160 <20> OP_EQUAL
+    if (len(spk) == 23 and spk[0:2] == _P2SH_PREFIX and spk[22:23] == _P2SH_SUFFIX):
+        version = 0x05 if network == "mainnet" else 0xc4
+        return base58.b58encode_check(bytes([version]) + spk[2:22]).decode()
+
+    # SegWit: OP_n <program> where n in {0..16} and 2 <= len(program) <= 40.
+    if len(spk) >= 4:
+        op = spk[0]
+        plen = spk[1]
+        program = spk[2:]
+        if len(program) == plen and 2 <= plen <= 40:
+            if op == 0x00:
+                wver = 0
+            elif 0x51 <= op <= 0x60:
+                wver = op - 0x50
+            else:
+                return None
+            if wver == 0 and plen not in (20, 32):
+                return None
+            hrp = _network_hrp(network)
+            if wver == 0:
+                # v0 uses the BECH32 checksum (the bundled lib's default).
+                data = [wver] + _b32.convertbits(program, 8, 5)
+                return _b32.bech32_encode(hrp, data)
+            # v1..v16 use BECH32M; reuse the module's bech32m encoder.
+            return _bech32m_encode(hrp, wver, program)
+
+    return None
+
+
 # =============================================================================
 # Pay-to-Anchor (P2A) utilities
 # =============================================================================

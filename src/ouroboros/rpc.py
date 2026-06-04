@@ -401,17 +401,58 @@ async def accept_block(
         db.connect_block_from_bytes, block_bytes, next_height
     )
 
+    # Deserialize once for the mempool-eviction and wallet-history steps.
+    _connected_block = None
+    try:
+        from ouroboros.database import Block as _Blk
+        _connected_block = _Blk.deserialize(block_bytes)
+    except Exception:
+        _connected_block = None
+
     # Step 5 — Evict confirmed transactions from the mempool (best-effort).
     mempool = getattr(node, "mempool", None)
-    if mempool is not None and len(mempool) > 0:
+    if mempool is not None and len(mempool) > 0 and _connected_block is not None:
         try:
-            from ouroboros.database import Block as _Blk
-            _blk = _Blk.deserialize(block_bytes)
-            mempool.remove_block_transactions(_blk)
+            mempool.remove_block_transactions(_connected_block)
         except Exception:
             pass
 
+    # Step 6 — Wallet transaction-history scan (best-effort).
+    # Walk the connected block's txs and record a wallet-history entry for any
+    # tx that credits a wallet script (receive/coinbase) or debits a wallet
+    # outpoint (send), so listtransactions / gettransaction can surface the
+    # wallet's own activity. Mirrors Bitcoin Core CWallet::blockConnected ->
+    # AddToWalletIfInvolvingMe. Bookkeeping only — never affects acceptance.
+    if _connected_block is not None:
+        for _w in _iter_node_wallets(node):
+            try:
+                _w.scan_block_connect(_connected_block, next_height)
+            except Exception:
+                pass
+
     return bytes(block_hash)
+
+
+def _iter_node_wallets(node):
+    """Yield every loaded Wallet on *node* (multi-wallet manager or legacy).
+
+    Used by the block-connect/disconnect history scan so all loaded wallets
+    see their own transactions. Falls back to the single ``node.wallet``.
+    """
+    seen: set[int] = set()
+    wm = getattr(node, "wallet_manager", None)
+    if wm is not None:
+        try:
+            for name in wm.list_loaded_wallets():
+                w = wm.get_wallet(name)
+                if w is not None and id(w) not in seen:
+                    seen.add(id(w))
+                    yield w
+        except Exception:
+            pass
+    w = getattr(node, "wallet", None)
+    if w is not None and id(w) not in seen:
+        yield w
 
 
 class JSONRPCRequest(BaseModel):
@@ -5807,6 +5848,18 @@ class RPCServer:
             # sequential).
             disconnect_height = current_height
             while disconnect_height > common_ancestor_height:
+                # Reverse the wallet-history scan for this height before the
+                # UTXO state is torn down, so a reorg can't leave stale
+                # send/receive entries. Mirrors CWallet::blockDisconnected.
+                # (The atomic-disconnect fast path above tears the chain down
+                # inside Rust without surfacing per-height blocks to Python;
+                # there the wallet history is rebuilt by the subsequent
+                # connect scan of the new branch rather than unwound here.)
+                for _w in _iter_node_wallets(self.node):
+                    try:
+                        _w.scan_block_disconnect(disconnect_height)
+                    except Exception:
+                        pass
                 try:
                     await asyncio.to_thread(db.disconnect_block, disconnect_height)
                 except Exception as e:
@@ -8259,27 +8312,43 @@ class RPCServer:
         self, label: str = "*", count: int = 10, skip: int = 0,
         include_watchonly: bool = True
     ) -> list[dict[str, Any]]:
-        """Return recent transactions for the wallet."""
-        if not hasattr(self.node, 'wallet') or not self.node.wallet:
-            return []
-        txs = await self.node.wallet.get_transactions()
-        return [
-            {"txid": t.txid, "amount": t.amount / 1e8,
-             "confirmations": t.confirmations, "time": t.timestamp}
-            for t in txs[skip:skip + count]
-        ]
+        """Return the wallet's recent transactions, newest-first.
 
-    async def rpc_gettransaction(self, txid: str) -> dict[str, Any]:
-        """Get detailed information about a wallet transaction."""
-        if not hasattr(self.node, 'db') or not self.node.db:
-            raise ValueError("No database available")
-        # JSON-RPC convention: txids arrive in display order (big-endian hex).
-        # DB keys use internal little-endian. W69.
-        txid_bytes = bytes.fromhex(txid)[::-1]
-        tx = self.node.db.get_transaction(txid_bytes)
-        if tx is None:
-            raise ValueError(f"Transaction not found: {txid}")
-        return self._tx_to_dict(tx)
+        One Core-shaped entry per send-output (category 'send', negative
+        amount + negative fee) and per receive-output (category receive/
+        generate/immature, positive amount). Built from the wallet's in-memory
+        history (populated by the block-connect scan), not a DB lookup.
+
+        Reference: Bitcoin Core wallet/rpc/transactions.cpp listtransactions.
+        """
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            return []
+        return wallet.listtransactions_entries(label=label, count=count, skip=skip)
+
+    async def rpc_gettransaction(
+        self, txid: str, include_watchonly: bool = True, verbose: bool = False
+    ) -> dict[str, Any]:
+        """Get detailed info about a wallet transaction (Core-shaped).
+
+        Returns ``amount`` (negative for a net send), ``fee`` (negative, only
+        for from-wallet txs), ``confirmations``, ``generated`` (coinbase),
+        block fields, a ``details[]`` array, and the raw ``hex``. Built from
+        the wallet's in-memory history.
+
+        Reference: Bitcoin Core wallet/rpc/transactions.cpp gettransaction.
+        """
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            wallet = getattr(self.node, "wallet", None)
+        if wallet is None:
+            raise ValueError("No wallet loaded")
+        entry = wallet.gettransaction_entry(txid)
+        if entry is None:
+            raise ValueError(f"Invalid or non-wallet transaction id: {txid}")
+        return entry
 
     async def rpc_importprivkey(self, privkey: str, label: str = "", rescan: bool = True) -> None:
         """Import a private key into the wallet."""
