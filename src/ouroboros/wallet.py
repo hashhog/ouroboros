@@ -1204,6 +1204,20 @@ class Wallet:
         # restart (written to disk); non-persistent locks are memory-only and
         # cleared on _load_or_create().
         self._locked_coins: dict[tuple[str, int], bool] = {}
+        # --- Wallet transaction history (Core CWallet::mapWallet) -------------
+        # Populated by the block-connect scan (scan_block_connect) as each
+        # connected block is walked: every tx that credits a wallet script
+        # (receive / coinbase) or debits a wallet-owned outpoint (send) gets a
+        # record here, keyed by display-order (big-endian hex) txid. Surfaced
+        # via listtransactions / gettransaction. In-memory only (Core rebuilds
+        # mapWallet from a rescan on load); reorg-safe via scan_block_disconnect.
+        # Each value is a dict (see scan_block_connect for the shape).
+        self._tx_history: dict[str, dict] = {}
+        # Outpoints this wallet owns (created by a credit) -> the spent value
+        # and script, so a later block that spends one can be attributed as a
+        # debit (send) without needing the already-deleted UTXO. Keyed by
+        # (txid_display_hex, vout). Mirrors which coins are "from me".
+        self._owned_outpoints: dict[tuple[str, int], dict] = {}
         self._load_or_create()
 
     # HD seed management #
@@ -1744,28 +1758,331 @@ class Wallet:
     async def get_transactions(
         self, address: str | None = None
     ) -> list[TransactionInfo]:
-        """Return transaction history for the wallet or a specific address."""
-        if self.db is None:
-            return []
+        """Return transaction history for the wallet, newest first.
+
+        Reads the in-memory history built by the block-connect scan
+        (``scan_block_connect``) rather than a (never-implemented) DB method.
+        Net amount per tx is credits-to-wallet minus debits-from-wallet.
+        """
+        tip = self._tip_height()
         results: list[TransactionInfo] = []
-        addresses = set()
-        if address:
-            addresses.add(address)
-        else:
-            for kd in self.keys:
-                k = self._get_wallet_key(kd)
-                addresses.add(k.get_p2wpkh_address())
-                addresses.add(k.get_p2pkh_address())
-        for addr in addresses:
-            txs = self.db.get_transactions_for_address(addr, self.network)
-            for tx_info in txs:
-                results.append(TransactionInfo(
-                    txid=tx_info.get('txid', ''),
-                    amount=tx_info.get('amount', 0),
-                    confirmations=tx_info.get('confirmations', 0),
-                    timestamp=tx_info.get('timestamp'),
-                ))
+        for rec in self._sorted_history():
+            net = rec["credit"] - rec["debit"]
+            results.append(TransactionInfo(
+                txid=rec["txid"],
+                amount=net,
+                confirmations=self._confirmations(rec, tip),
+                timestamp=rec.get("time"),
+            ))
         return results
+
+    # --- Wallet transaction history (Core CWallet::mapWallet) ---------------
+    # Reference: Bitcoin Core wallet/wallet.cpp (AddToWalletIfInvolvingMe,
+    # transactionAddedToMempool / blockConnected) and wallet/rpc/transactions.cpp
+    # (ListTransactions, WalletTxToJSON, gettransaction).
+
+    def _owned_script_set(self) -> dict[bytes, str]:
+        """Map every script_pubkey this wallet owns -> its display address.
+
+        Covers all four script types per key (legacy/p2sh-segwit/bech32/
+        bech32m), mirroring what ``list_unspent_by_address`` matches against.
+        """
+        from ouroboros.address import address_to_script_pubkey
+
+        out: dict[bytes, str] = {}
+        for kd in self.keys:
+            try:
+                k = self._get_wallet_key(kd)
+            except Exception:
+                continue
+            for addr in (
+                k.get_p2wpkh_address(),
+                k.get_p2pkh_address(),
+                k.get_p2sh_p2wpkh_address(),
+            ):
+                try:
+                    out[address_to_script_pubkey(addr, self.network)] = addr
+                except Exception:
+                    continue
+            # bech32m / Taproot derivation can raise on a malformed pubkey;
+            # guard it independently so the other three still register.
+            try:
+                taddr = k.get_p2tr_address()
+                out[address_to_script_pubkey(taddr, self.network)] = taddr
+            except Exception:
+                pass
+        return out
+
+    def scan_block_connect(self, block, height: int) -> None:
+        """Record wallet-relevant txs from a freshly-connected *block*.
+
+        Walks each tx; a tx is wallet-relevant when it either (a) creates an
+        output paying one of our scripts (credit) or (b) spends an outpoint we
+        previously credited (debit). Builds/extends a per-tx history record and
+        tracks newly-owned + newly-spent outpoints so a later block's spend is
+        correctly attributed. Idempotent per (txid, height) — re-connecting the
+        same block (e.g. reorg replay) overwrites rather than double-counts.
+
+        Mirrors Bitcoin Core CWallet::blockConnected ->
+        AddToWalletIfInvolvingMe.
+        """
+        owned = self._owned_script_set()
+        block_hash = getattr(block, "hash", None)
+        block_hash_hex = (
+            bytes(block_hash)[::-1].hex() if block_hash is not None else None
+        )
+        block_time = int(getattr(block, "timestamp", 0) or 0)
+        txs = getattr(block, "transactions", None) or []
+
+        for tx in txs:
+            # txid is stored internal (wire) byte order; display is reversed.
+            raw_txid = tx.get_txid()
+            txid_hex = bytes(raw_txid)[::-1].hex()
+            is_coinbase = bool(getattr(tx, "is_coinbase", False))
+
+            # --- Debit: total value of inputs spending outpoints we own ------
+            # Mirrors Core CachedTxGetDebit. nDebit > 0 ⇒ "we sent this tx".
+            debit = 0
+            if not is_coinbase:
+                for inp in tx.inputs:
+                    # input prev_txid is internal byte order -> display hex.
+                    prev_txid_hex = bytes(inp.prev_txid)[::-1].hex()
+                    spent = self._owned_outpoints.get(
+                        (prev_txid_hex, int(inp.prev_vout))
+                    )
+                    if spent is not None:
+                        debit += int(spent["value"])
+            is_from_me = debit > 0
+
+            # --- Per-output classification (Core CachedTxGetAmounts) ---------
+            # For each output: when we sent the tx (nDebit>0) every output is a
+            # "send" entry EXCEPT change/owned outputs (listtransactions uses
+            # include_change=false). When an output pays us it is a "receive".
+            sent_details: list[dict] = []
+            recv_details: list[dict] = []
+            credit = 0
+            for vout_i, out in enumerate(tx.outputs):
+                addr = owned.get(bytes(out.script_pubkey))
+                ismine = addr is not None
+                if ismine:
+                    credit += int(out.value)
+                    recv_details.append({
+                        "address": addr,
+                        "vout": int(vout_i),
+                        "value": int(out.value),
+                    })
+                    # Track the new owned outpoint so a future spend resolves it.
+                    self._owned_outpoints[(txid_hex, vout_i)] = {
+                        "value": int(out.value),
+                        "address": addr,
+                        "script_pubkey": bytes(out.script_pubkey),
+                    }
+                elif is_from_me:
+                    # Non-owned output of a tx we funded ⇒ a real payment out.
+                    from ouroboros.address import script_pubkey_to_address
+                    try:
+                        out_addr = script_pubkey_to_address(
+                            bytes(out.script_pubkey), self.network
+                        ) or ""
+                    except Exception:
+                        out_addr = ""
+                    sent_details.append({
+                        "address": out_addr,
+                        "vout": int(vout_i),
+                        "value": int(out.value),
+                    })
+
+            if not recv_details and not sent_details:
+                continue  # not ours
+
+            # Fee (Core: nFee = nDebit - GetValueOut, positive sats paid).
+            # The wallet only knows the value of the inputs it owns; on a
+            # wallet-funded spend that is the full input set, so this equals
+            # the real fee.
+            fee = 0
+            if is_from_me:
+                total_out = sum(int(o.value) for o in tx.outputs)
+                fee = debit - total_out
+
+            self._tx_history[txid_hex] = {
+                "txid": txid_hex,
+                "height": int(height),
+                "blockhash": block_hash_hex,
+                "blocktime": block_time,
+                "time": block_time,
+                "is_coinbase": is_coinbase,
+                "is_from_me": is_from_me,
+                "credit": int(credit),
+                "debit": int(debit),
+                "fee": int(fee),
+                "recv": recv_details,
+                "sent": sent_details,
+                "hex": tx.serialize_with_witness().hex(),
+            }
+
+    def scan_block_disconnect(self, height: int) -> None:
+        """Reverse :meth:`scan_block_connect` for the block at *height*.
+
+        Drops every history record (and the owned-outpoint bookkeeping for
+        outputs created) at that height, so a reorg can't leave stale send/
+        receive entries. Mirrors Core CWallet::blockDisconnected.
+        """
+        drop = [
+            txid for txid, rec in self._tx_history.items()
+            if int(rec.get("height", -1)) == int(height)
+        ]
+        for txid in drop:
+            rec = self._tx_history.pop(txid)
+            for d in rec.get("recv", []):
+                self._owned_outpoints.pop((txid, int(d["vout"])), None)
+
+    def _confirmations(self, rec: dict, tip: int) -> int:
+        h = int(rec.get("height", 0) or 0)
+        if h <= 0:
+            return 0
+        return max(0, tip - h + 1)
+
+    def _sorted_history(self) -> list[dict]:
+        """History records sorted newest-first (by height, then time)."""
+        return sorted(
+            self._tx_history.values(),
+            key=lambda r: (int(r.get("height", 0) or 0), int(r.get("time", 0) or 0)),
+            reverse=True,
+        )
+
+    def _category_for(self, rec: dict, tip: int) -> str:
+        """Receive-side category per Core ListTransactions."""
+        if not rec.get("is_coinbase"):
+            return "receive"
+        confs = self._confirmations(rec, tip)
+        if confs < 1:
+            return "orphan"
+        if confs < (self.COINBASE_MATURITY + 1):
+            return "immature"
+        return "generate"
+
+    def _wallet_tx_common(self, rec: dict, tip: int) -> dict:
+        """Fields shared by every list entry (Core WalletTxToJSON)."""
+        common: dict = {
+            "confirmations": self._confirmations(rec, tip),
+            "blockhash": rec.get("blockhash"),
+            "blockheight": int(rec.get("height", 0) or 0),
+            "blocktime": int(rec.get("blocktime", 0) or 0),
+            "txid": rec["txid"],
+            "time": int(rec.get("time", 0) or 0),
+            "timereceived": int(rec.get("time", 0) or 0),
+            "bip125-replaceable": "no",
+        }
+        if rec.get("is_coinbase"):
+            common["generated"] = True
+        return common
+
+    def listtransactions_entries(
+        self, label: str = "*", count: int = 10, skip: int = 0
+    ) -> list[dict]:
+        """Build Core-shaped listtransactions entries, newest-first.
+
+        One entry per send-output (category 'send', negative amount + fee) and
+        one per receive-output (category receive/generate/immature). Returns
+        the most recent *count* entries after skipping *skip*.
+
+        Reference: Bitcoin Core wallet/rpc/transactions.cpp ListTransactions.
+        """
+        tip = self._tip_height()
+        entries: list[dict] = []
+        for rec in self._sorted_history():
+            common = self._wallet_tx_common(rec, tip)
+            fee_btc = -rec.get("fee", 0) / 1e8  # Core: negative fee on sends
+
+            # Sent entries first (matches Core ordering within a tx).
+            for d in rec.get("sent", []):
+                e = {
+                    "address": d.get("address", ""),
+                    "category": "send",
+                    "amount": -d["value"] / 1e8,   # negative for send
+                    "vout": int(d["vout"]),
+                    "fee": fee_btc,
+                    "abandoned": False,
+                }
+                e.update(common)
+                entries.append(e)
+
+            # Received entries.
+            for d in rec.get("recv", []):
+                e = {
+                    "address": d.get("address", ""),
+                    "category": self._category_for(rec, tip),
+                    "amount": d["value"] / 1e8,    # positive for receive
+                    "vout": int(d["vout"]),
+                    "abandoned": False,
+                }
+                e.update(common)
+                entries.append(e)
+
+        return entries[skip:skip + count] if count >= 0 else entries[skip:]
+
+    def gettransaction_entry(self, txid_display_hex: str) -> dict | None:
+        """Build the Core-shaped gettransaction object for *txid* (display hex).
+
+        Returns None when the txid is not a wallet transaction (caller raises
+        the RPC error). Reference: Bitcoin Core wallet/rpc/transactions.cpp
+        gettransaction.
+        """
+        rec = self._tx_history.get(txid_display_hex.lower())
+        if rec is None:
+            return None
+        tip = self._tip_height()
+        credit = int(rec.get("credit", 0))
+        debit = int(rec.get("debit", 0))
+        net = credit - debit
+        is_from_me = bool(rec.get("is_from_me"))
+        fee = int(rec.get("fee", 0))
+
+        # Core: amount = nNet - nFee where nFee = GetValueOut() - nDebit (a
+        # NEGATIVE quantity when a fee was paid). Our ``fee`` is the positive
+        # sats paid, i.e. nFee == -fee, so amount = nNet - (-fee) = nNet + fee.
+        # Identity check: net + fee == credit - debit + (debit - total_out)
+        #               == credit - total_out == Core's nCredit - GetValueOut().
+        amount = (net + fee) / 1e8
+
+        out: dict = {
+            "amount": amount,
+            "confirmations": self._confirmations(rec, tip),
+            "blockhash": rec.get("blockhash"),
+            "blockheight": int(rec.get("height", 0) or 0),
+            "blocktime": int(rec.get("blocktime", 0) or 0),
+            "txid": rec["txid"],
+            "time": int(rec.get("time", 0) or 0),
+            "timereceived": int(rec.get("time", 0) or 0),
+            "bip125-replaceable": "no",
+            "hex": rec.get("hex", ""),
+        }
+        if rec.get("is_coinbase"):
+            out["generated"] = True
+        if is_from_me:
+            out["fee"] = -fee / 1e8   # negative, BTC
+
+        # details[] mirrors ListTransactions(fLong=false) for this one tx.
+        details: list[dict] = []
+        for d in rec.get("sent", []):
+            details.append({
+                "address": d.get("address", ""),
+                "category": "send",
+                "amount": -d["value"] / 1e8,
+                "vout": int(d["vout"]),
+                "fee": -fee / 1e8,
+                "abandoned": False,
+            })
+        for d in rec.get("recv", []):
+            details.append({
+                "address": d.get("address", ""),
+                "category": self._category_for(rec, tip),
+                "amount": d["value"] / 1e8,
+                "vout": int(d["vout"]),
+                "abandoned": False,
+            })
+        out["details"] = details
+        return out
 
     async def generate_address_of_type(
         self, address_type: str = DEFAULT_ADDRESS_TYPE, label: str | None = None
