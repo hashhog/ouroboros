@@ -1895,47 +1895,22 @@ class Mempool:
         txid = tx.get_txid()
 
         if test_accept:
-            # Dry-run: check if it would be accepted without modifying state.
-            # Coinbase txs are never accepted into the mempool, regardless of
-            # other gates — mirrors Core PreChecks (validation.cpp:802-804).
-            # We use Core's definition (prev_txid is null AND prev_vout ==
-            # 0xFFFFFFFF) rather than Transaction.is_coinbase to avoid false
-            # positives on test fixtures that use zero-prefixed txids.
-            if (
-                len(tx.inputs) == 1
-                and tx.inputs[0].prev_txid == bytes(32)
-                and tx.inputs[0].prev_vout == 0xFFFFFFFF
-            ):
-                return {
-                    "accepted": False, "txid": txid, "fee": 0,
-                    "vsize": 0, "reject_reason": "coinbase",
-                }
+            # Dry-run: route through the SINGLE real acceptance path so the
+            # verdict is byte-for-byte what an actual relay would decide — every
+            # gate (coinbase, duplicate, IsStandardTx version/dust/datacarrier,
+            # input/witness standardness, sigop cost, the full consensus
+            # validator with STANDARD_SCRIPT_VERIFY_FLAGS, RBF/TRUC/ancestor
+            # limits, ephemeral-dust, AND the min-relay-fee floor) — without
+            # inserting the tx or storing an orphan. The previous inline
+            # implementation only checked coinbase/duplicate/IsStandardTx and so
+            # ACCEPTED below-min-relay (zero-fee) txs that a real relay rejects.
             with self._lock:
-                # BIP-339 two-step duplicate detection (mirrors _add_transaction_inner).
-                try:
-                    wtxid = tx.get_wtxid()
-                except Exception:
-                    wtxid = txid
-                if wtxid in self.wtxid_to_txid:
-                    return {
-                        "accepted": False, "txid": txid, "fee": 0,
-                        "vsize": 0, "reject_reason": "txn-already-in-mempool",
-                    }
-                if txid in self.transactions:
-                    return {
-                        "accepted": False, "txid": txid, "fee": 0,
-                        "vsize": 0, "reject_reason": "txn-same-nonwitness-data-in-mempool",
-                    }
-                if self.require_standard:
-                    is_std, reason = _is_standard_tx(tx)
-                    if not is_std:
-                        return {
-                            "accepted": False, "txid": txid, "fee": 0,
-                            "vsize": 0, "reject_reason": f"non-standard: {reason}",
-                        }
+                ok, reason = self._add_transaction_inner(
+                    tx, height, test_accept=True
+                )
             return {
-                "accepted": True, "txid": txid, "fee": 0,
-                "vsize": 0, "reject_reason": None,
+                "accepted": ok, "txid": txid, "fee": 0,
+                "vsize": 0, "reject_reason": None if ok else reason,
             }
 
         ok, error = self.add_transaction(tx, height)
@@ -1954,8 +1929,22 @@ class Mempool:
                 "vsize": 0, "reject_reason": error,
             }
 
-    def _add_transaction_inner(self, tx: Transaction, height: int) -> tuple[bool, str]:
-        """Unlocked implementation of add_transaction."""
+    def _add_transaction_inner(
+        self, tx: Transaction, height: int, test_accept: bool = False
+    ) -> tuple[bool, str]:
+        """Unlocked implementation of add_transaction.
+
+        When *test_accept* is True every relay/standardness/consensus gate is
+        evaluated exactly as on the live path (coinbase, duplicate, IsStandardTx,
+        input-standardness, witness-standardness, sigop cost, the full consensus
+        validator with STANDARD_SCRIPT_VERIFY_FLAGS, RBF/TRUC/ancestor limits,
+        ephemeral-dust, and the min-relay-fee floor) but the transaction is NOT
+        inserted into the pool and no orphan is stored — a pure dry-run.  This is
+        what ``testmempoolaccept`` calls: routing it through this single code path
+        guarantees the RPC's accept/reject decision is byte-for-byte the same as
+        an actual relay would make, including the dust / bad-version /
+        below-min-relay floor that the bare consensus validator does not enforce.
+        """
         txid = tx.get_txid()
 
         # Coinbase rejection — a coinbase tx is only valid inside a block, never
@@ -2027,7 +2016,9 @@ class Mempool:
             if utxo is None and parent_txid not in self.transactions:
                 missing_parents.add(parent_txid)
         if missing_parents:
-            self.orphan_pool.add(tx, missing_parents)
+            # Dry-run (testmempoolaccept) must not mutate the orphan pool.
+            if not test_accept:
+                self.orphan_pool.add(tx, missing_parents)
             return False, "orphan"
 
         # Build the prevScripts map once — used both by ValidateInputsStandardness
@@ -2160,7 +2151,11 @@ class Mempool:
             for tx_in in tx.inputs
         )
         if has_conflict:
-            return self.try_replace(tx, height)
+            # _add_transaction_inner already runs unlocked under the caller's
+            # lock; call the unlocked replacement helper directly. In test_accept
+            # (dry-run) mode it validates the BIP125 RBF rules without evicting
+            # the conflicting tx or inserting the replacement.
+            return self._try_replace_inner(tx, height, test_accept=test_accept)
 
         # TRUC (v3 transaction) policy checks — must come before general
         # ancestor/descendant limits. This handles both v3 and non-v3 txs
@@ -2177,6 +2172,10 @@ class Mempool:
         )
         if not truc_ok:
             if sibling_txid is not None:
+                # Sibling eviction mutates the pool — in dry-run mode report the
+                # TRUC violation without performing the eviction.
+                if test_accept:
+                    return False, truc_err
                 # Sibling eviction: try to replace the existing child
                 return self._try_sibling_eviction(tx, sibling_txid, height)
             return False, truc_err
@@ -2228,8 +2227,9 @@ class Mempool:
         if not cluster_ok:
             return False, cluster_err
 
-        # Check mempool size
-        if self.current_size + tx_size > self.max_size:
+        # Check mempool size. Eviction mutates the pool, so skip it in dry-run
+        # mode — testmempoolaccept must not change mempool state.
+        if not test_accept and self.current_size + tx_size > self.max_size:
             self._evict_low_fee_txs(tx_size)
 
         # Calculate fee
@@ -2289,6 +2289,12 @@ class Mempool:
                     f"Insufficient fee: {fee} sat < rolling minimum "
                     f"{rolling_min_fee} sat (min rate {rolling_min_kvb:.1f} sat/kvB)"
                 )
+
+        # Dry-run (testmempoolaccept): every relay/standardness/consensus gate
+        # above has passed (including min-relay fee, ephemeral dust, version,
+        # and IsStandardTx). Report would-accept without mutating the pool.
+        if test_accept:
+            return True, ""
 
         # Compute direct parents (mempool txs this tx spends from)
         direct_parents: set[bytes] = set()
@@ -3588,9 +3594,14 @@ class Mempool:
             return self._try_replace_inner(new_tx, height)
 
     def _try_replace_inner(
-        self, new_tx: Transaction, height: int
+        self, new_tx: Transaction, height: int, test_accept: bool = False
     ) -> tuple[bool, str]:
-        """Unlocked implementation of try_replace."""
+        """Unlocked implementation of try_replace.
+
+        When *test_accept* is True all BIP125 RBF rules are validated but the
+        conflicting transactions are NOT evicted and the replacement is NOT
+        inserted — a pure dry-run for testmempoolaccept.
+        """
         conflicts = self._find_conflicts(new_tx)
         if not conflicts:
             return False, "No conflicts to replace"
@@ -3757,6 +3768,12 @@ class Mempool:
         )
         if not cluster_ok:
             return False, cluster_err
+
+        # All BIP125 rules satisfied. In dry-run mode stop here without mutating
+        # the pool (no eviction, no insertion) — testmempoolaccept only needs the
+        # would-accept verdict.
+        if test_accept:
+            return True, ""
 
         # All checks passed — evict and add (skip per-removal recount)
         evicted_ids = set(to_evict)
