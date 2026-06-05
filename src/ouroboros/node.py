@@ -348,6 +348,19 @@ class BitcoinNode:
                     self.block_filter_index = PersistentBlockFilterIndex(
                         data_dir=self.data_dir, enabled=True,
                     )
+                    # The BIP 157 filter-header chain MUST start at the
+                    # genesis block: height 1's header is
+                    # dSHA256(dSHA256(filter_1) || filter_header_0), where
+                    # filter_header_0 = dSHA256(dSHA256(filter_0) || 0^32).
+                    # Bitcoin Core's BlockFilterIndex indexes the genesis
+                    # block like any other (BaseIndex starts at the genesis
+                    # CBlockIndex).  The genesis is stored via
+                    # _init_genesis_block but is NEVER fed through the
+                    # block-connect hook (which only fires for heights >= 1),
+                    # so seed it here.  Without this the index tip_header
+                    # starts at 0^32 and EVERY subsequent header is off by
+                    # the genesis link.  Idempotent on restart.
+                    self._index_genesis_filter()
                     logger.info(
                         "BIP 157/158 block filter index: enabled "
                         "(NODE_COMPACT_FILTERS advertisement is gated on "
@@ -986,6 +999,41 @@ class BitcoinNode:
         # --- Fallback: just set the chain-tip pointer ---
         self.db.update_best_block(genesis_hash, 0)
         logger.info("Genesis block tip set (lightweight init)")
+
+    def _index_genesis_filter(self):
+        """Seed the BIP 157/158 filter index with the genesis block.
+
+        The filter-header chain is anchored at the genesis: every height-1
+        header chains off ``filter_header_0``, which itself chains off the
+        all-zero prev-header.  Bitcoin Core's BlockFilterIndex indexes the
+        genesis block exactly like any other (its BaseIndex begins at the
+        genesis CBlockIndex).  In ouroboros the genesis is connected via
+        :meth:`_init_genesis_block` but is never routed through the
+        block-connect index hook (which only runs for heights >= 1), so the
+        genesis filter/header would otherwise be missing and the chain would
+        start from 0^32 — making every height-1+ header diverge from Core.
+
+        Idempotent: if the genesis filter is already indexed (e.g. on
+        restart) this is a no-op.  Best-effort: any failure is logged and
+        swallowed so it can never block node startup.
+        """
+        bfi = self.block_filter_index
+        if bfi is None or self.db is None:
+            return
+        try:
+            genesis = self.db.get_block_by_height(0)
+            if genesis is None:
+                return
+            # Already indexed? get_header returns the stored 32-byte header.
+            if bfi.get_header(genesis.hash) is not None:
+                return
+            # add_block builds the filter and chains the header off the
+            # current tip header.  For a fresh index the tip header is 0^32
+            # (the genesis's parent), which is exactly Core's anchor.
+            bfi.add_block(genesis, height=0, db=self.db)
+            logger.info("BIP 157/158 filter index: seeded genesis filter")
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Failed to seed genesis filter into index: {e}")
 
     def _check_synced(self) -> bool:
         if not self.db:
