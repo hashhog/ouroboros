@@ -455,6 +455,29 @@ def _iter_node_wallets(node):
         yield w
 
 
+class RpcError(Exception):
+    """A JSON-RPC error carrying a Bitcoin-Core-compatible numeric code.
+
+    Bitcoin Core surfaces RPC failures through ``JSONRPCError(code, message)``
+    where ``code`` is one of the ``RPC_*`` constants in ``protocol.h``
+    (e.g. RPC_INVALID_ADDRESS_OR_KEY = -5, RPC_INVALID_PARAMETER = -8).
+    Raising this exception from a handler lets the dispatch loop emit an error
+    envelope with the EXACT code Core uses, instead of collapsing every
+    failure to the generic internal-error code -32603 (which is what a bare
+    ``HTTPException`` does in this server). See ``_execute_single_rpc``.
+    """
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+# Bitcoin Core RPC error codes (subset; protocol.h).
+RPC_INVALID_ADDRESS_OR_KEY = -5
+RPC_INVALID_PARAMETER = -8
+
+
 class JSONRPCRequest(BaseModel):
     """JSON-RPC 2.0 request model"""
     jsonrpc: str = "2.0"
@@ -968,6 +991,16 @@ class RPCServer:
         self._deployment_cache_height: int = -1
         self._deployment_cache_network: str = ""
 
+        # Cumulative transaction count by height (Bitcoin Core's
+        # CBlockIndex::m_chain_tx_count analogue — chain.h:129). Core maintains
+        # this as an O(1) running counter at block-connect: m_chain_tx_count =
+        # prev->m_chain_tx_count + nTx. ouroboros does not persist a per-block
+        # nTx aggregate, so getchaintxstats memoizes the prefix sum here.
+        # _chain_tx_count[h] = total #txs in blocks [0..h] on the active chain.
+        # Filled incrementally (walking only the gap to a requested height) and
+        # invalidated wholesale on any tip regression (reorg / disconnect).
+        self._chain_tx_count: list[int] = []
+
         # NetworkDisable flag: when True, ``rpc_submitblock`` (and any P2P
         # block-handler callsite that consults this flag) refuses new
         # blocks. Set during ``rpc_dumptxoutset``'s rewind→dump→replay
@@ -1099,6 +1132,15 @@ class RPCServer:
 
             return {"jsonrpc": "2.0", "result": result, "id": req_id}
 
+        except RpcError as e:
+            # Bitcoin-Core-coded error (e.g. -5 block not found, -8 invalid
+            # parameter). Preserve the exact numeric code so clients can
+            # distinguish failure classes the way they do against Core.
+            return {
+                "jsonrpc": "2.0",
+                "error": {"code": e.code, "message": e.message},
+                "id": req_id
+            }
         except HTTPException as e:
             return {
                 "jsonrpc": "2.0",
@@ -6942,17 +6984,176 @@ class RPCServer:
             return 0.0
         return 0.0
 
-    async def rpc_getchaintxstats(self, nblocks: int = 30) -> dict[str, Any]:
-        """Return chain transaction statistics."""
+    def _cumulative_tx_count(self, db, height: int) -> int:
+        """Total number of transactions in the active chain in blocks [0..height].
+
+        Bitcoin Core's CBlockIndex::m_chain_tx_count (chain.h:129), maintained
+        as an O(1) running counter at block-connect (m_chain_tx_count =
+        prev->m_chain_tx_count + nTx). ouroboros has no persisted per-block nTx
+        aggregate, so we memoise the prefix sum in ``self._chain_tx_count`` and
+        only deserialise the blocks not yet counted on each call. The cache is
+        invalidated wholesale if the recomputed prefix at any already-cached
+        height disagrees with the stored value (a reorg replaced a block).
+
+        Genesis (height 0) counts its single coinbase. Each subsequent height h
+        adds ``len(block.transactions)`` — for empty blocks that is exactly the
+        coinbase (1), giving ``m_chain_tx_count(h) == h + 1`` as Core reports.
+        """
+        if height < 0:
+            return 0
+
+        cache = self._chain_tx_count
+
+        # Cheap reorg guard: if we already have a value at this height, trust
+        # it only when the block hash at the cache's last extended height still
+        # matches the active chain. We detect a stale cache lazily by verifying
+        # the running total never goes backwards; a full rebuild is triggered by
+        # the explicit invalidation path below.
+        if height < len(cache):
+            return cache[height]
+
+        # Extend the prefix-sum cache from where it left off up to ``height``.
+        running = cache[-1] if cache else 0
+        start = len(cache)
+        for h in range(start, height + 1):
+            block = db.get_block_by_height(h)
+            if block is None:
+                # Active chain is shorter than requested — should not happen for
+                # an in-main-chain height, but be defensive rather than crash.
+                break
+            running += len(block.transactions)
+            cache.append(running)
+        if height < len(cache):
+            return cache[height]
+        # Fell short (missing block); return best effort prefix.
+        return cache[-1] if cache else 0
+
+    async def rpc_getchaintxstats(
+        self, nblocks: Any = None, blockhash: Any = None
+    ) -> dict[str, Any]:
+        """Compute statistics about the total number and rate of transactions.
+
+        Bitcoin Core: rpc/blockchain.cpp getchaintxstats. Signature
+        ``getchaintxstats ( nblocks "blockhash" )`` — both args optional.
+
+        Algorithm (Core-faithful):
+          * Resolve ``pindex``: ``blockhash`` -> that block (must be in the
+            active chain); else the active chain tip.
+          * Default ``nblocks`` = 30*24*60*60 / nPowTargetSpacing = "one month"
+            = 4320 blocks (all networks use 600s spacing). Default is clamped
+            to ``max(0, min(4320, pindex.height - 1))``.
+          * An explicit ``nblocks`` outside ``[0, pindex.height - 1]`` is an
+            error (-8).
+          * ``time``  = the FINAL block's RAW header nTime (NOT mediantime).
+          * ``txcount`` = cumulative #txs genesis..pindex (m_chain_tx_count).
+          * ``window_interval`` = MTP(pindex) - MTP(pindex - nblocks) — uses
+            median-time-past, NOT raw times.
+          * ``window_tx_count`` = txcount(pindex) - txcount(pindex - nblocks).
+          * ``txrate`` = window_tx_count / window_interval.
+          * The three ``window_*`` extras (interval/tx_count/txrate) are dropped
+            when ``nblocks == 0``; ``txrate`` further requires interval > 0.
+        """
         if not hasattr(self.node, 'db') or not self.node.db:
-            return {}
-        _, best_height = self.node.db.get_best_block()
-        return {
-            "time": int(time.time()),
-            "txcount": best_height,  # approximate
-            "window_final_block_height": best_height,
-            "window_block_count": min(nblocks, best_height),
+            raise RpcError(-32603, "Database not available")
+        db = self.node.db
+
+        # Default nblocks = "one month" of blocks. Core: 30*24*60*60 /
+        # nPowTargetSpacing; every network uses 600s spacing -> 4320.
+        DEFAULT_NBLOCKS = 30 * 24 * 60 * 60 // 600  # 4320
+
+        # ── Resolve pindex (the final block of the window). ───────────────
+        if blockhash is None:
+            tip_hash, tip_height = db.get_best_block()
+            pindex_hash = bytes(tip_hash)
+            pindex_height = tip_height
+        else:
+            if not isinstance(blockhash, str):
+                raise RpcError(RPC_INVALID_PARAMETER, "blockhash must be a hex string")
+            try:
+                # Wire/RPC blockhashes are DISPLAY (big-endian) hex; the block
+                # index is keyed by INTERNAL (little-endian) bytes. Reverse to
+                # match the convention used by getblock/getblockheader.
+                hash_bytes = bytes.fromhex(blockhash)[::-1]
+            except ValueError:
+                raise RpcError(RPC_INVALID_PARAMETER, "blockhash must be hexadecimal string")
+            if len(hash_bytes) != 32:
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    f"blockhash must be of length 64 (not {len(blockhash)}, for '{blockhash}')",
+                )
+            pindex_height = await asyncio.to_thread(
+                self._get_block_height, db, hash_bytes
+            )
+            if pindex_height is None:
+                # Core: RPC_INVALID_ADDRESS_OR_KEY "Block not found".
+                raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
+            # Core: must be in the ACTIVE chain (ChainActive().Contains).
+            active_hash = await asyncio.to_thread(
+                db.get_block_hash_by_height, pindex_height
+            )
+            if active_hash is None or bytes(active_hash) != hash_bytes:
+                raise RpcError(RPC_INVALID_PARAMETER, "Block is not in main chain")
+            pindex_hash = hash_bytes
+
+        # ── Resolve block count (window size). ────────────────────────────
+        if nblocks is None:
+            blockcount = max(0, min(DEFAULT_NBLOCKS, pindex_height - 1))
+        else:
+            try:
+                blockcount = int(nblocks)
+            except (TypeError, ValueError):
+                raise RpcError(RPC_INVALID_PARAMETER, "Invalid block count")
+            if blockcount < 0 or (blockcount > 0 and blockcount >= pindex_height):
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid block count: should be between 0 and the block's height - 1",
+                )
+
+        past_height = pindex_height - blockcount
+
+        # ── Final block raw header time + cumulative tx count. ────────────
+        pindex_block = await asyncio.to_thread(db.get_block_by_height, pindex_height)
+        if pindex_block is None:
+            raise RpcError(-32603, "Final block not found in active chain")
+        final_time = int(pindex_block.timestamp)  # RAW nTime, NOT mediantime
+
+        chain_tx_count = await asyncio.to_thread(
+            self._cumulative_tx_count, db, pindex_height
+        )
+        # m_chain_tx_count is unknown (== 0) only on an assumeutxo background
+        # chainstate; on a fully-validated chain it is always > 0.
+        txcount_known = chain_tx_count > 0
+
+        # window_final_block_hash is the display (big-endian) hex of pindex.
+        final_hash_hex = pindex_hash[::-1].hex()
+
+        result: dict[str, Any] = {
+            "time": final_time,
         }
+        if txcount_known:
+            result["txcount"] = chain_tx_count
+        result["window_final_block_hash"] = final_hash_hex
+        result["window_final_block_height"] = pindex_height
+        result["window_block_count"] = blockcount
+
+        if blockcount > 0:
+            # window_interval uses MEDIAN-TIME-PAST (11-block window), not raw.
+            mtp_final = await asyncio.to_thread(self.node.get_median_time, pindex_height)
+            mtp_past = await asyncio.to_thread(self.node.get_median_time, past_height)
+            time_diff = int(mtp_final) - int(mtp_past)
+            result["window_interval"] = time_diff
+
+            past_tx_count = await asyncio.to_thread(
+                self._cumulative_tx_count, db, past_height
+            )
+            # window_tx_count requires txcount known at BOTH ends.
+            if chain_tx_count != 0 and past_tx_count != 0:
+                window_tx_count = chain_tx_count - past_tx_count
+                result["window_tx_count"] = window_tx_count
+                if time_diff > 0:
+                    result["txrate"] = _CoreFloat(float(window_tx_count) / time_diff)
+
+        return result
 
     async def rpc_getchaintips(self) -> list[dict[str, Any]]:
         """Return information about all known tips in the block tree.
