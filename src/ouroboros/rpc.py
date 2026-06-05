@@ -3114,7 +3114,12 @@ class RPCServer:
                     raw_header_bytes = None
 
             if not block and raw_header_bytes is None:
-                raise HTTPException(status_code=404, detail="Block not found")
+                # Core: getblockheader throws JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                # "Block not found") when LookupBlockIndex returns null
+                # (rpc/blockchain.cpp:654-656). Use RpcError so the dispatch loop
+                # emits the exact -5 code, not the generic -32603 an HTTPException
+                # collapses to.
+                raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
 
             # Parse 80-byte wire-format header into field variables.
             # Wire format: version(4B sLE) prev_hash(32B) merkle(32B) time(4B LE) bits(4B LE) nonce(4B LE)
@@ -3210,20 +3215,24 @@ class RPCServer:
                     and any(b != 0 for b in raw_chainwork)):
                 chainwork_str = raw_chainwork.hex()
 
-            # Mediantime: prefer live computation from BLOCK_INDEX_CF metadata.
-            # For gap blocks, fall back to stored mediantime from HEADERS_CF.
-            mediantime_val: int = hdr_time  # last resort: use block's own timestamp
+            # Mediantime: live computation from the block index, identical to
+            # what rpc_getblock does (rpc.py:1936) and to Core's
+            # CBlockIndex::GetMedianTimePast() — the median of THIS block and up
+            # to 10 ancestors (nMedianTimeSpan = 11), chain.h:233-245. For an
+            # in-index block whose body we just loaded, get_median_time always
+            # finds at least the block itself, so the result is real; it only
+            # falls back to wall-clock when the DB has no blocks at all, which
+            # cannot happen here. The previous "< now - 86400" guard wrongly
+            # discarded the correct MTP for freshly-mined / recent blocks
+            # (regtest off-by-one vs Core) and fell back to the block's own
+            # nTime. For gap blocks (no block_height) fall back to the
+            # HEADERS_CF-stored mediantime, then the block's own timestamp.
             if block_height is not None:
-                computed_mt = self.node.get_median_time(block_height)
-                # get_median_time returns current time as fallback when no data found;
-                # only use it if it's in a plausible range (< current - 1 year).
-                import time as _time
-                if computed_mt < _time.time() - 86400:
-                    mediantime_val = computed_mt
-                elif raw_stored_mediantime:
-                    mediantime_val = raw_stored_mediantime
+                mediantime_val: int = self.node.get_median_time(block_height)
             elif raw_stored_mediantime:
                 mediantime_val = raw_stored_mediantime
+            else:
+                mediantime_val = hdr_time  # last resort: block's own timestamp
 
             # Difficulty: use %.16g precision to match Bitcoin Core's UniValue
             # serializer (std::setprecision(16) << val). For whole-number values
@@ -3268,6 +3277,10 @@ class RPCServer:
 
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}") from None
+        except RpcError:
+            # Core-coded error (e.g. -5 Block not found) — let the dispatch
+            # loop emit the exact numeric code instead of remapping it.
+            raise
         except HTTPException:
             raise
         except Exception as e:
