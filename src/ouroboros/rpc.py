@@ -2138,10 +2138,35 @@ class RPCServer:
         try:
             tx_hash = bytes.fromhex(txid)[::-1]
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid transaction id") from None
+            # Core's ParseHashV raises RPC_INVALID_PARAMETER (-8) for a
+            # non-hex / wrong-length txid (rpc/util.cpp:117-125).
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                f"parameter 1 must be hexadecimal string (not '{txid}')",
+            ) from None
 
         if len(tx_hash) != 32:
-            raise HTTPException(status_code=400, detail="Invalid transaction id")
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                f"parameter 1 must be of length 64 (not {len(txid)}, for '{txid}')",
+            )
+
+        # Special exception for the genesis block coinbase transaction.
+        #
+        # Core (rpc/rawtransaction.cpp:290-293) rejects a lookup of the
+        # genesis coinbase txid — which equals the genesis block's merkle
+        # root — with RPC_INVALID_ADDRESS_OR_KEY (-5) BEFORE any mempool /
+        # block / txindex lookup. The genesis coinbase output is unspendable
+        # and never enters the UTXO set, so it is "not considered an ordinary
+        # transaction". We resolve the genesis merkle root from the stored
+        # genesis block (height 0) so the check is network-agnostic.
+        genesis_merkle = self._genesis_merkle_root()
+        if genesis_merkle is not None and tx_hash == genesis_merkle:
+            raise RpcError(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "The genesis block coinbase is not considered an ordinary "
+                "transaction and cannot be retrieved",
+            )
 
         # Parse verbosity - support both bool and int
         if isinstance(verbose, bool):
@@ -2160,9 +2185,17 @@ class RPCServer:
                 # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
                 block_hash_bytes = bytes.fromhex(blockhash)[::-1]
             except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid block hash") from None
+                # Core's ParseHashV -> RPC_INVALID_PARAMETER (-8).
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    f"parameter 3 must be hexadecimal string (not '{blockhash}')",
+                ) from None
             if len(block_hash_bytes) != 32:
-                raise HTTPException(status_code=400, detail="Invalid block hash")
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    f"parameter 3 must be of length 64 (not {len(blockhash)}, "
+                    f"for '{blockhash}')",
+                )
 
         # Check database availability
         if not hasattr(self.node, 'db') or not self.node.db:
@@ -2190,9 +2223,11 @@ class RPCServer:
                 # Caller supplied the containing block hash
                 block = await asyncio.to_thread(self.node.db.get_block, block_hash_bytes)
                 if block is None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="Block hash not found"
+                    # Core: RPC_INVALID_ADDRESS_OR_KEY (-5), "Block hash not found"
+                    # (rpc/rawtransaction.cpp:302-304).
+                    raise RpcError(
+                        RPC_INVALID_ADDRESS_OR_KEY,
+                        "Block hash not found",
                     )
                 # Resolve block height via chainstate index (NOT block.height —
                 # PyBlock doesn't carry a height field; getattr fallback always
@@ -2235,31 +2270,44 @@ class RPCServer:
                         tx = block_tx
                         break
 
-        # 3. Handle not found
+        # 3. Handle not found.
+        #
+        # Core raises every not-found case under RPC_INVALID_ADDRESS_OR_KEY
+        # (-5) (rpc/rawtransaction.cpp:314-329); only the message suffix
+        # varies with txindex state.
         if tx is None:
             if explicit_blockhash:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No such transaction found in the provided block. "
-                           "Use gettransaction for wallet transactions."
+                raise RpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "No such transaction found in the provided block. "
+                    "Use gettransaction for wallet transactions.",
                 )
             elif not has_txindex:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No such mempool transaction. Use -txindex or provide "
-                           "a block hash to enable blockchain transaction queries. "
-                           "Use gettransaction for wallet transactions."
+                raise RpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "No such mempool transaction. Use -txindex or provide "
+                    "a block hash to enable blockchain transaction queries. "
+                    "Use gettransaction for wallet transactions.",
                 )
             else:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No such mempool or blockchain transaction. "
-                           "Use gettransaction for wallet transactions."
+                raise RpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "No such mempool or blockchain transaction. "
+                    "Use gettransaction for wallet transactions.",
                 )
 
         # 4. Return result based on verbosity
         if verbosity == 0:
-            # For raw hex, prefer witness-serialized bytes from raw block storage.
+            # verbosity 0 -> the raw tx hex via EncodeHexTx, which is the
+            # WITNESS-serialized form (marker/flag + witness stacks) whenever
+            # the tx has witness data (Core core_io.cpp EncodeHexTx -> CTxOut
+            # serialize with PROTOCOL_VERSION incl. witness). Use the
+            # witness-preserving serializer in EVERY case:
+            #   * confirmed tx: re-parse from raw block bytes (the in-memory
+            #     PyTx stub can strip witness items), then serialize_with_witness;
+            #   * mempool tx / fallback: tx.serialize_with_witness() — which is
+            #     byte-identical to the legacy form when has_witness is False,
+            #     and adds the marker/flag + stacks when it is True.
             if not in_mempool and block is not None and block_hash_bytes is not None:
                 raw_block_bytes: bytes | None = await asyncio.to_thread(
                     self.node.db.get_block_bytes, block_hash_bytes
@@ -2272,6 +2320,8 @@ class RPCServer:
                                 return ptx.serialize_with_witness().hex()
                     except Exception:
                         pass
+            if hasattr(tx, "serialize_with_witness"):
+                return tx.serialize_with_witness().hex()
             return tx.serialize().hex()
 
         # Verbose output (verbosity >= 1).
@@ -10770,6 +10820,40 @@ class RPCServer:
             pass
 
         return 0
+
+    def _genesis_merkle_root(self) -> bytes | None:
+        """Return the genesis block's merkle root in internal (LE) byte order.
+
+        The genesis coinbase txid == the genesis block's merkle root, and Core
+        rejects a getrawtransaction lookup of it as a special case
+        (rpc/rawtransaction.cpp:290). We resolve it from the stored genesis
+        block (height 0) so the check is network-agnostic and never hardcoded.
+        Returns None if the genesis block can't be resolved (in which case the
+        caller simply skips the special-case check).
+        """
+        # Cache only a SUCCESSFUL (non-None) resolution to avoid a DB
+        # round-trip on every call. A None result is not cached so we re-try
+        # on the (transient) case where genesis isn't stored yet.
+        cached = getattr(self, "_genesis_merkle_root_cache", None)
+        if cached is not None:
+            return cached
+
+        result: bytes | None = None
+        try:
+            if hasattr(self.node, "db") and self.node.db:
+                gh = self.node.db.get_block_hash_by_height(0)
+                if gh is not None:
+                    gblock = self.node.db.get_block(bytes(gh))
+                    if gblock is not None:
+                        mr = getattr(gblock, "merkle_root", None)
+                        if mr is not None:
+                            result = bytes(mr)
+        except Exception:
+            result = None
+
+        if result is not None:
+            self._genesis_merkle_root_cache = result
+        return result
 
     async def _get_next_block_hash(self, height: int) -> str | None:
         if not hasattr(self.node, "db") or not self.node.db:
