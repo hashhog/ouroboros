@@ -3720,6 +3720,38 @@ class Mempool:
         total_output = sum(out.value for out in new_tx.outputs)
         new_fee = total_input - total_output
 
+        # Sigop-adjusted virtual size of the replacement — this is the
+        # ``replacement_vsize`` Core feeds to PaysForRBF (Rule #4). Core uses
+        # ws.m_vsize = GetVirtualTransactionSize(weight, sigOpCost, nBytesPerSigOp)
+        # (validation.cpp:932, kernel/mempool_entry.h), NOT the stripped
+        # non-witness serialized byte count. Using len(serialize()) here (the
+        # no-witness size) UNDER-charges Rule #4 for segwit txs — a replacement
+        # whose fee delta lies between the stripped-size cost and the true
+        # vsize cost would be ACCEPTED by us but REJECTED by Core (a false-
+        # accept relay-policy hole). Compute the sigop cost the same way the
+        # primary acceptance path does (see _add_transaction_inner) so the
+        # vsize matches byte-for-byte.
+        # Reference: bitcoin-core/src/policy/rbf.cpp PaysForRBF (replacement_vsize);
+        #            bitcoin-core/src/validation.cpp:1010 (passes ws.m_vsize).
+        new_sigop_cost = 0
+        if self.require_standard:
+            def _rbf_utxo_resolver(prev_txid: bytes, prev_vout: int):
+                utxo = self.validator.db.get_utxo(prev_txid, prev_vout)
+                if utxo is not None:
+                    return utxo
+                parent_entry = self.transactions.get(prev_txid)
+                if parent_entry is not None and prev_vout < len(parent_entry.tx.outputs):
+                    out = parent_entry.tx.outputs[prev_vout]
+                    return {"script_pubkey": out.script_pubkey}
+                return None
+            try:
+                new_sigop_cost = _compute_tx_sigop_cost(new_tx, _rbf_utxo_resolver)
+            except Exception:
+                new_sigop_cost = 0
+        new_vsize = get_virtual_transaction_size(
+            new_tx.get_weight(), new_sigop_cost, DEFAULT_BYTES_PER_SIGOP
+        )
+
         # Modified-fee accounting (FIX-72): Core ReplacementChecks uses
         # CTxMemPoolEntry::GetModifiedFee() = nFee + nFeeDelta everywhere
         # (rbf.cpp:74, 107-111, 117-122).  Apply pending prioritisetransaction
@@ -3739,24 +3771,38 @@ class Mempool:
         # Core: reject if replacement_fees < original_fees (i.e. allow equal fees).
         # Reference: bitcoin/src/policy/rbf.cpp PaysForRBF() lines 107-111
         # Uses MODIFIED fees on both sides (Core: GetModifiedFee()).
+        # The reject string leads with Core's reject-reason TOKEN ("insufficient
+        # fee" — the strprintf prefix at validation.cpp:1014) so the reason
+        # surfaced through testmempoolaccept / sendrawtransaction normalizes to
+        # the SAME category as Core; the verbose tail mirrors PaysForRBF's
+        # "less fees than conflicting txs" detail string.
         if new_fee_modified < old_fees:
             return False, (
-                f"Replacement fee {new_fee_modified} sat is less than "
-                f"evicted fees {old_fees} sat"
+                f"insufficient fee, rejecting replacement, less fees than "
+                f"conflicting txs; {new_fee_modified} < {old_fees}"
             )
 
         # Rule #4 (PaysForRBF, part 2): The additional fees must pay for the
         # replacement's own bandwidth at or above the incremental relay feerate.
         # additional_fees = replacement_fees - original_fees
-        # additional_fees >= incrementalrelayfee * replacement_vsize / 1000
+        # additional_fees >= relay_fee.GetFee(replacement_vsize)
         # Reference: bitcoin/src/policy/rbf.cpp PaysForRBF() lines 117-122
         # Uses MODIFIED fees on both sides.
-        incremental_fee_needed = (new_size * self.INCREMENTAL_RELAY_FEE) // 1000
+        #
+        # Core's CFeeRate::GetFee(vsize) is CeilDiv(feerate_per_kvb * vsize,
+        # 1000) over the SIGOP-ADJUSTED vsize (util/feefrac.h EvaluateFeeUp +
+        # policy/feerate.cpp). We must (a) use new_vsize, not the stripped
+        # serialized size, and (b) round UP. Flooring the stripped size (the
+        # prior behaviour) under-charged Rule #4 and let a replacement with a
+        # too-small fee bump through that Core rejects.
+        incremental_fee_needed = (
+            (new_vsize * self.INCREMENTAL_RELAY_FEE) + 999
+        ) // 1000
         additional_fee = new_fee_modified - old_fees
         if additional_fee < incremental_fee_needed:
             return False, (
-                f"Replacement does not cover incremental relay fee: "
-                f"additional {additional_fee} sat < required {incremental_fee_needed} sat"
+                f"insufficient fee, rejecting replacement, not enough additional "
+                f"fees to relay; {additional_fee} < {incremental_fee_needed}"
             )
 
         # Rule 6 (cluster mempool): new linearization must be strictly better
