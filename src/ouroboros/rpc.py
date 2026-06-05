@@ -8196,20 +8196,22 @@ class RPCServer:
     async def rpc_testmempoolaccept(
         self, rawtxs: list[str], maxfeerate: float = 0.10
     ) -> list[dict[str, Any]]:
-        """Test whether raw transactions would be accepted to mempool."""
-        # Resolve the *transaction* validator robustly.  ``self.node.validator``
-        # is a ``BlockValidator`` (no ``validate_transaction`` method) and on a
-        # fresh/idle node may even be ``None`` -- calling through it raised an
-        # AttributeError that leaked into the reject-reason.  The single-tx
-        # mempool validator is the ``TransactionValidator`` wired at node init
-        # (``node.tx_validator``); the mempool holds the same instance and the
-        # BlockValidator owns an equivalent one.  Prefer them in that order so
-        # the call always lands on something with ``validate_transaction``.
-        tx_validator = (
-            getattr(self.node, "tx_validator", None)
-            or getattr(getattr(self.node, "mempool", None), "validator", None)
-            or getattr(getattr(self.node, "validator", None), "tx_validator", None)
-        )
+        """Test whether raw transactions would be accepted to mempool.
+
+        This must report the same accept/reject decision an actual relay would
+        make — i.e. it has to run the full mempool standardness + policy gate
+        (IsStandardTx version/dust/datacarrier, input/witness standardness,
+        sigop cost, RBF/TRUC, ephemeral dust, and the min-relay-fee floor),
+        not just the bare consensus validator.  Earlier this routed straight to
+        ``tx_validator.validate_transaction`` which enforces only consensus
+        rules, so it ACCEPTED dust, bad-version (nVersion outside [1,3]), and
+        zero-fee below-min-relay transactions that Bitcoin Core rejects.  We now
+        route through the mempool's ``accept_to_memory_pool(test_accept=True)``
+        dry-run, which evaluates every gate without mutating the pool.
+        Reference: bitcoin-core/src/policy/policy.cpp IsStandardTx +
+        validation.cpp PreChecks (the testmempoolaccept path).
+        """
+        mempool = getattr(self.node, "mempool", None)
         results: list[dict[str, Any]] = []
         for raw in rawtxs:
             try:
@@ -8219,7 +8221,7 @@ class RPCServer:
                 # JSON-RPC convention: txids in responses are display-order
                 # (BE). get_txid() returns LE (internal). Reverse for JSON. W69.
                 txid_be = tx.get_txid()[::-1].hex()
-                if tx_validator is None or getattr(self.node, "db", None) is None:
+                if mempool is None or getattr(self.node, "db", None) is None:
                     # Node not far enough through init to validate -- return a
                     # clean structured reject rather than a NoneType/attribute
                     # error.
@@ -8230,12 +8232,14 @@ class RPCServer:
                     })
                     continue
                 _, best_height = self.node.db.get_best_block()
-                valid, error = tx_validator.validate_transaction(
-                    tx, best_height + 1)
+                res = mempool.accept_to_memory_pool(
+                    tx, best_height + 1, test_accept=True
+                )
+                allowed = bool(res.get("accepted"))
                 results.append({
                     "txid": txid_be,
-                    "allowed": valid,
-                    "reject-reason": error if not valid else None,
+                    "allowed": allowed,
+                    "reject-reason": None if allowed else res.get("reject_reason"),
                 })
             except Exception as e:
                 results.append({
