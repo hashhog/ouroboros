@@ -495,6 +495,7 @@ class RpcError(Exception):
 
 
 # Bitcoin Core RPC error codes (subset; protocol.h).
+RPC_MISC_ERROR = -1
 RPC_INVALID_ADDRESS_OR_KEY = -5
 RPC_INVALID_PARAMETER = -8
 RPC_CLIENT_INVALID_IP_OR_SUBNET = -30
@@ -1336,7 +1337,18 @@ class RPCServer:
             ``blockhash`` is the hex-encoded block hash.
             ``filtertype`` is the filter type name (only ``basic`` supported).
             """
-            return await self.rpc_getblockfilter(blockhash, filtertype)
+            # rpc_getblockfilter raises RpcError with Core-coded numeric
+            # codes (-5/-1/-8) for the JSON-RPC path.  Translate to the
+            # nearest HTTP status for this REST GET surface.
+            try:
+                return await self.rpc_getblockfilter(blockhash, filtertype)
+            except RpcError as e:
+                _status = {
+                    RPC_INVALID_ADDRESS_OR_KEY: 404,
+                    RPC_MISC_ERROR: 400,
+                    RPC_INVALID_PARAMETER: 400,
+                }.get(e.code, 500)
+                raise HTTPException(status_code=_status, detail=e.message) from None
 
         # BIP-78 PayJoin receiver endpoint (FIX-65).
         #
@@ -3291,89 +3303,127 @@ class RPCServer:
         self, blockhash: str, filtertype: str = "basic"
     ) -> dict[str, Any]:
         """
-        Return the BIP 158 compact block filter for a block.
+        Return the BIP 157/158 compact block filter for a block.
+
+        Mirrors Bitcoin Core ``getblockfilter``
+        (``src/rpc/blockchain.cpp:2956-3031``) byte-for-byte:
+
+          - ``filter`` — the hex-encoded BIP 158 GCS basic filter
+            (``CompactSize(N)`` + Golomb-Rice bitstream), produced by
+            :func:`build_basic_filter` (P=19, M=784931, SipHash key = first
+            16 bytes of the block hash in internal/LE order, hash-to-range
+            via FastRange64).
+          - ``header`` — the hex-encoded 32-byte BIP 157 filter header,
+            chained as ``dSHA256(dSHA256(filter) || prev_filter_header)``.
+
+        Error parity (Core protocol.h codes):
+          - unknown ``filtertype``      -> -5  "Unknown filtertype"
+          - filter index not enabled    -> -1  "Index is not enabled for
+                                                filtertype <name>"
+          - ``blockhash`` not in index  -> -5  "Block not found"
 
         Args:
-            blockhash: Block hash (hex string).
+            blockhash: Block hash (display-order / big-endian hex string).
             filtertype: Filter type name (only ``"basic"`` is supported).
 
         Returns:
             ``{"filter": "<hex>", "header": "<hex>"}``
         """
+        # Core: BlockFilterTypeByName -> RPC_INVALID_ADDRESS_OR_KEY (-5)
+        # "Unknown filtertype" (blockchain.cpp:2981-2983).
         if filtertype != "basic":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown filtertype: {filtertype}. Only 'basic' is supported.",
-            )
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype")
 
-        try:
-            # JSON-RPC convention: hashes are display-order (big-endian) hex.
-            # Internal storage keys blocks (and the BlockFilterIndex) by
-            # little-endian uint256 bytes. Reverse for the lookup.
-            # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
-            block_hash = bytes.fromhex(blockhash)[::-1]
-            if len(block_hash) != 32:
-                raise ValueError("Block hash must be 32 bytes")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}") from None
-
-        if not hasattr(self.node, "db") or not self.node.db:
-            raise HTTPException(status_code=500, detail="Database not available")
-
-        block = await asyncio.to_thread(self.node.db.get_block, block_hash)
-        if not block:
-            raise HTTPException(status_code=404, detail="Block not found")
-
-        # Build the basic filter (includes prevout lookups when db is available)
-        filter_bytes = await asyncio.to_thread(build_basic_filter, block, self.node.db)
-
-        # Compute filter header.  For a full index the previous filter header
-        # would come from the stored chain; here we use a zero prev-header as
-        # a sane default when no persistent filter index is available.
-        prev_header = b"\x00" * 32
-
-        # If the node keeps a BlockFilterIndex (in-memory or persistent),
-        # try to use it.  Both variants share the read API used below.
+        # Core: GetBlockFilterIndex(filtertype) == nullptr ->
+        # RPC_MISC_ERROR (-1) "Index is not enabled for filtertype basic"
+        # (blockchain.cpp:2985-2988).  ouroboros enables the index via
+        # -blockfilterindex; when off, node.block_filter_index is None.
         bfi: BlockFilterIndex | PersistentBlockFilterIndex | None = (
             getattr(self.node, "block_filter_index", None)
         )
-        if bfi is not None:
-            cached_filter = bfi.get_filter(block_hash)
-            cached_header = bfi.get_header(block_hash)
-            if cached_filter is not None and cached_header is not None:
-                return {
-                    "filter": cached_filter.hex(),
-                    "header": cached_header.hex(),
-                }
-            # Look up previous filter header for chaining
-            if block.prev_blockhash and block.prev_blockhash != bytes(32):
-                prev_hdr = bfi.get_header(block.prev_blockhash)
-                if prev_hdr is not None:
-                    prev_header = prev_hdr
+        if bfi is None:
+            raise RpcError(
+                RPC_MISC_ERROR,
+                f"Index is not enabled for filtertype {filtertype}",
+            )
 
+        # JSON-RPC convention: hashes are display-order (big-endian) hex.
+        # Internal storage keys blocks (and the BlockFilterIndex) by
+        # little-endian uint256 bytes. Reverse for the lookup.
+        # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
+        try:
+            block_hash = bytes.fromhex(blockhash)[::-1]
+            if len(block_hash) != 32:
+                raise ValueError("Block hash must be 32 bytes")
+        except ValueError:
+            # Core's ParseHashV raises RPC_INVALID_PARAMETER (-8) on a
+            # malformed hex hash before the index lookup.
+            raise RpcError(
+                RPC_INVALID_PARAMETER, f"blockhash must be of length 64 (not {len(blockhash)}, for '{blockhash}')"
+            ) from None
+
+        if not hasattr(self.node, "db") or not self.node.db:
+            raise RpcError(RPC_MISC_ERROR, "Database not available")
+
+        # Core: LookupBlockIndex == nullptr -> RPC_INVALID_ADDRESS_OR_KEY
+        # (-5) "Block not found" (blockchain.cpp:2996-2998).
+        block = await asyncio.to_thread(self.node.db.get_block, block_hash)
+        if not block:
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
+
+        # Fast path: the index already holds this block's (filter, header).
+        # Filter headers are stored internally in uint256 internal/LE byte
+        # order (the order compute_filter_header emits).  Bitcoin Core's
+        # getblockfilter serialises the header via uint256::GetHex(), which
+        # prints the bytes REVERSED (display/big-endian order) —
+        # blockchain.cpp:3027 `ret.pushKV("header", filter_header.GetHex())`.
+        # The GCS `filter` field, by contrast, is a raw byte vector printed
+        # forward (HexStr).  Reverse ONLY the header for display parity.
+        def _result(filt: bytes, hdr: bytes) -> dict[str, Any]:
+            return {"filter": filt.hex(), "header": hdr[::-1].hex()}
+
+        # The block-connect hook (submitblock / IBD) feeds blocks in
+        # canonical order, so the persisted header is correctly chained off
+        # the parent's header — byte-identical to Core's index.
+        cached_filter = bfi.get_filter(block_hash)
+        cached_header = bfi.get_header(block_hash)
+        if cached_filter is not None and cached_header is not None:
+            return _result(cached_filter, cached_header)
+
+        # Slow path: the entry isn't cached yet (e.g. a block connected
+        # before the index hook ran).  Build the filter and chain its
+        # header off the PARENT's stored filter header (all-zero for the
+        # genesis's parent), exactly as Core's BlockFilterIndex does on
+        # connect.  Then persist via the public add_block API so subsequent
+        # queries hit the fast path and the chain advances monotonically.
+        filter_bytes = await asyncio.to_thread(
+            build_basic_filter, block, self.node.db
+        )
+
+        prev_header = b"\x00" * 32
+        if block.prev_blockhash and block.prev_blockhash != bytes(32):
+            prev_hdr = bfi.get_header(block.prev_blockhash)
+            if prev_hdr is not None:
+                prev_header = prev_hdr
         filter_header = compute_filter_header(filter_bytes, prev_header)
 
-        # Cache if index is available.  Prefer the public add_block API
-        # (mirrors block-connect path) so this works for both the
-        # in-memory BlockFilterIndex and PersistentBlockFilterIndex
-        # variants without reaching into private attributes.
-        if bfi is not None:
-            try:
-                bfi.add_block(block, height=block.height, db=self.node.db)
-            except Exception:
-                # Cache failures are best-effort — fall through to the
-                # legacy private-attr path used historically when the
-                # in-memory index lacked an add_block method.
-                if hasattr(bfi, "_filters"):
-                    bfi._filters[block_hash] = filter_bytes
-                    bfi._headers[block_hash] = filter_header
-                    if block.height is not None:
-                        bfi._height_to_hash[block.height] = block_hash
+        try:
+            bfi.add_block(block, height=block.height, db=self.node.db)
+            stored_filter = bfi.get_filter(block_hash)
+            stored_header = bfi.get_header(block_hash)
+            if stored_filter is not None and stored_header is not None:
+                return _result(stored_filter, stored_header)
+        except Exception:
+            # Cache failures are best-effort — fall through to the freshly
+            # computed values, and to the legacy private-attr path used
+            # historically when the in-memory index lacked add_block.
+            if hasattr(bfi, "_filters"):
+                bfi._filters[block_hash] = filter_bytes
+                bfi._headers[block_hash] = filter_header
+                if block.height is not None:
+                    bfi._height_to_hash[block.height] = block_hash
 
-        return {
-            "filter": filter_bytes.hex(),
-            "header": filter_header.hex(),
-        }
+        return _result(filter_bytes, filter_header)
 
     async def rpc_gettxout(self, txid: str, n: int, includemempool: bool = True) -> dict[str, Any] | None:
         """

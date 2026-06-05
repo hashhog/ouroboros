@@ -375,12 +375,28 @@ def collect_block_scripts(
             continue
         for inp in tx.inputs:
             if db is not None:
-                utxo = db.get_utxo(inp.prev_txid, inp.prev_vout)
+                # BUG FIX: the spent prevout has ALREADY been removed from the
+                # live UTXO set by the time the block is connected (or when
+                # getblockfilter rebuilds it for a historical block), so a
+                # plain get_utxo() returns None and the spent-prevout
+                # scriptPubKey silently drops out of the filter — yielding an
+                # N that is short by one element vs Core (which reads the
+                # prevout from CBlockUndo, not the live UTXO set).  Use
+                # get_utxo_or_spent() so the SPENT_CF undo record is consulted,
+                # mirroring Bitcoin Core's BasicFilterElements walking
+                # block_undo.vtxundo[].vprevout.  See blockfilter.cpp:200-208.
+                utxo = db.get_utxo_or_spent(inp.prev_txid, inp.prev_vout)
+                if utxo is None:
+                    # Fall back to the live UTXO set for older Rust builds
+                    # whose db wrapper lacks get_utxo_or_spent, or for a
+                    # prevout created earlier in THIS same block that has not
+                    # yet been flushed to the spent store.
+                    utxo = db.get_utxo(inp.prev_txid, inp.prev_vout)
                 if utxo is not None:
                     spk = utxo['script_pubkey']
-                    # BUG FIX: Core only excludes *empty* scripts from spent
-                    # prevouts — NOT OP_RETURN.  OP_RETURN exclusion applies
-                    # only to block outputs.  See blockfilter.cpp:200-208.
+                    # Core only excludes *empty* scripts from spent prevouts —
+                    # NOT OP_RETURN.  OP_RETURN exclusion applies only to block
+                    # outputs.  See blockfilter.cpp:200-208.
                     if spk:
                         scripts.append(bytes(spk))
 

@@ -241,6 +241,12 @@ class TestRPCBlockHashByteOrder(unittest.TestCase):
             self.genesis_internal = best_hash_internal
             self.genesis_display = best_hash_internal[::-1].hex()
             self._db_ready = self.node.db.get_block_by_height(0) is not None
+            # rpc_getblockfilter requires an enabled basic block filter index
+            # (Core parity: getblockfilter errors -1 when -blockfilterindex is
+            # off).  Attach an in-memory index so the byte-order tests exercise
+            # the real lookup path rather than the index-disabled error path.
+            from ouroboros.blockfilter import BlockFilterIndex
+            self.node.block_filter_index = BlockFilterIndex()
         except Exception as e:  # pragma: no cover — environment-dependent
             self._db_init_error = f"{type(e).__name__}: {e}"
         self.rpc_server = RPCServer(self.node, port=18332)
@@ -332,18 +338,65 @@ class TestRPCBlockHashByteOrder(unittest.TestCase):
         asyncio.run(test())
 
     def test_getblockfilter_internal_order_misses(self):
-        """Internal-order hex (= display reversed) must NOT resolve."""
+        """Internal-order hex (= display reversed) must NOT resolve.
+
+        Core parity: a blockhash not found in the index raises
+        JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY=-5, "Block not found")
+        (blockchain.cpp:2996-2998).  ouroboros surfaces this as RpcError(-5).
+        """
         import asyncio
 
-        from fastapi import HTTPException
+        from ouroboros.rpc import RPC_INVALID_ADDRESS_OR_KEY, RpcError
 
         self._require_db()
         internal_order_hex = self.genesis_internal.hex()
 
         async def test():
-            with self.assertRaises(HTTPException) as ctx:
+            with self.assertRaises(RpcError) as ctx:
                 await self.rpc_server.rpc_getblockfilter(internal_order_hex, "basic")
-            self.assertEqual(ctx.exception.status_code, 404)
+            self.assertEqual(ctx.exception.code, RPC_INVALID_ADDRESS_OR_KEY)
+
+        asyncio.run(test())
+
+    def test_getblockfilter_unknown_filtertype_errors(self):
+        """Unknown filtertype -> RpcError(-5) 'Unknown filtertype' (Core parity).
+
+        Mirrors Bitcoin Core blockchain.cpp:2981-2983
+        (BlockFilterTypeByName fail -> RPC_INVALID_ADDRESS_OR_KEY).
+        """
+        import asyncio
+
+        from ouroboros.rpc import RPC_INVALID_ADDRESS_OR_KEY, RpcError
+
+        self._require_db()
+
+        async def test():
+            with self.assertRaises(RpcError) as ctx:
+                await self.rpc_server.rpc_getblockfilter(self.genesis_display, "bogus")
+            self.assertEqual(ctx.exception.code, RPC_INVALID_ADDRESS_OR_KEY)
+            self.assertIn("Unknown filtertype", ctx.exception.message)
+
+        asyncio.run(test())
+
+    def test_getblockfilter_index_disabled_errors(self):
+        """Index off -> RpcError(-1) 'Index is not enabled' (Core parity).
+
+        Mirrors Bitcoin Core blockchain.cpp:2985-2988
+        (GetBlockFilterIndex == nullptr -> RPC_MISC_ERROR).
+        """
+        import asyncio
+
+        from ouroboros.rpc import RPC_MISC_ERROR, RpcError
+
+        self._require_db()
+        # Disable the index that setUp attached.
+        self.node.block_filter_index = None
+
+        async def test():
+            with self.assertRaises(RpcError) as ctx:
+                await self.rpc_server.rpc_getblockfilter(self.genesis_display, "basic")
+            self.assertEqual(ctx.exception.code, RPC_MISC_ERROR)
+            self.assertIn("Index is not enabled", ctx.exception.message)
 
         asyncio.run(test())
 
