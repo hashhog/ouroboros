@@ -167,11 +167,14 @@ def test_w133_g3_block_until_synced_to_current_chain() -> None:
 
 
 def test_w133_g4_rpc_getindexinfo_empty_bug3() -> None:
-    """G4 (BUG-3 P1): rpc_getindexinfo returns {} — operators cannot
-    verify the txindex is caught up.
+    """G4 (BUG-3 P1, NOW FIXED): rpc_getindexinfo emits per-index status so
+    operators can verify each running index is caught up.
 
-    Core: getindexinfo returns per-index status
-    `{ "synced": bool, "best_block_height": int }`.
+    Core (src/rpc/node.cpp:363-410 + SummaryToJSON:351-361): getindexinfo
+    returns a dynamic object keyed by index name; each value has EXACTLY
+    ``{ "synced": bool, "best_block_height": int }`` (in that order) and an
+    index appears only when running. The previous stub returned ``{}``; this
+    test now pins the FIXED Core-shaped handler.
     """
     src = _read_py("rpc.py")
     m = re.search(
@@ -180,14 +183,26 @@ def test_w133_g4_rpc_getindexinfo_empty_bug3() -> None:
     )
     assert m, "G4: rpc_getindexinfo not found"
     body = m.group(0)
-    # Bug signature: returns empty dict
-    assert "return {}" in body, (
-        "G4 BUG-3 already fixed? — check that getindexinfo no longer "
-        "returns the empty dict"
+    # The fixed handler emits the Core per-index value fields.
+    assert '"synced"' in body, (
+        "G4 REGRESSION: getindexinfo no longer emits the 'synced' field"
     )
-    # Negative: no per-index keys yet
-    assert "best_block_height" not in body
-    assert '"synced"' not in body
+    assert '"best_block_height"' in body, (
+        "G4 REGRESSION: getindexinfo no longer emits 'best_block_height'"
+    )
+    # Honours the optional index_name filter (positional arg 0).
+    assert "index_name" in body, (
+        "G4 REGRESSION: getindexinfo dropped the index_name filter arg"
+    )
+    # Wires the real txindex substrate (must not be a hardcoded stub).
+    assert "txindex" in body, (
+        "G4 REGRESSION: getindexinfo no longer reports the txindex"
+    )
+    # Bug signature must be gone: the body is no longer a bare ``return {}``
+    # stub (it now builds and returns a populated result dict).
+    assert re.search(r"\"\"\"\s*\n\s*return \{\}\s*$", body) is None, (
+        "G4 BUG-3 regressed: getindexinfo is back to the empty-dict stub"
+    )
 
 
 @pytest.mark.xfail(
