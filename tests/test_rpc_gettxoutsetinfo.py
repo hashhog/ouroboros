@@ -205,14 +205,60 @@ async def test_gettxoutsetinfo_hash_type_none_omits_digest() -> None:
 
 @pytest.mark.asyncio
 async def test_gettxoutsetinfo_rejects_unknown_hash_type() -> None:
-    from fastapi import HTTPException
+    # Core's ParseHashType throws RPC_INVALID_PARAMETER (-8) for an
+    # unrecognized keyword; ouroboros mirrors that via RpcError so the
+    # JSON-RPC envelope carries the same numeric code (rpc/blockchain.cpp).
+    from ouroboros.rpc import RPC_INVALID_PARAMETER, RpcError
 
     db = _StubDB()
     rpc = _make_rpc(db)
 
-    with pytest.raises(HTTPException) as exc:
+    with pytest.raises(RpcError) as exc:
         await rpc.rpc_gettxoutsetinfo(hash_type="sha3-512")
-    assert exc.value.status_code == 400
+    assert exc.value.code == RPC_INVALID_PARAMETER
+    assert "not a valid hash_type" in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_gettxoutsetinfo_hash_serialized_specific_block_rejected() -> None:
+    """``hash_serialized_3`` (the default) for a specific block/height must
+    raise RPC_INVALID_PARAMETER (-8) -- it can only be computed for the tip
+    (rpc/blockchain.cpp:1090-1092). Mirrors Core even without coinstatsindex,
+    so clients see -8 rather than silently getting tip stats."""
+    from ouroboros.rpc import RPC_INVALID_PARAMETER, RpcError
+
+    db = _StubDB()
+    rpc = _make_rpc(db)
+
+    with pytest.raises(RpcError) as exc:
+        await rpc.rpc_gettxoutsetinfo(
+            hash_type="hash_serialized_3", hash_or_height=2,
+        )
+    assert exc.value.code == RPC_INVALID_PARAMETER
+    assert "cannot be queried for a specific block" in exc.value.message
+
+    # height 0 is a valid "specific block" too (truthiness must not gate it).
+    with pytest.raises(RpcError) as exc0:
+        await rpc.rpc_gettxoutsetinfo(
+            hash_type="hash_serialized_3", hash_or_height=0,
+        )
+    assert exc0.value.code == RPC_INVALID_PARAMETER
+
+
+@pytest.mark.asyncio
+async def test_gettxoutsetinfo_specific_block_requires_index() -> None:
+    """A specific block with a non-hash_serialized hash_type still needs
+    coinstatsindex, which ouroboros lacks -> RPC_INVALID_PARAMETER (-8)
+    (rpc/blockchain.cpp:1086-1088)."""
+    from ouroboros.rpc import RPC_INVALID_PARAMETER, RpcError
+
+    db = _StubDB()
+    rpc = _make_rpc(db)
+
+    with pytest.raises(RpcError) as exc:
+        await rpc.rpc_gettxoutsetinfo(hash_type="muhash", hash_or_height=2)
+    assert exc.value.code == RPC_INVALID_PARAMETER
+    assert "coinstatsindex" in exc.value.message
 
 
 @pytest.mark.asyncio

@@ -7720,19 +7720,40 @@ class RPCServer:
         if hash_type_norm not in (
             "hash_serialized_3", "hash_serialized_2", "muhash", "none",
         ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "gettxoutsetinfo: unsupported hash_type "
-                    f"{hash_type!r}; expected hash_serialized_3, "
-                    "hash_serialized_2, muhash, or none"
-                ),
+            # Core's ParseHashType (rpc/blockchain.cpp) throws
+            # JSONRPCError(RPC_INVALID_PARAMETER, "<hash_type> is not a valid
+            # hash_type") for an unrecognized keyword. Use the same numeric
+            # code (-8) so clients distinguish this the way they do against
+            # Core, rather than the generic internal-error -32603 that a bare
+            # HTTPException collapses to.
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                f"{hash_type} is not a valid hash_type",
             )
 
         # ``hash_or_height``/``use_index`` are part of the wire signature
-        # for parity with Core's RPC help; ouroboros has no
-        # coinstatsindex so we always operate on the live chainstate.
-        _ = hash_or_height
+        # for parity with Core's RPC help. ouroboros has no coinstatsindex,
+        # so it can only report coinstats about the best block — exactly the
+        # base-chainstate case Core handles when g_coin_stats_index is null.
+        #
+        # Core (rpc/blockchain.cpp:1085-1097): when a specific block is
+        # requested (``!request.params[1].isNull()``) and the coinstatsindex
+        # is unavailable, it throws RPC_INVALID_PARAMETER. Crucially, even
+        # *with* the index, ``hash_serialized_3`` for a specific block is
+        # always rejected with RPC_INVALID_PARAMETER (it can only be computed
+        # for the tip). Mirror both error directions here.
+        if hash_or_height is not None:
+            if hash_type_norm in ("hash_serialized_3", "hash_serialized_2"):
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    "hash_serialized_3 hash type cannot be queried for a "
+                    "specific block",
+                )
+            # No coinstatsindex: any specific-block query is unsupported.
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "Querying specific block heights requires coinstatsindex",
+            )
         _ = use_index
 
         best_hash_internal, best_height = self.node.db.get_best_block()
