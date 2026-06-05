@@ -497,6 +497,7 @@ class RpcError(Exception):
 # Bitcoin Core RPC error codes (subset; protocol.h).
 RPC_INVALID_ADDRESS_OR_KEY = -5
 RPC_INVALID_PARAMETER = -8
+RPC_CLIENT_INVALID_IP_OR_SUBNET = -30
 
 
 class JSONRPCRequest(BaseModel):
@@ -6978,6 +6979,211 @@ class RPCServer:
             "totalbytessent": getattr(self.node, 'bytes_sent', 0),
             "timemillis": int(time.time() * 1000),
         }
+
+    def _get_addrman(self):
+        """Return the AddressManager (addrman), or None when unavailable.
+
+        The addrman lives on the PeerManager (``PeerManager.addrman``,
+        p2p.py:610). The peer manager is reached via ``node.peer_manager``
+        (or the legacy ``node.p2p`` alias).
+        """
+        pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
+        if pm is None:
+            return None
+        return getattr(pm, 'addrman', None)
+
+    @staticmethod
+    def _addrman_network_name(addr) -> str:
+        """Map a stored addrman entry to Core's network string.
+
+        Mirrors GetNetworkName(addr.GetNetClass()) (netbase.cpp:114-128):
+        ipv4 / ipv6 / onion / i2p / cjdns, with not_publicly_routable /
+        internal for the residual cases. ouroboros stores BIP155 network IDs
+        (addrman.py: NET_IPV4=1, NET_IPV6=2, NET_TORV3/4, NET_I2P=5,
+        NET_CJDNS=6); Tor v2 and v3 both map to Core's "onion".
+        """
+        from ouroboros.addrman import (
+            NET_IPV4, NET_IPV6, NET_TORV2, NET_TORV3, NET_I2P, NET_CJDNS,
+            is_routable,
+        )
+        nid = getattr(addr, 'network_id', NET_IPV4)
+        if nid == NET_IPV4:
+            base = "ipv4"
+        elif nid == NET_IPV6:
+            base = "ipv6"
+        elif nid in (NET_TORV2, NET_TORV3):
+            return "onion"
+        elif nid == NET_I2P:
+            return "i2p"
+        elif nid == NET_CJDNS:
+            return "cjdns"
+        else:
+            base = "ipv4"
+        # For IPv4/IPv6, Core reports not_publicly_routable for addresses
+        # that are valid but not publicly routable (GetNetClass -> NET_UNROUTABLE).
+        if not is_routable(getattr(addr, 'host', ''), nid):
+            return "not_publicly_routable"
+        return base
+
+    async def rpc_getnodeaddresses(self, count: Any = 1, network: Any = None) -> list[dict[str, Any]]:
+        """Return known addresses from the address manager.
+
+        Reference: Bitcoin Core rpc/net.cpp:911-970 (getnodeaddresses).
+
+        Returns a JSON array of objects, each with EXACTLY 5 keys in this
+        order: time (unix seconds, int), services (raw bitfield, int),
+        address (ip/onion/i2p literal, no port), port (int),
+        network (ipv4/ipv6/onion/i2p/cjdns/not_publicly_routable/internal).
+
+        Args:
+            count: Maximum number of addresses to return. 0 = all known.
+                   count < 0 -> RPC error -8 "Address count out of range".
+            network: Optional network filter. ParseNetwork accepts only
+                     ipv4|ipv6|onion|i2p|cjdns (case-insensitive); any other
+                     string -> RPC error -8 "Network not recognized: <arg>".
+        """
+        # count (positional 0): default 1; getInt<int> semantics.
+        try:
+            count_i = int(count) if count is not None else 1
+        except (TypeError, ValueError):
+            raise RpcError(RPC_INVALID_PARAMETER, "Address count out of range")
+        if count_i < 0:
+            raise RpcError(RPC_INVALID_PARAMETER, "Address count out of range")
+
+        # network (positional 1): ParseNetwork (netbase.cpp:100-112) lowercases
+        # and accepts only the five routable network names. Anything else is
+        # NET_UNROUTABLE -> error.
+        net_filter_id = None
+        if network is not None:
+            from ouroboros.addrman import (
+                NET_IPV4, NET_IPV6, NET_TORV3, NET_I2P, NET_CJDNS,
+            )
+            net_raw = str(network)
+            net_lc = net_raw.lower()
+            net_map = {
+                "ipv4": NET_IPV4,
+                "ipv6": NET_IPV6,
+                "onion": NET_TORV3,
+                "i2p": NET_I2P,
+                "cjdns": NET_CJDNS,
+            }
+            if net_lc not in net_map:
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    f"Network not recognized: {net_raw}",
+                )
+            net_filter_id = net_lc
+
+        addrman = self._get_addrman()
+        if addrman is None:
+            # No addrman available -> empty result (NOT an error), matching
+            # Core's behaviour for a node with an empty address manager.
+            return []
+
+        # GetAddressesUnsafe(count, max_pct=0, network): count==0 means "all".
+        # get_addresses() already returns a SHUFFLED list (order is not
+        # deterministic, matching Core). Pull everything, filter by network,
+        # then truncate to count.
+        all_addrs = addrman.get_addresses(addrman.size() if addrman.size() else 1)
+
+        ret: list[dict[str, Any]] = []
+        for addr in all_addrs:
+            net_name = self._addrman_network_name(addr)
+            if net_filter_id is not None and net_name != net_filter_id:
+                continue
+            obj = {
+                "time": int(getattr(addr, 'last_seen', 0) or 0),
+                "services": int(getattr(addr, 'services', 0) or 0),
+                "address": getattr(addr, 'host', ''),
+                "port": int(getattr(addr, 'port', 0) or 0),
+                "network": net_name,
+            }
+            ret.append(obj)
+
+        # count == 0 returns ALL known; otherwise cap at count.
+        if count_i != 0:
+            ret = ret[:count_i]
+        return ret
+
+    async def rpc_addpeeraddress(
+        self, address: Any = None, port: Any = None, tried: Any = False
+    ) -> dict[str, Any]:
+        """Add the address of a potential peer to the address manager.
+
+        Reference: Bitcoin Core rpc/net.cpp:972-1030 (addpeeraddress). This
+        RPC is for testing only; it makes the addrman deterministically
+        populatable so getnodeaddresses can be exercised differentially.
+
+        Returns {"success": bool} (plus an optional "error" string on failure),
+        matching Core's shape.
+
+        Args:
+            address: The IP address of the peer (required).
+            port: The port of the peer (required).
+            tried: If true, attempt to add the peer to the tried table.
+        """
+        obj: dict[str, Any] = {}
+
+        if address is None or port is None:
+            raise RpcError(RPC_INVALID_PARAMETER, "addpeeraddress requires address and port")
+
+        addr_string = str(address)
+        try:
+            port_i = int(port)
+        except (TypeError, ValueError):
+            raise RpcError(RPC_INVALID_PARAMETER, "Invalid port")
+        if port_i < 0 or port_i > 0xFFFF:
+            raise RpcError(RPC_INVALID_PARAMETER, "Invalid port")
+
+        tried_b = bool(tried) if not isinstance(tried, str) else tried.lower() in ("1", "true", "yes", "on")
+
+        addrman = self._get_addrman()
+        if addrman is None:
+            return {"success": False, "error": "address manager not available"}
+
+        # Determine BIP155 network id from the literal (IPv4 vs IPv6).
+        from ouroboros.addrman import NET_IPV4, NET_IPV6, is_routable
+        network_id = NET_IPV4
+        if ":" in addr_string:
+            network_id = NET_IPV6
+
+        # Core: LookupHost(addr_string) must resolve to a valid net addr.
+        import ipaddress as _ipaddress
+        try:
+            _ipaddress.ip_address(addr_string)
+        except ValueError:
+            raise RpcError(RPC_CLIENT_INVALID_IP_OR_SUBNET, "Invalid IP address")
+
+        # Core sets services = NODE_NETWORK | NODE_WITNESS = 1 | 8 = 9, and
+        # nTime = Now(). Match that so the differential against Core lines up.
+        services = 0x01 | 0x08  # NODE_NETWORK | NODE_WITNESS == 9
+        now = time.time()
+
+        success = False
+        # Core rejects non-routable addresses inside AddrMan::Add; surface
+        # that as success=false rather than throwing, mirroring the C++ path.
+        if not is_routable(addr_string, network_id):
+            obj["success"] = False
+            obj["error"] = "failed-adding-to-new"
+            return obj
+
+        added = addrman.add(
+            addr_string,
+            port_i,
+            services=services,
+            timestamp=now,
+            source=addr_string,  # peer announcing itself (source == address)
+            network_id=network_id,
+        )
+        if added:
+            success = True
+            if tried_b:
+                addrman.mark_good(addr_string, port_i)
+        else:
+            obj["error"] = "failed-adding-to-new"
+
+        obj["success"] = success
+        return obj
 
     async def rpc_getdifficulty(self) -> float:
         """Return the current difficulty."""
