@@ -417,6 +417,27 @@ async def accept_block(
         except Exception:
             pass
 
+    # Step 5b — Feed the block to every running index (best-effort).
+    # Core's ProcessNewBlock fires the BlockConnected signal which notifies
+    # ALL indexes (txindex, blockfilterindex, ...) regardless of whether the
+    # block was mined locally or received over P2P (src/index/base.cpp
+    # BaseIndex::BlockConnected). txindex is connected inside the Rust
+    # connect_block_from_bytes batch above, but the BIP-157/158 basic block
+    # filter index lives in Python and is only fed via the P2P/IBD connect
+    # hook (block_sync.py:1647 / :3700).  Without this, blocks added through
+    # the RPC path (generatetoaddress / submitblock) would leave the filter
+    # index stuck at synced=false — the same "skipped index for one entry
+    # point" gap accept_block was created to prevent (wave-29).  Mirror the
+    # off-thread add_block(block, height, db) call from block_sync.
+    bfi = getattr(node, "block_filter_index", None)
+    if bfi is not None and _connected_block is not None:
+        try:
+            await asyncio.to_thread(
+                bfi.add_block, _connected_block, next_height, db
+            )
+        except Exception:
+            pass  # an index fault must never abort block acceptance
+
     # Step 6 — Wallet transaction-history scan (best-effort).
     # Walk the connected block's txs and record a wallet-history entry for any
     # tx that credits a wallet script (receive/coinbase) or debits a wallet
@@ -9645,9 +9666,84 @@ class RPCServer:
             "active_commands": [],
         }
 
-    async def rpc_getindexinfo(self) -> dict[str, Any]:
-        """Return the status of indices."""
-        return {}
+    async def rpc_getindexinfo(self, index_name: str = "") -> dict[str, Any]:
+        """Return the status of one or all running indices.
+
+        Mirrors Bitcoin Core ``getindexinfo`` (src/rpc/node.cpp:363-410).
+        Returns a dynamic JSON OBJECT keyed by the index's ``GetName()``
+        string.  For each *running* index Core pushes one entry whose value
+        has EXACTLY two fields, in this order: ``synced`` (bool) then
+        ``best_block_height`` (int).  Core never emits ``best_block_hash``
+        from this RPC (it lives in IndexSummary but SummaryToJSON drops it).
+
+        Indices are listed ONLY when enabled/running.  ouroboros runs:
+          - ``txindex`` — the txid->location index, built inline with block
+            connection (always present; the Rust db exposes ``get_tx_index``).
+            Because it is written in the same WriteBatch as each connected
+            block, its best block always equals the chain tip and it is
+            considered synced whenever a best block exists.
+          - ``basic block filter index`` — only when ``-blockfilterindex`` is
+            enabled (``self.node.block_filter_index`` is not ``None``).  Its
+            best height / synced state come from the index's own
+            ``best_indexed_height`` / ``is_synced(tip)`` accessors, exactly
+            as the NODE_COMPACT_FILTERS sync-gate uses them.
+
+        The optional positional ``index_name`` argument filters to a single
+        index: a non-empty value drops every entry whose name differs (Core
+        SummaryToJSON:354).  ``getindexinfo "no-such-index"`` therefore
+        returns ``{}`` (an empty object, NOT an error).
+        """
+
+        def _emit(name: str, synced: bool, best_block_height: int) -> None:
+            # SummaryToJSON: skip when a name filter is set and does not match.
+            if index_name and index_name != name:
+                return
+            # EXACTLY two fields, in Core's order: synced, then height.
+            result[name] = {
+                "synced": bool(synced),
+                "best_block_height": int(best_block_height),
+            }
+
+        result: dict[str, Any] = {}
+
+        if not hasattr(self.node, "db") or self.node.db is None:
+            return result
+
+        # Active chain tip height (== the txindex best height; the txindex is
+        # written inline with each connected block).
+        try:
+            _, tip_height = self.node.db.get_best_block()
+            tip_height = int(tip_height) if tip_height is not None else 0
+        except Exception:
+            tip_height = 0
+
+        # --- txindex (always running in ouroboros) ---
+        # The Rust db always maintains the txid->location index; mirror Core's
+        # ``if (g_txindex)`` guard via the substrate-presence probe used by
+        # getrawtransaction (rpc.py:2150).
+        has_txindex = hasattr(self.node.db, "get_tx_index")
+        if has_txindex:
+            # Inline with block connect → best == tip; synced once a best
+            # block exists (GetSummary: best_block_height = m_best_block_index
+            # ->nHeight, else 0).
+            txindex_synced = tip_height >= 0
+            _emit("txindex", txindex_synced, tip_height)
+
+        # --- basic block filter index (only when -blockfilterindex on) ---
+        bfi = getattr(self.node, "block_filter_index", None)
+        if bfi is not None:
+            try:
+                best = bfi.best_indexed_height
+            except Exception:
+                best = None
+            best_height = int(best) if best is not None else 0
+            try:
+                bfi_synced = bool(bfi.is_synced(tip_height))
+            except Exception:
+                bfi_synced = False
+            _emit("basic block filter index", bfi_synced, best_height)
+
+        return result
 
     # Fee Bumping (RBF)
 
