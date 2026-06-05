@@ -483,9 +483,11 @@ class TestG10Rule3EqualFees(unittest.TestCase):
                        outputs=[TxOut(value=990_000)])
         ok, err = mp.try_replace(rep, height=101)
         self.assertFalse(ok)
-        # Reason must NOT be Rule 3 (less fees) — must be Rule 4 (incremental).
+        # Reason must NOT be Rule 3 (less fees) — must be Rule 4. The reject
+        # string now mirrors Core's PaysForRBF detail "not enough additional
+        # fees to relay" (rbf.cpp:119) under the "insufficient fee" token.
         self.assertNotIn("less fees", err.lower())
-        self.assertIn("incremental", err.lower())
+        self.assertIn("not enough additional fees to relay", err.lower())
 
 
 # ===========================================================================
@@ -508,7 +510,10 @@ class TestG11Rule4Incremental(unittest.TestCase):
                        outputs=[TxOut(value=989_999)])
         ok, err = mp.try_replace(rep, height=101)
         self.assertFalse(ok)
-        self.assertIn("incremental", err.lower())
+        # Core-faithful Rule 4 reject: "insufficient fee ... not enough
+        # additional fees to relay" (rbf.cpp PaysForRBF lines 117-122).
+        self.assertIn("insufficient fee", err.lower())
+        self.assertIn("not enough additional fees to relay", err.lower())
 
 
 # ===========================================================================

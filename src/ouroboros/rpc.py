@@ -2721,6 +2721,16 @@ class RPCServer:
         if "utxo not found" in error_lower:
             return "missing-inputs"
 
+        # RBF Rule #3 / #4 (BIP125 PaysForRBF) — replacement does not pay enough.
+        # ouroboros's mempool emits these leading with Core's reject TOKEN
+        # ("insufficient fee", validation.cpp:1014) so a substring match here
+        # routes them to Core's reject-reason rather than the generic conflict
+        # bucket. Must run BEFORE the conflict check below (an RBF reject string
+        # also mentions "replacement"/"conflicting txs").
+        # Reference: bitcoin-core/src/policy/rbf.cpp PaysForRBF.
+        if "insufficient fee" in error_lower:
+            return "insufficient fee"
+
         # Double spend / conflict
         if "conflict" in error_lower or "double" in error_lower:
             return "txn-mempool-conflict"
