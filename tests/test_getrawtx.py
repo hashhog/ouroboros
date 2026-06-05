@@ -359,68 +359,62 @@ class TestGetRawTransactionErrors:
 
     @pytest.mark.asyncio
     async def test_invalid_txid(self, mock_node):
-        """Test error on invalid transaction ID."""
-        from fastapi import HTTPException
+        """Test error on invalid transaction ID.
 
-        from ouroboros.rpc import RPCServer
+        Core's ParseHashV raises RPC_INVALID_PARAMETER (-8) for a non-hex /
+        wrong-length txid (rpc/util.cpp:117-125).
+        """
+        from ouroboros.rpc import RPC_INVALID_PARAMETER, RpcError, RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
 
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(RpcError) as exc_info:
             await rpc.rpc_getrawtransaction("invalid_hex")
 
-        assert exc_info.value.status_code == 400
-        assert "Invalid transaction id" in exc_info.value.detail
+        assert exc_info.value.code == RPC_INVALID_PARAMETER
 
     @pytest.mark.asyncio
     async def test_invalid_blockhash(self, mock_node, sample_tx):
-        """Test error on invalid block hash."""
-        from fastapi import HTTPException
-
-        from ouroboros.rpc import RPCServer
+        """Test error on invalid block hash (Core -> RPC_INVALID_PARAMETER -8)."""
+        from ouroboros.rpc import RPC_INVALID_PARAMETER, RpcError, RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
 
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(RpcError) as exc_info:
             await rpc.rpc_getrawtransaction(
                 sample_tx.get_txid().hex(),
                 verbose=True,
                 blockhash="invalid_hex",
             )
 
-        assert exc_info.value.status_code == 400
-        assert "Invalid block hash" in exc_info.value.detail
+        assert exc_info.value.code == RPC_INVALID_PARAMETER
 
     @pytest.mark.asyncio
     async def test_block_not_found(self, mock_node, sample_tx):
-        """Test error when block hash not found."""
-        from fastapi import HTTPException
-
-        from ouroboros.rpc import RPCServer
+        """Test error when block hash not found (Core -> -5)."""
+        from ouroboros.rpc import RPC_INVALID_ADDRESS_OR_KEY, RpcError, RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
 
         nonexistent_hash = "d" * 64
 
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(RpcError) as exc_info:
             await rpc.rpc_getrawtransaction(
                 sample_tx.get_txid().hex(),
                 verbose=True,
                 blockhash=nonexistent_hash,
             )
 
-        assert exc_info.value.status_code == 404
-        assert "Block hash not found" in exc_info.value.detail
+        assert exc_info.value.code == RPC_INVALID_ADDRESS_OR_KEY
+        assert "Block hash not found" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_tx_not_in_block(self, mock_node, sample_tx, sample_block):
-        """Test error when tx not found in specified block."""
-        from fastapi import HTTPException
-
-        from ouroboros.rpc import RPCServer
+        """Test error when tx not found in specified block (Core -> -5)."""
+        from ouroboros.rpc import RPC_INVALID_ADDRESS_OR_KEY, RpcError, RPCServer
 
         # Create block without the sample tx
         empty_block = MockBlock(
@@ -433,22 +427,20 @@ class TestGetRawTransactionErrors:
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
 
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(RpcError) as exc_info:
             await rpc.rpc_getrawtransaction(
                 sample_tx.get_txid().hex(),
                 verbose=True,
                 blockhash=sample_block.block_hash.hex(),
             )
 
-        assert exc_info.value.status_code == 404
-        assert "No such transaction found in the provided block" in exc_info.value.detail
+        assert exc_info.value.code == RPC_INVALID_ADDRESS_OR_KEY
+        assert "No such transaction found in the provided block" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_tx_not_found_no_txindex(self, mock_node, sample_tx):
-        """Test error message when tx not found and no txindex."""
-        from fastapi import HTTPException
-
-        from ouroboros.rpc import RPCServer
+        """Test error message when tx not found and no txindex (Core -> -5)."""
+        from ouroboros.rpc import RPC_INVALID_ADDRESS_OR_KEY, RpcError, RPCServer
 
         # Create a mock database without get_tx_index method
         class MockDatabaseNoTxIndex:
@@ -465,33 +457,60 @@ class TestGetRawTransactionErrors:
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
 
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(RpcError) as exc_info:
             await rpc.rpc_getrawtransaction(
                 sample_tx.get_txid().hex(),
                 verbose=True,
             )
 
-        assert exc_info.value.status_code == 404
-        assert "Use -txindex" in exc_info.value.detail
+        assert exc_info.value.code == RPC_INVALID_ADDRESS_OR_KEY
+        assert "Use -txindex" in exc_info.value.message
 
     @pytest.mark.asyncio
     async def test_tx_not_found_with_txindex(self, mock_node, sample_tx):
-        """Test error message when tx not found but txindex enabled."""
-        from fastapi import HTTPException
-
-        from ouroboros.rpc import RPCServer
+        """Test error message when tx not found but txindex enabled (Core -> -5)."""
+        from ouroboros.rpc import RPC_INVALID_ADDRESS_OR_KEY, RpcError, RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
 
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(RpcError) as exc_info:
             await rpc.rpc_getrawtransaction(
                 sample_tx.get_txid().hex(),
                 verbose=True,
             )
 
-        assert exc_info.value.status_code == 404
-        assert "No such mempool or blockchain transaction" in exc_info.value.detail
+        assert exc_info.value.code == RPC_INVALID_ADDRESS_OR_KEY
+        assert "No such mempool or blockchain transaction" in exc_info.value.message
+
+    @pytest.mark.asyncio
+    async def test_genesis_coinbase_rejected(self, mock_node):
+        """The genesis coinbase txid (== genesis merkle root) -> -5."""
+        from ouroboros.rpc import RPC_INVALID_ADDRESS_OR_KEY, RpcError, RPCServer
+
+        # Wire a genesis block (height 0) whose merkle root we then look up.
+        genesis_hash = bytes.fromhex("ee" * 32)
+        merkle = bytes.fromhex("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b")[::-1]
+        gblock = MockBlock(
+            block_hash=genesis_hash,
+            height=0,
+            transactions=[],
+            merkle_root=merkle,
+        )
+        mock_node.db.blocks[genesis_hash] = gblock
+        mock_node.db.height_to_hash[0] = genesis_hash
+
+        rpc = RPCServer.__new__(RPCServer)
+        rpc.node = mock_node
+
+        # The display-order txid is the merkle root reversed back to BE.
+        genesis_txid = merkle[::-1].hex()
+
+        with pytest.raises(RpcError) as exc_info:
+            await rpc.rpc_getrawtransaction(genesis_txid)
+
+        assert exc_info.value.code == RPC_INVALID_ADDRESS_OR_KEY
+        assert "genesis block coinbase" in exc_info.value.message
 
 
 class TestGetRawTransactionVerboseOutput:
