@@ -216,6 +216,7 @@ class BlockSync:
         mempool=None,  # Optional mempool for re-adding txs after reorg
         fee_estimator=None,  # Optional FeeEstimator to feed confirmed-block fee data
         block_filter_index=None,  # Optional BIP 157/158 block-filter index
+        wallet_notifier=None,  # Optional wallet block-connect/disconnect sink
     ):
         """Initialize block synchronizer."""
         self.db = db
@@ -227,6 +228,14 @@ class BlockSync:
         # passed to ``block_filter_index.add_block(block, height)`` so the
         # index stays in lock-step with the chain tip.  None = disabled.
         self.block_filter_index = block_filter_index
+        # Wallet block-connect sink (Core CWallet::blockConnected). When set,
+        # every canonically-connected block is passed to
+        # ``wallet_notifier.notify_block_connected(block, height)`` so loaded
+        # wallets scan it for relevant txs and keep their in-memory history /
+        # owned-outpoint set in lock-step with the chain tip. Without this hook
+        # P2P-synced funds are invisible until a manual ``rescanblockchain``.
+        # None = no wallet (e.g. headers-only / index-only runs).
+        self.wallet_notifier = wallet_notifier
 
         # Track requested blocks (hash -> request_time)
         # FIXME: race condition if called from multiple threads?
@@ -1780,6 +1789,23 @@ class BlockSync:
                 except Exception as e:
                     logger.warning(
                         f"block_filter_index.add_block failed at "
+                        f"height {new_height}: {e}"
+                    )
+
+            # Wallet block-connect (Core CWallet::blockConnected ->
+            # AddToWalletIfInvolvingMe). Off-thread because the scan walks
+            # every tx/output. Errors are non-fatal: a wallet fault must never
+            # stall IBD — the wallet can always be rebuilt via rescanblockchain.
+            if self.wallet_notifier is not None:
+                try:
+                    await asyncio.to_thread(
+                        self.wallet_notifier.notify_block_connected,
+                        block,
+                        new_height,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"wallet notify_block_connected failed at "
                         f"height {new_height}: {e}"
                     )
 
@@ -3750,6 +3776,26 @@ class BlockSync:
                         )
                     disconnect_height -= 1
 
+            # Wallet block-disconnect (Core CWallet::blockDisconnected). Roll
+            # the per-block credit/debit history back so a reorged-away receive
+            # disappears from listtransactions. Non-fatal — a wallet fault must
+            # never abort the reorg (matches the filter-index "log and continue"
+            # policy above; the wallet can always be rebuilt via rescan).
+            if self.wallet_notifier is not None:
+                disconnect_height = tip_height_at_disconnect
+                for _curr_hash, _curr_block, _ in reversed(blocks_to_disconnect):
+                    try:
+                        await asyncio.to_thread(
+                            self.wallet_notifier.notify_block_disconnected,
+                            disconnect_height,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"wallet notify_block_disconnected failed at "
+                            f"height {disconnect_height}: {e}"
+                        )
+                    disconnect_height -= 1
+
             # Sanity: tip should now be at the common ancestor height.
             tip_hash, tip_height = self.db.get_best_block()
             if tip_hash != common_ancestor:
@@ -3871,6 +3917,23 @@ class BlockSync:
                     except Exception as e:
                         logger.warning(
                             f"block_filter_index.add_block failed at "
+                            f"height {connect_height} during reorg "
+                            f"(hash {new_hash.hex()[:16]}...): {e}"
+                        )
+
+                # Wallet block-connect along the new active chain (mirrors the
+                # linear-connect hook and Core CWallet::blockConnected). Errors
+                # non-fatal so a wallet fault never aborts the reorg.
+                if self.wallet_notifier is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self.wallet_notifier.notify_block_connected,
+                            new_block_obj,
+                            connect_height,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"wallet notify_block_connected failed at "
                             f"height {connect_height} during reorg "
                             f"(hash {new_hash.hex()[:16]}...): {e}"
                         )
