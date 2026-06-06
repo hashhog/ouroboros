@@ -361,6 +361,29 @@ class BitcoinNode:
                     # starts at 0^32 and EVERY subsequent header is off by
                     # the genesis link.  Idempotent on restart.
                     self._index_genesis_filter()
+                    # Crash-safety reconcile (Core BaseIndex::Init parity).
+                    # The chainstate commit is atomic but the filter index is
+                    # written from a separate thread AFTER it, so an unclean
+                    # restart (or a rollback/reorg) can leave the index AHEAD
+                    # of / forked from the chainstate.  Rewind the index to the
+                    # active chain BEFORE the peer manager starts advertising
+                    # NODE_COMPACT_FILTERS, so we never serve cfilters for
+                    # blocks that are not on our active chain.
+                    try:
+                        rewound = self.block_filter_index.reconcile_to_chainstate(
+                            self.db
+                        )
+                        if rewound:
+                            logger.warning(
+                                f"BIP 157/158 block filter index: startup "
+                                f"reconcile rewound {rewound} height(s) to match "
+                                f"chainstate"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"BIP 157/158 block filter index: startup reconcile "
+                            f"failed ({e}); index may be ahead of chainstate"
+                        )
                     logger.info(
                         "BIP 157/158 block filter index: enabled "
                         "(NODE_COMPACT_FILTERS advertisement is gated on "

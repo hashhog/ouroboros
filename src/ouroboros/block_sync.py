@@ -908,10 +908,25 @@ class BlockSync:
                 self._requested_txs.pop(h, None)
 
             has_new_blocks = False
+            # Lazily read our tip height only when a block inv needs it, so
+            # tx-only inv batches stay on the cheap path.
+            _our_tip_height: int | None = None
             for inv_type, inv_hash in inv.inventory:
                 if inv_type == INV_TYPE_BLOCK:
                     if not self.db.has_block_hash(inv_hash):
                         has_new_blocks = True
+                        # Core UpdateBlockAvailability (net_processing.cpp:4069):
+                        # a block inv we do not yet have means the peer knows a
+                        # block beyond our index.  We cannot know its exact
+                        # height until headers arrive (Core stashes it in
+                        # hashLastUnknownBlock keyed by chain work); height-wise
+                        # the safe, useful bump is our_tip+1 — enough to keep
+                        # the peer eligible in _get_sync_peer so sync does not
+                        # starve.  The precise height lands when handle_headers
+                        # runs note_block_height on the matching header batch.
+                        if _our_tip_height is None:
+                            _, _our_tip_height = self.db.get_best_block()
+                        peer.note_block_height(_our_tip_height + 1)
                         # Directly request the block if not already in-flight.
                         # This is critical for receiving blocks from mining
                         # peers promptly (e.g., regtest mesh tests) rather
@@ -1099,6 +1114,13 @@ class BlockSync:
                     if _bh == block_hash:
                         claimed_height = active_height + 1 + _idx
                         break
+                if claimed_height is not None:
+                    # Core UpdateBlockAvailability on a delivered block whose
+                    # height we know (net_processing.cpp:4529).  Requested
+                    # blocks already had the peer's best-known height recorded
+                    # when their headers arrived; this covers unrequested
+                    # (directly-announced) deliveries.
+                    peer.note_block_height(claimed_height)
                 if (
                     claimed_height is not None
                     and claimed_height > active_height + MIN_BLOCKS_TO_KEEP
@@ -2282,6 +2304,24 @@ class BlockSync:
             # ``nUnconnectingHeaders = 0`` in the success path).
             if accepted > 0:
                 self._reset_unconnecting_headers(peer)
+                # Track the peer's live best-known height (Core's
+                # UpdateBlockAvailability on the last header of a batch —
+                # net_processing.cpp:2668).  The validated-header queue is
+                # anchored to our DB tip and chain-continuity-checked above,
+                # so slot N holds the header at height db_tip+1+N; the last
+                # slot is therefore the highest header this peer has revealed.
+                # Feeding this to note_block_height keeps header-sync peer
+                # selection from relying on the frozen handshake start_height.
+                try:
+                    _, _hdr_tip_height = self.db.get_best_block()
+                    peer.note_block_height(
+                        _hdr_tip_height + len(self._validated_headers)
+                    )
+                except Exception as _e:
+                    logger.debug(
+                        f"note_block_height (headers) failed for "
+                        f"{peer.host}:{peer.port}: {_e}"
+                    )
 
             # Hand the freshly-accepted, PoW-validated, chain-connected
             # headers to the Rust ``PyHeadersSyncState`` for commitment
@@ -2829,6 +2869,24 @@ class BlockSync:
 
         return locator
 
+    @staticmethod
+    def _peer_known_height(p: Peer) -> int:
+        """Best-known chain height for a peer — runtime-tracked, not frozen.
+
+        Returns ``max(best_known_height, start_height)`` so we always have a
+        usable estimate: ``best_known_height`` is the live value advanced
+        whenever the peer reveals a higher tip (headers/inv/block — Core's
+        ``CNodeState::pindexBestKnownBlock``, net_processing.cpp:441), while
+        ``start_height`` is the one-shot handshake snapshot that goes stale.
+        Using the frozen snapshot alone starves header sync once a peer that
+        was level with us at connect advances past us (the lunarblock
+        stale-start_height pattern).
+        """
+        return max(
+            int(getattr(p, 'best_known_height', 0) or 0),
+            int(getattr(p, 'start_height', 0) or 0),
+        )
+
     def _get_sync_peer(self, our_height: int) -> Peer | None:
         """Pick a random peer that's ahead of us for header requests."""
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
@@ -2840,7 +2898,7 @@ class BlockSync:
         candidates = [
             p for p in peers
             if isinstance(p, Peer) and hasattr(p, 'start_height')
-            and p.start_height > our_height and p.is_connected()
+            and self._peer_known_height(p) > our_height and p.is_connected()
         ]
         if not candidates:
             return None
@@ -2864,7 +2922,9 @@ class BlockSync:
         if not valid_peers:
             return None
 
-        return max(valid_peers, key=lambda p: p.start_height)
+        # Rank by the live best-known height, not the frozen handshake
+        # snapshot — see _peer_known_height.
+        return max(valid_peers, key=self._peer_known_height)
 
     def _w76_record_phases(
         self, deserialize_ns: int, validate_ns: int, connect_ns: int
