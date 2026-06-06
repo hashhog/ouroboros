@@ -277,6 +277,18 @@ class BitcoinNode:
             # Set legacy wallet reference for backwards compatibility
             self.wallet = self.wallet_manager.get_default_wallet()
 
+            # Rebuild each loaded wallet's in-memory tx history from the chain.
+            # The wallet file persists keys/seed/keypool durably, but the
+            # per-tx history is in-memory only (Core rebuilds mapWallet from a
+            # rescan on load). Without this, listtransactions / balance-by-
+            # history are empty after every restart until a manual
+            # rescanblockchain. Best-effort: a wallet fault must never block
+            # node startup.
+            try:
+                self.wallet_manager.reconcile_on_load()
+            except Exception as e:
+                logger.warning(f"Wallet startup reconcile failed: {e}")
+
             # Initialize block pruner (optional — enabled when prune=<MB> is set)
             prune_target = self.config.get('prune')
             if prune_target:
@@ -468,6 +480,10 @@ class BitcoinNode:
                 mempool=self.mempool,
                 fee_estimator=self.fee_estimator,
                 block_filter_index=self.block_filter_index,
+                # Feed every canonically-connected/disconnected block to the
+                # wallet manager so loaded wallets track their own txs in
+                # lock-step with the chain (Core CWallet::blockConnected).
+                wallet_notifier=self.wallet_manager,
             )
             # Reverse wiring: PeerManager._cleanup_peer_state delegates
             # per-peer state cleanup on disconnect to block_sync.cleanup_peer

@@ -1339,67 +1339,149 @@ class Wallet:
     # persistence
 
     def _load_or_create(self) -> None:
-        from ouroboros.descriptors import DescriptorEntry
-
-        if self.wallet_path.exists():
-            with open(self.wallet_path) as f:
-                data = json.load(f)
-            if data.get("encrypted"):
-                self._encrypted_blob = bytes.fromhex(data["ciphertext"])
-                self.keys = []
-                self.descriptors = []
-                logger.info(
-                    f"Loaded encrypted wallet '{self.name}' — "
-                    "call unlock(passphrase) to decrypt"
-                )
-                return
-            self._encrypted_blob = None
-            self.keys = data.get("keys", [])
-            # Load descriptors
-            self.descriptors = [
-                DescriptorEntry.from_dict(d)
-                for d in data.get("descriptors", [])
-            ]
-            hd = data.get("hd")
-            if hd:
-                self._hd_seed = bytes.fromhex(hd["seed_hex"])
-                self._hd_next_index = hd.get("next_index", 0)
-                self._hd_base_path = hd.get("base_path", self.HD_BASE_PATH)
-                mnemonic = hd.get("mnemonic")
-                if mnemonic:
-                    self._hd_mnemonic = list(mnemonic)
-                    self._hd_bip39_passphrase = hd.get("bip39_passphrase", "")
-            # Load key pool if present
-            key_pool_data = data.get("key_pool")
-            if key_pool_data:
-                self._key_pool = KeyPool.from_dict(key_pool_data)
-            elif self._hd_seed is not None:
-                # Create key pool from existing HD seed for backwards compatibility
-                self._key_pool = KeyPool(self._hd_seed, self.network)
-                self._key_pool.top_up()
-            # Load wallet flags
-            self._disable_private_keys = data.get("disable_private_keys", False)
-            # Load persistent lockunspent entries (memory-only locks are dropped
-            # by virtue of process exit; see Core wallet.cpp LockCoin docs).
-            for entry in data.get("locked_coins", []):
-                try:
-                    txid = str(entry["txid"])
-                    vout = int(entry["vout"])
-                    self._locked_coins[(txid, vout)] = True
-                except (KeyError, ValueError, TypeError):
-                    continue
-            logger.info(
-                f"Loaded wallet '{self.name}' with {len(self.keys)} keys, "
-                f"{len(self.descriptors)} descriptors"
-                + (" (HD)" if self._hd_seed else "")
-                + (" (watch-only)" if self._disable_private_keys else "")
-            )
-        else:
+        if not self.wallet_path.exists():
             self._encrypted_blob = None
             # Create parent directory (either wallet_dir or wallets/)
             self.wallet_path.parent.mkdir(parents=True, exist_ok=True)
             self._save()
             logger.info(f"Created new wallet '{self.name}'")
+            return
+
+        # --- Fault-tolerant parse -------------------------------------------
+        # A wallet.dat can be partial / torn / zero-length after an unclean
+        # shutdown (especially before fsync-on-save landed). Core never crashes
+        # the node on a damaged wallet — it reports a load error. Here we MUST
+        # also never crash node startup: an unreadable file is quarantined to a
+        # ``.corrupt-<ts>`` sidecar and a fresh wallet is created in its place,
+        # so the node always comes up. The user can recover funds from the
+        # sidecar (or via mnemonic) without losing the original bytes.
+        try:
+            raw = self.wallet_path.read_text()
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("wallet file is not a JSON object")
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            self._quarantine_corrupt_wallet(e)
+            self._encrypted_blob = None
+            self._save()
+            return
+
+        try:
+            self._populate_from_data(data)
+        except Exception as e:
+            # The JSON parsed but a field was structurally invalid (e.g. a
+            # truncated hex seed, a malformed key pool). Treat it the same as a
+            # corrupt file rather than letting the exception escape and crash
+            # the node.
+            self._reset_in_memory_state()
+            self._quarantine_corrupt_wallet(e)
+            self._encrypted_blob = None
+            self._save()
+
+    def _reset_in_memory_state(self) -> None:
+        """Reset all loadable in-memory wallet state to empty defaults.
+
+        Called before re-creating a quarantined wallet so a partially-applied
+        load does not leave half-populated fields behind.
+        """
+        self.keys = []
+        self.descriptors = []
+        self._hd_seed = None
+        self._hd_mnemonic = None
+        self._hd_bip39_passphrase = None
+        self._hd_next_index = 0
+        self._hd_base_path = self.HD_BASE_PATH
+        self._key_pool = None
+        self._disable_private_keys = False
+        self._locked_coins = {}
+        self._encrypted_blob = None
+        self._passphrase = None
+
+    def _quarantine_corrupt_wallet(self, error: Exception) -> None:
+        """Move a damaged wallet.dat aside so node startup can proceed.
+
+        Never raises — quarantine is best-effort. The original bytes are
+        preserved under ``<wallet.dat>.corrupt-<unixtime>`` for manual
+        recovery; if even the move fails we log and continue (a fresh
+        ``_save`` will overwrite the bad file).
+        """
+        logger.error(
+            f"Wallet '{self.name}' at {self.wallet_path} is unreadable "
+            f"({error!r}); quarantining and creating a fresh wallet. "
+            "Original bytes preserved for recovery."
+        )
+        try:
+            if self.wallet_path.exists():
+                sidecar = self.wallet_path.with_name(
+                    f"{self.wallet_path.name}.corrupt-{int(time.time())}"
+                )
+                os.replace(self.wallet_path, sidecar)
+                logger.error(f"Corrupt wallet preserved at {sidecar}")
+        except OSError as move_err:
+            logger.error(
+                f"Could not move corrupt wallet aside: {move_err!r}; "
+                "it will be overwritten by a fresh save"
+            )
+
+    def _populate_from_data(self, data: dict) -> None:
+        """Populate in-memory wallet state from a parsed wallet-file dict.
+
+        Shared by :meth:`_load_or_create` and :meth:`unlock` (which passes the
+        decrypted inner dict). Raises on structurally-invalid fields so the
+        caller can decide whether to quarantine.
+        """
+        from ouroboros.descriptors import DescriptorEntry
+
+        if data.get("encrypted"):
+            self._encrypted_blob = bytes.fromhex(data["ciphertext"])
+            self.keys = []
+            self.descriptors = []
+            logger.info(
+                f"Loaded encrypted wallet '{self.name}' — "
+                "call unlock(passphrase) to decrypt"
+            )
+            return
+        self._encrypted_blob = None
+        self.keys = data.get("keys", [])
+        # Load descriptors
+        self.descriptors = [
+            DescriptorEntry.from_dict(d)
+            for d in data.get("descriptors", [])
+        ]
+        hd = data.get("hd")
+        if hd:
+            self._hd_seed = bytes.fromhex(hd["seed_hex"])
+            self._hd_next_index = hd.get("next_index", 0)
+            self._hd_base_path = hd.get("base_path", self.HD_BASE_PATH)
+            mnemonic = hd.get("mnemonic")
+            if mnemonic:
+                self._hd_mnemonic = list(mnemonic)
+                self._hd_bip39_passphrase = hd.get("bip39_passphrase", "")
+        # Load key pool if present
+        key_pool_data = data.get("key_pool")
+        if key_pool_data:
+            self._key_pool = KeyPool.from_dict(key_pool_data)
+        elif self._hd_seed is not None:
+            # Create key pool from existing HD seed for backwards compatibility
+            self._key_pool = KeyPool(self._hd_seed, self.network)
+            self._key_pool.top_up()
+        # Load wallet flags
+        self._disable_private_keys = data.get("disable_private_keys", False)
+        # Load persistent lockunspent entries (memory-only locks are dropped
+        # by virtue of process exit; see Core wallet.cpp LockCoin docs).
+        for entry in data.get("locked_coins", []):
+            try:
+                txid = str(entry["txid"])
+                vout = int(entry["vout"])
+                self._locked_coins[(txid, vout)] = True
+            except (KeyError, ValueError, TypeError):
+                continue
+        logger.info(
+            f"Loaded wallet '{self.name}' with {len(self.keys)} keys, "
+            f"{len(self.descriptors)} descriptors"
+            + (" (HD)" if self._hd_seed else "")
+            + (" (watch-only)" if self._disable_private_keys else "")
+        )
 
     def _save(self) -> None:
         inner: dict = {
@@ -1446,10 +1528,37 @@ class Wallet:
         else:
             outer = {"version": 1, "network": self.network, **inner}
 
-        tmp = self.wallet_path.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump(outer, f, indent=2)
-        tmp.rename(self.wallet_path)
+        # Durable atomic write (mirror snapshot.py:1574-1584 and Bitcoin
+        # Core wallet DB flush semantics): write the full serialization to a
+        # sibling temp file, flush the user-space buffer, fsync the fd so the
+        # bytes are on stable storage, then atomically rename over the live
+        # wallet. Without the fsync a power loss between rename and dirty-page
+        # writeback can leave a zero-length / torn ``wallet.dat`` visible —
+        # exactly the corruption the fault-tolerant loader must also survive.
+        # ``os.replace`` is used (not Path.rename) for explicit atomic-replace
+        # semantics across platforms.
+        self.wallet_path.parent.mkdir(parents=True, exist_ok=True)
+        # Per-instance temp name keeps concurrent saves of *different* wallets
+        # (each its own path) independent; same-wallet saves are not
+        # re-entrant. Suffix ".tmp" matches the historical name.
+        tmp = self.wallet_path.with_name(self.wallet_path.name + ".tmp")
+        try:
+            with open(tmp, "w") as f:
+                json.dump(outer, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.wallet_path)
+        except BaseException:
+            # Best-effort cleanup so a failed/interrupted save does not leave a
+            # stale temp behind; the live wallet.dat is untouched (the rename
+            # is the only mutation and it is atomic).
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            raise
 
     # --- encryption / decryption ---
 
@@ -3090,6 +3199,76 @@ class WalletManager:
         self._mempool = mempool
         for wallet in self._wallets.values():
             wallet.set_mempool(mempool)
+
+    # --- Chain notifications (Core CValidationInterface fan-out) -----------
+    #
+    # The node's block-connect loop (BlockSync) holds a single reference to
+    # this manager as its ``wallet_notifier`` and calls these on every
+    # canonically-connected / disconnected block. The manager fans the
+    # notification out to every loaded wallet so each keeps its in-memory
+    # transaction history + owned-outpoint set in lock-step with the chain.
+    # Without this wiring P2P-synced funds are invisible until a manual
+    # ``rescanblockchain`` RPC.
+
+    def notify_block_connected(self, block, height: int) -> None:
+        """Fan a block-connect out to all loaded (unlocked) wallets.
+
+        Per-wallet errors are swallowed so one wallet's fault never stalls the
+        connect loop for the whole fleet (and never aborts IBD on the caller
+        side). Mirrors Bitcoin Core CWallet::blockConnected.
+        """
+        for wallet in list(self._wallets.values()):
+            try:
+                # A locked encrypted wallet has no scripts in memory; skip it
+                # (it will be reconciled on unlock/rescan).
+                if getattr(wallet, "is_locked", False):
+                    continue
+                wallet.scan_block_connect(block, height)
+            except Exception as e:
+                logger.warning(
+                    f"wallet '{getattr(wallet, 'name', '?')}' "
+                    f"scan_block_connect failed at height {height}: {e}"
+                )
+
+    def notify_block_disconnected(self, height: int) -> None:
+        """Fan a block-disconnect out to all loaded wallets (reorg rollback)."""
+        for wallet in list(self._wallets.values()):
+            try:
+                if getattr(wallet, "is_locked", False):
+                    continue
+                wallet.scan_block_disconnect(height)
+            except Exception as e:
+                logger.warning(
+                    f"wallet '{getattr(wallet, 'name', '?')}' "
+                    f"scan_block_disconnect failed at height {height}: {e}"
+                )
+
+    def reconcile_on_load(self) -> None:
+        """Rebuild every loaded wallet's in-memory history from the chain.
+
+        Called once at node startup after the database is attached. The wallet
+        file persists keys / HD seed / key pool / descriptors durably, but the
+        per-tx history (``_tx_history``) and owned-outpoint set are in-memory
+        only (Core rebuilds ``mapWallet`` from a rescan on load). A rescan over
+        the whole active chain repopulates them so listtransactions / balance
+        are correct immediately after a restart instead of empty until a manual
+        rescanblockchain. Best-effort and bounded by the current tip; per-wallet
+        errors are swallowed so a wallet fault never blocks node startup.
+        Mirrors Bitcoin Core CWallet::AttachChain / ScanForWalletTransactions.
+        """
+        if self._db is None:
+            return
+        for wallet in list(self._wallets.values()):
+            try:
+                if getattr(wallet, "is_locked", False):
+                    # Encrypted-and-locked: nothing derivable in memory yet.
+                    continue
+                wallet.rescan_chain(0, None)
+            except Exception as e:
+                logger.warning(
+                    f"wallet '{getattr(wallet, 'name', '?')}' "
+                    f"startup reconcile failed: {e}"
+                )
 
     def _wallet_dir(self, name: str) -> Path:
         """Get the directory path for a wallet."""
