@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import struct
 import threading
@@ -43,6 +44,8 @@ from ouroboros.compact_blocks import _siphash_2_4
 
 if TYPE_CHECKING:
     from ouroboros.database import Block, BlockchainDatabase
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # BIP 158 basic filter parameters
@@ -1166,6 +1169,126 @@ class PersistentBlockFilterIndex:
         if self._best_indexed_height is None:
             return False
         return self._best_indexed_height >= chain_tip_height
+
+    def reconcile_to_chainstate(self, db: "BlockchainDatabase") -> int:
+        """Rewind the index so it is never ahead of / forked from the chainstate.
+
+        Mirrors Bitcoin Core ``BaseIndex::Init`` + the rewind-to-fork-point
+        logic in ``BaseIndex::Sync`` (src/index/base.cpp:124-145, 219-242).
+        The core chainstate is crash-safe: a block connect is one atomic
+        ``WriteBatch`` plus a ``HEAD_BLOCKS`` marker.  The block-filter index
+        is written from a SEPARATE thread AFTER the chainstate commit (see
+        block_sync ``_drain_block_buffer`` add_block hook), so on an unclean
+        restart the index can be persisted PAST the chainstate (the index
+        thread committed height N's filter but the chainstate's atomic commit
+        for N never landed, OR a rollback/reorg moved the chainstate tip back
+        below the index).  In that state ``is_synced`` returns True and we
+        would advertise NODE_COMPACT_FILTERS and serve cfilters/cfheaders for
+        blocks that are NOT on our active chain — exactly the inconsistency
+        Core's startup reconcile prevents.
+
+        This walks the index tip down until it matches the chainstate, both in
+        HEIGHT (index must not be ahead) and in IDENTITY (the index's block
+        hash at the tip height must equal the chainstate's block hash at that
+        height — catches a same-height reorg fork, Core's ``chain.FindFork``).
+        Each rewound height has its filter/header/height entries removed and
+        the filter-header tip rolled back to the new tip's stored header.
+
+        MUST be called at startup BEFORE NODE_COMPACT_FILTERS is advertised.
+        Returns the number of heights rewound (0 == index already consistent).
+        """
+        if self._memory_index is not None:
+            # The transient in-memory index is rebuilt from scratch every run;
+            # there is nothing persisted that can outlive the chainstate.
+            return 0
+        if db is None:
+            return 0
+
+        try:
+            _, chain_tip_height = db.get_best_block()
+        except Exception as e:
+            logger.warning(
+                f"block filter index: could not read chainstate tip for "
+                f"startup reconcile ({e}); skipping reconcile"
+            )
+            return 0
+
+        rewound = 0
+        # Walk the index tip down while it is ahead of, or forks away from,
+        # the active chain.  Bounded by the height range so a corrupt index
+        # can never spin forever.
+        while True:
+            best = self._best_indexed_height
+            if best is None:
+                break
+
+            # (1) Index ahead of the chainstate height: this tip block is not
+            # on the active chain (the chainstate never committed it, or rolled
+            # back past it).  Always rewind.
+            ahead = best > chain_tip_height
+
+            # (2) Same height (or below tip) but a DIFFERENT block: a reorg
+            # replaced the block at this height on the active chain while the
+            # stale index still points at the old fork.  Compare identities.
+            forked = False
+            if not ahead:
+                idx_hash = self.get_block_hash_by_height(best)
+                try:
+                    chain_hash = db.get_block_hash_by_height(best)
+                except Exception:
+                    chain_hash = None
+                # Only treat as forked when BOTH sides have a hash and they
+                # disagree.  A missing chainstate hash at/below its own tip is
+                # anomalous; do not rewind on it (avoid destroying a good index
+                # because of a transient read miss) — leave it to the connect
+                # path / is_synced to settle.
+                if (
+                    idx_hash is not None
+                    and chain_hash is not None
+                    and idx_hash != chain_hash
+                ):
+                    forked = True
+
+            if not ahead and not forked:
+                break  # index tip agrees with the active chain — consistent.
+
+            # Rewind this one height: drop its entries and roll the
+            # best_indexed_height back to best-1 (remove() handles both).
+            tip_hash = self.get_block_hash_by_height(best)
+            self.remove(tip_hash if tip_hash is not None else b"\x00" * 32, height=best)
+            rewound += 1
+
+            # Restore the filter-header tip to the new tip's stored header so a
+            # subsequent add_block chains correctly (Core sets the locator to
+            # the rewound tip).  best_indexed_height was just decremented by
+            # remove().
+            new_best = self._best_indexed_height
+            if new_best is None:
+                # Rewound below genesis — reset the tip header to the genesis
+                # parent anchor (0^32), matching a fresh index.
+                self.set_tip_header(b"\x00" * 32)
+            else:
+                new_tip_hash = self.get_block_hash_by_height(new_best)
+                new_tip_header = (
+                    self.get_header(new_tip_hash)
+                    if new_tip_hash is not None
+                    else None
+                )
+                if new_tip_header is not None:
+                    self.set_tip_header(new_tip_header)
+                # If the new tip's header is missing, leave the tip header as
+                # remove() left it; the connect path will re-add forward and
+                # re-chain.  We do not fabricate a header.
+
+        if rewound:
+            logger.warning(
+                f"block filter index: rewound {rewound} height(s) on startup "
+                f"to reconcile with chainstate tip {chain_tip_height} "
+                f"(new best_indexed_height={self._best_indexed_height}) — "
+                f"Core BaseIndex::Init parity, NODE_COMPACT_FILTERS held until "
+                f"re-synced"
+            )
+        return rewound
 
     # -- BIP 157 helper API --
 

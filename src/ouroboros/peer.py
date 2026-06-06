@@ -390,7 +390,28 @@ class Peer:
         # fRelay.
         self.our_services: int = 0
         self.user_agent: str = ""
+        # ``start_height`` is the peer's chain height as advertised in its
+        # ``version`` handshake.  It is a ONE-TIME snapshot captured at
+        # connect (peer.py _inbound_handshake / _handshake) and is NEVER
+        # refreshed afterwards — the peer keeps extending its chain but this
+        # field stays frozen.  Do NOT use it for header-sync peer selection;
+        # it causes the stale-start_height starvation pattern (a peer that
+        # was level with us at handshake then advances past us is never
+        # picked because ``start_height > our_height`` stays false).  Use
+        # ``best_known_height`` for that — it tracks the highest block the
+        # peer has actually revealed to us at runtime (Core's
+        # CNodeState::pindexBestKnownBlock, net_processing.cpp:441).
         self.start_height: int = 0
+
+        # Live best-known chain height for this peer, updated whenever the
+        # peer reveals a higher tip via headers / inv / block (mirrors
+        # Bitcoin Core's CNodeState::pindexBestKnownBlock — Core tracks the
+        # best-known *block* by chain work; ouroboros' header-sync selector
+        # is height-based, so we track the height directly).  Seeded from
+        # ``start_height`` at handshake (see _inbound_handshake / _handshake)
+        # then advanced monotonically by ``note_block_height``.  Never
+        # decreases.
+        self.best_known_height: int = 0
 
         self.last_ping: float = 0
         self.latency: float = 0
@@ -733,6 +754,10 @@ class Peer:
         self.services = version.services
         self.user_agent = version.user_agent
         self.start_height = version.start_height
+        # Seed the live best-known-height from the handshake snapshot.  It is
+        # only ever advanced from here (note_block_height); it is the value
+        # header-sync peer selection reads, NOT the frozen start_height.
+        self.note_block_height(version.start_height)
         self.time_offset = int(version.timestamp - time.time())
         self._version_received = True
 
@@ -1319,6 +1344,10 @@ class Peer:
         self.services = version.services
         self.user_agent = version.user_agent
         self.start_height = version.start_height
+        # Seed the live best-known-height from the handshake snapshot.  It is
+        # only ever advanced from here (note_block_height); it is the value
+        # header-sync peer selection reads, NOT the frozen start_height.
+        self.note_block_height(version.start_height)
         self.time_offset = int(version.timestamp - time.time())
         self._version_received = True
 
@@ -1816,6 +1845,28 @@ class Peer:
         """Register *handler* to be called when a message with *command* is received."""
         self.message_handlers[command] = handler
         logger.debug(f"Registered handler for {command} on {self.host}:{self.port}")
+
+    def note_block_height(self, height: int) -> None:
+        """Record that this peer has revealed knowledge of a block at *height*.
+
+        Advances ``best_known_height`` monotonically.  Called from the
+        block-sync handlers whenever the peer reveals a higher tip via a
+        ``headers`` batch, a block ``inv`` for a block already in our index,
+        or a delivered ``block`` whose height we know.  This is ouroboros'
+        analogue of Bitcoin Core's ``UpdateBlockAvailability`` /
+        ``ProcessBlockAvailability`` (net_processing.cpp:1360,1375), which
+        keep ``CNodeState::pindexBestKnownBlock`` current so the block-fetch
+        scheduler never relies on the frozen handshake ``nStartingHeight``.
+
+        Idempotent and never decreasing — passing a height at or below the
+        current best is a no-op.
+        """
+        try:
+            h = int(height)
+        except (TypeError, ValueError):
+            return
+        if h > self.best_known_height:
+            self.best_known_height = h
 
     async def ping(self):
         """Send ping to peer"""
