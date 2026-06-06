@@ -277,17 +277,30 @@ class BitcoinNode:
             # Set legacy wallet reference for backwards compatibility
             self.wallet = self.wallet_manager.get_default_wallet()
 
-            # Rebuild each loaded wallet's in-memory tx history from the chain.
-            # The wallet file persists keys/seed/keypool durably, but the
-            # per-tx history is in-memory only (Core rebuilds mapWallet from a
-            # rescan on load). Without this, listtransactions / balance-by-
-            # history are empty after every restart until a manual
-            # rescanblockchain. Best-effort: a wallet fault must never block
-            # node startup.
-            try:
-                self.wallet_manager.reconcile_on_load()
-            except Exception as e:
-                logger.warning(f"Wallet startup reconcile failed: {e}")
+            # Rebuild each loaded wallet's in-memory tx history from the chain
+            # in the BACKGROUND. The wallet file persists keys/seed/keypool
+            # durably, but the per-tx history is in-memory only (Core rebuilds
+            # mapWallet from a rescan on load). Without this, listtransactions /
+            # balance-by-history are empty after a restart until a manual
+            # rescanblockchain.
+            #
+            # CRITICAL: this rescan walks every block from 0 to the tip. Running
+            # it synchronously here blocks the rest of node startup — the RPC
+            # server is not bound until ~250 lines below — so on a fully synced
+            # mainnet (~950k blocks) the node spins for many minutes with RPC
+            # refused and never finishes booting (the restart-wedge that kept
+            # this node down). Core keeps RPC responsive while the wallet
+            # rescans (getwalletinfo.scanning) — mirror that: offload the
+            # CPU-bound scan to a worker thread so the event loop, P2P sync and
+            # RPC all come up immediately and wallet history fills in
+            # concurrently. Best-effort: a wallet fault must never block startup.
+            async def _bg_wallet_reconcile():
+                try:
+                    await asyncio.to_thread(self.wallet_manager.reconcile_on_load)
+                    logger.info("Wallet startup reconcile complete")
+                except Exception as e:
+                    logger.warning(f"Wallet startup reconcile failed: {e}")
+            self._wallet_reconcile_task = asyncio.create_task(_bg_wallet_reconcile())
 
             # Initialize block pruner (optional — enabled when prune=<MB> is set)
             prune_target = self.config.get('prune')
