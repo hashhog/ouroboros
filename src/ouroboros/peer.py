@@ -1754,6 +1754,29 @@ class Peer:
                     logger.debug(f"Receive timeout from {self.host}:{self.port}")
                     continue
 
+                except (asyncio.IncompleteReadError, EOFError,
+                        ConnectionResetError, ConnectionError,
+                        BrokenPipeError, OSError) as e:
+                    # The socket is closed / half-closed: a peer that hung up
+                    # makes ``readexactly`` raise ``IncompleteReadError``
+                    # (subclass of ``EOFError``) immediately and forever — it
+                    # never blocks once the stream is at EOF.  The generic
+                    # ``except Exception`` below only docks score and ``continue``s,
+                    # so a hung-up peer spun the receive loop ~20 times back-to-
+                    # back (each iteration re-reading EOF instantly, allocating an
+                    # exception + a formatted log line) before the score finally
+                    # clamped to 0.  At chain tip, where peers churn constantly,
+                    # that hot-spin + per-iteration allocation churn was a steady
+                    # RSS/CPU drain.  Treat EOF / dead-socket the way Bitcoin Core
+                    # does in ``CConnman::SocketHandler`` (``nBytes == 0`` ⇒
+                    # disconnect immediately) — close and break, do NOT spin.
+                    logger.info(
+                        f"Peer {self.host}:{self.port} closed the connection "
+                        f"(EOF/socket error: {type(e).__name__}: {e})"
+                    )
+                    await self.disconnect()
+                    break
+
                 except V2TransportError as e:
                     # Peer speaks v2 transport but we parsed as v1 —
                     # disconnect gracefully without score penalty (same
