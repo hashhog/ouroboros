@@ -1032,8 +1032,12 @@ class TestG29SystemErrorCatchOnDiskWrite:
         import inspect
         from ouroboros.block_sync import BlockSync
         src = inspect.getsource(BlockSync._drain_block_buffer_locked)
-        # The rebuffer pattern is present.
-        assert "self._ibd_block_buffer[next_hash] = (block, raw_payload)" in src
+        # The rebuffer pattern is present.  Inserts now flow through the
+        # ``_buffer_put`` chokepoint (2026-06-06 IBD-buffer orphan-sweep fix)
+        # so the parallel insertion-time map (_ibd_block_buffer_ts) stays in
+        # lockstep with the buffer; the rebuffer-on-connect-failure behaviour
+        # is unchanged.
+        assert "self._buffer_put(next_hash, (block, raw_payload))" in src
 
 
 class TestG30BlockHaveDataBeforeNextReceivedBlockTransactions:
