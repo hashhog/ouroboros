@@ -34,9 +34,28 @@ from __future__ import annotations
 
 import logging
 import struct
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+# Hard cap on a per-peer ``ReconciliationSet.announced_txids`` FIFO.
+#
+# ``announced_txids`` is the BIP-330 / Erlay per-peer dedup-of-already-
+# announced set: ``mark_announced`` records every txid we have successfully
+# announced to a peer so ``add_tx`` never re-queues it.  At tip the node
+# announces transactions continuously, so a plain ``set[bytes]`` grew without
+# bound, per peer — the exact at-tip RSS-leak shape that
+# ``TrickleQueue.known_filter`` (p2p.py) already fixed by switching to a
+# bounded ``OrderedDict`` FIFO.  We mirror that here: cap the FIFO and evict
+# the oldest entry on insert.  Dropping an old entry only risks re-announcing a
+# very-stale txid the peer has long since forgotten (harmless — the peer just
+# replies notfound / ignores a dup), which is exactly the trade-off Core's
+# rolling bloom filter makes.
+#
+# Sized to match KNOWN_FILTER_MAX_ENTRIES (50_000) in p2p.py so the two
+# per-peer dedup structures stay on the same memory budget.
+ANNOUNCED_TXIDS_MAX_ENTRIES = 50_000
 
 
 # GF(2^32) arithmetic
@@ -583,7 +602,16 @@ class ReconciliationSet:
     local_salt: int = 0
     remote_salt: int = 0
     local_set: set[bytes] = field(default_factory=set)
-    announced_txids: set[bytes] = field(default_factory=set)
+    # Bounded FIFO of already-announced txids (membership-test only).  Stored
+    # as an ``OrderedDict[bytes, None]`` rather than a plain ``set`` so the
+    # oldest entry can be evicted once ``ANNOUNCED_TXIDS_MAX_ENTRIES`` is
+    # reached, keeping per-peer memory bounded at tip.  ``in`` / ``len`` work
+    # the same as on a set, so existing readers (and the
+    # ``txid in rs.announced_txids`` membership tests) are unaffected.  Mirrors
+    # ``TrickleQueue.known_filter`` in p2p.py.
+    announced_txids: OrderedDict[bytes, None] = field(default_factory=OrderedDict)
+    # FIFO cap; overridable per-instance for tests.
+    _announced_max: int = ANNOUNCED_TXIDS_MAX_ENTRIES
 
     def add_tx(self, txid: bytes) -> None:
         """Add a transaction to the reconciliation set."""
@@ -591,8 +619,20 @@ class ReconciliationSet:
             self.local_set.add(txid)
 
     def mark_announced(self, txid: bytes) -> None:
-        """Mark a transaction as successfully announced."""
-        self.announced_txids.add(txid)
+        """Mark a transaction as successfully announced.
+
+        Records *txid* in the bounded ``announced_txids`` FIFO, evicting the
+        oldest entry once the cap is reached.  Re-announcing an existing txid
+        refreshes its position (LRU-on-touch) so the most-recently announced
+        txids survive longest — matching ``TrickleQueue._known_filter_add``.
+        """
+        if txid in self.announced_txids:
+            self.announced_txids.move_to_end(txid)
+        else:
+            if len(self.announced_txids) >= self._announced_max:
+                # FIFO eviction: drop the oldest announced txid.
+                self.announced_txids.popitem(last=False)
+            self.announced_txids[txid] = None
         self.local_set.discard(txid)
 
     def get_short_ids(self) -> set[int]:

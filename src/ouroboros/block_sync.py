@@ -118,6 +118,25 @@ BLOCK_REQUEST_MAX_ATTEMPTS = 10
 # regardless of any future path that forgets to clean an entry.
 W77_FIRST_REQUEST_MAX_ENTRIES = 20_000
 
+# TTL (seconds) for an entry in ``_ibd_block_buffer`` that never lines up with
+# ``_validated_headers`` (an "orphan").  The drain
+# (``_drain_block_buffer_locked``) only ever pops hashes that appear
+# contiguously from the connect frontier in ``_validated_headers``; a buffered
+# block whose hash is NOT (or no longer) in that header queue — a competing /
+# stale / fork block a peer delivered out of band, or a block left behind after
+# a ``_validated_headers`` rebuild — is never popped and would retain its full
+# ~1-2 MB raw payload forever.  The near-full eviction band only reclaims
+# far-ahead entries while admitting new blocks; under a quiet-at-tip buffer
+# that stays below the band, nothing reclaims orphans at all.  This is the
+# second at-tip RSS-leak driver (peer with ``_partial_cmpct_blocks`` was the
+# first; same OOM family, 2026-06-02/03).  ``_sweep_ibd_block_buffer`` (driven
+# from ``sync_loop``) reclaims any buffer entry older than this whose hash is
+# not currently in ``_validated_headers``, mirroring
+# ``PeerManager._sweep_partial_cmpct_blocks``.  Generous (10 min) so a block
+# that is briefly ahead of a header batch still in flight is never swept while
+# legitimately awaited.
+IBD_BUFFER_ORPHAN_TTL = 600.0
+
 from ouroboros.database import Block, BlockchainDatabase, Transaction
 from ouroboros.p2p_messages import (
     INV_TYPE_BLOCK,
@@ -314,6 +333,14 @@ class BlockSync:
         # children sequentially.
         self._ibd_block_buffer: dict[bytes, Block] = {}
         self._max_ibd_buffer: int = 1024
+        # Parallel insertion-time map for the orphan TTL sweep
+        # (_sweep_ibd_block_buffer).  Keyed identically to _ibd_block_buffer;
+        # an entry is recorded on every buffer insert and removed on every pop
+        # / delete / clear so it never outlives its block.  See
+        # IBD_BUFFER_ORPHAN_TTL for the leak this reclaims.  Insertion time is
+        # kept in a sibling dict (not folded into the buffer tuple) so the
+        # drain's `(block, raw_payload)` unpacking is untouched.
+        self._ibd_block_buffer_ts: dict[bytes, float] = {}
 
         # Drain-loop stage timings (W60 B0, promoted to W76-PHASE cross-
         # impl phase table).  Accumulates wall-clock ns spent in each
@@ -585,6 +612,7 @@ class BlockSync:
         )
         self._validated_headers.clear()
         self._ibd_block_buffer.clear()
+        self._ibd_block_buffer_ts.clear()
         self.requested_blocks.clear()
         self._block_request_peer.clear()
         self._block_source_peer_addr.clear()
@@ -870,6 +898,14 @@ class BlockSync:
 
                 # Drain any buffered blocks that can now be connected.
                 await self._drain_block_buffer()
+
+                # Reclaim orphaned IBD-buffer entries (blocks that never line
+                # up with validated_headers and so are never drained — the
+                # second at-tip RSS-leak driver).  Cheap (early-returns on an
+                # empty buffer; O(buffer) otherwise, buffer <= _max_ibd_buffer)
+                # so it is safe to poll every tick; the TTL window does the
+                # actual rate-limiting.
+                await self._sweep_ibd_block_buffer()
 
                 # Advance headers-first download window (in case blocks
                 # connected between sync_loop iterations).
@@ -1161,7 +1197,7 @@ class BlockSync:
                 # Common case: ample room.  Admit anything (far-ahead or head).
                 # No is-head probe -- the hot path stays free of
                 # get_block_hash_by_height calls and scans.
-                self._ibd_block_buffer[block_hash] = (None, payload)
+                self._buffer_put(block_hash, (None, payload))
                 self._block_source_peer_addr[block_hash] = f"{peer.host}:{peer.port}"
                 self._blk_buffered += 1
             else:
@@ -1183,7 +1219,7 @@ class BlockSync:
                 is_head = block_hash in head_set
                 if is_head and buf_len < self._max_ibd_buffer:
                     # Head-of-window into one of the reserved slots.
-                    self._ibd_block_buffer[block_hash] = (None, payload)
+                    self._buffer_put(block_hash, (None, payload))
                     self._block_source_peer_addr[block_hash] = f"{peer.host}:{peer.port}"
                     self._blk_buffered += 1
                 elif is_head:
@@ -1206,10 +1242,10 @@ class BlockSync:
                             evict_hash = _bh
                             break
                     if evict_hash is not None:
-                        del self._ibd_block_buffer[evict_hash]
+                        self._buffer_remove(evict_hash)
                         self._block_source_peer_addr.pop(evict_hash, None)
                         self._blk_buffer_full += 1  # count the eviction-drop
-                        self._ibd_block_buffer[block_hash] = (None, payload)
+                        self._buffer_put(block_hash, (None, payload))
                         self._block_source_peer_addr[block_hash] = f"{peer.host}:{peer.port}"
                         self._blk_buffered += 1
                     else:
@@ -1218,7 +1254,7 @@ class BlockSync:
                         # bounded at HEAD_OF_WINDOW, so this can over-fill by at
                         # most HEAD_OF_WINDOW slots, and it IS the contiguous
                         # prefix so it drains immediately at the drain below.
-                        self._ibd_block_buffer[block_hash] = (None, payload)
+                        self._buffer_put(block_hash, (None, payload))
                         self._block_source_peer_addr[block_hash] = f"{peer.host}:{peer.port}"
                         self._blk_buffered += 1
                 else:
@@ -1244,6 +1280,75 @@ class BlockSync:
             self._blk_error += 1
             logger.error(f"Error handling block from {peer.host}:{peer.port}: {e}", exc_info=True)
             peer.adjust_score(-5)
+
+    def _buffer_put(self, block_hash: bytes, value) -> None:
+        """Insert *value* (a ``(block, raw_payload)`` tuple) into the IBD
+        block buffer and record its insertion time for the orphan TTL sweep.
+
+        The single insert chokepoint so ``_ibd_block_buffer_ts`` can never
+        drift out of sync with ``_ibd_block_buffer``.  A re-insert (e.g. the
+        transient "Previous block not found" / connect-failure requeue) keeps
+        the ORIGINAL insertion timestamp so a block that keeps bouncing on a
+        slow parent still ages toward the TTL rather than resetting its clock
+        forever.
+        """
+        self._ibd_block_buffer[block_hash] = value
+        self._ibd_block_buffer_ts.setdefault(block_hash, time.monotonic())
+
+    def _buffer_remove(self, block_hash: bytes):
+        """Pop *block_hash* from the IBD block buffer (and its timestamp).
+
+        Returns the popped value, or ``None`` if absent.  The single removal
+        chokepoint mirroring :meth:`_buffer_put`.
+        """
+        self._ibd_block_buffer_ts.pop(block_hash, None)
+        return self._ibd_block_buffer.pop(block_hash, None)
+
+    async def _sweep_ibd_block_buffer(self) -> int:
+        """Reclaim orphaned IBD-buffer entries (at-tip RSS-leak BUG 2).
+
+        The drain (:meth:`_drain_block_buffer_locked`) only pops a buffered
+        block once its hash appears contiguously from the connect frontier in
+        ``_validated_headers``.  A buffered block whose hash is NOT in that
+        header queue — a stale / competing / fork block delivered out of band,
+        or a leftover from a ``_validated_headers`` rebuild — is never popped
+        and retains its ~1-2 MB raw payload forever.  This sweep, driven from
+        :meth:`sync_loop`, drops any buffer entry that (a) is not currently in
+        ``_validated_headers`` AND (b) is older than ``IBD_BUFFER_ORPHAN_TTL``.
+
+        A block that is legitimately ahead of an in-flight header batch is
+        protected by the TTL window (10 min) — it will be in
+        ``_validated_headers`` long before then; an orphan that never lines up
+        is reclaimed once aged out.  Mirrors
+        ``PeerManager._sweep_partial_cmpct_blocks``.  Returns the number of
+        entries swept (for tests / telemetry).
+        """
+        if not self._ibd_block_buffer:
+            return 0
+        now = time.monotonic()
+        wanted = {bh for bh, _ in self._validated_headers}
+        expired = [
+            bh
+            for bh, ts in self._ibd_block_buffer_ts.items()
+            if bh not in wanted and now - ts > IBD_BUFFER_ORPHAN_TTL
+        ]
+        # Also reclaim any timestamp that lost its buffer entry through a path
+        # that bypassed _buffer_remove (belt-and-braces; should be empty).
+        stale_ts = [bh for bh in self._ibd_block_buffer_ts
+                    if bh not in self._ibd_block_buffer]
+        for bh in expired:
+            self._ibd_block_buffer.pop(bh, None)
+            self._ibd_block_buffer_ts.pop(bh, None)
+            self._block_source_peer_addr.pop(bh, None)
+        for bh in stale_ts:
+            self._ibd_block_buffer_ts.pop(bh, None)
+        if expired:
+            logger.debug(
+                "TTL-swept %d orphan IBD-buffer block(s) (> %.0fs, not in "
+                "validated_headers); buffer=%d",
+                len(expired), IBD_BUFFER_ORPHAN_TTL, len(self._ibd_block_buffer),
+            )
+        return len(expired)
 
     async def _drain_block_buffer(self) -> int:
         """Connect buffered blocks in chain order.
@@ -1301,6 +1406,7 @@ class BlockSync:
             )
             self._validated_headers.clear()
             self._ibd_block_buffer.clear()
+            self._ibd_block_buffer_ts.clear()
             self.requested_blocks.clear()
             self._block_request_peer.clear()
             self._block_source_peer_addr.clear()
@@ -1322,7 +1428,7 @@ class BlockSync:
             if next_hash not in self._ibd_block_buffer:
                 break  # need to wait for download
 
-            block, raw_payload = self._ibd_block_buffer.pop(next_hash)
+            block, raw_payload = self._buffer_remove(next_hash)
 
             # Lazy-deserialize: `handle_block` defers the ~1 MB Python-side
             # `Block.deserialize` here so it runs in a worker thread and
@@ -1589,7 +1695,7 @@ class BlockSync:
                 # redeliveries from any peer get dropped at handle_block
                 # without a fresh deserialize / validate cycle.
                 if error == "Previous block not found":
-                    self._ibd_block_buffer[next_hash] = (block, raw_payload)
+                    self._buffer_put(next_hash, (block, raw_payload))
                 else:
                     self._mark_perm_rejected(next_hash)
                     # G16/G17 (W99): Bitcoin Core's ProcessNewBlock calls
@@ -1627,7 +1733,7 @@ class BlockSync:
                 logger.error(f"Failed to connect block at height {new_height}: {e}")
                 # DB connect failure is also transient (e.g. chain-tip mismatch
                 # due to a concurrent update).  Put the block back so we retry.
-                self._ibd_block_buffer[next_hash] = (block, raw_payload)
+                self._buffer_put(next_hash, (block, raw_payload))
                 break
             connect_ns = time.perf_counter_ns() - t_con
 
