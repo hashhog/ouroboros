@@ -628,6 +628,73 @@ class TestG9OrphanPool(unittest.TestCase):
                       "BUG G9: orphan not resolved after parent arrival")
 
 
+class TestG9OrphanEraseForPeer(unittest.TestCase):
+    """Orphan-pool DoS hardening: per-peer attribution + EraseForPeer.
+
+    Mirrors Bitcoin Core txorphanage EraseForPeer (driven from
+    net_processing FinalizeNode on disconnect).  Without these, a peer can
+    fill its orphan slots and disconnect, leaving the entries pinned until
+    the 20-min TTL — an orphan-pool DoS.
+    """
+
+    def _orphan_from_peer(self, mp, db, n, peer):
+        """Submit an orphan tx attributed to *peer*; return its wtxid."""
+        missing = _bytes32(900 + n)  # not in db, not in mempool → orphan
+        tx = _make_tx(txid=_bytes32(n),
+                      inputs=[TxIn(prev_txid=missing, prev_vout=0)],
+                      outputs=[TxOut(value=50_000)])
+        ok, err = mp.add_transaction(tx, height=101, peer=peer)
+        self.assertFalse(ok)
+        self.assertEqual(err, "orphan")
+        return tx.get_wtxid()
+
+    def test_add_records_announcing_peer(self):
+        mp, db = _make_mempool()
+        wtxid = self._orphan_from_peer(mp, db, 10, "1.2.3.4:8333")
+        self.assertEqual(mp.orphan_pool.wtxid_to_peer.get(wtxid),
+                         "1.2.3.4:8333",
+                         "orphan must record the announcing peer addr")
+        self.assertIn(wtxid, mp.orphan_pool.by_peer.get("1.2.3.4:8333", set()),
+                      "by_peer index must hold the orphan for its peer")
+
+    def test_erase_for_peer_drops_only_that_peers_orphans(self):
+        mp, db = _make_mempool()
+        w_a1 = self._orphan_from_peer(mp, db, 11, "10.0.0.1:8333")
+        w_a2 = self._orphan_from_peer(mp, db, 12, "10.0.0.1:8333")
+        w_b1 = self._orphan_from_peer(mp, db, 13, "10.0.0.2:8333")
+        self.assertEqual(mp.orphan_pool.size(), 3)
+
+        removed = mp.orphan_pool.erase_for_peer("10.0.0.1:8333")
+        self.assertEqual(removed, 2, "should erase both of peer A's orphans")
+
+        # Peer A's orphans are gone; peer B's remains.
+        self.assertFalse(mp.orphan_pool.has_wtxid(w_a1))
+        self.assertFalse(mp.orphan_pool.has_wtxid(w_a2))
+        self.assertTrue(mp.orphan_pool.has_wtxid(w_b1),
+                        "EraseForPeer must not touch another peer's orphans")
+        self.assertEqual(mp.orphan_pool.size(), 1)
+
+        # by_peer / wtxid_to_peer indexes fully cleaned for peer A.
+        self.assertNotIn("10.0.0.1:8333", mp.orphan_pool.by_peer)
+        self.assertNotIn(w_a1, mp.orphan_pool.wtxid_to_peer)
+        self.assertNotIn(w_a2, mp.orphan_pool.wtxid_to_peer)
+
+    def test_erase_for_unknown_peer_is_noop(self):
+        mp, db = _make_mempool()
+        self._orphan_from_peer(mp, db, 14, "10.0.0.1:8333")
+        self.assertEqual(mp.orphan_pool.erase_for_peer("9.9.9.9:8333"), 0)
+        self.assertEqual(mp.orphan_pool.size(), 1)
+
+    def test_remove_cleans_peer_indexes(self):
+        mp, db = _make_mempool()
+        wtxid = self._orphan_from_peer(mp, db, 15, "10.0.0.3:8333")
+        mp.orphan_pool.remove(wtxid)
+        # remove() must purge the peer reverse-index too, otherwise a later
+        # erase_for_peer would try to remove a dangling wtxid.
+        self.assertNotIn(wtxid, mp.orphan_pool.wtxid_to_peer)
+        self.assertNotIn("10.0.0.3:8333", mp.orphan_pool.by_peer)
+
+
 # ---------------------------------------------------------------------------
 # G10 — coinbase rejection in mempool
 # ---------------------------------------------------------------------------

@@ -1470,12 +1470,33 @@ class OrphanPool:
         self.txid_to_wtxids: dict[bytes, set[bytes]] = {}
         # missing parent txid → set of orphan wtxids waiting on it
         self.by_parent: dict[bytes, set[bytes]] = {}
+        # DoS attribution (Core txorphanage m_announcer / EraseForPeer):
+        # which peer announced each orphan, so that all of a peer's orphans can
+        # be dropped the instant it disconnects (FinalizeNode → EraseForPeer).
+        # announcing peer addr ("host:port" or None) → set of orphan wtxids
+        self.by_peer: dict[object, set[bytes]] = {}
+        # orphan wtxid → announcing peer addr (reverse index, for O(1) cleanup
+        # on remove()).  None means "no peer attribution" (RPC / reorg refill /
+        # package paths) — those are still TTL-expirable but not peer-erasable.
+        self.wtxid_to_peer: dict[bytes, object] = {}
 
-    def add(self, tx: Transaction, missing_parents: set[bytes]) -> bool:
+    def add(
+        self,
+        tx: Transaction,
+        missing_parents: set[bytes],
+        peer: object = None,
+    ) -> bool:
         """Add an orphan transaction.  Returns True if added.
 
         Keyed by wtxid (BIP-339): two transactions with the same txid but
         different witness data are stored as separate orphans.
+
+        *peer* is the announcing peer's addr ("host:port") when the orphan
+        arrived over the wire from a live peer; it is recorded so that
+        :meth:`erase_for_peer` can drop every orphan a peer announced the
+        instant it disconnects (Bitcoin Core txorphanage EraseForPeer, driven
+        from net_processing FinalizeNode).  ``None`` for orphans not attributed
+        to a peer (RPC submission, reorg refill, package relay).
         """
         wtxid = tx.get_wtxid()
         if wtxid in self.orphans:
@@ -1488,6 +1509,8 @@ class OrphanPool:
         self.txid_to_wtxids.setdefault(txid, set()).add(wtxid)
         for parent in missing_parents:
             self.by_parent.setdefault(parent, set()).add(wtxid)
+        self.wtxid_to_peer[wtxid] = peer
+        self.by_peer.setdefault(peer, set()).add(wtxid)
         logger.debug(
             f"Added orphan tx wtxid={wtxid.hex()[:16]}... txid={txid.hex()[:16]}... "
             f"(missing {len(missing_parents)} parent(s), "
@@ -1513,6 +1536,31 @@ class OrphanPool:
                 s.discard(wtxid)
                 if not s:
                     del self.by_parent[parent]
+        peer = self.wtxid_to_peer.pop(wtxid, None)
+        peer_set = self.by_peer.get(peer)
+        if peer_set is not None:
+            peer_set.discard(wtxid)
+            if not peer_set:
+                del self.by_peer[peer]
+
+    def erase_for_peer(self, peer: object) -> int:
+        """Remove every orphan announced by *peer*.  Returns count removed.
+
+        Mirrors Bitcoin Core ``TxOrphanage::EraseForPeer`` (txorphanage.cpp),
+        called from ``net_processing`` ``FinalizeNode`` when a peer
+        disconnects so a malicious peer cannot leave its orphan slots
+        occupied after it is gone.  ``peer`` is the announcing addr
+        ("host:port") recorded by :meth:`add`.  ``None`` is a valid key
+        (unattributed orphans) but the disconnect path never passes it.
+        """
+        wtxids = list(self.by_peer.get(peer, set()))
+        for wtxid in wtxids:
+            self.remove(wtxid)
+        if wtxids:
+            logger.debug(
+                f"Erased {len(wtxids)} orphan transaction(s) from peer={peer}"
+            )
+        return len(wtxids)
 
     def remove_by_txid(self, txid: bytes) -> None:
         """Remove all orphan entries with the given txid (secondary-index lookup)."""
@@ -1871,10 +1919,18 @@ class Mempool:
                 })
             return result
 
-    def add_transaction(self, tx: Transaction, height: int) -> tuple[bool, str]:
-        """Validate and add *tx* to the mempool at *height*; returns ``(ok, error_message)``."""
+    def add_transaction(
+        self, tx: Transaction, height: int, peer: object = None
+    ) -> tuple[bool, str]:
+        """Validate and add *tx* to the mempool at *height*; returns ``(ok, error_message)``.
+
+        *peer* is the announcing peer's addr ("host:port") when the tx arrived
+        from a live peer; it is recorded on the orphan (if the tx turns out to
+        be an orphan) so ``OrphanPool.erase_for_peer`` can drop it on
+        disconnect.  ``None`` for RPC / reorg-refill / package callers.
+        """
         with self._lock:
-            return self._add_transaction_inner(tx, height)
+            return self._add_transaction_inner(tx, height, peer=peer)
 
     def accept_to_memory_pool(
         self, tx: Transaction, height: int, test_accept: bool = False
@@ -1930,7 +1986,8 @@ class Mempool:
             }
 
     def _add_transaction_inner(
-        self, tx: Transaction, height: int, test_accept: bool = False
+        self, tx: Transaction, height: int, test_accept: bool = False,
+        peer: object = None,
     ) -> tuple[bool, str]:
         """Unlocked implementation of add_transaction.
 
@@ -2018,7 +2075,7 @@ class Mempool:
         if missing_parents:
             # Dry-run (testmempoolaccept) must not mutate the orphan pool.
             if not test_accept:
-                self.orphan_pool.add(tx, missing_parents)
+                self.orphan_pool.add(tx, missing_parents, peer=peer)
             return False, "orphan"
 
         # Build the prevScripts map once — used both by ValidateInputsStandardness

@@ -2213,6 +2213,27 @@ class PeerManager:
             except Exception:
                 logger.debug("block_sync.cleanup_peer raised for %s", addr, exc_info=True)
 
+        # Orphan pool: drop every orphan this peer announced (Bitcoin Core
+        # txorphanage EraseForPeer, driven from net_processing FinalizeNode).
+        # Without this a peer can fill its orphan slots and disconnect, leaving
+        # the entries pinned until the 20-min TTL sweep — an orphan-pool DoS.
+        # OrphanPool has no lock of its own; the live tx handler mutates it
+        # under the mempool's RLock (add_transaction -> orphan_pool.add), so we
+        # take that same lock here to avoid racing a concurrent orphan add.
+        mp = getattr(self, "_mempool", None)
+        if mp is not None and hasattr(mp, "orphan_pool"):
+            try:
+                lock = getattr(mp, "_lock", None)
+                if lock is not None:
+                    with lock:
+                        mp.orphan_pool.erase_for_peer(addr)
+                else:
+                    mp.orphan_pool.erase_for_peer(addr)
+            except Exception:
+                logger.debug(
+                    "orphan_pool.erase_for_peer raised for %s", addr, exc_info=True
+                )
+
     async def _sweep_partial_cmpct_blocks(self) -> int:
         """Reclaim never-answered in-flight partial compact blocks.
 
