@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import signal
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -148,6 +149,10 @@ class BitcoinNode:
         # State
         self.running = False
         self.synced = False
+        # Last wall-clock time the mempool/orphan TTL sweep ran.  The status
+        # loop fires ~every 60s; gate the sweep to ORPHAN_TX_EXPIRE_INTERVAL
+        # (Core net_processing: 5 min) so we don't scan the pool every tick.
+        self._last_mempool_expire: float = 0.0
         self._rpc_task: asyncio.Task | None = None
         self._shutdown_event: asyncio.Event | None = None
         self._rpc_username: str | None = None
@@ -770,6 +775,25 @@ class BitcoinNode:
                 update_chain_metrics(best_height, self.get_current_difficulty(), peer_count)
                 update_mempool_metrics(self.mempool.total_size if self.mempool else 0, mempool_size)
 
+                # Periodic mempool + orphan-pool TTL sweep.  The status loop
+                # ticks ~every 60s; gate the sweep to ORPHAN_TX_EXPIRE_INTERVAL
+                # (Core net_processing.cpp: 5 min) so we don't scan the pool
+                # every tick.  expire_old_transactions() removes mempool txs
+                # past the 2-week expiry AND internally calls
+                # orphan_pool.expire() (the 20-min orphan TTL).  Before this
+                # call existed neither sweep had a live caller — both the
+                # mempool-expiry and orphan-TTL were dead code on the running
+                # node (Core LimitOrphans / periodic Expire equivalent).
+                ORPHAN_TX_EXPIRE_INTERVAL = 5 * 60  # seconds (Core: 5 min)
+                if self.mempool is not None:
+                    now = time.time()
+                    if now - self._last_mempool_expire >= ORPHAN_TX_EXPIRE_INTERVAL:
+                        self._last_mempool_expire = now
+                        try:
+                            self.mempool.expire_old_transactions(now)
+                        except Exception as exp_err:
+                            logger.debug(f"Mempool/orphan expiry error: {exp_err}")
+
                 # Run block pruning if enabled
                 if self.pruner is not None:
                     try:
@@ -1141,8 +1165,12 @@ class BitcoinNode:
                     # The Mempool already uses a re-entrant lock around the
                     # critical section, so dispatching from multiple worker
                     # threads is safe (only one ATMP can execute at a time).
+                    # Attribute the orphan (if this tx turns out to be one) to
+                    # the announcing peer so OrphanPool.erase_for_peer can drop
+                    # it the instant the peer disconnects (Core EraseForPeer).
+                    sender_addr = f"{sender_peer.host}:{sender_peer.port}"
                     success, error = await asyncio.to_thread(
-                        self.mempool.add_transaction, tx, height,
+                        self.mempool.add_transaction, tx, height, sender_addr,
                     )
 
                     if error == "orphan":
