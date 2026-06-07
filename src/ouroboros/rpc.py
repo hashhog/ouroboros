@@ -12492,53 +12492,172 @@ class RPCServer:
             - headers: Number of validated headers
             - chainstates: Array of chainstate info objects
 
-        Reference: Bitcoin Core rpc/blockchain.cpp getchainstates
+        Reference: Bitcoin Core rpc/blockchain.cpp getchainstates (3462-3519)
+
+        Shape matches Core exactly:
+          {
+            headers: NUM,                       # best header height (-1 if none)
+            chainstates: [                       # ordered by work, ACTIVE LAST
+              {
+                blocks: NUM,
+                bestblockhash: STR_HEX,
+                bits: STR_HEX,                   # e.g. "1702068f"
+                target: STR_HEX,
+                difficulty: NUM,
+                verificationprogress: NUM,       # [0..1]
+                snapshot_blockhash: STR_HEX,     # OPTIONAL, snapshot-based only
+                coins_db_cache_bytes: NUM,
+                coins_tip_cache_bytes: NUM,
+                validated: BOOL,
+              }, ...
+            ]
+          }
         """
         if not hasattr(self.node, 'db') or self.node.db is None:
             raise HTTPException(status_code=500, detail="Database not available")
 
-        best_hash, best_height = self.node.db.get_best_block()
+        db = self.node.db
+        best_hash, best_height = db.get_best_block()
 
-        chainstates = []
+        # Coins cache sizes — Core reports the configured coinsdb/coinstip
+        # cache budgets (cs.m_coinsdb_cache_size_bytes /
+        # cs.m_coinstip_cache_size_bytes).  Ouroboros has no native split
+        # cache accounting, so surface the configured dbcache budget (or 0).
+        config = getattr(self.node, 'config', None) or {}
+        dbcache_mb = config.get('dbcache', 0) if isinstance(config, dict) else 0
+        coins_db_cache_bytes = int(dbcache_mb) * 1024 * 1024 if dbcache_mb else 0
+        coins_tip_cache_bytes = coins_db_cache_bytes
 
-        # Main chainstate
-        main_chainstate = {
-            "id": 0,
-            "validated_height": best_height,
-            "validated_hash": best_hash.hex() if isinstance(best_hash, bytes) else str(best_hash),
-            "validated": True,
-            "active": True,
-        }
+        def _make_chain_data(
+            blocks: int,
+            tip_hash: Any,
+            bits: int,
+            validated: bool,
+            snapshot_blockhash: str | None = None,
+        ) -> dict[str, Any]:
+            # Compute difficulty target from compact bits (Core GetTarget).
+            mantissa = bits & 0x007FFFFF
+            exponent = (bits >> 24) & 0xFF
+            if exponent <= 3:
+                target_int = mantissa >> (8 * (3 - exponent))
+            else:
+                target_int = mantissa << (8 * (exponent - 3))
 
-        # Check if using assumeUTXO
+            if isinstance(tip_hash, bytes):
+                best_block_hex = tip_hash[::-1].hex()
+            elif tip_hash is None:
+                # Tip hash unavailable (e.g. background-validation chainstate
+                # whose in-progress tip is not tracked in memory) — emit a
+                # well-formed all-zero hash rather than a literal "None".
+                best_block_hex = "0" * 64
+            else:
+                best_block_hex = str(tip_hash)
+
+            difficulty = (
+                self.node.get_difficulty(bits)
+                if hasattr(self.node, 'get_difficulty')
+                else 1.0
+            )
+
+            data: dict[str, Any] = {
+                "blocks": blocks,
+                "bestblockhash": best_block_hex,
+                "bits": f"{bits:08x}",
+                "target": f"{target_int:064x}",
+                "difficulty": difficulty,
+                "verificationprogress": self._verification_progress(),
+                "coins_db_cache_bytes": coins_db_cache_bytes,
+                "coins_tip_cache_bytes": coins_tip_cache_bytes,
+            }
+            # OPTIONAL: present only for a from-snapshot chainstate.
+            if snapshot_blockhash is not None:
+                data["snapshot_blockhash"] = snapshot_blockhash
+            data["validated"] = validated
+            return data
+
+        # Header height (best header seen so far), -1 if none.  Mirrors
+        # getblockchaininfo's header-count derivation.
+        headers = best_height
+        if hasattr(self.node, 'sync_manager') and self.node.sync_manager:
+            sm = self.node.sync_manager
+            if hasattr(sm, 'header_height'):
+                headers = max(sm.header_height, best_height)
+        if headers is None:
+            headers = -1
+
+        tip_bits = getattr(db, '_tip_bits', 0x1d00ffff)
+
+        chainstates: list[dict[str, Any]] = []
+
+        # Determine whether the active chainstate is snapshot-based, and
+        # whether a separate background-validation chainstate exists.  Core
+        # orders by work with the active (most-work) chainstate LAST, so the
+        # background chainstate (if any) is pushed FIRST.
+        snapshot_status = None
         if hasattr(self.node, 'snapshot_manager') and self.node.snapshot_manager:
-            sm = self.node.snapshot_manager
-            status = sm.get_status()
+            snapshot_status = self.node.snapshot_manager.get_status()
 
-            if status["snapshot_loaded"]:
-                # The main chainstate is the snapshot chainstate
-                main_chainstate["snapshot_blockhash"] = status["snapshot_hash"]
-                main_chainstate["snapshot_height"] = status["snapshot_height"]
-                main_chainstate["from_snapshot"] = True
+        active_snapshot_blockhash: str | None = None
+        active_validated = True
 
-                # Add background validation chainstate if in progress
-                if status["background_validating"]:
-                    bg_chainstate = {
-                        "id": 1,
-                        "validated_height": status["background_validation_height"],
-                        "validated_hash": None,  # Would need to track this
-                        "validated": False,
-                        "active": False,
-                        "background_validation": True,
-                    }
-                    chainstates.append(bg_chainstate)
+        if snapshot_status and snapshot_status["snapshot_loaded"]:
+            active_snapshot_blockhash = snapshot_status["snapshot_hash"]
+            # The active (snapshot) chainstate is only fully validated once
+            # background validation has completed.
+            active_validated = bool(snapshot_status.get("background_validated", False))
 
-        chainstates.insert(0, main_chainstate)
+            # Background validation chainstate (validating from genesis) is a
+            # lower-work chainstate → emitted BEFORE the active one.
+            if snapshot_status["background_validating"]:
+                bg_bits = tip_bits
+                chainstates.append(
+                    _make_chain_data(
+                        blocks=snapshot_status["background_validation_height"],
+                        tip_hash=None,
+                        bits=bg_bits,
+                        validated=True,
+                    )
+                )
+
+        # Active (most-work) chainstate — emitted LAST.
+        chainstates.append(
+            _make_chain_data(
+                blocks=best_height,
+                tip_hash=best_hash,
+                bits=tip_bits,
+                validated=active_validated,
+                snapshot_blockhash=active_snapshot_blockhash,
+            )
+        )
 
         return {
-            "headers": best_height,  # Simplified; would need header count
+            "headers": headers,
             "chainstates": chainstates,
         }
+
+    def _verification_progress(self) -> float:
+        """Estimate verification progress in [0..1].
+
+        Mirrors getblockchaininfo's verificationprogress derivation:
+        1.0 when synced; otherwise a time-based estimate from the tip
+        block time relative to genesis.
+        """
+        is_ibd = not self._is_synced()
+        if not is_ibd:
+            return 1.0
+        db = getattr(self.node, 'db', None)
+        block_time = getattr(db, '_tip_timestamp', 0) if db is not None else 0
+        if block_time <= 0:
+            return 1.0
+        import time as _time
+        # Genesis time for mainnet: 2009-01-03 18:15:05 UTC.
+        genesis_time = 1231006505
+        current_time = int(_time.time())
+        if current_time <= genesis_time:
+            return 1.0
+        return min(1.0, max(0.0,
+            (block_time - genesis_time) / (current_time - genesis_time)
+        ))
 
     async def rpc_decoderawtransaction(
         self, hexstring: str, iswitness: bool = True
