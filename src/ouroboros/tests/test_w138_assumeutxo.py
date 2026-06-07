@@ -532,21 +532,16 @@ def test_w138_g15_load_already_loaded_cross_restart() -> None:
 # ===========================================================================
 
 
-@pytest.mark.xfail(
-    reason="W138 BUG-8 (P0-CDIV): `rpc_getchainstates` returns "
-    "{id, validated_height, validated_hash, validated, active, "
-    "snapshot_blockhash, snapshot_height, from_snapshot} but Core's "
-    "`getchainstates` (`rpc/blockchain.cpp:3462-3519`) returns "
-    "{blocks, bestblockhash, bits, target, difficulty, "
-    "verificationprogress, snapshot_blockhash (optional), "
-    "coins_db_cache_bytes, coins_tip_cache_bytes, validated}. "
-    "Cross-impl test suites and Core RPC clients hitting ouroboros "
-    "see KeyError on every expected field.",
-    strict=True,
-)
 def test_w138_g16_getchainstates_core_field_names() -> None:
-    """G16 (BUG-8): rpc_getchainstates must emit Core's canonical
+    """G16 (BUG-8 — FIXED): rpc_getchainstates emits Core's canonical
     field names.
+
+    Core's `getchainstates` (`rpc/blockchain.cpp:3462-3519`) returns
+    {headers, chainstates:[{blocks, bestblockhash, bits, target,
+    difficulty, verificationprogress, snapshot_blockhash (optional),
+    coins_db_cache_bytes, coins_tip_cache_bytes, validated}]}.  The
+    handler was rewritten to that exact shape (was previously emitting
+    {id, validated_height, validated_hash, active, ...}).
     """
     src = _read_py("rpc.py")
     # All Core fields must be pushed into the chainstate dict
@@ -559,14 +554,19 @@ def test_w138_g16_getchainstates_core_field_names() -> None:
         "verificationprogress",
         "coins_db_cache_bytes",
         "coins_tip_cache_bytes",
+        "validated",
     )
     m = re.search(
-        r"async def rpc_getchainstates[\s\S]*?(?=async def )", src
+        r"async def rpc_getchainstates[\s\S]*?(?=\n    async def |\n    def )",
+        src,
     )
     assert m, "G16: rpc_getchainstates not located"
     body = m.group(0)
     missing = [f for f in expected if f'"{f}"' not in body and f"'{f}'" not in body]
     assert not missing, f"G16 BUG-8: missing Core fields in response: {missing}"
+    # Non-Core legacy field names must be gone from the response dict.
+    for legacy in ('"validated_height"', '"validated_hash"', '"active"', '"id"'):
+        assert legacy not in body, f"G16 BUG-8: legacy field {legacy} still present"
 
 
 # ===========================================================================
