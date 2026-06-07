@@ -496,6 +496,7 @@ class RpcError(Exception):
 
 # Bitcoin Core RPC error codes (subset; protocol.h).
 RPC_MISC_ERROR = -1
+RPC_TYPE_ERROR = -3
 RPC_INVALID_ADDRESS_OR_KEY = -5
 RPC_INVALID_PARAMETER = -8
 RPC_CLIENT_INVALID_IP_OR_SUBNET = -30
@@ -2976,6 +2977,114 @@ class RPCServer:
                 result[_display_txid(txid)] = self._format_mempool_entry(entry, txid)
 
         return result
+
+    async def rpc_getorphantxs(
+        self, verbosity: int | bool | None = None, verbose: int | bool | None = None
+    ) -> list[Any]:
+        """Show transactions in the tx orphanage.
+
+        Reference: Bitcoin Core src/rpc/mempool.cpp getorphantxs (added in
+        Core v28; introducing commit 34a9c10e8c "rpc: add getorphantxs").
+        Field shape mirrors Core's OrphanDescription() / OrphanToJSON():
+          - verbosity 0: array of txid hex strings (may contain duplicates).
+          - verbosity 1: array of objects
+              {txid, wtxid, bytes, vsize, weight, from}.
+          - verbosity 2: verbosity-1 fields + ``hex`` (serialized tx hex).
+        An out-of-range verbosity (not 0, 1, or 2) raises RPC_INVALID_PARAMETER
+        (-8) with Core's message ("Invalid verbosity value <n>"), matching
+        Core's explicit verbosity-branch ``else``.
+
+        EXPERIMENTAL warning (Core): this call may be changed in future releases.
+
+        Data source: the node's OrphanPool (mempool.py). Each entry is
+        ``(tx, expiry_time, missing_parents)`` keyed by wtxid, with the
+        announcing peer recorded in ``wtxid_to_peer`` (single announcer, or
+        ``None`` for RPC/reorg/package-relay orphans). ``from`` holds the
+        single announcing peer when one is tracked, else an empty array
+        (best-effort; this node tracks the announcer as a peer addr
+        "host:port", not a numeric Core peer id). Core has NO ``expiration``
+        field — the stored ``expiry_time`` is intentionally not surfaced.
+        """
+        # Accept the ``verbose`` alias (Core's "verbosity|verbose" arg name).
+        if verbosity is None:
+            verbosity = verbose
+        # Core: ParseVerbosity(arg, default_verbosity=0, allow_bool=false). A
+        # null/missing arg → default 0. A boolean arg is REJECTED (NOT mapped to
+        # 0/1); otherwise the integer value is used.
+        if verbosity is None:
+            verbosity = 0
+        elif isinstance(verbosity, bool):
+            # allow_bool=false → Core throws RPC_TYPE_ERROR.
+            raise RpcError(
+                RPC_TYPE_ERROR, "Verbosity was boolean but only integer allowed"
+            )
+        else:
+            try:
+                verbosity = int(verbosity)
+            except (TypeError, ValueError):
+                raise RpcError(
+                    RPC_INVALID_PARAMETER, f"Invalid verbosity value {verbosity}"
+                ) from None
+
+        ret: list[Any] = []
+
+        mempool = getattr(self.node, "mempool", None)
+        orphan_pool = getattr(mempool, "orphan_pool", None) if mempool else None
+        if orphan_pool is None:
+            # No orphanage available (node not fully started) — Core returns an
+            # empty array when the orphanage is empty; mirror that here.
+            if verbosity in (0, 1, 2):
+                return ret
+            raise RpcError(
+                RPC_INVALID_PARAMETER, f"Invalid verbosity value {verbosity}"
+            )
+
+        # Hashes are stored little-endian internally; the RPC boundary displays
+        # them big-endian (reverse-byte), matching Core's ToString() and the
+        # rest of this server (see rpc_getrawmempool._display_txid).
+        def _display_hash(h: bytes) -> str:
+            return h[::-1].hex() if isinstance(h, bytes) else str(h)
+
+        def _orphan_to_json(tx, wtxid) -> dict[str, Any]:
+            # Field order mirrors Core's OrphanToJSON exactly: txid, wtxid,
+            # bytes, vsize, weight, from. bytes = total serialized size incl.
+            # witness (Core ComputeTotalSize). NO ``expiration`` field — Core
+            # does not emit one.
+            o: dict[str, Any] = {
+                "txid": _display_hash(tx.get_txid()),
+                "wtxid": _display_hash(tx.get_wtxid()),
+                "bytes": len(tx.serialize_with_witness()),
+                "vsize": tx.get_vsize(),
+                "weight": tx.get_weight(),
+            }
+            # Core's ``from`` is an array of announcing peer ids.  This node
+            # tracks a single announcer per orphan (peer addr "host:port", or
+            # None); emit a 1-element array when present, else empty.
+            peer = orphan_pool.wtxid_to_peer.get(wtxid)
+            o["from"] = [peer] if peer is not None else []
+            return o
+
+        # Snapshot the entries so concurrent expiry/eviction can't mutate
+        # mid-iteration. orphans: wtxid -> (tx, expiry_time, missing_parents).
+        entries = list(orphan_pool.orphans.items())
+
+        if verbosity == 0:
+            for wtxid, (tx, _expiry, _missing) in entries:
+                ret.append(_display_hash(tx.get_txid()))
+        elif verbosity == 1:
+            for wtxid, (tx, _expiry, _missing) in entries:
+                ret.append(_orphan_to_json(tx, wtxid))
+        elif verbosity == 2:
+            for wtxid, (tx, _expiry, _missing) in entries:
+                o = _orphan_to_json(tx, wtxid)
+                o["hex"] = tx.serialize_with_witness().hex()
+                ret.append(o)
+        else:
+            raise RpcError(
+                RPC_INVALID_PARAMETER, f"Invalid verbosity value {verbosity}"
+            )
+
+        return ret
 
     def _resolve_mempool_path(self, filepath: str | None = None) -> str:
         """Pick the mempool.dat path: explicit override → ``<datadir>/mempool.dat``."""
