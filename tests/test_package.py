@@ -63,8 +63,9 @@ class MockValidator:
     def __init__(self, db):
         self.db = db
 
-    def validate_transaction(self, tx, height):
-        # Always valid for testing
+    def validate_transaction(self, tx, height, mtp=0, intra_block_utxos=None):
+        # Always valid for testing — consensus is mocked out so the
+        # standardness / policy gates are what these tests exercise.
         return True, ""
 
 
@@ -332,6 +333,111 @@ class TestPackageValidation:
         assert success, f"Package should be accepted: {error}"
 
         # Both transactions should be in mempool
+        assert mempool.has_transaction(parent.get_txid())
+        assert mempool.has_transaction(child.get_txid())
+
+
+class TestPackageStandardnessGate:
+    """Proven-teeth tests for the per-member standardness PreChecks gate.
+
+    Regression for the package-relay PreChecks bypass: the package path
+    (_validate_package_inner) historically skipped IsStandardTx /
+    input-standardness / witness-standardness / sigop-cost that the single-tx
+    path enforces, so submitpackage / 1p1c could admit and re-relay txs the
+    single-tx accept path would reject (a relay-policy DoS hole).
+
+    These tests run with require_standard=True (the live mainnet default) so the
+    new gate is exercised, and assert that (a) a non-standard member is rejected
+    via the package path, while (b) a valid CPFP package with a low-fee parent
+    still succeeds — i.e. the package-feerate (CPFP) semantics are preserved.
+    """
+
+    # A standard P2PKH scriptPubKey (25 bytes).
+    P2PKH = b"\x76\xa9\x14" + b"\x11" * 20 + b"\x88\xac"
+    # A non-standard scriptPubKey (bare OP_TRUE — not a standard output type).
+    NONSTD = b"\x51"
+
+    @staticmethod
+    def _db_with_utxo(value: int, script_pubkey: bytes):
+        class TestDB:
+            def __init__(self):
+                self._utxos = {}
+
+            def get_utxo(self, txid, vout):
+                return self._utxos.get((txid, vout))
+
+            def get_best_block(self):
+                return (b"\x00" * 32, 100)
+
+            def get_median_time_past(self, height):
+                return 0
+
+        db = TestDB()
+        db._utxos[(b"\x01" * 32, 0)] = {
+            "value": value,
+            "script_pubkey": script_pubkey,
+        }
+        return db
+
+    def test_nonstandard_member_rejected_via_package_path(self):
+        """A package member with a non-standard output is rejected.
+
+        Without the standardness gate this package would be admitted; the
+        single-tx accept path rejects it via IsStandardTx, so the package path
+        must too.
+        """
+        db = self._db_with_utxo(100000, self.P2PKH)
+        validator = MockValidator(db)
+        mempool = Mempool(validator, require_standard=True)
+
+        # Parent with a non-standard (bare OP_TRUE) output.  One standard
+        # output is included so the tx clears the 65-byte minimum-size gate
+        # (CVE-2017-12842) and the rejection is unambiguously the
+        # non-standard scriptPubKey *type* gate, not the size gate.
+        parent = make_tx(
+            inputs=[(b"\x01" * 32, 0)],
+            outputs=[(50000, self.P2PKH), (49999, self.NONSTD)],
+        )
+        # Child spends the parent's standard output (vout 0 = 50000) and pays a
+        # large fee, so the package clears the fee gate and reaches the
+        # per-member standardness gate.
+        child = make_tx(
+            inputs=[(parent.get_txid(), 0)],
+            outputs=[(40000, self.P2PKH)],
+        )
+
+        success, error = mempool.validate_package([parent, child], height=100)
+        assert not success
+        assert "scriptpubkey" in error.lower()
+        # Neither member was admitted.
+        assert not mempool.has_transaction(parent.get_txid())
+        assert not mempool.has_transaction(child.get_txid())
+
+    def test_cpfp_lowfee_parent_accepted_under_require_standard(self):
+        """A valid CPFP package with a below-min-fee parent still succeeds.
+
+        Proves the new standardness gate does NOT re-introduce a per-member
+        individual-min-fee rejection: the parent pays ~1 sat (far below the
+        individual min-relay floor) but the package feerate covers it, so the
+        package is accepted with require_standard=True.
+        """
+        db = self._db_with_utxo(100000, self.P2PKH)
+        validator = MockValidator(db)
+        mempool = Mempool(validator, require_standard=True)
+
+        # Parent: standard outputs, ~1 sat fee (below individual min relay).
+        parent = make_tx(
+            inputs=[(b"\x01" * 32, 0)],
+            outputs=[(99999, self.P2PKH)],
+        )
+        # Child: standard output, high fee to cover the whole package.
+        child = make_tx(
+            inputs=[(parent.get_txid(), 0)],
+            outputs=[(90000, self.P2PKH)],
+        )
+
+        success, error = mempool.validate_package([parent, child], height=100)
+        assert success, f"CPFP package should be accepted: {error}"
         assert mempool.has_transaction(parent.get_txid())
         assert mempool.has_transaction(child.get_txid())
 
