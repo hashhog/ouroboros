@@ -8043,6 +8043,10 @@ class RPCServer:
             must not stall the asyncio event loop)."""
             from decimal import Decimal
 
+            # Active tip height, captured once for per-coin confirmations
+            # (Core: tip->nHeight - coin.nHeight + 1, blockchain.cpp:2464).
+            tip_height = int(best_height)
+
             txouts = 0
             total_in = 0
             unspents: list[dict[str, Any]] = []
@@ -8059,6 +8063,15 @@ class RPCServer:
                 # matching rpc_gettxout / Core's COutPoint::hash.GetHex().
                 txid_display = bytes(utxo.txid)[::-1].hex()
                 coin_height = int(utxo.height) if utxo.height is not None else 0
+                # Block hash at the coin's height, big-endian DISPLAY hex
+                # (Core: tip->GetAncestor(coin.nHeight)->GetBlockHash().GetHex(),
+                # blockchain.cpp:2451,2463). _scan() already runs on a worker
+                # thread via asyncio.to_thread, so call the sync DB lookup
+                # directly.
+                bh = self.node.db.get_block_hash_by_height(coin_height)
+                blockhash = (
+                    bh[::-1].hex() if isinstance(bh, (bytes, bytearray)) else ""
+                )
                 unspents.append({
                     "txid": txid_display,
                     "vout": int(utxo.vout),
@@ -8067,6 +8080,8 @@ class RPCServer:
                     "amount": float(Decimal(amount) / Decimal(100_000_000)),
                     "coinbase": bool(utxo.is_coinbase),
                     "height": coin_height,
+                    "blockhash": blockhash,
+                    "confirmations": tip_height - coin_height + 1,
                 })
             return {
                 "txouts": txouts,
