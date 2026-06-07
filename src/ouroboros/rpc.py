@@ -24,8 +24,10 @@ from pydantic import BaseModel
 from ouroboros.blockfilter import (
     BlockFilterIndex,
     PersistentBlockFilterIndex,
+    _block_filter_siphash_key,
     build_basic_filter,
     compute_filter_header,
+    gcs_match_any,
 )
 from ouroboros.database import Block, Transaction, TxIn, TxOut
 from ouroboros.metrics import record_rpc_request
@@ -8183,6 +8185,211 @@ class RPCServer:
 
             needles.setdefault(spk, desc)
         return needles
+
+    async def rpc_scanblocks(
+        self,
+        action: str = "start",
+        scanobjects: list[Any] | None = None,
+        start_height: int | None = None,
+        stop_height: int | None = None,
+        filtertype: str = "basic",
+        options: dict[str, Any] | None = None,
+    ) -> Any:
+        """Return relevant blockhashes for scanobjects via the BIP-157 index.
+
+        Mirrors Bitcoin Core ``scanblocks``
+        (``src/rpc/blockchain.cpp::scanblocks``, action start/status/abort).
+        Drives the EXISTING basic block filter index: for each block in
+        ``[start_height, stop_height]`` it tests whether the block's GCS
+        filter MATCHES any of the scanobjects' scriptPubKeys and, if so,
+        adds the block hash to ``relevant_blocks``.  It is the index-side
+        counterpart to ``scantxoutset`` (which walks the live UTXO set):
+        scanblocks walks compact block filters, so it can locate the block a
+        script was funded/spent in even after the coin is gone.
+
+        SIGNATURE (Core)::
+
+            scanblocks "action" ( [scanobjects] start_height stop_height
+                                   "filtertype" options )
+
+        ``action``:
+          - ``status``  -> ``null`` (ouroboros scans synchronously, so there
+            is never a background scan in progress — Core returns
+            NullUniValue when the reserver is not held).
+          - ``abort``   -> ``false`` (nothing running to abort — Core returns
+            false when the reserve was possible).
+          - ``start``   -> performs the scan; ``scanobjects`` required.
+          - anything else -> RPC_INVALID_PARAMETER (-8) "Invalid action".
+
+        ``filtertype`` defaults to ``"basic"`` (only type supported).
+        ``start_height`` defaults to the genesis (0); ``stop_height``
+        defaults to the chain tip.
+
+        Returns (for ``start``)::
+
+            {"from_height": int, "to_height": int,
+             "relevant_blocks": ["<blockhash>"...], "completed": bool}
+
+        Error parity (Core protocol.h codes):
+          - unknown ``filtertype``        -> -5  "Unknown filtertype"
+          - filter index not enabled      -> -1  "Index is not enabled for
+                                                  filtertype <name>"
+          - bad ``start_height``          -> -1  "Invalid start_height"
+          - bad ``stop_height``           -> -1  "Invalid stop_height"
+
+        CENTRAL CAVEAT: block filters have FALSE POSITIVES (rate ~1/M,
+        M=784931), so ``relevant_blocks`` is a SUPERSET — a block that
+        actually contains a matched script MUST appear, but the list may
+        carry extra (false-positive) blocks.  When
+        ``options.filter_false_positives`` is true every candidate block is
+        re-scanned against its raw body to drop GCS false positives (Core's
+        ``CheckBlockFilterMatches``), which can only REMOVE matches, never a
+        genuine one.
+        """
+        # (1) Action dispatch (Core blockchain.cpp scanblocks). ouroboros
+        # scans synchronously within this call, so there is never an
+        # in-progress scan: status -> null, abort -> false. Only start works.
+        action = (action or "start").lower()
+        if action == "status":
+            return None
+        if action == "abort":
+            return False
+        if action != "start":
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                f"Invalid action '{action}'",
+            )
+
+        # (2) filtertype validation (Core: BlockFilterTypeByName ->
+        # RPC_INVALID_ADDRESS_OR_KEY (-5) "Unknown filtertype"). Default basic.
+        ftype_name = filtertype or "basic"
+        if ftype_name != "basic":
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype")
+
+        # (3) options.filter_false_positives (Core). Default false. Reading it
+        # must never error when absent / null / non-dict.
+        filter_false_positives = False
+        if isinstance(options, dict):
+            filter_false_positives = bool(
+                options.get("filter_false_positives", False)
+            )
+
+        # (4) scanobjects required for "start" (Core get_array on params[1]).
+        if not scanobjects:
+            raise RpcError(
+                RPC_MISC_ERROR,
+                "scanobjects argument is required for the start action",
+            )
+
+        # (5) Index-enabled gate (Core: GetBlockFilterIndex == nullptr ->
+        # RPC_MISC_ERROR (-1) "Index is not enabled for filtertype <name>").
+        # ouroboros enables the index via -blockfilterindex; when off,
+        # node.block_filter_index is None.
+        bfi: BlockFilterIndex | PersistentBlockFilterIndex | None = (
+            getattr(self.node, "block_filter_index", None)
+        )
+        if bfi is None:
+            raise RpcError(
+                RPC_MISC_ERROR,
+                f"Index is not enabled for filtertype {ftype_name}",
+            )
+
+        if not hasattr(self.node, "db") or not self.node.db:
+            raise RpcError(RPC_MISC_ERROR, "Database not available")
+
+        network = getattr(self.node, "network", "mainnet")
+
+        # (6) Height range (Core: RPC_MISC_ERROR (-1) for bad heights here,
+        # NOT -8 like scantxoutset). Default start=genesis(0), stop=tip.
+        try:
+            _, tip_height = self.node.db.get_best_block()
+            tip = int(tip_height) if tip_height is not None else 0
+        except Exception:
+            tip = 0
+
+        start = 0 if start_height is None else int(start_height)
+        if start < 0 or start > tip:
+            raise RpcError(RPC_MISC_ERROR, "Invalid start_height")
+        stop = tip if stop_height is None else int(stop_height)
+        if stop < start or stop > tip:
+            raise RpcError(RPC_MISC_ERROR, "Invalid stop_height")
+
+        # (7) Build the needle set (Core scanobjects -> CScript). Reuse the
+        # same descriptor resolver scantxoutset uses; addr() parity is already
+        # proven by the scantxoutset differential. ``_scantxoutset_resolve``
+        # raises HTTPException(400) on unparseable objects, which the dispatch
+        # surfaces as an error envelope (Core RPC_INVALID_PARAMETER class).
+        needle_map = self._scantxoutset_resolve(scanobjects, network)
+        needles: list[bytes] = list(needle_map.keys())
+
+        def _scan() -> list[str]:
+            """Walk [start, stop] testing each block's GCS filter against the
+            needle set on a worker thread (large ranges must not stall the
+            asyncio event loop)."""
+            relevant: list[str] = []
+            for height in range(start, stop + 1):
+                # Active-chain block hash at this height (internal/LE order,
+                # the order the filter index and DB are keyed by).
+                block_hash = self.node.db.get_block_hash_by_height(height)
+                if block_hash is None:
+                    # A height in range lacks a chain block — the chain is
+                    # shorter than `tip` implies (should not happen given the
+                    # range gate, but be defensive and skip rather than crash).
+                    continue
+                block_hash = bytes(block_hash)
+
+                filt = bfi.get_filter(block_hash)
+                if filt is None:
+                    # The filter for an in-range block is not cached yet (the
+                    # block-connect hook is best-effort and may have skipped
+                    # it). Rebuild it on the fly from the raw block — the GCS
+                    # filter is deterministic, so the rebuilt bytes are
+                    # byte-identical to what the index would have stored.
+                    # Mirrors getblockfilter's slow path and the P2P cfilter
+                    # handler (node.py PrepareBlockFilterRequest fallback),
+                    # never returning a misleadingly incomplete list.
+                    block = self.node.db.get_block(block_hash)
+                    if block is None:
+                        raise RpcError(
+                            RPC_MISC_ERROR,
+                            "Filter not found. Block filters are still in "
+                            "the process of being indexed.",
+                        )
+                    filt = build_basic_filter(block, self.node.db)
+
+                # SipHash key = first 16 bytes of the block hash in internal
+                # (LE) order — exactly what build_basic_filter used, so the
+                # match keys are byte-identical to the indexed filter.
+                key = _block_filter_siphash_key(block_hash)
+                if not gcs_match_any(filt, key, needles):
+                    continue
+
+                # Optional re-scan to drop GCS false positives (Core's
+                # CheckBlockFilterMatches). A strict subset operation: it can
+                # only REMOVE false positives, never a genuine match, so the
+                # funded-block contract holds with or without it.
+                if filter_false_positives:
+                    block = self.node.db.get_block(block_hash)
+                    if block is not None:
+                        rebuilt = build_basic_filter(block, self.node.db)
+                        if not gcs_match_any(rebuilt, key, needles):
+                            continue
+
+                # Display-order block hash (Core uint256::GetHex()): reverse
+                # internal/LE to big-endian.
+                relevant.append(block_hash[::-1].hex())
+            return relevant
+
+        relevant = await asyncio.to_thread(_scan)
+
+        # (8) Return (Core shape). The synchronous scan is never aborted, so
+        # `completed` is always true.
+        return {
+            "from_height": start,
+            "to_height": stop,
+            "relevant_blocks": relevant,
+            "completed": True,
+        }
 
     async def rpc_verifychain(self, checklevel: int = 3, nblocks: int = 6) -> bool:
         """Verify the blockchain database.
