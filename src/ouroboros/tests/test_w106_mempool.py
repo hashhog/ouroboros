@@ -1606,20 +1606,24 @@ class TestBugClusterRbfDiagramApproximation(unittest.TestCase):
 
 
 class TestBugPackageValidationSkipsStandardness(unittest.TestCase):
-    """BUG: validate_package (_validate_package_inner) does NOT call _is_standard_tx
-    or _validate_inputs_standardness on package transactions, even when
-    require_standard=True. Bitcoin Core's AcceptPackage → AcceptMultipleTransactions
-    does call standardness checks on each tx in the package.
+    """FIXED: validate_package (_validate_package_inner) now applies the same
+    standardness PreChecks per package member as the single-tx path — _is_standard_tx
+    + _validate_inputs_standardness (gated on require_standard), mirroring Bitcoin
+    Core's AcceptPackage → AcceptMultipleTransactions → PreChecks. Previously the
+    package path skipped these (a relay-policy DoS bypass). The per-tx minimum-relay
+    fee is intentionally NOT applied per member (CPFP: the aggregate package feerate
+    is the gate) — see test_package_skips_minrelayfee_per_tx below.
     """
 
-    def test_package_skips_standardness(self):
+    def test_package_applies_standardness(self):
         from ouroboros.mempool import Mempool
         import inspect
-        # Read the _validate_package_inner source
+        # The package path must now run the standardness PreChecks per member.
         src = inspect.getsource(Mempool._validate_package_inner)
-        # Document: _is_standard_tx is not called in package path
-        self.assertNotIn("_is_standard_tx", src,
-                         "If this passes, package path now calls standardness — verify if intentional")
+        self.assertIn("_is_standard_tx", src,
+                      "package path must apply IsStandardTx per member (relay-policy parity)")
+        self.assertIn("_validate_inputs_standardness", src,
+                      "package path must apply input standardness per member")
 
     def test_package_skips_minrelayfee_per_tx(self):
         from ouroboros.mempool import Mempool

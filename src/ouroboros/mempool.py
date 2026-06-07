@@ -4782,6 +4782,100 @@ class Mempool:
                 f"(need {DEFAULT_MIN_RELAY_TX_FEE / 1000:.2f} sat/vB)"
             )
 
+        # Per-member standardness / policy PreChecks.
+        #
+        # The single-tx accept path (_add_transaction_inner, ~line 2052) runs
+        # IsStandardTx + input-standardness + witness-standardness + the per-tx
+        # sigop-cost gate before consensus validation.  Historically the package
+        # path skipped all of these, so submitpackage / 1p1c relay could admit
+        # and re-relay transactions that the single-tx PreChecks would reject —
+        # a relay-policy DoS hole (non-standard scriptPubKey, non-pushonly
+        # scriptSig, oversized datacarrier, non-standard input/witness types,
+        # excessive sigops).  Mirror the single-tx gate sequence here per member.
+        #
+        # Reference: Bitcoin Core validation.cpp AcceptMultipleTransactions /
+        # AcceptSubPackage runs PreChecks() for every member.  PreChecks is
+        # package-feerate aware for the *fee* gate only — every standardness /
+        # policy check is applied per member exactly as for a single tx.  We
+        # therefore intentionally do NOT add a per-member individual-min-fee
+        # rejection here: the package fee-rate gate above (lines computing
+        # package_fee_rate / min_relay) already enforces the fee floor over the
+        # whole package, which is what makes CPFP (a low-fee parent paid for by
+        # its child) work.  v3 ephemeral-dust parents are likewise not rejected
+        # by the standardness dust gate (IsStandardTx gate 8 exempts v3) — they
+        # are governed by the dedicated ephemeral-dust policy checked above.
+        if self.require_standard:
+            # Rolling map of script_pubkeys created by earlier package members,
+            # so a child member's inputs that spend a package parent can resolve
+            # their prevScript.  Txs are in topological order (enforced above).
+            pkg_prev_spks: dict[OutPoint, bytes] = {}
+
+            def _resolve_prev_spk(prev_txid: bytes, prev_vout: int) -> bytes | None:
+                spk = pkg_prev_spks.get((prev_txid, prev_vout))
+                if spk is not None:
+                    return spk
+                parent_entry = self.transactions.get(prev_txid)
+                if parent_entry is not None and prev_vout < len(parent_entry.tx.outputs):
+                    return parent_entry.tx.outputs[prev_vout].script_pubkey
+                utxo = self.validator.db.get_utxo(prev_txid, prev_vout)
+                if utxo is not None:
+                    return utxo["script_pubkey"]
+                return None
+
+            for tx in txs:
+                txid = tx.get_txid()
+
+                # Gate 1: IsStandardTx (version / weight / size / scriptSig /
+                # scriptPubKey type / datacarrier / dust).  Same call the
+                # single-tx path makes at line 2053.
+                is_std, reason = _is_standard_tx(tx)
+                if not is_std:
+                    return False, (
+                        f"Package tx {txid.hex()[:16]}... non-standard: {reason}"
+                    )
+
+                # Build the prevScripts map for input/witness standardness from
+                # the package view, in-mempool parents, then the chain UTXO set.
+                prevscripts: dict[int, bytes] = {}
+                for idx, tx_in in enumerate(tx.inputs):
+                    spk = _resolve_prev_spk(tx_in.prev_txid, tx_in.prev_vout)
+                    if spk is not None:
+                        prevscripts[idx] = spk
+
+                # Gate 2: input-side standardness (prevout types + P2SH sigops).
+                # Mirrors _add_transaction_inner line 2102.
+                iv_ok, iv_reason = _validate_inputs_standardness(tx, prevscripts)
+                if not iv_ok:
+                    return False, f"Package tx {txid.hex()[:16]}... {iv_reason}"
+
+                # Gate 3: witness standardness (only when the tx has witness
+                # data).  Mirrors _add_transaction_inner lines 2109-2112.
+                if any(tx_in.witness for tx_in in tx.inputs):
+                    is_ws, ws_reason = _is_witness_standard(tx, prevscripts)
+                    if not is_ws:
+                        return False, (
+                            f"Package tx {txid.hex()[:16]}... non-standard: {ws_reason}"
+                        )
+
+                # Gate 4: per-tx sigop-cost limit.  Mirrors lines 2122-2139.
+                def _sigop_resolver(prev_txid: bytes, prev_vout: int):
+                    spk = _resolve_prev_spk(prev_txid, prev_vout)
+                    return {"script_pubkey": spk} if spk is not None else None
+
+                member_sigop_cost = _compute_tx_sigop_cost(tx, _sigop_resolver)
+                if member_sigop_cost > MAX_STANDARD_TX_SIGOPS_COST:
+                    return False, (
+                        f"Package tx {txid.hex()[:16]}... "
+                        f"bad-txns-too-many-sigops: sigop cost {member_sigop_cost} "
+                        f"exceeds MAX_STANDARD_TX_SIGOPS_COST "
+                        f"({MAX_STANDARD_TX_SIGOPS_COST})"
+                    )
+
+                # Register this member's outputs so later (child) members can
+                # resolve their prevScripts from within the package.
+                for vout, out in enumerate(tx.outputs):
+                    pkg_prev_spks[(txid, vout)] = out.script_pubkey
+
         # Consensus-validate each transaction.
         # BIP-113: use MTP of current tip as locktime cutoff (same as
         # AcceptToMemoryPool in Core validation.cpp:164).
