@@ -12585,7 +12585,19 @@ class RPCServer:
         if headers is None:
             headers = -1
 
-        tip_bits = getattr(db, '_tip_bits', 0x1d00ffff)
+        # Read the ACTUAL tip block's nBits from the block store. The cached
+        # db._tip_bits is only set on block-connect (database.py) and is NOT
+        # restored on a restart-at-tip, so it reads the genesis default
+        # (0x1d00ffff) until the next block arrives — which would report a stale
+        # genesis bits/target/difficulty. Fetch the tip block directly (same
+        # source getblock/getblockheader use) and fall back to the cache only if
+        # the body is unavailable.
+        _tip_block = db.get_block(best_hash) if best_hash else None
+        tip_bits = (
+            _tip_block.bits
+            if _tip_block is not None and isinstance(getattr(_tip_block, 'bits', None), int)
+            else getattr(db, '_tip_bits', 0x1d00ffff)
+        )
 
         chainstates: list[dict[str, Any]] = []
 
