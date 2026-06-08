@@ -199,6 +199,15 @@ class NodeConfig:
             # getcfcheckpt/cfcheckpt).  When disabled (the default) the
             # node behaves identically to before this option was added.
             'blockfilterindex': '0',
+            # Coin-stats index (1=enabled, 0=off).  Mirrors Bitcoin Core's
+            # -coinstatsindex option (default off).  When enabled the node
+            # maintains a per-height running MuHash3072 commitment over the
+            # UTXO set (plus cumulative counts / total amount) alongside block
+            # validation, so gettxoutsetinfo can answer for a HISTORICAL
+            # hash_or_height (not just the tip) and getindexinfo reports the
+            # index.  When disabled (the default) a non-tip hash_or_height
+            # query errors with -8, matching Core.
+            'coinstatsindex': '0',
             # Path to an ASMap file for AS-number-based peer bucketing.
             # Mirrors Bitcoin Core's -asmap option (init.cpp:1584).
             # Empty string (the default) disables ASMap: addrman falls back
@@ -339,6 +348,11 @@ class NodeConfig:
             # filter index, serves BIP-157 P2P queries, and advertises
             # NODE_COMPACT_FILTERS in version handshakes.
             'blockfilterindex': self.getboolean('blockfilterindex'),
+            # Coin-stats index (Core: -coinstatsindex).  Default false (Core
+            # parity).  When true the node maintains a per-height running
+            # MuHash3072 + counts over the UTXO set so gettxoutsetinfo can
+            # answer for a historical hash_or_height.
+            'coinstatsindex': self.getboolean('coinstatsindex'),
             # ASMap file path (Core: -asmap).  Empty string disables ASMap.
             # Relative paths are resolved relative to datadir at startup.
             'asmap': self.get('asmap') or '',

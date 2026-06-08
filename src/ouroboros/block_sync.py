@@ -216,6 +216,7 @@ class BlockSync:
         mempool=None,  # Optional mempool for re-adding txs after reorg
         fee_estimator=None,  # Optional FeeEstimator to feed confirmed-block fee data
         block_filter_index=None,  # Optional BIP 157/158 block-filter index
+        coinstats_index=None,  # Optional -coinstatsindex (per-height MuHash)
         wallet_notifier=None,  # Optional wallet block-connect/disconnect sink
     ):
         """Initialize block synchronizer."""
@@ -228,6 +229,13 @@ class BlockSync:
         # passed to ``block_filter_index.add_block(block, height)`` so the
         # index stays in lock-step with the chain tip.  None = disabled.
         self.block_filter_index = block_filter_index
+        # -coinstatsindex — when set, every successfully connected block is
+        # passed to ``coinstats_index.add_block(block, height, db)`` and every
+        # disconnected block to ``coinstats_index.remove(hash, height)`` so the
+        # per-height UTXO MuHash3072 commitment stays in lock-step with the
+        # chain tip (same primary connect/disconnect path as the filter
+        # index above).  None = disabled.
+        self.coinstats_index = coinstats_index
         # Wallet block-connect sink (Core CWallet::blockConnected). When set,
         # every canonically-connected block is passed to
         # ``wallet_notifier.notify_block_connected(block, height)`` so loaded
@@ -1789,6 +1797,28 @@ class BlockSync:
                 except Exception as e:
                     logger.warning(
                         f"block_filter_index.add_block failed at "
+                        f"height {new_height}: {e}"
+                    )
+
+            # -coinstatsindex — update the per-height UTXO MuHash3072
+            # commitment for this canonically-connected block.  Off-thread
+            # (modular-exp per coin is non-trivial) and non-fatal: an index
+            # fault must never stall IBD.  Same primary connect path Core's
+            # CoinStatsIndex::CustomAppend runs on via BlockConnected.  The
+            # spent-prevout removal reads the SPENT_CF undo record written by
+            # the Rust connect above, so it MUST run after the chainstate
+            # connect (it does — connect happened earlier in this loop body).
+            if self.coinstats_index is not None:
+                try:
+                    await asyncio.to_thread(
+                        self.coinstats_index.add_block,
+                        block,
+                        new_height,
+                        self.db,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"coinstats_index.add_block failed at "
                         f"height {new_height}: {e}"
                     )
 
@@ -3776,6 +3806,29 @@ class BlockSync:
                         )
                     disconnect_height -= 1
 
+            # -coinstatsindex — drop each disconnected height's per-height
+            # snapshot (reorg disconnect side).  The running state for the new
+            # tip is the already-persisted height-1 snapshot, so disconnect is
+            # just a delete + best_indexed_height rollback (no recomputation).
+            # Same primary disconnect path Core's CoinStatsIndex::CustomRewind
+            # runs on via BlockDisconnected.  Non-fatal.
+            if self.coinstats_index is not None:
+                disconnect_height = tip_height_at_disconnect
+                for curr_hash, _curr_block, _ in reversed(blocks_to_disconnect):
+                    try:
+                        await asyncio.to_thread(
+                            self.coinstats_index.remove,
+                            curr_hash,
+                            disconnect_height,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"coinstats_index.remove failed at "
+                            f"height {disconnect_height} "
+                            f"(hash {curr_hash.hex()[:16]}...): {e}"
+                        )
+                    disconnect_height -= 1
+
             # Wallet block-disconnect (Core CWallet::blockDisconnected). Roll
             # the per-block credit/debit history back so a reorged-away receive
             # disappears from listtransactions. Non-fatal — a wallet fault must
@@ -3917,6 +3970,27 @@ class BlockSync:
                     except Exception as e:
                         logger.warning(
                             f"block_filter_index.add_block failed at "
+                            f"height {connect_height} during reorg "
+                            f"(hash {new_hash.hex()[:16]}...): {e}"
+                        )
+
+                # -coinstatsindex — re-index the newly connected block along
+                # the new active chain (reorg connect side).  add_block loads
+                # the running state from height-1 (which was just rolled back
+                # by the disconnect loop above) and applies this block's delta,
+                # so the per-height MuHash commitment follows the new chain.
+                # Same primary connect path as the linear hook.  Non-fatal.
+                if self.coinstats_index is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self.coinstats_index.add_block,
+                            new_block_obj,
+                            connect_height,
+                            self.db,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"coinstats_index.add_block failed at "
                             f"height {connect_height} during reorg "
                             f"(hash {new_hash.hex()[:16]}...): {e}"
                         )
