@@ -440,6 +440,21 @@ async def accept_block(
         except Exception:
             pass  # an index fault must never abort block acceptance
 
+    # -coinstatsindex — same rationale: a block accepted through the RPC
+    # path (submitblock / generatetoaddress) must update the per-height UTXO
+    # MuHash commitment exactly as a P2P/IBD-connected block does, else the
+    # index would stall at the pre-RPC height.  This complements (does not
+    # replace) the primary P2P/IBD connect hook in block_sync.py — both entry
+    # points feed the index, mirroring Core's single BlockConnected signal.
+    csi = getattr(node, "coinstats_index", None)
+    if csi is not None and _connected_block is not None:
+        try:
+            await asyncio.to_thread(
+                csi.add_block, _connected_block, next_height, db
+            )
+        except Exception:
+            pass  # an index fault must never abort block acceptance
+
     # Step 6 — Wallet transaction-history scan (best-effort).
     # Walk the connected block's txs and record a wallet-history entry for any
     # tx that credits a wallet script (receive/coinbase) or debits a wallet
@@ -6690,13 +6705,39 @@ class RPCServer:
         # Check if block exists
         db = self.node.db
         try:
-            # Use rust db if available
-            if hasattr(db, 'rust_db') and db.rust_db is not None:
-                new_tip_height = db.rust_db.invalidate_block(block_hash_internal)
+            # Resolve the Rust DB handle.  BlockchainDatabase wraps the
+            # PyBlockchainDB as ``_db`` (older drafts referenced a ``rust_db``
+            # attribute that never existed, so invalidateblock always errored
+            # — fixed here so the reorg primitive actually runs).
+            rust = getattr(db, '_db', None) or getattr(db, 'rust_db', None)
+            if rust is not None and hasattr(rust, 'invalidate_block'):
+                new_tip_height = rust.invalidate_block(block_hash_internal)
                 logger.info(
                     f"invalidateblock: Invalidated block {blockhash[:16]}... "
                     f"new tip height: {new_tip_height}"
                 )
+                # Keep the cached chain tip consistent with the Rust reorg.
+                if hasattr(db, '_cached_tip'):
+                    db._cached_tip = None
+                # Core's InvalidateBlock disconnects the target block ITSELF
+                # (the active tip ends at the target's parent).  The Rust
+                # invalidate_block disconnects only blocks ABOVE the target and
+                # RETURNS target-1 while leaving the target block connected, so
+                # the actual chainstate tip can sit one block high.  Reconcile
+                # the chainstate down to the returned new_tip_height so the tip
+                # lands at the parent, matching Core.
+                try:
+                    _, actual_h = rust.get_best_block()
+                    while int(actual_h) > int(new_tip_height):
+                        rust.disconnect_block(int(actual_h))
+                        _, actual_h = rust.get_best_block()
+                    if hasattr(db, '_cached_tip'):
+                        db._cached_tip = None
+                except Exception as _e:
+                    logger.warning(
+                        f"invalidateblock: tip reconcile to {new_tip_height} "
+                        f"failed: {_e}"
+                    )
             else:
                 # Fallback: Python-only implementation
                 raise HTTPException(
@@ -6709,6 +6750,21 @@ class RPCServer:
             if "genesis" in str(e).lower():
                 raise HTTPException(status_code=400, detail="Cannot invalidate genesis block") from None
             raise HTTPException(status_code=500, detail=str(e)) from None
+
+        # The Rust layer performed the chainstate reorg WITHOUT firing the
+        # Python connect/disconnect index hooks, so re-align the coin-stats
+        # index with the new active chain (rewind reorged-away heights, then
+        # re-connect the new chain forward).  Non-fatal: an index fault must
+        # never abort the RPC.  Same gap the block_sync reorg loop handles for
+        # the P2P/IBD path — here it is the invalidateblock-driven reorg.
+        csi = getattr(self.node, "coinstats_index", None)
+        if csi is not None:
+            try:
+                await asyncio.to_thread(csi.resync_to_chainstate, db)
+            except Exception as e:
+                logger.warning(
+                    f"invalidateblock: coinstatsindex resync failed: {e}"
+                )
 
         return None
 
@@ -6753,12 +6809,15 @@ class RPCServer:
         # Reconsider the block
         db = self.node.db
         try:
-            if hasattr(db, 'rust_db') and db.rust_db is not None:
-                new_tip_height = db.rust_db.reconsider_block(block_hash_internal)
+            rust = getattr(db, '_db', None) or getattr(db, 'rust_db', None)
+            if rust is not None and hasattr(rust, 'reconsider_block'):
+                new_tip_height = rust.reconsider_block(block_hash_internal)
                 logger.info(
                     f"reconsiderblock: Reconsidered block {blockhash[:16]}... "
                     f"tip height: {new_tip_height}"
                 )
+                if hasattr(db, '_cached_tip'):
+                    db._cached_tip = None
             else:
                 raise HTTPException(
                     status_code=500,
@@ -6768,6 +6827,19 @@ class RPCServer:
             if "not found" in str(e).lower():
                 raise HTTPException(status_code=404, detail=f"Block not found: {blockhash}") from None
             raise HTTPException(status_code=500, detail=str(e)) from None
+
+        # reconsiderblock can re-activate (and reorg onto) a previously
+        # invalidated branch in the Rust layer without firing the Python index
+        # hooks; re-align the coin-stats index with the resulting active chain.
+        # Non-fatal.
+        csi = getattr(self.node, "coinstats_index", None)
+        if csi is not None:
+            try:
+                await asyncio.to_thread(csi.resync_to_chainstate, db)
+            except Exception as e:
+                logger.warning(
+                    f"reconsiderblock: coinstatsindex resync failed: {e}"
+                )
 
         return None
 
@@ -7842,17 +7914,21 @@ class RPCServer:
                 f"{hash_type} is not a valid hash_type",
             )
 
-        # ``hash_or_height``/``use_index`` are part of the wire signature
-        # for parity with Core's RPC help. ouroboros has no coinstatsindex,
-        # so it can only report coinstats about the best block — exactly the
-        # base-chainstate case Core handles when g_coin_stats_index is null.
+        # ``hash_or_height``/``use_index``: with -coinstatsindex enabled the
+        # node maintains a per-height running MuHash3072 commitment over the
+        # UTXO set, so a HISTORICAL hash_or_height can be answered from the
+        # snapshot.  Without the index a non-tip query errors -8 (Core parity).
         #
         # Core (rpc/blockchain.cpp:1085-1097): when a specific block is
-        # requested (``!request.params[1].isNull()``) and the coinstatsindex
-        # is unavailable, it throws RPC_INVALID_PARAMETER. Crucially, even
-        # *with* the index, ``hash_serialized_3`` for a specific block is
-        # always rejected with RPC_INVALID_PARAMETER (it can only be computed
-        # for the tip). Mirror both error directions here.
+        # requested (``!request.params[1].isNull()``):
+        #   - ``hash_serialized_3`` for a specific block is ALWAYS rejected
+        #     with RPC_INVALID_PARAMETER (it can only be computed for the tip),
+        #     even WITH the index.
+        #   - any other hash_type requires g_coin_stats_index; when it is null
+        #     it throws RPC_INVALID_PARAMETER ("Querying specific block heights
+        #     requires coinstatsindex").
+        # Mirror both error directions here.
+        csi = getattr(self.node, "coinstats_index", None)
         if hash_or_height is not None:
             if hash_type_norm in ("hash_serialized_3", "hash_serialized_2"):
                 raise RpcError(
@@ -7860,10 +7936,14 @@ class RPCServer:
                     "hash_serialized_3 hash type cannot be queried for a "
                     "specific block",
                 )
-            # No coinstatsindex: any specific-block query is unsupported.
-            raise RpcError(
-                RPC_INVALID_PARAMETER,
-                "Querying specific block heights requires coinstatsindex",
+            if csi is None:
+                # No coinstatsindex: any specific-block query is unsupported.
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Querying specific block heights requires coinstatsindex",
+                )
+            return await self._gettxoutsetinfo_at_height(
+                hash_type_norm, hash_or_height, csi
             )
         _ = use_index
 
@@ -7966,6 +8046,114 @@ class RPCServer:
             result["muhash"] = stats["muhash_digest"][::-1].hex()
         # hash_type=="none": emit no digest field, matching Core.
 
+        return result
+
+    async def _gettxoutsetinfo_at_height(
+        self,
+        hash_type_norm: str,
+        hash_or_height: Any,
+        csi: Any,
+    ) -> dict[str, Any]:
+        """Answer gettxoutsetinfo for a HISTORICAL block from the coinstatsindex.
+
+        Resolves ``hash_or_height`` (a height int or a display-order block-hash
+        hex string) to a height + block hash, then reads the per-height
+        MuHash3072 snapshot maintained by :class:`CoinStatsIndex`.  Mirrors
+        Bitcoin Core's ``gettxoutsetinfo`` index branch
+        (rpc/blockchain.cpp:1085-1160 with ``index_used``):
+          - height must be 0..tip (ParseHashOrHeight errors otherwise),
+          - the result carries ``height``, ``bestblock`` (the hash AT that
+            height, NOT the tip), ``txouts``, ``bogosize``, ``muhash``,
+            ``total_amount`` and ``total_unspendable_amount``; ``transactions``
+            / ``disk_size`` are OMITTED when the index is used.
+        """
+        from decimal import Decimal
+
+        from ouroboros.muhash import MuHash3072
+
+        _, tip_height = self.node.db.get_best_block()
+
+        # ----- resolve hash_or_height to (height, block_hash_internal) -----
+        target_height: int
+        if isinstance(hash_or_height, bool):
+            # JSON true/false is never a valid height/hash.
+            raise RpcError(RPC_INVALID_PARAMETER, "Invalid hash_or_height")
+        if isinstance(hash_or_height, int):
+            target_height = hash_or_height
+            if target_height < 0:
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    f"Target block height {target_height} is negative",
+                )
+            if target_height > tip_height:
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    f"Target block height {target_height} after current tip "
+                    f"{tip_height}",
+                )
+        else:
+            # Display-order hash hex -> internal order -> height via the
+            # chainstate's block index.
+            try:
+                hh = str(hash_or_height)
+                block_hash_internal = bytes.fromhex(hh)[::-1]
+                if len(block_hash_internal) != 32:
+                    raise ValueError
+            except ValueError:
+                raise RpcError(
+                    RPC_INVALID_PARAMETER, "hash_or_height is not a hash or height"
+                ) from None
+            blk = await asyncio.to_thread(
+                self.node.db.get_block, block_hash_internal
+            )
+            if blk is None or getattr(blk, "height", None) is None:
+                raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
+            target_height = int(blk.height)
+
+        # Confirm the queried height is on the active chain and capture its
+        # canonical hash (the value Core returns as `bestblock`).
+        chain_hash = await asyncio.to_thread(
+            self.node.db.get_block_hash_by_height, target_height
+        )
+        if chain_hash is None:
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
+
+        # ----- read the per-height snapshot -----
+        snap = await asyncio.to_thread(csi.get_at_height, target_height)
+        if snap is None:
+            # Index enabled but this height has not been indexed yet (mid-sync).
+            best = csi.best_indexed_height
+            raise RpcError(
+                RPC_MISC_ERROR,
+                "Unable to get data because coinstatsindex is still syncing. "
+                f"Current height: {best if best is not None else -1}",
+            )
+
+        # The snapshot stores the block hash it was taken at; it must match the
+        # active chain's hash at that height (a stale snapshot from a reorged-
+        # away fork would differ — treat as not-yet-reindexed).
+        if bytes(snap["block_hash"]) != bytes(chain_hash):
+            raise RpcError(
+                RPC_MISC_ERROR,
+                "Unable to get data because coinstatsindex is still syncing.",
+            )
+
+        total_amount_btc = Decimal(snap["total_amount"]) / Decimal(100_000_000)
+
+        result: dict[str, Any] = {
+            "height": int(target_height),
+            # Core uint256.GetHex() => big-endian display hex.
+            "bestblock": bytes(chain_hash)[::-1].hex(),
+            "txouts": int(snap["txouts"]),
+            "bogosize": int(snap["bogo_size"]),
+            "total_amount": float(total_amount_btc),
+        }
+        if hash_type_norm == "muhash":
+            # snap["muhash"] is the 32-byte internal-order digest; reverse for
+            # display hex (same flip as the @tip path).
+            result["muhash"] = bytes(snap["muhash"])[::-1].hex()
+        # hash_type=="none": no digest field (Core parity).
+        _ = MuHash3072  # imported for symmetry with the @tip path
         return result
 
     async def rpc_scantxoutset(
@@ -10423,6 +10611,22 @@ class RPCServer:
             except Exception:
                 bfi_synced = False
             _emit("basic block filter index", bfi_synced, best_height)
+
+        # --- coinstatsindex (only when -coinstatsindex on) ---
+        # Core's CoinStatsIndex::GetName() returns "coinstatsindex" (the key
+        # the getindexinfo harness probes via d['coinstatsindex']).
+        csi = getattr(self.node, "coinstats_index", None)
+        if csi is not None:
+            try:
+                cbest = csi.best_indexed_height
+            except Exception:
+                cbest = None
+            cbest_height = int(cbest) if cbest is not None else 0
+            try:
+                csi_synced = bool(csi.is_synced(tip_height))
+            except Exception:
+                csi_synced = False
+            _emit("coinstatsindex", csi_synced, cbest_height)
 
         return result
 

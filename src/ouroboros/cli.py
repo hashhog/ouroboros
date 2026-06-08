@@ -416,6 +416,17 @@ def sync(ctx, reset, limit):
     ),
 )
 @click.option(
+    "--coinstatsindex/--nocoinstatsindex",
+    default=None,
+    help=(
+        "Maintain a coin-stats index: a per-height running MuHash3072 "
+        "commitment over the UTXO set (plus counts / total amount) so "
+        "gettxoutsetinfo can answer for a historical hash_or_height and "
+        "getindexinfo reports it (default: from config; config default is "
+        "off, matching Bitcoin Core's -coinstatsindex=0)."
+    ),
+)
+@click.option(
     "--daemon",
     is_flag=True,
     default=False,
@@ -473,8 +484,8 @@ def sync(ctx, reset, limit):
 @click.pass_context
 def start(
     ctx, rpc_port, p2p_port, listen, connect, dnsseed, force, v2transport,
-    peerbloomfilters, blockfilterindex, cfilter, daemon, pid_path, reindex,
-    rpc_tls_cert, rpc_tls_key,
+    peerbloomfilters, blockfilterindex, cfilter, coinstatsindex, daemon,
+    pid_path, reindex, rpc_tls_cert, rpc_tls_key,
 ):
     """Start the Bitcoin node"""
     global _node, _cancelled, _pid_file
@@ -570,6 +581,11 @@ def start(
                     f"--cfilter must be 0 (off) or 1 (basic), got {cfilter}"
                 )
             config["blockfilterindex"] = bool(cfilter)
+        # Same conf-vs-CLI precedence for --coinstatsindex.  Default off
+        # (Core parity, DEFAULT_COINSTATSINDEX=false).  When the operator
+        # omits the flag the conf-file value wins.
+        if coinstatsindex is not None:
+            config["coinstatsindex"] = bool(coinstatsindex)
 
         # FIX-64: HTTPS/TLS termination flags.  Reject mismatched pairs at
         # the CLI layer so the operator sees a clean Click error rather than
