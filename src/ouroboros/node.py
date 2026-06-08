@@ -146,6 +146,11 @@ class BitcoinNode:
         # build-on-demand path used before this option was added).
         self.block_filter_index = None
 
+        # Coin-stats index (-coinstatsindex).  Lazily instantiated in start()
+        # when the flag is enabled; remains None otherwise (gettxoutsetinfo
+        # then errors -8 on a non-tip hash_or_height, matching Core).
+        self.coinstats_index = None
+
         # State
         self.running = False
         self.synced = False
@@ -430,6 +435,61 @@ class BitcoinNode:
                 logger.info(
                     "BIP 157/158 block filter index: disabled (Core parity default)"
                 )
+
+            # -coinstatsindex (Core parity, default false).  Maintains a
+            # per-height running MuHash3072 commitment over the UTXO set so
+            # gettxoutsetinfo can answer for a historical hash_or_height.
+            csi_raw = self.config.get('coinstatsindex', False)
+            if isinstance(csi_raw, str):
+                coinstats_index_enabled = csi_raw.lower() in ("1", "true", "yes", "on")
+            else:
+                coinstats_index_enabled = bool(csi_raw)
+            if coinstats_index_enabled:
+                from ouroboros.coinstatsindex import CoinStatsIndex
+                try:
+                    self.coinstats_index = CoinStatsIndex(
+                        data_dir=self.data_dir, enabled=True,
+                    )
+                    # Seed the genesis height (height 0).  Core's
+                    # CoinStatsIndex indexes the genesis block, but its single
+                    # coinbase output is provably unspendable and never enters
+                    # the UTXO set, so the height-0 snapshot is an EMPTY set
+                    # (matching Core's coinstats at genesis).  The genesis is
+                    # never fed through the block-connect hook (which fires
+                    # only for heights >= 1), so seed it here.  Idempotent on
+                    # restart.
+                    self._index_genesis_coinstats()
+                    # Crash-safety reconcile (Core BaseIndex::Init parity):
+                    # rewind the index to the active chain if an unclean
+                    # restart / reorg left it ahead of or forked from the
+                    # chainstate.
+                    try:
+                        rewound = self.coinstats_index.reconcile_to_chainstate(
+                            self.db
+                        )
+                        if rewound:
+                            logger.warning(
+                                f"coinstatsindex: startup reconcile rewound "
+                                f"{rewound} height(s) to match chainstate"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"coinstatsindex: startup reconcile failed ({e}); "
+                            "index may be ahead of chainstate"
+                        )
+                    logger.info("coin-stats index: enabled")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to open coin-stats index ({e}); "
+                        "continuing without -coinstatsindex"
+                    )
+                    self.coinstats_index = None
+                    coinstats_index_enabled = False
+            else:
+                logger.info(
+                    "coin-stats index: disabled (Core parity default)"
+                )
+
             # FIX-71 / W121 BUG-5: pass a callable that re-evaluates the
             # NODE_COMPACT_FILTERS gate on every handshake.  The
             # predicate is two-part, matching Bitcoin Core's
@@ -498,6 +558,7 @@ class BitcoinNode:
                 mempool=self.mempool,
                 fee_estimator=self.fee_estimator,
                 block_filter_index=self.block_filter_index,
+                coinstats_index=self.coinstats_index,
                 # Feed every canonically-connected/disconnected block to the
                 # wallet manager so loaded wallets track their own txs in
                 # lock-step with the chain (Core CWallet::blockConnected).
@@ -1110,6 +1171,34 @@ class BitcoinNode:
             logger.info("BIP 157/158 filter index: seeded genesis filter")
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(f"Failed to seed genesis filter into index: {e}")
+
+    def _index_genesis_coinstats(self):
+        """Seed the coin-stats index with the genesis height (height 0).
+
+        Bitcoin Core's CoinStatsIndex indexes the genesis block like any
+        other, but the genesis coinbase output is provably unspendable and
+        never enters the UTXO set, so the height-0 coinstats snapshot is the
+        EMPTY set: txouts=0, total_amount=0, MuHash3072 of the empty multiset.
+        ``add_block`` at height 0 computes exactly this (the genesis coinbase
+        output is skipped by IsUnspendable on regtest/mainnet/testnet).
+
+        The genesis is connected via :meth:`_init_genesis_block` but never
+        routed through the block-connect index hook (heights >= 1 only), so
+        seed it here.  Idempotent on restart; best-effort.
+        """
+        csi = self.coinstats_index
+        if csi is None or self.db is None:
+            return
+        try:
+            if csi.get_at_height(0) is not None:
+                return
+            genesis = self.db.get_block_by_height(0)
+            if genesis is None:
+                return
+            csi.add_block(genesis, height=0, db=self.db)
+            logger.info("coin-stats index: seeded genesis snapshot")
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(f"Failed to seed genesis coinstats snapshot: {e}")
 
     def _check_synced(self) -> bool:
         if not self.db:
