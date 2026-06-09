@@ -2446,6 +2446,30 @@ class PeerManager:
                     logger.debug("ban_manager.sweep_expired raised",
                                  exc_info=True)
 
+                # Sweep expired BIP 324 v1-fallback records.  ``_v1_only_addrs``
+                # is lazily evicted on read (``_is_v1_only_addr``), but entries
+                # for addresses never re-probed would accumulate indefinitely
+                # on a long-running node that sees many unique v2-failing peers
+                # (e.g. scan traffic).  This periodic bulk sweep caps retention
+                # to at most one maintenance cycle (30 s) past V2_FALLBACK_TTL.
+                try:
+                    _now = time.time()
+                    _stale_v1 = [
+                        _a for _a, _ts in list(self._v1_only_addrs.items())
+                        if _now - _ts > V2_FALLBACK_TTL
+                    ]
+                    for _a in _stale_v1:
+                        self._v1_only_addrs.pop(_a, None)
+                    if _stale_v1:
+                        logger.debug(
+                            "BIP 324 v1-fallback sweep: evicted %d expired "
+                            "entries (%d remain)",
+                            len(_stale_v1),
+                            len(self._v1_only_addrs),
+                        )
+                except Exception:
+                    logger.debug("v1_only_addrs sweep raised", exc_info=True)
+
                 # Wait before next maintenance
                 await asyncio.sleep(30)
 
