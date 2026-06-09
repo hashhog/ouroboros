@@ -6878,6 +6878,159 @@ class RPCServer:
             return int(time.time() - start)
         return 0
 
+    def _aggregate_peerinfo_peers(self, pm: Any) -> list:
+        """Return the connected-peer list in ``getpeerinfo`` order.
+
+        Bitcoin Core lists every connection in the ``vNodes`` vector regardless
+        of direction (rpc/net.cpp getpeerinfo); ouroboros' PeerManager keeps
+        outbound full-relay peers, block-relay-only outbounds, and inbound
+        peers in three separate buckets.  Both ``getpeerinfo`` (which emits the
+        ``id`` field) and ``getblockfrompeer`` (which resolves the ``peer_id``
+        argument) MUST iterate the union of these buckets in the same order so
+        that the ``id`` a caller reads from ``getpeerinfo`` selects the same
+        peer when handed back to ``getblockfrompeer``.  Deduplicated by object
+        identity so a peer that appears in two buckets is listed once.
+        """
+        peer_list: list = []
+        seen_ids: set[int] = set()
+        for bucket_name in ("peers", "block_relay_peers", "inbound_peers"):
+            bucket = getattr(pm, bucket_name, None)
+            if bucket is None:
+                continue
+            iterable = bucket.values() if isinstance(bucket, dict) else bucket
+            for peer in iterable:
+                pid = id(peer)
+                if pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+                peer_list.append(peer)
+        return peer_list
+
+    def _resolve_peer_by_id(self, peer_id: int):
+        """Resolve a ``getpeerinfo`` ``id`` back to its ``Peer`` object.
+
+        ``getpeerinfo`` emits ``getattr(peer, 'id', i)`` for the i-th peer in
+        :meth:`_aggregate_peerinfo_peers` order, so we reconstruct that exact
+        same mapping and return the peer whose emitted id matches *peer_id*.
+        Returns ``None`` when no such peer exists (Core: GetPeerRef → nullptr →
+        "Peer does not exist", net_processing.cpp:1966).
+        """
+        pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
+        if pm is None:
+            return None
+        for i, peer in enumerate(self._aggregate_peerinfo_peers(pm)):
+            emitted_id = getattr(peer, 'id', i)
+            if emitted_id == peer_id:
+                return peer
+        return None
+
+    async def rpc_getblockfrompeer(self, blockhash: str, peer_id: int) -> dict[str, Any]:
+        """Attempt to fetch a block from a given peer.
+
+        Reference: Bitcoin Core rpc/blockchain.cpp getblockfrompeer +
+        net_processing.cpp PeerManagerImpl::FetchBlock.
+
+        We must already have the *header* for this block (e.g. from headers
+        sync or ``submitheader``).  On success we schedule a block ``getdata``
+        (``MSG_BLOCK | MSG_WITNESS_FLAG``) to the requested peer and return an
+        empty object — exactly mirroring Core, which returns ``UniValue::VOBJ``.
+
+        Errors (all ``RPC_MISC_ERROR`` / code ``-1``, matching Core):
+          * "Block header missing"  — we don't know the header (blockchain.cpp:547)
+          * "Peer does not exist"   — peer_id resolves to no peer (net_processing.cpp:1966)
+          * "Block already downloaded" — we already have the full body (blockchain.cpp:558)
+
+        Args:
+            blockhash: The block hash to fetch (display-order / big-endian hex).
+            peer_id:   The peer to fetch it from (an ``id`` from ``getpeerinfo``).
+
+        Returns:
+            ``{}`` if the request was successfully scheduled.
+        """
+        # JSON-RPC hashes are display-order (big-endian) hex; internal storage
+        # and the inv/getdata wire format both use little-endian byte order.
+        # Reference: rpc/blockchain.cpp ParseHashV + rpc_getblockheader above.
+        try:
+            block_hash = bytes.fromhex(blockhash)[::-1]
+        except ValueError:
+            raise RpcError(RPC_INVALID_PARAMETER, "blockhash must be hexadecimal string")
+        if len(block_hash) != 32:
+            raise RpcError(RPC_INVALID_PARAMETER, "blockhash must be of length 64 (not %d)" % len(blockhash))
+
+        # peer_id is a NodeId in Core (int64).  Accept numeric strings too.
+        try:
+            peer_id = int(peer_id)
+        except (TypeError, ValueError):
+            raise RpcError(RPC_INVALID_PARAMETER, "peer_id must be an integer")
+
+        if not hasattr(self.node, 'db') or not self.node.db:
+            raise RpcError(RPC_MISC_ERROR, "Database not available")
+
+        # ----------------------------------------------------------------
+        # (1) Header must be known — Core: LookupBlockIndex == nullptr ->
+        #     RPC_MISC_ERROR "Block header missing" (blockchain.cpp:547).
+        #     The full body being present (get_block) also implies the
+        #     header is known; otherwise consult the header-only store the
+        #     same way rpc_getblockheader does.
+        # ----------------------------------------------------------------
+        block = await asyncio.to_thread(self.node.db.get_block, block_hash)
+        header_known = block is not None
+        if not header_known:
+            try:
+                raw = await asyncio.to_thread(
+                    self.node.db._db.get_raw_header_with_chainwork, block_hash
+                )
+                header_known = raw is not None
+            except Exception:
+                header_known = False
+        if not header_known:
+            raise RpcError(RPC_MISC_ERROR, "Block header missing")
+
+        # ----------------------------------------------------------------
+        # (2) Resolve the peer — Core: GetPeerRef(peer_id) == nullptr ->
+        #     RPC_MISC_ERROR "Peer does not exist" (net_processing.cpp:1966).
+        #     Resolved against the SAME aggregated index getpeerinfo emits.
+        # ----------------------------------------------------------------
+        peer = self._resolve_peer_by_id(peer_id)
+        if peer is None:
+            raise RpcError(RPC_MISC_ERROR, "Peer does not exist")
+
+        # ----------------------------------------------------------------
+        # (3) Already-downloaded body — Core: index->nStatus & BLOCK_HAVE_DATA
+        #     -> RPC_MISC_ERROR "Block already downloaded" (blockchain.cpp:558).
+        #     Checked AFTER peer resolution to match Core's RPC ordering
+        #     (the RPC body-present check precedes FetchBlock, but FetchBlock's
+        #     own peer check is what produces "Peer does not exist"; Core
+        #     orders header -> body -> FetchBlock(peer).  We keep header ->
+        #     peer -> body so a bad peer_id is reported regardless of body
+        #     state, which is the more useful diagnostic).  See note below.
+        # ----------------------------------------------------------------
+        if block is not None:
+            raise RpcError(RPC_MISC_ERROR, "Block already downloaded")
+
+        # ----------------------------------------------------------------
+        # (4) Schedule the fetch: send a witness-block getdata to the peer.
+        #     Core: CInv(MSG_BLOCK | MSG_WITNESS_FLAG, hash) -> GETDATA
+        #     (net_processing.cpp:1981-1987).  Our inventory tuple is
+        #     (MSG_WITNESS_BLOCK, hash_internal_LE).
+        # ----------------------------------------------------------------
+        from ouroboros.p2p_messages import GetDataMessage, MSG_WITNESS_BLOCK
+
+        network = getattr(self.node, 'network', 'mainnet')
+        getdata = GetDataMessage(inventory=[(MSG_WITNESS_BLOCK, block_hash)])
+        try:
+            await peer.send_message(getdata.to_network_message(network))
+        except Exception as e:
+            # Core: ForNode returning false -> "Peer not fully connected".
+            raise RpcError(RPC_MISC_ERROR, "Peer not fully connected")
+
+        logger.debug(
+            "getblockfrompeer: requested block %s from peer=%d",
+            blockhash, peer_id,
+        )
+        # Core returns an empty JSON object (UniValue::VOBJ) on success.
+        return {}
+
     async def rpc_getpeerinfo(self) -> list[dict[str, Any]]:
         """Return information about connected peers.
 
@@ -6908,27 +7061,13 @@ class RPCServer:
         if pm is None:
             return []
 
-        # Aggregate every category PeerManager tracks.  Prior to this change
-        # only the outbound full-relay set (``pm.peers``) was returned, so
-        # inbound peers and block-relay-only outbounds were invisible to
-        # ``getpeerinfo`` — Bitcoin Core lists every connection in the
-        # vNodes vector regardless of direction (rpc/net.cpp getpeerinfo).
-        # Cross-impl tooling (BIP-324 interop matrix, fleet-snapshot) uses
-        # this RPC to detect inbound v2 transports, so the listing has to
-        # be complete.
-        peer_list: list = []
-        seen_ids: set[int] = set()
-        for bucket_name in ("peers", "block_relay_peers", "inbound_peers"):
-            bucket = getattr(pm, bucket_name, None)
-            if bucket is None:
-                continue
-            iterable = bucket.values() if isinstance(bucket, dict) else bucket
-            for peer in iterable:
-                pid = id(peer)
-                if pid in seen_ids:
-                    continue
-                seen_ids.add(pid)
-                peer_list.append(peer)
+        # Aggregate every category PeerManager tracks (see
+        # ``_aggregate_peerinfo_peers``).  ``getblockfrompeer`` resolves its
+        # ``peer_id`` argument against this exact same ordered list so that a
+        # caller can take an ``id`` straight out of ``getpeerinfo`` and feed it
+        # back in — Core makes the same guarantee (rpc/net.cpp getpeerinfo and
+        # rpc/blockchain.cpp getblockfrompeer both key off NodeId).
+        peer_list = self._aggregate_peerinfo_peers(pm)
 
         for i, peer in enumerate(peer_list):
             # Get peer ID (use internal ID if available)
