@@ -77,6 +77,24 @@ SOCKS5_REPLY_SUCCESS = 0x00
 # Bitcoin Core net.h:86 MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000
 MAX_PROTOCOL_MESSAGE_LENGTH = 4_000_000
 
+# Upper bound on how many consecutive non-message v2 packets (BIP 324 decoys
+# or unknown/short-id packets) we read inside a SINGLE _receive_v2_message
+# call before treating the peer as misbehaving and disconnecting.
+#
+# BIP 324 explicitly permits decoy packets (and Core silently ignores them —
+# net.cpp:1248 ``if (!ignore)``; unknown message types are dropped but the
+# connection is kept — net.cpp:1474-1477).  But Core can never busy-spin on
+# them: V2Transport::ReceivedBytes only consumes the bytes delivered by ONE
+# bounded ``Recv`` per socket-readiness event (net.cpp:2183, 64 KiB), then
+# returns to the poll loop.  Ouroboros's StreamReader can have a whole burst
+# of decoy/unknown packets already buffered, so the inner read loop would
+# otherwise spin synchronously over all of them in one call — never yielding
+# to the event loop and allocating a wait_for Task per iteration.  We mirror
+# Core's per-readiness bound + net_processing misbehavior posture: tolerate a
+# generous run of decoys, then disconnect a peer that floods them.  256 is far
+# above any plausible honest interleave of decoys with real messages.
+MAX_CONSECUTIVE_V2_SKIP = 256
+
 
 def is_onion_host(host: str) -> bool:
     """Return True if *host* is a Tor v3 .onion address."""
@@ -1622,6 +1640,15 @@ class Peer:
         )
 
         wire_bytes_this_call = 0
+        # Count consecutive non-message packets (decoys + unknown short-ids).
+        # readexactly() returns SYNCHRONOUSLY whenever the StreamReader buffer
+        # already holds the bytes, so a peer that pre-buffers a flood of decoy/
+        # unknown packets would otherwise turn this loop into an unbounded
+        # CPU-bound spin that never yields to the event loop (starving GC and
+        # other peers) and allocates a wait_for Task per iteration.  Core can't
+        # spin like that — it processes a bounded byte budget per socket
+        # readiness event (net.cpp:2183).  We bound the run and yield each skip.
+        consecutive_skipped = 0
         while True:
             # Read the 3-byte encrypted length prefix (no auth tag — the
             # length cipher is plain FSChaCha20, not AEAD; the contents
@@ -1666,6 +1693,16 @@ class Peer:
                 # Decoy packets count against bytes_recv because the wire
                 # bytes were real — the decoder just throws them away.
                 logger.debug(f"Discarded decoy packet from {self.host}:{self.port}")
+                consecutive_skipped += 1
+                if consecutive_skipped > MAX_CONSECUTIVE_V2_SKIP:
+                    raise V2TransportError(
+                        f"v2: too many consecutive decoy/unknown packets "
+                        f"from {self.host}:{self.port} "
+                        f"(>{MAX_CONSECUTIVE_V2_SKIP}) — disconnecting"
+                    )
+                # Yield to the event loop so the cyclic GC and other peers'
+                # coroutines run instead of spinning on a buffered burst.
+                await asyncio.sleep(0)
                 continue
 
             # BIP 324 contents = (1B short_id | 0x00+12B cmd) + payload.
@@ -1680,6 +1717,15 @@ class Peer:
                     f"v2: dropping packet with unknown/invalid type prefix "
                     f"from {self.host}:{self.port} ({contents_len} bytes)"
                 )
+                consecutive_skipped += 1
+                if consecutive_skipped > MAX_CONSECUTIVE_V2_SKIP:
+                    raise V2TransportError(
+                        f"v2: too many consecutive decoy/unknown packets "
+                        f"from {self.host}:{self.port} "
+                        f"(>{MAX_CONSECUTIVE_V2_SKIP}) — disconnecting"
+                    )
+                # Yield to the event loop (see comment at the loop top).
+                await asyncio.sleep(0)
                 continue
 
             command, payload = decoded
