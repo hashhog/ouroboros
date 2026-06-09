@@ -6,10 +6,18 @@ implementation, allowing Python code to interact with the blockchain storage lay
 """
 
 import hashlib
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
 import sync  # Rust extension module (required)
+
+# Bound on the in-memory chainwork fallback cache.  Old-block chainwork is
+# re-derivable from persisted Rust metadata; only the recent ~5 000 entries
+# (at most a few days of blocks) need to be hot.  Without this bound the
+# dict grows at one entry per block for the full chain lifetime — ~1 M entries
+# at tip — contributing to the at-tip RSS climb.
+_CHAINWORK_CACHE_MAX = 5_000
 
 
 @dataclass
@@ -342,6 +350,12 @@ class BlockchainDatabase:
         self._tip_timestamp: int = 0
         self._recent_timestamps: list = []  # last 11 block timestamps
         self._cached_chainwork: int = 0  # cumulative chain work, updated on connect
+        # Bounded FIFO cache for in-memory chainwork fallback (keyed by 32-byte
+        # block hash).  Capped at _CHAINWORK_CACHE_MAX entries with
+        # oldest-eviction so long-lived nodes don't accumulate one entry per
+        # block for the entire chain.  Persisted Rust metadata is always
+        # preferred (get_block_chainwork checks that path first).
+        self._chainwork_cache: OrderedDict[bytes, int] = OrderedDict()
         try:
             self._cached_tip = self.get_best_block()
         except Exception:
@@ -996,14 +1010,22 @@ class BlockchainDatabase:
         )
 
     def store_block_chainwork(self, block_hash: bytes, chainwork: int) -> None:
-        """Cache chainwork for *block_hash* in memory (fallback when Rust metadata is unavailable)."""
-        if not hasattr(self, "_chainwork_cache"):
-            self._chainwork_cache: dict[bytes, int] = {}
+        """Cache chainwork for *block_hash* in the bounded FIFO in-memory cache.
 
+        Fallback for when Rust-persisted metadata is unavailable.  The cache
+        is capped at ``_CHAINWORK_CACHE_MAX`` entries; the oldest entry is
+        evicted when the cap is reached so the dict never grows without bound.
+        """
         if len(block_hash) != 32:
             raise ValueError("Block hash must be 32 bytes")
 
+        # Refresh existing entry: remove first so re-insertion moves it to
+        # the "newest" end of the OrderedDict.
+        self._chainwork_cache.pop(block_hash, None)
         self._chainwork_cache[block_hash] = chainwork
+        # Evict oldest entry when over cap.
+        while len(self._chainwork_cache) > _CHAINWORK_CACHE_MAX:
+            self._chainwork_cache.popitem(last=False)
 
     def get_block_chainwork(self, block_hash: bytes, height: int | None = None) -> int:
         """Return chainwork for a block; prefers Rust metadata, falls back to in-memory cache."""
@@ -1011,9 +1033,6 @@ class BlockchainDatabase:
             persisted = self.get_chainwork_by_height(height)
             if persisted > 0:
                 return persisted
-
-        if not hasattr(self, "_chainwork_cache"):
-            self._chainwork_cache = {}
 
         if len(block_hash) != 32:
             raise ValueError("Block hash must be 32 bytes")

@@ -695,6 +695,99 @@ class BitcoinNode:
             self.running = True
             logger.info("Bitcoin node started successfully")
 
+            # Optional tracemalloc profiling thread — OPT-IN only.
+            #
+            # Set OUROBOROS_TRACEMALLOC=<N> (integer seconds) to start a
+            # background daemon thread that takes a heap snapshot every N
+            # seconds and appends the top-25 tracemalloc statistics (grouped
+            # by source line) to <datadir>/tracemalloc.log, each entry tagged
+            # with the current wall-clock time and process RSS (from
+            # /proc/self/statm).  When N is not set (or ≤ 0) this block is a
+            # complete no-op — zero overhead, zero threads, zero imports.
+            #
+            # Usage on maxbox:
+            #   OUROBOROS_TRACEMALLOC=60 python3 -m ouroboros.cli start ...
+            #
+            # The dumps just before the RSS knee finger the burst site.  Each
+            # dump is one JSON-lines record so `jq` can slice the log later.
+            _tracemalloc_interval_str = os.environ.get("OUROBOROS_TRACEMALLOC", "")
+            try:
+                _tm_interval = int(_tracemalloc_interval_str)
+            except (ValueError, TypeError):
+                _tm_interval = 0
+
+            if _tm_interval > 0:
+                import json
+                import threading
+                import tracemalloc
+
+                _tm_log_path = os.path.join(self.data_dir, "tracemalloc.log")
+                _tm_nframes = 25
+
+                def _tracemalloc_thread() -> None:
+                    tracemalloc.start(_tm_nframes)
+                    logger.info(
+                        "tracemalloc: profiling started (interval=%ds, "
+                        "log=%s, frames=%d)",
+                        _tm_interval,
+                        _tm_log_path,
+                        _tm_nframes,
+                    )
+                    while True:
+                        # Check a stop event rather than spinning forever so
+                        # the thread wakes promptly on shutdown.
+                        if _tracemalloc_stop.wait(timeout=_tm_interval):
+                            break
+
+                        try:
+                            snapshot = tracemalloc.take_snapshot()
+                            stats = snapshot.statistics("lineno")
+
+                            # RSS from /proc/self/statm (field 1 = RSS pages)
+                            try:
+                                with open("/proc/self/statm") as _f:
+                                    _rss_pages = int(_f.read().split()[1])
+                                    _rss_mb = _rss_pages * 4096 / (1024 * 1024)
+                            except Exception:
+                                _rss_mb = -1.0
+
+                            record = {
+                                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                    time.gmtime()),
+                                "rss_mb": round(_rss_mb, 1),
+                                "top": [
+                                    {
+                                        "file": str(s.traceback[0].filename),
+                                        "lineno": s.traceback[0].lineno,
+                                        "size_kb": round(s.size / 1024, 1),
+                                        "count": s.count,
+                                    }
+                                    for s in stats[:_tm_nframes]
+                                ],
+                            }
+                            with open(_tm_log_path, "a") as _lf:
+                                _lf.write(json.dumps(record) + "\n")
+                        except Exception as _e:
+                            logger.debug("tracemalloc snapshot error: %s", _e)
+
+                    tracemalloc.stop()
+                    logger.info("tracemalloc: profiling stopped")
+
+                _tracemalloc_stop = threading.Event()
+                _tm_thread = threading.Thread(
+                    target=_tracemalloc_thread,
+                    name="ouroboros-tracemalloc",
+                    daemon=True,
+                )
+                _tm_thread.start()
+                logger.info(
+                    "tracemalloc: daemon thread started (interval=%ds, log=%s)",
+                    _tm_interval,
+                    _tm_log_path,
+                )
+            else:
+                _tracemalloc_stop = None  # no-op reference
+
             # Print status block to terminal (best-effort; never fatal)
             try:
                 self._print_startup_status(rpc_port, p2p_port)
@@ -703,6 +796,10 @@ class BitcoinNode:
 
             # Main loop — runs indefinitely until shutdown signal
             await self._main_loop()
+
+            # Signal tracemalloc thread to stop when the main loop exits.
+            if _tracemalloc_stop is not None:
+                _tracemalloc_stop.set()
 
         except Exception as e:
             logger.error(f"Error starting node: {e}", exc_info=True)
