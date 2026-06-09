@@ -95,6 +95,32 @@ MAX_PROTOCOL_MESSAGE_LENGTH = 4_000_000
 # above any plausible honest interleave of decoys with real messages.
 MAX_CONSECUTIVE_V2_SKIP = 256
 
+# How often the message-receive hot path yields control back to the event loop
+# (``await asyncio.sleep(0)``).  This is the LOAD-BEARING fix for the at-tip
+# RSS burst (tracemalloc 2026-06-09 burst #2): every ``asyncio.wait_for`` /
+# ``async with asyncio.timeout`` read arms a timeout timer via
+# ``loop.call_at`` -> a ``TimerHandle`` on ``BaseEventLoop._scheduled``.  When a
+# read completes SYNCHRONOUSLY (StreamReader buffer already holds the bytes — a
+# high-rate flood of VALID v2 messages), the timeout context cancels the timer,
+# but ``TimerHandle.cancel()`` only flips ``_cancelled`` — it does NOT remove the
+# handle from the ``_scheduled`` heap.  The cancelled-timer purge lives ONLY
+# inside ``BaseEventLoop._run_once`` (base_events.py), which never runs while the
+# receive loop spins synchronously without re-entering the loop.  Result: the
+# ``_scheduled`` heap (plus the per-call ``wait_for`` Task / coro cyclic
+# garbage) grows MONOTONICALLY toward the RSS cap.  A single ``await
+# asyncio.sleep(0)`` returns control to ``_run_once``, which bulk-purges the
+# cancelled handles AND lets the cyclic GC reclaim the Task/coro chain.  The
+# first fix (50fdc48) yielded only on the decoy/unknown sub-branches, so a flood
+# of VALID messages never yielded — and recurred.  We now yield on the valid
+# path too, every N packets (a per-packet yield is correct but we batch to
+# amortize the sleep(0) cost; a local Python 3.13 repro showed batching at N
+# bounds ``_scheduled`` to ~N reads-per-window regardless of total iterations,
+# vs unbounded ~linear growth at N=0 — proven by the regression test, which the
+# pre-fix behavior fails).  This mirrors Core's bounded-work-per-readiness-event
+# model (net.cpp V2Transport never processes an unbounded buffered burst in one
+# go before returning to the poll loop).
+V2_RECV_YIELD_EVERY = 256
+
 
 def is_onion_host(host: str) -> bool:
     """Return True if *host* is a Tor v3 .onion address."""
@@ -499,6 +525,16 @@ class Peer:
         self.bytes_recv: int = 0
         self.last_send: float = 0.0
         self.last_recv: float = 0.0
+        # Running count of messages/packets received since we last yielded
+        # control to the event loop.  See V2_RECV_YIELD_EVERY: a high-rate
+        # flood of VALID, already-buffered messages otherwise spins the receive
+        # path (listen -> receive_message, one valid message per call) without
+        # re-entering BaseEventLoop._run_once, so the cancelled timeout
+        # TimerHandles each read arms accumulate unboundedly in loop._scheduled
+        # (the 2026-06-09 RSS burst).  The counter persists ACROSS
+        # receive_message calls because each valid call returns after a single
+        # packet, so a per-call check could never fire on the valid path.
+        self._recv_since_yield: int = 0
         # Clock-skew at handshake: peer_version_timestamp - our_unix_time_at_receipt.
         # Set once per peer when VERSION arrives; stays constant over the connection.
         # Matches Bitcoin Core CNode::nTimeOffset semantics (seconds).
@@ -1556,11 +1592,11 @@ class Peer:
             return await self._receive_v2_message(timeout)
 
         # v1 plaintext path
-        # Read header (24 bytes)
-        header = await asyncio.wait_for(
-            self.reader.readexactly(24),
-            timeout=timeout
-        )
+        # Read header (24 bytes).  asyncio.timeout (not wait_for) avoids the
+        # per-call Task churn; it raises TimeoutError on expiry exactly like
+        # wait_for, so listen()'s handlers are unchanged.
+        async with asyncio.timeout(timeout):
+            header = await self.reader.readexactly(24)
 
         # Parse header
         magic, command_bytes, length, checksum = struct.unpack('<I12sI4s', header)
@@ -1601,10 +1637,8 @@ class Peer:
             if length > MAX_PROTOCOL_MESSAGE_LENGTH:  # Core net.h MAX_PROTOCOL_MESSAGE_LENGTH
                 raise Exception(f"Payload too large: {length} bytes")
 
-            payload = await asyncio.wait_for(
-                self.reader.readexactly(length),
-                timeout=timeout
-            )
+            async with asyncio.timeout(timeout):
+                payload = await self.reader.readexactly(length)
 
         # Verify checksum
         expected_checksum = hashlib.sha256(
@@ -1640,23 +1674,44 @@ class Peer:
         )
 
         wire_bytes_this_call = 0
-        # Count consecutive non-message packets (decoys + unknown short-ids).
-        # readexactly() returns SYNCHRONOUSLY whenever the StreamReader buffer
-        # already holds the bytes, so a peer that pre-buffers a flood of decoy/
-        # unknown packets would otherwise turn this loop into an unbounded
-        # CPU-bound spin that never yields to the event loop (starving GC and
-        # other peers) and allocates a wait_for Task per iteration.  Core can't
+        # Count consecutive non-message packets (decoys + unknown short-ids) AND
+        # count total packets read in this call.  readexactly() returns
+        # SYNCHRONOUSLY whenever the StreamReader buffer already holds the bytes,
+        # so a peer that pre-buffers a flood of packets (decoy, unknown, OR
+        # valid) would otherwise turn this loop into an unbounded CPU-bound spin
+        # that never yields to the event loop — starving the event loop's
+        # cancelled-TimerHandle purge (RSS burst) and other peers.  Core can't
         # spin like that — it processes a bounded byte budget per socket
-        # readiness event (net.cpp:2183).  We bound the run and yield each skip.
+        # readiness event (net.cpp:2183).  We bound the consecutive-skip run AND
+        # yield every V2_RECV_YIELD_EVERY packets regardless of classification.
         consecutive_skipped = 0
         while True:
+            # Periodically return control to the event loop so its _run_once
+            # purges the cancelled timeout TimerHandles armed by each read
+            # below (see V2_RECV_YIELD_EVERY).  The counter is on the PEER (not
+            # call-local) because a valid-message receive returns after a single
+            # packet — a call-local counter would never reach the yield window
+            # on the valid-flood path (the case 50fdc48 missed).  It is shared
+            # with the v1 path and listen(), so any mix of v1/v2/decoy/unknown
+            # packets advances the same budget.  This makes EVERY exit path
+            # (valid return, decoy continue, unknown continue) yield, mirroring
+            # Core's bounded-work-per-readiness model.
+            self._recv_since_yield += 1
+            if self._recv_since_yield >= V2_RECV_YIELD_EVERY:
+                self._recv_since_yield = 0
+                await asyncio.sleep(0)
+
             # Read the 3-byte encrypted length prefix (no auth tag — the
             # length cipher is plain FSChaCha20, not AEAD; the contents
             # cipher's Poly1305 covers the body).
-            enc_length = await asyncio.wait_for(
-                self.reader.readexactly(LENGTH_FIELD_LEN),
-                timeout=timeout,
-            )
+            #
+            # asyncio.timeout (3.11+) arms the timeout on the CURRENT task
+            # instead of wrapping the read in a per-call Task (as wait_for
+            # does), eliminating the tasks.py Task churn the live tracemalloc
+            # flagged.  It raises TimeoutError on expiry, identical to
+            # wait_for, so listen()'s except handlers are unchanged.
+            async with asyncio.timeout(timeout):
+                enc_length = await self.reader.readexactly(LENGTH_FIELD_LEN)
             wire_bytes_this_call += LENGTH_FIELD_LEN
 
             try:
@@ -1671,10 +1726,8 @@ class Peer:
 
             # Read the AEAD-encrypted body: HEADER_LEN + contents_len + tag.
             aead_len = HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
-            aead_ct = await asyncio.wait_for(
-                self.reader.readexactly(aead_len),
-                timeout=timeout,
-            )
+            async with asyncio.timeout(timeout):
+                aead_ct = await self.reader.readexactly(aead_len)
             wire_bytes_this_call += aead_len
 
             try:
@@ -1748,10 +1801,27 @@ class Peer:
         VERSION, VERACK, WTXIDRELAY, and SENDADDRV2 messages. All other messages
         are dropped/ignored per Bitcoin Core's net_processing.cpp behavior.
         """
+        # Belt-and-suspenders for the at-tip RSS burst: bound work per receive
+        # so a high-rate flood of VALID, pre-buffered messages (v1 OR v2) cannot
+        # spin this loop without periodically re-entering the event loop's
+        # _run_once (which purges the cancelled timeout TimerHandles each read
+        # arms — see V2_RECV_YIELD_EVERY).  The v2 inner loop already advances
+        # self._recv_since_yield and yields, but the v1 path (each
+        # receive_message returns one message, then we loop and re-read the next
+        # pre-buffered one synchronously) does not — so we advance/check the
+        # SAME shared peer counter here.  Using one counter means a v2 receive
+        # that just yielded leaves the counter near 0, so this check rarely
+        # fires for v2; for a v1 flood it fires every V2_RECV_YIELD_EVERY
+        # messages.  Mirrors Core's bounded work-per-readiness-event posture.
         try:
             while self.state == PeerState.READY:
                 try:
                     msg = await self.receive_message(timeout=60.0)
+
+                    self._recv_since_yield += 1
+                    if self._recv_since_yield >= V2_RECV_YIELD_EVERY:
+                        self._recv_since_yield = 0
+                        await asyncio.sleep(0)
 
                     # Pre-handshake message filtering (Phase 16)
                     # Should not normally happen since listen() starts after
