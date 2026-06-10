@@ -97,6 +97,22 @@ class BIP32IndexExhaustedError(ValueError):
     """
 
 
+class WalletRpcError(Exception):
+    """Wallet-layer failure carrying an explicit JSON-RPC error code.
+
+    ``importdescriptors`` per-element failures must distinguish Core's
+    RPC_INVALID_ADDRESS_OR_KEY (-5, e.g. "Missing checksum" —
+    wallet/rpc/backup.cpp:158-161) from RPC_WALLET_ERROR (-4, "Cannot import
+    private keys to a wallet with private keys disabled" —
+    backup.cpp:224-226). The except-handler emits
+    ``getattr(exc, "code", -5)`` so plain exceptions keep the historical -5.
+    """
+
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = int(code)
+
+
 class AddressInfo(BaseModel):
     """Address information model."""
 
@@ -1218,6 +1234,11 @@ class Wallet:
         # debit (send) without needing the already-deleted UTXO. Keyed by
         # (txid_display_hex, vout). Mirrors which coins are "from me".
         self._owned_outpoints: dict[tuple[str, int], dict] = {}
+        # Cache for _descriptor_script_map(): script_pubkey -> address over
+        # every imported descriptor entry. Invalidated whenever the
+        # descriptor set changes (importdescriptors / wallet load). Mirrors
+        # Core DescriptorScriptPubKeyMan::m_map_script_pub_keys.
+        self._descriptor_spk_cache: dict[bytes, str] | None = None
         self._load_or_create()
 
     # HD seed management #
@@ -1386,6 +1407,7 @@ class Wallet:
         """
         self.keys = []
         self.descriptors = []
+        self._descriptor_spk_cache = None
         self._hd_seed = None
         self._hd_mnemonic = None
         self._hd_bip39_passphrase = None
@@ -1432,6 +1454,7 @@ class Wallet:
         """
         from ouroboros.descriptors import DescriptorEntry
 
+        self._descriptor_spk_cache = None
         if data.get("encrypted"):
             self._encrypted_blob = bytes.fromhex(data["ciphertext"])
             self.keys = []
@@ -1622,6 +1645,7 @@ class Wallet:
         self._encrypted_blob = self._read_encrypted_blob()
         self.keys = []
         self.descriptors = []
+        self._descriptor_spk_cache = None
         self._hd_seed = None
         self._hd_mnemonic = None
         self._hd_bip39_passphrase = None
@@ -1829,11 +1853,26 @@ class Wallet:
                 if self._is_spendable_utxo(u, tip)
             )
         total = 0
+        counted: set[str] = set()
         for kd in self.keys:
             k = self._get_wallet_key(kd)
-            for u in self.db.list_unspent_by_address(
-                k.get_p2wpkh_address(), self.network
-            ):
+            addr = k.get_p2wpkh_address()
+            counted.add(addr)
+            for u in self.db.list_unspent_by_address(addr, self.network):
+                if self._is_spendable_utxo(u, tip):
+                    total += u["value"]
+        # Imported descriptors (watch-only included) count toward the wallet
+        # balance: Core's GetBalance walks every ISMINE script
+        # (DescriptorScriptPubKeyMan::IsMine is privkey-free script-set
+        # membership). De-duplicated against the key addresses above.
+        for daddr in set(self._descriptor_script_map().values()):
+            if not daddr or daddr in counted:
+                continue
+            try:
+                utxos = self.db.list_unspent_by_address(daddr, self.network)
+            except Exception:
+                continue
+            for u in utxos:
                 if self._is_spendable_utxo(u, tip):
                     total += u["value"]
         return total
@@ -1920,6 +1959,65 @@ class Wallet:
                 out[address_to_script_pubkey(taddr, self.network)] = taddr
             except Exception:
                 pass
+        # Imported descriptors (including watch-only addr()/xpub entries) are
+        # ISMINE by script-set membership — Core
+        # DescriptorScriptPubKeyMan::IsMine (scriptpubkeyman.cpp:863-867);
+        # private keys play no role. Keys win on (unlikely) overlap.
+        for spk, addr in self._descriptor_script_map().items():
+            out.setdefault(spk, addr)
+        return out
+
+    def _descriptor_script_map(self) -> dict[bytes, str]:
+        """Map script_pubkey -> display address for every imported descriptor.
+
+        This is what makes imported (watch-only) descriptors ISMINE for the
+        history/balance/listunspent scans, mirroring Bitcoin Core
+        DescriptorScriptPubKeyMan::IsMine — pure script-set membership over
+        ``m_map_script_pub_keys`` (scriptpubkeyman.cpp:863-867). Ranged
+        entries expand over ``[range_start, range_end]``; non-ranged entries
+        (addr(), raw(), single-key) derive index 0 only. Cached; the cache is
+        invalidated whenever the descriptor set changes (importdescriptors /
+        wallet load / lock).
+        """
+        cached = self._descriptor_spk_cache
+        if cached is not None:
+            return cached
+
+        from ouroboros.address import script_pubkey_to_address
+
+        out: dict[bytes, str] = {}
+        for entry in self.descriptors:
+            desc = entry.descriptor
+            try:
+                if getattr(desc, "is_range", False):
+                    lo = int(entry.range_start)
+                    hi = int(entry.range_end)
+                    indices = range(lo, hi + 1)
+                else:
+                    indices = range(0, 1)
+                for i in indices:
+                    # derive_all_scripts covers combo() expansion; for every
+                    # other type it is the single canonical script.
+                    scripts = desc.derive_all_scripts(i)
+                    try:
+                        addr = desc.derive_address(i, self.network)
+                    except Exception:
+                        addr = None
+                    for spk in scripts:
+                        spk_b = bytes(spk)
+                        a = addr
+                        if a is None:
+                            try:
+                                a = script_pubkey_to_address(
+                                    spk_b, self.network
+                                ) or ""
+                            except Exception:
+                                a = ""
+                        out[spk_b] = a
+            except Exception:
+                # One malformed entry must not hide the others.
+                continue
+        self._descriptor_spk_cache = out
         return out
 
     # --- Chain rescan (Core CWallet::ScanForWalletTransactions) -------------
@@ -2744,7 +2842,6 @@ class Wallet:
         """
         from ouroboros.descriptors import (
             DescriptorEntry,
-            add_checksum,
             parse_descriptor,
             verify_checksum,
         )
@@ -2757,14 +2854,33 @@ class Wallet:
                 if not desc_str:
                     raise ValueError("Missing 'desc' field")
 
-                # Validate / add checksum
-                if "#" in desc_str:
-                    if not verify_checksum(desc_str):
-                        raise ValueError(f"Invalid checksum in: {desc_str}")
-                else:
-                    desc_str = add_checksum(desc_str)
+                # Checksum gate FIRST (Core wallet/rpc/backup.cpp:158-161
+                # calls Parse(..., require_checksum=true)): a descriptor
+                # without "#..." fails -5 with EXACTLY "Missing checksum"
+                # (descriptor.cpp:2845-2846) before any other validation.
+                if "#" not in desc_str:
+                    raise WalletRpcError(-5, "Missing checksum")
+                if not verify_checksum(desc_str):
+                    raise WalletRpcError(
+                        -5, f"Invalid checksum in: {desc_str}"
+                    )
 
                 descriptor = parse_descriptor(desc_str)
+
+                # Private-key gate AFTER the parse/checksum gate (ordering is
+                # part of the Core contract — backup.cpp:224-226): a
+                # well-formed descriptor containing private key material
+                # (WIF / xprv / tprv) cannot be imported into a
+                # disable_private_keys wallet. RPC_WALLET_ERROR = -4.
+                if self._disable_private_keys and any(
+                    getattr(k, "is_private", False)
+                    for k in (descriptor.keys or [])
+                ):
+                    raise WalletRpcError(
+                        -4,
+                        "Cannot import private keys to a wallet with "
+                        "private keys disabled",
+                    )
 
                 # Resolve timestamp
                 ts = req.get("timestamp", "now")
@@ -2812,12 +2928,16 @@ class Wallet:
                 results.append({
                     "success": False,
                     "error": {
-                        "code": -5,
+                        # WalletRpcError carries the Core code (-4 for the
+                        # privkey-into-dpk gate); anything else keeps the
+                        # historical -5 (RPC_INVALID_ADDRESS_OR_KEY).
+                        "code": getattr(exc, "code", -5),
                         "message": str(exc),
                     },
                 })
                 logger.warning("Failed to import descriptor: %s", exc)
 
+        self._descriptor_spk_cache = None
         self._save()
         return results
 

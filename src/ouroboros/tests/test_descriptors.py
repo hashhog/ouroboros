@@ -598,13 +598,19 @@ class TestWalletDescriptorIntegration:
         assert len(wallet.descriptors) == 1
 
     def test_importdescriptors_without_checksum(self, tmp_path):
+        # Core parity (wallet/rpc/backup.cpp:158-161 + descriptor.cpp:2845):
+        # importdescriptors REQUIRES the checksum — an unchecksummed
+        # descriptor fails per-element with -5 "Missing checksum".
+        # (Until 2026-06-09 ouroboros silently add_checksum()ed it; that
+        # divergence is what this test used to assert.)
         wallet = self._make_wallet(tmp_path)
         results = wallet.importdescriptors([
             {"desc": f"wpkh({_TEST_XPUB}/0/*)", "timestamp": "now"},
         ])
-        assert results[0]["success"] is True
-        # Checksum should have been added
-        assert "#" in wallet.descriptors[0].desc_string
+        assert results[0]["success"] is False
+        assert results[0]["error"]["code"] == -5
+        assert results[0]["error"]["message"] == "Missing checksum"
+        assert len(wallet.descriptors) == 0
 
     def test_importdescriptors_bad_checksum(self, tmp_path):
         wallet = self._make_wallet(tmp_path)
@@ -622,12 +628,15 @@ class TestWalletDescriptorIntegration:
         assert results[0]["success"] is False
 
     def test_importdescriptors_multiple(self, tmp_path):
+        # Checksums are REQUIRED on the importdescriptors path (Core
+        # backup.cpp:158-161) — these descriptors carry them.
         wallet = self._make_wallet(tmp_path)
         pk2 = "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
         results = wallet.importdescriptors([
-            {"desc": f"wpkh({_TEST_XPUB}/0/*)", "active": True},
-            {"desc": f"pkh({_TEST_PUBKEY_HEX})", "active": True},
-            {"desc": f"wsh(multi(1,{_TEST_PUBKEY_HEX},{pk2}))", "active": True},
+            {"desc": add_checksum(f"wpkh({_TEST_XPUB}/0/*)"), "active": True},
+            {"desc": add_checksum(f"pkh({_TEST_PUBKEY_HEX})"), "active": True},
+            {"desc": add_checksum(f"wsh(multi(1,{_TEST_PUBKEY_HEX},{pk2}))"),
+             "active": True},
         ])
         assert all(r["success"] for r in results)
         assert len(wallet.descriptors) == 3
@@ -708,6 +717,193 @@ class TestWalletDescriptorIntegration:
         desc = parse_descriptor(desc_str)
         direct_addrs = desc.derive_addresses(0, 5, "mainnet")
         assert wallet_addrs == direct_addrs
+
+
+# Watch-only importdescriptors Core-parity tests (2026-06-09)
+#
+# Ground truth: bitcoin-core wallet/rpc/backup.cpp (checksum gate :158-161
+# -> -5 "Missing checksum"; privkey-into-disable_private_keys gate :224-226
+# -> -4), script/descriptor.cpp addr() (:2447-2458, DecodeDestination),
+# key_io.cpp DecodeDestination (:85-204 — bech32 v0 / bech32m v1+ / hrp),
+# wallet/scriptpubkeyman.cpp DescriptorScriptPubKeyMan::IsMine (:863-867,
+# privkey-free script-set membership).
+
+
+class TestWatchOnlyImportParity:
+    """importdescriptors watch-only parity with Core v31.99."""
+
+    PRIV_SCALAR = (
+        "00112233445566778899aabbccddeeff"
+        "00112233445566778899aabbccdd4d04"
+    )
+
+    @staticmethod
+    def _regtest_wif(scalar_hex: str) -> str:
+        import base58
+        return base58.b58encode_check(
+            b"\xef" + bytes.fromhex(scalar_hex) + b"\x01"
+        ).decode()
+
+    def _make_wallet(self, tmp_path, network="regtest", dpk=False):
+        from ouroboros.wallet import Wallet
+        w = Wallet(data_dir=str(tmp_path), network=network, name="wo")
+        w._disable_private_keys = dpk
+        return w
+
+    @staticmethod
+    def _bcrt_p2wpkh():
+        from ouroboros.address import _bech32m_encode
+        prog = bytes(range(20))
+        return _bech32m_encode("bcrt", 0, prog), b"\x00\x14" + prog
+
+    # -- address decoding (descriptors._decode_address) --------------------
+
+    def test_decode_address_bcrt1_v0(self):
+        # Regression: 'bcrt1' fell through to the base58 parser ->
+        # "Invalid base58 address" on every regtest bech32 addr().
+        from ouroboros.descriptors import _decode_address
+        addr, spk = self._bcrt_p2wpkh()
+        assert _decode_address(addr, "regtest") == spk
+
+    def test_decode_address_spec_v0_vector(self):
+        # BIP-173 spec vector (P2WPKH).
+        from ouroboros.descriptors import _decode_address
+        spk = _decode_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
+        assert spk.hex() == "0014751e76e8199196d454941c45d1b3a323f1433bd6"
+
+    def test_decode_address_taproot_all_hrps(self):
+        # Regression: the old 2-arg _bech32m_decode call raised TypeError
+        # (swallowed) -> ALL P2TR addr() rejected on every network.
+        from ouroboros.address import _bech32m_encode
+        from ouroboros.descriptors import _decode_address
+        prog = bytes(range(32))
+        for hrp in ("bc", "tb", "bcrt"):
+            addr = _bech32m_encode(hrp, 1, prog)
+            assert _decode_address(addr) == b"\x51\x20" + prog
+
+    def test_decode_address_future_witness_versions(self):
+        # Core key_io.cpp:190-199: v2-16 decode to WitnessUnknown
+        # (OP_n <program>) rather than erroring.
+        from ouroboros.address import _bech32m_encode
+        from ouroboros.descriptors import _decode_address
+        prog = bytes(range(32))
+        addr = _bech32m_encode("bcrt", 2, prog)
+        assert _decode_address(addr) == bytes([0x52, 0x20]) + prog
+
+    # -- addr() imports -----------------------------------------------------
+
+    def test_addr_bech32_import_registers_script(self, tmp_path):
+        wallet = self._make_wallet(tmp_path, dpk=True)
+        addr, spk = self._bcrt_p2wpkh()
+        res = wallet.importdescriptors([
+            {"desc": add_checksum(f"addr({addr})"), "timestamp": 0},
+        ])
+        assert res[0] == {"success": True}
+        # The script registers as ISMINE (Core DescriptorSPKM::IsMine).
+        assert wallet._descriptor_script_map().get(spk) == addr
+        assert wallet._owned_script_set().get(spk) == addr
+
+    def test_addr_bech32m_taproot_import(self, tmp_path):
+        from ouroboros.address import _bech32m_encode
+        wallet = self._make_wallet(tmp_path, dpk=True)
+        prog = bytes(range(32))
+        addr = _bech32m_encode("bcrt", 1, prog)
+        res = wallet.importdescriptors([
+            {"desc": add_checksum(f"addr({addr})"), "timestamp": 0},
+        ])
+        assert res[0] == {"success": True}
+        assert b"\x51\x20" + prog in wallet._descriptor_script_map()
+
+    # -- checksum gate (-5, ordering FIRST) ----------------------------------
+
+    def test_missing_checksum_exact_minus5(self, tmp_path):
+        wallet = self._make_wallet(tmp_path, dpk=True)
+        addr, _ = self._bcrt_p2wpkh()
+        res = wallet.importdescriptors([
+            {"desc": f"addr({addr})", "timestamp": 0},
+        ])
+        assert res[0]["success"] is False
+        assert res[0]["error"]["code"] == -5
+        assert res[0]["error"]["message"] == "Missing checksum"
+
+    def test_privkey_missing_checksum_is_minus5_first(self, tmp_path):
+        # ORDERING CONTRACT (Core backup.cpp): the checksum gate runs BEFORE
+        # the privkey-vs-disabled-wallet gate, so an unchecksummed privkey
+        # descriptor on a dpk wallet is -5 "Missing checksum", not -4.
+        wallet = self._make_wallet(tmp_path, dpk=True)
+        wif = self._regtest_wif(self.PRIV_SCALAR)
+        res = wallet.importdescriptors([
+            {"desc": f"wpkh({wif})", "timestamp": 0},
+        ])
+        assert res[0]["success"] is False
+        assert res[0]["error"]["code"] == -5
+        assert res[0]["error"]["message"] == "Missing checksum"
+
+    # -- private-key gate (-4) ------------------------------------------------
+
+    def test_privkey_into_dpk_wallet_minus4(self, tmp_path):
+        wallet = self._make_wallet(tmp_path, dpk=True)
+        wif = self._regtest_wif(self.PRIV_SCALAR)
+        res = wallet.importdescriptors([
+            {"desc": add_checksum(f"wpkh({wif})"), "timestamp": 0},
+        ])
+        assert res[0]["success"] is False
+        assert res[0]["error"]["code"] == -4
+        assert res[0]["error"]["message"] == (
+            "Cannot import private keys to a wallet with "
+            "private keys disabled"
+        )
+        assert len(wallet.descriptors) == 0
+
+    def test_xprv_into_dpk_wallet_minus4(self, tmp_path):
+        wallet = self._make_wallet(tmp_path, network="mainnet", dpk=True)
+        res = wallet.importdescriptors([
+            {"desc": add_checksum(f"wpkh({_TEST_XPRV}/0/*)"), "timestamp": 0},
+        ])
+        assert res[0]["success"] is False
+        assert res[0]["error"]["code"] == -4
+
+    def test_privkey_into_normal_wallet_ok(self, tmp_path):
+        # Without disable_private_keys the WIF descriptor imports fine.
+        wallet = self._make_wallet(tmp_path, dpk=False)
+        wif = self._regtest_wif(self.PRIV_SCALAR)
+        res = wallet.importdescriptors([
+            {"desc": add_checksum(f"wpkh({wif})"), "timestamp": 0},
+        ])
+        assert res[0] == {"success": True}
+        # The derived script is the P2WPKH of the WIF's pubkey.
+        from coincurve import PrivateKey
+        from ouroboros.descriptors import _hash160
+        pub = PrivateKey(
+            bytes.fromhex(self.PRIV_SCALAR)
+        ).public_key.format(compressed=True)
+        assert b"\x00\x14" + _hash160(pub) in wallet._descriptor_script_map()
+
+    # -- balance credit (descriptor scripts feed the balance walk) ----------
+
+    def test_get_balance_credits_descriptor_utxos(self, tmp_path):
+        wallet = self._make_wallet(tmp_path, dpk=True)
+        addr, spk = self._bcrt_p2wpkh()
+        wallet.importdescriptors([
+            {"desc": add_checksum(f"addr({addr})"), "timestamp": 0},
+        ])
+
+        class _Db:
+            def get_best_block(self):
+                return (b"\x00" * 32, 104)
+
+            def list_unspent_by_address(self, a, network):
+                if a == addr:
+                    return [{
+                        "txid": "00" * 32, "vout": 0,
+                        "value": 5_000_000_000, "height": 1,
+                        "is_coinbase": True, "script_pubkey": spk,
+                    }]
+                return []
+
+        wallet.db = _Db()
+        import asyncio
+        assert asyncio.run(wallet.get_balance()) == 5_000_000_000
 
 
 # Cross-verification: wpkh xpub derivation against HDKey
