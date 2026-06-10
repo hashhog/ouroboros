@@ -639,8 +639,19 @@ class PeerManager:
         # orphaned cmpctblock round-trip — the 2026-06-02 93.8 GB OOM driver.
         self._partial_cmpct_blocks: dict = {}  # bytes -> (str, CompactBlock, list, float)
 
-        # BIP 330 Erlay reconciliation state
-        self.erlay_enabled: bool = True  # whether we support Erlay
+        # BIP 330 Erlay reconciliation state.
+        # Core-parity default is OFF: Bitcoin Core ships
+        # DEFAULT_TXRECONCILIATION_ENABLE{false} (net_processing.h:40) and only
+        # constructs its TxReconciliationTracker when the DEBUG_ONLY
+        # -txreconciliation arg is passed (net_processing.cpp:2018-2022), so a
+        # default Core node never sends sendtxrcncl and silently ignores any
+        # inbound sendtxrcncl (net_processing.cpp:3957-3961 — debug log only,
+        # no disconnect). Set OUROBOROS_ERLAY=1 to opt back in to the full
+        # reconciliation implementation (negotiation + 2s reconciliation loop);
+        # every downstream site is conditioned on this attribute.
+        self.erlay_enabled: bool = (
+            os.environ.get("OUROBOROS_ERLAY", "0") == "1"
+        )  # whether we initiate/accept Erlay reconciliation
         self._erlay_peers: dict[str, ReconciliationSet] = {}  # addr -> recon set
         self._erlay_local_salts: dict[str, int] = {}  # addr -> our salt
         self._erlay_pending_recon: dict[str, bool] = {}  # addr -> recon in progress

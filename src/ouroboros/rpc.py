@@ -1171,6 +1171,25 @@ class RPCServer:
             else:
                 result = await handler()
 
+            # Handlers may return a fully-formed JSONRPCResponse — the
+            # established idiom for Core-coded failures (e.g. -22
+            # "TX decode failed ..."). Unwrap it here: nesting the pydantic
+            # model inside "result" is unserializable by _BTCEncoder and
+            # surfaced as an opaque HTTP 500 "Internal Server Error" on the
+            # wire (observed live 2026-06-09 on the PSBT decode probes).
+            if isinstance(result, JSONRPCResponse):
+                if result.error is not None:
+                    return {
+                        "jsonrpc": "2.0",
+                        "error": result.error,
+                        "id": req_id,
+                    }
+                return {
+                    "jsonrpc": "2.0",
+                    "result": result.result,
+                    "id": req_id,
+                }
+
             return {"jsonrpc": "2.0", "result": result, "id": req_id}
 
         except RpcError as e:
@@ -3684,6 +3703,16 @@ class RPCServer:
                         scanned.add(k.get_p2tr_address())
                     except Exception:
                         pass
+                # Imported descriptors (watch-only included) are part of the
+                # wallet's UTXO view — Core DescriptorScriptPubKeyMan::IsMine
+                # is privkey-free script-set membership, so listunspent on a
+                # disable_private_keys wallet must surface their coins.
+                try:
+                    for a in wallet._descriptor_script_map().values():
+                        if a:
+                            scanned.add(a)
+                except Exception:
+                    pass
             addresses = list(scanned)
 
         for addr in addresses:
@@ -4038,6 +4067,9 @@ class RPCServer:
             raise HTTPException(
                 status_code=400, detail=f"Invalid base64 PSBT: {exc}"
             )
+        gate = self._psbt_v2_gate(original)
+        if gate is not None:
+            return gate
 
         resp = _payjoin.send_payjoin_request(
             endpoint_url,
@@ -4316,6 +4348,11 @@ class RPCServer:
             "hd": wallet.is_hd,
             "encrypted": wallet.is_encrypted,
             "locked": wallet.is_locked,
+            # Core wallet/rpc/wallet.cpp getwalletinfo: false for
+            # disable_private_keys (watch-only descriptor) wallets.
+            "private_keys_enabled": not getattr(
+                wallet, "_disable_private_keys", False
+            ),
         }
 
         if wallet.is_hd:
@@ -4373,6 +4410,73 @@ class RPCServer:
 
     # PSBT RPCs (BIP 174)
 
+    # --- PSBT v2 default-off gate (Core parity) ----------------------------
+    # Bitcoin Core supports ONLY PSBT v0 (psbt.h:80 PSBT_HIGHEST_VERSION = 0):
+    # any PSBT whose global 0xFB version record exceeds 0 fails
+    # deserialization with "Unsupported version number" (psbt.h:1322-1323),
+    # surfaced by every PSBT-accepting RPC as RPC_DESERIALIZATION_ERROR (-22)
+    # "TX decode failed Unsupported version number: iostream error" — the
+    # ": iostream error" suffix is ios_base::failure::what(); confirmed
+    # byte-identical against the v31.99.0 oracle (2026-06-09). ouroboros'
+    # psbt.py implements BIP-370 v2 end-to-end; to keep DEFAULT RPC behavior
+    # equal to Core's, v2+ PSBTs are rejected AT THE RPC BOUNDARY unless the
+    # operator opts in with OUROBOROS_PSBT_V2=1. The library layer is
+    # intentionally NOT gated (tests/test_fix63_psbt_v2_status.py exercises
+    # direct library v2 round-trips); creation surfaces (createpsbt,
+    # walletcreatefundedpsbt, converttopsbt, psbtbumpfee) always emit v0.
+
+    @staticmethod
+    def _psbt_v2_rpc_allowed() -> bool:
+        import os
+        return os.environ.get("OUROBOROS_PSBT_V2", "0") == "1"
+
+    def _psbt_v2_gate(self, psbt_obj: Any) -> "JSONRPCResponse | None":
+        """Return Core's ``-22`` rejection when *psbt_obj* carries a global
+        version record > 0 and ``OUROBOROS_PSBT_V2`` != ``1``, else ``None``.
+
+        Message observed byte-identically on the v31.99.0 oracle
+        (psbt.h:1322-1323 "Unsupported version number").
+        """
+        version = getattr(psbt_obj, "version", 0) or 0
+        if version > 0 and not self._psbt_v2_rpc_allowed():
+            return JSONRPCResponse(
+                error={
+                    "code": -22,
+                    "message": (
+                        "TX decode failed Unsupported version number:"
+                        " iostream error"
+                    ),
+                },
+                id=None,
+            )
+        return None
+
+    @staticmethod
+    def _psbt_decode_error(exc: Exception) -> "JSONRPCResponse":
+        """Map a PSBT deserialization failure to Core's -22 wire shape.
+
+        The v0-without-unsigned-tx failure (psbt.py raises "PSBT v0
+        requires unsigned transaction") is normalized to Core's exact wire
+        message — oracle-confirmed 2026-06-09: ``TX decode failed No
+        unsigned transaction was provided: iostream error``. Anything else
+        keeps this file's ``TX decode failed: <msg>`` convention.
+        """
+        if str(exc) == "PSBT v0 requires unsigned transaction":
+            return JSONRPCResponse(
+                error={
+                    "code": -22,
+                    "message": (
+                        "TX decode failed No unsigned transaction was"
+                        " provided: iostream error"
+                    ),
+                },
+                id=None,
+            )
+        return JSONRPCResponse(
+            error={"code": -22, "message": f"TX decode failed: {exc}"},
+            id=None,
+        )
+
     async def rpc_decodepsbt(self, psbt_base64: str) -> dict[str, Any]:
         """
         Decode a base64-encoded PSBT into a human-readable dict.
@@ -4398,10 +4502,10 @@ class RPCServer:
         try:
             psbt = PSBT.deserialize(raw)
         except Exception as exc:
-            return JSONRPCResponse(
-                error={"code": -22, "message": f"TX decode failed: {exc}"},
-                id=None,
-            )
+            return self._psbt_decode_error(exc)
+        gate = self._psbt_v2_gate(psbt)
+        if gate is not None:
+            return gate
         network = getattr(self.node, "network", "mainnet")
         return psbt.decode(network=network)
 
@@ -4425,6 +4529,10 @@ class RPCServer:
                 error={"code": -22, "message": f"TX decode failed: {exc}"},
                 id=None,
             )
+        for psbt_obj in decoded:
+            gate = self._psbt_v2_gate(psbt_obj)
+            if gate is not None:
+                return gate
         combined = decoded[0]
         for other in decoded[1:]:
             combined = combined.combine(other)
@@ -4449,6 +4557,9 @@ class RPCServer:
                 error={"code": -22, "message": f"TX decode failed: {exc}"},
                 id=None,
             )
+        gate = self._psbt_v2_gate(psbt)
+        if gate is not None:
+            return gate
 
         psbt.finalize()
 
@@ -9913,31 +10024,97 @@ class RPCServer:
         self.node.wallet.backup(destination)
 
     async def rpc_getaddressinfo(self, address: str) -> dict[str, Any]:
-        """Return information about a given address."""
+        """Return information about a given address.
+
+        ``ismine`` mirrors Core CWallet::IsMine(dest)
+        (wallet/wallet.cpp:1649-1671): script-set membership across the
+        wallet's keys AND its imported descriptors
+        (DescriptorScriptPubKeyMan::IsMine, scriptpubkeyman.cpp:863-867) —
+        private keys play no role, so watch-only imports (addr(), xpub-only
+        wpkh(), ...) report ismine=true. ``iswatchonly`` is DEPRECATED in
+        Core v31.99 and hardcoded false (wallet/rpc/addresses.cpp:383,478).
+        Routed through /wallet/<name> like every other wallet RPC.
+        """
+        wallet = self._get_wallet_for_rpc()
         is_mine = False
+        solvable = False
         pubkey_hex = ""
-        if hasattr(self.node, 'wallet') and self.node.wallet:
-            for kd in self.node.wallet.keys:
-                k = self.node.wallet._get_wallet_key(kd)
-                if (k.get_p2wpkh_address() == address
-                        or k.get_p2pkh_address() == address
-                        or k.get_p2sh_p2wpkh_address() == address):
+        if wallet is not None:
+            for kd in getattr(wallet, "keys", []):
+                try:
+                    k = wallet._get_wallet_key(kd)
+                except Exception:
+                    continue
+                key_addrs = []
+                for getter in (
+                    k.get_p2wpkh_address,
+                    k.get_p2pkh_address,
+                    k.get_p2sh_p2wpkh_address,
+                    k.get_p2tr_address,
+                ):
+                    try:
+                        key_addrs.append(getter())
+                    except Exception:
+                        continue
+                if address in key_addrs:
                     is_mine = True
+                    solvable = True
                     pubkey_hex = k.pubkey.hex()
                     break
+            if not is_mine:
+                # Imported descriptors: addr()/raw() entries are ISMINE but
+                # not solvable (Core AddressDescriptor::IsSolvable()=false);
+                # key-bearing descriptor entries are both.
+                try:
+                    for entry in getattr(wallet, "descriptors", []):
+                        desc = entry.descriptor
+                        if getattr(desc, "is_range", False):
+                            indices = range(
+                                int(entry.range_start),
+                                int(entry.range_end) + 1,
+                            )
+                        else:
+                            indices = range(0, 1)
+                        for i in indices:
+                            try:
+                                derived = desc.derive_address(
+                                    i, wallet.network
+                                )
+                            except Exception:
+                                continue
+                            if derived == address:
+                                is_mine = True
+                                solvable = desc.descriptor_type not in (
+                                    "addr", "raw"
+                                )
+                                break
+                        if is_mine:
+                            break
+                except Exception:
+                    pass
         script_type = "unknown"
-        if address.startswith("bc1q") or address.startswith("tb1q"):
+        lower = address.lower()
+        if lower.startswith(("bc1q", "tb1q", "bcrt1q")):
             script_type = "witness_v0_keyhash"
-        elif address.startswith("bc1p") or address.startswith("tb1p"):
+        elif lower.startswith(("bc1p", "tb1p", "bcrt1p")):
             script_type = "witness_v1_taproot"
         elif address.startswith("1") or address.startswith("m") or address.startswith("n"):
             script_type = "pubkeyhash"
         elif address.startswith("3") or address.startswith("2"):
             script_type = "scripthash"
+        spk_hex = ""
+        try:
+            from ouroboros.address import address_to_script_pubkey
+            spk_hex = address_to_script_pubkey(
+                address, getattr(self.node, "network", "mainnet")
+            ).hex()
+        except Exception:
+            pass
         return {
             "address": address,
-            "scriptPubKey": "",
+            "scriptPubKey": spk_hex,
             "ismine": is_mine,
+            "solvable": solvable,
             "iswatchonly": False,
             "isscript": script_type in ("scripthash",),
             "iswitness": script_type.startswith("witness"),
@@ -11653,7 +11830,17 @@ class RPCServer:
         Returns:
             Analysis including inputs status, next role, estimated fees
         """
-        from ouroboros.psbt import analyzepsbt
+        from ouroboros.psbt import PSBT, analyzepsbt
+
+        # Pre-parse for the v2 gate (PSBTs are small; the double decode is
+        # cheap) so default behavior matches Core's -22 rejection exactly.
+        try:
+            psbt_obj = PSBT.from_base64(psbt)
+        except Exception as exc:
+            return self._psbt_decode_error(exc)
+        gate = self._psbt_v2_gate(psbt_obj)
+        if gate is not None:
+            return gate
         return analyzepsbt(psbt)
 
     async def rpc_utxoupdatepsbt(
@@ -11672,6 +11859,9 @@ class RPCServer:
         from ouroboros.psbt import PSBT
 
         psbt_obj = PSBT.from_base64(psbt)
+        gate = self._psbt_v2_gate(psbt_obj)
+        if gate is not None:
+            return gate
 
         # Look up UTXOs from our database
         if psbt_obj.tx is not None and hasattr(self.node, 'db') and self.node.db:
@@ -11707,7 +11897,19 @@ class RPCServer:
         Returns:
             Joined base64-encoded PSBT
         """
-        from ouroboros.psbt import joinpsbts
+        from ouroboros.psbt import PSBT, joinpsbts
+
+        for p in psbts or []:
+            try:
+                psbt_obj = PSBT.from_base64(p)
+            except Exception as exc:
+                return JSONRPCResponse(
+                    error={"code": -22, "message": f"TX decode failed: {exc}"},
+                    id=None,
+                )
+            gate = self._psbt_v2_gate(psbt_obj)
+            if gate is not None:
+                return gate
         return joinpsbts(psbts)
 
     async def rpc_walletprocesspsbt(
@@ -11744,6 +11946,9 @@ class RPCServer:
         sighash_type = sighash_map.get(sighashtype.upper(), 0x01)
 
         psbt_obj = PSBT.from_base64(psbt)
+        gate = self._psbt_v2_gate(psbt_obj)
+        if gate is not None:
+            return gate
 
         if psbt_obj.tx is None:
             raise ValueError("PSBT has no transaction")
@@ -12375,12 +12580,43 @@ class RPCServer:
         Returns:
             List of results, one per request, containing success status
 
-        Reference: Bitcoin Core wallet/rpcwallet.cpp importdescriptors
+        Reference: Bitcoin Core wallet/rpc/backup.cpp importdescriptors
         """
-        if not hasattr(self.node, "wallet") or self.node.wallet is None:
+        # Route through /wallet/<name> like every other wallet RPC (Core
+        # GetWalletForJSONRPCRequest) — importing into self.node.wallet
+        # regardless of the URL path landed descriptors in the WRONG wallet.
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
             raise HTTPException(status_code=500, detail="Wallet not available")
 
-        return self.node.wallet.importdescriptors(requests)
+        results = wallet.importdescriptors(requests)
+
+        # Core wallet/rpc/backup.cpp:376-410: every request's timestamp is
+        # clamped to >= 1 (so 0 means "scan from genesis") and any successful
+        # import with a non-"now" timestamp triggers a SYNCHRONOUS
+        # RescanFromTime before the RPC returns — funds received BEFORE the
+        # import must be credited immediately. rescan_chain also rebuilds the
+        # wallet history records for the freshly-registered descriptor
+        # scripts (scan_block_connect reads the merged script set).
+        try:
+            needs_rescan = any(
+                isinstance(res, dict) and res.get("success") is True
+                and isinstance(req, dict)
+                and req.get("timestamp", "now") != "now"
+                for req, res in zip(requests, results, strict=False)
+            )
+        except Exception:
+            needs_rescan = False
+        if needs_rescan and getattr(wallet, "db", None) is not None:
+            tip = wallet._tip_height()
+            logger.info(
+                "importdescriptors: synchronous rescan of blocks 0..%d "
+                "(Core backup.cpp RescanFromTime parity; may take a while "
+                "on a long chain)", tip,
+            )
+            await asyncio.to_thread(wallet.rescan_chain, 0, None)
+
+        return results
 
     async def rpc_listdescriptors(self, private: bool = False) -> dict[str, Any]:
         """
@@ -12394,12 +12630,13 @@ class RPCServer:
 
         Reference: Bitcoin Core wallet/rpcwallet.cpp listdescriptors
         """
-        if not hasattr(self.node, "wallet") or self.node.wallet is None:
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
             raise HTTPException(status_code=500, detail="Wallet not available")
 
-        descriptors = self.node.wallet.listdescriptors()
+        descriptors = wallet.listdescriptors()
         return {
-            "wallet_name": getattr(self.node.wallet, "name", "default"),
+            "wallet_name": getattr(wallet, "name", "default"),
             "descriptors": descriptors,
         }
 

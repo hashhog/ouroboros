@@ -1007,10 +1007,15 @@ class TestG17Bip39Mnemonic:
             validate_mnemonic(["notaword"] * 12)
 
     def test_validate_mnemonic_wrong_checksum(self):
-        from ouroboros.bip39 import Bip39Error, WORDLIST
-        words = entropy_to_mnemonic(os.urandom(16))
-        # Flip last word to corrupt checksum
-        words[-1] = next(w for w in WORDLIST if w != words[-1])
+        # Deterministic (2026-06-09): the old random-entropy variant flipped
+        # the last word to the first different wordlist entry, which has a
+        # ~1/16 chance of producing a coincidentally-valid checksum — a
+        # recurring flake. "abandon" x12 is the canonical INVALID mnemonic
+        # (zero entropy requires final word "about").
+        from ouroboros.bip39 import Bip39Error
+        words = entropy_to_mnemonic(b"\x00" * 16)
+        assert words[-1] == "about"
+        words[-1] = "abandon"
         with pytest.raises(Bip39Error):
             validate_mnemonic(words)
 
@@ -1226,7 +1231,8 @@ class TestG23WalletStorage:
     def test_wallet_persists_descriptors(self):
         w, _ = _new_wallet()
         xpub = HDKey.from_seed(os.urandom(32)).serialize_xpub()
-        desc = f"wpkh({xpub}/0/*)"
+        # Checksum required (Core backup.cpp:158-161 parity, 2026-06-09).
+        desc = add_checksum(f"wpkh({xpub}/0/*)")
         w.importdescriptors([{"desc": desc, "timestamp": 0}])
         assert len(w.descriptors) == 1
         # Reload
@@ -1272,14 +1278,27 @@ class TestG24ImportDescriptors:
     def test_import_wpkh_range(self):
         w, _ = _new_wallet()
         xpub = HDKey.from_seed(os.urandom(32)).serialize_xpub()
-        desc = f"wpkh({xpub}/0/*)"
+        # Checksum required (Core backup.cpp:158-161 parity, 2026-06-09).
+        desc = add_checksum(f"wpkh({xpub}/0/*)")
         result = w.importdescriptors([{"desc": desc, "timestamp": 0}])
         assert result[0]["success"] is True
+
+    def test_unchecksummed_import_rejected_minus5(self):
+        # Core parity: importdescriptors requires the checksum
+        # (backup.cpp:158-161); missing '#...' -> -5 "Missing checksum".
+        w, _ = _new_wallet()
+        xpub = HDKey.from_seed(os.urandom(32)).serialize_xpub()
+        result = w.importdescriptors(
+            [{"desc": f"wpkh({xpub}/0/*)", "timestamp": 0}]
+        )
+        assert result[0]["success"] is False
+        assert result[0]["error"]["code"] == -5
+        assert result[0]["error"]["message"] == "Missing checksum"
 
     def test_list_descriptors_returns_imported(self):
         w, _ = _new_wallet()
         xpub = HDKey.from_seed(os.urandom(32)).serialize_xpub()
-        desc = f"wpkh({xpub}/0/*)"
+        desc = add_checksum(f"wpkh({xpub}/0/*)")
         w.importdescriptors([{"desc": desc, "timestamp": 0}])
         listed = w.listdescriptors()
         assert len(listed) == 1
