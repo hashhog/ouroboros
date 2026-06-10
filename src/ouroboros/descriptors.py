@@ -362,7 +362,8 @@ class KeyExpression:
     ext_key_str: str = ""                       # original xpub/tpub/xprv/tprv
     derivation_suffix: str = ""                 # e.g. "/0/*"
     is_range: bool = False                      # True when suffix contains *
-    is_private: bool = False                    # True when xprv/tprv
+    is_private: bool = False                    # True when xprv/tprv/WIF
+    wif: str = ""                               # original WIF when key was WIF
 
     def derive_pubkey(self, index: int = 0) -> bytes:
         """Return the 33-byte compressed public key at *index*."""
@@ -382,6 +383,28 @@ class KeyExpression:
     def derive_range(self, start: int, count: int) -> list[bytes]:
         """Derive *count* public keys starting at *start*."""
         return [self.derive_pubkey(i) for i in range(start, start + count)]
+
+
+def _try_decode_wif(s: str) -> tuple[bytes, bool] | None:
+    """Decode a WIF-encoded private key, or ``None`` if *s* is not WIF.
+
+    Core descriptors accept WIF key expressions (key_io.cpp DecodeSecret):
+    base58check payload = version byte (0x80 mainnet / 0xEF
+    testnet+regtest) + 32-byte scalar + optional 0x01 compressed marker.
+    Returns ``(raw_32_byte_key, compressed)``.
+    """
+    try:
+        payload = base58.b58decode_check(s)
+    except Exception:
+        return None
+    if not payload or payload[0] not in (0x80, 0xEF):
+        return None
+    body = payload[1:]
+    if len(body) == 33 and body[-1] == 0x01:
+        return bytes(body[:-1]), True
+    if len(body) == 32:
+        return bytes(body), False
+    return None
 
 
 def _parse_key_expression(raw: str) -> KeyExpression:
@@ -443,7 +466,26 @@ def _parse_key_expression(raw: str) -> KeyExpression:
             except ValueError:
                 raise ValueError(f"Invalid x-only pubkey hex: {hex_clean}") from None
         else:
-            raise ValueError(f"Cannot parse key expression: {raw}")
+            # WIF private key (Core accepts WIF in descriptors —
+            # script/descriptor.cpp ParsePubkeyInner -> DecodeSecret). The
+            # expression is flagged is_private so importdescriptors can
+            # enforce the disable_private_keys gate (backup.cpp:224-226);
+            # derivation uses the corresponding public key.
+            wif_decoded = _try_decode_wif(hex_clean)
+            if wif_decoded is None:
+                raise ValueError(f"Cannot parse key expression: {raw}")
+            priv_raw, compressed = wif_decoded
+            try:
+                from coincurve import PrivateKey
+                expr.hex_pubkey = PrivateKey(priv_raw).public_key.format(
+                    compressed=compressed
+                )
+            except Exception:
+                raise ValueError(
+                    f"Invalid WIF private key in expression: {raw}"
+                ) from None
+            expr.wif = hex_clean
+            expr.is_private = True
 
     return expr
 
@@ -903,40 +945,26 @@ def _compact_size(n: int) -> bytes:
 def _decode_address(addr: str, network: str = "mainnet") -> bytes:
     """Decode a Bitcoin address and return its scriptPubKey.
 
-    Supports: P2PKH (1.../m...), P2SH (3.../2...), P2WPKH (bc1q.../tb1q...),
-    P2WSH (bc1q... 32-byte), P2TR (bc1p.../tb1p...).
+    Supports: P2PKH (1.../m...), P2SH (3.../2...), P2WPKH
+    (bc1q.../tb1q.../bcrt1q...), P2WSH (32-byte v0 programs), P2TR
+    (bc1p.../tb1p.../bcrt1p...) and future witness versions 2-16.
+
+    The bech32/bech32m branch delegates to
+    :func:`ouroboros.address.address_to_script_pubkey` — the proven decoder
+    behind scantxoutset/scanblocks. The HRP is self-describing in the
+    address, so the *network* argument is not needed to decode it
+    (Core DecodeDestination, key_io.cpp:85-204: BECH32 required for v0,
+    BECH32M for v1+, v2-16 decode to WitnessUnknown).
     """
-    # Bech32/Bech32m addresses
-    if addr.lower().startswith(("bc1", "tb1")):
-        hrp = "bc" if network == "mainnet" else "tb"
+    # Bech32/Bech32m addresses (mainnet bc1, testnet/signet tb1, regtest bcrt1)
+    if addr.lower().startswith(("bc1", "tb1", "bcrt1")):
+        from ouroboros.address import address_to_script_pubkey
         try:
-            # Try bech32 first
-            decoded = bech32.bech32_decode(addr)
-            if decoded[0] is not None:
-                _, data = decoded
-                if data is None or len(data) < 1:
-                    raise ValueError(f"Invalid bech32 address: {addr}")
-                witver = data[0]
-                witprog = bytes(bech32.convertbits(data[1:], 5, 8, False))
-                if witver == 0:
-                    if len(witprog) == 20:
-                        # P2WPKH
-                        return b"\x00\x14" + witprog
-                    elif len(witprog) == 32:
-                        # P2WSH
-                        return b"\x00\x20" + witprog
+            return address_to_script_pubkey(addr, network)
         except Exception:
-            pass
-        # Try bech32m for taproot
-        try:
-            from ouroboros.address import _bech32m_decode
-            witver, witprog = _bech32m_decode(hrp, addr)
-            if witver == 1 and len(witprog) == 32:
-                # P2TR
-                return b"\x51\x20" + witprog
-        except Exception:
-            pass
-        raise ValueError(f"Invalid bech32/bech32m address: {addr}")
+            raise ValueError(
+                f"Invalid bech32/bech32m address: {addr}"
+            ) from None
 
     # Base58Check addresses (P2PKH, P2SH)
     try:
