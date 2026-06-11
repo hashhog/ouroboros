@@ -20,10 +20,12 @@ These tests verify:
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import types
 import unittest
 from dataclasses import dataclass, field
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -258,6 +260,77 @@ class TestPkgTxnsGate(unittest.TestCase):
         # Should not raise and must NOT mutate the mempool.
         asyncio.run(handlers["pkgtxns"](msg))
         self.assertEqual(self.pm._mempool.transactions, {})
+
+
+class TestPackageRelayDefaultGate(unittest.TestCase):
+    """BIP 331 package relay is a beyond-Core wire extension and must be
+    DEFAULT-OFF (Bitcoin Core v31.99 has no package-relay wire protocol and
+    never emits a sendpackages).  The opt-in is the OUROBOROS_PACKAGE_RELAY=1
+    env var, mirroring the OUROBOROS_ERLAY gate.
+
+    All four post-handshake dispatch sites and the handler registration are
+    already conditioned on ``package_relay_enabled``, so a default-OFF flag
+    suppresses the sendpackages SEND end-to-end while the RECEIVE side (peer
+    initiates) is unaffected.
+    """
+
+    def test_default_no_env_is_off(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OUROBOROS_PACKAGE_RELAY", None)
+            pm = PeerManager(network="regtest", listen=False)
+            self.assertFalse(
+                pm.package_relay_enabled,
+                "package_relay_enabled must default OFF so a default node "
+                "emits no sendpackages (Core v31.99 has no package-relay wire)",
+            )
+
+    def test_env_zero_is_off(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"OUROBOROS_PACKAGE_RELAY": "0"}, clear=False
+        ):
+            pm = PeerManager(network="regtest", listen=False)
+            self.assertFalse(pm.package_relay_enabled)
+
+    def test_env_one_re_enables(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"OUROBOROS_PACKAGE_RELAY": "1"}, clear=False
+        ):
+            pm = PeerManager(network="regtest", listen=False)
+            self.assertTrue(
+                pm.package_relay_enabled,
+                "OUROBOROS_PACKAGE_RELAY=1 must opt back in to BIP 331 relay",
+            )
+
+    def test_default_off_suppresses_send_dispatch(self) -> None:
+        """With the flag OFF the negotiate dispatch never runs, so no peer
+        is registered and no sendpackages is sent; the function itself is
+        unchanged and still sends when invoked directly (ON-path)."""
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OUROBOROS_PACKAGE_RELAY", None)
+            pm = PeerManager(network="regtest", listen=False)
+        # OFF: dispatch guard is False, so nothing would be negotiated/sent.
+        self.assertFalse(pm.package_relay_enabled)
+        self.assertEqual(pm._package_peers, set())
+
+        # ON-path sanity: the negotiate function itself still sends when the
+        # already-gated dispatch sites invoke it (verifies the gate is on the
+        # default flag, not on the send logic).
+        with mock.patch.dict(
+            os.environ, {"OUROBOROS_PACKAGE_RELAY": "1"}, clear=False
+        ):
+            pm_on = PeerManager(network="regtest", listen=False)
+        self.assertTrue(pm_on.package_relay_enabled)
+        peer = _make_peer()
+        sent: list[NetworkMessage] = []
+
+        async def fake_send(msg: NetworkMessage) -> None:
+            sent.append(msg)
+
+        peer.send_message = fake_send  # type: ignore[assignment]
+        asyncio.run(pm_on._negotiate_package_relay(peer))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0].command, "sendpackages")
+        self.assertTrue(peer._sendpackages_sent)
 
 
 if __name__ == "__main__":
