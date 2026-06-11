@@ -24,6 +24,7 @@ from ouroboros.p2p_messages import (
     NODE_BLOOM,
     NODE_COMPACT_FILTERS,
     NODE_NETWORK,
+    NODE_NETWORK_LIMITED,
     NODE_P2P_V2,
     NODE_WITNESS,
     NetworkAddress,
@@ -575,6 +576,44 @@ class Peer:
                 return False
         return bool(gate)
 
+    def _assemble_our_services(self) -> int:
+        """Build the service-flags bitset we advertise in our ``version``.
+
+        Mirrors Bitcoin Core's ``g_local_services`` (init.cpp). A full
+        (non-pruned) witness node advertises at minimum::
+
+            NODE_NETWORK (0x1) | NODE_WITNESS (0x8) | NODE_NETWORK_LIMITED (0x400)
+            = 0x409
+
+        - NODE_NETWORK_LIMITED is set UNCONDITIONALLY — it only promises the
+          last 288 blocks, which a full node also serves (Core init.cpp:863
+          sets it on g_local_services unconditionally; NODE_NETWORK is the
+          bit gated on not-pruning at init.cpp:1950). It is NOT prune-only.
+        - NODE_BLOOM only when -peerbloomfilters is on (default off).
+        - NODE_COMPACT_FILTERS only when -blockfilterindex is on AND synced.
+        - NODE_P2P_V2 only when this connection negotiated v2 transport
+          (BIP-324). ouroboros's v2 responder is genuinely default-on, so
+          advertising the bit when transport_version >= 2 is honest.
+        """
+        our_services = NODE_NETWORK | NODE_WITNESS
+        # BIP 111 NODE_BLOOM is advertised only when peer_bloom_filters
+        # is enabled (mirrors Bitcoin Core's -peerbloomfilters, default
+        # false; init.cpp:1104). BIP-35 MEMPOOL servicing is gated on
+        # this flag in p2p.py (matches Core net_processing.cpp ~4855).
+        if self.peer_bloom_filters:
+            our_services |= NODE_BLOOM
+        # FIX-71 / W121 BUG-5: NODE_COMPACT_FILTERS is gated on
+        # ``-blockfilterindex AND index-synced'' at handshake time, not
+        # at peer construction. See _should_advertise_node_compact_filters.
+        if self._should_advertise_node_compact_filters():
+            our_services |= NODE_COMPACT_FILTERS
+        # BIP-159: advertised unconditionally by every full node (see docstring).
+        our_services |= NODE_NETWORK_LIMITED
+        # BIP-324: honest only because ouroboros's v2 responder is default-on.
+        if self.transport_version >= 2:
+            our_services |= NODE_P2P_V2
+        return our_services
+
     async def connect(self, start_height: int = 0, retry: bool = True) -> bool:
         """Connect to the peer, complete the version handshake, and start background tasks."""
         max_attempts = self._max_retries + 1 if retry else 1
@@ -838,23 +877,8 @@ class Peer:
         addr_recv = self._create_network_address(self.host, self.port)
         addr_from = self._create_network_address("0.0.0.0", 8333)
 
-        # BIP 111 NODE_BLOOM is advertised only when peer_bloom_filters
-        # is enabled (mirrors Bitcoin Core's -peerbloomfilters, default
-        # false; init.cpp:1104).  BIP-35 MEMPOOL servicing is gated on
-        # this flag in p2p.py (matches Core net_processing.cpp ~4855).
-        our_services = NODE_NETWORK | NODE_WITNESS
-        if self.peer_bloom_filters:
-            our_services |= NODE_BLOOM
-        # FIX-71 / W121 BUG-5: NODE_COMPACT_FILTERS is gated on
-        # ``-blockfilterindex AND index-synced'' at handshake time, not
-        # at peer construction.  See _should_advertise_node_compact_filters.
-        if self._should_advertise_node_compact_filters():
-            our_services |= NODE_COMPACT_FILTERS
-        # BIP-159: signal limited-archive serving when prune mode is on.
-        if self.node_network_limited:
-            our_services |= NODE_NETWORK_LIMITED
-        if self.transport_version >= 2:
-            our_services |= NODE_P2P_V2
+        # Assemble the services we advertise (see _assemble_our_services).
+        our_services = self._assemble_our_services()
         self.our_services = our_services
         version_msg = VersionMessage(
             version=70016,
@@ -1355,23 +1379,8 @@ class Peer:
         # Send version message
         # Block-relay-only connections set relay=False (BIP 37) to signal
         # that we do not want transaction relay on this connection.
-        # BIP 111 NODE_BLOOM is advertised only when peer_bloom_filters
-        # is enabled (mirrors Bitcoin Core's -peerbloomfilters, default
-        # false; init.cpp:1104).  BIP-35 MEMPOOL servicing is gated on
-        # this flag in p2p.py (matches Core net_processing.cpp ~4855).
-        our_services = NODE_NETWORK | NODE_WITNESS
-        if self.peer_bloom_filters:
-            our_services |= NODE_BLOOM
-        # FIX-71 / W121 BUG-5: NODE_COMPACT_FILTERS is gated on
-        # ``-blockfilterindex AND index-synced'' at handshake time, not
-        # at peer construction.  See _should_advertise_node_compact_filters.
-        if self._should_advertise_node_compact_filters():
-            our_services |= NODE_COMPACT_FILTERS
-        # BIP-159: signal limited-archive serving when prune mode is on.
-        if self.node_network_limited:
-            our_services |= NODE_NETWORK_LIMITED
-        if self.transport_version >= 2:
-            our_services |= NODE_P2P_V2
+        # Assemble the services we advertise (see _assemble_our_services).
+        our_services = self._assemble_our_services()
         self.our_services = our_services
         version_msg = VersionMessage(
             version=70016,
