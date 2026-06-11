@@ -1603,14 +1603,26 @@ class RPCServer:
         # expensive os.walk on every getblockchaininfo call during IBD.
         size_on_disk = self._get_disk_usage_cached(db)
 
-        # Initial block download detection
-        # IBD if: sync progress < 99.9% OR last block time > 24 hours ago
-        is_ibd = not self._is_synced()
-        if not is_ibd and block_time > 0:
-            import time as _time
-            # If tip block is older than 24 hours, we're likely still syncing
-            if (_time.time() - block_time) > 24 * 60 * 60:
-                is_ibd = True
+        # Initial block download detection.
+        # On regtest, Core's IsInitialBlockDownload (validation.cpp) leaves IBD
+        # as soon as the chain is caught up: nMinimumChainWork is 0 and the node
+        # runs under -mocktime so the tip is never "stale". A submitblock-fed
+        # regtest node has no sync_manager progress (is_synced() stays False) and
+        # no mocktime clock, so both the sync-progress and the 24h wall-clock
+        # staleness heuristics would spuriously latch IBD. Scope BOTH heuristics
+        # OFF for regtest — report not-in-IBD once headers have caught up to
+        # blocks (the chain is fully connected). Keep the REAL gate on
+        # mainnet/testnet/signet.
+        if network == "regtest":
+            is_ibd = headers_count > best_height
+        else:
+            # IBD if: sync progress < 99.9% OR last block time > 24 hours ago.
+            is_ibd = not self._is_synced()
+            if not is_ibd and block_time > 0:
+                import time as _time
+                # If tip block is older than 24 hours, we're likely still syncing
+                if (_time.time() - block_time) > 24 * 60 * 60:
+                    is_ibd = True
 
         # Verification progress estimate
         # Use actual sync progress if available, otherwise estimate from time
@@ -1627,8 +1639,9 @@ class RPCServer:
                         (block_time - genesis_time) / (current_time - genesis_time)
                     ))
 
-        # Compute difficulty from cached bits (no FFI needed)
-        difficulty = self.node.get_difficulty(bits) if hasattr(self.node, 'get_difficulty') else 1.0
+        # Compute difficulty from cached bits (no FFI needed). Core prints it
+        # with %.16g, so wrap in _CoreFloat for the 16-sig-digit serialization.
+        difficulty = _CoreFloat(self.node.get_difficulty(bits)) if hasattr(self.node, 'get_difficulty') else _CoreFloat(1.0)
 
         # Median time from cached recent timestamps (no FFI needed)
         recent_ts = getattr(db, '_recent_timestamps', [])
@@ -1638,15 +1651,21 @@ class RPCServer:
         else:
             mediantime = block_time
 
-        # Chainwork — use incrementally-cached value (no FFI needed)
+        # Chainwork — use incrementally-cached value (no FFI needed).
+        # Core emits nChainWork.GetHex(): a 64-char zero-padded hex string with
+        # NO "0x" prefix (uint256 hex). Match that exactly.
         cached_cw = getattr(db, '_cached_chainwork', 0)
-        if cached_cw > 0:
-            chainwork = f"0x{cached_cw:x}"
-        else:
+        if cached_cw <= 0:
             try:
-                chainwork = await asyncio.to_thread(self.node.get_chainwork)
+                _cw_raw = await asyncio.to_thread(self.node.get_chainwork)
+                # get_chainwork may already be a hex string ("0x.." or bare) or int.
+                if isinstance(_cw_raw, str):
+                    cached_cw = int(_cw_raw, 16) if _cw_raw else 0
+                else:
+                    cached_cw = int(_cw_raw)
             except Exception:
-                chainwork = "0x0"
+                cached_cw = 0
+        chainwork = f"{cached_cw:064x}"
 
         # BIP 157/158 — surface whether the compact block filter index is
         # active.  Mirrors Bitcoin Core's getblockchaininfo "compact_filters"
@@ -1656,6 +1675,12 @@ class RPCServer:
             getattr(self.node, "block_filter_index", None) is not None
         )
 
+        # Core v31.99 getblockchaininfo (blockchain.cpp:1420) — NOTE: this
+        # version DROPPED the top-level "softforks" object (moved to
+        # getdeploymentinfo) and never had "compact_filters_enabled". Shape:
+        #   chain, blocks, headers, bestblockhash, bits, target, difficulty,
+        #   time, mediantime, verificationprogress, initialblockdownload,
+        #   chainwork, size_on_disk, pruned, [prune fields], warnings.
         info: dict[str, Any] = {
             "chain": self._rpc_chain_name(network),
             "blocks": best_height,
@@ -1671,8 +1696,6 @@ class RPCServer:
             "chainwork": chainwork,
             "size_on_disk": size_on_disk,
             "pruned": pruned,
-            "softforks": softforks,
-            "compact_filters_enabled": compact_filters_enabled,
         }
 
         if pruner is not None:
@@ -1970,13 +1993,13 @@ class RPCServer:
         # Number of transactions
         n_tx = len(block.transactions) if hasattr(block, 'transactions') and block.transactions else 0
 
-        # Build result
+        # Build result. Core's blockToJSON = blockheaderToJSON (header fields,
+        # ending with previousblockhash/nextblockhash) THEN strippedsize/size/
+        # weight/coinbase_tx/tx appended at the block tail (blockchain.cpp:202).
+        # strippedsize/size/weight are NOT emitted up here next to confirmations.
         result: dict[str, Any] = {
             "hash": blockhash,
             "confirmations": confirmations,
-            "size": size,
-            "strippedsize": strippedsize,
-            "weight": weight,
             "height": block_height if block_height is not None else 0,
             "version": block.version,
             "versionHex": f"{block.version:08x}",
@@ -2000,6 +2023,12 @@ class RPCServer:
             next_hash = await self._get_next_block_hash(block_height)
             if next_hash:
                 result["nextblockhash"] = next_hash
+
+        # Block-tail size fields (Core blockToJSON order: strippedsize, size,
+        # weight — appended AFTER the header fields, before coinbase_tx).
+        result["strippedsize"] = strippedsize
+        result["size"] = size
+        result["weight"] = weight
 
         # Build coinbase_tx from first transaction's first input (Core 27+ field).
         # Use witness_txs[0] if already parsed (verbosity >= 2 path), else parse
@@ -2088,14 +2117,15 @@ class RPCServer:
                 for i, tx in enumerate(txs_for_encoding):
                     tx_dict = _psbt_tx_to_univ(tx, network)
 
-                    # Add hex field (witness-serialized bytes in hex).
-                    # Core's TxToUniv include_hex=True path (core_io.cpp:490).
-                    tx_dict["hex"] = tx.serialize_with_witness().hex()
-
-                    # Fee for non-coinbase transactions.
-                    # Use get_utxo_or_spent so that historical blocks whose
-                    # inputs have already been spent (removed from the live UTXO
-                    # set) can still yield fee data from SPENT_CF undo records.
+                    # Core's TxToUniv (core_io.cpp:430) appends, in order:
+                    #   ... vout, [fee], [blockhash], [hex]
+                    # i.e. fee comes BEFORE hex. Emit fee first (non-coinbase),
+                    # then hex.
+                    #
+                    # Fee for non-coinbase transactions. Use get_utxo_or_spent so
+                    # historical blocks whose inputs were already spent (removed
+                    # from the live UTXO set) still yield fee data from SPENT_CF
+                    # undo records.
                     if not tx.is_coinbase:
                         input_total = 0
                         for tx_in in tx.inputs:
@@ -2114,6 +2144,10 @@ class RPCServer:
                             # _BTCEncoder via _BTCJsonResponse.
                             from ouroboros.psbt import BTCAmount as _BTCAmount
                             tx_dict["fee"] = _BTCAmount(fee_sats)
+
+                    # Add hex field (witness-serialized bytes in hex).
+                    # Core's TxToUniv include_hex=True path (core_io.cpp:502).
+                    tx_dict["hex"] = tx.serialize_with_witness().hex()
 
                     if verbosity >= 3:
                         # Include prevout information for each input (verbosity=3).
@@ -2504,18 +2538,24 @@ class RPCServer:
         - fullrbf: True if mempool accepts RBF without signaling
         """
         if not hasattr(self.node, "mempool") or self.node.mempool is None:
+            from ouroboros.psbt import BTCAmount
             return {
                 "loaded": True,
                 "size": 0,
                 "bytes": 0,
                 "usage": 0,
-                "total_fee": 0.0,
+                "total_fee": BTCAmount(0),
                 "maxmempool": 300_000_000,
-                "mempoolminfee": 0.00001,
-                "minrelaytxfee": 0.00001,
-                "incrementalrelayfee": 0.00001,
+                "mempoolminfee": BTCAmount(100),
+                "minrelaytxfee": BTCAmount(100),
+                "incrementalrelayfee": BTCAmount(100),
                 "unbroadcastcount": 0,
                 "fullrbf": True,
+                "permitbaremultisig": True,
+                "maxdatacarriersize": 100_000,
+                "limitclustercount": 64,
+                "limitclustersize": 101_000,
+                "optimal": True,
             }
 
         mempool = self.node.mempool
@@ -2555,29 +2595,40 @@ class RPCServer:
             # If require_standard is False, we likely accept full RBF
             full_rbf = True
 
-        # Min fee rate calculation (mempoolminfee)
-        # This is max(minrelaytxfee, dynamic_min_fee_for_mempool_acceptance)
-        min_fee_rate = info.get('min_fee_rate', 1000)  # sat/kvB
-        mempoolminfee_btc = min_fee_rate / 1e8  # BTC/kvB
+        from ouroboros.psbt import BTCAmount
 
-        # Min relay tx fee (static policy setting)
-        minrelaytxfee_btc = 0.00001  # 1 sat/vB = 0.00001 BTC/kvB
+        # Core v31.99 lowered DEFAULT_MIN_RELAY_TX_FEE / DEFAULT_INCREMENTAL_
+        # RELAY_FEE from 1000 to 100 sat/kvB (policy.h). ValueFromAmount of
+        # CFeeRate(100).GetFeePerK() = 0.00000100 BTC. mempoolminfee is
+        # max(GetMinFee, min_relay_feerate).GetFeePerK() = 100 sat on an empty
+        # regtest mempool. Emit all three via BTCAmount so the fixed-8-decimal
+        # token matches Core (Python float 0.00000100 reprs as 1e-06).
+        _MIN_RELAY_SATS = 100
+        min_fee_rate = info.get('min_fee_rate', 0)  # sat/kvB, dynamic floor
+        mempoolminfee_sats = max(int(min_fee_rate), _MIN_RELAY_SATS)
 
-        # Incremental relay fee for RBF (typically same as minrelaytxfee)
-        incrementalfee_btc = 0.00001
-
+        # Core key order (mempool.cpp MempoolInfoToJSON): loaded, size, bytes,
+        # usage, total_fee, maxmempool, mempoolminfee, minrelaytxfee,
+        # incrementalrelayfee, unbroadcastcount, fullrbf, permitbaremultisig,
+        # maxdatacarriersize, limitclustercount, limitclustersize, optimal.
         return {
             "loaded": loaded,
             "size": info['size'],
             "bytes": info['bytes'],
             "usage": usage,
-            "total_fee": total_fee_sat / 1e8,  # BTC
+            "total_fee": BTCAmount(int(total_fee_sat)),
             "maxmempool": info.get('max_size', 300_000_000),
-            "mempoolminfee": mempoolminfee_btc,
-            "minrelaytxfee": minrelaytxfee_btc,
-            "incrementalrelayfee": incrementalfee_btc,
+            "mempoolminfee": BTCAmount(mempoolminfee_sats),
+            "minrelaytxfee": BTCAmount(_MIN_RELAY_SATS),
+            "incrementalrelayfee": BTCAmount(_MIN_RELAY_SATS),
             "unbroadcastcount": unbroadcast_count,
             "fullrbf": full_rbf,
+            # The 5 policy fields Core v31.99 added after fullrbf, in Core order.
+            "permitbaremultisig": True,        # DEFAULT_PERMIT_BAREMULTISIG
+            "maxdatacarriersize": 100_000,     # MAX_OP_RETURN_RELAY
+            "limitclustercount": 64,           # DEFAULT_CLUSTER_LIMIT
+            "limitclustersize": 101_000,       # DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000
+            "optimal": True,                   # DoWork(0) on default mempool
         }
 
     # Default maxfeerate: 0.10 BTC/kvB (100,000 sat/kvB = 100 sat/vB)
@@ -2862,8 +2913,15 @@ class RPCServer:
 
         total_connections = len(peers)
 
-        # Local services we offer
-        local_services = 0x0409  # NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED
+        # Local services we offer (Core's g_local_services, init.cpp:863+987).
+        # ouroboros is v2-transport-default-on, so — like Core with
+        # DEFAULT_V2_TRANSPORT — NODE_P2P_V2 (bit 11, 0x800) is set in the
+        # NODE-LEVEL advertised word UNCONDITIONALLY (independent of any single
+        # connection's negotiated transport or of inbound-listen state). A full
+        # witness node advertises:
+        #   NODE_NETWORK(0x1) | NODE_WITNESS(0x8) | NODE_NETWORK_LIMITED(0x400)
+        #   | NODE_P2P_V2(0x800) = 0xc09
+        local_services = 0x0C09
         if hasattr(self.node, 'local_services'):
             local_services = self.node.local_services
         elif pm and hasattr(pm, 'local_services'):
@@ -2901,18 +2959,24 @@ class RPCServer:
         # Networks info
         networks = []
         for net_name in ["ipv4", "ipv6", "onion", "i2p", "cjdns"]:
+            # Core: limited == !reachable, reachable == g_reachable_nets.Contains
+            # (net.cpp GetNetworksInfo). With no proxy/onlynet, only clearnet
+            # (ipv4/ipv6) is reachable; onion/i2p/cjdns report reachable=false
+            # and therefore limited=true.
+            default_reachable = net_name in ["ipv4", "ipv6"]
             net_info = {
                 "name": net_name,
-                "limited": False,
-                "reachable": net_name in ["ipv4", "ipv6"],  # Default reachability
+                "limited": not default_reachable,
+                "reachable": default_reachable,
                 "proxy": "",
                 "proxy_randomize_credentials": False,
             }
             # Check if we have specific network config
             if hasattr(self.node, 'network_config'):
                 nc = self.node.network_config.get(net_name, {})
-                net_info["limited"] = nc.get("limited", False)
-                net_info["reachable"] = nc.get("reachable", net_name in ["ipv4", "ipv6"])
+                reachable = nc.get("reachable", default_reachable)
+                net_info["limited"] = nc.get("limited", not reachable)
+                net_info["reachable"] = reachable
                 net_info["proxy"] = nc.get("proxy", "")
                 net_info["proxy_randomize_credentials"] = nc.get("proxy_randomize_credentials", False)
             networks.append(net_info)
@@ -2927,14 +2991,19 @@ class RPCServer:
                     "score": addr_info.get("score", 0),
                 })
 
-        # Relay fee (minimum fee for tx to be relayed)
-        relay_fee = 0.00001  # 1 sat/vB in BTC/kvB
+        from ouroboros.psbt import BTCAmount
+
+        # Relay fee + incremental fee. Core v31.99 lowered DEFAULT_MIN_RELAY_TX
+        # _FEE / DEFAULT_INCREMENTAL_RELAY_FEE to 100 sat/kvB (policy.h);
+        # ValueFromAmount(CFeeRate(100).GetFeePerK()) = 0.00000100 BTC. Emit via
+        # BTCAmount for the fixed-8-decimal token (Python float reprs as 1e-06).
+        relay_fee = BTCAmount(100)
         if hasattr(self.node, 'mempool') and self.node.mempool:
             if hasattr(self.node.mempool, 'min_relay_fee'):
-                relay_fee = self.node.mempool.min_relay_fee / 1e8
+                relay_fee = BTCAmount(int(self.node.mempool.min_relay_fee))
 
         # Incremental fee for RBF
-        incremental_fee = 0.00001
+        incremental_fee = BTCAmount(100)
 
         # Warnings
         warnings = []
@@ -5166,9 +5235,10 @@ class RPCServer:
         #   PayToAnchor. isscript=false for PKHash (P2PKH) and WitnessV0KeyHash (P2WPKH).
         is_script = script_type in ("scripthash", "witness_v0_scripthash", "witness_v1_taproot")
 
+        # Core emits isvalid FIRST, then address (output_script.cpp:66-70).
         result: dict[str, Any] = {
-            "address": address,
             "isvalid": True,
+            "address": address,
             "scriptPubKey": script_pubkey.hex(),
             "isscript": is_script,
             "iswitness": is_witness,
@@ -5317,25 +5387,32 @@ class RPCServer:
             target_int = mantissa << (8 * (exponent - 3))
         bits_hex = f"{bits:08x}"
         target_hex = f"{target_int:064x}"
-        difficulty = self.node.get_current_difficulty()
+        from ouroboros.psbt import BTCAmount
+
+        _raw_diff = self.node.get_current_difficulty()
+        difficulty = _CoreFloat(_raw_diff) if isinstance(_raw_diff, float) else _raw_diff
         next_height = height + 1
 
+        # Core key order (mining.cpp:463): blocks, bits, difficulty, target,
+        # networkhashps, pooledtx, blockmintxfee, chain, next{}, warnings.
+        # blockmintxfee = DEFAULT_BLOCK_MIN_TX_FEE (1 sat) => 0.00000001 BTC/kvB.
+        # warnings is an ARRAY (Core v31.99 dropped the deprecated string form).
         return {
             "blocks": height,
             "bits": bits_hex,
             "difficulty": difficulty,
             "target": target_hex,
-            "blockmintxfee": 0.00001000,
             "networkhashps": 0,
             "pooledtx": len(mempool.get_all_transactions()) if mempool else 0,
+            "blockmintxfee": BTCAmount(1),
             "chain": self._rpc_chain_name(getattr(self.node, "network", "mainnet")),
             "next": {
                 "height": next_height,
                 "bits": bits_hex,
-                "difficulty": difficulty,
+                "difficulty": (_CoreFloat(_raw_diff) if isinstance(_raw_diff, float) else _raw_diff),
                 "target": target_hex,
             },
-            "warnings": "",
+            "warnings": [],
         }
 
     async def rpc_getblocktemplate(self, template_request: dict = None) -> dict[str, Any]:
@@ -7742,9 +7819,14 @@ class RPCServer:
         return obj
 
     async def rpc_getdifficulty(self) -> float:
-        """Return the current difficulty."""
+        """Return the current difficulty.
+
+        Core prints difficulty with ``%.16g`` (UniValue setprecision(16));
+        wrap in ``_CoreFloat`` so the serializer emits the 16-sig-digit form
+        (e.g. ``4.656542373906925e-10``) rather than Python's 17-digit repr.
+        """
         if not hasattr(self.node, 'db') or not self.node.db:
-            return 0.0
+            return _CoreFloat(0.0)
         try:
             _, best_height = self.node.db.get_best_block()
             block = await asyncio.to_thread(self.node.db.get_block_by_height, best_height)
@@ -7755,17 +7837,17 @@ class RPCServer:
                 mantissa = bits & 0x007FFFFF
                 exponent = (bits >> 24) & 0xFF
                 if mantissa == 0:
-                    return 0.0
+                    return _CoreFloat(0.0)
                 if exponent <= 3:
                     target = mantissa >> (8 * (3 - exponent))
                 else:
                     target = mantissa << (8 * (exponent - 3))
                 if target == 0:
-                    return 0.0
-                return max_target / target
+                    return _CoreFloat(0.0)
+                return _CoreFloat(max_target / target)
         except Exception:
-            return 0.0
-        return 0.0
+            return _CoreFloat(0.0)
+        return _CoreFloat(0.0)
 
     def _cumulative_tx_count(self, db, height: int) -> int:
         """Total number of transactions in the active chain in blocks [0..height].
@@ -7967,8 +8049,10 @@ class RPCServer:
         # Active chain tip ---------------------------------------------------
         best_hash, best_height = db.get_best_block()
         tip_hash_hex: str
+        # Core emits the DISPLAY (big-endian / byte-reversed) hash here, same as
+        # getbestblockhash/getblockheader. The internal hash is little-endian.
         if isinstance(best_hash, bytes):
-            tip_hash_hex = best_hash.hex()
+            tip_hash_hex = best_hash[::-1].hex()
         else:
             tip_hash_hex = str(best_hash)
 
@@ -8081,7 +8165,8 @@ class RPCServer:
 
                 tips.append({
                     "height": block_height,
-                    "hash": block_hash.hex() if isinstance(block_hash, bytes) else str(block_hash),
+                    # Display (byte-reversed) hash, matching Core.
+                    "hash": block_hash[::-1].hex() if isinstance(block_hash, bytes) else str(block_hash),
                     "branchlen": branchlen,
                     "status": status,
                 })
@@ -8266,24 +8351,19 @@ class RPCServer:
             if isinstance(best_hash_internal, (bytes, bytearray))
             else ""
         )
-        # Core formats CAmount via ValueFromAmount, which produces a
-        # JSON number with 8 decimal places. ``Decimal`` keeps the
-        # rounding deterministic (no float imprecision at large totals).
-        total_amount_btc = Decimal(stats["total_amount"]) / Decimal(100_000_000)
+        # Core formats CAmount via ValueFromAmount, which produces a JSON
+        # number with 8 decimal places ("%d.%08d"). Use BTCAmount so the
+        # serializer emits that exact decimal token.
+        from ouroboros.psbt import BTCAmount
 
+        # Core key order (blockchain.cpp:1114, non-index path):
+        #   height, bestblock, txouts, bogosize, [hash digest], total_amount,
+        #   transactions, disk_size.
         result: dict[str, Any] = {
             "height": int(best_height),
             "bestblock": bestblock_hex,
             "txouts": stats["txouts"],
             "bogosize": stats["bogosize"],
-            "transactions": stats["transactions"],
-            # Float for JSON; matches Core's wire output semantics
-            # (consensus-diff harness compares string forms only).
-            "total_amount": float(total_amount_btc),
-            # disk_size: ouroboros stores the chainstate in RocksDB and
-            # does not expose a per-CF size estimate here; emit 0 so the
-            # field is present (Core also emits 0 when no view is open).
-            "disk_size": 0,
         }
         if hash_type_norm in ("hash_serialized_3", "hash_serialized_2"):
             digest_hex = stats["sha_digest"][::-1].hex()
@@ -8295,6 +8375,13 @@ class RPCServer:
         elif hash_type_norm == "muhash":
             result["muhash"] = stats["muhash_digest"][::-1].hex()
         # hash_type=="none": emit no digest field, matching Core.
+
+        result["total_amount"] = BTCAmount(int(stats["total_amount"]))
+        result["transactions"] = stats["transactions"]
+        # disk_size: ouroboros stores the chainstate in RocksDB and does not
+        # expose a per-CF size estimate here; emit 0 so the field is present
+        # (Core also emits 0 when no view is open / unflushed on regtest).
+        result["disk_size"] = 0
 
         return result
 
@@ -11257,7 +11344,19 @@ class RPCServer:
                     status_code=404, detail="Block not found"
                 )
 
-        block_height = getattr(block, "height", None) or 0
+        # Resolve height. The wire-format Block carries height=None, so prefer
+        # the height the caller asked for (int form); otherwise look it up by
+        # hash. Falling back to 0 produces a wrong subsidy AND a height=0 field.
+        block_height = getattr(block, "height", None)
+        if block_height is None:
+            if isinstance(hash_or_height, int):
+                block_height = hash_or_height
+            else:
+                bh = block.hash if isinstance(block.hash, bytes) else bytes(32)
+                resolved = None
+                if hasattr(db, "get_block_height"):
+                    resolved = await asyncio.to_thread(db.get_block_height, bh)
+                block_height = resolved if resolved is not None else 0
         block_hash_bytes = (
             block.hash if isinstance(block.hash, bytes) else bytes(32)
         )
@@ -11281,144 +11380,210 @@ class RPCServer:
             subsidy = (50 * 100_000_000) >> halvings
 
         # ------------------------------------------------------------------
-        # Iterate transactions and accumulate statistics
+        # Iterate transactions and accumulate statistics. This mirrors Bitcoin
+        # Core's getblockstats accumulation loop (rpc/blockchain.cpp:2073-2165)
+        # exactly: coinbase inputs are NOT counted, sizes use the witness-
+        # inclusive serialization (ComputeTotalSize), per-UTXO sizes use
+        # GetSerializeSize(out)+PER_UTXO_OVERHEAD, and feerate is per-vbyte
+        # (txfee*4 / weight). Spent prevout values come from get_utxo_or_spent
+        # (Core reads them from the block undo data).
         # ------------------------------------------------------------------
-        txs_list: list[Transaction] = (
+        # The wire-format Block produced by _py_block_to_block carries NO
+        # witness data (every Transaction has has_witness=False), so its
+        # serialize_with_witness() returns the STRIPPED size and HasWitness()
+        # is always false — which would zero out swtxs/swtotal_* and undercount
+        # total_size/maxtxsize. Re-parse the raw block bytes (witness-preserving)
+        # the same way getblock verbosity>=2 does, falling back to the stripped
+        # Block only if raw bytes are unavailable.
+        block_hash_for_bytes = (
+            block.hash if isinstance(block.hash, bytes) else None
+        )
+        raw_block_bytes = None
+        if block_hash_for_bytes is not None and hasattr(db, "get_block_bytes"):
+            raw_block_bytes = await asyncio.to_thread(
+                db.get_block_bytes, block_hash_for_bytes
+            )
+        stripped_txs: list[Transaction] = (
             block.transactions if hasattr(block, "transactions") else []
         )
+        txs_list = stripped_txs
+        if raw_block_bytes is not None:
+            try:
+                witness_txs = _parse_block_txs(raw_block_bytes)
+                if witness_txs and len(witness_txs) == len(stripped_txs):
+                    txs_list = witness_txs
+            except Exception:
+                txs_list = stripped_txs
         num_txs = len(txs_list)
+
+        WITNESS_SCALE_FACTOR = 4
+        # PER_UTXO_OVERHEAD = sizeof(COutPoint)+sizeof(uint32_t)+sizeof(bool)
+        #   = (32+4) + 4 + 1 = 41 (rpc/blockchain.cpp:1954).
+        PER_UTXO_OVERHEAD = 41
+        MAX_MONEY = 21_000_000 * 100_000_000
+
+        def _compactsize_len(n: int) -> int:
+            if n < 0xFD:
+                return 1
+            if n <= 0xFFFF:
+                return 3
+            if n <= 0xFFFFFFFF:
+                return 5
+            return 9
+
+        def _txout_serialize_size(spk: bytes) -> int:
+            # GetSerializeSize(CTxOut) = 8 (nValue int64) + CompactSize(len) + len
+            return 8 + _compactsize_len(len(spk)) + len(spk)
+
+        def _is_unspendable(spk: bytes) -> bool:
+            # CScript::IsUnspendable: starts with OP_RETURN (0x6a) or too large.
+            return (len(spk) > 0 and spk[0] == 0x6a) or len(spk) > 10_000
 
         total_size = 0
         total_weight = 0
-        total_out = 0          # sum of all output values (satoshis)
+        total_out = 0          # sum of NON-coinbase output values (satoshis)
         totalfee = 0           # sum of all non-coinbase fees
 
-        ins = 0
-        outs = 0
+        inputs = 0             # non-coinbase inputs only
+        outputs = 0            # all outputs (incl. coinbase)
 
         swtxs = 0
         swtotal_size = 0
         swtotal_weight = 0
 
-        utxo_increase = 0      # outputs created minus inputs spent
+        utxos = 0              # spendable outputs added (excl. genesis/BIP30)
+        utxo_size_inc = 0
+        utxo_size_inc_actual = 0
 
-        # Per-tx collections (exclude coinbase for fee stats)
-        tx_fees: list[int] = []
-        tx_feerates: list[int] = []   # sat / vbyte (integer)
-        tx_sizes: list[int] = []
+        maxfee = 0
+        minfee = MAX_MONEY
+        maxfeerate = 0
+        minfeerate = MAX_MONEY
+        maxtxsize = 0
+        mintxsize = MAX_MONEY
+
+        fee_array: list[int] = []
+        feerate_array: list[tuple[int, int]] = []   # (feerate, weight)
+        txsize_array: list[int] = []
 
         for tx in txs_list:
-            tx_size = len(tx.serialize())
-            tx_weight = tx.get_weight()
-            tx_vsize = tx.get_vsize()
+            outputs += len(tx.outputs)
 
+            tx_total_out = 0
+            for o in tx.outputs:
+                tx_total_out += o.value
+                out_size = _txout_serialize_size(o.script_pubkey) + PER_UTXO_OVERHEAD
+                utxo_size_inc += out_size
+                # Genesis (height 0) coinbase outputs do not enter the UTXO set
+                # count; also skip unspendable outputs.
+                if block_height == 0:
+                    continue
+                if _is_unspendable(o.script_pubkey):
+                    continue
+                utxos += 1
+                utxo_size_inc_actual += out_size
+
+            if tx.is_coinbase:
+                continue
+
+            inputs += len(tx.inputs)   # don't count coinbase's fake input
+            total_out += tx_total_out  # don't count coinbase reward
+
+            tx_size = len(tx.serialize_with_witness())  # ComputeTotalSize
+            txsize_array.append(tx_size)
+            maxtxsize = max(maxtxsize, tx_size)
+            mintxsize = min(mintxsize, tx_size)
             total_size += tx_size
-            total_weight += tx_weight
 
-            n_in = len(tx.inputs)
-            n_out = len(tx.outputs)
-            ins += n_in
-            outs += n_out
-            utxo_increase += n_out  # each output creates a UTXO
-
-            out_value = sum(o.value for o in tx.outputs)
-            total_out += out_value
+            weight = tx.get_weight()
+            total_weight += weight
 
             if tx.has_witness:
                 swtxs += 1
                 swtotal_size += tx_size
-                swtotal_weight += tx_weight
+                swtotal_weight += weight
 
-            if tx.is_coinbase:
-                # Coinbase has no real inputs to spend
-                # utxo_increase is not reduced by coinbase inputs
-                continue
-
-            # Non-coinbase: each input spends a UTXO
-            utxo_increase -= n_in
-
-            # Fee = sum(input values) - sum(output values)
-            input_total = 0
+            # Inputs: sum prevout values (from undo / spent store) + UTXO deltas.
+            tx_total_in = 0
             for tx_in in tx.inputs:
-                utxo = await asyncio.to_thread(db.get_utxo, tx_in.prev_txid, tx_in.prev_vout)
+                utxo = await asyncio.to_thread(
+                    db.get_utxo_or_spent, tx_in.prev_txid, tx_in.prev_vout
+                )
                 if utxo:
-                    input_total += utxo["value"]
+                    tx_total_in += utxo["value"]
+                    prevout_size = (
+                        _txout_serialize_size(utxo["script_pubkey"])
+                        + PER_UTXO_OVERHEAD
+                    )
+                    utxo_size_inc -= prevout_size
+                    utxo_size_inc_actual -= prevout_size
 
-            fee = input_total - out_value
-            if fee < 0:
-                fee = 0
+            txfee = tx_total_in - tx_total_out
+            fee_array.append(txfee)
+            maxfee = max(maxfee, txfee)
+            minfee = min(minfee, txfee)
+            totalfee += txfee
 
-            totalfee += fee
-            tx_fees.append(fee)
-            tx_sizes.append(tx_size)
+            # feerate in sat/vbyte = txfee*WITNESS_SCALE_FACTOR / weight
+            feerate = (txfee * WITNESS_SCALE_FACTOR) // weight if weight else 0
+            feerate_array.append((feerate, weight))
+            maxfeerate = max(maxfeerate, feerate)
+            minfeerate = min(minfeerate, feerate)
 
-            if tx_vsize > 0:
-                tx_feerates.append(fee // tx_vsize)
-            else:
-                tx_feerates.append(0)
+        # --- truncated median (Core CalculateTruncatedMedian) ---------------
+        def _trunc_median(scores: list[int]) -> int:
+            n = len(scores)
+            if n == 0:
+                return 0
+            s = sorted(scores)
+            if n % 2 == 0:
+                return (s[n // 2 - 1] + s[n // 2]) // 2
+            return s[n // 2]
 
-        # ------------------------------------------------------------------
-        # Aggregates (guard against empty lists)
-        # ------------------------------------------------------------------
-        if tx_fees:
-            avgfee = totalfee // len(tx_fees)
-            minfee = min(tx_fees)
-            maxfee = max(tx_fees)
-            medianfee = int(statistics.median(tx_fees))
-        else:
-            avgfee = minfee = maxfee = medianfee = 0
+        # --- feerate percentiles by weight (Core CalculatePercentilesByWeight)
+        feerate_percentiles = [0, 0, 0, 0, 0]
+        if feerate_array:
+            scores = sorted(feerate_array)  # sorts by (feerate, weight)
+            weights = [
+                total_weight / 10.0,
+                total_weight / 4.0,
+                total_weight / 2.0,
+                (total_weight * 3.0) / 4.0,
+                (total_weight * 9.0) / 10.0,
+            ]
+            next_idx = 0
+            cumulative_weight = 0
+            for feerate_v, w in scores:
+                cumulative_weight += w
+                while next_idx < 5 and cumulative_weight >= weights[next_idx]:
+                    feerate_percentiles[next_idx] = feerate_v
+                    next_idx += 1
+            for i in range(next_idx, 5):
+                feerate_percentiles[i] = scores[-1][0]
 
-        if tx_feerates:
-            avgfeerate = sum(tx_feerates) // len(tx_feerates)
-            minfeerate = min(tx_feerates)
-            maxfeerate = max(tx_feerates)
-        else:
-            avgfeerate = minfeerate = maxfeerate = 0
-
-        if tx_sizes:
-            avgtxsize = sum(tx_sizes) // len(tx_sizes)
-            mintxsize = min(tx_sizes)
-            maxtxsize = max(tx_sizes)
-            mediantxsize = int(statistics.median(tx_sizes))
-        else:
-            avgtxsize = mintxsize = maxtxsize = mediantxsize = 0
-
-        # utxo_size_inc: approximate serialized size change of the UTXO set
-        # Each UTXO ≈ 32 (txid) + 4 (vout) + 8 (value) + scriptPubKey bytes
-        # Simplified: count * 50 bytes as a rough estimate, matching Bitcoin
-        # Core's approach of tracking the actual serialized UTXO set delta.
-        # A positive utxo_increase means the set grew.
-        utxo_size_inc = 0
-        for tx in txs_list:
-            if tx.is_coinbase:
-                for o in tx.outputs:
-                    utxo_size_inc += 50 + len(o.script_pubkey)
-                continue
-            for o in tx.outputs:
-                utxo_size_inc += 50 + len(o.script_pubkey)
-            for _ in tx.inputs:
-                utxo_size_inc -= 50
+        non_cb = max(num_txs - 1, 0)
 
         # ------------------------------------------------------------------
-        # Build result
+        # Build result — key order matches Core's ret_all (blockchain.cpp:2167).
         # ------------------------------------------------------------------
         result: dict[str, Any] = {
-            "avgfee": avgfee,
-            "avgfeerate": avgfeerate,
-            "avgtxsize": avgtxsize,
+            "avgfee": (totalfee // non_cb) if non_cb else 0,
+            "avgfeerate": (totalfee * WITNESS_SCALE_FACTOR) // total_weight if total_weight else 0,
+            "avgtxsize": (total_size // non_cb) if non_cb else 0,
             "blockhash": blockhash_hex,
+            "feerate_percentiles": feerate_percentiles,
             "height": block_height,
-            "ins": ins,
+            "ins": inputs,
             "maxfee": maxfee,
             "maxfeerate": maxfeerate,
             "maxtxsize": maxtxsize,
-            "medianfee": medianfee,
+            "medianfee": _trunc_median(fee_array),
             "mediantime": mediantime,
-            "mediantxsize": mediantxsize,
-            "minfee": minfee,
-            "minfeerate": minfeerate,
-            "mintxsize": mintxsize,
-            "outs": outs,
+            "mediantxsize": _trunc_median(txsize_array),
+            "minfee": 0 if minfee == MAX_MONEY else minfee,
+            "minfeerate": 0 if minfeerate == MAX_MONEY else minfeerate,
+            "mintxsize": 0 if mintxsize == MAX_MONEY else mintxsize,
+            "outs": outputs,
             "subsidy": subsidy,
             "swtotal_size": swtotal_size,
             "swtotal_weight": swtotal_weight,
@@ -11429,8 +11594,10 @@ class RPCServer:
             "total_weight": total_weight,
             "totalfee": totalfee,
             "txs": num_txs,
-            "utxo_increase": utxo_increase,
+            "utxo_increase": outputs - inputs,
             "utxo_size_inc": utxo_size_inc,
+            "utxo_increase_actual": utxos - inputs,
+            "utxo_size_inc_actual": utxo_size_inc_actual,
         }
 
         # Filter to requested stats
@@ -13597,14 +13764,16 @@ class RPCServer:
         if script_type == "nulldata" and not _is_push_only(script_bytes, start=1):
             script_type = "nonstandard"
 
-        # Top-level result: NO hex field (Core decodescript omits it)
+        # Top-level result: NO hex field (Core decodescript omits it).
+        # Core's ScriptToUniv emits address BEFORE type (core_io.cpp:409):
+        #   asm, desc, [address], type
         result: dict[str, Any] = {
             "asm": spk_json["asm"],
             "desc": spk_json["desc"],
-            "type": script_type,
         }
         if "address" in spk_json:
             result["address"] = spk_json["address"]
+        result["type"] = script_type
 
         # ── Core's can_wrap gate ─────────────────────────────────────────────
         # Types that CAN be wrapped: pubkey, pubkeyhash, multisig, nonstandard,
@@ -13760,17 +13929,18 @@ class RPCServer:
                     seg_script = b"\x00\x20" + script_sha256
 
                 # Build inner segwit object using _build_spk_json
-                # (which returns {asm, desc, hex, type, address?})
+                # (which returns {asm, desc, hex, address?, type})
                 seg_spk = _build_spk_json(seg_script, network)
-                # Inner segwit DOES include hex (Core include_hex=true)
+                # Inner segwit DOES include hex (Core include_hex=true).
+                # Core ScriptToUniv order: asm, desc, hex, [address], type.
                 seg_result: dict[str, Any] = {
                     "asm": seg_spk["asm"],
                     "desc": seg_spk["desc"],
                     "hex": seg_spk["hex"],
-                    "type": seg_spk["type"],
                 }
                 if "address" in seg_spk:
                     seg_result["address"] = seg_spk["address"]
+                seg_result["type"] = seg_spk["type"]
 
                 # p2sh-segwit: P2SH wrapping the segwit script
                 seg_hash160 = hashlib.new(

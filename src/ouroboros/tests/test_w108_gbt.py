@@ -447,15 +447,24 @@ def _make_rpc_mining_info(height: int = 800_000) -> RPCServer:
 
 
 class TestG14BlockMinTxFeeHardcoded(unittest.TestCase):
-    """BUG: getmininginfo blockmintxfee is hardcoded rather than read from node config."""
+    """getmininginfo blockmintxfee = DEFAULT_BLOCK_MIN_TX_FEE (1 sat/kvB).
 
-    def test_blockmintxfee_hardcoded(self):
+    Byte-diff parity (2026-06): Core's blockmintxfee is
+    ValueFromAmount(DEFAULT_BLOCK_MIN_TX_FEE=1 sat) = 0.00000001 BTC/kvB,
+    serialized via BTCAmount (fixed %d.%08d). Previously this was hardcoded
+    to the wrong 0.00001000.
+    """
+
+    def test_blockmintxfee_default(self):
+        from ouroboros.psbt import BTCAmount
         rpc = _make_rpc_mining_info()
         result = asyncio.run(rpc.rpc_getmininginfo())
-        # Core would read actual configured value; ouroboros always returns 0.00001000
+        val = result.get("blockmintxfee")
+        # Emitted as a BTCAmount sentinel (decimal text "0.00000001").
+        self.assertIsInstance(val, BTCAmount)
         self.assertEqual(
-            result.get("blockmintxfee"), 0.00001000,
-            "blockmintxfee is hardcoded to 0.00001000 — not read from node config"
+            val.text, "0.00000001",
+            "blockmintxfee should be DEFAULT_BLOCK_MIN_TX_FEE (1 sat) = 0.00000001"
         )
 
 
