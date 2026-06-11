@@ -713,7 +713,22 @@ class PeerManager:
         # True we send ``sendpackages`` post-handshake.  ``_package_peers``
         # is the set of addrs that completed the bidirectional handshake
         # (both sides sent sendpackages).
-        self.package_relay_enabled: bool = True
+        #
+        # Core-parity default is OFF: Bitcoin Core v31.99.0 has no
+        # package-relay wire protocol — there is no SENDPACKAGES NetMsgType
+        # in protocol.h and net_processing.cpp neither sends nor handles
+        # sendpackages, so a default Core node never emits one.  BIP 331 is
+        # still an open/draft P2P proposal, not merged to Core's wire.  To
+        # keep an out-of-the-box ouroboros node speaking only Core's wire
+        # (honest-wire, same spirit as the Erlay default-OFF above), the
+        # full BIP 331 implementation stays but is gated behind an opt-in
+        # env flag.  Every send/dispatch/handler-registration site is already
+        # conditioned on this single attribute, so flipping the default to
+        # env-gated OFF disables the send end-to-end.  Set
+        # OUROBOROS_PACKAGE_RELAY=1 to opt back in.
+        self.package_relay_enabled: bool = (
+            os.environ.get("OUROBOROS_PACKAGE_RELAY", "0") == "1"
+        )
         self.package_relay_version: int = 1
         self.package_max_count: int = 25       # MAX_PACKAGE_COUNT
         self.package_max_weight: int = 404_000  # MAX_PACKAGE_WEIGHT
