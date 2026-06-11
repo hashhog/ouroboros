@@ -408,16 +408,18 @@ def _build_spk_json(script: bytes, network: str) -> dict[str, Any]:
     address = _spk_to_address(script, network)
     desc = _infer_descriptor(script, address)
     asm = _spk_asm(script)
+    # Core's ScriptToUniv (core_io.cpp:409) emits keys in this order:
+    #   asm, desc, hex, [address], type  -- address BEFORE type.
     result: dict[str, Any] = {
         "asm": asm,
         "desc": desc,
         "hex": script.hex(),
-        "type": spk_type,
     }
     # Core suppresses "address" for bare-pubkey and bare-multisig outputs.
     # Reference: bitcoin-core/src/rpc/util.cpp ScriptPubKeyToUniv suppression.
     if address is not None and spk_type not in ("pubkey", "multisig", "nonstandard"):
         result["address"] = address
+    result["type"] = spk_type
     return result
 
 # Maximum PSBT file size (100 MB, per Bitcoin Core)
