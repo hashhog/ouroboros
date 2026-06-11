@@ -472,6 +472,56 @@ DNS_SEEDS_TESTNET4 = [
     "seed.testnet4.wiz.biz",
 ]
 
+# Hard-coded fixed seeds for mainnet (Core src/chainparamsseeds.h, surfaced via
+# CChainParams::FixedSeeds()).  This is the LAST-RESORT fallback dialed only when
+# every other peer source has produced nothing — see ``maybe_add_fixed_seeds``.
+# It is layered strictly AFTER the normal DNS bootstrap and never replaces or
+# bypasses it.  Curated IPv4 :8333 entries only.  Non-mainnet networks
+# (testnet/testnet4/signet/regtest) deliberately carry no fixed seeds, mirroring
+# Core clearing vFixedSeeds for those chains.
+FIXED_SEEDS_MAINNET = [
+    "2.121.116.198:8333",
+    "3.86.179.235:8333",
+    "4.2.51.251:8333",
+    "5.2.23.226:8333",
+    "12.11.29.34:8333",
+    "14.49.142.41:8333",
+    "18.27.125.103:8333",
+    "23.93.18.82:8333",
+    "24.16.202.74:8333",
+    "27.83.109.113:8333",
+    "31.41.23.249:8333",
+    "34.65.45.157:8333",
+    "35.78.97.86:8333",
+    "37.15.61.236:8333",
+    "38.52.3.192:8333",
+    "40.160.1.232:8333",
+    "44.223.26.178:8333",
+    "45.19.130.200:8333",
+    "46.126.216.3:8333",
+    "47.90.137.13:8333",
+    "50.4.123.66:8333",
+    "51.154.0.142:8333",
+    "52.182.185.242:8333",
+    "60.241.1.72:8333",
+    "62.34.57.141:8333",
+    "63.247.147.166:8333",
+    "64.23.97.128:8333",
+    "65.94.134.253:8333",
+    "66.35.84.14:8333",
+    "67.4.139.122:8333",
+    "68.61.69.53:8333",
+    "69.4.94.226:8333",
+    "70.44.20.24:8333",
+    "71.56.178.136:8333",
+    "72.88.192.74:8333",
+    "73.42.33.255:8333",
+    "74.48.195.218:8333",
+    "75.80.3.4:8333",
+    "76.124.35.108:8333",
+    "77.38.72.37:8333",
+]
+
 
 MAX_INBOUND = 117  # Bitcoin Core default max inbound connections
 
@@ -730,6 +780,15 @@ class PeerManager:
         # otherwise honour the independent flag.
         self._dns_seed_enabled: bool = bool(dns_seed) and not self._connect_only
 
+        # Fixed-seed last-resort fallback (Core net.cpp:2607-2643
+        # ThreadOpenConnections fixed-seed trigger).  One-shot: once we have
+        # injected the curated IPv4 seeds we never re-inject (Core's
+        # ``add_fixed_seeds = false`` latch).  ``_start_ts`` anchors the 60 s
+        # grace window that gives DNS / addnode / seednode a chance to populate
+        # the address pool first; it is set at the top of ``start()``.
+        self._fixed_seeds_added: bool = False
+        self._start_ts: float = 0.0
+
     async def start(self, start_height: int = 0, p2p_port: int = 0):
         """
         Start peer manager.
@@ -744,6 +803,10 @@ class PeerManager:
 
         self.running = True
         self._start_height = start_height
+        # Anchor the fixed-seed grace window (Core: ``start`` in
+        # ThreadOpenConnections — fixed seeds fire once GetTime() > start + 1min
+        # if addrman is still empty).
+        self._start_ts = time.time()
         logger.info(f"Starting PeerManager for {self.network} (max_peers={self.max_peers})")
 
         # Start listening for inbound connections
@@ -783,6 +846,12 @@ class PeerManager:
             # Discover peers from DNS seeds (suppressed when -nodnsseed; the
             # gate lives inside discover_peers()).
             await self.discover_peers()
+
+            # Fixed-seed last-resort fallback: fires THROUGH after DNS, never
+            # replacing it.  The immediate-fire case here covers the DNS-off
+            # path (-nodnsseed / proxy) where there is nothing to wait for; the
+            # 60 s-grace empty-book case is handled in maintain_connections().
+            await self.maybe_add_fixed_seeds()
 
             # Connect to anchor peers first (eclipse protection)
             await self._connect_anchor_peers(start_height)
@@ -1601,6 +1670,109 @@ class PeerManager:
             logger.debug(f"Error resolving {seed}: {e}")
             return 0
 
+    async def add_fixed_seeds(self) -> int:
+        """Inject the curated mainnet fixed seeds into the address pool.
+
+        Mirrors ``_resolve_dns_seed``'s add path (banlist filter +
+        ``_add_known_addr`` + ``addrman.add``), but with the static
+        ``FIXED_SEEDS_MAINNET`` list instead of a DNS lookup.  Each entry
+        carries the ``"fixedseeds"`` source tag (Core CNetAddr::SetInternal
+        "fixedseeds") and passes the normal routable / dedup / ban filter on
+        add — non-routable or banned entries are silently dropped, exactly as
+        addrman would for any other source.
+
+        Returns the number of entries added.  No-op on non-mainnet networks
+        (Core clears vFixedSeeds for testnet/signet/regtest).
+        """
+        if self.network != "mainnet":
+            return 0
+
+        count = 0
+        for entry in FIXED_SEEDS_MAINNET:
+            # Split host:port on the last ':' so future IPv6 literals would not
+            # be mangled (current list is IPv4 only).
+            ip, _, port_str = entry.rpartition(":")
+            if not ip or not port_str:
+                continue
+            try:
+                port = int(port_str)
+            except ValueError:
+                continue
+            addr = f"{ip}:{port}"
+            if self.ban_manager.is_banned(addr) or self.ban_manager.is_banned(ip):
+                continue
+            self._add_known_addr(addr)
+            # addrman.add drops non-routable + dedups; only routable entries
+            # actually land in the table.
+            if self.addrman.add(ip, port, source="fixedseeds"):
+                count += 1
+        return count
+
+    async def maybe_add_fixed_seeds(self) -> bool:
+        """Fire the one-shot fixed-seed injection iff the Core predicate holds.
+
+        Implements Core net.cpp:2607-2643 (ThreadOpenConnections fixed-seed
+        trigger).  Fires ONLY when ALL hold:
+
+          (1) ENABLED: fixed seeds are configured for this network (mainnet
+              only; non-empty list) AND we are not in -connect mode (Core folds
+              both into add_fixed_seeds; -connect implies the fixed-seed path is
+              off).
+          (2) BOOK EMPTY: ``known_addrs`` is empty — the impl-local proxy for
+              Core's ``!GetReachableEmptyNetworks().empty()`` over this
+              IPv4-only set.
+          (3) EITHER (a) >60 s elapsed since ``start()`` anchored ``_start_ts``
+              (Core: GetTime() > start + 1min — gives DNS / addnode / seednode
+              time to populate addrman first), OR (b) DNS seeding is disabled
+              (Core's cheap ``!dnsseed && !use_seednodes`` shortcut — nothing to
+              wait for, fire immediately).
+
+        After firing, the one-shot guard (``_fixed_seeds_added``) latches so
+        every subsequent tick is a no-op (Core: ``add_fixed_seeds = false``).
+        This is a LAST-RESORT fallback layered AFTER the untouched normal DNS
+        bootstrap; it never replaces DNS and never bypasses it.
+
+        Returns True iff the injection fired on this call.
+        """
+        # One-shot guard (Core add_fixed_seeds latch).
+        if self._fixed_seeds_added:
+            return False
+
+        # (1) ENABLED.  -connect disables the fallback entirely; the configured
+        # fixed-seed list must be non-empty (mainnet only).
+        if self._connect_only:
+            return False
+        if self.network != "mainnet" or not FIXED_SEEDS_MAINNET:
+            return False
+
+        # (2) BOOK EMPTY.
+        if self.known_addrs:
+            return False
+
+        # (3) timing: 60 s grace elapsed OR DNS seeding disabled (fire now).
+        grace_elapsed = (time.time() - self._start_ts) > 60.0
+        dns_disabled = not self._dns_seed_enabled
+        if not (grace_elapsed or dns_disabled):
+            return False
+
+        if dns_disabled:
+            logger.info(
+                "Adding fixed seeds: DNS seeding disabled and address pool is "
+                "empty (last-resort fallback)"
+            )
+        else:
+            logger.info(
+                "Adding fixed seeds: 60 s elapsed and address pool is still "
+                "empty (last-resort fallback)"
+            )
+
+        # Latch BEFORE the await so a concurrent maintain_connections tick
+        # cannot double-fire while this coroutine is suspended.
+        self._fixed_seeds_added = True
+        added = await self.add_fixed_seeds()
+        logger.info("Added %d fixed seeds to the address pool", added)
+        return True
+
     def _proxy_for_host(self, host: str) -> str | None:
         """Get SOCKS5 proxy for a host, if any.
 
@@ -2391,6 +2563,12 @@ class PeerManager:
                         "re-seeding from DNS..."
                     )
                     await self.discover_peers()
+
+                    # Last-resort fixed-seed fallback once the 60 s grace has
+                    # elapsed and DNS still produced nothing.  Layered AFTER the
+                    # DNS re-seed above so the curated IPs only fall through when
+                    # DNS has had its chance — never a bypass.
+                    await self.maybe_add_fixed_seeds()
 
                 # Reconnect to --connect peers that have dropped
                 for host, port in self._connect_addrs:
