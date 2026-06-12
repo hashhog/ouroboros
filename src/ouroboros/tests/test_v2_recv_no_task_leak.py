@@ -327,6 +327,12 @@ class TestV2ValidFloodNoLeak(unittest.IsolatedAsyncioTestCase):
         single per-call timer.  Measured WITHOUT the listen() yield so we observe
         the per-call arming rate directly: post-fix grows by ~1*N (vs the
         pre-fix ~2*N proven above)."""
+        self.skipTest(
+            "Superseded by attempt-4 (arm-only-when-buffer-empty): the candidate "
+            "per-call timer this asserted no longer exists (buffered reads arm 0); "
+            "arming is tested correctly in test_v2_recv_timer_arming.py with a real "
+            "StreamReader."
+        )
         with _BurialPressure():
             p = _make_v2_peer()
             n = 20_000
