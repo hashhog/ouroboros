@@ -214,6 +214,13 @@ PARTIAL_CMPCT_TTL = 60.0  # seconds (GETBLOCKTXN_TIMEOUT)
 # full cardinality of all addresses ever seen (~125 k unique/day on mainnet).
 KNOWN_ADDRS_MAX_ENTRIES = 100_000
 
+# INBOUND addr token-bucket rate limiting (Core net_processing.cpp:193-197).
+# The per-peer bucket refills at MAX_ADDR_RATE_PER_SECOND tokens/sec, soft-capped
+# at MAX_ADDR_PROCESSING_TOKEN_BUCKET; each processed address costs one token and
+# addresses are dropped once the bucket runs dry.  Genuine Core constants.
+MAX_ADDR_RATE_PER_SECOND = 0.1          # Core MAX_ADDR_RATE_PER_SECOND
+MAX_ADDR_PROCESSING_TOKEN_BUCKET = 1000  # Core MAX_ADDR_PROCESSING_TOKEN_BUCKET (= MAX_ADDR_TO_SEND)
+
 # Bound on BanManager misbehaviour-score retention.  A score record whose
 # last event is older than this is reclaimed by the periodic sweep, and each
 # record's ``events`` list is capped to a small ring.  Mirrors the spirit of
@@ -3337,8 +3344,12 @@ class PeerManager:
                 am = AddrMessage.from_payload(msg.payload)
                 if not self._rate_limit_addr_relay(addr, len(am.addresses)):
                     return
+                # INBOUND-addr token bucket (Core ProcessAddrs:5644-5671): cap how
+                # many of this message's addresses we actually process; excess is
+                # dropped (rate-limited).  Shared per-peer bucket across addr/addrv2.
+                admit = self._admit_addrs_token_bucket(peer, len(am.addresses))
                 added = 0
-                for ts, net_addr in am.addresses:
+                for ts, net_addr in am.addresses[:admit]:
                     host_str = self._netaddr_to_host(net_addr)
                     if host_str and not self.ban_manager.is_banned(host_str):
                         if self.addrman.add(
@@ -3361,8 +3372,12 @@ class PeerManager:
                 am = AddrV2Message.from_payload(msg.payload)
                 if not self._rate_limit_addr_relay(addr, len(am.addresses)):
                     return
+                # INBOUND-addr token bucket (Core ProcessAddrs:5644-5671): same
+                # per-peer bucket as on_addr — both addr and addrv2 spend tokens
+                # from ``peer.addr_token_bucket``.
+                admit = self._admit_addrs_token_bucket(peer, len(am.addresses))
                 added = 0
-                for entry in am.addresses:
+                for entry in am.addresses[:admit]:
                     # AddrV2Entry is a @dataclass — use attribute access, not
                     # dict-style .get().  Prior to W117 FIX-57 this was
                     # entry.get("network_id", 0) which raised AttributeError
@@ -3405,7 +3420,28 @@ class PeerManager:
 
         async def on_getaddr(msg: NetworkMessage):
             try:
-                infos = self.addrman.get_addresses(count=1000)
+                # (a) Ignore getaddr from OUTBOUND connections.  Core
+                # net_processing.cpp:4822 — a node that can only make outgoing
+                # connections (e.g. behind NAT) answering getaddr is an
+                # eclipse-amplification vector; only inbound peers are answered.
+                if not peer.inbound:
+                    logger.debug(
+                        f"Ignoring getaddr from outbound peer {addr}"
+                    )
+                    return
+                # (a) GETADDR-once per connection.  Core net_processing.cpp:4833
+                # (peer.m_getaddr_recvd): only the first getaddr per connection is
+                # answered; later ones are ignored to discourage addr stamping and
+                # repeated full-addrman draining.
+                if peer.getaddr_recvd:
+                    logger.debug(f"Ignoring repeated getaddr from {addr}")
+                    return
+                peer.getaddr_recvd = True
+                # (b) 23%-cap: min(1000, floor(23 * size / 100)).  Core
+                # net_processing.cpp:4842/4844 -> addrman GetAddr_ (addrman.cpp:797).
+                infos = self.addrman.get_addresses_for_sharing(
+                    max_addresses=1000, max_pct=23,
+                )
                 if not infos:
                     return
                 from ouroboros.p2p_messages import NetworkAddress
@@ -3462,6 +3498,51 @@ class PeerManager:
             self._addr_relay_day[addr] = now
         self._addr_relay_counts[addr] += count
         return self._addr_relay_counts[addr] <= 1000
+
+    @staticmethod
+    def _refill_addr_token_bucket(peer: Peer) -> None:
+        """Refill ``peer``'s inbound-addr token bucket (Core ProcessAddrs:5644-5652).
+
+        The bucket refills at ``MAX_ADDR_RATE_PER_SECOND`` (0.1 tok/s) since the
+        last refill, soft-capped at ``MAX_ADDR_PROCESSING_TOKEN_BUCKET`` (1000),
+        and the timestamp is advanced unconditionally.  Uses a MONOTONIC clock
+        (Core ``NodeClock`` is monotonic for this purpose) so a wall-clock jump
+        cannot mint or freeze tokens.
+        """
+        now = time.monotonic()
+        if peer.addr_token_bucket < MAX_ADDR_PROCESSING_TOKEN_BUCKET:
+            # Don't increment if already full (Core: skip the add when at cap).
+            time_diff = now - peer.addr_token_timestamp
+            increment = max(time_diff, 0.0) * MAX_ADDR_RATE_PER_SECOND
+            peer.addr_token_bucket = min(
+                peer.addr_token_bucket + increment,
+                MAX_ADDR_PROCESSING_TOKEN_BUCKET,
+            )
+        peer.addr_token_timestamp = now
+
+    def _admit_addrs_token_bucket(self, peer: Peer, total: int) -> int:
+        """How many of ``total`` received addresses pass the token bucket.
+
+        Core ProcessAddrs (net_processing.cpp:5654-5671): refill the bucket, then
+        for each address spend one token; once the bucket drops below 1.0 the
+        remaining addresses are dropped (rate-limited) unless the peer holds the
+        Addr net-permission.  We have no permission system, so every inbound peer
+        is rate-limited (``rate_limited = True``), exactly Core's default-peer
+        behaviour.  Returns the count to actually process; bumps the peer's
+        ``addr_processed`` / ``addr_rate_limited`` getpeerinfo counters.
+        """
+        self._refill_addr_token_bucket(peer)
+        admitted = 0
+        for _ in range(total):
+            if peer.addr_token_bucket < 1.0:
+                # rate_limited (no Addr permission) -> drop the rest.
+                break
+            peer.addr_token_bucket -= 1.0
+            admitted += 1
+        rate_limited = total - admitted
+        peer.addr_processed += admitted
+        peer.addr_rate_limited += rate_limited
+        return admitted
 
     @staticmethod
     def _netaddr_to_host(net_addr) -> str | None:

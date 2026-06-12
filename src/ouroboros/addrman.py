@@ -48,6 +48,10 @@ MIN_FAIL = 7 * 24 * 3600  # 7 days window for failure tracking
 MAX_TRIED_COLLISIONS = 10  # max pending collision entries
 REPLACEMENT_HOURS = 4  # recent success protects from eviction
 
+# getaddr anti-DoS share caps (Core net_processing.cpp:188-190 / addrman.cpp:797-803)
+MAX_ADDR_TO_SEND = 1000  # Core MAX_ADDR_TO_SEND — hard cap per getaddr response
+MAX_PCT_ADDR_TO_SEND = 23  # Core MAX_PCT_ADDR_TO_SEND — % of addrman shared per getaddr
+
 
 # BIP155 Network IDs
 NET_IPV4 = 1
@@ -817,6 +821,36 @@ class AddressManager:
         all_addrs = list(self._addrs.values())
         random.shuffle(all_addrs)
         return all_addrs[:count]
+
+    def get_addresses_for_sharing(
+        self,
+        max_addresses: int = MAX_ADDR_TO_SEND,
+        max_pct: int = MAX_PCT_ADDR_TO_SEND,
+    ) -> list[AddrInfo]:
+        """Addresses to share in a ``getaddr`` response, 23%-capped (Core parity).
+
+        Mirrors Bitcoin Core ``AddrManImpl::GetAddr_`` (addrman.cpp:792-816), the
+        cap applied at the getaddr handler (net_processing.cpp:4842/4844 pass
+        ``MAX_ADDR_TO_SEND``=1000, ``MAX_PCT_ADDR_TO_SEND``=23).  Core computes::
+
+            nNodes = vRandom.size()
+            if max_pct != 0:  nNodes = max_pct * nNodes / 100   # integer division = FLOOR
+            if max_addresses != 0:  nNodes = min(nNodes, max_addresses)
+
+        i.e. the response is bounded to ``min(1000, floor(23 * size / 100))``.
+        This prevents a single peer from draining too large a fraction of our
+        addrman per getaddr (eclipse-attack amplification).  The shuffle gives a
+        fresh random subset each call, matching Core's ``vRandom`` walk.
+        """
+        all_addrs = list(self._addrs.values())
+        random.shuffle(all_addrs)
+        n = len(all_addrs)
+        if max_pct != 0:
+            # Integer division == FLOOR, exactly Core's ``max_pct * nNodes / 100``.
+            n = (min(max_pct, 100) * n) // 100
+        if max_addresses != 0:
+            n = min(n, max_addresses)
+        return all_addrs[:n]
 
     def select_for_connection(
         self,

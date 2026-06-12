@@ -529,6 +529,26 @@ class Peer:
         # BIP 155: peer supports addrv2
         self.addrv2: bool = False
 
+        # ---- getaddr / addr anti-DoS state (Core net_processing.cpp Peer) ----
+        # GETADDR-once: whether we have already answered a ``getaddr`` from this
+        # peer.  Core ``peer.m_getaddr_recvd`` (net_processing.cpp:4833): only the
+        # FIRST getaddr per connection is answered; later ones are ignored to
+        # discourage addr stamping / addrman-draining DoS.
+        self.getaddr_recvd: bool = False
+        # INBOUND-addr token bucket (Core ``peer.m_addr_token_bucket``, init 1.0,
+        # net_processing.cpp:380).  Refilled by ``elapsed * MAX_ADDR_RATE_PER_SECOND``
+        # (0.1 tok/s), soft-capped at ``MAX_ADDR_PROCESSING_TOKEN_BUCKET`` (1000);
+        # each processed address costs one token and addresses are dropped once
+        # the bucket runs dry.  ``addr_token_timestamp`` (Core
+        # ``m_addr_token_timestamp``) is the monotonic time of the last refill.
+        self.addr_token_bucket: float = 1.0
+        self.addr_token_timestamp: float = time.monotonic()
+        # RPC getpeerinfo counters (Core ``m_addr_processed`` /
+        # ``m_addr_rate_limited``): running totals of addresses we processed vs
+        # dropped for rate-limiting, surfaced by getpeerinfo.
+        self.addr_processed: int = 0
+        self.addr_rate_limited: int = 0
+
         # RPC getpeerinfo counters (populated by send_message / receive_message
         # so `bytessent`, `bytesrecv`, `lastsend`, `lastrecv` stop reporting 0
         # for every peer).  Wire-bytes, not decrypted-bytes, so the numbers
