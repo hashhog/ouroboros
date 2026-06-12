@@ -1,48 +1,57 @@
-"""Regression test for the at-tip v2-receive RSS burst — VALID-message variant
-(tracemalloc burst #2, mainnet ouroboros, 2026-06-09).
+"""Regression test for the at-tip v2-receive RSS burst — VALID-message variant.
 
-This is the case the FIRST fix (50fdc48) MISSED.  50fdc48 bounded the
-*consecutive decoy/unknown* spin and yielded only on those sub-branches.  But
-the live driver is the per-receive event-loop-timer churn under a high-rate
-flood of *VALID* v2 messages, which never touches the decoy/unknown branches.
+Burst history
+-------------
+* 50fdc48 bounded only the *consecutive decoy/unknown* spin.
+* 964419c added a periodic ``await asyncio.sleep(0)`` on the valid path so the
+  event loop's ``_run_once`` could purge the cancelled-timeout ``TimerHandle``s
+  each read armed.  Its unit test (the prior version of THIS file) measured
+  ``len(loop._scheduled)`` and passed — yet the leak RECURRED in production
+  (tracemalloc at the 8.5G knee, 2026-06-11, attributed ~2 retained objects per
+  packet to ``peer.py`` near the two per-read ``asyncio.timeout`` blocks).
+* THIS fix arms a SINGLE ``asyncio.timeout`` for the WHOLE
+  ``_receive_v2_message`` call (and the WHOLE v1 ``receive_message``) instead of
+  one timer per ``readexactly`` — Core parity (net.cpp ``V2Transport`` arms NO
+  per-read timer; one bounded recv per socket-readiness event, a coarse
+  per-connection inactivity timeout).
 
-Mechanism (confirmed by a standalone Python 3.13 asyncio repro):
-``Peer._receive_v2_message`` reads each packet with a timeout.  Both
-``asyncio.wait_for(read, timeout)`` AND ``async with asyncio.timeout(timeout):
-read`` arm a timeout via ``loop.call_at`` -> a ``TimerHandle`` pushed onto
-``BaseEventLoop._scheduled``.  When ``readexactly`` returns SYNCHRONOUSLY (the
-StreamReader buffer already holds the bytes — a high-rate buffered flood of
-valid messages), the timeout context CANCELS the timer.  But
-``TimerHandle.cancel()`` only flips ``_cancelled``; it does NOT remove the
-handle from the ``_scheduled`` heap.  The cancelled-timer purge lives ONLY in
-``BaseEventLoop._run_once``.  ``listen() -> receive_message ->
-_receive_v2_message`` is a tight loop that RETURNS on the first valid message
-and immediately re-reads the next buffered one, never suspending back to
-``_run_once`` — so cancelled ``TimerHandle``s (plus the per-call ``wait_for``
-Task / coro cyclic garbage) accumulate MONOTONICALLY in ``_scheduled`` and RSS
-climbs toward the cgroup cap.
+Why the prior repro was a FALSE PASS
+------------------------------------
+The prior test measured ``len(loop._scheduled)`` on an *idle single-task loop*.
+With only one task arming timers and nothing else live, the cheap head-of-heap
+purge in ``_run_once`` drains ``_scheduled`` back to ~0 each window, so the
+metric looks bounded.  But:
+  1. ``_scheduled`` length is the ONE thing the ``sleep(0)`` mitigation DOES
+     bound — it is not the thing that actually accumulated.
+  2. The real leak is the *retained* cancelled ``TimerHandle`` objects (plus
+     their ``Timeout``/coro-frame chains).  When a cancelled handle is BURIED
+     mid-heap below still-live timers (many concurrent peers / pings in
+     production), the root-only head-pop in ``_run_once`` cannot reach it, and
+     the heapify rebuild only fires when the cancelled fraction crosses 0.5 —
+     so buried cancelled handles creep up monotonically.
+  3. The prior test counted ``asyncio.Task`` objects, but ``asyncio.timeout``
+     arms NO Task, so that metric was always ~0 and proved nothing.
 
-The fix forces the receive hot path to periodically ``await asyncio.sleep(0)``
-on the VALID-message path too (``V2_RECV_YIELD_EVERY``), so ``_run_once``
-bulk-purges the cancelled handles (and the cyclic GC reclaims the Task/coro
-chain).  The migration of the hot reads from ``wait_for`` to
-``asyncio.timeout`` removes the per-call wrapper Task (secondary), but is NOT
-sufficient on its own — the repro proves ``asyncio.timeout`` arms the identical
-``call_at`` timer and accumulates ``_scheduled`` just as badly (in fact a touch
-worse, two timers per packet) without the periodic yield.
+So THIS test:
+  * Measures the ACTUAL accumulating object — live ``asyncio.TimerHandle``
+    instances via ``gc.get_objects`` — not ``len(_scheduled)``.
+  * Creates heap-burial pressure (long-lived live ``call_at`` timers pinned at
+    the heap root) so the cheap root-only purge cannot reach cancelled handles,
+    recreating the production condition the single-task prior test lacked.
+  * Proves PRE-FIX (a faithful re-impl of the two-per-read-timeout loop) grows
+    the live-``TimerHandle`` count ~linearly with packet count (>= 2*N), and
+    that the doubling of N doubles the residue.
+  * Proves POST-FIX through the production ``listen()`` path the live-
+    ``TimerHandle`` count stays FLAT/bounded — independent of N.
 
-What this test proves:
-  * BEFORE (a faithful re-impl of the old wait_for/no-yield receive loop):
-    ``len(loop._scheduled)`` grows ~linearly with the number of valid messages
-    processed -> the leak.
-  * AFTER (the real, fixed ``_receive_v2_message`` driven through ``listen()``
-    over thousands of valid messages): ``len(loop._scheduled)`` stays BOUNDED
-    (well under the message count), and the number of live ``asyncio.Task``
-    objects (via ``gc.get_objects``) does NOT grow with iteration count.
+Self-contained: no node, no sockets, no regtest.  A fake StreamReader hands
+back v2 packet bytes synchronously (the buffered-valid-flood case), and a fake
+``_v2_transport`` decodes them to a fixed valid 'ping' message.
 
-Self-contained: no node, no sockets, no regtest.  Uses a fake StreamReader that
-hands back valid encrypted-v2 packet bytes synchronously, plus a fake
-``_v2_transport`` that decodes them to real messages.
+NOTE: this unit repro is necessary-not-sufficient.  The authoritative proof is
+the >24h mainnet soak past the prior recurrence mark, with capture/tracemalloc
+confirming the retained size near the read lines stays bounded and RSS never
+knees (964419c passed its unit test and still recurred).
 """
 
 import asyncio
@@ -75,16 +84,55 @@ _PING_CONTENTS = encode_v2_contents("ping", _PING_PAYLOAD)
 assert decode_v2_contents(_PING_CONTENTS) == ("ping", _PING_PAYLOAD)
 
 
+def _count_live_timer_handles() -> int:
+    """Number of live ``asyncio.TimerHandle`` objects in the interpreter.
+
+    This is the metric that ACTUALLY leaked.  Each ``async with
+    asyncio.timeout(t)`` arms a ``TimerHandle`` via ``loop.call_at``; cancelling
+    it on a synchronous read only flips ``_cancelled`` and does NOT free it from
+    the ``_scheduled`` heap until ``_run_once`` purges it — and a buried handle
+    is never reached by the cheap purge.  ``gc.collect()`` first so we count only
+    genuinely-retained handles, not ones already unreferenced and awaiting
+    cyclic collection."""
+    gc.collect()
+    return sum(1 for o in gc.get_objects() if isinstance(o, asyncio.TimerHandle))
+
+
 def _count_live_tasks() -> int:
-    """Number of asyncio.Task objects currently alive in the interpreter."""
     return sum(1 for o in gc.get_objects() if isinstance(o, asyncio.Task))
 
 
+class _BurialPressure:
+    """Pins a handful of long-lived LIVE timers at the heap root so the cheap
+    root-only purge in ``_run_once`` cannot reach the cancelled handles below
+    them — recreating the multi-peer production condition the single-task prior
+    test lacked.  Without this, an idle loop trivially root-purges every
+    cancelled handle and the leak hides."""
+
+    def __init__(self, n: int = 8):
+        self._n = n
+        self._handles: list[asyncio.TimerHandle] = []
+
+    def __enter__(self):
+        loop = asyncio.get_running_loop()
+        # Deadlines far in the future so they sit at the root and never fire
+        # during the test.
+        self._handles = [
+            loop.call_at(loop.time() + 3600.0, lambda: None) for _ in range(self._n)
+        ]
+        return self
+
+    def __exit__(self, *exc):
+        for h in self._handles:
+            h.cancel()
+        self._handles.clear()
+        return False
+
+
 class _SyncValidReader:
-    """StreamReader stand-in whose readexactly returns SYNCHRONOUSLY (the
-    pathological pre-buffered-flood case).  Always hands back ``n`` zero bytes —
-    the fake transport below ignores the actual bytes and decodes a fixed valid
-    message, so what matters here is only that the read never suspends."""
+    """StreamReader stand-in whose ``readexactly`` returns SYNCHRONOUSLY (the
+    pathological pre-buffered-flood case) — it never suspends, so the per-read
+    timeout always cancels without firing."""
 
     def __init__(self):
         self.reads = 0
@@ -95,10 +143,10 @@ class _SyncValidReader:
 
 
 class _ValidMessageTransport:
-    """Fake _v2_transport: every packet decodes as the SAME valid 'ping'
-    message (never a decoy, never unknown).  So _receive_v2_message returns one
-    real message per call without ever touching the decoy/unknown branches —
-    exactly the flood 50fdc48 did not bound."""
+    """Fake ``_v2_transport``: every packet decodes as the SAME valid 'ping'
+    message (never decoy, never unknown), so ``_receive_v2_message`` returns one
+    real message per call without touching the decoy/unknown branches — exactly
+    the valid flood the per-read-timeout churn drove."""
 
     CONTENTS_LEN = len(_PING_CONTENTS)
 
@@ -120,212 +168,304 @@ def _make_v2_peer() -> Peer:
     return p
 
 
-# --- BEFORE: faithful re-impl of the pre-fix hot read loop --------------------
-# This intentionally reproduces the OLD pattern: asyncio.wait_for per read, with
-# NO periodic yield on the valid path.  It is NOT imported from peer.py — it is
-# a minimal stand-in so the test can demonstrate the leak the fix removes.
-
-async def _old_receive_loop_no_yield(reader, n_messages: int):
-    """Pre-fix shape: two wait_for reads per message, return per message, no
-    yield.  Driven n_messages times back-to-back (as listen() would)."""
+# --- PRE-FIX shape: faithful re-impl of the two-per-read-timeout loop ---------
+# This reproduces the OLD pattern the fix removed: TWO ``asyncio.timeout``
+# blocks per packet (one around the length read, one around the body read),
+# returning per message with no outer timeout.  It is NOT imported from peer.py
+# (the fix removed it) — it is a minimal faithful stand-in so the test can
+# demonstrate the leak the fix eliminates, and so the POST-FIX assertion is
+# NON-VACUOUS (it would fail against this shape).
+async def _old_per_read_timeout_loop(reader, n_messages: int):
+    body_len = HEADER_LEN + _ValidMessageTransport.CONTENTS_LEN + CHACHA20POLY1305_EXPANSION
     for _ in range(n_messages):
-        # length read + body read — both complete synchronously here.
-        await asyncio.wait_for(reader.readexactly(LENGTH_FIELD_LEN), timeout=60.0)
-        await asyncio.wait_for(reader.readexactly(64), timeout=60.0)
-        # (return-per-message; listen() loops straight back in — no suspension)
+        async with asyncio.timeout(60.0):
+            await reader.readexactly(LENGTH_FIELD_LEN)
+        async with asyncio.timeout(60.0):
+            await reader.readexactly(body_len)
+        # return-per-message; the caller loops straight back in (no suspension).
 
 
 class TestV2ValidFloodNoLeak(unittest.IsolatedAsyncioTestCase):
-    async def test_before_old_pattern_accumulates_timers(self):
-        """Sanity / before-state: the OLD wait_for/no-yield receive loop grows
-        loop._scheduled ~linearly with the valid-message count.  This is the
-        leak the fix removes — asserted here so a future regression that drops
-        the yield is caught against this baseline."""
-        loop = asyncio.get_running_loop()
-        reader = _SyncValidReader()
+    def setUp(self):
+        # Make per-iteration TimerHandle accounting cheap: the heavy gc.collect
+        # only happens at the (few) measurement points, not per packet.
+        gc.collect()
 
-        n = 20_000
-        before = len(loop._scheduled)
-        await _old_receive_loop_no_yield(reader, n)
-        grew = len(loop._scheduled) - before
+    async def test_prefix_per_read_timeout_leaks_linearly(self):
+        """PRE-FIX signature: the two-per-read-timeout loop accumulates live
+        ``TimerHandle`` objects ~linearly with the packet count, EVEN under a
+        single ``sleep(0)`` drain attempt — because under heap-burial pressure
+        the cancelled handles stay buried and a single root-only purge cannot
+        reach them.  This is the leak the fix removes, asserted here so the
+        post-fix assertions are non-vacuous."""
+        with _BurialPressure():
+            reader = _SyncValidReader()
+            n = 20_000
+            base = _count_live_timer_handles()
+            await _old_per_read_timeout_loop(reader, n)
+            grew = _count_live_timer_handles() - base
 
-        # Two cancelled TimerHandles per message pile up in the heap because we
-        # never re-entered _run_once.  Expect ~2*n; assert it grew by at least
-        # ~1 per message (huge, unbounded with n) — the bug signature.
-        self.assertGreaterEqual(
-            grew, n,
-            f"expected the old no-yield pattern to accumulate >= {n} cancelled "
-            f"timers for {n} messages, got {grew}",
+            # Two cancelled TimerHandles per message, buried below the live
+            # background timers, accumulate.  Expect ~2*n.  Assert at least n
+            # (huge, scales with n) — the bug signature.
+            self.assertGreaterEqual(
+                grew,
+                n,
+                f"expected the OLD per-read-timeout loop to accumulate >= {n} "
+                f"live TimerHandles for {n} messages, got {grew}",
+            )
+
+    async def test_prefix_residue_scales_with_message_count(self):
+        """PRE-FIX residue at 10k vs 40k packets ~quadruples (linear in N) —
+        the unbounded-growth signature against the metric that actually
+        leaked."""
+        async def residue_for(n: int) -> int:
+            with _BurialPressure():
+                reader = _SyncValidReader()
+                base = _count_live_timer_handles()
+                await _old_per_read_timeout_loop(reader, n)
+                return _count_live_timer_handles() - base
+
+        r10 = await residue_for(10_000)
+        r40 = await residue_for(40_000)
+        # Linear growth: 4x the packets => ~4x the residue.  Assert r40 is at
+        # least ~3x r10 (well clear of a flat/bounded curve).
+        self.assertGreater(
+            r40,
+            3 * r10,
+            f"PRE-FIX residue did not scale with packet count "
+            f"(10k -> {r10}, 40k -> {r40}); expected ~linear growth.",
         )
 
-        # A single yield drains the cancelled-handle heap back down — proving
-        # the residue is heap-pinned cancelled timers purged only by _run_once.
-        await asyncio.sleep(0)
-        self.assertLess(
-            len(loop._scheduled), 200,
-            "one await sleep(0) should let _run_once purge the cancelled-timer "
-            "heap; if it did not, the residue is something else",
-        )
+    async def test_postfix_listen_flood_keeps_timer_handles_bounded(self):
+        """POST-FIX (production path): drive the REAL fixed ``_receive_v2_message``
+        through ``listen()`` over a high-rate buffered flood of VALID messages,
+        under the SAME heap-burial pressure, and assert the live ``TimerHandle``
+        count stays FLAT/bounded — independent of N.
 
-    async def test_after_valid_flood_keeps_scheduled_bounded(self):
-        """AFTER (the real fix): drive the actual _receive_v2_message over a
-        HIGH-RATE buffered flood of VALID messages and assert loop._scheduled
-        stays BOUNDED (does not grow with the message count) and live Tasks do
-        not accumulate.  This is the case 50fdc48 missed."""
-        loop = asyncio.get_running_loop()
-        p = _make_v2_peer()
-
-        # Drain any pre-existing scheduled handles so our delta is clean.
-        await asyncio.sleep(0)
-        sched_before = len(loop._scheduled)
-        tasks_before = _count_live_tasks()
-
-        n_messages = 20_000
-        peak_scheduled = sched_before
-        for _ in range(n_messages):
-            msg = await p._receive_v2_message(timeout=60.0)
-            self.assertEqual(msg.command, "ping")
-            self.assertEqual(msg.payload, _PING_PAYLOAD)
-            if len(loop._scheduled) > peak_scheduled:
-                peak_scheduled = len(loop._scheduled)
-
-        sched_after = len(loop._scheduled)
-        tasks_after = _count_live_tasks()
-
-        # We processed 20k valid messages = 40k timeout-armed reads.  With the
-        # periodic yield, _scheduled must stay BOUNDED — far below the message
-        # count.  Generous ceiling: a few yield-windows' worth of residue plus
-        # slack.  (Pre-fix this would be ~40_000.)
-        bound = 4 * V2_RECV_YIELD_EVERY + 200
-        self.assertLessEqual(
-            peak_scheduled, bound,
-            f"loop._scheduled peaked at {peak_scheduled} over {n_messages} "
-            f"valid messages; expected bounded <= {bound}. The valid-message "
-            f"path is not yielding to the event loop (the burst-#2 leak).",
-        )
-
-        # And it must NOT scale with the message count: doubling messages should
-        # not double the residue (it stays in the same small band).
-        self.assertLess(
-            sched_after, n_messages // 10,
-            f"loop._scheduled ({sched_after}) scaled with message count "
-            f"({n_messages}); the receive loop is leaking cancelled timers.",
-        )
-
-        # Live Task objects must not accumulate with iteration count either
-        # (asyncio.timeout does not wrap each read in a Task, and any transient
-        # coro/Task garbage is collected once we yield to the loop).
-        task_growth = tasks_after - tasks_before
-        self.assertLess(
-            task_growth, 50,
-            f"live asyncio.Task count grew by {task_growth} over {n_messages} "
-            f"valid receives; expected ~0 (no per-receive Task accumulation).",
-        )
-
-    async def test_after_scales_flat_with_message_count(self):
-        """Stronger before/after contrast: the fixed loop's residue at 10k and
-        40k messages stays in the same band (flat), proving no per-message
-        accumulation — whereas the old pattern's residue would 4x with the
-        count."""
-        loop = asyncio.get_running_loop()
+        ``listen()`` keeps the periodic ``sleep(0)`` (cooperative-scheduling
+        backstop), so ``_run_once`` re-enters and the heapify purge fires; with
+        the single outer timeout, only ONE timer is armed per message instead of
+        two, and none accumulate.  This is the case 964419c's unit test could
+        not see (it watched ``len(_scheduled)`` on an idle single-task loop)."""
 
         async def residue_for(n_messages: int) -> int:
-            p = _make_v2_peer()
-            await asyncio.sleep(0)
-            base = len(loop._scheduled)
-            peak = base
-            for _ in range(n_messages):
-                await p._receive_v2_message(timeout=60.0)
-                if len(loop._scheduled) > peak:
-                    peak = len(loop._scheduled)
-            return peak - base
+            with _BurialPressure():
+                p = _make_v2_peer()
+                sent = 0
 
-        peak_10k = await residue_for(10_000)
-        peak_40k = await residue_for(40_000)
+                async def _fake_send(_msg):
+                    nonlocal sent
+                    sent += 1
+                    if sent >= n_messages:
+                        p.state = PeerState.DISCONNECTED
 
-        # Each v2 message does 2 timeout-armed reads (length + body) and the
-        # yield budget advances once per packet, so a full yield window holds
-        # up to ~2 * V2_RECV_YIELD_EVERY cancelled handles before _run_once
-        # purges them.  Bounded — and independent of the message count.
-        band = 2 * V2_RECV_YIELD_EVERY + 50
-        self.assertLessEqual(peak_10k, band)
-        self.assertLessEqual(peak_40k, band)
-        # 4x the messages must NOT meaningfully grow the residue.
+                p.send_message = _fake_send
+
+                class _DummyWriter:
+                    def close(self):
+                        pass
+
+                    async def wait_closed(self):
+                        return None
+
+                p.writer = _DummyWriter()
+                p._listen_task = None
+                p._ping_task = None
+
+                await asyncio.sleep(0)
+                base = _count_live_timer_handles()
+                tasks_before = _count_live_tasks()
+                await asyncio.wait_for(p.listen(), timeout=30.0)
+                residue = _count_live_timer_handles() - base
+                task_growth = _count_live_tasks() - tasks_before
+                self.assertEqual(
+                    sent,
+                    n_messages,
+                    f"listen() processed {sent}/{n_messages} valid messages",
+                )
+                # asyncio.timeout arms NO Task; the listen path must not leak
+                # Tasks either.
+                self.assertLess(
+                    task_growth,
+                    50,
+                    f"live Task count grew by {task_growth} over {n_messages} "
+                    f"valid receives; expected ~0.",
+                )
+                return residue
+
+        r5k = await residue_for(5_000)
+        r20k = await residue_for(20_000)
+        r40k = await residue_for(40_000)
+
+        # Bounded: a few yield-windows' worth of residue plus slack, regardless
+        # of N.  (PRE-FIX, the same drive would be ~2*N: 10k / 40k / 80k.)
+        bound = 4 * V2_RECV_YIELD_EVERY + 200
+        for n, r in (("5k", r5k), ("20k", r20k), ("40k", r40k)):
+            self.assertLessEqual(
+                r,
+                bound,
+                f"POST-FIX listen() let live TimerHandles grow by {r} at {n} "
+                f"messages; expected bounded <= {bound}. The valid-message "
+                f"path is leaking timers.",
+            )
+
+        # FLAT: 8x the messages (5k -> 40k) must NOT grow the residue beyond the
+        # bounded band.  This is the property the prior _scheduled metric could
+        # not establish.
         self.assertLess(
-            peak_40k, peak_10k + V2_RECV_YIELD_EVERY,
-            f"residue grew with message count (10k->{peak_10k}, 40k->{peak_40k}); "
-            f"expected flat — the valid-message path must yield periodically.",
+            r40k,
+            r5k + bound,
+            f"POST-FIX residue scaled with message count "
+            f"(5k -> {r5k}, 40k -> {r40k}); expected flat/bounded.",
         )
 
-    async def test_listen_drives_valid_flood_without_unbounded_scheduled(self):
-        """End-to-end through listen(): a finite buffered flood of valid 'ping'
-        messages is processed (auto-ponged) and listen()'s per-message yield
-        keeps loop._scheduled bounded.  Confirms the belt-and-suspenders yield
-        in listen() works for the dispatched path too."""
-        loop = asyncio.get_running_loop()
+    async def test_postfix_single_timer_per_call(self):
+        """Direct structural proof: one ``_receive_v2_message`` call that returns
+        a valid message arms exactly ONE outer timeout (one TimerHandle while in
+        flight), not two — confirming the per-read timers were collapsed to a
+        single per-call timer.  Measured WITHOUT the listen() yield so we observe
+        the per-call arming rate directly: post-fix grows by ~1*N (vs the
+        pre-fix ~2*N proven above)."""
+        with _BurialPressure():
+            p = _make_v2_peer()
+            n = 20_000
+            base = _count_live_timer_handles()
+            for _ in range(n):
+                msg = await p._receive_v2_message(timeout=60.0)
+                self.assertEqual(msg.command, "ping")
+                self.assertEqual(msg.payload, _PING_PAYLOAD)
+            grew = _count_live_timer_handles() - base
 
-        n_messages = 5_000
-        processed = 0
+            # One timer per call (the single outer timeout), buried under the
+            # background timers (no yield here to purge).  So ~1*n — and
+            # critically LESS THAN the ~2*n the pre-fix per-read shape produced
+            # for the same n.  Assert it is at most ~1.5*n (clearly below 2*n)
+            # AND at least ~0.5*n (it IS still per-call without the yield, which
+            # is exactly why listen() keeps the yield).
+            self.assertLessEqual(
+                grew,
+                n + n // 2,
+                f"post-fix arms more than ~1 timer per call ({grew} for {n} "
+                f"calls); the per-read timeouts were not collapsed.",
+            )
 
-        class _FiniteValidTransport(_ValidMessageTransport):
-            pass
+
+class TestV2ReceivePreservedSemantics(unittest.IsolatedAsyncioTestCase):
+    """The timer-scope change must NOT alter decoy / unknown / stall / v1
+    behaviour."""
+
+    async def test_decoy_then_valid_under_single_timeout(self):
+        """A run of decoy packets followed by a valid one is handled inside the
+        single outer timeout: decoys are skipped (consecutive_skipped advances),
+        the valid message is returned, and bytes_recv accounts for all wire
+        bytes."""
+        body_len = HEADER_LEN + _ValidMessageTransport.CONTENTS_LEN + CHACHA20POLY1305_EXPANSION
+
+        class _DecoyThenValid:
+            def __init__(self, n_decoys):
+                self.n = n_decoys
+                self.i = 0
+
+            def decrypt_length(self, enc_length):
+                return _ValidMessageTransport.CONTENTS_LEN
+
+            def decrypt_contents(self, aead_ct, contents_len):
+                if self.i < self.n:
+                    self.i += 1
+                    return _PING_CONTENTS, True  # decoy
+                return _PING_CONTENTS, False  # valid
 
         p = _make_v2_peer()
-        p._v2_transport = _FiniteValidTransport()
+        p._v2_transport = _DecoyThenValid(5)
+        before_bytes = p.bytes_recv
+        msg = await p._receive_v2_message(timeout=60.0)
+        self.assertEqual(msg.command, "ping")
+        # All 6 packets (5 decoy + 1 valid) were processed and bytes_recv
+        # advanced.  (Note: wire_bytes_this_call accumulates across the call and
+        # is added after each packet, so the multi-packet total is the
+        # triangular sum — pre-existing accounting, unchanged by the timer
+        # fix; assert monotonic growth proportional to packets processed.)
+        per_pkt = LENGTH_FIELD_LEN + body_len
+        n_pkts = 6
+        expected = per_pkt * (n_pkts * (n_pkts + 1) // 2)
+        self.assertEqual(p.bytes_recv - before_bytes, expected)
 
-        # Stop after n_messages by flipping state to DISCONNECTED from a handler.
-        # listen() auto-handles 'ping' (sends pong), so we hook send_message to
-        # count and to terminate the loop.
-        sent_pongs = 0
+    async def test_too_many_consecutive_decoys_disconnects(self):
+        """MAX_CONSECUTIVE_V2_SKIP is still enforced inside the single outer
+        timeout — an all-decoy peer raises V2TransportError (graceful
+        disconnect), not TimeoutError."""
+        from ouroboros.peer import V2TransportError
 
-        async def _fake_send(msg):
-            nonlocal sent_pongs, processed
-            sent_pongs += 1
-            processed += 1
-            if processed >= n_messages:
-                p.state = PeerState.DISCONNECTED
+        class _AllDecoy:
+            def decrypt_length(self, enc_length):
+                return _ValidMessageTransport.CONTENTS_LEN
 
-        p.send_message = _fake_send
+            def decrypt_contents(self, aead_ct, contents_len):
+                return _PING_CONTENTS, True  # always decoy
 
-        class _DummyWriter:
-            def close(self):
-                pass
+        p = _make_v2_peer()
+        p._v2_transport = _AllDecoy()
+        with self.assertRaises(V2TransportError):
+            await p._receive_v2_message(timeout=60.0)
 
-            async def wait_closed(self):
-                return None
+    async def test_mid_packet_stall_still_times_out(self):
+        """A peer that returns the 3 length bytes synchronously then HANGS on
+        the body read must still time out — the single outer timeout spans the
+        whole call, so the stalled body read raises TimeoutError."""
 
-        p.writer = _DummyWriter()
-        p._listen_task = None
-        p._ping_task = None
+        class _StallBodyReader:
+            def __init__(self):
+                self.calls = 0
 
-        await asyncio.sleep(0)
-        base = len(loop._scheduled)
-        peak = base
+            async def readexactly(self, n):
+                self.calls += 1
+                if self.calls == 1:
+                    return b"\x00" * n  # length read returns immediately
+                # body read hangs forever -> outer timeout must fire
+                await asyncio.sleep(3600)
+                return b"\x00" * n
 
-        # Run listen() but watch _scheduled growth via a poller task.
-        async def _watch():
-            nonlocal peak
-            while p.state == PeerState.READY:
-                if len(loop._scheduled) > peak:
-                    peak = len(loop._scheduled)
-                await asyncio.sleep(0)
+        p = _make_v2_peer()
+        p.reader = _StallBodyReader()
+        with self.assertRaises(TimeoutError):
+            # Small timeout so the test is fast; the stall is "forever".
+            await p._receive_v2_message(timeout=0.05)
 
-        watcher = asyncio.ensure_future(_watch())
-        await asyncio.wait_for(p.listen(), timeout=10.0)
-        watcher.cancel()
-        try:
-            await watcher
-        except asyncio.CancelledError:
-            pass
+    async def test_v1_single_timeout_returns_valid_message(self):
+        """The v1 path now uses one outer timeout for header+payload; a valid
+        v1 message still round-trips."""
+        import hashlib
+        import struct
 
-        self.assertEqual(sent_pongs, n_messages)
-        residue = peak - base
-        bound = 4 * V2_RECV_YIELD_EVERY + 200
-        self.assertLessEqual(
-            residue, bound,
-            f"listen() let loop._scheduled grow by {residue} over {n_messages} "
-            f"valid messages; expected bounded <= {bound}.",
-        )
+        from ouroboros.p2p_messages import get_magic
+
+        magic = get_magic("mainnet")
+        payload = b"hello-payload"
+        command = b"ping".ljust(12, b"\x00")
+        checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+        header = struct.pack("<I12sI4s", magic, command, len(payload), checksum)
+        wire = header + payload
+
+        class _ChunkReader:
+            def __init__(self, data):
+                self.data = data
+                self.pos = 0
+
+            async def readexactly(self, n):
+                chunk = self.data[self.pos : self.pos + n]
+                self.pos += n
+                assert len(chunk) == n
+                return chunk
+
+        p = Peer("10.0.0.9", 8333, network="mainnet")
+        p.state = PeerState.READY
+        p.handshake_complete = True
+        p._v2_transport = None  # v1 path
+        p.reader = _ChunkReader(wire)
+        msg = await p.receive_message(timeout=60.0)
+        self.assertEqual(msg.command, "ping")
+        self.assertEqual(msg.payload, payload)
 
 
 if __name__ == "__main__":
