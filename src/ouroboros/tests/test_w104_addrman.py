@@ -742,27 +742,44 @@ class TestG20NetworkGroupComputation(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestG21GetAddressesPctCap(unittest.TestCase):
     """
-    BUG-21: ouroboros get_addresses(count=1000) returns up to 1000 addresses
-    unconditionally. Core's GetAddr_() applies `max_pct=23` when called from
-    GetAddresses (net_processing.cpp:4842-4844): min(1000, 23% of total).
-
-    This prevents a single getaddr response from returning too large a
-    fraction of the addrman (eclipse attack amplification).
+    BUG-21 FIXED: ``AddressManager.get_addresses_for_sharing`` applies Core's
+    getaddr 23%-cap.  Core's GetAddr_() applies ``max_pct=23`` when called from
+    GetAddresses (net_processing.cpp:4842-4844 -> addrman.cpp:797-803):
+    ``nNodes = 23 * size / 100`` (integer division == FLOOR), then
+    ``min(nNodes, 1000)``.  The legacy uncapped ``get_addresses`` is retained for
+    the byte-exact getnodeaddresses RPC dump; the new sharing path is capped.
     """
 
-    def test_no_percentage_cap(self):
+    def test_get_addresses_for_sharing_is_capped(self):
         am = AddressManager()
         now = time.time()
-        # Add 200 addresses
+        # Add 200 addresses (netgroup bucketing keeps a subset of these).
         for i in range(200):
             am.add(f"1.2.{i // 256}.{i % 256}", 8333, timestamp=now)
-        # get_addresses returns up to 1000, not limited to 23%
-        result = am.get_addresses(count=1000)
-        # 23% of 200 = 46 — Core would return at most 46
-        # ouroboros returns all ~200 (BUG-21)
-        self.assertGreater(
-            len(result), 46,
-            "BUG-21: get_addresses should be capped at 23% of total (Core parity)",
+        stored = len(am.get_addresses(count=1000))  # what the uncapped path holds
+        capped = am.get_addresses_for_sharing(max_addresses=1000, max_pct=23)
+        expected = (23 * stored) // 100  # Core FLOOR(23*size/100)
+        self.assertEqual(
+            len(capped), expected,
+            "BUG-21 FIX: get_addresses_for_sharing must apply FLOOR(23%) cap",
+        )
+        # And it must be strictly fewer than the uncapped path when stored>4.
+        self.assertLess(
+            len(capped), stored,
+            "BUG-21 FIX: 23%-cap must return a strict subset",
+        )
+
+    def test_sharing_cap_hard_1000_limit(self):
+        # FLOOR(23*size/100) exceeds 1000 only for size>4347; verify the hard cap.
+        am = AddressManager()
+        now = time.time()
+        # Seed a large addrman across many /16 groups so bucketing keeps lots.
+        for i in range(6000):
+            am.add(f"{10 + i // 60000}.{(i // 256) % 256}.{i % 256}.7", 8333, timestamp=now)
+        capped = am.get_addresses_for_sharing(max_addresses=1000, max_pct=23)
+        self.assertLessEqual(
+            len(capped), 1000,
+            "BUG-21 FIX: hard MAX_ADDR_TO_SEND=1000 cap must hold",
         )
 
     def test_get_addresses_does_not_filter_terrible(self):
@@ -808,22 +825,33 @@ class TestG22FeelerSelection(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestG23GetaddrOnce(unittest.TestCase):
     """
-    BUG-23: ouroboros p2p.py on_getaddr handler has NO once-per-connection
-    guard. Core at net_processing.cpp:4831 checks `peer.m_getaddr_sent`
-    and returns without sending if already sent once.
-
-    This allows a remote peer to call getaddr repeatedly and drain our
-    full addrman on each call — a lightweight DoS / info-gathering vector.
-
-    TWO-PIPELINE: Rust PeerManager has no getaddr handler at all.
+    BUG-23 FIXED: the once-per-connection getaddr guard now lives on the Peer
+    (``peer.getaddr_recvd``), exactly where Core keeps it (``peer.m_getaddr_recvd``
+    in net_processing.cpp:4833 — a per-Peer field, NOT on the addrman).  The
+    on_getaddr handler answers the first getaddr and ignores the rest.  The
+    behavioural proof (repeated getaddr -> one response) is in the functional
+    test ``test_w_getaddr_antidos.py``; here we confirm the per-peer field exists.
     """
 
-    def test_addrman_has_no_getaddr_sent_tracking(self):
-        # Verify AddressManager itself has no tracking — the bug is in p2p.py
+    def test_peer_has_getaddr_recvd_tracking(self):
+        from ouroboros.peer import Peer
+        peer = Peer(host="1.2.3.4", port=8333, network="mainnet", inbound=True)
+        self.assertTrue(
+            hasattr(peer, "getaddr_recvd"),
+            "BUG-23 FIX: Peer must carry getaddr_recvd (Core m_getaddr_recvd)",
+        )
+        self.assertFalse(
+            peer.getaddr_recvd,
+            "BUG-23 FIX: getaddr_recvd starts False (no getaddr answered yet)",
+        )
+
+    def test_addrman_does_not_own_getaddr_tracking(self):
+        # Per-connection state belongs on the Peer, not the shared addrman —
+        # this matches Core's layering (m_getaddr_recvd is a Peer field).
         am = AddressManager()
         self.assertFalse(
             hasattr(am, "_getaddr_sent"),
-            "BUG-23: AddressManager missing _getaddr_sent per-connection tracking",
+            "getaddr-once tracking is per-Peer (Core), not on the shared addrman",
         )
 
 
@@ -832,26 +860,37 @@ class TestG23GetaddrOnce(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestG24AddrRateLimit(unittest.TestCase):
     """
-    BUG-24: ouroboros _rate_limit_addr_relay uses a simple daily counter:
-    up to 1000 addresses per 24-hour window per peer.
-
-    Core uses a token-bucket rate limiter: MAX_ADDR_RATE_PER_SECOND=0.1
-    addr/sec with a burst bucket of MAX_ADDR_PROCESSING_TOKEN_BUCKET=1000.
-    The token bucket refills at 0.1/sec and can burst to 1000, but a peer
-    sending 1000 addresses instantly drains the bucket and must wait ~2.8
-    hours before sending another 1000. The daily counter allows 1000
-    addresses at any frequency within a 24h window (incorrect).
-
-    Additionally, when getaddr is sent, Core adds 1000 tokens to the bucket
-    (net_processing.cpp:3767) — ouroboros has no equivalent.
+    BUG-24 FIXED: inbound addresses now pass a Core-parity token bucket before
+    being processed (``PeerManager._admit_addrs_token_bucket`` /
+    ``_refill_addr_token_bucket``), distinct from the legacy daily
+    ``_rate_limit_addr_relay`` counter (which still gates the relay-amplification
+    path).  Core ProcessAddrs (net_processing.cpp:5644-5671): per-peer bucket init
+    1.0, refill ``elapsed * MAX_ADDR_RATE_PER_SECOND`` (0.1/s) soft-capped at
+    ``MAX_ADDR_PROCESSING_TOKEN_BUCKET`` (1000); each processed address costs one
+    token; excess dropped.  The behavioural drain proof is in the functional test
+    ``test_w_getaddr_antidos.py``.
     """
 
-    def test_daily_counter_not_token_bucket(self):
+    def test_token_bucket_uses_core_rate(self):
+        import inspect
+        import ouroboros.p2p as p2p_mod
+        # Genuine Core constants present at module scope.
+        self.assertEqual(p2p_mod.MAX_ADDR_RATE_PER_SECOND, 0.1)
+        self.assertEqual(p2p_mod.MAX_ADDR_PROCESSING_TOKEN_BUCKET, 1000)
+        src = inspect.getsource(p2p_mod.PeerManager._refill_addr_token_bucket)
+        self.assertIn(
+            "MAX_ADDR_RATE_PER_SECOND", src,
+            "BUG-24 FIX: token-bucket refill must use the 0.1 addr/sec rate",
+        )
+
+    def test_daily_relay_counter_still_separate(self):
+        # The daily-window relay-rate limiter is a DIFFERENT mechanism (Core's
+        # m_addr_token_bucket throttles processing; the daily counter caps
+        # relay amplification) — it intentionally keeps the 86400 window.
         import inspect
         import ouroboros.p2p as p2p_mod
         src = inspect.getsource(p2p_mod.PeerManager._rate_limit_addr_relay)
-        self.assertIn("86400", src, "BUG-24: daily counter (86400s) instead of token bucket")
-        self.assertNotIn("0.1", src, "BUG-24: missing 0.1 addr/sec token bucket rate")
+        self.assertIn("86400", src)
 
 
 # ---------------------------------------------------------------------------
