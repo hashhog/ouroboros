@@ -1655,6 +1655,14 @@ class Mempool:
         # mapTx is keyed by txid AND wtxid in Bitcoin Core.
         self.wtxid_to_txid: dict[bytes, bytes] = {}
         self.spent_outputs: set[OutPoint] = set()
+        # Reverse spend-index: outpoint -> txid of the in-mempool tx that spends
+        # it.  Bitcoin Core keeps this as ``mapNextTx`` (txmempool.h) and serves
+        # it via ``GetConflictTx``; the gettxspendingprevout RPC uses it for the
+        # mempool-spend path.  Maintained in lock-step with ``spent_outputs`` in
+        # the same add / remove / clear sites.  An outpoint can be spent by at
+        # most one tx in a valid mempool (double-spends are resolved by RBF
+        # before insertion), so this is a 1:1 map.
+        self.spender_by_outpoint: dict[OutPoint, bytes] = {}
 
         # Sorted by fee rate (for mining)
         self.by_fee_rate: list[bytes] = []  # txids sorted by fee rate (lowest first)
@@ -2422,6 +2430,8 @@ class Mempool:
         for tx_in in tx.inputs:
             outpoint: OutPoint = (tx_in.prev_txid, tx_in.prev_vout)
             self.spent_outputs.add(outpoint)
+            # Reverse spend-index (Core mapNextTx): this tx is the spender.
+            self.spender_by_outpoint[outpoint] = txid
 
         # Update parent entries to add this txid as a child
         for parent_txid in direct_parents:
@@ -3190,6 +3200,11 @@ class Mempool:
         for tx_in in entry.tx.inputs:
             outpoint: OutPoint = (tx_in.prev_txid, tx_in.prev_vout)
             self.spent_outputs.discard(outpoint)
+            # Reverse spend-index: drop the mapping only if it still points at
+            # THIS tx (an RBF replacement inserted before this eviction may have
+            # already re-pointed the outpoint to the replacing tx).
+            if self.spender_by_outpoint.get(outpoint) == txid:
+                self.spender_by_outpoint.pop(outpoint, None)
 
         # Update parent/child links: remove this txid from parents' children sets
         for parent_txid in entry.parents:
@@ -3319,6 +3334,21 @@ class Mempool:
         """
         entry = self.transactions.get(txid)
         return entry.tx if entry else None
+
+    def get_conflict_tx(self, outpoint: OutPoint) -> Transaction | None:
+        """Return the in-mempool tx that spends *outpoint*, or ``None``.
+
+        Mirrors Bitcoin Core ``CTxMemPool::GetConflictTx`` (txmempool.h): a
+        single O(1) lookup in the reverse spend-index (``mapNextTx``).  Used by
+        the gettxspendingprevout RPC's mempool-spend path.  *outpoint* is a
+        ``(prev_txid, prev_vout)`` tuple in internal byte order.
+        """
+        with self._lock:
+            spender_txid = self.spender_by_outpoint.get(outpoint)
+            if spender_txid is None:
+                return None
+            entry = self.transactions.get(spender_txid)
+            return entry.tx if entry else None
 
     def get_all_transactions(self) -> list[Transaction]:
         """
@@ -3941,7 +3971,9 @@ class Mempool:
         self.transactions[new_txid] = entry
         self.current_size += new_size
         for inp in new_tx.inputs:
-            self.spent_outputs.add((inp.prev_txid, inp.prev_vout))
+            op_in = (inp.prev_txid, inp.prev_vout)
+            self.spent_outputs.add(op_in)
+            self.spender_by_outpoint[op_in] = new_txid
         self._insert_sorted_by_fee_rate(new_txid, new_fee_rate)
 
         # Update parent entries to add this txid as a child
@@ -4054,6 +4086,7 @@ class Mempool:
             self.transactions.clear()
             self.wtxid_to_txid.clear()
             self.spent_outputs.clear()
+            self.spender_by_outpoint.clear()
             self.by_fee_rate.clear()
             self._cluster_manager.rebuild()  # Clear cluster data
             self.current_size = 0
@@ -4991,7 +5024,9 @@ class Mempool:
             self.current_size += tx_size
 
             for inp in tx.inputs:
-                self.spent_outputs.add((inp.prev_txid, inp.prev_vout))
+                op_in = (inp.prev_txid, inp.prev_vout)
+                self.spent_outputs.add(op_in)
+                self.spender_by_outpoint[op_in] = txid
 
             self._insert_sorted_by_fee_rate(txid, fee_rate)
 
