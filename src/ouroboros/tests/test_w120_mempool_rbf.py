@@ -671,23 +671,18 @@ class TestG17DiagramNoToleranceFudge(unittest.TestCase):
 
 
 # ===========================================================================
-# G18 — BUG-2 (P0-CDIV): INCREMENTAL_RELAY_FEE constant wrong
-# Core: policy/policy.h DEFAULT_INCREMENTAL_RELAY_FEE = 1000 sat/kvB (== 1 sat/vB).
-# ouroboros: DEFAULT_INCREMENTAL_RELAY_FEE = 100 (mempool.py:54). Rule 4 bar
-#   is 10x weaker. A replacement adding only 1 sat per 10 vbytes passes the
-#   incremental ceiling — Core would require 1 sat/vbyte.
-# Status: BUG-2 — DIVERGENT P0 (consensus-adjacent policy off by 10x).
+# G18 — INCREMENTAL_RELAY_FEE constant (Core parity).
+# Core: policy/policy.h:48 DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB.
+# ouroboros: DEFAULT_INCREMENTAL_RELAY_FEE = 100 (mempool.py) — MATCHES Core.
+# The earlier premise (Core == 1000) was wrong; policy.h is 100.  This now
+# asserts the true value so it can never silently regress.
 # ===========================================================================
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG-2: DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB; Core default is "
-    "1000 sat/kvB (1 sat/vB). Rule 4 ceiling is 10x lower than Core."
-))
 class TestG18IncrementalRelayFeeConstant(unittest.TestCase):
     def test_default_matches_core(self):
         from ouroboros.mempool import DEFAULT_INCREMENTAL_RELAY_FEE
-        self.assertEqual(DEFAULT_INCREMENTAL_RELAY_FEE, 1000,
-                         "Core policy/policy.h DEFAULT_INCREMENTAL_RELAY_FEE = 1000 sat/kvB")
+        self.assertEqual(DEFAULT_INCREMENTAL_RELAY_FEE, 100,
+                         "Core policy/policy.h:48 DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB")
 
 
 # ===========================================================================
