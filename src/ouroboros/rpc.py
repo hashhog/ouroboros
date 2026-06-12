@@ -455,6 +455,20 @@ async def accept_block(
         except Exception:
             pass  # an index fault must never abort block acceptance
 
+    # -txospenderindex — same rationale: a block accepted through the RPC path
+    # (submitblock / generatetoaddress) must record its spent-outpoint ->
+    # spending-tx keys exactly as a P2P/IBD-connected block does (Core's single
+    # BlockConnected signal feeds every index).  Complements the primary
+    # block_sync connect hook.
+    tsi = getattr(node, "txospender_index", None)
+    if tsi is not None and _connected_block is not None:
+        try:
+            await asyncio.to_thread(
+                tsi.add_block, _connected_block, next_height, db
+            )
+        except Exception:
+            pass  # an index fault must never abort block acceptance
+
     # Step 6 — Wallet transaction-history scan (best-effort).
     # Walk the connected block's txs and record a wallet-history entry for any
     # tx that credits a wallet script (receive/coinbase) or debits a wallet
@@ -509,6 +523,29 @@ class RpcError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def _core_uvtype(value: Any) -> str:
+    """Map a decoded-JSON Python value to Bitcoin Core's ``uvTypeName`` string.
+
+    Used to build RPC_TYPE_ERROR messages byte-identical to Core
+    (univalue.cpp ``uvTypeName``): null / bool / object / array / string /
+    number.  ``bool`` is checked before ``int`` because Python ``bool`` is a
+    subclass of ``int``.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    return "null"
 
 
 # Bitcoin Core RPC error codes (subset; protocol.h).
@@ -3226,6 +3263,222 @@ class RPCServer:
                 status_code=500, detail="Node has no data_dir configured"
             )
         return os.path.join(data_dir, "mempool.dat")
+
+    async def rpc_gettxspendingprevout(
+        self, outputs: Any = None, options: Any = None
+    ) -> list[dict[str, Any]]:
+        """Scan the mempool (and the txospenderindex, if available) to find
+        transactions spending any of the given outputs.
+
+        Mirrors Bitcoin Core ``rpc/mempool.cpp::gettxspendingprevout`` exactly.
+
+        Params:
+          [0] ``outputs`` (ARR, required): array of ``{"txid": hex, "vout": n}``.
+              Empty  -> RPC_INVALID_PARAMETER "Invalid parameter, outputs are missing".
+              vout<0 -> RPC_INVALID_PARAMETER "Invalid parameter, vout cannot be negative".
+              Strict per-object keys (only txid + vout) — RPCTypeCheckObj.
+          [1] ``options`` (OBJ, optional, strict): ``{mempool_only, return_spending_tx}``.
+              ``mempool_only`` default = (txospenderindex unavailable);
+              ``return_spending_tx`` default false.
+
+        Output: ARR of OBJ, pushKV order per object:
+          ``txid, vout, [spendingtxid], [spendingtx], [blockhash]``.
+        ``blockhash`` is set ONLY on the confirmed/index path (never for a
+        mempool spender).  Unspent -> object carries only txid+vout.
+
+        Algorithm (Core mempool.cpp:937-1039): scan the mempool FIRST via the
+        outpoint reverse-index (Core's GetConflictTx).  For each entry, if a
+        mempool spender is found OR mempool_only is set, emit and drop from the
+        worklist.  Return early if the worklist is empty.  Otherwise
+        (mempool_only==false) the index must be available and synced, else
+        RPC_MISC_ERROR; for each remaining outpoint, look it up in the index.
+        """
+        # Core: const UniValue& output_params = request.params[0].get_array();
+        if outputs is None or not isinstance(outputs, list):
+            # Core get_array() on a missing/non-array param is a type error,
+            # but the OMITTED-required arg surfaces as missing first; ouroboros
+            # collapses both to the "outputs are missing" message Core throws on
+            # an empty array — the common caller-facing case.
+            raise RpcError(
+                RPC_INVALID_PARAMETER, "Invalid parameter, outputs are missing"
+            )
+        if len(outputs) == 0:
+            raise RpcError(
+                RPC_INVALID_PARAMETER, "Invalid parameter, outputs are missing"
+            )
+
+        # Locate the confirmed-spend index (None when -txospenderindex is off).
+        tsi = getattr(self.node, "txospender_index", None)
+
+        # Parse options (strict: only mempool_only + return_spending_tx).
+        # mempool_only default = (index unavailable) — Core: !g_txospenderindex.
+        mempool_only = tsi is None
+        return_spending_tx = False
+        if options is not None:
+            if not isinstance(options, dict):
+                raise RpcError(
+                    RPC_TYPE_ERROR,
+                    "JSON value of type %s is not of expected type object"
+                    % _core_uvtype(options),
+                )
+            # RPCTypeCheckObj(fStrict): unexpected keys -> RPC_TYPE_ERROR.
+            for k in options:
+                if k not in ("mempool_only", "return_spending_tx"):
+                    raise RpcError(RPC_TYPE_ERROR, f"Unexpected key {k}")
+            if "mempool_only" in options:
+                v = options["mempool_only"]
+                if not isinstance(v, bool):
+                    raise RpcError(
+                        RPC_TYPE_ERROR,
+                        "JSON value of type %s for field mempool_only is not "
+                        "of expected type bool" % _core_uvtype(v),
+                    )
+                mempool_only = v
+            if "return_spending_tx" in options:
+                v = options["return_spending_tx"]
+                if not isinstance(v, bool):
+                    raise RpcError(
+                        RPC_TYPE_ERROR,
+                        "JSON value of type %s for field return_spending_tx is "
+                        "not of expected type bool" % _core_uvtype(v),
+                    )
+                return_spending_tx = v
+
+        # Worklist entry: parsed outpoint (internal byte order) + original
+        # {txid,vout} strings so the result object copies them verbatim.
+        worklist: list[dict[str, Any]] = []
+        for o in outputs:
+            if not isinstance(o, dict):
+                raise RpcError(
+                    RPC_TYPE_ERROR,
+                    "JSON value of type %s is not of expected type object"
+                    % _core_uvtype(o),
+                )
+            # RPCTypeCheckObj: type-check txid (str) + vout (num) first ...
+            if "txid" not in o or not isinstance(o["txid"], str):
+                raise RpcError(
+                    RPC_TYPE_ERROR,
+                    "JSON value of type %s for field txid is not of expected "
+                    "type string" % _core_uvtype(o.get("txid")),
+                )
+            vout_val = o.get("vout")
+            if not isinstance(vout_val, (int, float)) or isinstance(vout_val, bool):
+                raise RpcError(
+                    RPC_TYPE_ERROR,
+                    "JSON value of type %s for field vout is not of expected "
+                    "type number" % _core_uvtype(vout_val),
+                )
+            # ... then strict unknown-key reject.
+            for k in o:
+                if k not in ("txid", "vout"):
+                    raise RpcError(RPC_TYPE_ERROR, f"Unexpected key {k}")
+
+            # ParseHashO(o, "txid"): hex / length validation (rpc/util.cpp).
+            txid_str = o["txid"]
+            try:
+                txid_internal = bytes.fromhex(txid_str)[::-1]
+            except ValueError:
+                txid_internal = None
+            if txid_internal is None or len(txid_str) != 64:
+                if len(txid_str) != 64:
+                    raise RpcError(
+                        RPC_INVALID_PARAMETER,
+                        f"txid must be of length 64 (not {len(txid_str)}, for "
+                        f"'{txid_str}')",
+                    )
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    f"txid must be hexadecimal string (not '{txid_str}')",
+                )
+
+            n_output = int(vout_val)
+            if n_output < 0:
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, vout cannot be negative",
+                )
+
+            worklist.append(
+                {
+                    "outpoint": (txid_internal, n_output),
+                    "txid_str": txid_str,
+                    "vout": n_output,
+                }
+            )
+
+        def _make_output(entry: dict[str, Any], spending_tx_hex: bytes | None,
+                         spending_txid_internal: bytes | None) -> dict[str, Any]:
+            # Core pushKV order: txid, vout, [spendingtxid], [spendingtx].
+            # blockhash is appended by the caller on the confirmed path only.
+            out: dict[str, Any] = {
+                "txid": entry["txid_str"],
+                "vout": entry["vout"],
+            }
+            if spending_txid_internal is not None:
+                out["spendingtxid"] = spending_txid_internal[::-1].hex()
+                if return_spending_tx and spending_tx_hex is not None:
+                    out["spendingtx"] = bytes(spending_tx_hex).hex()
+            return out
+
+        result: list[dict[str, Any]] = []
+
+        # Phase 1: scan the mempool first (Core's GetConflictTx reverse-index).
+        remaining: list[dict[str, Any]] = []
+        mempool = getattr(self.node, "mempool", None)
+        for entry in worklist:
+            spending_tx = None
+            if mempool is not None and hasattr(mempool, "get_conflict_tx"):
+                spending_tx = mempool.get_conflict_tx(entry["outpoint"])
+            # If unspent in mempool and this is not a mempool-only request, defer.
+            if spending_tx is None and not mempool_only:
+                remaining.append(entry)
+                continue
+            if spending_tx is not None:
+                try:
+                    sp_hex = spending_tx.serialize_with_witness()
+                except Exception:
+                    sp_hex = spending_tx.serialize()
+                result.append(_make_output(entry, sp_hex, spending_tx.txid))
+            else:
+                # mempool_only and unspent in mempool: bare txid+vout.
+                result.append(_make_output(entry, None, None))
+
+        # Return early if the mempool scan handled everything.
+        if not remaining:
+            return result
+
+        # Phase 2: not mempool-only and some outpoints remain unresolved. The
+        # index must be available AND synced to the tip (Core:
+        # !g_txospenderindex || !BlockUntilSyncedToCurrentChain()).
+        tip_synced = False
+        if tsi is not None:
+            try:
+                _, tip_height = self.node.db.get_best_block()
+                tip_synced = bool(tsi.is_synced(tip_height))
+            except Exception:
+                tip_synced = False
+        if tsi is None or not tip_synced:
+            raise RpcError(
+                RPC_MISC_ERROR,
+                "Mempool lacks a relevant spend, and txospenderindex is "
+                "unavailable.",
+            )
+
+        for entry in remaining:
+            prev_txid, prev_vout = entry["outpoint"]
+            try:
+                rec = await asyncio.to_thread(tsi.find_spender, prev_txid, prev_vout)
+            except Exception as e:
+                raise RpcError(RPC_MISC_ERROR, str(e)) from None
+            if rec is not None:
+                out = _make_output(entry, rec.spending_tx_hex, rec.spending_txid)
+                out["blockhash"] = rec.block_hash[::-1].hex()
+                result.append(out)
+            else:
+                # Unspent on-chain: only txid+vout.
+                result.append(_make_output(entry, None, None))
+
+        return result
 
     async def rpc_dumpmempool(self, filepath: str | None = None) -> dict[str, Any]:
         """Persist the in-memory mempool to ``mempool.dat`` (Core format).
@@ -6975,6 +7228,18 @@ class RPCServer:
                     f"invalidateblock: coinstatsindex resync failed: {e}"
                 )
 
+        # Same gap for -txospenderindex: the Rust reorg did not fire the Python
+        # connect/disconnect hooks, so re-align the spender index with the new
+        # active chain (rewind reorged-away spend keys, re-connect forward).
+        tsi = getattr(self.node, "txospender_index", None)
+        if tsi is not None:
+            try:
+                await asyncio.to_thread(tsi.resync_to_chainstate, db)
+            except Exception as e:
+                logger.warning(
+                    f"invalidateblock: txospenderindex resync failed: {e}"
+                )
+
         return None
 
     async def rpc_reconsiderblock(self, blockhash: str) -> None:
@@ -7048,6 +7313,16 @@ class RPCServer:
             except Exception as e:
                 logger.warning(
                     f"reconsiderblock: coinstatsindex resync failed: {e}"
+                )
+
+        # Same re-alignment for -txospenderindex.
+        tsi = getattr(self.node, "txospender_index", None)
+        if tsi is not None:
+            try:
+                await asyncio.to_thread(tsi.resync_to_chainstate, db)
+            except Exception as e:
+                logger.warning(
+                    f"reconsiderblock: txospenderindex resync failed: {e}"
                 )
 
         return None
@@ -11051,6 +11326,21 @@ class RPCServer:
             except Exception:
                 csi_synced = False
             _emit("coinstatsindex", csi_synced, cbest_height)
+
+        # --- txospenderindex (only when -txospenderindex on) ---
+        # Core's TxoSpenderIndex BaseIndex name is "txospenderindex".
+        tsi = getattr(self.node, "txospender_index", None)
+        if tsi is not None:
+            try:
+                tbest = tsi.best_indexed_height
+            except Exception:
+                tbest = None
+            tbest_height = int(tbest) if tbest is not None else 0
+            try:
+                tsi_synced = bool(tsi.is_synced(tip_height))
+            except Exception:
+                tsi_synced = False
+            _emit("txospenderindex", tsi_synced, tbest_height)
 
         return result
 

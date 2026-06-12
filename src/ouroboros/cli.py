@@ -427,6 +427,18 @@ def sync(ctx, reset, limit):
     ),
 )
 @click.option(
+    "--txospenderindex/--notxospenderindex",
+    default=None,
+    help=(
+        "Maintain a transaction-output spender index: for every non-coinbase "
+        "input of every connected block, map the spent outpoint to its "
+        "spending tx so gettxspendingprevout can resolve confirmed spends "
+        "(options.mempool_only=false) and getindexinfo reports it (default: "
+        "from config; config default is off, matching Bitcoin Core's "
+        "-txospenderindex=0)."
+    ),
+)
+@click.option(
     "--daemon",
     is_flag=True,
     default=False,
@@ -484,7 +496,8 @@ def sync(ctx, reset, limit):
 @click.pass_context
 def start(
     ctx, rpc_port, p2p_port, listen, connect, dnsseed, force, v2transport,
-    peerbloomfilters, blockfilterindex, cfilter, coinstatsindex, daemon,
+    peerbloomfilters, blockfilterindex, cfilter, coinstatsindex,
+    txospenderindex, daemon,
     pid_path, reindex, rpc_tls_cert, rpc_tls_key,
 ):
     """Start the Bitcoin node"""
@@ -586,6 +599,11 @@ def start(
         # omits the flag the conf-file value wins.
         if coinstatsindex is not None:
             config["coinstatsindex"] = bool(coinstatsindex)
+        # Same conf-vs-CLI precedence for --txospenderindex.  Default off
+        # (Core parity, DEFAULT_TXOSPENDERINDEX=false).  When the operator
+        # omits the flag the conf-file value wins.
+        if txospenderindex is not None:
+            config["txospenderindex"] = bool(txospenderindex)
 
         # FIX-64: HTTPS/TLS termination flags.  Reject mismatched pairs at
         # the CLI layer so the operator sees a clean Click error rather than
