@@ -217,6 +217,7 @@ class BlockSync:
         fee_estimator=None,  # Optional FeeEstimator to feed confirmed-block fee data
         block_filter_index=None,  # Optional BIP 157/158 block-filter index
         coinstats_index=None,  # Optional -coinstatsindex (per-height MuHash)
+        txospender_index=None,  # Optional -txospenderindex (outpoint->spender)
         wallet_notifier=None,  # Optional wallet block-connect/disconnect sink
     ):
         """Initialize block synchronizer."""
@@ -236,6 +237,13 @@ class BlockSync:
         # chain tip (same primary connect/disconnect path as the filter
         # index above).  None = disabled.
         self.coinstats_index = coinstats_index
+        # -txospenderindex — when set, every successfully connected block is
+        # passed to ``txospender_index.add_block(block, height, db)`` and every
+        # disconnected block to ``txospender_index.remove_block(block, height)``
+        # so the spent-outpoint -> spending-tx index stays in lock-step with the
+        # chain tip (same primary connect/disconnect path as the indices above,
+        # Core's TxoSpenderIndex CustomAppend/CustomRemove).  None = disabled.
+        self.txospender_index = txospender_index
         # Wallet block-connect sink (Core CWallet::blockConnected). When set,
         # every canonically-connected block is passed to
         # ``wallet_notifier.notify_block_connected(block, height)`` so loaded
@@ -1819,6 +1827,25 @@ class BlockSync:
                 except Exception as e:
                     logger.warning(
                         f"coinstats_index.add_block failed at "
+                        f"height {new_height}: {e}"
+                    )
+
+            # -txospenderindex — record (spent outpoint -> spending tx) for
+            # every non-coinbase input of this canonically-connected block.
+            # Off-thread + non-fatal (an index fault must never stall IBD).
+            # Same primary connect path Core's TxoSpenderIndex::CustomAppend
+            # runs on via BlockConnected.
+            if self.txospender_index is not None:
+                try:
+                    await asyncio.to_thread(
+                        self.txospender_index.add_block,
+                        block,
+                        new_height,
+                        self.db,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"txospender_index.add_block failed at "
                         f"height {new_height}: {e}"
                     )
 
@@ -3829,6 +3856,28 @@ class BlockSync:
                         )
                     disconnect_height -= 1
 
+            # -txospenderindex — erase each disconnected block's spend keys,
+            # re-derived from the block's OWN inputs (no undo data needed).
+            # Same primary disconnect path Core's TxoSpenderIndex::CustomRemove
+            # runs on via BlockDisconnected.  Non-fatal.
+            if self.txospender_index is not None:
+                disconnect_height = tip_height_at_disconnect
+                for curr_hash, curr_block, _ in reversed(blocks_to_disconnect):
+                    try:
+                        await asyncio.to_thread(
+                            self.txospender_index.remove_block,
+                            curr_block,
+                            disconnect_height,
+                            self.db,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"txospender_index.remove_block failed at "
+                            f"height {disconnect_height} "
+                            f"(hash {curr_hash.hex()[:16]}...): {e}"
+                        )
+                    disconnect_height -= 1
+
             # Wallet block-disconnect (Core CWallet::blockDisconnected). Roll
             # the per-block credit/debit history back so a reorged-away receive
             # disappears from listtransactions. Non-fatal — a wallet fault must
@@ -3991,6 +4040,25 @@ class BlockSync:
                     except Exception as e:
                         logger.warning(
                             f"coinstats_index.add_block failed at "
+                            f"height {connect_height} during reorg "
+                            f"(hash {new_hash.hex()[:16]}...): {e}"
+                        )
+
+                # -txospenderindex — record this block's spend keys along the
+                # new active chain (reorg connect side).  Same primary connect
+                # path as the linear hook (Core TxoSpenderIndex::CustomAppend).
+                # Non-fatal.
+                if self.txospender_index is not None:
+                    try:
+                        await asyncio.to_thread(
+                            self.txospender_index.add_block,
+                            new_block_obj,
+                            connect_height,
+                            self.db,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"txospender_index.add_block failed at "
                             f"height {connect_height} during reorg "
                             f"(hash {new_hash.hex()[:16]}...): {e}"
                         )

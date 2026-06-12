@@ -151,6 +151,12 @@ class BitcoinNode:
         # then errors -8 on a non-tip hash_or_height, matching Core).
         self.coinstats_index = None
 
+        # Txo spender index (-txospenderindex).  Lazily instantiated in start()
+        # when the flag is enabled; remains None otherwise (gettxspendingprevout
+        # then only answers the mempool form, matching Core's
+        # DEFAULT_TXOSPENDERINDEX{false}).
+        self.txospender_index = None
+
         # State
         self.running = False
         self.synced = False
@@ -490,6 +496,54 @@ class BitcoinNode:
                     "coin-stats index: disabled (Core parity default)"
                 )
 
+            # -txospenderindex (Core parity, default false).  Maintains a
+            # spent-outpoint -> spending-tx index so gettxspendingprevout can
+            # resolve confirmed spends.  Same plumbing as -coinstatsindex.
+            tsi_raw = self.config.get('txospenderindex', False)
+            if isinstance(tsi_raw, str):
+                txospender_index_enabled = tsi_raw.lower() in ("1", "true", "yes", "on")
+            else:
+                txospender_index_enabled = bool(tsi_raw)
+            if txospender_index_enabled:
+                from ouroboros.txospenderindex import TxoSpenderIndex
+                try:
+                    self.txospender_index = TxoSpenderIndex(
+                        data_dir=self.data_dir, enabled=True,
+                    )
+                    # Crash-safety reconcile (Core BaseIndex::Init parity):
+                    # rewind the index to the active chain if an unclean
+                    # restart / reorg left it ahead of or forked from the
+                    # chainstate.  Then catch up forward to the chain tip so a
+                    # node enabled with an already-synced chain backfills the
+                    # spend keys it missed (Core builds the index from genesis).
+                    try:
+                        self.txospender_index.reconcile_to_chainstate(self.db)
+                        connected = self.txospender_index.resync_to_chainstate(
+                            self.db
+                        )
+                        if connected:
+                            logger.info(
+                                f"txospenderindex: built {connected} height(s) "
+                                f"forward to chainstate tip on startup"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"txospenderindex: startup reconcile/catch-up "
+                            f"failed ({e}); index may lag chainstate"
+                        )
+                    logger.info("txo spender index: enabled")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to open txo spender index ({e}); "
+                        "continuing without -txospenderindex"
+                    )
+                    self.txospender_index = None
+                    txospender_index_enabled = False
+            else:
+                logger.info(
+                    "txo spender index: disabled (Core parity default)"
+                )
+
             # FIX-71 / W121 BUG-5: pass a callable that re-evaluates the
             # NODE_COMPACT_FILTERS gate on every handshake.  The
             # predicate is two-part, matching Bitcoin Core's
@@ -559,6 +613,7 @@ class BitcoinNode:
                 fee_estimator=self.fee_estimator,
                 block_filter_index=self.block_filter_index,
                 coinstats_index=self.coinstats_index,
+                txospender_index=self.txospender_index,
                 # Feed every canonically-connected/disconnected block to the
                 # wallet manager so loaded wallets track their own txs in
                 # lock-step with the chain (Core CWallet::blockConnected).

@@ -208,6 +208,15 @@ class NodeConfig:
             # index.  When disabled (the default) a non-tip hash_or_height
             # query errors with -8, matching Core.
             'coinstatsindex': '0',
+            # Transaction-output spender index (1=enabled, 0=off).  Mirrors
+            # Bitcoin Core's -txospenderindex option (default off,
+            # DEFAULT_TXOSPENDERINDEX{false}).  When enabled the node records,
+            # for every non-coinbase input of every connected block, a mapping
+            # spent-outpoint -> spending tx, so the gettxspendingprevout RPC can
+            # resolve CONFIRMED spends (options.mempool_only=false) and
+            # getindexinfo reports the index.  When disabled (the default) the
+            # RPC's mempool form still works; the confirmed path errors.
+            'txospenderindex': '0',
             # Path to an ASMap file for AS-number-based peer bucketing.
             # Mirrors Bitcoin Core's -asmap option (init.cpp:1584).
             # Empty string (the default) disables ASMap: addrman falls back
@@ -353,6 +362,11 @@ class NodeConfig:
             # MuHash3072 + counts over the UTXO set so gettxoutsetinfo can
             # answer for a historical hash_or_height.
             'coinstatsindex': self.getboolean('coinstatsindex'),
+            # Transaction-output spender index (Core: -txospenderindex).
+            # Default false (Core parity).  When true the node maps every
+            # spent outpoint to its spending tx so gettxspendingprevout can
+            # resolve confirmed spends.
+            'txospenderindex': self.getboolean('txospenderindex'),
             # ASMap file path (Core: -asmap).  Empty string disables ASMap.
             # Relative paths are resolved relative to datadir at startup.
             'asmap': self.get('asmap') or '',
