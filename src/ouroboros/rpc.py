@@ -2539,6 +2539,10 @@ class RPCServer:
         """
         if not hasattr(self.node, "mempool") or self.node.mempool is None:
             from ouroboros.psbt import BTCAmount
+            from ouroboros.mempool import (
+                DEFAULT_MIN_RELAY_TX_FEE,
+                DEFAULT_INCREMENTAL_RELAY_FEE,
+            )
             return {
                 "loaded": True,
                 "size": 0,
@@ -2546,9 +2550,10 @@ class RPCServer:
                 "usage": 0,
                 "total_fee": BTCAmount(0),
                 "maxmempool": 300_000_000,
-                "mempoolminfee": BTCAmount(100),
-                "minrelaytxfee": BTCAmount(100),
-                "incrementalrelayfee": BTCAmount(100),
+                # No mempool yet: mempoolminfee == the min-relay floor.
+                "mempoolminfee": BTCAmount(DEFAULT_MIN_RELAY_TX_FEE),
+                "minrelaytxfee": BTCAmount(DEFAULT_MIN_RELAY_TX_FEE),
+                "incrementalrelayfee": BTCAmount(DEFAULT_INCREMENTAL_RELAY_FEE),
                 "unbroadcastcount": 0,
                 "fullrbf": True,
                 "permitbaremultisig": True,
@@ -2596,16 +2601,26 @@ class RPCServer:
             full_rbf = True
 
         from ouroboros.psbt import BTCAmount
+        from ouroboros.mempool import (
+            DEFAULT_MIN_RELAY_TX_FEE,
+            DEFAULT_INCREMENTAL_RELAY_FEE,
+        )
 
-        # Core v31.99 lowered DEFAULT_MIN_RELAY_TX_FEE / DEFAULT_INCREMENTAL_
-        # RELAY_FEE from 1000 to 100 sat/kvB (policy.h). ValueFromAmount of
-        # CFeeRate(100).GetFeePerK() = 0.00000100 BTC. mempoolminfee is
-        # max(GetMinFee, min_relay_feerate).GetFeePerK() = 100 sat on an empty
-        # regtest mempool. Emit all three via BTCAmount so the fixed-8-decimal
-        # token matches Core (Python float 0.00000100 reprs as 1e-06).
-        _MIN_RELAY_SATS = 100
-        min_fee_rate = info.get('min_fee_rate', 0)  # sat/kvB, dynamic floor
-        mempoolminfee_sats = max(int(min_fee_rate), _MIN_RELAY_SATS)
+        # Fee-display fields READ the real policy constants (mempool.py), never a
+        # local literal.  Core policy.h: DEFAULT_MIN_RELAY_TX_FEE = 100 and
+        # DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB.  Each sat/kvB value is
+        # serialized as ValueFromAmount(CFeeRate(x).GetFeePerK()) — BTCAmount(100)
+        # → 0.00000100 BTC (Python float 1e-6 would lose the trailing zeros).
+        #
+        # mempoolminfee is max(rolling GetMinFee, min-relay floor) per Core
+        # MempoolInfoToJSON.  get_mempool_min_fee() sources the rolling floor
+        # (_get_min_fee_inner) maxed with DEFAULT_MIN_RELAY_TX_FEE, not the
+        # min-feerate-of-txs-in-pool that get_mempool_info()['min_fee_rate'] gave.
+        if hasattr(mempool, 'get_mempool_min_fee'):
+            mempoolminfee_sats = int(mempool.get_mempool_min_fee())
+        else:
+            min_fee_rate = info.get('min_fee_rate', 0)  # sat/kvB, dynamic floor
+            mempoolminfee_sats = max(int(min_fee_rate), DEFAULT_MIN_RELAY_TX_FEE)
 
         # Core key order (mempool.cpp MempoolInfoToJSON): loaded, size, bytes,
         # usage, total_fee, maxmempool, mempoolminfee, minrelaytxfee,
@@ -2619,8 +2634,8 @@ class RPCServer:
             "total_fee": BTCAmount(int(total_fee_sat)),
             "maxmempool": info.get('max_size', 300_000_000),
             "mempoolminfee": BTCAmount(mempoolminfee_sats),
-            "minrelaytxfee": BTCAmount(_MIN_RELAY_SATS),
-            "incrementalrelayfee": BTCAmount(_MIN_RELAY_SATS),
+            "minrelaytxfee": BTCAmount(DEFAULT_MIN_RELAY_TX_FEE),
+            "incrementalrelayfee": BTCAmount(DEFAULT_INCREMENTAL_RELAY_FEE),
             "unbroadcastcount": unbroadcast_count,
             "fullrbf": full_rbf,
             # The 5 policy fields Core v31.99 added after fullrbf, in Core order.
@@ -2992,18 +3007,24 @@ class RPCServer:
                 })
 
         from ouroboros.psbt import BTCAmount
+        from ouroboros.mempool import (
+            DEFAULT_MIN_RELAY_TX_FEE,
+            DEFAULT_INCREMENTAL_RELAY_FEE,
+        )
 
-        # Relay fee + incremental fee. Core v31.99 lowered DEFAULT_MIN_RELAY_TX
-        # _FEE / DEFAULT_INCREMENTAL_RELAY_FEE to 100 sat/kvB (policy.h);
-        # ValueFromAmount(CFeeRate(100).GetFeePerK()) = 0.00000100 BTC. Emit via
-        # BTCAmount for the fixed-8-decimal token (Python float reprs as 1e-06).
-        relay_fee = BTCAmount(100)
+        # Relay fee + incremental fee READ the real policy constants (mempool.py),
+        # never a local literal.  Core policy.h: DEFAULT_MIN_RELAY_TX_FEE = 100,
+        # DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB.  ValueFromAmount of
+        # CFeeRate(100).GetFeePerK() = 0.00000100 BTC, emitted via BTCAmount for
+        # the fixed-8-decimal token.  When the mempool exposes its min_relay_fee
+        # accessor we read it (it returns DEFAULT_MIN_RELAY_TX_FEE in sat/kvB).
+        relay_fee = BTCAmount(DEFAULT_MIN_RELAY_TX_FEE)
         if hasattr(self.node, 'mempool') and self.node.mempool:
             if hasattr(self.node.mempool, 'min_relay_fee'):
                 relay_fee = BTCAmount(int(self.node.mempool.min_relay_fee))
 
         # Incremental fee for RBF
-        incremental_fee = BTCAmount(100)
+        incremental_fee = BTCAmount(DEFAULT_INCREMENTAL_RELAY_FEE)
 
         # Warnings
         warnings = []
