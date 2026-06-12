@@ -537,6 +537,19 @@ class Peer:
         self.bytes_recv: int = 0
         self.last_send: float = 0.0
         self.last_recv: float = 0.0
+        # Coarse per-connection inactivity clock (Core parity:
+        # ``CNode::m_last_recv``, net.cpp:623/667).  Updated on every successful
+        # wire read in ``_read_exactly`` (a monotonic clock so it is immune to
+        # wall-clock jumps).  The receive path arms NO per-read ``asyncio.timeout``
+        # (that was the v2-recv RSS-burst leak: cancelled ``TimerHandle``s pile up
+        # in ``loop._scheduled`` — one or two per message).  Instead a single
+        # per-node periodic sweeper (PeerManager.maintain_connections) disconnects
+        # any peer whose ``_last_recv_monotonic`` is older than its stall timeout,
+        # exactly as Core's coarse ``CConnman::InactivityCheck`` (net.cpp:2013)
+        # runs once per socket-handler pass — never per packet.  Seeded to "now"
+        # at construction so a freshly-accepted peer is not swept before its first
+        # read.
+        self._last_recv_monotonic: float = time.monotonic()
         # Running count of messages/packets received since we last yielded
         # control to the event loop.  See V2_RECV_YIELD_EVERY: a high-rate
         # flood of VALID, already-buffered messages otherwise spins the receive
@@ -698,8 +711,31 @@ class Peer:
                         await self.disconnect()
                         return False
 
-                # Perform handshake
-                await self._handshake(start_height)
+                # Perform handshake under a SINGLE per-connection deadline.
+                #
+                # The version/verack reads inside ``_handshake`` go through
+                # ``receive_message`` -> ``_read_exactly``, which (attempt-5,
+                # Core parity) is a PLAIN ``await readexactly`` arming ZERO
+                # per-read ``asyncio.timeout`` timers.  The coarse inactivity
+                # sweeper (PeerManager.maintain_connections) only iterates
+                # REGISTERED peers, and a peer is registered ONLY AFTER this
+                # call returns — so a peer that completes TCP connect (and any
+                # v2 negotiation) then hangs mid version/verack would await
+                # forever here, leaking a slot/coroutine/fd.  Bound the whole
+                # version handshake with ONE ``asyncio.timeout`` (one timer per
+                # connection ATTEMPT, cancelled on success — O(connections),
+                # NOT O(messages), so it does NOT reintroduce the per-read
+                # TimerHandle churn the leak fix removed).  On timeout the
+                # context raises ``TimeoutError``, which the ``except
+                # TimeoutError`` arm below turns into the normal connect-failure
+                # cleanup (disconnect, slot freed) — mirroring the pre-attempt-5
+                # behaviour where the per-read ``asyncio.timeout`` self-bounded
+                # these handshake reads.  (The 5 s TCP connect above and the v2
+                # negotiation reads are already individually bounded via
+                # ``asyncio.wait_for`` and are intentionally left outside this
+                # window.)
+                async with asyncio.timeout(HANDSHAKE_TIMEOUT):
+                    await self._handshake(start_height)
 
                 self.state = PeerState.READY
                 self._retry_count = 0
@@ -804,8 +840,25 @@ class Peer:
                     # only after the 16-byte decision (G20 fix).
                     await self._negotiate_v2_inbound(initial_prefix=prefix)
 
-            # Inbound handshake: receive version first, then send ours
-            await self._inbound_handshake(start_height)
+            # Inbound handshake: receive version first, then send ours.
+            #
+            # Bound it with a SINGLE per-connection ``asyncio.timeout`` for the
+            # same reason as the outbound path in ``connect`` (see that comment):
+            # the version/verack reads here go through ``receive_message`` ->
+            # ``_read_exactly``, a plain timer-free ``await``, and the inbound
+            # peer is NOT registered (p2p.py:_handle_inbound) until this returns
+            # True, so the coarse sweeper cannot see — let alone disconnect — a
+            # peer that hangs mid version/verack.  Without this bound such a
+            # peer would await forever, leaking a slot/coroutine/fd (inbound DoS).
+            # One timer per accepted connection, cancelled on success
+            # (O(connections), not O(messages)).  On timeout the context raises
+            # ``TimeoutError``, caught by the ``except Exception`` arm below,
+            # which disconnects and returns False so the peer is never
+            # registered — slot freed.  (The 16-byte v1/v2 classify-read and the
+            # v2 inbound negotiation reads above are already individually bounded
+            # via ``asyncio.wait_for``.)
+            async with asyncio.timeout(HANDSHAKE_TIMEOUT):
+                await self._inbound_handshake(start_height)
 
             self.state = PeerState.READY
 
@@ -1603,52 +1656,62 @@ class Peer:
         logger.debug(f"Sent {msg.command} to {self.host}:{self.port}")
 
     async def _read_exactly(self, n: int) -> bytes:
-        """Read exactly ``n`` bytes, arming a stall timeout ONLY when the read
-        would actually block.
+        """Read exactly ``n`` bytes with NO per-read timeout (Core parity).
 
-        Core parity (bitcoin-core/src/net.cpp ``V2Transport``): Core arms NO
-        per-read timer.  ``SocketHandlerConnected`` does one bounded ``recv``
-        per socket-readiness event and ``ReceivedBytes`` consumes a bounded
-        chunk per call; the only timeout in the recv path is the COARSE
-        per-connection ``CConnman::InactivityCheck`` (net.cpp:2013), run once
-        per socket-handler pass — never per packet, never per read.  So a
-        buffered flood of valid packets costs Core ZERO timer arms.
+        Core (bitcoin-core/src/net.cpp ``V2Transport`` /
+        ``SocketHandlerConnected``) arms NO per-read timer at all: it does one
+        bounded ``recv`` per socket-readiness event, updates ``m_last_recv``, and
+        a SEPARATE coarse per-connection ``CConnman::InactivityCheck``
+        (net.cpp:2013) — run once per socket-handler pass, never per packet —
+        disconnects a peer whose ``m_last_recv`` is older than ``TIMEOUT_INTERVAL``.
 
-        This helper mirrors that: if the bytes are already in the
-        ``StreamReader`` buffer, ``readexactly`` completes SYNCHRONOUSLY without
-        ever suspending, so we arm NO ``asyncio.timeout``.  Arming-then-
-        cancelling a doomed ``TimerHandle`` on a synchronous read is exactly the
-        v2-recv RSS-burst leak: ``TimerHandle.cancel()`` only flips
-        ``_cancelled`` and does NOT remove it from ``BaseEventLoop._scheduled``;
-        the purge in ``_run_once`` (root-only pop; full heapify only when
-        ``_timer_cancelled_count > 100`` AND cancelled/len(_scheduled) > 0.5)
-        never reaches a handle buried mid-heap below still-live timers under
-        steady multi-peer load, so the cancelled handles — each retaining its
-        callback -> Timeout -> task -> coroutine -> readexactly-bytes chain —
-        creep up monotonically (tracemalloc, 2026-06-12: 2.71M TimerHandles +
-        5.43M readexactly objects, ~1.8GB the bigger share).
+        Attempt-5 mirrors that exactly.  ``_read_exactly`` is a PLAIN
+        ``await reader.readexactly(n)``: it arms ZERO ``asyncio.timeout`` /
+        ``TimerHandle`` objects regardless of whether the bytes are already
+        buffered or the read blocks.  This eliminates the v2-recv RSS-burst leak
+        at its root — every prior variant (one timer per read, or one per
+        ``receive_message`` call) still armed O(messages) ``TimerHandle``s, and
+        ``TimerHandle.cancel()`` only flips ``_cancelled`` without removing the
+        handle from ``loop._scheduled``; under steady multi-peer load the
+        cancelled-handle purge in ``_run_once`` starves (it only heapify-rebuilds
+        when ``_timer_cancelled_count > 100`` AND cancelled/total > 0.5), so the
+        cancelled handles creep up monotonically toward the RSS cap (tracemalloc
+        at the 4.7 G knee: 1.42 M TimerHandles + 1.42 M readexactly objects).
 
-        Only when the read would genuinely BLOCK (buffer empty/short) do we arm
-        ``asyncio.timeout(self._read_timeout)`` so a real stall still raises
-        ``TimeoutError`` — the coarse per-connection inactivity guard.
+        On every successful read we stamp ``_last_recv_monotonic`` so the coarse
+        sweeper (PeerManager.maintain_connections) can disconnect a genuinely
+        stalled peer.  A peer that sends a valid header then hangs mid-payload
+        leaves this clock frozen and is disconnected on the next sweep pass —
+        the stall-disconnect semantics are preserved, just enforced coarsely
+        (bounded number of timers: ZERO on the read path) instead of per read.
 
-        Degradation: ``getattr(self.reader, "_buffer", None)`` returns ``None``
-        when the attribute is absent — on the ``_PrefixedStreamReader`` adapter
-        (no ``_buffer``; holds a ``_prefix``) or on a future CPython that
-        renames/removes the private ``_buffer``.  In that case we fall back to
-        ALWAYS arming the timeout (the prior candidate behaviour) — correct and
-        stall-bounded, just not leak-optimal.  Safe direction: a false "would
-        block" only costs an immediately-cancelled timer; it never misses a
-        stall (if the buffer says it has ``n`` bytes, ``readexactly`` truly will
-        not suspend)."""
-        buf = getattr(self.reader, "_buffer", None)
-        if buf is not None and len(buf) >= n:
-            # Data already buffered -> readexactly completes synchronously, so
-            # NO timer is needed (Core arms none on a ready recv).
-            return await self.reader.readexactly(n)
-        # Would block -> bound it with the coarse per-connection stall timeout.
-        async with asyncio.timeout(self._read_timeout):
-            return await self.reader.readexactly(n)
+        Historical note (do NOT reintroduce): earlier attempts arming
+        ``asyncio.timeout`` only when the buffer was empty/short still leaked,
+        because under a real flood the buffer is frequently empty between
+        readiness events, so the supposedly leak-free fast path armed a timer on
+        most reads anyway.  The only zero-timer design is to arm none at all and
+        let the coarse sweeper handle stalls (Option A)."""
+        # NO asyncio.timeout here — Core parity, zero per-read TimerHandles.
+        data = await self.reader.readexactly(n)
+        # Stamp the coarse per-connection inactivity clock (Core m_last_recv).
+        self._last_recv_monotonic = time.monotonic()
+        return data
+
+    def is_recv_stalled(self, stall_timeout: float | None = None) -> bool:
+        """True if no wire bytes have arrived within ``stall_timeout`` seconds.
+
+        Coarse per-connection inactivity check — the analogue of Core's
+        ``CConnman::InactivityCheck`` recv arm (net.cpp:2046, ``now > last_recv +
+        TIMEOUT_INTERVAL``).  Evaluated by the per-node periodic sweeper
+        (PeerManager.maintain_connections) once per pass, NEVER per read, so it
+        costs zero ``TimerHandle``s on the hot receive path.  ``stall_timeout``
+        defaults to ``self._read_timeout`` (the deadline the v1/v2 receive path
+        threads in: HANDSHAKE_TIMEOUT during handshake, 60 s once listening),
+        matching the per-read bound the removed ``asyncio.timeout`` used to
+        enforce."""
+        if stall_timeout is None:
+            stall_timeout = self._read_timeout
+        return (time.monotonic() - self._last_recv_monotonic) > stall_timeout
 
     async def receive_message(self, timeout: float = 30.0) -> NetworkMessage:
         """Read and parse the next message from the peer (v1 or BIP 324 v2); raises on timeout or bad format."""
@@ -1660,18 +1723,21 @@ class Peer:
             return await self._receive_v2_message(timeout)
 
         # v1 plaintext path
-        # NO call-spanning timeout.  Each read is bounded individually by
-        # ``_read_exactly``, which arms an ``asyncio.timeout`` ONLY when the read
-        # would actually block (buffer empty/short) — Core parity (net.cpp
-        # V2Transport arms NO per-read timer; one bounded recv per readiness
-        # event, a coarse per-connection inactivity timeout).  A buffered flood
-        # therefore arms ZERO timers (both header and payload reads are
-        # synchronous), eliminating the cancelled-TimerHandle accumulation that
-        # the prior call-spanning timeout still incurred (one per message).  A
-        # genuine mid-message stall still arms + fires: a peer that sends a valid
-        # header then hangs mid-payload leaves the payload ``_read_exactly`` with
-        # an empty buffer, so it arms a timer and raises TimeoutError.
-        # Thread the caller's deadline into the helper's arming branch.
+        # NO per-read AND no call-spanning timeout (attempt-5, Core parity).
+        # ``_read_exactly`` is a plain ``await readexactly`` that arms ZERO
+        # ``asyncio.timeout`` / ``TimerHandle`` objects — Core's net.cpp recv
+        # path arms none either (one bounded recv per readiness event; the only
+        # recv timeout is the COARSE per-connection ``CConnman::InactivityCheck``
+        # @net.cpp:2013, run once per socket-handler pass).  A buffered flood of
+        # N valid messages therefore arms ZERO timers (both the 24 B header read
+        # @ ~L1700 and the payload read @ ~L1740 are plain awaits), eliminating
+        # the cancelled-TimerHandle accumulation that every prior variant
+        # incurred (two per message originally, one per message after attempt-3,
+        # still O(N)).  A genuine mid-message stall is caught by the per-node
+        # sweeper (PeerManager.maintain_connections -> Peer.is_recv_stalled):
+        # a peer that sends a valid header then hangs mid-payload leaves
+        # ``_last_recv_monotonic`` frozen, so the next sweep pass disconnects it.
+        # ``timeout`` is still recorded as the stall threshold the sweeper uses.
         self._read_timeout = timeout
 
         header = await self._read_exactly(24)
@@ -1756,42 +1822,43 @@ class Peer:
 
         wire_bytes_this_call = 0
         consecutive_skipped = 0
-        # NO call-spanning timeout.  Each wire read is bounded individually by
-        # ``_read_exactly``, which arms an ``asyncio.timeout`` ONLY when the read
-        # would actually block (buffer empty/short) — Core parity.
+        # NO per-read AND no call-spanning timeout (attempt-5, Core parity).
+        # Every wire read goes through ``_read_exactly``, which is a plain
+        # ``await readexactly`` arming ZERO ``asyncio.timeout`` / ``TimerHandle``
+        # objects.
         #
-        # ROOT CAUSE of the v2-recv RSS burst (tracemalloc on the FAILED
-        # candidate ef28190, 2026-06-12): the candidate armed ONE
-        # `async with asyncio.timeout(timeout)` around the whole while-loop (down
-        # from TWO per packet in the original).  Under a buffered VALID-message
-        # flood, readexactly returns SYNCHRONOUSLY (the StreamReader buffer
-        # already holds the bytes), so the timer never fires and the context
-        # cancels it — but TimerHandle.cancel() only flips _cancelled, it does
-        # NOT remove the handle from BaseEventLoop._scheduled.  The purge runs
-        # only in _run_once and (a) cheaply pops only handles at the heap ROOT,
-        # (b) heapify-rebuilds only when _timer_cancelled_count > 100 AND the
-        # cancelled fraction crosses 0.5.  Under steady multi-peer load a
+        # ROOT CAUSE of the v2-recv RSS burst (tracemalloc at the 4.7 G knee,
+        # captures armed 2026-06-12): EVERY prior variant armed O(messages)
+        # timers — the original two per packet, attempt-3 one per packet/call,
+        # attempt-4 one per BLOCKED read.  Under a buffered VALID-message flood
+        # ``readexactly`` returns SYNCHRONOUSLY (the StreamReader buffer already
+        # holds the bytes), so the timer never fires and the context cancels it —
+        # but ``TimerHandle.cancel()`` only flips ``_cancelled``; it does NOT
+        # remove the handle from ``BaseEventLoop._scheduled``.  The purge runs
+        # only in ``_run_once`` and (a) cheaply pops only handles at the heap
+        # ROOT, (b) heapify-rebuilds only when ``_timer_cancelled_count > 100``
+        # AND the cancelled fraction crosses 0.5.  Under steady multi-peer load a
         # cancelled handle stays BURIED mid-heap below still-live timers and
         # never reaches the root — so the cancelled TimerHandles (each retaining
         # callback -> Timeout -> task -> coroutine -> readexactly-bytes) creep up
-        # monotonically (2.71M TimerHandles + 5.43M readexactly objects, ~1.8GB
-        # the bigger share).  The candidate's one-timer-per-message still leaked
-        # ~N because N buffered messages still arm N timers.
+        # monotonically (1.42 M TimerHandles + 1.42 M readexactly objects at the
+        # knee).  Even attempt-4's "arm only when blocked" leaked, because under
+        # a real flood the StreamReader buffer is frequently empty between
+        # readiness events, so most reads still armed a timer.
         #
-        # FIX = Core parity.  Core's V2Transport (net.cpp SocketHandlerConnected
-        # -> ReceivedBytes) arms NO per-read timer at all: one bounded recv per
-        # socket-readiness event and a bounded consume loop; the only recv-path
-        # timeout is the COARSE per-CONNECTION CConnman::InactivityCheck
-        # (net.cpp:2013), never per packet.  So a buffered read arms ZERO timers
-        # (both the enc_length and AEAD-body reads are synchronous), and a whole
+        # FIX = Core parity, ZERO timers.  Core's V2Transport (net.cpp
+        # SocketHandlerConnected -> ReceivedBytes) arms NO per-read timer at all:
+        # one bounded recv per socket-readiness event and a bounded consume loop;
+        # the only recv-path timeout is the COARSE per-CONNECTION
+        # ``CConnman::InactivityCheck`` (net.cpp:2013), never per packet.  So a
         # buffered burst of N packets (decoy/unknown skips inside one call) arms
-        # ZERO TimerHandles.  A genuine mid-packet stall still arms + fires: a
-        # peer that sends the 3 length bytes (buffered, no timer) then hangs
-        # leaves the AEAD-body _read_exactly with an empty/short buffer, so it
-        # arms a timer and raises TimeoutError.  Per-call packet count is bounded
-        # by MAX_CONSECUTIVE_V2_SKIP, so a slow-drip decoy peer cannot hold the
-        # call open beyond a bounded skip run.  Thread the caller's deadline into
-        # the helper's arming branch.
+        # ZERO TimerHandles.  A genuine mid-packet stall is caught by the per-node
+        # sweeper (PeerManager.maintain_connections -> Peer.is_recv_stalled): a
+        # peer that sends the 3 length bytes then hangs leaves
+        # ``_last_recv_monotonic`` frozen, so the next sweep pass disconnects it.
+        # Per-call packet count is bounded by MAX_CONSECUTIVE_V2_SKIP, so a
+        # slow-drip decoy peer cannot hold the call open beyond a bounded skip
+        # run.  ``timeout`` is recorded as the stall threshold the sweeper uses.
         self._read_timeout = timeout
         while True:
             # Read the 3-byte encrypted length prefix (no auth tag — the
