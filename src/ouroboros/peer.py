@@ -1601,52 +1601,70 @@ class Peer:
             return await self._receive_v2_message(timeout)
 
         # v1 plaintext path
-        # Read header (24 bytes).  asyncio.timeout (not wait_for) avoids the
-        # per-call Task churn; it raises TimeoutError on expiry exactly like
-        # wait_for, so listen()'s handlers are unchanged.
+        # ONE timeout for the WHOLE message (header + payload), not one per
+        # read.  asyncio.timeout arms a TimerHandle via loop.call_at; when the
+        # reads complete SYNCHRONOUSLY (StreamReader buffer pre-buffered a
+        # flood) the context cancels the handle, but TimerHandle.cancel() does
+        # NOT remove it from BaseEventLoop._scheduled — it only flips a flag,
+        # and the purge runs in _run_once which a back-to-back receive loop
+        # rarely re-enters.  Two per-read timeouts = 2 cancelled handles per
+        # message that creep up the heap monotonically (the v2-recv RSS burst,
+        # tracemalloc-confirmed 2026-06-11).  Mirror Core's V2Transport, which
+        # arms NO per-read timer at all (net.cpp SocketHandlerConnected: one
+        # bounded recv per readiness event; the inactivity timeout is a coarse
+        # per-connection concern, not per packet) — so a single outer timeout
+        # bounds a genuine mid-message stall while arming exactly ONE timer per
+        # message instead of one per read.  It raises TimeoutError on expiry
+        # exactly like the per-read version, so listen()'s handlers (and the
+        # v1-fallback V2TransportError path) are unchanged.
         async with asyncio.timeout(timeout):
             header = await self.reader.readexactly(24)
 
-        # Parse header
-        magic, command_bytes, length, checksum = struct.unpack('<I12sI4s', header)
+            # Parse header
+            magic, command_bytes, length, checksum = struct.unpack('<I12sI4s', header)
 
-        # Verify magic bytes FIRST — if wrong, the stream is desynchronised
-        # (e.g. we read into the middle of a previous payload) or the peer
-        # truly switched to v2.  Either way the connection is unrecoverable.
-        expected_magic = get_magic(self.network)
-        if magic != expected_magic:
-            # Check if this could be a genuine BIP 324 v2 negotiation
-            # (only plausible on the very first message exchange).
+            # Verify magic bytes FIRST — if wrong, the stream is desynchronised
+            # (e.g. we read into the middle of a previous payload) or the peer
+            # truly switched to v2.  Either way the connection is unrecoverable.
+            # (Raised INSIDE the timeout block: asyncio.timeout.__aexit__ only
+            # rewrites the exception to TimeoutError if the deadline actually
+            # fired, so these V2TransportError / desync exceptions propagate
+            # unchanged — listen()'s handlers stay correct.)
+            expected_magic = get_magic(self.network)
+            if magic != expected_magic:
+                # Check if this could be a genuine BIP 324 v2 negotiation
+                # (only plausible on the very first message exchange).
+                try:
+                    command_bytes.rstrip(b'\x00').decode('ascii')
+                except UnicodeDecodeError:
+                    raise V2TransportError(
+                        f"Peer {self.host}:{self.port} appears to use v2 transport, "
+                        f"disconnecting gracefully"
+                    ) from None
+                raise Exception(
+                    f"Invalid magic bytes from {self.host}:{self.port}: "
+                    f"expected {expected_magic:08x}, got {magic:08x} — stream desync"
+                )
+
             try:
-                command_bytes.rstrip(b'\x00').decode('ascii')
-            except UnicodeDecodeError:
-                raise V2TransportError(
-                    f"Peer {self.host}:{self.port} appears to use v2 transport, "
-                    f"disconnecting gracefully"
-                ) from None
-            raise Exception(
-                f"Invalid magic bytes from {self.host}:{self.port}: "
-                f"expected {expected_magic:08x}, got {magic:08x} — stream desync"
-            )
+                command = command_bytes.rstrip(b'\x00').decode('ascii')
+            except UnicodeDecodeError as exc:
+                # Magic was correct but command is non-ASCII — this is a stream
+                # framing error, NOT v2 transport.  Raise a normal exception so
+                # the score-based handling can decide whether to disconnect.
+                raise Exception(
+                    f"Non-ASCII command bytes from {self.host}:{self.port} "
+                    f"(likely stream desync): {command_bytes!r}"
+                ) from exc
 
-        try:
-            command = command_bytes.rstrip(b'\x00').decode('ascii')
-        except UnicodeDecodeError as exc:
-            # Magic was correct but command is non-ASCII — this is a stream
-            # framing error, NOT v2 transport.  Raise a normal exception so
-            # the score-based handling can decide whether to disconnect.
-            raise Exception(
-                f"Non-ASCII command bytes from {self.host}:{self.port} "
-                f"(likely stream desync): {command_bytes!r}"
-            ) from exc
+            # Read payload — same timeout, so a peer that sends a valid header
+            # then stalls mid-payload still times out (the single outer timeout
+            # spans the whole header+payload read).
+            payload = b''
+            if length > 0:
+                if length > MAX_PROTOCOL_MESSAGE_LENGTH:  # Core net.h MAX_PROTOCOL_MESSAGE_LENGTH
+                    raise Exception(f"Payload too large: {length} bytes")
 
-        # Read payload
-        payload = b''
-        if length > 0:
-            if length > MAX_PROTOCOL_MESSAGE_LENGTH:  # Core net.h MAX_PROTOCOL_MESSAGE_LENGTH
-                raise Exception(f"Payload too large: {length} bytes")
-
-            async with asyncio.timeout(timeout):
                 payload = await self.reader.readexactly(length)
 
         # Verify checksum
@@ -1683,119 +1701,124 @@ class Peer:
         )
 
         wire_bytes_this_call = 0
-        # Count consecutive non-message packets (decoys + unknown short-ids) AND
-        # count total packets read in this call.  readexactly() returns
-        # SYNCHRONOUSLY whenever the StreamReader buffer already holds the bytes,
-        # so a peer that pre-buffers a flood of packets (decoy, unknown, OR
-        # valid) would otherwise turn this loop into an unbounded CPU-bound spin
-        # that never yields to the event loop — starving the event loop's
-        # cancelled-TimerHandle purge (RSS burst) and other peers.  Core can't
-        # spin like that — it processes a bounded byte budget per socket
-        # readiness event (net.cpp:2183).  We bound the consecutive-skip run AND
-        # yield every V2_RECV_YIELD_EVERY packets regardless of classification.
         consecutive_skipped = 0
-        while True:
-            # Periodically return control to the event loop so its _run_once
-            # purges the cancelled timeout TimerHandles armed by each read
-            # below (see V2_RECV_YIELD_EVERY).  The counter is on the PEER (not
-            # call-local) because a valid-message receive returns after a single
-            # packet — a call-local counter would never reach the yield window
-            # on the valid-flood path (the case 50fdc48 missed).  It is shared
-            # with the v1 path and listen(), so any mix of v1/v2/decoy/unknown
-            # packets advances the same budget.  This makes EVERY exit path
-            # (valid return, decoy continue, unknown continue) yield, mirroring
-            # Core's bounded-work-per-readiness model.
-            self._recv_since_yield += 1
-            if self._recv_since_yield >= V2_RECV_YIELD_EVERY:
-                self._recv_since_yield = 0
-                await asyncio.sleep(0)
-
-            # Read the 3-byte encrypted length prefix (no auth tag — the
-            # length cipher is plain FSChaCha20, not AEAD; the contents
-            # cipher's Poly1305 covers the body).
-            #
-            # asyncio.timeout (3.11+) arms the timeout on the CURRENT task
-            # instead of wrapping the read in a per-call Task (as wait_for
-            # does), eliminating the tasks.py Task churn the live tracemalloc
-            # flagged.  It raises TimeoutError on expiry, identical to
-            # wait_for, so listen()'s except handlers are unchanged.
-            async with asyncio.timeout(timeout):
+        # ONE timeout for the WHOLE call (the whole while-loop), arming exactly
+        # ONE TimerHandle per receive_message — NOT one per readexactly.
+        #
+        # ROOT CAUSE of the v2-recv RSS burst (tracemalloc at the 8.5G knee,
+        # 2026-06-11): the old code armed `async with asyncio.timeout(timeout)`
+        # around BOTH the 3-byte length read AND the AEAD body read, i.e. TWO
+        # TimerHandles per packet.  Under a buffered VALID-message flood,
+        # readexactly returns SYNCHRONOUSLY (the StreamReader buffer already
+        # holds the bytes), so the timer never fires and the context cancels
+        # it — but TimerHandle.cancel() only flips _cancelled, it does NOT
+        # remove the handle from BaseEventLoop._scheduled.  The purge runs only
+        # in _run_once and (a) cheaply pops only handles at the heap ROOT, (b)
+        # heapify-rebuilds only when the cancelled fraction crosses 0.5.  Under
+        # steady multi-peer load a cancelled handle stays BURIED mid-heap below
+        # still-live timers and never reaches the root — so the cancelled
+        # TimerHandles (plus their retained Timeout/coro-frame chains) creep up
+        # monotonically (4.39M live objects at the knee).  The prior 964419c
+        # mitigation (periodic sleep(0)) bounded len(_scheduled) but NOT the
+        # buried retained objects, so the leak recurred.
+        #
+        # FIX = Core parity.  Core's V2Transport (net.cpp SocketHandlerConnected
+        # -> ReceivedBytes) arms NO per-read timer at all: it does one bounded
+        # recv per socket-readiness event and runs a bounded consume loop; the
+        # inactivity timeout is a coarse per-CONNECTION concern, never per
+        # packet.  So we arm a single outer timeout for the whole call.  A
+        # buffered burst of N packets (decoy/unknown skips inside one call) arms
+        # exactly 1 TimerHandle, not 2N.  The call still returns on the first
+        # valid message, so the single timeout still bounds a genuine mid-packet
+        # stall (a peer that sends the 3 length bytes then hangs leaves the next
+        # readexactly awaiting real data and the outer timeout fires).  Per-call
+        # packet count is bounded by MAX_CONSECUTIVE_V2_SKIP, so a slow-drip
+        # decoy peer cannot hold the call open beyond a bounded skip run.
+        async with asyncio.timeout(timeout):
+            while True:
+                # Read the 3-byte encrypted length prefix (no auth tag — the
+                # length cipher is plain FSChaCha20, not AEAD; the contents
+                # cipher's Poly1305 covers the body).
                 enc_length = await self.reader.readexactly(LENGTH_FIELD_LEN)
-            wire_bytes_this_call += LENGTH_FIELD_LEN
+                wire_bytes_this_call += LENGTH_FIELD_LEN
 
-            try:
-                contents_len = self._v2_transport.decrypt_length(enc_length)
-            except Exception as e:
-                raise V2TransportError(
-                    f"v2 length decrypt failed for {self.host}:{self.port}: {e}"
-                ) from e
+                try:
+                    contents_len = self._v2_transport.decrypt_length(enc_length)
+                except Exception as e:
+                    raise V2TransportError(
+                        f"v2 length decrypt failed for {self.host}:{self.port}: {e}"
+                    ) from e
 
-            if contents_len > MAX_PROTOCOL_MESSAGE_LENGTH:
-                raise Exception(f"v2 payload too large: {contents_len} bytes")
+                if contents_len > MAX_PROTOCOL_MESSAGE_LENGTH:
+                    raise Exception(f"v2 payload too large: {contents_len} bytes")
 
-            # Read the AEAD-encrypted body: HEADER_LEN + contents_len + tag.
-            aead_len = HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
-            async with asyncio.timeout(timeout):
+                # Read the AEAD-encrypted body: HEADER_LEN + contents_len + tag.
+                aead_len = HEADER_LEN + contents_len + CHACHA20POLY1305_EXPANSION
                 aead_ct = await self.reader.readexactly(aead_len)
-            wire_bytes_this_call += aead_len
+                wire_bytes_this_call += aead_len
 
-            try:
-                contents, is_decoy = self._v2_transport.decrypt_contents(
-                    aead_ct, contents_len
-                )
-            except Exception as e:
-                raise V2TransportError(
-                    f"v2 contents decrypt failed for {self.host}:{self.port}: {e}"
-                ) from e
-
-            self.bytes_recv += wire_bytes_this_call
-            self.last_recv = time.time()
-
-            if is_decoy:
-                # Decoy packets count against bytes_recv because the wire
-                # bytes were real — the decoder just throws them away.
-                logger.debug(f"Discarded decoy packet from {self.host}:{self.port}")
-                consecutive_skipped += 1
-                if consecutive_skipped > MAX_CONSECUTIVE_V2_SKIP:
-                    raise V2TransportError(
-                        f"v2: too many consecutive decoy/unknown packets "
-                        f"from {self.host}:{self.port} "
-                        f"(>{MAX_CONSECUTIVE_V2_SKIP}) — disconnecting"
+                try:
+                    contents, is_decoy = self._v2_transport.decrypt_contents(
+                        aead_ct, contents_len
                     )
-                # Yield to the event loop so the cyclic GC and other peers'
-                # coroutines run instead of spinning on a buffered burst.
-                await asyncio.sleep(0)
-                continue
-
-            # BIP 324 contents = (1B short_id | 0x00+12B cmd) + payload.
-            # The v1 24-byte header is NOT present (Core net.cpp:1415-1453
-            # ``V2Transport::GetMessageType``).
-            decoded = decode_v2_contents(contents)
-            if decoded is None:
-                # Unknown short ID or malformed long form — Core drops the
-                # message but keeps the connection (net.cpp:1474-1477).
-                # We mirror that, but loop to read the next packet.
-                logger.debug(
-                    f"v2: dropping packet with unknown/invalid type prefix "
-                    f"from {self.host}:{self.port} ({contents_len} bytes)"
-                )
-                consecutive_skipped += 1
-                if consecutive_skipped > MAX_CONSECUTIVE_V2_SKIP:
+                except Exception as e:
                     raise V2TransportError(
-                        f"v2: too many consecutive decoy/unknown packets "
-                        f"from {self.host}:{self.port} "
-                        f"(>{MAX_CONSECUTIVE_V2_SKIP}) — disconnecting"
-                    )
-                # Yield to the event loop (see comment at the loop top).
-                await asyncio.sleep(0)
-                continue
+                        f"v2 contents decrypt failed for {self.host}:{self.port}: {e}"
+                    ) from e
 
-            command, payload = decoded
-            return NetworkMessage(
-                command=command,
-                payload=payload,
-                magic=get_magic(self.network),
-            )
+                self.bytes_recv += wire_bytes_this_call
+                self.last_recv = time.time()
+
+                if is_decoy:
+                    # Decoy packets count against bytes_recv because the wire
+                    # bytes were real — the decoder just throws them away.
+                    logger.debug(f"Discarded decoy packet from {self.host}:{self.port}")
+                    consecutive_skipped += 1
+                    if consecutive_skipped > MAX_CONSECUTIVE_V2_SKIP:
+                        raise V2TransportError(
+                            f"v2: too many consecutive decoy/unknown packets "
+                            f"from {self.host}:{self.port} "
+                            f"(>{MAX_CONSECUTIVE_V2_SKIP}) — disconnecting"
+                        )
+                    # Yield to the event loop so the cyclic GC and other peers'
+                    # coroutines run instead of spinning on a buffered burst of
+                    # decoys.  (The single outer timeout already eliminated the
+                    # per-read TimerHandle churn that 964419c's periodic yield
+                    # was working around — this sleep(0) is now ONLY about
+                    # cooperative scheduling on the skip path, not timer purge.)
+                    await asyncio.sleep(0)
+                    continue
+
+                # BIP 324 contents = (1B short_id | 0x00+12B cmd) + payload.
+                # The v1 24-byte header is NOT present (Core net.cpp:1415-1453
+                # ``V2Transport::GetMessageType``).
+                decoded = decode_v2_contents(contents)
+                if decoded is None:
+                    # Unknown short ID or malformed long form — Core drops the
+                    # message but keeps the connection (net.cpp:1474-1477).
+                    # We mirror that, but loop to read the next packet.
+                    logger.debug(
+                        f"v2: dropping packet with unknown/invalid type prefix "
+                        f"from {self.host}:{self.port} ({contents_len} bytes)"
+                    )
+                    consecutive_skipped += 1
+                    if consecutive_skipped > MAX_CONSECUTIVE_V2_SKIP:
+                        raise V2TransportError(
+                            f"v2: too many consecutive decoy/unknown packets "
+                            f"from {self.host}:{self.port} "
+                            f"(>{MAX_CONSECUTIVE_V2_SKIP}) — disconnecting"
+                        )
+                    # Yield to the event loop (cooperative scheduling on the
+                    # unknown-skip path — see decoy branch above).
+                    await asyncio.sleep(0)
+                    continue
+
+                command, payload = decoded
+                return NetworkMessage(
+                    command=command,
+                    payload=payload,
+                    magic=get_magic(self.network),
+                )
 
     def _is_handshake_message(self, command: str) -> bool:
         """Check if message is allowed during handshake (before handshake_complete)."""
@@ -1810,18 +1833,19 @@ class Peer:
         VERSION, VERACK, WTXIDRELAY, and SENDADDRV2 messages. All other messages
         are dropped/ignored per Bitcoin Core's net_processing.cpp behavior.
         """
-        # Belt-and-suspenders for the at-tip RSS burst: bound work per receive
-        # so a high-rate flood of VALID, pre-buffered messages (v1 OR v2) cannot
-        # spin this loop without periodically re-entering the event loop's
-        # _run_once (which purges the cancelled timeout TimerHandles each read
-        # arms — see V2_RECV_YIELD_EVERY).  The v2 inner loop already advances
-        # self._recv_since_yield and yields, but the v1 path (each
-        # receive_message returns one message, then we loop and re-read the next
-        # pre-buffered one synchronously) does not — so we advance/check the
-        # SAME shared peer counter here.  Using one counter means a v2 receive
-        # that just yielded leaves the counter near 0, so this check rarely
-        # fires for v2; for a v1 flood it fires every V2_RECV_YIELD_EVERY
-        # messages.  Mirrors Core's bounded work-per-readiness-event posture.
+        # Cooperative-scheduling backstop for the at-tip valid-message flood.
+        # The per-packet TimerHandle leak is now gone (receive_message arms a
+        # SINGLE outer asyncio.timeout per message for BOTH v1 and v2 — see
+        # _receive_v2_message / the v1 path — instead of one timer per read), so
+        # this is NO LONGER about purging cancelled timers.  But a high-rate
+        # flood of VALID pre-buffered messages still returns one message per
+        # receive_message call and loops straight back in (readexactly satisfied
+        # synchronously from the StreamReader buffer), which could spin this
+        # loop CPU-bound without ever yielding to other peers or the cyclic GC.
+        # So we yield every V2_RECV_YIELD_EVERY messages here to preserve fair
+        # scheduling — mirroring Core's bounded-work-per-readiness posture
+        # (net.cpp SocketHandlerConnected processes a bounded recv then returns
+        # to the selector).  The counter advances once per dispatched message.
         try:
             while self.state == PeerState.READY:
                 try:
