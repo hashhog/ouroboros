@@ -46,7 +46,12 @@ MAX_DESCENDANT_COUNT = 25
 MAX_ANCESTOR_SIZE_KVB = 101
 MAX_DESCENDANT_SIZE_KVB = 101
 DUST_RELAY_TX_FEE = 3000  # sat/kB
-DEFAULT_MIN_RELAY_TX_FEE = 1000  # sat/kvB
+# Default for -minrelaytxfee, minimum relay fee for transactions.  Bitcoin Core
+# policy/policy.h:70 sets this to 100 sat/kvB (0.1 sat/vB).  This is the single
+# source-of-truth constant: every admission gate AND every fee-display field
+# (getmempoolinfo / getnetworkinfo / REST mempool/info) must derive from it,
+# never re-hardcode a literal.
+DEFAULT_MIN_RELAY_TX_FEE = 100  # sat/kvB (Core DEFAULT_MIN_RELAY_TX_FEE)
 # DEFAULT_INCREMENTAL_RELAY_FEE — sat/kvB (policy/policy.h:48)
 # This is the minimum fee increment for relay and for trimming.  Bitcoin Core
 # sets this to 100 sat/kvB (NOT 1000).  A higher value incorrectly tightens
@@ -1733,6 +1738,35 @@ class Mempool:
         """
         with self._lock:
             return self._get_min_fee_inner()
+
+    @property
+    def min_relay_fee(self) -> int:
+        """The minimum relay fee floor in sat/kvB (DEFAULT_MIN_RELAY_TX_FEE).
+
+        Single source of truth for the fee-display fields so that getmempoolinfo
+        / getnetworkinfo / the REST endpoint READ the real admission floor rather
+        than re-hardcoding a literal.  Mirrors Core CTxMemPool::m_opts.min_relay_feerate.
+        """
+        return DEFAULT_MIN_RELAY_TX_FEE
+
+    @property
+    def incremental_relay_fee(self) -> int:
+        """The incremental relay fee in sat/kvB (DEFAULT_INCREMENTAL_RELAY_FEE).
+
+        Mirrors Core's -incrementalrelayfee.  Used for the incrementalrelayfee /
+        incrementalfee display fields so they too derive from the constant.
+        """
+        return DEFAULT_INCREMENTAL_RELAY_FEE
+
+    def get_mempool_min_fee(self) -> float:
+        """Return mempoolminfee in sat/kvB = max(rolling GetMinFee, min-relay floor).
+
+        Mirrors Core MempoolInfoToJSON: mempoolminfee is
+        ValueFromAmount(std::max(pool.GetMinFee(), minrelaytxfee).GetFeePerK()).
+        On an empty pool GetMinFee() is 0 so this returns the min-relay floor.
+        """
+        with self._lock:
+            return max(self._get_min_fee_inner(), float(DEFAULT_MIN_RELAY_TX_FEE))
 
     def _get_min_fee_inner(self) -> float:
         """Unlocked implementation of get_min_fee."""

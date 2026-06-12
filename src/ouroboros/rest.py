@@ -1247,6 +1247,21 @@ class RESTInterface:
         """
         mempool = self._get_mempool()
 
+        # Fee-display fields READ the real policy constants (mempool.py) and are
+        # emitted in BTC, consistent with the JSON-RPC getmempoolinfo path.  Core
+        # policy.h: DEFAULT_MIN_RELAY_TX_FEE = DEFAULT_INCREMENTAL_RELAY_FEE = 100
+        # sat/kvB → 0.00000100 BTC.  mempoolminfee = max(rolling GetMinFee,
+        # min-relay floor); get_mempool_min_fee() returns it in sat/kvB.
+        from ouroboros.mempool import (
+            DEFAULT_MIN_RELAY_TX_FEE,
+            DEFAULT_INCREMENTAL_RELAY_FEE,
+        )
+
+        if hasattr(mempool, 'get_mempool_min_fee'):
+            mempoolminfee_sats = int(mempool.get_mempool_min_fee())
+        else:
+            mempoolminfee_sats = DEFAULT_MIN_RELAY_TX_FEE
+
         return JSONResponse(content={
             "loaded": True,
             "size": mempool.size(),
@@ -1254,9 +1269,9 @@ class RESTInterface:
             "usage": mempool.get_memory_usage() if hasattr(mempool, 'get_memory_usage') else 0,
             "total_fee": mempool.get_total_fee() / 1e8 if hasattr(mempool, 'get_total_fee') else 0.0,
             "maxmempool": mempool.max_size if hasattr(mempool, 'max_size') else 300000000,
-            "mempoolminfee": mempool.get_min_fee() if hasattr(mempool, 'get_min_fee') else 0.00001,
-            "minrelaytxfee": 0.00001,
-            "incrementalrelayfee": 0.00001,
+            "mempoolminfee": mempoolminfee_sats / 1e8,
+            "minrelaytxfee": DEFAULT_MIN_RELAY_TX_FEE / 1e8,
+            "incrementalrelayfee": DEFAULT_INCREMENTAL_RELAY_FEE / 1e8,
             "unbroadcastcount": 0,
             "fullrbf": getattr(mempool, 'full_rbf', False),
         })
