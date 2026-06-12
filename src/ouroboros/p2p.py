@@ -2627,6 +2627,39 @@ class PeerManager:
                     elif peer.latency > 0 and peer.latency < 0.5:
                         peer.adjust_score(1)
 
+                # Coarse per-connection inactivity sweep (Core parity:
+                # CConnman::InactivityCheck @bitcoin-core/src/net.cpp:2013, run
+                # once per socket-handler pass — never per packet).  The receive
+                # path (Peer._read_exactly) arms NO per-read asyncio.timeout —
+                # that per-read timer was the v2-recv RSS-burst leak (cancelled
+                # TimerHandles piling up in loop._scheduled, 1.42M = ~750 MB at
+                # the knee).  Instead each successful read stamps
+                # ``peer._last_recv_monotonic``; here we disconnect any peer that
+                # has received nothing within its stall timeout.  This is the
+                # SINGLE place a genuine stall is now caught — a stalled peer is
+                # still disconnected, just coarsely (bounded, O(peers) per 30 s
+                # pass) instead of via an O(messages) per-read timer.  Runs over
+                # the same ``all_peers`` snapshot taken above; ``disconnect()``
+                # is awaited so its event-driven cleanup hook fires and the next
+                # safety-net sweep finds the bucket already drained.
+                stalled = [
+                    p for p in all_peers
+                    if p.is_connected() and p.is_recv_stalled()
+                ]
+                for peer in stalled:
+                    logger.info(
+                        "Inactivity sweep: disconnecting stalled peer "
+                        "%s:%s (no wire bytes within %.0fs)",
+                        peer.host, peer.port, peer._read_timeout,
+                    )
+                    try:
+                        await peer.disconnect()
+                    except Exception:
+                        logger.debug(
+                            "stalled-peer disconnect raised for %s:%s",
+                            peer.host, peer.port, exc_info=True,
+                        )
+
                 # Update feefilter for full-relay peers only (skip block-relay-only)
                 await self._broadcast_feefilter()
 
