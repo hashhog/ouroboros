@@ -166,18 +166,15 @@ class TestW125_RpcErrorParity(unittest.TestCase):
         self.assertEqual(_error_code(resp), RPC_INVALID_PARAMS)
 
     # G4 — RPC_INTERNAL_ERROR -- inverted: must NOT be used for known cases
-    @pytest.mark.xfail(reason="W125 BUG-1 (F2 root): dispatcher collapses "
-                              "every HTTPException to -32603; "
-                              "gettxout invalid-txid → Core -8 RPC_INVALID_PARAMETER",
-                       strict=False)
+    # FIXED 2026-06-12 (ParseHashV alignment): gettxout now runs a Core-style
+    # ParseHashV guard at the parse boundary, so a malformed txid -> -8 (was
+    # -32603). xfail removed — this is a real, passing assertion now.
     def test_g4_invalid_txid_not_internal_error(self):
         """Core uses RPC_INVALID_PARAMETER (-8) for ParseHashV failures,
-        NOT RPC_INTERNAL_ERROR (-32603). The audit asserts the response
-        is NOT -32603 — it should be -8 once the dispatcher is fixed.
+        NOT RPC_INTERNAL_ERROR (-32603). gettxout with a non-hex txid must
+        emit -8 at the parse boundary, before any lookup.
         """
         resp = _dispatch(self.rpc, "gettxout", ["nothex", 0])
-        # Whatever ouroboros emits, it should NOT be -32603 (which is
-        # what F2 produces today) — it should be -8 RPC_INVALID_PARAMETER.
         self.assertEqual(_error_code(resp), RPC_INVALID_PARAMETER)
 
     # G5 — RPC_PARSE_ERROR -------------------------------------------------
