@@ -683,35 +683,51 @@ def test_w138_g19_validated_snapshot_cleanup_dir_swap() -> None:
 # ===========================================================================
 
 
-@pytest.mark.xfail(
-    reason="W138 BUG-12 (P0-CONSENSUS): `validation_worker` "
-    "(`snapshot.py:1100-1112`) iterates `range(target_height + 1)` "
-    "and counts heights; it does NOT actually re-validate any "
-    "block. Core's background chainstate "
-    "(`validation.cpp:6398-6404`) calls `ActivateBestChain` which "
-    "re-runs `ConnectBlock` end-to-end for every block from genesis "
-    "to the snapshot tip. A corrupted snapshot would never be "
-    "detected by ouroboros's stub.",
-    strict=True,
-)
 def test_w138_g20_background_validation_actually_validates() -> None:
-    """G20 (BUG-12): the validation worker must invoke real block
-    validation (e.g. `BlockValidator.validate_block`) for each
-    height from 0 to the snapshot tip.
+    """G20 (BUG-12) — CONFIRM-FIXED: the background validation worker now
+    drives a REAL second (background) chainstate.
+
+    Previously `validation_worker` iterated `range(target_height + 1)` and
+    counted heights, then re-hashed `self.db` (the SAME store the snapshot was
+    loaded into) — a tautological hash-of-self that could never detect a
+    corrupted snapshot.
+
+    The dual-chainstate rewrite (mirroring Core ActivateSnapshot /
+    AddChainstate / MaybeValidateSnapshot, validation.cpp:5588/6170/5967)
+    replaces the counter loop with `run_background_validation_sync`, which:
+      * builds a SECOND, genesis-rooted `BackgroundCoinsStore` (NOT self.db);
+      * re-connects every block genesis->base into THAT store via
+        `connect_block_bytes` (spend inputs, add outputs — real ConnectBlock);
+      * recomputes HASH_SERIALIZED over the SEPARATE store and compares to the
+        commitment, marking the snapshot INVALID on mismatch (never a silent
+        accept).
     """
     src = _read_py("snapshot.py")
-    m = re.search(r"def validation_worker[\s\S]*?finally:", src)
-    assert m, "G20: validation_worker not located"
-    body = m.group(0)
-    # Must call into real validation
-    invokes_validator = bool(
-        re.search(
-            r"validate_block\(|connect_block\(|BlockValidator", body
-        )
+    # The real driver exists and connects blocks into a SEPARATE store.
+    assert "def run_background_validation_sync(" in src, (
+        "G20: dual-chainstate driver run_background_validation_sync missing"
     )
-    assert invokes_validator, (
-        "G20 BUG-12: validation_worker does not invoke "
-        "validate_block / connect_block — it is a stub counter"
+    assert "class BackgroundCoinsStore" in src, (
+        "G20: SECOND coins store BackgroundCoinsStore missing"
+    )
+    m = re.search(
+        r"def run_background_validation_sync[\s\S]*?def start_background_validation",
+        src,
+    )
+    assert m, "G20: run_background_validation_sync body not located"
+    body = m.group(0)
+    # Must drive a real per-block connection into the background store and
+    # recompute the hash over THAT store (not self.db).
+    assert "connect_block_bytes" in body, (
+        "G20 BUG-12: driver does not connect blocks into the background store"
+    )
+    assert "compute_utxo_hash(bg" in body, (
+        "G20 BUG-12: driver does not recompute the hash over the SEPARATE "
+        "background store (tautological hash-of-self regression)"
+    )
+    # The old counter-loop self-hash must be gone.
+    assert "compute_utxo_hash(self.db" not in body, (
+        "G20 BUG-12: driver still re-hashes self.db (counter-loop tautology)"
     )
 
 
