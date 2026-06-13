@@ -13669,7 +13669,37 @@ class RPCServer:
                 lambda: sm.load_snapshot(path, progress_callback, active_chainwork=active_chainwork),
             )
 
-            # Start background validation
+            # Wire the REAL dual-chainstate background validator. The block
+            # source feeds the SECOND (background) chainstate the consensus
+            # bytes for every block genesis..base so it can re-connect them
+            # into its OWN coins store and independently re-derive the
+            # snapshot's HASH_SERIALIZED (Core ActivateSnapshot/AddChainstate/
+            # MaybeValidateSnapshot, validation.cpp:5588/6170/5967).
+            #
+            # The background chainstate genuinely re-connects the chain only
+            # when the node already has the block bodies genesis..base on disk
+            # (e.g. a node that had previously synced or imported them). When a
+            # body is missing the validator surfaces INVALID/NOT_READY rather
+            # than blindly flipping validated=true — never a silent accept.
+            node_db = getattr(self.node, "db", None)
+
+            def _live_block_source(height: int) -> bytes | None:
+                try:
+                    if node_db is None:
+                        return None
+                    blk = node_db.get_block_by_height(height)
+                    if blk is None:
+                        return None
+                    return blk.serialize()
+                except Exception:
+                    return None
+
+            sm.background_block_source = _live_block_source
+
+            # Start background validation in a thread (Core runs
+            # MaybeValidateSnapshot asynchronously; loadtxoutset returns
+            # success regardless of the eventual verdict, which is surfaced
+            # via getchainstates' validated flag).
             sm.start_background_validation()
 
             return {
@@ -14298,9 +14328,15 @@ class RPCServer:
 
         if snapshot_status and snapshot_status["snapshot_loaded"]:
             active_snapshot_blockhash = snapshot_status["snapshot_hash"]
-            # The active (snapshot) chainstate is only fully validated once
-            # background validation has completed.
-            active_validated = bool(snapshot_status.get("background_validated", False))
+            # The active (snapshot) chainstate is only fully validated once the
+            # background dual-chainstate re-derivation MATCHED the commitment.
+            # It is False while the background validator is still running AND
+            # stays False after a mismatch (Core marks the snapshot INVALID and
+            # AbortNode()s; we surface it via validated=False rather than
+            # silently accepting). snapshot_invalid pins that terminal state.
+            active_validated = bool(
+                snapshot_status.get("background_validated", False)
+            ) and not bool(snapshot_status.get("snapshot_invalid", False))
 
             # Background validation chainstate (validating from genesis) is a
             # lower-work chainstate → emitted BEFORE the active one.
