@@ -5028,6 +5028,212 @@ class RPCServer:
         psbt = PSBT.from_transaction(tx)
         return b64.b64encode(psbt.serialize()).decode("ascii")
 
+    def _fund_existing_tx(
+        self,
+        *,
+        wallet: Any,
+        manual_inputs: list[Any],
+        manual_meta: list[dict[str, Any]],
+        tx_outputs: list[Any],
+        recipient_total: int,
+        opts: dict[str, Any],
+    ) -> tuple[list[Any], list[dict[str, Any]], list[Any], int, int | None]:
+        """Core funding engine shared by walletcreatefundedpsbt + fundrawtransaction.
+
+        Given the caller's existing inputs (``manual_inputs`` / ``manual_meta``)
+        and existing recipient outputs (``tx_outputs`` summing to
+        ``recipient_total`` sats), walk the wallet UTXO set through the existing
+        ``select_coins`` machinery (wallet.py::select_coins — BnB / knapsack /
+        SRD), append a change output derived from the wallet's first descriptor /
+        key, and honor changeAddress / changePosition / feeRate / lockUnspents
+        like Bitcoin Core's FundTransaction (wallet/rpc/spend.cpp::FundTransaction).
+
+        Returns ``(all_inputs, all_meta, tx_outputs, est_fee_sats, change_pos)``.
+        ``tx_outputs`` is the same list, mutated in place with the change output
+        (if any) inserted at ``change_pos``. ``change_pos`` is ``None`` when no
+        change output was added (caller maps that to ``-1``).
+        """
+        from ouroboros.address import address_to_script_pubkey
+        from ouroboros.database import TxIn, TxOut
+        from ouroboros.wallet import select_coins
+
+        add_inputs = bool(opts.get("add_inputs", len(manual_inputs) == 0))
+        fee_rate_sat_vb = opts.get("fee_rate")
+        if fee_rate_sat_vb is None and "feeRate" in opts:
+            # Core's deprecated BTC/kvB form. 1 BTC/kvB = 100_000 sat/vB.
+            try:
+                fee_rate_sat_vb = float(opts["feeRate"]) * 100_000.0
+            except (TypeError, ValueError):
+                fee_rate_sat_vb = None
+        if fee_rate_sat_vb is None:
+            fee_estimator = getattr(self.node, "fee_estimator", None)
+            if fee_estimator is not None:
+                try:
+                    fee_rate_sat_vb = fee_estimator.estimate_fee(
+                        int(opts.get("conf_target", 6))
+                    )
+                except Exception:
+                    fee_rate_sat_vb = None
+        if fee_rate_sat_vb is None:
+            fee_rate_sat_vb = 2.0  # match send_transaction fallback
+        try:
+            fee_rate_sat_vb = max(1.0, float(fee_rate_sat_vb))
+        except (TypeError, ValueError):
+            fee_rate_sat_vb = 2.0
+
+        manual_input_value = sum(m["value"] for m in manual_meta)
+        selected_extra: list[dict] = []
+        est_fee = 0
+        change_pos: int | None = None
+
+        if add_inputs:
+            # Pull eligible UTXOs (already filters out lockunspent locks).
+            avail = wallet._collect_utxos() if hasattr(wallet, "_collect_utxos") else []
+            # Skip any UTXO that's already been listed as a manual input.
+            # manual_inputs have prev_txid in internal LE byte order; avail
+            # UTXOs have txid as display-order (BE) hex from Rust PyUTXO.
+            # Compare in display-order (BE) to keep the dedup correct. W69.
+            manual_keys = {(bytes(t.prev_txid)[::-1].hex(), int(t.prev_vout)) for t in manual_inputs}
+            eligible = [
+                u for u in avail
+                if (
+                    (u["txid"] if isinstance(u["txid"], str) else u["txid"].hex()).lower(),
+                    int(u["vout"]),
+                ) not in manual_keys
+            ]
+            shortfall = max(0, recipient_total - manual_input_value)
+            if shortfall > 0:
+                try:
+                    selected_extra, est_fee, _algo = select_coins(
+                        eligible, shortfall, float(fee_rate_sat_vb),
+                    )
+                except ValueError:
+                    # select_coins raises when no combination covers
+                    # target + fees. Mirror Core's bitcoin insufficient-funds
+                    # error (wallet/spend.cpp CreateTransaction →
+                    # RPC_WALLET_INSUFFICIENT_FUNDS) rather than leaking the
+                    # raw ValueError as an unhandled 500.
+                    raise HTTPException(
+                        status_code=500, detail="Insufficient funds"
+                    ) from None
+            else:
+                # No additional inputs needed — assume manual inputs fully cover.
+                selected_extra = []
+                est_fee = int(round(
+                    fee_rate_sat_vb * (
+                        10 + 41 * max(1, len(manual_inputs)) + 31 * len(tx_outputs)
+                    )
+                ))
+        else:
+            est_fee = int(round(
+                fee_rate_sat_vb * (
+                    10 + 41 * max(1, len(manual_inputs)) + 31 * len(tx_outputs)
+                )
+            ))
+            if recipient_total > manual_input_value:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Insufficient input value (add_inputs disabled and "
+                        "manual inputs do not cover outputs + fee)"
+                    ),
+                )
+
+        # Append auto-selected inputs.
+        all_inputs = list(manual_inputs)
+        all_meta = list(manual_meta)
+        for u in selected_extra:
+            # u["txid"] is display-order (BE) hex from Rust PyUTXO.txid.
+            # TxIn.prev_txid must be internal LE — reverse at the boundary. W69.
+            txid_bytes = (
+                bytes.fromhex(u["txid"])[::-1] if isinstance(u["txid"], str) else bytes(u["txid"])
+            )
+            all_inputs.append(TxIn(
+                prev_txid=txid_bytes,
+                prev_vout=int(u["vout"]),
+                script_sig=b"",
+                sequence=0xFFFFFFFD,
+            ))
+            all_meta.append({
+                "value": int(u["value"]),
+                "spk": bytes(u.get("script_pubkey", b"")),
+                "key": u.get("_key"),
+            })
+
+        total_in = sum(m["value"] for m in all_meta)
+
+        # Insufficient funds: the wallet could not cover outputs + fee. Mirror
+        # Core's bitcoin insufficient-funds error (RPC_WALLET_INSUFFICIENT_FUNDS).
+        if add_inputs and total_in < recipient_total + est_fee:
+            raise HTTPException(
+                status_code=500,
+                detail="Insufficient funds",
+            )
+
+        change_value = total_in - recipient_total - est_fee
+
+        # ------------------------------------------------------------------
+        # Change output. Honor changeAddress / changePosition.
+        # ------------------------------------------------------------------
+        DUST = 546
+        if change_value > DUST:
+            change_addr = opts.get("changeAddress") or opts.get("change_address")
+            if not change_addr:
+                # Derive from the wallet's first descriptor / key.
+                if wallet.descriptors:
+                    try:
+                        entry = wallet.descriptors[0]
+                        change_addr = entry.descriptor.derive_address(
+                            entry.next_index, wallet.network
+                        )
+                    except Exception:
+                        change_addr = None
+                if not change_addr and wallet.keys:
+                    try:
+                        change_key = wallet._get_wallet_key(wallet.keys[0])
+                        change_addr = change_key.get_p2wpkh_address()
+                    except Exception:
+                        change_addr = None
+            if not change_addr:
+                # No usable wallet output — fold the would-be change into the fee.
+                est_fee += change_value
+                change_value = 0
+            else:
+                try:
+                    change_spk = address_to_script_pubkey(change_addr, wallet.network)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid changeAddress {change_addr}: {exc}",
+                    ) from None
+                change_pos_req = opts.get("changePosition")
+                if change_pos_req is None or not isinstance(change_pos_req, int):
+                    change_pos = len(tx_outputs)
+                    tx_outputs.append(TxOut(value=change_value, script_pubkey=change_spk))
+                else:
+                    cp = max(0, min(int(change_pos_req), len(tx_outputs)))
+                    tx_outputs.insert(cp, TxOut(value=change_value, script_pubkey=change_spk))
+                    change_pos = cp
+        else:
+            # Would-be change <= dust: fold it into the fee so the reported fee
+            # equals inputs - outputs (Core spend.cpp:1330 sets current_fee =
+            # SelectedValue - output_value). Without this the dropped dust would
+            # silently under-report the fee. No change output is added (change_pos
+            # stays None / -1).
+            if change_value > 0:
+                est_fee += change_value
+                change_value = 0
+
+        # Apply lockUnspents (post-construction, like Core).
+        if bool(opts.get("lockUnspents", False)) and selected_extra:
+            for u in selected_extra:
+                txid_str = (
+                    u["txid"] if isinstance(u["txid"], str) else u["txid"].hex()
+                )
+                wallet.lock_coin(txid_str.lower(), int(u["vout"]), persistent=False)
+
+        return all_inputs, all_meta, tx_outputs, est_fee, change_pos
+
     async def rpc_walletcreatefundedpsbt(
         self,
         inputs: list[dict[str, Any]] | None = None,
@@ -5176,154 +5382,18 @@ class RPCServer:
             recipient_total += sats
 
         # ------------------------------------------------------------------
-        # 3) Auto-fund missing inputs.
+        # 3+4) Auto-fund missing inputs + add change. Shared with
+        #      fundrawtransaction via the _fund_existing_tx engine so both RPCs
+        #      drive the SAME select_coins / change-derivation path.
         # ------------------------------------------------------------------
-        add_inputs = bool(opts.get("add_inputs", len(manual_inputs) == 0))
-        fee_rate_sat_vb = opts.get("fee_rate")
-        if fee_rate_sat_vb is None and "feeRate" in opts:
-            # Core's deprecated BTC/kvB form. 1 BTC/kvB = 100_000 sat/vB.
-            try:
-                fee_rate_sat_vb = float(opts["feeRate"]) * 100_000.0
-            except (TypeError, ValueError):
-                fee_rate_sat_vb = None
-        if fee_rate_sat_vb is None:
-            fee_estimator = getattr(self.node, "fee_estimator", None)
-            if fee_estimator is not None:
-                try:
-                    fee_rate_sat_vb = fee_estimator.estimate_fee(
-                        int(opts.get("conf_target", 6))
-                    )
-                except Exception:
-                    fee_rate_sat_vb = None
-        if fee_rate_sat_vb is None:
-            fee_rate_sat_vb = 2.0  # match send_transaction fallback
-        try:
-            fee_rate_sat_vb = max(1.0, float(fee_rate_sat_vb))
-        except (TypeError, ValueError):
-            fee_rate_sat_vb = 2.0
-
-        manual_input_value = sum(m["value"] for m in manual_meta)
-        selected_extra: list[dict] = []
-        est_fee = 0
-        change_pos: int | None = None
-
-        if add_inputs:
-            # Pull eligible UTXOs (already filters out lockunspent locks).
-            avail = wallet._collect_utxos() if hasattr(wallet, "_collect_utxos") else []
-            # Skip any UTXO that's already been listed as a manual input.
-            # manual_inputs have prev_txid in internal LE byte order; avail
-            # UTXOs have txid as display-order (BE) hex from Rust PyUTXO.
-            # Compare in display-order (BE) to keep the dedup correct. W69.
-            manual_keys = {(bytes(t.prev_txid)[::-1].hex(), int(t.prev_vout)) for t in manual_inputs}
-            eligible = [
-                u for u in avail
-                if (
-                    (u["txid"] if isinstance(u["txid"], str) else u["txid"].hex()).lower(),
-                    int(u["vout"]),
-                ) not in manual_keys
-            ]
-            shortfall = max(0, recipient_total - manual_input_value)
-            if shortfall > 0:
-                selected_extra, est_fee, _algo = select_coins(
-                    eligible, shortfall, float(fee_rate_sat_vb),
-                )
-            else:
-                # No additional inputs needed — assume manual inputs fully cover.
-                selected_extra = []
-                est_fee = int(round(
-                    fee_rate_sat_vb * (
-                        10 + 41 * max(1, len(manual_inputs)) + 31 * len(tx_outputs)
-                    )
-                ))
-        else:
-            est_fee = int(round(
-                fee_rate_sat_vb * (
-                    10 + 41 * max(1, len(manual_inputs)) + 31 * len(tx_outputs)
-                )
-            ))
-            if recipient_total > manual_input_value:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Insufficient input value (add_inputs disabled and "
-                        "manual inputs do not cover outputs + fee)"
-                    ),
-                )
-
-        # Append auto-selected inputs.
-        all_inputs = list(manual_inputs)
-        all_meta = list(manual_meta)
-        for u in selected_extra:
-            # u["txid"] is display-order (BE) hex from Rust PyUTXO.txid.
-            # TxIn.prev_txid must be internal LE — reverse at the boundary. W69.
-            txid_bytes = (
-                bytes.fromhex(u["txid"])[::-1] if isinstance(u["txid"], str) else bytes(u["txid"])
-            )
-            all_inputs.append(TxIn(
-                prev_txid=txid_bytes,
-                prev_vout=int(u["vout"]),
-                script_sig=b"",
-                sequence=0xFFFFFFFD,
-            ))
-            all_meta.append({
-                "value": int(u["value"]),
-                "spk": bytes(u.get("script_pubkey", b"")),
-                "key": u.get("_key"),
-            })
-
-        total_in = sum(m["value"] for m in all_meta)
-        change_value = total_in - recipient_total - est_fee
-
-        # ------------------------------------------------------------------
-        # 4) Change output. Honor changeAddress / changePosition.
-        # ------------------------------------------------------------------
-        DUST = 546
-        if change_value > DUST:
-            change_addr = opts.get("changeAddress") or opts.get("change_address")
-            if not change_addr:
-                # Derive from the wallet's first descriptor / key.
-                if wallet.descriptors:
-                    try:
-                        entry = wallet.descriptors[0]
-                        change_addr = entry.descriptor.derive_address(
-                            entry.next_index, wallet.network
-                        )
-                    except Exception:
-                        change_addr = None
-                if not change_addr and wallet.keys:
-                    try:
-                        change_key = wallet._get_wallet_key(wallet.keys[0])
-                        change_addr = change_key.get_p2wpkh_address()
-                    except Exception:
-                        change_addr = None
-            if not change_addr:
-                # No usable wallet output — fold the would-be change into the fee.
-                est_fee += change_value
-                change_value = 0
-            else:
-                try:
-                    change_spk = address_to_script_pubkey(change_addr, wallet.network)
-                except Exception as exc:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Invalid changeAddress {change_addr}: {exc}",
-                    ) from None
-                change_pos_req = opts.get("changePosition")
-                if change_pos_req is None or not isinstance(change_pos_req, int):
-                    change_pos = len(tx_outputs)
-                    tx_outputs.append(TxOut(value=change_value, script_pubkey=change_spk))
-                else:
-                    cp = max(0, min(int(change_pos_req), len(tx_outputs)))
-                    tx_outputs.insert(cp, TxOut(value=change_value, script_pubkey=change_spk))
-                    change_pos = cp
-
-        # Apply lockUnspents (post-construction, like Core).
-        if bool(opts.get("lockUnspents", False)) and selected_extra:
-            for u in selected_extra:
-                txid_str = (
-                    u["txid"] if isinstance(u["txid"], str) else u["txid"].hex()
-                )
-                wallet.lock_coin(txid_str.lower(), int(u["vout"]), persistent=False)
+        all_inputs, all_meta, tx_outputs, est_fee, change_pos = self._fund_existing_tx(
+            wallet=wallet,
+            manual_inputs=manual_inputs,
+            manual_meta=manual_meta,
+            tx_outputs=tx_outputs,
+            recipient_total=recipient_total,
+            opts=opts,
+        )
 
         # ------------------------------------------------------------------
         # 5) Build PSBT and fill witness-UTXO + bip32 derivs (Updater).
@@ -5369,6 +5439,281 @@ class RPCServer:
         psbt_bytes = psbt.serialize()
         return {
             "psbt": b64.b64encode(psbt_bytes).decode("ascii"),
+            "fee": est_fee / 100_000_000,
+            "changepos": change_pos if change_pos is not None else -1,
+        }
+
+    @staticmethod
+    def _decode_hex_tx(raw_bytes: bytes, iswitness: bool | None) -> Any:
+        """Decode a raw tx, resolving the BIP-144 empty-vin / segwit-marker
+        ambiguity the way Bitcoin Core's DecodeHexTx does.
+
+        TxMessage.from_payload always treats a leading ``00 01`` as the segwit
+        marker+flag, which mis-parses a non-witness tx that has zero inputs
+        (e.g. the output of ``createrawtransaction`` with no inputs — the most
+        common input to fundrawtransaction). Core tries non-witness and witness
+        decodes and picks the one that succeeds (controllable via ``iswitness``):
+        try_no_witness = iswitness is None or iswitness is False;
+        try_witness    = iswitness is None or iswitness is True.
+        We prefer the non-witness parse when allowed, matching Core's
+        ``DecodeTx``: a non-witness decode that consumes the whole buffer wins.
+        """
+        from ouroboros.database import Transaction, TxIn, TxOut
+        from ouroboros.p2p_messages import decode_varint
+
+        def _parse_no_witness(payload: bytes) -> Any:
+            offset = 0
+            if len(payload) < 4:
+                raise ValueError("Payload too short for version")
+            version = int.from_bytes(payload[0:4], "little", signed=False)
+            offset = 4
+            n_in, sz = decode_varint(payload, offset); offset += sz
+            inputs = []
+            for i in range(n_in):
+                if len(payload) < offset + 36:
+                    raise ValueError(f"Payload too short for input {i}")
+                prev_txid = payload[offset:offset + 32]; offset += 32
+                prev_vout = int.from_bytes(payload[offset:offset + 4], "little"); offset += 4
+                slen, sz = decode_varint(payload, offset); offset += sz
+                if len(payload) < offset + slen:
+                    raise ValueError(f"Payload too short for script_sig in input {i}")
+                script_sig = payload[offset:offset + slen]; offset += slen
+                if len(payload) < offset + 4:
+                    raise ValueError(f"Payload too short for sequence in input {i}")
+                sequence = int.from_bytes(payload[offset:offset + 4], "little"); offset += 4
+                inputs.append(TxIn(prev_txid=prev_txid, prev_vout=prev_vout,
+                                   script_sig=script_sig, sequence=sequence, witness=None))
+            n_out, sz = decode_varint(payload, offset); offset += sz
+            outputs = []
+            for i in range(n_out):
+                if len(payload) < offset + 8:
+                    raise ValueError(f"Payload too short for value in output {i}")
+                value = int.from_bytes(payload[offset:offset + 8], "little"); offset += 8
+                slen, sz = decode_varint(payload, offset); offset += sz
+                if len(payload) < offset + slen:
+                    raise ValueError(f"Payload too short for script_pubkey in output {i}")
+                outputs.append(TxOut(value=value, script_pubkey=payload[offset:offset + slen]))
+                offset += slen
+            if len(payload) < offset + 4:
+                raise ValueError("Payload too short for locktime")
+            locktime = int.from_bytes(payload[offset:offset + 4], "little"); offset += 4
+            if offset != len(payload):
+                raise ValueError("Extra bytes after non-witness tx")
+            return Transaction(txid=b"\x00" * 32, version=version, locktime=locktime,
+                               inputs=inputs, outputs=outputs, has_witness=False)
+
+        try_no_witness = iswitness is None or iswitness is False
+        try_witness = iswitness is None or iswitness is True
+
+        last_exc: Exception | None = None
+        if try_no_witness:
+            try:
+                return _parse_no_witness(raw_bytes)
+            except Exception as exc:
+                last_exc = exc
+        if try_witness:
+            from ouroboros.p2p_messages import TxMessage
+            try:
+                return TxMessage.from_payload(raw_bytes).transaction
+            except Exception as exc:
+                last_exc = exc
+        raise ValueError(str(last_exc) if last_exc else "TX decode failed")
+
+    async def rpc_fundrawtransaction(
+        self,
+        hexstring: str,
+        options: dict[str, Any] | None = None,
+        iswitness: bool | None = None,
+    ) -> dict[str, Any]:
+        """Add inputs (and a change output) to a raw transaction so the wallet
+        funds all of its outputs plus the fee.
+
+        Reference: bitcoin-core/src/wallet/rpc/spend.cpp::fundrawtransaction
+        (which calls FundTransaction). fundrawtransaction is the raw-tx sibling
+        of walletcreatefundedpsbt: both drive Core's one FundTransaction engine.
+        Here we decode the raw tx hex, keep its existing inputs and outputs, run
+        the SAME funding core as walletcreatefundedpsbt (``_fund_existing_tx`` →
+        wallet.py::select_coins), then serialize the funded tx to hex instead of
+        a PSBT.
+
+        Result: ``{"hex": <funded raw tx>, "fee": <BTC>, "changepos": <int|-1>}``.
+
+        options (all optional): changeAddress, changePosition, includeWatching,
+        lockUnspents, feeRate (BTC/kvB) / fee_rate (sat/vB),
+        subtractFeeFromOutputs, add_inputs, conf_target. The no-options default
+        path funds a tx that has outputs but no/insufficient inputs.
+        """
+        from ouroboros.database import Transaction, TxIn, TxOut
+
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            raise HTTPException(status_code=500, detail="No wallet loaded")
+        if getattr(wallet, "is_locked", False):
+            raise HTTPException(
+                status_code=500,
+                detail="Wallet is locked; unlock with walletpassphrase first",
+            )
+
+        opts = dict(options) if isinstance(options, dict) else {}
+
+        # ------------------------------------------------------------------
+        # 1) Decode the raw tx hex (Core DecodeHexTx). _decode_hex_tx resolves
+        #    the BIP-144 empty-vin/segwit-marker ambiguity using iswitness.
+        # ------------------------------------------------------------------
+        try:
+            raw_bytes = bytes.fromhex(hexstring)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid hex string: {exc}"
+            ) from None
+        try:
+            tx = self._decode_hex_tx(raw_bytes, iswitness)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400, detail=f"TX decode failed: {exc}"
+            ) from None
+
+        # ------------------------------------------------------------------
+        # 2) Existing inputs -> manual_inputs / manual_meta (resolve values
+        #    from the wallet UTXO set so the fee/change math is genuine).
+        # ------------------------------------------------------------------
+        manual_inputs: list[TxIn] = []
+        manual_meta: list[dict[str, Any]] = []
+        for tin in tx.inputs:
+            manual_inputs.append(TxIn(
+                prev_txid=bytes(tin.prev_txid),
+                prev_vout=int(tin.prev_vout),
+                script_sig=bytes(tin.script_sig),
+                sequence=int(tin.sequence),
+            ))
+            value = 0
+            spk = b""
+            if getattr(wallet, "db", None) is not None:
+                try:
+                    utxo = wallet.db.get_utxo(bytes(tin.prev_txid), int(tin.prev_vout))
+                except Exception:
+                    utxo = None
+                if utxo:
+                    value = int(utxo.get("value", utxo.get("amount", 0)) or 0)
+                    spk_field = utxo.get("script_pubkey", b"")
+                    spk = bytes(spk_field) if spk_field else b""
+            manual_meta.append({"value": value, "spk": spk, "key": None})
+
+        # ------------------------------------------------------------------
+        # 3) Existing outputs -> tx_outputs (kept verbatim). subtractFeeFrom
+        #    Outputs is resolved after the fee is known (Core deducts equally
+        #    from the named output indices, indices are pre-change).
+        # ------------------------------------------------------------------
+        tx_outputs: list[TxOut] = [
+            TxOut(value=int(o.value), script_pubkey=bytes(o.script_pubkey))
+            for o in tx.outputs
+        ]
+        recipient_total = sum(o.value for o in tx_outputs)
+
+        sffo_raw = opts.get("subtractFeeFromOutputs") or opts.get(
+            "subtract_fee_from_outputs"
+        )
+        sffo: list[int] = []
+        if isinstance(sffo_raw, list):
+            for idx in sffo_raw:
+                if not isinstance(idx, int) or isinstance(idx, bool):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="subtractFeeFromOutputs must be a list of integers",
+                    )
+                if idx < 0 or idx >= len(tx_outputs):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"subtractFeeFromOutputs index {idx} out of range",
+                    )
+                sffo.append(idx)
+
+        # ------------------------------------------------------------------
+        # 4) Run the shared funding engine (select_coins + change), exactly
+        #    as walletcreatefundedpsbt does. The engine sizes inputs for
+        #    recipient_total + fee; for subtractFeeFromOutputs we carve the fee
+        #    back out of the named outputs in step 5 so the input total (and the
+        #    sum(inputs)==sum(outputs)+fee invariant) is preserved either way.
+        # ------------------------------------------------------------------
+        all_inputs, all_meta, tx_outputs, est_fee, change_pos = self._fund_existing_tx(
+            wallet=wallet,
+            manual_inputs=manual_inputs,
+            manual_meta=manual_meta,
+            tx_outputs=tx_outputs,
+            recipient_total=recipient_total,
+            opts=opts,
+        )
+
+        # ------------------------------------------------------------------
+        # 5) subtractFeeFromOutputs: deduct the fee equally from the named
+        #    outputs and re-credit the would-be change so the invariant
+        #    sum(inputs) == sum(outputs) + fee is preserved.
+        # ------------------------------------------------------------------
+        if sffo:
+            # The engine sized inputs for recipient_total + est_fee and may have
+            # produced a change output for the surplus. Move est_fee back into
+            # change (so inputs cover outputs+fee), then subtract est_fee from
+            # the named outputs. Net effect: those outputs pay the fee.
+            share = est_fee // len(sffo)
+            remainder = est_fee - share * len(sffo)
+            # Map pre-change output indices to current indices (a change output
+            # inserted at/below an index shifts it by one).
+            for n, out_idx in enumerate(sffo):
+                cur = out_idx
+                if change_pos is not None and change_pos <= out_idx:
+                    cur = out_idx + 1
+                deduct = share + (remainder if n == len(sffo) - 1 else 0)
+                new_val = tx_outputs[cur].value - deduct
+                if new_val < 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Output value too small to subtract fee from "
+                            f"(index {out_idx})"
+                        ),
+                    )
+                tx_outputs[cur] = TxOut(
+                    value=new_val, script_pubkey=tx_outputs[cur].script_pubkey
+                )
+            # Credit the fee back into the change output (or drop change if it
+            # was folded into the fee). After this, the change output holds the
+            # surplus PLUS est_fee, and the named outputs are smaller by est_fee.
+            if change_pos is not None:
+                ch = tx_outputs[change_pos]
+                tx_outputs[change_pos] = TxOut(
+                    value=ch.value + est_fee, script_pubkey=ch.script_pubkey
+                )
+
+        # ------------------------------------------------------------------
+        # 6) Build the funded tx + serialize to hex (Core EncodeHexTx). Added
+        #    inputs are unsigned (no witness), so the non-witness serialization
+        #    is the canonical funded hex. Existing witness data, if any, is
+        #    preserved on the original inputs.
+        # ------------------------------------------------------------------
+        has_witness = any(
+            getattr(tin, "witness", None) for tin in tx.inputs
+        )
+        funded = Transaction(
+            txid=b"\x00" * 32,
+            version=int(tx.version),
+            locktime=int(tx.locktime),
+            inputs=all_inputs,
+            outputs=tx_outputs,
+            has_witness=has_witness,
+        )
+        if has_witness:
+            # Re-attach witness stacks from the originally-decoded inputs to the
+            # corresponding manual inputs (added inputs carry none).
+            for i, orig in enumerate(tx.inputs):
+                w = getattr(orig, "witness", None)
+                if w and i < len(funded.inputs):
+                    funded.inputs[i].witness = w
+            hex_str = funded.serialize_with_witness().hex()
+        else:
+            hex_str = funded.serialize().hex()
+
+        return {
+            "hex": hex_str,
             "fee": est_fee / 100_000_000,
             "changepos": change_pos if change_pos is not None else -1,
         }
