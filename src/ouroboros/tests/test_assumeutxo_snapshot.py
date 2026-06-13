@@ -582,51 +582,107 @@ class TestG12_ThreeChainstateArchitecture:
 class TestG15_BackgroundValidation:
     """G15-G17 — background validation worker does not actually replay blocks."""
 
-    def test_background_validation_worker_is_noop_loop(self):
-        """BUG-7: background validation loop counts heights but never replays blocks.
+    def test_background_validation_replays_blocks_into_second_store(self):
+        """FIXED (BUG-7): the worker now connects blocks into a SEPARATE store.
 
-        The worker iterates range(target_height+1) incrementing
-        self.background_validation_height but calls no block-validation function.
-        The loop completes in microseconds for any height, proving it is a no-op.
+        Previously it iterated range(target_height+1) incrementing a counter
+        and called no block-connection function. The dual-chainstate rewrite
+        replays every block genesis->base into a SECOND BackgroundCoinsStore
+        (real spend-inputs/add-outputs) and recomputes the hash over THAT
+        store. We prove the wiring by asserting the worker invokes the real
+        per-block connect, observed via a counting block source.
+        """
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        _src = _Path(__file__).resolve().parents[1]
+        if str(_src.parent) not in _sys.path:
+            _sys.path.insert(0, str(_src.parent))
+        from ouroboros.snapshot import (
+            AssumeutxoData,
+            register_regtest_assumeutxo,
+            clear_regtest_assumeutxo,
+        )
+
+        # Build a trivial 1-block regtest chain (genesis only) and register a
+        # regtest AU entry at height 0 committing to its (empty) UTXO hash.
+        import hashlib as _hl
+        import struct as _st
+        from ouroboros.database import Transaction, TxIn, TxOut, Block
+        from ouroboros.p2p_messages import encode_varint
+        from ouroboros.snapshot import HashWriter
+
+        cb0 = Transaction(
+            txid=None, version=1, locktime=0,
+            inputs=[TxIn(prev_txid=b"\x00" * 32, prev_vout=0xFFFFFFFF,
+                         script_sig=bytes([0x03, 0, 0, 0]), sequence=0xFFFFFFFF,
+                         witness=[])],
+            outputs=[TxOut(value=50 * 10**8, script_pubkey=bytes([0x51]))],
+            has_witness=False,
+        )
+        hdr = (_st.pack("<i", 0x20000000) + b"\x00" * 32 + b"\x11" * 32
+               + _st.pack("<I", 1700000000) + _st.pack("<I", 0x207FFFFF)
+               + _st.pack("<I", 0))
+        gbytes = hdr + encode_varint(1) + cb0.serialize()
+        ghash = _hl.sha256(_hl.sha256(gbytes[:80]).digest()).digest()
+        # Genesis coinbase is unspendable -> empty UTXO set -> empty SHA256d.
+        empty_hash = HashWriter().digest()
+
+        clear_regtest_assumeutxo()
+        register_regtest_assumeutxo(
+            AssumeutxoData(height=0, block_hash=ghash,
+                           hash_serialized=empty_hash, chain_tx_count=1)
+        )
+        try:
+            mock_db = MagicMock()
+            sm = SnapshotManager(mock_db, "regtest", "/tmp/fake_bg")
+            sm.snapshot_loaded = True
+            sm.snapshot_height = 0
+            sm.snapshot_hash = ghash
+
+            calls: list[int] = []
+
+            def source(h: int):
+                calls.append(h)
+                return gbytes if h == 0 else None
+
+            sm.start_background_validation(block_source=source)
+            if sm._validation_thread:
+                sm._validation_thread.join(timeout=5.0)
+
+            # The worker REALLY connected the block (source was invoked).
+            assert calls == [0], "worker did not replay the chain"
+            # Empty genesis-only UTXO set matches the empty-hash commitment.
+            assert sm.background_validated is True
+            assert sm.snapshot_invalid is False
+        finally:
+            clear_regtest_assumeutxo()
+
+    def test_background_validation_never_validates_without_real_work(self):
+        """FIXED (BUG-7): background validation NO LONGER sets validated=True
+        without a real genesis->base re-derivation in a SECOND store.
+
+        The old counter loop set background_validated=True even with no block
+        source and no matching assumeUTXO entry (a tautological self-hash). The
+        dual-chainstate rewrite refuses to do that: with no block source wired,
+        start_background_validation logs a warning and leaves the snapshot
+        UNVALIDATED — never a silent accept.
         """
         mock_db = MagicMock()
         mock_db.iter_utxos = MagicMock(return_value=[])
         sm = SnapshotManager(mock_db, "mainnet", "/tmp/fake")
         sm.snapshot_loaded = True
-        sm.snapshot_height = 10  # small number for speed
-        sm.snapshot_hash = b"\x00" * 32
-
-        start = time.monotonic()
-        sm.start_background_validation()
-        # Give the thread time to "complete"
-        if sm._validation_thread:
-            sm._validation_thread.join(timeout=2.0)
-        elapsed = time.monotonic() - start
-
-        # A real IBD from genesis to height 10 would take far longer than 1s
-        # even on a trivial chain. If it finished in <1s, it's clearly not
-        # replaying any blocks.
-        assert elapsed < 1.0, "Background validation finished impossibly fast"
-        # Document the bug: the loop does no real validation.
-        pytest.xfail(
-            "BUG-7: background_validation_worker is a counter loop, not a block replay"
-        )
-
-    def test_background_validation_sets_validated_flag(self):
-        """Background validation sets background_validated=True even without any real work."""
-        mock_db = MagicMock()
-        mock_db.iter_utxos = MagicMock(return_value=[])
-        sm = SnapshotManager(mock_db, "mainnet", "/tmp/fake")
-        sm.snapshot_loaded = True
         sm.snapshot_height = 2
-        sm.snapshot_hash = b"\x00" * 32  # no matching AU entry -> logs warning, sets True
+        sm.snapshot_hash = b"\x00" * 32  # no matching AU entry
 
+        # No block source wired -> validator does NOT start a thread and does
+        # NOT flip the flag.
         sm.start_background_validation()
         if sm._validation_thread:
             sm._validation_thread.join(timeout=2.0)
 
-        # With no AU entry matching all-zeros, it logs a warning and sets True.
-        assert sm.background_validated is True
+        assert sm.background_validated is False
+        assert sm.snapshot_invalid is False
 
     def test_background_validation_requires_snapshot_loaded(self):
         """start_background_validation must no-op when snapshot_loaded is False."""

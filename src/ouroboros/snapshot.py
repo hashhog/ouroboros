@@ -343,6 +343,41 @@ _TESTNET4_ASSUMEUTXO: list[AssumeutxoData] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Runtime-registerable regtest assumeUTXO whitelist.
+#
+# Bitcoin Core's regtest `CRegTestParams` ships an `m_assumeutxo_data` table
+# that the test framework appends to at runtime (e.g. the `assumeutxo`
+# functional tests register the snapshot they just dumped). Mainnet /
+# testnet3 / testnet4 entries are baked-in chainparams and MUST NOT be
+# mutated at runtime — only regtest is registerable, mirroring Core.
+#
+# These entries let `loadtxoutset` (and the dual-chainstate background
+# validator it drives) run end-to-end on a self-built regtest chain without
+# requiring a hardcoded mainnet-sized snapshot. The registry is process-local
+# and cleared in test teardown so no probe state leaks across runs.
+# ---------------------------------------------------------------------------
+_REGTEST_ASSUMEUTXO: list[AssumeutxoData] = []
+
+
+def register_regtest_assumeutxo(data: AssumeutxoData) -> None:
+    """Append a regtest assumeUTXO entry (Core regtest m_assumeutxo_data).
+
+    Only valid for regtest. Re-registering the same block hash overwrites the
+    prior entry (idempotent for tests). Mainnet/testnet entries are immutable.
+    """
+    global _REGTEST_ASSUMEUTXO
+    _REGTEST_ASSUMEUTXO = [
+        d for d in _REGTEST_ASSUMEUTXO if d.block_hash != data.block_hash
+    ]
+    _REGTEST_ASSUMEUTXO.append(data)
+
+
+def clear_regtest_assumeutxo() -> None:
+    """Clear the runtime regtest assumeUTXO whitelist (test teardown)."""
+    _REGTEST_ASSUMEUTXO.clear()
+
+
 def get_assumeutxo_params(network: str) -> list[AssumeutxoData]:
     """Get hardcoded assumeUTXO parameters for a network."""
     if network in ("mainnet", "bitcoin"):
@@ -351,7 +386,11 @@ def get_assumeutxo_params(network: str) -> list[AssumeutxoData]:
         return list(_TESTNET_ASSUMEUTXO)
     if network == "testnet4":
         return list(_TESTNET4_ASSUMEUTXO)
-    # Regtest / signet allow any snapshot.
+    if network == "regtest":
+        # Regtest: only the runtime-registered entries (Core regtest behaviour
+        # — its baked-in m_assumeutxo_data is empty; the test framework appends).
+        return list(_REGTEST_ASSUMEUTXO)
+    # Signet etc.: no entries.
     return []
 
 
@@ -908,8 +947,24 @@ class SnapshotManager:
         self.background_validating = False
         self.background_validated = False
         self.background_validation_height = 0
+        # Set True when the genesis->base background re-derivation produced a
+        # UTXO hash that did NOT match the assumeUTXO commitment.  Core's
+        # MaybeValidateSnapshot marks the snapshot INVALID + AbortNode()s on
+        # this; we surface it through getchainstates (validated stays False)
+        # rather than silently accepting (validation.cpp:5967, handle_invalid_snapshot).
+        self.snapshot_invalid = False
         self._validation_thread: threading.Thread | None = None
         self._validation_cancel = threading.Event()
+        # Optional callback the background validator uses to fetch a block's
+        # raw consensus bytes by height (genesis..base).  Wired by the live
+        # node / loadtxoutset to ``db.get_block`` + ``Block.serialize`` so the
+        # SECOND (background) chainstate can re-connect the real chain.  Left
+        # None outside the live path; the dual-chainstate driver is then
+        # invoked directly with an explicit block source (see tests).
+        self.background_block_source: Callable[[int], bytes | None] | None = None
+        # The live background chainstate (a SEPARATE coins store) once a
+        # dual-chainstate validation has been activated.  None until then.
+        self._background_store: "BackgroundCoinsStore | None" = None
 
     def get_snapshot_chainstate_dir(self) -> Path:
         """Get the directory for snapshot chainstate data."""
@@ -1428,11 +1483,150 @@ class SnapshotManager:
         logger.info(f"[snapshot] Loaded {coins_loaded:,} coins from snapshot")
         return metadata
 
+    # ------------------------------------------------------------------
+    # Real dual-chainstate background validation.
+    #
+    # Mirrors Bitcoin Core's two-chainstate handshake
+    # (validation.cpp ActivateSnapshot:5588 / AddChainstate:6170 /
+    # MaybeValidateSnapshot:5967):
+    #
+    #   * the ACTIVE chainstate is the one the snapshot was loaded into
+    #     (self.db) — it serves queries while UNVALIDATED;
+    #   * a SECOND, genesis-rooted BACKGROUND chainstate with its OWN coins
+    #     store (BackgroundCoinsStore — NOT self.db) re-connects every block
+    #     genesis -> base, spending inputs and adding outputs;
+    #   * at the base the background store's HASH_SERIALIZED is recomputed
+    #     over the SEPARATE store and compared to the assumeUTXO commitment.
+    #     MATCH -> snapshot VALIDATED + background retired. MISMATCH -> the
+    #     snapshot is marked INVALID and the verdict is surfaced (Core's
+    #     handle_invalid_snapshot / AbortNode) — never silently accepted.
+    #
+    # The previous implementation was a tautology: it incremented a height
+    # counter and then re-hashed self.db (the SAME store the snapshot was
+    # loaded into) — a hash-of-self, not an independent re-derivation. This
+    # is the real second chainstate.
+    # ------------------------------------------------------------------
+
+    def run_background_validation_sync(
+        self,
+        block_source: Callable[[int], bytes | None],
+        progress_callback: Callable[[int, int], None] | None = None,
+        bg_data_dir: str | None = None,
+    ) -> "SnapshotValidationResult":
+        """Synchronously drive the dual-chainstate background validation.
+
+        ``block_source(height)`` returns the raw consensus bytes of the block
+        at ``height`` (genesis = 0), or None if not available yet. The
+        background chainstate connects each block genesis..base into its OWN
+        separate coins store, then recomputes the HASH_SERIALIZED over THAT
+        store and compares it to the assumeUTXO commitment.
+
+        Returns a :class:`SnapshotValidationResult` (VALID / INVALID /
+        NOT_READY). On VALID the snapshot is marked validated. On INVALID the
+        snapshot is marked invalid (``snapshot_invalid = True``,
+        ``background_validated`` stays False). Aliasing guard: the background
+        store is a distinct object from ``self.db`` — a write to one is never
+        visible in the other.
+        """
+        if not self.snapshot_loaded or self.snapshot_hash is None:
+            logger.error(
+                "[snapshot] Cannot run background validation: no snapshot loaded"
+            )
+            return SnapshotValidationResult.NOT_READY
+
+        au_data = get_assumeutxo_by_hash(self.network, self.snapshot_hash)
+        if au_data is None:
+            logger.warning(
+                "[snapshot] Background validation: no assumeUTXO commitment for "
+                f"{self.snapshot_hash[::-1].hex()}; cannot re-derive — skipping"
+            )
+            # No commitment to compare against; leave UNVALIDATED.
+            return SnapshotValidationResult.NOT_READY
+
+        target_height = au_data.height
+        # SECOND chainstate: a brand-new, EMPTY coins store rooted at genesis.
+        # Distinct object from self.db (the active/snapshot store) — this is
+        # the aliasing guard Core gets for free from two CChainState/CCoinsView
+        # instances.
+        bg = BackgroundCoinsStore(self.network, data_dir=bg_data_dir)
+        self._background_store = bg
+        if bg is self.db:  # pragma: no cover - structurally impossible
+            raise RuntimeError(
+                "background store aliases the active store — refusing "
+                "(tautological hash-of-self)"
+            )
+
+        self.background_validating = True
+        self.background_validated = False
+        self.snapshot_invalid = False
+        self.background_validation_height = 0
+        try:
+            for height in range(target_height + 1):
+                if self._validation_cancel.is_set():
+                    logger.info("[snapshot] Background validation cancelled")
+                    return SnapshotValidationResult.NOT_READY
+                raw = block_source(height)
+                if raw is None:
+                    logger.error(
+                        f"[snapshot] Background validation: block {height} "
+                        "unavailable — cannot complete re-derivation"
+                    )
+                    self.snapshot_invalid = True
+                    return SnapshotValidationResult.INVALID
+                # REAL connect: spend inputs, add outputs into the SEPARATE
+                # background store (Core ConnectBlock / AddCoins / SpendCoin).
+                bg.connect_block_bytes(raw, height)
+                self.background_validation_height = height
+                if progress_callback:
+                    progress_callback(height, target_height)
+
+            # Reached the base: recompute HASH_SERIALIZED over the BACKGROUND
+            # store's OWN coins and compare to the commitment (Core
+            # MaybeValidateSnapshot). This is the trustless re-derivation by
+            # independent re-connection — it catches a snapshot whose file
+            # hash passes the load-time gate but is inconsistent with the
+            # genesis->base replay.
+            digest = compute_utxo_hash(bg, hash_type="hash_serialized")
+            if digest == au_data.hash_serialized:
+                logger.info(
+                    "[snapshot] Background validation OK at height "
+                    f"{target_height} (HASH_SERIALIZED={digest[::-1].hex()}) — "
+                    "snapshot VALIDATED, retiring background chainstate"
+                )
+                self.background_validated = True
+                self.snapshot_invalid = False
+                return SnapshotValidationResult.VALID
+            logger.error(
+                "[snapshot] !!! Background validation hash MISMATCH at height "
+                f"{target_height}: expected {au_data.hash_serialized_hex()}, "
+                f"got {digest[::-1].hex()} — snapshot marked INVALID "
+                "(Core handle_invalid_snapshot / AbortNode)"
+            )
+            self.background_validated = False
+            self.snapshot_invalid = True
+            return SnapshotValidationResult.INVALID
+        except Exception as e:
+            logger.error(f"[snapshot] Background validation failed: {e}")
+            self.snapshot_invalid = True
+            return SnapshotValidationResult.INVALID
+        finally:
+            self.background_validating = False
+            # Background chainstate is retired once we reach a terminal state;
+            # release its store so its tmp dir can be cleaned up.
+            bg.close()
+
     def start_background_validation(
         self,
         progress_callback: Callable[[int, int], None] | None = None,
+        block_source: Callable[[int], bytes | None] | None = None,
     ) -> None:
-        """Kick off background validation from genesis to the snapshot height."""
+        """Kick off the real dual-chainstate background validation in a thread.
+
+        ``block_source`` supplies block bytes by height; if omitted, falls back
+        to ``self.background_block_source`` (wired by the live node). If neither
+        is available the validator cannot re-derive and leaves the snapshot
+        UNVALIDATED — it never flips ``background_validated`` true blindly.
+        """
         if self.background_validating:
             logger.warning("[snapshot] Background validation already in progress")
             return
@@ -1440,63 +1634,21 @@ class SnapshotManager:
             logger.error("[snapshot] Cannot start background validation: no snapshot loaded")
             return
 
-        self.background_validating = True
+        source = block_source or self.background_block_source
+        if source is None:
+            logger.warning(
+                "[snapshot] Background validation: no block source wired; "
+                "snapshot stays UNVALIDATED until one is provided"
+            )
+            return
+
         self._validation_cancel.clear()
 
         def validation_worker():
             try:
-                logger.info(
-                    f"[snapshot] Starting background validation to height {self.snapshot_height}"
-                )
-                target_height = self.snapshot_height or 0
-                for height in range(target_height + 1):
-                    if self._validation_cancel.is_set():
-                        logger.info("[snapshot] Background validation cancelled")
-                        return
-                    self.background_validation_height = height
-                    if progress_callback:
-                        progress_callback(height, target_height)
-
-                # After reaching target height, recompute the
-                # HASH_SERIALIZED (SHA256d) commitment over the live
-                # UTXO set and compare against the assumeUTXO chainparams
-                # entry. Mirrors validation.cpp's post-load assertion
-                # (lines 5902-5915), but here it runs against the
-                # chainstate as rebuilt during background IBD, so it
-                # doubles as an end-of-IBD audit.
-                au_data = get_assumeutxo_by_hash(self.network, self.snapshot_hash)
-                if au_data is not None:
-                    try:
-                        digest = compute_utxo_hash(self.db, hash_type="hash_serialized")
-                    except Exception as e:
-                        logger.error(
-                            f"[snapshot] Background validation: digest failed: {e}"
-                        )
-                        self.background_validated = False
-                        return
-                    if digest == au_data.hash_serialized:
-                        logger.info(
-                            f"[snapshot] Background validation OK at height {target_height} "
-                            f"(HASH_SERIALIZED={digest[::-1].hex()})"
-                        )
-                        self.background_validated = True
-                    else:
-                        logger.error(
-                            "[snapshot] Background validation hash mismatch "
-                            f"at height {target_height}: expected "
-                            f"{au_data.hash_serialized_hex()}, got "
-                            f"{digest[::-1].hex()}"
-                        )
-                        self.background_validated = False
-                else:
-                    logger.warning(
-                        "[snapshot] Background validation completed but no assumeUTXO data to verify"
-                    )
-                    self.background_validated = True
-            except Exception as e:
-                logger.error(f"[snapshot] Background validation failed: {e}")
-            finally:
-                self.background_validating = False
+                self.run_background_validation_sync(source, progress_callback)
+            except Exception as e:  # pragma: no cover - defensive
+                logger.error(f"[snapshot] Background validation thread failed: {e}")
 
         self._validation_thread = threading.Thread(
             target=validation_worker,
@@ -1607,6 +1759,10 @@ class SnapshotManager:
             "background_validating": self.background_validating,
             "background_validated": self.background_validated,
             "background_validation_height": self.background_validation_height,
+            # True once the background re-derivation produced a hash mismatch
+            # (Core: snapshot marked INVALID). getchainstates uses this to keep
+            # validated=False after a mismatch even though bg is no longer running.
+            "snapshot_invalid": self.snapshot_invalid,
         }
 
 
@@ -1670,3 +1826,180 @@ def compute_utxo_hash(db, hash_type: str = "hash_serialized") -> bytes:
             )
         )
     return hasher.digest()
+
+
+# ---------------------------------------------------------------------------
+# Dual-chainstate machinery — the SECOND (background) coins store.
+#
+# Core's assumeUTXO keeps TWO chainstates: the snapshot-rooted active one and
+# a genesis-rooted BACKGROUND one with its OWN CCoinsView. The background
+# chainstate re-connects every block genesis -> base into its own coins store
+# and the result is hashed and compared to the commitment
+# (validation.cpp AddChainstate:6170 / MaybeValidateSnapshot:5967). This module
+# provides that second store + the real connect path.
+# ---------------------------------------------------------------------------
+
+
+class SnapshotValidationResult:
+    """Terminal verdict of the dual-chainstate background validation."""
+
+    VALID = "valid"        # bg re-derivation matched the commitment
+    INVALID = "invalid"    # bg re-derivation mismatched (Core AbortNode)
+    NOT_READY = "not_ready"  # could not reach a terminal state
+
+
+@dataclass
+class _BgCoinView:
+    """A single coin in the background store (compute_utxo_hash-compatible)."""
+
+    txid: bytes
+    vout: int
+    amount: int
+    script_pubkey: bytes
+    height: int
+    is_coinbase: bool
+
+
+def _is_unspendable(script_pubkey: bytes) -> bool:
+    """True if an output can never be spent — Core never adds it to the UTXO set.
+
+    Mirrors ``CScript::IsUnspendable`` (script.h): an OP_RETURN-led script
+    (0x6a) or a script longer than ``MAX_SCRIPT_SIZE`` is provably
+    unspendable. Core's ``AddCoins`` skips such outputs
+    (coins.cpp::AddCoins, ``if (overwrite || !tx.vout[i].scriptPubKey
+    .IsUnspendable())``), so a faithful background re-connection must too,
+    or the re-derived UTXO set (and thus the hash) would diverge from the
+    snapshot's.
+    """
+    if len(script_pubkey) > MAX_SCRIPT_SIZE:
+        return True
+    return len(script_pubkey) > 0 and script_pubkey[0] == 0x6A  # OP_RETURN
+
+
+class BackgroundCoinsStore:
+    """The SECOND, genesis-rooted coins store for snapshot background validation.
+
+    This is a DISTINCT store from the active/snapshot chainstate (``self.db``
+    in :class:`SnapshotManager`). It is seeded EMPTY at genesis (height 0) and
+    grows ONLY by connecting blocks through :meth:`connect_block_bytes`, which
+    performs the real Core ``ConnectBlock`` UTXO mutation: spend each input's
+    prevout, add each (spendable) output. There is no shortcut and no counter —
+    the resulting UTXO set is exactly what the chain implies.
+
+    Aliasing guarantee: the store keeps its own ``_coins`` map; a write here is
+    invisible in the active store and vice-versa. ``iter_utxos`` yields views
+    shaped for :func:`compute_utxo_hash`, so the background HASH_SERIALIZED is
+    computed over THIS store, never over the snapshot store (the old counter
+    loop's tautological hash-of-self bug).
+
+    The optional ``data_dir`` is reserved for a future on-disk RocksDB-backed
+    background store (mirroring Core's separate ``chainstate_<hash>`` dir); the
+    current in-memory map is sufficient for the regtest-scale background
+    re-derivation and keeps the SECOND store strictly isolated from the live
+    Rust DB so a test can never corrupt the running node's chainstate.
+    """
+
+    def __init__(self, network: str, data_dir: str | None = None):
+        self.network = network
+        self.data_dir = data_dir
+        # outpoint (txid32, vout) -> _BgCoinView. Genesis-empty.
+        self._coins: dict[tuple[bytes, int], _BgCoinView] = {}
+        self.best_height: int = -1  # pre-genesis sentinel
+        self.best_hash: bytes = b"\x00" * 32
+        self._closed = False
+
+    def connect_block_bytes(self, block_bytes: bytes, height: int) -> bytes:
+        """Connect one block into THIS store (spend inputs, add outputs).
+
+        Mirrors Core ``ConnectBlock`` UTXO bookkeeping (validation.cpp
+        ConnectBlock / coins.cpp UpdateCoins):
+
+          * the genesis block (height 0) has its coinbase output treated as
+            UNSPENDABLE and is never added to the UTXO set — Core special-cases
+            the genesis block and skips ConnectBlock entirely
+            (validation.cpp:2337-2343);
+          * for every non-coinbase input, the referenced prevout coin is
+            removed (SpendCoin);
+          * every spendable output is added as a new coin (AddCoins), tagged
+            with this block height and coinbase flag. OP_RETURN / oversize
+            outputs are unspendable and skipped, exactly as Core's AddCoins.
+
+        Returns the block hash (internal byte order).
+        """
+        if self._closed:
+            raise RuntimeError("BackgroundCoinsStore is closed")
+        from ouroboros.database import Block  # local import: avoid cycle
+
+        block = Block.deserialize(block_bytes)
+        block_hash = block.hash
+
+        is_genesis = height == 0
+        for tx_idx, tx in enumerate(block.transactions):
+            is_coinbase = tx_idx == 0
+            txid = tx.txid
+
+            # Spend inputs (skip the coinbase's null prevout).
+            if not is_coinbase:
+                for txin in tx.inputs:
+                    key = (bytes(txin.prev_txid), int(txin.prev_vout))
+                    # SpendCoin: prevout must exist; pop removes it.
+                    if key in self._coins:
+                        del self._coins[key]
+                    else:
+                        # A spend of a coin the background store never created
+                        # means the re-connected chain disagrees with the
+                        # snapshot's history. Surface it loudly rather than
+                        # silently diverging — the hash compare would catch it
+                        # anyway, but failing here gives a precise reason.
+                        raise ValueError(
+                            f"background connect: input {key[0][::-1].hex()}:"
+                            f"{key[1]} at height {height} spends a coin not in "
+                            "the background UTXO set"
+                        )
+
+            # Add outputs (AddCoins). Genesis coinbase output is never added.
+            if is_genesis and is_coinbase:
+                continue
+            for vout, txout in enumerate(tx.outputs):
+                spk = bytes(txout.script_pubkey)
+                if _is_unspendable(spk):
+                    continue
+                self._coins[(bytes(txid), int(vout))] = _BgCoinView(
+                    txid=bytes(txid),
+                    vout=int(vout),
+                    amount=int(txout.value),
+                    script_pubkey=spk,
+                    height=int(height),
+                    is_coinbase=is_coinbase,
+                )
+
+        self.best_height = height
+        self.best_hash = block_hash
+        return block_hash
+
+    def get_utxo(self, txid: bytes, vout: int) -> dict[str, Any] | None:
+        """Outpoint lookup — proves the SECOND store's contents independently."""
+        coin = self._coins.get((bytes(txid), int(vout)))
+        if coin is None:
+            return None
+        return {
+            "txid": coin.txid,
+            "vout": coin.vout,
+            "value": coin.amount,
+            "script_pubkey": coin.script_pubkey,
+            "height": coin.height,
+            "is_coinbase": coin.is_coinbase,
+        }
+
+    def utxo_count(self) -> int:
+        return len(self._coins)
+
+    def iter_utxos(self):
+        """Yield every coin in THIS store (shape: compute_utxo_hash-ready)."""
+        yield from self._coins.values()
+
+    def get_best_block(self) -> tuple[bytes, int]:
+        return self.best_hash, self.best_height
+
+    def close(self) -> None:
+        self._closed = True
