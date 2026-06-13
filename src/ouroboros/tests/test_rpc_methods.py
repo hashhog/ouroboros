@@ -63,14 +63,18 @@ class TestRPCMethods(unittest.TestCase):
         self.assertTrue(callable(getattr(self.rpc_server, 'rpc_getblockheader', None)))
 
     def test_getblockheader_handles_invalid_hash(self):
-        """Test that getblockheader handles invalid hash"""
+        """getblockheader rejects a malformed hash with -8 at the parse
+        boundary (Core ParseHashV, rpc/util.cpp:117 -> RPC_INVALID_PARAMETER).
+        Was HTTPException (-> -32603); flipped to confirm -8.
+        """
         import asyncio
 
-        from fastapi import HTTPException
+        from ouroboros.rpc import RPC_INVALID_PARAMETER, RpcError
 
         async def test():
-            with self.assertRaises(HTTPException):
+            with self.assertRaises(RpcError) as ctx:
                 await self.rpc_server.rpc_getblockheader("invalid_hash", verbose=True)
+            self.assertEqual(ctx.exception.code, RPC_INVALID_PARAMETER)
 
         asyncio.run(test())
 
@@ -94,14 +98,18 @@ class TestRPCMethods(unittest.TestCase):
         self.assertTrue(callable(getattr(self.rpc_server, 'rpc_gettxout', None)))
 
     def test_gettxout_handles_invalid_txid(self):
-        """Test that gettxout handles invalid transaction ID"""
+        """gettxout rejects a malformed txid with -8 at the parse boundary
+        (Core ParseHashV, rpc/util.cpp:117 -> RPC_INVALID_PARAMETER). Was
+        HTTPException (-> -32603); flipped to confirm -8.
+        """
         import asyncio
 
-        from fastapi import HTTPException
+        from ouroboros.rpc import RPC_INVALID_PARAMETER, RpcError
 
         async def test():
-            with self.assertRaises(HTTPException):
+            with self.assertRaises(RpcError) as ctx:
                 await self.rpc_server.rpc_gettxout("invalid_txid", 0, includemempool=True)
+            self.assertEqual(ctx.exception.code, RPC_INVALID_PARAMETER)
 
         asyncio.run(test())
 
@@ -287,34 +295,42 @@ class TestRPCBlockHashByteOrder(unittest.TestCase):
         asyncio.run(test())
 
     def test_getblock_internal_order_misses(self):
-        """Internal-order hex (= display reversed) must NOT resolve."""
+        """Internal-order hex (= display reversed) is well-formed but does
+        not resolve -> Core getblock raises -5 RPC_INVALID_ADDRESS_OR_KEY
+        "Block not found" (blockchain.cpp:849). Was HTTPException 404
+        (-> -32603); flipped to confirm -5 (the malformed-parse boundary is
+        unaffected — this hash is valid 64-hex).
+        """
         import asyncio
 
-        from fastapi import HTTPException
+        from ouroboros.rpc import RPC_INVALID_ADDRESS_OR_KEY, RpcError
 
         self._require_db()
         internal_order_hex = self.genesis_internal.hex()
 
         async def test():
-            with self.assertRaises(HTTPException) as ctx:
+            with self.assertRaises(RpcError) as ctx:
                 await self.rpc_server.rpc_getblock(internal_order_hex, verbosity=1)
-            self.assertEqual(ctx.exception.status_code, 404)
+            self.assertEqual(ctx.exception.code, RPC_INVALID_ADDRESS_OR_KEY)
 
         asyncio.run(test())
 
     def test_getblock_rejects_truncated_hex(self):
-        """rpc_getblock must validate length, not silently miss."""
+        """rpc_getblock must validate length at the parse boundary, not
+        silently miss. A wrong-length hash -> Core ParseHashV -8
+        (RPC_INVALID_PARAMETER), BEFORE the db lookup. Was HTTPException
+        400/404/500; flipped to confirm -8.
+        """
         import asyncio
 
-        from fastapi import HTTPException
+        from ouroboros.rpc import RPC_INVALID_PARAMETER, RpcError
 
         async def test():
             # 16 hex chars = 8 bytes, not 32.
-            with self.assertRaises(HTTPException) as ctx:
+            with self.assertRaises(RpcError) as ctx:
                 await self.rpc_server.rpc_getblock("deadbeefdeadbeef", verbosity=1)
-            # Either 400 (length / parse) or 500 (db unavailable in some
-            # setups) is acceptable as long as we don't silently miss.
-            self.assertIn(ctx.exception.status_code, (400, 404, 500))
+            self.assertEqual(ctx.exception.code, RPC_INVALID_PARAMETER)
+            self.assertIn("must be of length 64", ctx.exception.message)
 
         asyncio.run(test())
 
@@ -1004,12 +1020,18 @@ class TestMempoolEntryRPCs(unittest.TestCase):
         asyncio.run(test())
 
     def test_getmempoolentry_not_found(self):
-        """getmempoolentry raises on unknown txid."""
+        """getmempoolentry with a well-formed but unknown txid raises -5
+        RPC_INVALID_ADDRESS_OR_KEY "Transaction not in mempool" (Core
+        mempool.cpp:887). Was a bare ValueError (-> -32603); flipped to -5.
+        """
         import asyncio
 
+        from ouroboros.rpc import RPC_INVALID_ADDRESS_OR_KEY, RpcError
+
         async def test():
-            with self.assertRaises(ValueError):
+            with self.assertRaises(RpcError) as ctx:
                 await self.rpc_server.rpc_getmempoolentry("ff" * 32)
+            self.assertEqual(ctx.exception.code, RPC_INVALID_ADDRESS_OR_KEY)
 
         asyncio.run(test())
 

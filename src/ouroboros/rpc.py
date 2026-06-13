@@ -556,6 +556,43 @@ RPC_INVALID_PARAMETER = -8
 RPC_CLIENT_INVALID_IP_OR_SUBNET = -30
 
 
+def _parse_hash_v(value: str, name: str) -> bytes:
+    """Parse a 64-char hex uint256 (txid / blockhash) RPC argument.
+
+    Mirrors Bitcoin Core ``ParseHashV`` (rpc/util.cpp:117): a string that is
+    not a valid 64-char hex uint256 is rejected at the PARSE boundary, BEFORE
+    any lookup, with ``RPC_INVALID_PARAMETER`` (-8). The message form depends
+    on the failure mode, byte-for-byte with Core:
+
+      * wrong length -> "<name> must be of length 64 (not N, for '<hex>')"
+      * right length, non-hex chars -> "<name> must be hexadecimal string
+        (not '<hex>')"
+
+    Returns the decoded 32 bytes in the wire (the same big-endian display
+    order the caller supplied — callers reverse to internal little-endian
+    keying themselves, exactly as before). Only the malformed-parse case is
+    affected; a well-formed-but-absent hash decodes cleanly here and the
+    caller's own lookup decides the not-found code (Core: -5, or null).
+    """
+    expected_len = 64
+    if not isinstance(value, str) or len(value) != expected_len:
+        shown_len = len(value) if isinstance(value, str) else 0
+        raise RpcError(
+            RPC_INVALID_PARAMETER,
+            f"{name} must be of length {expected_len} "
+            f"(not {shown_len}, for '{value}')",
+        )
+    try:
+        return bytes.fromhex(value)
+    except ValueError:
+        # Right length, but contains non-hex characters -> Core's second
+        # ParseHashV message (rpc/util.cpp:124).
+        raise RpcError(
+            RPC_INVALID_PARAMETER,
+            f"{name} must be hexadecimal string (not '{value}')",
+        ) from None
+
+
 class JSONRPCRequest(BaseModel):
     """JSON-RPC 2.0 request model"""
     jsonrpc: str = "2.0"
@@ -1939,24 +1976,31 @@ class RPCServer:
             If verbosity = 2: JSON object with full transaction details
             If verbosity = 3: JSON object with transaction details and prevout info
         """
-        try:
-            # JSON-RPC convention: hashes are display-order (big-endian) hex.
-            # Internal storage uses little-endian uint256 keying. Reverse the
-            # bytes so the lookup hits the BLOCKS_CF entry written by
-            # connect_block_from_bytes.
-            # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
-            block_hash = bytes.fromhex(blockhash)[::-1]
-            if len(block_hash) != 32:
-                raise ValueError("Block hash must be 32 bytes")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid block hash") from None
+        # JSON-RPC convention: hashes are display-order (big-endian) hex.
+        # Internal storage uses little-endian uint256 keying. Reverse the
+        # bytes so the lookup hits the BLOCKS_CF entry written by
+        # connect_block_from_bytes.
+        #
+        # Reference: Bitcoin Core src/rpc/blockchain.cpp:842
+        # getblock -> ParseHashV(request.params[0], "blockhash"), which
+        # (rpc/util.cpp:117 ParseHashV) throws RPC_INVALID_PARAMETER (-8) for
+        # a malformed hash BEFORE any lookup: wrong length vs non-hex pick
+        # the two Core message forms. A well-formed-but-absent hash falls
+        # through to the -5 "Block not found" path below, unchanged.
+        block_hash = _parse_hash_v(blockhash, "blockhash")[::-1]
 
         if not hasattr(self.node, 'db'):
             raise HTTPException(status_code=500, detail="Database not available")
 
         block = await asyncio.to_thread(self.node.db.get_block, block_hash)
         if not block:
-            raise HTTPException(status_code=404, detail="Block not found")
+            # Core: getblock with a well-formed but unknown hash throws
+            # JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
+            # (rpc/blockchain.cpp:849, LookupBlockIndex == nullptr). Use
+            # RpcError so the dispatch loop emits the exact -5, not the -32603
+            # an HTTPException collapses to. (Malformed hashes never reach
+            # here — _parse_hash_v already rejected them with -8.)
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
 
         # Fetch raw block bytes (witness-preserving) once; used for verbosity=0
         # hex, verbosity>=1 block-level size/weight, and verbosity>=2 per-tx hex.
@@ -3566,15 +3610,18 @@ class RPCServer:
 
             If verbose=False: Hex-encoded block header (80 bytes)
         """
+        # JSON-RPC convention: hashes are display-order (big-endian) hex.
+        # Internal storage uses little-endian uint256 keying. Reverse the
+        # bytes so the lookup hits the BLOCKS_CF / HEADERS_CF entry written
+        # by connect_block_from_bytes (which uses the internal byte order).
+        #
+        # Reference: Bitcoin Core src/rpc/blockchain.cpp:639
+        # getblockheader -> ParseHashV(request.params[0], "hash") -> -8 on a
+        # malformed hash (rpc/util.cpp:117) BEFORE any lookup. Parse outside
+        # the body try so the -8 RpcError is not remapped to HTTP 400. The
+        # well-formed-but-absent path still raises -5 "Block not found" below.
+        block_hash = _parse_hash_v(blockhash, "hash")[::-1]
         try:
-            # JSON-RPC convention: hashes are display-order (big-endian) hex.
-            # Internal storage uses little-endian uint256 keying. Reverse the
-            # bytes so the lookup hits the BLOCKS_CF / HEADERS_CF entry written
-            # by connect_block_from_bytes (which uses the internal byte order).
-            # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
-            block_hash = bytes.fromhex(blockhash)[::-1]
-            if len(block_hash) != 32:
-                raise ValueError("Block hash must be 32 bytes")
             if not hasattr(self.node, 'db') or not self.node.db:
                 raise HTTPException(status_code=500, detail="Database not available")
 
@@ -3930,17 +3977,18 @@ class RPCServer:
         from ouroboros.psbt import BTCAmount as _BTCAmount
         from ouroboros.psbt import _build_spk_json
 
-        try:
-            # JSON-RPC convention: txids arrive in display order (big-endian hex).
-            # Internal DB keys use little-endian (reversed) bytes.
-            # Reference: Bitcoin Core ParseHashV in src/rpc/util.cpp.
-            try:
-                txid_internal = bytes.fromhex(txid)[::-1]
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid transaction id") from None
-            if len(txid_internal) != 32:
-                raise HTTPException(status_code=400, detail="Invalid transaction id")
+        # JSON-RPC convention: txids arrive in display order (big-endian hex).
+        # Internal DB keys use little-endian (reversed) bytes.
+        #
+        # Reference: Bitcoin Core src/rpc/blockchain.cpp:1224 gettxout ->
+        # ParseHashV(request.params[0], "txid") -> -8 on a malformed txid
+        # (rpc/util.cpp:117) BEFORE any lookup. A well-formed-but-absent
+        # txid returns null (the `if not utxo: return None` path below),
+        # never -8. Parse outside the body try so the -8 RpcError reaches the
+        # dispatcher instead of being remapped to HTTP 500 by the catch-all.
+        txid_internal = _parse_hash_v(txid, "txid")[::-1]
 
+        try:
             network = getattr(self.node, "network", "mainnet")
 
             if not hasattr(self.node, 'db') or not self.node.db:
@@ -11593,15 +11641,26 @@ class RPCServer:
         }
 
     async def rpc_getmempoolentry(self, txid: str) -> dict[str, Any]:
-        """Return mempool data for a given transaction."""
-        if not hasattr(self.node, "mempool") or self.node.mempool is None:
-            raise ValueError("No mempool available")
+        """Return mempool data for a given transaction.
+
+        Reference: Bitcoin Core src/rpc/mempool.cpp:880 getmempoolentry ->
+        ParseHashV(request.params[0], "txid") -> -8 on a malformed txid
+        (rpc/util.cpp:117) BEFORE any lookup; a well-formed-but-absent txid
+        -> RPC_INVALID_ADDRESS_OR_KEY (-5) "Transaction not in mempool"
+        (mempool.cpp:887).
+        """
         # JSON-RPC convention: txids arrive in display order (big-endian hex).
         # Internal mempool keys are little-endian (internal byte order). W69.
-        txid_bytes = bytes.fromhex(txid)[::-1]
+        # Core runs ParseHashV FIRST (mempool.cpp:880), so a malformed txid
+        # -> -8 at the parse boundary, before any mempool check or lookup.
+        txid_bytes = _parse_hash_v(txid, "txid")[::-1]
+        if not hasattr(self.node, "mempool") or self.node.mempool is None:
+            raise ValueError("No mempool available")
         entry = self.node.mempool.get_transaction_entry(txid_bytes)
         if entry is None:
-            raise ValueError(f"Transaction not in mempool: {txid}")
+            raise RpcError(
+                RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool"
+            )
         return self._format_mempool_entry(entry, txid_bytes)
 
     async def rpc_getblockstats(
