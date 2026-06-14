@@ -1807,21 +1807,21 @@ impl BlockchainDB {
                 }
             }
 
-            // 3. Drop the txid → DiskTxPos mapping (Pattern C revert).
+            // 3. txid → DiskTxPos mapping: intentionally NOT deleted on
+            // disconnect, mirroring Bitcoin Core's TxIndex behaviour.
             //
-            // Without this, `getrawtransaction(<disconnected-tx>, true)`
-            // continues to resolve through the stale TX_INDEX_CF row,
-            // returning a positive `confirmations` count for a tx whose
-            // only block is no longer on the active chain. Mirrors
-            // `validate/block.rs::disconnect_block` (the parallel
-            // disconnect helper used by the validator pipeline) and the
-            // Bitcoin Core `BaseIndex::BlockDisconnected` →
-            // `CTxIndex::CustomRemove` chain (`src/index/base.cpp`,
-            // `src/index/txindex.cpp`). Pre-fix this method only
-            // touched UTXOs + UNDO_CF, leaving the txindex stale on
-            // submitblock-driven reorgs (Pattern C, txindex-revert-on-
-            // reorg corpus, 2026-05-05).
-            self.delete_tx_index_batch(&mut batch, txid.as_byte_array())?;
+            // Core's TxIndex class (`src/index/txindex.cpp`) has NO
+            // `CustomRemove` override — it inherits the BaseIndex no-op
+            // default (`src/index/base.h:136`: `{ return true; }`).
+            // Consequently `getrawtransaction` for a tx on a stale/reorged
+            // branch continues to resolve through the TX_INDEX_CF row and
+            // returns the tx with its (now-stale) block context, which
+            // matches Core's observed behaviour.  Deleting the entry on
+            // disconnect was an incorrect assumption that "Pattern C" had
+            // forced; removing the delete restores Core parity.
+            //
+            // Reference: bitcoin-core/src/index/txindex.cpp (no CustomRemove),
+            //            bitcoin-core/src/index/base.h:136 (CustomRemove no-op).
         }
 
         // Delete the undo data.
@@ -2047,8 +2047,8 @@ impl BlockchainDB {
                     }
                 }
 
-                // 3. Drop the txid → DiskTxPos mapping (Pattern C revert).
-                batch.delete_cf(tx_index_cf, txid.as_byte_array());
+                // 3. txid → DiskTxPos: intentionally NOT deleted on disconnect
+                // (Core TxIndex has no CustomRemove; entries survive reorgs).
             }
 
             // 4. Delete the undo data for this height.

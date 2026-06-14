@@ -982,8 +982,9 @@ impl BlockValidator {
                 }
             }
 
-            // 3. Remove transaction index entry.
-            self.db.delete_tx_index(txid.as_byte_array())?;
+            // 3. txid → DiskTxPos: intentionally NOT deleted on disconnect.
+            // Core TxIndex has no CustomRemove (base.h:136 no-op); entries
+            // survive reorgs so getrawtransaction still resolves stale-chain txs.
         }
 
         // 4. Update best block to the previous block (G18).
