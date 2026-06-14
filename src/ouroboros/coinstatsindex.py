@@ -83,6 +83,44 @@ logger = logging.getLogger(__name__)
 OP_RETURN = 0x6A
 MAX_SCRIPT_SIZE = 10000
 
+# BIP30 duplicate-coinbase blocks (IsBIP30Unspendable in validation.cpp:6195-6198).
+# These two mainnet blocks contain coinbase transactions that duplicate an earlier
+# block's coinbase txid.  The earlier outputs became unspendable; consequently the
+# duplicate coinbase outputs must NOT be applied to the MuHash / txouts /
+# total_amount / bogo_size in the coinstats index (Core skips them and accounts
+# their subsidy in m_total_unspendables_bip30 instead).
+#
+# Block hashes are stored in INTERNAL byte order (little-endian, as returned by
+# block.hash throughout ouroboros — double-SHA256 of the serialised header).
+# Display hashes (big-endian / hex-string form):
+#   height 91722: "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"
+#   height 91812: "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"
+#
+# Reference: bitcoin-core/src/index/coinstatsindex.cpp:128-131,
+#            bitcoin-core/src/validation.cpp:6195-6198.
+_BIP30_UNSPENDABLE: dict[int, bytes] = {
+    91722: bytes.fromhex(
+        "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"
+    )[::-1],
+    91812: bytes.fromhex(
+        "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"
+    )[::-1],
+}
+
+
+def _is_bip30_unspendable(height: int, block_hash: bytes) -> bool:
+    """Mirror Bitcoin Core ``IsBIP30Unspendable`` (validation.cpp:6195-6198).
+
+    Returns True iff the block at *height* / *block_hash* is one of the two
+    historical mainnet blocks whose coinbase duplicated an earlier coinbase txid
+    and whose outputs are therefore unspendable.  The coinstats index must skip
+    the coinbase tx for these blocks and count its subsidy in the
+    ``total_unspendables_bip30`` bucket instead (skipped here — ouroboros does
+    not yet persist per-bucket unspendable totals).
+    """
+    expected = _BIP30_UNSPENDABLE.get(height)
+    return expected is not None and bytes(block_hash) == expected
+
 
 def _is_unspendable(script: bytes) -> bool:
     """Mirror Bitcoin Core ``CScript::IsUnspendable`` (script/script.h:563).
@@ -346,8 +384,24 @@ class CoinStatsIndex:
                     self._persist_best_indexed_height()
                 return
 
+            # BIP30 duplicate-coinbase exception (IsBIP30Unspendable,
+            # coinstatsindex.cpp:128-131): skip the coinbase tx entirely for
+            # the two historical mainnet blocks (91722 / 91812) whose coinbase
+            # txids duplicate an earlier block's coinbase.  The earlier
+            # outputs became unspendable, so these duplicate outputs must NOT
+            # be added to the MuHash / txouts / total_amount / bogo_size.
+            # Core accounts their subsidy in m_total_unspendables_bip30; we
+            # simply skip (ouroboros does not yet persist the per-bucket
+            # unspendable counters).
+            skip_coinbase_bip30 = _is_bip30_unspendable(height, block.hash)
+
             for tx in block.transactions:
                 is_coinbase = bool(tx.is_coinbase)
+
+                # Skip the duplicate coinbase for BIP30 exception blocks.
+                if is_coinbase and skip_coinbase_bip30:
+                    continue
+
                 txid = tx.txid
                 created_here = 0
 

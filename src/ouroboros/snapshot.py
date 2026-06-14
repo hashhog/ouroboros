@@ -687,6 +687,21 @@ def _is_p2pk_compressed(script: bytes) -> tuple[bool, bytes]:
     return False, b""
 
 
+def _is_p2pk_uncompressed(script: bytes) -> tuple[bool, bytes]:
+    """Return (matches, 65-byte pubkey) for a 67-byte uncompressed-key P2PK.
+
+    Matches Bitcoin Core ``IsToKey`` / ``IsToPubKey`` for the 0x04-prefixed
+    (uncompressed) pubkey form (compressor.cpp:47-51).
+
+    The caller is responsible for validating the pubkey is fully on the curve
+    before emitting tag 0x04/0x05 (Core: ``pubkey.IsFullyValid()``).
+    """
+    if (len(script) == 67 and script[0] == 65 and script[66] == _OP_CHECKSIG
+            and script[1] == 0x04):
+        return True, script[1:66]
+    return False, b""
+
+
 def compress_script(script: bytes) -> bytes | None:
     """
     Try to encode `script` as one of the six special compressed forms.
@@ -695,13 +710,15 @@ def compress_script(script: bytes) -> bytes | None:
     `script` does not match any recognized template. The returned body
     starts with the 1-byte tag (0x00..0x05).
 
-    Note: tags 0x04/0x05 (uncompressed-key P2PK on the wire) are fully
-    supported on the *read* side (`decompress_script` recovers the full
-    pubkey via libsecp256k1). On the write side we currently fall through
-    to raw encoding for 67-byte uncompressed-key P2PK -- this is a Core
-    parity gap when ouroboros emits its own snapshots, but does not block
-    `loadtxoutset` against Core dumps (which is the consumer of this code).
-    TODO: emit tag 0x04|(y&1) || x32 for 67-byte uncompressed P2PK.
+    Mirrors Bitcoin Core ``CompressScript`` (compressor.cpp:55-83):
+      0x00: P2PKH (25 bytes)
+      0x01: P2SH  (23 bytes)
+      0x02/0x03: P2PK with compressed pubkey (35 bytes, 0x02/0x03 prefix)
+      0x04/0x05: P2PK with uncompressed pubkey (67 bytes, 0x04 prefix) —
+                 tag = 0x04 | (pubkey[64] & 1), body = pubkey[1:33] (X coord).
+                 Requires libsecp256k1 (coincurve) to validate the point; an
+                 off-curve pubkey falls through to the raw fallback so the
+                 snapshot remains valid rather than raising.
     """
     ok, h160 = _is_p2pkh(script)
     if ok:
@@ -714,8 +731,21 @@ def compress_script(script: bytes) -> bytes | None:
         # pubkey is 33 bytes starting with 0x02 or 0x03; we keep that prefix
         # as the tag byte and the remaining 32 bytes as the body.
         return bytes([pubkey[0]]) + pubkey[1:]
-    # TODO: detect uncompressed-key P2PK (script.size()==67, leading 0x41,
-    # pubkey[1]==0x04) and emit tag 0x04|(y&1) + x32. Requires secp256k1.
+    ok, pubkey65 = _is_p2pk_uncompressed(script)
+    if ok:
+        # Mirror compressor.cpp:78-80:
+        #   out[0] = 0x04 | (pubkey[64] & 0x01);   // Y-coordinate LSB
+        #   memcpy(&out[1], &pubkey[1], 32);         // X-coordinate
+        # Validate the point via libsecp256k1 before emitting tag (Core:
+        # pubkey.IsFullyValid()).  Off-curve pubkeys fall through to raw.
+        try:
+            from coincurve import PublicKey as _PK
+            _PK(pubkey65)   # raises if not on the curve
+        except Exception:
+            return None
+        tag = 0x04 | (pubkey65[64] & 0x01)
+        x_coord = pubkey65[1:33]
+        return bytes([tag]) + x_coord
     return None
 
 
