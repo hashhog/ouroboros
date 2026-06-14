@@ -409,28 +409,35 @@ def test_w133_g13_txindex_optin_flag() -> None:
     )
 
 
-def test_w133_g14_txindex_reorg_rewind_present() -> None:
-    """G14 (PRESENT): tx_index entries are removed during reorg disconnect.
+def test_w133_g14_txindex_reorg_no_delete() -> None:
+    """G14 (PRESENT — Core parity): tx_index entries are NOT deleted during
+    reorg disconnect.
 
-    Pins the FIX-from-Pattern-C0 (txindex-revert-on-reorg corpus,
-    2026-05-05) that added `delete_tx_index` calls to the disconnect
-    path. Regression here would re-open the bug class.
+    Bitcoin Core's TxIndex has no CustomRemove override; the BaseIndex
+    default (base.h:136) is a no-op, so txindex entries survive reorgs.
+    getrawtransaction can therefore still resolve a tx from a disconnected
+    block.  Ouroboros must match this behaviour.
+
+    Reference:
+      - bitcoin-core/src/index/txindex.cpp  (no CustomRemove method)
+      - bitcoin-core/src/index/base.h:136   (CustomRemove returns true; no-op)
     """
     db = _read_rust("sync/src/storage/db.rs")
-    # disconnect_block path calls delete_tx_index
-    assert "self.delete_tx_index(txid.as_byte_array())" in db, (
-        "G14 REGRESSION: disconnect path no longer calls delete_tx_index"
+    # The per-block disconnect path must NOT call delete_tx_index
+    assert "self.delete_tx_index(txid.as_byte_array())" not in db, (
+        "G14 REGRESSION: disconnect path calls delete_tx_index — "
+        "Core TxIndex keeps entries across reorgs (base.h:136 no-op)."
     )
-    # atomic disconnect path also deletes
-    assert "batch.delete_cf(tx_index_cf, txid.as_byte_array())" in db, (
-        "G14 REGRESSION: atomic disconnect path no longer deletes "
-        "tx_index entries"
+    # The atomic batch disconnect path must NOT delete tx_index entries
+    assert "batch.delete_cf(tx_index_cf, txid.as_byte_array())" not in db, (
+        "G14 REGRESSION: atomic disconnect batch deletes tx_index entries — "
+        "Core TxIndex keeps entries across reorgs (base.h:136 no-op)."
     )
-    # validate/block.rs disconnect_block also deletes
+    # validate/block.rs disconnect_block must NOT delete either
     block_rs = _read_rust("sync/src/validate/block.rs")
-    assert "self.db.delete_tx_index(txid.as_byte_array())" in block_rs, (
-        "G14 REGRESSION: validate/block.rs::disconnect_block no longer "
-        "deletes tx_index entries"
+    assert "self.db.delete_tx_index(txid.as_byte_array())" not in block_rs, (
+        "G14 REGRESSION: validate/block.rs::disconnect_block deletes "
+        "tx_index entries — Core TxIndex keeps entries across reorgs."
     )
 
 
@@ -521,18 +528,15 @@ def test_w133_g18_prune_lock_for_txindex() -> None:
 # ===========================================================================
 
 
-@pytest.mark.xfail(
-    reason="W133 BUG-9 (P0-CDIV): CoinStatsIndex class entirely absent. "
-           "gettxoutsetinfo walks live chainstate every call "
-           "(rpc.py:7022-7198); multi-minute latency at mainnet UTXO size.",
-    strict=True,
-)
 def test_w133_g19_coinstatsindex_class_present() -> None:
-    """G19 (P0-CDIV): CoinStatsIndex class implemented in either pipeline.
+    """G19 (NOW PRESENT): CoinStatsIndex class implemented in the Python pipeline.
 
     Core: `class CoinStatsIndex final : public BaseIndex`
     (`coinstatsindex.h:30`). Maintains MuHash3072 + per-block DBVal
     so `gettxoutsetinfo` is O(1).
+
+    BUG-9 WAS: class entirely absent.  NOW: ouroboros.coinstatsindex.CoinStatsIndex
+    exists in Python.  This test is a PRESENT (regression) guard.
 
     The check uses anchored definition patterns (line-start
     `class/struct/trait CoinStatsIndex`) to avoid matching audit
@@ -567,17 +571,14 @@ def test_w133_g19_coinstatsindex_class_present() -> None:
     )
 
 
-@pytest.mark.xfail(
-    reason="W133 BUG-10 (P0-CDIV): gettxoutsetinfo hash_or_height "
-           "parameter silently ignored (rpc.py:7095-7097). Caller "
-           "cannot query historical UTXO state. Cross-impl divergence.",
-    strict=True,
-)
 def test_w133_g20_gettxoutsetinfo_honors_hash_or_height() -> None:
-    """G20 (P0-CDIV): gettxoutsetinfo honors `hash_or_height` parameter.
+    """G20 (NOW PRESENT): gettxoutsetinfo honors `hash_or_height` parameter.
+
+    BUG-10 WAS: parameter silently discarded (`_ = hash_or_height`).
+    NOW: hash_or_height is used; the coinstatsindex lookup is wired.
 
     Core: looks up cached entry from coinstatsindex at the specified
-    height/hash. ouroboros: returns tip stats regardless.
+    height/hash.
     """
     rpc = _read_py("rpc.py")
     m = re.search(
@@ -720,13 +721,12 @@ def test_w133_g26_dbhashkey_typed_prefix() -> None:
     )
 
 
-@pytest.mark.xfail(
-    reason="W133 BUG-24 (P2): No scanblocks/scantxoutset RPC. Both "
-           "depend on indexes (W121 BUG-26 + this audit's BUG-9).",
-    strict=True,
-)
 def test_w133_g27_scanblocks_scantxoutset_rpc() -> None:
-    """G27: scanblocks + scantxoutset RPCs implemented."""
+    """G27 (NOW PRESENT): scanblocks + scantxoutset RPCs implemented.
+
+    BUG-24 WAS: both RPCs absent.  NOW: rpc.py exports rpc_scanblocks
+    and rpc_scantxoutset.  This is a PRESENT (regression) guard.
+    """
     rpc = _read_py("rpc.py")
     has_scanblocks = "async def rpc_scanblocks" in rpc
     has_scantxoutset = "async def rpc_scantxoutset" in rpc
@@ -792,8 +792,12 @@ def test_w133_g30_two_pipeline_txindex_live_in_rust_only() -> None:
     forbidden_python_identifiers = [
         # If any Python file gains these, the two-pipeline boundary
         # is violated: tx_index storage moves out of Rust into Python.
+        # NOTE: "class CoinStatsIndex" is intentionally absent here —
+        # the Python-layer CoinStatsIndex (coinstatsindex.py) is a
+        # legitimate Python implementation of the index (analogous to
+        # blockfilterindex.py), not a boundary violation.  The two-pipeline
+        # rule only covers the live *tx_index* (txid→DiskTxPos) path.
         "class TxIndex",
-        "class CoinStatsIndex",
         "store_tx_index",  # writing tx_index from Python = wrong
         "TX_INDEX_CF",     # column-family name in Python = wrong
     ]
@@ -867,39 +871,29 @@ def test_w133_g30_two_pipeline_dead_code_alternate_pinned() -> None:
     )
 
 
-def test_w133_g30_two_pipeline_no_coinstatsindex_in_either() -> None:
-    """G30 (PRESENT): no CoinStatsIndex storage class in either pipeline.
+def test_w133_g30_coinstatsindex_in_python() -> None:
+    """G30 (NOW PRESENT): CoinStatsIndex is implemented in the Python pipeline.
 
-    Pins the architectural gap noted in F3 + BUG-9 + BUG-19. If a
-    future wave adds CoinStatsIndex, this test fails (forcing the
-    audit to be updated with the new entry's location).
+    BUG-9/BUG-19 WAS: class entirely absent, no MuHash per-block state.
+    NOW: ouroboros.coinstatsindex.CoinStatsIndex exists in Python and
+    maintains an incremental MuHash3072 commitment.  This test is a
+    PRESENT (regression) guard — if CoinStatsIndex disappears, it fails.
     """
-    if not FERROUS_UTILS.exists() and not SRC_OUROBOROS.exists():
-        pytest.skip("source trees not present")
+    if not SRC_OUROBOROS.exists():
+        pytest.skip("src/ouroboros tree not present")
 
-    forbidden_class_definitions = [
-        ("Python", r"^class\s+CoinStatsIndex\b", SRC_OUROBOROS),
-        ("Rust", r"^(pub\s+)?struct\s+CoinStatsIndex\b", FERROUS_UTILS),
-        ("Rust", r"^(pub\s+)?trait\s+CoinStatsIndex\b", FERROUS_UTILS),
-    ]
-    offenders: list[tuple[str, str, str]] = []
-    for lang, pattern, tree in forbidden_class_definitions:
-        if not tree.exists():
+    found_python = False
+    for path in SRC_OUROBOROS.rglob("*.py"):
+        if "tests" in path.parts:
             continue
-        ext = "*.py" if lang == "Python" else "*.rs"
-        for path in tree.rglob(ext):
-            # Skip the audit-test directory: it references the
-            # identifier in framing comments + assertion strings.
-            if "tests" in path.parts:
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-            if re.search(pattern, text, re.M):
-                offenders.append((lang, pattern, str(path.relative_to(tree))))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if re.search(r"^class\s+CoinStatsIndex\b", text, re.M):
+            found_python = True
+            break
 
-    assert not offenders, (
-        f"G30 CoinStatsIndex was added: {offenders}. Update W133 "
-        "audit to mark BUG-9/19 closed and check the new wiring "
-        "against Core's coinstatsindex.cpp semantics."
+    assert found_python, (
+        "G30 REGRESSION: CoinStatsIndex class no longer present in Python pipeline. "
+        "BUG-9 was resolved by adding ouroboros.coinstatsindex.CoinStatsIndex."
     )
 
 
@@ -925,20 +919,30 @@ def test_w133_rust_live_path_three_call_sites() -> None:
     )
 
 
-def test_w133_rust_disconnect_path_three_call_sites() -> None:
-    """Sanity: the live tx_index disconnect path has three call sites
-    matching the connect sites (single, atomic-batch, validator).
-    Regression = Pattern C0 (txindex-revert-on-reorg, 2026-05-05) is
-    re-opened.
+def test_w133_rust_disconnect_path_no_txindex_delete() -> None:
+    """Sanity (Core parity): the live tx_index disconnect path does NOT
+    delete txindex entries — Core TxIndex has no CustomRemove (base.h:136
+    no-op), so entries survive reorgs.  The connect path still writes them.
+
+    A failure here means the delete was re-introduced (Pattern C0 regression)
+    or the connect write was accidentally removed.
     """
     db_rs = _read_rust("sync/src/storage/db.rs")
     block_rs = _read_rust("sync/src/validate/block.rs")
-    # Single-block disconnect_block path
-    assert "self.delete_tx_index(txid.as_byte_array())?" in db_rs
-    # Atomic batch disconnect path
-    assert "batch.delete_cf(tx_index_cf, txid.as_byte_array())" in db_rs
-    # Validator pipeline disconnect_block
-    assert "self.db.delete_tx_index(txid.as_byte_array())?" in block_rs
+    # delete must NOT be present in any of the three disconnect paths
+    assert "self.delete_tx_index_batch(&mut batch, txid.as_byte_array())" not in db_rs, (
+        "REGRESSION: per-block disconnect path calls delete_tx_index_batch"
+    )
+    assert "batch.delete_cf(tx_index_cf, txid.as_byte_array())" not in db_rs, (
+        "REGRESSION: atomic batch disconnect path deletes txindex entries"
+    )
+    assert "self.db.delete_tx_index(txid.as_byte_array())" not in block_rs, (
+        "REGRESSION: validate/block.rs disconnect deletes txindex entries"
+    )
+    # connect path must still be present
+    assert "store_tx_index_batch" in db_rs or "store_tx_index_batch" in block_rs, (
+        "REGRESSION: store_tx_index_batch missing — txindex no longer written on connect"
+    )
 
 
 def test_w133_python_wrapper_thin() -> None:
