@@ -346,3 +346,103 @@ class TestSigCacheKeyCommitsToWitness(unittest.TestCase):
             "Forged-witness lookup MUST miss the cache — pre-fix it hit, "
             "letting a tampered witness replay a cached valid result.",
         )
+
+
+class TestIsCoinbasePredicate(unittest.TestCase):
+    """Finding 4C: is_coinbase must require BOTH null prevout hash AND n==0xFFFFFFFF.
+
+    Bitcoin Core COutPoint::IsNull() = (hash.IsNull() && n == NULL_INDEX)
+    where NULL_INDEX = 0xFFFFFFFF (transaction.h:34,42).
+    IsCoinBase() = (vin.size()==1 && vin[0].prevout.IsNull()) (transaction.h:341-343).
+
+    Pre-fix ouroboros only tested the null hash, so a tx with null hash but
+    n != 0xFFFFFFFF was wrongly classified as coinbase.
+    """
+
+    def setUp(self):
+        from ouroboros.database import Transaction, TxIn, TxOut
+        self.Transaction = Transaction
+        self.TxIn = TxIn
+        self.TxOut = TxOut
+
+    def _make_tx(self, prev_txid: bytes, prev_vout: int) -> object:
+        """Build a minimal single-input transaction."""
+        return self.Transaction(
+            txid=bytes(32),
+            version=1,
+            locktime=0,
+            has_witness=False,
+            inputs=[
+                self.TxIn(
+                    prev_txid=prev_txid,
+                    prev_vout=prev_vout,
+                    script_sig=b"\x03\xd2\x04\x00",  # BIP34 height push
+                    sequence=0xFFFF_FFFF,
+                ),
+            ],
+            outputs=[
+                self.TxOut(value=5_000_000_000, script_pubkey=b"\x51"),
+            ],
+        )
+
+    def test_real_coinbase_null_hash_and_null_index(self):
+        """A tx with null hash AND n==0xFFFFFFFF IS a coinbase (Core faithful)."""
+        tx = self._make_tx(prev_txid=bytes(32), prev_vout=0xFFFF_FFFF)
+        self.assertTrue(
+            tx.is_coinbase,
+            "null-hash + n=0xFFFFFFFF must be recognised as coinbase "
+            "(Core IsCoinBase, transaction.h:341-343)",
+        )
+
+    def test_null_hash_but_wrong_index_is_not_coinbase(self):
+        """A tx with null prevout hash but n != 0xFFFFFFFF is NOT a coinbase.
+
+        Pre-fix: is_coinbase returned True (only hash was checked).
+        Post-fix: is_coinbase returns False (both conditions required).
+        This is the divergence from Core that finding 4C reports.
+        """
+        for bad_vout in (0, 1, 0xFFFE, 0xFFFE_FFFF):
+            with self.subTest(prev_vout=bad_vout):
+                tx = self._make_tx(prev_txid=bytes(32), prev_vout=bad_vout)
+                self.assertFalse(
+                    tx.is_coinbase,
+                    f"null-hash + n={bad_vout:#x} must NOT be classified as "
+                    "coinbase — Core requires n==0xFFFFFFFF (NULL_INDEX)",
+                )
+
+    def test_nonzero_hash_any_index_is_not_coinbase(self):
+        """A tx with a non-null prevout hash is never a coinbase."""
+        for vout in (0, 0xFFFF_FFFF):
+            with self.subTest(prev_vout=vout):
+                tx = self._make_tx(prev_txid=b"\x01" + bytes(31), prev_vout=vout)
+                self.assertFalse(
+                    tx.is_coinbase,
+                    f"non-null hash + n={vout:#x} must not be classified as coinbase",
+                )
+
+    def test_multi_input_is_never_coinbase(self):
+        """A transaction with more than one input is never a coinbase."""
+        coinbase_input = self.TxIn(
+            prev_txid=bytes(32),
+            prev_vout=0xFFFF_FFFF,
+            script_sig=b"\x03\xd2\x04\x00",
+            sequence=0xFFFF_FFFF,
+        )
+        extra_input = self.TxIn(
+            prev_txid=b"\x02" * 32,
+            prev_vout=0,
+            script_sig=b"",
+            sequence=0xFFFF_FFFF,
+        )
+        tx = self.Transaction(
+            txid=bytes(32),
+            version=1,
+            locktime=0,
+            has_witness=False,
+            inputs=[coinbase_input, extra_input],
+            outputs=[self.TxOut(value=1000, script_pubkey=b"\x51")],
+        )
+        self.assertFalse(
+            tx.is_coinbase,
+            "two-input tx is never a coinbase even if the first input looks like one",
+        )
