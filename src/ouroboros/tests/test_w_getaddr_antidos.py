@@ -219,5 +219,91 @@ class TestInboundAddrTokenBucket(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# (d) addr/addrv2 timestamp clamping (Core net_processing.cpp:5678-5680)
+# ---------------------------------------------------------------------------
+class TestAddrTimestampClamping(unittest.TestCase):
+    """Core net_processing.cpp:5678-5680:
+      if (addr.nTime <= NodeSeconds{100000000s} || addr.nTime > current_time + 10min)
+          addr.nTime = current_time - 5 * 24h;
+
+    Pre-fix: ouroboros stored the raw peer-supplied timestamp.
+    Post-fix: timestamps <= 100_000_000 or > now+600 are clamped to now-5days.
+    """
+
+    def _make_pm_peer_with_full_bucket(self):
+        pm, peer, addr_key = _make_pm_and_peer(inbound=True)
+        # Give enough tokens to admit all addresses without rate-limiting.
+        peer.addr_token_bucket = 1000.0
+        peer.addr_token_timestamp = time.monotonic()
+        return pm, peer, addr_key
+
+    def test_ancient_timestamp_clamped_addr(self):
+        """An addr entry with ts=1 (pre-2001) must be stored with a clamped timestamp.
+
+        Non-vacuous: without the fix, addrman._addrs[key].last_seen == 1;
+        with the fix, last_seen is approximately now - 5*24*3600.
+        """
+        pm, peer, _ = self._make_pm_peer_with_full_bucket()
+        ancient_ts = 1  # far before the 100_000_000 threshold (~1973)
+        msg = _addr_message(1, ts=ancient_ts).to_network_message("mainnet")
+        t_before = time.time()
+        asyncio.run(peer.message_handlers["addr"](msg))
+        t_after = time.time()
+
+        # Lookup the entry that should have been stored.
+        key = "20.0.0.5:8333"
+        self.assertIn(key, pm.addrman._addrs,
+                      "addr entry must be stored despite ancient timestamp")
+        stored_ts = pm.addrman._addrs[key].last_seen
+
+        # The stored timestamp must NOT be the raw ancient value.
+        self.assertGreater(
+            stored_ts, ancient_ts + 100,
+            f"stored timestamp ({stored_ts}) must not be the raw ancient value ({ancient_ts})"
+        )
+        # Must be in the range: now - 5days ± 10s.
+        expected_lo = t_before - 5 * 24 * 3600 - 10
+        expected_hi = t_after - 5 * 24 * 3600 + 10
+        self.assertGreaterEqual(stored_ts, expected_lo,
+                                f"clamped ts {stored_ts} below expected floor {expected_lo}")
+        self.assertLessEqual(stored_ts, expected_hi,
+                             f"clamped ts {stored_ts} above expected ceiling {expected_hi}")
+
+    def test_future_timestamp_clamped_addr(self):
+        """An addr entry with ts 1 hour in the future must be clamped."""
+        pm, peer, _ = self._make_pm_peer_with_full_bucket()
+        future_ts = int(time.time()) + 3600  # 1h in the future (> now + 10 min)
+        msg = _addr_message(1, ts=future_ts).to_network_message("mainnet")
+        t_before = time.time()
+        asyncio.run(peer.message_handlers["addr"](msg))
+
+        key = "20.0.0.5:8333"
+        self.assertIn(key, pm.addrman._addrs,
+                      "addr entry must be stored despite future timestamp")
+        stored_ts = pm.addrman._addrs[key].last_seen
+
+        self.assertLess(stored_ts, time.time(),
+                        "clamped ts must be in the past, not the supplied future value")
+        # Must be approximately now - 5days.
+        expected_lo = t_before - 5 * 24 * 3600 - 10
+        self.assertGreaterEqual(stored_ts, expected_lo,
+                                f"clamped ts {stored_ts} below expected floor {expected_lo}")
+
+    def test_valid_recent_timestamp_not_clamped_addr(self):
+        """A recent valid timestamp (now - 1h) must NOT be clamped."""
+        pm, peer, _ = self._make_pm_peer_with_full_bucket()
+        valid_ts = int(time.time()) - 3600  # 1 hour ago — well within the valid window
+        msg = _addr_message(1, ts=valid_ts).to_network_message("mainnet")
+        asyncio.run(peer.message_handlers["addr"](msg))
+
+        key = "20.0.0.5:8333"
+        self.assertIn(key, pm.addrman._addrs)
+        stored_ts = pm.addrman._addrs[key].last_seen
+        # Must be preserved (within 1s of the original).
+        self.assertAlmostEqual(stored_ts, float(valid_ts), delta=1.0,
+                               msg="valid recent timestamp must be stored as-is")
+
+
 if __name__ == "__main__":
     unittest.main()

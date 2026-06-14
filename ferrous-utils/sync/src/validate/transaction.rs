@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use std::collections::HashMap;
 
-use bitcoin::{Transaction, OutPoint, absolute::LockTime};
+use bitcoin::{Network, Transaction, OutPoint, absolute::LockTime};
 use bitcoin::hashes::Hash;
 use thiserror::Error;
 
@@ -83,12 +83,14 @@ pub type Result<T> = std::result::Result<T, TransactionValidationError>;
 /// Transaction validator
 pub struct TransactionValidator {
     db: Arc<BlockchainDB>,
+    /// Network used for consensus-activation-height lookups (e.g. BIP34).
+    network: Network,
 }
 
 impl TransactionValidator {
     /// Create a new transaction validator
-    pub fn new(db: Arc<BlockchainDB>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<BlockchainDB>, network: Network) -> Self {
+        Self { db, network }
     }
 
     /// Validate a transaction
@@ -520,14 +522,15 @@ impl TransactionValidator {
             return Err(TransactionValidationError::InvalidCoinbase);
         }
 
-        // BIP34 (activated at mainnet height 227_931): the coinbase scriptSig
-        // must begin with a serialised push of the block height. Python
-        // reference: validation.py:775-793. We mirror Python's unsigned
-        // little-endian decode rather than full CScriptNum, which is
-        // intentionally lenient — Core is stricter about minimal encoding
-        // but the drain path must match Python bit-for-bit.
-        const BIP34_HEIGHT: u32 = 227_931;
-        if height >= BIP34_HEIGHT {
+        // BIP34: the coinbase scriptSig must begin with a serialised push of
+        // the block height. Activation height is network-dependent — mainnet
+        // 227_931, testnet4/regtest/signet 1. Core reference: validation.cpp
+        // ConnectBlock (BIP34Height from CChainParams), Python validation.py:775-793.
+        // We mirror Python's unsigned little-endian decode rather than full
+        // CScriptNum, intentionally lenient — the drain path must match Python.
+        // Reference: bitcoin-core/src/chainparams.cpp consensus.BIP34Height.
+        let bip34_height = crate::chain_params::bip_activation_heights(self.network).0;
+        if height >= bip34_height {
             let script = coinbase_input.script_sig.as_bytes();
             let push_size = script[0] as usize;
             if push_size == 0 {
@@ -716,7 +719,7 @@ mod tests {
     #[test]
     fn test_check_structure_no_inputs() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         let tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -736,7 +739,7 @@ mod tests {
     #[test]
     fn test_check_structure_no_outputs() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         let tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -758,7 +761,7 @@ mod tests {
     #[test]
     fn test_check_structure_duplicate_inputs() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         let prev_txid = bitcoin::Txid::from_byte_array([1u8; 32]);
         let outpoint = bitcoin::OutPoint::new(prev_txid, 0);
@@ -794,7 +797,7 @@ mod tests {
     #[test]
     fn test_check_coinbase() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         // Valid coinbase
         let coinbase_tx = Transaction {
@@ -820,13 +823,71 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// BIP34 activation height is network-dependent.
+    ///
+    /// Pre-fix: `check_coinbase` used `const BIP34_HEIGHT: u32 = 227_931`
+    /// (mainnet only). On testnet4/regtest BIP34 is active from height 1, so
+    /// a height-1 coinbase without the height push MUST be rejected — but the
+    /// old constant let it pass silently.
+    ///
+    /// Post-fix: `bip_activation_heights(network).0` returns 1 for testnet4,
+    /// causing the missing-height-push to be rejected at height >= 1.
+    #[test]
+    fn test_bip34_height_is_network_aware() {
+        // --- testnet4: BIP34 active from height 1 ---
+        // A coinbase at height 1 with NO height-push in scriptSig must fail
+        // on testnet4. Script: two-byte padding, no height push.
+        let (_temp_dir, db) = create_test_db();
+        let validator_t4 = TransactionValidator::new(Arc::clone(&db), Network::Testnet4);
+
+        // Coinbase scriptSig: 0x02 0x00 (length=2, value=0x00) — encodes
+        // height 0, not height 1.  On mainnet this block would be < 227_931
+        // so the BIP34 check is skipped; on testnet4 height 1 is already
+        // active and must be rejected.
+        let bad_t4_coinbase = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(
+                    bitcoin::Txid::from_byte_array([0u8; 32]),
+                    u32::MAX,
+                ),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x00]), // encodes height 0
+                sequence: bitcoin::transaction::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: Amount::from_sat(625_000_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        // On testnet4, height 1 >= bip34_height(1), so wrong height must
+        // be rejected with InvalidCoinbaseHeight.
+        let result = validator_t4.check_coinbase(&bad_t4_coinbase, 1);
+        assert!(
+            matches!(result, Err(TransactionValidationError::InvalidCoinbaseHeight)),
+            "testnet4 h=1: coinbase with wrong height must be rejected; got {:?}",
+            result
+        );
+
+        // Mainnet validator at the SAME height should ACCEPT (height 1 <
+        // mainnet BIP34 activation 227_931 — check not yet enforced).
+        let validator_main = TransactionValidator::new(Arc::clone(&db), Network::Bitcoin);
+        let result_main = validator_main.check_coinbase(&bad_t4_coinbase, 1);
+        assert!(
+            result_main.is_ok(),
+            "mainnet h=1: BIP34 not yet active, coinbase must be accepted; got {:?}",
+            result_main
+        );
+    }
+
     #[test]
     fn test_validate_amounts_accepts_zero_value_output() {
         // Regression: zero-value outputs are consensus-valid (OP_RETURN
         // witness commitments, data-embed txs). The earlier `amount == 0`
         // rejection broke every modern block in B3 cross-check.
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         let tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -852,7 +913,7 @@ mod tests {
     #[test]
     fn test_validate_amounts_rejects_single_output_over_max_money() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         let tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -874,7 +935,7 @@ mod tests {
     #[test]
     fn test_calculate_block_subsidy() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         // Genesis block: 50 BTC = 5_000_000_000 satoshis
         // Reference: Bitcoin Core amount.h COIN = 100_000_000; nSubsidy = 50 * COIN
@@ -895,7 +956,7 @@ mod tests {
     #[test]
     fn test_is_final() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         // Transaction with lock time 0 (always final)
         let tx = Transaction {
@@ -947,7 +1008,7 @@ mod tests {
     #[test]
     fn test_check_lock_time_accepts_zero_locktime() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         // nLockTime == 0 is always final regardless of sequence.
         let tx = make_locktime_tx(0, 0);
@@ -957,7 +1018,7 @@ mod tests {
     #[test]
     fn test_check_lock_time_accepts_past_height_locktime() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         // nLockTime < current height is final even without SEQUENCE_FINAL
         // (anti-fee-snipe pattern: most wallets set lock_time = height-1
@@ -969,7 +1030,7 @@ mod tests {
     #[test]
     fn test_check_lock_time_rejects_future_locktime_with_non_final_sequence() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         // nLockTime > height AND any input has non-final sequence:
         // the transaction is not yet final and MUST be rejected.
@@ -983,7 +1044,7 @@ mod tests {
     #[test]
     fn test_check_lock_time_accepts_future_locktime_with_sequence_final() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         // W66 regression: nLockTime > height but all inputs are
         // SEQUENCE_FINAL (0xFFFFFFFF). Per BIP65/IsFinalTx the tx opts
@@ -1005,7 +1066,7 @@ mod tests {
     #[test]
     fn test_check_lock_time_rejects_locktime_at_block_height_without_final_sequence() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         // Edge case: nLockTime == height with non-final sequence. Per
         // Core's strict `<` comparison this is NOT yet final
@@ -1022,7 +1083,7 @@ mod tests {
     #[test]
     fn test_check_lock_time_time_based_preserves_accept_all() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         // Time-based lock-times (nLockTime >= 500,000,000) are accepted
         // unconditionally by the current implementation (BIP113 MTP not
@@ -1035,7 +1096,7 @@ mod tests {
     #[test]
     fn test_get_sigop_count() {
         let (_temp_dir, db) = create_test_db();
-        let validator = TransactionValidator::new(db);
+        let validator = TransactionValidator::new(db, Network::Bitcoin);
 
         use bitcoin::blockdata::script::Builder;
         use bitcoin::opcodes::all::OP_CHECKSIG;
