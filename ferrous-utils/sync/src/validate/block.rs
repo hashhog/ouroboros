@@ -132,7 +132,7 @@ impl BlockValidator {
     /// Create a new block validator
     pub fn new(db: Arc<BlockchainDB>, network: Network) -> Self {
         let header_validator = HeaderValidator::new(Arc::clone(&db), network);
-        let tx_validator = TransactionValidator::new(Arc::clone(&db));
+        let tx_validator = TransactionValidator::new(Arc::clone(&db), network);
 
         let default_height = match network {
             Network::Bitcoin => 938_343,   // Bitcoin Core v28 default assumevalid

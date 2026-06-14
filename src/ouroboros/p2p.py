@@ -3349,13 +3349,22 @@ class PeerManager:
                 # dropped (rate-limited).  Shared per-peer bucket across addr/addrv2.
                 admit = self._admit_addrs_token_bucket(peer, len(am.addresses))
                 added = 0
+                _now = time.time()
                 for ts, net_addr in am.addresses[:admit]:
+                    # Core net_processing.cpp:5678-5680: clamp timestamps that
+                    # are either pre-2001 (nTime <= 100_000_000) or more than
+                    # 10 minutes in the future (> now + 10min).  Clamped to
+                    # (now - 5 days) so the entry is treated as stale but
+                    # still stored.  Core does NOT drop stale-but-clamped addrs.
+                    ts_f = float(ts)
+                    if ts_f <= 100_000_000 or ts_f > _now + 600:
+                        ts_f = _now - 5 * 24 * 3600
                     host_str = self._netaddr_to_host(net_addr)
                     if host_str and not self.ban_manager.is_banned(host_str):
                         if self.addrman.add(
                             host_str, net_addr.port,
                             services=net_addr.services,
-                            timestamp=float(ts),
+                            timestamp=ts_f,
                             source=addr,
                         ):
                             added += 1
@@ -3377,6 +3386,7 @@ class PeerManager:
                 # from ``peer.addr_token_bucket``.
                 admit = self._admit_addrs_token_bucket(peer, len(am.addresses))
                 added = 0
+                _now = time.time()
                 for entry in am.addresses[:admit]:
                     # AddrV2Entry is a @dataclass — use attribute access, not
                     # dict-style .get().  Prior to W117 FIX-57 this was
@@ -3390,12 +3400,16 @@ class PeerManager:
                     port = entry.port
                     services = entry.services
                     ts = entry.time
+                    # Core net_processing.cpp:5678-5680: same clamp as addr.
+                    ts_f = float(ts)
+                    if ts_f <= 100_000_000 or ts_f > _now + 600:
+                        ts_f = _now - 5 * 24 * 3600
                     host_str = self._addr_bytes_to_host(net_id, addr_bytes)
                     if host_str and not self.ban_manager.is_banned(host_str):
                         if self.addrman.add(
                             host_str, port,
                             services=services,
-                            timestamp=float(ts),
+                            timestamp=ts_f,
                             source=addr,
                         ):
                             added += 1

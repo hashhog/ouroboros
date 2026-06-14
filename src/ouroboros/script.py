@@ -2455,10 +2455,12 @@ class ScriptInterpreter:
                 )
             except (ValueError, Exception):
                 return False
-            if not result_stack:
+            # Core interpreter.cpp:1866-1868 ExecuteWitnessScript:
+            #   if (stack.size() != 1) return SCRIPT_ERR_CLEANSTACK;
+            #   if (!CastToBool(stack.back())) return SCRIPT_ERR_EVAL_FALSE;
+            if len(result_stack) != 1:
                 return False
-            top = result_stack[-1]
-            return len(top) > 0 and any(b != 0 for b in top)
+            return self._cast_to_bool(result_stack[-1])
 
         # DISCOURAGE_UPGRADABLE_TAPROOT_VERSION: reject unknown leaf versions
         # when this policy flag is set (for relay/mempool).
