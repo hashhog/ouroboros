@@ -350,7 +350,7 @@ impl BlockValidator {
                 .ok_or(BlockValidationError::CoinbaseAmountExceeded)?;
             prefetched_input_scripts.push(input_scripts);
 
-            if enforce_bip68 && tx.version.0 >= 2 {
+            if enforce_bip68 && super::sequence_lock::bip68_version_active(tx.version.0) {
                 self.check_tx_sequence_locks(
                     tx, prev_height, height, &mut block_median_time, &intra_utxos,
                 )?;
