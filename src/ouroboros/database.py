@@ -176,8 +176,19 @@ class Transaction:
 
     @property
     def is_coinbase(self) -> bool:
-        """Check if this is a coinbase transaction"""
-        return len(self.inputs) == 1 and self.inputs[0].prev_txid == bytes(32)
+        """Check if this is a coinbase transaction.
+
+        Matches Bitcoin Core CTransaction::IsCoinBase():
+          vin.size() == 1 && vin[0].prevout.IsNull()
+        where COutPoint::IsNull() requires BOTH hash == null (32 zero bytes)
+        AND n == 0xFFFFFFFF (NULL_INDEX).  A single input whose prevout hash
+        is all-zero but whose index is not 0xFFFFFFFF is NOT a coinbase.
+        """
+        return (
+            len(self.inputs) == 1
+            and self.inputs[0].prev_txid == bytes(32)
+            and self.inputs[0].prev_vout == 0xFFFF_FFFF
+        )
 
     def get_txid(self) -> bytes:
         """Get transaction ID"""
