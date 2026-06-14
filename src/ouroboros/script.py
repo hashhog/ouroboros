@@ -276,6 +276,34 @@ def _tagged_hash(tag: str, data: bytes) -> bytes:
     return hashlib.sha256(tag_hash + tag_hash + data).digest()
 
 
+def _minimal_push_script(data: bytes) -> bytes:
+    """Return the MINIMAL canonical CScript push of *data*.
+
+    Mirrors CScript::operator<<(std::span<const value_type>) in
+    bitcoin-core/src/script/script.h (AppendDataSize + AppendData).
+
+    Length 0          -> 0x00 (OP_0)
+    Length 1-75       -> <len_byte> <data>
+    Length 76-255     -> OP_PUSHDATA1 (0x4c) <len_byte> <data>
+    Length 256-65535  -> OP_PUSHDATA2 (0x4d) <len_le16> <data>
+    Length 65536+     -> OP_PUSHDATA4 (0x4e) <len_le32> <data>
+
+    P2WPKH (22-byte) and P2WSH (34-byte) redeemScripts always fall in the
+    1-75 range, so their canonical scriptSig is simply ``bytes([22]) + W``
+    or ``bytes([34]) + W`` — no OP_PUSHDATA1 prefix.
+    """
+    n = len(data)
+    if n == 0:
+        return b'\x00'
+    if n <= 75:
+        return bytes([n]) + data
+    if n <= 0xff:
+        return bytes([0x4c, n]) + data
+    if n <= 0xffff:
+        return bytes([0x4d]) + n.to_bytes(2, 'little') + data
+    return bytes([0x4e]) + n.to_bytes(4, 'little') + data
+
+
 def _is_push_only(script: bytes) -> bool:
     i = 0
     while i < len(script):
@@ -514,10 +542,17 @@ class ScriptInterpreter:
                 wp_inner = _get_witness_version_and_program(redeem_script)
                 if (flags & SCRIPT_VERIFY_WITNESS) and wp_inner is not None:
                     version, program = wp_inner
-                    if script_sig != bytes([len(redeem_script)]) + redeem_script:
-                        # scriptSig must be exactly a single push of the redeem script
-                        if not _is_push_only_simple(script_sig):
-                            return False
+                    # Core interpreter.cpp:2082-2086: scriptSig must equal
+                    # CScript() << redeemScript (the MINIMAL canonical push of
+                    # the redeemScript bytes).  Any non-minimal encoding (e.g.
+                    # OP_PUSHDATA1 for a <=75-byte redeemScript) is rejected as
+                    # SCRIPT_ERR_WITNESS_MALLEATED_P2SH, even though it is
+                    # push-only and would evaluate to the same stack value.
+                    # MINIMALDATA is a policy flag only and is NOT in
+                    # GetBlockScriptFlags, so this byte-exact check is the sole
+                    # guard against non-canonical encodings in block validation.
+                    if script_sig != _minimal_push_script(redeem_script):
+                        return False
                     return self._verify_witness_program(
                         tx, input_index, version, program,
                         witness or [], flags, amount,
