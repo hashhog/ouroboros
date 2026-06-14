@@ -373,6 +373,17 @@ def block_weight(transactions: list) -> int:
     return weight
 
 
+def bip68_version_active(version: int) -> bool:
+    """BIP-68 applies only when version >= 2. Core stores version as uint32_t and
+    compares it UNSIGNED (fEnforceBIP68 = tx.version >= 2, tx_verify.cpp:51), so a
+    high-bit version (e.g. 0x80000002) STILL enforces BIP-68. ouroboros decodes the
+    version as a signed i32, so a signed < 2 would treat 0x80000002 as negative and
+    SKIP enforcement, false-accepting a tx with an unmet relative timelock (a chain
+    split). Mask to the unsigned 32-bit value before comparing.
+    """
+    return (version & 0xFFFFFFFF) >= 2
+
+
 def _read_compact_size(data: bytes, offset: int = 0) -> tuple[int, int]:
     """Decode CompactSize at *offset* in *data*; returns (value, bytes_consumed).
 
@@ -2654,8 +2665,8 @@ class TransactionValidator:
         MTP computation.  See ``_log_bip68_stopgap_skip``.  Long-term
         fix is Option 1 (backwards-header-sync after snapshot load).
         """
-        # BIP68 only applies to version 2+ transactions
-        if tx.version < 2:
+        # BIP68 only applies to version 2+ transactions (compared unsigned).
+        if not bip68_version_active(tx.version):
             return True
 
         # Check if BIP68 is active at this height
@@ -2767,7 +2778,8 @@ class TransactionValidator:
             Required to resolve inputs that spend intra-block outputs;
             without this, such inputs would falsely fail with "UTXO not found".
         """
-        if tx.version < 2:
+        # BIP-68 version gate, compared unsigned (Core uint32_t).
+        if not bip68_version_active(tx.version):
             return True
 
         stopgap_enabled = self._bip68_stopgap_enabled()

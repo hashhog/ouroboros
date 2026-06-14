@@ -89,6 +89,16 @@ pub struct InputLockInfo {
     pub prev_median_time: i64,
 }
 
+/// BIP-68 applies only when version >= 2. Core stores version as uint32_t and
+/// compares it UNSIGNED (fEnforceBIP68 = tx.version >= 2, tx_verify.cpp:51), so a
+/// high-bit version (e.g. 0x80000002) STILL enforces BIP-68. ouroboros decodes the
+/// version as i32 (signed); a signed comparison would treat 0x80000002 as negative
+/// and SKIP enforcement, false-accepting a tx with an unmet relative timelock (a
+/// chain split). Cast to u32 to match Core exactly.
+pub fn bip68_version_active(version: i32) -> bool {
+    (version as u32) >= 2
+}
+
 /// Calculate sequence locks for a transaction.
 ///
 /// This mirrors Bitcoin Core's `CalculateSequenceLocks()` in consensus/tx_verify.cpp.
@@ -111,8 +121,8 @@ pub fn calculate_sequence_locks(
 ) -> SequenceLock {
     let mut lock = SequenceLock::new();
 
-    // BIP68 only applies to transactions version 2 or higher
-    if tx_version < 2 || !enforce_bip68 {
+    // BIP68 only applies to transactions version 2 or higher (compared unsigned).
+    if !bip68_version_active(tx_version) || !enforce_bip68 {
         return lock;
     }
 
@@ -266,6 +276,19 @@ pub fn is_final_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bip68_version_active_compares_unsigned() {
+        // Core compares version unsigned (uint32_t, tx_verify.cpp:51): a high-bit
+        // version still enforces BIP-68. A signed >= 2 (the bug) treats 0x80000002
+        // (= -2147483646 as i32) as < 2 and skips enforcement.
+        assert!(bip68_version_active(0x8000_0002u32 as i32));
+        assert!(bip68_version_active(0xFFFF_FFFFu32 as i32));
+        assert!(bip68_version_active(2));
+        assert!(bip68_version_active(3));
+        assert!(!bip68_version_active(1));
+        assert!(!bip68_version_active(0));
+    }
 
     #[test]
     fn test_sequence_lock_constants() {
