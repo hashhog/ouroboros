@@ -44,6 +44,7 @@ from ouroboros.validation import (  # noqa: E402
     DEFAULT_BYTES_PER_SIGOP,
     get_sigops_adjusted_weight,
     get_virtual_transaction_size,
+    block_weight,
 )
 from ouroboros.mempool import (  # noqa: E402
     MAX_STANDARD_TX_WEIGHT,
@@ -634,6 +635,35 @@ class TestSigopAdjustedFeeRate(unittest.TestCase):
                 expected,
                 f"Mismatch for weight={weight}, sigop={sigop}, bps={bps}",
             )
+
+
+class TestBlockWeightWholeBlock(unittest.TestCase):
+    """Bug-hunt fix: GetBlockWeight is the weight of the WHOLE serialized block.
+
+    The 80-byte header and the CompactSize transaction count are witness-free and
+    count at WITNESS_SCALE_FACTOR on top of the per-tx weights
+    (bitcoin-core/src/consensus/validation.h::GetBlockWeight). Summing only per-tx
+    weights under-counts by (80 + varint) * WSF and false-accepts a marginally
+    overweight block Core rejects with bad-blk-weight (a chain split).
+    """
+
+    def test_block_weight_includes_header_and_varint(self):
+        tx1 = MagicMock()
+        tx1.get_weight = MagicMock(return_value=1000)
+        tx2 = MagicMock()
+        tx2.get_weight = MagicMock(return_value=500)
+        txs = [tx1, tx2]
+        per_tx_sum = 1500
+        # 2 txs -> the CompactSize tx-count is 1 byte; extra = (80 + 1) * WSF.
+        expected_extra = (80 + 1) * WITNESS_SCALE_FACTOR
+        self.assertEqual(
+            block_weight(txs),
+            per_tx_sum + expected_extra,
+            "block weight must include the 80-byte header + tx-count varint (GetBlockWeight)",
+        )
+        # Non-vacuity: a per-tx-only sum (the bug) under-counts by exactly that gap,
+        # so this strictly-greater assertion fails on the buggy code.
+        self.assertGreater(block_weight(txs), per_tx_sum)
 
 
 if __name__ == "__main__":
