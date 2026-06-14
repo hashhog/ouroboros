@@ -638,7 +638,10 @@ impl BlockValidator {
 
         match (has_witness, commitment) {
             (true, None) => Err(BlockValidationError::MissingWitnessCommitment),
-            (true, Some(commit)) => {
+            (true, Some(commit)) | (false, Some(commit)) => {
+                // Core validation.cpp:3876-3885: whenever a witness commitment is
+                // present in the coinbase, the coinbase witness stack MUST be
+                // exactly one 32-byte item — unconditional on has_witness.
                 let cb_witness = &coinbase.input[0].witness;
                 let nonce = match cb_witness.last() {
                     Some(n) if cb_witness.len() == 1 && n.len() == 32 => n,
@@ -662,7 +665,7 @@ impl BlockValidator {
                 }
                 Ok(())
             }
-            _ => Ok(()),
+            (false, None) => Ok(()),
         }
     }
 
@@ -1396,6 +1399,30 @@ mod tests {
         let coinbase = mk_coinbase(vec![], false);
         let block = mk_block(vec![coinbase]);
         assert!(validator.check_witness_commitment(&block, 500_000).is_ok());
+    }
+
+    #[test]
+    fn test_witness_commitment_present_but_no_witness_txs_no_nonce() {
+        // Core validation.cpp:3876-3885: commitment present in coinbase is
+        // unconditionally enforced — even when has_witness=false (no non-coinbase
+        // tx carries witness data).  A coinbase with a commitment output but an
+        // EMPTY coinbase witness stack must be rejected with
+        // InvalidCoinbaseWitnessNonce.  The old (false, Some) → Ok() catch-all
+        // was wrong; this test FAILS without the fix and PASSES with it.
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Bitcoin);
+        // Coinbase has a commitment output, but with_nonce=false → empty witness.
+        let coinbase = mk_coinbase(vec![bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: commitment_spk(&[0xab; 32]),
+        }], false);
+        // No witness-bearing non-coinbase txs (has_witness will be false).
+        let block = mk_block(vec![coinbase]);
+        let r = validator.check_witness_commitment(&block, 500_000);
+        assert!(
+            matches!(r, Err(BlockValidationError::InvalidCoinbaseWitnessNonce)),
+            "expected InvalidCoinbaseWitnessNonce, got {r:?}"
+        );
     }
 
     #[test]

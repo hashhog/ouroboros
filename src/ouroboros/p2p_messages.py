@@ -600,6 +600,11 @@ class TxMessage:
                     sequence=inputs[i].sequence,
                     witness=witness_stack,
                 )
+            # BIP144 / Core primitives/transaction.h:228-231:
+            # It's illegal to encode witnesses when all witness stacks are empty.
+            # Core throws "Superfluous witness record" in this case.
+            if not any(inp.witness for inp in inputs):
+                raise ValueError("Superfluous witness record")
 
         # Parse locktime (4 bytes)
         if len(payload) < offset + 4:
