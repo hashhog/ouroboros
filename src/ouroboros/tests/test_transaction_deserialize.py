@@ -114,6 +114,51 @@ class TestTransactionDeserialize(unittest.TestCase):
         with self.assertRaises(ValueError):
             TxMessage.from_payload(b'')
 
+    def test_superfluous_witness_record_rejected(self):
+        """BIP144 / Core primitives/transaction.h:228-231: segwit marker+flag set but
+        all witness stacks empty must be REJECTED with 'Superfluous witness record'.
+
+        This 63-byte tx encodes marker 0x00 flag 0x01 (segwit), one input with a
+        single witness item of zero length, producing an all-empty witness set.
+        Core throws std::ios_base::failure("Superfluous witness record"); we must
+        raise ValueError with the same message.
+        """
+        # 01000000  version=1
+        # 00 01      segwit marker + flag
+        # 01         input count = 1
+        # 0000..00   prev_txid (32 bytes all-zero)
+        # 00000000   prev_vout = 0
+        # 00         script_sig len = 0
+        # ffffffff   sequence
+        # 01         output count = 1
+        # 00f2052a01000000  value = 5000000000 sat
+        # 00         script_pubkey len = 0
+        # 00         witness item count for input[0] = 0  (empty stack)
+        # 00000000   locktime = 0
+        # Constructed as: version(4) + segwit_marker(2) + in_count(1) +
+        # prev_txid(32) + prev_vout(4) + script_sig_len(1) + sequence(4) +
+        # out_count(1) + value(8) + spk_len(1) +
+        # witness_item_count_for_inp0(1) + locktime(4) = 63 bytes.
+        # Witness item count = 0 → all-empty witness → "Superfluous witness record".
+        tx_hex = (
+            "01000000"  # version = 1
+            "0001"      # segwit marker + flag
+            "01"        # input count = 1
+            "0000000000000000000000000000000000000000000000000000000000000000"  # prev_txid
+            "00000000"  # prev_vout = 0
+            "00"        # script_sig len = 0
+            "ffffffff"  # sequence
+            "01"        # output count = 1
+            "00f2052a01000000"  # value = 5_000_000_000 sat
+            "00"        # script_pubkey len = 0
+            "00"        # witness item count for input[0] = 0 (empty stack)
+            "00000000"  # locktime = 0
+        )
+        payload = bytes.fromhex(tx_hex)
+        with self.assertRaises(ValueError) as ctx:
+            TxMessage.from_payload(payload)
+        self.assertIn("Superfluous witness record", str(ctx.exception))
+
 
 if __name__ == '__main__':
     unittest.main()
