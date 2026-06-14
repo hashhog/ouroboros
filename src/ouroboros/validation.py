@@ -343,6 +343,36 @@ def _is_p2sh(script: bytes) -> bool:
 _MAX_COMPACT_SIZE = 0x02000000  # Bitcoin Core serialize.h MAX_SIZE
 
 
+def _compact_size_len(n: int) -> int:
+    """Byte length of the CompactSize encoding of *n* (the block tx-count prefix)."""
+    if n < 0xFD:
+        return 1
+    if n <= 0xFFFF:
+        return 3
+    if n <= 0xFFFFFFFF:
+        return 5
+    return 9
+
+
+def block_weight(transactions: list) -> int:
+    """Block weight per Bitcoin Core consensus/validation.h::GetBlockWeight:
+    GetSerializeSize(TX_NO_WITNESS(block)) * (WSF-1) + GetSerializeSize(TX_WITH_WITNESS(block)).
+    This serializes the WHOLE block, which prepends an 80-byte header and a
+    CompactSize transaction count to the transactions. Both are witness-free, so
+    they appear in both serializations and count at the full WITNESS_SCALE_FACTOR:
+    weight = (80 + compact_size_len(n)) * WSF + sum(per-tx weight). Summing only
+    the per-tx weights under-counts by (80 + varint) * WSF (324 for a 1-byte
+    varint, up to 332), which false-accepts a block whose true Core weight is in
+    (MAX_BLOCK_WEIGHT, MAX_BLOCK_WEIGHT + that gap] -- Core rejects it as
+    bad-blk-weight, so accepting it is a chain split.
+    """
+    n = len(transactions)
+    weight = (80 + _compact_size_len(n)) * WITNESS_SCALE_FACTOR
+    for tx in transactions:
+        weight += tx.get_weight()
+    return weight
+
+
 def _read_compact_size(data: bytes, offset: int = 0) -> tuple[int, int]:
     """Decode CompactSize at *offset* in *data*; returns (value, bytes_consumed).
 
@@ -1496,12 +1526,14 @@ class BlockValidator:
                 f"{WITNESS_SCALE_FACTOR} exceeds MAX_BLOCK_WEIGHT"
             )
 
-        total_weight = 0
+        # Core GetBlockWeight: the whole-block weight (80-byte header + CompactSize
+        # tx-count counted at WITNESS_SCALE_FACTOR, on top of the per-tx weights).
+        # See block_weight(); the old per-tx-only sum under-counted by ~324-332 WU
+        # and false-accepted a marginally overweight block Core rejects bad-blk-weight.
+        total_weight = block_weight(block.transactions)
         total_sigops_cost = 0
 
         for tx in block.transactions:
-            total_weight += tx.get_weight()
-
             tx_sigops_cost = 0
 
             # --- Legacy sigops (outputs + inputs) × WITNESS_SCALE_FACTOR ---
