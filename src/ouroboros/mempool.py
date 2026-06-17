@@ -876,28 +876,54 @@ def _is_standard_output_type(script_pubkey: bytes) -> bool:
 
 
 def _get_dust_threshold(script_pubkey: bytes) -> int:
-    """Get the dust threshold for a given scriptPubKey.
+    """Get the dust threshold for a given scriptPubKey (mempool RELAY policy).
 
-    P2A outputs are exempt from dust (return 0).
-    Reference: Bitcoin Core policy/policy.cpp GetDustThreshold()
+    Faithful to Bitcoin Core ``GetDustThreshold`` (policy/policy.cpp:27-63):
+    an output is dust when it would cost more in fees to spend than it is
+    worth.  The threshold is::
+
+        nSize = GetSerializeSize(txout) + spend_cost
+        threshold = CeilDiv(nSize * dustRelayFee, 1000)
+
+    where ``GetSerializeSize(txout)`` = 8 (value, int64) + CompactSize(len)
+    + len(scriptPubKey), and ``spend_cost`` is the cost of a spending CTxIn:
+    ``32 + 4 + 1 + 107 + 4 = 148`` for a legacy output, or the same with a
+    75% segwit discount on the 107-byte script witness
+    (``32 + 4 + 1 + (107 // WITNESS_SCALE_FACTOR) + 4 = 67``) for any witness
+    program.  The witness branch is keyed on ``IsWitnessProgram`` (Core uses
+    one uniform segwit-discounted cost for P2WPKH/P2WSH/P2TR/unknown-witness),
+    NOT a per-script-type table.
+
+    Unspendable outputs (OP_RETURN) and Pay-to-Anchor (P2A) outputs return 0.
+
+    This is purely mempool relay policy (IsStandardTx); it is never reachable
+    from block/tx connect validation.
     """
-    # P2A outputs are exempt from dust threshold (anyone-can-spend anchors)
+    # OP_RETURN and other unspendable scripts can never be dust
+    # (Core ``txout.scriptPubKey.IsUnspendable()`` ⇒ return 0).
+    if script_pubkey and script_pubkey[0] == 0x6a:
+        return 0
+    # P2A (Pay-to-Anchor) outputs are exempt from the dust threshold.
     if is_pay_to_anchor(script_pubkey):
         return 0
 
-    # P2PKH/P2SH cost: 34 + 148 = 182 bytes
-    # P2WPKH cost: 31 + 68 = 99 bytes (roughly)
-    # P2WSH cost: 43 + 68 = 111 bytes
-    # P2TR cost: 43 + 57.5 = 100.5 bytes
-    if len(script_pubkey) == 22 and script_pubkey[0] == 0x00:
-        n_size = 99  # P2WPKH
-    elif len(script_pubkey) == 34 and script_pubkey[0] in (0x00, 0x51):
-        n_size = 110  # P2WSH or P2TR
-    elif len(script_pubkey) == 23 and script_pubkey[0] == 0xa9:
-        n_size = 182  # P2SH
+    script_len = len(script_pubkey)
+    if script_len < 0xfd:
+        script_len_prefix = 1
+    elif script_len <= 0xffff:
+        script_len_prefix = 3
     else:
-        n_size = 182  # P2PKH and others
-    return (n_size * DUST_RELAY_TX_FEE) // 1000
+        script_len_prefix = 5
+    # GetSerializeSize(CTxOut) = 8 (nValue) + CompactSize(len) + len.
+    txout_ser_size = 8 + script_len_prefix + script_len
+    if _get_witness_program(script_pubkey) is not None:
+        # Spending a witness output: 75% segwit discount on the 107-byte script.
+        spend_cost = 32 + 4 + 1 + (107 // WITNESS_SCALE_FACTOR) + 4  # 67
+    else:
+        spend_cost = 32 + 4 + 1 + 107 + 4  # 148
+    n_size = txout_ser_size + spend_cost
+    # dustRelayFee.GetFee(nSize) — Core rounds UP (CeilDiv).
+    return -((-(n_size * DUST_RELAY_TX_FEE)) // 1000)
 
 
 def _has_ephemeral_dust(tx: Transaction) -> list[int]:
