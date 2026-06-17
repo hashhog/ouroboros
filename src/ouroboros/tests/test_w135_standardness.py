@@ -273,18 +273,19 @@ def test_w135_g12_p2pk_output_recognized_bug3() -> None:
     )
 
 
-@pytest.mark.xfail(
-    reason="W135 BUG-4 (P0-CDIV): WITNESS_UNKNOWN rejected at output side. "
-           "Core's IsStandard accepts WITNESS_UNKNOWN (only spending is "
-           "rejected in ValidateInputsStandardness). ouroboros's symmetric "
-           "rejection breaks forward-compatibility for future witness "
-           "versions added by soft fork. See policy.cpp:80-98 vs "
-           "ValidateInputsStandardness policy.cpp:234-240.",
-    strict=True,
-)
 def test_w135_g16_witness_unknown_accepted_at_output_bug4() -> None:
-    """G16 (BUG-4 P0-CDIV): WITNESS_UNKNOWN output accepted (asymmetric
-    with input-side rejection)."""
+    """G16 (BUG-4 P0-CDIV, FIXED): WITNESS_UNKNOWN output accepted (asymmetric
+    with input-side rejection).
+
+    Core's Solver classifies any witness program of version >= 1 whose shape is
+    not P2TR/P2A as TxoutType::WITNESS_UNKNOWN, and IsStandard accepts it at the
+    OUTPUT side (forward-compat for future soft forks); only *spending* such an
+    output is rejected (ValidateInputsStandardness).  Previously ouroboros only
+    recognised v0/P2TR/P2A witness shapes and symmetrically rejected everything
+    else.  RELAY POLICY ONLY — never block/tx consensus validation.
+    Reference: script/solver.cpp Solver (version != 0 → WITNESS_UNKNOWN) +
+    policy.cpp:80-98 IsStandard vs ValidateInputsStandardness policy.cpp:234-240.
+    """
     # Witness version 2, 20-byte program — not standard yet, but Core's
     # IsStandard returns true (WITNESS_UNKNOWN). Future soft fork.
     witness_v2 = bytes([0x52, 0x14]) + b"\x77" * 20
@@ -292,82 +293,94 @@ def test_w135_g16_witness_unknown_accepted_at_output_bug4() -> None:
         "G16: WITNESS_UNKNOWN should be standard at output side "
         "(forward-compat); only rejected on spend"
     )
-
-
-@pytest.mark.xfail(
-    reason="W135 BUG-2 (P0-CDIV): Bare multisig 'detection' is just "
-           "script_pubkey[-1] == 0xae (last byte is OP_CHECKMULTISIG). "
-           "Core's IsStandard for MULTISIG rejects n > 3 "
-           "(policy.cpp:91-92). ouroboros accepts 4-of-7 multisig.",
-    strict=True,
-)
-def test_w135_g13_multisig_n_le_3_bug2() -> None:
-    """G13 (BUG-2 P0-CDIV): n ≤ 3 enforced for bare multisig."""
-    # 4-of-7 — Core: nonstandard. ouroboros: currently passes the lazy check.
-    assert not mempool_mod._is_standard_output_type(MULTI_4_OF_7), (
-        "G13: 4-of-7 bare multisig is non-standard in Core (n>3)"
+    # v16 (OP_16), 40-byte program — also WITNESS_UNKNOWN → standard at output.
+    witness_v16 = bytes([0x60, 0x28]) + b"\x99" * 40
+    assert mempool_mod._is_standard_output_type(witness_v16), (
+        "G16: v16 witness program is WITNESS_UNKNOWN → output-standard"
+    )
+    # MUTATION-CHECK negative: a v0 program of a non-standard length (e.g. 30
+    # bytes) is NONSTANDARD, NOT WITNESS_UNKNOWN (Core only emits
+    # WITNESS_UNKNOWN for version != 0).
+    witness_v0_bad = bytes([0x00, 0x1e]) + b"\x77" * 30
+    assert not mempool_mod._is_standard_output_type(witness_v0_bad), (
+        "G16: v0 witness program of non-standard length is NONSTANDARD"
     )
 
 
-@pytest.mark.xfail(
-    reason="W135 BUG-2 (P0-CDIV): Bare multisig has no opcode parser. "
-           "Core's MatchMultisig (solver.cpp:85-105) parses ALL opcodes "
-           "+ verifies m/pubkeys/n. ouroboros accepts any script ending "
-           "in 0xae as standard.",
-    strict=True,
-)
+def test_w135_g13_multisig_n_le_3_bug2() -> None:
+    """G13 (BUG-2 P0-CDIV, FIXED): n ≤ 3 enforced for bare multisig.
+
+    Core's IsStandard for MULTISIG rejects n > 3 (policy.cpp:86-94).  ouroboros's
+    bare-multisig matcher now parses the full script (MatchMultisig) and the
+    caller applies the n in [1,3] bound.  RELAY POLICY ONLY.
+    """
+    # 4-of-7 — Core: nonstandard (n > 3).
+    assert not mempool_mod._is_standard_output_type(MULTI_4_OF_7), (
+        "G13: 4-of-7 bare multisig is non-standard in Core (n>3)"
+    )
+    # 2-of-3 remains standard (positive control).
+    assert mempool_mod._is_standard_output_type(MULTI_2_OF_3), (
+        "G13: 2-of-3 bare multisig is standard in Core"
+    )
+
+
 def test_w135_g15_multisig_full_opcode_parse_bug2() -> None:
-    """G15 (BUG-2 P0-CDIV): Bare multisig requires full opcode parse,
-    not just last-byte check."""
-    # Garbage 3-byte script ending in OP_CHECKMULTISIG (0xae).
-    # Core's Solver / MatchMultisig will return NONSTANDARD because parsing
-    # fails (first byte isn't OP_1..OP_16 + valid pushdata pattern).
+    """G15 (BUG-2 P0-CDIV, FIXED): Bare multisig requires full opcode parse,
+    not just last-byte check.
+
+    Core's MatchMultisig (solver.cpp:85-105) parses ALL opcodes + verifies
+    m/pubkeys/n.  ouroboros now mirrors this; a garbage script that merely ends
+    in 0xae no longer passes.  RELAY POLICY ONLY.
+    """
+    # Garbage 4-byte script ending in OP_CHECKMULTISIG (0xae).
+    # Core's Solver / MatchMultisig returns NONSTANDARD because parsing fails
+    # (first byte isn't OP_1..OP_16 + valid pushdata pattern).
     assert not mempool_mod._is_standard_output_type(BOGUS_MULTI), (
         "G15: <0x99 0x98 0x97 0xae> is not a valid bare multisig; "
         "Core's MatchMultisig rejects via opcode parse"
     )
+    # A PUSHDATA1-prefixed pubkey push must be accepted (the actual rustoshi
+    # a11cdd4 behaviour): 1-of-1 with the single 33-byte pubkey pushed via
+    # OP_PUSHDATA1 (0x4c 0x21 <33 bytes>) instead of the direct 0x21 push.
+    multi_1_of_1_pushdata1 = (
+        bytes([0x51])              # OP_1 (m)
+        + bytes([0x4c, 0x21]) + PK33A  # OP_PUSHDATA1, len 33, pubkey
+        + bytes([0x51])              # OP_1 (n)
+        + bytes([0xae])              # OP_CHECKMULTISIG
+    )
+    assert mempool_mod._is_standard_output_type(multi_1_of_1_pushdata1), (
+        "G15: PUSHDATA1-prefixed pubkey push in bare multisig must be accepted "
+        "(Core MatchMultisig is PUSHDATA-aware via GetScriptOp + CPubKey::ValidSize)"
+    )
 
 
-@pytest.mark.xfail(
-    reason="W135 BUG-13 (P1): MAX_PUBKEYS_PER_MULTISIG=20 not enforced. "
-           "Core's MatchMultisig (solver.cpp:101-103) requires "
-           "num_keys ≤ MAX_PUBKEYS_PER_MULTISIG. Sub-issue of BUG-2.",
-    strict=True,
-)
 def test_w135_g13_max_pubkeys_per_multisig_bug13() -> None:
-    """G13b (BUG-13 P1): Bare multisig with > 20 pubkeys rejected.
+    """G13b (BUG-13 P1, FIXED): Bare multisig with > 20 pubkeys rejected.
 
-    Even closing BUG-2 with just the n≤3 check would leave a separate
-    overflow with n=21+. This pins the additional bound.
+    Core's MatchMultisig (solver.cpp:101-103) requires
+    num_keys ≤ MAX_PUBKEYS_PER_MULTISIG (= 20).  ouroboros's matcher applies the
+    same bound when decoding the m/n counts.  RELAY POLICY ONLY.
     """
-    # We can't reach this without first matching the multisig pattern; the
-    # bug surfaces if and when MatchMultisig is rewritten to parse opcodes
-    # but forgets MAX_PUBKEYS_PER_MULTISIG.
-    # Pseudo-multisig 21-of-21 would be rejected by Core's MatchMultisig.
-    # Currently ouroboros accepts because of the last-byte check.
+    # 21-of-21: the m count (21) already exceeds MAX_PUBKEYS_PER_MULTISIG so the
+    # GetScriptNumber bound rejects it, exactly as Core's MatchMultisig does.
     fake_21_of_21 = (
-        bytes([0x01, 21])  # PUSH 1 byte: value 21 (not OP_N; Core wants OP_21 which doesn't exist either)
+        bytes([0x01, 21])  # PUSH 1 byte: value 21 (m)
         + (b"\x21" + b"\x02" + b"\xee" * 32) * 21
-        + bytes([0x01, 21])
+        + bytes([0x01, 21])  # n
         + bytes([0xae])
     )
-    # When BUG-2 is fixed (MatchMultisig with opcode parse), 21-of-21 must
-    # still fail MAX_PUBKEYS_PER_MULTISIG. Today's `_is_standard_output_type`
-    # accepts via last-byte, so this xfails (the assertion holds when the
-    # fix lands).
     assert not mempool_mod._is_standard_output_type(fake_21_of_21), (
         "G13b: 21-of-21 multisig > MAX_PUBKEYS_PER_MULTISIG=20"
     )
 
 
-@pytest.mark.xfail(
-    reason="W135 BUG-14 (P1): minimal-push encoding not enforced for "
-           "m/n in bare multisig. Core's GetScriptNumber "
-           "(solver.cpp:66-83) calls CheckMinimalPush. Sub-issue of BUG-2.",
-    strict=True,
-)
 def test_w135_g14_multisig_minimal_push_encoding_bug14() -> None:
-    """G14 (BUG-14 P1): m/n in bare multisig must be minimally encoded."""
+    """G14 (BUG-14 P1, FIXED): m/n in bare multisig must be minimally encoded.
+
+    Core's GetScriptNumber (solver.cpp:66-83) calls CheckMinimalPush, so an m/n
+    count pushed non-minimally (PUSH1 0x03 instead of OP_3) is rejected.
+    ouroboros's matcher applies the same CheckMinimalPush.  RELAY POLICY ONLY.
+    """
     # 3-of-3 with m encoded as `01 03` (PUSH1 byte 3) instead of OP_3.
     non_minimal_3_of_3 = (
         bytes([0x01, 0x03])  # non-minimal: PUSH1 0x03 instead of OP_3 (0x53)
@@ -377,30 +390,53 @@ def test_w135_g14_multisig_minimal_push_encoding_bug14() -> None:
         + bytes([0x53])
         + bytes([0xae])
     )
-    # Core's MatchMultisig + GetScriptNumber with CheckMinimalPush would reject.
-    # ouroboros's last-byte check accepts.
+    # Core's MatchMultisig + GetScriptNumber with CheckMinimalPush rejects this.
     assert not mempool_mod._is_standard_output_type(non_minimal_3_of_3), (
         "G14: non-minimal m encoding is rejected by Core's CheckMinimalPush"
+    )
+    # Positive control: the same 3-of-3 with OP_3 minimal encoding IS standard.
+    minimal_3_of_3 = (
+        bytes([0x53])  # OP_3 (m)
+        + b"\x21" + PK33A
+        + b"\x21" + PK33B
+        + b"\x21" + PK33C
+        + bytes([0x53])  # OP_3 (n)
+        + bytes([0xae])
+    )
+    assert mempool_mod._is_standard_output_type(minimal_3_of_3), (
+        "G14: minimally-encoded 3-of-3 bare multisig is standard"
     )
 
 
 def test_w135_g15_p2a_forward_compat_lax() -> None:
-    """G15b (BUG-15 P1): is_pay_to_anchor accepts ALL OP_1 OP_PUSHBYTES_2
-    outputs, not just program=0x4e73.
+    """G15b (BUG-15 P1): is_pay_to_anchor() is strict (program==0x4e73 only),
+    but a non-canonical OP_1 OP_PUSHBYTES_2 output is still *output-standard* as
+    WITNESS_UNKNOWN (a v1 witness program of an unknown shape).
 
-    Reviewing the actual code: mempool.py:730 is_pay_to_anchor() DOES check
-    bytes 2,3 == 0x4e,0x73. So this is actually PRESENT, not missing.
-    Pin the present behavior so a regression flips the test.
+    mempool.py is_pay_to_anchor() DOES check bytes 2,3 == 0x4e,0x73, so the P2A
+    classifier itself rejects a bogus program.  But per Core's Solver/IsStandard
+    a v1 2-byte program that is NOT exactly 0x4e73 is WITNESS_UNKNOWN, which
+    IsStandard accepts at the OUTPUT side (forward-compat; only spending is
+    rejected).  This was previously (incorrectly) asserted non-standard back when
+    ouroboros only recognised v0/P2TR witness shapes — de-staled to match Core.
+    Reference: script/script.cpp IsPayToAnchor (program must be 0x4e73) +
+    script/solver.cpp Solver (version != 0 → WITNESS_UNKNOWN) + policy.cpp
+    IsStandard (WITNESS_UNKNOWN → true).
     """
-    # Correct P2A pattern → accepted
+    # Correct P2A pattern → accepted, and the P2A classifier recognises it.
     assert mempool_mod._is_standard_output_type(P2A_SPK)
-    # Bogus "anchor" with same length but different program bytes → rejected
+    assert mempool_mod.is_pay_to_anchor(P2A_SPK)
+    # Bogus "anchor" with same length but different program bytes → the strict
+    # P2A classifier rejects it …
     fake_anchor = bytes([0x51, 0x02, 0xab, 0xcd])
-    assert not mempool_mod._is_standard_output_type(fake_anchor) or (
-        # If any future P2A semantics expand to more programs, this assertion
-        # would loosen — flag for regression review.
-        False
-    ), "G15b: P2A pattern accepts non-canonical anchor program"
+    assert not mempool_mod.is_pay_to_anchor(fake_anchor), (
+        "G15b: is_pay_to_anchor must require program==0x4e73 exactly"
+    )
+    # … yet it remains output-standard as WITNESS_UNKNOWN (v1 unknown program),
+    # exactly as Core's IsStandard accepts it at the output side.
+    assert mempool_mod._is_standard_output_type(fake_anchor), (
+        "G15b: non-canonical v1 program is WITNESS_UNKNOWN → output-standard"
+    )
 
 
 # ===========================================================================
@@ -950,13 +986,22 @@ def test_w135_op_return_check_precedes_multisig_check() -> None:
     # Find the _is_standard_output_type body
     fn_start = src.find("def _is_standard_output_type")
     assert fn_start != -1, "Audit guard: _is_standard_output_type not found"
-    fn_body = src[fn_start:fn_start + 4000]
+    fn_body = src[fn_start:fn_start + 8000]
     op_return_pos = fn_body.find("script_pubkey[0] == 0x6a")
-    multisig_pos = fn_body.find("script_pubkey[-1] == 0xae")
+    # The bare-multisig check is now a faithful MatchMultisig parse rather than a
+    # last-byte test (Core script/solver.cpp:85-105); the ordering invariant
+    # still holds: OP_RETURN must be classified before multisig.
+    multisig_pos = fn_body.find("_match_multisig(")
     assert op_return_pos != -1, "OP_RETURN check missing from _is_standard_output_type"
     assert multisig_pos != -1, "Multisig check missing from _is_standard_output_type"
     assert op_return_pos < multisig_pos, (
         "Order regression: OP_RETURN check must precede multisig check"
+    )
+    # Functional pin: an OP_RETURN whose tail happens to end in 0xae is nulldata,
+    # never multisig.
+    op_return_ending_in_cms = bytes([0x6a, 0x01, 0xae])
+    assert mempool_mod._is_standard_output_type(op_return_ending_in_cms), (
+        "OP_RETURN ending in 0xae must classify as nulldata (push-only tail)"
     )
 
 

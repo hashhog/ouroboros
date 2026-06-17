@@ -102,6 +102,7 @@ MAX_STANDARD_P2WSH_STACK_ITEM_SIZE = 80  # policy/policy.h
 MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE = 80  # policy/policy.h (BIP 342)
 WITNESS_V0_SCRIPTHASH_SIZE = 32          # script/interpreter.h
 WITNESS_V1_TAPROOT_SIZE = 32             # script/interpreter.h
+MAX_PUBKEYS_PER_MULTISIG = 20            # script/script.h (bare-multisig relay bound)
 ANNEX_TAG = 0x50                         # script/script.h
 TAPROOT_LEAF_MASK = 0xfe                 # script/interpreter.h
 TAPROOT_LEAF_TAPSCRIPT = 0xc0            # script/interpreter.h (BIP 342 leaf version)
@@ -814,6 +815,212 @@ def _is_push_only_from(script: bytes, start: int) -> bool:
     return True
 
 
+def _pubkey_valid_size(data: bytes) -> bool:
+    """Mirror Bitcoin Core CPubKey::ValidSize (src/pubkey.h:77).
+
+    A serialized pubkey's length must be exactly determined by its header byte:
+    33 bytes (compressed, header 0x02/0x03) or 65 bytes (uncompressed, header
+    0x04/0x06/0x07).  Used only by the bare-multisig relay-standardness matcher.
+    """
+    if len(data) == 0:
+        return False
+    header = data[0]
+    if header == 0x02 or header == 0x03:
+        return len(data) == 33
+    if header == 0x04 or header == 0x06 or header == 0x07:
+        return len(data) == 65
+    return False
+
+
+def _get_script_op(script: bytes, i: int) -> tuple[int, int, bytes] | None:
+    """Read one (opcode, data) pair starting at byte offset ``i``.
+
+    Mirrors Bitcoin Core CScript::GetOp / GetScriptOp (src/script/script.cpp):
+    handles the inline push opcodes (0x01-0x4b) and OP_PUSHDATA1/2/4
+    (0x4c/0x4d/0x4e), returning the data bytes for a push or empty bytes for a
+    non-push opcode.  Returns ``(opcode, next_index, data)`` or ``None`` if the
+    script is malformed (a push runs past end-of-script).
+    """
+    n = len(script)
+    if i >= n:
+        return None
+    opcode = script[i]
+    i += 1
+    data = b""
+    if opcode <= 0x4b:
+        # Direct push of `opcode` bytes.
+        if i + opcode > n:
+            return None
+        data = script[i:i + opcode]
+        i += opcode
+    elif opcode == 0x4c:  # OP_PUSHDATA1
+        if i + 1 > n:
+            return None
+        length = script[i]
+        i += 1
+        if i + length > n:
+            return None
+        data = script[i:i + length]
+        i += length
+    elif opcode == 0x4d:  # OP_PUSHDATA2
+        if i + 2 > n:
+            return None
+        length = script[i] | (script[i + 1] << 8)
+        i += 2
+        if i + length > n:
+            return None
+        data = script[i:i + length]
+        i += length
+    elif opcode == 0x4e:  # OP_PUSHDATA4
+        if i + 4 > n:
+            return None
+        length = (script[i] | (script[i + 1] << 8) |
+                  (script[i + 2] << 16) | (script[i + 3] << 24))
+        i += 4
+        if i + length > n:
+            return None
+        data = script[i:i + length]
+        i += length
+    # else: non-push opcode (OP_0 is 0x00 handled above; OP_1..OP_16 etc.)
+    return opcode, i, data
+
+
+def _check_minimal_push(data: bytes, opcode: int) -> bool:
+    """Mirror Bitcoin Core CheckMinimalPush (src/script/script.cpp).
+
+    A push must use the smallest possible opcode for its data.  Used by the
+    bare-multisig m/n number decode so non-minimally-encoded counts are
+    rejected, matching Core's GetScriptNumber.
+    """
+    size = len(data)
+    if size == 0:
+        # Should have used OP_0.
+        return opcode == 0x00
+    if size == 1 and 1 <= data[0] <= 16:
+        # Should have used OP_1..OP_16.
+        return False
+    if size == 1 and data[0] == 0x81:
+        # Should have used OP_1NEGATE.
+        return False
+    if size <= 75:
+        # Must have used a direct push opcode of exactly `size`.
+        return opcode == size
+    if size <= 255:
+        return opcode == 0x4c  # OP_PUSHDATA1
+    if size <= 65535:
+        return opcode == 0x4d  # OP_PUSHDATA2
+    return True
+
+
+def _decode_minimal_scriptnum(data: bytes) -> int | None:
+    """Decode a minimally-encoded CScriptNum (little-endian, sign-magnitude).
+
+    Returns None if the encoding is non-minimal (a trailing 0x00/0x80 padding
+    byte), mirroring CScriptNum(..., fRequireMinimal=true).  Used for the
+    multisig m/n counts.
+    """
+    if len(data) == 0:
+        return 0
+    # Reject non-minimal encoding: the most significant byte must not be 0x00
+    # or 0x80 unless it sets the sign bit of the next-most-significant byte.
+    if (data[-1] & 0x7f) == 0:
+        if len(data) <= 1 or (data[-2] & 0x80) == 0:
+            return None
+    result = 0
+    for idx, b in enumerate(data):
+        result |= b << (8 * idx)
+    if data[-1] & 0x80:
+        # Negative: clear the sign bit and negate.
+        result &= ~(0x80 << (8 * (len(data) - 1)))
+        return -result
+    return result
+
+
+def _get_script_number(opcode: int, data: bytes, vmin: int, vmax: int) -> int | None:
+    """Mirror Bitcoin Core GetScriptNumber (src/script/solver.cpp:64-83).
+
+    Decode a small integer in [vmin, vmax] either from an OP_N opcode or from a
+    minimally-encoded push.  Returns None if out of range or non-minimal.
+    """
+    if opcode == 0x00:
+        count = 0  # OP_0
+    elif 0x51 <= opcode <= 0x60:
+        count = opcode - 0x50  # OP_1..OP_16
+    elif 0x01 <= opcode <= 0x4e:
+        # Pushdata: require minimal push then decode as a scriptnum.
+        if not _check_minimal_push(data, opcode):
+            return None
+        count = _decode_minimal_scriptnum(data)
+        if count is None:
+            return None
+    else:
+        return None
+    if count < vmin or count > vmax:
+        return None
+    return count
+
+
+def _match_multisig(script: bytes) -> tuple[int, int] | None:
+    """Mirror Bitcoin Core MatchMultisig (src/script/solver.cpp:85-105).
+
+    Returns ``(required_sigs, num_keys)`` if ``script`` is a well-formed bare
+    multisig (``OP_m <pubkey>... OP_n OP_CHECKMULTISIG``) where each pubkey push
+    is PUSHDATA-aware and passes CPubKey::ValidSize, m/n are minimally encoded in
+    [1, MAX_PUBKEYS_PER_MULTISIG], and the declared n equals the pubkey count.
+    Returns ``None`` otherwise.  RELAY-STANDARDNESS ONLY — never consensus.
+
+    NB: the IsStandard MULTISIG bound (n in [1,3], m in [1,n]) is applied by the
+    caller, mirroring Core's split between Solver (this) and IsStandard.
+    """
+    n = len(script)
+    # Must end in OP_CHECKMULTISIG (0xae).
+    if n < 1 or script[-1] != 0xae:
+        return None
+
+    it = 0
+    # First opcode: required_sigs (m), in [1, MAX_PUBKEYS_PER_MULTISIG].
+    first = _get_script_op(script, it)
+    if first is None:
+        return None
+    opcode, it, data = first
+    req_sigs = _get_script_number(opcode, data, 1, MAX_PUBKEYS_PER_MULTISIG)
+    if req_sigs is None:
+        return None
+
+    # Pubkey pushes, while the data is a valid pubkey size.
+    num_pubkeys = 0
+    while True:
+        nxt = _get_script_op(script, it)
+        if nxt is None:
+            return None
+        opcode, next_it, data = nxt
+        if not _pubkey_valid_size(data):
+            break
+        num_pubkeys += 1
+        it = next_it
+
+    # `opcode`/`data` now hold the count opcode (n).
+    num_keys = _get_script_number(opcode, data, req_sigs, MAX_PUBKEYS_PER_MULTISIG)
+    if num_keys is None:
+        return None
+    if num_pubkeys != num_keys:
+        return None
+    it = next_it
+
+    # The only remaining opcode must be the trailing OP_CHECKMULTISIG.
+    last = _get_script_op(script, it)
+    if last is None:
+        return None
+    opcode, it, _ = last
+    if opcode != 0xae:
+        return None
+    # Nothing after OP_CHECKMULTISIG.
+    if it != n:
+        return None
+
+    return req_sigs, num_keys
+
+
 def _is_standard_output_type(script_pubkey: bytes) -> bool:
     """Check if a scriptPubKey is a standard output type.
 
@@ -851,26 +1058,58 @@ def _is_standard_output_type(script_pubkey: bytes) -> bool:
             script_pubkey[1] == 0x14 and script_pubkey[22] == 0x87):
         return True
 
-    # P2WPKH: OP_0 <20>
-    if len(script_pubkey) == 22 and script_pubkey[0] == 0x00 and script_pubkey[1] == 0x14:
-        return True
+    # Witness programs (BIP141 + later soft forks).  Core's Solver handles the
+    # ENTIRE witness-program family inside one branch (script/solver.cpp ~165-185):
+    # any IsWitnessProgram script is classified as a witness type or NONSTANDARD;
+    # it never falls through to the multisig/pubkey branches below.  Mirror that
+    # structure here so we don't accidentally re-classify a malformed witness
+    # program as something else.
+    wp = _get_witness_program(script_pubkey)
+    if wp is not None:
+        version, program = wp
+        # P2WPKH: v0, 20-byte program
+        if version == 0 and len(program) == 20:
+            return True
+        # P2WSH: v0, 32-byte program
+        if version == 0 and len(program) == WITNESS_V0_SCRIPTHASH_SIZE:
+            return True
+        # P2TR: v1, 32-byte program
+        if version == 1 and len(program) == WITNESS_V1_TAPROOT_SIZE:
+            return True
+        # P2A (anchor): v1, program == 0x4e73
+        if is_pay_to_anchor_program(version, program):
+            return True
+        # WITNESS_UNKNOWN: any witness program of version >= 1 with a different
+        # program length is a *standard* output type (TxoutType::WITNESS_UNKNOWN).
+        # Core's IsStandard accepts it (forward-compat for future soft forks);
+        # only *spending* such an output is rejected (ValidateInputsStandardness).
+        # Reference: script/solver.cpp Solver() (version != 0 → WITNESS_UNKNOWN)
+        # + policy/policy.cpp IsStandard() (only NONSTANDARD / out-of-range
+        # MULTISIG return false).  RELAY POLICY ONLY — never consensus.
+        if version != 0:
+            return True
+        # v0 with a non-standard program length → NONSTANDARD (matches Core).
+        return False
 
-    # P2WSH: OP_0 <32>
-    if len(script_pubkey) == 34 and script_pubkey[0] == 0x00 and script_pubkey[1] == 0x20:
-        return True
-
-    # P2TR: OP_1 <32>
-    if len(script_pubkey) == 34 and script_pubkey[0] == 0x51 and script_pubkey[1] == 0x20:
-        return True
-
-    # P2A: OP_1 <2>
+    # P2A short form (OP_1 <2-byte 0x4e73>) is a witness program already handled
+    # above, but keep the explicit guard in case _get_witness_program's bounds
+    # ever change; harmless and self-documenting.
     if is_pay_to_anchor(script_pubkey):
         return True
 
-    # Bare multisig: OP_m ... OP_n OP_CHECKMULTISIG
-    # This is rare but standard. Check for OP_CHECKMULTISIG at end.
-    if len(script_pubkey) >= 3 and script_pubkey[-1] == 0xae:
-        return True
+    # Bare multisig: OP_m <pubkey>... OP_n OP_CHECKMULTISIG.
+    # Faithful to Core's Solver -> MatchMultisig (script/solver.cpp:85-105) +
+    # IsStandard MULTISIG bound (policy/policy.cpp:86-94): the script must fully
+    # parse as a multisig (PUSHDATA-aware pubkey pushes, valid pubkey sizes,
+    # minimal m/n encodings, num_keys <= MAX_PUBKEYS_PER_MULTISIG) AND have
+    # n in [1,3], m in [1,n] to be relay-standard.  RELAY POLICY ONLY.
+    m_n = _match_multisig(script_pubkey)
+    if m_n is not None:
+        required_sigs, num_keys = m_n
+        # IsStandard MULTISIG bound: 1 <= n <= 3 and 1 <= m <= n.
+        if 1 <= num_keys <= 3 and 1 <= required_sigs <= num_keys:
+            return True
+        return False
 
     return False
 
