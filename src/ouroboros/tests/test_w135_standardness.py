@@ -495,39 +495,72 @@ def test_w135_g10_max_dust_outputs_per_tx_present() -> None:
     assert mempool_mod.DUST_RELAY_TX_FEE == 3000
 
 
-@pytest.mark.xfail(
-    reason="W135 BUG-6 (P1): GetDustThreshold uses hardcoded per-type "
-           "sizes (99/110/182) instead of GetSerializeSize(txout) + "
-           "spend-cost formula. policy.cpp:27-64. Coincidentally matches "
-           "for the 5 standard sizes; diverges for custom sizes.",
-    strict=True,
-)
 def test_w135_g9_dust_threshold_formula_bug6() -> None:
-    """G9 (BUG-6 P1): GetDustThreshold matches Core's serialize-size formula."""
-    # Core formula: nSize = GetSerializeSize(txout) + spend_cost
-    #   spend_cost: 32+4+1+107+4=148 legacy, OR 32+4+1+(107/4)+4=68 segwit
-    # Then: dustRelayFee.GetFee(nSize) = nSize * 3000 / 1000
-    #
-    # For P2PKH (25-byte script):
-    #   GetSerializeSize(CTxOut(0, scriptpubkey)) = 8 (value) + 1 (varint=25) + 25 = 34
-    #   spend_cost (legacy) = 148
-    #   nSize = 34 + 148 = 182
-    #   dust = 182 * 3000 / 1000 = 546 sat ✓
-    #
-    # ouroboros's _get_dust_threshold returns 182 * 3000 / 1000 = 546 for P2PKH
-    # because it HARDCODES n_size=182. So for P2PKH the answer matches.
-    #
-    # Probe: for a non-standard 30-byte script (custom but spendable), Core
-    # would compute (8 + 1 + 30 + 148) * 3000 / 1000 = 561 sat. ouroboros
-    # would return its catch-all 182*3000/1000 = 546 → divergence.
-    custom_30 = b"\x76\xa9\x14" + b"\x77" * 20 + b"\x88\xac\x00\x00\x00\x00\x00"  # 30 bytes
+    """G9 (BUG-6 P1): GetDustThreshold matches Core's serialize-size formula.
+
+    FIXED (ported from rustoshi d6e9934): _get_dust_threshold now computes
+    nSize = GetSerializeSize(txout) + spend_cost faithfully to Core
+    policy.cpp:27-63, instead of a hardcoded per-type size table (which both
+    dropped the GetSerializeSize term and mis-sized P2WPKH to 297).
+
+    Core formula: nSize = GetSerializeSize(txout) + spend_cost
+      GetSerializeSize(CTxOut) = 8 (value, int64) + CompactSize(len) + len
+      spend_cost = 32+4+1+107+4 = 148 legacy, OR 32+4+1+(107//4)+4 = 67 segwit
+      threshold = CeilDiv(nSize * dustRelayFee, 1000)
+    """
+    def core_dust_threshold(spk: bytes) -> int:
+        """Independent Core reference (does NOT call the impl)."""
+        if spk and spk[0] == 0x6a:
+            return 0
+        if mempool_mod.is_pay_to_anchor(spk):
+            return 0
+        n = len(spk)
+        prefix = 1 if n < 0xfd else (3 if n <= 0xffff else 5)
+        ser = 8 + prefix + n
+        # witness program: OP_0/OP_1..16 + 2..40 byte push
+        is_wp = (
+            4 <= n <= 42
+            and (spk[0] == 0x00 or 0x51 <= spk[0] <= 0x60)
+            and spk[1] + 2 == n
+            and 2 <= spk[1] <= 40
+        )
+        spend = 67 if is_wp else 148
+        nsize = ser + spend
+        return -((-(nsize * mempool_mod.DUST_RELAY_TX_FEE)) // 1000)
+
+    # The five standard Core thresholds at the default 3000 sat/kvB rate.
+    p2pkh = b"\x76\xa9\x14" + b"\x77" * 20 + b"\x88\xac"            # 25B legacy
+    p2sh = b"\xa9\x14" + b"\x77" * 20 + b"\x87"                      # 23B legacy
+    p2wpkh = b"\x00\x14" + b"\x77" * 20                             # 22B segwit
+    p2wsh = b"\x00\x20" + b"\x77" * 32                              # 34B segwit
+    p2tr = b"\x51\x20" + b"\x77" * 32                               # 34B segwit
+    expected = {
+        bytes(p2pkh): 546,
+        bytes(p2sh): 540,
+        bytes(p2wpkh): 294,
+        bytes(p2wsh): 330,
+        bytes(p2tr): 330,
+    }
+    for spk, want in expected.items():
+        got = mempool_mod._get_dust_threshold(spk)
+        assert got == want, f"dust({spk.hex()}) = {got}, Core = {want}"
+        assert got == core_dust_threshold(spk)
+
+    # Custom-size probe: a 30-byte spendable legacy script. The OLD hardcoded
+    # table returned its catch-all 182*3000//1000 = 546; Core's formula gives
+    # (8 + 1 + 30 + 148) * 3000 / 1000 = 561 → the fix is required to match.
+    custom_30 = b"\x76\xa9\x14" + b"\x77" * 20 + b"\x88\xac\x00\x00\x00\x00\x00"
     assert len(custom_30) == 30
-    # Core formula: (8 + 1 + 30 + 148) * 3000 / 1000 = 561
     core_dust = (8 + 1 + 30 + 148) * mempool_mod.DUST_RELAY_TX_FEE // 1000
+    assert core_dust == 561
     actual = mempool_mod._get_dust_threshold(custom_30)
     assert actual == core_dust, (
         f"G9: dust threshold {actual} != Core formula {core_dust} for 30-byte script"
     )
+
+    # OP_RETURN and P2A are unspendable / anchor → threshold 0.
+    assert mempool_mod._get_dust_threshold(b"\x6a\x04dead") == 0
+    assert mempool_mod._get_dust_threshold(b"\x51\x02\x4e\x73") == 0
 
 
 # ===========================================================================

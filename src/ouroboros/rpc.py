@@ -8093,6 +8093,14 @@ class RPCServer:
                 # Peer.relay_txs (peer.py:207) — prior `relay_txes` lookup
                 # fell through to the `True` default on every peer.
                 "relaytxes": getattr(peer, 'relay_txs', True),
+                # last_inv_sequence / inv_to_send — Core v31.99 emits these two
+                # NUM fields immediately after relaytxes and before lastsend
+                # (rpc/net.cpp:242-245).  ouroboros does not track per-peer INV
+                # mempool-sequence / outbound-INV-queue depth at the manager
+                # layer, so emit 0 (same pattern as addr_processed /
+                # addr_rate_limited) to preserve Core's exact wire order.
+                "last_inv_sequence": int(getattr(peer, 'last_inv_sequence', 0) or 0),
+                "inv_to_send": int(getattr(peer, 'inv_to_send', 0) or 0),
                 "lastsend": lastsend,
                 "lastrecv": lastrecv,
                 "last_transaction": getattr(peer, 'last_tx_time', 0),
@@ -8106,7 +8114,11 @@ class RPCServer:
                 "inbound": inbound,
                 "bip152_hb_to": bip152_hb_to,
                 "bip152_hb_from": bip152_hb_from,
-                "startingheight": getattr(peer, 'start_height', 0),
+                # startingheight removed in Bitcoin Core v31.99 — getpeerinfo
+                # now goes bip152_hb_from -> presynced_headers with no
+                # startingheight pushKV (rpc/net.cpp:269-270).  m_starting_height
+                # survives only as a local int in version-message handling and
+                # is no longer surfaced via RPC.
                 "presynced_headers": getattr(peer, 'presynced_headers', -1),
                 "synced_headers": getattr(peer, 'synced_headers', -1),
                 "synced_blocks": getattr(peer, 'synced_blocks', -1),
