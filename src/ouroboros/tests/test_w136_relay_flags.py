@@ -671,6 +671,73 @@ def test_w136_g29_getpeerinfo_wtxid_relay_field() -> None:
     )
 
 
+def test_w136_getpeerinfo_inv_fields_and_no_startingheight() -> None:
+    """getpeerinfo: last_inv_sequence + inv_to_send present in Core v31.99 wire
+    order, and startingheight absent.
+
+    Ported from rustoshi 077eb2f (add last_inv_sequence + inv_to_send) + 528045a
+    (drop startingheight, removed in Core v31.99).  Core rpc/net.cpp:242-245
+    pushes relaytxes -> last_inv_sequence -> inv_to_send -> lastsend; net.cpp
+    no longer pushes startingheight (bip152_hb_from -> presynced_headers).
+
+    Pure RPC response shape — never reachable from block/tx validation.
+    """
+    import asyncio
+
+    from ouroboros.rpc import RPCServer
+
+    class _StubPeer:
+        id = 0
+        address = "203.0.113.7:8333"
+        services = 1
+        relay_txs = True
+        last_inv_sequence = 0
+        inv_to_send = 0
+        start_height = 654321  # would have populated the removed field
+
+    class _StubPM:
+        peers = [_StubPeer()]
+        block_relay_peers: list = []
+        inbound_peers: list = []
+
+    class _StubNode:
+        peer_manager = _StubPM()
+
+    server = RPCServer(_StubNode())
+    result = asyncio.run(server.rpc_getpeerinfo())
+    assert len(result) == 1
+    info = result[0]
+    keys = list(info.keys())
+
+    # Both new NUM fields present and numeric.
+    assert "last_inv_sequence" in info, "last_inv_sequence missing (Core v31.99)"
+    assert "inv_to_send" in info, "inv_to_send missing (Core v31.99)"
+    assert isinstance(info["last_inv_sequence"], int)
+    assert isinstance(info["inv_to_send"], int)
+
+    # Exact Core wire order: relaytxes -> last_inv_sequence -> inv_to_send -> lastsend.
+    i_relay = keys.index("relaytxes")
+    i_lis = keys.index("last_inv_sequence")
+    i_its = keys.index("inv_to_send")
+    i_send = keys.index("lastsend")
+    assert i_relay < i_lis < i_its < i_send, (
+        f"getpeerinfo INV-field order wrong: {keys[i_relay:i_send + 1]}"
+    )
+
+    # startingheight removed in Core v31.99 — must be absent.
+    assert "startingheight" not in info, (
+        "startingheight must not be emitted (removed in Bitcoin Core v31.99)"
+    )
+    # bip152_hb_from -> presynced_headers contiguous (no startingheight between).
+    i_hb = keys.index("bip152_hb_from")
+    i_pre = keys.index("presynced_headers")
+    assert keys[i_hb + 1] == "presynced_headers", (
+        f"expected presynced_headers right after bip152_hb_from, got "
+        f"{keys[i_hb + 1]!r}"
+    )
+    assert i_hb < i_pre
+
+
 def test_w136_g30_two_pipeline_relay_flags_python_only() -> None:
     """G30 (architectural guard): relay flags are Python-only (active surface).
 
