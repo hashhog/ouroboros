@@ -7,6 +7,7 @@ supporting standard Bitcoin RPC methods.
 
 import asyncio
 import hashlib as _hashlib
+import ipaddress as _ipaddress
 import json
 import logging
 import statistics
@@ -553,7 +554,34 @@ RPC_MISC_ERROR = -1
 RPC_TYPE_ERROR = -3
 RPC_INVALID_ADDRESS_OR_KEY = -5
 RPC_INVALID_PARAMETER = -8
+RPC_CLIENT_NODE_ALREADY_ADDED = -23  # protocol.h:60 — Node is already added
+RPC_CLIENT_NODE_NOT_ADDED = -24      # protocol.h:61 — Node has not been added before
+RPC_CLIENT_NODE_NOT_CONNECTED = -29  # protocol.h:62 — disconnect target not connected
 RPC_CLIENT_INVALID_IP_OR_SUBNET = -30
+
+
+def _is_valid_ip_or_subnet(value: str) -> bool:
+    """Return True if *value* is a valid bare IP or CIDR subnet.
+
+    Mirrors Bitcoin Core ``LookupSubNet`` (rpc/net.cpp setban): a bare address
+    (``192.168.0.1`` / ``2001:db8::1``) or a ``addr/prefix`` subnet
+    (``192.168.0.0/24`` / ``2001:db8::/32``). Hostnames, empty strings and
+    malformed octets are rejected — the caller raises
+    ``RPC_CLIENT_INVALID_IP_OR_SUBNET`` (-30) on a False result.
+    """
+    if not isinstance(value, str):
+        return False
+    token = value.strip()
+    if not token:
+        return False
+    try:
+        if "/" in token:
+            _ipaddress.ip_network(token, strict=False)
+        else:
+            _ipaddress.ip_address(token)
+    except ValueError:
+        return False
+    return True
 
 
 def _parse_hash_v(value: str, name: str) -> bytes:
@@ -1942,9 +1970,31 @@ class RPCServer:
         }
 
     async def rpc_getblockhash(self, height: int) -> str:
-        """Return block hash at height"""
+        """Return block hash at height.
+
+        Reference: Bitcoin Core rpc/blockchain.cpp getblockhash. Core rejects a
+        height that is negative or beyond the active-chain tip at the PARAMETER
+        boundary, BEFORE any lookup, with
+        ``JSONRPCError(RPC_INVALID_PARAMETER, "Block height out of range")``
+        (blockchain.cpp:590-591; protocol.h:44 RPC_INVALID_PARAMETER=-8). Raise
+        RpcError so the dispatch loop emits the exact -8, not the -32603 a bare
+        HTTPException collapses to.
+        """
         if not hasattr(self.node, 'db'):
             raise HTTPException(status_code=500, detail="Database not available")
+
+        # Core: nHeight = request.params[0].getInt<int>() — a non-integer height
+        # is a parameter error. Match Core's out-of-range guard against the
+        # active-chain tip height (db.get_best_block() -> (hash, height)).
+        try:
+            height = int(height)
+        except (TypeError, ValueError):
+            raise RpcError(
+                RPC_INVALID_PARAMETER, "Block height out of range"
+            ) from None
+        _, tip_height = self.node.db.get_best_block()
+        if height < 0 or height > tip_height:
+            raise RpcError(RPC_INVALID_PARAMETER, "Block height out of range")
 
         block = await asyncio.to_thread(self.node.db.get_block_by_height, height)
         if not block:
@@ -8173,6 +8223,37 @@ class RPCServer:
             host = node
             port = getattr(pm, '_default_port', 8333)
 
+        # Bitcoin Core keeps an "added node" list (CConnman::m_added_nodes).
+        # ``add`` of a node already on the list, and ``remove`` of a node not
+        # on the list, are operator errors with dedicated codes:
+        #   CConnman::AddNode dedups -> RPC_CLIENT_NODE_ALREADY_ADDED (-23)
+        #   CConnman::RemoveAddedNode absent-check -> RPC_CLIENT_NODE_NOT_ADDED (-24)
+        # (net.cpp:359-369; protocol.h:60-61). ``onetry`` is NOT added to the
+        # list (Core OpenNetworkConnection only), so it never dedups. Mirror the
+        # list on the RPCServer keyed by normalized host:port. This is an
+        # RPC-layer error gate only — the success-path dial behaviour below is
+        # unchanged.
+        added = getattr(self, '_added_nodes', None)
+        if added is None:
+            added = set()
+            self._added_nodes = added
+        node_key = f"{host}:{port}"
+
+        if command == "add":
+            if node_key in added:
+                raise RpcError(
+                    RPC_CLIENT_NODE_ALREADY_ADDED, "Error: Node already added"
+                )
+            added.add(node_key)
+        elif command == "remove":
+            if node_key not in added:
+                raise RpcError(
+                    RPC_CLIENT_NODE_NOT_ADDED,
+                    "Error: Node could not be removed. "
+                    "It has not been added previously.",
+                )
+            added.discard(node_key)
+
         if command in ("add", "onetry"):
             # Fire-and-forget: queue the dial as a background task and
             # return immediately. Matches Bitcoin Core
@@ -8221,6 +8302,11 @@ class RPCServer:
             task.add_done_callback(tasks.discard)
             return None
         elif command == "remove":
+            # The added-node membership check (and its -24 for a node that was
+            # never added) is handled above, matching Core's RemoveAddedNode.
+            # Here we only sever the connection if one is currently open — a
+            # node may be on the added list without being connected, and Core's
+            # remove still succeeds in that case. Best-effort, no error.
             addr = f"{host}:{port}"
             peers = getattr(pm, 'peers', {})
             if addr in peers:
@@ -8228,14 +8314,65 @@ class RPCServer:
                 if hasattr(peer, 'disconnect'):
                     await peer.disconnect() if asyncio.iscoroutinefunction(peer.disconnect) else peer.disconnect()
                 del peers[addr]
-            else:
-                raise ValueError(f"Node not found: {node}")
 
     async def rpc_disconnectnode(self, address: str = "", nodeid: int = -1) -> None:
-        """Disconnect a peer by address or node id."""
+        """Disconnect a peer by address or node id.
+
+        Reference: Bitcoin Core rpc/net.cpp disconnectnode (net.cpp:458-482).
+        ``CConnman::DisconnectNode`` returns true when a connected node matched
+        and was scheduled for disconnect, false otherwise. When nothing matched,
+        Core raises
+        ``JSONRPCError(RPC_CLIENT_NODE_NOT_CONNECTED, "Node not found in
+        connected nodes")`` (-29; protocol.h:62). Previously this handler keyed
+        off ``hasattr(pm, 'disconnect_peer')`` — a method the PeerManager does
+        not expose — so disconnectnode silently returned success (null) for any
+        input. Mirror Core: locate the connected peer, sever it, and raise -29
+        on a miss.
+        """
         pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
-        if pm and hasattr(pm, 'disconnect_peer'):
-            await pm.disconnect_peer(address or nodeid)
+        if pm is None:
+            raise RpcError(
+                RPC_CLIENT_NODE_NOT_CONNECTED,
+                "Node not found in connected nodes",
+            )
+
+        # Search the connected-peer maps (full-relay outbound, block-relay
+        # outbound, inbound), all keyed by "host:port" address strings. Match by
+        # address; if disconnect-by-id was requested (nodeid >= 0), match a
+        # peer carrying that id when the impl tracks one.
+        peer_maps = [
+            getattr(pm, 'peers', {}) or {},
+            getattr(pm, 'block_relay_peers', {}) or {},
+            getattr(pm, 'inbound_peers', {}) or {},
+        ]
+
+        matched = None
+        if address:
+            for pmap in peer_maps:
+                if address in pmap:
+                    matched = (pmap, address, pmap[address])
+                    break
+        if matched is None and nodeid is not None and nodeid >= 0:
+            for pmap in peer_maps:
+                for addr, peer in list(pmap.items()):
+                    if getattr(peer, 'node_id', None) == nodeid:
+                        matched = (pmap, addr, peer)
+                        break
+                if matched is not None:
+                    break
+
+        if matched is None:
+            raise RpcError(
+                RPC_CLIENT_NODE_NOT_CONNECTED,
+                "Node not found in connected nodes",
+            )
+
+        pmap, addr, peer = matched
+        if hasattr(peer, 'disconnect'):
+            disc = peer.disconnect
+            await disc() if asyncio.iscoroutinefunction(disc) else disc()
+        pmap.pop(addr, None)
+        return None
 
     async def rpc_setban(
         self,
@@ -8262,6 +8399,19 @@ class RPCServer:
         bm = pm.ban_manager
         if command not in ("add", "remove"):
             raise ValueError(f"Invalid command: {command}")
+
+        # Reference: Bitcoin Core rpc/net.cpp setban (net.cpp:776-781). Core
+        # parses the argument via LookupSubNet (bare IP or CIDR subnet); if the
+        # result is not valid it throws
+        # JSONRPCError(RPC_CLIENT_INVALID_IP_OR_SUBNET, "Error: Invalid
+        # IP/Subnet") (-30; protocol.h:63). Mirror that parse boundary with the
+        # stdlib ipaddress parser: a bare IP must parse as ip_address, a "x/y"
+        # token as ip_network. Raise RpcError so the dispatcher emits -30, not
+        # the -32603 a bare ValueError collapses to.
+        if not _is_valid_ip_or_subnet(subnet):
+            raise RpcError(
+                RPC_CLIENT_INVALID_IP_OR_SUBNET, "Error: Invalid IP/Subnet"
+            )
 
         success = bm.setban(subnet, command, bantime, absolute)
         if not success:
