@@ -103,6 +103,18 @@ def _make_server():
     return rpc, node, temp
 
 
+class _PeerManagerStub:
+    """Minimal peer manager exposing the connected-peer maps + a real
+    BanManager, for the net-management error-code gates (G24/G25/G29/G30b)."""
+
+    def __init__(self, peers=None):
+        from ouroboros.banman import BanManager
+        self.peers = dict(peers or {})
+        self.block_relay_peers = {}
+        self.inbound_peers = {}
+        self.ban_manager = BanManager()  # no data_dir -> in-memory only
+
+
 def _dispatch(rpc, method, params, id_=1):
     """Drive a single JSON-RPC request through the dispatcher and
     return the response dict the wire client would see.
@@ -137,6 +149,13 @@ class TestW125_RpcErrorParity(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.rpc, cls.node, cls.tempdir = _make_server()
+
+    def setUp(self):
+        # The addnode added-node list lives on the shared RPCServer; reset it
+        # per-test so the net-management gates (G24/G25) don't bleed across
+        # test ordering.
+        if hasattr(self.rpc, "_added_nodes"):
+            self.rpc._added_nodes = set()
 
     # G1 — RPC_INVALID_REQUEST: missing method ----------------------------
     def test_g1_invalid_request_missing_method(self):
@@ -241,16 +260,23 @@ class TestW125_RpcErrorParity(unittest.TestCase):
         self.assertTrue(re.search(r"\bRPC_OUT_OF_MEMORY\b", rpc_py))
 
     # G10 — RPC_INVALID_PARAMETER (-8) -------------------------------------
-    @pytest.mark.xfail(reason="W125 BUG-1: invalid hex/txid emits -32603; "
-                              "Core: -8",
-                       strict=False)
+    # FIXED (W125 FIX wave, ported from rustoshi ee86d76): getblockhash for a
+    # negative or out-of-range height now raises RPC_INVALID_PARAMETER (-8)
+    # "Block height out of range" at the parameter boundary (Core
+    # blockchain.cpp:590-591), instead of collapsing to -32603. xfail removed.
+    # Full behavioral coverage (in-range success-path guard, exact message,
+    # above-tip case) lives in test_w125_rpc_errcode_port.py.
     def test_g10_invalid_parameter_bad_hex_to_sendrawtransaction(self):
-        """Core rawtransaction.cpp: sendrawtransaction with non-hex raises
-        RPC_DESERIALIZATION_ERROR (-22) actually; for negative block
-        height Core raises RPC_INVALID_PARAMETER (-8). Test the negative
-        height path on getblockhash.
-        """
-        # getblockhash(-1) — negative height
+        """getblockhash(-1) — negative height -> RPC_INVALID_PARAMETER (-8)."""
+
+        class _Db:
+            def get_best_block(self):
+                return (b"\x00" * 32, 100)
+
+            def get_block_by_height(self, h):
+                return None
+
+        self.node.db = _Db()
         resp = _dispatch(self.rpc, "getblockhash", [-1])
         self.assertEqual(_error_code(resp), RPC_INVALID_PARAMETER)
 
@@ -391,16 +417,24 @@ class TestW125_RpcErrorParity(unittest.TestCase):
         self.assertEqual(_error_code(resp), RPC_DESERIALIZATION_ERROR)
 
     # G24 — RPC_CLIENT_NODE_ALREADY_ADDED (-23) ---------------------------
-    @pytest.mark.xfail(reason="W125 BUG-9: addnode has no duplicate check",
-                       strict=False)
+    # FIXED (W125 FIX wave, ported from rustoshi 7b94ef1): addnode keeps an
+    # added-node list (Core CConnman::m_added_nodes); a duplicate 'add' now
+    # raises RPC_CLIENT_NODE_ALREADY_ADDED (-23) (net.cpp:362). xfail removed.
     def test_g24_node_already_added_absent(self):
+        """Second 'add' of the same node -> -23 (and constant present)."""
         rpc_py = (_src / "ouroboros" / "rpc.py").read_text()
         self.assertIn("RPC_CLIENT_NODE_ALREADY_ADDED", rpc_py)
+        self.node.peer_manager = _PeerManagerStub()
+        _dispatch(self.rpc, "addnode", ["127.0.0.1:12345", "add"])
+        resp = _dispatch(self.rpc, "addnode", ["127.0.0.1:12345", "add"])
+        self.assertEqual(_error_code(resp), RPC_CLIENT_NODE_ALREADY_ADDED)
 
     # G25 — RPC_CLIENT_NODE_NOT_ADDED (-24) -------------------------------
-    @pytest.mark.xfail(reason="W125 BUG-1: addnode remove → ValueError → -32603",
-                       strict=False)
+    # FIXED (W125 FIX wave, ported from rustoshi 7b94ef1): 'remove' of a node
+    # never added now raises RPC_CLIENT_NODE_NOT_ADDED (-24) instead of a
+    # ValueError->-32603 (net.cpp:368). xfail removed.
     def test_g25_node_not_added_via_remove(self):
+        self.node.peer_manager = _PeerManagerStub()
         resp = _dispatch(self.rpc, "addnode",
                          ["127.0.0.1:12345", "remove"])
         self.assertEqual(_error_code(resp), RPC_CLIENT_NODE_NOT_ADDED)
@@ -455,13 +489,14 @@ class TestW125_RpcErrorParity(unittest.TestCase):
         self.assertIn("RPC_IN_WARMUP", rpc_py)
 
     # G29 — RPC_CLIENT_NODE_NOT_CONNECTED (-29) ---------------------------
-    @pytest.mark.xfail(reason="W125 BUG-11: disconnectnode on missing peer "
-                              "silently returns null",
-                       strict=False)
+    # FIXED (W125 FIX wave, ported from rustoshi 845f7e4): disconnectnode for a
+    # peer not in any connected-peer map now raises RPC_CLIENT_NODE_NOT_CONNECTED
+    # (-29) instead of silently returning null (net.cpp:478). Use a peer manager
+    # with zero connected peers (the genuine miss path), not the no-pm degenerate
+    # path. xfail removed.
     def test_g29_node_not_connected_via_disconnectnode(self):
-        """disconnectnode on a non-existent peer should emit -29.
-        ouroboros returns `{"result": null}`.
-        """
+        """disconnectnode on a non-connected peer emits -29."""
+        self.node.peer_manager = _PeerManagerStub()  # no peers connected
         resp = _dispatch(self.rpc, "disconnectnode",
                          ["127.0.0.1:65535", -1])
         self.assertEqual(_error_code(resp), RPC_CLIENT_NODE_NOT_CONNECTED)
@@ -484,6 +519,18 @@ class TestW125_RpcErrorParity(unittest.TestCase):
         self.assertTrue(re.search(r"\bRPC_CLIENT_NODE_CAPACITY_REACHED\b", rpc_py))
         self.assertTrue(re.search(r"\bRPC_WALLET_ALREADY_LOADED\b", rpc_py))
         self.assertTrue(re.search(r"\bRPC_WALLET_ALREADY_EXISTS\b", rpc_py))
+
+    # G30b — RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) on setban --------------
+    # FIXED (W125 FIX wave, ported from rustoshi 980a31d): setban with an
+    # un-parseable IP/subnet now raises RPC_CLIENT_INVALID_IP_OR_SUBNET (-30)
+    # "Error: Invalid IP/Subnet" (Core net.cpp:780), instead of -32603. This is
+    # the focused behavioral gate; the G30 aggregate above tracks the remaining
+    # operator-surface codes (-31/-32/-33/-34/-35/-36) which are still absent.
+    def test_g30b_setban_invalid_ip_subnet(self):
+        self.node.peer_manager = _PeerManagerStub()
+        resp = _dispatch(self.rpc, "setban", ["not-an-ip", "add"])
+        self.assertEqual(_error_code(resp), RPC_CLIENT_INVALID_IP_OR_SUBNET)
+        self.assertEqual(resp["error"]["message"], "Error: Invalid IP/Subnet")
 
 
 # ---------------------------------------------------------------------------
