@@ -72,6 +72,32 @@ class Block:
 
         return bytes(data)
 
+    def serialize_with_witness(self) -> bytes:
+        """Serialize the block in segwit wire format (BIP144).
+
+        80-byte header + tx count + each tx serialized WITH witness.  Unlike
+        :meth:`serialize` (which strips witnesses on the round-trip), this
+        preserves the coinbase witness reserved value (nonce) that
+        ``CheckWitnessCommitment`` requires — so a peer answering a
+        ``MSG_WITNESS_BLOCK`` getdata does not serve a witness-less block that
+        the requester then rejects with ``bad-witness-nonce-size``.  Used as a
+        fallback when the witness-preserving raw bytes (``get_block_bytes``)
+        are unavailable.
+        """
+        from ouroboros.p2p_messages import encode_varint
+
+        data = bytearray()
+        data.extend(self.version.to_bytes(4, 'little', signed=True))
+        data.extend(self.prev_blockhash)
+        data.extend(self.merkle_root)
+        data.extend(self.timestamp.to_bytes(4, 'little'))
+        data.extend(self.bits.to_bytes(4, 'little'))
+        data.extend(self.nonce.to_bytes(4, 'little'))
+        data.extend(encode_varint(len(self.transactions)))
+        for tx in self.transactions:
+            data.extend(tx.serialize_with_witness())
+        return bytes(data)
+
     @classmethod
     def deserialize(cls, data: bytes) -> 'Block':
         """Deserialize a block from Bitcoin wire format.

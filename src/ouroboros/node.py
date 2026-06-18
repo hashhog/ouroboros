@@ -713,6 +713,23 @@ class BitcoinNode:
 
             self._rpc_task = asyncio.create_task(_safe_rpc_start())
 
+            # P2P-reorg route-through wiring (GAP3): now that BOTH block_sync
+            # and rpc_server exist, inject the RPC server's submitblock
+            # side-branch reorg methods (_attach_side_branch_block /
+            # _reorg_to_side_branch_tip) into block_sync via a callback
+            # closure.  This routes a P2P-discovered heavier fork through the
+            # SAME tested reorg path submitblock uses, without block_sync
+            # importing rpc at module top (which would create an import cycle).
+            try:
+                if self.block_sync is not None and self.rpc_server is not None:
+                    self.block_sync.set_reorg_handler(self.rpc_server)
+                    logger.debug("P2P fork reorg handler wired into block_sync")
+            except Exception as e:
+                logger.warning(
+                    f"Failed to wire P2P fork reorg handler "
+                    f"(P2P reorg disabled, node continues): {e}"
+                )
+
             # ZMQ notifier (optional — per-topic configuration)
             # Configure endpoints for each ZMQ topic
             self.zmq_notifier = ZMQNotifier()
@@ -1537,9 +1554,48 @@ class BitcoinNode:
                                     not_found.append((inv_type, inv_hash))
                                     continue
                             if block:
+                                # BIP144: a MSG_WITNESS_BLOCK getdata MUST be
+                                # answered with the segwit (witness) block
+                                # serialization.  The coinbase witness reserved
+                                # value (nonce) is part of it, and a peer
+                                # connecting the block runs
+                                # CheckWitnessCommitment — which rejects
+                                # "bad-witness-nonce-size" when the witness is
+                                # stripped.  The Python Block round-trip drops
+                                # witnesses (see Database.get_block_bytes), so
+                                # BlockMessage(block).serialize() serves a
+                                # witness-LESS block; this broke P2P block
+                                # download from ouroboros (e.g. a peer fetching
+                                # a competing fork's bodies for a reorg).  Prefer
+                                # the stored raw consensus bytes (byte-exact,
+                                # witness-preserving); fall back to an explicit
+                                # witness serialization of the Block; only a
+                                # legacy MSG_BLOCK request gets the stripped form.
                                 from ouroboros.p2p_messages import BlockMessage
-                                block_msg = BlockMessage(block=block)
-                                await peer.send_message(block_msg.to_network_message(network))
+                                payload = None
+                                if inv_type == MSG_WITNESS_BLOCK:
+                                    payload = await asyncio.to_thread(
+                                        self.db.get_block_bytes, inv_hash,
+                                    )
+                                    if payload is None:
+                                        try:
+                                            payload = block.serialize_with_witness()
+                                        except Exception:
+                                            payload = None
+                                if payload is not None:
+                                    from ouroboros.p2p_messages import (
+                                        NetworkMessage, get_magic,
+                                    )
+                                    msg_out = NetworkMessage(
+                                        command="block",
+                                        payload=bytes(payload),
+                                        magic=get_magic(network),
+                                    )
+                                    await peer.send_message(msg_out)
+                                else:
+                                    await peer.send_message(
+                                        BlockMessage(block=block).to_network_message(network)
+                                    )
                                 logger.debug(f"Sent block {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
                             else:
                                 not_found.append((inv_type, inv_hash))

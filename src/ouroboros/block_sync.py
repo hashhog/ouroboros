@@ -168,6 +168,13 @@ logger = logging.getLogger(__name__)
 # peer keeps us in an infinite getheaders/orphan loop.
 _MAX_NUM_UNCONNECTING_HEADERS_MSGS: int = 10
 
+# Maximum combined reorg depth (disconnect + connect) the P2P fork path will
+# bridge/route before refusing — mirrors rpc.MAX_REORG_DEPTH (=100).  Defined
+# locally rather than imported from rpc to avoid the rpc↔block_sync import
+# cycle (rpc imports block_sync); the reorg machinery itself re-checks the cap
+# in rpc._reorg_to_side_branch_tip, so this is a download-side guard only.
+MAX_REORG_DEPTH: int = 100
+
 
 def _distribute_blocks_round_robin(
     items: list,
@@ -487,6 +494,129 @@ class BlockSync:
         # Counters for the per-header PoW gate (used by tests + ops).
         self._headers_pow_rejected: int = 0
         self._headers_presync_failures: int = 0
+
+        # ----------------------------------------------------------------
+        # Fork-header discovery store (GAP1 of the P2P-reorg fix).
+        #
+        # ``_validated_headers`` is a LINEAR, tip-anchored queue: slot 0 is
+        # always tip+1 and every entry chains forward from our active DB tip
+        # (the 938231 slot-alignment + IBD-window invariant).  It therefore
+        # CANNOT hold a competing side chain that forks BELOW the active tip
+        # — admitting such a header into that queue corrupts the slot↔height
+        # mapping and false-rejects the block at connect time.
+        #
+        # Pre-fix, a header whose ``prev`` is a hash we know but which does
+        # NOT extend our active tip was simply DROPPED at the continuity
+        # check, so ouroboros never discovered a heavier fork over P2P (it
+        # stayed on chain A forever — the reorg-drop production blocker).
+        #
+        # These maps are the side-chain analogue of the RPC layer's
+        # ``_side_branch_blocks`` (rpc.py:1172): a separate, bounded store of
+        # fork headers (and, once downloaded, their raw block bytes) that the
+        # heavier-fork path feeds into the SAME submitblock side-branch reorg
+        # machinery via the callback set by :meth:`set_reorg_handler`.  Kept
+        # off ``_validated_headers`` so the normal tip-extension path stays
+        # byte-identical.
+        #
+        # Bounded with evict-oldest (FIFO via dict insertion order, mirroring
+        # rpc._evict_side_branch_if_full :6755) so a peer cannot grow them
+        # without bound by spamming valid-prev fork headers.
+        self._fork_headers: dict[bytes, BlockHeader] = {}      # hash -> header
+        self._fork_header_prev: dict[bytes, bytes] = {}        # hash -> prev_hash
+        self._fork_block_bytes: dict[bytes, bytes] = {}        # hash -> raw block
+        # hash -> monotonic ts of the last getheaders we sent chasing this
+        # fork tip / unknown-prev (rate-limits fork getheaders so a churn of
+        # competing-tip invs / unconnecting batches cannot flood the peer).
+        self._fork_getheaders_sent: dict[bytes, float] = {}
+        self._fork_headers_max: int = 2048
+        # Rate-limit window (s) for repeat fork getheaders on the same hash.
+        self._fork_getheaders_interval: float = 5.0
+        # Counters (tests + ops).
+        self._fork_headers_stored: int = 0
+        self._fork_reorg_triggered: int = 0
+        # Reorg route-through handlers, injected by node.py once both
+        # block_sync and rpc_server are built (see set_reorg_handler).  Left
+        # None in header-only / test contexts; the fork path then stores +
+        # logs but does not attempt a reorg.
+        self._attach_side_branch_block = None
+        self._reorg_to_side_branch_tip = None
+        self._reorg_db = None
+        # Reference to the RPC server's side-branch buffer + evictor, captured
+        # in set_reorg_handler so GAP3 can pre-populate a multi-block bridge
+        # into the SAME buffer the reorg engine walks (single-reorg path).
+        self._side_branch_buffer = None
+        self._evict_side_branch_if_full = None
+        # GAP0 fork discovery: peers we have already sent a one-shot initial
+        # getheaders to (Core's per-peer headers-sync start).  A heavier
+        # competing fork on an already-connected peer whose ADVERTISED height
+        # is stale or equal is never selected by the height-gated
+        # _get_sync_peer, so without an unconditional initial probe the
+        # fork-aware path is unreachable.  Pruned to connected peers each tick
+        # so a reconnect is re-probed.  Bounded by the peer count.
+        self._initial_getheaders_sent: set = set()
+
+    def set_reorg_handler(self, rpc_server) -> None:
+        """Wire the P2P fork path through the EXISTING submitblock side-branch
+        reorg machinery on *rpc_server*.
+
+        Called by node.py after both ``block_sync`` and ``rpc_server`` are
+        constructed.  We store bound-method references to the RPC server's
+        ``_attach_side_branch_block`` / ``_reorg_to_side_branch_tip`` (the
+        tested reorg path submitblock already uses — rpc.py:6765/6920) rather
+        than importing ``rpc`` at module top, which would create an import
+        cycle (rpc imports block_sync).  This is the blockbrew / nimrod /
+        lunarblock pattern: route the P2P fork through the same code path
+        submitblock uses, never a second reorg engine.
+        """
+        try:
+            self._attach_side_branch_block = rpc_server._attach_side_branch_block
+            self._reorg_to_side_branch_tip = rpc_server._reorg_to_side_branch_tip
+            # The reorg machinery reads its connect chain from the RPC server's
+            # ``_side_branch_blocks`` buffer (the dict ``_attach_side_branch_block``
+            # populates and ``_reorg_to_side_branch_tip`` walks).  Capture a
+            # reference so GAP3 can pre-populate every bridging block of a
+            # multi-block fork into the SAME buffer and then trigger ONE reorg
+            # on the tip — instead of calling ``_attach_side_branch_block`` per
+            # block, which would cascade a separate reorg for every fork block
+            # above the active tip (each disconnect/reconnect, and the second
+            # such call would re-walk an already-connected block).  Defaults to
+            # None when absent so the fork path degrades to store-only.
+            self._side_branch_buffer = getattr(
+                rpc_server, "_side_branch_blocks", None
+            )
+            self._evict_side_branch_if_full = getattr(
+                rpc_server, "_evict_side_branch_if_full", None
+            )
+            # The reorg machinery takes ``db`` as its first argument; pin the
+            # block_sync DB so the fork path can call it without threading db
+            # through every call site.
+            self._reorg_db = self.db
+        except AttributeError as e:
+            logger.warning(
+                f"set_reorg_handler: rpc_server missing reorg method ({e}); "
+                f"P2P fork reorg disabled"
+            )
+
+    def _evict_fork_headers_if_full(self) -> None:
+        """Bound the fork-header store (evict-oldest FIFO).
+
+        Mirrors rpc._evict_side_branch_if_full (:6755): a peer could otherwise
+        flood valid-prev fork headers and grow these maps without bound.  We
+        evict the OLDEST entries (dict insertion order) across all three
+        per-hash maps in lock-step once past the cap.
+        """
+        excess = len(self._fork_headers) - self._fork_headers_max
+        if excess <= 0:
+            return
+        for _ in range(excess):
+            try:
+                k = next(iter(self._fork_headers))
+            except StopIteration:
+                break
+            self._fork_headers.pop(k, None)
+            self._fork_header_prev.pop(k, None)
+            self._fork_block_bytes.pop(k, None)
+            self._fork_getheaders_sent.pop(k, None)
 
     def set_zmq_publisher(self, publisher) -> None:
         """Attach a ZMQPublisher for real-time block/tx notifications."""
@@ -918,6 +1048,40 @@ class BlockSync:
                 if self._header_sync_peer:
                     await self._catch_up(self._header_sync_peer, best_height)
 
+                # GAP0 — fork discovery at tip.  The height-gated selector
+                # above only sends getheaders to a peer that ADVERTISES a
+                # taller chain (_peer_known_height > our_height).  A heavier
+                # competing fork on an already-connected peer whose advertised
+                # height is stale or equal (a peer that mined past us after the
+                # handshake, or a same-height fork carrying more work) is
+                # therefore never discovered, and the fork-aware reorg path
+                # (handle_headers GAP1 → fork download → side-branch reorg) is
+                # unreachable dead code.  Core sends an initial getheaders to
+                # every block-serving peer regardless of advertised height
+                # (net_processing.cpp SendMessages :5796 — at tip it probes
+                # *every* such peer, the locator starting just below the tip so
+                # the reply is non-empty and the peer's best block is learned).
+                # Mirror that with a one-shot per-peer initial getheaders, fired
+                # only when no peer claims to be ahead of us (i.e. we are at the
+                # tip of everything we currently know) so normal IBD — driven by
+                # the taller-peer path above — is byte-for-byte unchanged.
+                # Bounded: exactly one getheaders per peer per connection.
+                if self._get_sync_peer(best_height) is None:
+                    for peer in list(self._peer_handlers.keys()):
+                        if peer in self._initial_getheaders_sent:
+                            continue
+                        if not (isinstance(peer, Peer) and peer.is_connected()):
+                            continue
+                        await self._catch_up(peer, best_height)
+                        self._initial_getheaders_sent.add(peer)
+                # Forget departed peers so a reconnect is re-probed (and the
+                # set cannot retain refs to dead peers).
+                if self._initial_getheaders_sent:
+                    self._initial_getheaders_sent = {
+                        p for p in self._initial_getheaders_sent
+                        if isinstance(p, Peer) and p.is_connected()
+                    }
+
                 # Handle timeouts
                 await self._handle_timeouts()
 
@@ -935,6 +1099,13 @@ class BlockSync:
                 # Advance headers-first download window (in case blocks
                 # connected between sync_loop iterations).
                 await self._request_next_blocks()
+
+                # PART 5: re-evaluate stored competing forks each tick.  A
+                # fork that was NOT heavier when its headers arrived (or whose
+                # bridging base only landed later) may have become heavier; a
+                # per-tick re-check catches it without waiting for another
+                # header batch.  Cheap (no-op when the fork store is empty).
+                await self._recheck_forks()
 
                 # Prune validated headers that have been downloaded and connected.
                 self._prune_validated_headers()
@@ -969,6 +1140,11 @@ class BlockSync:
                 self._requested_txs.pop(h, None)
 
             has_new_blocks = False
+            # Last unknown-block inv hash in this batch — used as the rate-limit
+            # key for the unknown-inv getheaders below (GAP1 / Core
+            # MaybeSendGetHeaders), and to nudge fork discovery for a competing
+            # tip announced via inv.
+            _last_unknown_block: bytes | None = None
             # Lazily read our tip height only when a block inv needs it, so
             # tx-only inv batches stay on the cheap path.
             _our_tip_height: int | None = None
@@ -976,6 +1152,7 @@ class BlockSync:
                 if inv_type == INV_TYPE_BLOCK:
                     if not self.db.has_block_hash(inv_hash):
                         has_new_blocks = True
+                        _last_unknown_block = inv_hash
                         # Core UpdateBlockAvailability (net_processing.cpp:4069):
                         # a block inv we do not yet have means the peer knows a
                         # block beyond our index.  We cannot know its exact
@@ -1029,11 +1206,11 @@ class BlockSync:
             )
 
             if has_new_blocks:
-                # Don't send getheaders here — let the sync_loop's single-peer
-                # approach handle it.  Sending getheaders to the inv peer AND
-                # the sync peer creates overlapping header batches that arrive
-                # out of order and get dropped.  Instead, just designate this
-                # peer as the sync peer if we don't have one.
+                # Designate this peer as the sync peer if we don't have one,
+                # so the normal single-peer header-sync loop drives forward
+                # extension without overlapping header batches (the original
+                # rationale for NOT blindly sending getheaders here — two peers
+                # streaming headers arrive out of order and get dropped).
                 if not self._header_sync_peer or not self._header_sync_peer.is_connected():
                     self._header_sync_peer = peer
                     self._header_sync_time = time.time()
@@ -1041,6 +1218,21 @@ class BlockSync:
                         f"Block inv from {peer.host}:{peer.port} — "
                         f"set as header sync peer"
                     )
+
+                # GAP1 (Core MaybeSendGetHeaders, net_processing.cpp): on an
+                # unknown-block inv, send a getheaders with a FULL locator so
+                # the peer can find our common ancestor and stream the
+                # bridging headers for a COMPETING fork that forks below our
+                # tip.  Without this, a peer that announces a heavier
+                # side-chain only via inv (no header push) is never asked for
+                # the fork headers and the reorg is never discovered.  This is
+                # rate-limited per-hash via ``_fork_getheaders_sent`` (5 s
+                # window) so it cannot create the out-of-order header flood the
+                # old "never send" rule guarded against — at steady tip the
+                # same competing hash is announced repeatedly but we ask at
+                # most once per window.
+                if _last_unknown_block is not None:
+                    await self._maybe_send_fork_getheaders(peer, _last_unknown_block)
 
             if blocks_to_request:
                 getdata = GetDataMessage(inventory=blocks_to_request)
@@ -1130,6 +1322,37 @@ class BlockSync:
             if was_requested:
                 del self.requested_blocks[block_hash]
             self._block_request_peer.pop(block_hash, None)
+
+            # GAP2: competing-fork body delivery.  If this block's hash is a
+            # header we admitted into the fork store (handle_headers GAP1), it
+            # is a bridging body for a heavier side chain — NOT a tip-extension
+            # IBD block.  Stash the raw bytes in the SEPARATE ``_fork_block_bytes``
+            # store (keyed by hash) rather than ``_ibd_block_buffer`` so the TTL
+            # sweep (_sweep_ibd_block_buffer) cannot evict it before the whole
+            # bridge is downloaded, and so the height-anchored IBD drain (which
+            # only connects tip+1..) never tries to connect a fork body at a
+            # height the active chain already occupies.  Then re-evaluate whether
+            # the bridge is now complete and route it through the submitblock
+            # side-branch reorg engine (GAP3 — _complete_fork_bridge).
+            if block_hash in self._fork_headers:
+                self._fork_block_bytes[block_hash] = payload
+                logger.info(
+                    f"Fork body {block_hash.hex()[:16]}... received from "
+                    f"{peer.host}:{peer.port} ({len(self._fork_block_bytes)}/"
+                    f"{len(self._fork_headers)} fork bodies present)"
+                )
+                # Continue draining the missing bridging bodies and, once the
+                # bridge to a known active-chain ancestor is complete, attach +
+                # reorg.  Guarded so a malformed bridge cannot wedge the loop.
+                try:
+                    await self._on_fork_body_received(block_hash, peer)
+                except Exception as e:
+                    logger.error(
+                        f"fork-bridge handling for {block_hash.hex()[:16]}... "
+                        f"failed: {e}",
+                        exc_info=True,
+                    )
+                return
 
             # Already have this block?  Skip duplicate ONLY if we did not
             # request it.  After a chainstate rollback, BLOCKS_CF still
@@ -1963,6 +2186,170 @@ class BlockSync:
             # Malformed bits or serialization → treat as failed PoW.
             return False
 
+    def _resolve_active_height(self, block_hash: bytes) -> int | None:
+        """Return the active-chain height of ``block_hash``, or ``None`` if it
+        is not on the active best chain.
+
+        Mirrors the resolution tiering in rpc._resolve_parent_height (active
+        tip → Rust ``find_height_of_hash`` → Python backwards-walk on
+        ``get_block_hash_by_height``) but consults ONLY the active chain — the
+        fork store is checked separately by the caller.  Used to (a) test
+        whether a fork header's prev anchors to a known active-chain block and
+        (b) compute the fork-point height for the strictly-heavier compare.
+        """
+        try:
+            tip_hash, tip_height = self.db.get_best_block()
+        except Exception:
+            tip_hash, tip_height = None, None
+        if tip_hash is not None and block_hash == tip_hash:
+            return tip_height
+        if tip_height is None:
+            return None
+        if hasattr(self.db, "find_height_of_hash"):
+            try:
+                h = self.db.find_height_of_hash(block_hash, tip_height)
+                if h is not None:
+                    return h
+            except Exception:
+                pass
+        if hasattr(self.db, "get_block_hash_by_height"):
+            for h in range(tip_height, -1, -1):
+                try:
+                    candidate = self.db.get_block_hash_by_height(h)
+                except Exception:
+                    candidate = None
+                if candidate is not None and bytes(candidate) == block_hash:
+                    return h
+        return None
+
+    def _fork_anchor_known(self, prev_hash: bytes) -> bool:
+        """True iff ``prev_hash`` is a block we already know — on the active
+        best chain OR already stored in the fork header store.
+
+        This is the gate that separates a genuine COMPETING FORK (admit into
+        ``_fork_headers``) from a genuinely-unconnecting header (truly-unknown
+        prev → DoS counter + getheaders + break, unchanged).
+        """
+        if prev_hash is None:
+            return False
+        if prev_hash in self._fork_headers:
+            return True
+        return self._resolve_active_height(prev_hash) is not None
+
+    def _store_fork_header(self, block_hash: bytes, header, prev_hash: bytes) -> None:
+        """Record a competing-fork header (and its prev edge) in the bounded
+        fork store.  Does NOT touch ``_validated_headers`` (that queue stays
+        linear + tip-anchored).  Idempotent on the hash.
+        """
+        if block_hash in self._fork_headers:
+            return
+        self._fork_headers[block_hash] = header
+        self._fork_header_prev[block_hash] = prev_hash
+        self._fork_headers_stored += 1
+        self._evict_fork_headers_if_full()
+
+    def _fork_tip_height(self, fork_tip_hash: bytes) -> int | None:
+        """Compute the height of ``fork_tip_hash`` by walking ``_fork_header_prev``
+        down to the first ancestor that is on the active chain, then counting
+        forward.  Returns ``None`` if the fork does not anchor to a known
+        active-chain block within ``MAX_REORG_DEPTH`` hops (defensive).
+
+        Height-as-work regtest shortcut: with a uniform target across competing
+        branches at the same height range, fork height stands in for cumulative
+        chain work — the same shortcut rpc._attach_side_branch_block (:6903)
+        and the camlcoin/rustoshi Pattern-Y closures take.  A real chainwork
+        compare is a mainnet follow-up (see the fix plan "Invariants / risks").
+        """
+        cursor = fork_tip_hash
+        steps = 0
+        # +1 over MAX_REORG_DEPTH so a fork exactly at the cap still resolves.
+        max_walk = MAX_REORG_DEPTH + 1
+        while steps <= max_walk:
+            anchor_h = self._resolve_active_height(cursor)
+            if anchor_h is not None:
+                # cursor is the common-ancestor on the active chain; the fork
+                # tip is `steps` blocks above it.
+                return anchor_h + steps
+            prev = self._fork_header_prev.get(cursor)
+            if prev is None:
+                # Walked off the known fork edges without hitting the active
+                # chain — incomplete fork (a bridging header is missing).
+                return None
+            cursor = prev
+            steps += 1
+        return None
+
+    async def _maybe_send_fork_getheaders(self, peer: Peer, key_hash: bytes) -> None:
+        """Send a getheaders with a FULL locator to *peer* to chase a fork /
+        unknown-prev header, rate-limited per ``key_hash``.
+
+        Core's ProcessHeadersMessage sends getheaders on nUnconnectingHeaders
+        (the unconnecting case) and MaybeSendGetHeaders fires on an unknown
+        block inv — both with the node's full block locator so the peer can
+        find the common ancestor and stream the bridging headers.  Pre-fix
+        ouroboros sent NEITHER from these paths, so a heavier fork below our
+        tip was never discovered.  Rate-limited via ``_fork_getheaders_sent``
+        so a churn of competing-tip invs / unconnecting batches cannot flood
+        the peer.
+        """
+        now = time.monotonic()
+        last = self._fork_getheaders_sent.get(key_hash)
+        if last is not None and (now - last) < self._fork_getheaders_interval:
+            return
+        try:
+            _, best_height = self.db.get_best_block()
+        except Exception:
+            best_height = 0
+        locator = self._build_locator(best_height if isinstance(best_height, int) else 0)
+        if not locator:
+            return
+        network = (
+            self.peer_manager.network
+            if hasattr(self.peer_manager, "network")
+            else "mainnet"
+        )
+        getheaders = GetHeadersMessage(
+            version=70015,
+            locator_hashes=locator,
+            hash_stop=b"\x00" * 32,
+        )
+        try:
+            await peer.send_message(getheaders.to_network_message(network))
+            # Re-stamp under the current key (move-to-end so the FIFO cap below
+            # evicts genuinely-stale keys first) and bound the map.  A churn of
+            # DISTINCT unknown-block invs at steady tip (the at-tip RSS-leak
+            # scenario) would otherwise grow this rate-limit map without bound,
+            # since unknown-inv keys never enter ``_fork_headers`` and so are
+            # never reached by ``_evict_fork_headers_if_full``.
+            self._fork_getheaders_sent.pop(key_hash, None)
+            self._fork_getheaders_sent[key_hash] = now
+            self._bound_fork_getheaders_sent()
+            logger.info(
+                f"Sent fork/unconnecting getheaders (locator {len(locator)} "
+                f"hashes) to {peer.host}:{peer.port}"
+            )
+        except Exception as e:
+            logger.debug(f"fork getheaders send failed to {peer.host}: {e}")
+
+    def _bound_fork_getheaders_sent(self) -> None:
+        """FIFO-cap the fork-getheaders rate-limit map.
+
+        Independent of ``_evict_fork_headers_if_full`` (which is keyed off
+        ``_fork_headers``): unknown-block-inv keys (Core MaybeSendGetHeaders)
+        never enter the fork-header store, so without this they would leak one
+        rate-limit entry per distinct hash.  Capped at ``2 * _fork_headers_max``
+        — comfortably above the legitimate distinct-fork-tip count while still
+        bounding the at-tip inv churn.
+        """
+        cap = self._fork_headers_max * 2
+        excess = len(self._fork_getheaders_sent) - cap
+        for _ in range(excess):
+            try:
+                k = next(iter(self._fork_getheaders_sent))
+            except StopIteration:
+                break
+            self._fork_getheaders_sent.pop(k, None)
+
     def _get_presync_state(self, peer: Peer):
         """Lazily create / fetch the Rust ``PyHeadersSyncState`` for *peer*.
 
@@ -2260,6 +2647,14 @@ class BlockSync:
                 expected_prev = best_hash
 
             accepted = 0
+            # Snapshot the fork-store counter so we can tell, after the loop,
+            # whether THIS batch admitted any competing-fork headers (GAP1) —
+            # the heavier-fork download trigger fires only when it did.
+            _fork_stored_before = self._fork_headers_stored
+            # Track the last fork-header hash we stored in this batch so the
+            # heavier-fork check below knows the candidate fork tip without a
+            # second scan.
+            _last_fork_hash: bytes | None = None
             # Headers that pass PoW + chain continuity in this batch and
             # therefore should be fed to the Rust ``HeadersSyncState``
             # presync state machine for commitment tracking.  Collected
@@ -2325,6 +2720,60 @@ class BlockSync:
                 # Validate chain continuity: header must extend expected_prev.
                 header_prev = header.prev_blockhash if hasattr(header, 'prev_blockhash') else None
                 if header_prev != expected_prev:
+                    # ----------------------------------------------------------
+                    # GAP1: competing-fork discovery.
+                    #
+                    # The header does NOT extend the active tip-anchored queue.
+                    # Pre-fix this was unconditionally treated as
+                    # "unconnecting" and the batch was dropped — so a heavier
+                    # fork that forks BELOW our tip (R3's chain B in the proof)
+                    # was never discovered and ouroboros stayed on chain A
+                    # forever (the reorg-drop production blocker).
+                    #
+                    # Distinguish two cases by whether ``header_prev`` is a
+                    # KNOWN hash — on our active best chain OR already in the
+                    # fork store (so a multi-header fork batch chains onto its
+                    # own earlier members):
+                    #   * KNOWN prev  -> genuine competing FORK.  PoW already
+                    #     passed above; store it in the SEPARATE bounded
+                    #     ``_fork_headers`` store (NOT ``_validated_headers``,
+                    #     which must stay linear + tip-anchored) and continue.
+                    #     The validated cursor ``expected_prev`` is left pinned
+                    #     to the active tip; the next fork header re-enters this
+                    #     branch via its prev now being in ``_fork_headers``.
+                    #   * UNKNOWN prev -> genuinely unconnecting.  Send a
+                    #     getheaders with a FULL locator so the peer can find
+                    #     our common ancestor and stream the bridging headers
+                    #     (Core ProcessHeadersMessage nUnconnectingHeaders →
+                    #     getheaders), keep the Core-parity DoS counter, and
+                    #     break.
+                    if self._fork_anchor_known(header_prev):
+                        # NB: do NOT advance ``expected_prev`` and do NOT add to
+                        # ``known_hashes`` — both track the TIP-ANCHORED
+                        # validated chain only.  A subsequent header that
+                        # builds on THIS fork header will re-enter this branch
+                        # (its prev is now in ``_fork_headers`` →
+                        # ``_fork_anchor_known`` True), so the whole fork batch
+                        # accumulates in the fork store while the validated
+                        # cursor stays pinned to the active tip.  Advancing
+                        # ``expected_prev`` here would make the next fork header
+                        # look like a tip-extension and wrongly append it to
+                        # ``_validated_headers`` (slot-misalignment).
+                        self._store_fork_header(block_hash, header, header_prev)
+                        _last_fork_hash = block_hash
+                        logger.info(
+                            f"Fork header {block_hash.hex()[:16]}... stored "
+                            f"(prev {header_prev.hex()[:16]}... is known, "
+                            f"does not extend active tip) from "
+                            f"{peer.host}:{peer.port}"
+                        )
+                        # A connecting (fork-extending) batch is NOT
+                        # unconnecting — reset the per-peer counter, matching
+                        # Core's nUnconnectingHeaders=0 on any header that
+                        # links to our block index.
+                        self._reset_unconnecting_headers(peer)
+                        continue
+
                     logger.warning(
                         f"Header {block_hash.hex()[:16]}... does not connect "
                         f"(expected prev {expected_prev.hex()[:16]}..., "
@@ -2342,6 +2791,13 @@ class BlockSync:
                     # CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
                     # (Pattern B).
                     if accepted == 0:
+                        # Core nUnconnectingHeaders → getheaders: ask this peer
+                        # for the bridging headers (full locator) BEFORE the
+                        # DoS break, so an honest peer announcing a fork whose
+                        # base we haven't seen yet can backfill it.  Rate-
+                        # limited per first-unknown-hash; does NOT itself
+                        # exempt the peer from the misbehavior counter below.
+                        await self._maybe_send_fork_getheaders(peer, block_hash)
                         if self._note_unconnecting_headers(peer):
                             addr = f"{peer.host}:{peer.port}"
                             logger.warning(
@@ -2604,12 +3060,493 @@ class BlockSync:
                     except Exception as e:
                         logger.error(f"Failed to request continuation headers: {e}")
 
+            # GAP1 → GAP2/GAP3 trigger: if this batch admitted competing-fork
+            # headers, evaluate whether the fork is now STRICTLY HEAVIER than
+            # our active best chain and, if so, kick off the bridging-body
+            # download that GAP2/GAP3 route through the submitblock reorg
+            # machinery.  Done after the tip-extension path above so the
+            # normal IBD / tip-extend flow is untouched when no fork headers
+            # were stored.
+            if (
+                self._fork_headers_stored > _fork_stored_before
+                and _last_fork_hash is not None
+            ):
+                await self._maybe_trigger_fork_download(_last_fork_hash, peer)
+
         except Exception as e:
             logger.error(f"Error handling headers from {peer.host}:{peer.port}: {e}")
             peer.adjust_score(-2)
             if hasattr(self.peer_manager, 'misbehaving'):
                 addr = f"{peer.host}:{peer.port}"
                 self.peer_manager.misbehaving(addr, 20, f"invalid headers: {e}")
+
+    async def _maybe_trigger_fork_download(
+        self, fork_tip_hash: bytes, peer: Peer
+    ) -> bool:
+        """If the stored fork ending at ``fork_tip_hash`` is STRICTLY HEAVIER
+        than our active best chain, begin downloading its bridging bodies
+        (GAP2) so the fork can be routed through the submitblock side-branch
+        reorg machinery (GAP3).
+
+        PART 1 (this phase) implements the heavier-fork DECISION and records
+        the candidate; the body-download (``_request_fork_blocks``) and the
+        route-through (``_attach_side_branch_block`` callback) are wired in the
+        GAP2/GAP3 phases.  This method is the single entry point both phases
+        will hang off, and it is also re-evaluated each sync_loop tick (PART 5)
+        so a fork that becomes heavier later still triggers.
+
+        Strictly-heavier uses the height-as-work regtest shortcut (mirrors
+        rpc._attach_side_branch_block :6903); a real chainwork compare is a
+        mainnet follow-up.
+
+        Returns True iff the fork was found strictly heavier (a download was
+        requested or would be once GAP2 lands).
+        """
+        fork_height = self._fork_tip_height(fork_tip_hash)
+        if fork_height is None:
+            # Fork does not anchor to a known active-chain ancestor yet (a
+            # bridging header is still missing).  Chase the missing base by
+            # asking this peer for more headers with a full locator.
+            await self._maybe_send_fork_getheaders(peer, fork_tip_hash)
+            return False
+        try:
+            _, active_height = self.db.get_best_block()
+        except Exception:
+            active_height = -1
+        if fork_height <= active_height:
+            # Stored but not heavier — keep it in the fork store in case it
+            # extends further later (Core stores it in the block index but
+            # does not flip the tip).  No download.
+            logger.debug(
+                f"Fork tip {fork_tip_hash.hex()[:16]}... h={fork_height} "
+                f"not heavier than active h={active_height}; stored only"
+            )
+            return False
+        # Strictly heavier — this fork should become the active chain.
+        self._fork_reorg_triggered += 1
+        logger.warning(
+            f"Heavier competing fork discovered: tip "
+            f"{fork_tip_hash.hex()[:16]}... h={fork_height} > active "
+            f"h={active_height} — requesting bridging bodies for reorg"
+        )
+        # GAP2 hand-off: download the missing bridging bodies, then GAP3
+        # routes the completed bridge through the submitblock side-branch
+        # reorg path.  ``_request_fork_blocks`` short-circuits to the GAP3
+        # attach/reorg directly when every bridging body is already present
+        # (e.g. the bodies arrived via the normal inv/getdata path before the
+        # heavier-fork trigger fired).
+        try:
+            await self._request_fork_blocks(fork_tip_hash, peer)
+        except Exception as e:
+            logger.error(f"_request_fork_blocks failed: {e}", exc_info=True)
+        return True
+
+    def _fork_bridge_chain(
+        self, fork_tip_hash: bytes
+    ) -> tuple[list[bytes], bytes | None, int | None] | None:
+        """Walk ``_fork_header_prev`` from ``fork_tip_hash`` down to the first
+        ancestor that is on the ACTIVE chain (the common ancestor / fork
+        point).
+
+        Returns ``(bridge_hashes, ancestor_hash, ancestor_height)`` where
+        ``bridge_hashes`` is the fork chain in FORWARD order
+        (ancestor+1 … fork_tip), ``ancestor_hash`` is the common-ancestor block
+        on the active chain, and ``ancestor_height`` is its active-chain
+        height.  Returns ``None`` if the fork does not yet anchor to a known
+        active-chain block within ``MAX_REORG_DEPTH`` hops (a bridging header
+        is still missing — the caller should chase it with getheaders).
+
+        This is the descent the GAP2 download and GAP3 attach both need: the
+        same edge-set ``_fork_tip_height`` walks, but it returns the full
+        ordered hash list rather than just the height.  No tip floor — a fork
+        body may be at or below the active tip height (Core stores side-branch
+        blocks in the index regardless of height).
+        """
+        bridge_rev: list[bytes] = []
+        cursor = fork_tip_hash
+        # +1 over the cap so a bridge exactly at MAX_REORG_DEPTH still resolves;
+        # the rpc reorg loop applies the authoritative depth cap itself.
+        for _ in range(MAX_REORG_DEPTH + 2):
+            anchor_h = self._resolve_active_height(cursor)
+            if anchor_h is not None:
+                # cursor is the common ancestor on the active chain; everything
+                # collected so far is the fork bridge above it.
+                bridge_rev.reverse()
+                return bridge_rev, cursor, anchor_h
+            bridge_rev.append(cursor)
+            prev = self._fork_header_prev.get(cursor)
+            if prev is None:
+                # Walked off the known fork edges without reaching the active
+                # chain — a bridging header is missing.
+                return None
+            cursor = prev
+        # Exceeded the walk bound without anchoring — too deep / cyclic.
+        return None
+
+    async def _request_fork_blocks(self, fork_tip_hash: bytes, peer: Peer) -> None:
+        """GAP2: download the missing bridging bodies of the heavier fork that
+        ends at ``fork_tip_hash``.
+
+        Descends ``_fork_header_prev`` from the fork tip to the common ancestor
+        on the active chain, requesting (``MSG_WITNESS_BLOCK`` getdata) every
+        fork body we do NOT already have buffered in ``_fork_block_bytes``.  The
+        request bypasses the IBD head-of-window / buffer-pressure throttle
+        (those gates are anchored to the active-tip download window, which a
+        below-tip fork body is never part of) but still records each request in
+        ``requested_blocks`` / ``_block_request_peer`` so the normal in-flight
+        bookkeeping + timeout re-request path covers fork bodies too.  Honours
+        the global in-flight cap so a deep fork cannot blow past
+        ``_max_blocks_in_flight``.
+
+        Once every bridging body is present this defers to
+        ``_complete_fork_bridge`` (GAP3) immediately, so a fork whose bodies all
+        arrived before the heavier-fork trigger fired reorgs without waiting for
+        the next delivery.
+        """
+        chain = self._fork_bridge_chain(fork_tip_hash)
+        if chain is None:
+            # Bridge incomplete — a header is missing.  Chase it.
+            await self._maybe_send_fork_getheaders(peer, fork_tip_hash)
+            return
+        bridge_hashes, _ancestor_hash, _ancestor_h = chain
+
+        missing = [
+            h for h in bridge_hashes
+            if h not in self._fork_block_bytes and not self._have_fork_body(h)
+        ]
+        if not missing:
+            # Every bridging body is in hand — go straight to attach + reorg.
+            await self._complete_fork_bridge(fork_tip_hash)
+            return
+
+        network = (
+            self.peer_manager.network
+            if hasattr(self.peer_manager, "network")
+            else "mainnet"
+        )
+        now = time.time()
+        to_request: list[tuple[int, bytes]] = []
+        for h in missing:
+            if h in self.requested_blocks:
+                continue  # already in flight (this or another peer)
+            if len(self.requested_blocks) + len(to_request) >= self._max_blocks_in_flight:
+                # Respect the global in-flight cap; the per-tick _recheck_forks
+                # re-evaluation (PART 5) will request the rest as slots free up.
+                break
+            to_request.append((MSG_WITNESS_BLOCK, h))
+
+        if not to_request:
+            return
+        getdata = GetDataMessage(inventory=to_request)
+        try:
+            await peer.send_message(getdata.to_network_message(network))
+            for _, h in to_request:
+                self.requested_blocks[h] = now
+                self._record_first_request_time(h, now)
+                self._block_request_peer[h] = peer
+            logger.info(
+                f"Requested {len(to_request)} fork bridging bodies "
+                f"(tip {fork_tip_hash.hex()[:16]}...) from "
+                f"{peer.host}:{peer.port}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to request fork bodies: {e}")
+
+    def _have_fork_body(self, block_hash: bytes) -> bool:
+        """True iff the raw bytes for ``block_hash`` are recoverable without a
+        new network request — either buffered in ``_fork_block_bytes`` or
+        already persisted in ``BLOCKS_CF`` (a block we received earlier and
+        stored, e.g. one that was on the active chain before a prior reorg, or
+        was delivered via the IBD path).  ``BLOCKS_CF`` is never pruned to the
+        active chain, so a disconnected block's bytes survive there."""
+        if block_hash in self._fork_block_bytes:
+            return True
+        # Prefer the bytes-present probe (``has_block_data``) so we do not skip
+        # downloading a body for which we only have the header; fall back to the
+        # block-store existence probe (``has_block_hash``) when absent.
+        probe = getattr(self.db, "has_block_data", None)
+        if probe is None:
+            probe = getattr(self.db, "has_block_hash", None)
+        if probe is None:
+            return False
+        try:
+            return bool(probe(block_hash))
+        except Exception:
+            return False
+
+    def _load_fork_body(self, block_hash: bytes) -> bytes | None:
+        """Return the raw bytes for a bridging block: the freshly-downloaded
+        copy in ``_fork_block_bytes`` if present, else the persisted copy from
+        ``BLOCKS_CF`` (so a bridge that partially overlaps already-stored blocks
+        does not need them re-fetched)."""
+        raw = self._fork_block_bytes.get(block_hash)
+        if raw is not None:
+            return raw
+        for getter in ("get_block_bytes", "get_raw_block", "get_block_raw"):
+            fn = getattr(self.db, getter, None)
+            if fn is None:
+                continue
+            try:
+                raw = fn(block_hash)
+            except Exception:
+                raw = None
+            if raw:
+                return bytes(raw)
+        # Last resort: re-serialize a deserialized block, if the DB exposes one.
+        try:
+            blk = self.db.get_block(block_hash)  # type: ignore[attr-defined]
+        except Exception:
+            blk = None
+        if blk is not None and hasattr(blk, "serialize"):
+            try:
+                return blk.serialize()
+            except Exception:
+                return None
+        return None
+
+    async def _on_fork_body_received(self, block_hash: bytes, peer: Peer) -> None:
+        """Called from ``handle_block`` after a bridging body is stashed.
+
+        Finds the fork tip(s) that ``block_hash`` belongs to and re-drives the
+        download (to fetch any still-missing bodies) and, when the bridge is
+        complete, the GAP3 attach/reorg.  Routing through the tip keeps the
+        bridge-completion logic in one place (``_request_fork_blocks`` →
+        ``_complete_fork_bridge``).
+        """
+        for tip_hash in self._fork_tip_hashes():
+            # Only re-drive tips whose bridge this body is part of.  Cheap
+            # membership walk (bounded by MAX_REORG_DEPTH).
+            chain = self._fork_bridge_chain(tip_hash)
+            if chain is None:
+                continue
+            bridge_hashes, _anc, _anch = chain
+            if block_hash not in bridge_hashes and tip_hash != block_hash:
+                continue
+            await self._request_fork_blocks(tip_hash, peer)
+
+    async def _complete_fork_bridge(self, fork_tip_hash: bytes) -> str | None:
+        """GAP3: route a fully-downloaded heavier fork through the EXISTING
+        submitblock side-branch reorg engine.
+
+        Pre-conditions (checked here, not assumed): the reorg handler is wired
+        (``set_reorg_handler`` ran), the fork still anchors to a known
+        active-chain ancestor, every bridging body is in hand, and the fork tip
+        is strictly heavier than the active tip.
+
+        For each bridging block in FORWARD chain order it calls the RPC server's
+        ``_attach_side_branch_block(db, raw, hash, prev, height)`` — the SAME
+        tested machinery ``submitblock`` uses (rpc.py:6765).  Each call stashes
+        the block in the RPC server's ``_side_branch_blocks`` map; the heaviest
+        (the fork tip) auto-triggers ``_reorg_to_side_branch_tip``
+        (rpc.py:6912), which disconnects the active chain back to the common
+        ancestor and connects the buffered fork blocks — full ConnectBlock
+        validation (UTXO/script/BIP-30/sigops) runs there against the
+        disconnected chainstate, and the mempool is refilled.  We never call
+        ``accept_block`` directly on a fork body: that connects at tip+1 only
+        and cannot reorg.
+
+        Returns the BIP-22 result string of the final (tip) attach, or ``None``
+        on success / when the bridge is not yet actionable (still downloading,
+        not heavier, or no reorg handler).
+        """
+        if self._attach_side_branch_block is None or self._reorg_db is None:
+            # No reorg handler wired (header-only / test context) — keep the
+            # fork stored; nothing more to do.
+            logger.debug(
+                "fork bridge complete but no reorg handler wired; storing only"
+            )
+            return None
+
+        chain = self._fork_bridge_chain(fork_tip_hash)
+        if chain is None:
+            return None  # bridge still incomplete (a header is missing)
+        bridge_hashes, ancestor_hash, ancestor_height = chain
+        if not bridge_hashes:
+            return None  # fork tip IS the ancestor (nothing to connect)
+
+        # All bridging bodies must be in hand before we touch the chainstate.
+        bodies: dict[bytes, bytes] = {}
+        for h in bridge_hashes:
+            raw = self._load_fork_body(h)
+            if raw is None:
+                logger.debug(
+                    f"fork bridge {fork_tip_hash.hex()[:16]}... still missing "
+                    f"body {h.hex()[:16]}...; deferring reorg"
+                )
+                return None
+            bodies[h] = raw
+
+        # Strictly-heavier re-check (the active chain may have advanced since
+        # the trigger fired; height-as-work regtest shortcut, mirrors
+        # rpc._attach_side_branch_block :6903).
+        fork_height = ancestor_height + len(bridge_hashes)
+        try:
+            _, active_height = self.db.get_best_block()
+        except Exception:
+            active_height = -1
+        if fork_height <= active_height:
+            logger.debug(
+                f"fork bridge {fork_tip_hash.hex()[:16]}... h={fork_height} no "
+                f"longer heavier than active h={active_height}; not reorging"
+            )
+            return None
+
+        # Depth guard (mirrors the rpc reorg loop's MAX_REORG_DEPTH cap, applied
+        # here so we never even begin attaching an over-deep bridge).
+        if len(bridge_hashes) > MAX_REORG_DEPTH:
+            logger.warning(
+                f"fork bridge {fork_tip_hash.hex()[:16]}... too deep "
+                f"({len(bridge_hashes)} > {MAX_REORG_DEPTH}); refusing reorg"
+            )
+            return None
+
+        logger.warning(
+            f"Routing heavier P2P fork (tip {fork_tip_hash.hex()[:16]}..., "
+            f"h={fork_height}, {len(bridge_hashes)} bridging blocks) through "
+            f"submitblock side-branch reorg engine"
+        )
+        # The rpc reorg engine reorgs whenever ``_attach_side_branch_block`` is
+        # called with a block ABOVE the active tip.  A multi-block fork has
+        # MULTIPLE blocks above the active tip, so calling attach per block
+        # would cascade a separate reorg for each one (and the second such call
+        # would re-walk an already-connected block).  Instead, pre-populate the
+        # SAME ``_side_branch_blocks`` buffer the engine walks with every
+        # bridging block EXCEPT the tip, then call ``_attach_side_branch_block``
+        # ONLY on the tip — the heaviest block, which triggers exactly ONE
+        # ``_reorg_to_side_branch_tip`` that disconnects back to the common
+        # ancestor and connects the whole buffered bridge through the full
+        # ConnectBlock validation (UTXO/script/BIP-30/sigops) + mempool refill.
+        # This is the plan's "the heaviest block auto-triggers
+        # _reorg_to_side_branch_tip" with no cascade.
+        if self._side_branch_buffer is None:
+            # No buffer reference (older rpc server / test handler without the
+            # buffer).  Fall back to attaching only the tip and let the engine's
+            # own resolution handle the bridge.  Pre-populating is preferred but
+            # this keeps a degraded path working.
+            logger.debug(
+                "fork bridge: no side-branch buffer reference; tip-only attach"
+            )
+        else:
+            height = ancestor_height
+            for h in bridge_hashes:
+                height += 1
+                if h == fork_tip_hash:
+                    continue  # the tip is attached (validated + reorg) below
+                prev = self._fork_header_prev.get(h, ancestor_hash)
+                self._side_branch_buffer[h] = (prev, height, bodies[h])
+            if self._evict_side_branch_if_full is not None:
+                try:
+                    self._evict_side_branch_if_full()
+                except Exception:
+                    pass
+
+        # Attach the tip — its height > active tip, so this is the call that
+        # drives the single reorg through the engine.
+        tip_prev = self._fork_header_prev.get(fork_tip_hash, ancestor_hash)
+        try:
+            result: str | None = await self._attach_side_branch_block(
+                self._reorg_db, bodies[fork_tip_hash], fork_tip_hash,
+                tip_prev, fork_height,
+            )
+        except Exception as e:
+            logger.error(
+                f"attach_side_branch_block for fork tip "
+                f"{fork_tip_hash.hex()[:16]}... (h={fork_height}) failed: {e}",
+                exc_info=True,
+            )
+            return None
+        if result is not None:
+            # The reorg engine rejected the heavier fork (invalid block in the
+            # connect loop, missing ancestor, too-deep, etc.).  Drop the bridge
+            # so the per-tick re-check does not retry it forever, and purge the
+            # blocks we pre-populated into the side-branch buffer.
+            logger.warning(
+                f"P2P fork reorg rejected by engine: {result}; "
+                f"dropping fork {fork_tip_hash.hex()[:16]}..."
+            )
+            if self._side_branch_buffer is not None:
+                for h in bridge_hashes:
+                    self._side_branch_buffer.pop(h, None)
+            self._discard_fork(fork_tip_hash)
+            return result
+
+        # The tip attach auto-triggered the reorg inside the rpc engine.  If it
+        # succeeded the active tip is now the fork tip; clear the fork store
+        # entries for this bridge so the per-tick re-check does not re-attach.
+        try:
+            _, new_tip_height = self.db.get_best_block()
+        except Exception:
+            new_tip_height = -1
+        if new_tip_height >= fork_height:
+            self._reorg_applied_via_p2p = getattr(
+                self, "_reorg_applied_via_p2p", 0
+            ) + 1
+            logger.warning(
+                f"P2P fork reorg APPLIED: active tip now h={new_tip_height} "
+                f"(was h={active_height}); fork {fork_tip_hash.hex()[:16]}... "
+                f"adopted"
+            )
+            self._discard_fork(fork_tip_hash)
+        return result
+
+    def _discard_fork(self, fork_tip_hash: bytes) -> None:
+        """Drop a fork bridge (tip → common ancestor) from the fork store after
+        it has been adopted or rejected, so the per-tick re-check (PART 5) does
+        not re-process it.  Walks the same edge set as ``_fork_bridge_chain``
+        but tolerates a now-changed active chain by stopping at the first hash
+        no longer in ``_fork_header_prev``."""
+        cursor = fork_tip_hash
+        for _ in range(MAX_REORG_DEPTH + 2):
+            self._fork_headers.pop(cursor, None)
+            self._fork_block_bytes.pop(cursor, None)
+            self._fork_getheaders_sent.pop(cursor, None)
+            prev = self._fork_header_prev.pop(cursor, None)
+            if prev is None:
+                break
+            cursor = prev
+
+    def _fork_tip_hashes(self) -> list[bytes]:
+        """Return the hashes in the fork store that are NOT the prev of any
+        other stored fork header — i.e. the current fork TIPS.
+
+        A multi-header fork batch stores a chain h1→h2→…→hN; only hN is a tip.
+        Re-evaluating only tips keeps the per-tick re-check O(forks) rather
+        than O(forks²).
+        """
+        if not self._fork_headers:
+            return []
+        referenced = set(self._fork_header_prev.values())
+        return [h for h in self._fork_headers if h not in referenced]
+
+    async def _recheck_forks(self) -> None:
+        """PART 5: per-tick re-evaluation of stored competing forks.
+
+        For each current fork tip, re-run the strictly-heavier check so a fork
+        that becomes heavier later (e.g. its bridging base arrived after the
+        initial batch, or the active chain rolled back) still triggers the
+        download/reorg path.  No-op when the fork store is empty.
+        """
+        if not self._fork_headers:
+            return
+        peer = self._header_sync_peer
+        if peer is None or not peer.is_connected():
+            # Fall back to any ready peer so getheaders for a missing fork base
+            # can still be sent.
+            try:
+                ready = [
+                    p for p in self.peer_manager.get_all_ready_peers()
+                    if isinstance(p, Peer) and p.is_connected()
+                ] if hasattr(self.peer_manager, "get_all_ready_peers") else []
+            except Exception:
+                ready = []
+            peer = ready[0] if ready else None
+        if peer is None:
+            return
+        for tip_hash in self._fork_tip_hashes():
+            try:
+                await self._maybe_trigger_fork_download(tip_hash, peer)
+            except Exception as e:
+                logger.debug(f"_recheck_forks: {tip_hash.hex()[:16]}...: {e}")
 
     async def _request_next_blocks(self):
         """Request blocks from the validated header queue up to the in-flight limit.
