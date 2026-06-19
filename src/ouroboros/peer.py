@@ -428,6 +428,18 @@ class Peer:
         # callers keep their deadline semantics.
         self._read_timeout: float = 30.0
 
+        # Whole-connection idle-reaper threshold — DISTINCT from _read_timeout
+        # (the per-read deadline). Core's CConnman::InactivityCheck uses
+        # TIMEOUT_INTERVAL = 20 min (net.h:59), comfortably larger than the
+        # keepalive ping cadence (120 s here), so a peer that is merely quiet
+        # between blocks is NOT reaped before its own ping/pong refreshes
+        # _last_recv_monotonic. is_recv_stalled() previously defaulted to
+        # _read_timeout (60 s once listening) < the 120 s ping interval, so every
+        # quiet peer (block-relay-only peers, and full-relay peers between blocks)
+        # was GUARANTEED reaped on each 30 s sweep — constant peer churn + v1/v2
+        # re-dial + addrman burn. Decoupled to Core's 1200 s.
+        self._inactivity_timeout: float = 1200.0
+
         # BIP 324 v2 transport (set after successful negotiation)
         self._v2_transport: V2Transport | None = None
         self._v2_recv_buffer: bytes = b""
@@ -570,6 +582,10 @@ class Peer:
         # at construction so a freshly-accepted peer is not swept before its first
         # read.
         self._last_recv_monotonic: float = time.monotonic()
+        # Connection-age stamp for the inactivity-check grace window — mirrors
+        # Core ShouldRunInactivityChecks (net.cpp): skip the recv-idle reap for
+        # the first 60 s after connect so the handshake window is never swept.
+        self._connected_monotonic: float = time.monotonic()
         # Running count of messages/packets received since we last yielded
         # control to the event loop.  See V2_RECV_YIELD_EVERY: a high-rate
         # flood of VALID, already-buffered messages otherwise spins the receive
@@ -1725,12 +1741,19 @@ class Peer:
         TIMEOUT_INTERVAL``).  Evaluated by the per-node periodic sweeper
         (PeerManager.maintain_connections) once per pass, NEVER per read, so it
         costs zero ``TimerHandle``s on the hot receive path.  ``stall_timeout``
-        defaults to ``self._read_timeout`` (the deadline the v1/v2 receive path
-        threads in: HANDSHAKE_TIMEOUT during handshake, 60 s once listening),
-        matching the per-read bound the removed ``asyncio.timeout`` used to
-        enforce."""
+        defaults to ``self._inactivity_timeout`` (Core's TIMEOUT_INTERVAL = 20 min,
+        net.h:59) — the WHOLE-CONNECTION idle bound, which MUST exceed the keepalive
+        ping cadence (120 s) so a merely-quiet peer is refreshed by its own pong
+        before being reaped. (It deliberately does NOT default to ``_read_timeout``,
+        the 60 s per-read deadline; reusing that as the reaper window inverted the
+        Core relationship and churned every quiet peer each sweep.) A 60 s
+        post-connect grace mirrors Core ShouldRunInactivityChecks so the handshake
+        window is never swept."""
         if stall_timeout is None:
-            stall_timeout = self._read_timeout
+            stall_timeout = self._inactivity_timeout
+        # Don't reap during the first 60 s after connect (handshake window).
+        if (time.monotonic() - self._connected_monotonic) <= 60.0:
+            return False
         return (time.monotonic() - self._last_recv_monotonic) > stall_timeout
 
     async def receive_message(self, timeout: float = 30.0) -> NetworkMessage:
