@@ -220,6 +220,11 @@ KNOWN_ADDRS_MAX_ENTRIES = 100_000
 # addresses are dropped once the bucket runs dry.  Genuine Core constants.
 MAX_ADDR_RATE_PER_SECOND = 0.1          # Core MAX_ADDR_RATE_PER_SECOND
 MAX_ADDR_PROCESSING_TOKEN_BUCKET = 1000  # Core MAX_ADDR_PROCESSING_TOKEN_BUCKET (= MAX_ADDR_TO_SEND)
+# Bound on how long an awaited addr-relay send may block on a target peer's
+# writer.drain() before the target is treated as wedged and disconnected. Keeps
+# _relay_addr inline-awaited (no unbounded fire-and-forget send Tasks) without
+# letting one non-draining peer stall addr processing indefinitely.
+ADDR_RELAY_SEND_TIMEOUT = 5.0  # seconds
 
 # Bound on BanManager misbehaviour-score retention.  A score record whose
 # last event is older than this is reclaimed by the periodic sweep, and each
@@ -3372,7 +3377,7 @@ class PeerManager:
                 if added:
                     logger.debug(f"Learned {added} new addresses from {addr}")
                     # Relay to 1-2 random peers
-                    self._relay_addr(msg, exclude=addr)
+                    await self._relay_addr(msg, exclude=addr)
             except Exception as e:
                 logger.debug(f"Error parsing addr from {addr}: {e}")
 
@@ -3416,7 +3421,7 @@ class PeerManager:
                         self._add_known_addr(f"{host_str}:{port}")
                 if added:
                     logger.debug(f"Learned {added} new addresses (v2) from {addr}")
-                    self._relay_addr(msg, exclude=addr)
+                    await self._relay_addr(msg, exclude=addr)
             except (ValueError, struct.error) as e:
                 # Expected for malformed wire payloads (truncated, bad varint,
                 # oversize address).  ``AddrV2Message.from_payload`` raises
@@ -3491,7 +3496,7 @@ class PeerManager:
         except Exception as e:
             logger.debug(f"Failed to send getaddr to {peer.host}:{peer.port}: {e}")
 
-    def _relay_addr(self, msg: NetworkMessage, exclude: str = "") -> None:
+    async def _relay_addr(self, msg: NetworkMessage, exclude: str = "") -> None:
         all_items = list(self.peers.items()) + list(self.inbound_peers.items())
         candidates = [
             p for a, p in all_items
@@ -3499,8 +3504,29 @@ class PeerManager:
         ]
         targets = random.sample(candidates, min(2, len(candidates)))
         for p in targets:
+            # AWAIT the relay send (bounded by a timeout) instead of
+            # asyncio.ensure_future(p.send_message(msg)). The fire-and-forget
+            # form parked a Task on writer.drain() forever against any relay
+            # target that stops draining its socket, and each parked Task held
+            # the full inbound `msg` (NetworkMessage + its two read buffers)
+            # alive — the only un-bounded message-capturing Task in the node.
+            # Under load that piled up millions of Tasks: the 2026-06-20 box OOM
+            # captured ~2.5M retained messages (tracemalloc at peer.py:1910/1731,
+            # 5M read-objects). Awaiting here back-pressures the recv loop (its
+            # callers on_addr/on_addrv2 already `await _relay_addr`); a peer that
+            # cannot accept the relay within the timeout is dropped, mirroring
+            # Bitcoin Core, which disconnects a peer whose send buffer stays full
+            # (net.cpp SocketSendData / nSendSize). No Task is left holding `msg`.
             try:
-                asyncio.ensure_future(p.send_message(msg))
+                await asyncio.wait_for(
+                    p.send_message(msg), timeout=ADDR_RELAY_SEND_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.debug(
+                    f"addr relay to {p.host}:{p.port} timed out "
+                    f"(peer not draining) — disconnecting"
+                )
+                asyncio.ensure_future(p.disconnect())
             except Exception:
                 pass
 
