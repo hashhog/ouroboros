@@ -1,6 +1,9 @@
 //! RocksDB database implementation for Bitcoin blockchain storage
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitcoin::OutPoint;
 use bitcoin::hashes::Hash;
@@ -118,7 +121,20 @@ pub type Result<T> = std::result::Result<T, DbError>;
 /// Blockchain database using RocksDB
 pub struct BlockchainDB {
     db: Arc<DB>,
+    /// Read-through UTXO cache for CHAINSTATE_CF. Keyed by the 36-byte
+    /// `encode_outpoint` key; `None` caches a confirmed-absent lookup.
+    /// Wholesale-cleared on every chainstate commit (`clear_utxo_read_cache`).
+    utxo_read_cache: Mutex<HashMap<[u8; 36], Option<UTXO>>>,
+    /// Bumped under the cache lock on every commit/clear. The TOCTOU guard:
+    /// a reader captures it before `get_cf` and re-checks before populate, so
+    /// a concurrent commit invalidates the populate rather than caching a
+    /// stale value (the RPC-vs-connect double-spend race).
+    cache_generation: AtomicU64,
 }
+
+/// Soft cap on read-through cache entries; on overflow the cache is cleared
+/// (bounded memory, no per-entry eviction needed — the next reads repopulate).
+const UTXO_READ_CACHE_MAX_ENTRIES: usize = 4_000_000;
 
 impl BlockchainDB {
     /// Attempt to repair a corrupted database at the given path.
@@ -164,7 +180,11 @@ impl BlockchainDB {
 
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            utxo_read_cache: Mutex::new(HashMap::new()),
+            cache_generation: AtomicU64::new(0),
+        })
     }
 
     // ========== Block Storage Methods ==========
@@ -519,6 +539,7 @@ impl BlockchainDB {
         let cf = self.db.cf_handle(CHAINSTATE_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
         self.db.put_cf(cf, key, value)?;
+        self.clear_utxo_read_cache();
 
         Ok(())
     }
@@ -561,6 +582,7 @@ impl BlockchainDB {
             undo_value.extend_from_slice(utxo_bytes);
             self.db.put_cf(spent_cf, &key, &undo_value)?;
         }
+        self.clear_utxo_read_cache();
 
         Ok(utxo.map(|(u, _)| u))
     }
@@ -616,38 +638,87 @@ impl BlockchainDB {
         let cf = self.db.cf_handle(CHAINSTATE_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
         self.db.delete_cf(cf, &key)?;
+        self.clear_utxo_read_cache();
         Ok(())
     }
 
-    /// Get a UTXO by its outpoint
+    /// Get a UTXO by its outpoint (read-through cache).
+    ///
+    /// Validation (`transaction.rs:241/409`) and RPC (`lib.rs` gettxout) both
+    /// call this, so they share one cache-consistent source of truth.
     pub fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<UTXO>> {
+        self.get_utxo_cached(outpoint)
+    }
+
+    /// Clear the read-through UTXO cache and bump the generation counter.
+    ///
+    /// MUST be called after EVERY commit that mutates CHAINSTATE_CF. The bump
+    /// happens under the same lock as `clear()` and as the populate in
+    /// `get_utxo_cached`, which closes the RPC-vs-connect TOCTOU: a reader that
+    /// did `get_cf` before this clear will observe the new generation on its
+    /// re-check and skip the (now-stale) populate. Cleared AFTER `db.write`
+    /// (not before): a stale populate landing in the write→clear window is
+    /// wiped by this clear, whereas a clear-before-write would let such a
+    /// populate persist until the next commit.
+    pub fn clear_utxo_read_cache(&self) {
+        let mut map = self.utxo_read_cache.lock().unwrap();
+        map.clear();
+        // Bump under the lock so no populate can interleave with the clear.
+        self.cache_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Read-through variant of `get_utxo`: peek the in-mem cache, on miss read
+    /// CHAINSTATE_CF and populate (guarded by the generation counter so a
+    /// concurrent commit invalidates the populate rather than caching a stale
+    /// value). Returns exactly what a direct `get_cf` + deserialize would
+    /// return at lookup time.
+    pub fn get_utxo_cached(&self, outpoint: &OutPoint) -> Result<Option<UTXO>> {
         let txid_bytes = *outpoint.txid.as_byte_array();
         let key = encode_outpoint(&txid_bytes, outpoint.vout);
 
+        // 1. Peek. Hit → return clone (drop the lock first).
+        let gen0 = {
+            let map = self.utxo_read_cache.lock().unwrap();
+            if let Some(hit) = map.get(&key) {
+                return Ok(hit.clone());
+            }
+            self.cache_generation.load(Ordering::SeqCst)
+        };
+
+        // 2. Miss — read RocksDB lock-free.
         let cf = self.db.cf_handle(CHAINSTATE_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
-
-        match self.db.get_cf(cf, &key)? {
+        let value = match self.db.get_cf(cf, &key)? {
             Some(data) => {
                 let (utxo, _) = UTXO::bitcoin_deserialize(&data)
                     .map_err(|e| DbError::InvalidData(format!("Failed to deserialize UTXO: {}", e)))?;
-                Ok(Some(utxo))
+                Some(utxo)
             }
-            None => Ok(None),
-        }
-    }
-
-    /// Check if a UTXO exists
-    pub fn utxo_exists(&self, outpoint: &OutPoint) -> bool {
-        let txid_bytes = *outpoint.txid.as_byte_array();
-        let key = encode_outpoint(&txid_bytes, outpoint.vout);
-
-        let cf = match self.db.cf_handle(CHAINSTATE_CF) {
-            Some(cf) => cf,
-            None => return false,
+            None => None,
         };
 
-        self.db.get_cf(cf, &key).map(|opt| opt.is_some()).unwrap_or(false)
+        // 3. Populate iff no commit happened during the get_cf (gen unchanged).
+        {
+            let mut map = self.utxo_read_cache.lock().unwrap();
+            if self.cache_generation.load(Ordering::SeqCst) == gen0 {
+                if map.len() >= UTXO_READ_CACHE_MAX_ENTRIES {
+                    map.clear();
+                    // Treat the overflow-clear as a generation event so any
+                    // in-flight populate that raced it is also invalidated.
+                    self.cache_generation.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    map.insert(key, value.clone());
+                }
+            }
+            // else: stale window — return the value but skip the put.
+        }
+
+        Ok(value)
+    }
+
+    /// Check if a UTXO exists (read-through cache; never diverges from `get_utxo`).
+    pub fn utxo_exists(&self, outpoint: &OutPoint) -> bool {
+        self.get_utxo_cached(outpoint).map(|opt| opt.is_some()).unwrap_or(false)
     }
 
     /// Iterate all UTXOs in the chainstate (for address balance/scan).
@@ -714,6 +785,7 @@ impl BlockchainDB {
         self.db.delete_range_cf(cf, &start, &end)?;
         // delete_range is exclusive on the end key, so delete the max key too
         self.db.delete_cf(cf, &end)?;
+        self.clear_utxo_read_cache();
 
         Ok(())
     }
@@ -789,6 +861,7 @@ impl BlockchainDB {
         if pending > 0 {
             self.db.write(batch)?;
         }
+        self.clear_utxo_read_cache();
 
         Ok((removed, bytes_freed))
     }
@@ -2068,6 +2141,9 @@ impl BlockchainDB {
 
         // Atomic apply — either every write lands or none does.
         self.db.write(batch)?;
+        // Reorg-entry clear (mandatory): the disconnect just mutated
+        // CHAINSTATE_CF, so any cached pre-disconnect coin is now stale.
+        self.clear_utxo_read_cache();
 
         Ok(disconnected_hashes)
     }
@@ -2082,6 +2158,11 @@ impl BlockchainDB {
     /// Apply a write batch atomically
     pub fn apply_batch(&self, batch: WriteBatch) -> Result<()> {
         self.db.write(batch)?;
+        // Commit-driven clear: covers every connect/snapshot/dump consumer
+        // that routes its chainstate writes through apply_batch. Cleared
+        // AFTER db.write so a stale populate in the write→clear window is
+        // wiped here rather than surviving until the next commit.
+        self.clear_utxo_read_cache();
         Ok(())
     }
 

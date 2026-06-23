@@ -230,6 +230,77 @@ mod tests {
         assert!(retrieved.is_none());
     }
 
+    /// Read-through UTXO cache must never serve a STALE POSITIVE: once a coin
+    /// is spent (or deleted), a prior `get_utxo` that populated the cache must
+    /// not let it read back as present. This is the consensus-critical
+    /// invariant — a stale positive would enable a double-spend accept. Each
+    /// mutator's `clear_utxo_read_cache()` hook is what makes this hold; this
+    /// test fails loudly if any of those hooks is dropped.
+    #[test]
+    fn test_read_through_cache_no_stale_positive_after_spend() {
+        let (db, _temp_dir) = create_test_db();
+        let txid = bitcoin::Txid::from_byte_array([7u8; 32]);
+        let (outpoint, utxo) = create_test_utxo(txid, 0, 50_000_000, Some(100));
+
+        // Populate the read-through cache with a PRESENT value.
+        db.add_utxo(&outpoint, &utxo).unwrap();
+        assert!(db.get_utxo(&outpoint).unwrap().is_some(), "warm cache");
+        assert!(db.utxo_exists(&outpoint), "warm cache (exists)");
+
+        // Spend it — spend_utxo must clear the cache.
+        db.spend_utxo(&outpoint, &[9u8; 32]).unwrap();
+        assert!(db.get_utxo(&outpoint).unwrap().is_none(),
+            "STALE POSITIVE: spent coin still cached as present");
+        assert!(!db.utxo_exists(&outpoint),
+            "STALE POSITIVE: spent coin still reports exists");
+
+        // Re-add then delete via delete_utxo (the disconnect path) — also clears.
+        db.add_utxo(&outpoint, &utxo).unwrap();
+        assert!(db.get_utxo(&outpoint).unwrap().is_some(), "re-added present");
+        db.delete_utxo(&outpoint).unwrap();
+        assert!(db.get_utxo(&outpoint).unwrap().is_none(),
+            "STALE POSITIVE: deleted coin still cached as present");
+    }
+
+    /// Read-through cache must never serve a STALE NEGATIVE: a `get_utxo` miss
+    /// caches `None`, but a subsequent `add_utxo` (a freshly-created coin) must
+    /// invalidate that negative so the new coin is visible. A stale negative
+    /// would false-reject a valid spend of a just-created output.
+    #[test]
+    fn test_read_through_cache_no_stale_negative_after_add() {
+        let (db, _temp_dir) = create_test_db();
+        let txid = bitcoin::Txid::from_byte_array([8u8; 32]);
+        let (outpoint, utxo) = create_test_utxo(txid, 1, 25_000_000, Some(200));
+
+        // Prime a negative cache entry.
+        assert!(db.get_utxo(&outpoint).unwrap().is_none(), "absent");
+        assert!(!db.utxo_exists(&outpoint), "absent (exists)");
+
+        // Create the coin — add_utxo must clear the cached None.
+        db.add_utxo(&outpoint, &utxo).unwrap();
+        let got = db.get_utxo(&outpoint).unwrap();
+        assert!(got.is_some(),
+            "STALE NEGATIVE: freshly-added coin shadowed by cached None");
+        assert_eq!(got.unwrap().amount, utxo.amount);
+        assert!(db.utxo_exists(&outpoint));
+    }
+
+    /// `clear_chainstate` must drop the read-through cache so a snapshot reload
+    /// can't be shadowed by pre-clear entries.
+    #[test]
+    fn test_read_through_cache_cleared_by_clear_chainstate() {
+        let (db, _temp_dir) = create_test_db();
+        let txid = bitcoin::Txid::from_byte_array([6u8; 32]);
+        let (outpoint, utxo) = create_test_utxo(txid, 0, 50_000_000, Some(100));
+
+        db.add_utxo(&outpoint, &utxo).unwrap();
+        assert!(db.get_utxo(&outpoint).unwrap().is_some(), "warm cache");
+
+        db.clear_chainstate().unwrap();
+        assert!(db.get_utxo(&outpoint).unwrap().is_none(),
+            "STALE POSITIVE: coin survived clear_chainstate in the read cache");
+    }
+
     #[test]
     fn test_update_chain_state() {
         let (db, _temp_dir) = create_test_db();
@@ -900,6 +971,74 @@ mod tests {
 
         // Coinbase output is gone from the chainstate.
         assert!(!db.utxo_exists(&cb_outpoint));
+    }
+
+    /// Reorg-entry clear: `disconnect_blocks_atomic` (the multi-block reorg
+    /// primitive that bypasses `apply_batch` with a direct `db.write`) must
+    /// drop the read-through cache, so coins removed by the disconnect can
+    /// never read back as present from a warmed cache. This is the path the
+    /// (currently regtest-mining-blocked) reorg-proof harness would exercise;
+    /// we prove the clear here at the storage layer instead.
+    #[test]
+    fn test_w92_disconnect_blocks_atomic_clears_read_cache() {
+        let (db, _tmp) = create_test_db();
+        let genesis = BlockHash::all_zeros();
+        let genesis_bytes = *genesis.as_byte_array();
+        db.update_best_block(&genesis_bytes, 0).unwrap();
+
+        // Build a 2-block coinbase-only chain on top of genesis and seed both
+        // coinbase outputs into the chainstate exactly as apply_block would.
+        let mut prev = genesis;
+        let mut cb_outpoints = Vec::new();
+        for height in 1u32..=2 {
+            let (block, _) = build_block_with_optional_spend(
+                height,
+                prev,
+                50_000_000,
+                ScriptBuf::from_bytes(vec![0x51]), // OP_1 — spendable
+                None,
+            );
+            let hash_bytes = *block.block_hash().as_byte_array();
+            db.store_block(&block).unwrap();
+            let meta = BlockMetadata::new(height, [height as u8; 32], block.header().time);
+            db.store_block_metadata(height, &hash_bytes, &meta).unwrap();
+            db.update_best_block(&hash_bytes, height).unwrap();
+
+            let coinbase_txid = block.inner().txdata[0].compute_txid();
+            let cb_outpoint = OutPoint::new(coinbase_txid, 0);
+            let cb_utxo = UTXO::new(
+                OutPointWrapper::new(cb_outpoint),
+                50_000_000,
+                ScriptBuf::from_bytes(vec![0x51]),
+                Some(height),
+                true,
+            );
+            db.add_utxo(&cb_outpoint, &cb_utxo).unwrap();
+            cb_outpoints.push(cb_outpoint);
+            prev = block.block_hash();
+        }
+
+        // WARM the read-through cache with both coinbase outputs PRESENT.
+        for op in &cb_outpoints {
+            assert!(db.get_utxo(op).unwrap().is_some(), "warm cache (present)");
+        }
+
+        // Atomic multi-block disconnect back to genesis.
+        let disconnected = db.disconnect_blocks_atomic(2, 0).unwrap();
+        assert_eq!(disconnected.len(), 2, "both blocks disconnected");
+
+        // Chain rolled back to genesis.
+        let (best, h) = db.get_best_block().unwrap();
+        assert_eq!(best, genesis_bytes);
+        assert_eq!(h, 0);
+
+        // STALE POSITIVE check: neither coinbase output may read back present.
+        for op in &cb_outpoints {
+            assert!(db.get_utxo(op).unwrap().is_none(),
+                "STALE POSITIVE: disconnected coinbase still cached present");
+            assert!(!db.utxo_exists(op),
+                "STALE POSITIVE: disconnected coinbase still reports exists");
+        }
     }
 
     /// G12: An unspendable (OP_RETURN) output in a block being disconnected
