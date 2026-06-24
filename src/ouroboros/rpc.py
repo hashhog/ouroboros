@@ -558,6 +558,7 @@ RPC_CLIENT_NODE_ALREADY_ADDED = -23  # protocol.h:60 — Node is already added
 RPC_CLIENT_NODE_NOT_ADDED = -24      # protocol.h:61 — Node has not been added before
 RPC_CLIENT_NODE_NOT_CONNECTED = -29  # protocol.h:62 — disconnect target not connected
 RPC_CLIENT_INVALID_IP_OR_SUBNET = -30
+RPC_CLIENT_P2P_DISABLED = -31        # protocol.h:64 — no valid connection manager instance found
 
 
 def _is_valid_ip_or_subnet(value: str) -> bool:
@@ -3015,6 +3016,45 @@ class RPCServer:
 
         # Default: return original error
         return error
+
+    async def rpc_setnetworkactive(self, state: Any = None) -> bool:
+        """Disable/enable all p2p network activity.
+
+        Reference: Bitcoin Core rpc/net.cpp setnetworkactive (:889) +
+        CConnman::SetNetworkActive (net.cpp:3361).
+
+        Param:
+            state (bool, REQUIRED): true to enable networking, false to disable.
+
+        Returns the value that was passed in (bare JSON boolean), read back from
+        the peer manager after the toggle (Core returns ``GetNetworkActive()``,
+        which absent a race equals ``state``).  Setting false suppresses NEW
+        connection establishment only — existing peers are NOT disconnected.
+        The ``networkactive`` field of getnetworkinfo mirrors this flag.
+        """
+        # Required positional bool.  Core reads request.params[0].get_bool();
+        # a missing arg is a dispatcher arity error, a non-bool a JSON type
+        # error.  Python's bool is an int subclass, so reject ints/floats
+        # explicitly to match get_bool()'s strictness.
+        if state is None:
+            raise RpcError(RPC_INVALID_PARAMETER, "Missing required argument: state")
+        if not isinstance(state, bool):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                f"JSON value of type {_core_uvtype(state)} is not of expected type bool",
+            )
+
+        # EnsureConnman parity (server_util.cpp:100): a missing connection
+        # manager is RPC_CLIENT_P2P_DISABLED (-31), NOT an empty success.
+        pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
+        if pm is None or not hasattr(pm, 'set_network_active'):
+            raise RpcError(
+                RPC_CLIENT_P2P_DISABLED,
+                "Error: Peer-to-peer functionality missing or disabled",
+            )
+
+        # SetNetworkActive then return the read-back value (Core net.cpp:904-906).
+        return pm.set_network_active(state)
 
     async def rpc_getnetworkinfo(self) -> dict[str, Any]:
         """Return network information.
