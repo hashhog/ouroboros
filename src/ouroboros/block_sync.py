@@ -325,6 +325,12 @@ class BlockSync:
 
         self._zmq_publisher = None
 
+        # Tip-change notifier (Core KernelNotifications blockTip /
+        # WaitTipChanged).  Set by the node via set_tip_notifier(); signalled
+        # on every IBD/P2P/reorg tip advance so the wait-family RPCs can wake
+        # promptly.  Left None until wired — guards keep this optional.
+        self._tip_notifier = None
+
         self.running = False
         self._sync_task: asyncio.Task | None = None
 
@@ -621,6 +627,15 @@ class BlockSync:
     def set_zmq_publisher(self, publisher) -> None:
         """Attach a ZMQPublisher for real-time block/tx notifications."""
         self._zmq_publisher = publisher
+
+    def set_tip_notifier(self, notifier) -> None:
+        """Attach the node's tip-change notifier (Core WaitTipChanged).
+
+        Signalled on every IBD/P2P tip advance and after a reorg so the
+        wait-family RPCs wake promptly instead of polling.  Called by node.py
+        after both block_sync and the notifier exist.
+        """
+        self._tip_notifier = notifier
 
     def _mark_perm_rejected(self, block_hash: bytes) -> None:
         """Add *block_hash* to the permanent-reject set, evicting the oldest
@@ -2095,6 +2110,15 @@ class BlockSync:
 
             if self._zmq_publisher:
                 self._zmq_publisher.notify_block(block)
+
+            # Wake the wait-family RPCs on this tip advance (Core
+            # KernelNotifications blockTip / WaitTipChanged).  Best-effort: a
+            # notifier fault must never stall IBD.
+            if self._tip_notifier is not None:
+                try:
+                    self._tip_notifier.notify()
+                except Exception:
+                    pass
 
             # Log progress every 1000 blocks
             if new_height % 1000 == 0 or connected == 1:
@@ -5064,6 +5088,15 @@ class BlockSync:
 
             logger.info(f"Reorg handled: new tip at height {final_height}")
             self.reorg_depth += 1
+
+            # Wake the wait-family RPCs — a reorg is a tip change (Core
+            # KernelNotifications blockTip / WaitTipChanged fires on reorg too).
+            if self._tip_notifier is not None:
+                try:
+                    self._tip_notifier.notify()
+                except Exception:
+                    pass
+
             return True
 
         except Exception as e:
