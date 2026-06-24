@@ -483,6 +483,13 @@ class Peer:
 
         self.last_ping: float = 0
         self.latency: float = 0
+        # Running minimum pong round-trip (Core CNode::m_min_ping_time), and the
+        # monotonic timestamp at which an outstanding ping was sent but not yet
+        # answered (Core PingStart / m_ping_start).  ``min_ping`` stays None until
+        # the first pong; ``ping_wait_since`` is None while no ping is in flight.
+        # getpeerinfo surfaces these as ``minping`` / ``pingwait``.
+        self.min_ping: float | None = None
+        self.ping_wait_since: float | None = None
         self.score: int = 100  # Reputation score (0-100)
 
         self.message_handlers: dict[str, Callable] = {}
@@ -2075,6 +2082,12 @@ class Peer:
                         pong = PongMessage.from_payload(msg.payload)
                         if self.last_ping > 0:
                             self.latency = time.time() - self.last_ping
+                            # Running minimum round-trip (Core m_min_ping_time)
+                            # and clear the outstanding-ping marker so
+                            # getpeerinfo's pingwait drops back to 0.
+                            if self.min_ping is None or self.latency < self.min_ping:
+                                self.min_ping = self.latency
+                            self.ping_wait_since = None
                             logger.debug(
                                 f"Pong from {self.host}:{self.port} - "
                                 f"latency: {self.latency:.3f}s"
@@ -2188,7 +2201,12 @@ class Peer:
     async def ping(self):
         """Send ping to peer"""
         nonce = self._generate_nonce()
-        self.last_ping = time.time()
+        now = time.time()
+        self.last_ping = now
+        # Mark the ping as outstanding (Core PingStart / m_ping_start). Cleared
+        # when the matching pong arrives; getpeerinfo reports the elapsed wait as
+        # ``pingwait`` while it is non-None.
+        self.ping_wait_since = now
         ping = PingMessage(nonce=nonce)
         ping_msg = ping.to_network_message(self.network)
         await self.send_message(ping_msg)
