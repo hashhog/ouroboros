@@ -75,36 +75,102 @@ _CATEGORY_TO_LOGGERS: dict[str, tuple[str, ...]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Live (runtime-mutable) active-category state
+# ---------------------------------------------------------------------------
+#
+# The set of currently-enabled debug categories is held here as process-global
+# state so it can be toggled at runtime (Core parity: the ``logging`` RPC
+# mutates ``BCLog::Logger::m_categories`` in-memory, taking effect immediately
+# without restart).  ``_CategoryFilter`` consults this set on EVERY record
+# rather than snapshotting it at construction, so a filter instance already
+# attached to a handler honours a category flip the instant the set changes.
+#
+# Empty set  -> no DEBUG records pass (just INFO+ everywhere).
+# Full set   -> every DEBUG record passes ("all").
+_ACTIVE_CATEGORIES: set[str] = set()
+
+
+def _resolve_allowed_loggers(cats: set[str]) -> set[str]:
+    """Expand a set of category names to the logger-name prefixes they gate."""
+    allowed: set[str] = set()
+    for cat in cats:
+        for prefix in _CATEGORY_TO_LOGGERS.get(cat, ()):
+            allowed.add(prefix)
+        # Also allow a free-form match on logger-name suffix.
+        allowed.add(f"ouroboros.{cat}")
+    return allowed
+
+
+def get_active_categories() -> set[str]:
+    """Return a copy of the currently-enabled debug categories."""
+    return set(_ACTIVE_CATEGORIES)
+
+
+def set_active_categories(categories: Iterable[str]) -> None:
+    """Replace the active debug-category set (takes effect immediately).
+
+    Also brings the root logger level up to DEBUG when any category is
+    active (otherwise no DEBUG records are produced for the filter to pass),
+    and back down to INFO when the set is emptied — mirroring how
+    ``configure_logging`` derives the level from the category set.
+    """
+    global _ACTIVE_CATEGORIES
+    _ACTIVE_CATEGORIES = set(categories)
+    root = logging.getLogger()
+    if _ACTIVE_CATEGORIES:
+        if root.level > logging.DEBUG:
+            root.setLevel(logging.DEBUG)
+    # NB: we never lower an explicitly-requested DEBUG level here; configure_
+    # logging owns the baseline.  When the set empties, the filter simply
+    # stops passing DEBUG records, which is the same observable result.
+
+
+def enable_category(name: str) -> None:
+    """Enable a single category (or all of them for the ALL token)."""
+    from ouroboros.daemon import DEBUG_CATEGORIES  # local import: avoid cycle
+    if name in _ALL_TOKENS:
+        set_active_categories(DEBUG_CATEGORIES)
+    else:
+        set_active_categories(_ACTIVE_CATEGORIES | {name})
+
+
+def disable_category(name: str) -> None:
+    """Disable a single category (or all of them for the ALL token)."""
+    if name in _ALL_TOKENS:
+        set_active_categories(set())
+    else:
+        set_active_categories(_ACTIVE_CATEGORIES - {name})
+
+
+# Core's special input-only tokens that expand to the full category mask
+# (logging.cpp: "all", "1", and the empty string "").  These are accepted as
+# inputs but are NEVER emitted as output keys.
+_ALL_TOKENS: frozenset[str] = frozenset({"all", "1", ""})
+
+
 class _CategoryFilter(logging.Filter):
     """Filter records so only logs from selected categories are emitted at DEBUG.
 
     INFO and above are always allowed through (parity with Core's
-    ``LogPrintLevel`` semantics — DEBUG is the gated level).  Empty
-    set means no DEBUG records pass — i.e. just INFO+ everywhere.
+    ``LogPrintLevel`` semantics — DEBUG is the gated level).  The active
+    category set is read live from ``_ACTIVE_CATEGORIES`` on every record so
+    runtime toggles (the ``logging`` RPC) take effect with no restart.
+    Empty set means no DEBUG records pass — i.e. just INFO+ everywhere.
     """
-
-    def __init__(self, categories: Iterable[str]):
-        super().__init__()
-        self.allowed_loggers: set[str] = set()
-        self.all = False
-        cats = set(categories)
-        from ouroboros.daemon import DEBUG_CATEGORIES  # local import: avoid cycle at module load
-        if cats >= set(DEBUG_CATEGORIES):
-            self.all = True
-            return
-        for cat in cats:
-            for prefix in _CATEGORY_TO_LOGGERS.get(cat, ()):
-                self.allowed_loggers.add(prefix)
-            # Also allow free-form match on logger name suffix.
-            self.allowed_loggers.add(f"ouroboros.{cat}")
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.levelno >= logging.INFO:
             return True
-        if self.all:
+        cats = _ACTIVE_CATEGORIES
+        if not cats:
+            return False
+        from ouroboros.daemon import DEBUG_CATEGORIES  # local import: avoid cycle
+        if cats >= set(DEBUG_CATEGORIES):
             return True
-        # DEBUG-level: only let through if the logger name matches.
-        for prefix in self.allowed_loggers:
+        # DEBUG-level: only let through if the logger name matches an
+        # enabled category's logger prefix.
+        for prefix in _resolve_allowed_loggers(cats):
             if record.name == prefix or record.name.startswith(prefix + "."):
                 return True
         return False
@@ -149,6 +215,10 @@ def configure_logging(
         JSONFormatter() if json_format else logging.Formatter(_PLAIN_FMT)
     )
 
+    # Seed the process-global active-category state from startup config so the
+    # ``logging`` RPC reports & toggles relative to the -debug startup flags.
+    set_active_categories(cats)
+
     root = logging.getLogger()
     root.setLevel(level)
     root.handlers.clear()
@@ -160,14 +230,16 @@ def configure_logging(
     # Filters on a Logger only fire for direct logger.handle() calls — they
     # do NOT apply to records propagating up from child loggers.  Handler-
     # level filters DO apply to every record reaching the handler, so we
-    # attach the category filter there instead.
-    cat_filter = _CategoryFilter(cats) if cats else None
+    # attach the category filter there instead.  The filter is ALWAYS attached
+    # (even when no categories are enabled at startup) so the ``logging`` RPC
+    # can enable a category at runtime and have it take effect immediately —
+    # the filter reads the live _ACTIVE_CATEGORIES set on each record.
+    cat_filter = _CategoryFilter()
 
     if print_to_console:
         console = logging.StreamHandler()
         console.setFormatter(formatter)
-        if cat_filter is not None:
-            console.addFilter(cat_filter)
+        console.addFilter(cat_filter)
         root.addHandler(console)
 
     if log_file:
@@ -179,8 +251,7 @@ def configure_logging(
             backupCount=backup_count,
         )
         file_handler.setFormatter(formatter)
-        if cat_filter is not None:
-            file_handler.addFilter(cat_filter)
+        file_handler.addFilter(cat_filter)
         root.addHandler(file_handler)
         _FILE_HANDLER = file_handler
         _LOG_FILE_PATH = str(path)
