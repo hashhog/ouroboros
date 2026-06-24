@@ -8238,6 +8238,105 @@ class RPCServer:
                 total += 1
         return total
 
+    async def rpc_getaddednodeinfo(self, node: Any = None) -> list[dict[str, Any]]:
+        """Return information about the persistent added-node list.
+
+        Reference: Bitcoin Core rpc/net.cpp getaddednodeinfo (:486-558) +
+        CConnman::GetAddedNodeInfo (net.cpp:2914). Mirrors Core's exact shape:
+
+            [
+              {
+                "addednode": <str>,               # node as provided to addnode
+                "connected": <bool>,              # a current peer matches
+                "addresses": [                    # ALWAYS present; [] when not connected
+                  {"address": <str ip:port>,
+                   "connected": "inbound" | "outbound"}   # at most ONE entry
+                ]
+              },
+              ...
+            ]
+
+        Params:
+            node (str, OPTIONAL): if provided, return only the matching added
+                node; if it is NOT on the added list, raise -24
+                RPC_CLIENT_NODE_NOT_ADDED "Error: Node has not been added."
+                If omitted, all added nodes are returned (``[]`` when none).
+                ``onetry`` adds are NOT on the list (Core parity).
+
+        ouroboros keeps the added-node registry as ``self._added_nodes`` (a set
+        of normalized ``"host:port"`` keys, populated by ``rpc_addnode`` —
+        net.cpp's CConnman::m_added_nodes equivalent). Because ouroboros
+        normalizes the entry to ``host:port`` at add time (a bare host gets the
+        default port appended), the ``addednode`` string reported here is that
+        normalized form, and the optional ``node`` filter is normalized the same
+        way before the exact-string match so ``getaddednodeinfo "1.2.3.4"``
+        matches a node added as ``1.2.3.4``. Pure read — no side effects.
+        """
+        pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
+
+        # Normalize a "host[:port]" string to the same "host:port" key form
+        # rpc_addnode uses, so the stored list and the filter compare apples to
+        # apples (Core matches the raw string; ouroboros stores the normalized
+        # key, so we normalize both sides).
+        def _normalize_key(addr: str) -> str:
+            if ':' in addr:
+                h, _, p = addr.rpartition(':')
+                try:
+                    return f"{h}:{int(p)}"
+                except ValueError:
+                    return addr  # leave malformed input as-is; it just won't match
+            default_port = getattr(pm, '_default_port', 8333) if pm is not None else 8333
+            return f"{addr}:{default_port}"
+
+        # Snapshot the persistent added-node list. A set has no defined order;
+        # sort for deterministic, reproducible output (Core preserves insertion
+        # order — see caveat in the porting notes).
+        added = getattr(self, '_added_nodes', None) or set()
+        added_keys = sorted(added)
+
+        # Build a lookup of currently-connected peers keyed by "host:port".
+        # Covers every peer bucket the PeerManager tracks (full-relay outbound,
+        # block-relay outbound, inbound), matching disconnectnode's aggregation.
+        connected: dict[str, bool] = {}  # host:port -> inbound?
+        if pm is not None:
+            for bucket_name in ("peers", "block_relay_peers", "inbound_peers"):
+                pmap = getattr(pm, bucket_name, None) or {}
+                if not isinstance(pmap, dict):
+                    continue
+                for addr, peer in pmap.items():
+                    connected[addr] = bool(getattr(peer, 'inbound', False))
+
+        # Optional `node` filter: exact match against the normalized added list.
+        # Miss -> -24 "Error: Node has not been added." (Core net.cpp:533-535).
+        if node is not None:
+            if not isinstance(node, str):
+                raise RpcError(
+                    RPC_TYPE_ERROR,
+                    f"JSON value of type {_core_uvtype(node)} is not of expected type string",
+                )
+            want = _normalize_key(node)
+            if want not in added:
+                raise RpcError(
+                    RPC_CLIENT_NODE_NOT_ADDED, "Error: Node has not been added."
+                )
+            added_keys = [want]
+
+        ret: list[dict[str, Any]] = []
+        for key in added_keys:
+            is_connected = key in connected
+            addresses: list[dict[str, Any]] = []
+            if is_connected:
+                addresses.append({
+                    "address": key,
+                    "connected": "inbound" if connected[key] else "outbound",
+                })
+            ret.append({
+                "addednode": key,
+                "connected": is_connected,
+                "addresses": addresses,
+            })
+        return ret
+
     async def rpc_addnode(self, node: str, command: str = "add") -> None:
         """Add or remove a peer.
 
