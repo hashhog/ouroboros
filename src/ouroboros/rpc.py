@@ -8709,6 +8709,104 @@ class RPCServer:
         obj["success"] = success
         return obj
 
+    async def rpc_getaddrmaninfo(self) -> dict[str, Any]:
+        """Provide information about the node's address manager.
+
+        Reference: Bitcoin Core rpc/net.cpp getaddrmaninfo (:1080-1117) +
+        AddrMan::Size (addrman.cpp Size_ :1006-1026).
+
+        Params: NONE.
+
+        Returns a JSON object keyed by network name. The key set is FIXED and
+        always present (every routable network emitted unconditionally, even at
+        count 0), in Core's enum order::
+
+            ipv4, ipv6, onion, i2p, cjdns, all_networks
+
+        Each value is an object with exactly three integer keys in order::
+
+            { "new":   <count in new table for this network>,
+              "tried": <count in tried table for this network>,
+              "total": <new + tried> }
+
+        ``all_networks`` is the global sum across networks (new = total new,
+        tried = total tried, total = new + tried). NET_UNROUTABLE
+        (not_publicly_routable) and NET_INTERNAL (internal) are never emitted,
+        matching Core's loop that skips those two enum values.
+
+        Invariants (oracle-free, hold by construction):
+          - per network: total == new + tried
+          - all_networks.new   == Σ networks.new
+          - all_networks.tried == Σ networks.tried
+          - all_networks.total == Σ networks.total == all_networks.new
+                                                      + all_networks.tried
+
+        Pure read-only snapshot of the addrman — no params, no side effects, no
+        peers/sockets/disk touched.
+        """
+        # Fixed routable-network key order (Core enum NET_IPV4..NET_CJDNS,
+        # skipping NET_UNROUTABLE / NET_INTERNAL). Every key is emitted even
+        # when the count is zero (an IPv4-only node still reports onion/i2p/
+        # cjdns as 0/0/0).
+        NETWORK_KEYS = ("ipv4", "ipv6", "onion", "i2p", "cjdns")
+
+        # Pre-seed all routable networks at zero so the key set is always
+        # complete, then accumulate. {net_name: {"new": int, "tried": int}}.
+        counts: dict[str, dict[str, int]] = {
+            name: {"new": 0, "tried": 0} for name in NETWORK_KEYS
+        }
+
+        addrman = self._get_addrman()
+        if addrman is not None:
+            # ouroboros's AddressManager splits addresses into two membership
+            # sets, _in_new and _in_tried (addrman.py:383-384), mirroring
+            # Core's new / tried tables. Map each stored entry to its Core
+            # network name via GetNetClass parity (_addrman_network_name) and
+            # bump the matching (network, table) counter. This reproduces
+            # Core's per-network Size(net, in_new) split exactly. Entries that
+            # map to not_publicly_routable / internal are skipped, matching
+            # Core's loop (those networks are never emitted).
+            addrs = getattr(addrman, "_addrs", {})
+            in_new = getattr(addrman, "_in_new", set())
+            in_tried = getattr(addrman, "_in_tried", set())
+
+            for addr_key in in_new:
+                info = addrs.get(addr_key)
+                if info is None:
+                    continue
+                net_name = self._addrman_network_name(info)
+                if net_name in counts:
+                    counts[net_name]["new"] += 1
+
+            for addr_key in in_tried:
+                info = addrs.get(addr_key)
+                if info is None:
+                    continue
+                net_name = self._addrman_network_name(info)
+                if net_name in counts:
+                    counts[net_name]["tried"] += 1
+
+        ret: dict[str, Any] = {}
+        total_new = 0
+        total_tried = 0
+        for name in NETWORK_KEYS:
+            n_new = counts[name]["new"]
+            n_tried = counts[name]["tried"]
+            ret[name] = {
+                "new": n_new,
+                "tried": n_tried,
+                "total": n_new + n_tried,
+            }
+            total_new += n_new
+            total_tried += n_tried
+
+        ret["all_networks"] = {
+            "new": total_new,
+            "tried": total_tried,
+            "total": total_new + total_tried,
+        }
+        return ret
+
     async def rpc_getdifficulty(self) -> float:
         """Return the current difficulty.
 
