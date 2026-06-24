@@ -554,6 +554,8 @@ RPC_MISC_ERROR = -1
 RPC_TYPE_ERROR = -3
 RPC_INVALID_ADDRESS_OR_KEY = -5
 RPC_INVALID_PARAMETER = -8
+RPC_DESERIALIZATION_ERROR = -22      # protocol.h:53 — error parsing or validating structure in raw format
+RPC_VERIFY_ERROR = -25               # protocol.h:42 — general error during transaction or block submission
 RPC_CLIENT_NODE_ALREADY_ADDED = -23  # protocol.h:60 — Node is already added
 RPC_CLIENT_NODE_NOT_ADDED = -24      # protocol.h:61 — Node has not been added before
 RPC_CLIENT_NODE_NOT_CONNECTED = -29  # protocol.h:62 — disconnect target not connected
@@ -5065,6 +5067,156 @@ class RPCServer:
         for other in decoded[1:]:
             combined = combined.combine(other)
         return b64.b64encode(combined.serialize()).decode("ascii")
+
+    async def rpc_combinerawtransaction(self, txs: Any) -> str:
+        """Combine multiple partially-signed versions of the SAME transaction
+        into one carrying the union of their signature data.
+
+        Reference: Bitcoin Core ``rpc/rawtransaction.cpp`` combinerawtransaction
+        (impl body 605-668). Each element of ``txs`` is a hex-encoded raw tx
+        with the SAME inputs/outputs/version/locktime but DIFFERENT partial
+        signatures. The first variant is the structural template; per input we
+        merge the scriptSig + witness across all variants and write the
+        combined result back. Returns the witness-serialized hex.
+
+        Merge scope (see the per-input pick below): for the common/realistic
+        case where each variant carries a complete single-key signature for a
+        DIFFERENT subset of inputs (or one variant is unsigned), we take, per
+        input, the non-empty (signed) scriptSig + witness. This is BYTE-
+        IDENTICAL to Core for single-sig inputs (P2PKH / P2WPKH / P2SH-P2WPKH),
+        because Core's ``DataFromTransaction`` returns the variant's scriptSig +
+        scriptWitness verbatim once ``VerifyScript`` marks the input complete,
+        and ``MergeSignatureData`` adopts that complete sigdata wholesale.
+
+        KNOWN LIMITATION (flagged): the FULL Core behavior also merges PARTIAL
+        multisig signatures WITHIN a single input — two variants each holding
+        one of M sigs for a bare/P2SH/P2WSH M-of-N — via ``SignatureData::
+        Merge`` over the extracted (pubkey -> sig) map. That needs Solver /
+        VerifyScript-with-a-signature-extracting-checker / sighash validation,
+        which this handler does NOT implement. For an input that is partially
+        signed in BOTH variants (neither alone complete), we keep the longer
+        (more-signatures) of the two scriptSigs rather than splicing the two
+        sig sets together; the output for that input is therefore NOT
+        guaranteed byte-identical to Core. The per-input single-sig pick — the
+        dominant case — IS byte-identical and is what is verified.
+
+        DEVIATION (flagged): Core resolves every input's prevout from its own
+        UTXO + mempool ``CCoinsViewCache`` and throws RPC_VERIFY_ERROR (-25)
+        "Input not found or already spent" when a coin is missing/spent. This
+        handler does NOT consult chainstate — combine is a pure function of the
+        provided variants here — so it does NOT raise -25 for unresolvable
+        prevouts. Consequence: the byte-identical SUCCESS vector must be run
+        against a Core oracle whose UTXO actually resolves the prevouts (a
+        scratch regtest), and the -25 path is a documented non-match on this
+        impl. The -22 empty / -22 decode-failure error paths DO match Core.
+        """
+        from ouroboros.database import Transaction, TxIn
+        from ouroboros.p2p_messages import TxMessage
+
+        # Param shape: dispatcher passes the JSON array straight through.
+        # A non-array (Core: request.params[0].get_array()) is a type error.
+        if not isinstance(txs, list):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "Expected type array, got {}".format(_core_uvtype(txs)),
+            )
+
+        # 1. Decode every variant (witness-aware). Core: DecodeHexTx per idx;
+        #    on failure -> -22 "TX decode failed for tx %d. ..." (0-based idx).
+        variants: list[Transaction] = []
+        for idx, item in enumerate(txs):
+            if not isinstance(item, str):
+                # Core reads each element with .get_str() -> type error.
+                raise RpcError(
+                    RPC_TYPE_ERROR,
+                    "JSON value of type {} is not of expected type string".format(
+                        _core_uvtype(item)
+                    ),
+                )
+            try:
+                raw = bytes.fromhex(item)
+                tx = TxMessage.from_payload(raw).transaction
+                if len(tx.inputs) == 0:
+                    raise ValueError("no inputs")
+            except Exception:
+                raise RpcError(
+                    RPC_DESERIALIZATION_ERROR,
+                    "TX decode failed for tx {}. Make sure the tx has at "
+                    "least one input.".format(idx),
+                ) from None
+            variants.append(tx)
+
+        # 2. Empty array -> -22 "Missing transactions".
+        if not variants:
+            raise RpcError(RPC_DESERIALIZATION_ERROR, "Missing transactions")
+
+        # 3. mergedTx starts as a clone of the first variant (the template:
+        #    its version / locktime / vin / vout define the result; only each
+        #    input's scriptSig + witness get rebuilt below).
+        template = variants[0]
+        merged_inputs: list[TxIn] = []
+
+        any_witness = False
+        for i in range(len(template.inputs)):
+            base = template.inputs[i]
+            best_script_sig = b""
+            best_witness: list[bytes] | None = None
+            best_score = -1  # rank candidates; higher = more complete
+
+            for variant in variants:
+                if i >= len(variant.inputs):
+                    continue
+                vin = variant.inputs[i]
+                ss = vin.script_sig or b""
+                wit = vin.witness if vin.witness else None
+                wit_nonempty = bool(wit) and any(len(x) for x in wit)
+                ss_nonempty = len(ss) > 0
+
+                # Score the candidate so we deterministically prefer the
+                # variant that actually carries signature data for this input.
+                # Tie-break by total signature-data length (longer = more
+                # sigs, matching the partial-multisig fallback note above).
+                # Equal length -> keep the earliest variant (Core's merge is
+                # order-stable for the complete single-sig case).
+                if not ss_nonempty and not wit_nonempty:
+                    score = 0
+                else:
+                    sig_len = len(ss) + (
+                        sum(len(x) for x in wit) if wit else 0
+                    )
+                    score = 1_000_000 + sig_len
+
+                if score > best_score:
+                    best_score = score
+                    best_script_sig = ss
+                    best_witness = list(wit) if wit else None
+
+            if best_witness and any(len(x) for x in best_witness):
+                any_witness = True
+
+            merged_inputs.append(TxIn(
+                prev_txid=base.prev_txid,
+                prev_vout=base.prev_vout,
+                script_sig=best_script_sig,
+                sequence=base.sequence,
+                witness=best_witness,
+            ))
+
+        merged = Transaction(
+            txid=b"\x00" * 32,
+            version=template.version,
+            locktime=template.locktime,
+            inputs=merged_inputs,
+            outputs=list(template.outputs),
+            # Core re-encodes WITH witness (TX_WITH_WITNESS) unconditionally;
+            # serialize_with_witness only emits the marker/flag when
+            # has_witness is set, so mirror Core: witness-serialize iff any
+            # input carries a non-empty witness stack (matches Core, whose
+            # CTransaction::HasWitness drives the marker).
+            has_witness=any_witness,
+        )
+
+        return merged.serialize_with_witness().hex()
 
     async def rpc_finalizepsbt(
         self, psbt_base64: str, extract: bool = True
