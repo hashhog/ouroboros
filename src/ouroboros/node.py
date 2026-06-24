@@ -31,6 +31,7 @@ from ouroboros.pruning import BlockPruner
 from ouroboros.rpc import RPCServer
 from ouroboros.snapshot import SnapshotManager, read_snapshot_metadata
 from ouroboros.sync_manager import SyncManager
+from ouroboros.tip_notifier import TipNotifier
 from ouroboros.validation import BlockValidator, TransactionValidator
 from ouroboros.wallet import Wallet, WalletManager
 from ouroboros.zmq_notifier import ZMQNotifier
@@ -156,6 +157,14 @@ class BitcoinNode:
         # then only answers the mempool form, matching Core's
         # DEFAULT_TXOSPENDERINDEX{false}).
         self.txospender_index = None
+
+        # Tip-change notifier — Core's KernelNotifications/WaitTipChanged
+        # condition variable.  Signalled on every active-chain tip advance so
+        # the wait-family RPCs (waitfornewblock / waitforblock /
+        # waitforblockheight) can block-with-timeout instead of polling.
+        # Constructed eagerly (no event loop needed for __init__); the connect
+        # and reorg chokepoints call .notify() on it.
+        self.tip_notifier = TipNotifier()
 
         # State
         self.running = False
@@ -627,6 +636,12 @@ class BitcoinNode:
             # its socket buffers + BIP-324 transport state) for every peer
             # that ever disconnected.
             self.peer_manager.block_sync = self.block_sync
+            # Wire the tip-change notifier (Core WaitTipChanged) so the IBD/P2P
+            # connect drain and the reorg path can wake the wait-family RPCs.
+            try:
+                self.block_sync.set_tip_notifier(self.tip_notifier)
+            except Exception as e:
+                logger.warning(f"tip_notifier wiring skipped: {e}")
             try:
                 await self.block_sync.start()
             except Exception as e:

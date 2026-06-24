@@ -483,6 +483,19 @@ async def accept_block(
             except Exception:
                 pass
 
+    # Step 7 — Signal the tip-change notifier (Core KernelNotifications
+    # blockTip / WaitTipChanged).  Every block accepted through this unified
+    # helper (submitblock / generatetoaddress / the RPC accept path) advances
+    # the active-chain tip, so wake any waitfornewblock / waitforblock /
+    # waitforblockheight RPC blocked on a tip change.  Best-effort: a notifier
+    # fault must never abort block acceptance.
+    _tip_notifier = getattr(node, "tip_notifier", None)
+    if _tip_notifier is not None:
+        try:
+            _tip_notifier.notify()
+        except Exception:
+            pass
+
     return bytes(block_hash)
 
 
@@ -1903,6 +1916,173 @@ class RPCServer:
         if isinstance(hash_bytes, bytes):
             return hash_bytes[::-1].hex()
         return str(hash_bytes)
+
+    # ------------------------------------------------------------------
+    # Wait-family RPCs (Core rpc/blockchain.cpp: waitfornewblock /
+    # waitforblock / waitforblockheight).
+    #
+    # All three block until a tip-change predicate is satisfied OR a
+    # millisecond timeout elapses, then return the *current* tip
+    # ``{hash, height}`` (on match OR timeout — identical shape either way,
+    # exactly like Core).  The wait mechanism is the node's TipNotifier
+    # (Core KernelNotifications/WaitTipChanged): the waiter snapshots the
+    # notifier generation, evaluates its predicate against the authoritative
+    # DB tip, then awaits the next generation bump with an asyncio timeout,
+    # re-checking after every wake.  Reading the real DB tip each time means
+    # a coalesced / missed notify can never produce a wrong answer.
+    # ------------------------------------------------------------------
+
+    def _current_tip(self) -> tuple[str, int]:
+        """Return the authoritative active-chain tip as ``(display_hash, height)``.
+
+        ``display_hash`` is the big-endian hex form Core's RPCs emit (the same
+        order ``getbestblockhash`` returns).  Raises if the DB is unavailable.
+        """
+        if not hasattr(self.node, "db") or self.node.db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+        hash_bytes, height = self.node.db.get_best_block()
+        if isinstance(hash_bytes, bytes):
+            display = hash_bytes[::-1].hex()
+        else:
+            display = str(hash_bytes)
+        return display, int(height)
+
+    @staticmethod
+    def _parse_wait_timeout(timeout: Any) -> int:
+        """Validate the wait-family ``timeout`` argument (milliseconds).
+
+        Mirrors Core (rpc/blockchain.cpp): the value is read as an int and a
+        negative timeout raises ``RPC_MISC_ERROR`` (-1) "Negative timeout".
+        0 means no timeout (wait indefinitely).
+        """
+        if timeout is None:
+            return 0
+        if isinstance(timeout, bool) or not isinstance(timeout, int):
+            # Core's getInt<int> rejects non-integral JSON with a type error.
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "JSON value of type "
+                f"{_core_uvtype(timeout)} is not of expected type number",
+            )
+        if timeout < 0:
+            raise RpcError(RPC_MISC_ERROR, "Negative timeout")
+        return timeout
+
+    def _tip_notifier(self):
+        """Return the node's TipNotifier, or None if unavailable."""
+        return getattr(self.node, "tip_notifier", None)
+
+    async def _wait_for_tip(self, predicate, timeout_ms: int) -> dict[str, Any]:
+        """Core's wait-tip-changed loop shared by all three wait-family RPCs.
+
+        Args:
+            predicate: ``callable(display_hash, height) -> bool`` — return True
+                       once the desired tip condition holds.
+            timeout_ms: milliseconds to wait; 0 = wait indefinitely.
+
+        Returns the current tip ``{"hash", "height"}`` once the predicate holds
+        OR the timeout elapses (Core returns the current block in both cases).
+        """
+        display, height = self._current_tip()
+        if predicate(display, height):
+            return {"hash": display, "height": height}
+
+        notifier = self._tip_notifier()
+        if notifier is None:
+            # No notifier wired (degraded boot): we cannot block on tip changes.
+            # Return the current tip rather than hang — Core would have a kernel
+            # notification source; this is a defensive fallback only.
+            return {"hash": display, "height": height}
+
+        loop = asyncio.get_event_loop()
+        # Absolute deadline for the bounded-timeout case (Core uses a steady
+        # clock deadline and re-derives the remaining slice after each wake).
+        deadline = (loop.time() + timeout_ms / 1000.0) if timeout_ms else None
+
+        while True:
+            gen = notifier.generation
+            # Re-check after snapshotting the generation so a notify that raced
+            # in between the predicate check and the await is not lost.
+            display, height = self._current_tip()
+            if predicate(display, height):
+                return {"hash": display, "height": height}
+
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    # Timed out — return the current tip (Core's behaviour).
+                    return {"hash": display, "height": height}
+                await notifier.wait(gen, remaining)
+            else:
+                await notifier.wait(gen, None)
+
+    async def rpc_waitfornewblock(
+        self, timeout: Any = 0, current_tip: Any = None
+    ) -> dict[str, Any]:
+        """Wait for any new block (tip change) and return the tip.
+
+        Core rpc/blockchain.cpp ``waitfornewblock``.  Waits until the tip
+        differs from ``current_tip`` (or, if omitted, from the tip observed at
+        call entry), then returns ``{"hash", "height"}``.  ``timeout`` is in
+        milliseconds; 0 = no timeout.  On timeout returns the current tip.
+        """
+        timeout_ms = self._parse_wait_timeout(timeout)
+
+        # Determine the reference hash the new tip must differ from.  When the
+        # caller passes a current_tip it is parsed as a 64-hex uint256 (Core
+        # ParseHashV: -8 on malformed).  When omitted, snapshot the live tip.
+        if current_tip is None:
+            ref_hash, _ = self._current_tip()
+        else:
+            # _parse_hash_v raises RpcError(-8) on a malformed hash, matching
+            # Core's ParseHashV("current_tip").  The display form is the input
+            # itself (already big-endian hex); normalise via the parsed bytes.
+            ref_bytes = _parse_hash_v(current_tip, "current_tip")
+            ref_hash = ref_bytes.hex()
+
+        return await self._wait_for_tip(
+            lambda h, _ht: h != ref_hash, timeout_ms
+        )
+
+    async def rpc_waitforblock(
+        self, blockhash: Any, timeout: Any = 0
+    ) -> dict[str, Any]:
+        """Wait until the tip's hash equals ``blockhash``; return the tip.
+
+        Core rpc/blockchain.cpp ``waitforblock``.  ``blockhash`` must be a
+        valid 64-hex uint256 (ParseHashV -> -8 on malformed).  ``timeout`` is
+        in milliseconds; 0 = no timeout.  On timeout returns the current tip.
+        """
+        # Core parses blockhash FIRST (before reading timeout), so a malformed
+        # blockhash errors -8 even when a negative timeout is also supplied.
+        target_bytes = _parse_hash_v(blockhash, "blockhash")
+        target = target_bytes.hex()
+        timeout_ms = self._parse_wait_timeout(timeout)
+
+        return await self._wait_for_tip(
+            lambda h, _ht: h == target, timeout_ms
+        )
+
+    async def rpc_waitforblockheight(
+        self, height: Any, timeout: Any = 0
+    ) -> dict[str, Any]:
+        """Wait until the tip height >= ``height``; return the tip.
+
+        Core rpc/blockchain.cpp ``waitforblockheight``.  ``height`` is read as
+        an int (type error on non-integral).  ``timeout`` is in milliseconds;
+        0 = no timeout.  On timeout returns the current tip.
+        """
+        if isinstance(height, bool) or not isinstance(height, int):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "JSON value of type "
+                f"{_core_uvtype(height)} is not of expected type number",
+            )
+        timeout_ms = self._parse_wait_timeout(timeout)
+
+        return await self._wait_for_tip(
+            lambda _h, ht: ht >= height, timeout_ms
+        )
 
     async def rpc_getsyncstate(self) -> dict[str, Any]:
         """hashhog W70: uniform fleet-wide sync-state report.
