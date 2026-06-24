@@ -9050,6 +9050,109 @@ class RPCServer:
         # Any other mode is Core's RPC_INVALID_PARAMETER (-8) "unknown mode %s".
         raise RpcError(RPC_INVALID_PARAMETER, f"unknown mode {mode}")
 
+    async def rpc_logging(self, include: Any = None, exclude: Any = None) -> dict[str, bool]:
+        """Get and set the debug-logging category configuration.
+
+        Reference: Bitcoin Core rpc/node.cpp ``logging`` (:218-275) +
+        ``EnableOrDisableLogCategories`` (:200-216); logging.cpp
+        ``LogCategoriesList`` / ``EnableCategory`` / ``DisableCategory``.
+
+        ouroboros has a REAL category-based debug-logging system (parity with
+        Core's per-category bitmask): ``DEBUG_CATEGORIES`` in daemon.py is the
+        name set, and a handler-level ``_CategoryFilter`` gates DEBUG records
+        by category against a live process-global active set. This RPC reads
+        and mutates that live set, so enabling a category here makes its DEBUG
+        logs actually start flowing with no restart — exactly like Core's
+        in-memory ``m_categories`` mutation.
+
+        Params (both OPTIONAL, positional, Core order: include THEN exclude):
+          - include (array of category strings): categories to ENABLE.
+          - exclude (array of category strings): categories to DISABLE.
+          A param is acted on ONLY if it is an array (Core ``isArray()`` guard);
+          null/omitted is a no-op for that slot, so ``logging`` with no args is
+          a pure read-and-report. include is applied first, then exclude, so a
+          category named in both ends up DISABLED ("exclude wins").
+
+        Special input-only tokens (never emitted as output keys): ``"all"`` /
+        ``"1"`` / ``""`` expand to the full category mask; in the exclude slot
+        they clear the whole mask (Core's "none" effect — note Core itself only
+        documents all/1, but DisableCategory("all"/"1"/"") clears every bit,
+        which is how ``logging [], ["all"]`` disables everything).
+
+        Returns: a JSON object mapping every real category name in
+        ``DEBUG_CATEGORIES`` -> bool (whether it is currently being debug
+        logged), emitted in ascending alphabetical key order (Core iterates a
+        std::map; alphabetical order makes the output byte-stable). all/1/""
+        are never output keys.
+
+        Errors:
+          - Unknown category in either array -> RPC_INVALID_PARAMETER (-8),
+            message "unknown logging category <cat>" (Core node.cpp:213).
+            Thrown as soon as the bad name is hit, after scanning include fully
+            then exclude in order; categories BEFORE the bad one in the same
+            call have ALREADY been applied (partial application, no rollback —
+            Core parity).
+          - Non-string array element -> RPC_TYPE_ERROR (Core ``get_str()``).
+
+        Scope: mutates the running node's in-memory active set immediately;
+        NOT persisted to config, resets on restart to the ``-debug`` startup
+        flags. Idempotent (enabling an already-on / disabling an already-off
+        category still returns the full list).
+        """
+        from ouroboros.daemon import DEBUG_CATEGORIES
+        from ouroboros.logging_config import (
+            disable_category,
+            enable_category,
+            get_active_categories,
+        )
+
+        # Core's special input-only tokens (logging.cpp): "all"/"1"/"" map to
+        # the full mask. These are accepted as inputs but never output as keys.
+        all_tokens = {"all", "1", ""}
+
+        def _apply(cats: Any, enable: bool) -> None:
+            # Core: EnableOrDisableLogCategories does cats.get_array() then
+            # per-element get_str(); a non-array param is silently ignored at
+            # the call site (only isArray() triggers processing).
+            if not isinstance(cats, list):
+                return
+            for item in cats:
+                if not isinstance(item, str):
+                    # Core get_str() type error on a non-string element.
+                    raise RpcError(
+                        RPC_TYPE_ERROR,
+                        f"JSON value of type {_core_uvtype(item)} is not of "
+                        "expected type string",
+                    )
+                cat = item
+                if cat in all_tokens:
+                    # all/1/"" -> whole mask (enable: turn on everything;
+                    # disable: turn off everything).
+                    if enable:
+                        enable_category(cat)
+                    else:
+                        disable_category(cat)
+                    continue
+                if cat not in DEBUG_CATEGORIES:
+                    # Core node.cpp:213 — EnableCategory/DisableCategory return
+                    # false for an unknown name -> -8 "unknown logging category".
+                    raise RpcError(
+                        RPC_INVALID_PARAMETER, "unknown logging category " + cat
+                    )
+                if enable:
+                    enable_category(cat)
+                else:
+                    disable_category(cat)
+
+        # Core order: include first, then exclude (exclude wins on conflict).
+        _apply(include, True)
+        _apply(exclude, False)
+
+        # Emit the full {category: active} map, alphabetically sorted, for
+        # every REAL category (all/1/"" are never keys).
+        active = get_active_categories()
+        return {cat: (cat in active) for cat in sorted(DEBUG_CATEGORIES)}
+
     async def rpc_getdifficulty(self) -> float:
         """Return the current difficulty.
 
