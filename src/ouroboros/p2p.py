@@ -657,6 +657,17 @@ class PeerManager:
         self._server: asyncio.AbstractServer | None = None
         self._start_height: int = 0
 
+        # Node-global "P2P network active" flag (Core CConnman.fNetworkActive,
+        # net.h:1164 / SetNetworkActive net.cpp:3361, default true).  Toggled by
+        # the ``setnetworkactive`` RPC and surfaced read-only as
+        # ``networkactive`` in getnetworkinfo.  When false we suppress NEW
+        # connection establishment ONLY — existing peers are NOT force-dropped
+        # (Core's contract): (a) inbound accepts are refused
+        # (_handle_inbound_connection), (b) the outbound auto-dial refill and
+        # (c) DNS-seed / fixed-seed re-seeding are skipped in
+        # maintain_connections.  Not persisted; resets to enabled on restart.
+        self.network_active: bool = True
+
         # Callback for registering handlers on newly accepted inbound peers
         self._on_inbound_peer: asyncio.coroutines | None = None
 
@@ -1025,6 +1036,25 @@ class PeerManager:
 
         logger.info("PeerManager stopped")
 
+    def set_network_active(self, state: bool) -> bool:
+        """Enable/disable all NEW P2P network activity (Core CConnman::SetNetworkActive).
+
+        Mirrors Bitcoin Core net.cpp:3361: idempotent (logs + early-returns when
+        the flag already equals *state*, no notification), otherwise flips the
+        atomic flag.  Does NOT disconnect existing/established peers — only
+        suppresses establishing new connections (inbound accept, outbound
+        auto-dial refill, DNS/fixed-seed re-seeding).  Returns the read-back
+        value (``GetNetworkActive()`` equivalent), which absent a race equals
+        *state*.  Not persisted; resets to enabled on restart.
+        """
+        state = bool(state)
+        if self.network_active == state:
+            logger.info("SetNetworkActive: %s (unchanged)", state)
+            return self.network_active
+        self.network_active = state
+        logger.info("SetNetworkActive: %s", state)
+        return self.network_active
+
     # Inbound eviction logic
 
     @staticmethod
@@ -1134,6 +1164,14 @@ class PeerManager:
         # Check ban list
         if self.ban_manager.is_banned(host) or self.ban_manager.is_banned(addr):
             logger.debug(f"Rejected banned inbound peer {addr}")
+            writer.close()
+            return
+
+        # Network-active gate (Core net.cpp:1786): while networking is disabled
+        # (`setnetworkactive false`) refuse NEW inbound connections.  Existing
+        # peers are untouched — only new establishment is suppressed.
+        if not self.network_active:
+            logger.debug(f"Rejected inbound peer {addr}: networking inactive")
             writer.close()
             return
 
@@ -2581,7 +2619,8 @@ class PeerManager:
                 # log line every 30 s while pinned).
                 total_outbound = len(self.peers) + len(self.block_relay_peers)
                 if (
-                    not self._connect_only
+                    self.network_active
+                    and not self._connect_only
                     and total_outbound == 0
                     and not self.known_addrs
                 ):
@@ -2597,33 +2636,40 @@ class PeerManager:
                     # DNS has had its chance — never a bypass.
                     await self.maybe_add_fixed_seeds()
 
-                # Reconnect to --connect peers that have dropped
-                for host, port in self._connect_addrs:
-                    addr = f"{host}:{port}"
-                    if addr not in self.peers and addr not in self.block_relay_peers:
-                        # --connect peers are always allowed; unban if needed
-                        if self.ban_manager.is_banned(addr):
-                            self.ban_manager.unban(addr)
-                        if self.ban_manager.is_banned(host):
-                            self.ban_manager.unban(host)
-                        try:
-                            logger.info(f"Reconnecting to --connect peer {addr}")
-                            await self.connect_to_node(host, port)
-                        except Exception as e:
-                            logger.warning(f"Failed to reconnect to {addr}: {e}")
+                # Network-active gate (Core net.cpp:2351/3022/3219): while
+                # networking is disabled the outbound connect loop holds off
+                # establishing ANY new connection — pinned --connect reconnects
+                # AND addrman auto-outbound refill alike.  Existing peers stay
+                # up (handled by the safety-net + health sweeps above, which run
+                # unconditionally); only NEW establishment is suppressed.
+                if self.network_active:
+                    # Reconnect to --connect peers that have dropped
+                    for host, port in self._connect_addrs:
+                        addr = f"{host}:{port}"
+                        if addr not in self.peers and addr not in self.block_relay_peers:
+                            # --connect peers are always allowed; unban if needed
+                            if self.ban_manager.is_banned(addr):
+                                self.ban_manager.unban(addr)
+                            if self.ban_manager.is_banned(host):
+                                self.ban_manager.unban(host)
+                            try:
+                                logger.info(f"Reconnecting to --connect peer {addr}")
+                                await self.connect_to_node(host, port)
+                            except Exception as e:
+                                logger.warning(f"Failed to reconnect to {addr}: {e}")
 
-                # Refill outbound slots from addrman — the auto-outbound
-                # behaviour -connect disables (clearbit peer.zig:7050 gates
-                # maintainOutbound on connect_address == null).  Under -connect
-                # the only reconnection is the pinned-peer loop above.
-                if not self._connect_only:
-                    # Refill full-relay outbound slots
-                    if len(self.peers) < self.max_peers:
-                        await self.connect_to_peers(start_height)
+                    # Refill outbound slots from addrman — the auto-outbound
+                    # behaviour -connect disables (clearbit peer.zig:7050 gates
+                    # maintainOutbound on connect_address == null).  Under -connect
+                    # the only reconnection is the pinned-peer loop above.
+                    if not self._connect_only:
+                        # Refill full-relay outbound slots
+                        if len(self.peers) < self.max_peers:
+                            await self.connect_to_peers(start_height)
 
-                    # Refill block-relay-only outbound slots
-                    if len(self.block_relay_peers) < self.max_block_relay_only:
-                        await self._connect_block_relay_peers(start_height)
+                        # Refill block-relay-only outbound slots
+                        if len(self.block_relay_peers) < self.max_block_relay_only:
+                            await self._connect_block_relay_peers(start_height)
 
                 # Health check all peers (outbound + block-relay-only + inbound)
                 all_peers = (
