@@ -3017,6 +3017,53 @@ class RPCServer:
         # Default: return original error
         return error
 
+    async def rpc_ping(self) -> None:
+        """Request that a ping be sent to all connected peers.
+
+        Reference: Bitcoin Core rpc/net.cpp ping (:84-107) →
+        PeerManager::SendPings (net_processing.cpp).
+
+        Params: none. Any argument is a dispatcher arity error (Core: "too many
+        parameters"); here the no-positional-arg signature raises a TypeError →
+        JSON-RPC error, never a silent accept.
+
+        Behaviour: side-effect-only control method. Iterates every connected
+        peer and sends a P2P PING (fire-and-forget) — it does NOT measure
+        latency synchronously or wait for the PONGs. The round-trip results
+        surface LATER via getpeerinfo's ``pingtime`` / ``minping`` fields, and an
+        outstanding ping shows transiently as ``pingwait``. With zero peers it is
+        a successful no-op. Returns JSON ``null`` immediately (Core
+        UniValue::VNULL).
+        """
+        # EnsurePeerman parity: a missing peer manager is P2P-disabled, code -31
+        # (Core RPC_CLIENT_P2P_DISABLED), not an empty success.
+        pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
+        if pm is None:
+            raise RpcError(
+                RPC_CLIENT_P2P_DISABLED,
+                "Error: Peer-to-peer functionality missing or disabled",
+            )
+
+        # Send a PING to the same aggregated peer set getpeerinfo reports, so the
+        # observable (pingwait now, pingtime/minping after the pong) lines up
+        # with the id-list a caller sees. Fire each ping concurrently and do not
+        # block on the responses — Core only QUEUES the ping per peer (sets
+        # m_ping_queued) and returns; the actual send happens on the next message
+        # pass. A per-peer send error must not fail the RPC (peerless / dropped
+        # peers are tolerated), matching Core's loop-over-the-map-and-return.
+        for peer in self._aggregate_peerinfo_peers(pm):
+            ping_coro = getattr(peer, 'ping', None)
+            if ping_coro is None:
+                continue
+            try:
+                asyncio.create_task(peer.ping())
+            except Exception as exc:  # never let one peer fail the whole RPC
+                logger.debug(f"ping: failed to schedule ping to peer: {exc}")
+
+        # Core returns UniValue::VNULL → JSON null. The dispatcher serialises a
+        # Python None return as {"result": null}.
+        return None
+
     async def rpc_setnetworkactive(self, state: Any = None) -> bool:
         """Disable/enable all p2p network activity.
 
@@ -8093,13 +8140,21 @@ class RPCServer:
             elif hasattr(peer, 'is_block_relay_only') and peer.is_block_relay_only:
                 connection_type = "block-relay-only"
 
-            # Ping times.  Peer tracks `latency` (last pong RTT in seconds,
-            # peer.py:931); there is no running minimum, so `minping` is
-            # omitted rather than faked.  `ping_wait` is also not tracked.
+            # Ping times.  Peer tracks `latency` (last pong RTT in seconds),
+            # `min_ping` (running minimum RTT, Core m_min_ping_time) and
+            # `ping_wait_since` (monotonic-clock send time of an outstanding
+            # ping, Core m_ping_start).  These mirror Core's pingtime / minping /
+            # pingwait (rpc/net.cpp:253-260): pingwait is the elapsed time of an
+            # in-flight ping and is omitted once the pong lands.
             latency = getattr(peer, 'latency', 0) or 0
             pingtime = latency if latency > 0 else None
-            minping = None
-            pingwait = None
+            min_ping = getattr(peer, 'min_ping', None)
+            minping = min_ping if (min_ping is not None and min_ping > 0) else None
+            ping_wait_since = getattr(peer, 'ping_wait_since', None)
+            if ping_wait_since is not None:
+                pingwait = max(0.0, _time.time() - ping_wait_since)
+            else:
+                pingwait = None
 
             # Block relay info
             bip152_hb_to = getattr(peer, 'bip152_highbandwidth_to', False)
