@@ -521,6 +521,70 @@ def _iter_node_wallets(node):
         yield w
 
 
+class _VerifyChainDBProxy:
+    """Read-only UTXO overlay over a live ``BlockchainDatabase`` for verifychain.
+
+    Wraps the node's real database, delegating EVERY attribute except the
+    UTXO-read methods to the underlying handle. UTXO reads (``get_utxo``,
+    ``get_utxo_batch``, ``get_utxo_or_spent``) are served from the in-memory
+    ``overlay`` dict first (``None`` = spent/absent in the sandbox, a present
+    dict shadows the live entry) and fall through to the live DB on a miss.
+
+    This is the Core ``CCoinsViewCache`` analog used by ``CVerifyDB::VerifyDB``:
+    the throwaway cache the level-4 reconnect runs against. It NEVER writes to
+    the live chainstate — the overlay is the only mutable state, owned by the
+    rpc_verifychain caller. Letting the node's real ``BlockValidator`` /
+    ``TransactionValidator`` read through this proxy is what makes level 4 a
+    faithful ConnectBlock (full input-script verification on the rewound UTXO
+    view), not a stub.
+    """
+
+    __slots__ = ("_db", "_overlay")
+
+    def __init__(self, db, overlay: dict) -> None:
+        self._db = db
+        self._overlay = overlay
+
+    def get_utxo(self, txid: bytes, vout: int):
+        key = (txid, vout)
+        if key in self._overlay:
+            return self._overlay[key]
+        return self._db.get_utxo(txid, vout)
+
+    def get_utxo_or_spent(self, txid: bytes, vout: int):
+        key = (txid, vout)
+        if key in self._overlay:
+            return self._overlay[key]
+        return self._db.get_utxo_or_spent(txid, vout)
+
+    def get_utxo_batch(self, outpoints):
+        # Serve from the overlay where present; batch the genuine misses to the
+        # live DB in one FFI call (preserving the validator's batched fast path).
+        results: list = [None] * len(outpoints)
+        miss_positions: list[int] = []
+        miss_outpoints: list = []
+        for i, (txid, vout) in enumerate(outpoints):
+            key = (txid, vout)
+            if key in self._overlay:
+                results[i] = self._overlay[key]
+            else:
+                miss_positions.append(i)
+                miss_outpoints.append((txid, vout))
+        if miss_outpoints and hasattr(self._db, "get_utxo_batch"):
+            fetched = self._db.get_utxo_batch(miss_outpoints)
+            for pos, val in zip(miss_positions, fetched):
+                results[pos] = val
+        elif miss_outpoints:
+            for pos, (txid, vout) in zip(miss_positions, miss_outpoints):
+                results[pos] = self._db.get_utxo(txid, vout)
+        return results
+
+    def __getattr__(self, name):
+        # Everything else (get_block, get_best_block, get_median_time_past,
+        # validate_block_from_bytes, _db, ...) delegates to the real handle.
+        return getattr(self._db, name)
+
+
 class RpcError(Exception):
     """A JSON-RPC error carrying a Bitcoin-Core-compatible numeric code.
 
@@ -10761,118 +10825,311 @@ class RPCServer:
         }
 
     async def rpc_verifychain(self, checklevel: int = 3, nblocks: int = 6) -> bool:
-        """Verify the blockchain database.
+        """Verify the blockchain database (Core-faithful CVerifyDB::VerifyDB).
 
-        Checks the most recent *nblocks* blocks at the given level:
-          0 — Block data reads and deserializes correctly
-          1 — Block hash matches the stored hash
-          2 — Merkle root matches computed merkle root
-          3 — Proof-of-work meets difficulty target (default)
-          4 — Full transaction structure validation (expensive)
+        Re-validates the last *nblocks* blocks of the active chain at the
+        requested *checklevel*, returning a JSON bool (true = all checked
+        blocks passed). This is the ouroboros analog of Bitcoin Core
+        ``CVerifyDB::VerifyDB`` (bitcoin-core/src/validation.cpp:4611), called
+        from the ``verifychain`` RPC (bitcoin-core/src/rpc/blockchain.cpp:1262).
 
-        Args:
-            checklevel: Verification depth 0-4 (default 3)
-            nblocks: Number of recent blocks to check (default 6)
+        Levels (cumulative, exactly Core's nCheckLevel ladder):
+          0  ReadBlock from disk (read + deserialize)
+          1  + CheckBlock          (real context-free validation: PoW, merkle
+                                     root, basic structure / coinbase sanity)
+          2  + read undo data      (ReadBlockUndo presence/consistency)
+          3  + DisconnectBlock     (in-memory disconnect into a sandbox overlay,
+                                     reverse-tx-order, reusing the node's real
+                                     undo store — DISCONNECT_UNCLEAN is a
+                                     NON-FATAL warning, only DISCONNECT_FAILED
+                                     is fatal)
+          4  + reconnect           (full ConnectBlock-equivalent: re-run the
+                                     node's real ``validate_block`` with scripts
+                                     forced on, against the rewound overlay)
 
-        Returns:
-            True if all checks pass, False otherwise
+        Args (positional, both optional):
+          checklevel: verification depth, default 3, clamped to 0..4
+          nblocks:    number of recent blocks, default 6; 0 or > chain-height
+                      means ALL blocks.
+
+        CRITICAL: this MUST NOT mutate the live chainstate. Core's VerifyDB
+        works on a throwaway ``CCoinsViewCache`` layered over the real coins
+        view; ouroboros mirrors that with an in-memory ``overlay`` dict over
+        the live UTXO set. The live RocksDB chainstate, block index, and undo
+        store are only ever READ. Levels 3/4 reconstruct the fork-point UTXO
+        view by rewinding each block (disconnect) into the overlay and then
+        re-run the SAME ``validate_block`` machinery the node uses during sync,
+        never a constant-true stub.
+
+        CRITICAL undo semantics (Core validation.cpp:4672-4680, 2179-2247):
+          * A block with a NULL undo position is SKIPPED for levels >= 2 (the
+            assume-valid / snapshot "only go back as far as we have data"
+            rule), NOT failed — and the walk-down stops there.
+          * DisconnectBlock walks txs in REVERSE; an absent intra-block-spend
+            output on disconnect is the NON-FATAL unclean signal (fClean=False,
+            continue, still return true). Only an irrecoverable inconsistency
+            (DISCONNECT_FAILED — undo/tx count mismatch) is fatal/false.
         """
-        import hashlib
-
         from ouroboros.validation import _bits_to_target
 
         if not hasattr(self.node, "db") or not self.node.db:
             return True
 
+        db = self.node.db
         try:
-            _, best_height = self.node.db.get_best_block()
+            _, best_height = await asyncio.to_thread(db.get_best_block)
         except Exception:
             return True
 
-        start_height = max(0, best_height - nblocks + 1)
         checklevel = max(0, min(4, checklevel))
 
-        for h in range(best_height, start_height - 1, -1):
-            try:
-                block = await asyncio.to_thread(self.node.db.get_block_by_height, h)
+        # Core: genesis-only / empty chain -> SUCCESS (validation.cpp:4619).
+        if best_height <= 0:
+            return True
+
+        # if (nCheckDepth <= 0 || nCheckDepth > chain.Height()) nCheckDepth = Height();
+        check_depth = nblocks
+        if check_depth <= 0 or check_depth > best_height:
+            check_depth = best_height
+        start_height = best_height - check_depth + 1  # inclusive lower bound
+
+        logger.info(
+            "verifychain: verifying last %d blocks at level %d (heights %d..%d)",
+            check_depth, checklevel, start_height, best_height,
+        )
+
+        def _verify_sync() -> bool:
+            # In-memory sandbox UTXO view layered over the live coins view.
+            #   overlay[(txid, vout)] = utxo-dict  -> shadows the live entry
+            #   overlay[(txid, vout)] = None       -> spent/absent in sandbox
+            # A missing key falls through to the live DB read. Mutated ONLY here.
+            overlay: dict[tuple[bytes, int], dict | None] = {}
+
+            # Stack of blocks disconnected during the down-walk, so level 4 can
+            # reconnect oldest-first (Core walks chain.Next upward to the tip).
+            disconnected: list[tuple] = []
+
+            from ouroboros.database import Block as _Block
+
+            def read_block(h: int):
+                # Witness-preserving read (Core ReadBlock). get_block_by_height
+                # strips the coinbase witness reserved value, which would make
+                # the level-1 merkle / level-4 witness-commitment checks fail on
+                # every segwit block. Prefer the raw consensus bytes (which keep
+                # the witness) + Block.deserialize — the SAME path the production
+                # connect uses (accept_block: Block.deserialize(block_bytes)).
+                bh = db.get_block_hash_by_height(h)
+                if bh is not None:
+                    raw = db.get_block_bytes(bytes(bh))
+                    if raw:
+                        try:
+                            return _Block.deserialize(bytes(raw))
+                        except Exception:
+                            pass
+                return db.get_block_by_height(h)
+
+            # ---- Levels 0-3: walk DOWN from the tip (disconnect direction) ----
+            for h in range(best_height, start_height - 1, -1):
+                # Level 0: ReadBlock from disk (read + deserialize).
+                block = read_block(h)
                 if block is None:
-                    logger.warning(f"verifychain: block at height {h} not found")
+                    logger.warning("verifychain: ReadBlock failed at height %d", h)
                     return False
 
-                # Level 0: block deserialized successfully (implied)
-
+                # Level 1: CheckBlock — real context-free validation.
                 if checklevel >= 1:
-                    # Recompute block hash from header and compare
-                    header = bytearray()
-                    header.extend(block.version.to_bytes(4, "little", signed=True))
-                    header.extend(block.prev_blockhash[::-1])
-                    header.extend(block.merkle_root[::-1])
-                    header.extend(block.timestamp.to_bytes(4, "little"))
-                    header.extend(block.bits.to_bytes(4, "little"))
-                    header.extend(block.nonce.to_bytes(4, "little"))
-                    computed = hashlib.sha256(
-                        hashlib.sha256(bytes(header)).digest()
-                    ).digest()[::-1]
-                    if computed != block.hash:
-                        logger.warning(
-                            f"verifychain: hash mismatch at height {h}"
-                        )
+                    if not block.transactions:
+                        logger.warning("verifychain: empty block at height %d", h)
                         return False
-
-                if checklevel >= 2:
-                    # Verify merkle root
-                    txids = [tx.get_txid() for tx in block.transactions]
-                    if not txids:
-                        logger.warning(
-                            f"verifychain: no transactions at height {h}"
-                        )
-                        return False
-                    computed_root = self._compute_merkle_root(txids)
-                    if computed_root != block.merkle_root:
-                        logger.warning(
-                            f"verifychain: merkle root mismatch at height {h}"
-                        )
-                        return False
-
-                if checklevel >= 3:
-                    # Verify proof-of-work meets difficulty target
+                    # PoW: hash <= target(nBits). block.hash is stored in
+                    # internal/wire (little-endian) order — the same order the
+                    # node's miner compares (int.from_bytes(.., "little") <=
+                    # target). Display order (getblockhash) is the reverse.
                     target = _bits_to_target(block.bits)
-                    if target <= 0:
+                    if target <= 0 or int.from_bytes(block.hash, "little") > target:
+                        logger.warning("verifychain: bad PoW at height %d", h)
+                        return False
+                    # Merkle root (with malleation / duplicate-txid detection).
+                    if self.node.validator is not None:
+                        if not self.node.validator._verify_merkle_root(block):
+                            logger.warning(
+                                "verifychain: bad merkle root at height %d", h
+                            )
+                            return False
+                    # First tx must be coinbase, and ONLY the first.
+                    if not block.transactions[0].is_coinbase:
                         logger.warning(
-                            f"verifychain: invalid target at height {h}"
+                            "verifychain: missing coinbase at height %d", h
                         )
                         return False
-                    # block.hash is display format (big-endian)
-                    block_hash_int = int.from_bytes(block.hash, "big")
-                    if block_hash_int > target:
-                        logger.warning(
-                            f"verifychain: PoW failed at height {h}"
-                        )
-                        return False
+                    for tx in block.transactions[1:]:
+                        if tx.is_coinbase:
+                            logger.warning(
+                                "verifychain: multiple coinbase at height %d", h
+                            )
+                            return False
+                    for tx in block.transactions:
+                        if not tx.inputs or not tx.outputs:
+                            logger.warning(
+                                "verifychain: tx with no in/outputs at height %d",
+                                h,
+                            )
+                            return False
 
-                if checklevel >= 4:
-                    # Full transaction structure validation
+                # Level 2: undo-data presence + recovery. ouroboros's per-spend
+                # undo coins live in the SPENT_CF store (Core's "block undo"),
+                # read back via get_utxo_or_spent. We reconstruct the block's
+                # undo by restoring every non-coinbase spent input from there.
+                #
+                # NULL undo position (Core validation.cpp:4674): a block whose
+                # undo data is absent is SKIPPED, NOT failed — the assume-valid /
+                # snapshot / pruned "only go back as far as we have data" rule.
+                # In ouroboros that manifests as a block with real non-coinbase
+                # spends whose undo coins are ALL unrecoverable from SPENT_CF
+                # (e.g. a block below the assumeUTXO base whose body/undo was
+                # never downloaded). When that happens we stop the down-walk.
+                # A coinbase-only block legitimately has an EMPTY undo set —
+                # that is not "missing data", so we keep going.
+                #
+                # NOTE: has_block_undo()/UNDO_CF is NOT used here — the normal
+                # connect path (connect_block_from_bytes) only writes SPENT_CF,
+                # leaving UNDO_CF empty, so has_block_undo would falsely report
+                # "no data" for every block and skip the whole verification.
+                block_undo: dict[tuple[bytes, int], dict] | None = None
+                if checklevel >= 2:
+                    block_undo = {}
+                    spend_inputs: list[tuple[bytes, int]] = []
                     for tx in block.transactions:
                         if tx.is_coinbase:
                             continue
-                        if len(tx.inputs) == 0:
+                        for tx_in in tx.inputs:
+                            spend_inputs.append(
+                                (tx_in.prev_txid, tx_in.prev_vout)
+                            )
+                    recovered = 0
+                    for op in spend_inputs:
+                        try:
+                            coin = db.get_utxo_or_spent(op[0], op[1])
+                        except Exception:
+                            coin = None
+                        if coin is not None:
+                            block_undo[op] = coin
+                            recovered += 1
+                    if spend_inputs and recovered == 0:
+                        # All spends unrecoverable -> genuine missing undo data.
+                        logger.info(
+                            "verifychain: block %d has no recoverable undo data; "
+                            "stopping verification here (snapshot/pruned)", h
+                        )
+                        break
+
+                # Level 3: in-memory disconnect into the overlay, REVERSE tx
+                # order, restoring spent inputs from the recovered undo coins.
+                # Mirrors Core DisconnectBlock (validation.cpp:2179-2247): a
+                # created-output mismatch on spend is the NON-FATAL unclean
+                # signal (fClean=False, continue); only an undo/tx inconsistency
+                # (DISCONNECT_FAILED — a spent input on a data-bearing block with
+                # no undo coin to restore) is fatal/false.
+                if checklevel >= 3:
+                    assert block_undo is not None  # set whenever checklevel>=2
+                    for tx in reversed(block.transactions):
+                        txid = tx.get_txid()
+                        # Spend (remove) this tx's created outputs from the
+                        # sandbox. Reverse order means a later tx's restored
+                        # inputs already put back any intra-block-created coin
+                        # an earlier tx consumes, so a valid chain disconnects
+                        # cleanly. An absent output here is UNCLEAN (non-fatal).
+                        for o in range(len(tx.outputs)):
+                            overlay[(txid, o)] = None
+                        # Restore spent inputs from the recovered undo (skip
+                        # coinbase, which has no real inputs to undo).
+                        if not tx.is_coinbase:
+                            for tx_in in tx.inputs:
+                                op = (tx_in.prev_txid, tx_in.prev_vout)
+                                restored = block_undo.get(op)
+                                if restored is None:
+                                    # Missing undo coin for a real spend on a
+                                    # data-bearing block = irrecoverable
+                                    # inconsistency (Core ApplyTxInUndo ->
+                                    # DISCONNECT_FAILED), fatal/false.
+                                    logger.warning(
+                                        "verifychain: irrecoverable inconsistency "
+                                        "(missing undo) at height %d", h
+                                    )
+                                    return False
+                                overlay[op] = restored
+                    disconnected.append((block, h))
+
+            # ---- Level 4: walk UP (reconnect direction), full re-validation ---
+            # The overlay now represents the UTXO set at start_height-1 (the
+            # fork point). Re-run the node's REAL validate_block with scripts
+            # forced on, bottom-up, against an overlay-backed db proxy (reads
+            # served from the overlay, writes never touch the live DB).
+            if checklevel >= 4 and disconnected:
+                validator = self.node.validator
+                if validator is None:
+                    logger.warning("verifychain: validator unavailable for L4")
+                    return False
+
+                # validate_block reads UTXOs through ``validator.tx_validator``
+                # (its OWN internal TransactionValidator), NOT node.tx_validator
+                # — node.py wires those as two SEPARATE instances that "do not
+                # share" (node.py:243-248). The db-swap MUST therefore target
+                # validator.tx_validator (and validator itself, used by
+                # _validate_block_limits' P2SH-sigop prevout lookups). We also
+                # swap node.tx_validator defensively in case any path reads it.
+                proxy = _VerifyChainDBProxy(db, overlay)
+                inner_tx = getattr(validator, "tx_validator", None)
+                node_tx = self.node.tx_validator
+                swap_targets = []
+                _seen_ids: set[int] = set()
+                for obj in (validator, inner_tx, node_tx):
+                    # Skip None and dedup by identity so the saved "original" db
+                    # is never the proxy we just installed on an aliased object.
+                    if obj is not None and id(obj) not in _seen_ids:
+                        _seen_ids.add(id(obj))
+                        swap_targets.append((obj, obj.db))
+                        obj.db = proxy
+                try:
+                    for block, h in reversed(disconnected):
+                        ok, err = validator.validate_block(
+                            block, known_height=h, force_check_scripts=True
+                        )
+                        if not ok:
                             logger.warning(
-                                f"verifychain: tx with no inputs "
-                                f"at height {h}"
+                                "verifychain: unconnectable block at height %d: %s",
+                                h, err,
                             )
                             return False
-                        if len(tx.outputs) == 0:
-                            logger.warning(
-                                f"verifychain: tx with no outputs "
-                                f"at height {h}"
-                            )
-                            return False
+                        # Apply this block forward into the overlay so the next
+                        # (higher) block sees the coins it creates / spends —
+                        # replays ConnectBlock's UTXO mutation in the overlay
+                        # only (never the live DB).
+                        for ti, tx in enumerate(block.transactions):
+                            txid = tx.get_txid()
+                            if ti != 0:  # non-coinbase: spend inputs
+                                for tx_in in tx.inputs:
+                                    overlay[(tx_in.prev_txid, tx_in.prev_vout)] = None
+                            for vout_idx, out in enumerate(tx.outputs):
+                                overlay[(txid, vout_idx)] = {
+                                    "txid": txid,
+                                    "vout": vout_idx,
+                                    "value": out.value,
+                                    "script_pubkey": out.script_pubkey,
+                                    "height": h,
+                                    "is_coinbase": (ti == 0),
+                                }
+                finally:
+                    for obj, saved_db in swap_targets:
+                        obj.db = saved_db
 
-            except Exception as e:
-                logger.warning(f"verifychain: error at height {h}: {e}")
-                return False
+            return True
 
-        return True
+        try:
+            return await asyncio.to_thread(_verify_sync)
+        except Exception as e:
+            logger.warning("verifychain: error during verification: %s", e)
+            return False
 
     @staticmethod
     def _compute_merkle_root(txids: list) -> bytes:
