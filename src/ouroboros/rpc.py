@@ -10937,35 +10937,123 @@ class RPCServer:
         return result
 
     async def rpc_createrawtransaction(
-        self, inputs: list[dict], outputs: list[dict],
-        locktime: int = 0, replaceable: bool = False
+        self, inputs: list[dict], outputs, locktime: int = 0,
+        replaceable: bool = None
     ) -> str:
-        """Create a raw transaction (unsigned)."""
+        """Create a raw transaction (unsigned).
+
+        Faithful to Bitcoin Core's ConstructTransaction / AddInputs /
+        NormalizeOutputs / ParseOutputs
+        (src/rpc/rawtransaction_util.cpp).
+
+        Sequence default (AddInputs, lines 47-65): per input, an explicit
+        "sequence" wins; otherwise the default depends on `replaceable`
+        (RPCArg Default{true}) and locktime:
+          rbf.value_or(true)         -> MAX_BIP125_RBF_SEQUENCE 0xFFFFFFFD
+          else if locktime != 0      -> MAX_SEQUENCE_NONFINAL   0xFFFFFFFE
+          else                       -> SEQUENCE_FINAL           0xFFFFFFFF
+        So with no explicit sequence, no `replaceable`, no locktime, the
+        default is 0xFFFFFFFD (replaceable defaults TRUE).
+
+        Outputs (NormalizeOutputs) accepts BOTH a JSON object
+        {address:amount, "data":hex, ...} AND a JSON array of single-key
+        objects [{address:amount}, {"data":hex}, ...]; the array form is
+        flattened (and permits duplicate addresses + ordering).
+        """
+        from decimal import Decimal
+
         from ouroboros.database import Transaction as DbTx
         from ouroboros.database import TxIn, TxOut
+
+        # Core: rbf is std::optional<bool>; unset -> value_or(true).
+        rbf = True if replaceable is None else bool(replaceable)
+
+        # Default sequence depends on rbf and locktime (Core AddInputs).
+        lock = int(locktime) if locktime is not None else 0
+        if rbf:
+            default_sequence = 0xFFFFFFFD   # MAX_BIP125_RBF_SEQUENCE
+        elif lock != 0:
+            default_sequence = 0xFFFFFFFE   # MAX_SEQUENCE_NONFINAL
+        else:
+            default_sequence = 0xFFFFFFFF   # SEQUENCE_FINAL
+
+        # --- inputs (AddInputs) ------------------------------------------
         tx_inputs = []
         for inp in inputs:
             # JSON-RPC convention: txids arrive in display order (big-endian
             # hex); wire format stores prev_txid in little-endian. W69.
             txid_bytes = bytes.fromhex(inp['txid'])[::-1]
+            # Explicit per-input "sequence" wins (Core: range check
+            # [0, SEQUENCE_FINAL=0xFFFFFFFF]); otherwise use the default.
+            seq_v = inp.get('sequence')
+            if seq_v is not None:
+                seq = int(seq_v)
+                if seq < 0 or seq > 0xFFFFFFFF:
+                    raise ValueError(
+                        "Invalid parameter, sequence number is out of range"
+                    )
+            else:
+                seq = default_sequence
             tx_inputs.append(TxIn(
                 prev_txid=txid_bytes,
                 prev_vout=inp['vout'],
                 script_sig=b'',
-                sequence=0xFFFFFFFD if replaceable else 0xFFFFFFFF,
+                sequence=seq,
             ))
+
+        # --- outputs (NormalizeOutputs) ----------------------------------
+        # Flatten an array of single-key objects into an ordered list of
+        # (key, value) pairs; an object is iterated in its given order.
+        # Both forms must work, hence accept dict OR list.
+        if outputs is None:
+            raise ValueError(
+                "Invalid parameter, output argument must be non-null"
+            )
+        output_items = []
+        if isinstance(outputs, dict):
+            output_items = list(outputs.items())
+        elif isinstance(outputs, list):
+            for entry in outputs:
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        "Invalid parameter, key-value pair not an object as "
+                        "expected"
+                    )
+                if len(entry) != 1:
+                    raise ValueError(
+                        "Invalid parameter, key-value pair must contain "
+                        "exactly one key"
+                    )
+                output_items.extend(entry.items())
+        else:
+            raise ValueError(
+                "Invalid parameter, output argument must be an object or array"
+            )
+
+        # --- outputs (ParseOutputs) --------------------------------------
         tx_outputs = []
-        for out_dict in outputs:
-            for addr, amount in out_dict.items():
-                if addr == "data":
-                    script = b'\x6a' + bytes.fromhex(amount)
-                else:
-                    from ouroboros.address import address_to_script_pubkey
-                    script = address_to_script_pubkey(addr, self.node.network)
-                sat_amount = int(float(amount) * 1e8) if addr != "data" else 0
-                tx_outputs.append(TxOut(value=sat_amount, script_pubkey=script))
+        for addr, amount in output_items:
+            if addr == "data":
+                # Core: CScript() << OP_RETURN << data — canonical minimal
+                # push encoding (direct push / PUSHDATA1 / PUSHDATA2). Reuse
+                # the node's existing CScript-push encoder.
+                from ouroboros.script import _minimal_push_script
+                data = bytes.fromhex(amount)
+                script = b'\x6a' + _minimal_push_script(data)
+                sat_amount = 0
+            else:
+                from ouroboros.address import address_to_script_pubkey
+                script = address_to_script_pubkey(addr, self.node.network)
+                # Core AmountFromValue: exact decimal -> satoshis (no float
+                # rounding error).
+                sat_amount = int(
+                    (Decimal(str(amount)) * Decimal(100_000_000))
+                    .to_integral_value()
+                )
+            tx_outputs.append(TxOut(value=sat_amount, script_pubkey=script))
+
         tx = DbTx(
-            txid=b'\x00' * 32, version=2, locktime=locktime,
+            txid=b'\x00' * 32, version=2, locktime=lock,
             inputs=tx_inputs, outputs=tx_outputs,
         )
         return tx.serialize().hex()
