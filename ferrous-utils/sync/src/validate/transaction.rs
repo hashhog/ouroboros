@@ -1021,9 +1021,14 @@ mod tests {
         };
 
         let result = validator.validate_amounts(&tx, u64::MAX);
+        // A single output > MAX_MONEY is Core's "bad-txns-vout-toolarge"
+        // (consensus/tx_check.cpp CheckTransaction:30), which validate_amounts
+        // maps to OutputAmountTooLarge. The prior assertion expected
+        // InvalidOutputAmount — a variant the validator never produces — so it
+        // failed on every run.
         assert!(matches!(
             result,
-            Err(TransactionValidationError::InvalidOutputAmount)
+            Err(TransactionValidationError::OutputAmountTooLarge)
         ));
     }
 
