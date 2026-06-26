@@ -11350,11 +11350,18 @@ class RPCServer:
         sighash_type = sighash_map.get(sighashtype.upper(), 0x01)
 
         # --- Deserialize transaction -------------------------------------
+        # Core: DecodeHexTx failure -> RPC_DESERIALIZATION_ERROR (-22) with a
+        # fixed message (rpc/rawtransaction.cpp:742). A bare ValueError here
+        # would collapse to -32603; raise RpcError so the dispatch loop emits
+        # the exact -22 Core uses.
         try:
             tx_msg = TxMessage.from_payload(bytes.fromhex(hexstring))
             tx = tx_msg.transaction
-        except Exception as e:
-            raise ValueError(f"TX decode failed: {e}") from None
+        except Exception:
+            raise RpcError(
+                RPC_DESERIALIZATION_ERROR,
+                "TX decode failed. Make sure the tx has at least one input.",
+            ) from None
 
         # --- Build key lookup: pubkey_hash / pubkey -> WalletKey ---------
         network = getattr(self.node, "network", "mainnet")
@@ -14280,6 +14287,14 @@ class RPCServer:
             Joined base64-encoded PSBT
         """
         from ouroboros.psbt import PSBT, joinpsbts
+
+        # Core: txs.size() <= 1 -> RPC_INVALID_PARAMETER (-8), checked before
+        # any PSBT is decoded (rpc/rawtransaction.cpp:1802-1804).
+        if len(psbts or []) <= 1:
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "At least two PSBTs are required to join PSBTs.",
+            )
 
         for p in psbts or []:
             try:
