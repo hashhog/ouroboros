@@ -881,8 +881,12 @@ mod tests {
         let checker = VersionBitsChecker::new(deployment, Network::Bitcoin);
         let mut cache = ThresholdConditionCache::new();
 
-        // Should be FAILED
-        let state = checker.get_state_for(4031, &provider, &mut cache);
+        // FAILED is period 2's state ([4032,6047]): period 1 (2016-4031) is
+        // STARTED, and at the end of period 1 (MTP 101 >= timeout 100, zero
+        // signals) it transitions to FAILED for the next period. Height 4031 is
+        // still in the STARTED period 1 (get_state_for(h) = state of block h,
+        // matching Core GetStateFor); query the first block of period 2.
+        let state = checker.get_state_for(4032, &provider, &mut cache);
         assert_eq!(state, ThresholdState::Failed);
     }
 
@@ -943,13 +947,19 @@ mod tests {
             provider.set_version(h, VERSIONBITS_TOP_BITS);
         }
 
-        let version = cache.compute_block_version(143, &provider);
+        // compute_block_version(h) sets bits for deployments whose state at
+        // block h is STARTED or LOCKED_IN. Regtest TestDummy (bit 28, start=0)
+        // is DEFINED in period 0 ([0,143]) and only STARTED from period 1
+        // ([144,287]) — a DEFINED deployment never signals. Query a period-1
+        // height (144 = the block being assembled on tip 143, the production
+        // case). Taproot is ALWAYS_ACTIVE -> ACTIVE, which is terminal and does
+        // NOT signal, so its bit is intentionally not set.
+        let version = cache.compute_block_version(144, &provider);
 
         // Should have top bits set
         assert_eq!(version & VERSIONBITS_TOP_MASK, VERSIONBITS_TOP_BITS);
 
-        // Taproot is always active on regtest, so its bit should be set
-        // TestDummy starts at time 0, so it should be STARTED, bit 28 set
+        // TestDummy is STARTED at period 1, so its bit 28 must be set.
         assert_ne!(version & (1 << 28), 0);
     }
 
@@ -974,13 +984,17 @@ mod tests {
         let checker = VersionBitsChecker::new(deployment, Network::Bitcoin);
         let mut cache = ThresholdConditionCache::new();
 
-        // At height 4031 (end of period 2) - should be LOCKED_IN, not ACTIVE
-        // because min_activation_height is 6048
-        let state = checker.get_state_for(4031, &provider, &mut cache);
+        // LOCKED_IN is period 2's state ([4032,6047]): period 1 (2016-4031) is
+        // STARTED and signals over threshold, so period 2 locks in. It must NOT
+        // be ACTIVE yet because min_activation_height is 6048. Height 4031 is
+        // still STARTED (period 1); query the first block of period 2.
+        let state = checker.get_state_for(4032, &provider, &mut cache);
         assert_eq!(state, ThresholdState::LockedIn);
 
-        // At height 6047 (end of period 3) - should be ACTIVE now
-        let state = checker.get_state_for(6047, &provider, &mut cache);
+        // ACTIVE is period 3's state ([6048,8063]): LOCKED_IN -> ACTIVE once the
+        // first block of the new period (6048) reaches min_activation_height
+        // 6048. Height 6047 is still LOCKED_IN (period 2); query period 3.
+        let state = checker.get_state_for(6048, &provider, &mut cache);
         assert_eq!(state, ThresholdState::Active);
     }
 
