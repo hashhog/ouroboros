@@ -522,31 +522,57 @@ impl TransactionValidator {
             return Err(TransactionValidationError::InvalidCoinbase);
         }
 
-        // BIP34: the coinbase scriptSig must begin with a serialised push of
-        // the block height. Activation height is network-dependent — mainnet
-        // 227_931, testnet4/regtest/signet 1. Core reference: validation.cpp
-        // ConnectBlock (BIP34Height from CChainParams), Python validation.py:775-793.
-        // We mirror Python's unsigned little-endian decode rather than full
-        // CScriptNum, intentionally lenient — the drain path must match Python.
-        // Reference: bitcoin-core/src/chainparams.cpp consensus.BIP34Height.
+        // BIP34: the coinbase scriptSig must BEGIN WITH the canonical
+        // `CScript() << nHeight` serialisation of the block height. Activation
+        // height is network-dependent — mainnet 227_931, testnet4/regtest/signet 1.
+        //
+        // Core ContextualCheckBlock (validation.cpp:4151-4159):
+        //     CScript expect = CScript() << nHeight;
+        //     if sig.size() < expect.size() || !equal(expect, sig[..expect.size()])
+        //         -> "bad-cb-height"
+        // The `<< nHeight` encoding (script.h push_int64) is NOT always a
+        // length-prefixed push:
+        //     0      -> OP_0  (0x00)
+        //     1..16  -> OP_1..OP_16 (0x51..0x60, single opcode, NO length prefix)
+        //     else   -> minimal little-endian sign-magnitude CScriptNum push.
+        // The previous code read script[0] as a length-prefix and rejected the
+        // OP_1..OP_16 single-opcode form, so regtest/testnet4/signet heights 1..16
+        // (BIP34 active from height 1) were spuriously rejected with "Invalid
+        // coinbase height". Mainnet was unaffected: its post-activation heights are
+        // always > 16, hence always length-prefixed. This now mirrors Core's
+        // prefix-equality AND the Python validator (validation.py _validate_coinbase),
+        // which already used `_encode_bip34_height` + a starts_with check.
+        // Reference: bitcoin-core/src/script/script.h CScript::operator<<(int64_t)
+        //            + validation.cpp ContextualCheckBlock; chainparams.cpp BIP34Height.
+        fn encode_bip34_height(height: u32) -> Vec<u8> {
+            if height == 0 {
+                return vec![0x00]; // OP_0
+            }
+            if height <= 16 {
+                return vec![0x50 + height as u8]; // OP_1..OP_16
+            }
+            // minimal little-endian sign-magnitude bytes, length-prefixed
+            let mut le: Vec<u8> = Vec::new();
+            let mut h = height;
+            while h > 0 {
+                le.push((h & 0xff) as u8);
+                h >>= 8;
+            }
+            // high bit of MSB set -> append a 0x00 sign byte to stay positive
+            if le.last().is_some_and(|b| b & 0x80 != 0) {
+                le.push(0x00);
+            }
+            let mut out = Vec::with_capacity(1 + le.len());
+            out.push(le.len() as u8);
+            out.extend_from_slice(&le);
+            out
+        }
         let bip34_height = crate::chain_params::bip_activation_heights(self.network).0;
         if height >= bip34_height {
+            let expect = encode_bip34_height(height);
             let script = coinbase_input.script_sig.as_bytes();
-            let push_size = script[0] as usize;
-            if push_size == 0 {
-                if height != 0 {
-                    return Err(TransactionValidationError::InvalidCoinbaseHeight);
-                }
-            } else {
-                if push_size > 4 || 1 + push_size > script.len() {
-                    return Err(TransactionValidationError::InvalidCoinbaseHeight);
-                }
-                let mut buf = [0u8; 8];
-                buf[..push_size].copy_from_slice(&script[1..1 + push_size]);
-                let encoded = u64::from_le_bytes(buf);
-                if encoded != height as u64 {
-                    return Err(TransactionValidationError::InvalidCoinbaseHeight);
-                }
+            if script.len() < expect.len() || !script.starts_with(&expect) {
+                return Err(TransactionValidationError::InvalidCoinbaseHeight);
             }
         }
 
@@ -878,6 +904,75 @@ mod tests {
             result_main.is_ok(),
             "mainnet h=1: BIP34 not yet active, coinbase must be accepted; got {:?}",
             result_main
+        );
+    }
+
+    /// Regression: BIP34 coinbase height for heights 1..16 uses Core's
+    /// OP_1..OP_16 single-opcode encoding (`CScript() << nHeight`), NOT a
+    /// length-prefixed push. The pre-fix decoder read OP_1 (0x51) as a
+    /// push-size of 81 and rejected every regtest/testnet4 height-1..16 block
+    /// with InvalidCoinbaseHeight (the `generatetoaddress` self-reject,
+    /// _finding-ouroboros-regtest-mining-bip34). Mainnet was unaffected:
+    /// post-227_931 heights are always > 16 (always length-prefixed).
+    #[test]
+    fn test_bip34_accepts_op_n_low_heights() {
+        let (_temp_dir, db) = create_test_db();
+        let v = TransactionValidator::new(Arc::clone(&db), Network::Regtest);
+
+        let cb = |script_sig: Vec<u8>| Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(
+                    bitcoin::Txid::from_byte_array([0u8; 32]),
+                    u32::MAX,
+                ),
+                script_sig: ScriptBuf::from_bytes(script_sig),
+                sequence: bitcoin::transaction::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        // height 1 -> OP_1 (0x51) + extra-nonce padding: MUST be accepted
+        // (this is the exact case the pre-fix decoder rejected).
+        assert!(
+            v.check_coinbase(&cb(vec![0x51, 0x00]), 1).is_ok(),
+            "regtest h=1: canonical OP_1 coinbase height must be accepted"
+        );
+        // height 16 -> OP_16 (0x60): accepted.
+        assert!(
+            v.check_coinbase(&cb(vec![0x60, 0x00]), 16).is_ok(),
+            "regtest h=16: canonical OP_16 coinbase height must be accepted"
+        );
+        // height 17 -> length-prefixed minimal push 0x01 0x11: accepted.
+        assert!(
+            v.check_coinbase(&cb(vec![0x01, 0x11]), 17).is_ok(),
+            "regtest h=17: length-prefixed coinbase height must be accepted"
+        );
+        // height 0 -> OP_0 (0x00) + padding: accepted.
+        assert!(
+            v.check_coinbase(&cb(vec![0x00, 0x00]), 0).is_ok(),
+            "regtest h=0: OP_0 coinbase height must be accepted"
+        );
+        // wrong height: OP_2 (0x52) claimed at height 1 -> rejected.
+        assert!(
+            matches!(
+                v.check_coinbase(&cb(vec![0x52, 0x00]), 1),
+                Err(TransactionValidationError::InvalidCoinbaseHeight)
+            ),
+            "regtest h=1 with OP_2 (wrong height) must be rejected"
+        );
+        // wrong height: length-prefixed 18 claimed at height 17 -> rejected.
+        assert!(
+            matches!(
+                v.check_coinbase(&cb(vec![0x01, 0x12]), 17),
+                Err(TransactionValidationError::InvalidCoinbaseHeight)
+            ),
+            "regtest h=17 encoding 18 (wrong height) must be rejected"
         );
     }
 
