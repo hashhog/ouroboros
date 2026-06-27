@@ -8257,15 +8257,12 @@ class RPCServer:
         if not hasattr(self.node, 'db') or self.node.db is None:
             raise HTTPException(status_code=500, detail="Database not available")
 
-        # Parse and validate block hash
-        try:
-            block_hash = bytes.fromhex(blockhash)
-            if len(block_hash) != 32:
-                raise ValueError("Block hash must be 32 bytes")
-            # Convert from display (big-endian) to internal (little-endian)
-            block_hash_internal = bytes(reversed(block_hash))
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}") from None
+        # Parse the block hash the way Core's ParseHashV does: a malformed
+        # (non-hex / wrong-length) hash is RPC_INVALID_PARAMETER (-8) at the
+        # parse boundary, BEFORE any lookup (rpc/util.cpp ParseHashV) — not the
+        # internal-error/-32603 the old HTTPException(400) mapped to.
+        block_hash = _parse_hash_v(blockhash, "blockhash")  # display order; -8 on malformed
+        block_hash_internal = bytes(reversed(block_hash))   # internal little-endian
 
         # Check if block exists
         db = self.node.db
@@ -8311,7 +8308,7 @@ class RPCServer:
                 )
         except Exception as e:
             if "not found" in str(e).lower():
-                raise HTTPException(status_code=404, detail=f"Block not found: {blockhash}") from None
+                raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found") from None
             if "genesis" in str(e).lower():
                 raise HTTPException(status_code=400, detail="Cannot invalidate genesis block") from None
             raise HTTPException(status_code=500, detail=str(e)) from None
@@ -8373,15 +8370,12 @@ class RPCServer:
         if not hasattr(self.node, 'db') or self.node.db is None:
             raise HTTPException(status_code=500, detail="Database not available")
 
-        # Parse and validate block hash
-        try:
-            block_hash = bytes.fromhex(blockhash)
-            if len(block_hash) != 32:
-                raise ValueError("Block hash must be 32 bytes")
-            # Convert from display (big-endian) to internal (little-endian)
-            block_hash_internal = bytes(reversed(block_hash))
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid block hash: {e}") from None
+        # Parse the block hash the way Core's ParseHashV does: a malformed
+        # (non-hex / wrong-length) hash is RPC_INVALID_PARAMETER (-8) at the
+        # parse boundary, BEFORE any lookup (rpc/util.cpp ParseHashV) — not the
+        # internal-error/-32603 the old HTTPException(400) mapped to.
+        block_hash = _parse_hash_v(blockhash, "blockhash")  # display order; -8 on malformed
+        block_hash_internal = bytes(reversed(block_hash))   # internal little-endian
 
         # Reconsider the block
         db = self.node.db
@@ -8402,7 +8396,7 @@ class RPCServer:
                 )
         except Exception as e:
             if "not found" in str(e).lower():
-                raise HTTPException(status_code=404, detail=f"Block not found: {blockhash}") from None
+                raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found") from None
             raise HTTPException(status_code=500, detail=str(e)) from None
 
         # reconsiderblock can re-activate (and reorg onto) a previously
@@ -13548,23 +13542,15 @@ class RPCServer:
                     detail=f"Block not found at height {hash_or_height}",
                 )
         else:
-            try:
-                # JSON-RPC convention: hashes are display-order (big-endian)
-                # hex. Internal storage keys blocks by little-endian uint256
-                # bytes. Reference: Bitcoin Core src/rpc/blockchain.cpp
-                # ParseHashV.
-                block_hash = bytes.fromhex(hash_or_height)[::-1]
-                if len(block_hash) != 32:
-                    raise ValueError("Block hash must be 32 bytes")
-            except ValueError:
-                raise HTTPException(
-                    status_code=400, detail="Invalid block hash"
-                ) from None
+            # JSON-RPC convention: hashes are display-order (big-endian) hex;
+            # internal storage keys by little-endian uint256 bytes. ParseHashV
+            # rejects a malformed hash with RPC_INVALID_PARAMETER (-8) at the
+            # parse boundary (Bitcoin Core src/rpc/util.cpp ParseHashV), and an
+            # unknown-but-well-formed hash is RPC_INVALID_ADDRESS_OR_KEY (-5).
+            block_hash = bytes(reversed(_parse_hash_v(hash_or_height, "hash_or_height")))
             block = await asyncio.to_thread(db.get_block, block_hash)
             if not block:
-                raise HTTPException(
-                    status_code=404, detail="Block not found"
-                )
+                raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
 
         # Resolve height. The wire-format Block carries height=None, so prefer
         # the height the caller asked for (int form); otherwise look it up by
