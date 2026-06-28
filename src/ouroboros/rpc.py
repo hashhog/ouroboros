@@ -7,6 +7,7 @@ supporting standard Bitcoin RPC methods.
 
 import asyncio
 import hashlib as _hashlib
+import hmac
 import ipaddress as _ipaddress
 import json
 import logging
@@ -1607,7 +1608,12 @@ class RPCServer:
                 detail="Authentication required",
                 headers=_www_auth,
             ) from None
-        if credentials.username != self.username or credentials.password != self.password:
+        # Constant-time credential compare (hmac.compare_digest) to avoid the
+        # timing oracle that plain != opens; evaluate both before the check so
+        # neither field leaks via short-circuit.
+        user_ok = hmac.compare_digest(credentials.username, self.username)
+        pass_ok = hmac.compare_digest(credentials.password, self.password)
+        if not (user_ok and pass_ok):
             raise HTTPException(
                 status_code=401,
                 detail="Invalid credentials",
