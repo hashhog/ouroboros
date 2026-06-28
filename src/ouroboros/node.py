@@ -1522,6 +1522,7 @@ class BitcoinNode:
                         INV_TYPE_TX,
                         MSG_WITNESS_BLOCK,
                         MSG_WITNESS_TX,
+                        MSG_WTX,
                         GetDataMessage,
                         NotFoundMessage,
                         TxMessage,
@@ -1543,12 +1544,26 @@ class BitcoinNode:
 
                     not_found = []
                     for inv_type, inv_hash in getdata.inventory:
-                        if inv_type in (INV_TYPE_TX, MSG_WITNESS_TX) and self.mempool:
+                        if inv_type in (INV_TYPE_TX, MSG_WITNESS_TX) and self.mempool is not None:
                             tx = self.mempool.get_transaction(inv_hash)
                             if tx:
                                 tx_msg = TxMessage(transaction=tx)
                                 await peer.send_message(tx_msg.to_network_message(network))
                                 logger.debug(f"Sent tx {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
+                            else:
+                                not_found.append((inv_type, inv_hash))
+                        elif inv_type == MSG_WTX and self.mempool is not None:
+                            # BIP-339 wtxid relay: a getdata MSG_WTX(5) keys on the
+                            # WITNESS txid, so resolve it through the wtxid index.
+                            # Previously MSG_WTX matched neither the tx nor the block
+                            # arm and was dropped silently (no tx, no notfound),
+                            # telling wtxid-relay peers — the dominant modern class —
+                            # that we lack a tx we actually hold.
+                            tx = self.mempool.get_transaction_by_wtxid(inv_hash)
+                            if tx:
+                                tx_msg = TxMessage(transaction=tx)
+                                await peer.send_message(tx_msg.to_network_message(network))
+                                logger.debug(f"Sent wtx {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
                             else:
                                 not_found.append((inv_type, inv_hash))
                         elif inv_type in (INV_TYPE_BLOCK, MSG_WITNESS_BLOCK):
