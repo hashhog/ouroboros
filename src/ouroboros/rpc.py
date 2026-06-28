@@ -6493,16 +6493,12 @@ class RPCServer:
         # Find the block
         block = None
         if blockhash:
-            try:
-                # JSON-RPC convention: hashes are display-order (big-endian) hex.
-                # Internal storage keys blocks by little-endian uint256 bytes.
-                # Reference: Bitcoin Core src/rpc/blockchain.cpp ParseHashV.
-                bh_bytes = bytes.fromhex(blockhash)[::-1]
-                if len(bh_bytes) != 32:
-                    raise ValueError("Block hash must be 32 bytes")
-                block = await asyncio.to_thread(db.get_block, bh_bytes)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid blockhash") from None
+            # JSON-RPC convention: hashes are display-order (big-endian) hex;
+            # internal storage keys by little-endian uint256 bytes. ParseHashV
+            # rejects a malformed hash with -8 RPC_INVALID_PARAMETER at the parse
+            # boundary (Bitcoin Core src/rpc/util.cpp), not -32602.
+            bh_bytes = bytes(reversed(_parse_hash_v(blockhash, "blockhash")))
+            block = await asyncio.to_thread(db.get_block, bh_bytes)
         else:
             _, best_height = db.get_best_block()
             for h in range(best_height, max(best_height - 100, -1), -1):
@@ -6515,7 +6511,9 @@ class RPCServer:
                     break
 
         if block is None:
-            raise HTTPException(status_code=404, detail="Block not found")
+            # Core gettxoutproof: an unknown block -> -5 RPC_INVALID_ADDRESS_OR_KEY
+            # "Block not found" (was a 404 -> generic error, not -5).
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
 
         all_txids = [tx.get_txid() for tx in block.transactions]
         for t in target_set:
