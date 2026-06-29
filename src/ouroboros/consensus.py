@@ -123,6 +123,7 @@ BURIED_DEPLOYMENTS = {
         "bip66": BuriedDeployment("bip66", 363725),   # Strict DER signatures
         "csv": BuriedDeployment("csv", 419328),       # BIP68/112/113
         "segwit": BuriedDeployment("segwit", 481824), # BIP141/143/147
+        "taproot": BuriedDeployment("taproot", 709632), # BIP340/341/342 (buried in Core)
     },
     "testnet": {
         "bip34": BuriedDeployment("bip34", 21111),
@@ -130,6 +131,7 @@ BURIED_DEPLOYMENTS = {
         "bip66": BuriedDeployment("bip66", 330776),
         "csv": BuriedDeployment("csv", 770112),
         "segwit": BuriedDeployment("segwit", 834624),
+        "taproot": BuriedDeployment("taproot", 2011968), # testnet3 taproot signaling-activation
     },
     "testnet3": {
         "bip34": BuriedDeployment("bip34", 21111),
@@ -137,6 +139,7 @@ BURIED_DEPLOYMENTS = {
         "bip66": BuriedDeployment("bip66", 330776),
         "csv": BuriedDeployment("csv", 770112),
         "segwit": BuriedDeployment("segwit", 834624),
+        "taproot": BuriedDeployment("taproot", 2011968), # testnet3 taproot signaling-activation
     },
     "testnet4": {
         # All buried deployments active from genesis on testnet4
@@ -145,6 +148,7 @@ BURIED_DEPLOYMENTS = {
         "bip66": BuriedDeployment("bip66", 1),
         "csv": BuriedDeployment("csv", 1),
         "segwit": BuriedDeployment("segwit", 1),
+        "taproot": BuriedDeployment("taproot", 1), # active from genesis (post-taproot network)
     },
     "signet": {
         # All buried deployments active from genesis on signet
@@ -153,6 +157,7 @@ BURIED_DEPLOYMENTS = {
         "bip66": BuriedDeployment("bip66", 1),
         "csv": BuriedDeployment("csv", 1),
         "segwit": BuriedDeployment("segwit", 1),
+        "taproot": BuriedDeployment("taproot", 1), # active from genesis (post-taproot network)
     },
     "regtest": {
         # All buried deployments active from genesis on regtest
@@ -161,6 +166,7 @@ BURIED_DEPLOYMENTS = {
         "bip66": BuriedDeployment("bip66", 1),
         "csv": BuriedDeployment("csv", 1),
         "segwit": BuriedDeployment("segwit", 0),  # Active from genesis
+        "taproot": BuriedDeployment("taproot", 0),  # Active from genesis (regtest)
     },
 }
 
