@@ -161,7 +161,7 @@ def get_flags_for_height(
 
     # Import consensus module for deployment checks
     try:
-        from ouroboros.consensus import is_buried_deployment_active, is_deployment_active
+        from ouroboros.consensus import is_buried_deployment_active
         use_consensus = True
     except ImportError:
         use_consensus = False
@@ -198,7 +198,7 @@ def get_flags_for_height(
         # Taproot (BIP340/341/342) — TAPROOT only.
         # DISCOURAGE_UPGRADABLE_TAPROOT_VERSION and DISCOURAGE_OP_SUCCESS
         # are policy flags for mempool/relay only.
-        if is_deployment_active("taproot", height, network):
+        if is_buried_deployment_active("taproot", height, network):
             flags |= SCRIPT_VERIFY_TAPROOT
 
     else:
@@ -238,7 +238,7 @@ def get_standard_script_flags(
 
     # Add policy-only flags for mempool/relay standardness
     try:
-        from ouroboros.consensus import is_buried_deployment_active, is_deployment_active
+        from ouroboros.consensus import is_buried_deployment_active
         use_consensus = True
     except ImportError:
         use_consensus = False
@@ -252,7 +252,7 @@ def get_standard_script_flags(
                       | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
                       | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS
                       | SCRIPT_VERIFY_CONST_SCRIPTCODE)
-        if is_deployment_active("taproot", height, network):
+        if is_buried_deployment_active("taproot", height, network):
             flags |= (SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
                       | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
     else:
