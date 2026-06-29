@@ -136,6 +136,7 @@ impl BlockValidator {
 
         let default_height = match network {
             Network::Bitcoin => 938_343,   // Bitcoin Core v28 default assumevalid
+            Network::Testnet => 4_842_348, // Testnet3 assumevalid
             Network::Testnet4 => 123_613,  // Testnet4 assumevalid
             _ => 0,                        // Validate everything on other networks
         };
