@@ -862,14 +862,22 @@ class ScriptInterpreter:
         opcode_pos = 0
         codesep_pos = 0xFFFFFFFF
 
-        # Tapscript initial-stack constraints (interpreter.cpp:1855-1861):
-        #   * stack size must be <= MAX_STACK_SIZE (1000) BEFORE any push;
-        #   * every initial witness stack item must be <= MAX_SCRIPT_ELEMENT_SIZE (520).
-        # Core enforces these inside ExecuteWitnessScript right before
-        # EvalScript runs, so they fire for both tapscript and v0 P2WSH.
-        if is_tapscript or is_witness_v0:
+        # Initial witness-stack constraints (interpreter.cpp:1836-1861,
+        # ExecuteWitnessScript):
+        #
+        #   * MAX_STACK_SIZE (1000) pre-execution cap:
+        #     Core: `if (sigversion == SigVersion::TAPSCRIPT)` at line 1855.
+        #     TAPSCRIPT-ONLY — Core does NOT apply this to witness-v0 P2WSH.
+        #     A P2WSH with >1000 initial stack items is consensus-valid but
+        #     will almost certainly fail later (EvalScript dynamic check).
+        #
+        #   * MAX_SCRIPT_ELEMENT_SIZE (520) per-element cap:
+        #     Core: `for (const valtype& elem : stack)` at line 1858-1861.
+        #     Applies to BOTH tapscript and witness-v0 P2WSH.
+        if is_tapscript:
             if len(stack) > MAX_STACK_SIZE:
                 raise ValueError("Stack size exceeded (initial witness stack)")
+        if is_tapscript or is_witness_v0:
             for elem in stack:
                 if len(elem) > MAX_SCRIPT_ELEMENT_SIZE:
                     raise ValueError(
@@ -1900,7 +1908,21 @@ class ScriptInterpreter:
 
     @staticmethod
     def _find_and_delete_count(script: bytes, sig: bytes) -> tuple[bytes, int]:
-        # Build the serialized push of the signature
+        """
+        Opcode-aligned FindAndDelete (mirrors Core interpreter.cpp:229-255).
+
+        Builds `needle` = canonical push-serialisation of `sig`, then walks
+        `script` opcode-by-opcode (GetOp-equivalent).  A needle occurrence is
+        removed only when it begins exactly at an opcode boundary — bytes that
+        happen to look like the needle but are embedded inside a larger push
+        payload are NEVER matched.
+
+        Reference: bitcoin-core/src/script/interpreter.cpp:229-255.
+        """
+        if not sig:
+            return script, 0
+
+        # Build the serialized push of the signature (needle).
         sig_len = len(sig)
         if sig_len < 0x4C:
             needle = bytes([sig_len]) + sig
@@ -1911,13 +1933,51 @@ class ScriptInterpreter:
         else:
             needle = b"\x4e" + sig_len.to_bytes(4, "little") + sig
 
-        # Remove all occurrences, counting how many were removed.
-        result = script
+        needle_len = len(needle)
+        script_len = len(script)
+        result = bytearray()
+        keep_start = 0
+        pos = 0
         found = 0
-        while needle in result:
-            result = result.replace(needle, b"", 1)
-            found += 1
-        return result, found
+
+        while pos < script_len:
+            # --- opcode-boundary match (Core's inner while loop) ---
+            while script_len - pos >= needle_len and \
+                    script[pos:pos + needle_len] == needle:
+                # Flush script[keep_start..pos] then skip over the needle.
+                result.extend(script[keep_start:pos])
+                pos += needle_len
+                keep_start = pos
+                found += 1
+
+            # --- advance past the next opcode (Core's GetOp) ---
+            if pos >= script_len:
+                break
+            op = script[pos]
+            if op <= 0x4b:          # OP_0 (0) through OP_PUSHDATA direct (75)
+                pos += 1 + op
+            elif op == 0x4c:        # OP_PUSHDATA1: 1-byte length follows
+                if pos + 1 >= script_len:
+                    pos = script_len
+                    break
+                pos += 1 + 1 + script[pos + 1]
+            elif op == 0x4d:        # OP_PUSHDATA2: 2-byte LE length follows
+                if pos + 2 >= script_len:
+                    pos = script_len
+                    break
+                pos += 1 + 2 + int.from_bytes(script[pos + 1:pos + 3], "little")
+            elif op == 0x4e:        # OP_PUSHDATA4: 4-byte LE length follows
+                if pos + 4 >= script_len:
+                    pos = script_len
+                    break
+                pos += 1 + 4 + int.from_bytes(script[pos + 1:pos + 5], "little")
+            else:
+                pos += 1            # single-byte opcode (no data)
+
+        if found > 0:
+            result.extend(script[keep_start:])
+            return bytes(result), found
+        return script, 0
 
     def _calculate_signature_hash(
         self,
