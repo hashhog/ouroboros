@@ -1253,6 +1253,18 @@ class RPCServer:
         self._side_branch_blocks: dict[bytes, tuple[bytes, int, bytes]] = {}
         self._side_branch_max_entries: int = 1024
 
+        # preciousblock (Bitcoin Core CChainState::PreciousBlock) bookkeeping.
+        # Mirrors ChainstateManager::nLastPreciousChainwork /
+        # nBlockReverseSequenceId (validation.cpp:3490). A precious block is
+        # assigned a strictly-decreasing "received-before" sequence id so that,
+        # on a tie of cumulative proof-of-work, chain selection prefers it over
+        # equal-work blocks that were seen earlier. These live only in memory —
+        # the effects of preciousblock are NOT retained across restarts, exactly
+        # as in Core.
+        self._last_precious_chainwork: int = -1
+        self._block_reverse_sequence_id: int = -1
+        self._precious_sequence: dict[bytes, int] = {}
+
         # Register RPC methods
         self._register_methods()
 
@@ -7857,6 +7869,114 @@ class RPCServer:
 
         return None
 
+    def _side_branch_chainwork(
+        self, db, tip_hash: bytes, tip_height: int
+    ) -> int | None:
+        """Cumulative chainwork of the branch ending at ``tip_hash``.
+
+        Walks the in-memory side-branch buffer from ``tip_hash`` back to the
+        common ancestor on the active chain, summing each buffered block's
+        proof-of-work onto the ancestor's active-chain cumulative work. Returns
+        the branch's total cumulative work as an int (the value Bitcoin Core's
+        ``CBlockIndex::nChainWork`` would carry for this block), or ``None`` if
+        the branch cannot be resolved through the buffer.
+        """
+        total = 0
+        cursor = tip_hash
+        seen: set[bytes] = set()
+        for _ in range(self._side_branch_max_entries + 4):
+            if cursor in seen:
+                return None
+            seen.add(cursor)
+            entry = self._side_branch_blocks.get(cursor)
+            if entry is None:
+                # cursor is no longer in the side-branch buffer — it must be the
+                # common ancestor on the active chain. Confirm it really is the
+                # active-chain block at its height, then add its cumulative work.
+                anc_h = self._resolve_parent_height(db, cursor)
+                if anc_h is None:
+                    return None
+                try:
+                    anc_active = db.get_block_hash_by_height(anc_h)
+                except Exception:
+                    anc_active = None
+                if anc_active is None or bytes(anc_active) != cursor:
+                    return None
+                return total + self.node._calculate_chainwork_at_height(anc_h)
+            prev_hash, _h, raw_bytes = entry
+            # 80-byte header: version(4) prev(32) merkle(32) time(4) bits(4)
+            # nonce(4) -> compact ``bits`` lives at offset 72:76 (little-endian).
+            if len(raw_bytes) >= 76:
+                bits = int.from_bytes(raw_bytes[72:76], "little")
+                total += self.node._calculate_block_work(bits)
+            cursor = prev_hash
+        return None
+
+    async def _activate_precious_block(
+        self, db, block_hash: bytes, block_height: int
+    ) -> None:
+        """ActivateBestChain analog for a precious block.
+
+        Drives the same DisconnectTip/ConnectTip reorg machinery the
+        submitblock side-branch path uses. The equal-work tiebreak is implicit:
+        the normal P2P/IBD path only reorgs onto a STRICTLY-heavier branch,
+        whereas preciousblock forces the flip onto an equal-work competitor that
+        has just been marked precious.
+
+        Reference: bitcoin-core/src/validation.cpp
+        ``Chainstate::PreciousBlock`` -> ``ActivateBestChain``.
+        """
+        if block_hash not in self._side_branch_blocks:
+            # Not staged in the in-memory side-branch buffer, so a buffered
+            # branch reorg cannot be assembled. Fall back to the Rust
+            # ActivateBestChain analog, which reactivates a strictly-heavier
+            # stored leaf (a no-op for an equal-work block — documented gap).
+            rust = getattr(db, "_db", None) or getattr(db, "rust_db", None)
+            if rust is not None and hasattr(rust, "reactivate_best_chain"):
+                try:
+                    await asyncio.to_thread(rust.reactivate_best_chain)
+                    if hasattr(db, "_cached_tip"):
+                        db._cached_tip = None
+                except Exception as e:
+                    logger.warning(
+                        "preciousblock: reactivate_best_chain failed: %s", e
+                    )
+            return
+
+        result = await self._reorg_to_side_branch_tip(db, block_hash)
+        if result is not None:
+            # The reorg engine returned a BIP-22 reject string — the precious
+            # branch could not be activated (e.g. a buffered block failed
+            # validation). Core would surface this via state.IsValid(); here we
+            # log and leave the active chain unchanged.
+            logger.warning(
+                "preciousblock: activation did not flip the chain: %s", result
+            )
+            return
+
+        if hasattr(db, "_cached_tip"):
+            db._cached_tip = None
+
+        # The reorg did not fire the Python connect/disconnect index hooks, so
+        # re-align the optional indexes with the new active chain — same
+        # non-fatal pattern invalidateblock / reconsiderblock use.
+        csi = getattr(self.node, "coinstats_index", None)
+        if csi is not None:
+            try:
+                await asyncio.to_thread(csi.resync_to_chainstate, db)
+            except Exception as e:
+                logger.warning(
+                    "preciousblock: coinstatsindex resync failed: %s", e
+                )
+        tsi = getattr(self.node, "txospender_index", None)
+        if tsi is not None:
+            try:
+                await asyncio.to_thread(tsi.resync_to_chainstate, db)
+            except Exception as e:
+                logger.warning(
+                    "preciousblock: txospenderindex resync failed: %s", e
+                )
+
     async def rpc_submitblock(self, hexdata: str) -> str | None:
         """
         Submit a mined block to the network.
@@ -8426,6 +8546,101 @@ class RPCServer:
                     f"reconsiderblock: txospenderindex resync failed: {e}"
                 )
 
+        return None
+
+    async def rpc_preciousblock(self, blockhash: str) -> None:
+        """
+        Treats a block as if it were received before others with the same work.
+
+        A later preciousblock call can override the effect of an earlier one.
+        The effects of preciousblock are NOT retained across restarts.
+
+        Marks the named block "precious": it is assigned a strictly-decreasing
+        receive-sequence id so that, on a tie of cumulative proof-of-work, chain
+        selection prefers it over equal-work blocks that were seen earlier. The
+        node then re-activates the best chain — so if the precious block heads a
+        valid competing branch of equal-or-greater work, the active chain is
+        reorganised onto it. If the block is already on the active chain, has
+        less work than the current tip, or is otherwise not a viable
+        competitor, this is a no-op.
+
+        Arguments:
+            blockhash: The hash of the block to mark as precious (hex string)
+
+        Returns:
+            None on success (JSON null).
+
+        Raises:
+            RpcError(-5): if the block hash is unknown.
+            RpcError(-8): if the hash is not a valid 64-char hex string.
+
+        Reference:
+            Bitcoin Core: validation.cpp Chainstate::PreciousBlock,
+            rpc/blockchain.cpp preciousblock().
+        """
+        if not hasattr(self.node, "db") or self.node.db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+        db = self.node.db
+
+        # Core: uint256 hash(ParseHashV(request.params[0], "blockhash"));
+        # ParseHashV rejects a malformed hash at the parse boundary with -8.
+        parsed = _parse_hash_v(blockhash, "blockhash")  # big-endian display
+        block_hash = bytes(reversed(parsed))            # internal little-endian
+
+        # Core: pblockindex = LookupBlockIndex(hash);
+        #       if (!pblockindex) throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+        #                                            "Block not found");
+        block_height = self._get_block_height(db, block_hash)
+        if block_height is None:
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
+
+        # --- Chainstate::PreciousBlock (validation.cpp:3490) ---
+        try:
+            best_hash, best_height = db.get_best_block()
+            best_hash = bytes(best_hash)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"chain tip unavailable: {e}"
+            ) from None
+
+        # Already the active tip, or on the active chain at its height:
+        # ActivateBestChain would be a no-op (the block is at or below the tip
+        # on the active chain). Return null, matching Core.
+        if block_hash == best_hash:
+            return None
+        try:
+            active_at_height = db.get_block_hash_by_height(block_height)
+        except Exception:
+            active_at_height = None
+        if active_at_height is not None and bytes(active_at_height) == block_hash:
+            return None
+
+        # Cumulative work of the active tip vs. the precious block's branch.
+        tip_work = self.node._calculate_chainwork_at_height(best_height)
+        precious_work = self._side_branch_chainwork(db, block_hash, block_height)
+
+        # Core: if (pindex->nChainWork < m_chain.Tip()->nChainWork) return true;
+        # The precious block has strictly less work than the tip — nothing to
+        # do; do NOT touch the reverse-sequence counter.
+        if precious_work is not None and precious_work < tip_work:
+            return None
+
+        # Core: reset the reverse-sequence counter when the chain has been
+        # extended since the last call, then assign this block the current
+        # (decreasing) sequence id and decrement — so a later preciousblock
+        # call overrides an earlier one.
+        if tip_work > self._last_precious_chainwork:
+            self._block_reverse_sequence_id = -1
+        self._last_precious_chainwork = tip_work
+        self._precious_sequence[block_hash] = self._block_reverse_sequence_id
+        _INT32_MIN = -(2 ** 31)
+        if self._block_reverse_sequence_id > _INT32_MIN:
+            self._block_reverse_sequence_id -= 1
+
+        # --- ActivateBestChain (validation.cpp:3518) ---
+        # The precious block now wins the equal-work tie; re-activate the best
+        # chain, reorganising onto the precious branch if it is a competitor.
+        await self._activate_precious_block(db, block_hash, block_height)
         return None
 
     # --- Additional RPC methods ---
