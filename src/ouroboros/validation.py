@@ -1109,6 +1109,18 @@ class BlockValidator:
         # block so that intra-block dependencies (tx N spending tx M's
         # output where M < N) can be resolved.
         intra_block_utxos: dict[tuple[bytes, int], dict] = {}
+        # Cross-transaction spent-outpoint set for in-block double-spend detection.
+        #
+        # Core: CCoinsViewCache::SpendCoin (coins.cpp:153-175) removes each coin
+        # from the cache after CheckTxInputs succeeds, so HaveInputs (coins.cpp:329-339)
+        # returns False for any later tx that tries to spend the same outpoint.
+        # We replicate that here: add each input's (prev_txid, prev_vout) after a tx
+        # is accepted, and reject any later tx whose input is already in the set.
+        # Without this, both on-disk UTXO double-spends (DB not yet flushed) AND
+        # intra-block output double-spends (still in intra_block_utxos) slip through.
+        # Reference: bitcoin-core/src/coins.cpp:153-175, :329-339;
+        #            bitcoin-core/src/validation.cpp:2535.
+        spent_in_block: set[tuple[bytes, int]] = set()
         total_fees = 0
         for i, tx in enumerate(block.transactions):
             # IsFinalTx check applies to ALL transactions including coinbase.
@@ -1121,6 +1133,15 @@ class BlockValidator:
                 if not self._validate_coinbase(tx, expected_height):
                     return False, "Invalid coinbase"
             else:
+                # In-block double-spend gate.
+                # Check every input before calling validate_transaction: the DB is
+                # not yet flushed, so get_utxo / get_utxo_batch would still return
+                # a coin that was already spent by an earlier tx in this block.
+                for tx_in in tx.inputs:
+                    key = (tx_in.prev_txid, tx_in.prev_vout)
+                    if key in spent_in_block:
+                        return False, "bad-txns-inputs-missingorspent"
+
                 # Capture the fee from validate_transaction directly to avoid
                 # re-fetching every input UTXO in _calculate_tx_fee (was doing
                 # ~6000 extra individual FFI calls per block at height 800k).
@@ -1140,6 +1161,13 @@ class BlockValidator:
                 #   ("bad-txns-accumulated-fee-outofrange")
                 if total_fees < 0 or total_fees > MAX_MONEY:
                     return False, "bad-txns-accumulated-fee-outofrange"
+
+                # Mark all inputs spent so any later tx in this block that
+                # tries to re-spend the same outpoint is caught by the guard
+                # above (mirrors Core's CCoinsViewCache::SpendCoin tombstone).
+                for tx_in in tx.inputs:
+                    key = (tx_in.prev_txid, tx_in.prev_vout)
+                    spent_in_block.add(key)
 
             # Register this tx's outputs in the intra-block view for
             # subsequent transactions.
