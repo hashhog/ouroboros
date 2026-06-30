@@ -8971,6 +8971,9 @@ class RPCServer:
             info: dict[str, Any] = {
                 "id": peer_id,
                 "addr": addr,
+                # network: derived from the peer's connection type (ipv4/ipv6/
+                # onion/i2p/cjdns/not_publicly_routable), matching Core rpc/net.cpp.
+                "network": self._addrman_network_name(peer),
                 "services": services_hex,
                 "servicesnames": service_names,
                 # Peer.relay_txs (peer.py:207) — prior `relay_txes` lookup
@@ -13684,27 +13687,30 @@ class RPCServer:
         base_fee_btc = entry.fee / 1e8
         modified_fee_btc = own_modified_fee / 1e8
 
+        # Core entryToJSON order (rpc/mempool.cpp): vsize, weight, time, height,
+        # descendant*/ancestor*, wtxid, fees{}, depends, spentby, unbroadcast.
+        # Fees are ONLY in the nested fees{} object — the old flat fee/modifiedfee/
+        # ancestorfees/descendantfees top-level fields are NOT part of Core's shape.
         return {
+            "vsize": vsize,
+            "weight": weight,
+            "time": int(entry.time_added),
+            "height": entry.height_added,
+            "descendantcount": entry.descendant_count,
+            "descendantsize": entry.descendant_size,
+            "ancestorcount": entry.ancestor_count,
+            "ancestorsize": entry.ancestor_size,
+            "wtxid": _display_hash(entry.tx.get_wtxid())
+                if hasattr(entry.tx, "get_wtxid") else _display_txid(txid_bytes),
             "fees": {
                 "base": base_fee_btc,
                 "modified": modified_fee_btc,
                 "ancestor": ancestor_fees / 1e8,
                 "descendant": descendant_fees / 1e8,
             },
-            "vsize": vsize,
-            "weight": weight,
-            "fee": base_fee_btc,
-            "modifiedfee": modified_fee_btc,
-            "time": int(entry.time_added),
-            "height": entry.height_added,
-            "descendantcount": entry.descendant_count,
-            "descendantsize": entry.descendant_size,
-            "descendantfees": descendant_fees,
-            "ancestorcount": entry.ancestor_count,
-            "ancestorsize": entry.ancestor_size,
-            "ancestorfees": ancestor_fees,
             "depends": depends,
             "spentby": spentby,
+            "unbroadcast": False,
         }
 
     async def rpc_getmempoolentry(self, txid: str) -> dict[str, Any]:
