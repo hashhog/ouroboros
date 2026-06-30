@@ -296,6 +296,31 @@ impl BlockValidator {
         // 6b. BIP30 duplicate-txid against UTXO set (mainnet window only)
         self.check_bip30(inner, height)?;
 
+        // 6c. BIP113 IsFinalTx for ALL transactions (including coinbase).
+        //
+        // Mirrors Core ContextualCheckBlock (validation.cpp:4133-4148):
+        //   nLockTimeCutoff = MTP(pindexPrev) when CSV active, else block.GetBlockTime().
+        //   Then for each tx: if !IsFinalTx(*tx, nHeight, nLockTimeCutoff) → reject.
+        //
+        // Previously ouroboros's check_lock_time accepted ALL time-based locktimes
+        // (see the `LockTime::Seconds(_) => false` / `return Ok(())` path), so a
+        // non-final time-locked tx would be silently admitted into a block.
+        {
+            let enforce_bip113 = super::sequence_lock::is_bip68_active(height, self.network);
+            let time_cutoff: u32 = if enforce_bip113 && prev_height > 0 {
+                self.header_validator
+                    .get_median_time_past(prev_height)
+                    .map_err(BlockValidationError::HeaderValidation)? as u32
+            } else {
+                inner.header.time
+            };
+            for tx in &inner.txdata {
+                self.tx_validator
+                    .check_tx_is_final(tx, height, time_cutoff)
+                    .map_err(BlockValidationError::TransactionValidation)?;
+            }
+        }
+
         // 7. Per-tx validation — always, regardless of assumevalid.
         //    Matches Python's skip_scripts=True path which keeps UTXO
         //    lookups, coinbase maturity, amount, and BIP68 checks.
@@ -758,9 +783,13 @@ impl BlockValidator {
         let subsidy = self.calculate_block_subsidy(height);
 
         let coinbase = &block.txdata[0];
+        // Use checked_add so a coinbase with wire-negative outputs (which pass
+        // value.to_sat() as a huge u64) cannot wrap around and hide an oversize
+        // coinbase total. (check_coinbase already rejects such outputs individually,
+        // but this hardens the subsidy gate defensively.)
         let coinbase_total: u64 = coinbase.output.iter()
-            .map(|out| out.value.to_sat())
-            .sum();
+            .try_fold(0u64, |acc, out| acc.checked_add(out.value.to_sat()))
+            .ok_or(BlockValidationError::CoinbaseAmountExceeded)?;
 
         let max_coinbase = subsidy
             .checked_add(total_fees)
@@ -1459,6 +1488,70 @@ mod tests {
         let block_wrapper = BlockWrapper::new(block);
         let result = validator.check_duplicate_transactions(block_wrapper.inner());
         assert!(matches!(result, Err(BlockValidationError::DuplicateTransaction)));
+    }
+
+    // --- Wave-2 finding tests ---
+
+    /// Finding 3 (BIP113): validate_block_subsidy uses checked_add for coinbase total.
+    ///
+    /// If the coinbase outputs sum to more than subsidy + fees, reject.
+    /// The `.sum()` was replaced with `try_fold / checked_add` so wrapping
+    /// arithmetic can no longer hide an oversized coinbase.
+    #[test]
+    fn test_validate_block_subsidy_checked_add() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Bitcoin);
+
+        // Construct a block where the coinbase pays exactly MAX_MONEY to one output
+        // and one satoshi to another — total > MAX_MONEY, so checked_add overflows.
+        const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+
+        let coinbase_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(
+                    bitcoin::Txid::from_byte_array([0u8; 32]),
+                    u32::MAX,
+                ),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::transaction::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![
+                bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(MAX_MONEY),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                },
+                bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(1),
+                    script_pubkey: bitcoin::ScriptBuf::new(),
+                },
+            ],
+        };
+
+        let txids: Vec<[u8; 32]> = vec![*coinbase_tx.compute_txid().as_byte_array()];
+        let merkle_root = compute_merkle_root(&txids);
+
+        let block = Block {
+            header: bitcoin::blockdata::block::Header {
+                version: bitcoin::blockdata::block::Version::from_consensus(1),
+                prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+                merkle_root: bitcoin::blockdata::block::TxMerkleNode::from_byte_array(merkle_root),
+                time: 1234567890u32,
+                bits: bitcoin::CompactTarget::from_consensus(0x1d00ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase_tx],
+        };
+
+        // subsidy at height 0 = 5_000_000_000 sat, fees = 0.
+        // coinbase_total = MAX_MONEY + 1 > subsidy, so reject.
+        let result = validator.validate_block_subsidy(&block, 0, 0);
+        assert!(
+            matches!(result, Err(BlockValidationError::CoinbaseAmountExceeded)),
+            "coinbase total > MAX_MONEY must be rejected: {result:?}"
+        );
     }
 }
 
