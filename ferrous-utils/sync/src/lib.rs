@@ -3807,6 +3807,22 @@ impl PyBlockchainDB {
         // (skip-coinbase, then per non-coinbase tx, then per input).
         // `input_cursor` advances across the flat input list.
         let mut input_cursor: usize = 0;
+
+        // In-block spent-outpoint set (mirrors Core CCoinsViewCache tombstone).
+        //
+        // When two txs in the same block both try to spend the same outpoint:
+        //   • Intra-block outputs: `in_block_added.remove()` returns None on the
+        //     second attempt (already evicted by the first), leaving utxo_bytes=None,
+        //     which was previously TOLERATED.  Now caught by this set.
+        //   • On-disk UTXOs: the multi_get_cf prefetch has the value at BOTH cursor
+        //     positions (two entries with the same key), so BOTH spends silently
+        //     succeeded.  Now caught by this set.
+        //
+        // Reference: bitcoin-core/src/coins.cpp:153-175 (SpendCoin),
+        //            :329-339 (HaveInputs), validation.cpp:2535 (ConnectBlock).
+        let mut spent_in_block: std::collections::HashSet<[u8; 36]> =
+            std::collections::HashSet::new();
+
         for (tx_pos, tx) in inner.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
             let txid_bytes = *txid.as_byte_array();
@@ -3816,6 +3832,14 @@ impl PyBlockchainDB {
                 for _input in &tx.input {
                     let key = &input_keys[input_cursor];
                     let spending_txid = &input_spending_txids[input_cursor];
+
+                    // Reject any outpoint already spent by an earlier tx in
+                    // this block — Core's CCoinsViewCache tombstone semantics.
+                    if spent_in_block.contains(key) {
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                            "bad-txns-inputs-missingorspent: double-spend within block",
+                        ));
+                    }
 
                     // Resolve UTXO bytes: overlay first, then on-disk
                     // prefetch (same precedence as `connect_blocks_atomic`).
@@ -3848,6 +3872,10 @@ impl PyBlockchainDB {
                     // Note: an outpoint with no on-disk hit AND no overlay
                     // hit indicates an early-IBD missing UTXO (the same
                     // tolerated gap as the original implementation).
+
+                    // Mark as spent so any later tx in this block that tries
+                    // to re-spend the same outpoint is caught above.
+                    spent_in_block.insert(*key);
 
                     input_cursor += 1;
                 }
