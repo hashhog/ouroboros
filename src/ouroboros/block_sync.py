@@ -2277,12 +2277,6 @@ class BlockSync:
         down to the first ancestor that is on the active chain, then counting
         forward.  Returns ``None`` if the fork does not anchor to a known
         active-chain block within ``MAX_REORG_DEPTH`` hops (defensive).
-
-        Height-as-work regtest shortcut: with a uniform target across competing
-        branches at the same height range, fork height stands in for cumulative
-        chain work — the same shortcut rpc._attach_side_branch_block (:6903)
-        and the camlcoin/rustoshi Pattern-Y closures take.  A real chainwork
-        compare is a mainnet follow-up (see the fix plan "Invariants / risks").
         """
         cursor = fork_tip_hash
         steps = 0
@@ -2301,6 +2295,52 @@ class BlockSync:
                 return None
             cursor = prev
             steps += 1
+        return None
+
+    def _fork_tip_chainwork(self, fork_tip_hash: bytes) -> int | None:
+        """Cumulative 256-bit chainwork at ``fork_tip_hash``.
+
+        Walks ``_fork_header_prev`` from the fork tip to the first ancestor
+        that is on the active chain, accumulating ``_bits_to_work(header.bits)``
+        for every bridging fork header.  Then adds the common ancestor's
+        stored cumulative chainwork from the DB.
+
+        Mirrors Bitcoin Core's ``CBlockIndex::nChainWork`` semantics:
+        arith_uint256 (exact 256-bit unsigned), reorg only on STRICTLY greater.
+        Returns ``None`` if the fork doesn't anchor within MAX_REORG_DEPTH or
+        if a bridging header is missing from the fork store.
+
+        If the DB doesn't have chainwork persisted for the anchor (returns 0),
+        the returned value is the incremental fork work above the ancestor —
+        still monotone and correct for the equal-/greater-work comparison, but
+        may undercount if the anchor's own history is not represented.
+        """
+        cursor = fork_tip_hash
+        accumulated = 0
+        seen: set[bytes] = set()
+        max_walk = MAX_REORG_DEPTH + 1
+        for _ in range(max_walk + 1):
+            if cursor in seen:
+                return None  # cycle guard
+            seen.add(cursor)
+            anchor_h = self._resolve_active_height(cursor)
+            if anchor_h is not None:
+                # cursor is the common ancestor on the active chain.
+                # Its cumulative chainwork is stored in the DB.
+                try:
+                    ancestor_cw = self.db.get_chainwork_by_height(anchor_h)
+                except Exception:
+                    ancestor_cw = 0
+                return ancestor_cw + accumulated
+            # cursor is a fork header — accumulate its proof-of-work.
+            header = self._fork_headers.get(cursor)
+            if header is None:
+                return None  # incomplete fork store
+            accumulated += self._bits_to_work(header.bits)
+            prev = self._fork_header_prev.get(cursor)
+            if prev is None:
+                return None
+            cursor = prev
         return None
 
     async def _maybe_send_fork_getheaders(self, peer: Peer, key_hash: bytes) -> None:
@@ -3119,9 +3159,10 @@ class BlockSync:
         will hang off, and it is also re-evaluated each sync_loop tick (PART 5)
         so a fork that becomes heavier later still triggers.
 
-        Strictly-heavier uses the height-as-work regtest shortcut (mirrors
-        rpc._attach_side_branch_block :6903); a real chainwork compare is a
-        mainnet follow-up.
+        Chain selection uses cumulative 256-bit chainwork (Core
+        CBlockIndexWorkComparator: nChainWork first, then first-seen
+        sequence-id tie-break).  Reorg only on STRICTLY greater work;
+        equal-work forks keep the current tip.
 
         Returns True iff the fork was found strictly heavier (a download was
         requested or would be once GAP2 lands).
@@ -3137,22 +3178,62 @@ class BlockSync:
             _, active_height = self.db.get_best_block()
         except Exception:
             active_height = -1
-        if fork_height <= active_height:
-            # Stored but not heavier — keep it in the fork store in case it
-            # extends further later (Core stores it in the block index but
-            # does not flip the tip).  No download.
-            logger.debug(
-                f"Fork tip {fork_tip_hash.hex()[:16]}... h={fork_height} "
-                f"not heavier than active h={active_height}; stored only"
-            )
-            return False
+
+        # --- Cumulative chainwork comparison (Core arith_uint256 semantics) ---
+        # Prefer exact 256-bit chainwork over the height shortcut: at a
+        # difficulty-adjustment boundary, a shorter fork can have MORE work
+        # than the active tip if it carries harder blocks.
+        fork_cw = self._fork_tip_chainwork(fork_tip_hash)
+        try:
+            active_cw = self.db.get_chainwork_by_height(active_height) if active_height >= 0 else 0
+        except Exception:
+            active_cw = 0
+
+        # Use exact chainwork comparison only when BOTH values are available:
+        # fork_cw is not None (fork store is complete) AND active_cw > 0
+        # (the active tip's cumulative work is persisted in the DB).
+        # If the active tip's chainwork is 0 (unavailable), comparing fork
+        # incremental work against 0 would always favour the fork — wrong.
+        if fork_cw is not None and active_cw > 0:
+            # Chainwork data available: use exact comparison.
+            if fork_cw <= active_cw:
+                # Not strictly heavier (equal work = first-seen tie-break,
+                # keep the current tip per CBlockIndexWorkComparator).
+                logger.debug(
+                    "Fork tip %s... h=%d cw=0x%064x not strictly heavier than "
+                    "active h=%d cw=0x%064x; stored only",
+                    fork_tip_hash.hex()[:16], fork_height, fork_cw,
+                    active_height, active_cw,
+                )
+                return False
+        else:
+            # Chainwork unavailable (old datadir / pre-persistence blocks):
+            # fall back to height comparison.
+            if fork_height <= active_height:
+                logger.debug(
+                    "Fork tip %s... h=%d not heavier than active h=%d "
+                    "(height fallback, chainwork unavailable); stored only",
+                    fork_tip_hash.hex()[:16], fork_height, active_height,
+                )
+                return False
+
         # Strictly heavier — this fork should become the active chain.
         self._fork_reorg_triggered += 1
-        logger.warning(
-            f"Heavier competing fork discovered: tip "
-            f"{fork_tip_hash.hex()[:16]}... h={fork_height} > active "
-            f"h={active_height} — requesting bridging bodies for reorg"
-        )
+        if fork_cw is not None and active_cw > 0:
+            logger.warning(
+                "Heavier competing fork discovered: tip %s... h=%d "
+                "cw=0x%064x > active h=%d cw=0x%064x — requesting bridging "
+                "bodies for reorg",
+                fork_tip_hash.hex()[:16], fork_height, fork_cw,
+                active_height, active_cw,
+            )
+        else:
+            logger.warning(
+                "Heavier competing fork discovered: tip %s... h=%d > "
+                "active h=%d — requesting bridging bodies for reorg "
+                "(height fallback, chainwork unavailable)",
+                fork_tip_hash.hex()[:16], fork_height, active_height,
+            )
         # GAP2 hand-off: download the missing bridging bodies, then GAP3
         # routes the completed bridge through the submitblock side-branch
         # reorg path.  ``_request_fork_blocks`` short-circuits to the GAP3
