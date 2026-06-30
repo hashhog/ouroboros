@@ -1803,7 +1803,14 @@ class ScriptInterpreter:
                 SEQ_MASK = 0x0000ffff
                 if lock_value & SEQ_DISABLE:
                     continue
-                if tx.version < 2:
+                # Core stores nVersion as uint32_t and compares UNSIGNED:
+                # ``if (txTo->nVersion < 2) return false;`` (interpreter.cpp:1790).
+                # A Python/Rust signed i32 source would decode 0xFFFFFFFF as -1,
+                # making the signed ``< 2`` check falsely reject a consensus-valid
+                # spend.  Mask to uint32 semantics to match Core (BIP112 tx_valid
+                # vector 165). Mirrors bip68_version_active() in validation.py but
+                # inlined here to avoid a circular import (validation imports script).
+                if (tx.version & 0xFFFFFFFF) < 2:
                     raise ValueError("OP_CHECKSEQUENCEVERIFY: tx version < 2")
                 tx_seq = tx.inputs[input_index].sequence
                 if tx_seq & SEQ_DISABLE:

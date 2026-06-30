@@ -7388,34 +7388,63 @@ class RPCServer:
             block_hash.hex()[:16], prev_hash.hex()[:16], new_height,
         )
 
-        # Heavier-chain check. On regtest and in the IBD common case the
-        # PoW target is uniform across competing branches at the same
-        # height range, so we can use ``height`` as a stand-in for
-        # cumulative chain work — the same shortcut camlcoin's Pattern Y
-        # closure (22667c2) and rustoshi's (68a422b) take. A
-        # difficulty-adjustment-boundary side-branch on mainnet/testnet
-        # would need a chain_work-aware variant; deferred per the audit
-        # follow-up (out of scope for the Pattern X+Y closure).
         try:
             _, active_tip_height = db.get_best_block()
         except Exception:
             active_tip_height = -1
 
-        if new_height <= active_tip_height:
-            # Same-or-lighter side-branch: stored, no tip flip. Core's
-            # ``rpc/mining.cpp`` returns ``"inconclusive"`` here; the
-            # diff-test harness treats both ``None`` (accept) and
-            # ``reject:inconclusive`` as "context successfully ingested",
-            # so returning None keeps wire-compat with the rest of the
-            # fleet's submitblock semantics.
-            return None
+        # --- Cumulative chainwork comparison (Core CBlockIndexWorkComparator) ---
+        # nChainWork is exact arith_uint256; reorg only on STRICTLY greater.
+        # Equal work = first-seen tie-break = keep the current tip.
+        # _side_branch_chainwork walks the in-memory side-branch buffer from
+        # block_hash to the common ancestor, accumulating proof-of-work, then
+        # adds the ancestor's active-chain cumulative work from the DB.
+        fork_cw = self._side_branch_chainwork(db, block_hash, new_height)
+        active_cw = (
+            self.node._calculate_chainwork_at_height(active_tip_height)
+            if active_tip_height >= 0 and hasattr(self.node, "_calculate_chainwork_at_height")
+            else 0
+        )
+
+        # Use exact chainwork comparison only when BOTH values are available:
+        # fork_cw is not None (buffer walk succeeded to the active ancestor)
+        # AND active_cw > 0 (active tip's cumulative work is persisted).
+        # If active_cw is 0, comparing fork incremental work against 0 would
+        # always favour the fork — wrong for old datadirs without persistence.
+        if fork_cw is not None and active_cw > 0:
+            # Chainwork available: exact 256-bit comparison.
+            if fork_cw <= active_cw:
+                # Same-or-lighter side-branch: stored, no tip flip. Core's
+                # ``rpc/mining.cpp`` returns ``"inconclusive"`` here; the
+                # diff-test harness treats both ``None`` (accept) and
+                # ``reject:inconclusive`` as "context successfully ingested",
+                # so returning None keeps wire-compat with the rest of the
+                # fleet's submitblock semantics.
+                logger.debug(
+                    "submitblock: side-branch h=%d cw=0x%064x not strictly "
+                    "heavier than active_tip h=%d cw=0x%064x; stored only",
+                    new_height, fork_cw, active_tip_height, active_cw,
+                )
+                return None
+        else:
+            # Chainwork unavailable (old datadir): height fallback.
+            if new_height <= active_tip_height:
+                return None
 
         # Strictly heavier — drive the reorg.
-        logger.info(
-            "submitblock: heavier side-branch h=%d > active_tip h=%d, "
-            "driving reorg to %s",
-            new_height, active_tip_height, block_hash.hex()[:16],
-        )
+        if fork_cw is not None and active_cw > 0:
+            logger.info(
+                "submitblock: heavier side-branch h=%d cw=0x%064x > "
+                "active_tip h=%d cw=0x%064x, driving reorg to %s",
+                new_height, fork_cw, active_tip_height, active_cw,
+                block_hash.hex()[:16],
+            )
+        else:
+            logger.info(
+                "submitblock: heavier side-branch h=%d > active_tip h=%d, "
+                "driving reorg to %s (height fallback)",
+                new_height, active_tip_height, block_hash.hex()[:16],
+            )
         return await self._reorg_to_side_branch_tip(db, block_hash)
 
     async def _reorg_to_side_branch_tip(
