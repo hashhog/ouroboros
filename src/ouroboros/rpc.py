@@ -278,15 +278,17 @@ def bip22_result_string(error: str) -> str:
 # Hard cap on the depth of a single submitblock-driven reorg. Mirrors the
 # operational reorg-safety margin used elsewhere in ouroboros (see
 # ``rpc_loadtxoutset`` / pruning code which use the same 288-block Core
-# convention). 100 is a deliberately tight cap for the *atomic* reorg path:
-# it bounds the size of the single in-Rust ``WriteBatch`` (so we can't OOM
-# the process by accepting a 10k-deep side branch through ``submitblock``)
-# without coming anywhere near a real-world reorg depth (Core has not seen
-# a >10-deep reorg in ~14 years of operation).
+# convention). 288 (= MIN_BLOCKS_TO_KEEP) is an implementation-specific
+# memory-safety cap on the *atomic* reorg path: it bounds the size of the single
+# in-Rust ``WriteBatch`` (so we can't OOM the process by accepting a deep side
+# branch through ``submitblock``) while aligning with Core's pruned-node undo
+# retention. Bitcoin Core itself has NO reorg-depth cap (it follows most-work,
+# bounded only by prune/undo retention); Core has not seen a >10-deep reorg in
+# ~14 years of operation, so this is observationally inert on the honest chain.
 #
 # Reference: ``CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md``
-# Pattern D.
-MAX_REORG_DEPTH: int = 100
+# Pattern D. Raised 100->288 (was deferred pending the preciousblock WIP).
+MAX_REORG_DEPTH: int = 288
 
 
 async def accept_block(
