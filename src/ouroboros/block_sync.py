@@ -169,11 +169,11 @@ logger = logging.getLogger(__name__)
 _MAX_NUM_UNCONNECTING_HEADERS_MSGS: int = 10
 
 # Maximum combined reorg depth (disconnect + connect) the P2P fork path will
-# bridge/route before refusing — mirrors rpc.MAX_REORG_DEPTH (=100).  Defined
+# bridge/route before refusing — mirrors rpc.MAX_REORG_DEPTH (=288).  Defined
 # locally rather than imported from rpc to avoid the rpc↔block_sync import
 # cycle (rpc imports block_sync); the reorg machinery itself re-checks the cap
 # in rpc._reorg_to_side_branch_tip, so this is a download-side guard only.
-MAX_REORG_DEPTH: int = 100
+MAX_REORG_DEPTH: int = 288
 
 
 def _distribute_blocks_round_robin(
@@ -4614,7 +4614,7 @@ class BlockSync:
             # so the asyncio loop stays responsive during the walk.
             temp_hash = current_hash
             temp_height = current_height
-            for _ in range(100):
+            for _ in range(MAX_REORG_DEPTH):
                 if temp_hash is None:
                     break
                 block = await asyncio.to_thread(self.db.get_block, temp_hash)
@@ -4630,7 +4630,7 @@ class BlockSync:
             # Build new chain back (new_block is the tip we received, may not be in db yet)
             temp_hash = new_chain_tip
             temp_height = current_height
-            for _ in range(100):
+            for _ in range(MAX_REORG_DEPTH):
                 if temp_hash is None:
                     break
                 # Use the block we received if it's the tip; otherwise get from db
@@ -4673,7 +4673,7 @@ class BlockSync:
             if not common_ancestor:
                 # No common ancestor found - this is a major reorg
                 # May need to re-validate entire chain
-                logger.warning("Major reorg detected - no common ancestor found within 100 blocks")
+                logger.warning("Major reorg detected - no common ancestor found within %d blocks", MAX_REORG_DEPTH)
                 return False
 
             blocks_to_disconnect = [
