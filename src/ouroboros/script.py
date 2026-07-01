@@ -1209,6 +1209,11 @@ class ScriptInterpreter:
                 if not stack:
                     raise ValueError("OP_SIZE: stack underflow")
                 stack.append(self._encode_script_num(len(stack[-1])))
+                # MAX_STACK_SIZE enforced after the push, mirroring Core's
+                # end-of-iteration check (interpreter.cpp:1221-1223): OP_SIZE
+                # grows the stack and must fail at 1001 elements (1000 is OK).
+                if len(stack) + len(altstack) > MAX_STACK_SIZE:
+                    raise ValueError("Stack size exceeded")
                 continue
 
             # Bitwise logic
@@ -1637,7 +1642,13 @@ class ScriptInterpreter:
                 num_bytes = stack.pop()
                 if len(num_bytes) > 4:
                     raise ValueError("OP_CHECKSIGADD: n is not a valid CScriptNum")
-                n = self._read_num(num_bytes)
+                # Core reads `n` as a signed CScriptNum (interpreter.cpp:1093:
+                # `CScriptNum num(stacktop(-2), fRequireMinimal)`), NOT an
+                # unsigned integer.  b'\x81' must decode to -1, not 129.
+                n = self._read_signed_num(
+                    num_bytes,
+                    require_minimal=bool(flags & SCRIPT_VERIFY_MINIMALDATA),
+                )
                 sig = stack.pop()
 
                 # BIP 342 CHECKSIGADD shares EvalChecksigTapscript with
