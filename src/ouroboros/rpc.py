@@ -7447,6 +7447,80 @@ class RPCServer:
             )
         return await self._reorg_to_side_branch_tip(db, block_hash)
 
+    async def _restore_original_chain(
+        self,
+        db,
+        ancestor_height: int,
+        disconnected_active: list[tuple[bytes, int, bytes]],
+        failed_tip_hash: bytes,
+        reason: str,
+    ) -> str:
+        """Roll the chainstate back to the ORIGINAL active tip after a failed
+        competing-chain connect.
+
+        A reorg that disconnects the original chain and then fails part-way
+        through connecting the heavier competitor must NOT leave the node on a
+        partial prefix of the losing chain (the S5 / clearbit-incident class).
+        Bitcoin Core's ``ActivateBestChainStep`` handles this by marking the
+        failing block ``BLOCK_FAILED_VALID`` (``InvalidBlockFound``) and
+        returning; the outer ``ActivateBestChain`` loop then re-selects the
+        best VALID chain via ``FindMostWorkChain`` and reconnects it — so the
+        net effect is that the node stays on (or returns to) its original tip.
+        We reproduce that net effect explicitly here (validation.cpp
+        ActivateBestChainStep / ConnectTip failure path).
+
+        Steps:
+          1. Disconnect any partially-connected losing-chain prefix back to
+             the common ancestor.
+          2. Re-connect the captured original active-chain blocks
+             (ancestor+1 .. original tip), restoring coins via their undo
+             records.
+          3. Drop the failed competing tip from the side-branch buffer so it
+             cannot re-drive the same doomed reorg.
+        """
+        # 1. Tear down any partial losing-chain prefix.
+        try:
+            _, cur_h = db.get_best_block()
+        except Exception:
+            cur_h = ancestor_height
+        while cur_h > ancestor_height:
+            try:
+                await asyncio.to_thread(db.disconnect_block, cur_h)
+            except Exception as e:
+                logger.error(
+                    "reorg rollback: disconnect_block(%d) failed: %s", cur_h, e
+                )
+                break
+            cur_h -= 1
+
+        # 2. Re-connect the original active chain (ancestor+1 → original tip).
+        for _blk_hash, blk_height, raw_bytes in disconnected_active:
+            try:
+                await asyncio.to_thread(
+                    db.connect_block_from_bytes, raw_bytes, blk_height
+                )
+            except Exception as e:
+                logger.error(
+                    "reorg rollback: reconnect original block h=%d failed: %s — "
+                    "chainstate may be left at the common ancestor",
+                    blk_height, e,
+                )
+                break
+
+        # 3. Forget the invalid competing tip (Core BLOCK_FAILED_VALID).
+        self._side_branch_blocks.pop(failed_tip_hash, None)
+
+        try:
+            _, restored_h = db.get_best_block()
+        except Exception:
+            restored_h = None
+        logger.warning(
+            "submitblock reorg: connect failed (%s) — rolled back to original "
+            "chain (tip h=%s)",
+            reason, restored_h,
+        )
+        return bip22_result_string(reason)
+
     async def _reorg_to_side_branch_tip(
         self,
         db,
@@ -7564,7 +7638,24 @@ class RPCServer:
         # after the connect loop completes, mirroring Bitcoin Core's
         # ``MaybeUpdateMempoolForReorg`` (validation.cpp).
         # ----------------------------------------------------------
+        #
+        # We ALSO capture each disconnected active-chain block's raw bytes +
+        # hash (``disconnected_active``, ascending by height) for two Core-
+        # parity reasons handled below:
+        #   (a) ROLLBACK (S5 / atomicity): if the competing chain fails to
+        #       connect part-way through, we re-connect these to restore the
+        #       ORIGINAL tip — Core's ActivateBestChainStep never leaves the
+        #       node on a partially-connected losing chain (validation.cpp
+        #       ConnectTip failure → InvalidBlockFound → return to best VALID
+        #       chain).
+        #   (b) RETAIN (S4 / reorg-back): on a SUCCESSFUL flip we stash these
+        #       into the side-branch buffer so a later block extending the
+        #       now-abandoned branch can resolve its parent and drive a reorg
+        #       BACK onto it — mirroring Core keeping every block in
+        #       m_block_index regardless of which chain is active.
+        # ----------------------------------------------------------
         disconnected_txs: list = []
+        disconnected_active: list[tuple[bytes, int, bytes]] = []
         for h in range(current_height, common_ancestor_height, -1):
             try:
                 blk = db.get_block_by_height(h)
@@ -7577,10 +7668,25 @@ class RPCServer:
                 continue
             if blk is None:
                 continue
+            # Capture raw (witness-preserving) bytes + hash before disconnect.
+            try:
+                _h_hash = db.get_block_hash_by_height(h)
+                _h_hash = bytes(_h_hash) if _h_hash is not None else None
+                _h_bytes = db.get_block_bytes(_h_hash) if _h_hash is not None else None
+                if _h_hash is not None and _h_bytes is not None:
+                    disconnected_active.append((_h_hash, h, bytes(_h_bytes)))
+            except Exception as e:
+                logger.warning(
+                    "submitblock reorg: could not capture active block at h=%d "
+                    "for rollback/retain: %s",
+                    h, e,
+                )
             for tx in getattr(blk, "transactions", []) or []:
                 if getattr(tx, "is_coinbase", False):
                     continue
                 disconnected_txs.append(tx)
+        # Order ascending by height (ancestor+1 → original tip) for re-connect.
+        disconnected_active.reverse()
 
         # ----------------------------------------------------------
         # Pattern D — single-batch atomic disconnect of all N blocks.
@@ -7810,12 +7916,14 @@ class RPCServer:
                     "submitblock reorg: connect_blocks_atomic failed: %s",
                     e, exc_info=True,
                 )
-                # Atomic helper aborts the batch on any failure — disk
-                # state is unchanged (the disconnect-side commit may
-                # have already landed; that's a valid chain prefix
-                # rooted at the common ancestor and the operator can
-                # retry).
-                return bip22_result_string(str(e))
+                # ATOMICITY (S5): the disconnect-side commit already landed,
+                # so the disk state is now a prefix of the LOSING competitor
+                # (or the bare common ancestor). Core never stays there — roll
+                # back to the original tip so a failed reorg is a no-op.
+                return await self._restore_original_chain(
+                    db, common_ancestor_height, disconnected_active,
+                    new_tip_hash, str(e),
+                )
         else:
             # Single-block reorg (or atomic helper unavailable): retain
             # the original per-block accept_block path. accept_block
@@ -7842,16 +7950,42 @@ class RPCServer:
                         "submitblock reorg: accept_block at h=%d failed: %s",
                         blk_height, e, exc_info=True,
                     )
-                    # Leave the chain in whatever state we got to; it's still
-                    # a connected prefix of the would-be new chain. A retry
-                    # of submitblock with the heavier tip can resume.
-                    return bip22_result_string(str(e))
+                    # ATOMICITY (S5): we have already disconnected the original
+                    # chain and connected 0..k blocks of the losing competitor.
+                    # A partial switch to the losing chain is a consensus fault
+                    # (the clearbit-incident / blockbrew-R3 class). Roll the
+                    # chainstate back to the original tip so the failed reorg
+                    # leaves no trace — matching Core ActivateBestChainStep.
+                    return await self._restore_original_chain(
+                        db, common_ancestor_height, disconnected_active,
+                        new_tip_hash, str(e),
+                    )
 
         # Successful flip: drop the connected blocks from the side-branch
         # buffer (they're now on the active chain), and shed any blocks
         # whose buffered height is now stale-equal to the displaced A-chain.
         for h in connected_hashes:
             self._side_branch_blocks.pop(h, None)
+
+        # RETAIN (S4 / reorg-back): stash the just-disconnected original-chain
+        # blocks into the side-branch buffer so a later block extending the
+        # now-abandoned branch can resolve its parent (``_resolve_parent_height``)
+        # and drive a reorg BACK onto it. Without this, ouroboros's height-keyed
+        # BLOCK_INDEX_CF overwrites the displaced branch's height slots with the
+        # winning chain, so the abandoned blocks become unreachable and any
+        # follow-up on them is false-rejected as "prev-blk-not-found" — the node
+        # can reorg A->B but never B->A'. Bitcoin Core retains every block in
+        # ``m_block_index`` regardless of active chain, which is what makes its
+        # ``FindMostWorkChain`` able to switch back (validation.cpp).
+        for _blk_hash, _blk_height, _raw in disconnected_active:
+            if _blk_hash in self._side_branch_blocks:
+                continue
+            try:
+                _prev = bytes(_raw[4:36])
+            except Exception:
+                continue
+            self._side_branch_blocks[_blk_hash] = (_prev, _blk_height, _raw)
+        self._evict_side_branch_if_full()
 
         # ----------------------------------------------------------
         # Mempool refill (Pattern B closure for the submitblock path).
