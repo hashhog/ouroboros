@@ -458,6 +458,29 @@ def sync(ctx, reset, limit):
     ),
 )
 @click.option(
+    "--assumevalid",
+    "assumevalid",
+    default=None,
+    help=(
+        "Assume-valid control (Bitcoin Core -assumevalid parity). Pass "
+        "``0`` to DISABLE the assume-valid / checkpoint script-skip "
+        "heuristic and force FULL per-input script/witness verification for "
+        "every block on the sync/drain path — including blocks at or below "
+        "the last hardcoded checkpoint (mainnet 850000). Equivalent to "
+        "Core's -assumevalid=0. Any other value (or omitting the flag) keeps "
+        "the default behaviour (script verification skipped below the last "
+        "checkpoint during IBD). Hash-pinned assumevalid is not implemented; "
+        "only the ``0`` disable form is honoured."
+    ),
+)
+@click.option(
+    "--noassumevalid",
+    "noassumevalid",
+    is_flag=True,
+    default=False,
+    help="Convenience alias for --assumevalid 0 (force full script verification).",
+)
+@click.option(
     "--reindex",
     is_flag=True,
     default=False,
@@ -497,7 +520,7 @@ def sync(ctx, reset, limit):
 def start(
     ctx, rpc_port, p2p_port, listen, connect, dnsseed, force, v2transport,
     peerbloomfilters, blockfilterindex, cfilter, coinstatsindex,
-    txospenderindex, daemon,
+    txospenderindex, assumevalid, noassumevalid, daemon,
     pid_path, reindex, rpc_tls_cert, rpc_tls_key,
 ):
     """Start the Bitcoin node"""
@@ -604,6 +627,15 @@ def start(
         # omits the flag the conf-file value wins.
         if txospenderindex is not None:
             config["txospenderindex"] = bool(txospenderindex)
+
+        # -assumevalid=0 (Core parity): --noassumevalid is a convenience alias
+        # for --assumevalid 0.  Either one disables the assume-valid /
+        # checkpoint script-skip heuristic and forces full script verification
+        # on the sync/drain path (see node.py + block_sync.force_full_scripts).
+        if noassumevalid:
+            config["assumevalid"] = "0"
+        elif assumevalid is not None:
+            config["assumevalid"] = str(assumevalid)
 
         # FIX-64: HTTPS/TLS termination flags.  Reject mismatched pairs at
         # the CLI layer so the operator sees a clean Click error rather than

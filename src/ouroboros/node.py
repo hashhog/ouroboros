@@ -616,6 +616,24 @@ class BitcoinNode:
 
             # Initialize block sync
             logger.info("Initializing block synchronization...")
+            # -assumevalid=0 (Core parity): when the operator passes
+            # `--assumevalid 0` (or sets assumevalid=0 in the conf file) the
+            # assume-valid / checkpoint script-skip heuristic is disabled and
+            # every block on the P2P drain/sync path runs full per-input
+            # script/witness verification.  Any other value (including the
+            # default / unset) preserves the production skip-below-checkpoint
+            # behaviour.  We only special-case "0" — hash-pinned assumevalid is
+            # not implemented (the default checkpoint set governs the cut).
+            _assumevalid_raw = self.config.get('assumevalid')
+            force_full_scripts = (
+                _assumevalid_raw is not None
+                and str(_assumevalid_raw).strip() in ('0', 'false', 'False', 'no')
+            )
+            if force_full_scripts:
+                logger.info(
+                    "-assumevalid=0: full script verification forced on the "
+                    "sync/drain path (assume-valid script-skip DISABLED)"
+                )
             self.block_sync = BlockSync(
                 self.db, self.validator, self.peer_manager,
                 mempool=self.mempool,
@@ -627,6 +645,7 @@ class BitcoinNode:
                 # wallet manager so loaded wallets track their own txs in
                 # lock-step with the chain (Core CWallet::blockConnected).
                 wallet_notifier=self.wallet_manager,
+                force_full_scripts=force_full_scripts,
             )
             # Reverse wiring: PeerManager._cleanup_peer_state delegates
             # per-peer state cleanup on disconnect to block_sync.cleanup_peer
