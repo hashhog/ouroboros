@@ -45,13 +45,17 @@ _MAINNET_BIP34_HASH = bytes.fromhex(
 _MAINNET_BIP34_HEIGHT = 227_931
 _BIP30_RECHECK_HEIGHT = 1_983_702
 
-# Hash of block 91842 (IsBIP30Repeat) — internal byte order (LE as stored).
+# Hash of blocks 91842 / 91880 (IsBIP30Repeat) in *internal* byte order — this
+# is what block.hash carries (database.py:178, the raw double-SHA256 digest, LE).
+# The literals are the *display* (big-endian) hashes; [::-1] reverses them into
+# the internal little-endian form actually compared in validation.py.  The real
+# 91842 block hash starts with eccae000... in this order — NOT 00000000000a...
 _REPEAT_HASH_91842 = bytes.fromhex(
     "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
-)
+)[::-1]
 _REPEAT_HASH_91880 = bytes.fromhex(
     "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"
-)
+)[::-1]
 
 # A fake block hash for non-canonical forks.
 _FORK_HASH = bytes(b"\xde\xad" * 16)
@@ -63,10 +67,15 @@ def _make_tx(txid: bytes, n_outputs: int = 1, is_coinbase: bool = False):
     tx.get_txid.return_value = txid
     tx.outputs = [MagicMock() for _ in range(n_outputs)]
     tx.is_coinbase = is_coinbase
+    # locktime must be a real int (0) so the IsFinalTx stub short-circuits;
+    # otherwise a MagicMock locktime blows up the '<' comparison and masks the
+    # BIP30 accept path we are exercising.
+    tx.locktime = 0
     tx.inputs = [MagicMock()]
     tx.inputs[0].prev_txid = bytes(32) if is_coinbase else b"\xaa" * 32
     tx.inputs[0].prev_vout = 0xFFFFFFFF if is_coinbase else 0
     tx.inputs[0].script_sig = b"\x03\x01\x00\x00"
+    tx.inputs[0].sequence = 0xFFFFFFFF
     return tx
 
 
@@ -771,14 +780,24 @@ class TestConsensusConstantsCorrectness:
         assert BIP34_HASHES.get("testnet3") == expected
 
     def test_repeat_block_91842_hash_prefix(self):
-        """Block 91842 exception hash starts with 00000000000a4d0a (Core:6191)."""
+        """Block 91842 exception hash is stored in internal LE order (starts
+        eccae000...), matching block.hash so IsBIP30Repeat actually fires."""
         h = BIP30_REPEAT_EXCEPTIONS[91842].hex()
-        assert h.startswith("00000000000a4d0a"), f"Unexpected: {h}"
+        assert h.startswith("eccae000"), f"Unexpected: {h}"
+        # And it is the byte-reverse of the display hash (Core:6191).
+        assert h == bytes.fromhex(
+            "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
+        )[::-1].hex()
 
     def test_repeat_block_91880_hash_prefix(self):
-        """Block 91880 exception hash starts with 00000000000743f1 (Core:6192)."""
+        """Block 91880 exception hash is stored in internal LE order (starts
+        21d77ccb...), matching block.hash so IsBIP30Repeat actually fires."""
         h = BIP30_REPEAT_EXCEPTIONS[91880].hex()
-        assert h.startswith("00000000000743f1"), f"Unexpected: {h}"
+        assert h.startswith("21d77ccb"), f"Unexpected: {h}"
+        # And it is the byte-reverse of the display hash (Core:6192).
+        assert h == bytes.fromhex(
+            "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"
+        )[::-1].hex()
 
     def test_zero_hashes_are_exactly_32_zero_bytes(self):
         """testnet4/signet/regtest BIP34Hash must be exactly 32 zero bytes."""
