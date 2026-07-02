@@ -218,16 +218,21 @@ BIP34_HASHES: dict[str, bytes] = {
 # block hash — a fork block at the same height does NOT get the exception.
 #
 # Block hashes are stored as 32-byte little-endian (internal byte order,
-# matching get_txid() / block.hash throughout ouroboros).
+# matching get_txid() / block.hash throughout ouroboros).  The literals
+# below are the *display* (big-endian) hashes, so they are reversed with
+# [::-1] to produce the internal little-endian form that block.hash uses
+# (database.py:178, the raw double-SHA256 digest).  Without the reversal
+# the compare in validation.py never matches and the BIP30 exception
+# never fires, wrongly rejecting mainnet blocks 91842 & 91880.
 #
 # Ref: Bitcoin Core validation.cpp:6189-6193
 BIP30_REPEAT_EXCEPTIONS: dict[int, bytes] = {
     91842: bytes.fromhex(
         "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
-    ),
+    )[::-1],
     91880: bytes.fromhex(
         "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"
-    ),
+    )[::-1],
 }
 
 # BIP9 deployments by network
