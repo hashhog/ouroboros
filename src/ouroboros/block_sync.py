@@ -226,6 +226,7 @@ class BlockSync:
         coinstats_index=None,  # Optional -coinstatsindex (per-height MuHash)
         txospender_index=None,  # Optional -txospenderindex (outpoint->spender)
         wallet_notifier=None,  # Optional wallet block-connect/disconnect sink
+        force_full_scripts=False,  # -assumevalid=0: force full script verification
     ):
         """Initialize block synchronizer."""
         self.db = db
@@ -259,6 +260,19 @@ class BlockSync:
         # P2P-synced funds are invisible until a manual ``rescanblockchain``.
         # None = no wallet (e.g. headers-only / index-only runs).
         self.wallet_notifier = wallet_notifier
+
+        # -assumevalid=0 parity (Core's `-assumevalid=0` /
+        # `Chainstate::m_options.assumevalid.IsNull()`): when True, the
+        # assume-valid / checkpoint script-skip heuristic is DISABLED on the
+        # live P2P drain/sync path.  Every block — including those at or below
+        # the last hardcoded checkpoint (mainnet 850000) — runs full per-input
+        # script/witness verification through the Python validator
+        # (`validate_block(..., force_check_scripts=True)`) rather than the
+        # Rust fast path (whose interpreter is decorative — it never runs
+        # scripts).  Default False preserves the production behaviour
+        # (assume-valid script-skip below the last checkpoint).  Set from the
+        # `assumevalid` config key (see cli.py `--assumevalid` / node.py).
+        self.force_full_scripts = bool(force_full_scripts)
 
         # Track requested blocks (hash -> request_time)
         # FIXME: race condition if called from multiple threads?
@@ -1780,13 +1794,18 @@ class BlockSync:
                 else "mainnet"
             )
             skip_scripts = False
-            if (cross_check or route_only) and rust_available:
+            if (cross_check or route_only) and rust_available and not self.force_full_scripts:
                 try:
                     skip_scripts = _sync_module.can_skip_scripts_for_block(
                         network, new_height, next_hash
                     )
                 except Exception:
                     skip_scripts = False
+            # -assumevalid=0: never route to the Rust fast path (its interpreter
+            # is decorative — it does not run scripts).  Forcing skip_scripts
+            # False here keeps every block on the Python validator branch below,
+            # where force_check_scripts=True actually invokes the script
+            # interpreter per-input.
 
             async def _run_rust() -> tuple[bool, str]:
                 try:
@@ -1806,6 +1825,7 @@ class BlockSync:
                     self.validator.validate_block,
                     block,
                     known_height=new_height,
+                    force_check_scripts=self.force_full_scripts,
                 )
 
             validated_via_rust = False
@@ -3996,6 +4016,7 @@ class BlockSync:
 
             valid, error = await asyncio.to_thread(
                 self.validator.validate_block, block,
+                force_check_scripts=self.force_full_scripts,
             )
             if not valid:
                 logger.warning(f"Orphan block {block_hash.hex()[:16]}... invalid: {error}")
