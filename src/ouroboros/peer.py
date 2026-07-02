@@ -32,9 +32,15 @@ from ouroboros.p2p_messages import (
     PingMessage,
     PongMessage,
     VersionMessage,
+    decode_varint,
     get_magic,
 )
 from ouroboros.transport_v2 import V2Handshake, V2Transport
+
+# Bitcoin Core MAX_INV_SZ (net_processing.cpp:126): maximum number of entries
+# an inv (or getdata) message may carry.  A peer exceeding it is misbehaving
+# (net_processing.cpp:4040 / :4131) and must be discouraged + disconnected.
+MAX_INV_SZ = 50000
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,17 @@ class V2NegotiationFailed(Exception):
 
     Mirrors Bitcoin Core's ``V2Transport::ShouldReconnectV1()`` flow
     (net.cpp ~1555–1570 + the m_reconnections queue at ~1949)."""
+    pass
+
+
+class OversizeMessageError(Exception):
+    """Raised when a peer's message-header length field exceeds
+    ``MAX_PROTOCOL_MESSAGE_LENGTH`` (4 MB).  Bitcoin Core rejects the frame
+    on the header (net.cpp ``V1Transport::GetMessage`` /
+    ``CNetMessage`` size guard) and disconnects the peer — the oversized
+    length also desynchronises the v1 stream, so the connection is
+    unrecoverable.  The listener MUST disconnect immediately (no
+    score-and-continue), matching Core's hard drop."""
     pass
 
 
@@ -1833,7 +1850,16 @@ class Peer:
         payload = b''
         if length > 0:
             if length > MAX_PROTOCOL_MESSAGE_LENGTH:  # Core net.h MAX_PROTOCOL_MESSAGE_LENGTH
-                raise Exception(f"Payload too large: {length} bytes")
+                # Core rejects the frame on the header and disconnects the
+                # peer; the oversized length also desyncs the v1 stream (we
+                # never read the claimed payload).  Raise the dedicated type
+                # so listen() drops the peer immediately instead of merely
+                # docking score and continuing on a corrupt stream.
+                raise OversizeMessageError(
+                    f"Payload too large from {self.host}:{self.port}: "
+                    f"{length} bytes (> MAX_PROTOCOL_MESSAGE_LENGTH="
+                    f"{MAX_PROTOCOL_MESSAGE_LENGTH})"
+                )
 
             payload = await self._read_exactly(length)
 
@@ -2070,6 +2096,31 @@ class Peer:
                             logger.debug(f"Peer {self.host}:{self.port} supports addrv2")
                         continue
 
+                    # Bitcoin Core net_processing.cpp:4040 (inv) / :4131
+                    # (getdata): a peer whose inv/getdata carries more than
+                    # MAX_INV_SZ (50000) entries is misbehaving — discourage +
+                    # disconnect.  Guard here (before handler dispatch) so it
+                    # fires for EVERY peer: block_sync only registers an inv
+                    # handler on the peers it selects for sync, so an inbound
+                    # attacker's oversized inv would otherwise reach no handler
+                    # and go unpenalised.  adjust_score(-100) drives the score
+                    # to 0 -> BanManager records the discouragement and
+                    # schedules the disconnect (single-event discourage).
+                    if msg.command in ("inv", "getdata"):
+                        try:
+                            _inv_count, _ = decode_varint(msg.payload, 0)
+                        except Exception:
+                            _inv_count = 0
+                        if _inv_count > MAX_INV_SZ:
+                            logger.warning(
+                                f"{msg.command} message size = {_inv_count} "
+                                f"from {self.host}:{self.port} (> MAX_INV_SZ="
+                                f"{MAX_INV_SZ}) — discouraging + disconnecting"
+                            )
+                            self.adjust_score(-100)
+                            await self.disconnect()
+                            break
+
                     # Handle ping/pong automatically
                     if msg.command == "ping":
                         ping = PingMessage.from_payload(msg.payload)
@@ -2141,6 +2192,16 @@ class Peer:
                     # disconnect gracefully without score penalty (same
                     # behaviour as Bitcoin Core, see net.cpp).
                     logger.info(str(e))
+                    await self.disconnect()
+                    break
+
+                except OversizeMessageError as e:
+                    # Message-header length field > MAX_PROTOCOL_MESSAGE_LENGTH
+                    # (4 MB).  Bitcoin Core rejects this on the header and
+                    # disconnects the peer; the oversized length also desyncs
+                    # the v1 stream, so this is a hard drop — NOT a
+                    # score-and-continue.
+                    logger.warning(str(e) + " — disconnecting peer")
                     await self.disconnect()
                     break
 
