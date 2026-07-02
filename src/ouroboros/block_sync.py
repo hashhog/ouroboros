@@ -2932,12 +2932,31 @@ class BlockSync:
             # call, matching ``ProcessNewBlockHeaders``' early-exit semantics).
             if accepted > 0 and not min_pow_checked and _has_sync_module:
                 try:
-                    min_work_hex = _sync_module.get_minimum_chain_work(
-                        self.peer_manager.network
-                        if hasattr(self.peer_manager, "network")
-                        else "mainnet"
-                    )
-                    min_work_int = int(min_work_hex, 16)
+                    # Replay-harness escape hatch (default UNSET => production
+                    # behaviour BYTE-FOR-BYTE; the chainparams value is used).
+                    # When OUROBOROS_MINCHAINWORK_OVERRIDE is set, use it as
+                    # nMinimumChainWork instead. This lets a TRUSTED capped
+                    # block-replay server drive a from-GENESIS differential
+                    # replay: a genesis-first chain's cumulative work is below
+                    # mainnet nMinimumChainWork by definition, so the G8
+                    # low-work rollback below would otherwise re-request the
+                    # first batch forever and never advance the header tip.
+                    # Value is hex (0x-optional); "0" disables the G8 gate.
+                    # This is an IBD-liveness knob only — it never weakens any
+                    # per-header PoW / continuity consensus check above it.
+                    _mcw_override = os.environ.get("OUROBOROS_MINCHAINWORK_OVERRIDE")
+                    if _mcw_override is not None and _mcw_override.strip() != "":
+                        _s = _mcw_override.strip().lower()
+                        if _s.startswith("0x"):
+                            _s = _s[2:]
+                        min_work_int = int(_s or "0", 16)
+                    else:
+                        min_work_hex = _sync_module.get_minimum_chain_work(
+                            self.peer_manager.network
+                            if hasattr(self.peer_manager, "network")
+                            else "mainnet"
+                        )
+                        min_work_int = int(min_work_hex, 16)
                     if min_work_int > 0:
                         # Compute the TOTAL chain work of the candidate chain,
                         # exactly as Bitcoin Core does in
