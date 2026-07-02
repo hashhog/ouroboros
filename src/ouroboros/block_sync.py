@@ -2978,24 +2978,38 @@ class BlockSync:
                         )
                         batch_work = base_chain_work + headers_work
                         if batch_work < min_work_int:
-                            # Roll back: remove the headers we just appended.
+                            # Roll back: DO NOT COMMIT the headers we just
+                            # appended — the candidate chain has not yet proven
+                            # enough cumulative work.
                             del self._validated_headers[-accepted:]
                             self._headers_pow_rejected += accepted
-                            logger.warning(
+                            logger.debug(
                                 f"Batch of {accepted} headers from "
-                                f"{peer.host}:{peer.port} rejected: "
+                                f"{peer.host}:{peer.port} not committed: "
                                 f"cumulative work {batch_work:#066x} "
                                 f"(base {base_chain_work:#066x} + headers "
                                 f"{headers_work:#066x}) < nMinimumChainWork "
                                 f"{min_work_int:#066x} "
-                                f"(too-little-chainwork; G8)"
+                                f"(too-little-chainwork; G8, low-work presync)"
                             )
-                            peer.adjust_score(-20)
-                            if hasattr(self.peer_manager, "misbehaving"):
-                                addr = f"{peer.host}:{peer.port}"
-                                self.peer_manager.misbehaving(
-                                    addr, 20, "too-little-chainwork"
-                                )
+                            # Bitcoin Core NEVER punishes a peer for serving a
+                            # low-work header chain.  In
+                            # net_processing.cpp::MaybePunishNodeForBlock the
+                            # BLOCK_HEADER_LOW_WORK result is a bare `break`
+                            # (no Misbehaving), and low-work chains are routed
+                            # through presync (TryLowWorkHeadersSync) which
+                            # stores nothing and bans no one — it just keeps
+                            # requesting header batches until cumulative work
+                            # reaches nMinimumChainWork.  A fresh node syncing
+                            # from genesis is BELOW nMinimumChainWork by
+                            # definition, so every honest genesis-first batch
+                            # would otherwise be treated as an attack and the
+                            # serving peer banned, permanently bricking IBD.
+                            # We therefore do NOT adjust score or flag
+                            # misbehaving here; the per-header PoW gate above
+                            # (a genuine BLOCK_CONSENSUS violation) still bans,
+                            # and the presync/HeadersSyncState layer remains the
+                            # anti-DoS bound for low-difficulty header floods.
                             self._drop_presync_state(peer)
                             return
                 except Exception as _e:

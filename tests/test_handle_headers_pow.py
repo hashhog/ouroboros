@@ -536,13 +536,14 @@ async def test_g8_accepts_batch_when_db_tip_chainwork_above_minimum(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_g8_rejects_batch_when_total_work_below_minimum(monkeypatch):
-    """A low-work batch forking a zero-work base is REJECTED.
+async def test_g8_does_not_commit_batch_when_total_work_below_minimum(monkeypatch):
+    """A low-work batch forking a zero-work base is NOT committed.
 
     When the base chain work is 0 (e.g. genuinely syncing from genesis)
     and the header batch alone does not reach nMinimumChainWork, the G8
-    gate must still reject — proving the gate is real, not disabled by
-    the fix.
+    gate must NOT append the headers to the committed queue — proving the
+    gate is real, not disabled by the fix.  Crucially, it must NOT punish
+    the peer (Core parity — see the next test).
     """
     genesis_be = bytes.fromhex(
         "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
@@ -570,12 +571,119 @@ async def test_g8_rejects_batch_when_total_work_below_minimum(monkeypatch):
 
     await bs.handle_headers(msg, peer, min_pow_checked=False)
 
-    # The batch was rolled back — too-little-chainwork.
+    # The batch was rolled back — not committed (too-little-chainwork).
     assert bs._validated_headers == []
     assert bs._headers_pow_rejected == 1
+
+
+@pytest.mark.asyncio
+async def test_g8_low_work_genesis_batch_does_not_ban_peer(monkeypatch):
+    """A low-work, from-genesis headers batch must NOT ban / misbehave.
+
+    This is the confirmed Core divergence (Glass-box wave 3, ouroboros
+    HIGH).  Bitcoin Core's ``MaybePunishNodeForBlock`` handles the
+    ``BLOCK_HEADER_LOW_WORK`` result with a bare ``break`` — no
+    ``Misbehaving`` — and routes low-work chains through presync
+    (``TryLowWorkHeadersSync``), which stores nothing and bans no one.
+    A fresh node syncing from genesis is BELOW nMinimumChainWork by
+    definition, so an honest peer's valid genesis-first batch must be
+    accepted-without-commit, never treated as an attack.
+
+    Pre-fix: the G8 gate fired ``peer.adjust_score(-20)`` and
+    ``peer_manager.misbehaving(addr, 20, "too-little-chainwork")``,
+    permanently banning every honest peer and bricking IBD from genesis.
+    Post-fix: no score adjustment, no misbehaving — matching Core.
+    """
+    genesis_be = bytes.fromhex(
+        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    )
+    genesis_le = genesis_be[::-1]
+    bs = _make_block_sync(tip_hash=genesis_le, tip_height=0)
+
+    # Genuine from-genesis IBD: base chain work at the DB tip is 0 (well,
+    # genesis-level), so a small honest batch of early difficulty-1 headers
+    # is far below nMinimumChainWork.
+    bs.db.get_chainwork_by_height = MagicMock(return_value=0)
+
+    # block #1 has genuinely valid PoW — this is an HONEST low-work header,
+    # not a forged one.
+    block1 = _real_block_one()
+    assert BlockSync._header_meets_pow(block1) is True
+
+    headers_msg = HeadersMessage(headers=[block1])
+    msg = MagicMock()
+    msg.payload = headers_msg.serialize_payload()
+
+    peer = _make_peer()
+    bs._header_sync_peer = peer
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(bs, "_request_next_blocks", _noop)
+    monkeypatch.setattr(bs, "_get_presync_state", lambda _peer: None)
+
+    await bs.handle_headers(msg, peer, min_pow_checked=False)
+
+    # Not committed (Core does not store low-work headers)...
+    assert bs._validated_headers == []
+    # ...but the honest peer is NOT punished (the whole point of the fix).
+    bs.peer_manager.misbehaving.assert_not_called()
+    for call in peer.adjust_score.call_args_list:
+        assert call.args[0] >= 0, (
+            "low-work header sync must not decrement peer score "
+            f"(saw adjust_score({call.args[0]}))"
+        )
+
+
+@pytest.mark.asyncio
+async def test_g8_low_work_does_not_disable_bad_pow_ban(monkeypatch):
+    """The low-work leniency must NOT weaken the genuine bad-PoW ban.
+
+    A header whose hash exceeds its claimed target is a BLOCK_CONSENSUS
+    violation (invalid data), which Core DOES punish.  Even while syncing
+    from genesis (below nMinimumChainWork), such a forged header must
+    still ban the peer.
+    """
+    genesis_be = bytes.fromhex(
+        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+    )
+    genesis_le = genesis_be[::-1]
+    bs = _make_block_sync(tip_hash=genesis_le, tip_height=0)
+    bs.db.get_chainwork_by_height = MagicMock(return_value=0)
+
+    # Valid prev + valid bits but nonce=0 → hash above target (forged PoW).
+    forged = BlockHeader(
+        version=1,
+        prev_blockhash=genesis_le,
+        merkle_root=b"\xcc" * 32,
+        timestamp=1_700_000_000,
+        bits=0x1D00FFFF,
+        nonce=0,
+    )
+    assert BlockSync._header_meets_pow(forged) is False
+
+    headers_msg = HeadersMessage(headers=[forged])
+    msg = MagicMock()
+    msg.payload = headers_msg.serialize_payload()
+
+    peer = _make_peer()
+    bs._header_sync_peer = peer
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(bs, "_request_next_blocks", _noop)
+    monkeypatch.setattr(bs, "_get_presync_state", lambda _peer: None)
+
+    await bs.handle_headers(msg, peer, min_pow_checked=False)
+
+    # Forged-PoW header still bans (score-100 misbehaving), unchanged.
+    peer.adjust_score.assert_called_with(-20)
     bs.peer_manager.misbehaving.assert_called_once()
     args, _kw = bs.peer_manager.misbehaving.call_args
-    assert args[2] == "too-little-chainwork"
+    assert args[1] == 100
+    assert "PoW" in args[2]
 
 
 @pytest.mark.asyncio
