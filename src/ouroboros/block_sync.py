@@ -1140,7 +1140,13 @@ class BlockSync:
                 await asyncio.sleep(10)
 
     async def handle_inv(self, msg: NetworkMessage, peer: Peer):
-        """Handle inventory announcement (blocks + transactions)."""
+        """Handle inventory announcement (blocks + transactions).
+
+        Note: the MAX_INV_SZ (50000) oversize guard (Bitcoin Core
+        net_processing.cpp:4040) lives in ``Peer.listen`` so it fires for
+        EVERY peer (inbound attackers never get a block_sync inv handler);
+        by the time an inv reaches here it is already size-bounded.
+        """
         try:
             inv = InvMessage.from_payload(msg.payload)
             # logger.debug(f'inv from {peer.host}:{peer.port}, {len(inv.inventory)} items')
