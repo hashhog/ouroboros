@@ -275,19 +275,25 @@ def bip22_result_string(error: str) -> str:
 # Reorg safety constants
 # ---------------------------------------------------------------------------
 #
-# Hard cap on the depth of a single submitblock-driven reorg. Mirrors the
-# operational reorg-safety margin used elsewhere in ouroboros (see
-# ``rpc_loadtxoutset`` / pruning code which use the same 288-block Core
-# convention). 288 (= MIN_BLOCKS_TO_KEEP) is an implementation-specific
-# memory-safety cap on the *atomic* reorg path: it bounds the size of the single
-# in-Rust ``WriteBatch`` (so we can't OOM the process by accepting a deep side
-# branch through ``submitblock``) while aligning with Core's pruned-node undo
-# retention. Bitcoin Core itself has NO reorg-depth cap (it follows most-work,
-# bounded only by prune/undo retention); Core has not seen a >10-deep reorg in
-# ~14 years of operation, so this is observationally inert on the honest chain.
+# Retained-undo window used as the reorg-depth cap ON PRUNED NODES ONLY.
+# Bitcoin Core has NO reorg-depth cap: ActivateBestChainStep disconnects to the
+# fork point unbounded and follows the most-work valid chain to any depth,
+# FatalError-ing only when a disconnected block's undo data is missing on disk
+# (a pruned-node condition). MIN_BLOCKS_TO_KEEP/288 governs pruning + the
+# fTooFarAhead buffering gate — NOT reorg depth (validation.cpp:4325,6362).
+#
+# Enforcing this as an unconditional cap was a Class-A consensus divergence: on
+# an ARCHIVE node (the default — no ``prune`` config, all undo present) it made
+# ouroboros REFUSE a >288-deep most-work reorg and stay on the lower-work
+# minority chain, splitting from Core. It is therefore now gated on
+# pruning-enabled (see ``_reorg_to_side_branch_tip`` and
+# ``BlockSync`` fork-bridge): archive => unbounded (Core-parity); pruned => this
+# cap protects the retained undo window (a conservative refusal in lieu of
+# Core's physical missing-undo fatal abort). Core has not seen a >10-deep reorg
+# in ~14 years, so this is observationally inert on the honest chain.
 #
 # Reference: ``CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md``
-# Pattern D. Raised 100->288 (was deferred pending the preciousblock WIP).
+# Pattern D; the 288-cap Class-A divergence entry in ``_loop-ledger.md``.
 MAX_REORG_DEPTH: int = 288
 
 
@@ -7604,18 +7610,30 @@ class RPCServer:
         # ----------------------------------------------------------
         # Pattern D — atomic multi-block disconnect.
         #
-        # Bound the total reorg depth (disconnect side + connect side)
-        # to ``MAX_REORG_DEPTH`` so a malicious/buggy peer cannot drive
-        # the in-Rust ``WriteBatch`` to unbounded size. 100 is a
-        # generous cap relative to any realistic reorg (Core has not
-        # observed a >10-deep mainnet reorg in ~14y of operation).
+        # Core has NO reorg-depth cap: ActivateBestChainStep disconnects
+        # to the fork point unbounded and follows the most-work valid
+        # chain to any depth, FatalError-ing only if a disconnected
+        # block's undo data is missing on disk (a pruned-node condition).
+        # MIN_BLOCKS_TO_KEEP/288 governs pruning + the fTooFarAhead
+        # buffering gate — NOT reorg depth (validation.cpp:4325,6362).
+        #
+        # On an ARCHIVE node (the default — no `prune` config) every
+        # block's undo is present, so a MAX_REORG_DEPTH refusal is
+        # gratuitous and a Class-A consensus split: we would stay on the
+        # lower-work minority chain while Core reorgs.  We therefore only
+        # enforce the cap when pruning is enabled, where it protects
+        # against reorging past the retained undo window (a conservative
+        # refusal in lieu of Core's physical missing-undo fatal abort).
         # ----------------------------------------------------------
         disconnect_depth = current_height - common_ancestor_height
         connect_depth = len(chain_to_connect)
-        if disconnect_depth > MAX_REORG_DEPTH or connect_depth > MAX_REORG_DEPTH:
+        _pruning_on = getattr(self.node, "pruner", None) is not None
+        if _pruning_on and (
+            disconnect_depth > MAX_REORG_DEPTH or connect_depth > MAX_REORG_DEPTH
+        ):
             logger.warning(
-                "submitblock reorg: depth cap exceeded — disconnect=%d "
-                "connect=%d cap=%d",
+                "submitblock reorg: depth cap exceeded on pruned node — "
+                "disconnect=%d connect=%d retained-undo-window=%d",
                 disconnect_depth, connect_depth, MAX_REORG_DEPTH,
             )
             return bip22_result_string(

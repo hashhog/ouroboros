@@ -227,6 +227,7 @@ class BlockSync:
         txospender_index=None,  # Optional -txospenderindex (outpoint->spender)
         wallet_notifier=None,  # Optional wallet block-connect/disconnect sink
         force_full_scripts=False,  # -assumevalid=0: force full script verification
+        pruning_enabled=False,  # True when -prune=<MB> is set (undo may be gone)
     ):
         """Initialize block synchronizer."""
         self.db = db
@@ -273,6 +274,19 @@ class BlockSync:
         # (assume-valid script-skip below the last checkpoint).  Set from the
         # `assumevalid` config key (see cli.py `--assumevalid` / node.py).
         self.force_full_scripts = bool(force_full_scripts)
+
+        # Archive vs pruned parity (Core has NO reorg-depth cap — it follows the
+        # most-work valid chain to any depth; the disconnect loop in
+        # ActivateBestChainStep is unbounded and only FatalErrors when the undo
+        # data of a block being disconnected is missing on disk).  On an ARCHIVE
+        # node (the default — no `prune` config) every block's undo is present,
+        # so the MAX_REORG_DEPTH refusal is gratuitous and causes a Class-A
+        # consensus split (we would stay on the lower-work minority chain while
+        # Core reorgs).  We therefore only enforce the depth cap when pruning is
+        # enabled, where it protects against reorging past the retained undo
+        # window (Core's physical missing-undo limit, expressed here as a
+        # conservative refusal rather than a fatal abort).
+        self.pruning_enabled = bool(pruning_enabled)
 
         # Track requested blocks (hash -> request_time)
         # FIXME: race condition if called from multiple threads?
@@ -3555,12 +3569,17 @@ class BlockSync:
             )
             return None
 
-        # Depth guard (mirrors the rpc reorg loop's MAX_REORG_DEPTH cap, applied
-        # here so we never even begin attaching an over-deep bridge).
-        if len(bridge_hashes) > MAX_REORG_DEPTH:
+        # Depth guard — ONLY on a pruned node.  Core has no reorg-depth cap
+        # (ActivateBestChainStep disconnects to the fork point unbounded); on an
+        # archive node (default) all undo is present, so refusing an over-deep
+        # bridge would strand us on the lower-work minority chain = Class-A
+        # consensus divergence.  When pruning is enabled the cap protects
+        # against bridging a reorg past the retained undo window.
+        if self.pruning_enabled and len(bridge_hashes) > MAX_REORG_DEPTH:
             logger.warning(
-                f"fork bridge {fork_tip_hash.hex()[:16]}... too deep "
-                f"({len(bridge_hashes)} > {MAX_REORG_DEPTH}); refusing reorg"
+                f"fork bridge {fork_tip_hash.hex()[:16]}... too deep for a "
+                f"pruned node ({len(bridge_hashes)} > {MAX_REORG_DEPTH} "
+                f"retained-undo window); refusing reorg"
             )
             return None
 

@@ -646,6 +646,10 @@ class BitcoinNode:
                 # lock-step with the chain (Core CWallet::blockConnected).
                 wallet_notifier=self.wallet_manager,
                 force_full_scripts=force_full_scripts,
+                # Archive (default) => no reorg-depth cap (Core-parity, follows
+                # the most-work chain to any depth); pruned => cap protects the
+                # retained undo window.  self.pruner is set above iff prune=<MB>.
+                pruning_enabled=(self.pruner is not None),
             )
             # Reverse wiring: PeerManager._cleanup_peer_state delegates
             # per-peer state cleanup on disconnect to block_sync.cleanup_peer
