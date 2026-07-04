@@ -2269,6 +2269,23 @@ class RPCServer:
         if height < 0 or height > tip_height:
             raise RpcError(RPC_INVALID_PARAMETER, "Block height out of range")
 
+        # Resolve the hash from the height-keyed block index (BLOCK_INDEX_CF),
+        # exactly as Core's getblockhash reads pindex->GetBlockHash() off the
+        # active-chain CBlockIndex — it never loads the full block body.  This
+        # is essential for the assumeUTXO snapshot base (and any header-only
+        # index entry): the base block's body is intentionally absent from
+        # BLOCKS_CF, so the legacy get_block_by_height path (which loads the
+        # body via get_block) returned None and getblockhash(base) wrongly
+        # 404'd — even though the tip pointer and get_block_hash_by_height
+        # already knew the hash from the persisted index row.  Core (and the
+        # other hashhog nodes) answer getblockhash purely from the index.
+        block_hash = await asyncio.to_thread(
+            self.node.db.get_block_hash_by_height, height
+        )
+        if isinstance(block_hash, (bytes, bytearray)):
+            return bytes(block_hash)[::-1].hex()
+
+        # Fallback: backends that only populate the full-block store.
         block = await asyncio.to_thread(self.node.db.get_block_by_height, height)
         if not block:
             raise HTTPException(status_code=404, detail="Block not found")
