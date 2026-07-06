@@ -148,6 +148,7 @@ def bip22_result_string(error: str) -> str:
              "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
              "bad-witness-nonce-size", "unexpected-witness",
              "bad-cb-amount", "bad-blk-sigops", "bad-cb-height",
+             "bad-diffbits",
              "bad-txns-nonfinal", "bad-txns-duplicate", "rejected",
              "block-script-verify-flag-failed",
              "bad-txns-inputs-missingorspent"):
@@ -7336,6 +7337,41 @@ class RPCServer:
         _bip34_activation = (
             _bip34_depl.height if _bip34_depl is not None else 227_931
         )
+
+        # bad-diffbits (ContextualCheckBlockHeader parity). Core runs
+        # ContextualCheckBlockHeader inside AcceptBlockHeader for ALL
+        # headers — including fork/side-branch headers — so a block whose
+        # nBits != GetNextWorkRequired(pindexPrev) is rejected BEFORE it can
+        # be stored or drive a reorg (validation.cpp:4088-4089 "bad-diffbits",
+        # reached from AcceptBlockHeader:4224). The direct-connect path
+        # enforces this via BlockValidator._validate_header ->
+        # _get_expected_bits (validation.py:1294-1296); the side-branch store
+        # path skipped it, so a fork block carrying an nBits one ULP harder
+        # than GetNextWorkRequired (e.g. regtest 0x207ffffe vs the constant
+        # 0x207fffff) sailed straight into the buffer and could win a reorg.
+        # Reuse the SAME code the direct path uses so both agree with Core.
+        _validator = getattr(self.node, "validator", None)
+        if _validator is not None:
+            try:
+                _hdr_blk = _Block.deserialize(block_bytes)
+                _parent_blk = db.get_block(prev_hash)
+                if _parent_blk is None:
+                    _side_parent = self._side_branch_blocks.get(prev_hash)
+                    if _side_parent is not None:
+                        _parent_blk = _Block.deserialize(_side_parent[2])
+                _expected_bits = _validator._get_expected_bits(
+                    new_height, _parent_blk, _hdr_blk
+                )
+                if _expected_bits is not None and _hdr_blk.bits != _expected_bits:
+                    return bip22_result_string("bad-diffbits")
+            except Exception as _e:
+                # Degrade to the pre-fix behaviour (no diffbits rejection)
+                # only when the expected-bits computation itself cannot run
+                # — never mask a genuine mismatch, which returns above.
+                logger.debug(
+                    "side-branch diffbits check skipped at h=%d: %s",
+                    new_height, _e,
+                )
 
         # BIP-34 byte-prefix check against parent.height + 1. This is the
         # core of the Pattern X fix — pre-fix the height came from
