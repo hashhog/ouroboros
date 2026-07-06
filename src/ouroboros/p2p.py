@@ -14,6 +14,7 @@ Reference: Bitcoin Core net.cpp, net_processing.cpp
 
 import asyncio
 import base64
+import gc
 import json
 import logging
 import os
@@ -2764,6 +2765,30 @@ class PeerManager:
                         )
                 except Exception:
                     logger.debug("v1_only_addrs sweep raised", exc_info=True)
+
+                # RSS-leak backstop (2026-07-06, ouroboros OOM-loop root-cause).
+                # The v2 receive path can leave coroutine frames the generational
+                # GC under-collects between its own passes (~1 retained frame/msg
+                # -> climbs to the 16G cgroup cap -> OOM ~every 7h, self-heals via
+                # systemd Restart). A periodic FULL collection reclaims them when
+                # the retention is a reference cycle; it is harmless (no behaviour
+                # change) otherwise. Gated to every 10th sweep (~5 min) so it never
+                # sits on the hot path, and self-limiting: kept from reaching the
+                # multi-GB knee, each collection stays cheap. If RSS still climbs
+                # after this lands, the root is a strong ref (not a cycle) and
+                # needs the live referrer dump (_ouroboros-leak-hunt-2026-06-21.md
+                # "NEXT STEP") for a targeted frame-retention fix.
+                self._gc_sweep_count = getattr(self, "_gc_sweep_count", 0) + 1
+                if self._gc_sweep_count >= 10:
+                    self._gc_sweep_count = 0
+                    try:
+                        _freed = gc.collect()
+                        if _freed:
+                            logger.debug(
+                                "periodic gc.collect reclaimed %d objects", _freed
+                            )
+                    except Exception:
+                        logger.debug("periodic gc.collect raised", exc_info=True)
 
                 # Wait before next maintenance
                 await asyncio.sleep(30)
