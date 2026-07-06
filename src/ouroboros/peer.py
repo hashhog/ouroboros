@@ -2015,6 +2015,17 @@ class Peer:
                 continue
 
             command, payload = decoded
+            # RSS-leak mitigation (2026-07-06, ouroboros OOM-loop root-cause):
+            # the v2 receive path was retaining ~1 coroutine frame + its byte
+            # buffers per inbound message (tracemalloc soaks 2026-06-21), climbing
+            # to the 16G cgroup cap -> OOM. ``payload`` is an INDEPENDENT copy
+            # (decode_v2_contents does ``rest = contents[1:]``, a bytes copy — not
+            # a view), so drop the large intermediate buffers before returning: a
+            # frame that ends up retained then pins only small locals, never the
+            # ~payload-sized enc_length/aead_ct/contents. Bounds retained receive
+            # memory to in-flight work, matching Core (net.cpp ReceivedBytes),
+            # not cumulative message count.
+            del enc_length, aead_ct, contents, decoded
             return NetworkMessage(
                 command=command,
                 payload=payload,
