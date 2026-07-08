@@ -664,22 +664,17 @@ def test_w135_g21_bytespersigop_flag_bug9() -> None:
 # ===========================================================================
 
 
-@pytest.mark.xfail(
-    reason="W135 BUG-7 (P1): _is_standard_tx emits English diagnostic "
-           "strings instead of Core's short kebab strings ('version', "
-           "'tx-size', 'scriptsig-size', 'scriptsig-not-pushonly', "
-           "'scriptpubkey', 'bare-multisig', 'datacarrier', 'dust'). "
-           "Continuation of W125 RPC error parity.",
-    strict=True,
-)
 def test_w135_g22_error_string_parity_bug7() -> None:
-    """G22 (BUG-7 P1): Core short kebab strings emitted, not English."""
+    """G22 (BUG-7 P1): Core short kebab strings emitted, not English.
+
+    Fixed by ``fix(rpc): emit Core bare reject tokens on mempool RPC path``
+    (2026-07-08): _is_standard_tx now returns the bare Core IsStandardTx token.
+    """
     # Test: version-out-of-range should produce "version" (Core's short string)
     tx = _make_tx(version=5)
     ok, reason = mempool_mod._is_standard_tx(tx)
     assert not ok
-    # Core's IsStandardTx sets reason="version" (single token). ouroboros says
-    # "Non-standard version: 5". Pin Core's short form.
+    # Core's IsStandardTx sets reason="version" (single token).
     assert reason == "version" or reason.startswith("version"), (
         f"G22: expected Core short string 'version', got {reason!r}"
     )
