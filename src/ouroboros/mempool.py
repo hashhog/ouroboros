@@ -1393,7 +1393,7 @@ def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
       8. Dust check (skipped for v3 which uses ephemeral-dust rules)
     """
     if tx.version < 1 or tx.version > TX_MAX_STANDARD_VERSION:
-        return False, f"Non-standard version: {tx.version}"
+        return False, "version"
 
     # Gate 2: weight.  Use the real BIP-141 weight formula (stripped_size × 3 +
     # total_size) rather than the previous stripped_size × 4 approximation,
@@ -1402,14 +1402,14 @@ def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
     # Reference: Bitcoin Core policy/policy.cpp IsStandardTx() ~line 111-115.
     tx_weight = tx.get_weight()
     if tx_weight > MAX_STANDARD_TX_WEIGHT:
-        return False, f"Transaction weight {tx_weight} exceeds {MAX_STANDARD_TX_WEIGHT}"
+        return False, "tx-size"
 
     # Gate 3: minimum non-witness size (CVE-2017-12842).
     # tx.serialize() returns stripped (no-witness) bytes, matching TX_NO_WITNESS.
     # Reference: Bitcoin Core validation.cpp:813.
     tx_size = len(tx.serialize())
     if tx_size < MIN_STANDARD_TX_NONWITNESS_SIZE:
-        return False, f"Transaction too small: {tx_size} < {MIN_STANDARD_TX_NONWITNESS_SIZE}"
+        return False, "tx-size-small"
 
     # Gates 4 + 5: per-input scriptSig checks.
     # Reference: Bitcoin Core policy/policy.cpp IsStandardTx() ~line 117-135:
@@ -1417,9 +1417,9 @@ def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
     #   if (!txin.scriptSig.IsPushOnly())                        → "scriptsig-not-pushonly"
     for idx, tx_in in enumerate(tx.inputs):
         if len(tx_in.script_sig) > MAX_STANDARD_SCRIPTSIG_SIZE:
-            return False, f"Input {idx} scriptSig size {len(tx_in.script_sig)} exceeds {MAX_STANDARD_SCRIPTSIG_SIZE} (scriptsig-size)"
+            return False, "scriptsig-size"
         if tx_in.script_sig and not _is_push_only_from(tx_in.script_sig, 0):
-            return False, f"Input {idx} scriptSig is not push-only (scriptsig-not-pushonly)"
+            return False, "scriptsig-not-pushonly"
 
     # Gates 6 + 7: per-output type + cumulative datacarrier limit.
     # Reference: Bitcoin Core policy/policy.cpp IsStandardTx() ~line 137-156:
@@ -1429,15 +1429,12 @@ def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
     datacarrier_bytes_used = 0
     for idx, out in enumerate(tx.outputs):
         if not _is_standard_output_type(out.script_pubkey):
-            return False, f"Output {idx} has non-standard script type (scriptpubkey)"
+            return False, "scriptpubkey"
         # Track cumulative OP_RETURN payload bytes.
         if out.script_pubkey and out.script_pubkey[0] == 0x6a:
             datacarrier_bytes_used += len(out.script_pubkey)
             if datacarrier_bytes_used > MAX_OP_RETURN_RELAY:
-                return False, (
-                    f"Total OP_RETURN data {datacarrier_bytes_used} bytes exceeds "
-                    f"{MAX_OP_RETURN_RELAY} (datacarrier)"
-                )
+                return False, "datacarrier"
 
     # Gate 8: dust output cap.
     # Reference: Bitcoin Core policy/policy.cpp IsStandardTx() lines 158-162:
@@ -1452,10 +1449,7 @@ def _is_standard_tx(tx: Transaction) -> tuple[bool, str]:
     if tx.version != 3:
         dust_indices = _has_ephemeral_dust(tx)
         if len(dust_indices) > MAX_DUST_OUTPUTS_PER_TX:
-            return False, (
-                f"dust: {len(dust_indices)} dust output(s) exceeds "
-                f"MAX_DUST_OUTPUTS_PER_TX ({MAX_DUST_OUTPUTS_PER_TX})"
-            )
+            return False, "dust"
 
     return True, ""
 
@@ -2273,7 +2267,8 @@ class Mempool:
                 )
             return {
                 "accepted": ok, "txid": txid, "fee": 0,
-                "vsize": 0, "reject_reason": None if ok else reason,
+                "vsize": 0,
+                "reject_reason": None if ok else self._rpc_reject_reason(reason),
             }
 
         ok, error = self.add_transaction(tx, height)
@@ -2289,8 +2284,24 @@ class Mempool:
         else:
             return {
                 "accepted": False, "txid": txid, "fee": 0,
-                "vsize": 0, "reject_reason": error,
+                "vsize": 0, "reject_reason": self._rpc_reject_reason(error),
             }
+
+    @staticmethod
+    def _rpc_reject_reason(reason: str) -> str:
+        """Normalize an internal mempool control token to the token Core's
+        mempool RPC layer surfaces.
+
+        The only divergence is ``"orphan"``: the mempool keeps it as an internal
+        control signal (``node.py`` branches on ``error == "orphan"`` to store
+        the orphan and fetch its parents), whereas Bitcoin Core's
+        ``rpc/mempool.cpp:400`` remaps the TX_MISSING_INPUTS result to
+        ``"missing-inputs"`` at the RPC boundary.  Every other reason is already
+        a bare Core token and passes through unchanged.
+        """
+        if reason == "orphan":
+            return "missing-inputs"
+        return reason
 
     def _add_transaction_inner(
         self, tx: Transaction, height: int, test_accept: bool = False,
@@ -2359,7 +2370,13 @@ class Mempool:
         if self.require_standard:
             is_std, reason = _is_standard_tx(tx)
             if not is_std:
-                return False, f"Non-standard transaction: {reason}"
+                # _is_standard_tx returns the bare Core IsStandardTx token
+                # (version / tx-size / tx-size-small / scriptsig-size /
+                # scriptsig-not-pushonly / scriptpubkey / datacarrier / dust);
+                # surface it verbatim so the mempool RPC reject-reason matches
+                # Core (validation.cpp PreChecks passes state.GetRejectReason()
+                # through unwrapped).
+                return False, reason
 
         # Ephemeral dust: reject v3 txs with dust when submitted
         # individually (ephemeral dust is only valid inside packages).
@@ -2380,9 +2397,24 @@ class Mempool:
             if utxo is None and parent_txid not in self.transactions:
                 missing_parents.add(parent_txid)
         if missing_parents:
+            # Distinguish "already known" from a genuine orphan.  Mirrors Bitcoin
+            # Core PreChecks (validation.cpp:857-864): when an input coin is
+            # unavailable, Core probes the coins cache for THIS tx's own outputs;
+            # a hit means the exact tx is already known/confirmed in the chain and
+            # it returns "txn-already-known" (TX_CONFLICT) rather than the
+            # missing-inputs orphan path.
+            for _vout in range(len(tx.outputs)):
+                if self.validator.db.get_utxo(txid, _vout) is not None:
+                    return False, "txn-already-known"
             # Dry-run (testmempoolaccept) must not mutate the orphan pool.
             if not test_accept:
                 self.orphan_pool.add(tx, missing_parents, peer=peer)
+            # Internal control token: node.py's tx handler branches on
+            # ``error == "orphan"`` to store the orphan and request its parents.
+            # The RPC layer remaps it to Core's "missing-inputs"
+            # (rpc/mempool.cpp:400): sendrawtransaction via
+            # _map_mempool_error_to_reject_reason, testmempoolaccept via
+            # accept_to_memory_pool's boundary normalization.
             return False, "orphan"
 
         # Build the prevScripts map once — used both by ValidateInputsStandardness
@@ -2416,7 +2448,9 @@ class Mempool:
             if any(tx_in.witness for tx_in in tx.inputs):
                 is_ws, ws_reason = _is_witness_standard(tx, prevscripts)
                 if not is_ws:
-                    return False, f"Non-standard transaction: {ws_reason}"
+                    # Bare Core token (bad-witness-nonstandard, TX_WITNESS_MUTATED
+                    # at validation.cpp:905) — no "Non-standard transaction:" wrap.
+                    return False, ws_reason
 
         # Per-transaction sigop cost limit (mempool policy, not consensus).
         # Reference: Bitcoin Core validation.cpp AcceptToMemoryPoolWorker:908-943
@@ -2636,7 +2670,8 @@ class Mempool:
         # DEFAULT_MIN_RELAY_TX_FEE is in sat/kB; convert to sat for this tx.
         min_relay = (tx_vsize * DEFAULT_MIN_RELAY_TX_FEE) // 1000
         if fee < min_relay:
-            return False, f"Below minimum relay fee: {fee} < {min_relay}"
+            # Bare Core token (validation.cpp:708 "min relay fee not met").
+            return False, "min relay fee not met"
 
         # Rolling minimum fee check (txmempool.cpp GetMinFee gate).
         # After TrimToSize evicts transactions the rolling min fee rises so
@@ -2649,10 +2684,10 @@ class Mempool:
         if rolling_min_kvb > DEFAULT_MIN_RELAY_TX_FEE:
             rolling_min_fee = (tx_vsize * rolling_min_kvb) // 1000
             if fee < rolling_min_fee:
-                return False, (
-                    f"Insufficient fee: {fee} sat < rolling minimum "
-                    f"{rolling_min_fee} sat (min rate {rolling_min_kvb:.1f} sat/kvB)"
-                )
+                # Bare Core token (validation.cpp:705 "mempool min fee not met")
+                # for the dynamic rolling-floor case, distinct from the static
+                # "min relay fee not met" above.
+                return False, "mempool min fee not met"
 
         # Dry-run (testmempoolaccept): every relay/standardness/consensus gate
         # above has passed (including min-relay fee, ephemeral dust, version,

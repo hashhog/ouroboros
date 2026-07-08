@@ -2226,13 +2226,23 @@ class TransactionValidator:
         flags = get_flags_for_height(height, block_hash, self.network)
         flags |= int(extra_script_flags)
 
-        # 1. Check structure
-        if not self._check_structure(tx):
-            return False, "Invalid structure"
+        # 1. Check structure — CheckTransaction (consensus/tx_check.cpp).
+        # _check_structure returns the specific Core reject token (or None when
+        # the structure is valid) so testmempoolaccept / sendrawtransaction
+        # surface the same bare token Core emits (bad-txns-vin-empty,
+        # bad-txns-vout-empty, bad-txns-oversize, bad-txns-vout-negative,
+        # bad-txns-vout-toolarge, bad-txns-txouttotal-toolarge,
+        # bad-txns-inputs-duplicate, bad-cb-length, bad-txns-prevout-null)
+        # instead of one opaque "Invalid structure".
+        structure_reject = self._check_structure(tx)
+        if structure_reject is not None:
+            return False, structure_reject
 
-        # 2. IsFinalTx — complete locktime validation
+        # 2. IsFinalTx — complete locktime validation.
+        # Core validation.cpp PreChecks emits the bare token "non-final"
+        # (TX_PREMATURE_SPEND) for a mempool-path finality failure.
         if not self._is_final_tx(tx, height, block_mtp):
-            return False, "Transaction is not final (locktime not satisfied)"
+            return False, "non-final"
 
         # 3. Gather ALL input UTXOs first — Taproot sighash (BIP 341)
         #    needs the complete list of input amounts and scriptPubKeys
@@ -2377,8 +2387,13 @@ class TransactionValidator:
                 return False  # BIP-113: MTP unavailable → cannot confirm finality
             return tx.locktime < block_mtp
 
-    def _check_structure(self, tx: Transaction) -> bool:
-        """Check basic transaction structure.
+    def _check_structure(self, tx: Transaction) -> str | None:
+        """Check basic transaction structure (CheckTransaction).
+
+        Returns ``None`` when the structure is valid, otherwise the specific
+        Bitcoin Core reject-reason token for the first failing condition so the
+        mempool RPC path (testmempoolaccept / sendrawtransaction) reports the
+        same bare token Core does.
 
         Mirrors Bitcoin Core consensus/tx_check.cpp::CheckTransaction.
         Ref: tx_check.cpp:11-59.
@@ -2395,23 +2410,25 @@ class TransactionValidator:
         # Check we have at least one input (unless coinbase)
         # Ref: tx_check.cpp:14-16 ("bad-txns-vin-empty")
         if len(tx.inputs) == 0:
-            return False
+            return "bad-txns-vin-empty"
 
         # Check we have at least one output
         # Ref: tx_check.cpp:17-18 ("bad-txns-vout-empty")
         if len(tx.outputs) == 0:
-            return False
+            return "bad-txns-vout-empty"
 
-        # Check locktime is valid
+        # Check locktime is valid.  No Core CheckTransaction equivalent (nLockTime
+        # is a wire uint32 so this is effectively unreachable); keep a descriptive
+        # token rather than silently accepting.
         if tx.locktime < 0 or tx.locktime > 0xffffffff:
-            return False
+            return "bad-txns-locktime-outofrange"
 
         # Oversize check (non-witness serialized size).
         # Ref: tx_check.cpp:19-21 ("bad-txns-oversize"):
         #   GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
         # Transaction.serialize() returns the non-witness form.
         if len(tx.serialize()) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT:
-            return False
+            return "bad-txns-oversize"
 
         # Check all outputs have valid values and total doesn't overflow.
         # out.value is deserialized as unsigned (int.from_bytes without signed=True);
@@ -2426,12 +2443,12 @@ class TransactionValidator:
         for out in tx.outputs:
             signed_value = out.value - (1 << 64) if out.value > INT64_MAX else out.value
             if signed_value < 0:
-                return False
+                return "bad-txns-vout-negative"
             if out.value > MAX_MONEY:
-                return False
+                return "bad-txns-vout-toolarge"
             total_out += out.value
             if total_out > MAX_MONEY:
-                return False
+                return "bad-txns-txouttotal-toolarge"
 
         # Check for duplicate inputs (CVE-2018-17144)
         # Ref: tx_check.cpp:36-44 ("bad-txns-inputs-duplicate")
@@ -2439,7 +2456,7 @@ class TransactionValidator:
         for tx_in in tx.inputs:
             outpoint = (tx_in.prev_txid, tx_in.prev_vout)
             if outpoint in seen_inputs:
-                return False
+                return "bad-txns-inputs-duplicate"
             seen_inputs.add(outpoint)
 
         # Coinbase vs non-coinbase prevout rules.
@@ -2454,15 +2471,15 @@ class TransactionValidator:
             #   tx.vin[0].scriptSig.size() < 2 || > 100
             cb_script_len = len(tx.inputs[0].script_sig)
             if cb_script_len < 2 or cb_script_len > 100:
-                return False
+                return "bad-cb-length"
         else:
             # Ref: tx_check.cpp:54-56 ("bad-txns-prevout-null")
             _null_txid = bytes(32)
             for tx_in in tx.inputs:
                 if tx_in.prev_txid == _null_txid and tx_in.prev_vout == 0xFFFFFFFF:
-                    return False
+                    return "bad-txns-prevout-null"
 
-        return True
+        return None
 
     def _verify_input_signature(
         self,

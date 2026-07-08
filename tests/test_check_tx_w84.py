@@ -163,15 +163,17 @@ class TestVinEmpty:
         """G1: transaction with no inputs fails _check_structure (bad-txns-vin-empty)."""
         tv = _make_validator()
         tx = Transaction(txid=b"", version=1, locktime=0, inputs=[], outputs=[_make_txout()])
-        assert tv._check_structure(tx) is False
+        assert tv._check_structure(tx) is not None
 
     def test_one_input_passes(self):
         """G1: transaction with one input passes vin-empty check."""
         tv = _make_validator()
         tx = _make_tx(inputs=[_make_txin()])
-        # May fail for other reasons but NOT vin-empty
+        # May fail for other reasons but NOT vin-empty. _check_structure now
+        # returns the specific Core reject token (str) or None when valid.
         result = tv._check_structure(tx)
-        assert isinstance(result, bool)
+        assert result is None or isinstance(result, str)
+        assert result != "bad-txns-vin-empty"
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +185,7 @@ class TestVoutEmpty:
         """G2: transaction with no outputs fails _check_structure (bad-txns-vout-empty)."""
         tv = _make_validator()
         tx = _make_tx(outputs=[])
-        assert tv._check_structure(tx) is False
+        assert tv._check_structure(tx) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +202,7 @@ class TestOversize:
         big_script = bytes(1_000_001)
         inp = _make_txin(script_sig=big_script)
         tx = _make_tx(inputs=[inp])
-        assert tv._check_structure(tx) is False
+        assert tv._check_structure(tx) is not None
 
     def test_just_below_oversize_passes(self):
         """G3: exactly at the limit does not trip oversize check."""
@@ -208,7 +210,7 @@ class TestOversize:
         # A minimal tx (version 4B + varint 1B + input ~41B + varint 1B + output ~10B + locktime 4B)
         # is well below 1,000,000 bytes.
         tx = _make_tx()
-        assert tv._check_structure(tx) is True
+        assert tv._check_structure(tx) is None
 
 
 # ---------------------------------------------------------------------------
@@ -225,14 +227,14 @@ class TestVoutNegative:
         # -1 as unsigned int64
         out = _make_txout(value=0xFFFFFFFFFFFFFFFF)
         tx = _make_tx(outputs=[out])
-        assert tv._check_structure(tx) is False
+        assert tv._check_structure(tx) is not None
 
     def test_zero_output_value_allowed(self):
         """G4: output with value 0 is valid."""
         tv = _make_validator()
         out = _make_txout(value=0)
         tx = _make_tx(outputs=[out])
-        assert tv._check_structure(tx) is True
+        assert tv._check_structure(tx) is None
 
 
 # ---------------------------------------------------------------------------
@@ -245,14 +247,14 @@ class TestVoutTooLarge:
         tv = _make_validator()
         out = _make_txout(value=MAX_MONEY + 1)
         tx = _make_tx(outputs=[out])
-        assert tv._check_structure(tx) is False
+        assert tv._check_structure(tx) is not None
 
     def test_output_equals_max_money_passes(self):
         """G5: single output value == MAX_MONEY passes."""
         tv = _make_validator()
         out = _make_txout(value=MAX_MONEY)
         tx = _make_tx(outputs=[out])
-        assert tv._check_structure(tx) is True
+        assert tv._check_structure(tx) is None
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +269,7 @@ class TestTxOutTotalTooLarge:
         out1 = _make_txout(value=MAX_MONEY)
         out2 = _make_txout(value=1)
         tx = _make_tx(outputs=[out1, out2])
-        assert tv._check_structure(tx) is False
+        assert tv._check_structure(tx) is not None
 
     def test_sum_equals_max_money_passes(self):
         """G6: sum of outputs == MAX_MONEY passes."""
@@ -276,7 +278,7 @@ class TestTxOutTotalTooLarge:
         out1 = _make_txout(value=half)
         out2 = _make_txout(value=MAX_MONEY - half)
         tx = _make_tx(outputs=[out1, out2])
-        assert tv._check_structure(tx) is True
+        assert tv._check_structure(tx) is None
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +293,7 @@ class TestDuplicateInputs:
         inp1 = _make_txin(prev_txid=txid, prev_vout=0)
         inp2 = _make_txin(prev_txid=txid, prev_vout=0)
         tx = _make_tx(inputs=[inp1, inp2])
-        assert tv._check_structure(tx) is False
+        assert tv._check_structure(tx) is not None
 
     def test_same_txid_different_vout_passes(self):
         """G7: same txid but different vout is NOT a duplicate."""
@@ -300,7 +302,7 @@ class TestDuplicateInputs:
         inp1 = _make_txin(prev_txid=txid, prev_vout=0)
         inp2 = _make_txin(prev_txid=txid, prev_vout=1)
         tx = _make_tx(inputs=[inp1, inp2])
-        assert tv._check_structure(tx) is True
+        assert tv._check_structure(tx) is None
 
     def test_different_txid_same_vout_passes(self):
         """G7: different txid with same vout is NOT a duplicate."""
@@ -308,7 +310,7 @@ class TestDuplicateInputs:
         inp1 = _make_txin(prev_txid=bytes(32), prev_vout=0)
         inp2 = _make_txin(prev_txid=bytes(range(32)), prev_vout=0)
         tx = _make_tx(inputs=[inp1, inp2])
-        assert tv._check_structure(tx) is True
+        assert tv._check_structure(tx) is None
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +335,7 @@ class TestPrevoutNull:
         tx = _make_tx(inputs=[inp])
         # is_coinbase == False because prev_txid != bytes(32)
         assert tx.is_coinbase is False
-        assert tv._check_structure(tx) is True
+        assert tv._check_structure(tx) is None
 
     def test_coinbase_null_prevout_allowed(self):
         """G8b: coinbase tx with null prevout (bytes(32), vout=0xFFFFFFFF) is valid."""
@@ -342,14 +344,14 @@ class TestPrevoutNull:
         tx = _make_coinbase_tx()
         # Coinbase null prevout is the canonical form — must pass _check_structure
         assert tx.is_coinbase is True
-        assert tv._check_structure(tx) is True
+        assert tv._check_structure(tx) is None
 
     def test_non_coinbase_non_null_prevout_passes(self):
         """G8: non-coinbase tx with non-null prevout passes prevout-null check."""
         tv = _make_validator()
         inp = _make_txin(prev_txid=bytes(range(32)), prev_vout=0)
         tx = _make_tx(inputs=[inp])
-        assert tv._check_structure(tx) is True
+        assert tv._check_structure(tx) is None
 
 
 # ---------------------------------------------------------------------------
