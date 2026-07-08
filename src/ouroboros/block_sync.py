@@ -703,9 +703,26 @@ class BlockSync:
             return
         self._w77_first_request_time[block_hash] = now
         self._w77_first_request_order.append(block_hash)
-        while len(self._w77_first_request_time) > W77_FIRST_REQUEST_MAX_ENTRIES:
-            oldest = self._w77_first_request_order.popleft()
-            self._w77_first_request_time.pop(oldest, None)
+        # The dict is popped independently on the common paths — delivery
+        # (`_w77_record_connect`) and abandon (`_abandon_block_request`) — but a
+        # plain deque cannot drop those hashes from its middle.  Before this
+        # fix the FIFO therefore retained one stale block-hash per *connected*
+        # block forever: the eviction gate below was on ``len(dict)``, and
+        # because delivery keeps the dict small it never crossed the cap, so
+        # the deque was never drained in steady state and grew unbounded across
+        # a sync (leak confirmed 2026-07-07: single growing deque, block-hash
+        # bytes, rooted at BlockSync._w77_first_request_order).  Fix: drain
+        # stale front entries (hashes no longer resident in the dict = already
+        # delivered/abandoned, telemetry already consumed — never a live
+        # in-flight baseline) so the FIFO tracks only live requests, then cap on
+        # the DEQUE length as the backstop.  Telemetry-only; no consensus path.
+        _order = self._w77_first_request_order
+        _times = self._w77_first_request_time
+        while _order and _order[0] not in _times:
+            _order.popleft()
+        while len(_order) > W77_FIRST_REQUEST_MAX_ENTRIES:
+            oldest = _order.popleft()
+            _times.pop(oldest, None)
 
     def _abandon_block_request(self, block_hash: bytes) -> None:
         """Drop *block_hash* from every in-flight block-request map.
