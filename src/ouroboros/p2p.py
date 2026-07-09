@@ -2518,13 +2518,15 @@ class PeerManager:
         # ready peer so a stuck round-trip still resolves.  Best-effort —
         # a failed send just means the next inv/announce re-triggers it.
         try:
-            from ouroboros.p2p_messages import INV_TYPE_BLOCK, GetDataMessage
+            from ouroboros.p2p_messages import MSG_WITNESS_BLOCK, GetDataMessage
             ready = self.get_all_ready_peers()
             if ready:
                 target = ready[0]
                 for h, _addr in expired:
                     try:
-                        getdata = GetDataMessage(inventory=[(INV_TYPE_BLOCK, h)])
+                        # MSG_WITNESS_BLOCK: a witness-stripped segwit block
+                        # would fail validation and poison the hash.
+                        getdata = GetDataMessage(inventory=[(MSG_WITNESS_BLOCK, h)])
                         await target.send_message(
                             getdata.to_network_message(self.network))
                     except Exception:
@@ -3081,10 +3083,13 @@ class PeerManager:
                     )
                     try:
                         from ouroboros.p2p_messages import (
-                            INV_TYPE_BLOCK, GetDataMessage,
+                            MSG_WITNESS_BLOCK, GetDataMessage,
                         )
+                        # MSG_WITNESS_BLOCK (0x40000002), never bare
+                        # INV_TYPE_BLOCK: a witness-stripped segwit block fails
+                        # the witness-commitment check and gets perm-rejected.
                         getdata = GetDataMessage(
-                            inventory=[(INV_TYPE_BLOCK, oldest_hash)])
+                            inventory=[(MSG_WITNESS_BLOCK, oldest_hash)])
                         await peer.send_message(
                             getdata.to_network_message(self.network))
                     except Exception as e:
@@ -3149,8 +3154,8 @@ class PeerManager:
                 )
                 # Fall back: request the full block via getdata
                 try:
-                    from ouroboros.p2p_messages import INV_TYPE_BLOCK, GetDataMessage
-                    getdata = GetDataMessage(inventory=[(INV_TYPE_BLOCK, bt.block_hash)])
+                    from ouroboros.p2p_messages import MSG_WITNESS_BLOCK, GetDataMessage
+                    getdata = GetDataMessage(inventory=[(MSG_WITNESS_BLOCK, bt.block_hash)])
                     await peer.send_message(getdata.to_network_message(self.network))
                 except Exception as e:
                     logger.warning(f"Failed to send getdata fallback: {e}")
@@ -3163,8 +3168,8 @@ class PeerManager:
                     f"{bt.block_hash.hex()[:16]}...; falling back to getdata"
                 )
                 try:
-                    from ouroboros.p2p_messages import INV_TYPE_BLOCK, GetDataMessage
-                    getdata = GetDataMessage(inventory=[(INV_TYPE_BLOCK, bt.block_hash)])
+                    from ouroboros.p2p_messages import MSG_WITNESS_BLOCK, GetDataMessage
+                    getdata = GetDataMessage(inventory=[(MSG_WITNESS_BLOCK, bt.block_hash)])
                     await peer.send_message(getdata.to_network_message(self.network))
                 except Exception as e:
                     logger.warning(f"Failed to send getdata fallback: {e}")

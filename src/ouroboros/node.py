@@ -691,6 +691,11 @@ class BitcoinNode:
                     # getblocktxn or received cmpctblock from a sendcmpct peer).
                     if len(_block_sync_ref._ibd_block_buffer) < _block_sync_ref._max_ibd_buffer:
                         _block_sync_ref._ibd_block_buffer[block_hash] = (None, raw_bytes)
+                        # Tag as compact-reconstruction origin: if these bytes
+                        # fail validation the drain drops + re-requests the full
+                        # witness block instead of permanently rejecting the hash
+                        # (the at-tip wedge). See block_sync _compact_origin_hashes.
+                        _block_sync_ref._compact_origin_hashes.add(block_hash)
                         _block_sync_ref._blk_buffered += 1
                         logger.debug(
                             f"compact block buffered "
