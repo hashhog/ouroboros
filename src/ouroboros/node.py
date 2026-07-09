@@ -1434,7 +1434,12 @@ class BitcoinNode:
         def _make_tx_handler(sender_peer):
             """Create a per-peer tx handler that relays accepted txs."""
             async def handler(msg):
-                if not self.mempool:
+                # Mempool.__len__ returns the tx count, so an EMPTY (but valid)
+                # mempool is falsy — `if not self.mempool` would drop the first
+                # inbound tx into a fresh mempool (masked on mainnet by the
+                # persisted mempool at boot; exposed cold by the regtest harness).
+                # Guard on identity, not truthiness.
+                if self.mempool is None:
                     return
                 try:
                     from ouroboros.p2p_messages import (
