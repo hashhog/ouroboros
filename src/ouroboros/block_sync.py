@@ -1123,15 +1123,30 @@ class BlockSync:
                     logger.info(
                         "Header sync peer %s stalled, switching%s",
                         self._header_sync_peer.host,
-                        " (pinned -connect peer: NoBan, not scored)" if is_pinned else "",
+                        " (not scored)" if is_pinned else "",
                     )
-                    # Score misbehavior for stalling block downloads (+50) —
-                    # only for non-pinned peers.
-                    if self.peer_manager and not is_pinned:
-                        from ouroboros.banman import SCORE_BLOCK_DOWNLOAD_STALL
-                        self.peer_manager.misbehaving(
-                            self._header_sync_peer.host, SCORE_BLOCK_DOWNLOAD_STALL,
-                            "block download stalling")
+                    # Rotate the designated header-sync peer WITHOUT banning it.
+                    # A peer that is merely slow (or has no NEW headers to give)
+                    # is NOT misbehaving: Bitcoin Core's headers-sync timeout
+                    # drops the designated sync peer but never discourages it, and
+                    # even block-download stalling past BLOCK_STALLING_TIMEOUT only
+                    # sets fDisconnect — it does NOT Misbehaving/ban.  The prior
+                    # misbehaving(+50) here == DISCOURAGEMENT_THRESHOLD, so it
+                    # instantly banned+disconnected the sync peer every 30s.  Near
+                    # tip that is catastrophic: once our validated-header frontier
+                    # has caught up to the peers, EVERY designated sync peer
+                    # "stalls" (there are no new headers to deliver) and gets
+                    # insta-banned — churning away exactly the peers that were
+                    # serving block bodies up to the tip, until only zombie peers
+                    # (connected, high historical score, no longer serving) remain
+                    # and tip+1 never downloads.  This was the recurring near-tip
+                    # block-download wedge (h=957257/957262/957320…).  Apply only a
+                    # small score demotion so block-download rotation prefers
+                    # fresher peers; a genuinely dead socket is still reaped by the
+                    # coarse inactivity sweep (is_recv_stalled) in
+                    # PeerManager.maintain_connections.
+                    if not is_pinned:
+                        self._header_sync_peer.adjust_score(-2)
                     self._header_sync_peer = None
 
                 if not self._header_sync_peer:
@@ -3951,8 +3966,9 @@ class BlockSync:
                     self._block_request_peer[frontier_hash] = frontier_peer
                     self._record_first_request_time(frontier_hash, now)
                     logger.info(
-                        "H1 frontier priority: re-requested tip+1 from "
-                        "%s:%s (score=%s)",
+                        "H1 frontier priority: re-requested tip+1 %s "
+                        "from %s:%s (score=%s)",
+                        frontier_hash.hex()[:12],
                         frontier_peer.host, frontier_peer.port,
                         getattr(frontier_peer, 'score', '?'),
                     )
