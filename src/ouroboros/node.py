@@ -696,6 +696,19 @@ class BitcoinNode:
                         # witness block instead of permanently rejecting the hash
                         # (the at-tip wedge). See block_sync _compact_origin_hashes.
                         _block_sync_ref._compact_origin_hashes.add(block_hash)
+                        # Clear full-block in-flight tracking for this hash. The
+                        # block may have been requested via getdata(MSG_WITNESS_BLOCK)
+                        # and then arrived via compact reconstruction instead.
+                        # handle_block clears these on a full-block delivery
+                        # (block_sync.py:1414-1417); the compact path must too, or
+                        # the stale in-flight entry later fires as a spurious
+                        # "general" timeout, is re-requested, and after
+                        # BLOCK_REQUEST_MAX_ATTEMPTS gets _mark_perm_rejected —
+                        # re-poisoning a good on-chain hash (undoing the 91870c1
+                        # fix) and inflating in_flight toward its cap.
+                        _block_sync_ref.requested_blocks.pop(block_hash, None)
+                        _block_sync_ref._block_request_peer.pop(block_hash, None)
+                        _block_sync_ref._block_request_attempts.pop(block_hash, None)
                         _block_sync_ref._blk_buffered += 1
                         logger.debug(
                             f"compact block buffered "
