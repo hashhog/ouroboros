@@ -4561,7 +4561,15 @@ class BlockSync:
         # with the recent-payload EMA and the per-peer in-flight count;
         # clamped to [MIN,MAX] so an outlier block can't wedge the loop.
         HEAD_OF_WINDOW = 8
-        HEAD_TIMEOUT = 2.0
+        # W96b: size-aware head rescue. The fixed 2s (W94b) WEDGED mainnet
+        # at-tip (2026-07-09): a ~1.5 MB block cannot download in 2s, so the
+        # optimistic head rescue re-requested the same block every 2s across
+        # all peers forever and it never completed (recurring live wedge at
+        # h=957257). A small IBD block still finishes in <1s so it keeps the
+        # fast 2s floor (rescue preserved); mainnet-size blocks get enough time
+        # to actually finish before we rotate. Scale with the recent-payload
+        # EMA. Floor 2s, cap 15s.
+        HEAD_TIMEOUT = max(2.0, min(15.0, max(0.1, self._w95_block_mb_ema) * 6.0))
 
         # Build the head-of-window set: the first HEAD_OF_WINDOW headers
         # that are NOT yet on the active chain.  Active-chain membership
