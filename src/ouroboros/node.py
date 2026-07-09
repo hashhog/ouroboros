@@ -790,7 +790,7 @@ class BitcoinNode:
             if self.zmq_notifier._topic_endpoints:
                 await self.zmq_notifier.start()
                 if self.block_sync:
-                    self.block_sync.set_zmq_notifier(self.zmq_notifier)
+                    self.block_sync.set_zmq_publisher(self.zmq_notifier)
 
             # Prometheus metrics (best-effort; disabled if prometheus_client not installed)
             metrics_port = int(self.config.get('metrics_port', 9332))
@@ -1486,8 +1486,8 @@ class BitcoinNode:
                         logger.info(
                             f"Added transaction {txid.hex()[:16]}... to mempool"
                         )
-                        if self.zmq_publisher:
-                            self.zmq_publisher.notify_transaction(tx)
+                        if self.zmq_notifier:
+                            self.zmq_notifier.notify_transaction(tx)
 
                         # Relay INV to all peers except the sender.
                         # BIP-339: wtxid-relay peers get MSG_WTX(5)+wtxid;
