@@ -110,6 +110,31 @@ MAX_GETDATA_SZ = 1000
 # is torn down on FinalizeNode; there is no unbounded retain-and-retry queue.
 BLOCK_REQUEST_MAX_ATTEMPTS = 10
 
+# H1 — connect-frontier priority re-request interval (seconds).
+#
+# The strictly-in-order block drain (``_drain_block_buffer_locked``) can only
+# advance on the CONNECT FRONTIER — slot 0 of ``_validated_headers`` == tip+1.
+# Peers reliably flood the IBD buffer with FAR-AHEAD blocks, but the single
+# round-robin-assigned peer for the frontier frequently fails to serve it
+# within ``HEAD_TIMEOUT`` (size-aware, up to 64 s), head-of-line-blocking the
+# drain for minutes while ~14 later blocks sit ready.  This is a SCHEDULING
+# problem (budget is ample), not a budget/peer-count one.
+#
+# Fix (H1 v2): each request cycle, re-issue the frontier as a SINGLE getdata to
+# the TOP-scoring ready peer (bypassing the round-robin that starves it),
+# rotating to a DIFFERENT top peer than its current holder so one unresponsive
+# peer cannot hold it hostage.  This interval gates the re-issue so we rotate
+# fresh peers on a tight cadence (the sync_loop ticks every 1 s during IBD)
+# WITHOUT spamming — deliberately SHORTER than ``HEAD_TIMEOUT`` so the frontier
+# retries a fresh peer long before the general head rescue would fire.  Core
+# achieves the same reliability by disconnecting the block-download staller at
+# BLOCK_STALLING_TIMEOUT and re-fetching from another peer (net_processing.cpp
+# FindNextBlocksToDownload / the nodeStaller path); we rotate rather than
+# disconnect.  SINGLE send to ONE peer — never a fan-out (fan-out with an
+# awaited send to a marginal/closing transport caused the FIX-ATTEMPT-1
+# socket.send() flood + sync-loop stall; reverted).
+FRONTIER_REQUEST_INTERVAL = 5.0
+
 # Hard cap on the ``_w77_first_request_time`` telemetry map.  It is
 # diagnostic-only (request->connect latency rollup) and must NEVER be
 # load-bearing for memory.  FIFO-evict the oldest entry past this cap.  This
@@ -3864,12 +3889,86 @@ class BlockSync:
         # genuine head (the 938231 wedge guard).
         HEAD_OF_WINDOW = 8
         head_set: set[bytes] = set()
+        # The CONNECT FRONTIER is the first queued header not yet on the active
+        # chain (tip+1). It is the ONLY block the drain can advance on, so it
+        # gets a dedicated priority re-request below (H1).
+        frontier_hash: bytes | None = None
         for i, (bh, _) in enumerate(self._validated_headers):
             if self.db.get_block_hash_by_height(current_height + 1 + i) == bh:
                 continue
+            if frontier_hash is None:
+                frontier_hash = bh
             head_set.add(bh)
             if len(head_set) >= HEAD_OF_WINDOW:
                 break
+
+        # Peers eligible to serve blocks, sorted by score (descending) so the
+        # chain-closest work goes to the highest-quality peers.  Computed once
+        # here and reused by BOTH the frontier-priority send (H1) and the
+        # normal round-robin distribution below.
+        if hasattr(self.peer_manager, 'get_all_ready_peers'):
+            candidates = [p for p in self.peer_manager.get_all_ready_peers()
+                          if isinstance(p, Peer) and p.is_connected()]
+        else:
+            candidates = []
+        candidates.sort(key=lambda p: -getattr(p, 'score', 100))
+
+        now = time.time()
+
+        # ------------------------------------------------------------------
+        # H1 — CONNECT-FRONTIER PRIORITY (single send, no fan-out).
+        #
+        # Re-issue the frontier (tip+1) as ONE getdata to the top-scoring ready
+        # peer, rotating away from its current holder, on the
+        # FRONTIER_REQUEST_INTERVAL cadence.  This bypasses the round-robin that
+        # otherwise pins the frontier to one (possibly unresponsive) peer for a
+        # full size-aware HEAD_TIMEOUT.  The frontier is marked in
+        # requested_blocks here, so the HEAD pass below naturally skips it (no
+        # duplicate send).  Skip when the frontier is already sitting in the IBD
+        # buffer (received, awaiting drain) — re-requesting it would be wasted.
+        # ------------------------------------------------------------------
+        if (
+            frontier_hash is not None
+            and candidates
+            and frontier_hash not in self._ibd_block_buffer
+        ):
+            last_req = self.requested_blocks.get(frontier_hash)
+            if last_req is None or (now - last_req) >= FRONTIER_REQUEST_INTERVAL:
+                current_peer = self._block_request_peer.get(frontier_hash)
+                # Rotate: first top-scoring peer that is NOT the current holder,
+                # so a single unresponsive peer can't hold the frontier hostage.
+                frontier_peer = next(
+                    (p for p in candidates if p is not current_peer), candidates[0]
+                )
+                try:
+                    getdata = GetDataMessage(
+                        inventory=[(MSG_WITNESS_BLOCK, frontier_hash)]
+                    )
+                    await frontier_peer.send_message(
+                        getdata.to_network_message(network)
+                    )
+                    self.requested_blocks[frontier_hash] = now
+                    self._block_request_peer[frontier_hash] = frontier_peer
+                    self._record_first_request_time(frontier_hash, now)
+                    logger.info(
+                        "H1 frontier priority: re-requested tip+1 from "
+                        "%s:%s (score=%s)",
+                        frontier_peer.host, frontier_peer.port,
+                        getattr(frontier_peer, 'score', '?'),
+                    )
+                except Exception as e:
+                    # Exactly the existing normal-path failure discipline: log,
+                    # penalize, and DO NOT block or drop a validly-tracked
+                    # in-flight entry.  If the frontier was already in flight to
+                    # its old holder, that tracking is left intact (it will time
+                    # out normally); if it was fresh, we simply didn't add it and
+                    # the next cycle retries.  Never awaits a drain on a stuck
+                    # transport — this is why FIX-ATTEMPT-1's flood cannot recur.
+                    logger.error(
+                        "H1 frontier priority send to %s:%s failed: %s",
+                        frontier_peer.host, frontier_peer.port, e,
+                    )
+                    frontier_peer.adjust_score(-2)
 
         to_request: list[tuple[int, bytes]] = []
         seen: set[bytes] = set()
@@ -3915,21 +4014,13 @@ class BlockSync:
             return
 
         # Distribute across connected peers round-robin, respecting the
-        # per-peer in-flight cap.
-        if hasattr(self.peer_manager, 'get_all_ready_peers'):
-            candidates = [p for p in self.peer_manager.get_all_ready_peers()
-                          if isinstance(p, Peer) and p.is_connected()]
-        else:
-            candidates = []
+        # per-peer in-flight cap.  ``candidates`` was already gathered and
+        # score-sorted above (shared with the H1 frontier-priority send); it
+        # is the same insertion-order-then-score-desc list the round-robin
+        # relied on (W91: sorting hands the chain-closest blocks to the
+        # highest-quality peers first).
         if not candidates:
             return
-
-        # Sort peers by score (descending) so round-robin hands the
-        # chain-closest (head-of-window) blocks to the highest-quality
-        # peers first.  get_all_ready_peers() returns insertion order,
-        # which consistently awarded candidates[0] to a slow peer during
-        # W91 soaks (98% no-progress drains).
-        candidates.sort(key=lambda p: -getattr(p, 'score', 100))
 
         peer_load = Counter(self._block_request_peer.values())
         per_peer, assigned = _distribute_blocks_round_robin(
@@ -3939,7 +4030,6 @@ class BlockSync:
         if not assigned:
             return
 
-        now = time.time()
         for _, bh in assigned:
             self.requested_blocks[bh] = now
             self._record_first_request_time(bh, now)
