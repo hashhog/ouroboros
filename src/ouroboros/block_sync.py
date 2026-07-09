@@ -503,6 +503,15 @@ class BlockSync:
         self._perm_rejected_blocks: set[bytes] = set()
         self._perm_rejected_order: list[bytes] = []
         self._perm_rejected_max: int = 10000
+        # Hashes whose buffered bytes came from BIP152 compact-block
+        # reconstruction (node.py _compact_block_handler), not a solicited
+        # full-block getdata.  A reconstruction that fails validation (short-id
+        # collision, incomplete/witness-stripped fill) must NOT poison the hash
+        # in _perm_rejected_blocks — Bitcoin Core treats a
+        # PartiallyDownloadedBlock failure as "re-request the full block", never
+        # as permanent block invalidity.  The drain drops such a failure and
+        # re-requests the full witness block instead of perm-rejecting.
+        self._compact_origin_hashes: set[bytes] = set()
         self._blk_perm_rejected_dropped: int = 0
         # Track which peer (as "host:port" string) delivered each buffered block
         # so the drain loop can score Misbehaving(100) against the right peer when
@@ -1742,6 +1751,7 @@ class BlockSync:
             self.requested_blocks.clear()
             self._block_request_peer.clear()
             self._block_source_peer_addr.clear()
+            self._compact_origin_hashes.clear()
             # Telemetry-only request→connect latency dict; clear with the
             # sibling maps so a bulk queue-drop doesn't orphan its entries.
             self._w77_first_request_time.clear()
@@ -2034,6 +2044,32 @@ class BlockSync:
                 # without a fresh deserialize / validate cycle.
                 if error == "Previous block not found":
                     self._buffer_put(next_hash, (block, raw_payload))
+                elif next_hash in self._compact_origin_hashes:
+                    # These bytes came from BIP152 compact-block reconstruction,
+                    # not a solicited full block.  A reconstruction can fail
+                    # validation for a recoverable reason — a 6-byte short-id
+                    # collision substituting the wrong mempool tx, or an
+                    # incomplete/witness-stripped fill — none of which means the
+                    # block itself is invalid.  Bitcoin Core treats a
+                    # PartiallyDownloadedBlock / FillBlock failure as
+                    # "reconstruction failed -> request the full block"
+                    # (net_processing.cpp), NEVER as permanent block invalidity.
+                    # Drop the bad reconstruction and let the head-of-window
+                    # request loop re-fetch the FULL witness block
+                    # (MSG_WITNESS_BLOCK); do NOT poison the hash and do NOT
+                    # penalise the peer.  Poisoning here was the at-tip wedge:
+                    # every later honest full-block delivery got dropped at
+                    # handle_block's _perm_rejected gate and the tip froze until
+                    # a restart cleared the in-memory set.
+                    self._compact_origin_hashes.discard(next_hash)
+                    self._abandon_block_request(next_hash)
+                    self._block_source_peer_addr.pop(next_hash, None)
+                    logger.warning(
+                        f"Compact-reconstructed block {next_hash.hex()[:16]}... "
+                        f"failed validation ({error}); dropping + re-requesting "
+                        f"full witness block (not perm-rejecting)"
+                    )
+                    break
                 else:
                     self._mark_perm_rejected(next_hash)
                     # G16/G17 (W99): Bitcoin Core's ProcessNewBlock calls
@@ -2056,6 +2092,7 @@ class BlockSync:
 
             # Clear peer-address tracking for successfully accepted block
             self._block_source_peer_addr.pop(next_hash, None)
+            self._compact_origin_hashes.discard(next_hash)
 
             # Connect block
             t_con = time.perf_counter_ns()
