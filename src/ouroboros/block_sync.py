@@ -1256,14 +1256,32 @@ class BlockSync:
                             self._record_first_request_time(inv_hash, now)
 
                 elif inv_type in (INV_TYPE_TX, MSG_WITNESS_TX, MSG_WTX):
-                    # Request transactions we don't already have
-                    if (
-                        self.mempool
-                        and not self.mempool.get_transaction(inv_hash)
-                        and inv_hash not in self._requested_txs
-                    ):
-                        txs_to_request.append((MSG_WITNESS_TX, inv_hash))
-                        self._requested_txs[inv_hash] = now
+                    # Request transactions we don't already have.
+                    #
+                    # BIP-339: a MSG_WTX(5) inv carries the WITNESS txid
+                    # (wtxid); INV_TYPE_TX(1) / MSG_WITNESS_TX carry the plain
+                    # txid.  Mirror Core's GetRequestsToSend
+                    # (gtxid.IsWtxid() ? MSG_WTX : MSG_TX|fetch_flags): request
+                    # a wtxid-announced tx with a MSG_WTX getdata so the peer
+                    # resolves it through its wtxid index, and dedup in the
+                    # wtxid namespace (get_transaction_by_wtxid).  Requesting a
+                    # wtxid via MSG_WITNESS_TX (a TXID request) makes a segwit
+                    # peer miss (wtxid != txid) and reply notfound — the tx is
+                    # then never ingested (harness --tx-relay Ingested=NO).
+                    # NB: ``is not None`` — Mempool defines __len__, so an EMPTY
+                    # mempool is falsy; a bare ``if self.mempool`` would skip the
+                    # very first tx request (the fresh-mempool case the harness
+                    # exercises) and never ingest a wtxid-relayed tx.
+                    if self.mempool is not None and inv_hash not in self._requested_txs:
+                        if inv_type == MSG_WTX:
+                            have = self.mempool.get_transaction_by_wtxid(inv_hash)
+                            request_item = (MSG_WTX, inv_hash)
+                        else:
+                            have = self.mempool.get_transaction(inv_hash)
+                            request_item = (MSG_WITNESS_TX, inv_hash)
+                        if not have:
+                            txs_to_request.append(request_item)
+                            self._requested_txs[inv_hash] = now
 
             network = (
                 self.peer_manager.network
