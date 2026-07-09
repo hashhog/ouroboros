@@ -4568,8 +4568,13 @@ class BlockSync:
         # h=957257). A small IBD block still finishes in <1s so it keeps the
         # fast 2s floor (rescue preserved); mainnet-size blocks get enough time
         # to actually finish before we rotate. Scale with the recent-payload
-        # EMA. Floor 2s, cap 15s.
-        HEAD_TIMEOUT = max(2.0, min(15.0, max(0.1, self._w95_block_mb_ema) * 6.0))
+        # EMA. Floor 2s (fast small-block rescue), cap 64s to MATCH Core's
+        # BLOCK_STALLING_TIMEOUT_MAX (net_processing.cpp:135) — the first
+        # 15s-cap pass still re-wedged at h=957262 (a ~1.5MB block needs more
+        # than 9s from typical peers, and the head rescue resets the window on
+        # every re-request so a block never gets a long-enough download). At
+        # avg_mb=1.5 the *25 factor gives ~37s; small IBD blocks keep the 2s floor.
+        HEAD_TIMEOUT = max(2.0, min(64.0, max(0.1, self._w95_block_mb_ema) * 25.0))
 
         # Build the head-of-window set: the first HEAD_OF_WINDOW headers
         # that are NOT yet on the active chain.  Active-chain membership
