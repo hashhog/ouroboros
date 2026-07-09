@@ -7338,6 +7338,38 @@ class RPCServer:
             _bip34_depl.height if _bip34_depl is not None else 227_931
         )
 
+        # bad-txnmrklroot / bad-txns-duplicate (CheckBlock parity). Core runs
+        # CheckBlock — which is CONTEXT-FREE and includes the merkle-root check
+        # — for EVERY block, side branches included. In the submitblock path
+        # (ProcessNewBlock, validation.cpp:4416) CheckBlock runs BEFORE
+        # AcceptBlock, so it precedes even ContextualCheckBlockHeader's
+        # bad-diffbits below; CheckMerkleRoot (validation.cpp:3843-3857) rejects
+        # a header merkle root that does not match its transactions
+        # (bad-txnmrklroot), then a mutated tree (CVE-2012-2459, bad-txns-
+        # duplicate) — all WITHOUT storing or connecting the block. The direct-
+        # connect path enforces this via BlockValidator._verify_merkle_root; the
+        # side-branch store path skipped it, so a fork block with a corrupted
+        # merkle root false-accepted and could even win a reorg into the buffer.
+        # Reuse the SAME merkle computation so both paths agree with Core.
+        _validator = getattr(self.node, "validator", None)
+        if _validator is not None:
+            try:
+                _mrk_blk = _Block.deserialize(block_bytes)
+                _txids = [tx.get_txid() for tx in _mrk_blk.transactions]
+                _root, _mutated = _validator._calculate_merkle_root_checked(_txids)
+                if _root != _mrk_blk.merkle_root:
+                    return bip22_result_string("bad-txnmrklroot")
+                if _mutated:
+                    return bip22_result_string("bad-txns-duplicate")
+            except Exception as _e:
+                # Degrade to pre-fix behaviour only when the merkle computation
+                # itself cannot run — never mask a genuine mismatch, which
+                # returns above.
+                logger.debug(
+                    "side-branch merkle check skipped at h=%d: %s",
+                    new_height, _e,
+                )
+
         # bad-diffbits (ContextualCheckBlockHeader parity). Core runs
         # ContextualCheckBlockHeader inside AcceptBlockHeader for ALL
         # headers — including fork/side-branch headers — so a block whose
