@@ -169,6 +169,7 @@ from ouroboros.p2p_messages import (
     MSG_WITNESS_BLOCK,
     MSG_WITNESS_TX,
     MSG_WTX,
+    NODE_WITNESS,
     BlockHeader,
     CmpctBlockMessage,
     GetDataMessage,
@@ -199,6 +200,30 @@ _MAX_NUM_UNCONNECTING_HEADERS_MSGS: int = 10
 # cycle (rpc imports block_sync); the reorg machinery itself re-checks the cap
 # in rpc._reorg_to_side_branch_tip, so this is a download-side guard only.
 MAX_REORG_DEPTH: int = 288
+
+
+def _can_serve_witness_blocks(peer) -> bool:
+    """True if ``peer`` advertises NODE_WITNESS and can serve MSG_WITNESS_BLOCK.
+
+    Bitcoin Core parity: block download only fetches a segwit-active block
+    from a peer when ``peer.m_their_services & NODE_WITNESS``
+    (``CanServeWitnesses``, net_processing.cpp:1168), gating both the
+    parallel and direct-fetch paths (net_processing.cpp:1501, 2854) and
+    rejecting a "Pre-SegWit peer" outright when setting up a fetch
+    (net_processing.cpp:1969).
+
+    ouroboros requests EVERY block body as ``MSG_WITNESS_BLOCK`` (0x40000002),
+    which a peer that does not advertise NODE_WITNESS silently drops — it
+    serves headers, tx-relay, addr, etc. but never answers the block getdata.
+    Sending the connect-frontier (tip+1) getdata to such peers is exactly the
+    near-tip block-body wedge: the frontier is re-requested forever from
+    non-witness peers that will never deliver it, so the tip never advances
+    even though headers keep flowing.  Filtering block-download candidates to
+    witness-capable peers restores Core's invariant.  (Pre-segwit blocks are
+    served identically by witness peers, so this filter is safe at every
+    height a MSG_WITNESS_BLOCK request is issued.)
+    """
+    return bool(getattr(peer, "services", 0) & NODE_WITNESS)
 
 
 def _distribute_blocks_round_robin(
@@ -3921,9 +3946,15 @@ class BlockSync:
         # chain-closest work goes to the highest-quality peers.  Computed once
         # here and reused by BOTH the frontier-priority send (H1) and the
         # normal round-robin distribution below.
+        # Block download requires witness-capable peers: ouroboros requests
+        # MSG_WITNESS_BLOCK, which non-witness peers silently drop (Core
+        # CanServeWitnesses gate, net_processing.cpp:1501/2854).  Filtering
+        # here keeps the connect-frontier getdata off peers that will never
+        # deliver it — the near-tip block-body wedge fix.
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             candidates = [p for p in self.peer_manager.get_all_ready_peers()
-                          if isinstance(p, Peer) and p.is_connected()]
+                          if isinstance(p, Peer) and p.is_connected()
+                          and _can_serve_witness_blocks(p)]
         else:
             candidates = []
         candidates.sort(key=lambda p: -getattr(p, 'score', 100))
@@ -4824,7 +4855,11 @@ class BlockSync:
         for peer in penalize_peers:
             peer.adjust_score(-1)
 
-        connected_peers = [p for p in all_peers if p.is_connected()]
+        # Re-requests are block getdata (MSG_WITNESS_BLOCK) too, so the same
+        # witness-capability gate applies — never re-route a timed-out block to
+        # a non-witness peer that cannot serve it (Core CanServeWitnesses).
+        connected_peers = [p for p in all_peers
+                           if p.is_connected() and _can_serve_witness_blocks(p)]
 
         # If no peers available, clear all in-flight requests so they re-queue on reconnect
         if not connected_peers:

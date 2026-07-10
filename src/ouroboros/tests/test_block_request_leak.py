@@ -36,7 +36,7 @@ from ouroboros.block_sync import (  # noqa: E402
     W77_FIRST_REQUEST_MAX_ENTRIES,
 )
 import ouroboros.block_sync as bsmod  # noqa: E402
-from ouroboros.p2p_messages import InvMessage, INV_TYPE_BLOCK  # noqa: E402
+from ouroboros.p2p_messages import InvMessage, INV_TYPE_BLOCK, NODE_WITNESS  # noqa: E402
 from ouroboros.peer import Peer, PeerState  # noqa: E402
 
 
@@ -78,6 +78,10 @@ class _StubPeerManager:
 def _make_peer(i: int) -> Peer:
     p = Peer("10.0.0.%d" % i, 18444, network="regtest")
     p.state = PeerState.READY  # is_connected() -> True
+    # Block-download peers must advertise NODE_WITNESS (ouroboros requests
+    # MSG_WITNESS_BLOCK; block_sync now filters candidates to witness-capable
+    # peers, Core CanServeWitnesses parity).
+    p.services = NODE_WITNESS
     p.adjust_score = lambda d: None  # keep peers in the ready set (no ban churn)
 
     async def _send(_msg):
