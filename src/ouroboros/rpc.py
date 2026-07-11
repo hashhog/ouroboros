@@ -7329,6 +7329,8 @@ class RPCServer:
         # have to run against the disconnected-A-chain chainstate, which
         # only happens during the reorg connect loop below.
         from ouroboros.validation import _encode_bip34_height
+        from ouroboros.validation import _bits_to_target as _v_bits_to_target
+        from ouroboros.validation import MAX_FUTURE_BLOCK_TIME as _MAX_FUTURE
         from ouroboros.consensus import BURIED_DEPLOYMENTS
         from ouroboros.database import Block as _Block
 
@@ -7337,6 +7339,27 @@ class RPCServer:
         _bip34_activation = (
             _bip34_depl.height if _bip34_depl is not None else 227_931
         )
+
+        # high-hash (CheckBlockHeader / CheckProofOfWork parity). Proof-of-work
+        # is CONTEXT-FREE: Core runs CheckBlock -> CheckBlockHeader ->
+        # CheckProofOfWork FIRST for EVERY block (side branches included), in
+        # ProcessNewBlock BEFORE AcceptBlock (validation.cpp:4416), so a block
+        # whose hash does not meet the target encoded in nBits is rejected
+        # "high-hash" (validation.cpp CheckBlockHeader, pow.cpp CheckProofOfWork)
+        # before it can be stored or drive a reorg. The P2P headers path already
+        # enforces this via BlockSync._header_meets_pow; the side-branch store
+        # path skipped it, so a fork block with sub-target PoW false-accepted
+        # (fuzz-sweep-6nodes-2026-07-11.md Finding 2, high-hash x15). ``block_hash``
+        # here is already dsha256(header[:80]) in internal (little-endian) order,
+        # matching Core's arith_uint256; ``_v_bits_to_target`` is the SAME compact
+        # decoder validation._validate_header uses — no second PoW engine.
+        # bits live at header offset 72:76 (version 4|prev 32|merkle 32|time 4|
+        # bits 4|nonce 4), little-endian.
+        _bits_val = int.from_bytes(block_bytes[72:76], "little")
+        _target = _v_bits_to_target(_bits_val)
+        _hash_int = int.from_bytes(block_hash, "little")
+        if _target <= 0 or _hash_int > _target:
+            return bip22_result_string("high-hash")
 
         # bad-txnmrklroot / bad-txns-duplicate (CheckBlock parity). Core runs
         # CheckBlock — which is CONTEXT-FREE and includes the merkle-root check
@@ -7404,6 +7427,28 @@ class RPCServer:
                     "side-branch diffbits check skipped at h=%d: %s",
                     new_height, _e,
                 )
+
+        # time-too-new (ContextualCheckBlockHeader parity). Core rejects a block
+        # whose timestamp is more than MAX_FUTURE_BLOCK_TIME (2h) beyond the
+        # node's clock — validation.cpp:4108-4110 compares block.Time() against
+        # NodeClock::now() + MAX_FUTURE_BLOCK_TIME. This gate needs only the wall
+        # clock (no chain context), so it is safe to run for side-branch blocks:
+        # a genuinely valid side-branch never carries a >2h-future timestamp (Core
+        # would reject it too). The side-branch store path skipped it
+        # (fuzz-sweep-6nodes-2026-07-11.md Finding 2, time-too-new x2). Runs AFTER
+        # high-hash/merkle (CheckBlock) and bad-diffbits, mirroring Core's order
+        # (ContextualCheckBlockHeader: bad-diffbits before the timestamp gates).
+        # NB: time-too-old (<= MTP) and bad-version (BIP34/66/65 height-gated) are
+        # left to a follow-up — both are CONTEXTUAL and computing them for a
+        # side branch would require the parent's median-time-past / height-gated
+        # deployment state via the height-keyed index, which resolves to the
+        # ACTIVE chain (wrong for a deeper side branch) — mirroring them
+        # imprecisely would introduce a NEW divergence (spurious reject of a
+        # valid side-branch), which this path must not do.
+        _blk_time = int.from_bytes(block_bytes[68:72], "little")
+        _now = int(time.time())
+        if _blk_time > _now + _MAX_FUTURE:
+            return bip22_result_string("time-too-new")
 
         # BIP-34 byte-prefix check against parent.height + 1. This is the
         # core of the Pattern X fix — pre-fix the height came from
