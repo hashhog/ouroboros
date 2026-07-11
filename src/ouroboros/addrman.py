@@ -24,7 +24,50 @@ import secrets
 import time
 from dataclasses import dataclass
 
+from ouroboros.p2p_messages import (
+    NODE_NETWORK,
+    NODE_NETWORK_LIMITED,
+    NODE_WITNESS,
+)
+
 logger = logging.getLogger(__name__)
+
+# Core parity: net_processing.cpp NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS.
+# A NODE_NETWORK_LIMITED peer (BIP159, last-288-block window) is only an
+# acceptable substitute for a full NODE_NETWORK peer when we are within this
+# many blocks of the tip — i.e. its 288-block window can cover what we need.
+NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS = 288
+
+
+def get_desirable_service_flags(services: int, near_tip: bool = True) -> int:
+    """Service flags an outbound candidate must advertise to be desirable.
+
+    Mirrors Bitcoin Core's ``PeerManagerImpl::GetDesirableServiceFlags``
+    (net_processing.cpp). We always want NODE_WITNESS. We normally also want
+    NODE_NETWORK (full block history); but a NODE_NETWORK_LIMITED peer is an
+    acceptable substitute when we are close to the tip (``near_tip``), since
+    its last-288-block window then covers what we need.
+
+    Args:
+        services: The service flags the candidate advertises (from addrman).
+        near_tip: True when the local node is within
+            ``NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS`` of the tip. Core derives
+            this from ``ApproximateBestBlockDepth()``.
+    """
+    if (services & NODE_NETWORK_LIMITED) and near_tip:
+        return NODE_NETWORK_LIMITED | NODE_WITNESS
+    return NODE_NETWORK | NODE_WITNESS
+
+
+def has_all_desirable_service_flags(services: int, near_tip: bool = True) -> bool:
+    """True if ``services`` advertises every flag we desire for an outbound peer.
+
+    Direct port of Bitcoin Core's ``HasAllDesirableServiceFlags``:
+    ``!(GetDesirableServiceFlags(services) & (~services))``. Note that a
+    candidate with unknown services (0) is never desirable — witness capability
+    must be advertised, exactly as in Core.
+    """
+    return (get_desirable_service_flags(services, near_tip) & (~services)) == 0
 
 # Bucket configuration (Bitcoin Core: addrman.h)
 # New table: 256 buckets, 64 entries each = 16,384 slots
@@ -857,6 +900,8 @@ class AddressManager:
         exclude: set[str] | None = None,
         exclude_groups: set[str] | None = None,
         exclude_asns: set[int] | None = None,
+        require_services: int = 0,
+        near_tip: bool = True,
     ) -> str | None:
         """Select a candidate address for connection.
 
@@ -866,12 +911,26 @@ class AddressManager:
         Core's outbound ASN-diversity check (net.cpp / addrman.cpp), which
         limits one outbound connection per Autonomous System.
 
+        Desirable-service-flag preference (Core parity: HasAllDesirableServiceFlags):
+        When ``require_services`` is non-zero, candidates are first restricted to
+        those advertising the desired flags (NODE_WITNESS, plus NODE_NETWORK or a
+        near-tip NODE_NETWORK_LIMITED — see :func:`has_all_desirable_service_flags`).
+        Bitcoin Core's ``ThreadOpenConnections`` hard-skips undesirable addrs
+        (net.cpp:2852); we instead PREFER them and fall back to the unfiltered
+        population if no desirable candidate is available, so outbound slots are
+        never starved (e.g. an addrman still populated with services=0 entries).
+
         Args:
             exclude: Set of address keys to exclude
             exclude_groups: Set of /16 network groups to exclude (for diversity)
             exclude_asns: Set of ASNs already used by outbound peers; candidates
                           with a mapped ASN in this set are skipped.  Ignored
                           when no asmap is loaded.
+            require_services: Desired service-flag bitmask (0 = no requirement).
+                          Callers making full-relay / block-relay outbound
+                          connections pass ``NODE_NETWORK | NODE_WITNESS``.
+            near_tip: Passed through to the desirability check; controls whether
+                          NODE_NETWORK_LIMITED peers substitute for NODE_NETWORK.
 
         Returns:
             Address key (host:port) or None
@@ -880,31 +939,50 @@ class AddressManager:
         exclude_groups = exclude_groups or set()
         exclude_asns = exclude_asns or set()
 
-        # Prefer tried table (70% of the time)
-        use_tried = random.random() < 0.7
+        def _select(req_services: int) -> str | None:
+            # Prefer tried table (70% of the time)
+            use_tried = random.random() < 0.7
 
-        if use_tried and self._in_tried:
-            result = self._select_from_tried(exclude, exclude_groups, exclude_asns)
+            if use_tried and self._in_tried:
+                result = self._select_from_tried(
+                    exclude, exclude_groups, exclude_asns, req_services, near_tip
+                )
+                if result:
+                    return result
+
+            # Fall back to new table
+            if self._in_new:
+                result = self._select_from_new(
+                    exclude, exclude_groups, exclude_asns, req_services, near_tip
+                )
+                if result:
+                    return result
+
+            # Try the other table
+            if not use_tried and self._in_tried:
+                return self._select_from_tried(
+                    exclude, exclude_groups, exclude_asns, req_services, near_tip
+                )
+
+            return None
+
+        # First pass: restrict to peers advertising the desired service flags.
+        if require_services:
+            result = _select(require_services)
             if result:
                 return result
 
-        # Fall back to new table
-        if self._in_new:
-            result = self._select_from_new(exclude, exclude_groups, exclude_asns)
-            if result:
-                return result
-
-        # Try the other table
-        if not use_tried and self._in_tried:
-            return self._select_from_tried(exclude, exclude_groups, exclude_asns)
-
-        return None
+        # Fallback pass: unfiltered, so we never starve outbound slots when no
+        # witness-capable candidate is currently selectable.
+        return _select(0)
 
     def _select_from_tried(
         self,
         exclude: set[str],
         exclude_groups: set[str],
         exclude_asns: set[int] | None = None,
+        require_services: int = 0,
+        near_tip: bool = True,
     ) -> str | None:
         """Select from tried table with weighted random."""
         exclude_asns = exclude_asns or set()
@@ -914,6 +992,12 @@ class AddressManager:
                 continue
             info = self._addrs.get(addr_key)
             if not info:
+                continue
+            # Core parity (HasAllDesirableServiceFlags): when a service-flag
+            # requirement is set, skip candidates that don't advertise it.
+            if require_services and not has_all_desirable_service_flags(
+                info.services, near_tip
+            ):
                 continue
             group = get_network_group(info.host)
             if group in exclude_groups:
@@ -950,6 +1034,8 @@ class AddressManager:
         exclude: set[str],
         exclude_groups: set[str],
         exclude_asns: set[int] | None = None,
+        require_services: int = 0,
+        near_tip: bool = True,
     ) -> str | None:
         """Select from new table with weighted random."""
         exclude_asns = exclude_asns or set()
@@ -959,6 +1045,12 @@ class AddressManager:
                 continue
             info = self._addrs.get(addr_key)
             if not info:
+                continue
+            # Core parity (HasAllDesirableServiceFlags): when a service-flag
+            # requirement is set, skip candidates that don't advertise it.
+            if require_services and not has_all_desirable_service_flags(
+                info.services, near_tip
+            ):
                 continue
             group = get_network_group(info.host)
             if group in exclude_groups:
