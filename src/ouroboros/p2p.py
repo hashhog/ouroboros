@@ -37,6 +37,8 @@ from ouroboros.minisketch import (
 from ouroboros.p2p_messages import (
     INV_TYPE_TX,
     MSG_WTX,
+    NODE_NETWORK,
+    NODE_WITNESS,
     AddrMessage,
     AddrV2Message,
     BlockTxnMessage,
@@ -2009,12 +2011,17 @@ class PeerManager:
               len(self.peers) < min_peers:
             attempts += 1
 
-            # Use address manager with network group + ASN exclusion for diversity
+            # Use address manager with network group + ASN exclusion for diversity.
+            # Core parity (HasAllDesirableServiceFlags, net.cpp:2852): full-relay
+            # outbound connections should go to NODE_NETWORK | NODE_WITNESS peers.
+            # addrman treats this as a strong preference with an unfiltered
+            # fallback, so slots are never starved.
             exclude = self._all_outbound_addrs() | set(self.inbound_peers.keys())
             addr = self.addrman.select_for_connection(
                 exclude=exclude,
                 exclude_groups=self._outbound_netgroups,
                 exclude_asns=self._outbound_asns,
+                require_services=NODE_NETWORK | NODE_WITNESS,
             )
 
             # Fall back to known_addrs if addrman is empty
@@ -2167,12 +2174,17 @@ class PeerManager:
         while len(self.block_relay_peers) < self.max_block_relay_only and attempts < max_attempts:
             attempts += 1
 
-            # Use address manager with network group + ASN exclusion
+            # Use address manager with network group + ASN exclusion.
+            # Core parity: block-relay-only outbound also wants NODE_WITNESS
+            # (and NODE_NETWORK / near-tip NODE_NETWORK_LIMITED) so block
+            # bodies arrive with witnesses. Strong preference with unfiltered
+            # fallback (see select_for_connection) — never starves slots.
             exclude = self._all_outbound_addrs() | set(self.inbound_peers.keys())
             addr = self.addrman.select_for_connection(
                 exclude=exclude,
                 exclude_groups=self._outbound_netgroups,
                 exclude_asns=self._outbound_asns,
+                require_services=NODE_NETWORK | NODE_WITNESS,
             )
 
             # Fall back to known_addrs
