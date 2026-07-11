@@ -148,7 +148,7 @@ def bip22_result_string(error: str) -> str:
              "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
              "bad-witness-nonce-size", "unexpected-witness",
              "bad-cb-amount", "bad-blk-sigops", "bad-cb-height",
-             "bad-diffbits",
+             "bad-diffbits", "bad-blk-length", "bad-blk-weight",
              "bad-txns-nonfinal", "bad-txns-duplicate", "rejected",
              "block-script-verify-flag-failed",
              "bad-txns-inputs-missingorspent"):
@@ -7323,11 +7323,12 @@ class RPCServer:
         """
         # Validate the block in the SAME shape Core's CheckBlock +
         # ContextualCheckBlock do for side-branch blocks: PoW, merkle,
-        # cb-len, witness commitment, BIP-34 height (vs the parent's
-        # height + 1), MTP-of-parent (vs the parent's last 11 ancestors).
-        # We deliberately skip ConnectBlock-style UTXO checks here — those
-        # have to run against the disconnected-A-chain chainstate, which
-        # only happens during the reorg connect loop below.
+        # cb-len, serialized size / weight, legacy sigop budget, witness
+        # commitment, bad-diffbits, time-too-new, BIP-34 height (vs the
+        # parent's height + 1). We deliberately skip ConnectBlock-style
+        # checks here (UTXO spend, script verify, P2SH/witness sigops,
+        # BIP-30/68) — those have to run against the disconnected-A-chain
+        # chainstate, which only happens during the reorg connect loop below.
         from ouroboros.validation import _encode_bip34_height
         from ouroboros.validation import _bits_to_target as _v_bits_to_target
         from ouroboros.validation import MAX_FUTURE_BLOCK_TIME as _MAX_FUTURE
@@ -7479,10 +7480,12 @@ class RPCServer:
         # side-branch validation through the height-keyed index would
         # therefore mis-validate or false-reject the side branch.
         #
-        # Cheap structural checks (PoW, merkle, cb-len, BIP-34) above
-        # are sufficient to bound side-branch storage cost: the heavy
-        # ConnectBlock-class checks (BIP-30, BIP-68, sigops, UTXO
-        # spend, script verify) all run when the reorg connect loop
+        # The full context-free CheckBlock set (PoW, merkle, cb-len,
+        # serialized size / weight, LEGACY sigop budget, witness
+        # commitment, BIP-34) runs above and bounds side-branch storage
+        # cost. Only the UTXO-dependent ConnectBlock-class checks (BIP-30,
+        # BIP-68, P2SH/witness sigops, UTXO spend, script verify) remain
+        # deferred — they all run when the reorg connect loop
         # below feeds each buffered block back through the unified
         # ``accept_block`` pipeline — at that point the active chain
         # has been disconnected back to the common ancestor, so every
@@ -7513,6 +7516,86 @@ class RPCServer:
                 "side-branch deserialize warning at h=%d: %s",
                 new_height, e,
             )
+
+        # bad-blk-length / bad-blk-weight / bad-blk-sigops (CheckBlock body
+        # parity, CONTEXT-FREE). Core's CheckBlock (validation.cpp:3946-3977) runs
+        # the size-limit and legacy-sigop gates for EVERY block — side branches
+        # included — in ProcessNewBlock BEFORE AcceptBlock stores it. 1b883b7
+        # wired up PoW/merkle/time-too-new but left these body gates to a
+        # follow-up: the structural bad-blk-length branch above only catches
+        # empty-block / coinbase-scriptSig-length, NOT real serialized size,
+        # weight, or the sigop budget. The systematic sweep
+        # (submitblock-path-differential-2026-07-11.md, finding 2) then showed the
+        # side-branch store path admitting oversize / high-sigop siblings Core
+        # rejects. Reuse the SAME helpers the direct-connect CheckBlock path uses
+        # (validation.block_weight, _count_legacy_sigops) — no second validation
+        # engine. All three gates are CONTEXT-FREE (block's own bytes only).
+        # IMPORTANT: Core CheckBlock counts LEGACY sigops only (validation.cpp:3970
+        # "does not count witness and p2sh sigops"); the UTXO-dependent P2SH /
+        # witness sigop cost stays DEFERRED to the reorg ConnectBlock loop below.
+        try:
+            from ouroboros.validation import block_weight as _v_block_weight
+            from ouroboros.validation import _count_legacy_sigops as _v_legacy_sigops
+            from ouroboros.validation import MAX_BLOCK_WEIGHT as _V_MAX_WEIGHT
+            from ouroboros.validation import (
+                MAX_BLOCK_SIGOPS_COST as _V_MAX_SIGOPS,
+            )
+            from ouroboros.validation import WITNESS_SCALE_FACTOR as _V_WSF
+
+            _txs = _blk_chk.transactions
+            # Core early size gates (validation.cpp:3947): tx-count guard, then
+            # the stripped (TX_NO_WITNESS) serialized-size guard → bad-blk-length.
+            if len(_txs) * _V_WSF > _V_MAX_WEIGHT:
+                return bip22_result_string("bad-blk-length")
+            _stripped = sum(len(_tx.serialize()) for _tx in _txs)
+            if _stripped * _V_WSF > _V_MAX_WEIGHT:
+                return bip22_result_string("bad-blk-length")
+            # Full GetBlockWeight (header + CompactSize tx-count + per-tx
+            # weights) → bad-blk-weight.
+            if _v_block_weight(_txs) > _V_MAX_WEIGHT:
+                return bip22_result_string("bad-blk-weight")
+            # Legacy sigop budget × WITNESS_SCALE_FACTOR → bad-blk-sigops. Counts
+            # GetLegacySigOpCount over outputs + scriptSigs of every tx incl.
+            # coinbase, matching Core CheckBlock exactly.
+            _legacy = 0
+            for _tx in _txs:
+                for _out in _tx.outputs:
+                    _legacy += _v_legacy_sigops(_out.script_pubkey)
+                for _inp in _tx.inputs:
+                    _legacy += _v_legacy_sigops(_inp.script_sig)
+            if _legacy * _V_WSF > _V_MAX_SIGOPS:
+                return bip22_result_string("bad-blk-sigops")
+        except Exception as _e:
+            # Degrade to pre-fix behaviour only when the size/sigop computation
+            # itself cannot run — genuine violations return above.
+            logger.debug(
+                "side-branch size/sigops check skipped at h=%d: %s",
+                new_height, _e,
+            )
+
+        # bad-witness-merkle-match / bad-witness-nonce-size / unexpected-witness
+        # (CheckWitnessMalleation parity, CONTEXT-FREE). Core runs
+        # CheckWitnessMalleation in ContextualCheckBlock (validation.cpp:4050),
+        # which — like CheckBlock — executes in AcceptBlock BEFORE the block is
+        # saved to disk, so a side-branch sibling with a corrupted witness
+        # commitment is rejected before storage. The check needs only the block's
+        # own coinbase commitment output, coinbase witness nonce, and the wtxid
+        # merkle root of the block's transactions plus a segwit-active bool (no
+        # chainstate / UTXOs), so it is safe on the side-branch path. Reuse the
+        # validator's existing _validate_witness_commitment — the SAME helper the
+        # direct-connect path uses — rather than a second engine.
+        if _validator is not None:
+            try:
+                _wok, _wreason = _validator._validate_witness_commitment(
+                    _blk_chk, new_height
+                )
+                if not _wok:
+                    return bip22_result_string(_wreason)
+            except Exception as _e:
+                logger.debug(
+                    "side-branch witness-commitment check skipped at h=%d: %s",
+                    new_height, _e,
+                )
 
         # Stash the block in the side-branch buffer. Future submissions
         # whose prev points at this hash can chain off it without needing
