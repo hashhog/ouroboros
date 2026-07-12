@@ -163,6 +163,22 @@ def bip22_result_string(error: str) -> str:
     if "merkle root" in s and "witness" not in s:
         return "bad-txnmrklroot"
 
+    # Witness data present but NO commitment output (BIP141). Core's
+    # CheckWitnessMalleation finds GetWitnessCommitmentIndex ==
+    # NO_WITNESS_COMMITMENT and rejects any witness-bearing tx with
+    # "unexpected-witness" (BLOCK_MUTATED). Ref: Bitcoin Core
+    # validation.cpp:3905-3913. This MUST precede the generic
+    # witness-commitment rule below: the Rust CheckBlock labels this case
+    # "block has witness data but no witness commitment" (ferrous-utils
+    # sync src/lib.rs / src/validate/block.rs MissingWitnessCommitment),
+    # whose substring "witness commitment" would otherwise be mis-mapped to
+    # bad-witness-merkle-match. Decision is unchanged (reject either way);
+    # only the BIP-22 token is corrected to match Core.
+    if ("unexpected-witness" in s or "unexpected witness" in s
+            or "no witness commitment" in s
+            or "witness data but no" in s):
+        return "unexpected-witness"
+
     # Witness commitment errors (BIP141)
     if ("bad-witness-merkle-match" in s or "witness commitment" in s
             or "witness nonce" in s
