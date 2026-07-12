@@ -63,7 +63,17 @@ class TestBip22ResultString:
 
     def test_missing_witness_commitment(self):
         # BlockValidationError::MissingWitnessCommitment
-        assert bip22_result_string("BIP141: block has witness data but no witness commitment") == "bad-witness-merkle-match"
+        #   #[error("BIP141: block has witness data but no witness commitment")]
+        # This is Core's CheckWitnessMalleation NO_WITNESS_COMMITMENT case:
+        # a witness-bearing block with no coinbase commitment output is
+        # rejected as "unexpected-witness" (validation.cpp:3905-3913), NOT
+        # bad-witness-merkle-match (which is the commitment-*present*-but-
+        # mismatched case). Regression guard for the substring mis-map.
+        assert bip22_result_string("BIP141: block has witness data but no witness commitment") == "unexpected-witness"
+        # The Rust CheckBlock also prefixes this variant with a "bad-witness-
+        # merkle-match:" label in one path; the mapper must still yield the
+        # Core-exact token.
+        assert bip22_result_string("bad-witness-merkle-match: block has witness data but no witness commitment") == "unexpected-witness"
 
     def test_invalid_coinbase_witness_nonce(self):
         # BlockValidationError::InvalidCoinbaseWitnessNonce
