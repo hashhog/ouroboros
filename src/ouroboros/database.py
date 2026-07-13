@@ -1076,16 +1076,26 @@ class BlockchainDatabase:
 
         return self._chainwork_cache.get(block_hash, 0)
 
-    def connect_block_from_bytes(self, block_bytes: bytes, height: int) -> bytes:
+    def connect_block_from_bytes(
+        self, block_bytes: bytes, height: int, network: str | None = None
+    ) -> bytes:
         """Connect a block via Rust FFI and update the cached chain tip.
 
         Wraps ``_db.connect_block_from_bytes`` so that every call site that
         connects a block through this method automatically keeps the
         in-memory tip cache consistent.
 
+        ``network`` selects the BIP-113/CSV activation height for the Rust
+        inline IsFinalTx cutoff (block header time pre-CSV, previous-block MTP
+        post-CSV). Live IBD/accept paths pass the node's network; it defaults
+        to mainnet in the Rust layer when omitted.
+
         Returns the block hash (bytes) as returned by the Rust layer.
         """
-        result = self._db.connect_block_from_bytes(block_bytes, height)
+        if network is None:
+            result = self._db.connect_block_from_bytes(block_bytes, height)
+        else:
+            result = self._db.connect_block_from_bytes(block_bytes, height, network)
         # Invalidate cache so next get_best_block() re-reads from Rust.
         # We don't know the hash here without parsing, so just invalidate.
         self._cached_tip = None
