@@ -3432,9 +3432,34 @@ impl PyBlockchainDB {
     ///
     /// This is used by `generatetoaddress` (regtest mining) where the block
     /// is constructed in Python and needs to be persisted via the Rust DB.
-    fn connect_block_from_bytes(&self, block_bytes: Vec<u8>, height: u32) -> PyResult<Vec<u8>> {
+    ///
+    /// `network` selects the per-network BIP-113/CSV activation height so the
+    /// inline IsFinalTx cutoff matches Core (block header time pre-CSV, MTP of
+    /// the previous block post-CSV). It defaults to mainnet when the caller
+    /// omits it (matches the `getattr(node, "network", "mainnet")` convention);
+    /// live IBD/accept paths pass the node's real network.
+    #[pyo3(signature = (block_bytes, height, network=None))]
+    fn connect_block_from_bytes(
+        &self,
+        block_bytes: Vec<u8>,
+        height: u32,
+        network: Option<String>,
+    ) -> PyResult<Vec<u8>> {
         use common::BitcoinDeserialize;
         use crate::storage::schema::{encode_outpoint, CHAINSTATE_CF, SPENT_CF};
+
+        let network_enum = match network.as_deref().unwrap_or("mainnet").to_lowercase().as_str() {
+            "mainnet" | "bitcoin" => Network::Bitcoin,
+            "testnet" | "testnet3" => Network::Testnet,
+            "testnet4" => Network::Testnet4,
+            "regtest" => Network::Regtest,
+            "signet" => Network::Signet,
+            other => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid network: {}", other),
+                ));
+            }
+        };
 
         // Deserialize
         let (block, _) = BlockWrapper::bitcoin_deserialize(&block_bytes).map_err(|e| {
@@ -3698,14 +3723,26 @@ impl PyBlockchainDB {
         }
 
         // ContextualCheckBlock: enforce IsFinalTx for every transaction
-        // (Bitcoin Core validation.cpp:4146). Consensus rule that runs even
+        // (Bitcoin Core validation.cpp:4133-4148). Consensus rule that runs even
         // under assumevalid — assumevalid only skips script verification.
-        // lock_time_cutoff = prev_mtp (MTP-of-11) when BIP-113/CSV is active
-        // (prev_mtp > 0 implies we're post-genesis); else block header timestamp.
-        // Reference: bitcoin-core/src/consensus/tx_verify.cpp:IsFinalTx, BIP-113.
+        //
+        //   nLockTimeCutoff = DeploymentActiveAfter(pindexPrev, DEPLOYMENT_CSV)
+        //                       ? pindexPrev->GetMedianTimePast()   // BIP-113
+        //                       : block.GetBlockTime();
+        //
+        // BIP-113 (median-time-past for locktime) activates with the CSV soft
+        // fork (mainnet 419328). PRE-CSV the cutoff MUST be the block's own
+        // header timestamp, NOT the MTP — the MTP lags block time by ~1h, so a
+        // tx whose time-based locktime sits between MTP and block time is
+        // canonical/final under Core but was wrongly rejected as
+        // "bad-txns-nonfinal" here (e.g. mainnet block 216413, tx 0c7de5f5…,
+        // locktime 1358113570, block time 1358114045 > locktime > MTP).
+        // Reference: bitcoin-core/src/validation.cpp:4133-4148,
+        //            bitcoin-core/src/consensus/tx_verify.cpp:IsFinalTx.
         {
-            // prev_mtp is 0 only at/before genesis; use block.timestamp then
-            let lock_time_cutoff: i64 = if prev_mtp > 0 {
+            let enforce_bip113 = sequence_lock::is_bip68_active(height, network_enum);
+            // prev_mtp is 0 only at/before genesis; use block.timestamp then.
+            let lock_time_cutoff: i64 = if enforce_bip113 && prev_mtp > 0 {
                 prev_mtp
             } else {
                 inner.header.time as i64
@@ -4031,7 +4068,20 @@ impl PyBlockchainDB {
         use common::{BitcoinDeserialize, BitcoinSerialize};
         use crate::storage::schema::{encode_outpoint, CHAINSTATE_CF, SPENT_CF};
 
-        let _ = network; // reserved — heavy validation runs in caller pre-flight
+        // Select the per-network BIP-113/CSV activation height for the inline
+        // IsFinalTx cutoff (mirrors connect_block_from_bytes).
+        let network_enum = match network.to_lowercase().as_str() {
+            "mainnet" | "bitcoin" => Network::Bitcoin,
+            "testnet" | "testnet3" => Network::Testnet,
+            "testnet4" => Network::Testnet4,
+            "regtest" => Network::Regtest,
+            "signet" => Network::Signet,
+            other => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid network: {}", other),
+                ));
+            }
+        };
 
         if blocks.is_empty() {
             return Ok(Vec::new());
@@ -4354,9 +4404,13 @@ impl PyBlockchainDB {
 
             // ----------------------------------------------------------
             // IsFinalTx for every transaction.
+            // BIP-113: cutoff is the previous block's MTP only once CSV is
+            // active (mainnet 419328); pre-CSV it is the block header time.
+            // Ref: bitcoin-core validation.cpp:4133-4148.
             // ----------------------------------------------------------
             {
-                let lock_time_cutoff: i64 = if prev_mtp > 0 {
+                let enforce_bip113 = sequence_lock::is_bip68_active(height, network_enum);
+                let lock_time_cutoff: i64 = if enforce_bip113 && prev_mtp > 0 {
                     prev_mtp
                 } else {
                     inner.header.time as i64
@@ -4679,7 +4733,7 @@ impl PyBlockchainDB {
                     ))?;
             }
 
-            self.connect_block_from_bytes(block_data, frame_height)?;
+            self.connect_block_from_bytes(block_data, frame_height, network.clone())?;
             imported += 1;
 
             if interval > 0 && imported % interval == 0 {

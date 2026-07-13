@@ -2164,7 +2164,7 @@ class BlockSync:
             try:
                 if hasattr(self.db, 'connect_block_from_bytes'):
                     await asyncio.to_thread(
-                        self.db.connect_block_from_bytes, raw_payload, new_height
+                        self.db.connect_block_from_bytes, raw_payload, new_height, network
                     )
                 else:
                     await asyncio.to_thread(self.validator.apply_block, block)
@@ -5330,8 +5330,16 @@ class BlockSync:
 
                 try:
                     if hasattr(self.db, "connect_block_from_bytes"):
+                        _reorg_net = (
+                            self.peer_manager.network
+                            if hasattr(self.peer_manager, "network")
+                            else "mainnet"
+                        )
                         await asyncio.to_thread(
-                            self.db.connect_block_from_bytes, raw_bytes, connect_height
+                            self.db.connect_block_from_bytes,
+                            raw_bytes,
+                            connect_height,
+                            _reorg_net,
                         )
                     else:
                         # Last-resort path used only when the Rust

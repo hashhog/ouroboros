@@ -586,4 +586,74 @@ mod tests {
         assert!(is_final_tx(500_000_000, &sequences, 0, 500_000_001));
         assert!(!is_final_tx(500_000_000, &sequences, 0, 500_000_000));
     }
+
+    /// Regression: mainnet block 216413 (2013-01-13) carries tx
+    /// 0c7de5f54c5ceadc5754098d687f40b9378d174e63cd4946ca0dd9dfd16e54e9
+    /// at index 308 with a time-based nLockTime that sits BETWEEN the
+    /// previous block's median-time-past and this block's header time:
+    ///
+    ///   locktime      = 1358113570
+    ///   block header  = 1358114045  (> locktime → final under Core)
+    ///   prev MTP      = 1358108577  (< locktime → would be non-final)
+    ///   input seq     = 0xFEFFFFFF  (NOT SEQUENCE_FINAL, so no short-circuit)
+    ///
+    /// Bitcoin Core accepts this block. Height 216413 is PRE-CSV
+    /// (mainnet CSV/BIP-113 activates at 419328), so the IsFinalTx cutoff
+    /// MUST be the block's own header time, not the MTP. The old
+    /// connect-path code used the MTP unconditionally and wedged IBD here
+    /// with "bad-txns-nonfinal". This test pins the corrected cutoff
+    /// selection (the exact gate now used inline in connect_block_from_bytes
+    /// and connect_blocks_atomic).
+    #[test]
+    fn test_is_final_tx_block_216413_pre_bip113() {
+        let height: u32 = 216_413;
+        let locktime: u32 = 1_358_113_570;
+        let sequences = vec![0xFEFF_FFFFu32]; // 0xFEFFFFFF, not final
+        let block_time: i64 = 1_358_114_045;
+        let prev_mtp: i64 = 1_358_108_577;
+
+        // Pre-CSV: BIP-113 is NOT enforced at 216413 on mainnet.
+        let enforce_bip113 = is_bip68_active(height, Network::Bitcoin);
+        assert!(!enforce_bip113, "216413 must be pre-CSV on mainnet");
+
+        // Corrected cutoff = block header time (pre-CSV) → tx is FINAL,
+        // matching Core's accept.
+        let cutoff: i64 = if enforce_bip113 && prev_mtp > 0 { prev_mtp } else { block_time };
+        assert_eq!(cutoff, block_time);
+        assert!(
+            is_final_tx(locktime, &sequences, height, cutoff),
+            "216413 tx must be final under the block-time cutoff (Core accepts)"
+        );
+
+        // Document the pre-fix behavior: using the MTP as the cutoff wrongly
+        // judged the tx non-final and wedged IBD.
+        assert!(
+            !is_final_tx(locktime, &sequences, height, prev_mtp),
+            "the MTP cutoff (old bug) wrongly rejects the tx"
+        );
+    }
+
+    /// Post-CSV the cutoff must be the previous block's MTP (BIP-113), not
+    /// the block header time — the inverse of the 216413 case. Ensures the
+    /// fix did not over-loosen finality after activation.
+    #[test]
+    fn test_is_final_tx_post_bip113_uses_mtp() {
+        let height: u32 = 500_000; // > mainnet CSV activation (419328)
+        let sequences = vec![0u32]; // non-final
+        let locktime: u32 = 1_500_000_000; // time-based
+        let block_time: i64 = 1_500_000_100; // block time AFTER locktime
+        let prev_mtp: i64 = 1_499_999_900; // MTP BEFORE locktime
+
+        let enforce_bip113 = is_bip68_active(height, Network::Bitcoin);
+        assert!(enforce_bip113, "500000 must be post-CSV on mainnet");
+
+        let cutoff: i64 = if enforce_bip113 && prev_mtp > 0 { prev_mtp } else { block_time };
+        assert_eq!(cutoff, prev_mtp);
+        // With MTP < locktime the tx is NOT final (Core would defer it),
+        // even though block_time > locktime would have made it final.
+        assert!(
+            !is_final_tx(locktime, &sequences, height, cutoff),
+            "post-CSV tx must be judged by MTP, not block time"
+        );
+    }
 }
