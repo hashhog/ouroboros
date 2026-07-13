@@ -426,8 +426,10 @@ async def accept_block(
                 raise ValueError(_err)
 
     # Step 4 — Connect block (UTXO mutation + persistence, Rust).
+    # Pass network so the inline IsFinalTx cutoff uses the correct BIP-113/CSV
+    # activation height (block header time pre-CSV, previous-block MTP post-CSV).
     block_hash: bytes = await asyncio.to_thread(
-        db.connect_block_from_bytes, block_bytes, next_height
+        db.connect_block_from_bytes, block_bytes, next_height, network
     )
 
     # Deserialize once for the mempool-eviction and wallet-history steps.
@@ -7729,10 +7731,11 @@ class RPCServer:
             cur_h -= 1
 
         # 2. Re-connect the original active chain (ancestor+1 → original tip).
+        _net = getattr(self.node, "network", "mainnet")
         for _blk_hash, blk_height, raw_bytes in disconnected_active:
             try:
                 await asyncio.to_thread(
-                    db.connect_block_from_bytes, raw_bytes, blk_height
+                    db.connect_block_from_bytes, raw_bytes, blk_height, _net
                 )
             except Exception as e:
                 logger.error(
