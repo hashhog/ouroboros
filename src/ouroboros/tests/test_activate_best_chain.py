@@ -940,5 +940,51 @@ class TestRustRouteErrorPrefixNormalization(unittest.TestCase):
             "prefix normalization must run before the reject dispatch")
 
 
+class TestFlushCommitInstrumentation(unittest.TestCase):
+    """
+    OUROBOROS-RUST-TRACK-SPEC §M0 item 4: ouroboros emitted zero flush/commit
+    timing lines. _flush_record_commit adds a per-commit DEBUG line plus a
+    throttled INFO rollup — pure instrumentation, no behavior change.
+    """
+
+    def _stub(self, log_every):
+        import types
+        s = types.SimpleNamespace()
+        s._flush_commits = 0
+        s._flush_commit_sum_ns = 0
+        s._flush_commit_max_ns = 0
+        s._flush_log_every = log_every
+        return s
+
+    def test_rollup_fires_at_threshold_and_resets(self):
+        from ouroboros.block_sync import BlockSync
+        stub = self._stub(log_every=3)
+        with self.assertLogs("ouroboros.block_sync", level="INFO") as cm:
+            # Two commits: no rollup yet.
+            BlockSync._flush_record_commit(stub, 100, 5_000_000)
+            BlockSync._flush_record_commit(stub, 101, 15_000_000)
+            self.assertEqual(stub._flush_commits, 2)
+            # Third commit: rollup fires and counters reset.
+            BlockSync._flush_record_commit(stub, 102, 10_000_000)
+        joined = "\n".join(cm.output)
+        self.assertIn("[FLUSH-ATTR]", joined,
+            "flush rollup must emit an INFO [FLUSH-ATTR] line at the threshold")
+        self.assertIn("commits=3", joined)
+        # avg of 5,15,10 ms = 10.00 ms; max = 15.00 ms.
+        self.assertIn("commit_avg_ms=10.00", joined)
+        self.assertIn("commit_max_ms=15.00", joined)
+        # Counters reset after the rollup.
+        self.assertEqual(stub._flush_commits, 0)
+        self.assertEqual(stub._flush_commit_sum_ns, 0)
+        self.assertEqual(stub._flush_commit_max_ns, 0)
+
+    def test_call_site_present_in_drain(self):
+        import inspect
+        from ouroboros.block_sync import BlockSync
+        src = inspect.getsource(BlockSync._drain_block_buffer_locked)
+        self.assertIn("_flush_record_commit(new_height, connect_ns)", src,
+            "the drain must record a commit-timing sample after each connect")
+
+
 if __name__ == "__main__":
     unittest.main()
