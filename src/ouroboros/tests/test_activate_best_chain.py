@@ -881,5 +881,34 @@ class TestBlockInvalidHeaderMisbehaving(unittest.TestCase):
             "'Previous block not found' check")
 
 
+class TestCrossCheckFallthrough(unittest.TestCase):
+    """
+    OUROBOROS-RUST-TRACK-SPEC §M0 item 1: with
+    OUROBOROS_VALIDATE_CROSS_CHECK=1 and skip_scripts=False (the permanent
+    condition at tip), neither the cross-check branch nor the route-only
+    branch runs, so (valid, error) was never assigned and the drain hit
+    `if not valid:` with an unbound local (UnboundLocalError).
+
+    The fix tracks whether any branch produced a verdict and falls back to
+    the Python validator otherwise — the old fallback was guarded on
+    `not cross_check`, which could never run in cross-check mode.
+    """
+
+    def test_fallback_not_guarded_on_not_cross_check(self):
+        import inspect
+        from ouroboros.block_sync import BlockSync
+
+        src = inspect.getsource(BlockSync._drain_block_buffer_locked)
+        # The Python fallback must be reachable in cross-check mode: it must
+        # be gated on the verdict tracker, NOT on `not cross_check`.
+        self.assertIn("verdict_assigned", src,
+            "_drain_block_buffer_locked must track verdict assignment")
+        self.assertIn("if not verdict_assigned:", src,
+            "Python-validator fallback must be gated on `not verdict_assigned`")
+        self.assertNotIn("if not validated_via_rust and not cross_check:", src,
+            "the old `not cross_check` fallback guard (the fallthrough bug) "
+            "must be gone")
+
+
 if __name__ == "__main__":
     unittest.main()
