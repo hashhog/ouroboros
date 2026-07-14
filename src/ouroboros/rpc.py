@@ -227,8 +227,19 @@ def bip22_result_string(error: str) -> str:
     if "duplicate" in s and ("tx" in s or "transaction" in s):
         return "bad-txns-inputs-missingorspent"
 
-    # Missing inputs / UTXO
-    if "missing" in s and ("input" in s or "utxo" in s):
+    # Missing inputs / UTXO. Core CheckTxInputs / ConnectBlock reports a
+    # spent-or-absent prevout as "bad-txns-inputs-missingorspent"
+    # (consensus/tx_verify.cpp). Besides the "missing input/utxo" phrasing,
+    # ouroboros surfaces this same class as "Input not found: <txid>:<vout>"
+    # (validation.py CheckTxInputs) and the Rust TransactionValidationError::
+    # InputNotFound ("InputNotFound" / "input not found"). These MUST map here
+    # and therefore fire BEFORE the generic "transaction validation" script-
+    # verify catch-all below, which would otherwise mis-map them to
+    # block-script-verify-flag-failed (issue #119).
+    if ("missing" in s and ("input" in s or "utxo" in s)
+            or "input not found" in s
+            or "inputnotfound" in s
+            or "not found in utxo" in s):
         return "bad-txns-inputs-missingorspent"
 
     # Negative output value: Rust NegativeOutputAmount ("Negative output value") wrapped as
@@ -7759,6 +7770,126 @@ class RPCServer:
         )
         return bip22_result_string(reason)
 
+    async def _finalize_failed_reorg(
+        self,
+        db,
+        common_ancestor_height: int,
+        disconnected_active: list[tuple[bytes, int, bytes]],
+        new_tip_hash: bytes,
+        connected_hashes: list[bytes],
+        chain_to_connect: list[tuple[bytes, int, bytes]],
+        reason: str,
+    ) -> str:
+        """Decide what to do after a competing-chain connect fails PART-WAY.
+
+        Bitcoin Core parity (validation.cpp:3234-3260, ActivateBestChainStep /
+        ConnectTip failure). When ``ConnectTip`` fails on block *k* of the
+        competing chain, Core does NOT unwind the ``0..k-1`` prefix it already
+        connected. It marks the failing block ``BLOCK_FAILED_VALID`` and returns;
+        the outer ``ActivateBestChain`` loop then re-selects the best VALID chain
+        via ``FindMostWorkChain``. The NET on-disk result is therefore:
+
+          * KEEP the connected prefix iff its cumulative ``nChainWork`` is
+            STRICTLY greater than the original tip's ("We're in a better
+            position than we were", validation.cpp:3255) — the prefix is now the
+            most-work valid chain, so FindMostWorkChain re-selects it, not the
+            original; or
+          * otherwise the original tip is still the most-work valid chain, so
+            Core disconnects the prefix and reconnects the original — i.e. a
+            full roll-back to the original tip.
+
+        Pre-fix, ouroboros ALWAYS rolled back (issue #118): a strictly-heavier
+        valid prefix was thrown away, dropping the node onto a lower-work chain
+        that Core would never have chosen. This restores the Core net effect.
+
+        The connected prefix and the original tip share the common ancestor,
+        which contributes identically to both cumulative works, so it cancels in
+        the STRICTLY-greater test: we compare only the INCREMENTAL work above the
+        ancestor, reusing the SAME primitive as ``_side_branch_chainwork`` /
+        the ``CBlockIndexWorkComparator`` gate — per-block
+        ``node._calculate_block_work`` over the 80-byte header's compact ``bits``
+        (little-endian at offset 72:76). When that primitive is unavailable
+        (e.g. old datadir), we fall back to a height comparison, matching the
+        strictly-heavier reorg gate's own height fallback at rpc.py:7667-7669.
+        """
+        n_connected = len(connected_hashes)
+        prefix_raws = [raw for _, _, raw in chain_to_connect[:n_connected]]
+        original_raws = [raw for _, _, raw in disconnected_active]
+
+        keep_prefix = False
+        if n_connected > 0:
+            _calc = getattr(self.node, "_calculate_block_work", None)
+            _decided = False
+            if callable(_calc):
+                try:
+                    def _incremental_work(raws: list[bytes]) -> int:
+                        total = 0
+                        for raw in raws:
+                            if len(raw) >= 76:
+                                total += _calc(
+                                    int.from_bytes(raw[72:76], "little")
+                                )
+                        return total
+
+                    prefix_work = _incremental_work(prefix_raws)
+                    original_work = _incremental_work(original_raws)
+                    # STRICTLY greater = keep (equal work first-seen tie-break
+                    # keeps the original, matching rpc.py:7653).
+                    keep_prefix = prefix_work > original_work
+                    _decided = True
+                except Exception:
+                    _decided = False
+            if not _decided:
+                # Height fallback (work primitive unavailable): both tips hang
+                # off the common ancestor, so more blocks above it == more work
+                # under the constant-difficulty assumption this fallback serves.
+                prefix_height = common_ancestor_height + n_connected
+                original_height = (
+                    common_ancestor_height + len(disconnected_active)
+                )
+                keep_prefix = prefix_height > original_height
+
+        if keep_prefix:
+            # Keep the heavier valid prefix on the active chain.
+            #  (a) it's active now, so drop its blocks from the side buffer;
+            #  (b) forget the invalid competing tip (Core BLOCK_FAILED_VALID) so
+            #      it cannot re-drive the same doomed reorg;
+            #  (c) retain the displaced original blocks in the side buffer so a
+            #      later extension can reorg BACK onto them (mirrors the
+            #      successful-flip retain in _reorg_to_side_branch_tip).
+            for _h in connected_hashes:
+                self._side_branch_blocks.pop(_h, None)
+            self._side_branch_blocks.pop(new_tip_hash, None)
+            for _bh, _bhh, _br in disconnected_active:
+                if _bh in self._side_branch_blocks:
+                    continue
+                try:
+                    _pv = bytes(_br[4:36])
+                except Exception:
+                    continue
+                self._side_branch_blocks[_bh] = (_pv, _bhh, _br)
+            self._evict_side_branch_if_full()
+            try:
+                _, kept_h = db.get_best_block()
+            except Exception:
+                kept_h = None
+            logger.warning(
+                "submitblock reorg: connect failed (%s) but the connected "
+                "prefix (%d block(s), tip h=%s) is STRICTLY heavier than the "
+                "original tip (ancestor h=%d, %d original block(s)) — keeping "
+                "it (Core ActivateBestChainStep parity, validation.cpp:"
+                "3234-3260, issue #118)",
+                reason, n_connected, kept_h,
+                common_ancestor_height, len(disconnected_active),
+            )
+            return bip22_result_string(reason)
+
+        # Original tip is at least as heavy (or nothing connected) — roll back
+        # to it, exactly as before.
+        return await self._restore_original_chain(
+            db, common_ancestor_height, disconnected_active, new_tip_hash, reason,
+        )
+
     async def _reorg_to_side_branch_tip(
         self,
         db,
@@ -8167,12 +8298,17 @@ class RPCServer:
                     e, exc_info=True,
                 )
                 # ATOMICITY (S5): the disconnect-side commit already landed,
-                # so the disk state is now a prefix of the LOSING competitor
-                # (or the bare common ancestor). Core never stays there — roll
-                # back to the original tip so a failed reorg is a no-op.
-                return await self._restore_original_chain(
+                # so the disk state is now a prefix of the competitor (0 blocks
+                # for the atomic all-or-nothing batch, i.e. the bare common
+                # ancestor). Delegate the keep-vs-rollback decision to the
+                # Core-parity finalizer (validation.cpp:3234-3260, issue #118):
+                # it keeps a connected prefix only when it is STRICTLY heavier
+                # than the original tip, otherwise rolls back. For the atomic
+                # batch nothing committed, so this always rolls back — but the
+                # single call site keeps both failure paths in lock-step.
+                return await self._finalize_failed_reorg(
                     db, common_ancestor_height, disconnected_active,
-                    new_tip_hash, str(e),
+                    new_tip_hash, connected_hashes, chain_to_connect, str(e),
                 )
         else:
             # Single-block reorg (or atomic helper unavailable): retain
@@ -8200,15 +8336,22 @@ class RPCServer:
                         "submitblock reorg: accept_block at h=%d failed: %s",
                         blk_height, e, exc_info=True,
                     )
-                    # ATOMICITY (S5): we have already disconnected the original
-                    # chain and connected 0..k blocks of the losing competitor.
-                    # A partial switch to the losing chain is a consensus fault
-                    # (the clearbit-incident / blockbrew-R3 class). Roll the
-                    # chainstate back to the original tip so the failed reorg
-                    # leaves no trace — matching Core ActivateBestChainStep.
-                    return await self._restore_original_chain(
+                    # ATOMICITY (S5) + Core-parity keep/rollback (issue #118):
+                    # we have disconnected the original chain and connected
+                    # 0..k blocks of the competitor. Core (validation.cpp:
+                    # 3234-3260, ActivateBestChainStep/ConnectTip failure) does
+                    # NOT unconditionally unwind the connected prefix — it keeps
+                    # it when it is STRICTLY heavier than the original tip (the
+                    # prefix is then the most-work valid chain) and only rolls
+                    # back to the original when the original is at least as
+                    # heavy. Delegating to the finalizer restores that net
+                    # effect; a partial switch to a LOSING (lighter) chain still
+                    # rolls all the way back, as before. (connected_hashes holds
+                    # only the blocks that succeeded — the failing block is
+                    # appended only on success, so its prefix count is exact.)
+                    return await self._finalize_failed_reorg(
                         db, common_ancestor_height, disconnected_active,
-                        new_tip_hash, str(e),
+                        new_tip_hash, connected_hashes, chain_to_connect, str(e),
                     )
 
         # Successful flip: drop the connected blocks from the side-branch

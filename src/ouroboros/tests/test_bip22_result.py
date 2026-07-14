@@ -104,6 +104,20 @@ class TestBip22ResultString:
         # BlockValidationError::Bip68MissingUtxo
         assert bip22_result_string("BIP68: missing UTXO for input 0") == "bad-txns-inputs-missingorspent"
 
+    def test_input_not_found_maps_to_missingorspent(self):
+        # Issue #119: a missing/absent prevout surfaces from ouroboros as
+        # "Input not found: <txid>:<vout>" (validation.py CheckTxInputs) and as
+        # the Rust TransactionValidationError::InputNotFound ("InputNotFound").
+        # Both are the Core CheckTxInputs "bad-txns-inputs-missingorspent" class
+        # (consensus/tx_verify.cpp) and MUST NOT fall through to the generic
+        # "transaction validation" script-verify catch-all (which would wrongly
+        # yield block-script-verify-flag-failed).
+        assert bip22_result_string("Input not found: abcd:0") == "bad-txns-inputs-missingorspent"
+        assert bip22_result_string("InputNotFound") == "bad-txns-inputs-missingorspent"
+        assert bip22_result_string("input not found") == "bad-txns-inputs-missingorspent"
+        assert bip22_result_string("Transaction validation error: InputNotFound") == "bad-txns-inputs-missingorspent"
+        assert bip22_result_string("prevout not found in utxo set") == "bad-txns-inputs-missingorspent"
+
     def test_transaction_validation_error(self):
         # BlockValidationError::TransactionValidation wraps script errors
         assert bip22_result_string("Transaction validation error: script verify failed") == "mandatory-script-verify-flag-failed"
