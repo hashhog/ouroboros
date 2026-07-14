@@ -1953,6 +1953,14 @@ class BlockSync:
                 )
 
             validated_via_rust = False
+            # Tracks whether one of the branches below has already assigned a
+            # (valid, error) verdict.  Without this, cross-check at a height
+            # where the Rust path cannot engage (skip_scripts=False — the
+            # permanent condition at tip) fell through BOTH gated branches and
+            # then hit `if not valid:` with `valid` unbound (UnboundLocalError).
+            # The old `not cross_check` fallback guard could never run the
+            # Python validator in that case.  See OUROBOROS-RUST-TRACK-SPEC §M0.
+            verdict_assigned = False
             if cross_check and rust_available and skip_scripts:
                 try:
                     rust_result = await _run_rust()
@@ -1964,6 +1972,7 @@ class BlockSync:
                     rust_result = None
                 python_result = await _run_python()
                 valid, error = python_result
+                verdict_assigned = True
                 if rust_result is not None:
                     # Match on the accept/reject boolean only. Rust and
                     # Python often reject invalid blocks for different
@@ -2082,6 +2091,7 @@ class BlockSync:
                 try:
                     valid, error = await _run_rust()
                     validated_via_rust = True
+                    verdict_assigned = True
                 except Exception as e:
                     logger.warning(
                         f"Rust validate_block_from_bytes raised "
@@ -2089,7 +2099,11 @@ class BlockSync:
                         f"falling back to Python validator"
                     )
 
-            if not validated_via_rust and not cross_check:
+            # Fall back to the Python validator whenever no branch above
+            # produced a verdict: route_only when skip_scripts is False or Rust
+            # raised, AND cross_check when the Rust path could not engage
+            # (skip_scripts=False) so its Python-trusted branch never ran.
+            if not verdict_assigned:
                 valid, error = await _run_python()
             validate_ns = time.perf_counter_ns() - t_val
             if not valid:
