@@ -910,5 +910,35 @@ class TestCrossCheckFallthrough(unittest.TestCase):
             "must be gone")
 
 
+class TestRustRouteErrorPrefixNormalization(unittest.TestCase):
+    """
+    OUROBOROS-RUST-TRACK-SPEC §M0 item 2: the Rust FFI wraps every reject as
+    "validate: <msg>" (deserialize failures as "deserialize: <msg>"), but the
+    drain dispatch matches Python-validator strings verbatim
+    (== "Previous block not found"; startswith(("Invalid merkle root",
+    "Invalid header"))). The prefix must be stripped before dispatch so a
+    Rust-routed reject requeues/bans identically to a Python reject.
+    """
+
+    def test_prefix_stripped_before_dispatch(self):
+        import inspect
+        from ouroboros.block_sync import BlockSync
+
+        src = inspect.getsource(BlockSync._drain_block_buffer_locked)
+        # The normalization must strip the Rust FFI prefixes.
+        self.assertIn('"validate: "', src,
+            "drain must normalize the Rust 'validate: ' reject prefix")
+        self.assertIn('"deserialize: "', src,
+            "drain must normalize the Rust 'deserialize: ' reject prefix")
+        # And it must appear BEFORE the reject dispatch so `== "Previous block
+        # not found"` and the misbehaving startswith() see the bare message.
+        norm_pos = src.find('for _ffi_prefix in ("validate: "')
+        dispatch_pos = src.find('if error == "Previous block not found":')
+        self.assertGreater(norm_pos, 0, "prefix normalization must be present")
+        self.assertGreater(dispatch_pos, 0, "reject dispatch must be present")
+        self.assertLess(norm_pos, dispatch_pos,
+            "prefix normalization must run before the reject dispatch")
+
+
 if __name__ == "__main__":
     unittest.main()
