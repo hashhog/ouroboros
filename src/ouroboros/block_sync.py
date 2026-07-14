@@ -516,6 +516,22 @@ class BlockSync:
         self._w91_buffer_on_entry_sum: int = 0
         self._w91_log_every: int = 100
 
+        # M0 flush/commit attribution (OUROBOROS-RUST-TRACK-SPEC §M0 item 4).
+        # Ouroboros emitted ZERO flush/commit timing lines
+        # (measured-baseline.md:172-174); the M4/M5 flush budget (≤15 ms
+        # amortized) cannot be audited without a baseline.  The durable-commit
+        # boundary that Python can see is the connect_block_from_bytes call —
+        # its RocksDB WriteBatch apply is the flush/commit point.  We emit a
+        # per-commit DEBUG line plus a throttled INFO rollup; PURE
+        # instrumentation, no behavior change.  (Finer intra-connect flush
+        # breakdown — WriteBatch apply vs UTXO update vs tx-index — needs
+        # lib.rs-side timing and is deferred to M4, which owns the connect
+        # loop.)
+        self._flush_commits: int = 0
+        self._flush_commit_sum_ns: int = 0
+        self._flush_commit_max_ns: int = 0
+        self._flush_log_every: int = 1000
+
         # Serializes `_drain_block_buffer` against itself.  The drain is
         # invoked from both `sync_loop` (periodic) and `handle_block`
         # (every incoming P2P block); without this lock two drains can
@@ -2207,6 +2223,10 @@ class BlockSync:
                 self._buffer_put(next_hash, (block, raw_payload))
                 break
             connect_ns = time.perf_counter_ns() - t_con
+
+            # M0 flush/commit attribution — the connect above is the durable
+            # RocksDB commit boundary for this block.
+            self._flush_record_commit(new_height, connect_ns)
 
             self._w76_record_phases(deserialize_ns, validate_ns, connect_ns)
             self._w90_record_validate(
@@ -4668,6 +4688,41 @@ class BlockSync:
             self._w91_drain_idle_sum_ns = 0
             self._w91_drain_idle_max_ns = 0
             self._w91_buffer_on_entry_sum = 0
+
+    def _flush_record_commit(self, height: int, commit_ns: int) -> None:
+        """M0 flush/commit attribution (OUROBOROS-RUST-TRACK-SPEC §M0 item 4).
+
+        Emits one DEBUG line per block commit with its duration, and a
+        throttled INFO rollup every ``_flush_log_every`` commits (avg / max /
+        total commit ms + the implied commit-bound blk/hr).  ``commit_ns`` is
+        the wall time of ``connect_block_from_bytes`` — the durable RocksDB
+        WriteBatch-apply boundary, which is the first flush/commit timing
+        ouroboros has ever recorded.  Pure instrumentation: no behavior
+        change, and a logging fault must never stall IBD.
+        """
+        commit_ms = commit_ns / 1_000_000
+        # Literal "one log line per commit with duration" (DEBUG so it never
+        # spams production INFO; enable ouroboros DEBUG for per-block detail).
+        logger.debug("[FLUSH] block=%d commit_ms=%.2f", height, commit_ms)
+
+        self._flush_commits += 1
+        self._flush_commit_sum_ns += commit_ns
+        if commit_ns > self._flush_commit_max_ns:
+            self._flush_commit_max_ns = commit_ns
+        if self._flush_commits >= self._flush_log_every:
+            n = self._flush_commits
+            avg_ms = self._flush_commit_sum_ns / n / 1_000_000
+            max_ms = self._flush_commit_max_ns / 1_000_000
+            total_ms = self._flush_commit_sum_ns / 1_000_000
+            rate = 3600_000 / avg_ms if avg_ms > 0 else 0
+            logger.info(
+                "[FLUSH-ATTR] commits=%d commit_avg_ms=%.2f commit_max_ms=%.2f "
+                "commit_total_ms=%.0f (~%.0f blk/hr commit-bound)",
+                n, avg_ms, max_ms, total_ms, rate,
+            )
+            self._flush_commits = 0
+            self._flush_commit_sum_ns = 0
+            self._flush_commit_max_ns = 0
 
     def _w77_record_connect(self, block_hash: bytes, connect_time: float) -> None:
         """W77: roll a successful connect into the 100-block timeout rollup.
