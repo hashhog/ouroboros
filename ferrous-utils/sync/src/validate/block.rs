@@ -769,12 +769,28 @@ impl BlockValidator {
                     .ok_or_else(|| BlockValidationError::Bip68MissingUtxo(
                         format!("{}:{}", input.previous_output.txid, input.previous_output.vout)))?
             };
-            let prev_h = utxo.height.unwrap_or(0);
+            // BIP-68 unknown-height alignment with the trusted Python
+            // validator (validation.py:2744-2749): when the prevout UTXO
+            // carries no height metadata, Python OR-s SEQUENCE_DISABLE into
+            // that input's sequence (BIP-68 skipped for it) instead of
+            // defaulting the height to 0 and ENFORCING against a bogus
+            // relative lock.  The old `unwrap_or(0)` made Rust enforce where
+            // Python skips — a Rust-stricter divergence and the standing
+            // hypothesis for the h≈774,495/533 cross-check BIP68 class.
+            // Mirror Python (the trusted side) here.  (Fail-closed conversion
+            // — rejecting on unknown height — is deferred to the post-snapshot
+            // header backfill; see OUROBOROS-RUST-TRACK-SPEC §5.)
+            let (seq, prev_h) = match utxo.height {
+                Some(h) => (input.sequence.0, h),
+                None => (input.sequence.0 | SEQUENCE_LOCKTIME_DISABLE_FLAG, 0),
+            };
 
             // MTP at (prev_h - 1) is only needed for time-locked live inputs.
+            // Uses the (possibly disable-flagged) `seq` so an unknown-height
+            // input never triggers an MTP fetch.
             let is_time_locked =
-                input.sequence.0 & SEQUENCE_LOCKTIME_DISABLE_FLAG == 0
-                && input.sequence.0 & SEQUENCE_LOCKTIME_TYPE_FLAG != 0;
+                seq & SEQUENCE_LOCKTIME_DISABLE_FLAG == 0
+                && seq & SEQUENCE_LOCKTIME_TYPE_FLAG != 0;
             let prev_mtp = if is_time_locked && prev_h > 0 {
                 self.header_validator
                     .get_median_time_past(prev_h.saturating_sub(1))? as i64
@@ -783,7 +799,7 @@ impl BlockValidator {
             };
 
             input_infos.push(InputLockInfo {
-                sequence: input.sequence.0,
+                sequence: seq,
                 prev_height: prev_h,
                 prev_median_time: prev_mtp,
             });
@@ -1697,6 +1713,117 @@ mod tests {
         assert!(spent_in_block.contains(&op_m), "spent_in_block must catch the re-spend");
         //   (b) belt-and-suspenders: op_m is gone from intra_utxos too.
         assert!(!intra_utxos.contains_key(&op_m), "op_m must have been evicted from intra_utxos");
+    }
+
+    /// M0.3 — BIP-68 unknown-height alignment with the trusted Python
+    /// validator (validation.py:2744-2749).
+    ///
+    /// When a prevout UTXO has no height metadata (`height == None`), Python
+    /// OR-s SEQUENCE_DISABLE into that input's sequence, skipping BIP-68 for
+    /// it. The old Rust `utxo.height.unwrap_or(0)` instead enforced the
+    /// relative lock against height 0 — a Rust-stricter divergence and the
+    /// standing hypothesis for the h≈774,495/533 cross-check BIP68 class.
+    ///
+    /// This test drives `check_tx_sequence_locks` directly with the prevout
+    /// supplied via `extras`, using a height-based relative lock of 100:
+    ///   • unknown height (None)  → post-fix ACCEPTS (input disabled),
+    ///                              pre-fix REJECTED (prev_h=0, min_height=99).
+    ///   • known height Some(0)   → still REJECTS (proves the change is
+    ///                              scoped to the None case, not Some(0)).
+    ///   • known height Some(10)  → still enforces normally (regression guard
+    ///                              that the fix did not disable BIP-68 for
+    ///                              coins with real height metadata).
+    #[test]
+    fn test_bip68_unknown_height_disables_like_python() {
+        use std::collections::HashMap;
+
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Bitcoin);
+
+        // Prevout being spent.
+        let prev_txid = bitcoin::Txid::from_byte_array([0x77u8; 32]);
+        let prevout = OutPoint::new(prev_txid, 0);
+
+        // v2 tx, single input with a height-based relative lock of 100
+        // (DISABLE clear, TYPE clear → block-height lock).
+        let make_tx = || bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: prevout,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::transaction::Sequence(100),
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![],
+        };
+
+        let utxo_with = |height: Option<u32>| {
+            UTXO::new(
+                OutPointWrapper::new(prevout),
+                50_000,
+                bitcoin::ScriptBuf::new(),
+                height,
+                false,
+            )
+        };
+
+        // Include the tx at block height 50 — below the lock's min_height (99)
+        // when enforced against prev_height 0, so any enforcement rejects.
+        let height = 50u32;
+
+        // Unknown height: post-fix must ACCEPT (input disabled), matching
+        // Python. (Pre-fix this returned Err(InvalidSequenceLock).)
+        let mut extras: HashMap<OutPoint, UTXO> = HashMap::new();
+        extras.insert(prevout, utxo_with(None));
+        let tx = make_tx();
+        let mut bmt = None;
+        assert!(
+            validator
+                .check_tx_sequence_locks(&tx, 0, height, &mut bmt, &extras)
+                .is_ok(),
+            "unknown-height prevout must disable BIP-68 for the input (Python parity)"
+        );
+
+        // Known height Some(0): still enforced → reject. Proves the change is
+        // scoped to the None case (Some(0) is NOT treated as unknown).
+        let mut extras0: HashMap<OutPoint, UTXO> = HashMap::new();
+        extras0.insert(prevout, utxo_with(Some(0)));
+        let tx0 = make_tx();
+        let mut bmt0 = None;
+        assert!(
+            validator
+                .check_tx_sequence_locks(&tx0, 0, height, &mut bmt0, &extras0)
+                .is_err(),
+            "known height Some(0) must still enforce the relative lock"
+        );
+
+        // Known height Some(10): min_height = 10 + 100 - 1 = 109; at block
+        // height 50 the lock is unmet → reject. Regression guard that the fix
+        // did not blanket-disable BIP-68 for coins with real height metadata.
+        let mut extras10: HashMap<OutPoint, UTXO> = HashMap::new();
+        extras10.insert(prevout, utxo_with(Some(10)));
+        let tx10 = make_tx();
+        let mut bmt10 = None;
+        assert!(
+            validator
+                .check_tx_sequence_locks(&tx10, 0, height, &mut bmt10, &extras10)
+                .is_err(),
+            "known-height coin must still enforce BIP-68 normally"
+        );
+
+        // And Some(10) at a height ABOVE min_height (200 > 109) must pass —
+        // confirms enforcement is a real lock, not an unconditional reject.
+        let mut extras10b: HashMap<OutPoint, UTXO> = HashMap::new();
+        extras10b.insert(prevout, utxo_with(Some(10)));
+        let tx10b = make_tx();
+        let mut bmt10b = None;
+        assert!(
+            validator
+                .check_tx_sequence_locks(&tx10b, 0, 200, &mut bmt10b, &extras10b)
+                .is_ok(),
+            "known-height coin above min_height must satisfy the lock"
+        );
     }
 }
 
