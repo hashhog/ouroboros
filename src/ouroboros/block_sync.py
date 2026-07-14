@@ -2106,6 +2106,23 @@ class BlockSync:
             if not verdict_assigned:
                 valid, error = await _run_python()
             validate_ns = time.perf_counter_ns() - t_val
+            # Normalize the Rust FFI reject prefix before the reject dispatch
+            # below.  The Rust validate/connect path wraps every reject as
+            # "validate: <msg>" (and deserialize failures as "deserialize:
+            # <msg>"; ferrous-utils/sync/src/lib.rs:3413-3418), but the
+            # dispatch matches Python-validator strings verbatim
+            # (== "Previous block not found"; startswith(("Invalid merkle
+            # root", "Invalid header"))).  Without stripping the prefix, a
+            # Rust-routed "Previous block not found" would be perm-rejected +
+            # peer-banned instead of re-buffered, and a Rust-routed mutated
+            # block would miss the misbehaving() score.  Python-validator
+            # errors never carry these prefixes, so this is a no-op for the
+            # Python path.  See OUROBOROS-RUST-TRACK-SPEC §M0 item 2.
+            if error:
+                for _ffi_prefix in ("validate: ", "deserialize: "):
+                    if error.startswith(_ffi_prefix):
+                        error = error[len(_ffi_prefix):]
+                        break
             if not valid:
                 self._blk_validate_rejected += 1
                 logger.warning(
