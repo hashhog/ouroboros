@@ -36,7 +36,9 @@ References:
 """
 
 import hashlib
+import json
 import logging
+import os
 import struct
 import threading
 from collections.abc import Callable
@@ -344,19 +346,67 @@ _TESTNET4_ASSUMEUTXO: list[AssumeutxoData] = [
 
 
 # ---------------------------------------------------------------------------
-# Runtime-registerable regtest assumeUTXO whitelist.
+# Regtest assumeUTXO parameters: builtin (Core-parity) + runtime-registered.
 #
-# Bitcoin Core's regtest `CRegTestParams` ships an `m_assumeutxo_data` table
-# that the test framework appends to at runtime (e.g. the `assumeutxo`
-# functional tests register the snapshot they just dumped). Mainnet /
-# testnet3 / testnet4 entries are baked-in chainparams and MUST NOT be
-# mutated at runtime — only regtest is registerable, mirroring Core.
+# Bitcoin Core's regtest `CRegTestParams` DOES ship a non-empty, baked-in
+# `m_assumeutxo_data` table (bitcoin-core/src/kernel/chainparams.cpp:607-628)
+# with three fixed heights used by Core's own test/fuzz infrastructure:
+#   110 -- "For use by unit tests"
+#   200 -- "For use by fuzz target src/test/fuzz/utxo_snapshot.cpp"
+#   299 -- "For use by test/functional/feature_assumeutxo.py and
+#           test/functional/tool_bitcoin_chainstate.py"
+# `_REGTEST_ASSUMEUTXO_BUILTIN` mirrors that table verbatim (Core-parity;
+# these specific heights/hashes only ever match a snapshot built by
+# replaying Core's own deterministic regtest fixture chain -- ordinary
+# hand-built regtest chains used elsewhere in this codebase's own tests
+# never produce these hashes). Like Core, this table is immutable: it is
+# NOT touched by `register_regtest_assumeutxo` / `clear_regtest_assumeutxo`.
 #
-# These entries let `loadtxoutset` (and the dual-chainstate background
-# validator it drives) run end-to-end on a self-built regtest chain without
-# requiring a hardcoded mainnet-sized snapshot. The registry is process-local
-# and cleared in test teardown so no probe state leaks across runs.
+# On top of that, ouroboros ALSO supports runtime registration (a facility
+# Core itself doesn't need, since its C++ test framework can poke internals
+# directly): `_REGTEST_ASSUMEUTXO` lets tests register the snapshot they
+# just dumped from a synthetic chain, without requiring a hardcoded
+# mainnet-sized snapshot. That registry is process-local and cleared in
+# test teardown so no probe state leaks across runs; it is layered
+# *alongside* the builtin table, not a replacement for it.
 # ---------------------------------------------------------------------------
+_REGTEST_ASSUMEUTXO_BUILTIN: list[AssumeutxoData] = [
+    AssumeutxoData(
+        # For use by unit tests (Core: CRegTestParams m_assumeutxo_data[0]).
+        height=110,
+        block_hash=_hex_to_hash_le(
+            "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"
+        ),
+        hash_serialized=_hex_to_hash_le(
+            "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"
+        ),
+        chain_tx_count=111,
+    ),
+    AssumeutxoData(
+        # For use by fuzz target src/test/fuzz/utxo_snapshot.cpp.
+        height=200,
+        block_hash=_hex_to_hash_le(
+            "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9"
+        ),
+        hash_serialized=_hex_to_hash_le(
+            "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a"
+        ),
+        chain_tx_count=201,
+    ),
+    AssumeutxoData(
+        # For use by test/functional/feature_assumeutxo.py and
+        # test/functional/tool_bitcoin_chainstate.py.
+        height=299,
+        block_hash=_hex_to_hash_le(
+            "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2"
+        ),
+        hash_serialized=_hex_to_hash_le(
+            "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2"
+        ),
+        chain_tx_count=334,
+    ),
+]
+
 _REGTEST_ASSUMEUTXO: list[AssumeutxoData] = []
 
 
@@ -374,24 +424,206 @@ def register_regtest_assumeutxo(data: AssumeutxoData) -> None:
 
 
 def clear_regtest_assumeutxo() -> None:
-    """Clear the runtime regtest assumeUTXO whitelist (test teardown)."""
+    """Clear the runtime regtest assumeUTXO whitelist (test teardown).
+
+    Only clears the runtime-registered entries; the Core-parity builtin
+    table (`_REGTEST_ASSUMEUTXO_BUILTIN`, heights 110/200/299) is immutable
+    and unaffected, matching Core's own regtest chainparams.
+    """
     _REGTEST_ASSUMEUTXO.clear()
 
 
+# ---------------------------------------------------------------------------
+# Campaign-only assumeUTXO allowlist (HASHHOG_CAMPAIGN_ASSUMEUTXO).
+#
+# See receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md for the full design. Summary:
+# an env flag naming an absolute path to a JSON file of extra assumeUTXO
+# entries, read exactly ONCE per process and appended to whatever network's
+# allowlist `get_assumeutxo_params` is asked for. This exists so the M2
+# boundary campaign can boot "mainnet params" fast-forwarded to a boundary
+# snapshot WITHOUT permanently widening the production mainnet/testnet4
+# trust tables above. When the env var is unset (the default -- every
+# existing deployment today), the only new code that runs is a single
+# `os.environ.get` call that returns `None`; no table is copied or mutated,
+# so behavior is bit-identical to before this change.
+# ---------------------------------------------------------------------------
+_CAMPAIGN_ASSUMEUTXO_ENV = "HASHHOG_CAMPAIGN_ASSUMEUTXO"
+_CAMPAIGN_ASSUMEUTXO_LOADED = False
+_CAMPAIGN_ASSUMEUTXO_ENTRIES: list[AssumeutxoData] = []
+
+# 32-byte hash hex strings are 64 hex chars (display order, per spec).
+_CAMPAIGN_HASH_HEXLEN = 64
+
+
+def _campaign_builtin_entries() -> list[AssumeutxoData]:
+    """All hardcoded (non-campaign) entries across every network.
+
+    Used only for the campaign loader's collision check. The campaign
+    fixture JSON is not tagged with a network, so -- conservatively, per
+    "campaign data may never override a production hash" -- we refuse a
+    collision against ANY network's builtin table, not just the one the
+    node happens to be running.
+    """
+    return (
+        _MAINNET_ASSUMEUTXO
+        + _TESTNET_ASSUMEUTXO
+        + _TESTNET4_ASSUMEUTXO
+        + _REGTEST_ASSUMEUTXO_BUILTIN
+    )
+
+
+def _load_campaign_assumeutxo() -> list[AssumeutxoData]:
+    """Read `HASHHOG_CAMPAIGN_ASSUMEUTXO` exactly once and cache the result.
+
+    Unset/empty: returns `[]` immediately (single getenv, no further work --
+    this is the bit-identical-by-default path).
+
+    Set: parses+validates the JSON file at the given absolute path and
+    caches the parsed entries for the rest of the process. Raises
+    `ValueError` (refusing to start) on a malformed fixture or on any
+    collision with a builtin entry (matching blockhash OR height), since
+    campaign data must never be able to shadow or override a production
+    trust-table entry.
+    """
+    global _CAMPAIGN_ASSUMEUTXO_LOADED, _CAMPAIGN_ASSUMEUTXO_ENTRIES
+    if _CAMPAIGN_ASSUMEUTXO_LOADED:
+        return _CAMPAIGN_ASSUMEUTXO_ENTRIES
+
+    path = os.environ.get(_CAMPAIGN_ASSUMEUTXO_ENV)
+    if not path:
+        _CAMPAIGN_ASSUMEUTXO_LOADED = True
+        _CAMPAIGN_ASSUMEUTXO_ENTRIES = []
+        return _CAMPAIGN_ASSUMEUTXO_ENTRIES
+
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"[CAMPAIGN-ASSUMEUTXO] {path}: expected a JSON array of entries, "
+            f"got {type(raw).__name__}"
+        )
+
+    builtin = _campaign_builtin_entries()
+    builtin_hashes = {d.block_hash for d in builtin}
+    builtin_heights = {d.height for d in builtin}
+
+    entries: list[AssumeutxoData] = []
+    seen_hashes: set[bytes] = set()
+    seen_heights: set[int] = set()
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {i} is not an object")
+
+        missing = [k for k in ("height", "blockhash", "hash_serialized", "m_chain_tx_count") if k not in item]
+        if missing:
+            raise ValueError(
+                f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {i} missing required field(s) {missing}"
+            )
+
+        height = item["height"]
+        if not isinstance(height, int) or height <= 0:
+            raise ValueError(
+                f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {i} height must be a positive int, "
+                f"got {height!r}"
+            )
+
+        blockhash_hex = item["blockhash"]
+        hash_serialized_hex = item["hash_serialized"]
+        for field_name, hex_val in (
+            ("blockhash", blockhash_hex),
+            ("hash_serialized", hash_serialized_hex),
+        ):
+            if not isinstance(hex_val, str) or len(hex_val) != _CAMPAIGN_HASH_HEXLEN:
+                raise ValueError(
+                    f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {i} field {field_name!r} must be "
+                    f"{_CAMPAIGN_HASH_HEXLEN}-char hex, got {hex_val!r}"
+                )
+            try:
+                bytes.fromhex(hex_val)
+            except ValueError as e:
+                raise ValueError(
+                    f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {i} field {field_name!r} is not "
+                    f"valid hex: {e}"
+                ) from e
+
+        chain_tx_count = item["m_chain_tx_count"]
+        if not isinstance(chain_tx_count, int) or chain_tx_count < 0:
+            raise ValueError(
+                f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {i} m_chain_tx_count must be a "
+                f"non-negative int, got {chain_tx_count!r}"
+            )
+
+        # All hex in the fixture is DISPLAY order (per spec); convert to
+        # ouroboros's internal byte order the same way the builtin tables do.
+        block_hash = _hex_to_hash_le(blockhash_hex)
+        hash_serialized = _hex_to_hash_le(hash_serialized_hex)
+
+        if block_hash in builtin_hashes or height in builtin_heights:
+            raise ValueError(
+                f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {i} (height={height}, "
+                f"blockhash={blockhash_hex}) collides with a builtin assumeUTXO "
+                "entry; campaign data may never override a production hash"
+            )
+        if block_hash in seen_hashes or height in seen_heights:
+            raise ValueError(
+                f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {i} (height={height}, "
+                f"blockhash={blockhash_hex}) duplicates another entry in the same "
+                "campaign fixture"
+            )
+        seen_hashes.add(block_hash)
+        seen_heights.add(height)
+
+        base_header_hex = item.get("base_header")
+        base_header = bytes.fromhex(base_header_hex) if base_header_hex else None
+
+        chainwork_hex = item.get("chainwork")
+
+        entries.append(
+            AssumeutxoData(
+                height=height,
+                block_hash=block_hash,
+                hash_serialized=hash_serialized,
+                chain_tx_count=chain_tx_count,
+                base_header=base_header,
+                chainwork_hex=chainwork_hex,
+            )
+        )
+
+    logger.warning(
+        "[CAMPAIGN-ASSUMEUTXO] loaded %d entries from %s heights=%s",
+        len(entries),
+        path,
+        sorted(d.height for d in entries),
+    )
+
+    _CAMPAIGN_ASSUMEUTXO_LOADED = True
+    _CAMPAIGN_ASSUMEUTXO_ENTRIES = entries
+    return _CAMPAIGN_ASSUMEUTXO_ENTRIES
+
+
 def get_assumeutxo_params(network: str) -> list[AssumeutxoData]:
-    """Get hardcoded assumeUTXO parameters for a network."""
+    """Get hardcoded assumeUTXO parameters for a network.
+
+    Appends any campaign entries (`HASHHOG_CAMPAIGN_ASSUMEUTXO`, read once
+    per process) to whichever network's allowlist is requested. When the
+    env var is unset this is a single cached no-op getenv and the returned
+    list is identical to before this function gained campaign support.
+    """
     if network in ("mainnet", "bitcoin"):
-        return list(_MAINNET_ASSUMEUTXO)
-    if network in ("testnet", "testnet3"):
-        return list(_TESTNET_ASSUMEUTXO)
-    if network == "testnet4":
-        return list(_TESTNET4_ASSUMEUTXO)
-    if network == "regtest":
-        # Regtest: only the runtime-registered entries (Core regtest behaviour
-        # — its baked-in m_assumeutxo_data is empty; the test framework appends).
-        return list(_REGTEST_ASSUMEUTXO)
-    # Signet etc.: no entries.
-    return []
+        base = list(_MAINNET_ASSUMEUTXO)
+    elif network in ("testnet", "testnet3"):
+        base = list(_TESTNET_ASSUMEUTXO)
+    elif network == "testnet4":
+        base = list(_TESTNET4_ASSUMEUTXO)
+    elif network == "regtest":
+        # Regtest: Core-parity builtin table (110/200/299, immutable) plus
+        # any runtime-registered entries from this process's own tests.
+        base = list(_REGTEST_ASSUMEUTXO_BUILTIN) + list(_REGTEST_ASSUMEUTXO)
+    else:
+        # Signet etc.: no builtin entries.
+        base = []
+    base.extend(_load_campaign_assumeutxo())
+    return base
 
 
 def get_assumeutxo_data(network: str, height: int) -> AssumeutxoData | None:
