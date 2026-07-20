@@ -3649,14 +3649,16 @@ impl PyBlockchainDB {
             }
         }
 
-        // BIP141 witness commitment recompute (validation.cpp:3870-3901)
+        // BIP141 witness commitment recompute (validation.cpp:3870-3917)
         // Reference: Bitcoin Core CheckWitnessMalleation() / GetWitnessCommitmentIndex()
-        // Rule: whenever the commitment OUTPUT (0xaa21a9ed magic) is present in
-        // the coinbase, ALWAYS recompute SHA256d(witness_merkle_root || nonce)
-        // and compare against the on-chain bytes.  Gate is commitment OUTPUT
-        // presence, not height or whether non-coinbase txs have witness data.
-        // (No network field on PyBlockchainDB — height-gate omitted; the check
-        // is a no-op when neither commitment nor witness data are present.)
+        // Core gates the commitment verification on `expect_witness_commitment`
+        // = DeploymentActiveAfter(pindexPrev, DEPLOYMENT_SEGWIT), i.e. segwit
+        // active for THIS block's height (validation.cpp:4169). Pre-activation,
+        // the commitment check is SKIPPED even when a commitment-shaped output
+        // is present (real mainnet history: block 434499 carries 6a24aa21a9ed
+        // in its coinbase, pre-segwit — GEN-OURO-434499), and only the
+        // unexpected-witness sweep applies. `height`/`network_enum` are fn
+        // params (the earlier "no network field" comment was stale).
         {
             use bitcoin::hashes::{sha256d, Hash as _};
             use common::crypto::compute_merkle_root;
@@ -3680,9 +3682,11 @@ impl PyBlockchainDB {
             let has_witness = inner.txdata.iter()
                 .any(|tx| tx.input.iter().any(|inp| !inp.witness.is_empty()));
 
+            let witness_enabled = height >= activation_heights::segwit_height(network_enum);
+
             match (commitment_in_coinbase, has_witness) {
-                (Some(on_chain_commit), _) => {
-                    // Commitment output present → ALWAYS verify the recomputed hash
+                (Some(on_chain_commit), _) if witness_enabled => {
+                    // Segwit active + commitment output present → verify the recomputed hash
                     let cb_witness = &coinbase.input[0].witness;
                     if cb_witness.len() != 1 || cb_witness.last().map_or(0, |w| w.len()) != 32 {
                         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -3710,14 +3714,21 @@ impl PyBlockchainDB {
                         ));
                     }
                 }
-                (None, true) => {
-                    // Has witness data but no commitment output → reject
+                (_, true) => {
+                    // Witness data with no ACTIVE commitment → reject. Covers
+                    // (a) no commitment output at any height and (b) witness
+                    // data pre-activation (a commitment-shaped output does not
+                    // count before segwit — Core falls through to the
+                    // unexpected-witness sweep, validation.cpp:3907-3915).
+                    // Message substring "witness data but no" is load-bearing:
+                    // rpc.py:179 maps it to Core's "unexpected-witness".
                     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                         "bad-witness-merkle-match: block has witness data but no witness commitment".to_string()
                     ));
                 }
-                (None, false) => {
-                    // No commitment, no witness — nothing to check
+                (_, false) => {
+                    // No witness data; commitment absent or pre-activation
+                    // (skipped, e.g. mainnet 434499) — nothing to check.
                 }
             }
         }
@@ -4365,8 +4376,14 @@ impl PyBlockchainDB {
                 let has_witness = inner.txdata.iter()
                     .any(|tx| tx.input.iter().any(|inp| !inp.witness.is_empty()));
 
+                // Same segwit-activation gate as connect_block_from_bytes /
+                // Core CheckWitnessMalleation (GEN-OURO-434499): pre-activation
+                // the commitment check is skipped even if a commitment-shaped
+                // output is present; only the unexpected-witness sweep applies.
+                let witness_enabled = height >= activation_heights::segwit_height(network_enum);
+
                 match (commitment_in_coinbase, has_witness) {
-                    (Some(on_chain_commit), _) => {
+                    (Some(on_chain_commit), _) if witness_enabled => {
                         let cb_witness = &coinbase.input[0].witness;
                         if cb_witness.len() != 1 || cb_witness.last().map_or(0, |w| w.len()) != 32 {
                             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -4393,12 +4410,14 @@ impl PyBlockchainDB {
                             ));
                         }
                     }
-                    (None, true) => {
+                    (_, true) => {
+                        // No ACTIVE commitment (absent, or present pre-activation)
+                        // + witness data → Core "unexpected-witness".
                         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                             format!("connect_blocks_atomic[{}]: witness data without commitment", block_idx),
                         ));
                     }
-                    (None, false) => {}
+                    (_, false) => {}
                 }
             }
 
