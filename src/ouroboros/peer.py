@@ -2377,6 +2377,25 @@ class Peer:
         still safe to reference (its socket may close shortly afterward).
         """
         self.score = max(0, min(100, self.score + delta))
+        if self.score == 0 and (self.noban or self.is_manual):
+            # Core-canonical NoBan exemption (net_processing.cpp
+            # MaybeDiscourageAndDisconnect): a whitelisted or manually-added
+            # (-connect / -addnode) peer is NEVER disconnected or banned for
+            # misbehaviour score — Core logs and returns.  Under --connect
+            # this is the ONLY peer; banning it kills sync outright with no
+            # reconnect possible (banned addr is refused).  2026-07-19: the
+            # block-request-timeout drip (-1/cycle) clamped the sole pinned
+            # peer to 0 over ~1 h and banned the reference Core for 24 h,
+            # wedging genesis-ouroboros — the same bug class the header-stall
+            # path already exempted.  Reset to a floor so the drip cannot
+            # immediately re-clamp.
+            self.score = 1
+            logger.info(
+                "Peer %s:%s hit score clamp but is NoBan/manual — not "
+                "banning (Core NoBan parity); score floored to 1",
+                self.host, self.port,
+            )
+            return
         if self.score == 0 and not self._ban_recorded:
             self._ban_recorded = True
             if self.ban_manager is not None:
