@@ -185,6 +185,14 @@ from ouroboros.validation import SIG_CACHE, BlockValidator
 logger = logging.getLogger(__name__)
 
 
+class _G8SkipGate(Exception):
+    """Control-flow sentinel: skip the G8 low-work gate for this batch
+    (liveness guard when the chainwork index is unreadable at a non-zero
+    tip). Caught by the G8 block's outer defense-in-depth except, whose
+    semantics — keep the appended headers, continue — are exactly the
+    skip we want."""
+
+
 # Bitcoin Core's ``MAX_NUM_UNCONNECTING_HEADERS_MSGS`` from
 # ``net_processing.cpp``.  A peer that delivers more than this many
 # successive unconnecting-headers messages is misbehavior-scored and
@@ -1540,6 +1548,21 @@ class BlockSync:
             # forever for a buffer entry that never arrives.
             if not was_requested and self.db.has_block_hash(block_hash):
                 self._blk_duplicate += 1
+                # Rate-limited visibility (2026-07-20): this branch silently ate
+                # every redelivery of a stored-but-not-connected block for
+                # hours while the tip sat frozen — the drop reason was
+                # invisible at INFO.  One line per 30s is cheap and makes the
+                # wedge class diagnosable from the log alone.
+                _now = time.time()
+                if _now - getattr(self, "_last_dup_drop_log", 0.0) > 30.0:
+                    self._last_dup_drop_log = _now
+                    logger.info(
+                        f"Dropping unrequested already-stored block "
+                        f"{block_hash.hex()[:16]}... from "
+                        f"{peer.host}:{peer.port} (dup #{self._blk_duplicate}; "
+                        f"was_requested=False, has_block_hash=True — stored "
+                        f"bytes exist but block may not be CONNECTED)"
+                    )
                 return
 
             # Permanently rejected on a prior validation pass?  Drop without
@@ -1622,6 +1645,14 @@ class BlockSync:
                 self._buffer_put(block_hash, (None, payload))
                 self._block_source_peer_addr[block_hash] = f"{peer.host}:{peer.port}"
                 self._blk_buffered += 1
+                _now = time.time()
+                if _now - getattr(self, "_last_buf_log", 0.0) > 30.0:
+                    self._last_buf_log = _now
+                    logger.info(
+                        f"Buffered block {block_hash.hex()[:16]}... "
+                        f"(buffer={len(self._ibd_block_buffer)}, "
+                        f"buffered_total={self._blk_buffered})"
+                    )
             else:
                 # Near-full (top HEAD_OF_WINDOW slots): only the head-of-window
                 # may use the reserved slots.  Build head_set with the SAME
@@ -1808,6 +1839,16 @@ class BlockSync:
                     self._w91_drain_idle_max_ns = idle_ns
         current_hash, current_height = self.db.get_best_block()
 
+        if not self._validated_headers:
+            _now = time.time()
+            if _now - getattr(self, "_last_drain_empty_log", 0.0) > 30.0:
+                self._last_drain_empty_log = _now
+                logger.info(
+                    f"Drain idle: validated-header queue EMPTY at tip "
+                    f"{current_height} (headers arriving but not connecting "
+                    f"into the queue?)"
+                )
+
         # Sanity-check the queue invariant before draining.  If
         # ``_validated_headers[0]`` does not extend the active chain tip
         # (which can happen after a chainstate rollback or reorg between
@@ -1847,11 +1888,49 @@ class BlockSync:
         while header_idx < len(self._validated_headers):
             next_hash, _ = self._validated_headers[header_idx]
 
-            # Is the next block in our buffer?
+            # Is the next block in our buffer?  If not, fall back to bytes
+            # already persisted in BLOCKS_CF: a prior run may have STORED the
+            # body without ever CONNECTING it (download ran ahead of
+            # validation, then the process died/rolled back).  Without this
+            # fallback the node deadlocks: _request_next_blocks skips the
+            # block (the height index says "already have it"), the network
+            # never re-delivers it as a requested block, and the drain waits
+            # forever on a buffer entry that cannot arrive (GEN-OURO 434499
+            # wedge, 2026-07-20).  Core-parity: Core connects from its on-disk
+            # block files whenever the next block's data is present
+            # (ActivateBestChain does not care how the bytes arrived).
             if next_hash not in self._ibd_block_buffer:
-                break  # need to wait for download
-
-            block, raw_payload = self._buffer_remove(next_hash)
+                try:
+                    _disk_bytes = await asyncio.to_thread(
+                        self.db.get_block_bytes, next_hash
+                    )
+                except Exception:
+                    _disk_bytes = None
+                if not _disk_bytes:
+                    _now = time.time()
+                    if _now - getattr(self, "_last_drain_wait_log", 0.0) > 30.0:
+                        self._last_drain_wait_log = _now
+                        logger.info(
+                            f"Drain waiting on network for "
+                            f"{next_hash.hex()[:16]}... (height "
+                            f"{current_height + 1 + header_idx}; queue="
+                            f"{len(self._validated_headers)} buffer="
+                            f"{len(self._ibd_block_buffer)} requested="
+                            f"{len(self.requested_blocks)}; no disk bytes)"
+                        )
+                    break  # genuinely need the network download
+                _now = time.time()
+                if _now - getattr(self, "_last_disk_drain_log", 0.0) > 30.0:
+                    self._last_disk_drain_log = _now
+                    logger.info(
+                        f"Draining stored-but-unconnected block "
+                        f"{next_hash.hex()[:16]}... from BLOCKS_CF "
+                        f"(disk fallback; buffer miss at height "
+                        f"{current_height + 1 + header_idx})"
+                    )
+                block, raw_payload = None, _disk_bytes
+            else:
+                block, raw_payload = self._buffer_remove(next_hash)
 
             # Lazy-deserialize: `handle_block` defers the ~1 MB Python-side
             # `Block.deserialize` here so it runs in a worker thread and
@@ -2957,6 +3036,25 @@ class BlockSync:
             # rebuilding it for every header.  With 200K+ queued headers
             # this was O(n*m) and burned 97% CPU, starving RPC.
             known_hashes = {h for h, _ in self._validated_headers}
+            # One-line batch anatomy (rate-limited): first header's identity
+            # vs the queue anchor.  Added 2026-07-20 while chasing a batch
+            # consumption point that no existing branch logged.
+            _now = time.time()
+            _log_batch = _now - getattr(self, "_last_batch_anatomy_log", 0.0) > 30.0
+            if _log_batch and headers_msg.headers:
+                self._last_batch_anatomy_log = _now
+                _h0 = headers_msg.headers[0]
+                _h0_hash = self._header_to_block_hash(_h0)
+                _h0_prev = getattr(_h0, "prev_blockhash", None)
+                logger.info(
+                    f"[batch-anatomy] n={len(headers_msg.headers)} "
+                    f"h0={_h0_hash.hex()[:16]} "
+                    f"h0.prev={bytes(_h0_prev).hex()[:16] if _h0_prev is not None else 'None'} "
+                    f"(type {type(_h0_prev).__name__}) "
+                    f"expected_prev={expected_prev.hex()[:16] if expected_prev else 'None'} "
+                    f"(type {type(expected_prev).__name__}) "
+                    f"queue={len(self._validated_headers)}"
+                )
             for header in headers_msg.headers:
                 block_hash = self._header_to_block_hash(header)
 
@@ -3219,6 +3317,34 @@ class BlockSync:
                                 f"G8: could not read DB-tip chainwork "
                                 f"({_e}); using 0 base"
                             )
+                        # G8 LIVENESS GUARD (2026-07-20, GEN-OURO 434499
+                        # wedge, final layer): a 0 base at a NON-ZERO tip is
+                        # not "stricter but safe" — it is a permanent sync
+                        # brick.  With the chainwork index unreadable at the
+                        # tip (index gap / older writer), base=0 makes
+                        # base+window < nMinimumChainWork true for EVERY
+                        # batch, and the rollback below silently un-appends
+                        # each one at DEBUG — the queue never fills, blocks
+                        # are never requested, the node freezes at its tip
+                        # forever.  Core cannot enter this state (nChainWork
+                        # is in-memory and always present at the fork point).
+                        # A tip of 434k+ FULLY-VALIDATED blocks (scripts on)
+                        # already embodies the work the gate is probing for;
+                        # per-header PoW + chain continuity above remain
+                        # enforced.  Skip the gate LOUDLY instead of bricking.
+                        if base_chain_work == 0 and _db_tip_height and _db_tip_height > 0:
+                            _now = time.time()
+                            if _now - getattr(self, "_last_g8_skip_log", 0.0) > 60.0:
+                                self._last_g8_skip_log = _now
+                                logger.warning(
+                                    f"G8 low-work gate SKIPPED: chainwork "
+                                    f"index unreadable at tip "
+                                    f"{_db_tip_height} (base=0) — accepting "
+                                    f"batch on per-header PoW+continuity "
+                                    f"only. Backfill the chainwork index to "
+                                    f"restore the gate."
+                                )
+                            raise _G8SkipGate()
                         headers_work = sum(
                             self._bits_to_work(int(hdr.bits))
                             for _, hdr in self._validated_headers
@@ -3230,15 +3356,22 @@ class BlockSync:
                             # enough cumulative work.
                             del self._validated_headers[-accepted:]
                             self._headers_pow_rejected += accepted
-                            logger.debug(
-                                f"Batch of {accepted} headers from "
-                                f"{peer.host}:{peer.port} not committed: "
-                                f"cumulative work {batch_work:#066x} "
-                                f"(base {base_chain_work:#066x} + headers "
-                                f"{headers_work:#066x}) < nMinimumChainWork "
-                                f"{min_work_int:#066x} "
-                                f"(too-little-chainwork; G8, low-work presync)"
-                            )
+                            # WARNING (rate-limited), not DEBUG: this rollback
+                            # silently un-appending every batch was invisible
+                            # for hours during the 2026-07-20 wedge — a gate
+                            # that stalls sync must be loud.
+                            _now = time.time()
+                            if _now - getattr(self, "_last_g8_reject_log", 0.0) > 60.0:
+                                self._last_g8_reject_log = _now
+                                logger.warning(
+                                    f"G8: batch of {accepted} headers from "
+                                    f"{peer.host}:{peer.port} not committed: "
+                                    f"cumulative work {batch_work:#066x} "
+                                    f"(base {base_chain_work:#066x} + headers "
+                                    f"{headers_work:#066x}) < nMinimumChainWork "
+                                    f"{min_work_int:#066x} "
+                                    f"(too-little-chainwork; G8, low-work presync)"
+                                )
                             # Bitcoin Core NEVER punishes a peer for serving a
                             # low-work header chain.  In
                             # net_processing.cpp::MaybePunishNodeForBlock the
@@ -3272,6 +3405,11 @@ class BlockSync:
             # Successful connecting batch resets the per-peer
             # unconnecting-headers counter (Core's
             # ``nUnconnectingHeaders = 0`` in the success path).
+            if _log_batch:
+                logger.info(
+                    f"[batch-anatomy] outcome: accepted={accepted} "
+                    f"queue_now={len(self._validated_headers)}"
+                )
             if accepted > 0:
                 self._reset_unconnecting_headers(peer)
                 # Track the peer's live best-known height (Core's
