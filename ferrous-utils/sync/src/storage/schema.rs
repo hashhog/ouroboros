@@ -163,9 +163,6 @@ pub mod meta_keys {
     /// Key for pruning state: lowest block height whose data is still available
     pub const PRUNE_HEIGHT: &[u8] = b"prune_height";
 
-    /// Key for whether pruning is enabled
-    pub const PRUNING_ENABLED: &[u8] = b"pruning_enabled";
-
     /// Key for two-phase commit crash recovery.
     ///
     /// Written before apply_block touches UTXO set (Phase 1), deleted after
