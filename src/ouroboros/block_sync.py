@@ -4939,6 +4939,15 @@ class BlockSync:
                 if block_hash in general_set:
                     penalize_peers.add(failed_peer)
         for peer in penalize_peers:
+            # Pinned-peer exemption (Core NoBan parity) — same rationale as
+            # the header-stall path above: a manually-pinned (-connect /
+            # -addnode / whitelisted) peer is never scored for slowness; a
+            # slow loopback block fetch from a busy archival Core is not
+            # misbehaviour, and under --connect it is the ONLY peer.
+            if (getattr(self.peer_manager, "_connect_only", False)
+                    or getattr(peer, "is_manual", False)
+                    or getattr(peer, "noban", False)):
+                continue
             peer.adjust_score(-1)
 
         # Re-requests are block getdata (MSG_WITNESS_BLOCK) too, so the same
