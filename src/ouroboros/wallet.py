@@ -1234,6 +1234,13 @@ class Wallet:
         # debit (send) without needing the already-deleted UTXO. Keyed by
         # (txid_display_hex, vout). Mirrors which coins are "from me".
         self._owned_outpoints: dict[tuple[str, int], dict] = {}
+        # Highest chain height this wallet has scanned (persisted in
+        # wallet.dat as "best_scanned_height").  The wallet's Core-parity
+        # "locator": reconcile_on_load rescans only the gap ABOVE this
+        # height instead of genesis..tip (CWallet::AttachChain rescans from
+        # the stored locator, never the whole chain).  None = legacy wallet
+        # file with no marker.
+        self._best_scanned_height: int | None = None
         # Cache for _descriptor_script_map(): script_pubkey -> address over
         # every imported descriptor entry. Invalidated whenever the
         # descriptor set changes (importdescriptors / wallet load). Mirrors
@@ -1466,6 +1473,8 @@ class Wallet:
             return
         self._encrypted_blob = None
         self.keys = data.get("keys", [])
+        bsh = data.get("best_scanned_height")
+        self._best_scanned_height = int(bsh) if bsh is not None else None
         # Load descriptors
         self.descriptors = [
             DescriptorEntry.from_dict(d)
@@ -1510,6 +1519,8 @@ class Wallet:
         inner: dict = {
             "keys": self.keys,
         }
+        if self._best_scanned_height is not None:
+            inner["best_scanned_height"] = int(self._best_scanned_height)
         if self.descriptors:
             inner["descriptors"] = [d.to_dict() for d in self.descriptors]
         if self._hd_seed is not None:
@@ -2176,6 +2187,23 @@ class Wallet:
         candidates = self._rescan_candidate_scripts()
         owned_keys_changed = False
 
+        # Keyless-wallet fast path: with no candidate scripts AND no owned
+        # outpoints, no block can possibly match — the walk is a provable
+        # no-op.  Without this, reconcile_on_load's rescan_chain(0, None)
+        # deserialized the ENTIRE chain in Python on every boot even for the
+        # empty default wallet (2026-07-19: 434k blocks on genesis-ouroboros,
+        # a GIL-hogging thread that starved the event loop for hours — slow
+        # header batches, >30s block-delivery processing, timeout churn, and
+        # the downstream self-ban).  Core equivalent: a fresh wallet's
+        # birthday/locator short-circuits ScanForWalletTransactions.
+        if not candidates and not self._owned_outpoints:
+            logger.info(
+                "rescan_chain: wallet '%s' has no keys/scripts/outpoints — "
+                "skipping no-op scan of heights %d..%d",
+                getattr(self, "name", "?"), start, stop,
+            )
+            return {"start_height": start, "stop_height": stop}
+
         for height in range(start, stop + 1):
             try:
                 block = self.db.get_block_by_height(height)
@@ -2202,6 +2230,13 @@ class Wallet:
             except Exception:
                 pass
 
+        # Advance the persisted scan locator: this wallet has now seen
+        # everything up to `stop` (Core: WalletBatch::WriteBestBlock after
+        # ScanForWalletTransactions).
+        if self._best_scanned_height is None or stop > self._best_scanned_height:
+            self._best_scanned_height = stop
+            owned_keys_changed = True
+
         if owned_keys_changed:
             try:
                 self._save()
@@ -2224,6 +2259,11 @@ class Wallet:
         AddToWalletIfInvolvingMe.
         """
         owned = self._owned_script_set()
+        # Live tip-follow keeps the scan locator current in memory; it is
+        # persisted on the wallet's existing _save() cadence (rescan end,
+        # key changes, unload).
+        if self._best_scanned_height is None or height > self._best_scanned_height:
+            self._best_scanned_height = height
         block_hash = getattr(block, "hash", None)
         block_hash_hex = (
             bytes(block_hash)[::-1].hex() if block_hash is not None else None
@@ -3383,7 +3423,35 @@ class WalletManager:
                 if getattr(wallet, "is_locked", False):
                     # Encrypted-and-locked: nothing derivable in memory yet.
                     continue
-                wallet.rescan_chain(0, None)
+                # Core-parity locator semantics (CWallet::AttachChain): rescan
+                # only the gap ABOVE the wallet's persisted scan marker — never
+                # the whole chain.  The prior unconditional rescan_chain(0,
+                # None) Python-deserialized EVERY block at EVERY boot
+                # (2026-07-19: 434k blocks on genesis-ouroboros, a GIL-hogging
+                # thread that starved sync for hours and cascaded into the
+                # timeout/self-ban wedge).
+                marker = getattr(wallet, "_best_scanned_height", None)
+                if marker is None:
+                    # Legacy wallet file with no marker: adopt "born now" (a
+                    # fresh Core wallet's birthday is its creation tip; it
+                    # never auto-rescans history).  A restored-from-seed
+                    # wallet with real history needs an explicit
+                    # rescanblockchain — same as Core.
+                    tip = wallet._tip_height()
+                    wallet._best_scanned_height = tip
+                    try:
+                        wallet._save()
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "wallet '%s' has no scan marker — adopting birthday at "
+                        "current tip %s (Core AttachChain parity). If this "
+                        "wallet may have historical activity, run "
+                        "rescanblockchain 0.",
+                        getattr(wallet, "name", "?"), tip,
+                    )
+                    continue
+                wallet.rescan_chain(marker + 1, None)
             except Exception as e:
                 logger.warning(
                     f"wallet '{getattr(wallet, 'name', '?')}' "
