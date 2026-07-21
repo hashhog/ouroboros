@@ -651,6 +651,35 @@ class BlockSync:
         # Counters (tests + ops).
         self._fork_headers_stored: int = 0
         self._fork_reorg_triggered: int = 0
+        # --- CPU-spin fix (receipts/BUG-ouroboros-recheck-forks-spin-2026-07-20) ---
+        # _resolve_active_height memo: hash -> active height (or None for a
+        # definitive miss).  Valid only while the active tip hash is unchanged
+        # (a tip move / reorg can change any answer); self-invalidates by
+        # comparing ``_active_height_cache_tip`` on every call.  Without this,
+        # every fork-edge probe re-scanned the DB and the sync_loop pinned the
+        # event loop (97% CPU, RPC starvation — py-spy-confirmed 2026-07-20).
+        self._active_height_cache: dict[bytes, int | None] = {}
+        self._active_height_cache_tip: bytes | None = None
+        self._active_height_cache_max: int = 8192
+        # _fork_tip_height memo: fork_tip_hash -> height|None.  The answer can
+        # only change when the active tip moves OR the fork store gains/loses
+        # an edge, so the cache is keyed on (tip_hash, store generation) and
+        # cleared wholesale when either changes.
+        self._fork_tip_height_cache: dict[bytes, int | None] = {}
+        self._fork_tip_height_cache_key: tuple = (None, -1)
+        self._fork_store_generation: int = 0
+        # Per-fork-tip re-check backoff: hash -> (first_seen_mono, attempts,
+        # next_retry_mono).  _recheck_forks re-evaluates a tip on an
+        # exponential schedule (2s, 4s, … cap 60s) instead of every 1s tick,
+        # and discards a tip that stays UNANCHORED (bridging header never
+        # arrives) past the attempt cap or TTL — Core drops unconnectable
+        # headers rather than perpetually re-evaluating them.
+        self._fork_recheck_state: dict[bytes, tuple[float, int, float]] = {}
+        self._fork_recheck_backoff_max: float = 60.0
+        # Mirrors _MAX_NUM_UNCONNECTING_HEADERS_MSGS (=10): after this many
+        # failed bridging chases, the fork tip is unresolvable — drop it.
+        self._fork_unanchored_max_attempts: int = _MAX_NUM_UNCONNECTING_HEADERS_MSGS
+        self._fork_unanchored_ttl: float = 600.0  # 10 min unanchored -> drop
         # Reorg route-through handlers, injected by node.py once both
         # block_sync and rpc_server are built (see set_reorg_handler).  Left
         # None in header-only / test contexts; the fork path then stores +
@@ -734,6 +763,9 @@ class BlockSync:
             self._fork_header_prev.pop(k, None)
             self._fork_block_bytes.pop(k, None)
             self._fork_getheaders_sent.pop(k, None)
+            self._fork_recheck_state.pop(k, None)
+        # Edges removed: invalidate cached _fork_tip_height answers.
+        self._fork_store_generation += 1
 
     def set_zmq_publisher(self, publisher) -> None:
         """Attach a ZMQPublisher for real-time block/tx notifications."""
@@ -2536,22 +2568,47 @@ class BlockSync:
             return tip_height
         if tip_height is None:
             return None
+        # Memo (positive AND negative results), valid while the tip hash is
+        # unchanged.  The fork case is by definition the negative case (fork
+        # headers are not on the active chain), so caching misses is what
+        # kills the per-tick re-scan spin.
+        if self._active_height_cache_tip != tip_hash:
+            self._active_height_cache.clear()
+            self._active_height_cache_tip = tip_hash
+        elif block_hash in self._active_height_cache:
+            return self._active_height_cache[block_hash]
+        result: int | None = None
         if hasattr(self.db, "find_height_of_hash"):
             try:
                 h = self.db.find_height_of_hash(block_hash, tip_height)
                 if h is not None:
-                    return h
+                    result = h
             except Exception:
                 pass
-        if hasattr(self.db, "get_block_hash_by_height"):
-            for h in range(tip_height, -1, -1):
+        if result is None and hasattr(self.db, "get_block_hash_by_height"):
+            # Bounded backwards scan: every caller of this helper is on the
+            # fork path (_fork_anchor_known / _fork_tip_height /
+            # _fork_tip_chainwork / _fork_bridge_chain), and the reorg
+            # machinery refuses any fork point deeper than MAX_REORG_DEPTH
+            # below the tip — so an anchor below that window is useless even
+            # if found.  The previous unbounded range(tip_height, -1, -1)
+            # walked ~905k synchronous DB reads per MISS on mainnet, on the
+            # event loop, which was the CPU-spin / RPC-starvation root cause.
+            floor = max(0, tip_height - (MAX_REORG_DEPTH + 1))
+            for h in range(tip_height, floor - 1, -1):
                 try:
                     candidate = self.db.get_block_hash_by_height(h)
                 except Exception:
                     candidate = None
                 if candidate is not None and bytes(candidate) == block_hash:
-                    return h
-        return None
+                    result = h
+                    break
+        # Bound the memo (keys are fork-walk cursor hashes; the fork store is
+        # capped at _fork_headers_max, so this should never trip in practice).
+        if len(self._active_height_cache) >= self._active_height_cache_max:
+            self._active_height_cache.clear()
+        self._active_height_cache[block_hash] = result
+        return result
 
     def _fork_anchor_known(self, prev_hash: bytes) -> bool:
         """True iff ``prev_hash`` is a block we already know — on the active
@@ -2577,6 +2634,8 @@ class BlockSync:
         self._fork_headers[block_hash] = header
         self._fork_header_prev[block_hash] = prev_hash
         self._fork_headers_stored += 1
+        # New edge: cached _fork_tip_height answers may now be stale.
+        self._fork_store_generation += 1
         self._evict_fork_headers_if_full()
 
     def _fork_tip_height(self, fork_tip_hash: bytes) -> int | None:
@@ -2584,7 +2643,23 @@ class BlockSync:
         down to the first ancestor that is on the active chain, then counting
         forward.  Returns ``None`` if the fork does not anchor to a known
         active-chain block within ``MAX_REORG_DEPTH`` hops (defensive).
+
+        Memoized per (active tip, fork-store generation): the answer cannot
+        change unless the active tip moved or the fork store gained/lost an
+        edge, so the per-tick re-check (PART 5) costs one dict lookup per tip
+        instead of a fresh walk (CPU-spin fix, 2026-07-20).
         """
+        try:
+            _cache_tip, _ = self.db.get_best_block()
+        except Exception:
+            _cache_tip = None
+        cache_key = (_cache_tip, self._fork_store_generation)
+        if self._fork_tip_height_cache_key != cache_key:
+            self._fork_tip_height_cache.clear()
+            self._fork_tip_height_cache_key = cache_key
+        elif fork_tip_hash in self._fork_tip_height_cache:
+            return self._fork_tip_height_cache[fork_tip_hash]
+        result: int | None = None
         cursor = fork_tip_hash
         steps = 0
         # +1 over MAX_REORG_DEPTH so a fork exactly at the cap still resolves.
@@ -2594,15 +2669,17 @@ class BlockSync:
             if anchor_h is not None:
                 # cursor is the common-ancestor on the active chain; the fork
                 # tip is `steps` blocks above it.
-                return anchor_h + steps
+                result = anchor_h + steps
+                break
             prev = self._fork_header_prev.get(cursor)
             if prev is None:
                 # Walked off the known fork edges without hitting the active
                 # chain — incomplete fork (a bridging header is missing).
-                return None
+                break
             cursor = prev
             steps += 1
-        return None
+        self._fork_tip_height_cache[fork_tip_hash] = result
+        return result
 
     def _fork_tip_chainwork(self, fork_tip_hash: bytes) -> int | None:
         """Cumulative 256-bit chainwork at ``fork_tip_hash``.
@@ -4009,10 +4086,13 @@ class BlockSync:
             self._fork_headers.pop(cursor, None)
             self._fork_block_bytes.pop(cursor, None)
             self._fork_getheaders_sent.pop(cursor, None)
+            self._fork_recheck_state.pop(cursor, None)
             prev = self._fork_header_prev.pop(cursor, None)
             if prev is None:
                 break
             cursor = prev
+        # Edges removed: invalidate cached _fork_tip_height answers.
+        self._fork_store_generation += 1
 
     def _fork_tip_hashes(self) -> list[bytes]:
         """Return the hashes in the fork store that are NOT the prev of any
@@ -4034,8 +4114,22 @@ class BlockSync:
         that becomes heavier later (e.g. its bridging base arrived after the
         initial batch, or the active chain rolled back) still triggers the
         download/reorg path.  No-op when the fork store is empty.
+
+        CPU-spin fix (receipts/BUG-ouroboros-recheck-forks-spin-2026-07-20):
+        each tip is re-checked on an EXPONENTIAL backoff (2s, 4s, … cap 60s)
+        instead of every 1s tick, the loop yields to the event loop between
+        tips, and a tip that stays UNANCHORED (its bridging header never
+        arrives despite our getheaders chases) is discarded after
+        ``_fork_unanchored_max_attempts`` failures or ``_fork_unanchored_ttl``
+        seconds — Core drops unconnectable headers rather than perpetually
+        re-evaluating them.  Responsiveness is preserved: a header batch that
+        extends a stored fork still triggers ``_maybe_trigger_fork_download``
+        immediately from ``handle_headers`` (the GAP1 trigger), which this
+        backoff does not gate.
         """
         if not self._fork_headers:
+            if self._fork_recheck_state:
+                self._fork_recheck_state.clear()
             return
         peer = self._header_sync_peer
         if peer is None or not peer.is_connected():
@@ -4051,11 +4145,49 @@ class BlockSync:
             peer = ready[0] if ready else None
         if peer is None:
             return
+        now = time.monotonic()
         for tip_hash in self._fork_tip_hashes():
+            state = self._fork_recheck_state.get(tip_hash)
+            if state is not None and now < state[2]:
+                continue  # backing off — not due for re-evaluation yet
+            triggered = False
             try:
-                await self._maybe_trigger_fork_download(tip_hash, peer)
+                triggered = await self._maybe_trigger_fork_download(tip_hash, peer)
             except Exception as e:
                 logger.debug(f"_recheck_forks: {tip_hash.hex()[:16]}...: {e}")
+            # Yield between tips so a long re-check pass can never monopolise
+            # the event loop (RPC + peer I/O run in the gaps).
+            await asyncio.sleep(0)
+            if triggered:
+                # Fork went heavier → download/reorg path took over; the
+                # adopt/reject paths call _discard_fork which clears state.
+                self._fork_recheck_state.pop(tip_hash, None)
+                continue
+            first_seen, attempts, _ = state if state is not None else (now, 0, now)
+            attempts += 1
+            delay = min(
+                self._fork_recheck_backoff_max, float(2 ** min(attempts, 6))
+            )
+            self._fork_recheck_state[tip_hash] = (first_seen, attempts, now + delay)
+            # Unanchored (bridging header still missing) is the
+            # never-resolving case: _fork_tip_height is memoized, so this
+            # probe is a dict lookup.  Cap the chase.
+            if self._fork_tip_height(tip_hash) is None and (
+                attempts >= self._fork_unanchored_max_attempts
+                or (now - first_seen) >= self._fork_unanchored_ttl
+            ):
+                logger.info(
+                    "Discarding unanchored fork tip %s... after %d attempts / "
+                    "%.0fs (bridging header never arrived)",
+                    tip_hash.hex()[:16], attempts, now - first_seen,
+                )
+                self._discard_fork(tip_hash)
+        # Prune backoff state for tips no longer in the fork store (evicted /
+        # adopted / no longer a tip) so the map cannot grow unbounded.
+        if self._fork_recheck_state:
+            for k in list(self._fork_recheck_state):
+                if k not in self._fork_headers:
+                    del self._fork_recheck_state[k]
 
     async def _request_next_blocks(self):
         """Request blocks from the validated header queue up to the in-flight limit.
