@@ -296,6 +296,25 @@ _MAINNET_ASSUMEUTXO: list[AssumeutxoData] = [
         # snapshot load at this height (which would otherwise start from 0).
         chainwork_hex="00000000000000000000000000000000000000011de68a167d5dad115a96be80",
     ),
+    # Track-B WINDOWED replay boundary: h=481823 = last pre-segwit block
+    # (segwit activates at 481824). NOT from Core chainparams. hash_serialized
+    # + chain_tx_count from the boundary-snapshot result JSON (Core dumptxoutset
+    # rollback=481823). base_header verified to hash to block_hash. chainwork_hex
+    # is the cumulative work at h=481823 (getblockheader).
+    AssumeutxoData(
+        height=481_823,
+        block_hash=_hex_to_hash_le(
+            "000000000000000000cbeff0b533f8e1189cf09dfbebf57a8ebe349362811b80"
+        ),
+        hash_serialized=_hex_to_hash_le(
+            "25429c30cfa0b6051106c29d15b188d746d8e7ecd184bf34fae1cebe2ea447f4"
+        ),
+        chain_tx_count=249036369,
+        base_header=bytes.fromhex(
+            "02000020ca03823ead70b2a2449e591c1c3bebd8eb0bbab788ec3b000000000000000000c923486e8a03e68504dd59c81a3b942a431eb0c6298592b0000986409f6722ff73319e59e0300118194e0e38"
+        ),
+        chainwork_hex="0000000000000000000000000000000000000000007eb5d786594edfb7192580",
+    ),
 ]
 
 _TESTNET_ASSUMEUTXO: list[AssumeutxoData] = [
