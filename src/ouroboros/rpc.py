@@ -13855,7 +13855,16 @@ class RPCServer:
                     skip_scripts=False,
                 )
                 # accept_block already handles mempool eviction; derive hash.
-                block_hash_hex = bytes(stored_hash).hex()
+                # connect_block_from_bytes returns the hash in INTERNAL
+                # (little-endian) byte order; every other block-hash RPC
+                # (getblockhash, getbestblockhash, submitblock) reports the
+                # REVERSED big-endian display form. Reverse here so
+                # generatetoaddress agrees — previously it returned the raw
+                # internal order, so getblock(<that hash>) / a Core oracle
+                # keyed on the returned hash raised "Block not found". Matches
+                # the AttributeError fallback below (block_hash[::-1]).
+                # Reference: Bitcoin Core uint256::GetHex / RPC hash display order.
+                block_hash_hex = bytes(stored_hash)[::-1].hex()
             except AttributeError:
                 # Fallback: Rust extension not yet rebuilt.
                 block_hash_hex = block_hash[::-1].hex()
@@ -15119,8 +15128,15 @@ class RPCServer:
         if psbt_obj.tx is None:
             raise ValueError("PSBT has no transaction")
 
-        # Get wallet if available
-        wallet = getattr(self.node, 'wallet', None)
+        # Get the wallet for THIS RPC request (multi-wallet aware). Using the
+        # legacy ``self.node.wallet`` handle signed against the wrong wallet
+        # whenever the active RPC wallet was not the node's default — e.g. after
+        # unloadwallet(default)+createwallet(w), walletprocesspsbt saw none of
+        # w's keys and returned complete=False (nothing signed). Mirror every
+        # other wallet RPC (getnewaddress, signrawtransactionwithwallet) which
+        # route through _get_wallet_for_rpc. Reference: Bitcoin Core
+        # GetWalletForJSONRPCRequest.
+        wallet = self._get_wallet_for_rpc()
         if wallet is None:
             return {"psbt": psbt_obj.to_base64(), "complete": False}
 
@@ -15620,8 +15636,9 @@ class RPCServer:
             return _hashlib.sha256(data).digest()
 
         network = getattr(self.node, "network", "mainnet")
+        from ouroboros.address import _network_hrp
         p2sh_version = b"\x05" if network == "mainnet" else b"\xc4"
-        hrp = "bc" if network == "mainnet" else "tb"
+        hrp = _network_hrp(network)
 
         if address_type == "legacy":
             # P2SH: HASH160(redeemScript)
