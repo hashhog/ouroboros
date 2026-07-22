@@ -80,6 +80,7 @@ _BIP32_MAX_DEPTH = 0xFF
 from ouroboros.wallet import (  # noqa: E402  (intentional late import)
     BIP32IndexExhaustedError,
     BIP32MaxDepthError,
+    HDKey,
 )
 
 # BIP 32 version bytes
@@ -359,6 +360,10 @@ class KeyExpression:
     # Exactly one of: hex pubkey *or* extended key
     hex_pubkey: bytes | None = None          # 33-byte compressed
     ext_key: ExtendedPubKey | None = None
+    # Private-capable extended key (xprv/tprv). Present whenever the key
+    # expression carried a private extended key, so HARDENED path steps
+    # (e.g. /44h/) can be derived — public-only ExtendedPubKey cannot.
+    ext_privkey: "HDKey | None" = None
     ext_key_str: str = ""                       # original xpub/tpub/xprv/tprv
     derivation_suffix: str = ""                 # e.g. "/0/*"
     is_range: bool = False                      # True when suffix contains *
@@ -369,6 +374,15 @@ class KeyExpression:
         """Return the 33-byte compressed public key at *index*."""
         if self.hex_pubkey is not None:
             return self.hex_pubkey
+        # Private extended key: derive through the HDKey so HARDENED steps
+        # (/44h/, /86h/, …) work — the public-only ExtendedPubKey path below
+        # raises on hardened children (Core key.cpp CExtKey::Derive parity).
+        if self.ext_privkey is not None:
+            suffix = self.derivation_suffix
+            if suffix:
+                path = suffix.replace("*", str(index))
+                return self.ext_privkey.derive_path("m/" + path).public_key
+            return self.ext_privkey.public_key
         if self.ext_key is None:
             raise ValueError("No key material in expression")
         # Apply derivation suffix, substituting * → index
@@ -446,6 +460,10 @@ def _parse_key_expression(raw: str) -> KeyExpression:
         expr.ext_key_str = ext_str
         expr.ext_key = ExtendedPubKey.deserialize(ext_str)
         expr.is_private = ext_str.startswith(("xprv", "tprv"))
+        if expr.is_private:
+            # Keep the private extended key so hardened path steps derive.
+            network = "mainnet" if ext_str.startswith("xprv") else "testnet"
+            expr.ext_privkey = HDKey.from_xprv(ext_str, network=network)
     else:
         # Raw hex public key: compressed (02/03 + 32 bytes = 66 hex chars) or
         # x-only (32 bytes = 64 hex chars, used by rawtr()).
@@ -547,8 +565,8 @@ class Descriptor:
             # BIP-386: rawtr(X-ONLY) — OP_1 <32-byte> with NO tweak.
             # derive_pubkey() returns the raw 32-byte x-only key directly.
             xonly = self.keys[0].derive_pubkey(index)
-            hrp = "bc" if network == "mainnet" else "tb"
-            from ouroboros.address import _bech32m_encode
+            from ouroboros.address import _bech32m_encode, _network_hrp
+            hrp = _network_hrp(network)
             return _bech32m_encode(hrp, 1, xonly)
 
         if dtype == "sh-wpkh":
@@ -593,8 +611,8 @@ class Descriptor:
         if dtype == "tr-script":
             pub = self.keys[0].derive_pubkey(index)
             tweaked = self._taproot_tweak_with_tree(pub, index)
-            hrp = "bc" if network == "mainnet" else "tb"
-            from ouroboros.address import _bech32m_encode
+            from ouroboros.address import _bech32m_encode, _network_hrp
+            hrp = _network_hrp(network)
             return _bech32m_encode(hrp, 1, tweaked)
 
         if dtype == "addr":
@@ -862,8 +880,9 @@ class Descriptor:
 
 
 def _pubkey_to_p2wpkh(pub: bytes, network: str) -> str:
+    from ouroboros.address import _network_hrp
     h160 = _hash160(pub)
-    hrp = "bc" if network == "mainnet" else "tb"
+    hrp = _network_hrp(network)
     bits5 = bech32.convertbits(h160, 8, 5)
     return bech32.bech32_encode(hrp, [0] + bits5)
 
@@ -897,9 +916,9 @@ def _taproot_tweak_pubkey(pub: bytes) -> bytes:
 
 
 def _pubkey_to_p2tr(pub: bytes, network: str) -> str:
-    from ouroboros.address import _bech32m_encode
+    from ouroboros.address import _bech32m_encode, _network_hrp
     tweaked_x = _taproot_tweak_pubkey(pub)
-    hrp = "bc" if network == "mainnet" else "tb"
+    hrp = _network_hrp(network)
     return _bech32m_encode(hrp, 1, tweaked_x)
 
 
@@ -995,8 +1014,9 @@ def _script_to_p2sh(script: bytes, network: str) -> str:
 
 
 def _script_to_p2wsh(script: bytes, network: str) -> str:
+    from ouroboros.address import _network_hrp
     witness_program = _sha256(script)
-    hrp = "bc" if network == "mainnet" else "tb"
+    hrp = _network_hrp(network)
     bits5 = bech32.convertbits(witness_program, 8, 5)
     return bech32.bech32_encode(hrp, [0] + bits5)
 
