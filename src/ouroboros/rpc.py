@@ -17327,6 +17327,15 @@ class RPCServer:
                 h160 = _hash160(key.pubkey)
                 p2pkh_spk = b"\x76\xa9\x14" + h160 + b"\x88\xac"
                 spk_to_key[p2pkh_spk] = key
+                # P2TR scriptPubKey (BIP-341/BIP-86). The 32-byte program
+                # is the TWEAKED output key (internal x-only + TapTweak),
+                # NOT the internal x-only key — index that so a key-path
+                # spend of an owned taproot output finds its key. Mirrors
+                # the PSBT signer's ``derive_taproot_output_xonly`` indexing.
+                try:
+                    spk_to_key[key.get_p2tr_script_pubkey()] = key
+                except Exception:
+                    pass
             except Exception:
                 continue
 
@@ -17337,6 +17346,109 @@ class RPCServer:
                 txid = prev.get("txid", "")
                 vout = prev.get("vout", 0)
                 prevtxs_map[(txid, vout)] = prev
+
+        # Pre-gather EVERY input's prevout scriptPubKey + amount.
+        #
+        # BIP-341 TapSighash commits to all prevouts (hashAmounts +
+        # hashScriptPubKeys over all inputs), so the taproot key-path
+        # signing branch below cannot resolve its sighash one input at a
+        # time — it needs the full prevout set before the per-input loop
+        # starts. This mirrors the PSBT signer's ``all_amounts``/
+        # ``all_spks`` pre-pass. Resolution order matches the in-loop
+        # lookup: explicit ``prevtxs`` first, then the wallet UTXO DB.
+        all_spks: list[bytes] = []
+        all_amounts: list[int] = []
+        for tx_in_g in tx.inputs:
+            g_txid_hex = tx_in_g.prev_txid[::-1].hex()
+            g_vout = tx_in_g.prev_vout
+            g_spk = b""
+            g_val = 0
+            if (g_txid_hex, g_vout) in prevtxs_map:
+                prev = prevtxs_map[(g_txid_hex, g_vout)]
+                spk_hex = prev.get("scriptPubKey", "")
+                if spk_hex:
+                    g_spk = bytes.fromhex(spk_hex)
+                g_val = int(prev.get("amount", 0) * 100_000_000)
+            elif wallet.db:
+                utxo = await asyncio.to_thread(
+                    wallet.db.get_utxo, tx_in_g.prev_txid, g_vout
+                )
+                if utxo:
+                    g_spk = utxo.get('script_pubkey') or b""
+                    g_val = utxo.get('value') or 0
+            all_spks.append(g_spk)
+            all_amounts.append(g_val)
+
+        # BIP-341 TapSighash helper — byte-for-byte the same construction
+        # as the proven PSBT signer (walletprocesspsbt) in this file.
+        import hashlib
+        import struct
+
+        def _tr_encode_varint(n: int) -> bytes:
+            if n < 0xFD:
+                return bytes([n])
+            elif n <= 0xFFFF:
+                return b'\xfd' + struct.pack('<H', n)
+            elif n <= 0xFFFFFFFF:
+                return b'\xfe' + struct.pack('<I', n)
+            else:
+                return b'\xff' + struct.pack('<Q', n)
+
+        def _taproot_sighash(tx, idx, sh_type, amounts, spks):
+            acp = (sh_type & 0x80) != 0
+            base = sh_type & 0x03
+            data = bytearray()
+            data.append(0x00)  # epoch
+            data.append(sh_type if sh_type != 0 else 0x00)
+            data.extend(struct.pack("<i", tx.version))
+            data.extend(struct.pack("<I", tx.locktime))
+            if not acp:
+                prevouts = bytearray()
+                for inp in tx.inputs:
+                    prevouts.extend(inp.prev_txid)
+                    prevouts.extend(struct.pack("<I", inp.prev_vout))
+                data.extend(hashlib.sha256(bytes(prevouts)).digest())
+                amt_data = bytearray()
+                for a in amounts:
+                    amt_data.extend(struct.pack("<q", a))
+                data.extend(hashlib.sha256(bytes(amt_data)).digest())
+                spk_data = bytearray()
+                for s in spks:
+                    spk_data.extend(_tr_encode_varint(len(s)))
+                    spk_data.extend(s)
+                data.extend(hashlib.sha256(bytes(spk_data)).digest())
+                seqs = bytearray()
+                for inp in tx.inputs:
+                    seqs.extend(struct.pack("<I", inp.sequence))
+                data.extend(hashlib.sha256(bytes(seqs)).digest())
+            if base not in (2, 3):
+                outs = bytearray()
+                for o in tx.outputs:
+                    outs.extend(struct.pack("<q", o.value))
+                    outs.extend(_tr_encode_varint(len(o.script_pubkey)))
+                    outs.extend(o.script_pubkey)
+                data.extend(hashlib.sha256(bytes(outs)).digest())
+            elif base == 3 and idx < len(tx.outputs):
+                o = tx.outputs[idx]
+                out = struct.pack("<q", o.value)
+                out += _tr_encode_varint(len(o.script_pubkey))
+                out += o.script_pubkey
+                data.extend(hashlib.sha256(out).digest())
+            else:
+                data.extend(b"\x00" * 32)
+            data.append(0x00)  # spend_type: no annex
+            if acp:
+                inp = tx.inputs[idx]
+                data.extend(inp.prev_txid)
+                data.extend(struct.pack("<I", inp.prev_vout))
+                data.extend(struct.pack("<q", amounts[idx]))
+                data.extend(_tr_encode_varint(len(spks[idx])))
+                data.extend(spks[idx])
+                data.extend(struct.pack("<I", inp.sequence))
+            else:
+                data.extend(struct.pack("<I", idx))
+            tag = hashlib.sha256(b"TapSighash").digest()
+            return hashlib.sha256(tag + tag + bytes(data)).digest()
 
         # Track signing status
         errors = []
@@ -17465,6 +17577,37 @@ class RPCServer:
                     # Build scriptSig: <sig> <pubkey>
                     script_sig = bytes([len(sig)]) + sig + bytes([len(key.pubkey)]) + key.pubkey
                     tx.inputs[i].script_sig = script_sig
+                    signed_count += 1
+
+                elif script_type == "witness_v1_taproot":
+                    # BIP-341 key-path spend (BIP-86 tweaked output key).
+                    # Reuses the EXACT crypto proven in the PSBT signer
+                    # (walletprocesspsbt native_p2tr=PASS, Core-accepted):
+                    # all-prevout TapSighash + BIP-86 output-key tweak +
+                    # BIP-340 schnorr. No new crypto is introduced here.
+                    from ouroboros.taproot import derive_taproot_sign_secret
+                    from coincurve import PrivateKey as _CPrivKey
+
+                    # SIGHASH_DEFAULT (0x00) is the canonical taproot
+                    # key-path hash type and yields the 64-byte witness.
+                    # Core's signrawtransactionwithwallet default
+                    # ("DEFAULT") maps to SIGHASH_DEFAULT on taproot inputs
+                    # and to SIGHASH_ALL elsewhere; this wallet's RPC
+                    # default is the string "ALL" (0x01), so treat the
+                    # default 0x01 as 0x00 for the taproot leg. Explicit
+                    # NONE/SINGLE/ANYONECANPAY flags pass through.
+                    tr_sh = 0x00 if sighash == 0x01 else sighash
+                    sh = _taproot_sighash(tx, i, tr_sh, all_amounts, all_spks)
+                    tweaked_secret = derive_taproot_sign_secret(
+                        key.secret, None
+                    )
+                    raw_sig = _CPrivKey(tweaked_secret).sign_schnorr(sh)
+                    # BIP-341: a SIGHASH_DEFAULT sig is 64 bytes with no
+                    # trailing hash-type byte; any other type appends it.
+                    if tr_sh != 0x00:
+                        raw_sig += bytes([tr_sh])
+                    tx.inputs[i].witness = [raw_sig]
+                    tx.has_witness = True
                     signed_count += 1
 
                 else:
