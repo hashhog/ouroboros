@@ -284,22 +284,20 @@ class BitcoinNode:
             self.wallet_manager.set_database(self.db)
             self.wallet_manager.set_mempool(self.mempool)
 
-            # Load wallets configured for startup, or create default wallet
+            # Load only the wallets configured for startup. Do NOT auto-create
+            # a "default" wallet: Bitcoin Core loads no wallet on a fresh datadir
+            # (createwallet/loadwallet is required), and multi-wallet RPC
+            # dispatch resolves the base URL "/" to THE single loaded wallet only
+            # when exactly one is loaded. Pre-loading a "default" meant that after
+            # a client createwallet('w') there were TWO loaded wallets, so every
+            # base-URL wallet RPC failed with "Wallet file not specified" — a
+            # divergence from Core that stranded a freshly-created wallet.
+            # Reference: Bitcoin Core wallet startup (no implicit wallet) +
+            # GetWalletForJSONRPCRequest single-wallet base-path resolution.
             self.wallet_manager.load_startup_wallets()
-            if not self.wallet_manager.list_loaded_wallets():
-                # Create a default wallet if none configured
-                try:
-                    self.wallet_manager.create_wallet("default")
-                    logger.info("Created default wallet")
-                except ValueError:
-                    # Wallet already exists; try to load it
-                    try:
-                        self.wallet_manager.load_wallet("default")
-                        logger.info("Loaded default wallet")
-                    except Exception as e:
-                        logger.warning(f"Could not load default wallet: {e}")
 
-            # Set legacy wallet reference for backwards compatibility
+            # Set legacy wallet reference for backwards compatibility (None when
+            # no wallet is loaded, exactly like Core's optional wallet).
             self.wallet = self.wallet_manager.get_default_wallet()
 
             # Rebuild each loaded wallet's in-memory tx history from the chain

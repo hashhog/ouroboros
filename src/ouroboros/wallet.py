@@ -1030,8 +1030,9 @@ class WalletKey:
 
     def get_p2wpkh_address(self) -> str:
         """Native SegWit bech32 P2WPKH address."""
+        from ouroboros.address import _network_hrp
         h160 = _hash160(self.pubkey)
-        hrp = "bc" if self.network == "mainnet" else "tb"
+        hrp = _network_hrp(self.network)
         converted = bech32.convertbits(h160, 8, 5)
         return bech32.bech32_encode(hrp, [0] + converted)
 
@@ -1104,7 +1105,8 @@ class WalletKey:
                 f"{len(tweaked_x)}"
             )
 
-        hrp = "bc" if self.network == "mainnet" else "tb"
+        from ouroboros.address import _network_hrp
+        hrp = _network_hrp(self.network)
         return _bech32m_encode(hrp, 1, tweaked_x)
 
     def get_script_pubkey(self) -> bytes:
@@ -1867,11 +1869,15 @@ class Wallet:
         counted: set[str] = set()
         for kd in self.keys:
             k = self._get_wallet_key(kd)
-            addr = k.get_p2wpkh_address()
-            counted.add(addr)
-            for u in self.db.list_unspent_by_address(addr, self.network):
-                if self._is_spendable_utxo(u, tip):
-                    total += u["value"]
+            # Count EVERY script type the key owns (p2wpkh, p2pkh, p2sh-p2wpkh,
+            # p2tr), matching listunspent + Core GetBalance. Scanning only the
+            # p2wpkh address stranded taproot/legacy/nested coinbase credits at
+            # a reported balance of 0.
+            for addr in self._key_script_addresses(k):
+                counted.add(addr)
+                for u in self.db.list_unspent_by_address(addr, self.network):
+                    if self._is_spendable_utxo(u, tip):
+                        total += u["value"]
         # Imported descriptors (watch-only included) count toward the wallet
         # balance: Core's GetBalance walks every ISMINE script
         # (DescriptorScriptPubKeyMan::IsMine is privkey-free script-set
@@ -3070,6 +3076,36 @@ class Wallet:
 
     # --- UTXO helpers ----------------------------------------------------------
 
+    @staticmethod
+    def _key_script_addresses(k) -> list[str]:
+        """Every standard address type key *k* controls (p2wpkh, p2pkh,
+        p2sh-p2wpkh, p2tr), de-duplicated.
+
+        Mirrors the enumeration ``rpc_listunspent`` already uses so that
+        BALANCE and COIN SELECTION see every script type the key owns — not
+        just P2WPKH. Previously ``get_balance`` / ``_collect_utxos`` scanned
+        ONLY ``get_p2wpkh_address()``, so coins received on a taproot (or
+        legacy / nested-segwit) address were invisible to the balance and
+        UNSPENDABLE by coin selection even though ``listunspent`` showed them
+        — funds effectively stranded. Reference: Bitcoin Core
+        wallet/spend.cpp AvailableCoins() / wallet.cpp GetBalance() walk every
+        ISMINE script, not one canonical type.
+        """
+        addrs: list[str] = []
+        for fn in (
+            k.get_p2wpkh_address,
+            k.get_p2pkh_address,
+            k.get_p2sh_p2wpkh_address,
+            k.get_p2tr_address,
+        ):
+            try:
+                a = fn()
+            except Exception:
+                continue
+            if a and a not in addrs:
+                addrs.append(a)
+        return addrs
+
     def _collect_utxos(self) -> list[dict]:
         if self.db is None:
             return []
@@ -3077,22 +3113,22 @@ class Wallet:
         utxos: list[dict] = []
         for kd in self.keys:
             k = self._get_wallet_key(kd)
-            addr = k.get_p2wpkh_address()
-            for u in self.db.list_unspent_by_address(addr, self.network):
-                # Skip immature coinbase: selecting one would build a tx the
-                # node rejects as bad-txns-premature-spend-of-coinbase.
-                # Reference: Bitcoin Core wallet/spend.cpp AvailableCoins()
-                # only offers coins with GetBlocksToMaturity() == 0.
-                if not self._is_spendable_utxo(u, tip):
-                    continue
-                # Honor lockunspent — skip coins the user has explicitly locked.
-                # Reference: Bitcoin Core wallet/spend.cpp AvailableCoins().
-                txid_field = u.get("txid", "")
-                txid_str = txid_field if isinstance(txid_field, str) else txid_field.hex()
-                if self.is_locked_coin(txid_str, int(u.get("vout", 0))):
-                    continue
-                u["_key"] = k
-                utxos.append(u)
+            for addr in self._key_script_addresses(k):
+                for u in self.db.list_unspent_by_address(addr, self.network):
+                    # Skip immature coinbase: selecting one would build a tx the
+                    # node rejects as bad-txns-premature-spend-of-coinbase.
+                    # Reference: Bitcoin Core wallet/spend.cpp AvailableCoins()
+                    # only offers coins with GetBlocksToMaturity() == 0.
+                    if not self._is_spendable_utxo(u, tip):
+                        continue
+                    # Honor lockunspent — skip coins the user explicitly locked.
+                    # Reference: Bitcoin Core wallet/spend.cpp AvailableCoins().
+                    txid_field = u.get("txid", "")
+                    txid_str = txid_field if isinstance(txid_field, str) else txid_field.hex()
+                    if self.is_locked_coin(txid_str, int(u.get("vout", 0))):
+                        continue
+                    u["_key"] = k
+                    utxos.append(u)
         return utxos
 
     # --- lockunspent / listlockunspent -----------------------------------------
