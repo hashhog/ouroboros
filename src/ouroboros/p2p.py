@@ -77,7 +77,18 @@ FEE_FILTER_SPACING = 1.1
 # Maximum fee rate for filter
 MAX_FILTER_FEERATE = 1e7
 # Minimum relay fee rate (sat/kvB)
-MIN_RELAY_FEE_RATE = 1000
+# Floor for the BIP-133 feefilter we advertise, in sat/kvB. MUST match what the
+# mempool actually enforces: mempool.DEFAULT_MIN_RELAY_TX_FEE = 100
+# (Core policy/policy.h:70, lowered from the historical 1000). Core builds the
+# advertisement the same way we do — max(rounded mempool min fee,
+# min_relay_feerate) — from the SAME symbol the mempool reads
+# (net_processing.cpp:5550/5565-5567).
+#
+# This was 1000, i.e. 10x the value our own mempool applies, so under BIP-133
+# peers withheld transactions we would happily have accepted. Kept as a literal
+# rather than importing mempool.py to avoid a p2p<->mempool import cycle; keep
+# the two in step.
+MIN_RELAY_FEE_RATE = 100
 
 
 # BIP 324 v2 fall-back TTL.  An address that fails the v2 ElligatorSwift
