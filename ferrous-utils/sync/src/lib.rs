@@ -155,14 +155,31 @@ use crate::validate::difficulty::{self, BlockIndexInfo};
 use crate::chain_params::get_consensus_params;
 use crate::versionbits::{VersionBitsCache, DeploymentPos, BlockIndexProvider};
 
-/// Get script verification flags for a given block height and network.
+/// Get the consensus script verification flags for a block.
 ///
-/// This mirrors Bitcoin Core's GetBlockScriptFlags() and determines which
-/// consensus rules are active at a given height.
+/// Faithful port of Bitcoin Core's `GetBlockScriptFlags()`
+/// (validation.cpp:2249-2289): unconditional `P2SH|WITNESS|TAPROOT` base, then
+/// the `script_flag_exceptions` block-hash table REPLACES that set, then the
+/// four height-gated flags (DERSIG/CLTV/CSV/NULLDUMMY) are OR'd on top.
+///
+/// `block_hash` is the 32-byte hash in INTERNAL (little-endian) byte order —
+/// the same orientation `Block.hash` uses on the Python side.  Omitting it
+/// skips the exception lookup and is only safe for callers that provably
+/// cannot be looking at one of the three exception blocks.
+///
+/// The previous `get_script_flags_for_height(height, network)` export was
+/// removed: being hash-less by signature it could not consult
+/// `script_flag_exceptions` at all, and it additionally leaked the policy
+/// flags NULLFAIL and WITNESS_PUBKEYTYPE into a consensus flag set.
 ///
 /// Networks: "mainnet"/"bitcoin", "testnet"/"testnet3", "testnet4", "regtest", "signet"
 #[pyfunction]
-fn get_script_flags_for_height(height: u32, network: String) -> PyResult<u32> {
+#[pyo3(signature = (height, network, block_hash=None))]
+fn get_block_script_flags(
+    height: u32,
+    network: String,
+    block_hash: Option<Vec<u8>>,
+) -> PyResult<u32> {
     let network_enum = match network.to_lowercase().as_str() {
         "mainnet" | "bitcoin" => Network::Bitcoin,
         "testnet" | "testnet3" => Network::Testnet,
@@ -175,7 +192,21 @@ fn get_script_flags_for_height(height: u32, network: String) -> PyResult<u32> {
             ));
         }
     };
-    Ok(activation_heights::get_script_flags_for_height(height, network_enum).bits())
+
+    let hash_array: Option<[u8; 32]> = match block_hash {
+        None => None,
+        Some(bytes) => Some(bytes.as_slice().try_into().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "block_hash must be exactly 32 bytes, got {}",
+                bytes.len()
+            ))
+        })?),
+    };
+
+    Ok(
+        activation_heights::get_block_script_flags(height, hash_array.as_ref(), network_enum)
+            .bits(),
+    )
 }
 
 /// Get SegWit activation height for a network.
@@ -2355,7 +2386,7 @@ fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(crypto_verify_schnorr, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(crypto_batch_verify_schnorr, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(crypto_verify_ecdsa_compact, m)?)?;
-    m.add_function(pyo3::wrap_pyfunction!(get_script_flags_for_height, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(get_block_script_flags, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(segwit_activation_height, m)?)?;
     // BIP68 sequence lock functions
     m.add_function(pyo3::wrap_pyfunction!(bip68_activation_height, m)?)?;

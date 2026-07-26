@@ -219,7 +219,8 @@ impl BlockValidator {
         // Legacy/P2SH sigops cost 4 weight units each (WITNESS_SCALE_FACTOR).
         // Witness sigops cost 1 weight unit each (discounted).
         // Total block sigop cost must not exceed MAX_BLOCK_SIGOPS_COST (80,000).
-        let (verify_p2sh, verify_witness) = self.get_sigop_flags(height);
+        let (verify_p2sh, verify_witness) =
+            self.get_sigop_flags(height, inner.block_hash().as_byte_array());
         let total_sigop_cost = super::sigop::get_block_sigop_cost(
             &inner.txdata,
             &self.db,
@@ -444,7 +445,8 @@ impl BlockValidator {
         //    W85 fix: use prefetched script_pubkeys instead of re-fetching
         //    every input's UTXO from RocksDB inside `get_p2sh_sigop_count`
         //    + the witness loop.
-        let (verify_p2sh, verify_witness) = self.get_sigop_flags(height);
+        let (verify_p2sh, verify_witness) =
+            self.get_sigop_flags(height, inner.block_hash().as_byte_array());
         let total_sigop_cost = super::sigop::get_block_sigop_cost_with_prefetched_scripts(
             &inner.txdata,
             &prefetched_input_scripts,
@@ -458,24 +460,36 @@ impl BlockValidator {
         Ok(())
     }
 
-    /// Get sigop verification flags based on block height and network.
+    /// Get sigop verification flags for a block.
     ///
-    /// Returns (verify_p2sh, verify_witness) based on activation heights.
-    fn get_sigop_flags(&self, height: u32) -> (bool, bool) {
-        use super::script::activation_heights;
+    /// Returns `(verify_p2sh, verify_witness)` derived from the FINAL,
+    /// exception-aware script flags — not from raw height booleans.
+    ///
+    /// Core counts sigops with `GetTransactionSigOpCost(tx, inputs, flags)`
+    /// (consensus/tx_verify.cpp:143-162) where `flags` is exactly the value
+    /// `GetBlockScriptFlags()` returned for this block:
+    ///   * P2SH sigops are added only `if (flags & SCRIPT_VERIFY_P2SH)` (:150-152)
+    ///   * `CountWitnessSigOps` returns 0 when `SCRIPT_VERIFY_WITNESS` is clear
+    ///     (script/interpreter.cpp:2141-2143)
+    ///
+    /// So the two `script_flag_exceptions` blocks whose replacement value
+    /// clears P2SH (mainnet 170060 and the testnet3 BIP16 violator, both
+    /// SCRIPT_VERIFY_NONE) must ALSO skip P2SH and witness sigop counting.
+    /// Using `height >= p2sh_height` masked that on testnet3, where the old
+    /// gate was `height >= 0` — always true — while Core counted nothing.
+    ///
+    /// This is called on EVERY connect (assumevalid IBD, reorg replay, import),
+    /// so it must stay outside any "skip scripts" guard.
+    fn get_sigop_flags(&self, height: u32, block_hash: &[u8; 32]) -> (bool, bool) {
+        use super::script::{activation_heights, ScriptVerifyFlags};
 
-        // P2SH activation height
-        let p2sh_height = match self.network {
-            Network::Bitcoin => 173805,
-            _ => 0, // active from genesis on testnets
-        };
-        let verify_p2sh = height >= p2sh_height;
+        let flags =
+            activation_heights::get_block_script_flags(height, Some(block_hash), self.network);
 
-        // SegWit activation height
-        let segwit_height = activation_heights::segwit_height(self.network);
-        let verify_witness = height >= segwit_height;
-
-        (verify_p2sh, verify_witness)
+        (
+            flags.contains(ScriptVerifyFlags::P2SH),
+            flags.contains(ScriptVerifyFlags::WITNESS),
+        )
     }
 
     /// Validate block header
@@ -1091,6 +1105,67 @@ mod tests {
         let db_path = temp_dir.path().to_str().unwrap();
         let db = Arc::new(BlockchainDB::open(db_path).unwrap());
         (temp_dir, db)
+    }
+
+    /// Display (big-endian) hex -> internal (little-endian) 32-byte hash.
+    fn internal_hash(display_hex: &str) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        for i in 0..32 {
+            bytes[i] = u8::from_str_radix(&display_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        bytes.reverse();
+        bytes
+    }
+
+    /// Sigop counting must be gated on the FINAL exception-aware flags, not on
+    /// raw height booleans.
+    ///
+    /// Core: `GetTransactionSigOpCost(tx, inputs, flags)` skips P2SH sigops
+    /// unless `flags & SCRIPT_VERIFY_P2SH` (consensus/tx_verify.cpp:150-152),
+    /// and `CountWitnessSigOps` returns 0 unless `flags & SCRIPT_VERIFY_WITNESS`
+    /// (script/interpreter.cpp:2141-2143).
+    #[test]
+    fn test_get_sigop_flags_honours_script_flag_exceptions() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db.clone(), Network::Bitcoin);
+
+        // mainnet 170060 — exception value is SCRIPT_VERIFY_NONE, so neither
+        // P2SH nor witness sigops may be counted.
+        let bip16 =
+            internal_hash("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22");
+        assert_eq!(validator.get_sigop_flags(170060, &bip16), (false, false));
+
+        // mainnet 692261 — exception value is P2SH|WITNESS, so BOTH stay on.
+        let taproot =
+            internal_hash("0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad");
+        assert_eq!(validator.get_sigop_flags(692261, &taproot), (true, true));
+
+        // Control: a non-exception block at 170060 counts both, because the
+        // base flag set is unconditional (the old `height >= 173805` gate
+        // wrongly returned false here).
+        let mut other = bip16;
+        other[0] ^= 0x01;
+        assert_eq!(validator.get_sigop_flags(170060, &other), (true, true));
+
+        // Height 0, no exception: base set is unconditional.
+        assert_eq!(validator.get_sigop_flags(0, &[0u8; 32]), (true, true));
+    }
+
+    /// testnet3 regression: the old gate was `height >= 0` on non-mainnet, so
+    /// P2SH sigops were counted for the testnet3 BIP16 violator while Core
+    /// counted none (its exception value is SCRIPT_VERIFY_NONE).
+    #[test]
+    fn test_get_sigop_flags_testnet3_bip16_violator() {
+        let (_temp_dir, db) = create_test_db();
+        let validator = BlockValidator::new(db, Network::Testnet);
+
+        let exception =
+            internal_hash("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105");
+        assert_eq!(validator.get_sigop_flags(211_000, &exception), (false, false));
+
+        let mut other = exception;
+        other[31] ^= 0x40;
+        assert_eq!(validator.get_sigop_flags(211_000, &other), (true, true));
     }
 
     #[test]
