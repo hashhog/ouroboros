@@ -1,22 +1,31 @@
-"""W75 — Ancestor / descendant / cluster limit comprehensive audit (ouroboros).
+"""W75 — Ancestor / descendant / cluster limit audit (ouroboros).
 
-Gates tested (Bitcoin Core policy/policy.h:70-95, kernel/mempool_limits.h,
-txmempool.cpp:179-181):
+UPDATED FOR CORE v31 (cluster mempool).  The generic ancestor/descendant
+ADMISSION gates no longer exist: the ancestor/descendant SIZE limits were
+deleted outright, and DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT survive
+only as wallet coin-selection hints (node/interfaces.cpp:709-716 →
+wallet/spend.cpp:879-883).  The reject token "too-long-mempool-chain" no longer
+occurs anywhere in bitcoin-core/src.  What bounds a topology now:
 
-  Gate 1  — Ancestor COUNT limit: <= DEFAULT_ANCESTOR_LIMIT = 25 (self included).
-  Gate 2  — Ancestor SIZE limit:  ancestor set + new tx <= 101,000 vbytes.
-  Gate 3  — Descendant COUNT limit: each ancestor's descendant_count+1 <= 25.
-  Gate 4  — Descendant SIZE limit: each ancestor's descendant_size + new tx <= 101,000 vbytes.
-  Gate 5  — Cluster COUNT limit = 64 (was wrong: 100). DEFAULT_CLUSTER_LIMIT.
-  Gate 6  — Cluster SIZE limit  = 101,000 vbytes. (Was MISSING entirely.)
-  Gate 7  — Constant values match Core defaults.
-  Gate 8  — At-boundary acceptance: ancestor_count == 25 is accepted.
-  Gate 9  — Cluster-count boundary: 64 accepted, 65 rejected.
-  Gate 10 — Cluster-size boundary: cluster joining triggers vbyte gate.
+  Gate 5  — Cluster COUNT limit = 64            (DEFAULT_CLUSTER_LIMIT)
+  Gate 6  — Cluster SIZE limit  = 404,000 WEIGHT units
+            (101 kvB × WITNESS_SCALE_FACTOR, converted once at
+             txmempool.cpp:181; each member contributes its UNROUNDED
+             sigop-adjusted weight per txmempool.cpp:1017)
+  Both compare with a strict `>` (txgraph.cpp:2059), and both reject with the
+  bare token "too-large-cluster" and an EMPTY debug string
+  (validation.cpp:1024, :1116, :1343, :1521).
 
-Reference: bitcoin/src/policy/policy.h:70-95,
-           bitcoin/src/kernel/mempool_limits.h,
-           bitcoin/src/txmempool.cpp:169-188.
+Gates 1-4 below are retained as REGRESSION tests asserting the v31 outcome —
+that the topologies they used to reject are now accepted — so that the removed
+gates cannot be quietly reintroduced.  TRUC's 2-ancestor / 2-descendant rule is
+the only surviving ancestor/descendant enforcement and is tested elsewhere.
+
+Reference: bitcoin-core/src/policy/policy.h:72-74,
+           bitcoin-core/src/kernel/mempool_limits.h:20-22,
+           bitcoin-core/src/policy/policy.cpp:390,
+           bitcoin-core/src/txmempool.cpp:181,1017,
+           bitcoin-core/src/txgraph.cpp:2059.
 """
 
 from __future__ import annotations
@@ -35,6 +44,8 @@ from ouroboros.mempool import (
     MAX_DESCENDANT_SIZE_KVB,
     MAX_CLUSTER_COUNT,
     MAX_CLUSTER_SIZE_VBYTES,
+    MAX_CLUSTER_SIZE_WEIGHT,
+    CLUSTER_REJECT_TOKEN,
     EXTRA_DESCENDANT_TX_SIZE_LIMIT,
 )
 
@@ -60,6 +71,46 @@ def _make_tx(txid: bytes, inputs: list, outputs: list[int], version: int = 2) ->
         ],
         outputs=[TxOut(value=v, script_pubkey=b"\x51") for v in outputs],
     )
+
+
+def _tx_of_weight(txid: bytes, inputs: list, target: int) -> Transaction:
+    """Build a transaction whose BIP-141 weight is EXACTLY `target`.
+
+    Cluster size is enforced in WEIGHT units, so a test that wants a member of a
+    given cluster size must produce a transaction that genuinely weighs that
+    much — faking `entry.size` no longer influences the gate (`size` is the
+    stripped byte count driving the mempool RAM budget, not the cluster
+    summand).  Segwit padding is used because a witness-less transaction always
+    weighs a multiple of 4.
+    """
+    def mk(wit_lens: list[int]) -> Transaction:
+        return Transaction(
+            txid=txid,
+            version=2,
+            locktime=0,
+            inputs=[
+                TxIn(prev_txid=pt, prev_vout=pv, script_sig=b"", sequence=0xFFFFFFFD,
+                     witness=[b"\x00" * n for n in wit_lens])
+                for pt, pv in inputs
+            ],
+            outputs=[TxOut(value=50_000, script_pubkey=b"\x51")],
+            has_witness=True,
+        )
+
+    length = 0
+    for _ in range(10):
+        tx = mk([length])
+        if tx.get_weight() == target:
+            return tx
+        length += target - tx.get_weight()
+        if length < 0:
+            raise ValueError(f"target weight {target} is below the minimum")
+    for back in range(6):
+        for extra in range(6):
+            tx = mk([max(length - back, 0), extra])
+            if tx.get_weight() == target:
+                return tx
+    raise ValueError(f"could not build a transaction of weight {target}")
 
 
 class _StubDB:
@@ -275,26 +326,32 @@ class TestAncestorCountLimit:
         # Simulate gate 1
         assert len(ancestors) + 1 > MAX_ANCESTOR_COUNT
 
-    def test_add_transaction_inner_rejects_on_ancestor_count(self):
-        """_add_transaction_inner must return (False, ...) for a 26-level chain."""
+    def test_add_transaction_inner_accepts_26_level_chain(self):
+        """A 26-level chain is ACCEPTED — Core v31 deleted the ancestor gate.
+
+        The only thing bounding this topology now is the cluster pair: 26
+        transactions is inside DEFAULT_CLUSTER_LIMIT (64) and their combined
+        weight is trivial.  Mirrors the `cluster-linear-26` corpus entry.
+        """
         pool = _pool({(_txid(0), 0): {"value": 100_000}})
-        # Build 25-deep chain: need UTXO at every step for _add_transaction_inner
-        # Use _inject for levels 0..23 to set up ancestors, then try level 24.
-        chain = _build_chain(pool, 25)  # levels 0-24 in pool (ancestor_count 1-25)
+        chain = _build_chain(pool, 25)  # levels 0-24 in pool
         tip = chain[-1]
         assert pool.transactions[tip].ancestor_count == 25
 
         txid_26 = _txid(9001)
         tx_26 = _make_tx(txid_26, [(tip, 0)], [49_980])
 
-        # Seed UTXO so UTXO check passes and ancestor gate can fire
         pool.validator.db._m[(tip, 0)] = {"value": 50_000}
         ok, err = pool._add_transaction_inner(tx_26, height=100)
-        assert not ok, "26-level chain must be rejected by ancestor count gate"
-        assert "ancestor" in err.lower()
+        assert ok, f"26-level chain must be accepted under the cluster mempool; err={err}"
 
-    def test_ancestor_gate_fires_before_utxo_for_count(self):
-        """Ancestor count check precedes UTXO lookup in add_transaction_inner."""
+    def test_no_ancestor_gate_preempts_the_utxo_lookup(self):
+        """With the ancestor gate gone, a missing UTXO is what this now reports.
+
+        Pre-v31 the 25-ancestor check ran before the UTXO lookup and shadowed
+        it.  The surviving reject proves no generic ancestor gate remains in
+        front of the fee/UTXO path.
+        """
         pool = _pool()  # No UTXOs seeded
         chain = _build_chain(pool, 25)
         tip = chain[-1]
@@ -302,9 +359,10 @@ class TestAncestorCountLimit:
         tx_26 = _make_tx(txid_26, [(tip, 0)], [49_980])
 
         ok, err = pool._add_transaction_inner(tx_26, height=100)
-        # Should fail with ancestor error (count gate), not UTXO-not-found
         assert not ok
-        assert "ancestor" in err.lower(), f"Expected ancestor error, got: {err}"
+        assert "utxo not found" in err.lower(), (
+            f"Expected the UTXO lookup to be the first failing gate, got: {err}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -350,11 +408,15 @@ class TestAncestorSizeLimit:
             f"{ancestor_size + child_serial} should exceed 101,000"
         )
 
-        # Confirm the gate fires in the actual code
+        # v31: no ancestor SIZE gate exists at all, and `entry.size` is not the
+        # cluster summand — the real cluster weight here is a few hundred units,
+        # so the child is admitted.
         pool2.validator.db._m[(big_anc_txid, 0)] = {"value": 50_000}
         ok, err = pool2._add_transaction_inner(child_tx, height=100)
-        assert not ok, f"ancestor size gate should fire; err={err}"
-        assert "ancestor" in err.lower() and "size" in err.lower(), f"Unexpected error: {err}"
+        assert ok, (
+            "the ancestor size limit was deleted in Core v31, and a faked "
+            f"`entry.size` no longer influences the cluster gate; err={err}"
+        )
 
     def test_ancestor_size_within_limit_accepted(self):
         """Single small ancestor; ancestor_size well under 101 kB → accepted."""
@@ -407,15 +469,19 @@ class TestDescendantCountLimit:
             f"Expected 25, got {root_entry.descendant_count}"
         )
 
-        # 25th child would push root to 26 descendants — must be rejected
+        # 25th child takes root to 26 descendants — a 26-member cluster, which
+        # is inside DEFAULT_CLUSTER_LIMIT (64), so v31 ACCEPTS it.  Mirrors the
+        # `cluster-fan-26` corpus entry.
         txid_new = _txid(9000)
         tx_new = _make_tx(txid_new, [(root_txid, 24)], [48_000])
 
         # Seed UTXO so UTXO gate doesn't fire (root output 24 exists as confirmed)
         pool.validator.db._m[(root_txid, 24)] = {"value": 49_000}
         ok, err = pool._add_transaction_inner(tx_new, height=100)
-        assert not ok, "Root with descendant_count=25 should reject 25th child"
-        assert "descendant" in err.lower(), f"Expected descendant error, got: {err}"
+        assert ok, (
+            "the 25-descendant gate was deleted in Core v31; a 26-member "
+            f"cluster is well inside the 64-transaction limit; err={err}"
+        )
 
     def test_ancestor_at_24_descendants_accepts_new_child(self):
         """Root with descendant_count=24 (self + 23 descendants) must accept 24th child.
@@ -491,10 +557,14 @@ class TestDescendantSizeLimit:
             f"Test setup error: 100,940 + {child_size} should exceed 101,000"
         )
 
+        # v31: the descendant SIZE limit was deleted, and an inflated
+        # `descendant_size` field is no longer consulted by any gate.
         pool.validator.db._m[(root_txid, 0)] = {"value": 50_000}
         ok, err = pool._add_transaction_inner(child_tx, height=100)
-        assert not ok, f"Descendant size gate must fire; err={err}"
-        assert "descendant" in err.lower() and "size" in err.lower(), f"Got: {err}"
+        assert ok, (
+            "the descendant size limit was deleted in Core v31; only the "
+            f"cluster limits bound this topology; err={err}"
+        )
 
     def test_ancestor_descendant_size_within_limit(self):
         """Root with descendant_size=0 (fresh singleton) and small child → accept.
@@ -655,31 +725,59 @@ class TestClusterCountLimit:
 # ---------------------------------------------------------------------------
 
 class TestClusterSizeLimit:
-    """Gate 6: merged cluster total vbytes > MAX_CLUSTER_SIZE_VBYTES (101,000) → reject."""
+    """Gate 6: merged cluster WEIGHT > MAX_CLUSTER_SIZE_WEIGHT (404,000) → reject.
+
+    Core converts the declared 101 kvB limit to weight exactly once, at TxGraph
+    construction (txmempool.cpp:181), and then sums each member's UNROUNDED
+    sigop-adjusted weight (txmempool.cpp:1017).  There is no per-transaction
+    division anywhere in the sum, so these tests are all expressed in weight.
+    """
 
     def test_cluster_size_gate_fires(self):
-        """Ancestor with fake size 100,940 bytes; child join (61 bytes) → 101,001 > 101,000."""
+        """403,900-weight ancestor + 244-weight child = 404,144 > 404,000."""
         pool = _pool()
         big_txid = _txid(1)
-        big_tx = _make_tx(big_txid, [(_txid(0), 0)], [50_000])
-        _inject(pool, big_tx, size=100_940)
+        big_tx = _tx_of_weight(big_txid, [(_txid(0), 0)], 403_900)
+        _inject(pool, big_tx)
 
         child_txid = _txid(2)
         child_tx = _make_tx(child_txid, [(big_txid, 0)], [49_000])
-        child_size = len(child_tx.serialize())
+        child_weight = child_tx.get_weight()
 
-        # _make_tx produces 61 bytes; 100,940 + 61 = 101,001 > 101,000
-        assert 100_940 + child_size > MAX_CLUSTER_SIZE_VBYTES, (
-            f"Test setup error: 100,940 + {child_size} should exceed 101,000"
+        assert 403_900 + child_weight > MAX_CLUSTER_SIZE_WEIGHT, (
+            f"Test setup error: 403,900 + {child_weight} should exceed 404,000"
         )
 
         ok, err = pool._check_cluster_limit(child_tx)
         assert not ok, (
-            f"Should reject: cluster vbytes {100_940 + child_size} > 101,000; err={err}"
+            f"Should reject: cluster weight {403_900 + child_weight} > 404,000; err={err}"
         )
-        assert "cluster" in err.lower() and (
-            "vbyte" in err.lower() or "size" in err.lower()
-        )
+        assert err == CLUSTER_REJECT_TOKEN
+
+    def test_cluster_size_boundary_is_strict_greater_than(self):
+        """Exactly 404,000 ACCEPTS; one more weight unit rejects (txgraph.cpp:2059).
+
+        The accepting case also pins the UNITS: this cluster's per-transaction
+        ceil-vbyte sum is 100_875 + 126 = 101_001 > 101_000, so an
+        implementation that rounds each member before summing wrongly rejects
+        it, while Core (which never divides per transaction) accepts.
+        """
+        pool = _pool()
+        parent_weight = 403_499          # ceil/4 = 100_875
+        child_weight = 404_000 - parent_weight  # 501, ceil/4 = 126
+        assert -(-parent_weight // 4) + -(-child_weight // 4) > MAX_CLUSTER_SIZE_VBYTES
+        _inject(pool, _tx_of_weight(_txid(1), [(_txid(0), 0)], parent_weight))
+        child_tx = _tx_of_weight(_txid(2), [(_txid(1), 0)], child_weight)
+
+        ok, err = pool._check_cluster_limit(child_tx)
+        assert ok, f"a cluster weighing exactly 404,000 is at the limit, not over it; err={err}"
+
+        pool_over = _pool()
+        _inject(pool_over, _tx_of_weight(_txid(1), [(_txid(0), 0)], parent_weight))
+        over_tx = _tx_of_weight(_txid(2), [(_txid(1), 0)], child_weight + 1)
+        ok, err = pool_over._check_cluster_limit(over_tx)
+        assert not ok, "404,001 weight units exceeds the cluster size limit"
+        assert err == CLUSTER_REJECT_TOKEN
 
     def test_cluster_size_within_limit_accepted(self):
         """Ancestor with size=200; child joining is 200+child_size << 101,000 → accepted."""
@@ -694,22 +792,22 @@ class TestClusterSizeLimit:
         assert ok, f"Small cluster merge under size limit must succeed; err={err}"
 
     def test_cluster_size_merge_over_limit(self):
-        """Two clusters of 50,600 vbytes each; bridge merges to >101,000 → rejected."""
+        """Two clusters of 202,400 weight each; bridge merges to >404,000 → rejected."""
         pool = _pool()
         a_txid = _txid(1)
-        _inject(pool, _make_tx(a_txid, [(_txid(0), 0)], [50_000]), size=50_600)
+        _inject(pool, _tx_of_weight(a_txid, [(_txid(0), 0)], 202_400))
 
         b_txid = _txid(2)
-        _inject(pool, _make_tx(b_txid, [(_txid(100), 0)], [50_000]), size=50_600)
+        _inject(pool, _tx_of_weight(b_txid, [(_txid(100), 0)], 202_400))
 
         bridge_txid = _txid(3)
         bridge_tx = _make_tx(bridge_txid, [(a_txid, 0), (b_txid, 0)], [49_000])
-        bridge_size = len(bridge_tx.serialize())
-        expected_total = 50_600 + 50_600 + bridge_size  # clearly > 101,000
+        expected_total = 202_400 + 202_400 + bridge_tx.get_weight()
+        assert expected_total > MAX_CLUSTER_SIZE_WEIGHT
 
         ok, err = pool._check_cluster_limit(bridge_tx)
-        assert not ok, f"Merged cluster {expected_total} vbytes > 101,000 must be rejected"
-        assert "cluster" in err.lower()
+        assert not ok, f"Merged cluster {expected_total} weight > 404,000 must be rejected"
+        assert err == CLUSTER_REJECT_TOKEN
 
     def test_cluster_size_merge_within_limit(self):
         """Two tiny clusters (200 vbytes each); bridge merges to <<101,000 → accepted."""
@@ -725,29 +823,28 @@ class TestClusterSizeLimit:
         ok, err = pool._check_cluster_limit(bridge_tx)
         assert ok, f"Tiny cluster merge (<<101,000 vbytes) must succeed; err={err}"
 
-    def test_cluster_size_was_missing_before_w75(self):
-        """Confirm the new vbyte gate catches what old code (count=100 only) allowed.
+    def test_cluster_size_ignores_stripped_byte_count(self):
+        """The summand is weight, NOT `entry.size` (the witness-less byte count).
 
-        Before W75: MAX_CLUSTER_COUNT=100, no size gate.
-          - 2-tx cluster (count=2 <= 100) → ACCEPTED (wrong).
-        After W75: MAX_CLUSTER_COUNT=64, + size gate at 101,000 vbytes.
-          - 2-tx cluster but 100,940 + 61 = 101,001 vbytes > 101,000 → REJECTED (correct).
+        The ancestor below serialises to a handful of stripped bytes but weighs
+        403,900 units.  A gate that sums `entry.size` sees a trivially small
+        cluster and admits the child; a gate that sums weight rejects it.
         """
         pool = _pool()
         big_txid = _txid(1)
-        _inject(pool, _make_tx(big_txid, [(_txid(0), 0)], [50_000]), size=100_940)
+        _inject(pool, _tx_of_weight(big_txid, [(_txid(0), 0)], 403_900))
+
+        stripped = pool.transactions[big_txid].size
+        assert stripped < 1_000, (
+            f"premise: the stripped byte count ({stripped}) is nowhere near the "
+            "403,900-unit weight, so the two forms disagree here"
+        )
 
         child_txid = _txid(2)
         child_tx = _make_tx(child_txid, [(big_txid, 0)], [49_000])
-        child_size = len(child_tx.serialize())
-
-        # _make_tx produces 61 bytes; 100,940 + 61 = 101,001 > 101,000
-        assert 100_940 + child_size > MAX_CLUSTER_SIZE_VBYTES
-
-        # Old code would check: total_count=2 <= 100 → pass (no size gate)
-        # New code checks: total_vbytes = 100,940 + child_size > 101,000 → fail
         ok, err = pool._check_cluster_limit(child_tx)
-        assert not ok, "Cluster vbyte gate (new in W75) must fire here"
+        assert not ok, "cluster weight gate must fire on a witness-heavy ancestor"
+        assert err == CLUSTER_REJECT_TOKEN
 
 
 # ---------------------------------------------------------------------------
@@ -860,18 +957,17 @@ class TestClusterSizeBoundary:
         ok, err = pool._check_cluster_limit(tx2)
         assert ok, "Unrelated tx (singleton) must be accepted regardless of big tx"
 
-    def test_child_joining_100940_cluster_rejected(self):
-        """100,940-byte ancestor + 61-byte child = 101,001 > 101,000 → rejected."""
+    def test_child_joining_403900_weight_cluster_rejected(self):
+        """403,900-weight ancestor + 244-weight child = 404,144 > 404,000 → rejected."""
         pool = _pool()
-        _inject(pool, _make_tx(_txid(1), [(_txid(0), 0)], [50_000]), size=100_940)
+        _inject(pool, _tx_of_weight(_txid(1), [(_txid(0), 0)], 403_900))
 
         child_tx = _make_tx(_txid(2), [(_txid(1), 0)], [49_000])
-        child_size = len(child_tx.serialize())
-        assert 100_940 + child_size > MAX_CLUSTER_SIZE_VBYTES
+        assert 403_900 + child_tx.get_weight() > MAX_CLUSTER_SIZE_WEIGHT
 
         ok, err = pool._check_cluster_limit(child_tx)
         assert not ok
-        assert "cluster" in err.lower()
+        assert err == CLUSTER_REJECT_TOKEN
 
     def test_child_joining_small_cluster_accepted(self):
         """200-byte ancestor + small child << 101,000 → accepted by size gate."""
