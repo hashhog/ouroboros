@@ -108,18 +108,60 @@ SEGWIT_ACTIVATION_HEIGHT = 481824
 TAPROOT_ACTIVATION_HEIGHT = 709632
 
 # Historical blocks that violate rules applied retroactively.
-# Ref: Bitcoin Core chainparams.cpp script_flag_exceptions.
-# Keys are block hashes in internal byte order (little-endian).
-_SCRIPT_FLAG_EXCEPTIONS: dict[bytes, int] = {
-    # BIP16 exception (mainnet height ~170,060)
-    bytes.fromhex(
-        "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
-    )[::-1]: SCRIPT_VERIFY_NONE,
-    # Taproot exception (mainnet height 709,632)
-    bytes.fromhex(
-        "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"
-    )[::-1]: SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS,
+# Ref: Bitcoin Core kernel/chainparams.cpp:85-88 (mainnet), :210-211 (testnet3)
+# — `consensus.script_flag_exceptions`.
+#
+# BYTE ORDER: keys are block hashes in INTERNAL byte order (little-endian) —
+# the raw double-SHA256 digest, which is what `Block.hash` holds
+# (database.py:178) and what `validation.py` passes down as `block_hash`.  The
+# literals below are the *display* (big-endian) hashes from chainparams.cpp,
+# reversed with [::-1].  Do NOT "fix" this to display order: the compare would
+# then never match and the exceptions would silently stop firing.
+# `tests/functional/test_script_flags.py` carries a byte-reversed negative
+# control that fails if the orientation is flipped.
+#
+# The table is keyed by network exactly as Core keys it per-chainparams, so a
+# testnet3 exception can never fire on mainnet (or vice versa).
+_SCRIPT_FLAG_EXCEPTIONS: dict[str, dict[bytes, int]] = {
+    "mainnet": {
+        # BIP16 exception — mainnet height 170,060
+        bytes.fromhex(
+            "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+        )[::-1]: SCRIPT_VERIFY_NONE,
+        # Taproot exception — mainnet height 692,261
+        bytes.fromhex(
+            "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"
+        )[::-1]: SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS,
+    },
+    # BIP16 exception — testnet3 (chainparams.cpp:210-211)
+    "testnet": {
+        bytes.fromhex(
+            "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"
+        )[::-1]: SCRIPT_VERIFY_NONE,
+    },
+    # testnet4 / signet / regtest declare no script_flag_exceptions.
 }
+_SCRIPT_FLAG_EXCEPTIONS["bitcoin"] = _SCRIPT_FLAG_EXCEPTIONS["mainnet"]
+_SCRIPT_FLAG_EXCEPTIONS["testnet3"] = _SCRIPT_FLAG_EXCEPTIONS["testnet"]
+
+
+def get_script_flag_exception(
+    block_hash: bytes | None, network: str = "mainnet"
+) -> int | None:
+    """Look up *block_hash* in *network*'s ``script_flag_exceptions`` table.
+
+    Returns the REPLACEMENT flag set on a hit, or ``None`` when the block is
+    not an exception.  Core assigns rather than ORs on a hit
+    (``flags = it->second;``, validation.cpp:2266).
+
+    *block_hash* is in internal (little-endian) byte order.
+    """
+    if block_hash is None:
+        return None
+    table = _SCRIPT_FLAG_EXCEPTIONS.get(network.lower())
+    if not table:
+        return None
+    return table.get(block_hash)
 
 # secp256k1 curve order / 2, for low-S enforcement
 SECP256K1_ORDER_HALF = (
@@ -133,32 +175,58 @@ def get_flags_for_height(
     network: str = "mainnet",
 ) -> int:
     """
-    Consensus script verification flags for *height*.
+    Consensus script verification flags for a block.
 
-    Returns ONLY Bitcoin Core MANDATORY_SCRIPT_VERIFY_FLAGS:
-      P2SH | DERSIG | NULLDUMMY | CLTV | CSV | WITNESS | TAPROOT
-    (each gated on its BIP deployment height, plus two named block-hash
-    exceptions per validation.cpp:2250-2289).
+    Faithful port of Bitcoin Core's ``GetBlockScriptFlags()``
+    (validation.cpp:2249-2289).  THREE steps, and the order is load-bearing:
 
-    Policy-only flags (NULLFAIL, LOW_S, CLEANSTACK, SIGPUSHONLY,
-    MINIMALDATA, MINIMALIF, WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE,
-    DISCOURAGE_UPGRADABLE_NOPS, etc.) are NOT set here — they belong in
-    get_standard_script_flags() for mempool/relay use only.
+    1. BASE — seed ``P2SH | WITNESS | TAPROOT`` UNCONDITIONALLY, for every
+       block (:2262).  Core has had no ``BIP16Height`` and no ``taprootHeight``
+       in this path since v23; only one historical block violated P2SH and one
+       violated Taproot, and both are handled by the exception table below.  A
+       height gate on any of these three flags is a consensus bug.
+    2. EXCEPTION — on a block-hash hit in ``script_flag_exceptions``, REPLACE
+       the whole flag set with the table's value (:2264-2267).  This is an
+       assignment, NOT an early return.
+    3. HEIGHT — OR the four still-height-gated flags ON TOP of step 2's result
+       (:2268-2286): DERSIG (BIP66), CLTV (BIP65), CSV (BIP68/112/113) and
+       NULLDUMMY (BIP147, which rides SegWit).
 
-    Ref: Bitcoin Core policy/policy.h:105-111 + validation.cpp:2250-2289.
+    Step 3 has to run AFTER step 2.  Block 692261's exception value is
+    ``P2SH|WITNESS``; returning that directly would drop DERSIG|CLTV|CSV|
+    NULLDUMMY — all four active at that height — and FALSE-ACCEPT scripts Core
+    rejects under BIP-66/65/112/147.
+
+    Policy-only flags (NULLFAIL, LOW_S, CLEANSTACK, SIGPUSHONLY, MINIMALDATA,
+    MINIMALIF, WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE,
+    DISCOURAGE_UPGRADABLE_NOPS, ...) are STANDARD_SCRIPT_VERIFY_FLAGS
+    (policy/policy.h:125) and must NEVER appear here — they belong in
+    get_standard_script_flags() for mempool/relay only.
+
+    Ref: Bitcoin Core validation.cpp:2249-2289 + policy/policy.h:105-111.
 
     Args:
         height: Block height
-        block_hash: Optional block hash to check for historical exceptions
-        network: Network name (mainnet, testnet, testnet4, regtest, signet)
+        block_hash: Block hash in INTERNAL (little-endian) byte order, used
+            for the script_flag_exceptions lookup.  ``None`` skips step 2 and
+            is only correct for callers that provably cannot be looking at an
+            exception block (e.g. mempool acceptance at the tip).
+        network: Network name (mainnet, testnet, testnet3, testnet4, regtest,
+            signet)
 
     Returns:
         Combined consensus-only script verification flags
     """
-    # Check for historical exception blocks first
-    if block_hash is not None and block_hash in _SCRIPT_FLAG_EXCEPTIONS:
-        return _SCRIPT_FLAG_EXCEPTIONS[block_hash]
+    # --- Step 1: unconditional base set (validation.cpp:2262) ---------------
+    flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT
 
+    # --- Step 2: exception table REPLACES the base set (:2264-2267) ---------
+    # NOT an early return — step 3 still runs on top of this value.
+    exception_flags = get_script_flag_exception(block_hash, network)
+    if exception_flags is not None:
+        flags = exception_flags
+
+    # --- Step 3: the four height-gated flags, OR'd on top (:2268-2286) ------
     # Import consensus module for deployment checks
     try:
         from ouroboros.consensus import is_buried_deployment_active
@@ -166,45 +234,28 @@ def get_flags_for_height(
     except ImportError:
         use_consensus = False
 
-    flags = SCRIPT_VERIFY_NONE
-
     if use_consensus:
-        # P2SH (BIP16) - not a buried deployment but always active
-        # (activated via ISM, hardcoded to height 173805 on mainnet)
-        if network.lower() in ("regtest", "testnet4", "signet"):
-            flags |= SCRIPT_VERIFY_P2SH
-        elif height >= BIP16_ACTIVATION_HEIGHT:
-            flags |= SCRIPT_VERIFY_P2SH
-
-        # BIP66 - strict DER signatures (DERSIG only; LOW_S is policy-only)
+        # BIP66 — strict DER signatures (DERSIG only; LOW_S is policy-only)
         if is_buried_deployment_active("bip66", height, network):
             flags |= SCRIPT_VERIFY_DERSIG
 
-        # BIP65 - CHECKLOCKTIMEVERIFY
+        # BIP65 — CHECKLOCKTIMEVERIFY
         if is_buried_deployment_active("bip65", height, network):
             flags |= SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
 
-        # CSV (BIP68/112/113) - CHECKSEQUENCEVERIFY
+        # BIP68/112/113 — CHECKSEQUENCEVERIFY
         if is_buried_deployment_active("csv", height, network):
             flags |= SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
 
-        # SegWit (BIP141/143/147) — WITNESS + NULLDUMMY only.
+        # BIP147 NULLDUMMY — activated simultaneously with SegWit.
         # NULLFAIL, CLEANSTACK, SIGPUSHONLY, MINIMALDATA, MINIMALIF,
         # WITNESS_PUBKEYTYPE, DISCOURAGE_UPGRADABLE_NOPS, CONST_SCRIPTCODE
         # are all STANDARD_SCRIPT_VERIFY_FLAGS (policy only).
         if is_buried_deployment_active("segwit", height, network):
-            flags |= SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_NULLDUMMY
-
-        # Taproot (BIP340/341/342) — TAPROOT only.
-        # DISCOURAGE_UPGRADABLE_TAPROOT_VERSION and DISCOURAGE_OP_SUCCESS
-        # are policy flags for mempool/relay only.
-        if is_buried_deployment_active("taproot", height, network):
-            flags |= SCRIPT_VERIFY_TAPROOT
+            flags |= SCRIPT_VERIFY_NULLDUMMY
 
     else:
         # Fallback to hardcoded mainnet heights
-        if height >= BIP16_ACTIVATION_HEIGHT:
-            flags |= SCRIPT_VERIFY_P2SH
         if height >= BIP66_ACTIVATION_HEIGHT:
             flags |= SCRIPT_VERIFY_DERSIG
         if height >= BIP65_ACTIVATION_HEIGHT:
@@ -212,9 +263,7 @@ def get_flags_for_height(
         if height >= BIP68_ACTIVATION_HEIGHT:
             flags |= SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
         if height >= SEGWIT_ACTIVATION_HEIGHT:
-            flags |= SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_NULLDUMMY
-        if height >= TAPROOT_ACTIVATION_HEIGHT:
-            flags |= SCRIPT_VERIFY_TAPROOT
+            flags |= SCRIPT_VERIFY_NULLDUMMY
 
     return flags
 

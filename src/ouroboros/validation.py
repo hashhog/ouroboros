@@ -984,8 +984,13 @@ class BlockValidator:
         if not self._verify_merkle_root(block):
             return False, "Invalid merkle root"
 
-        # 5. Validate block weight and sigops limits
-        valid, error = self._validate_block_limits(block)
+        # 5. Validate block weight and sigops limits.
+        #    height + hash are threaded in so P2SH/witness sigop counting is
+        #    gated on the FINAL exception-aware script flags, exactly as Core's
+        #    GetTransactionSigOpCost(tx, inputs, flags) does.
+        valid, error = self._validate_block_limits(
+            block, expected_height, block.hash
+        )
         if not valid:
             return False, error
 
@@ -1530,7 +1535,12 @@ class BlockValidator:
         return root
 
     # Block weight / sigops
-    def _validate_block_limits(self, block: Block) -> tuple[bool, str]:
+    def _validate_block_limits(
+        self,
+        block: Block,
+        height: int | None = None,
+        block_hash: bytes | None = None,
+    ) -> tuple[bool, str]:
         """Validate block weight and sigops cost limits.
 
         Includes the two early-exit size checks from Bitcoin Core CheckBlock()
@@ -1543,7 +1553,36 @@ class BlockValidator:
         These catch malicious blocks with pathological tx counts or stripped
         serialization before the more expensive per-tx weight summation.
         Reference: bitcoin-core/src/validation.cpp:3947
+
+        SIGOP FLAG GATING — Core counts sigops with
+        ``GetTransactionSigOpCost(tx, inputs, flags)``
+        (consensus/tx_verify.cpp:143-162) where ``flags`` is exactly what
+        ``GetBlockScriptFlags()`` returned for THIS block:
+
+          * P2SH sigops are added only ``if (flags & SCRIPT_VERIFY_P2SH)``
+            (tx_verify.cpp:150-152);
+          * ``CountWitnessSigOps`` returns 0 when ``SCRIPT_VERIFY_WITNESS`` is
+            clear (script/interpreter.cpp:2141-2143).
+
+        So the exception blocks whose replacement value is SCRIPT_VERIFY_NONE
+        (mainnet 170060, the testnet3 BIP16 violator) must skip P2SH *and*
+        witness sigop counting.  The flags are computed here rather than
+        inherited from the script-verification path because sigops are counted
+        on EVERY connect — assumevalid IBD, reorg replay, import — while
+        scripts are not.
+
+        *height* / *block_hash* are optional only so pre-existing test doubles
+        that call this with a bare block keep working; when they are omitted
+        both gates default to ON, which is the historical behaviour.
         """
+        if height is None:
+            verify_p2sh = True
+            verify_witness = True
+        else:
+            _flags = get_flags_for_height(height, block_hash, self.network)
+            verify_p2sh = bool(_flags & SCRIPT_VERIFY_P2SH)
+            verify_witness = bool(_flags & SCRIPT_VERIFY_WITNESS)
+
         # Early check 1: tx count overflow guard
         # `block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT`
         # A block with > 1,000,000 transactions would be invalid even if each
@@ -1587,27 +1626,34 @@ class BlockValidator:
                 legacy_sigops += _count_legacy_sigops(inp.script_sig)
             tx_sigops_cost += legacy_sigops * WITNESS_SCALE_FACTOR
 
-            # --- P2SH sigops × WITNESS_SCALE_FACTOR ---
-            if not tx.is_coinbase:
+            # --- P2SH + witness sigops (both flag-gated, tx_verify.cpp:143-162) ---
+            if not tx.is_coinbase and (verify_p2sh or verify_witness):
                 for inp in tx.inputs:
                     utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
                     if utxo is None:
                         continue
                     prev_spk = bytes(utxo["script_pubkey"])
-                    p2sh_sigops = _get_p2sh_sigops(inp.script_sig, prev_spk)
-                    tx_sigops_cost += p2sh_sigops * WITNESS_SCALE_FACTOR
+
+                    # --- P2SH sigops × WITNESS_SCALE_FACTOR ---
+                    # Core: `if (flags & SCRIPT_VERIFY_P2SH)` (tx_verify.cpp:150)
+                    if verify_p2sh:
+                        p2sh_sigops = _get_p2sh_sigops(inp.script_sig, prev_spk)
+                        tx_sigops_cost += p2sh_sigops * WITNESS_SCALE_FACTOR
 
                     # --- Witness sigops × 1 ---
-                    witness_spk = prev_spk
-                    witness_data = inp.witness
-                    # For P2SH-wrapped witness, use the redeem script
-                    if _is_p2sh(prev_spk):
-                        redeem = _get_last_push(inp.script_sig)
-                        if redeem is not None:
-                            witness_spk = redeem
-                    tx_sigops_cost += _count_witness_sigops(
-                        witness_spk, witness_data
-                    )
+                    # Core: CountWitnessSigOps returns 0 when SCRIPT_VERIFY_WITNESS
+                    # is clear (interpreter.cpp:2141-2143).
+                    if verify_witness:
+                        witness_spk = prev_spk
+                        witness_data = inp.witness
+                        # For P2SH-wrapped witness, use the redeem script
+                        if _is_p2sh(prev_spk):
+                            redeem = _get_last_push(inp.script_sig)
+                            if redeem is not None:
+                                witness_spk = redeem
+                        tx_sigops_cost += _count_witness_sigops(
+                            witness_spk, witness_data
+                        )
 
             # NOTE: MAX_TX_SIGOPS_COST (16,000) is a mempool policy limit
             # (MAX_STANDARD_TX_SIGOPS_COST in Bitcoin Core), NOT a consensus

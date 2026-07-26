@@ -149,84 +149,186 @@ bitflags::bitflags! {
     }
 }
 
-/// SegWit activation heights per network
+/// Buried-deployment activation heights and the port of Bitcoin Core's
+/// `GetBlockScriptFlags()` (validation.cpp:2249-2289).
 pub mod activation_heights {
+    use super::ScriptVerifyFlags;
     use bitcoin::Network;
 
     /// Returns the SegWit (BIP141) activation height for the given network.
-    /// NULLFAIL (BIP146) is consensus-mandatory at the same height as SegWit.
+    ///
+    /// Ref: `consensus.SegwitHeight`, kernel/chainparams.cpp:94 (main),
+    /// :217 (testnet3), :316 (testnet4), :460 (signet), :541 (regtest).
     pub fn segwit_height(network: Network) -> u32 {
         match network {
             Network::Bitcoin => 481824,     // mainnet
             Network::Testnet => 834624,     // testnet3
-            Network::Testnet4 => 0,         // active from genesis
-            Network::Signet => 0,           // active from genesis
-            Network::Regtest => 0,          // active from genesis
-            _ => 0,                         // conservative default
+            Network::Testnet4 => 1,         // chainparams.cpp:316
+            Network::Signet => 1,           // chainparams.cpp:460
+            Network::Regtest => 0,          // chainparams.cpp:541
         }
     }
 
-    /// Returns the script verification flags for a given block height on the network.
-    /// This mirrors Bitcoin Core's GetBlockScriptFlags() in validation.cpp.
-    pub fn get_script_flags_for_height(height: u32, network: Network) -> super::ScriptVerifyFlags {
-        use super::ScriptVerifyFlags;
+    /// BIP66 (DERSIG) activation height. Ref: `consensus.BIP66Height`.
+    pub fn dersig_height(network: Network) -> u32 {
+        match network {
+            Network::Bitcoin => 363725,     // chainparams.cpp:92
+            Network::Testnet => 330776,     // chainparams.cpp:215
+            Network::Testnet4 => 1,         // chainparams.cpp:314
+            Network::Signet => 1,           // chainparams.cpp:458
+            Network::Regtest => 1,          // chainparams.cpp:539
+        }
+    }
 
-        let mut flags = ScriptVerifyFlags::NONE;
+    /// BIP65 (CHECKLOCKTIMEVERIFY) activation height. Ref: `consensus.BIP65Height`.
+    pub fn cltv_height(network: Network) -> u32 {
+        match network {
+            Network::Bitcoin => 388381,     // chainparams.cpp:91
+            Network::Testnet => 581885,     // chainparams.cpp:214
+            Network::Testnet4 => 1,         // chainparams.cpp:313
+            Network::Signet => 1,           // chainparams.cpp:457
+            Network::Regtest => 1,          // chainparams.cpp:538
+        }
+    }
 
-        // BIP16 (P2SH) - activated at height 173805 on mainnet
-        let bip16_height = match network {
-            Network::Bitcoin => 173805,
-            _ => 0, // active from genesis on testnets
-        };
-        if height >= bip16_height {
-            flags |= ScriptVerifyFlags::P2SH;
+    /// BIP68/112/113 (CHECKSEQUENCEVERIFY) activation height.
+    /// Ref: `consensus.CSVHeight`.
+    pub fn csv_height(network: Network) -> u32 {
+        match network {
+            Network::Bitcoin => 419328,     // chainparams.cpp:93
+            Network::Testnet => 770112,     // chainparams.cpp:216
+            Network::Testnet4 => 1,         // chainparams.cpp:315
+            Network::Signet => 1,           // chainparams.cpp:459
+            Network::Regtest => 1,          // chainparams.cpp:540
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // script_flag_exceptions (kernel/chainparams.cpp:85-88, :210-211)
+    // ------------------------------------------------------------------
+    //
+    // BYTE ORDER: these keys are in INTERNAL (little-endian) byte order — the
+    // orientation `bitcoin::BlockHash::as_byte_array()` returns and the
+    // orientation ouroboros stores block hashes in (storage/db.rs:1594).
+    // They are the *display* (big-endian) hashes in chainparams.cpp reversed
+    // byte-for-byte.  `test_script_flag_exception_key_byte_order` re-derives
+    // them from the display hex so a typo cannot silently disable the table,
+    // and `test_script_flag_exception_display_order_is_not_a_key` is the
+    // byte-reversed negative control.
+
+    /// mainnet height 170060 —
+    /// 00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22
+    const EXC_BIP16_MAINNET: [u8; 32] = [
+        0x22, 0x9c, 0x4f, 0xac, 0x88, 0xba, 0xb1, 0x94,
+        0xeb, 0x08, 0xf1, 0xa5, 0x28, 0xcc, 0x30, 0x8d,
+        0xed, 0x23, 0x97, 0xf4, 0xf4, 0xeb, 0x6e, 0x75,
+        0xdc, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// mainnet height 692261 —
+    /// 0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad
+    const EXC_TAPROOT_MAINNET: [u8; 32] = [
+        0xad, 0x95, 0xe3, 0xa1, 0x5e, 0xe5, 0xff, 0xd5,
+        0x85, 0xc5, 0xe8, 0x1d, 0x44, 0xb5, 0x6a, 0x98,
+        0x1e, 0x84, 0x2d, 0x5b, 0xc3, 0x14, 0x0f, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// testnet3 —
+    /// 00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105
+    const EXC_BIP16_TESTNET3: [u8; 32] = [
+        0x05, 0xb1, 0x32, 0xa4, 0xf7, 0x4a, 0x87, 0x99,
+        0xa5, 0x7a, 0x42, 0x02, 0xd0, 0xee, 0xb0, 0x96,
+        0x12, 0xcc, 0x08, 0xd2, 0x95, 0x40, 0x1f, 0x00,
+        0x7c, 0x45, 0x30, 0xdd, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// Look up `block_hash` in this network's `script_flag_exceptions` table.
+    ///
+    /// Returns the REPLACEMENT flag set on a hit (Core assigns, it does not OR:
+    /// `flags = it->second;`, validation.cpp:2266).
+    pub fn script_flag_exception(
+        network: Network,
+        block_hash: &[u8; 32],
+    ) -> Option<ScriptVerifyFlags> {
+        match network {
+            Network::Bitcoin => {
+                if block_hash == &EXC_BIP16_MAINNET {
+                    Some(ScriptVerifyFlags::NONE)
+                } else if block_hash == &EXC_TAPROOT_MAINNET {
+                    Some(ScriptVerifyFlags::P2SH | ScriptVerifyFlags::WITNESS)
+                } else {
+                    None
+                }
+            }
+            Network::Testnet => {
+                if block_hash == &EXC_BIP16_TESTNET3 {
+                    Some(ScriptVerifyFlags::NONE)
+                } else {
+                    None
+                }
+            }
+            // testnet4 / signet / regtest have no script_flag_exceptions.
+            _ => None,
+        }
+    }
+
+    /// Port of Bitcoin Core `GetBlockScriptFlags()` (validation.cpp:2249-2289).
+    ///
+    /// THREE steps, and the order is load-bearing:
+    ///
+    /// 1. BASE — seed `P2SH | WITNESS | TAPROOT` UNCONDITIONALLY, for every
+    ///    block (validation.cpp:2262).  Core has had no BIP16Height and no
+    ///    taprootHeight in this path since v23; a height gate on any of these
+    ///    three is a consensus bug.
+    /// 2. EXCEPTION — on a block-hash hit in `script_flag_exceptions`, REPLACE
+    ///    the whole flag set with the table's value (:2264-2267).  This is an
+    ///    assignment, NOT an early return.
+    /// 3. HEIGHT — OR the four still-height-gated flags ON TOP of step 2's
+    ///    result (:2268-2286): DERSIG (BIP66), CLTV (BIP65), CSV (BIP68/112/113)
+    ///    and NULLDUMMY (BIP147, rides SegWit).
+    ///
+    /// Step 3 running after step 2 is the whole point: block 692261's exception
+    /// value is `P2SH|WITNESS`, and an early return there would drop
+    /// DERSIG|CLTV|CSV|NULLDUMMY — all four active at that height — producing a
+    /// FALSE-ACCEPT of scripts Core rejects under BIP-66/65/112/147.
+    ///
+    /// `block_hash` is in INTERNAL (little-endian) byte order.  Passing `None`
+    /// skips step 2 and is only correct for callers that provably cannot be
+    /// looking at an exception block (e.g. mempool acceptance at the tip).
+    ///
+    /// NOTE: only consensus (MANDATORY) flags belong here.  NULLFAIL,
+    /// CLEANSTACK, LOW_S, STRICTENC, MINIMALDATA, MINIMALIF and
+    /// WITNESS_PUBKEYTYPE are STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:125)
+    /// and must never appear in block validation.
+    pub fn get_block_script_flags(
+        height: u32,
+        block_hash: Option<&[u8; 32]>,
+        network: Network,
+    ) -> ScriptVerifyFlags {
+        // Step 1: unconditional base set.
+        let mut flags =
+            ScriptVerifyFlags::P2SH | ScriptVerifyFlags::WITNESS | ScriptVerifyFlags::TAPROOT;
+
+        // Step 2: exception table REPLACES the base set (not an early return).
+        if let Some(hash) = block_hash {
+            if let Some(exception_flags) = script_flag_exception(network, hash) {
+                flags = exception_flags;
+            }
         }
 
-        // BIP66 (DERSIG) - activated at height 363725 on mainnet
-        let bip66_height = match network {
-            Network::Bitcoin => 363725,
-            _ => 0,
-        };
-        if height >= bip66_height {
+        // Step 3: the four still-height-gated flags, OR'd on top of step 2.
+        if height >= dersig_height(network) {
             flags |= ScriptVerifyFlags::DERSIG;
         }
-
-        // BIP65 (CLTV) - activated at height 388381 on mainnet
-        let bip65_height = match network {
-            Network::Bitcoin => 388381,
-            _ => 0,
-        };
-        if height >= bip65_height {
+        if height >= cltv_height(network) {
             flags |= ScriptVerifyFlags::CHECKLOCKTIMEVERIFY;
         }
-
-        // BIP68/112 (CSV) - activated at height 419328 on mainnet
-        let csv_height = match network {
-            Network::Bitcoin => 419328,
-            _ => 0,
-        };
-        if height >= csv_height {
+        if height >= csv_height(network) {
             flags |= ScriptVerifyFlags::CHECKSEQUENCEVERIFY;
         }
-
-        // SegWit (BIP141/143/147/146) - activated at height 481824 on mainnet
-        // CRITICAL: NULLFAIL is consensus-mandatory at SegWit activation, NOT policy-only
-        let segwit_height = segwit_height(network);
-        if height >= segwit_height {
-            flags |= ScriptVerifyFlags::WITNESS
-                | ScriptVerifyFlags::NULLDUMMY
-                | ScriptVerifyFlags::NULLFAIL  // BIP146: consensus-mandatory
-                | ScriptVerifyFlags::WITNESS_PUBKEYTYPE;
-        }
-
-        // Taproot (BIP341/342) - activated at height 709632 on mainnet
-        let taproot_height = match network {
-            Network::Bitcoin => 709632,
-            Network::Signet => 0,
-            _ => 0,
-        };
-        if height >= taproot_height {
-            flags |= ScriptVerifyFlags::TAPROOT;
+        if height >= segwit_height(network) {
+            flags |= ScriptVerifyFlags::NULLDUMMY;
         }
 
         flags
@@ -2051,52 +2153,341 @@ mod tests {
     fn test_segwit_activation_heights() {
         use bitcoin::Network;
 
-        // Test activation heights
+        // Test activation heights — `consensus.SegwitHeight` per network.
+        // Ref: kernel/chainparams.cpp:94, :217, :316, :460, :541.
         assert_eq!(activation_heights::segwit_height(Network::Bitcoin), 481824);
         assert_eq!(activation_heights::segwit_height(Network::Testnet), 834624);
-        assert_eq!(activation_heights::segwit_height(Network::Testnet4), 0);
+        // testnet4/signet are 1 in Core, not 0 (chainparams.cpp:316, :460) —
+        // matching `BURIED_DEPLOYMENTS` on the Python side (consensus.py:150,
+        // :159).  Only the genesis block is affected, and genesis is never
+        // script-validated.
+        assert_eq!(activation_heights::segwit_height(Network::Testnet4), 1);
+        assert_eq!(activation_heights::segwit_height(Network::Signet), 1);
         assert_eq!(activation_heights::segwit_height(Network::Regtest), 0);
     }
 
+    // ------------------------------------------------------------------
+    // GetBlockScriptFlags parity (validation.cpp:2249-2289)
+    // ------------------------------------------------------------------
+
+    /// Consensus flags must NEVER contain policy bits.  These are
+    /// STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:125) and belong only in
+    /// mempool/relay acceptance.
+    const POLICY_ONLY: ScriptVerifyFlags = ScriptVerifyFlags::from_bits_truncate(
+        ScriptVerifyFlags::NULLFAIL.bits()
+            | ScriptVerifyFlags::CLEANSTACK.bits()
+            | ScriptVerifyFlags::LOW_S.bits()
+            | ScriptVerifyFlags::STRICTENC.bits()
+            | ScriptVerifyFlags::MINIMALDATA.bits()
+            | ScriptVerifyFlags::MINIMALIF.bits()
+            | ScriptVerifyFlags::SIGPUSHONLY.bits()
+            | ScriptVerifyFlags::WITNESS_PUBKEYTYPE.bits()
+            | ScriptVerifyFlags::CONST_SCRIPTCODE.bits()
+            | ScriptVerifyFlags::DISCOURAGE_UPGRADABLE_NOPS.bits()
+            | ScriptVerifyFlags::DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM.bits()
+            | ScriptVerifyFlags::DISCOURAGE_UPGRADABLE_TAPROOT_VERSION.bits()
+            | ScriptVerifyFlags::DISCOURAGE_OP_SUCCESS.bits()
+            | ScriptVerifyFlags::DISCOURAGE_UPGRADABLE_PUBKEYTYPE.bits(),
+    );
+
+    /// Display (big-endian) hex → internal (little-endian) 32-byte hash, the
+    /// orientation `BlockHash::as_byte_array()` and ouroboros storage use.
+    fn internal_hash(display_hex: &str) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        for i in 0..32 {
+            bytes[i] = u8::from_str_radix(&display_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        bytes.reverse();
+        bytes
+    }
+
+    const BIP16_EXCEPTION_DISPLAY: &str =
+        "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22";
+    const TAPROOT_EXCEPTION_DISPLAY: &str =
+        "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad";
+    const TESTNET3_EXCEPTION_DISPLAY: &str =
+        "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105";
+
+    /// Re-derive the hard-coded table keys from the chainparams display hex so
+    /// a typo in the byte literals cannot silently disable the whole table.
     #[test]
-    fn test_get_script_flags_for_height_mainnet() {
+    fn test_script_flag_exception_key_byte_order() {
         use bitcoin::Network;
 
-        // Before any softforks
-        let flags = activation_heights::get_script_flags_for_height(0, Network::Bitcoin);
-        assert_eq!(flags, ScriptVerifyFlags::NONE);
+        // Each key hits its own entry when supplied in INTERNAL byte order.
+        assert_eq!(
+            activation_heights::script_flag_exception(
+                Network::Bitcoin,
+                &internal_hash(BIP16_EXCEPTION_DISPLAY)
+            ),
+            Some(ScriptVerifyFlags::NONE),
+        );
+        assert_eq!(
+            activation_heights::script_flag_exception(
+                Network::Bitcoin,
+                &internal_hash(TAPROOT_EXCEPTION_DISPLAY)
+            ),
+            Some(ScriptVerifyFlags::P2SH | ScriptVerifyFlags::WITNESS),
+        );
+        assert_eq!(
+            activation_heights::script_flag_exception(
+                Network::Testnet,
+                &internal_hash(TESTNET3_EXCEPTION_DISPLAY)
+            ),
+            Some(ScriptVerifyFlags::NONE),
+        );
+    }
 
-        // At P2SH activation (173805)
-        let flags = activation_heights::get_script_flags_for_height(173805, Network::Bitcoin);
+    /// NEGATIVE CONTROL for byte order: the display (big-endian) orientation
+    /// must NOT match.  If someone "fixes" the table to display order this
+    /// test fails, and the real block hashes stop matching in production.
+    #[test]
+    fn test_script_flag_exception_display_order_is_not_a_key() {
+        use bitcoin::Network;
+
+        let mut reversed = internal_hash(BIP16_EXCEPTION_DISPLAY);
+        reversed.reverse(); // back to display order
+        assert_eq!(
+            activation_heights::script_flag_exception(Network::Bitcoin, &reversed),
+            None,
+            "display-order hash must not hit the exception table"
+        );
+
+        let mut reversed = internal_hash(TAPROOT_EXCEPTION_DISPLAY);
+        reversed.reverse();
+        assert_eq!(
+            activation_heights::script_flag_exception(Network::Bitcoin, &reversed),
+            None,
+        );
+
+        // Exceptions are per-network: the testnet3 key must not fire on mainnet
+        // and the mainnet keys must not fire on testnet3.
+        assert_eq!(
+            activation_heights::script_flag_exception(
+                Network::Bitcoin,
+                &internal_hash(TESTNET3_EXCEPTION_DISPLAY)
+            ),
+            None,
+        );
+        assert_eq!(
+            activation_heights::script_flag_exception(
+                Network::Testnet,
+                &internal_hash(BIP16_EXCEPTION_DISPLAY)
+            ),
+            None,
+        );
+    }
+
+    /// Step 1: the base set is UNCONDITIONAL — P2SH, WITNESS and TAPROOT are
+    /// on for EVERY block, including height 0.  Core dropped BIP16Height and
+    /// taprootHeight from this path in v23 (validation.cpp:2262).
+    #[test]
+    fn test_block_script_flags_base_is_unconditional() {
+        use bitcoin::Network;
+
+        let flags = activation_heights::get_block_script_flags(0, None, Network::Bitcoin);
+        assert!(flags.contains(ScriptVerifyFlags::P2SH), "P2SH is unconditional");
+        assert!(flags.contains(ScriptVerifyFlags::WITNESS), "WITNESS is unconditional");
+        assert!(flags.contains(ScriptVerifyFlags::TAPROOT), "TAPROOT is unconditional");
+
+        // ...but the four height-gated flags are still off at height 0.
+        assert!(!flags.contains(ScriptVerifyFlags::DERSIG));
+        assert!(!flags.contains(ScriptVerifyFlags::CHECKLOCKTIMEVERIFY));
+        assert!(!flags.contains(ScriptVerifyFlags::CHECKSEQUENCEVERIFY));
+        assert!(!flags.contains(ScriptVerifyFlags::NULLDUMMY));
+
+        // Height 1 before P2SH's old 173805 gate: still on.
+        let flags = activation_heights::get_block_script_flags(1, None, Network::Bitcoin);
         assert!(flags.contains(ScriptVerifyFlags::P2SH));
-        assert!(!flags.contains(ScriptVerifyFlags::NULLFAIL));
-
-        // At SegWit activation (481824) - NULLFAIL must be enabled
-        let flags = activation_heights::get_script_flags_for_height(481824, Network::Bitcoin);
-        assert!(flags.contains(ScriptVerifyFlags::P2SH));
-        assert!(flags.contains(ScriptVerifyFlags::WITNESS));
-        assert!(flags.contains(ScriptVerifyFlags::NULLFAIL));
-        assert!(flags.contains(ScriptVerifyFlags::NULLDUMMY));
-        assert!(flags.contains(ScriptVerifyFlags::WITNESS_PUBKEYTYPE));
-
-        // After Taproot activation (709632)
-        let flags = activation_heights::get_script_flags_for_height(709632, Network::Bitcoin);
-        assert!(flags.contains(ScriptVerifyFlags::NULLFAIL));
         assert!(flags.contains(ScriptVerifyFlags::TAPROOT));
     }
 
+    /// ACCEPTANCE CRITERION 1 — mainnet 170060 (the BIP16 violator).
+    /// Exception value is SCRIPT_VERIFY_NONE and none of DERSIG/CLTV/CSV/
+    /// NULLDUMMY are active at that height, so the result is exactly NONE.
     #[test]
-    fn test_get_script_flags_for_height_regtest() {
+    fn test_block_script_flags_bip16_exception_block_170060() {
         use bitcoin::Network;
 
-        // Regtest has all flags from genesis
-        let flags = activation_heights::get_script_flags_for_height(0, Network::Regtest);
+        let hash = internal_hash(BIP16_EXCEPTION_DISPLAY);
+        let flags = activation_heights::get_block_script_flags(170060, Some(&hash), Network::Bitcoin);
+
+        assert_eq!(
+            flags,
+            ScriptVerifyFlags::NONE,
+            "block 170060 must verify with SCRIPT_VERIFY_NONE, got {:?}",
+            flags
+        );
+    }
+
+    /// ACCEPTANCE CRITERION 2 — mainnet 692261 (the Taproot violator).
+    /// The exception value is P2SH|WITNESS, which STRIPS TAPROOT; the four
+    /// height-gated flags are then OR'd back ON TOP.  An early return here
+    /// would drop DERSIG|CLTV|CSV|NULLDUMMY and false-accept scripts Core
+    /// rejects under BIP-66/65/112/147.
+    #[test]
+    fn test_block_script_flags_taproot_exception_block_692261() {
+        use bitcoin::Network;
+
+        let hash = internal_hash(TAPROOT_EXCEPTION_DISPLAY);
+        let flags = activation_heights::get_block_script_flags(692261, Some(&hash), Network::Bitcoin);
+
+        let expected = ScriptVerifyFlags::P2SH
+            | ScriptVerifyFlags::WITNESS
+            | ScriptVerifyFlags::DERSIG
+            | ScriptVerifyFlags::CHECKLOCKTIMEVERIFY
+            | ScriptVerifyFlags::CHECKSEQUENCEVERIFY
+            | ScriptVerifyFlags::NULLDUMMY;
+
+        assert_eq!(
+            flags, expected,
+            "692261 must be P2SH|WITNESS|DERSIG|CLTV|CSV|NULLDUMMY, got {:?}",
+            flags
+        );
+        assert!(
+            !flags.contains(ScriptVerifyFlags::TAPROOT),
+            "the exception must strip TAPROOT"
+        );
+        // Regression guard against the early-return shape.
+        assert!(flags.contains(ScriptVerifyFlags::DERSIG), "BIP66 active at 692261");
+        assert!(flags.contains(ScriptVerifyFlags::CHECKLOCKTIMEVERIFY), "BIP65 active at 692261");
+        assert!(flags.contains(ScriptVerifyFlags::CHECKSEQUENCEVERIFY), "BIP112 active at 692261");
+        assert!(flags.contains(ScriptVerifyFlags::NULLDUMMY), "BIP147 active at 692261");
+    }
+
+    /// ACCEPTANCE CRITERION 3 — the CONTROL.  Any NON-exception block hash at
+    /// height 692261 must KEEP TAPROOT.  The exception is keyed by hash, not
+    /// by height: a fork block at the same height gets no exemption.
+    #[test]
+    fn test_block_script_flags_non_exception_at_692261_keeps_taproot() {
+        use bitcoin::Network;
+
+        // Perturb one byte of the real exception hash.
+        let mut hash = internal_hash(TAPROOT_EXCEPTION_DISPLAY);
+        hash[0] ^= 0x01;
+
+        let flags = activation_heights::get_block_script_flags(692261, Some(&hash), Network::Bitcoin);
+
+        assert!(
+            flags.contains(ScriptVerifyFlags::TAPROOT),
+            "a non-exception block at 692261 must keep TAPROOT"
+        );
+        assert_eq!(
+            flags,
+            ScriptVerifyFlags::P2SH
+                | ScriptVerifyFlags::WITNESS
+                | ScriptVerifyFlags::TAPROOT
+                | ScriptVerifyFlags::DERSIG
+                | ScriptVerifyFlags::CHECKLOCKTIMEVERIFY
+                | ScriptVerifyFlags::CHECKSEQUENCEVERIFY
+                | ScriptVerifyFlags::NULLDUMMY,
+        );
+
+        // Same for a block at 170060 that is not the BIP16 violator.
+        let mut hash = internal_hash(BIP16_EXCEPTION_DISPLAY);
+        hash[31] ^= 0x80;
+        let flags = activation_heights::get_block_script_flags(170060, Some(&hash), Network::Bitcoin);
         assert!(flags.contains(ScriptVerifyFlags::P2SH));
+        assert!(flags.contains(ScriptVerifyFlags::TAPROOT));
+        assert!(flags.contains(ScriptVerifyFlags::WITNESS));
+    }
+
+    /// The testnet3 BIP16 violator also collapses to SCRIPT_VERIFY_NONE when
+    /// none of the four height gates are active yet (its height, ~211k, is
+    /// below testnet3's BIP66Height of 330776).
+    #[test]
+    fn test_block_script_flags_testnet3_exception() {
+        use bitcoin::Network;
+
+        let hash = internal_hash(TESTNET3_EXCEPTION_DISPLAY);
+        let flags = activation_heights::get_block_script_flags(211_000, Some(&hash), Network::Testnet);
+        assert_eq!(flags, ScriptVerifyFlags::NONE);
+
+        // Control: a different hash at the same testnet3 height keeps the base.
+        let mut other = hash;
+        other[5] ^= 0xff;
+        let flags = activation_heights::get_block_script_flags(211_000, Some(&other), Network::Testnet);
+        assert!(flags.contains(ScriptVerifyFlags::P2SH));
+        assert!(flags.contains(ScriptVerifyFlags::WITNESS));
+        assert!(flags.contains(ScriptVerifyFlags::TAPROOT));
+    }
+
+    /// The four height gates fire exactly at their chainparams heights.
+    #[test]
+    fn test_block_script_flags_height_gates_mainnet() {
+        use bitcoin::Network;
+
+        let at = |h| activation_heights::get_block_script_flags(h, None, Network::Bitcoin);
+
+        assert!(!at(363724).contains(ScriptVerifyFlags::DERSIG));
+        assert!(at(363725).contains(ScriptVerifyFlags::DERSIG));
+
+        assert!(!at(388380).contains(ScriptVerifyFlags::CHECKLOCKTIMEVERIFY));
+        assert!(at(388381).contains(ScriptVerifyFlags::CHECKLOCKTIMEVERIFY));
+
+        assert!(!at(419327).contains(ScriptVerifyFlags::CHECKSEQUENCEVERIFY));
+        assert!(at(419328).contains(ScriptVerifyFlags::CHECKSEQUENCEVERIFY));
+
+        assert!(!at(481823).contains(ScriptVerifyFlags::NULLDUMMY));
+        assert!(at(481824).contains(ScriptVerifyFlags::NULLDUMMY));
+    }
+
+    /// No policy flag may ever leak into the consensus flag set — at any
+    /// height, on any network, exception block or not.
+    #[test]
+    fn test_block_script_flags_never_contain_policy_flags() {
+        use bitcoin::Network;
+
+        let networks = [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+            Network::Regtest,
+        ];
+        let heights = [0u32, 1, 170060, 173805, 363725, 388381, 419328, 481824, 692261, 709632, 900_000];
+        let hashes = [
+            None,
+            Some(internal_hash(BIP16_EXCEPTION_DISPLAY)),
+            Some(internal_hash(TAPROOT_EXCEPTION_DISPLAY)),
+            Some(internal_hash(TESTNET3_EXCEPTION_DISPLAY)),
+        ];
+
+        for network in networks {
+            for height in heights {
+                for hash in &hashes {
+                    let flags =
+                        activation_heights::get_block_script_flags(height, hash.as_ref(), network);
+                    assert!(
+                        !flags.intersects(POLICY_ONLY),
+                        "policy flags leaked at {:?}/{}: {:?}",
+                        network,
+                        height,
+                        flags & POLICY_ONLY
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_block_script_flags_regtest() {
+        use bitcoin::Network;
+
+        // Regtest: P2SH/WITNESS/TAPROOT unconditional, NULLDUMMY from height 0
+        // (SegwitHeight = 0), DERSIG/CLTV/CSV from height 1.
+        let flags = activation_heights::get_block_script_flags(0, None, Network::Regtest);
+        assert!(flags.contains(ScriptVerifyFlags::P2SH));
+        assert!(flags.contains(ScriptVerifyFlags::WITNESS));
+        assert!(flags.contains(ScriptVerifyFlags::TAPROOT));
+        assert!(flags.contains(ScriptVerifyFlags::NULLDUMMY));
+        assert!(!flags.contains(ScriptVerifyFlags::DERSIG));
+
+        let flags = activation_heights::get_block_script_flags(1, None, Network::Regtest);
         assert!(flags.contains(ScriptVerifyFlags::DERSIG));
         assert!(flags.contains(ScriptVerifyFlags::CHECKLOCKTIMEVERIFY));
         assert!(flags.contains(ScriptVerifyFlags::CHECKSEQUENCEVERIFY));
-        assert!(flags.contains(ScriptVerifyFlags::WITNESS));
-        assert!(flags.contains(ScriptVerifyFlags::NULLFAIL));
+        assert!(flags.contains(ScriptVerifyFlags::NULLDUMMY));
     }
 
     #[test]
