@@ -41,6 +41,14 @@ MAX_STANDARD_TX_SIGOPS_COST = 16_000
 MIN_STANDARD_TX_NONWITNESS_SIZE = 65
 MAX_STANDARD_SCRIPTSIG_SIZE = 1650  # Bitcoin Core policy/policy.h MAX_STANDARD_SCRIPTSIG_SIZE
 MAX_OP_RETURN_RELAY = 100_000  # MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR (100 kB, policy/policy.h)
+# NOT mempool admission gates any more.  Core v31's cluster mempool removed the
+# generic ancestor/descendant enforcement from PreChecks; MAX_CLUSTER_COUNT /
+# MAX_CLUSTER_SIZE_WEIGHT below are what bound a cluster now.  Core keeps
+# DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT (policy/policy.h:76-80) only
+# so the wallet can size its coin-selection chains (node/interfaces.cpp:709-716
+# → wallet/spend.cpp:879-883), and dropped the ancestor/descendant SIZE limits
+# entirely.  These four are retained for that reporting/parity role — do not
+# reintroduce them as admission checks.
 MAX_ANCESTOR_COUNT = 25
 MAX_DESCENDANT_COUNT = 25
 MAX_ANCESTOR_SIZE_KVB = 101
@@ -78,8 +86,27 @@ MAX_PACKAGE_WEIGHT = 404_000  # weight units
 # Cluster mempool limits (Bitcoin Core policy/policy.h + kernel/mempool_limits.h)
 # DEFAULT_CLUSTER_LIMIT = 64  (policy/policy.h:72)
 # DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101  (policy/policy.h:74)
-MAX_CLUSTER_COUNT = 64        # Maximum transactions per cluster (was 100 — WRONG)
-MAX_CLUSTER_SIZE_VBYTES = 101_000  # Maximum virtual bytes per cluster (101 kvB)
+MAX_CLUSTER_COUNT = 64        # Maximum transactions per cluster
+# The *declared* limit, in virtual bytes.  This is the number Core surfaces on
+# the wire (rpc/mempool.cpp:1062 pushes `limits.cluster_size_vbytes`), so
+# getmempoolinfo.limitclustersize must report exactly this.  It is NOT the
+# quantity the gate compares against — see MAX_CLUSTER_SIZE_WEIGHT.
+MAX_CLUSTER_SIZE_VBYTES = 101_000  # kernel/mempool_limits.h:22 (101 * 1'000)
+# The *enforced* limit, in weight units.  Core converts once, at TxGraph
+# construction:
+#     txmempool.cpp:181  max_cluster_size = cluster_size_vbytes * WITNESS_SCALE_FACTOR
+# and TxGraph then sums an UNROUNDED per-transaction weight quantity
+#     txmempool.cpp:1017  GetSigOpsAdjustedWeight(GetTransactionWeight(tx), sigops, nBytesPerSigOp)
+# comparing with a strict > (txgraph.cpp:2059).  Summing per-tx ceil(w/4) vbytes
+# against 101_000 instead is systematically STRICTER than Core, because
+# Σ⌈wᵢ/4⌉ ≥ (Σwᵢ)/4 — so the sum must stay in weight units end to end and the
+# single division must never happen per transaction.
+MAX_CLUSTER_SIZE_WEIGHT = MAX_CLUSTER_SIZE_VBYTES * WITNESS_SCALE_FACTOR  # 404_000
+# Core's bare reject token for BOTH cluster gates, with an empty debug string.
+# validation.cpp:1024, :1116, :1343, :1521 — count and size are not
+# distinguished on the wire.  Consumers must key off this token, never off
+# prose.  ("too-long-mempool-chain" no longer occurs anywhere in Core.)
+CLUSTER_REJECT_TOKEN = "too-large-cluster"
 
 # Extra descendant tx size limit for package validation (Bitcoin Core policy/policy.h:90)
 # EXTRA_DESCENDANT_TX_SIZE_LIMIT = 10000 weight units; governs the one-extra-tx package
@@ -1709,6 +1736,34 @@ class MempoolEntry:
         weight = self.tx.get_weight()
         return get_virtual_transaction_size(weight, self.sigop_cost, DEFAULT_BYTES_PER_SIGOP)
 
+    @property
+    def sigop_adjusted_weight(self) -> int:
+        """Sigop-adjusted WEIGHT (not vbytes) — the cluster-size summand.
+
+        This is the exact per-transaction quantity Bitcoin Core hands to TxGraph
+        and that TxGraph sums when enforcing the cluster size limit:
+
+            txmempool.cpp:1017
+                FeePerWeight feerate(fee, GetSigOpsAdjustedWeight(
+                    GetTransactionWeight(*tx), sigops_cost, ::nBytesPerSigOp));
+            policy.cpp:390
+                GetSigOpsAdjustedWeight = std::max(weight, sigop_cost * bytes_per_sigop)
+
+        Deliberately NOT ``vsize``: vsize is ceil(this / 4), and rounding every
+        member up before summing over-counts a cluster by up to 3 weight units
+        per transaction.  Also deliberately NOT ``size``: ``size`` is the
+        STRIPPED, witness-less byte count used for the mempool RAM budget
+        (current_size / max_size / _evict_low_fee_txs), which for segwit
+        transactions is *smaller* than vsize and would under-count the cluster.
+
+        Reference: bitcoin-core/src/policy/policy.cpp:390,
+                   bitcoin-core/src/txmempool.cpp:181,1017,
+                   bitcoin-core/src/txgraph.cpp:2059.
+        """
+        return get_sigops_adjusted_weight(
+            self.tx.get_weight(), self.sigop_cost, DEFAULT_BYTES_PER_SIGOP
+        )
+
 
 # Orphan transaction pool
 MAX_ORPHAN_TRANSACTIONS = 100
@@ -2578,7 +2633,20 @@ class Mempool:
                 return self._try_sibling_eviction(tx, sibling_txid, height)
             return False, truc_err
 
-        # Ancestor/descendant limits (Bitcoin Core: CalculateMemPoolAncestors)
+        # Ancestor set — bookkeeping only.  As of Bitcoin Core v31 (cluster
+        # mempool) there is NO generic ancestor/descendant count or size
+        # admission gate: kernel/mempool_limits.h still carries ancestor_count /
+        # descendant_count, but the only consumer left is the WALLET's coin
+        # selection via getPackageLimits (node/interfaces.cpp:709-716 →
+        # wallet/spend.cpp:879-883).  PreChecks no longer consults them, the
+        # ancestor/descendant *size* limits were deleted outright, and the
+        # "too-long-mempool-chain" reject token no longer occurs anywhere in
+        # bitcoin-core/src.  The cluster count/size gates below replace them;
+        # TRUC's 2-ancestor / 2-descendant rule (_check_truc_policy, above) is
+        # the only surviving ancestor/descendant enforcement.
+        # The set itself is still needed for the entry's ancestor_count /
+        # ancestor_size fields and for the descendant bookkeeping after insert.
+        # Reference: bitcoin-core/src/validation.cpp:1341-1344.
         ancestors = self._get_ancestors(tx)
         # Stripped non-witness byte count: used for raw byte-budget accounting
         # (mempool max_size, ancestor_size, descendant_size stored on entries).
@@ -2593,35 +2661,17 @@ class Mempool:
         #            bitcoin-core/src/kernel/mempool_entry.h:110-113
         tx_vsize = get_virtual_transaction_size(tx.get_weight(), tx_sigop_cost, DEFAULT_BYTES_PER_SIGOP)
 
-        # Check ancestor count limit
-        if len(ancestors) + 1 > MAX_ANCESTOR_COUNT:
-            return False, (
-                f"Too many ancestors: {len(ancestors) + 1} > {MAX_ANCESTOR_COUNT}")
-
-        # Check ancestor size limit (101KB)
+        # Ancestor byte total — bookkeeping for the entry's ancestor_size field.
+        # No longer a gate (see the note on `ancestors` above).
         ancestor_size = sum(self.transactions[a].size for a in ancestors if a in self.transactions)
-        if ancestor_size + tx_size > MAX_ANCESTOR_SIZE_KVB * 1000:
-            return False, (
-                f"Ancestor size limit exceeded: {ancestor_size + tx_size} > "
-                f"{MAX_ANCESTOR_SIZE_KVB * 1000}")
 
-        # Check descendant limits for each ancestor
-        for a_txid in ancestors:
-            if a_txid in self.transactions:
-                entry = self.transactions[a_txid]
-                # Descendant count limit
-                if entry.descendant_count + 1 > MAX_DESCENDANT_COUNT:
-                    return False, (
-                        f"Too many descendants for ancestor {a_txid.hex()[:16]}...: "
-                        f"{entry.descendant_count + 1} > {MAX_DESCENDANT_COUNT}")
-                # Descendant size limit (101KB)
-                if entry.descendant_size + tx_size > MAX_DESCENDANT_SIZE_KVB * 1000:
-                    return False, (
-                        f"Descendant size limit exceeded for {a_txid.hex()[:16]}...: "
-                        f"{entry.descendant_size + tx_size} > {MAX_DESCENDANT_SIZE_KVB * 1000}")
-
-        # Check cluster size limit
-        cluster_ok, cluster_err = self._check_cluster_limit(tx)
+        # Cluster count + cluster size limits.  These are the ONLY generic
+        # topology limits in Core v31, and they subsume the ancestor/descendant
+        # count and size gates that used to live here.  Pass the already-computed
+        # sigop cost so the incoming transaction contributes the same
+        # sigop-adjusted weight that TxGraph would store for it.
+        # Reference: bitcoin-core/src/validation.cpp:1341-1344.
+        cluster_ok, cluster_err = self._check_cluster_limit(tx, sigop_cost=tx_sigop_cost)
         if not cluster_ok:
             return False, cluster_err
 
@@ -2798,24 +2848,52 @@ class Mempool:
                     queue.append(grandparent_txid)
         return result
 
-    def _check_cluster_limit(self, tx: Transaction) -> tuple[bool, str]:
-        """Check if adding a transaction would exceed cluster limits.
+    def _check_cluster_limit(self, tx: Transaction, sigop_cost: int = 0) -> tuple[bool, str]:
+        """Check whether admitting `tx` would exceed either cluster limit.
 
-        Bitcoin Core enforces two independent cluster limits
-        (kernel/mempool_limits.h MemPoolLimits / txmempool.cpp:179-181):
-          1. cluster_count  <= DEFAULT_CLUSTER_LIMIT = 64 transactions
-          2. cluster_size   <= DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000 vbytes
+        THE LIVE GATE.  Called from `add_transaction` immediately after the TRUC
+        checks.  (`ClusterManager.check_cluster_limit` is a near-identical but
+        entirely unreferenced duplicate — it is not on any admission path.)
 
-        Both are checked before admitting a new transaction.  A single
-        transaction that would merge several existing clusters is evaluated
-        against the *merged* total.
+        Core enforces two independent cluster limits.  A transaction that joins
+        several existing clusters is evaluated against the MERGED total:
 
-        Reference: Bitcoin Core txmempool.cpp:179-181, policy/policy.h:72-74,
-                   kernel/mempool_limits.h
+          1. count:  total_count > 64        → reject   (DEFAULT_CLUSTER_LIMIT)
+          2. size:   total_weight > 404_000  → reject   (101 kvB × 4)
+
+        Both comparisons are strict `>` (txgraph.cpp:2059), so 64 txs and
+        404_000 weight both ACCEPT; 65 and 404_001 reject.
+
+        UNITS.  The size gate runs entirely in WEIGHT units.  Core converts the
+        vbyte limit to weight exactly once, when TxGraph is constructed
+        (txmempool.cpp:181), and every transaction contributes the UNROUNDED
+        `GetSigOpsAdjustedWeight(weight, sigops, bytes_per_sigop)`
+        (txmempool.cpp:1017).  There is no per-transaction division and no
+        per-transaction rounding anywhere in the sum.  Dividing each member by 4
+        first and comparing Σ⌈wᵢ/4⌉ against 101_000 is a DIFFERENT, strictly
+        tighter predicate — up to 48 vB tighter across a 64-tx cluster, and
+        always in the reject direction.
+
+        Args:
+            tx: The transaction being admitted (not yet in the mempool).
+            sigop_cost: BIP-141-weighted sigop cost of `tx`, as computed by
+                `_compute_tx_sigop_cost`.  0 when standardness checks are off,
+                which degrades the max() to plain weight — the same degradation
+                Core gets from a zero sigops_cost.
+
+        Returns:
+            (ok, reject_reason).  The reason is Core's bare reject TOKEN
+            "too-large-cluster" with an EMPTY debug string, for both gates —
+            validation.cpp:1024, :1116, :1343, :1521 all pass "" as the debug
+            message and do not distinguish count from size.
+
+        Reference: bitcoin-core/src/policy/policy.h:72-74,
+                   bitcoin-core/src/kernel/mempool_limits.h:20-22,
+                   bitcoin-core/src/policy/policy.cpp:390,
+                   bitcoin-core/src/txmempool.cpp:181,1017,
+                   bitcoin-core/src/txgraph.cpp:2059,
+                   bitcoin-core/src/validation.cpp:1024,1116,1343,1521.
         """
-        # Determine the vsize of the incoming tx (virtual bytes = ceil(weight/4))
-        tx_vsize = tx.get_vsize() if hasattr(tx, "get_vsize") else len(tx.serialize())
-
         # Find all clusters that would be merged by this transaction
         neighbor_cluster_ids: set[int] = set()
         for inp in tx.inputs:
@@ -2835,29 +2913,27 @@ class Mempool:
                 total_count += cluster.size()
 
         if total_count > MAX_CLUSTER_COUNT:
-            return False, (
-                f"Transaction would create cluster of {total_count} txs "
-                f"exceeding limit {MAX_CLUSTER_COUNT} "
-                f"(policy/policy.h DEFAULT_CLUSTER_LIMIT)"
-            )
+            return False, CLUSTER_REJECT_TOKEN
 
-        # Gate 2: vbyte size — total virtual bytes in the merged cluster
-        # Sum the stored .size field for each txid across all neighbor clusters.
-        total_vbytes = tx_vsize
+        # Gate 2: size — total sigop-adjusted WEIGHT in the merged cluster.
+        # The incoming transaction contributes max(weight, sigops*20); every
+        # existing member contributes its own `sigop_adjusted_weight`.  Note
+        # this is deliberately NOT `entry.size`: `size` is the stripped,
+        # witness-less serialisation used for the mempool RAM budget, which for
+        # segwit members is smaller than vsize and would UNDER-count the cluster.
+        total_weight = get_sigops_adjusted_weight(
+            tx.get_weight(), sigop_cost, DEFAULT_BYTES_PER_SIGOP
+        )
         for cid in neighbor_cluster_ids:
             cluster = self._cluster_manager._clusters.get(cid)
             if cluster:
                 for txid in cluster.txids:
                     entry = self._cluster_manager.transactions.get(txid)
                     if entry is not None:
-                        total_vbytes += entry.size
+                        total_weight += entry.sigop_adjusted_weight
 
-        if total_vbytes > MAX_CLUSTER_SIZE_VBYTES:
-            return False, (
-                f"Transaction would create cluster of {total_vbytes} vbytes "
-                f"exceeding limit {MAX_CLUSTER_SIZE_VBYTES} "
-                f"(policy/policy.h DEFAULT_CLUSTER_SIZE_LIMIT_KVB)"
-            )
+        if total_weight > MAX_CLUSTER_SIZE_WEIGHT:
+            return False, CLUSTER_REJECT_TOKEN
 
         return True, ""
 
