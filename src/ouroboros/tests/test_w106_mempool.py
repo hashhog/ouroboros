@@ -209,20 +209,28 @@ def _make_mempool(full_rbf: bool = True, require_standard: bool = False):
 
 
 # ---------------------------------------------------------------------------
-# G1 — ancestor count limit (MAX_ANCESTOR_COUNT = 25)
+# G1 — chain depth is bounded by the CLUSTER limits, not an ancestor limit
 # ---------------------------------------------------------------------------
 
 class TestG1AncestorCountLimit(unittest.TestCase):
-    """G1: Ancestor count must not exceed MAX_ANCESTOR_COUNT=25."""
+    """G1: Core v31 deleted the 25-ancestor admission gate.
 
-    def test_chain_of_25_ancestors_rejected(self):
+    DEFAULT_ANCESTOR_LIMIT survives in kernel/mempool_limits.h only as a wallet
+    coin-selection hint (node/interfaces.cpp:709-716 → wallet/spend.cpp:879-883);
+    PreChecks no longer consults it, and "too-long-mempool-chain" no longer
+    occurs anywhere in bitcoin-core/src.  Chain depth is now bounded solely by
+    DEFAULT_CLUSTER_LIMIT (64 transactions) and the 404_000-weight cluster size
+    limit.
+    """
+
+    def test_chain_of_26_accepted_ancestor_gate_removed(self):
         from ouroboros.mempool import Mempool, MAX_ANCESTOR_COUNT
         mp, db = _make_mempool()
 
-        # Build a chain: confirmed_utxo -> tx1 -> tx2 -> ... -> tx(N)
-        # MAX_ANCESTOR_COUNT = 25 means: self + at most 24 unconfirmed ancestors
-        # len(ancestors) + 1 > MAX_ANCESTOR_COUNT → rejected when len(ancestors) >= 25
-        # i.e. when the chain has 25 in-mempool txs already.
+        # Build a chain: confirmed_utxo -> tx1 -> tx2 -> ... -> tx26.
+        # All 26 form one cluster, inside the 64-transaction limit, and their
+        # combined weight is a few thousand units — far under 404_000.
+        # Mirrors the `cluster-linear-26` corpus entry.
         prev_txid = _bytes32(0)
         db.add_utxo(prev_txid, 0, value=1_000_000)
 
@@ -239,18 +247,17 @@ class TestG1AncestorCountLimit(unittest.TestCase):
             self.assertTrue(ok, f"Expected tx {i} to be accepted (ancestor_count={i} <= {MAX_ANCESTOR_COUNT}): {err}")
             prev_txid = new_txid
 
-        # The (MAX_ANCESTOR_COUNT + 1)-th in-mempool tx has 25 unconfirmed ancestors
-        # → ancestor_count = 26 > 25 → rejected
+        # The 26th tx has 25 unconfirmed ancestors.  Pre-v31 this was rejected;
+        # under the cluster mempool it is a 26-member cluster and is ACCEPTED.
         new_txid_over = _bytes32(MAX_ANCESTOR_COUNT + 1)
         inp = TxIn(prev_txid=prev_txid, prev_vout=0)
         tx_over = _make_tx(txid=new_txid_over, inputs=[inp],
                            outputs=[TxOut(value=800_000,
                                           script_pubkey=bytes([0x51, 0x20]) + bytes(32))])
         ok, err = mp.add_transaction(tx_over, height=101)
-        self.assertFalse(ok,
-                         f"Tx with {MAX_ANCESTOR_COUNT} in-mempool ancestors must be rejected")
-        self.assertIn("ancestor", err.lower(),
-                      f"Expected ancestor-limit error, got: {err}")
+        self.assertTrue(ok,
+                        "26-transaction chain must be ACCEPTED: the 25-ancestor "
+                        f"gate was removed in Core v31; err={err}")
 
     def test_single_tx_accepted(self):
         mp, db = _make_mempool()

@@ -323,7 +323,20 @@ class TestAncestorLimits:
 
 
 class TestAncestorDescendantLimits:
-    """Tests for ancestor/descendant count and size limits (BIP 125 limits)."""
+    """Topology limits under Core v31's cluster mempool.
+
+    v31 deleted the generic ancestor/descendant admission gates: the
+    ancestor/descendant SIZE limits are gone outright, and the 25-count limits
+    survive only as wallet coin-selection hints (node/interfaces.cpp:709-716).
+    What bounds a mempool topology now is the pair of CLUSTER limits — 64
+    transactions and 404_000 weight units — and the reject token for both is the
+    bare "too-large-cluster" with an empty debug string
+    (validation.cpp:1024, :1116, :1343, :1521).
+
+    These tests therefore assert the v31 outcome: chains and fans that the old
+    25-limits rejected are now ACCEPTED, while byte-heavy topologies are still
+    rejected — but by the cluster gate, under its token.
+    """
 
     def _make_chain_tx(self, txid_byte, parent_txid, parent_vout, output_value):
         """Helper to build a tx spending a specific parent output."""
@@ -343,8 +356,14 @@ class TestAncestorDescendantLimits:
         )
 
     def test_ancestor_count_limit(self):
-        """Reject transaction exceeding MAX_ANCESTOR_COUNT (25)."""
-        # Build a chain of 25 transactions (the maximum allowed)
+        """A 26-long chain is ACCEPTED — the 25-ancestor gate no longer exists.
+
+        Pre-v31 this was rejected with "too-long-mempool-chain".  Under the
+        cluster mempool a 26-transaction chain is one cluster of 26, well inside
+        both DEFAULT_CLUSTER_LIMIT (64) and the 404_000-weight size limit, so it
+        must be admitted.  Mirrors the `cluster-linear-26` corpus entry.
+        """
+        # Build a chain of 25 transactions, then extend it to 26
         utxos = {(b"\x00" * 32, 0): {"value": 1_000_000}}
         pool = _truc_pool(utxos)
 
@@ -361,15 +380,21 @@ class TestAncestorDescendantLimits:
             prev_value -= 1000
             pool.validator.db.add(prev_txid, 0, prev_value)
 
-        # 26th transaction should be rejected (ancestor count = 26 > 25)
+        # 26th transaction: cluster of 26 <= 64 and far under 404_000 weight
         tx_26 = self._make_chain_tx(26, prev_txid, 0, prev_value - 1000)
         ok, err = pool.add_transaction(tx_26, height=100)
-        assert not ok, "26th transaction should be rejected (ancestor limit)"
-        assert "ancestor" in err.lower()
+        assert ok, (
+            "26th transaction must be ACCEPTED: Core v31 has no 25-ancestor "
+            f"gate, and the cluster limits are nowhere near breached. err={err}"
+        )
 
     def test_descendant_count_limit(self):
-        """Reject transaction when an ancestor would exceed MAX_DESCENDANT_COUNT."""
-        # Add a root tx then try to add 26 children spending the same parent
+        """A 26-member fan is ACCEPTED — the 25-descendant gate no longer exists.
+
+        Root + 25 children = a cluster of 26, inside DEFAULT_CLUSTER_LIMIT (64).
+        Mirrors the `cluster-fan-26` corpus entry.
+        """
+        # Add a root tx then 25 children spending distinct root outputs
         utxos = {(b"\x00" * 32, 0): {"value": 10_000_000}}
         pool = _truc_pool(utxos)
 
@@ -403,18 +428,23 @@ class TestAncestorDescendantLimits:
             ok, err = pool.add_transaction(child, height=100)
             assert ok, f"Child {i+1} should be accepted: {err}"
 
-        # 25th child should also succeed (exactly at the limit)
+        # 25th child takes the cluster to 26 members — accepted under v31.
         child_25 = self._make_chain_tx(25, b"\xAA" * 32, 24, 90_000)
         ok, err = pool.add_transaction(child_25, height=100)
-        # Actually this may exceed if root counts itself. Let's check the actual behavior.
-        # Descendant count for root = 1 (itself) + 24 children = 25. Adding one more = 26.
-        # So child_25 should be rejected.
-        assert not ok, "25th child should be rejected (descendant limit for root)"
-        assert "descendant" in err.lower()
+        assert ok, (
+            "25th child must be ACCEPTED: the cluster is 26 members, inside the "
+            f"64-transaction limit, and the old descendant gate is gone. err={err}"
+        )
 
     def test_ancestor_size_limit(self):
-        """Reject transaction when ancestor size exceeds 101KB."""
-        # Create large transactions that together exceed 101KB
+        """A byte-heavy chain is still rejected — now by the CLUSTER size gate.
+
+        Each transaction below carries a 20 kB script_sig and is witness-less,
+        so it weighs ~80_252 units.  Five of them are ~401_260 (accepted); the
+        sixth takes the cluster to ~481_512 > 404_000 and is rejected — with
+        Core's bare "too-large-cluster" token, NOT the retired ancestor-size
+        prose.
+        """
         # Each ~20KB tx needs ~20 sat/vB = 400,000 sats fee minimum
         utxos = {(b"\x00" * 32, 0): {"value": 100_000_000}}
         pool = _truc_pool(utxos)
@@ -464,11 +494,18 @@ class TestAncestorDescendantLimits:
             outputs=[TxOut(value=prev_value - fee_per_tx, script_pubkey=b"\x51")],
         )
         ok, err = pool.add_transaction(tx_6, height=100)
-        assert not ok, "6th large tx should be rejected (ancestor size limit)"
-        assert "ancestor" in err.lower() and "size" in err.lower()
+        assert not ok, "6th large tx should be rejected (cluster size limit)"
+        assert err == "too-large-cluster", (
+            f"expected Core's bare cluster token with an empty debug string, got {err!r}"
+        )
 
     def test_descendant_size_limit(self):
-        """Reject transaction when descendant size for an ancestor exceeds 101KB."""
+        """A byte-heavy fan is still rejected — now by the CLUSTER size gate.
+
+        Root plus five ~80_252-weight children is ~401_500 units (accepted); the
+        sixth child pushes the cluster past 404_000 and is rejected under
+        "too-large-cluster", not the retired descendant-size prose.
+        """
         # Each ~20KB tx needs ~20 sat/vB = 400,000 sats fee minimum
         utxos = {(b"\x00" * 32, 0): {"value": 100_000_000}}
         pool = _truc_pool(utxos)
@@ -535,8 +572,10 @@ class TestAncestorDescendantLimits:
             outputs=[TxOut(value=output_value - fee_per_child, script_pubkey=b"\x51")],
         )
         ok, err = pool.add_transaction(child_6, height=100)
-        assert not ok, "6th large child should be rejected (descendant size limit)"
-        assert "descendant" in err.lower() and "size" in err.lower()
+        assert not ok, "6th large child should be rejected (cluster size limit)"
+        assert err == "too-large-cluster", (
+            f"expected Core's bare cluster token with an empty debug string, got {err!r}"
+        )
 
     def test_parent_child_links_updated_on_add(self):
         """Verify parent/child links are set correctly when adding transactions."""

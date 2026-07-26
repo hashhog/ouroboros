@@ -3313,7 +3313,20 @@ class RPCServer:
         if "script" in error_lower:
             return "script-failed"
 
-        # Ancestor/descendant limits
+        # Cluster count / cluster size limits.  The mempool already emits Core's
+        # bare token, so this is a pass-through — but it MUST be matched
+        # explicitly and BEFORE the generic size/weight bucket below, so that a
+        # future reject string mentioning "size" cannot silently re-route a
+        # cluster rejection to "tx-size".  Core does not distinguish the count
+        # gate from the size gate: both are "too-large-cluster" with an empty
+        # debug string (validation.cpp:1024, :1116, :1343, :1521).
+        if "too-large-cluster" in error_lower:
+            return "too-large-cluster"
+
+        # Ancestor/descendant limits.  Retained only for TRUC (v3) rejections,
+        # which are the sole surviving ancestor/descendant enforcement as of
+        # Core v31 — the generic 25-ancestor / 25-descendant mempool gates are
+        # gone, replaced by the cluster limits above.
         if "ancestor" in error_lower or "descendant" in error_lower:
             return "too-long-mempool-chain"
 
