@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitcoin::OutPoint;
 use bitcoin::hashes::Hash;
-use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, DataBlockIndexType, IteratorMode, Options, WriteBatch, DB};
 use thiserror::Error;
 
 use common::{
@@ -172,10 +172,15 @@ impl BlockchainDB {
         opts.optimize_for_point_lookup(1024); // 1GB block cache (up from 10MB)
 
         // Create column family descriptors with optimized options
-        let cf_opts = create_cf_options();
+        // Per-CF options, built individually. Do NOT hoist this back to one
+        // Options + .clone(): cloning shares the block cache (see
+        // create_cf_options) and re-creates the hot/cold starvation.
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = get_column_families()
             .into_iter()
-            .map(|name| ColumnFamilyDescriptor::new(name, cf_opts.clone()))
+            .map(|name| {
+                let o = create_cf_options(&name);
+                ColumnFamilyDescriptor::new(name, o)
+            })
             .collect();
 
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)?;
@@ -3040,8 +3045,50 @@ impl BlockchainDB {
     }
 }
 
-/// Create optimized column family options
-fn create_cf_options() -> Options {
+/// Default dedicated block cache for CHAINSTATE_CF, in MiB.
+///
+/// Sized to hold the whole live mainnet chainstate uncompressed (measured at
+/// 3.20 GB on 2026-07-30) with headroom for growth. Override at runtime with
+/// OUROBOROS_CHAINSTATE_CACHE_MB — deliberately an env var so this can be
+/// re-tuned on a memory-tight host WITHOUT a rebuild.
+const CHAINSTATE_CACHE_MB_DEFAULT: usize = 4096;
+
+fn chainstate_cache_bytes() -> usize {
+    std::env::var("OUROBOROS_CHAINSTATE_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .unwrap_or(CHAINSTATE_CACHE_MB_DEFAULT)
+        * 1024
+        * 1024
+}
+
+/// Create optimized column family options.
+///
+/// CACHE ISOLATION (2026-07-30). The previous version built ONE `Options` and
+/// the caller cloned it for all ten column families. `Options::clone()` copies
+/// the C++ Options struct, whose table factory is a `shared_ptr` — so the clone
+/// SHARES the block cache rather than duplicating it. Every CF therefore
+/// competed for a single 256 MiB LRU. The old comment "256MB block cache per
+/// CF" asserted the opposite and was wrong on exactly that point.
+///
+/// Measured consequence on the live from-genesis rig: the hot CHAINSTATE_CF was
+/// 3.20 GB and read ~17,700x per block, while sharing that one cache with
+/// blocks (167.42 GB), spent (84.46 GB) and tx_index (26.67 GB) — data streamed
+/// once and never re-read. The hot working set was continuously evicted by cold
+/// traffic. Wall-time profiling showed get_utxo at 53.75% of validate_block
+/// WALL time but only 5.8% of CPU self-time: the process sat BLOCKED in RocksDB
+/// holding the GIL. That was the single largest term in a 3,770 ms block.
+///
+/// CHAINSTATE_CF now gets its own cache; the cold CFs keep sharing theirs,
+/// which is the correct arrangement for data that is written once and streamed.
+///
+/// CONSENSUS SAFETY: this is provable by construction, not by testing. A block
+/// cache sits strictly BELOW the key/value interface — `get_cf` returns
+/// identical bytes whether the block came from the cache, the OS page cache, or
+/// the device. No validation input is derived from it: not a script flag, not a
+/// sighash, not a reject token. The only observables are latency and RSS.
+fn create_cf_options(cf_name: &str) -> Options {
     let mut opts = Options::default();
     opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
     opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
@@ -3050,8 +3097,27 @@ fn create_cf_options() -> Options {
     opts.set_bloom_locality(10);
     opts.set_memtable_prefix_bloom_ratio(0.1);
 
-    // Optimize for point lookups (256MB block cache per CF)
-    opts.optimize_for_point_lookup(256);
+    if cf_name == CHAINSTATE_CF {
+        // Replicate what optimize_for_point_lookup() configures (10-bit bloom,
+        // hash-augmented data-block index, whole-key memtable filtering) but
+        // with a dedicated, much larger cache instead of the shared 256 MiB.
+        let cache = Cache::new_lru_cache(chainstate_cache_bytes());
+        let mut bbt = BlockBasedOptions::default();
+        bbt.set_block_cache(&cache);
+        bbt.set_bloom_filter(10.0, false);
+        bbt.set_data_block_index_type(DataBlockIndexType::BinaryAndHash);
+        bbt.set_data_block_hash_ratio(0.75);
+        // Keep index/filter blocks accounted in the cache, and pin the L0 ones
+        // so the hottest filters are never evicted by a scan.
+        bbt.set_cache_index_and_filter_blocks(true);
+        bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        opts.set_block_based_table_factory(&bbt);
+        opts.set_memtable_whole_key_filtering(true);
+    } else {
+        // Cold CFs (blocks, spent, tx_index, headers, meta, undo, ...) are
+        // written once and streamed; they share one modest cache.
+        opts.optimize_for_point_lookup(256);
+    }
 
     opts
 }
