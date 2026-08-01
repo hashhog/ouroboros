@@ -91,5 +91,5 @@ class TipNotifier:
             else:
                 await asyncio.wait_for(self._event.wait(), timeout)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False

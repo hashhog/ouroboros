@@ -55,9 +55,12 @@ from ouroboros.script import (  # noqa: E402
     ScriptInterpreter,
 )
 
-# Locate script_tests.json: check common locations for the Bitcoin Core source.
+# Locate script_tests.json: the vendored copy in tests/fixtures/ is canonical
+# (so CI needs no Bitcoin Core checkout); local Core trees are still honored
+# for development against newer vectors.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CANDIDATE_PATHS = [
+    Path(__file__).parent / "fixtures" / "script_tests.json",
     _REPO_ROOT / "bitcoin" / "src" / "test" / "data" / "script_tests.json",
     Path("/home/work/hashhog/bitcoin-core/src/test/data/script_tests.json"),
     Path("/home/work/hashhog/bitcoin/src/test/data/script_tests.json"),

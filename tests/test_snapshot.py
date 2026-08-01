@@ -19,6 +19,7 @@ import os
 import struct
 import tempfile
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
@@ -29,6 +30,8 @@ from ouroboros.snapshot import (
     SNAPSHOT_VERSION,
     SnapshotManager,
     SnapshotMetadata,
+    _read_compact_size,
+    _write_compact_size,
     compress_amount,
     compress_script,
     decompress_amount,
@@ -42,10 +45,7 @@ from ouroboros.snapshot import (
     serialize_coin,
     write_compressed_script,
     write_varint,
-    _read_compact_size,
-    _write_compact_size,
 )
-
 
 # ---------------------------------------------------------------------------
 # CompactSize round-trip
