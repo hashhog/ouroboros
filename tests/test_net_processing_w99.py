@@ -56,6 +56,7 @@ Gates tested: G1-G3, G7-G9, G11-G18, G23, G25, G28-G30
 
 import time
 import unittest
+from pathlib import Path
 
 import pytest
 
@@ -734,7 +735,8 @@ class TestG23MaxMessageLength(unittest.TestCase):
 
     def test_no_32mib_literal_in_peer_py(self):
         """peer.py must not contain the old 32 * 1024 * 1024 literal."""
-        with open("/home/work/hashhog/ouroboros/src/ouroboros/peer.py") as f:
+        peer_py = Path(__file__).resolve().parent.parent / "src" / "ouroboros" / "peer.py"
+        with open(peer_py) as f:
             src = f.read()
         self.assertNotIn("32 * 1024 * 1024", src,
                          "Old 32 MiB literal still present — fix not applied")

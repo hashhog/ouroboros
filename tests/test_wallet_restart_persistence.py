@@ -289,10 +289,12 @@ def test_manager_notify_swallows_per_wallet_errors():
 
 
 def test_reconcile_on_load_rescans_loaded_wallets():
-    """reconcile_on_load triggers a full-chain rescan of each loaded wallet.
+    """reconcile_on_load rescans each loaded wallet above its scan marker.
 
     Teeth: pre-fix there was no startup reconcile at all, so the in-memory tx
-    history started empty after every restart.
+    history started empty after every restart. Post GEN-OURO boot-starvation
+    fix the rescan covers only the gap above the persisted scan marker —
+    never the whole chain (Core CWallet::AttachChain locator parity).
     """
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -303,13 +305,40 @@ def test_reconcile_on_load_rescans_loaded_wallets():
 
         rescans = []
         w = mgr.get_default_wallet()
+        w._best_scanned_height = 5
         w.rescan_chain = (
             lambda start=0, stop=None: rescans.append((start, stop)) or
             {"start_height": 0, "stop_height": 0}
         )
 
         mgr.reconcile_on_load()
-        assert rescans == [(0, None)]
+        assert rescans == [(6, None)]
+
+
+def test_reconcile_on_load_no_marker_adopts_birthday():
+    """A wallet with no scan marker adopts the tip as its birthday.
+
+    Core AttachChain parity: a fresh wallet's birthday is its creation tip,
+    so it never auto-rescans history (an explicit rescanblockchain is needed
+    for restored wallets). Pinning this guards the GEN-OURO boot-starvation
+    fix — an unconditional rescan_chain(0, None) at every boot.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        mgr = WalletManager(str(tmp), network="regtest")
+        mgr.set_database(SimpleNamespace(get_best_block=lambda: (b"\x00" * 32, 7)))
+        mgr.create_wallet("a")
+
+        rescans = []
+        w = mgr.get_default_wallet()
+        w.rescan_chain = (
+            lambda start=0, stop=None: rescans.append((start, stop)) or
+            {"start_height": 0, "stop_height": 0}
+        )
+
+        mgr.reconcile_on_load()
+        assert rescans == []
+        assert w._best_scanned_height == 7
 
 
 def test_reconcile_on_load_noop_without_db():

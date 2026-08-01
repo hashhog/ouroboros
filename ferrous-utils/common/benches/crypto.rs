@@ -1,6 +1,7 @@
 // Benchmarks for Bitcoin cryptographic operations
 //
-// Tests hardware-accelerated SHA256 (SHA-NI / ARM SHA2) and secp256k1 operations
+// Tests SHA256 (ARM SHA2-accelerated where available, software elsewhere) and
+// secp256k1 operations
 
 use common::crypto::{
     bits_to_target, compute_merkle_root, double_sha256, hash160, target_to_bits,

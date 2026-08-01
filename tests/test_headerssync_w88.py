@@ -230,7 +230,10 @@ def test_get_presync_state_passes_height_and_bits_to_constructor(monkeypatch):
 def test_get_presync_state_falls_back_zero_bits_when_db_bits_returns_none(monkeypatch):
     """When the DB's get_block_bits returns None, _get_presync_state passes
     chain_start_bits=0 (safe default for genesis / tests).
-    The ``or 0`` guard in the implementation converts None to 0.
+    The ``or 0`` guard in the implementation converts None to 0 — but only
+    after the snapshot-bootstrap recovery path (which probes the tip block
+    bytes / Block.bits / the assumeUTXO base header for real bits) also
+    comes up empty, so this fixture stubs those probes to return nothing.
     """
     TIP_HASH = b"\xcd" * 32
     TIP_HEIGHT = 0
@@ -238,6 +241,9 @@ def test_get_presync_state_falls_back_zero_bits_when_db_bits_returns_none(monkey
     bs = _make_block_sync(tip_hash=TIP_HASH, tip_height=TIP_HEIGHT, tip_bits=0)
     # Return None from get_block_bits to exercise the "or 0" fallback.
     bs.db.get_block_bits = MagicMock(return_value=None)
+    # Recovery probes must also find nothing, else their result is seeded.
+    bs.db.get_block_bytes = MagicMock(return_value=None)
+    bs.db.get_block = MagicMock(return_value=None)
 
     captured: dict = {}
 

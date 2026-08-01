@@ -75,6 +75,12 @@ class MockTransaction:
     def serialize(self) -> bytes:
         return b"\x00" * self._vsize
 
+    def serialize_with_witness(self) -> bytes:
+        # The mock carries no witness: witness serialization is
+        # byte-identical to the legacy form when has_witness is False
+        # (Core core_io.cpp EncodeHexTx).
+        return self.serialize()
+
 
 class MockBlock:
     """Mock block for testing."""
@@ -314,6 +320,9 @@ class TestGetRawTransactionBlockchain:
 
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
+        # Explicit-blockhash path resolves height via _get_block_height,
+        # which consults this __init__-initialized side-branch buffer.
+        rpc._side_branch_blocks = {}
 
         result = await rpc.rpc_getrawtransaction(
             sample_tx.get_txid().hex(),
@@ -341,6 +350,9 @@ class TestGetRawTransactionBlockchain:
 
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
+        # Explicit-blockhash path resolves height via _get_block_height,
+        # which consults this __init__-initialized side-branch buffer.
+        rpc._side_branch_blocks = {}
 
         result = await rpc.rpc_getrawtransaction(
             sample_tx.get_txid().hex(),
@@ -426,6 +438,9 @@ class TestGetRawTransactionErrors:
 
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
+        # Explicit-blockhash path resolves height via _get_block_height,
+        # which consults this __init__-initialized side-branch buffer.
+        rpc._side_branch_blocks = {}
 
         with pytest.raises(RpcError) as exc_info:
             await rpc.rpc_getrawtransaction(

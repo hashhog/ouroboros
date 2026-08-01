@@ -179,18 +179,24 @@ async def test_prefix_attempt4_per_read_timeout_leaks():
 def test_is_recv_stalled_threshold(monkeypatch):
     """The coarse inactivity check (replacing the per-read timer) flags a peer
     whose last successful read is older than its stall timeout, and clears once
-    a read updates the monotonic clock."""
+    a read updates the monotonic clock.  The threshold is the whole-connection
+    ``_inactivity_timeout`` (Core TIMEOUT_INTERVAL = 20 min, net.h:59) —
+    deliberately NOT the 60 s per-read deadline, which is shorter than the
+    120 s ping cadence and reaped every merely-quiet peer on each sweep (see
+    Peer.is_recv_stalled)."""
     peer = Peer("127.0.0.1", 18444, "regtest", transport_version=1)
-    peer._read_timeout = 60.0
 
     import ouroboros.peer as peer_mod
     fake_now = [1000.0]
     monkeypatch.setattr(peer_mod.time, "monotonic", lambda: fake_now[0])
+    # Past the 60 s post-connect grace (Core ShouldRunInactivityChecks) so the
+    # sweep is eligible to reap at all.
+    peer._connected_monotonic = fake_now[0] - 61.0
 
     peer._last_recv_monotonic = fake_now[0]
     assert not peer.is_recv_stalled()
 
-    fake_now[0] += 61.0
+    fake_now[0] += peer._inactivity_timeout + 1.0
     assert peer.is_recv_stalled()
 
     peer._last_recv_monotonic = fake_now[0]

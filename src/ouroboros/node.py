@@ -813,7 +813,7 @@ class BitcoinNode:
             if init_metrics(port=metrics_port):
                 from ouroboros.metrics import NODE_INFO as _node_info
                 if _node_info is not None:
-                    _node_info.info({"version": "0.1.0", "network": self.network})
+                    _node_info.info({"version": "1.0.0", "network": self.network})
 
             # Register message handlers
             self._register_handlers()

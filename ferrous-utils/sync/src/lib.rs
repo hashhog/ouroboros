@@ -68,20 +68,21 @@ fn verify_ecdsa(der_sig: Vec<u8>, pubkey: Vec<u8>, msg_hash: Vec<u8>) -> PyResul
 // ============================================================================
 
 /// Get the detected SHA256 implementation (hardware-accelerated or software).
-/// Returns one of: "sha256:x86_shani", "sha256:arm_sha2", "sha256:software"
+/// Returns one of: "sha256:arm_sha2", "sha256:software"
+/// (The x86 SHA-NI path was removed: it produced incorrect digests.)
 #[pyfunction]
 fn crypto_sha256_implementation() -> String {
     sha256_impl_string()
 }
 
-/// Compute SHA256 hash using hardware acceleration when available.
-/// Uses SHA-NI on x86 (Intel/AMD) or SHA2 extensions on ARM (Apple Silicon).
+/// Compute SHA256 hash.
+/// Uses SHA2 extensions on ARM (Apple Silicon); portable software path elsewhere.
 #[pyfunction]
 fn crypto_sha256(data: Vec<u8>) -> Vec<u8> {
     hw_sha256(&data).to_vec()
 }
 
-/// Compute double SHA256 (SHA256(SHA256(data))) using hardware acceleration.
+/// Compute double SHA256 (SHA256(SHA256(data))).
 /// This is Bitcoin's primary hash function for block headers, merkle trees, etc.
 #[pyfunction]
 fn crypto_double_sha256(data: Vec<u8>) -> Vec<u8> {

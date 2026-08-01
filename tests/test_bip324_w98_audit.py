@@ -66,6 +66,7 @@ import os
 import random
 import secrets
 import struct
+from pathlib import Path
 
 import pytest
 
@@ -412,7 +413,8 @@ class TestG24DoSLimit:
 
     def test_no_32mib_literal_in_peer_py(self):
         """peer.py must not contain the old 32 * 1024 * 1024 literal."""
-        with open("/home/work/hashhog/ouroboros/src/ouroboros/peer.py") as f:
+        peer_py = Path(__file__).resolve().parent.parent / "src" / "ouroboros" / "peer.py"
+        with open(peer_py) as f:
             src = f.read()
         assert "32 * 1024 * 1024" not in src, (
             "Old 32 MiB literal still present — fix not applied"

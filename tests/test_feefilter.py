@@ -154,8 +154,10 @@ class TestFeeFilterConstants:
         assert FEE_FILTER_SPACING == 1.1
 
     def test_min_relay_fee_rate(self):
-        """MIN_RELAY_FEE_RATE is 1000 sat/kvB."""
-        assert MIN_RELAY_FEE_RATE == 1000
+        """MIN_RELAY_FEE_RATE is 100 sat/kvB — Core policy/policy.h:70
+        DEFAULT_MIN_RELAY_TX_FEE (lowered from 1000), kept in step with
+        mempool.py's DEFAULT_MIN_RELAY_TX_FEE (commit 0024f9a)."""
+        assert MIN_RELAY_FEE_RATE == 100
 
 
 class TestTrickleQueueFeefilter:
