@@ -24,6 +24,7 @@ import struct
 import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
+from typing import Callable
 
 from ouroboros.addrman import AddressManager, get_network_group
 from ouroboros.banman import (
@@ -3106,7 +3107,8 @@ class PeerManager:
                     )
                     try:
                         from ouroboros.p2p_messages import (
-                            MSG_WITNESS_BLOCK, GetDataMessage,
+                            MSG_WITNESS_BLOCK,
+                            GetDataMessage,
                         )
                         # MSG_WITNESS_BLOCK (0x40000002), never bare
                         # INV_TYPE_BLOCK: a witness-stripped segwit block fails
@@ -3620,7 +3622,7 @@ class PeerManager:
                 await asyncio.wait_for(
                     p.send_message(msg), timeout=ADDR_RELAY_SEND_TIMEOUT
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.debug(
                     f"addr relay to {p.host}:{p.port} timed out "
                     f"(peer not draining) — disconnecting"

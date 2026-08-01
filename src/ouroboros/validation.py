@@ -5,7 +5,14 @@ import logging
 import os
 import struct
 import time as _time
+from typing import TYPE_CHECKING
 
+from ouroboros.consensus import (
+    BIP30_REPEAT_EXCEPTIONS,
+    BIP34_HASHES,
+    BURIED_DEPLOYMENTS,
+    is_buried_deployment_active,
+)
 from ouroboros.database import Block, BlockchainDatabase, Transaction, TxIn, TxOut
 from ouroboros.script import (
     SCRIPT_VERIFY_DERSIG,
@@ -17,12 +24,9 @@ from ouroboros.script import (
     get_flags_for_height,
 )
 from ouroboros.sig_cache import SigCache
-from ouroboros.consensus import (
-    BURIED_DEPLOYMENTS,
-    BIP34_HASHES,
-    BIP30_REPEAT_EXCEPTIONS,
-    is_buried_deployment_active,
-)
+
+if TYPE_CHECKING:
+    from ouroboros.snapshot import SnapshotManager
 
 logger = logging.getLogger(__name__)
 
