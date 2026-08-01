@@ -56,11 +56,18 @@ class TestCompactSize:
 
     def test_four_bytes(self):
         """Values 0x10000-0xFFFFFFFF encode with 0xFE prefix."""
-        for n in [0x10000, 0xFFFFFFFF]:
+        # Round-trip only in-range values: _read_compact_size enforces Core's
+        # serialize.h MAX_SIZE (0x02000000) range check on read.
+        for n in [0x10000, 0x02000000]:
             encoded = _write_compact_size(n)
             assert len(encoded) == 5
             assert encoded[0] == 0xFE
             assert _read_compact_size(io.BytesIO(encoded)) == n
+
+        # 0xFFFFFFFF exceeds MAX_SIZE and must be rejected on read
+        # (Core serialize.h ReadCompactSize).
+        with pytest.raises(ValueError, match="exceeds MAX_SIZE"):
+            _read_compact_size(io.BytesIO(_write_compact_size(0xFFFFFFFF)))
 
 
 class TestKeyOriginInfo:
@@ -78,16 +85,17 @@ class TestKeyOriginInfo:
         assert restored.path == origin.path
 
     def test_to_string(self):
-        """Human-readable path string."""
+        """Human-readable path string (Core WriteHDKeypath format)."""
         origin = KeyOriginInfo(
             fingerprint=bytes.fromhex("deadbeef"),
             path=[84 | 0x80000000, 0 | 0x80000000, 0 | 0x80000000, 0, 1],
         )
         path_str = origin.to_string()
-        assert path_str.startswith("deadbeef")
-        assert "84'" in path_str
-        assert "0'" in path_str
-        assert "/0/1" in path_str
+        # Core util/bip32.cpp WriteHDKeypath (apostrophe=false): "m/..."
+        # with 'h' hardened suffix; the fingerprint is NOT part of the path
+        # string — decodepsbt emits it separately as master_fingerprint.
+        assert path_str == "m/84h/0h/0h/0/1"
+        assert "deadbeef" not in path_str
 
 
 class TestPSBTInput:
@@ -425,7 +433,9 @@ class TestRPCFunctions:
 
         decoded = decodepsbt(psbt.to_base64())
 
-        assert "version" in decoded
+        # Core decodepsbt top level has "psbt_version" (there is no
+        # "version" key; the tx version lives under decoded["tx"]).
+        assert "psbt_version" in decoded
         assert "tx" in decoded
         assert "inputs" in decoded
         assert "outputs" in decoded
@@ -491,7 +501,10 @@ class TestPSBTDecoding:
 
         decoded = psbt.decode()
         assert "witness_utxo" in decoded["inputs"][0]
-        assert decoded["inputs"][0]["witness_utxo"]["amount"] == 0.001  # 100000 sat
+        # Amount is a BTCAmount sentinel that serializes as Core's fixed
+        # %d.%08d decimal (core_io.cpp ValueFromAmount), not a float.
+        amount = decoded["inputs"][0]["witness_utxo"]["amount"]
+        assert amount.text == "0.00100000"  # 100000 sat
 
     def test_decode_with_bip32_derivs(self):
         """Decode PSBT with BIP32 derivation paths."""

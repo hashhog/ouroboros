@@ -37,7 +37,8 @@ from ouroboros.rpc import RPCServer
 
 # ---------------------------------------------------------------------------
 # Minimal block / db stubs.  Mirrors the surface getblock / getblockheader
-# reach for: ``get_block``, ``get_best_block``, ``get_block_hash_by_height``.
+# reach for: ``get_block``, ``get_block_bytes``, ``get_best_block``,
+# ``get_block_hash_by_height``.
 # ---------------------------------------------------------------------------
 
 
@@ -101,6 +102,14 @@ class _StubDB:
 
     def get_block(self, block_hash: bytes):
         return self._by_hash.get(bytes(block_hash))
+
+    def get_block_bytes(self, block_hash: bytes):
+        # Raw on-wire bytes (witness-preserving) — rpc_getblock fetches
+        # these unconditionally since the W59 verbosity=2 byte-identity
+        # work (10efff0) for verbosity=0 hex and true size/weight.  The
+        # stub has no witness txs, so stripped == raw serialization.
+        block = self._by_hash.get(bytes(block_hash))
+        return block.serialize() if block is not None else None
 
     def get_best_block(self) -> tuple[bytes, int]:
         return (self._tip_hash, self._tip_height)

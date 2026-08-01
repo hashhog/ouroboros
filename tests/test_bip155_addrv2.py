@@ -433,11 +433,11 @@ class TestAddressManagerBIP155(unittest.TestCase):
             time=int(time.time()),
             services=1,
             network_id=BIP155_NET_IPV4,
-            addr=bytes([10, 0, 0, 1]),
+            addr=bytes([1, 2, 3, 4]),
             port=8333,
         )
 
-        result = addrman.add_from_addrv2(entry, source="192.168.1.1:8333")
+        result = addrman.add_from_addrv2(entry, source="5.6.7.8:8333")
 
         self.assertTrue(result)
         self.assertEqual(addrman.size(), 1)

@@ -33,7 +33,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install ".[dev]" || pip install . pytest pytest-asyncio
-      - run: pytest tests/ -v
+      # Functional tests spin up live nodes and need the compiled Rust
+      # extension; the unit suite is the CI gate.
+      - run: pytest tests/ -v --ignore=tests/functional
 
   lint:
     name: Lint

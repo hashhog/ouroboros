@@ -173,11 +173,23 @@ def test_getrawtransaction_compares_against_le_in_block_search():
     le_bytes = bytes.fromhex(display_hex)[::-1]
 
     # Stub a block with a single tx whose internal txid (get_txid) is the
-    # LE form.  Using SimpleNamespace because the RPC path only touches
-    # `.transactions[*].get_txid()` and `.serialize()`.
+    # LE form.  The SimpleNamespace must carry the surface the verbose path
+    # touches: ``.transactions[*].get_txid()`` for the block-walk match, plus
+    # what the shared TxToUniv builder (psbt._tx_to_univ) and the hex
+    # emitter read — txid / has_witness / serialize_with_witness /
+    # get_weight / get_vsize / version / locktime / inputs / outputs.
     matching_tx = SimpleNamespace(
         get_txid=lambda b=le_bytes: b,
         serialize=lambda: b"\x02\x00\x00\x00",  # arbitrary bytes
+        txid=le_bytes,
+        has_witness=False,
+        serialize_with_witness=lambda: b"\x02\x00\x00\x00",
+        get_weight=lambda: 16,
+        get_vsize=lambda: 4,
+        version=2,
+        locktime=0,
+        inputs=[],
+        outputs=[],
     )
     fake_block = SimpleNamespace(
         transactions=[matching_tx],
@@ -196,8 +208,6 @@ def test_getrawtransaction_compares_against_le_in_block_search():
     mempool.get_transaction.return_value = None
 
     server = _build_server_with_db(db, mempool)
-    # Patch _tx_to_dict to a stub since the matching_tx isn't a real Tx.
-    server._tx_to_dict = lambda tx: {"txid": "stub"}
 
     result = asyncio.run(server.rpc_getrawtransaction(display_hex, True))
 

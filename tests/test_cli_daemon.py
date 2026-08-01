@@ -29,7 +29,9 @@ from ouroboros.daemon import (
 from ouroboros.logging_config import (
     _CategoryFilter,
     configure_logging,
+    get_active_categories,
     reopen_log_file,
+    set_active_categories,
 )
 
 
@@ -137,23 +139,35 @@ def test_sd_notify_sends_datagram(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_category_filter_blocks_debug_outside_category():
-    flt = _CategoryFilter({"net"})
+    # The filter reads the LIVE active-category set (see logging_config
+    # `_ACTIVE_CATEGORIES`) so runtime toggles via the `logging` RPC take
+    # effect without a restart — enable "net" there instead of a ctor arg.
+    flt = _CategoryFilter()
+    prev = get_active_categories()
+    set_active_categories({"net"})
+    try:
+        def make(name, level=logging.DEBUG):
+            return logging.LogRecord(name, level, __file__, 0, "x", None, None)
 
-    def make(name, level=logging.DEBUG):
-        return logging.LogRecord(name, level, __file__, 0, "x", None, None)
-
-    assert flt.filter(make("ouroboros.p2p")) is True   # net category
-    assert flt.filter(make("ouroboros.peer")) is True  # net category
-    assert flt.filter(make("ouroboros.mempool")) is False
-    # INFO+ is always allowed regardless of category
-    assert flt.filter(make("ouroboros.mempool", logging.INFO)) is True
+        assert flt.filter(make("ouroboros.p2p")) is True   # net category
+        assert flt.filter(make("ouroboros.peer")) is True  # net category
+        assert flt.filter(make("ouroboros.mempool")) is False
+        # INFO+ is always allowed regardless of category
+        assert flt.filter(make("ouroboros.mempool", logging.INFO)) is True
+    finally:
+        set_active_categories(prev)
 
 
 def test_category_filter_all_passes_through():
-    flt = _CategoryFilter(set(DEBUG_CATEGORIES))
-    rec = logging.LogRecord("ouroboros.anything", logging.DEBUG,
-                            __file__, 0, "x", None, None)
-    assert flt.filter(rec) is True
+    flt = _CategoryFilter()
+    prev = get_active_categories()
+    set_active_categories(set(DEBUG_CATEGORIES))
+    try:
+        rec = logging.LogRecord("ouroboros.anything", logging.DEBUG,
+                                __file__, 0, "x", None, None)
+        assert flt.filter(rec) is True
+    finally:
+        set_active_categories(prev)
 
 
 def test_log_file_reopen_creates_new_handle(tmp_path):
@@ -247,9 +261,9 @@ def test_debug_csv_parsed_in_ctx(runner, tmp_path):
         "Expected a _CategoryFilter to be installed on a handler "
         "by --debug=net,mempool"
     )
-    assert any(
-        not f.all and f.allowed_loggers for f in handler_filters
-    ) or any(f.all for f in handler_filters)
+    # The filter snapshots nothing at construction; it reads the live
+    # active-category set, which configure_logging seeds from --debug.
+    assert get_active_categories() == {"net", "mempool"}
 
 
 def test_reindex_flag_warns_but_doesnt_crash(runner, tmp_path, monkeypatch):

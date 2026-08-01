@@ -200,7 +200,9 @@ class TestIsStandardTxOpReturn:
         assert ok is False, (
             "Expected _is_standard_tx to reject tx with truncated OP_RETURN"
         )
-        assert "non-standard" in reason.lower() or "output" in reason.lower(), (
+        # Core's bare reject token for a nonstandard scriptPubKey
+        # (policy/policy.cpp:141, IsStandardTx → "scriptpubkey").
+        assert reason == "scriptpubkey", (
             f"Unexpected rejection reason: {reason!r}"
         )
 

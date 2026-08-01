@@ -363,8 +363,11 @@ class TestG10BasicFilterElements(unittest.TestCase):
         """
         op_ret_spk = self._op_return_spk()
 
-        # Build a mock DB that returns an OP_RETURN UTXO for the spent input
+        # Build a mock DB that returns an OP_RETURN UTXO for the spent input.
+        # collect_block_scripts consults get_utxo_or_spent() first (Core reads
+        # prevouts from CBlockUndo, not the live UTXO set), so seed that path.
         mock_db = MagicMock()
+        mock_db.get_utxo_or_spent.return_value = {"script_pubkey": op_ret_spk}
         mock_db.get_utxo.return_value = {"script_pubkey": op_ret_spk}
 
         # Coinbase (index 0) is skipped, so use a non-coinbase tx

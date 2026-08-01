@@ -119,8 +119,21 @@ async def test_gettxoutsetinfo_basic_shape() -> None:
     assert res["transactions"] == 2  # two distinct txids
     assert isinstance(res["bogosize"], int)
     assert res["bogosize"] > 0
-    # 50M + 25M + 12.345678M sats = 0.87345678 BTC
-    assert abs(res["total_amount"] - 0.87345678) < 1e-9
+    # 50M + 25M + 12.345678M sats = 0.87345678 BTC.
+    # Core (rpc/blockchain.cpp gettxoutsetinfo) emits total_amount via
+    # ValueFromAmount (core_io.cpp): a JSON number with exactly 8 decimal
+    # places ("%d.%08d"). The handler returns a psbt.BTCAmount sentinel that
+    # the dispatch layer's _BTCJsonResponse/_BTCEncoder serializes as that
+    # exact raw decimal token — pin both the pre-serialization form and the
+    # on-the-wire text.
+    from ouroboros.psbt import BTCAmount
+    assert isinstance(res["total_amount"], BTCAmount)
+    assert res["total_amount"].text == "0.87345678"
+    from ouroboros.rpc import _BTCEncoder
+    wire = "".join(_BTCEncoder().iterencode({"total_amount": res["total_amount"]}))
+    assert wire == '{"total_amount":0.87345678}'
+    import json
+    assert json.loads(wire)["total_amount"] == 0.87345678  # plain number
     # Default hash_type is hash_serialized_3 (Core post-#26553).
     assert "hash_serialized_3" in res
     assert "hash_serialized_2" in res
@@ -272,7 +285,9 @@ async def test_gettxoutsetinfo_empty_chainstate() -> None:
     assert res["height"] == 0
     assert res["txouts"] == 0
     assert res["transactions"] == 0
-    assert res["total_amount"] == 0.0
+    # BTCAmount sentinel serializes (via _BTCJsonResponse at dispatch) as
+    # Core's ValueFromAmount "%d.%08d" number: 0.00000000.
+    assert res["total_amount"].text == "0.00000000"
     # Empty SHA256d chain (HashWriter over no input) is still a
     # well-defined 32-byte digest, not absent.
     assert isinstance(res["hash_serialized_3"], str)

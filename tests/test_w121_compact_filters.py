@@ -764,7 +764,10 @@ def _build_fix74_harness():
             self._tip = (self._height_to_block[height - 1].hash, height - 1)
             self._height_to_block.pop(height, None)
 
-        def connect_block_from_bytes(self, raw, height):
+        def connect_block_from_bytes(self, raw, height, network=None):
+            # Signature mirrors BlockchainDatabase.connect_block_from_bytes
+            # (network param added in 5e6e1fd for pre-BIP113 finality);
+            # _handle_reorg passes it positionally.
             # Pick whichever new-chain block corresponds to the height
             # — by harness contract, only B1 is connect-target post-reorg.
             new = B1

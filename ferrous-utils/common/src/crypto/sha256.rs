@@ -1,19 +1,21 @@
-// Hardware-accelerated SHA256 implementation
+// SHA256 implementation with optional hardware acceleration
 //
 // Provides runtime CPU feature detection for:
-// - x86/x86_64 SHA-NI (Intel Goldmont+, AMD Zen+)
 // - ARM SHA2 extensions (Apple Silicon, ARMv8-A)
-// Falls back to software implementation when hardware acceleration unavailable.
+// Falls back to the software implementation otherwise.
+//
+// NOTE: the x86/x86_64 SHA-NI transform was removed before v1.0 — it produced
+// incorrect digests (sha256(b"") gave 46c5b51e… instead of e3b0c442…). The
+// portable software path below is used on x86 until a corrected SHA-NI
+// transform can be landed and validated against known-answer vectors.
 
 use std::sync::OnceLock;
 
 /// SHA256 implementation variant detected at runtime
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sha256Implementation {
-    /// Software implementation (portable, ~4x slower)
+    /// Software implementation (portable)
     Software,
-    /// x86 SHA-NI intrinsics (Intel/AMD)
-    X86Shani,
     /// ARM SHA2 extensions (Apple Silicon, ARMv8)
     ArmSha2,
 }
@@ -22,7 +24,6 @@ impl std::fmt::Display for Sha256Implementation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Software => write!(f, "software"),
-            Self::X86Shani => write!(f, "x86_shani"),
             Self::ArmSha2 => write!(f, "arm_sha2"),
         }
     }
@@ -34,13 +35,9 @@ static DETECTED_IMPL: OnceLock<Sha256Implementation> = OnceLock::new();
 /// Detect available SHA256 implementation at runtime
 pub fn detect_implementation() -> Sha256Implementation {
     *DETECTED_IMPL.get_or_init(|| {
-        // x86/x86_64: check for SHA-NI
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            if std::is_x86_feature_detected!("sha") && std::is_x86_feature_detected!("sse4.1") {
-                return Sha256Implementation::X86Shani;
-            }
-        }
+        // x86/x86_64: SHA-NI detection intentionally absent — the former
+        // SHA-NI transform produced incorrect digests and was removed (see
+        // the note at the top of this file). x86 uses the software path.
 
         // ARM: check for SHA2 extensions
         #[cfg(target_arch = "aarch64")]
@@ -188,19 +185,6 @@ impl Sha256 {
     /// Transform a single 64-byte block
     fn transform_block(&mut self, block: &[u8; 64]) {
         match detect_implementation() {
-            Sha256Implementation::X86Shani => {
-                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                {
-                    // SAFETY: We've verified SHA-NI is available via detect_implementation
-                    unsafe {
-                        self.transform_x86_shani(block);
-                    }
-                }
-                #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-                {
-                    self.transform_software(block);
-                }
-            }
             Sha256Implementation::ArmSha2 => {
                 #[cfg(target_arch = "aarch64")]
                 {
@@ -274,357 +258,6 @@ impl Sha256 {
         self.state[5] = self.state[5].wrapping_add(f);
         self.state[6] = self.state[6].wrapping_add(g);
         self.state[7] = self.state[7].wrapping_add(h);
-    }
-
-    /// x86 SHA-NI accelerated transform
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sha", enable = "sse4.1")]
-    unsafe fn transform_x86_shani(&mut self, block: &[u8; 64]) {
-        #[cfg(target_arch = "x86")]
-        use core::arch::x86::*;
-        #[cfg(target_arch = "x86_64")]
-        use core::arch::x86_64::*;
-
-        // Load initial state
-        // SHA256 state is stored as [a, b, c, d, e, f, g, h]
-        // Intel intrinsics expect [d, c, b, a] and [h, g, f, e]
-        let mut state0 = _mm_set_epi32(
-            self.state[0] as i32,
-            self.state[1] as i32,
-            self.state[2] as i32,
-            self.state[3] as i32,
-        );
-        let mut state1 = _mm_set_epi32(
-            self.state[4] as i32,
-            self.state[5] as i32,
-            self.state[6] as i32,
-            self.state[7] as i32,
-        );
-
-        // Shuffle mask for big-endian to little-endian conversion
-        let shuf_mask = _mm_set_epi64x(0x0c0d0e0f08090a0b, 0x0405060700010203);
-
-        // Save initial state for final addition
-        let init_state0 = state0;
-        let init_state1 = state1;
-
-        // Shuffle state for SHA instructions
-        let tmp = _mm_shuffle_epi32(state0, 0xB1); // CDAB
-        state1 = _mm_shuffle_epi32(state1, 0x1B); // EFGH
-        state0 = _mm_alignr_epi8(tmp, state1, 8); // ABEF
-        state1 = _mm_blend_epi16(state1, tmp, 0xF0); // CDGH
-
-        // Load message block and convert to little-endian
-        let msg0 = _mm_shuffle_epi8(_mm_loadu_si128(block.as_ptr() as *const __m128i), shuf_mask);
-        let msg1 = _mm_shuffle_epi8(
-            _mm_loadu_si128(block.as_ptr().add(16) as *const __m128i),
-            shuf_mask,
-        );
-        let msg2 = _mm_shuffle_epi8(
-            _mm_loadu_si128(block.as_ptr().add(32) as *const __m128i),
-            shuf_mask,
-        );
-        let msg3 = _mm_shuffle_epi8(
-            _mm_loadu_si128(block.as_ptr().add(48) as *const __m128i),
-            shuf_mask,
-        );
-
-        // Rounds 0-3
-        let mut msg = _mm_add_epi32(
-            msg0,
-            _mm_set_epi32(
-                K[3] as i32,
-                K[2] as i32,
-                K[1] as i32,
-                K[0] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 4-7
-        let mut msg0 = _mm_sha256msg1_epu32(msg0, msg1);
-        msg = _mm_add_epi32(
-            msg1,
-            _mm_set_epi32(
-                K[7] as i32,
-                K[6] as i32,
-                K[5] as i32,
-                K[4] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 8-11
-        let mut msg1 = _mm_sha256msg1_epu32(msg1, msg2);
-        msg = _mm_add_epi32(
-            msg2,
-            _mm_set_epi32(
-                K[11] as i32,
-                K[10] as i32,
-                K[9] as i32,
-                K[8] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 12-15
-        let mut msg2 = _mm_sha256msg1_epu32(msg2, msg3);
-        msg = _mm_add_epi32(
-            msg3,
-            _mm_set_epi32(
-                K[15] as i32,
-                K[14] as i32,
-                K[13] as i32,
-                K[12] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg3, msg2, 4);
-        msg0 = _mm_add_epi32(msg0, tmp);
-        msg0 = _mm_sha256msg2_epu32(msg0, msg3);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 16-19
-        let mut msg3 = _mm_sha256msg1_epu32(msg3, msg0);
-        msg = _mm_add_epi32(
-            msg0,
-            _mm_set_epi32(
-                K[19] as i32,
-                K[18] as i32,
-                K[17] as i32,
-                K[16] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg0, msg3, 4);
-        msg1 = _mm_add_epi32(msg1, tmp);
-        msg1 = _mm_sha256msg2_epu32(msg1, msg0);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 20-23
-        msg0 = _mm_sha256msg1_epu32(msg0, msg1);
-        msg = _mm_add_epi32(
-            msg1,
-            _mm_set_epi32(
-                K[23] as i32,
-                K[22] as i32,
-                K[21] as i32,
-                K[20] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg1, msg0, 4);
-        msg2 = _mm_add_epi32(msg2, tmp);
-        msg2 = _mm_sha256msg2_epu32(msg2, msg1);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 24-27
-        msg1 = _mm_sha256msg1_epu32(msg1, msg2);
-        msg = _mm_add_epi32(
-            msg2,
-            _mm_set_epi32(
-                K[27] as i32,
-                K[26] as i32,
-                K[25] as i32,
-                K[24] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg2, msg1, 4);
-        msg3 = _mm_add_epi32(msg3, tmp);
-        msg3 = _mm_sha256msg2_epu32(msg3, msg2);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 28-31
-        msg2 = _mm_sha256msg1_epu32(msg2, msg3);
-        msg = _mm_add_epi32(
-            msg3,
-            _mm_set_epi32(
-                K[31] as i32,
-                K[30] as i32,
-                K[29] as i32,
-                K[28] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg3, msg2, 4);
-        msg0 = _mm_add_epi32(msg0, tmp);
-        msg0 = _mm_sha256msg2_epu32(msg0, msg3);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 32-35
-        msg3 = _mm_sha256msg1_epu32(msg3, msg0);
-        msg = _mm_add_epi32(
-            msg0,
-            _mm_set_epi32(
-                K[35] as i32,
-                K[34] as i32,
-                K[33] as i32,
-                K[32] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg0, msg3, 4);
-        msg1 = _mm_add_epi32(msg1, tmp);
-        msg1 = _mm_sha256msg2_epu32(msg1, msg0);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 36-39
-        msg0 = _mm_sha256msg1_epu32(msg0, msg1);
-        msg = _mm_add_epi32(
-            msg1,
-            _mm_set_epi32(
-                K[39] as i32,
-                K[38] as i32,
-                K[37] as i32,
-                K[36] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg1, msg0, 4);
-        msg2 = _mm_add_epi32(msg2, tmp);
-        msg2 = _mm_sha256msg2_epu32(msg2, msg1);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 40-43
-        msg1 = _mm_sha256msg1_epu32(msg1, msg2);
-        msg = _mm_add_epi32(
-            msg2,
-            _mm_set_epi32(
-                K[43] as i32,
-                K[42] as i32,
-                K[41] as i32,
-                K[40] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg2, msg1, 4);
-        msg3 = _mm_add_epi32(msg3, tmp);
-        msg3 = _mm_sha256msg2_epu32(msg3, msg2);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 44-47
-        msg2 = _mm_sha256msg1_epu32(msg2, msg3);
-        msg = _mm_add_epi32(
-            msg3,
-            _mm_set_epi32(
-                K[47] as i32,
-                K[46] as i32,
-                K[45] as i32,
-                K[44] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg3, msg2, 4);
-        msg0 = _mm_add_epi32(msg0, tmp);
-        msg0 = _mm_sha256msg2_epu32(msg0, msg3);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 48-51
-        msg3 = _mm_sha256msg1_epu32(msg3, msg0);
-        msg = _mm_add_epi32(
-            msg0,
-            _mm_set_epi32(
-                K[51] as i32,
-                K[50] as i32,
-                K[49] as i32,
-                K[48] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg0, msg3, 4);
-        msg1 = _mm_add_epi32(msg1, tmp);
-        msg1 = _mm_sha256msg2_epu32(msg1, msg0);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 52-55
-        msg = _mm_add_epi32(
-            msg1,
-            _mm_set_epi32(
-                K[55] as i32,
-                K[54] as i32,
-                K[53] as i32,
-                K[52] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg1, msg0, 4);
-        msg2 = _mm_add_epi32(msg2, tmp);
-        msg2 = _mm_sha256msg2_epu32(msg2, msg1);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 56-59
-        msg = _mm_add_epi32(
-            msg2,
-            _mm_set_epi32(
-                K[59] as i32,
-                K[58] as i32,
-                K[57] as i32,
-                K[56] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        let tmp = _mm_alignr_epi8(msg2, msg1, 4);
-        msg3 = _mm_add_epi32(msg3, tmp);
-        msg3 = _mm_sha256msg2_epu32(msg3, msg2);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Rounds 60-63
-        msg = _mm_add_epi32(
-            msg3,
-            _mm_set_epi32(
-                K[63] as i32,
-                K[62] as i32,
-                K[61] as i32,
-                K[60] as i32,
-            ),
-        );
-        state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
-        msg = _mm_shuffle_epi32(msg, 0x0E);
-        state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-        // Add initial state
-        state0 = _mm_add_epi32(state0, init_state0);
-        state1 = _mm_add_epi32(state1, init_state1);
-
-        // Unshuffle state back to original format
-        let tmp = _mm_shuffle_epi32(state0, 0x1B); // FEBA
-        state1 = _mm_shuffle_epi32(state1, 0xB1); // DCHG
-        state0 = _mm_blend_epi16(tmp, state1, 0xF0); // DCBA
-        state1 = _mm_alignr_epi8(state1, tmp, 8); // HGFE
-
-        // Extract state to array
-        let mut s0 = [0i32; 4];
-        let mut s1 = [0i32; 4];
-        _mm_storeu_si128(s0.as_mut_ptr() as *mut __m128i, state0);
-        _mm_storeu_si128(s1.as_mut_ptr() as *mut __m128i, state1);
-
-        self.state[0] = s0[3] as u32;
-        self.state[1] = s0[2] as u32;
-        self.state[2] = s0[1] as u32;
-        self.state[3] = s0[0] as u32;
-        self.state[4] = s1[3] as u32;
-        self.state[5] = s1[2] as u32;
-        self.state[6] = s1[1] as u32;
-        self.state[7] = s1[0] as u32;
     }
 
     /// ARM SHA2 accelerated transform
@@ -855,16 +488,13 @@ mod tests {
 
     #[test]
     fn test_double_sha256_hello() {
+        // Known-answer vector (verified via `sha256sum | xxd -r -p | sha256sum`).
+        // The previous literal was a corrupted 31-byte string and the test
+        // only compared the function against itself, so it could not fail.
         let hash = double_sha256(b"hello");
-        let expected = hex::decode("9595c9df90075148eb0686036533584b75bff782a510c6cd4883a419833d50")
+        let expected = hex::decode("9595c9df90075148eb06860365df33584b75bff782a510c6cd4883a419833d50")
             .unwrap();
-        // Note: The expected value is 31 bytes due to leading zero, so pad it
-        let mut expected_arr = [0u8; 32];
-        expected_arr[1..].copy_from_slice(&expected);
-        // Actually compute the correct value
-        let hash2 = double_sha256(b"hello");
-        // Compare with known Bitcoin test vector
-        assert_eq!(hash, hash2);
+        assert_eq!(hash.as_slice(), expected.as_slice());
     }
 
     #[test]
@@ -890,25 +520,21 @@ mod tests {
 
         // Should detect something
         match impl_type {
-            Sha256Implementation::Software
-            | Sha256Implementation::X86Shani
-            | Sha256Implementation::ArmSha2 => {}
+            Sha256Implementation::Software | Sha256Implementation::ArmSha2 => {}
         }
     }
 
     #[test]
     fn test_software_matches_hardware() {
-        // Test that software implementation produces same results
-        // (implicitly tested by other tests, but explicit here)
+        // Previously compared sha256(data) against itself (Sha256::new().update()
+        // .finalize() dispatches through the exact same code path), so it could
+        // never catch a broken hardware transform — that's how the wrong-digest
+        // SHA-NI bug shipped. This is now a known-answer test against an
+        // independently computed vector (sha256sum).
         let data = b"test data for sha256 comparison";
         let hash = sha256(data);
-
-        // Force software implementation for comparison
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        // Manually call software transform
-        let software_hash = hasher.finalize();
-
-        assert_eq!(hash, software_hash);
+        let expected = hex::decode("f93f3a675a7d17227ed63848db82b790019296b0883d65f74a3cc75eecd4fe11")
+            .unwrap();
+        assert_eq!(hash.as_slice(), expected.as_slice());
     }
 }
