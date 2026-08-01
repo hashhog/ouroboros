@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3053,6 +3054,33 @@ impl BlockchainDB {
 /// re-tuned on a memory-tight host WITHOUT a rebuild.
 const CHAINSTATE_CACHE_MB_DEFAULT: usize = 4096;
 
+/// Total budget for the COLD column families, shared between all of them.
+///
+/// REGRESSION FIX (2026-08-01). The 2026-07-30 change that gave CHAINSTATE_CF
+/// its own cache also, unintentionally, stopped the cold CFs from sharing one.
+/// Previously a single `Options` was built and `.clone()`d, and because
+/// rust-rocksdb's Options clone copies a shared_ptr to the table factory, all
+/// ten CFs shared ONE 256 MiB cache. Building options per-CF gave each its own,
+/// so the total budget went from 256 MiB to 4 GiB + 9 x 256 MiB = 6.03 GiB.
+///
+/// On a host with room that is merely wasteful. On the mainnet ouroboros node,
+/// whose cgroup MemoryMax is 16 GiB, it is 36% of the entire budget — measured
+/// live: ten distinct cache allocations totalling 6.03 GiB.
+///
+/// The cold CFs are written once and streamed; they do not need per-CF caches.
+/// One shared 256 MiB is what the code did before and what it should do now.
+fn cold_cache() -> &'static Cache {
+    static COLD: OnceLock<Cache> = OnceLock::new();
+    COLD.get_or_init(|| {
+        let mb: usize = std::env::var("OUROBOROS_COLD_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|m: &usize| *m > 0)
+            .unwrap_or(256);
+        Cache::new_lru_cache(mb * 1024 * 1024)
+    })
+}
+
 fn chainstate_cache_bytes() -> usize {
     std::env::var("OUROBOROS_CHAINSTATE_CACHE_MB")
         .ok()
@@ -3115,8 +3143,17 @@ fn create_cf_options(cf_name: &str) -> Options {
         opts.set_memtable_whole_key_filtering(true);
     } else {
         // Cold CFs (blocks, spent, tx_index, headers, meta, undo, ...) are
-        // written once and streamed; they share one modest cache.
-        opts.optimize_for_point_lookup(256);
+        // written once and streamed. They SHARE one modest cache — passing the
+        // same Cache handle is what makes it shared; calling
+        // optimize_for_point_lookup here would give each CF its own, which is
+        // exactly the regression this replaces.
+        let mut bbt = BlockBasedOptions::default();
+        bbt.set_block_cache(cold_cache());
+        bbt.set_bloom_filter(10.0, false);
+        bbt.set_data_block_index_type(DataBlockIndexType::BinaryAndHash);
+        bbt.set_data_block_hash_ratio(0.75);
+        opts.set_block_based_table_factory(&bbt);
+        opts.set_memtable_whole_key_filtering(true);
     }
 
     opts
