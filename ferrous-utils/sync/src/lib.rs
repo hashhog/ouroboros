@@ -275,10 +275,24 @@ fn is_bip68_active(height: u32, network: String) -> PyResult<bool> {
 /// Tuple (min_height, min_time) representing sequence lock requirements.
 /// Values of -1 mean "no lock of this type required".
 #[pyfunction]
+// tx_version arrives as i64, not i32, deliberately. Bitcoin Core stores the
+// transaction version as uint32_t and compares it UNSIGNED (tx_verify.cpp:51),
+// so a consensus-valid transaction may carry any value up to 0xFFFFFFFF.
+// Declaring this parameter as i32 made PyO3 reject 0xFFFFFFFF outright with
+// "out of range integral type conversion attempted", which propagated out of
+// submitblock as a bare "rejected" -- ouroboros refused a block Bitcoin Core
+// ACCEPTS (corpus entry version-dup/txver-maxuint-accept, 2026-08-02).
+//
+// i64 accepts both representations Python may hand over: the unsigned wire
+// value (4294967295) and the sign-extended form (-1). Both are normalised
+// through `as u32 as i32` to the identical bit pattern the Rust sequence-lock
+// code already expects, which handles it correctly
+// (sequence_lock.rs:285-286 assert exactly this).
 fn calculate_sequence_locks(
-    tx_version: i32,
+    tx_version: i64,
     inputs: Vec<(u32, u32, i64)>,
 ) -> PyResult<(i32, i64)> {
+    let tx_version: i32 = tx_version as u32 as i32;
     let input_infos: Vec<sequence_lock::InputLockInfo> = inputs
         .into_iter()
         .map(|(seq, height, mtp)| sequence_lock::InputLockInfo {
@@ -304,13 +318,27 @@ fn calculate_sequence_locks(
 /// # Returns
 /// True if sequence locks are satisfied.
 #[pyfunction]
+// tx_version arrives as i64, not i32, deliberately. Bitcoin Core stores the
+// transaction version as uint32_t and compares it UNSIGNED (tx_verify.cpp:51),
+// so a consensus-valid transaction may carry any value up to 0xFFFFFFFF.
+// Declaring this parameter as i32 made PyO3 reject 0xFFFFFFFF outright with
+// "out of range integral type conversion attempted", which propagated out of
+// submitblock as a bare "rejected" -- ouroboros refused a block Bitcoin Core
+// ACCEPTS (corpus entry version-dup/txver-maxuint-accept, 2026-08-02).
+//
+// i64 accepts both representations Python may hand over: the unsigned wire
+// value (4294967295) and the sign-extended form (-1). Both are normalised
+// through `as u32 as i32` to the identical bit pattern the Rust sequence-lock
+// code already expects, which handles it correctly
+// (sequence_lock.rs:285-286 assert exactly this).
 fn check_sequence_locks(
-    tx_version: i32,
+    tx_version: i64,
     inputs: Vec<(u32, u32, i64)>,
     block_height: u32,
     block_median_time: i64,
     enforce_bip68: bool,
 ) -> PyResult<bool> {
+    let tx_version: i32 = tx_version as u32 as i32;
     let input_infos: Vec<sequence_lock::InputLockInfo> = inputs
         .into_iter()
         .map(|(seq, height, mtp)| sequence_lock::InputLockInfo {
