@@ -388,6 +388,41 @@ async def accept_block(
     network = getattr(node, "network", "mainnet")
     best_height = next_height - 1
 
+    # Step 0 — coinbase scriptSig length, BEFORE the BIP-34 height check.
+    #
+    # Core evaluates these in the opposite order to the one this function used.
+    # bad-cb-length lives in CheckTransaction (consensus/tx_check.cpp:49-50),
+    # which runs inside the CONTEXT-FREE CheckBlock; bad-cb-height lives in
+    # ContextualCheckBlock (validation.cpp:4157), much later. Because the
+    # Python BIP-34 check below was bolted on ahead of the Rust call that owns
+    # bad-cb-length, a coinbase with a too-short scriptSig reported
+    # bad-cb-height where Core reports bad-cb-length (corpus entry
+    # _cve-histbug-2026-07-07/.../C-cb-scriptsig-too-short, 2026-08-02).
+    #
+    # The decision is identical either way -- the block is rejected -- so this
+    # is reason-code parity (R2), not a chain-split fix. It still matters:
+    # first-failure order is observable behaviour, and today three real
+    # consensus bugs in this fleet turned out to be ordering bugs of exactly
+    # this shape.
+    #
+    # This duplicates a rule the Rust CheckBlock also enforces. That is
+    # deliberate and bounded: it is two lines, the bounds have been fixed since
+    # 2012, and the alternative -- moving the BIP-34 check after the Rust call
+    # -- would run it after the block had already been connected.
+    try:
+        from ouroboros.database import Block as _Block0
+        _blk0 = _Block0.deserialize(block_bytes)
+        if _blk0.transactions and _blk0.transactions[0].inputs:
+            _cb_script = _blk0.transactions[0].inputs[0].script_sig
+            if len(_cb_script) < 2 or len(_cb_script) > 100:
+                raise ValueError("bad-cb-length")
+    except ValueError:
+        raise
+    except Exception:
+        # Undecodable block: leave it to the Rust CheckBlock, which produces
+        # the correct structural reason. Never invent a rejection here.
+        pass
+
     # Step 1 — BIP-34 coinbase height byte-exact prefix check.
     # Rust connect_block_from_bytes has no network context so it cannot enforce
     # the per-network activation height.  Run a lightweight Python check here.
