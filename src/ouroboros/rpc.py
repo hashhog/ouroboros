@@ -8747,6 +8747,20 @@ class RPCServer:
                 )
                 return None
             except Exception as e:
+                # Log before mapping. bip22_result_string collapses any
+                # unrecognised message to the generic "rejected", which erases
+                # the only description of WHY the block failed — there was no
+                # other record of it anywhere, so a rejection reaching this arm
+                # was undiagnosable from the outside. The 2026-08-02 corpus
+                # sweep found 25 ouroboros entries answering a bare "rejected",
+                # and identifying the cause of even one of them required
+                # attaching to a kept datadir and re-submitting by hand.
+                # debug level: this is a normal outcome for an invalid block,
+                # not an operational error.
+                logger.debug(
+                    "submitblock rejected block %s at height %d: %s",
+                    block_hash[::-1].hex()[:16], best_height + 1, e,
+                )
                 return bip22_result_string(str(e))
 
         # Side-branch path: parent is not the active tip. Resolve its
