@@ -332,9 +332,8 @@ class TestG8MinimumChainWork:
     @pytest.mark.asyncio
     async def test_low_work_batch_rejected_when_min_pow_checked_false(self):
         """When ``min_pow_checked=False``, a batch of regtest-bits headers
-        (bits=0x207fffff, near-zero work) forking a ZERO-work base must be
-        rejected with a misbehaviour call and the headers must NOT be
-        queued.
+        (bits=0x207fffff, near-zero work) forking a LOW-work base must be
+        rejected and the headers must NOT be queued.
 
         The conftest mock returns ``get_minimum_chain_work("mainnet")`` as
         the mainnet minimum (a large hex value), so any regtest-work batch
@@ -343,8 +342,11 @@ class TestG8MinimumChainWork:
         Note: the G8 gate computes TOTAL chain work — the DB-tip base plus
         the queued headers — exactly as Bitcoin Core's
         ``chain_start_header.nChainWork + CalculateClaimedHeadersWork``.
-        This test stubs the DB-tip chainwork to 0 so the low-work batch
-        genuinely has too little total work.  (See
+        This test seeds a readable chainwork index whose stored work is far
+        below the mainnet minimum, so the batch genuinely has too little
+        total work.  A 0 base at a non-zero tip would instead trip the
+        2026-07-20 liveness guard (commit 0d5911d: chainwork index
+        unreadable → skip the gate loudly rather than brick sync).  (See
         test_g8_accepts_batch_when_db_tip_chainwork_above_minimum in
         tests/test_handle_headers_pow.py for the complementary case where
         a deep DB tip lets a short batch through — the mainnet-stall
@@ -353,8 +355,13 @@ class TestG8MinimumChainWork:
         tip = b"\x11" * 32
         # Use mainnet network so the minimum chain work is nonzero
         bs = _make_block_sync(tip_hash=tip, tip_height=100, network="mainnet")
-        # Zero-work base: the batch must stand on its own (near-zero) work.
-        bs.db.get_chainwork_by_height = MagicMock(return_value=0)
+        # Low-work base: nonzero at/below the tip (readable index — a 0 read
+        # at a non-zero tip now SKIPS the gate, see docstring), nothing
+        # stored above the tip so the assumeUTXO snapshot-offset probe finds
+        # no block and returns 0.
+        bs.db.get_chainwork_by_height = MagicMock(
+            side_effect=lambda height: 2 * (height + 1) if 0 <= height <= 100 else 0
+        )
         peer = _make_peer()
 
         h1 = _valid_header_extending(tip, bits=REGTEST_BITS)
@@ -370,8 +377,14 @@ class TestG8MinimumChainWork:
         assert len(bs._validated_headers) == 0, (
             "G8: low-work header must not be queued when min_pow_checked=False"
         )
-        # Misbehaviour must fire.
-        peer.adjust_score.assert_called()
+        # …but the peer must NOT be punished.  Bitcoin Core never calls
+        # Misbehaving for BLOCK_HEADER_LOW_WORK: MaybePunishNodeForBlock
+        # treats it as a bare ``break`` (net_processing.cpp) and low-work
+        # chains are routed through presync — a genesis-first node is below
+        # nMinimumChainWork by definition, so banning the serving peer would
+        # brick honest IBD.  Pin the no-punish behaviour (fixed 2026-07-20,
+        # commit 0d5911d).
+        peer.adjust_score.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_low_work_batch_accepted_when_min_pow_checked_true(self):

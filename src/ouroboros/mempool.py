@@ -1354,17 +1354,39 @@ def _validate_inputs_standardness(
             continue
         prev_spk = bytes(prev_spk)
 
+        # G2: WITNESS_UNKNOWN inputs.  A syntactically valid witness program
+        # with version != 0 that is none of the known standard types (P2TR,
+        # P2A) is a standard *output* (Core's IsStandard accepts
+        # TxoutType::WITNESS_UNKNOWN for forward-compat), but SPENDING it is
+        # non-standard and rejected here.  This check must run BEFORE the G1
+        # gate below: _is_standard_output_type() (correctly) classifies
+        # WITNESS_UNKNOWN v1+ programs as standard outputs, so without this
+        # branch a spend of a witness v2..16 output would sail through.
+        # Core: policy/policy.cpp ValidateInputsStandardness (lines 234-240):
+        #     } else if (whichType == TxoutType::WITNESS_UNKNOWN) {
+        #         ... "input %u witness program is undefined"
+        wp = _get_witness_program(prev_spk)
+        if wp is not None:
+            ver, prog = wp
+            if ver != 0 and not (
+                (ver == 1 and len(prog) == WITNESS_V1_TAPROOT_SIZE)
+                or is_pay_to_anchor_program(ver, prog)
+            ):
+                return False, (
+                    f"bad-txns-nonstandard-inputs: input {idx} witness "
+                    f"program is undefined (witness version {ver})"
+                )
+
         # G1: prevScript type must be standard.  We treat
         # _is_standard_output_type() as the Solver-equivalent: it returns
         # True iff the script matches a known standard pattern (P2PKH, P2SH,
-        # P2WPKH, P2WSH, P2TR, P2A, bare multisig, OP_RETURN).
+        # P2WPKH, P2WSH, P2TR, P2A, bare multisig, OP_RETURN) — and also for
+        # WITNESS_UNKNOWN v1+ programs (Core IsStandard parity), which is why
+        # the G2 spend-side rejection above runs first.
         if not _is_standard_output_type(prev_spk):
-            # G2 cousin: a witness program with version != 0/1 and a 2..40
-            # byte program is technically IsStandard returning WITNESS_UNKNOWN
-            # in Core, which is also rejected here.  Since
-            # _is_standard_output_type() already returns False for
-            # witness_unknown (only OP_0 and OP_1 witness-program versions
-            # pass), this branch handles both G1 and G2.
+            # Only NONSTANDARD scripts reach this branch: v0 witness programs
+            # with a non-{20,32}-byte program length (Core's Solver maps
+            # those to NONSTANDARD) and non-witness junk.
             wp = _get_witness_program(prev_spk)
             if wp is not None:
                 ver, _prog = wp

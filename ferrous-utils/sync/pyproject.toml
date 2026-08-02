@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sync"
-version = "0.1.0"
+version = "1.0.0"
 description = "Rust extension module for the Ouroboros Bitcoin node (block/header/script validation + RocksDB storage via pyo3)"
 requires-python = ">=3.11,<3.14"
 license = { text = "MIT" }
@@ -28,7 +28,7 @@ classifiers = [
 #   way to keep `ouroboros` and `sync` as independent distributions is to
 #   give each its own pyproject.toml.
 #
-# Canonical install flow (see ../../setup.sh / ../../scripts/install.sh):
+# Canonical install flow (see ../../setup.sh at the repo root):
 #   python3 -m venv .venv
 #   source .venv/bin/activate
 #   pip install --upgrade pip maturin patchelf

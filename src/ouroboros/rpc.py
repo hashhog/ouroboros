@@ -9951,7 +9951,7 @@ class RPCServer:
                             )
                     elif hasattr(pm, 'add_peer'):
                         await asyncio.wait_for(pm.add_peer(_node), timeout=60.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning(
                         "rpc_addnode background dial timed out after 60s for %s",
                         _node,
@@ -14330,6 +14330,12 @@ class RPCServer:
         """Format a MempoolEntry into the standard mempool dict."""
         mempool = self.node.mempool
 
+        # Internal hashes are little-endian; the RPC boundary displays
+        # big-endian (reverse-byte) hex, matching Core's ToString() and the
+        # same-named helpers in rpc_getrawmempool / OrphanToJSON.
+        def _display_hash(h: bytes) -> str:
+            return h[::-1].hex() if isinstance(h, bytes) else str(h)
+
         # -- depends: unconfirmed parents of this tx -----------------------
         # inp.prev_txid is internal LE; JSON-RPC emits display-order (BE). W69.
         depends: list[str] = []
@@ -14392,7 +14398,7 @@ class RPCServer:
             "ancestorcount": entry.ancestor_count,
             "ancestorsize": entry.ancestor_size,
             "wtxid": _display_hash(entry.tx.get_wtxid())
-                if hasattr(entry.tx, "get_wtxid") else _display_txid(txid_bytes),
+                if hasattr(entry.tx, "get_wtxid") else _display_hash(txid_bytes),
             "fees": {
                 "base": base_fee_btc,
                 "modified": modified_fee_btc,

@@ -351,11 +351,15 @@ class TestCoinbaseAmountUsesNetworkSubsidy:
 
 def test_bip30_repeat_exceptions_pinned():
     assert set(BIP30_REPEAT_EXCEPTIONS.keys()) == {91842, 91880}
-    # Hashes are stored internal byte order (LE-of-display).
+    # Hashes are stored internal byte order (LE-of-display) so they compare
+    # equal to block.hash (the raw double-SHA256 digest) in
+    # validation.py's BIP30 gate — see consensus.py and commit 9e64d76.
+    # The literals below are the display (big-endian) hashes, reversed with
+    # [::-1] to the internal form.
     # mainnet block 91842 display-hash: 00000000000a4d0a398161ffc163c503...
     assert BIP30_REPEAT_EXCEPTIONS[91842] == bytes.fromhex(
         "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
-    )
+    )[::-1]
     assert BIP30_REPEAT_EXCEPTIONS[91880] == bytes.fromhex(
         "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"
-    )
+    )[::-1]

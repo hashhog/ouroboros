@@ -731,8 +731,9 @@ async def test_dumptxoutset_rollback_unpruned_node_unaffected(tmp_path) -> None:
 #
 # Mirrors Bitcoin Core's NetworkDisable wrapper around TemporaryRollback in
 # rpc/blockchain.cpp::dumptxoutset. We exercise the flag directly and
-# confirm submitblock short-circuits with a "paused" reject string before
-# any deserialization or chain mutation.
+# confirm submitblock short-circuits with the canonical BIP-22 "rejected"
+# result string (commit d1d589d — the gate used to return a long non-spec
+# message containing "paused") before any deserialization or chain mutation.
 # ---------------------------------------------------------------------------
 
 
@@ -748,10 +749,15 @@ async def test_submitblock_refuses_while_paused(tmp_path) -> None:
     db = _make_db_with_chain()
     rpc = _make_rpc(db, tmp_path=tmp_path)
     rpc.block_submission_paused = True
-    # Garbage hex is fine: gate runs before deserialization or DB access.
-    result = await rpc.rpc_submitblock("00")
-    assert isinstance(result, str)
-    assert "paused" in result
+    # Feed a full-length (80-byte) garbage header so that, were the gate
+    # absent, the flow would get past deserialization and reach the
+    # duplicate-check read; arm that read to prove the gate fired first.
+    header_reads: list[bytes] = []
+    db.has_block_hash = lambda h: header_reads.append(h) or False
+    result = await rpc.rpc_submitblock("00" * 80)
+    # Canonical BIP-22 result string, not a long "paused" message (d1d589d).
+    assert result == "rejected"
+    assert header_reads == []
 
 
 @pytest.mark.asyncio
@@ -759,9 +765,15 @@ async def test_submitblockbatch_refuses_while_paused(tmp_path) -> None:
     db = _make_db_with_chain()
     rpc = _make_rpc(db, tmp_path=tmp_path)
     rpc.block_submission_paused = True
-    results = await rpc.rpc_submitblockbatch(["00", "11"])
+    # Same first-statement gate; arm the batch loop's first chainstate
+    # read (get_best_block) to prove the whole batch short-circuits.
+    tip_reads: list[int] = []
+    db.get_best_block = lambda: tip_reads.append(1) or (db.best_hash, db.best_height)
+    results = await rpc.rpc_submitblockbatch(["00" * 80, "11" * 80])
     assert len(results) == 2
-    assert all(isinstance(r, str) and "paused" in r for r in results)
+    # Canonical BIP-22 result strings, not "paused" messages (d1d589d).
+    assert results == ["rejected", "rejected"]
+    assert tip_reads == []
 
 
 @pytest.mark.asyncio

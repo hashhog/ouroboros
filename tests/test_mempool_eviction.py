@@ -419,9 +419,9 @@ class TestAdmissionRollingFeeGate:
         """Gate 12: tx below rolling min fee is rejected at admission.
 
         Uses a high rolling minimum fee rate (locked, no block decay) so that
-        a tx paying only DEFAULT_MIN_RELAY_TX_FEE (1000 sat/kvB) is rejected
-        by the rolling-min gate.  The tx is sized to pass the static min-relay
-        check but fail the rolling-min gate.
+        a tx paying only ~1000 sat/kvB is rejected by the rolling-min gate.
+        The tx is sized to pass the static min-relay check but fail the
+        rolling-min gate.
         """
         pool = _pool(max_size=300_000_000)
 
@@ -435,13 +435,17 @@ class TestAdmissionRollingFeeGate:
         pool.validator = _StubValidator(utxos)
 
         tx_txid = _txid(1)
-        # Pay exactly 1000 sat/kvB (static minimum) but far below rolling min.
+        # Pay ~1000 sat/kvB (well above the 100 sat/kvB static floor) but far
+        # below rolling min.
         # tx serialized size ≈ 85-100 bytes; set fee = 100 sats (≈ 1000 sat/kvB for 100 B)
         # rolling_min_fee = 85 * 50_000 / 1000 = 4_250 sats >> 100 sats
         tx = _make_tx(tx_txid, [(confirmed_txid, 0)], [utxo_value - 100])  # 100 sat fee
         ok, err = pool._add_transaction_inner(tx, height=100)
         assert not ok, "Tx below rolling min fee should be rejected"
-        assert "rolling minimum" in err.lower() or "insufficient" in err.lower(), (
+        # Core's bare reject token for the dynamic rolling-floor case
+        # (validation.cpp:705 "mempool min fee not met"), distinct from the
+        # static "min relay fee not met".
+        assert err == "mempool min fee not met", (
             f"Expected rolling min fee rejection, got: {err}"
         )
 

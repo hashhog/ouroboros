@@ -22,6 +22,14 @@ if "sync" not in sys.modules:
         def get_utxo(self, *a, **kw): return None
         def get_median_time_past(self, *a, **kw): return 0
 
+        def has_block_hash(self, block_hash: bytes) -> bool:
+            # Mirrors sync.PyBlockchainDB.has_block_hash (cheap existence
+            # probe, added in commit 3eb75bc): ValueError on non-32-byte
+            # input; the stub DB is always empty, so always False.
+            if len(block_hash) != 32:
+                raise ValueError("Block hash must be 32 bytes")
+            return False
+
         def invalidate_block(self, block_hash: bytes) -> None:
             if len(block_hash) != 32:
                 raise ValueError("block_hash must be 32 bytes")

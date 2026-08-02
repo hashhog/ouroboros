@@ -1011,7 +1011,7 @@ class Peer:
             addr_recv=addr_recv,
             addr_from=addr_from,
             nonce=self._generate_nonce(),
-            user_agent='/ouroboros:0.1.0/',
+            user_agent='/ouroboros:1.0.0/',
             start_height=start_height,
             relay=self.relay_txs,
         )
@@ -1513,7 +1513,7 @@ class Peer:
             addr_recv=addr_recv,
             addr_from=addr_from,
             nonce=self._generate_nonce(),
-            user_agent="/ouroboros:0.1.0/",
+            user_agent="/ouroboros:1.0.0/",
             start_height=start_height,
             relay=self.relay_txs,
         )

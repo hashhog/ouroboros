@@ -1,6 +1,6 @@
 """Ouroboros - A Bitcoin node implementation in Python with Rust extensions."""
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 # Core modules
 # Rust extension module

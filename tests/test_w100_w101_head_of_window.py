@@ -47,6 +47,7 @@ from ouroboros.block_sync import (
     MAX_BLOCKS_IN_FLIGHT_PER_PEER,
     BlockSync,
 )
+from ouroboros.p2p_messages import NODE_WITNESS
 from ouroboros.peer import Peer
 
 # Must match the HEAD_OF_WINDOW literal in both _request_next_blocks and
@@ -81,12 +82,14 @@ def _make_block_sync(tip_hash: bytes, tip_height: int) -> BlockSync:
 
 
 def _make_ready_peer(host: str = "10.0.0.1", port: int = 8333) -> MagicMock:
-    """A peer that passes the ``isinstance(p, Peer)`` + ``is_connected()``
-    gate in _request_next_blocks and records its sent getdata payloads."""
+    """A peer that passes the ``isinstance(p, Peer)`` + ``is_connected()`` +
+    NODE_WITNESS (Core CanServeWitnesses, net_processing.cpp:1168) gates in
+    _request_next_blocks and records its sent getdata payloads."""
     peer = MagicMock(spec=Peer)
     peer.host = host
     peer.port = port
     peer.score = 100
+    peer.services = NODE_WITNESS
     peer.is_connected.return_value = True
     peer.send_message = AsyncMock()
     peer.adjust_score = MagicMock()

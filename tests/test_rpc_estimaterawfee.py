@@ -3,9 +3,9 @@ Tests for the estimaterawfee RPC handler.
 
 Reference: bitcoin-core/src/rpc/fees.cpp estimaterawfee.
 
-ouroboros's bucket-based ``FeeEstimator`` only tracks one horizon (the
-``LONG`` horizon in Core terms), so the response object always contains a
-single ``"long"`` key.
+ouroboros's bucket-based ``FeeEstimator`` tracks three horizons (short /
+medium / long — Core's shortStats / feeStats / longStats), so the response
+object carries ``"short"``, ``"medium"`` and ``"long"`` keys.
 """
 
 from __future__ import annotations
@@ -72,11 +72,15 @@ async def test_estimaterawfee_returns_pass_bucket_with_data(
     confirm the response carries a ``pass`` bucket and a ``feerate``."""
     fe = rpc_with_estimator.node.fee_estimator
     # Force bucket 5 (10 sat/vB boundary) to a 100 % success rate at conf
-    # target 6 by writing the running counters directly.
+    # target 6 by writing the running counters directly.  The estimator is
+    # 3-horizon since W114/FIX-48 (6c0d1f4): counters live per horizon and
+    # are indexed by *period*, so target 6 lands in LONG period
+    # ceil(6 / 24) = 1 (one LONG period spans 24 blocks).
     bucket_idx = 5
     target = 6
-    fe.total[bucket_idx][target] = 50.0
-    fe.confirmed[bucket_idx][target] = 50.0  # 100 % success
+    period = 1
+    fe.long_totals[bucket_idx][period] = 50.0
+    fe.long_stats[bucket_idx][period] = 50.0  # 100 % success
 
     result = await rpc_with_estimator.rpc_estimaterawfee(target, threshold=0.85)
     assert "long" in result

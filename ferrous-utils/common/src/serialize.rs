@@ -1,8 +1,8 @@
 // Bitcoin serialization with VarInt support
 
 use crate::types::{
-    BlockHeaderWrapper, BlockMetadata, BlockWrapper, OutPointWrapper, TransactionWrapper,
-    TxInWrapper, TxOutWrapper, UTXO,
+    BlockHeaderWrapper, BlockMetadata, BlockStatus, BlockWrapper, OutPointWrapper,
+    TransactionWrapper, TxInWrapper, TxOutWrapper, UTXO,
 };
 use bitcoin::{
     consensus::{Decodable, Encodable},
@@ -429,10 +429,20 @@ impl BitcoinDeserialize for BlockMetadata {
             .map_err(|e| SerializeError::Encode(format!("{}", e)))?;
         let timestamp = u32::consensus_decode(&mut decoder)
             .map_err(|e| SerializeError::Encode(format!("{}", e)))?;
+        // Status is optional for backwards compatibility with older data
+        // (mirrors BlockMetadata::from_bytes)
+        let status = if decoder.is_empty() {
+            BlockStatus::new()
+        } else {
+            BlockStatus(
+                u32::consensus_decode(&mut decoder)
+                    .map_err(|e| SerializeError::Encode(format!("{}", e)))?,
+            )
+        };
 
         let bytes_consumed = original_len - decoder.len();
         Ok((
-            BlockMetadata::new(height, chainwork, timestamp),
+            BlockMetadata::with_status(height, chainwork, timestamp, status),
             bytes_consumed,
         ))
     }

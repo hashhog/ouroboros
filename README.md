@@ -182,7 +182,8 @@ Initial Block Download (IBD):
 
 - Block and transaction storage — RocksDB-backed UTXO set and block index via
   `PyBlockchainDB`
-- Cryptographic primitives — SHA-NI-accelerated double-SHA256, secp256k1
+- Cryptographic primitives — double-SHA256 (ARM SHA2-accelerated where
+  available, portable software elsewhere), secp256k1
   ECDSA/Schnorr via libsecp256k1 with batch Schnorr verification
 - Batch UTXO lookup — `get_utxo_batch()` fetches all inputs for a transaction
   in a single FFI call, replacing N individual calls and halving GIL

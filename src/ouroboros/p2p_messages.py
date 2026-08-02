@@ -267,7 +267,7 @@ class VersionMessage:
     addr_recv: NetworkAddress = field(default_factory=lambda: NetworkAddress())
     addr_from: NetworkAddress = field(default_factory=lambda: NetworkAddress())
     nonce: int = 0
-    user_agent: str = "/bitcoin-hybrid:0.1.0/"
+    user_agent: str = "/bitcoin-hybrid:1.0.0/"
     start_height: int = 0
     relay: bool = True
 
