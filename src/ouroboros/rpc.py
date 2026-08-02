@@ -154,6 +154,16 @@ def bip22_result_string(error: str) -> str:
              "bad-txns-inputs-missingorspent"):
         return s
 
+    # bad-version embeds the offending version inline — Core builds it with
+    # strprintf("bad-version(0x%08x)", block.nVersion) at validation.cpp:4116 —
+    # so it cannot live in the fixed-string set above and would otherwise fall
+    # through to the generic "rejected". The side-branch gate that emits this
+    # was added 2026-08-02; without this arm the block is correctly REJECTED but
+    # reports the wrong reason, turning a fixed consensus split into a
+    # needless error-code divergence.
+    if s == "bad-version" or s.startswith("bad-version(0x"):
+        return s
+
     # PoW / difficulty errors
     if ("proof of work" in s or "invalid pow" in s or "invalid difficulty" in s
             or ("difficulty" in s and ("does not match" in s or "expected" in s))):
@@ -7329,6 +7339,61 @@ class RPCServer:
                 break
             self._side_branch_blocks.pop(k, None)
 
+    def _branch_median_time_past(self, db, parent_hash: bytes) -> int | None:
+        """Median-time-past of ``parent_hash``, walked along ITS OWN branch.
+
+        Core's ``pindexPrev->GetMedianTimePast()`` (chain.h:233-245) walks
+        ``pprev`` pointers, so on a side branch it reads the side branch's own
+        ancestors — never the active chain's. ``db.get_median_time_past(height)``
+        cannot express that: it is height-keyed and therefore always answers for
+        the ACTIVE chain, which is why the time-too-old gate was deferred here
+        rather than implemented against it (see the note in
+        ``_attach_side_branch_block``).
+
+        This walks the real branch instead: at each step the side-branch buffer
+        is consulted before the database, so blocks that exist only on the fork
+        are followed correctly. Core takes as many of the last 11 ancestors as
+        exist, sorts, and returns the middle element.
+
+        Returns None when the branch cannot be fully resolved, and the caller
+        then SKIPS the check. That direction matters: an unresolvable branch
+        must never produce a rejection, because a spurious reject of a valid
+        side-branch block is a worse divergence than the one being fixed.
+        """
+        from ouroboros.database import Block as _Blk
+
+        MEDIAN_TIME_SPAN = 11
+        times: list[int] = []
+        h = parent_hash
+        for _ in range(MEDIAN_TIME_SPAN):
+            blk = None
+            sb = self._side_branch_blocks.get(h)
+            if sb is not None:
+                try:
+                    blk = _Blk.deserialize(sb[2])
+                except Exception:
+                    return None
+            else:
+                try:
+                    blk = db.get_block(h)
+                except Exception:
+                    return None
+            if blk is None:
+                # Ran off the end of what we can see. If we already have at
+                # least one ancestor this mirrors Core hitting the genesis
+                # block (pindex becomes null and the loop stops early);
+                # with none at all we cannot compute anything.
+                break
+            times.append(int(blk.timestamp))
+            h = blk.prev_blockhash
+            if not h or h == b"\x00" * 32:
+                break
+
+        if not times:
+            return None
+        times.sort()
+        return times[len(times) // 2]
+
     async def _attach_side_branch_block(
         self,
         db,
@@ -7375,6 +7440,7 @@ class RPCServer:
         from ouroboros.validation import _bits_to_target as _v_bits_to_target
         from ouroboros.validation import MAX_FUTURE_BLOCK_TIME as _MAX_FUTURE
         from ouroboros.consensus import BURIED_DEPLOYMENTS
+        from ouroboros.consensus import is_buried_deployment_active as _is_buried_active
         from ouroboros.database import Block as _Block
 
         network = getattr(self.node, "network", "mainnet")
@@ -7481,17 +7547,64 @@ class RPCServer:
         # (fuzz-sweep-6nodes-2026-07-11.md Finding 2, time-too-new x2). Runs AFTER
         # high-hash/merkle (CheckBlock) and bad-diffbits, mirroring Core's order
         # (ContextualCheckBlockHeader: bad-diffbits before the timestamp gates).
-        # NB: time-too-old (<= MTP) and bad-version (BIP34/66/65 height-gated) are
-        # left to a follow-up — both are CONTEXTUAL and computing them for a
-        # side branch would require the parent's median-time-past / height-gated
-        # deployment state via the height-keyed index, which resolves to the
-        # ACTIVE chain (wrong for a deeper side branch) — mirroring them
-        # imprecisely would introduce a NEW divergence (spurious reject of a
-        # valid side-branch), which this path must not do.
         _blk_time = int.from_bytes(block_bytes[68:72], "little")
+
+        # time-too-old (ContextualCheckBlockHeader parity, validation.cpp:4092-4093).
+        # Core: `if (block.GetBlockTime() <= pindexPrev->GetMedianTimePast())`.
+        # Note the comparison is <=, not <.
+        #
+        # This was previously deferred because the only MTP accessor available
+        # (db.get_median_time_past) is height-keyed and so answers for the ACTIVE
+        # chain, which is wrong for a side branch. That objection was correct;
+        # _branch_median_time_past resolves it by walking the parent's own
+        # ancestors through the side-branch buffer, exactly as Core's pprev walk
+        # does. When the branch cannot be resolved it returns None and the gate
+        # is skipped — never rejected — so an unresolvable fork can still not
+        # produce a spurious reject.
+        #
+        # Found by the full corpus sweep, 2026-08-02: entry
+        # submitblock-sidebranch/time-too-old-mtp, Core reject:time-too-old vs
+        # ouroboros ACCEPT (receipts/corpus-sweep-2026-08-02.md).
+        _branch_mtp = self._branch_median_time_past(db, prev_hash)
+        if _branch_mtp is not None and _blk_time <= _branch_mtp:
+            return bip22_result_string("time-too-old")
+
+        # time-too-new (ContextualCheckBlockHeader parity). Core rejects a block
+        # whose timestamp is more than MAX_FUTURE_BLOCK_TIME (2h) beyond the
+        # node's clock — validation.cpp:4108-4110 compares block.Time() against
+        # NodeClock::now() + MAX_FUTURE_BLOCK_TIME. This gate needs only the wall
+        # clock (no chain context), so it is safe to run for side-branch blocks:
+        # a genuinely valid side-branch never carries a >2h-future timestamp (Core
+        # would reject it too). The side-branch store path skipped it
+        # (fuzz-sweep-6nodes-2026-07-11.md Finding 2, time-too-new x2). Runs AFTER
+        # high-hash/merkle (CheckBlock) and bad-diffbits, mirroring Core's order
+        # (ContextualCheckBlockHeader: bad-diffbits before the timestamp gates).
         _now = int(time.time())
         if _blk_time > _now + _MAX_FUTURE:
             return bip22_result_string("time-too-new")
+
+        # bad-version (ContextualCheckBlockHeader parity, validation.cpp:4113-4118).
+        # Core rejects outdated block versions once the corresponding soft fork
+        # has activated: <2 after BIP34, <3 after BIP66/DERSIG, <4 after
+        # BIP65/CLTV.
+        #
+        # Unlike time-too-old this needs NO branch walk. All three are BURIED
+        # deployments — gated purely on height (chainparams.cpp BIP34Height /
+        # BIP66Height / BIP65Height), not on chain state — and Core evaluates
+        # them via DeploymentActiveAfter(pindexPrev, ...), i.e. at
+        # pindexPrev->nHeight + 1, which is exactly `new_height` here.
+        # Height is height on any branch, so this is unambiguous.
+        #
+        # Found by the full corpus sweep, 2026-08-02: entry
+        # submitblock-sidebranch/bad-version-v3, Core
+        # reject:bad-version(0x00000003) vs ouroboros ACCEPT.
+        _blk_version = int.from_bytes(block_bytes[0:4], "little", signed=True)
+        if (
+            (_blk_version < 2 and _is_buried_active("bip34", new_height, network))
+            or (_blk_version < 3 and _is_buried_active("bip66", new_height, network))
+            or (_blk_version < 4 and _is_buried_active("bip65", new_height, network))
+        ):
+            return bip22_result_string(f"bad-version(0x{_blk_version & 0xFFFFFFFF:08x})")
 
         # BIP-34 byte-prefix check against parent.height + 1. This is the
         # core of the Pattern X fix — pre-fix the height came from
