@@ -203,6 +203,30 @@ def bip22_result_string(error: str) -> str:
     if "sigops" in s:
         return "bad-blk-sigops"
 
+    # First transaction is not a coinbase. Core CheckBlock
+    # (validation.cpp:3952) emits "bad-cb-missing" / "first tx is not
+    # coinbase". The Rust validator raises BlockValidationError::NoCoinbase,
+    # whose thiserror text is "Block has no coinbase transaction"
+    # (ferrous-utils/sync/src/validate/block.rs:39-40); no rule matched it, so
+    # it fell through to the generic "rejected".
+    #
+    # MUST precede the bad-cb-length rule below: that rule fires on
+    # ("invalid coinbase structure" in s and "coinbase" in s), and a future
+    # reword of the NoCoinbase text toward "invalid coinbase" would otherwise
+    # be captured by it and mislabelled.
+    #
+    # Found by the 2026-08-02 corpus sweep, entry F-coinbase-prevout-nonnull:
+    # a coinbase with a non-null prevout fails IsCoinBase(), so Core reports
+    # bad-cb-missing. SEVEN of ten impls answered the generic form on that
+    # entry — only beamchain and rustoshi were correct — so this is a shared
+    # gap, not an ouroboros quirk.
+    #
+    # Decision unchanged (rejected either way): R2 reason-code parity.
+    if ("bad-cb-missing" in s
+            or "no coinbase transaction" in s
+            or "first tx is not coinbase" in s):
+        return "bad-cb-missing"
+
     # Coinbase scriptSig length (consensus/tx_check.cpp:49 — 2..=100 bytes).
     # Also catches Rust validate_block_from_bytes coinbase-structure error when
     # the script length is out of range: "Transaction validation error: Invalid
