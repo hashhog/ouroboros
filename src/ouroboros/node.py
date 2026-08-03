@@ -843,12 +843,70 @@ class BitcoinNode:
                 _tm_interval = 0
 
             if _tm_interval > 0:
+                import gc
                 import json
+                import sys as _sys
                 import threading
                 import tracemalloc
 
+                def _type_histogram(limit: int = 25) -> list:
+                    """Live-object counts and bytes by type name.
+
+                    Complements tracemalloc, which reports the ALLOCATION site;
+                    this reports what is still RETAINED and in what shape.
+
+                    Deliberately bounded: the walk is capped so a 14 GB process
+                    mid-burst cannot turn the diagnostic into the outage. It
+                    returns partial data rather than stalling the sampler, and
+                    marks it so a truncated sample is never mistaken for a
+                    complete one — the truncation this replaces is exactly the
+                    kind of silent limit that misled the earlier analysis.
+                    """
+                    MAX_OBJECTS = 3_000_000
+                    counts: dict = {}
+                    sizes: dict = {}
+                    truncated = False
+                    try:
+                        objs = gc.get_objects()
+                        if len(objs) > MAX_OBJECTS:
+                            objs = objs[:MAX_OBJECTS]
+                            truncated = True
+                        for o in objs:
+                            tn = type(o).__name__
+                            counts[tn] = counts.get(tn, 0) + 1
+                            try:
+                                sizes[tn] = sizes.get(tn, 0) + _sys.getsizeof(o)
+                            except Exception:
+                                pass
+                        del objs
+                    except Exception:
+                        return [{"type": "<histogram-failed>"}]
+                    top = sorted(sizes.items(), key=lambda kv: -kv[1])[:limit]
+                    out = [{"type": t, "mb": round(b / 1048576, 1),
+                            "n": counts.get(t, 0)} for t, b in top]
+                    if truncated:
+                        out.append({"type": "<TRUNCATED>",
+                                    "mb": 0.0, "n": MAX_OBJECTS})
+                    return out
+
                 _tm_log_path = os.path.join(self.data_dir, "tracemalloc.log")
+                # Traceback depth for tracemalloc.start(). Deeper costs real
+                # memory per traced allocation, so keep it modest.
                 _tm_nframes = 25
+                # How many statistics lines to RECORD per snapshot. This used to
+                # reuse _tm_nframes, which silently conflated two unrelated
+                # things and truncated every snapshot to 25 sites.
+                #
+                # That truncation is load-bearing: analysing the 2026-08-03
+                # bursts, tracemalloc appeared to account for only ~36% of the
+                # RSS growth, which read as "most of it is native memory the
+                # profiler cannot see". But the smaps evidence says otherwise —
+                # anon and [heap] rise together at a fixed ~13:1 across three
+                # captures, and a native RocksDB/Rust arena would not touch
+                # CPython's brk heap at all. So the shortfall is far more likely
+                # growth spread thinly across MORE THAN 25 sites.
+                # 200 tests that directly.
+                _tm_top = 200
 
                 def _tracemalloc_thread() -> None:
                     tracemalloc.start(_tm_nframes)
@@ -888,8 +946,29 @@ class BitcoinNode:
                                         "size_kb": round(s.size / 1024, 1),
                                         "count": s.count,
                                     }
-                                    for s in stats[:_tm_nframes]
+                                    for s in stats[:_tm_top]
                                 ],
+                                # WHAT RETAINS, not what allocated.
+                                #
+                                # tracemalloc attributes memory to the
+                                # ALLOCATION SITE. Every burst analysed so far
+                                # points at peer.py's readexactly /
+                                # _receive_v2_message — which is simply where
+                                # every inbound byte is born, and says nothing
+                                # about who is still holding them. A type
+                                # histogram is the complementary view: if the
+                                # ramp shows up as N million live bytes/dict/
+                                # tuple objects, that names the retained SHAPE,
+                                # and the count-vs-size split distinguishes
+                                # "many small" from "few large".
+                                #
+                                # gc.get_objects() only sees GC-tracked
+                                # containers; bytes/bytearray are NOT tracked,
+                                # so they are counted separately via
+                                # gc.get_referents of the tracked set. Cost is
+                                # a full heap walk, acceptable at a 30s
+                                # interval and worth it to name the retainer.
+                                "types": _type_histogram(),
                             }
                             with open(_tm_log_path, "a") as _lf:
                                 _lf.write(json.dumps(record) + "\n")
