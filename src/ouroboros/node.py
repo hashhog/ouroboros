@@ -849,45 +849,108 @@ class BitcoinNode:
                 import threading
                 import tracemalloc
 
-                def _type_histogram(limit: int = 25) -> list:
-                    """Live-object counts and bytes by type name.
+                def _type_histogram(limit: int = 25,
+                                    deadline_s: float = 8.0,
+                                    site_limit: int = 25) -> dict:
+                    """Live-object counts/bytes by type, plus frame code sites.
 
                     Complements tracemalloc, which reports the ALLOCATION site;
                     this reports what is still RETAINED and in what shape.
 
-                    Deliberately bounded: the walk is capped so a 14 GB process
-                    mid-burst cannot turn the diagnostic into the outage. It
-                    returns partial data rather than stalling the sampler, and
-                    marks it so a truncated sample is never mistaken for a
-                    complete one — the truncation this replaces is exactly the
-                    kind of silent limit that misled the earlier analysis.
+                    Bounded by a TIME deadline, not an object count. The
+                    previous version sliced the first 3 M objects, which is
+                    biased by position in ``gc.get_objects()``: at the
+                    2026-08-03T14:54Z peak, frame+traceback alone (2.8 M) ate
+                    the whole cap, so every other type in that sample was
+                    undercounted by an unknown amount and the absence of a type
+                    proved nothing. A deadline degrades the same way under load
+                    but does not systematically hide the tail.
+
+                    ``frame_sites`` is the payload that actually names a leak.
+                    The retained shape is known to be frames+tracebacks, whose
+                    own bytes are minor (601 MB of a 12.8 GB peak) — the memory
+                    is in what their LOCALS reference. Counting frames by
+                    ``co_filename:co_firstlineno:co_name`` points at the exact
+                    function whose frames are being pinned, which neither
+                    tracemalloc (allocation site) nor a type histogram
+                    (shape only) can do.
                     """
-                    MAX_OBJECTS = 3_000_000
+                    t0 = time.monotonic()
                     counts: dict = {}
                     sizes: dict = {}
-                    truncated = False
+                    sites: dict = {}
+                    scanned = 0
+                    total = -1
+                    truncated = None
                     try:
                         objs = gc.get_objects()
-                        if len(objs) > MAX_OBJECTS:
-                            objs = objs[:MAX_OBJECTS]
-                            truncated = True
+                        total = len(objs)
                         for o in objs:
+                            scanned += 1
+                            # Check the clock every 64 K objects; time.monotonic
+                            # per-object would dominate the walk.
+                            if (scanned & 0xFFFF) == 0 and (
+                                    time.monotonic() - t0) > deadline_s:
+                                truncated = "deadline"
+                                break
                             tn = type(o).__name__
                             counts[tn] = counts.get(tn, 0) + 1
                             try:
                                 sizes[tn] = sizes.get(tn, 0) + _sys.getsizeof(o)
                             except Exception:
                                 pass
+                            if tn == "frame":
+                                try:
+                                    _c = o.f_code
+                                    _fn = _c.co_filename.rsplit("/", 1)[-1]
+                                    _k = (f"{_fn}:{_c.co_firstlineno}"
+                                          f":{_c.co_name}")
+                                    sites[_k] = sites.get(_k, 0) + 1
+                                except Exception:
+                                    pass
                         del objs
-                    except Exception:
-                        return [{"type": "<histogram-failed>"}]
+                    except Exception as _he:
+                        return {"error": f"histogram-failed: {_he}"}
                     top = sorted(sizes.items(), key=lambda kv: -kv[1])[:limit]
-                    out = [{"type": t, "mb": round(b / 1048576, 1),
-                            "n": counts.get(t, 0)} for t, b in top]
+                    top_sites = sorted(sites.items(),
+                                       key=lambda kv: -kv[1])[:site_limit]
+                    out = {
+                        "types": [{"type": t, "mb": round(b / 1048576, 1),
+                                   "n": counts.get(t, 0)} for t, b in top],
+                        "frame_sites": [{"site": s, "n": n}
+                                        for s, n in top_sites],
+                        "scanned": scanned,
+                        "total": total,
+                        "walk_s": round(time.monotonic() - t0, 2),
+                    }
                     if truncated:
-                        out.append({"type": "<TRUNCATED>",
-                                    "mb": 0.0, "n": MAX_OBJECTS})
+                        out["truncated"] = truncated
                     return out
+
+                def _gc_stats() -> dict:
+                    """Per-generation collection counters + uncollectable set.
+
+                    ``collections`` per generation is the discriminator: if
+                    gen-2 stops advancing while gen-0/1 keep climbing, cycles
+                    are accumulating unreclaimed. ``garbage`` is nonzero only
+                    when a cycle is genuinely uncollectable (e.g. reachable
+                    from a live frame), which is the failure mode here.
+                    """
+                    try:
+                        return {
+                            "enabled": gc.isenabled(),
+                            "counts": list(gc.get_count()),
+                            "stats": [
+                                {"gen": i,
+                                 "collections": s.get("collections"),
+                                 "collected": s.get("collected"),
+                                 "uncollectable": s.get("uncollectable")}
+                                for i, s in enumerate(gc.get_stats())
+                            ],
+                            "garbage": len(gc.garbage),
+                        }
+                    except Exception as _ge:
+                        return {"error": str(_ge)}
 
                 _tm_log_path = os.path.join(self.data_dir, "tracemalloc.log")
                 # Traceback depth for tracemalloc.start(). Deeper costs real
@@ -968,7 +1031,24 @@ class BitcoinNode:
                                 # gc.get_referents of the tracked set. Cost is
                                 # a full heap walk, acceptable at a 30s
                                 # interval and worth it to name the retainer.
-                                "types": _type_histogram(),
+                                # frame_sites names the FUNCTION whose frames
+                                # are pinned — the one thing neither the
+                                # allocation site nor the type shape can give.
+                                **_type_histogram(),
+                                # frame<->exception<->traceback form REFERENCE
+                                # CYCLES, so they are reclaimable ONLY by the
+                                # cyclic collector, never by refcounting. gc is
+                                # at defaults here (nothing calls disable/
+                                # freeze), but "enabled" is not "running":
+                                # CPython gates a full gen-2 pass on
+                                # long_lived_pending > long_lived_total/4, so
+                                # gen-2 collections get RARER as the heap grows.
+                                # A stalled gen-2 count while gen-0/1 keep
+                                # climbing turns a small cycle leak into the
+                                # observed runaway, and would make the leak an
+                                # amplification of an ordinary error path
+                                # rather than an unbounded allocation.
+                                "gc": _gc_stats(),
                             }
                             with open(_tm_log_path, "a") as _lf:
                                 _lf.write(json.dumps(record) + "\n")
