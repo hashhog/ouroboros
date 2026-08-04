@@ -952,6 +952,60 @@ class BitcoinNode:
                     except Exception as _ge:
                         return {"error": str(_ge)}
 
+                def _buffers() -> dict:
+                    """Sizes of the block_sync retention dicts.
+
+                    THE TYPE HISTOGRAM CANNOT SEE THESE. ``gc.get_objects()``
+                    only returns GC-TRACKED containers, and ``bytes`` is not
+                    tracked — so a dict holding gigabytes of raw block payloads
+                    contributes only the dict itself to the histogram. That is
+                    the leading explanation for the central anomaly: at the
+                    2026-08-03T14:54Z peak the histogram accounted for 601 MB
+                    of a 12,830 MB RSS. It also reconciles tracemalloc always
+                    naming peer.py readexactly (correct — block bytes are born
+                    on the wire) with retention living somewhere else entirely.
+
+                    ``_fork_block_bytes`` is the specific suspect: block_sync
+                    stashes fork/IBD bodies there precisely BECAUSE it is
+                    exempt from the ``_sweep_ibd_block_buffer`` TTL sweep
+                    (block_sync.py:1543-1552), and that sweep exists because
+                    this dict's sibling already caused an OOM (the
+                    2026-06-02/03 'same OOM family' note at block_sync.py:146).
+                    An unresolved fork would grow it without bound.
+
+                    Read-only: len() and a summed len() over a snapshot. The
+                    sampler is a separate thread, so a dict mutated by the
+                    event loop mid-iteration raises RuntimeError; each field
+                    degrades to its count rather than failing the snapshot.
+                    """
+                    bs = getattr(self, "block_sync", None)
+                    if bs is None:
+                        return {"block_sync": None}
+                    out: dict = {}
+                    for name in ("_fork_block_bytes", "_ibd_block_buffer",
+                                 "_fork_headers", "_fork_header_prev",
+                                 "_validated_headers", "requested_blocks",
+                                 "_block_request_peer", "_block_request_attempts",
+                                 "_perm_rejected_blocks", "_requested_txs",
+                                 "_compact_origin_hashes", "_presync_states"):
+                        d = getattr(bs, name, None)
+                        if d is None:
+                            continue
+                        try:
+                            out[name] = len(d)
+                        except Exception:
+                            continue
+                    # Byte weight of the raw-payload dict is the number that
+                    # matters; count alone hides 4 MB-per-entry growth.
+                    try:
+                        fb = getattr(bs, "_fork_block_bytes", None)
+                        if fb is not None:
+                            out["_fork_block_bytes_mb"] = round(
+                                sum(len(v) for v in list(fb.values())) / 1048576, 1)
+                    except Exception:
+                        out["_fork_block_bytes_mb"] = -1.0
+                    return out
+
                 _tm_log_path = os.path.join(self.data_dir, "tracemalloc.log")
                 # Traceback depth for tracemalloc.start(). Deeper costs real
                 # memory per traced allocation, so keep it modest.
@@ -1049,6 +1103,7 @@ class BitcoinNode:
                                 # amplification of an ordinary error path
                                 # rather than an unbounded allocation.
                                 "gc": _gc_stats(),
+                                "buf": _buffers(),
                             }
                             with open(_tm_log_path, "a") as _lf:
                                 _lf.write(json.dumps(record) + "\n")
