@@ -363,7 +363,8 @@ class TestGetExpectedBitsBip94OffByOne:
         # new block at height=2016; timestamp matches prev exactly (trivial)
         new_block = _FakeBlock(bits=0, timestamp=prev.timestamp + POW_TARGET_SPACING)
 
-        result = v._get_expected_bits(2016, prev, new_block)
+        result, status = v._get_expected_bits(2016, prev, new_block)
+        assert status == "ok"
 
         # BIP94: base = period_start_block.bits = hard_bits (at height=0).
         # actual_timespan = prev.timestamp - first_block.timestamp = TARGET_TIMESPAN
@@ -410,7 +411,8 @@ class TestSignetNoMinDifficultyException:
         # Timestamp 30 minutes later — would trigger min-diff on testnet.
         new_block = _FakeBlock(bits=0, timestamp=1_700_000_000 + 30 * 60)
 
-        result = v._get_expected_bits(100, prev, new_block)
+        result, status = v._get_expected_bits(100, prev, new_block)
+        assert status == "ok"
 
         # Must return prev.bits, NOT the min-difficulty sentinel.
         assert result == real_bits, (
@@ -431,7 +433,8 @@ class TestSignetNoMinDifficultyException:
         prev = _FakeBlock(bits=real_bits, timestamp=1_700_000_000)
         new_block = _FakeBlock(bits=0, timestamp=1_700_000_000 + 30 * 60)
 
-        result = v._get_expected_bits(100, prev, new_block)
+        result, status = v._get_expected_bits(100, prev, new_block)
+        assert status == "ok"
 
         assert result == 0x1D00FFFF, (
             f"testnet must grant min-difficulty exception; "
@@ -568,5 +571,216 @@ class TestRegtestNoRetargeting:
         new_block = _FakeBlock(bits=0, timestamp=1_700_000_000 + 999_999_999)
 
         for height in [1, 100, 2016, 4032]:
-            result = v._get_expected_bits(height, prev, new_block)
+            result, status = v._get_expected_bits(height, prev, new_block)
+            assert status == "ok"
             assert result == 0x207FFFFF, f"regtest height {height} returned {result:#010x}"
+
+
+# ===========================================================================
+# 11. bad-diffbits — Core ContextualCheckBlockHeader's FIRST gate
+#     (bitcoin-core/src/validation.cpp:4088-4089)
+#
+# These pin `_get_expected_bits` to Bitcoin Core's pow.cpp on MAINNET- and
+# TESTNET4-shaped parameters.  A regtest-only test is a NO-OP for this rule:
+# regtest sets fPowNoRetargeting, so every height answers powLimit and an
+# implementation that ignores the rule entirely still passes.
+# ===========================================================================
+
+
+class TestMainnetRetargetVectors:
+    """Exact-equality retarget arithmetic against real mainnet boundaries.
+
+    Ref: Bitcoin Core pow.cpp:41-47 (GetNextWorkRequired boundary branch) and
+    pow.cpp:50-85 (CalculateNextWorkRequired).
+    """
+
+    def test_boundary_2016_unchanged(self):
+        """Mainnet height 2016: the first period took slightly over 2 weeks,
+        so the clamp/rounding leaves nBits at 0x1d00ffff."""
+        db = _FakeDB()
+        # Height 0 (genesis) timestamp; height 2015 timestamp.
+        db.store(0, _FakeBlock(bits=0x1D00FFFF, timestamp=1231006505))
+        prev = _FakeBlock(bits=0x1D00FFFF, timestamp=1233061996)
+        v = _make_validator("mainnet", db)
+        blk = _FakeBlock(bits=0, timestamp=1233063531)
+        result, status = v._get_expected_bits(2016, prev, blk)
+        assert status == "ok"
+        assert result == 0x1D00FFFF, f"got {result:#010x}"
+
+    def test_boundary_32256_first_real_retarget(self):
+        """Mainnet height 32256: the first difficulty INCREASE.
+
+        Core: nHeightFirst = 32256-2016 = 30240 (ts 1261130161); pindexLast is
+        32255 (ts 1262152739).  actual_timespan = 1022578s, well inside the
+        clamp, so bnNew = target(0x1d00ffff) * 1022578 / 1209600.
+        """
+        db = _FakeDB()
+        db.store(30240, _FakeBlock(bits=0x1D00FFFF, timestamp=1261130161))
+        prev = _FakeBlock(bits=0x1D00FFFF, timestamp=1262152739)
+        v = _make_validator("mainnet", db)
+        blk = _FakeBlock(bits=0, timestamp=1262153464)
+        result, status = v._get_expected_bits(32256, prev, blk)
+        assert status == "ok"
+        assert result == 0x1D00D86A, (
+            f"mainnet 32256 must retarget to 0x1d00d86a, got {result:#010x}"
+        )
+
+    def test_boundary_clamped_to_four_times_easier(self):
+        """A period 10x longer than target clamps to exactly 4x (pow.cpp:57-60)."""
+        db = _FakeDB()
+        t0 = 1_500_000_000
+        db.store(0, _FakeBlock(bits=0x1B0404CB, timestamp=t0))
+        prev = _FakeBlock(bits=0x1B0404CB, timestamp=t0 + POW_TARGET_TIMESPAN * 10)
+        v = _make_validator("mainnet", db)
+        blk = _FakeBlock(bits=0, timestamp=prev.timestamp + 600)
+        result, status = v._get_expected_bits(2016, prev, blk)
+        assert status == "ok"
+        expected = _target_to_bits(_bits_to_target(0x1B0404CB) * 4)
+        assert result == expected, f"got {result:#010x}, want {expected:#010x}"
+
+
+class TestMainnetNonBoundaryIsTheDefect:
+    """The case that currently sails through `_header_meets_pow`.
+
+    A header at a mainnet non-boundary height carrying 0x1d00ffff, whose hash
+    genuinely meets 0x1d00ffff.  Core's CheckBlockHeader ("high-hash") is
+    satisfied; ContextualCheckBlockHeader's bad-diffbits is NOT.
+    """
+
+    def test_expected_is_prev_bits_not_pow_limit(self):
+        db = _FakeDB()
+        v = _make_validator("mainnet", db)
+        prev = _FakeBlock(bits=0x17030ECD, timestamp=1_760_000_000)
+        attack = _FakeBlock(bits=0x1D00FFFF, timestamp=1_760_000_600)
+        result, status = v._get_expected_bits(900_001, prev, attack)
+        assert status == "ok"
+        assert result == 0x17030ECD
+        assert attack.bits != result, "the difficulty-1 header must not match"
+
+    def test_no_ancestor_lookup_at_non_boundary(self):
+        """Mainnet non-boundary must never consult an ancestor — so it can
+        never 'fail to resolve' and can never fall open."""
+        db = _FakeDB()
+        v = _make_validator("mainnet", db)
+
+        def _boom(_h):
+            raise AssertionError("mainnet non-boundary must not resolve ancestors")
+
+        prev = _FakeBlock(bits=0x17030ECD, timestamp=1_760_000_000)
+        blk = _FakeBlock(bits=0x17030ECD, timestamp=1_760_000_600)
+        result, status = v._get_expected_bits(900_001, prev, blk, ancestor_at=_boom)
+        assert (result, status) == (0x17030ECD, "ok")
+
+
+class TestTestnet4TwentyMinuteRuleBothDirections:
+    """Ref: Bitcoin Core pow.cpp:22-36.  Getting either direction wrong is a
+    chain split, so both are asserted."""
+
+    def test_gap_over_20_minutes_requires_pow_limit(self):
+        db = _FakeDB()
+        v = _make_validator("testnet4", db)
+        prev = _FakeBlock(bits=0x1B0404CB, timestamp=1_700_000_000)
+        blk = _FakeBlock(bits=0, timestamp=prev.timestamp + 1201)
+        result, status = v._get_expected_bits(1000, prev, blk)
+        assert (result, status) == (0x1D00FFFF, "ok")
+        # A child carrying prev.bits must therefore be REJECTED.
+        assert prev.bits != result
+
+    def test_gap_under_20_minutes_requires_walkback_result(self):
+        db = _FakeDB()
+        v = _make_validator("testnet4", db)
+        # prev at powLimit; a real-difficulty ancestor two hops back.
+        ancestors = {
+            999: _FakeBlock(bits=0x1D00FFFF, timestamp=1_699_999_400),
+            998: _FakeBlock(bits=0x1B0404CB, timestamp=1_699_998_800),
+        }
+        prev = _FakeBlock(bits=0x1D00FFFF, timestamp=1_700_000_000)
+        blk = _FakeBlock(bits=0, timestamp=prev.timestamp + 300)
+        result, status = v._get_expected_bits(
+            1000, prev, blk, ancestor_at=ancestors.get
+        )
+        assert status == "ok"
+        assert result == 0x1B0404CB, f"got {result:#010x}"
+        # A child carrying 0x1d00ffff must therefore be REJECTED.
+        assert result != 0x1D00FFFF
+
+
+class TestTestnet4Bip94RetargetBase:
+    """BIP94 (Core pow.cpp:66-76): the base is the period's FIRST block, not
+    the last.  Asserted to DIFFER from the mainnet-shaped answer so a
+    mainnet-shaped implementation fails loudly."""
+
+    def test_first_block_base_not_last_block_base(self):
+        t0 = 1_700_000_000
+        real_bits = 0x1B0404CB
+        db = _FakeDB()
+        db.store(0, _FakeBlock(bits=real_bits, timestamp=t0))
+        prev = _FakeBlock(bits=0x1D00FFFF, timestamp=t0 + POW_TARGET_TIMESPAN)
+        blk = _FakeBlock(bits=0, timestamp=prev.timestamp + 600)
+
+        v4 = _make_validator("testnet4", db)
+        bip94, status = v4._get_expected_bits(2016, prev, blk)
+        assert status == "ok"
+
+        v3 = _make_validator("testnet", db)
+        mainnet_shaped, status3 = v3._get_expected_bits(2016, prev, blk)
+        assert status3 == "ok"
+
+        assert bip94 == real_bits, f"BIP94 base must be first-block; got {bip94:#010x}"
+        assert mainnet_shaped == 0x1D00FFFF
+        assert bip94 != mainnet_shaped, (
+            "testnet4 (BIP94) and last-block-base must diverge here"
+        )
+
+
+class TestFailClosedStatuses:
+    """FAIL-OPEN IS THE BUG.  An unresolvable ancestor must be reported, not
+    silently answered."""
+
+    def test_missing_period_first(self):
+        db = _FakeDB()  # empty
+        v = _make_validator("mainnet", db)
+        prev = _FakeBlock(bits=0x1B0404CB, timestamp=1_700_000_000)
+        blk = _FakeBlock(bits=0x1D00FFFF, timestamp=prev.timestamp + 600)
+        result, status = v._get_expected_bits(2016, prev, blk)
+        assert result is None
+        assert status == "missing-period-first"
+
+    def test_truncated_walkback_does_not_answer_pow_limit(self):
+        """Pre-fix this returned prev_block.bits — which on this branch is
+        ALWAYS powLimit, i.e. it silently answered 'difficulty 1'."""
+        db = _FakeDB()
+        v = _make_validator("testnet4", db)
+        prev = _FakeBlock(bits=0x1D00FFFF, timestamp=1_700_000_000)
+        blk = _FakeBlock(bits=0x1D00FFFF, timestamp=prev.timestamp + 300)
+        result, status = v._get_expected_bits(
+            1000, prev, blk, ancestor_at=lambda _h: None
+        )
+        assert status == "walkback-incomplete"
+        assert result is None, "must not answer powLimit on a truncated walk"
+
+
+class TestUnresolvedFallbackPolicy:
+    """`diffbits_unresolved_fallback_ok` — the NARROW fallback.  It is not a
+    skip: an attacker must not be able to steer a resolution failure into an
+    arbitrary accept."""
+
+    def test_mainnet_keeps_the_four_times_clamp(self):
+        from ouroboros.validation import diffbits_unresolved_fallback_ok as fb
+        # 0x1d00ffff is ~2^32x easier than 0x1b0404cb -> far past 4x.
+        assert not fb("mainnet", 2016, 0x1B0404CB, 0x1D00FFFF)
+        # Unchanged bits at a boundary are inside the clamp.
+        assert fb("mainnet", 2016, 0x1B0404CB, 0x1B0404CB)
+        # Non-boundary: strict equality.
+        assert fb("mainnet", 2017, 0x1B0404CB, 0x1B0404CB)
+        assert not fb("mainnet", 2017, 0x1B0404CB, 0x1C00FFFF)
+
+    def test_min_difficulty_networks_use_the_two_value_rule(self):
+        from ouroboros.validation import diffbits_unresolved_fallback_ok as fb
+        # PermittedDifficultyTransition is unconditionally True on testnet4,
+        # so it has zero strength and must NOT be the fallback.
+        assert permitted_difficulty_transition("testnet4", 1000, 0x1B0404CB, 0x1C00FFFF)
+        # The two-value rule still rejects a third value.
+        assert fb("testnet4", 1000, 0x1D00FFFF, 0x1D00FFFF)   # powLimit
+        assert fb("testnet4", 1000, 0x1B0404CB, 0x1B0404CB)   # prev.bits
+        assert not fb("testnet4", 1000, 0x1B0404CB, 0x1C00FFFF)  # third value

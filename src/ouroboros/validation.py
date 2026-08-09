@@ -268,6 +268,58 @@ def permitted_difficulty_transition(
     return True
 
 
+# ---------------------------------------------------------------------------
+# bad-diffbits resolution status codes (returned by
+# BlockValidator._get_expected_bits alongside the value).
+#
+# Callers MUST branch on the status.  Collapsing "rule says X" and "could not
+# resolve the ancestors" into a single ``None`` is what made the pre-fix code
+# fail OPEN: validation.py's old ``if expected_bits is not None and ...``
+# silently skipped Core's FIRST ContextualCheckBlockHeader gate
+# (validation.cpp:4088-4089) whenever an ancestor lookup missed.
+# ---------------------------------------------------------------------------
+DIFFBITS_OK = "ok"
+DIFFBITS_MISSING_PERIOD_FIRST = "missing-period-first"
+DIFFBITS_WALKBACK_INCOMPLETE = "walkback-incomplete"
+
+
+def diffbits_unresolved_fallback_ok(
+    network: str, height: int, prev_bits: int, actual_bits: int
+) -> bool:
+    """NARROW, documented fallback for when GetNextWorkRequired's ancestors
+    cannot be resolved at all.
+
+    This is deliberately NOT "skip the check".  Constraint: an attacker must
+    not be able to *steer* a resolution failure into an accept of an
+    arbitrary nBits value.  The only condition that can legitimately fail to
+    resolve on a healthy node is a datadir-shaped gap (assumeUTXO snapshot
+    base, or a pruned body) — a fixed property of our own storage, not
+    something a peer can induce.  Callers bound the fallback to that
+    condition; this helper decides what is still enforceable without the
+    ancestor.
+
+    * Min-difficulty networks (testnet3/testnet4/regtest,
+      fPowAllowMinDifficultyBlocks=true).  ``PermittedDifficultyTransition``
+      returns TRUE unconditionally there (Core pow.cpp:91) so it has ZERO
+      strength and cannot be used.  Instead: the only two values Core's
+      non-boundary path can produce once the walk-back is truncated are
+      ``powLimit`` (the 20-minute rule, pow.cpp:27-28) and the previous
+      block's nBits (the walk terminating immediately, pow.cpp:31-36).
+      Accept exactly those two; a third value is rejected.
+
+    * Everything else (mainnet, signet).  ``PermittedDifficultyTransition``
+      (Core pow.cpp:89-136) still binds: at a boundary the 4x/0.25x clamp
+      around the previous nBits, at a non-boundary strict equality.  A
+      difficulty-1 header below a real-difficulty parent fails it.
+    """
+    if network in _POW_ALLOW_MIN_DIFFICULTY_NETWORKS:
+        return (
+            actual_bits == _get_pow_limit_bits(network)
+            or actual_bits == prev_bits
+        )
+    return permitted_difficulty_transition(network, height, prev_bits, actual_bits)
+
+
 def _count_legacy_sigops(script: bytes, accurate: bool = False) -> int:
     """Count legacy signature operations in a script.
 
@@ -1295,10 +1347,34 @@ class BlockValidator:
 
         # Verify difficulty retarget — block.bits must match expected value.
         # Ref: validation.cpp:4088-4089 ("bad-diffbits").
+        #
+        # The status branch is load-bearing.  The pre-fix test was
+        # ``if expected_bits is not None and ...``, which collapsed "the rule
+        # says X" and "I could not resolve the ancestor" into the same
+        # ``None`` and therefore SKIPPED Core's first ContextualCheckBlockHeader
+        # gate whenever a lookup missed.  Now an unresolvable ancestor still
+        # has to clear the narrow fallback (4x clamp on mainnet, two-value rule
+        # on min-difficulty networks) — it is never a free pass.
         if height > 0:
-            expected_bits = self._get_expected_bits(height, prev_block, block)
-            if expected_bits is not None and block.bits != expected_bits:
-                return False
+            expected_bits, bits_status = self._get_expected_bits(
+                height, prev_block, block
+            )
+            if bits_status == DIFFBITS_OK:
+                if block.bits != expected_bits:
+                    return False
+            else:
+                _prev_bits = getattr(prev_block, "bits", None)
+                if _prev_bits is None:
+                    return False
+                if not diffbits_unresolved_fallback_ok(
+                    self.network, height, int(_prev_bits), int(block.bits)
+                ):
+                    return False
+                logger.warning(
+                    "bad-diffbits ancestors unresolvable at height %d (%s); "
+                    "accepted on the narrow fallback (bits=%#010x prev=%#010x)",
+                    height, bits_status, int(block.bits), int(_prev_bits),
+                )
 
         # 2. time-too-old: timestamp must strictly exceed MTP of previous 11 blocks.
         # Guard on height > 0: genesis (height 0) has no pindexPrev in Core,
@@ -1378,8 +1454,12 @@ class BlockValidator:
         return True
 
     def _get_expected_bits(
-        self, height: int, prev_block: Block, block: Block
-    ) -> int | None:
+        self,
+        height: int,
+        prev_block: Block,
+        block: Block,
+        ancestor_at=None,
+    ) -> tuple[int | None, str]:
         """Calculate expected nBits for a block at *height*.
 
         Mirrors Bitcoin Core GetNextWorkRequired() + CalculateNextWorkRequired()
@@ -1389,15 +1469,42 @@ class BlockValidator:
             height:     Height of the block being validated (the new block).
             prev_block: The block at height-1 (pindexLast in Core).
             block:      The block being validated (only timestamp used).
+            ancestor_at: Optional ``(height) -> block-like | None`` resolver for
+                ancestors of *prev_block*.  This is Core's
+                ``pindexLast->GetAncestor(nHeight)`` (pow.cpp:45, :73).
+
+                POISON-IMMUNITY.  The default resolver is the active-chain
+                height index (``db.get_block_by_height``), which is correct
+                ONLY when *prev_block* is itself on the active best chain —
+                i.e. the block-connect / submitblock side-branch callers.
+                The P2P header path validates headers ABOVE the validated
+                tip, where the height index (a) does not cover them and
+                (b) is attacker-poisonable: resolving through it INVERTS
+                the check, rejecting honest headers and accepting an
+                attacker's difficulty-1 ones.  Those callers pass a
+                resolver built by walking ``prev_blockhash`` POINTERS
+                (``BlockSync._header_ancestor_provider``).
 
         Returns:
-            Expected nBits, or None if the ancestor block needed for the
-            calculation is unavailable (cannot verify at this time).
+            ``(expected_bits, status)``.  ``status`` is ``DIFFBITS_OK`` when
+            the rule produced an answer; otherwise ``expected_bits`` is None
+            and ``status`` says WHY it could not be resolved
+            (``DIFFBITS_MISSING_PERIOD_FIRST`` / ``DIFFBITS_WALKBACK_INCOMPLETE``).
+            Callers MUST branch on the status — treating "unresolvable" as
+            "no opinion" is the fail-open this contract exists to prevent.
         """
+        # Default ancestor resolver: the active-chain height index.  Safe for
+        # the block-connect callers only (see the poison-immunity note above).
+        _ancestor = (
+            ancestor_at
+            if ancestor_at is not None
+            else (lambda h: self.db.get_block_by_height(h))
+        )
+
         # fPowNoRetargeting: regtest always stays at the minimum difficulty.
         # Ref: Bitcoin Core pow.cpp:52-53.
         if self.network == "regtest":
-            return 0x207fffff
+            return 0x207fffff, DIFFBITS_OK
 
         # Per-network pow_limit in compact bits form.
         pow_limit_bits = _get_pow_limit_bits(self.network)
@@ -1414,7 +1521,7 @@ class BlockValidator:
             # Ref: Bitcoin Core pow.cpp:22-36.
             if self.network in _POW_ALLOW_MIN_DIFFICULTY_NETWORKS:
                 if block.timestamp > prev_block.timestamp + POW_TARGET_SPACING * 2:
-                    return pow_limit_bits
+                    return pow_limit_bits, DIFFBITS_OK
                 # Otherwise walk back to find last non-min-difficulty block.
                 # Walk stops at: height 0, a retarget boundary, or a block
                 # with real difficulty.
@@ -1427,13 +1534,28 @@ class BlockValidator:
                     and walk_height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0
                     and pindex.bits == pow_limit_bits
                 ):
-                    pindex = self.db.get_block(pindex.prev_blockhash)
+                    if ancestor_at is not None:
+                        # Pointer-proven ancestry (P2P header path).
+                        pindex = ancestor_at(walk_height - 1)
+                    else:
+                        # Core walks ``pindex = pindex->pprev`` (pow.cpp:33);
+                        # the by-hash read is the same pointer hop.
+                        pindex = self.db.get_block(pindex.prev_blockhash)
                     walk_height -= 1
                 if pindex:
-                    return pindex.bits
-                return prev_block.bits
+                    return pindex.bits, DIFFBITS_OK
+                # FAIL-CLOSED.  The pre-fix code returned ``prev_block.bits``
+                # here, which on this branch is ALWAYS pow_limit — i.e. it
+                # silently answered "difficulty 1" whenever the walk broke.
+                # Report the failure instead and let the caller apply the
+                # narrow, bounded fallback.
+                return None, DIFFBITS_WALKBACK_INCOMPLETE
             # All other networks (mainnet, signet): return previous block's bits.
-            return prev_block.bits
+            # NOTE: no ancestor lookup at all — this is the overwhelming
+            # majority of mainnet headers, so the check is O(1) and can never
+            # fail to resolve.  A difficulty-1 header below a real-difficulty
+            # parent is rejected on prev.bits alone.
+            return prev_block.bits, DIFFBITS_OK
 
         # Difficulty adjustment boundary (height % 2016 == 0).
         # Go back by DifficultyAdjustmentInterval - 1 blocks from pindexLast
@@ -1443,9 +1565,10 @@ class BlockValidator:
         #              = height - 2016
         # Ref: Bitcoin Core pow.cpp:42-47.
         first_height = height - DIFFICULTY_ADJUSTMENT_INTERVAL
-        first_block = self.db.get_block_by_height(first_height)
+        first_block = _ancestor(first_height)
         if first_block is None:
-            return None  # cannot verify — missing ancestor
+            # FAIL-CLOSED: report WHY, do not answer.
+            return None, DIFFBITS_MISSING_PERIOD_FIRST
 
         actual_timespan = prev_block.timestamp - first_block.timestamp
 
@@ -1465,10 +1588,9 @@ class BlockValidator:
         #   = (height-1) - 2015 = height - 2016 = first_height
         # Ref: Bitcoin Core pow.cpp:67-76 (enforce_BIP94 branch).
         if self.network == "testnet4":
-            period_start_block = self.db.get_block_by_height(first_height)
-            if period_start_block is None:
-                return None
-            old_target = _bits_to_target(period_start_block.bits)
+            # Same height as the timespan lookup above — reuse the resolved
+            # ancestor instead of a second, independently-failable read.
+            old_target = _bits_to_target(first_block.bits)
         else:
             old_target = _bits_to_target(prev_block.bits)
         new_target = old_target * actual_timespan // POW_TARGET_TIMESPAN
@@ -1479,7 +1601,7 @@ class BlockValidator:
         if new_target > pow_limit:
             new_target = pow_limit
 
-        return _target_to_bits(new_target)
+        return _target_to_bits(new_target), DIFFBITS_OK
 
     def _verify_merkle_root(self, block: Block) -> bool:
         txids = [tx.get_txid() for tx in block.transactions]

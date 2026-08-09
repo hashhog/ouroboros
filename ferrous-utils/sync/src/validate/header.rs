@@ -13,7 +13,10 @@ use crate::chain_params::{
 use common::BlockHeaderWrapper;
 use primitive_types::U256;
 
-use super::pow::{bits_to_target, calculate_next_difficulty, validate_pow};
+use super::pow::{bits_to_target, validate_pow};
+use super::difficulty::{self, BlockIndexInfo};
+use crate::chain_params::get_consensus_params;
+use bitcoin::hashes::Hash as _;
 
 /// Header validation error types
 #[derive(Error, Debug)]
@@ -58,6 +61,101 @@ pub enum HeaderValidationError {
 /// Result type for header validation
 pub type Result<T> = std::result::Result<T, HeaderValidationError>;
 
+/// Core's FIRST `ContextualCheckBlockHeader` gate, as a pure function of the
+/// header pair, the height, the network and an ancestor resolver:
+///
+/// ```text
+/// if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
+///     return state.Invalid(BLOCK_INVALID_HEADER, "bad-diffbits", ...);
+/// ```
+/// bitcoin-core/src/validation.cpp:4088-4089.
+///
+/// Split out of [`HeaderValidator::validate_difficulty`] so the rule can be
+/// unit-tested against injected ancestors on mainnet- and testnet4-shaped
+/// parameters, with no RocksDB in the loop.  A regtest-only test would be a
+/// NO-OP here: `pow_no_retargeting` makes every height answer powLimit, so an
+/// implementation that ignores the rule entirely passes it.
+pub fn check_diffbits<F>(
+    header: &Header,
+    prev_header: &Header,
+    prev_height: u32,
+    network: Network,
+    get_ancestor: F,
+) -> Result<()>
+where
+    F: Fn(u32) -> Option<BlockIndexInfo>,
+{
+    let actual_bits = header.bits.to_consensus();
+    let prev_bits = prev_header.bits.to_consensus();
+    let height = prev_height + 1;
+    let params = get_consensus_params(network);
+    let last_block = BlockIndexInfo {
+        height: prev_height,
+        bits: prev_bits,
+        timestamp: prev_header.time,
+    };
+
+    match difficulty::get_next_work_required(&last_block, header.time, network, get_ancestor) {
+        Some(bits) => {
+            if actual_bits != bits {
+                log::warn!(
+                    "bad-diffbits at height {}: nBits {:#010x} != required {:#010x}",
+                    height,
+                    actual_bits,
+                    bits
+                );
+                return Err(HeaderValidationError::InvalidDifficulty);
+            }
+            Ok(())
+        }
+        None => {
+            // NARROW, documented fallback — never a silent skip.
+            //
+            // `get_next_work_required` propagates absence instead of answering
+            // powLimit (see its fail-closed contract).  On this path the
+            // ancestor set comes from OUR OWN store below OUR OWN active tip,
+            // so a miss is a datadir-shaped gap (assumeUTXO base, pruned
+            // body), not something a peer can steer.  What is still
+            // enforceable:
+            //   * min-difficulty networks: `PermittedDifficultyTransition`
+            //     returns true unconditionally (Core pow.cpp:91) so it has
+            //     zero strength — use the explicit two-value rule instead
+            //     (powLimit and prev.nBits are the only values the truncated
+            //     path can produce).
+            //   * everything else: the 4x/0.25x clamp still binds.
+            let ok = if params.pow_allow_min_difficulty_blocks {
+                actual_bits == params.pow_limit_bits || actual_bits == prev_bits
+            } else {
+                difficulty::permitted_difficulty_transition(
+                    height,
+                    prev_bits,
+                    actual_bits,
+                    network,
+                )
+            };
+            if ok {
+                log::warn!(
+                    "bad-diffbits ancestors unresolvable at height {} — accepted \
+                     on the narrow fallback (nBits {:#010x}, prev {:#010x})",
+                    height,
+                    actual_bits,
+                    prev_bits
+                );
+                Ok(())
+            } else {
+                log::warn!(
+                    "bad-diffbits at height {} (ancestors unresolvable, fallback \
+                     rejected): nBits {:#010x}, prev {:#010x}",
+                    height,
+                    actual_bits,
+                    prev_bits
+                );
+                Err(HeaderValidationError::InvalidDifficulty)
+            }
+        }
+    }
+}
+
 /// Block header validator
 pub struct HeaderValidator {
     db: Arc<BlockchainDB>,
@@ -82,6 +180,7 @@ impl HeaderValidator {
         &self,
         header: &BlockHeaderWrapper,
         prev_header: &BlockHeaderWrapper,
+        prev_height: u32,
     ) -> Result<()> {
         let inner = header.inner();
         let prev_inner = prev_header.inner();
@@ -98,7 +197,9 @@ impl HeaderValidator {
         self.validate_timestamp(inner, prev_inner)?;
 
         // 4. Verify difficulty matches expected
-        self.validate_difficulty(inner, prev_inner)?;
+        //    Core ContextualCheckBlockHeader "bad-diffbits"
+        //    (validation.cpp:4088-4089).
+        self.validate_difficulty(inner, prev_inner, prev_height)?;
 
         // 5. Check proof of work (most expensive check last)
         let target = bits_to_target(inner.bits.to_consensus());
@@ -113,7 +214,15 @@ impl HeaderValidator {
     ///
     /// Checks that all headers form a valid chain and that difficulty
     /// adjustments are correct for the network rules.
-    pub fn validate_header_chain(&self, headers: &[BlockHeaderWrapper]) -> Result<()> {
+    /// `first_height` is the height of `headers[0]`; every subsequent header
+    /// is one higher.  The height is REQUIRED — the difficulty rule is
+    /// height-dependent (retarget boundary, min-difficulty walk-back), so a
+    /// height-free variant cannot evaluate it.
+    pub fn validate_header_chain(
+        &self,
+        headers: &[BlockHeaderWrapper],
+        first_height: u32,
+    ) -> Result<()> {
         if headers.is_empty() {
             return Ok(());
         }
@@ -129,11 +238,15 @@ impl HeaderValidator {
             let prev_header = &headers[i - 1];
             let current_header = &headers[i];
 
-            self.validate_header(current_header, prev_header)?;
+            self.validate_header(current_header, prev_header, first_height + (i as u32) - 1)?;
         }
 
-        // Verify difficulty adjustments for the entire chain
-        self.validate_chain_difficulty_adjustments(headers)?;
+        // NOTE: the old `validate_chain_difficulty_adjustments` heuristic was
+        // deleted here.  It compared the RAW u32 compact nBits values as a
+        // ±10% ratio and used the BATCH INDEX (`(i + 1) % 2016`) as the
+        // retarget-boundary test — both meaningless (compact encoding is not
+        // linear in difficulty, and batch index is not height).  With the real
+        // per-header rule above it was pure false-reject risk.
 
         Ok(())
     }
@@ -162,42 +275,14 @@ impl HeaderValidator {
         Ok(timestamps[median_index])
     }
 
-    /// Calculate the next work required (difficulty) for a given height
-    ///
-    /// Returns the expected difficulty target for the block at the given height.
-    pub fn get_next_work_required(&self, height: u32) -> Result<u32> {
-        // Special case: genesis block
-        if height == 0 {
-            return Ok(0x1d00ffff); // Genesis difficulty
-        }
-
-        // Check if this is a difficulty adjustment height
-        if (height + 1) % 2016 == 0 {
-            // Get the block at height (difficulty adjustment happens every 2016 blocks)
-            let adjustment_height = height.saturating_sub(2015); // First block of the period
-
-            // Get first and last blocks of the 2016-block period
-            let first_block = self.db.get_block_by_height(adjustment_height)?
-                .ok_or_else(|| HeaderValidationError::BlockNotFound(format!("Block at height {}", adjustment_height)))?;
-
-            let last_block = self.db.get_block_by_height(height)?
-                .ok_or_else(|| HeaderValidationError::BlockNotFound(format!("Block at height {}", height)))?;
-
-            // Calculate actual timespan
-            let actual_timespan = last_block.inner().header.time.saturating_sub(first_block.inner().header.time);
-
-            // Get previous difficulty
-            let prev_bits = first_block.inner().header.bits.to_consensus();
-
-            Ok(calculate_next_difficulty(prev_bits, actual_timespan))
-        } else {
-            // Not a difficulty adjustment height, use previous block's difficulty
-            let prev_block = self.db.get_block_by_height(height)?
-                .ok_or_else(|| HeaderValidationError::BlockNotFound(format!("Block at height {}", height)))?;
-
-            Ok(prev_block.inner().header.bits.to_consensus())
-        }
-    }
+    // NOTE: `HeaderValidator::get_next_work_required(height)` used to live
+    // here.  It was a dead, height-indexed, mainnet-only THIRD implementation
+    // of the retarget rule (hardcoded 0x1d00ffff for genesis, `(height+1) %
+    // 2016` boundary test, no min-difficulty / BIP94 handling) referenced only
+    // by this file's own tests.  Deleted so a future caller cannot pick up the
+    // wrong engine: `validate/difficulty.rs` is the one Rust implementation,
+    // and `ouroboros.validation._get_expected_bits` is the one Python
+    // implementation.
 
     /// Validate timestamp constraints
     fn validate_timestamp(&self, header: &Header, prev_header: &Header) -> Result<()> {
@@ -244,53 +329,80 @@ impl HeaderValidator {
         Ok(())
     }
 
-    /// Validate difficulty target
-    fn validate_difficulty(&self, header: &Header, prev_header: &Header) -> Result<()> {
-        // For now, use simplified validation
-        // In production, this would use get_next_work_required based on height
-
-        let expected_bits = prev_header.bits.to_consensus();
-        let actual_bits = header.bits.to_consensus();
-
-        // Allow some tolerance for difficulty adjustments
-        // This is a simplified check - real validation is more complex
-        if actual_bits != expected_bits {
-            // For testing purposes, accept the difficulty
-            // In production, this would be much stricter
-        }
-
-        Ok(())
+    /// Validate difficulty target — Core's FIRST ContextualCheckBlockHeader
+    /// gate: `block.nBits != GetNextWorkRequired(pindexPrev, &block, params)`
+    /// -> `bad-diffbits` (bitcoin-core/src/validation.cpp:4088-4089).
+    ///
+    /// This is NOT the hash-vs-declared-target check (that is
+    /// `CheckProofOfWork`, run by the caller as step 5).  It is
+    /// nBits-vs-REQUIRED, and without it a peer can hand us a chain of
+    /// difficulty-1 headers whose hashes legitimately meet their own claimed
+    /// targets.
+    ///
+    /// Before this fix the body of `if actual_bits != expected_bits {}` was
+    /// literally EMPTY with a comment saying production would be "much
+    /// stricter".  That branch has been on the production block-connect path
+    /// (block.rs:504, reached from `validate_block_from_bytes` for every
+    /// block below the assumevalid checkpoint) the whole time.
+    ///
+    /// POISON-IMMUNITY.  Ancestors are resolved through
+    /// [`Self::ancestor_provider`], which only consults the height index
+    /// BELOW a hash that has been proven to sit on the active best chain.
+    /// `prev_header` here is by construction the caller's parent block
+    /// (block.rs:500 reads it by height and `validate_header` then asserts
+    /// `header.prev_blockhash == prev_header.block_hash()`), so its ancestry
+    /// IS the active chain — this is Core's `pindexLast->GetAncestor(h)`.
+    fn validate_difficulty(
+        &self,
+        header: &Header,
+        prev_header: &Header,
+        prev_height: u32,
+    ) -> Result<()> {
+        let anchor_hash = prev_header.block_hash().to_byte_array();
+        check_diffbits(
+            header,
+            prev_header,
+            prev_height,
+            self.network,
+            |h| self.ancestor_at(h, prev_height, &anchor_hash),
+        )
     }
 
-    /// Validate difficulty adjustments across an entire chain
-    fn validate_chain_difficulty_adjustments(&self, headers: &[BlockHeaderWrapper]) -> Result<()> {
-        // This is a simplified implementation
-        // In production, this would verify that difficulty adjustments occur every 2016 blocks
-        // and that the calculated difficulty matches the actual difficulty
-
-        for (i, header) in headers.iter().enumerate() {
-            if i == 0 {
-                continue;
-            }
-
-            // Basic sanity check: difficulty should not change drastically between blocks
-            // except at adjustment boundaries
-            let prev_header = &headers[i - 1];
-            let prev_bits = prev_header.inner().bits.to_consensus() as i64;
-            let current_bits = header.inner().bits.to_consensus() as i64;
-
-            // Difficulty bits should not change by more than 10% between non-adjustment blocks
-            // This is a very rough heuristic
-            let diff_ratio = (current_bits as f64) / (prev_bits as f64);
-            if diff_ratio < 0.9 || diff_ratio > 1.1 {
-                // Check if this is a difficulty adjustment boundary (every 2016 blocks)
-                if (i + 1) % 2016 != 0 {
-                    return Err(HeaderValidationError::InvalidDifficulty);
-                }
-            }
+    /// Resolve an ancestor of the block at `(anchor_height, anchor_hash)` for
+    /// the difficulty rule — Core's `pindexLast->GetAncestor(height)`.
+    ///
+    /// The anchor is verified to be the active-chain block at
+    /// `anchor_height` (its hash must match the height index) BEFORE any
+    /// height-addressed read is allowed.  Without that proof a height read
+    /// could return a block from a different chain, which is the inversion
+    /// this whole fix exists to avoid.
+    ///
+    /// Cost: `None` for `height >= anchor_height` never touches the DB; a
+    /// retarget boundary costs exactly ONE `get_block_by_height`
+    /// (`anchor_height - 2015`), not a 2015-block walk.  The min-difficulty
+    /// walk-back is the only multi-read case and is testnet-only.
+    fn ancestor_at(
+        &self,
+        height: u32,
+        anchor_height: u32,
+        anchor_hash: &[u8; 32],
+    ) -> Option<BlockIndexInfo> {
+        if height > anchor_height {
+            return None;
         }
-
-        Ok(())
+        // Anchor proof: the height index must agree that `anchor_hash` is the
+        // active-chain block at `anchor_height`.
+        match self.db.get_block_hash_by_height(anchor_height) {
+            Ok(Some(h)) if &h == anchor_hash => {}
+            _ => return None,
+        }
+        let block = self.db.get_block_by_height(height).ok()??;
+        let hdr = block.inner().header;
+        Some(BlockIndexInfo {
+            height,
+            bits: hdr.bits.to_consensus(),
+            timestamp: hdr.time,
+        })
     }
 
     // =========================================================================
@@ -436,7 +548,7 @@ mod tests {
         );
 
         // Test self-validation (genesis -> genesis should fail due to prev_hash mismatch)
-        let result = validator.validate_header(&genesis_header, &genesis_header);
+        let result = validator.validate_header(&genesis_header, &genesis_header, 0);
         assert!(matches!(result, Err(HeaderValidationError::PrevHashMismatch)));
     }
 
@@ -460,7 +572,7 @@ mod tests {
             0,
         );
 
-        let result = validator.validate_header(&header2, &header1);
+        let result = validator.validate_header(&header2, &header1, 0);
         // This might pass or fail depending on whether nonce 0 happens to be valid
         // In practice, we'd use known valid headers
         let _ = result; // Just ensure it doesn't panic
@@ -515,15 +627,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_next_work_required_genesis() {
-        let (db, _temp_dir) = create_test_db();
-        let validator = HeaderValidator::new(db, Network::Bitcoin);
-
-        let work = validator.get_next_work_required(0).unwrap();
-        assert_eq!(work, 0x1d00ffff); // Genesis difficulty
-    }
-
-    #[test]
     fn test_validate_header_chain() {
         let (db, _temp_dir) = create_test_db();
         let validator = HeaderValidator::new(db, Network::Bitcoin);
@@ -549,7 +652,7 @@ mod tests {
         }
 
         // Validate the chain
-        let result = validator.validate_header_chain(&headers);
+        let result = validator.validate_header_chain(&headers, 0);
         // This is a simplified test - in practice we'd need to store blocks first
         let _ = result; // Just ensure it doesn't panic
     }
@@ -579,7 +682,7 @@ mod tests {
             2,
         );
 
-        let result = validator.validate_header(&header2, &header1);
+        let result = validator.validate_header(&header2, &header1, 0);
         assert!(matches!(result, Err(HeaderValidationError::TimestampTooFarFuture)));
     }
 
@@ -608,7 +711,7 @@ mod tests {
             nonce: 0,
         });
 
-        let result = validator.validate_header(&wrapper, &prev_wrapper);
+        let result = validator.validate_header(&wrapper, &prev_wrapper, 0);
         assert!(matches!(result, Err(HeaderValidationError::InvalidVersion)));
     }
 
@@ -622,16 +725,11 @@ mod tests {
         let (db, _temp_dir) = create_test_db();
         let validator = HeaderValidator::new(db, Network::Bitcoin);
 
-        // Test genesis difficulty
-        let genesis_bits = 0x1d00ffff;
-        let next_work = validator.get_next_work_required(0).unwrap();
-        assert_eq!(next_work, genesis_bits);
-
-        // Test first difficulty adjustment (simplified)
-        // In reality, this would require storing 2016 blocks and calculating actual timespan
-        // For this test, we just verify the method doesn't panic
-        let _next_work_2016 = validator.get_next_work_required(2016);
-        let _next_work_4032 = validator.get_next_work_required(4032);
+        // `HeaderValidator::get_next_work_required` was a dead, mainnet-only
+        // duplicate of validate/difficulty.rs and has been deleted; the real
+        // rule is exercised by `validate_difficulty` (see the bad-diffbits
+        // tests below) and by difficulty.rs's own suite.
+        let _ = validator;
     }
 
     #[test]
@@ -665,9 +763,184 @@ mod tests {
         }
 
         // Validate the chain (this is a simplified test)
-        let result = validator.validate_header_chain(&headers);
+        let result = validator.validate_header_chain(&headers, 0);
         // The result may fail due to various reasons in this simplified test,
         // but the important thing is that it doesn't panic
         let _ = result;
+    }
+
+    // =====================================================================
+    // bad-diffbits — Core validation.cpp:4088-4089
+    //
+    // Driven through `check_diffbits` with an INJECTED ancestor provider, so
+    // the rule is exercised on mainnet- and testnet4-shaped parameters
+    // without a RocksDB in the loop.  Before this fix `validate_difficulty`
+    // computed `expected_bits`/`actual_bits` and then had an EMPTY
+    // `if actual_bits != expected_bits {}` body — every one of the reject
+    // cases below returned Ok(()).
+    // =====================================================================
+
+    const MAINNET_REAL_BITS: u32 = 0x1b0404cb;
+    const POW_LIMIT: u32 = 0x1d00ffff;
+
+    fn hdr(bits: u32, time: u32) -> Header {
+        Header {
+            version: bitcoin::blockdata::block::Version::ONE,
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root: TxMerkleNode::all_zeros(),
+            time,
+            bits: bitcoin::CompactTarget::from_consensus(bits),
+            nonce: 0,
+        }
+    }
+
+    fn no_ancestors(_h: u32) -> Option<BlockIndexInfo> {
+        None
+    }
+
+    #[test]
+    fn test_diffbits_mainnet_non_boundary() {
+        // The actual production defect: a difficulty-1 header below a
+        // real-difficulty parent, at a NON-boundary height.  Requires no
+        // ancestor lookup at all, so it can never "fail to resolve".
+        let prev = hdr(MAINNET_REAL_BITS, 1_760_000_000);
+        let good = hdr(MAINNET_REAL_BITS, 1_760_000_600);
+        let bad = hdr(POW_LIMIT, 1_760_000_600);
+
+        assert!(check_diffbits(&good, &prev, 900_000, Network::Bitcoin, no_ancestors).is_ok());
+        assert!(matches!(
+            check_diffbits(&bad, &prev, 900_000, Network::Bitcoin, no_ancestors),
+            Err(HeaderValidationError::InvalidDifficulty)
+        ), "difficulty-1 nBits under a real-difficulty parent must be rejected");
+    }
+
+    #[test]
+    fn test_diffbits_mainnet_boundary() {
+        // Retarget at height 2016: actual timespan == target, so the new bits
+        // equal the old bits.  A header claiming powLimit is rejected.
+        let first_time = 1_231_006_505u32;
+        let prev = hdr(MAINNET_REAL_BITS, first_time + 14 * 24 * 3600);
+        let ancestors = |h: u32| {
+            if h == 0 {
+                Some(BlockIndexInfo { height: 0, bits: MAINNET_REAL_BITS, timestamp: first_time })
+            } else {
+                None
+            }
+        };
+        let good = hdr(MAINNET_REAL_BITS, prev.time + 600);
+        let bad = hdr(POW_LIMIT, prev.time + 600);
+
+        assert!(check_diffbits(&good, &prev, 2015, Network::Bitcoin, ancestors).is_ok());
+        assert!(matches!(
+            check_diffbits(&bad, &prev, 2015, Network::Bitcoin, ancestors),
+            Err(HeaderValidationError::InvalidDifficulty)
+        ));
+    }
+
+    #[test]
+    fn test_diffbits_testnet4_20min_rule_both_directions() {
+        // (a) gap > 20 min -> powLimit is REQUIRED; carrying prev.bits is a
+        //     rejection.  (b) gap <= 20 min with a real-difficulty parent ->
+        //     prev.bits is required; carrying powLimit is a rejection.
+        // An implementation that only handles (a) splits the chain on (b).
+        let prev_real = hdr(MAINNET_REAL_BITS, 1_700_000_000);
+
+        // (a)
+        let late = hdr(POW_LIMIT, prev_real.time + 1201);
+        let late_wrong = hdr(MAINNET_REAL_BITS, prev_real.time + 1201);
+        assert!(check_diffbits(&late, &prev_real, 1000, Network::Testnet4, no_ancestors).is_ok());
+        assert!(matches!(
+            check_diffbits(&late_wrong, &prev_real, 1000, Network::Testnet4, no_ancestors),
+            Err(HeaderValidationError::InvalidDifficulty)
+        ), "a >20-minute testnet4 gap MUST carry powLimit");
+
+        // (b) parent at powLimit, real-difficulty ancestor two hops back.
+        let prev_min = hdr(POW_LIMIT, 1_700_000_000);
+        let ancestors = |h: u32| match h {
+            999 => Some(BlockIndexInfo { height: 999, bits: POW_LIMIT, timestamp: 1_699_999_400 }),
+            998 => Some(BlockIndexInfo { height: 998, bits: MAINNET_REAL_BITS, timestamp: 1_699_998_800 }),
+            _ => None,
+        };
+        let soon_good = hdr(MAINNET_REAL_BITS, prev_min.time + 300);
+        let soon_bad = hdr(POW_LIMIT, prev_min.time + 300);
+        assert!(check_diffbits(&soon_good, &prev_min, 1000, Network::Testnet4, ancestors).is_ok());
+        assert!(matches!(
+            check_diffbits(&soon_bad, &prev_min, 1000, Network::Testnet4, ancestors),
+            Err(HeaderValidationError::InvalidDifficulty)
+        ), "inside the 20-minute window the walk-back result is required, not powLimit");
+    }
+
+    #[test]
+    fn test_diffbits_testnet4_bip94_boundary() {
+        // BIP94: the retarget base is the FIRST block of the period, not prev.
+        // Period-first and prev carry DIFFERENT bits so a mainnet-shaped
+        // implementation produces a different answer and fails loudly.
+        let first_time = 1_700_000_000u32;
+        let prev = hdr(POW_LIMIT, first_time + 14 * 24 * 3600);
+        let ancestors = |h: u32| {
+            if h == 0 {
+                Some(BlockIndexInfo { height: 0, bits: MAINNET_REAL_BITS, timestamp: first_time })
+            } else {
+                None
+            }
+        };
+        // actual_timespan == TARGET_TIMESPAN -> base bits are preserved.
+        let bip94_answer = MAINNET_REAL_BITS;         // first-block base
+        let mainnet_answer = POW_LIMIT;               // last-block base
+
+        let good = hdr(bip94_answer, prev.time + 600);
+        let bad = hdr(mainnet_answer, prev.time + 600);
+        assert!(check_diffbits(&good, &prev, 2015, Network::Testnet4, ancestors).is_ok());
+        assert!(matches!(
+            check_diffbits(&bad, &prev, 2015, Network::Testnet4, ancestors),
+            Err(HeaderValidationError::InvalidDifficulty)
+        ), "testnet4 must use the BIP94 (first-block) base, not the mainnet one");
+        assert_ne!(bip94_answer, mainnet_answer);
+    }
+
+    #[test]
+    fn test_diffbits_mainnet_unresolvable_still_clamped() {
+        // Boundary with NO ancestor: the rule cannot be evaluated.  The narrow
+        // fallback keeps the 4x clamp, so a 5x difficulty DROP is still
+        // rejected — "unresolvable" is not a free pass.
+        let prev = hdr(MAINNET_REAL_BITS, 1_231_006_505 + 14 * 24 * 3600);
+        // 0x1d00ffff is ~2^32 times easier than 0x1b0404cb -> way past 4x.
+        let way_easier = hdr(POW_LIMIT, prev.time + 600);
+        assert!(matches!(
+            check_diffbits(&way_easier, &prev, 2015, Network::Bitcoin, no_ancestors),
+            Err(HeaderValidationError::InvalidDifficulty)
+        ));
+        // Unchanged bits at a boundary are inside the clamp -> accepted.
+        let same = hdr(MAINNET_REAL_BITS, prev.time + 600);
+        assert!(check_diffbits(&same, &prev, 2015, Network::Bitcoin, no_ancestors).is_ok());
+    }
+
+    #[test]
+    fn test_diffbits_testnet4_unresolvable_rejects_third_value() {
+        // Truncated walk-back on testnet4: PermittedDifficultyTransition is
+        // unconditionally true there, so the fallback is the explicit
+        // two-value rule.  A THIRD value must still be rejected.
+        let prev = hdr(POW_LIMIT, 1_700_000_000);
+        let third = hdr(0x1c00ffff, prev.time + 300);
+        assert!(matches!(
+            check_diffbits(&third, &prev, 1000, Network::Testnet4, no_ancestors),
+            Err(HeaderValidationError::InvalidDifficulty)
+        ));
+        // The two permitted values still pass.
+        assert!(check_diffbits(&hdr(POW_LIMIT, prev.time + 300), &prev, 1000, Network::Testnet4, no_ancestors).is_ok());
+    }
+
+    #[test]
+    fn test_diffbits_regtest_is_a_noop_surface() {
+        // DOCSTRING WARNING: this case is INSUFFICIENT on its own.  Regtest
+        // sets pow_no_retargeting, so every height answers powLimit and an
+        // implementation that ignores the difficulty rule entirely passes it.
+        // It is here only to prove the fix does not break regtest fixtures.
+        let prev = hdr(0x207fffff, 1_700_000_000);
+        assert!(check_diffbits(&hdr(0x207fffff, prev.time + 1), &prev, 500, Network::Regtest, no_ancestors).is_ok());
+        assert!(matches!(
+            check_diffbits(&hdr(0x207ffffe, prev.time + 1), &prev, 500, Network::Regtest, no_ancestors),
+            Err(HeaderValidationError::InvalidDifficulty)
+        ));
     }
 }

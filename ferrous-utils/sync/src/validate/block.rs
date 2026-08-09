@@ -501,7 +501,15 @@ impl BlockValidator {
             .ok_or(BlockValidationError::PreviousBlockNotFound)?;
         let prev_header = BlockHeaderWrapper::new(prev_block.inner().header);
 
-        self.header_validator.validate_header(&header, &prev_header)?;
+        // `prev_height` is required by the bad-diffbits gate
+        // (Core validation.cpp:4088-4089) — the retarget rule is
+        // height-dependent.  `prev_block` was read BY HEIGHT immediately
+        // above, so the parent is by construction the active-chain block at
+        // `prev_height`; `validate_header` then asserts
+        // `header.prev_blockhash == prev_header.block_hash()`, which is what
+        // makes the height-addressed ancestor reads inside legitimate.
+        self.header_validator
+            .validate_header(&header, &prev_header, prev_height)?;
 
         Ok(())
     }

@@ -497,7 +497,18 @@ fn get_next_work_required(
         |height| ancestor_map.get(&height).cloned(),
     );
 
-    Ok(result)
+    // RAISE rather than answer powLimit.  Pre-fix this returned 0x1d00ffff
+    // for an incomplete ancestor list (measured), which is a fail-OPEN that
+    // inverts on mainnet: a caller wiring it into a header check would demand
+    // difficulty-1 and reject every honest header.  Callers must handle the
+    // "cannot resolve" case explicitly.
+    result.ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "get_next_work_required: ancestor set is incomplete — the rule \
+             has no answer (refusing to fall back to powLimit)"
+                .to_string(),
+        )
+    })
 }
 
 /// Calculate difficulty at a retarget boundary.

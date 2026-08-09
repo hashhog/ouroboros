@@ -688,7 +688,10 @@ impl HeaderSync {
                             peer_addr: None,
                         });
                     }
-                    self.validator.validate_header(header, prev_header)
+                    // current_height is this header's height, so the parent is
+                    // at current_height - 1 (bad-diffbits needs the height).
+                    self.validator
+                        .validate_header(header, prev_header, current_height.saturating_sub(1))
                         .map_err(|e| HeaderSyncError::Validation(e))?;
                 } else if let Some(ref best_hash) = best_hash_opt {
                     // Header-only sync: check connection using best block hash
@@ -731,7 +734,8 @@ impl HeaderSync {
                         log::debug!("Skipping validation for header at height {} (bootstrap mode, i={})", current_height, i);
                     }
                 } else {
-                    self.validator.validate_header(header, prev_in_batch)
+                    self.validator
+                        .validate_header(header, prev_in_batch, current_height.saturating_sub(1))
                         .map_err(|e| {
                             log::error!("Header validation failed at height {} (i={}, was_empty={}): {}", current_height, i, was_empty, e);
                             HeaderSyncError::Validation(e)

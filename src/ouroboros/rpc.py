@@ -42,6 +42,11 @@ from ouroboros.validation import (
     _get_p2sh_sigops,
     _is_p2sh,
 )
+from ouroboros.validation import DIFFBITS_OK as _DIFFBITS_OK
+from ouroboros.validation import (
+    diffbits_unresolved_fallback_ok as _diffbits_unresolved_fallback_ok,
+)
+from ouroboros.validation import _bits_to_target_checked as _bits_to_target_checked
 
 # BIP9 versionbits support
 try:
@@ -7582,10 +7587,18 @@ class RPCServer:
                     _side_parent = self._side_branch_blocks.get(prev_hash)
                     if _side_parent is not None:
                         _parent_blk = _Block.deserialize(_side_parent[2])
-                _expected_bits = _validator._get_expected_bits(
+                _expected_bits, _bits_status = _validator._get_expected_bits(
                     new_height, _parent_blk, _hdr_blk
                 )
-                if _expected_bits is not None and _hdr_blk.bits != _expected_bits:
+                if _bits_status == _DIFFBITS_OK:
+                    if _hdr_blk.bits != _expected_bits:
+                        return bip22_result_string("bad-diffbits")
+                elif not _diffbits_unresolved_fallback_ok(
+                    _validator.network, new_height,
+                    int(_parent_blk.bits), int(_hdr_blk.bits),
+                ):
+                    # Unresolvable ancestors are NOT a free pass — the 4x
+                    # clamp / two-value rule still binds.
                     return bip22_result_string("bad-diffbits")
             except Exception as _e:
                 # Degrade to the pre-fix behaviour (no diffbits rejection)
@@ -8963,22 +8976,92 @@ class RPCServer:
             pow_ok = type(block_sync)._header_meets_pow(header)
         else:
             # Inline fallback (same logic as BlockSync._header_meets_pow).
+            # Uses the ONE compact decoder (validation._bits_to_target_checked,
+            # Core arith_uint256::SetCompact + pow.cpp DeriveTarget) rather
+            # than a third private copy of it.
             try:
-                _mantissa = int(header.bits) & 0x007FFFFF
-                _exp = (int(header.bits) >> 24) & 0xFF
-                if _mantissa == 0:
-                    _target = 0
-                elif _exp <= 3:
-                    _target = _mantissa >> (8 * (3 - _exp))
-                else:
-                    _target = _mantissa << (8 * (_exp - 3))
+                _target, _neg, _ovf = _bits_to_target_checked(int(header.bits))
                 _hash_int = int.from_bytes(block_hash, "little")
-                pow_ok = (_target > 0) and (_hash_int <= _target)
+                pow_ok = (
+                    not _neg and not _ovf and _target > 0
+                    and _hash_int <= _target
+                )
             except Exception:
                 pow_ok = False
 
         if not pow_ok:
-            raise RpcError(RPC_VERIFY_ERROR, "bad-diffbits")
+            # "high-hash", NOT "bad-diffbits".  This gate is
+            # hash-vs-DECLARED-target — Core's CheckBlockHeader
+            # (validation.cpp:3832), reached from rpc/mining.cpp:1138 via
+            # ProcessNewBlockHeaders → AcceptBlockHeader.  "bad-diffbits" is a
+            # DIFFERENT rule (nBits vs GetNextWorkRequired,
+            # validation.cpp:4088-4089) and is enforced immediately below.
+            # The old label advertised a rule this code never evaluated.
+            raise RpcError(RPC_VERIFY_ERROR, "high-hash")
+
+        # --- Step 4b: bad-diffbits -----------------------------------------
+        # Core's FIRST ContextualCheckBlockHeader gate — nBits must equal
+        # GetNextWorkRequired(pindexPrev) (validation.cpp:4088-4089).  Runs
+        # AFTER the CheckBlockHeader/high-hash gate above, matching Core's
+        # CheckBlock-before-ContextualCheckBlockHeader ordering, so a header
+        # that fails BOTH reports "high-hash".
+        #
+        # Uses the SAME pointer-based ancestor provider as the P2P path:
+        # a submitted header sits above our validated tip exactly like a
+        # P2P one, so resolving its retarget ancestors through the
+        # height->hash index would invert the check (see
+        # BlockSync._header_ancestor_provider).
+        _validator = getattr(self.node, "validator", None)
+        if block_sync is not None and _validator is not None:
+            try:
+                _hdr_height = None
+                _hdr_provider = None
+                _hdr_parent = None
+                _tip_hash, _tip_height = db.get_best_block()
+                _queue = block_sync._validated_headers
+                _queue_index = {h: i for i, (h, _) in enumerate(_queue)}
+                if _queue and prev_hash == _queue[-1][0]:
+                    _parent_height = _tip_height + len(_queue)
+                elif not _queue and prev_hash == _tip_hash:
+                    _parent_height = _tip_height
+                elif prev_hash in block_sync._fork_headers:
+                    _parent_height = block_sync._fork_tip_height(prev_hash)
+                else:
+                    _parent_height = block_sync._resolve_active_height(prev_hash)
+                if _parent_height is not None:
+                    _hdr_height = _parent_height + 1
+                    _hdr_provider = block_sync._header_ancestor_provider(
+                        prev_hash, _parent_height, _tip_hash, _tip_height,
+                        _queue_index, {},
+                    )
+                    _hdr_parent = _hdr_provider(_parent_height)
+            except Exception as _e:
+                logger.debug("submitheader: height resolution failed: %s", _e)
+                _hdr_height = _hdr_parent = None
+            if _hdr_height is None or _hdr_parent is None:
+                # FAIL CLOSED.  Previously this fell through to Step 5 and
+                # STORED the header — so "I could not evaluate bad-diffbits"
+                # admitted it, which is the exact hole the check exists to
+                # close.  submitheader is a local operator call, not a peer
+                # message: there is no honest-peer to punish and no bridging
+                # headers to request, so the correct answer is to refuse the
+                # header rather than admit it unchecked.
+                raise RpcError(
+                    RPC_VERIFY_ERROR,
+                    "bad-diffbits check could not be evaluated (parent "
+                    "unresolvable) — refusing to admit header unchecked",
+                )
+            _ok, _reason, _exp = block_sync._check_header_diffbits(
+                header, _hdr_height, _hdr_parent, _hdr_provider
+            )
+            if not _ok:
+                logger.warning(
+                    "submitheader: header at height %d rejected (%s): "
+                    "bits=%#010x expected=%s",
+                    _hdr_height, _reason, int(header.bits),
+                    f"{_exp:#010x}" if _exp is not None else "?",
+                )
+                raise RpcError(RPC_VERIFY_ERROR, "bad-diffbits")
 
         # --- Step 5: admit the header into the appropriate store ------------
         # Mirrors Core's ProcessNewBlockHeaders → AcceptBlockHeader which

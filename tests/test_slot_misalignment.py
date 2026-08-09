@@ -40,9 +40,28 @@ from ouroboros.block_sync import BlockSync
 # ---------------------------------------------------------------------------
 
 
+class _StubBlk:
+    """Minimal block-like parent record (bits / timestamp / prev_blockhash).
+
+    A bare ``MagicMock`` will not do: ``int(MagicMock())`` is 1, so a mock DB
+    answers "the parent's nBits is 0x00000001" for every height, and the
+    header-time bad-diffbits gate (Core validation.cpp:4088-4089) then
+    rejects every header in these fixtures.  ``bits`` matches what the test
+    headers carry; all heights used here are non-boundary, where the rule is
+    expected == prev.nBits.
+    """
+
+    def __init__(self, bits: int = 0x207FFFFF, timestamp: int = 1_700_000_000):
+        self.bits = bits
+        self.timestamp = timestamp
+        self.prev_blockhash = b"\x00" * 32
+
+
 def _make_block_sync() -> BlockSync:
     db = MagicMock()
     db.get_best_block.return_value = (b"\x00" * 32, 0)
+    db.get_block_by_height.return_value = _StubBlk()
+    db.get_block.return_value = _StubBlk()
     return BlockSync(db=db, validator=MagicMock(), peer_manager=MagicMock())
 
 

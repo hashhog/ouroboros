@@ -32,6 +32,15 @@ from ouroboros.p2p_messages import BlockHeader, HeadersMessage
 # ---------------------------------------------------------------------------
 
 
+class _StubBlk:
+    """Minimal block-like parent record (bits / timestamp / prev_blockhash)."""
+
+    def __init__(self, bits: int, timestamp: int):
+        self.bits = bits
+        self.timestamp = timestamp
+        self.prev_blockhash = b"\x00" * 32
+
+
 def _make_block_sync(tip_hash: bytes = b"\x00" * 32, tip_height: int = 0) -> BlockSync:
     """Build a ``BlockSync`` with a stubbed db / validator / peer manager.
 
@@ -42,6 +51,15 @@ def _make_block_sync(tip_hash: bytes = b"\x00" * 32, tip_height: int = 0) -> Blo
     db.get_best_block.return_value = (tip_hash, tip_height)
     db.has_block_hash.return_value = False
     db.get_median_time_past.return_value = 1_700_000_000
+    # Parent block for the header-time bad-diffbits gate (Core
+    # validation.cpp:4088-4089).  A bare MagicMock is NOT usable: int() of one
+    # is 1, so the mock DB would answer "the parent's nBits is 0x00000001" for
+    # every height and every header below would mismatch its required nBits.
+    # These fixtures mine at 0x1d00ffff on mainnet-shaped params, and every
+    # height used here is a non-boundary, where the rule is expected ==
+    # prev.nBits.
+    db.get_block_by_height.return_value = _StubBlk(0x1D00FFFF, 1_700_000_000)
+    db.get_block.return_value = _StubBlk(0x1D00FFFF, 1_700_000_000)
 
     peer_manager = MagicMock()
     peer_manager.network = "mainnet"

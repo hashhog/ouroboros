@@ -49,13 +49,26 @@ pub struct BlockIndexInfo {
 /// * `get_ancestor` - Callback to get ancestor blocks by height
 ///
 /// # Returns
-/// The expected nBits value for the next block
+/// `Some(expected nBits)`, or `None` when the ancestor set handed in is
+/// INCOMPLETE and the rule therefore has no answer.
+///
+/// # Fail-closed contract (do not "restore" the old fallback)
+///
+/// This function used to return `pow_limit_bits` on an unresolvable
+/// ancestor — `None => return pow_limit_bits, // Shouldn't happen, but safe
+/// fallback` at the retarget branch, and a bare `break` out of the
+/// min-difficulty walk-back.  That is NOT safe, it is inverted: measured on
+/// the shipped extension, `get_next_work_required(2015, 0x1b0404cb, T,
+/// T+600, "mainnet", [])` answered `0x1d00ffff`.  A caller that trusts that
+/// would demand difficulty-1 on mainnet — rejecting every honest header and
+/// accepting an attacker's.  Absence must propagate; the CALLER decides what
+/// a missing ancestor means, with a narrow documented fallback.
 pub fn get_next_work_required<F>(
     last_block: &BlockIndexInfo,
     new_block_time: u32,
     network: Network,
     get_ancestor: F,
-) -> u32
+) -> Option<u32>
 where
     F: Fn(u32) -> Option<BlockIndexInfo>,
 {
@@ -64,7 +77,7 @@ where
 
     // Regtest: always return pow_limit (no retargeting)
     if params.pow_no_retargeting {
-        return pow_limit_bits;
+        return Some(pow_limit_bits);
     }
 
     let next_height = last_block.height + 1;
@@ -76,40 +89,41 @@ where
             // If new block's timestamp is more than 2x target spacing after
             // the previous block, allow min-difficulty block
             if new_block_time > last_block.timestamp + (TARGET_SPACING as u32 * 2) {
-                return pow_limit_bits;
+                return Some(pow_limit_bits);
             }
 
             // Otherwise, walk back to find the last non-min-difficulty block
             // Bitcoin Core: walk back until we find a non-pow-limit block or
-            // hit a retarget boundary
+            // hit a retarget boundary (pow.cpp:31-36).
             let mut index = last_block.clone();
             while index.height > 0
                 && index.height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0
                 && index.bits == pow_limit_bits
             {
-                if let Some(prev) = get_ancestor(index.height - 1) {
-                    index = prev;
-                } else {
-                    break;
+                match get_ancestor(index.height - 1) {
+                    Some(prev) => index = prev,
+                    // Core cannot reach this: pprev is always populated for a
+                    // block in the index.  We can, if the caller's ancestor
+                    // set is short.  Truncating the walk and returning
+                    // `index.bits` would answer pow_limit (the loop only runs
+                    // while bits == pow_limit) — the fail-open.  Say "unknown".
+                    None => return None,
                 }
             }
-            return index.bits;
+            return Some(index.bits);
         }
 
         // Normal case: return previous block's bits
-        return last_block.bits;
+        return Some(last_block.bits);
     }
 
     // Difficulty adjustment: calculate new target
 
     // Get the first block of the 2016-block period
     let first_height = last_block.height - (DIFFICULTY_ADJUSTMENT_INTERVAL - 1);
-    let first_block = match get_ancestor(first_height) {
-        Some(b) => b,
-        None => return pow_limit_bits, // Shouldn't happen, but safe fallback
-    };
+    let first_block = get_ancestor(first_height)?;
 
-    calculate_next_work_required(last_block, &first_block, &params)
+    Some(calculate_next_work_required(last_block, &first_block, &params))
 }
 
 /// Calculate the next difficulty target at a retarget boundary.
@@ -440,7 +454,7 @@ mod tests {
             |_| None,
         );
 
-        assert_eq!(result, POW_LIMIT_REGTEST);
+        assert_eq!(result, Some(POW_LIMIT_REGTEST));
     }
 
     #[test]
@@ -462,7 +476,7 @@ mod tests {
             |_| None,
         );
 
-        assert_eq!(result, POW_LIMIT_TESTNET, "Should allow min difficulty after 20+ minutes");
+        assert_eq!(result, Some(POW_LIMIT_TESTNET), "Should allow min difficulty after 20+ minutes");
     }
 
     #[test]
@@ -505,7 +519,7 @@ mod tests {
             },
         );
 
-        assert_eq!(result, 0x1b0404cb, "Should walk back to real difficulty block");
+        assert_eq!(result, Some(0x1b0404cb), "Should walk back to real difficulty block");
     }
 
     #[test]
@@ -671,8 +685,8 @@ mod tests {
         // not from last_block.bits (min_diff). With actual_timespan == target,
         // the retarget yields ~first_block.bits.
         assert_eq!(
-            result, real_bits,
-            "testnet4 retarget must use first_block.bits (BIP94); got {:#010x}, want {:#010x}",
+            result, Some(real_bits),
+            "testnet4 retarget must use first_block.bits (BIP94); got {:?}, want {:#010x}",
             result, real_bits,
         );
 
@@ -698,7 +712,7 @@ mod tests {
         assert_ne!(
             result, result_testnet3,
             "testnet4 (BIP94) and testnet3 paths must diverge at retarget; \
-             both returned {:#010x}",
+             both returned {:?}",
             result,
         );
     }
@@ -771,5 +785,113 @@ mod tests {
                 network,
             );
         }
+    }
+
+    // =====================================================================
+    // FAIL-OPEN REGRESSION (pins the MEASURED pre-fix behaviour)
+    //
+    // Before this fix `get_next_work_required` answered `pow_limit_bits`
+    // whenever the ancestor set was incomplete:
+    //   difficulty.rs:109 `None => return pow_limit_bits, // Shouldn't
+    //                      happen, but safe fallback`
+    //   difficulty.rs:93  bare `break` out of the min-difficulty walk-back
+    // Probed on the shipped extension, BOTH of the calls below returned
+    // 0x1d00ffff.  Wiring that into a header check inverts it on mainnet:
+    // difficulty-1 becomes the REQUIRED value, so every honest header is
+    // rejected and the attacker's is accepted.  Absence must propagate.
+    // =====================================================================
+
+    #[test]
+    fn test_fail_closed_missing_period_first_mainnet() {
+        // Mainnet retarget boundary (next height 2016) with NO ancestors.
+        let last_block = BlockIndexInfo {
+            height: 2015,
+            bits: 0x1b0404cb,
+            timestamp: 1231006505 + (TARGET_TIMESPAN as u32),
+        };
+        let result = get_next_work_required(
+            &last_block,
+            last_block.timestamp + TARGET_SPACING as u32,
+            Network::Bitcoin,
+            |_| None,
+        );
+        assert_eq!(
+            result, None,
+            "mainnet boundary with an empty ancestor set must report absence, \
+             NOT {:#010x} (the pre-fix powLimit fail-open)",
+            POW_LIMIT_MAINNET,
+        );
+        assert_ne!(result, Some(POW_LIMIT_MAINNET));
+    }
+
+    #[test]
+    fn test_fail_closed_truncated_walkback_testnet4() {
+        // testnet4 non-boundary, inside the 20-minute window, prev at
+        // powLimit -> the walk-back runs and immediately misses.
+        let last_block = BlockIndexInfo {
+            height: 1000,
+            bits: POW_LIMIT_TESTNET,
+            timestamp: 1231006505,
+        };
+        let result = get_next_work_required(
+            &last_block,
+            last_block.timestamp + 300, // <= 20 min, so no min-diff exception
+            Network::Testnet4,
+            |_| None,
+        );
+        assert_eq!(
+            result, None,
+            "truncated testnet4 walk-back must report absence, NOT {:#010x}",
+            POW_LIMIT_TESTNET,
+        );
+    }
+
+    #[test]
+    fn test_resolvable_ancestors_still_answer() {
+        // Positive control: the same mainnet boundary WITH the ancestor
+        // present still produces the retarget answer (the fix must not turn
+        // healthy lookups into None).
+        let first_time = 1231006505u32;
+        let last_block = BlockIndexInfo {
+            height: 2015,
+            bits: 0x1b0404cb,
+            timestamp: first_time + (TARGET_TIMESPAN as u32),
+        };
+        let result = get_next_work_required(
+            &last_block,
+            last_block.timestamp + TARGET_SPACING as u32,
+            Network::Bitcoin,
+            |h| {
+                if h == 0 {
+                    Some(BlockIndexInfo { height: 0, bits: 0x1b0404cb, timestamp: first_time })
+                } else {
+                    None
+                }
+            },
+        );
+        // actual_timespan == TARGET_TIMESPAN -> difficulty unchanged.
+        assert_eq!(result, Some(0x1b0404cb));
+    }
+
+    #[test]
+    fn test_mainnet_non_boundary_needs_no_ancestor() {
+        // The overwhelming majority of mainnet headers: expected == prev.bits
+        // with ZERO ancestor lookups, so it can never fail to resolve.
+        let last_block = BlockIndexInfo {
+            height: 900000,
+            bits: 0x17030ecd,
+            timestamp: 1_760_000_000,
+        };
+        let result = get_next_work_required(
+            &last_block,
+            last_block.timestamp + 600,
+            Network::Bitcoin,
+            |_| panic!("mainnet non-boundary must not consult ancestors"),
+        );
+        assert_eq!(result, Some(0x17030ecd));
+        assert_ne!(
+            result, Some(POW_LIMIT_MAINNET),
+            "a difficulty-1 answer here would reject every honest mainnet header",
+        );
     }
 }

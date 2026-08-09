@@ -180,9 +180,40 @@ from ouroboros.p2p_messages import (
 )
 from ouroboros.config import MIN_BLOCKS_TO_KEEP
 from ouroboros.peer import Peer
-from ouroboros.validation import SIG_CACHE, BlockValidator
+from ouroboros.validation import (
+    DIFFBITS_OK,
+    DIFFICULTY_ADJUSTMENT_INTERVAL,
+    SIG_CACHE,
+    BlockValidator,
+    diffbits_unresolved_fallback_ok,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class _HdrInfo:
+    """Ancestor view used by ``BlockValidator._get_expected_bits``.
+
+    Deliberately duck-typed against ``ouroboros.database.Block`` (only
+    ``bits`` / ``timestamp`` / ``prev_blockhash`` are read by the retarget
+    math) so the SAME retarget engine serves the block-connect path and the
+    P2P header path.  Holding a header-shaped record rather than a full
+    ``Block`` keeps the header path off the ~1.5 MB-per-read block store.
+    """
+
+    __slots__ = ("height", "bits", "timestamp", "prev_blockhash")
+
+    def __init__(self, height: int, bits: int, timestamp: int, prev_blockhash):
+        self.height = height
+        self.bits = int(bits)
+        self.timestamp = int(timestamp)
+        self.prev_blockhash = prev_blockhash
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return (
+            f"_HdrInfo(height={self.height}, bits={self.bits:#010x}, "
+            f"timestamp={self.timestamp})"
+        )
 
 
 class _G8SkipGate(Exception):
@@ -611,6 +642,17 @@ class BlockSync:
         # Counters for the per-header PoW gate (used by tests + ops).
         self._headers_pow_rejected: int = 0
         self._headers_presync_failures: int = 0
+        # bad-diffbits at header time (Core validation.cpp:4088-4089).
+        # ``_rejected`` counts batches dropped because a header's nBits did
+        # not equal GetNextWorkRequired; ``_unresolved`` counts the narrow
+        # snapshot-bounded fallback engaging.  Both are WARNING-logged: a
+        # wrong expected-bits computation must show up in minutes, not as a
+        # silent stall (the G8 low-work gate froze the node for hours at
+        # DEBUG level on 2026-07-20).
+        self._headers_diffbits_rejected: int = 0
+        self._headers_diffbits_unresolved: int = 0
+        self._last_diffbits_unresolved_log: float = 0.0
+        self._snapshot_base_height_cache: int | None = None
 
         # ----------------------------------------------------------------
         # Fork-header discovery store (GAP1 of the P2P-reorg fix).
@@ -2624,6 +2666,386 @@ class BlockSync:
             return True
         return self._resolve_active_height(prev_hash) is not None
 
+    # =====================================================================
+    # bad-diffbits at header time (Core validation.cpp:4088-4089, the FIRST
+    # check in ContextualCheckBlockHeader)
+    # =====================================================================
+
+    def _header_ancestor_provider(
+        self,
+        start_hash: bytes,
+        start_height: int,
+        db_tip_hash: bytes | None,
+        db_tip_height: int | None,
+        queue_index: dict,
+        batch_headers: dict,
+    ):
+        """Build ``ancestor_at(height) -> _HdrInfo | None`` for the ancestry of
+        the block at ``start_hash`` / ``start_height``.
+
+        This is Core's ``pindexLast->GetAncestor(nHeight)`` (pow.cpp:45, :73)
+        — height-addressed WITHIN a pointer-proven ancestry.
+
+        WHY NOT ``db.get_block_hash_by_height``?  POISON-IMMUNITY.  The header
+        path validates headers that sit ABOVE our validated tip, and the
+        height->hash index (a) does not contain them at all and (b) describes
+        OUR active chain, which is a different chain from the candidate being
+        validated whenever a fork is in play.  Resolving a candidate header's
+        retarget ancestors through that index INVERTS the check: at a
+        boundary it hands back some unrelated block's timestamp/bits, so the
+        honest header's correct nBits mismatches and is rejected while an
+        attacker who picks nBits to match the *poisoned* answer is accepted.
+        camlcoin shipped exactly that inversion this week.
+
+        Resolution order — pointers only:
+          1. headers seen earlier in the batch currently being processed;
+          2. ``_validated_headers`` — linear and tip-anchored, so slot i is
+             height ``db_tip_height + 1 + i``; indexed POSITIONALLY, never by
+             a height index;
+          3. ``_fork_headers`` / ``_fork_header_prev`` — walk the stored prev
+             edges (the same walk ``_fork_tip_height`` does);
+          4. once the pointer walk reaches a hash that ``_resolve_active_height``
+             places on the active best chain, that hash's ancestry IS the
+             active chain by definition, so BELOW that anchor
+             ``db.get_block_by_height(h)`` is legitimate.
+
+        Returns ``None`` for any height it cannot reach.  It never substitutes
+        an active-chain block for an unproven ancestor.
+
+        The walk is INCREMENTAL and memoized: mainnet non-boundary headers
+        never call the provider at all (expected == prev.bits, zero lookups),
+        a boundary costs one hop into the queue/anchor, and the testnet
+        min-difficulty walk-back descends only as far as it actually needs.
+        """
+        chain: dict[int, _HdrInfo] = {}
+        memo: dict[int, _HdrInfo | None] = {}
+        # Mutable walk state (closure-shared; no `nonlocal` gymnastics).
+        st = {
+            "cursor": start_hash,
+            "height": start_height,
+            "steps": 0,
+            "exhausted": False,
+            "anchor_height": None,   # active-chain anchor (index legit below)
+            "anchor_hash": None,     # that anchor's hash (pointer-proven)
+            "queue_base": None,      # positional queue base height
+        }
+        # A retarget boundary reaches back exactly 2016; the min-difficulty
+        # walk-back terminates at the previous boundary.  Give it one interval
+        # plus the fork-store depth and refuse to walk further.
+        max_walk = DIFFICULTY_ADJUSTMENT_INTERVAL + MAX_REORG_DEPTH + 8
+
+        def _header_for(h: bytes):
+            hdr = batch_headers.get(h)
+            if hdr is not None:
+                return hdr
+            return self._fork_headers.get(h)
+
+        def _extend(target_height: int) -> None:
+            """Descend the pointer chain until ``target_height`` is recorded,
+            an active-chain anchor is found, or we run out."""
+            while (
+                not st["exhausted"]
+                and st["anchor_height"] is None
+                and st["queue_base"] is None
+                and st["height"] >= target_height
+                and st["height"] >= 0
+                and st["steps"] <= max_walk
+            ):
+                cursor = st["cursor"]
+                h = st["height"]
+                # (2) tip-anchored validated queue: slot i == db_tip+1+i.
+                slot = queue_index.get(cursor)
+                if slot is not None and db_tip_height is not None:
+                    if db_tip_height + 1 + slot != h:
+                        # Our height derivation disagrees with the queue's own
+                        # positional height — the queue is stale.  Refuse.
+                        st["exhausted"] = True
+                        return
+                    st["queue_base"] = db_tip_height
+                    st["anchor_height"] = db_tip_height
+                    st["anchor_hash"] = db_tip_hash
+                    return
+                # (1)/(3) headers we hold: batch member or fork-store member.
+                hdr = _header_for(cursor)
+                if hdr is None:
+                    break
+                chain[h] = _HdrInfo(
+                    h, int(hdr.bits), int(hdr.timestamp),
+                    getattr(hdr, "prev_blockhash", None),
+                )
+                nxt = getattr(hdr, "prev_blockhash", None)
+                if nxt is None:
+                    st["exhausted"] = True
+                    return
+                st["cursor"] = bytes(nxt)
+                st["height"] = h - 1
+                st["steps"] += 1
+            if st["anchor_height"] is not None or st["queue_base"] is not None:
+                return
+            if st["steps"] > max_walk or st["height"] < 0:
+                st["exhausted"] = True
+                return
+            if st["height"] < target_height:
+                return  # target already recorded in `chain`
+            # (4) The walk left the headers we hold.  If the cursor is on the
+            # active best chain AT the height our walk says it is, the walk is
+            # pointer-proven down to the active chain and height-addressed
+            # reads below it are Core's GetAncestor.  The height cross-check
+            # is what makes this safe: a hash that resolves to a DIFFERENT
+            # height means our derivation is wrong, so we refuse rather than
+            # answer with a block from the wrong height.
+            cursor = st["cursor"]
+            if db_tip_hash is not None and cursor == db_tip_hash:
+                anchor_h = db_tip_height
+            else:
+                anchor_h = self._resolve_active_height(cursor)
+            if anchor_h is not None and anchor_h == st["height"]:
+                st["anchor_height"] = anchor_h
+                st["anchor_hash"] = cursor
+            else:
+                st["exhausted"] = True
+
+        def _blk_to_info(target_height: int, blk):
+            """Coerce a Block-like into an _HdrInfo, or None if it is not
+            usable (a stub / mock whose bits are not integral)."""
+            if blk is None:
+                return None
+            try:
+                return _HdrInfo(
+                    target_height, int(blk.bits), int(blk.timestamp),
+                    getattr(blk, "prev_blockhash", None),
+                )
+            except (TypeError, ValueError, AttributeError):
+                return None
+
+        def ancestor_at(target_height: int):
+            if target_height < 0 or target_height > start_height:
+                return None
+            if target_height in memo:
+                return memo[target_height]
+            _extend(target_height)
+            info = chain.get(target_height)
+            if info is None:
+                qb = st["queue_base"]
+                if qb is not None and target_height > qb:
+                    slot = target_height - qb - 1
+                    if 0 <= slot < len(self._validated_headers):
+                        hdr = self._validated_headers[slot][1]
+                        info = _HdrInfo(
+                            target_height, int(hdr.bits), int(hdr.timestamp),
+                            getattr(hdr, "prev_blockhash", None),
+                        )
+            if info is None:
+                anchor_h = st["anchor_height"]
+                if anchor_h is not None and target_height <= anchor_h:
+                    # BELOW a pointer-proven active-chain anchor the height
+                    # index describes this very ancestry — Core's
+                    # pindexLast->GetAncestor(h).
+                    try:
+                        info = _blk_to_info(
+                            target_height,
+                            self.db.get_block_by_height(target_height),
+                        )
+                    except Exception:
+                        info = None
+                    if info is None and target_height == anchor_h:
+                        # The anchor's own hash is known by pointer, so a
+                        # by-hash read is still pointer-addressed.
+                        anchor_hash = st["anchor_hash"]
+                        if anchor_hash is not None:
+                            try:
+                                info = _blk_to_info(
+                                    target_height,
+                                    self.db.get_block(anchor_hash),
+                                )
+                            except Exception:
+                                info = None
+                            if info is None:
+                                # assumeUTXO base: the BODY is absent but the
+                                # loader persisted the 80-byte header.  Same
+                                # gap _synthesize_snapshot_prev_block exists
+                                # for on the block-connect path.
+                                try:
+                                    info = _blk_to_info(
+                                        target_height,
+                                        self.validator._synthesize_snapshot_prev_block(
+                                            anchor_hash
+                                        ),
+                                    )
+                                except Exception:
+                                    info = None
+                            if (
+                                info is None
+                                and db_tip_hash is not None
+                                and anchor_hash == db_tip_hash
+                            ):
+                                # Last resort for the ACTIVE TIP only.  The DB
+                                # caches the tip's own header fields
+                                # (database.py:386 `_tip_bits`/`_tip_timestamp`,
+                                # updated on every connect).  This is still
+                                # pointer-addressed — it describes exactly the
+                                # block whose hash we walked to, not "whatever
+                                # is at height N" — so it does not reopen the
+                                # poisoning hole.  It exists so an assumeUTXO
+                                # datadir with no readable base body cannot
+                                # stall header admission outright.
+                                _tb = getattr(self.db, "_tip_bits", None)
+                                _tt = getattr(self.db, "_tip_timestamp", None)
+                                if _tb and _tt:
+                                    info = _HdrInfo(
+                                        target_height, int(_tb), int(_tt), None
+                                    )
+            memo[target_height] = info
+            return info
+
+        return ancestor_at
+
+    def _snapshot_base_height(self) -> int:
+        """Height of the assumeUTXO snapshot this datadir was bootstrapped
+        from, or -1 when it was not.
+
+        This bounds the ONLY condition under which an unresolvable retarget
+        ancestor is allowed to fall back instead of hard-rejecting: below a
+        snapshot base the blocks genuinely do not exist (the same gap that
+        forces ``_synthesize_snapshot_prev_block`` and
+        ``_snapshot_base_mtp_fallback``).  It is a fixed property of our own
+        storage — a peer cannot induce it — which is what makes the fallback
+        narrow rather than attacker-steerable.
+        """
+        cached = getattr(self, "_snapshot_base_height_cache", None)
+        if cached is not None:
+            return cached
+        base = -1
+        try:
+            from ouroboros.snapshot import (
+                SnapshotManager,
+                get_assumeutxo_by_hash,
+            )
+            network = getattr(self.peer_manager, "network", "mainnet")
+            # Prefer the SnapshotManager the node already wired into the
+            # validator (same object `_synthesize_snapshot_prev_block` uses);
+            # only construct one as a fallback, from the DB's real data dir
+            # (`BlockchainDatabase._data_dir`, database.py:378).
+            sm = getattr(self.validator, "snapshot_manager", None)
+            if sm is None:
+                data_dir = (
+                    getattr(self.db, "_data_dir", None)
+                    or getattr(self.db, "data_dir", None)
+                )
+                if data_dir is None:
+                    raise RuntimeError("no data dir to probe for a snapshot")
+                sm = SnapshotManager(self.db, network, str(data_dir))
+            base_hash = sm.read_snapshot_base_blockhash()
+            if base_hash:
+                entry = get_assumeutxo_by_hash(network, bytes(base_hash))
+                if entry is not None:
+                    base = int(entry.height)
+        except Exception as _e:  # pragma: no cover - defensive
+            logger.debug("snapshot base height probe failed: %s", _e)
+        self._snapshot_base_height_cache = base
+        return base
+
+    def _diffbits_validator(self):
+        """The ONE retarget engine (``BlockValidator._get_expected_bits``),
+        bound for header-time use.
+
+        Constraint 5: do not reimplement the retarget math.  When the node was
+        constructed without a REAL validator (None, or a stub/mock in a test
+        fixture) a bare ``BlockValidator`` shell is used instead — it needs
+        only ``network``, plus ``db`` for the default ancestor resolver, which
+        the header path always overrides with the pointer-based provider.
+
+        The ``isinstance`` test is deliberate rather than ``hasattr``: a
+        ``MagicMock`` answers ``hasattr`` for everything and would return a
+        Mock from ``_get_expected_bits``, which then fails to unpack and turns
+        every header into a fail-closed reject.  The rule must be evaluated by
+        the real engine or by nothing.
+        """
+        cached = getattr(self, "_diffbits_validator_cache", None)
+        if cached is not None:
+            return cached
+        v = self.validator
+        if not isinstance(v, BlockValidator):
+            v = BlockValidator.__new__(BlockValidator)
+            v.network = getattr(self.peer_manager, "network", "mainnet")
+            v.db = self.db
+        self._diffbits_validator_cache = v
+        return v
+
+    def _check_header_diffbits(
+        self,
+        header,
+        height: int,
+        parent_info,
+        ancestor_at,
+    ) -> tuple[bool, str, int | None]:
+        """Core ContextualCheckBlockHeader's FIRST gate, at header-admission
+        time — ``block.nBits != GetNextWorkRequired(pindexPrev, ...)`` ->
+        ``bad-diffbits`` (validation.cpp:4088-4089).
+
+        This is NOT the hash-vs-declared-target check.  ``_header_meets_pow``
+        already does that one (Core's CheckBlockHeader -> "high-hash",
+        validation.cpp:3832); it proves only that the miner did the work its
+        OWN nBits claims, which for a difficulty-1 claim is ~nothing.  The
+        gate here is nBits-vs-REQUIRED.
+
+        Returns ``(ok, reason, expected_bits)``.
+        """
+        try:
+            expected_bits, status = self._diffbits_validator()._get_expected_bits(
+                height, parent_info, header, ancestor_at=ancestor_at
+            )
+        except Exception as _e:
+            # Fail CLOSED.  This is reached when the parent itself could not be
+            # resolved on a network whose rule needs it (every network except
+            # regtest, which short-circuits to powLimit before touching the
+            # parent).  "I could not evaluate the rule" must never mean "admit".
+            logger.warning(
+                "bad-diffbits check errored at height %d: %s — rejecting "
+                "(fail-closed)", height, _e,
+            )
+            return False, "diffbits-check-error", None
+
+        if status == DIFFBITS_OK:
+            if int(header.bits) != int(expected_bits):
+                return False, "bad-diffbits", expected_bits
+            return True, "ok", expected_bits
+
+        # --- unresolvable ancestor -------------------------------------
+        # FAIL-OPEN IS THE BUG.  The only legitimate cause on a healthy node
+        # is the assumeUTXO gap: for roughly the first 2016 blocks above a
+        # snapshot base, the height-2016 boundary ancestor genuinely does not
+        # exist on disk.  Bound the fallback to exactly that; ANY other cause
+        # is a hard reject.
+        if parent_info is None:
+            return False, f"bad-diffbits-no-parent({status})", None
+        snap_base = self._snapshot_base_height()
+        first_height = height - DIFFICULTY_ADJUSTMENT_INTERVAL
+        if snap_base < 0 or first_height > snap_base:
+            return False, f"bad-diffbits-unresolved({status})", None
+
+        prev_bits = int(getattr(parent_info, "bits", 0) or 0)
+        network = getattr(self.peer_manager, "network", "mainnet")
+        if not diffbits_unresolved_fallback_ok(
+            network, height, prev_bits, int(header.bits)
+        ):
+            return False, f"bad-diffbits-fallback({status})", None
+
+        self._headers_diffbits_unresolved += 1
+        _now = time.time()
+        if _now - getattr(self, "_last_diffbits_unresolved_log", 0.0) > 60.0:
+            self._last_diffbits_unresolved_log = _now
+            logger.warning(
+                "bad-diffbits ancestors unresolvable at height %d (%s, "
+                "first_height=%d <= snapshot_base=%d) — accepted on the "
+                "narrow snapshot fallback (bits=%#010x prev=%#010x); "
+                "unresolved total=%d",
+                height, status, first_height, snap_base,
+                int(header.bits), prev_bits,
+                self._headers_diffbits_unresolved,
+            )
+        return True, "unresolved-fallback", None
+
     def _store_fork_header(self, block_hash: bytes, header, prev_hash: bytes) -> None:
         """Record a competing-fork header (and its prev edge) in the bounded
         fork store.  Does NOT touch ``_validated_headers`` (that queue stays
@@ -3075,6 +3497,22 @@ class BlockSync:
 
             logger.info(f"Received {len(headers_msg.headers)} headers from {peer.host}:{peer.port}")
 
+            # QUEUE-ANCHOR INVARIANT (must hold before ANY height is derived).
+            # Every header height below is computed positionally from the
+            # queue: slot i == db_tip_height + 1 + i.  If slot 0 no longer
+            # extends the DB tip (post-reorg / rollback) every derived height
+            # is wrong, and validating nBits against a fabricated height
+            # INVERTS the check.  Drop the stale queue loudly instead.
+            if self._validated_headers and not self._queue_anchored_to_tip():
+                logger.error(
+                    "[slot-misalign] validated_headers no longer anchors to "
+                    "the DB tip at headers-receive time — clearing %d entries "
+                    "rather than deriving bad-diffbits heights from a stale "
+                    "queue",
+                    len(self._validated_headers),
+                )
+                self._validated_headers.clear()
+
             # Throttle header accumulation: if we already have a huge backlog
             # of validated headers waiting for block download, skip processing
             # more until we catch up.  This prevents unbounded memory growth
@@ -3088,11 +3526,17 @@ class BlockSync:
                 return
 
             # Determine expected prev_hash: either last validated header or our DB tip.
+            # The DB tip is ALSO the positional base for every height derived
+            # below (slot i == db_tip_height + 1 + i), so read it once here
+            # rather than per header.
+            try:
+                _db_tip_hash, _db_tip_height = self.db.get_best_block()
+            except Exception:
+                _db_tip_hash, _db_tip_height = None, None
             if self._validated_headers:
                 expected_prev = self._validated_headers[-1][0]  # hash of last queued header
             else:
-                best_hash, _ = self.db.get_best_block()
-                expected_prev = best_hash
+                expected_prev = _db_tip_hash
 
             accepted = 0
             # Snapshot the fork-store counter so we can tell, after the loop,
@@ -3109,10 +3553,19 @@ class BlockSync:
             # here so we hand them to the state machine in one call
             # after the loop, matching Core's batch semantics.
             presync_feed: list = []
-            # Build the known-hash set ONCE before the loop instead of
+            # Build the known-hash index ONCE before the loop instead of
             # rebuilding it for every header.  With 200K+ queued headers
             # this was O(n*m) and burned 97% CPU, starving RPC.
-            known_hashes = {h for h, _ in self._validated_headers}
+            #
+            # It maps hash -> SLOT (not just membership) so the bad-diffbits
+            # ancestor provider can address queued ancestors positionally —
+            # slot i is height db_tip_height+1+i — instead of going through
+            # the attacker-poisonable height->hash index.  `x in known_hashes`
+            # keeps working unchanged on a dict.
+            known_hashes = {h: i for i, (h, _) in enumerate(self._validated_headers)}
+            # Headers already processed in THIS batch, by hash — source (1) of
+            # the ancestor provider.
+            _batch_headers: dict[bytes, object] = {}
             # One-line batch anatomy (rate-limited): first header's identity
             # vs the queue anchor.  Added 2026-07-20 while chasing a batch
             # consumption point that no existing branch logged.
@@ -3134,6 +3587,7 @@ class BlockSync:
                 )
             for header in headers_msg.headers:
                 block_hash = self._header_to_block_hash(header)
+                _batch_headers[block_hash] = header
 
                 # Skip duplicates already in our validated queue.  This is
                 # safe because such hashes were chain-validated when first
@@ -3226,6 +3680,78 @@ class BlockSync:
                         # ``expected_prev`` here would make the next fork header
                         # look like a tip-extension and wrongly append it to
                         # ``_validated_headers`` (slot-misalignment).
+                        #
+                        # bad-diffbits (Core validation.cpp:4088-4089) applies
+                        # to fork headers too: AcceptBlockHeader runs
+                        # ContextualCheckBlockHeader for EVERY header, not just
+                        # tip-extending ones, so a difficulty-1 side chain must
+                        # never reach the fork store (from where it can drive a
+                        # reorg).
+                        _fork_parent_h = self._fork_tip_height(header_prev)
+                        if _fork_parent_h is None:
+                            # Unanchored fork: the height is unknown, so the
+                            # rule cannot be evaluated.  Failing to resolve
+                            # must never mean "admit" — ask for the bridging
+                            # headers and drop this one without penalty.
+                            logger.debug(
+                                "Fork header %s... has unresolvable height "
+                                "(prev %s...) — requesting bridge, not storing",
+                                block_hash.hex()[:16], header_prev.hex()[:16],
+                            )
+                            await self._maybe_send_fork_getheaders(
+                                peer, header_prev
+                            )
+                            self._reset_unconnecting_headers(peer)
+                            continue
+                        _fork_height = _fork_parent_h + 1
+                        _fork_provider = self._header_ancestor_provider(
+                            header_prev, _fork_parent_h,
+                            _db_tip_hash, _db_tip_height,
+                            known_hashes, _batch_headers,
+                        )
+                        _fork_parent_info = _fork_provider(_fork_parent_h)
+                        if _fork_parent_info is None:
+                            # "I cannot reach the parent" is not "the header is
+                            # invalid".  Core never conflates the two: a header
+                            # whose prev is absent returns prev-blk-not-found
+                            # (validation.cpp:4215-4217) and never reaches
+                            # ContextualCheckBlockHeader, which asserts a
+                            # non-null pindexPrev (validation.cpp:4083).
+                            # Request the bridge; do NOT score the peer.
+                            logger.debug(
+                                "Fork header %s... at height %d: parent "
+                                "unresolvable — requesting bridge, no penalty",
+                                block_hash.hex()[:16], _fork_height,
+                            )
+                            await self._maybe_send_fork_getheaders(
+                                peer, header_prev
+                            )
+                            self._reset_unconnecting_headers(peer)
+                            continue
+                        _ok, _reason, _exp = self._check_header_diffbits(
+                            header, _fork_height, _fork_parent_info,
+                            _fork_provider,
+                        )
+                        if not _ok:
+                            self._headers_diffbits_rejected += 1
+                            logger.warning(
+                                "Fork header %s... at height %d REJECTED "
+                                "(%s): bits=%#010x expected=%s parent=%s... "
+                                "from %s:%s — dropping batch",
+                                block_hash.hex()[:16], _fork_height, _reason,
+                                int(header.bits),
+                                f"{_exp:#010x}" if _exp is not None else "?",
+                                header_prev.hex()[:16],
+                                peer.host, peer.port,
+                            )
+                            peer.adjust_score(-20)
+                            if hasattr(self.peer_manager, "misbehaving"):
+                                self.peer_manager.misbehaving(
+                                    f"{peer.host}:{peer.port}", 100,
+                                    "bad-diffbits",
+                                )
+                            self._drop_presync_state(peer)
+                            return
                         self._store_fork_header(block_hash, header, header_prev)
                         _last_fork_hash = block_hash
                         logger.info(
@@ -3282,8 +3808,139 @@ class BlockSync:
                             self._drop_presync_state(peer)
                     break
 
+                # ------------------------------------------------------------
+                # bad-diffbits — Core's FIRST ContextualCheckBlockHeader gate
+                # (validation.cpp:4088-4089), reached from AcceptBlockHeader
+                # (validation.cpp:4224) for every header, including these.
+                #
+                # Runs AFTER _header_meets_pow (CheckBlockHeader / "high-hash",
+                # validation.cpp:3832) and AFTER chain continuity has fixed the
+                # parent, and BEFORE the header is admitted to any store —
+                # matching Core's order and its early exit in
+                # ProcessNewBlockHeaders.
+                #
+                # The height is derived POSITIONALLY from the tip-anchored
+                # queue (slot i == db_tip_height + 1 + i), which is why the
+                # queue-anchor invariant is asserted at the top of this
+                # function: a stale queue makes every height wrong and inverts
+                # the check.
+                # ------------------------------------------------------------
+                if _db_tip_height is None:
+                    logger.error(
+                        "Cannot derive header heights (DB tip unreadable) — "
+                        "refusing to admit headers without the bad-diffbits "
+                        "check"
+                    )
+                    return
+                # Height comes from the PARENT'S IDENTITY, never from the queue
+                # LENGTH.  Core derives it exactly this way —
+                # `nHeight = pindexPrev->nHeight + 1` (validation.cpp:4084),
+                # off the looked-up parent index, not off any counter.
+                #
+                # `len(self._validated_headers)` is only equal to the parent's
+                # position when every earlier header in this batch was
+                # APPENDED.  The duplicate-skip path above (:3593) advances
+                # `expected_prev` WITHOUT appending, so after a peer re-sends
+                # headers we already hold, the length overshoots the cursor.
+                # A batch of [A1,A2,B0,…] where we already hold A1..A5 and B0
+                # forks off A2 then derived height db_tip+5+1 for a header
+                # whose true height is db_tip+3 — and the ancestor provider,
+                # whose queue cross-check correctly refused to answer for a
+                # parent at the wrong height, returned None.  That became
+                # "diffbits-check-error" and a 100-point ban on a peer serving
+                # a perfectly honest competing branch.
+                _parent_slot = known_hashes.get(expected_prev)
+                if _parent_slot is not None:
+                    _parent_height = _db_tip_height + 1 + _parent_slot
+                elif expected_prev == _db_tip_hash:
+                    _parent_height = _db_tip_height
+                else:
+                    _parent_height = None
+
+                if _parent_height is None:
+                    # We cannot place the parent, so we cannot evaluate the
+                    # rule.  That is OUR uncertainty, not peer misbehaviour:
+                    # Core in this position has already returned
+                    # "prev-blk-not-found" from AcceptBlockHeader
+                    # (validation.cpp:4215-4217) and asks for the bridging
+                    # headers.  Ask, drop the batch, do NOT score the peer.
+                    logger.debug(
+                        "Header %s... has unplaceable parent %s... — "
+                        "requesting bridge, not admitting",
+                        block_hash.hex()[:16],
+                        (expected_prev or b"").hex()[:16],
+                    )
+                    await self._maybe_send_fork_getheaders(peer, expected_prev)
+                    self._drop_presync_state(peer)
+                    return
+
+                # A header building on an INTERIOR queue member is a competing
+                # fork, not a tip extension.  Appending it would break the
+                # linear tip-anchored invariant (slot i == db_tip+1+i) that
+                # every height derivation here depends on, silently poisoning
+                # the heights of everything after it.  Core keeps forks in the
+                # same block index precisely because that index is a tree; our
+                # queue is a list and cannot represent one.
+                if _parent_slot is not None and _parent_slot != len(self._validated_headers) - 1:
+                    logger.debug(
+                        "Header %s... builds on queue slot %d (tip slot %d) — "
+                        "competing fork, not admitting to the linear queue",
+                        block_hash.hex()[:16], _parent_slot,
+                        len(self._validated_headers) - 1,
+                    )
+                    await self._maybe_send_fork_getheaders(peer, expected_prev)
+                    self._drop_presync_state(peer)
+                    return
+
+                _height = _parent_height + 1
+                _provider = self._header_ancestor_provider(
+                    header_prev if header_prev is not None else expected_prev,
+                    _parent_height,
+                    _db_tip_hash, _db_tip_height,
+                    known_hashes, _batch_headers,
+                )
+                _parent_info = _provider(_parent_height)
+                if _parent_info is None:
+                    # Same distinction as above, one layer down: the rule is
+                    # unevaluable because we cannot reach the parent, which is
+                    # NOT evidence the header is bad.  Core cannot reach this
+                    # state at all — ContextualCheckBlockHeader asserts
+                    # pindexPrev != nullptr (validation.cpp:4083) and
+                    # GetAncestor within a fully-linked index cannot fail.
+                    # Never convert our own gap into a ban.
+                    logger.debug(
+                        "Header %s... at height %d: parent unresolvable — "
+                        "requesting bridge, not admitting (no penalty)",
+                        block_hash.hex()[:16], _height,
+                    )
+                    await self._maybe_send_fork_getheaders(peer, expected_prev)
+                    self._drop_presync_state(peer)
+                    return
+                _ok, _reason, _exp = self._check_header_diffbits(
+                    header, _height, _parent_info, _provider
+                )
+                if not _ok:
+                    self._headers_diffbits_rejected += 1
+                    logger.warning(
+                        "Header %s... at height %d REJECTED (%s): "
+                        "bits=%#010x expected=%s parent=%s... from %s:%s — "
+                        "dropping batch",
+                        block_hash.hex()[:16], _height, _reason,
+                        int(header.bits),
+                        f"{_exp:#010x}" if _exp is not None else "?",
+                        (header_prev or b"").hex()[:16],
+                        peer.host, peer.port,
+                    )
+                    peer.adjust_score(-20)
+                    if hasattr(self.peer_manager, "misbehaving"):
+                        self.peer_manager.misbehaving(
+                            f"{peer.host}:{peer.port}", 100, "bad-diffbits"
+                        )
+                    self._drop_presync_state(peer)
+                    return
+
+                known_hashes[block_hash] = len(self._validated_headers)
                 self._validated_headers.append((block_hash, header))
-                known_hashes.add(block_hash)
                 expected_prev = block_hash
                 accepted += 1
                 presync_feed.append(header)

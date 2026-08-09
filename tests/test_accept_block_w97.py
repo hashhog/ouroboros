@@ -53,16 +53,41 @@ MAINNET_BITS = 0x1D00FFFF
 REGTEST_BITS = 0x207FFFFF
 
 
+class _StubBlk:
+    """Minimal block-like parent record for the header-path fixtures.
+
+    A bare ``MagicMock`` is NOT usable here: ``int(MagicMock())`` is 1, so a
+    mock DB silently answers "the parent's nBits is 0x00000001" for every
+    height.  With the bad-diffbits gate (Core validation.cpp:4088-4089) now
+    enforced at header-admission time, that made every header in these
+    fixtures mismatch its required nBits.  Give the stub the SAME bits the
+    test headers carry so the rule is satisfied and each test keeps asserting
+    what it was written to assert.
+    """
+
+    def __init__(self, bits: int, timestamp: int):
+        self.bits = bits
+        self.timestamp = timestamp
+        self.prev_blockhash = b"\x00" * 32
+
+
 def _make_block_sync(
     tip_hash: bytes = b"\x00" * 32,
     tip_height: int = 0,
     network: str = "mainnet",
+    tip_bits: int = REGTEST_BITS,
 ) -> BlockSync:
     """Build a ``BlockSync`` with stubbed db / validator / peer manager."""
     db = MagicMock()
     db.get_best_block.return_value = (tip_hash, tip_height)
     db.has_block_hash.return_value = False
     db.get_median_time_past.return_value = 1_700_000_000
+    # Parent block for the header-time difficulty rule.  ``tip_bits`` matches
+    # the bits ``_valid_header_extending`` mines with, so a non-boundary
+    # height (all of these fixtures) expects exactly that value.
+    _parent = _StubBlk(tip_bits, GENESIS_TIME)
+    db.get_block_by_height.return_value = _parent
+    db.get_block.return_value = _parent
 
     peer_manager = MagicMock()
     peer_manager.network = network
