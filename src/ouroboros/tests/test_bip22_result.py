@@ -92,8 +92,13 @@ class TestBip22ResultString:
         assert bip22_result_string("BIP68: sequence lock not satisfied") == "bad-txns-nonfinal"
 
     def test_bip30_duplicate_txid(self):
-        # BlockValidationError::Bip30DuplicateTxid
-        assert bip22_result_string("BIP30: duplicate unspent txid") == "bad-txns-duplicate"
+        # BlockValidationError::Bip30DuplicateTxid. Core's ConnectBlock BIP30
+        # gate reports "bad-txns-BIP30" (validation.cpp:2471), NOT
+        # "bad-txns-duplicate" (which is the CheckTransaction in-block dup-vin
+        # token). Corpus: version-dup/bip30-duplicate-txid-reject.
+        assert bip22_result_string("BIP30: duplicate unspent txid") == "bad-txns-BIP30"
+        # The Python validator emits the token directly; it must round-trip too.
+        assert bip22_result_string("bad-txns-BIP30") == "bad-txns-BIP30"
 
     def test_duplicate_transaction(self):
         # BlockValidationError::DuplicateTransaction — Core parity (bad-txns-inputs-missingorspent)
@@ -121,6 +126,29 @@ class TestBip22ResultString:
     def test_transaction_validation_error(self):
         # BlockValidationError::TransactionValidation wraps script errors
         assert bip22_result_string("Transaction validation error: script verify failed") == "mandatory-script-verify-flag-failed"
+
+    def test_checktransaction_bare_tokens_round_trip(self):
+        # CheckTransaction (consensus/tx_check.cpp) tokens are already Core-exact
+        # when emitted by the Python validator / accept_block refinement pass and
+        # must survive the normaliser verbatim. In particular
+        # "bad-txns-inputs-duplicate" contains the "tx"+"duplicate" substrings
+        # that the CVE-2012-2459 in-block-dup rule keys on, so without an explicit
+        # pass-through it would be mis-mapped to bad-txns-inputs-missingorspent.
+        for tok in (
+            "bad-txns-vout-empty", "bad-txns-vin-empty",
+            "bad-txns-inputs-duplicate", "bad-txns-oversize",
+            "bad-txns-vout-negative", "bad-txns-vout-toolarge",
+            "bad-txns-txouttotal-toolarge", "bad-txns-prevout-null",
+            "bad-cb-length",
+        ):
+            assert bip22_result_string(tok) == tok
+
+    def test_bad_version_tokens_round_trip(self):
+        # ContextualCheckBlockHeader bad-version, strprintf("bad-version(0x%08x)").
+        # The signed/unsigned discriminators (high-bit, -1) must render unsigned.
+        assert bip22_result_string("bad-version(0x00000001)") == "bad-version(0x00000001)"
+        assert bip22_result_string("bad-version(0x80000000)") == "bad-version(0x80000000)"
+        assert bip22_result_string("bad-version(0xffffffff)") == "bad-version(0xffffffff)"
 
     def test_previous_block_not_found(self):
         # BlockValidationError::PreviousBlockNotFound → inconclusive (orphan)

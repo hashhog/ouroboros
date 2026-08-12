@@ -156,7 +156,21 @@ def bip22_result_string(error: str) -> str:
              "bad-diffbits", "bad-blk-length", "bad-blk-weight",
              "bad-txns-nonfinal", "bad-txns-duplicate", "rejected",
              "block-script-verify-flag-failed",
-             "bad-txns-inputs-missingorspent"):
+             "bad-txns-inputs-missingorspent",
+             # CheckTransaction (consensus/tx_check.cpp) bare tokens. These are
+             # already Core-exact when emitted by the Python CheckTransaction
+             # (validation.py TransactionValidator._check_structure) or by the
+             # accept_block reason-refinement pass, so they must survive the
+             # normaliser verbatim rather than being swallowed by the coarse
+             # substring rules below. In particular "bad-txns-inputs-duplicate"
+             # contains the substring "tx"+"duplicate" and would otherwise be
+             # mis-mapped to "bad-txns-inputs-missingorspent" by the CVE-2012-2459
+             # in-block-dup rule further down.
+             "bad-txns-vin-empty", "bad-txns-vout-empty",
+             "bad-txns-inputs-duplicate", "bad-txns-oversize",
+             "bad-txns-vout-negative", "bad-txns-vout-toolarge",
+             "bad-txns-txouttotal-toolarge", "bad-txns-prevout-null",
+             "bad-cb-length", "bad-txns-locktime-outofrange"):
         return s
 
     # bad-version embeds the offending version inline — Core builds it with
@@ -254,10 +268,15 @@ def bip22_result_string(error: str) -> str:
         return "bad-txns-nonfinal"
 
     # BIP30 cross-block duplicate UTXO: both Rust ("BIP30: duplicate unspent txid")
-    # and Python ("BIP30: duplicate txid ... with unspent output") contain "bip30".
-    # Core canonical for this path is "bad-txns-duplicate".
-    if "bip30" in s and "duplicate" in s:
-        return "bad-txns-duplicate"
+    # and Python ("bad-txns-BIP30" / "BIP30: duplicate txid ... with unspent
+    # output") contain "bip30". Core's canonical BIP-22 reject reason for the
+    # ConnectBlock BIP30 gate is "bad-txns-BIP30" (validation.cpp:2471,
+    # state.Invalid(BLOCK_CONSENSUS, "bad-txns-BIP30", ...)), NOT
+    # "bad-txns-duplicate" (that token is the in-block dup-vin CheckTransaction
+    # reason). The literal is returned verbatim — Core prints "BIP30" with the
+    # capital tail, so we must not return the lowercased *s* here.
+    if "bip30" in s:
+        return "bad-txns-BIP30"
 
     # In-block dup-txid (CVE-2012-2459): "Duplicate transaction detected"
     # Core reaches ConnectBlock prevout-already-spent and returns
@@ -336,6 +355,79 @@ def bip22_result_string(error: str) -> str:
         return "inconclusive"
 
     return "rejected"
+
+
+def _refine_block_reject_reason(
+    node, block_bytes: bytes, next_height: int, network: str, original: str
+) -> str:
+    """Sharpen a coarse block-rejection message to Core's exact BIP-22 reason.
+
+    REASON-STRING PARITY ONLY (CHARTER R2). The block is *already* being
+    rejected by the caller (Rust ``validate_block_from_bytes`` or the Python
+    ``BlockValidator.validate_block``); this helper never changes the
+    accept/reject DECISION. It only re-derives *which* consensus rule failed
+    first so the returned reason matches Core, because those two validators
+    surface some rejects with a coarse/mis-staged message:
+
+      * a coinbase (or spend tx) with an empty ``vout`` comes back as the Rust
+        ``InvalidCoinbase`` ("Invalid coinbase structure" → bad-cb-length) or a
+        script-verify catch-all, where Core's context-free CheckTransaction
+        reports ``bad-txns-vout-empty`` first (consensus/tx_check.cpp:17);
+      * a tx listing the same prevout twice comes back as ``DuplicateInput`` /
+        a spent-utxo message, where Core reports ``bad-txns-inputs-duplicate``
+        (tx_check.cpp:36-44) before any UTXO/double-spend check;
+      * a buried-soft-fork version violation comes back as the generic
+        "Invalid header" / "Version too low …", where Core reports
+        ``bad-version(0x%08x)`` (ContextualCheckBlockHeader, validation.cpp:4113).
+
+    Evaluation order mirrors Core: CheckBlock's per-tx CheckTransaction
+    (context-free, all txs incl. coinbase) runs before
+    ContextualCheckBlockHeader's bad-version gate. When no more-specific rule
+    matches, *original* is returned unchanged so BIP30 / double-spend / merkle
+    reasons flow through the existing normaliser untouched.
+    """
+    try:
+        from ouroboros.database import Block as _Blk
+        _blk = _Blk.deserialize(block_bytes)
+    except Exception:
+        return original
+
+    # (a) CheckTransaction (consensus/tx_check.cpp) — context-free, runs on
+    #     EVERY transaction including the coinbase, and precedes the coinbase-
+    #     structure / script / connect stages. Reuse the node's own
+    #     TransactionValidator._check_structure, which returns the exact Core
+    #     token (bad-txns-vout-empty / bad-txns-inputs-duplicate / …) or None.
+    _validator = getattr(node, "validator", None)
+    _txv = getattr(_validator, "tx_validator", None) if _validator is not None else None
+    if _txv is not None:
+        try:
+            for _tx in _blk.transactions:
+                _tok = _txv._check_structure(_tx)
+                if _tok is not None:
+                    return _tok
+        except Exception:
+            pass  # never let refinement mask the genuine reject
+
+    # (b) ContextualCheckBlockHeader bad-version (validation.cpp:4113-4118).
+    #     Core prints strprintf("bad-version(0x%08x)", block.nVersion) where
+    #     nVersion is the signed int32 header field reinterpreted UNSIGNED, so
+    #     0x80000000 and 0xffffffff (the signed/unsigned discriminators) render
+    #     as themselves. Gated on the SAME buried-deployment activation the
+    #     Python _validate_header and the side-branch gate use, so this can only
+    #     fire where those already reject — reason-string parity, not a new rule.
+    try:
+        from ouroboros.consensus import is_buried_deployment_active as _act
+        _v = int.from_bytes(block_bytes[0:4], "little", signed=True)
+        if next_height > 0 and (
+            (_v < 2 and _act("bip34", next_height, network))
+            or (_v < 3 and _act("bip66", next_height, network))
+            or (_v < 4 and _act("bip65", next_height, network))
+        ):
+            return f"bad-version(0x{_v & 0xFFFFFFFF:08x})"
+    except Exception:
+        pass
+
+    return original
 
 
 # ---------------------------------------------------------------------------
@@ -483,13 +575,24 @@ async def accept_block(
     # block weight.  skip_scripts is honoured by the validator for blocks
     # below the assumevalid checkpoint.
     if hasattr(db, "validate_block_from_bytes"):
-        await asyncio.to_thread(
-            db.validate_block_from_bytes,
-            block_bytes,
-            best_height,  # prev_height = best_height (= next_height - 1)
-            skip_scripts,
-            network,
-        )
+        try:
+            await asyncio.to_thread(
+                db.validate_block_from_bytes,
+                block_bytes,
+                best_height,  # prev_height = best_height (= next_height - 1)
+                skip_scripts,
+                network,
+            )
+        except Exception as _rust_err:
+            # Reject decision unchanged — sharpen the reason to Core's exact
+            # BIP-22 token (bad-txns-vout-empty / bad-txns-inputs-duplicate /
+            # bad-version(0x…)) the Rust validator surfaces coarsely. Runs only
+            # on the (rare) reject path, so no happy-path IBD cost.
+            raise ValueError(
+                _refine_block_reject_reason(
+                    node, block_bytes, next_height, network, str(_rust_err)
+                )
+            )
 
     # Step 3 — Python script verification.
     # Rust validate_block_with_flags currently reserves skip_scripts for future
@@ -508,7 +611,15 @@ async def accept_block(
                 next_height,
             )
             if not _valid:
-                raise ValueError(_err)
+                # Same reason-refinement as the Rust arm above: the buried
+                # bad-version reject is surfaced here as the generic
+                # "Invalid header", so map it to bad-version(0x%08x). Decision
+                # (reject) is unchanged; only the reason is sharpened.
+                raise ValueError(
+                    _refine_block_reject_reason(
+                        node, block_bytes, next_height, network, str(_err)
+                    )
+                )
 
     # Step 4 — Connect block (UTXO mutation + persistence, Rust).
     # Pass network so the inline IsFinalTx cutoff uses the correct BIP-113/CSV
