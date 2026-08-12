@@ -4450,6 +4450,19 @@ class RPCServer:
             if block_height is None and raw_stored_height is not None:
                 block_height = raw_stored_height
 
+            # R3(b) 2026-08-12 (ratified active-chain clause): a header whose
+            # height resolves from NEITHER the block index NOR the HEADERS_CF
+            # record cannot be served honestly — height is a required field
+            # and emitting 0 with confirmations=-1 is confidently-wrong
+            # output (the early headers held from the genesis header-sync
+            # below the snapshot base hit this; 2026-08-12 fleet sweep).
+            # Report the block absent instead, matching getblockhash's
+            # not-found for those heights: both paths fail consistently,
+            # the same "genuinely lacks that history" branch this node
+            # already takes for un-held mid-range history.
+            if block_height is None:
+                raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
+
             # Get confirmations
             # -1 if block is not on the main chain
             confirmations = -1
@@ -4520,7 +4533,7 @@ class RPCServer:
             result: dict[str, Any] = {
                 "hash": blockhash,
                 "confirmations": confirmations,
-                "height": block_height if block_height is not None else 0,
+                "height": block_height,  # never None: unresolvable height raised -5 above
                 "version": hdr_version,
                 "versionHex": f"{hdr_version & 0xFFFFFFFF:08x}",
                 "merkleroot": hdr_merkle[::-1].hex(),
