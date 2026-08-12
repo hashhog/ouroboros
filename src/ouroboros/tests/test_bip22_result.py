@@ -77,7 +77,14 @@ class TestBip22ResultString:
 
     def test_invalid_coinbase_witness_nonce(self):
         # BlockValidationError::InvalidCoinbaseWitnessNonce
-        assert bip22_result_string("BIP141: coinbase witness must be exactly one 32-byte item") == "bad-witness-merkle-match"
+        # Core's CheckWitnessMalleation rejects a coinbase witness stack that
+        # is not exactly one 32-byte item as "bad-witness-nonce-size"
+        # (validation.cpp:3878-3886) BEFORE the commitment-hash compare.
+        # The old expectation (bad-witness-merkle-match) encoded the mis-map
+        # the bwmc corpus flagged (C7-reserved-nonce-31-bytes, 2026-08-10).
+        assert bip22_result_string("BIP141: coinbase witness must be exactly one 32-byte item") == "bad-witness-nonce-size"
+        # Bare Core token round-trips unchanged.
+        assert bip22_result_string("bad-witness-nonce-size") == "bad-witness-nonce-size"
 
     def test_coinbase_amount_exceeded(self):
         # BlockValidationError::CoinbaseAmountExceeded #[error("Coinbase amount exceeds subsidy + fees")]

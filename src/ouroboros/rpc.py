@@ -170,7 +170,8 @@ def bip22_result_string(error: str) -> str:
              "bad-txns-inputs-duplicate", "bad-txns-oversize",
              "bad-txns-vout-negative", "bad-txns-vout-toolarge",
              "bad-txns-txouttotal-toolarge", "bad-txns-prevout-null",
-             "bad-cb-length", "bad-txns-locktime-outofrange"):
+             "bad-cb-length", "bad-cb-missing", "bad-cb-multiple",
+             "bad-txns-locktime-outofrange"):
         return s
 
     # bad-version embeds the offending version inline — Core builds it with
@@ -208,10 +209,23 @@ def bip22_result_string(error: str) -> str:
             or "witness data but no" in s):
         return "unexpected-witness"
 
+    # Witness reserved value (nonce) size. Core's CheckWitnessMalleation
+    # checks the coinbase witness stack — exactly one 32-byte item — BEFORE
+    # comparing the commitment hash, and rejects "bad-witness-nonce-size"
+    # (validation.cpp:3878-3886). The Rust validator enforces the same
+    # pre-check (InvalidCoinbaseWitnessNonce, "BIP141: coinbase witness must
+    # be exactly one 32-byte item"), but this normaliser used to swallow that
+    # text into the generic bad-witness-merkle-match rule below, so a 31-byte
+    # reserved value reported the wrong token (bwmc C7-reserved-nonce-31-bytes,
+    # 2026-08-10). Decision unchanged (reject either way); MUST precede the
+    # merkle-match rule.
+    if ("bad-witness-nonce-size" in s or "witness nonce" in s
+            or "witness reserved value" in s
+            or ("coinbase witness" in s and ("32-byte" in s or "32 byte" in s))):
+        return "bad-witness-nonce-size"
+
     # Witness commitment errors (BIP141)
-    if ("bad-witness-merkle-match" in s or "witness commitment" in s
-            or "witness nonce" in s
-            or ("coinbase witness" in s and "32-byte" in s)):
+    if "bad-witness-merkle-match" in s or "witness commitment" in s:
         return "bad-witness-merkle-match"
 
     # Coinbase value / subsidy
@@ -243,8 +257,24 @@ def bip22_result_string(error: str) -> str:
     # Decision unchanged (rejected either way): R2 reason-code parity.
     if ("bad-cb-missing" in s
             or "no coinbase transaction" in s
-            or "first tx is not coinbase" in s):
+            or "first tx is not coinbase" in s
+            or "first transaction must be coinbase" in s):
         return "bad-cb-missing"
+
+    # More than one coinbase in the block. Core CheckBlock
+    # (validation.cpp:3953-3955) emits "bad-cb-multiple" / "more than one
+    # coinbase". The Rust validator raises BlockValidationError::
+    # MultipleCoinbase ("Block has multiple coinbase transactions",
+    # ferrous-utils/sync/src/validate/block.rs:42-43) and the Python
+    # BlockValidator says "Transaction {i} is an unexpected coinbase" —
+    # neither matched any rule, so both fell through to the generic
+    # "rejected" (bwmc A5-two-coinbases / A6-coinbase-at-index2,
+    # 2026-08-10). Decision unchanged: R2 reason-code parity.
+    if ("bad-cb-multiple" in s
+            or "multiple coinbase" in s
+            or "more than one coinbase" in s
+            or "unexpected coinbase" in s):
+        return "bad-cb-multiple"
 
     # Coinbase scriptSig length (consensus/tx_check.cpp:49 — 2..=100 bytes).
     # Also catches Rust validate_block_from_bytes coinbase-structure error when
@@ -348,6 +378,16 @@ def bip22_result_string(error: str) -> str:
 
     # Block size / weight
     if "size" in s and "exceed" in s:
+        return "bad-blk-length"
+
+    # Empty block (no transactions at all). Core folds vtx.empty() into the
+    # CheckBlock size-limits gate → "bad-blk-length" (validation.cpp:3947-3948).
+    # The Rust validator raises BlockValidationError::NoTransactions ("Block
+    # has no transactions", ferrous-utils/sync/src/validate/block.rs:36-37) and
+    # the Python BlockValidator says the same — neither matched any rule, so
+    # both fell through to the generic "rejected" (bwmc A2-empty-block,
+    # 2026-08-10). Decision unchanged: R2 reason-code parity.
+    if "no transactions" in s:
         return "bad-blk-length"
 
     # Previous block not found → inconclusive (we don't know the chain context)
@@ -509,16 +549,27 @@ async def accept_block(
     network = getattr(node, "network", "mainnet")
     best_height = next_height - 1
 
-    # Step 0 — coinbase scriptSig length, BEFORE the BIP-34 height check.
+    # Step 0 — CheckBlock structural gates, BEFORE the BIP-34 height check,
+    # in Core's exact first-failure order (validation.cpp CheckBlock):
     #
-    # Core evaluates these in the opposite order to the one this function used.
-    # bad-cb-length lives in CheckTransaction (consensus/tx_check.cpp:49-50),
-    # which runs inside the CONTEXT-FREE CheckBlock; bad-cb-height lives in
-    # ContextualCheckBlock (validation.cpp:4157), much later. Because the
-    # Python BIP-34 check below was bolted on ahead of the Rust call that owns
-    # bad-cb-length, a coinbase with a too-short scriptSig reported
-    # bad-cb-height where Core reports bad-cb-length (corpus entry
-    # _cve-histbug-2026-07-07/.../C-cb-scriptsig-too-short, 2026-08-02).
+    #   merkle root         -> bad-txnmrklroot / bad-txns-duplicate (:3846-3856)
+    #   vtx.empty()         -> bad-blk-length                       (:3947-3948)
+    #   first tx ! coinbase -> bad-cb-missing                       (:3951-3952)
+    #   >1 coinbase         -> bad-cb-multiple                      (:3953-3955)
+    #   CheckTransaction    -> bad-cb-length (coinbase scriptSig 2..100,
+    #                          consensus/tx_check.cpp:49-50)
+    #
+    # Core evaluates all of these before ContextualCheckBlock's bad-cb-height
+    # (validation.cpp:4157), but the Python BIP-34 check below was bolted on
+    # ahead of the Rust call that owns them, so:
+    #   * a coinbase with a too-short scriptSig reported bad-cb-height where
+    #     Core reports bad-cb-length (corpus C-cb-scriptsig-too-short,
+    #     2026-08-02);
+    #   * a NON-coinbase first tx whose scriptSig fell outside 2..100 (any
+    #     ordinary >100-byte P2PKH spend) reported bad-cb-length where Core
+    #     reports bad-cb-missing (bwmc A3-no-coinbase-single-tx /
+    #     A4-first-tx-not-coinbase, 2026-08-10) — the length rule is a
+    #     COINBASE rule and must only fire once the first tx IS a coinbase.
     #
     # The decision is identical either way -- the block is rejected -- so this
     # is reason-code parity (R2), not a chain-split fix. It still matters:
@@ -526,17 +577,42 @@ async def accept_block(
     # consensus bugs in this fleet turned out to be ordering bugs of exactly
     # this shape.
     #
-    # This duplicates a rule the Rust CheckBlock also enforces. That is
-    # deliberate and bounded: it is two lines, the bounds have been fixed since
-    # 2012, and the alternative -- moving the BIP-34 check after the Rust call
-    # -- would run it after the block had already been connected.
+    # This duplicates rules the Rust CheckBlock also enforces. That is
+    # deliberate and bounded: they are a handful of lines, fixed since 2012,
+    # and the alternative -- moving the BIP-34 check after the Rust call --
+    # would run it after the block had already been connected.
     try:
         from ouroboros.database import Block as _Block0
         _blk0 = _Block0.deserialize(block_bytes)
-        if _blk0.transactions and _blk0.transactions[0].inputs:
-            _cb_script = _blk0.transactions[0].inputs[0].script_sig
-            if len(_cb_script) < 2 or len(_cb_script) > 100:
-                raise ValueError("bad-cb-length")
+        # Core checks the merkle root BEFORE any structural gate below, so
+        # only emit the structural tokens when the merkle root actually
+        # matches; otherwise fall through to the Rust CheckBlock, which
+        # surfaces bad-txnmrklroot / bad-txns-duplicate itself.
+        _merkle_ok = True
+        _pyv0 = getattr(node, "validator", None)
+        if _pyv0 is not None:
+            try:
+                _merkle_ok = bool(_pyv0._verify_merkle_root(_blk0))
+            except Exception:
+                _merkle_ok = True  # can't tell — never invent an order change
+        if _merkle_ok:
+            # Size limits, vtx.empty() arm (validation.cpp:3947-3948). The
+            # weight/serialized-size arms stay with the Rust check_size_limits.
+            if not _blk0.transactions:
+                raise ValueError("bad-blk-length")
+            # First transaction must be coinbase (validation.cpp:3951-3952).
+            if not _blk0.transactions[0].is_coinbase:
+                raise ValueError("bad-cb-missing")
+            # ... and only the first may be (validation.cpp:3953-3955).
+            for _tx0 in _blk0.transactions[1:]:
+                if _tx0.is_coinbase:
+                    raise ValueError("bad-cb-multiple")
+            # CheckTransaction on the (now-known-genuine) coinbase:
+            # scriptSig length 2..100 (consensus/tx_check.cpp:49-50).
+            if _blk0.transactions[0].inputs:
+                _cb_script = _blk0.transactions[0].inputs[0].script_sig
+                if len(_cb_script) < 2 or len(_cb_script) > 100:
+                    raise ValueError("bad-cb-length")
     except ValueError:
         raise
     except Exception:
@@ -7839,6 +7915,16 @@ class RPCServer:
             _blk_chk = _BlockChk.deserialize(block_bytes)
             if not _blk_chk.transactions:
                 return bip22_result_string("bad-blk-length")
+            # Core CheckBlock order (validation.cpp:3951-3955): first tx must
+            # be coinbase (bad-cb-missing), and only the first may be
+            # (bad-cb-multiple) — both BEFORE the per-tx CheckTransaction
+            # coinbase-scriptSig-length gate (bad-cb-length). Same ordering
+            # fix as accept_block Step 0 (bwmc A3/A4/A5/A6, 2026-08-10).
+            if not _blk_chk.transactions[0].is_coinbase:
+                return bip22_result_string("bad-cb-missing")
+            for _sb_tx in _blk_chk.transactions[1:]:
+                if _sb_tx.is_coinbase:
+                    return bip22_result_string("bad-cb-multiple")
             _cb = _blk_chk.transactions[0]
             if not _cb.inputs:
                 return bip22_result_string("bad-cb-length")

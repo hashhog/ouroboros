@@ -1130,14 +1130,19 @@ class BlockValidator:
                     if self.db.get_utxo(txid, vout_idx) is not None:
                         return False, "bad-txns-BIP30"
 
-        # 8. Validate coinbase position and uniqueness
+        # 8. Validate coinbase position and uniqueness.
+        # Emit Core's exact CheckBlock tokens (validation.cpp:3947-3955):
+        # a block with no transactions falls under Core's size-limits gate
+        # ("bad-blk-length"), a non-coinbase first tx is "bad-cb-missing",
+        # and any later coinbase is "bad-cb-multiple" (bwmc R2 parity,
+        # 2026-08-10).
         if not block.transactions:
-            return False, "Block has no transactions"
+            return False, "bad-blk-length"
         if not block.transactions[0].is_coinbase:
-            return False, "First transaction must be coinbase"
-        for i, tx in enumerate(block.transactions[1:], 1):
+            return False, "bad-cb-missing"
+        for tx in block.transactions[1:]:
             if tx.is_coinbase:
-                return False, f"Transaction {i} is an unexpected coinbase"
+                return False, "bad-cb-multiple"
 
         # Determine if script validation can be skipped (assume-valid).
         # During IBD, blocks below the last checkpoint have their PoW and
