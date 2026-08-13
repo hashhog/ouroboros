@@ -416,6 +416,12 @@ def _refine_block_reject_reason(
       * a tx listing the same prevout twice comes back as ``DuplicateInput`` /
         a spent-utxo message, where Core reports ``bad-txns-inputs-duplicate``
         (tx_check.cpp:36-44) before any UTXO/double-spend check;
+      * an ALIGNED in-block duplicate txid/subtree (CVE-2012-2459) comes back
+        as the Rust ``DuplicateTransaction`` ("Duplicate transaction
+        detected" → bad-txns-inputs-missingorspent), where Core's
+        CheckMerkleRoot reports ``bad-txns-duplicate`` via the
+        ComputeMerkleRoot mutated flag (validation.cpp:3850-3858,
+        consensus/merkle.cpp:46-63);
       * a buried-soft-fork version violation comes back as the generic
         "Invalid header" / "Version too low …", where Core reports
         ``bad-version(0x%08x)`` (ContextualCheckBlockHeader, validation.cpp:4113).
@@ -431,6 +437,43 @@ def _refine_block_reject_reason(
         _blk = _Blk.deserialize(block_bytes)
     except Exception:
         return original
+
+    # (a0) CheckMerkleRoot mutated-tree detection (CVE-2012-2459). Core's
+    #     CheckBlock runs CheckMerkleRoot (validation.cpp:3837-3862) BEFORE the
+    #     per-tx CheckTransaction loop (:3961), and ComputeMerkleRoot
+    #     (consensus/merkle.cpp:46-63) flags `mutated` when two ALIGNED equal
+    #     siblings are hashed together at ANY tree level — the scan runs before
+    #     the odd-count padding push_back, so honest last-leaf padding is never
+    #     flagged. The Rust validator's check_duplicate_transactions instead
+    #     does an any-position leaf dup-txid scan whose "Duplicate transaction
+    #     detected" string normalises to bad-txns-inputs-missingorspent (right
+    #     for MISALIGNED dups, which Core only catches at ConnectBlock), so an
+    #     aligned dup (corpus reject-leaf-dup / reject-subtree-dup) reported the
+    #     wrong token. Core's precedence is bad-txnmrklroot FIRST (root
+    #     mismatch), THEN bad-txns-duplicate (mutated), so only refine when the
+    #     computed root matches the header root. Decision unchanged — the block
+    #     is already rejected; R2 reason parity only.
+    try:
+        _leaves = [bytes(_tx.get_txid()) for _tx in _blk.transactions]
+        if len(_leaves) > 1:
+            _mutation = False
+            _lvl = _leaves
+            while len(_lvl) > 1:
+                for _pos in range(0, len(_lvl) - 1, 2):
+                    if _lvl[_pos] == _lvl[_pos + 1]:
+                        _mutation = True
+                if len(_lvl) & 1:
+                    _lvl = _lvl + [_lvl[-1]]
+                _lvl = [
+                    _hashlib.sha256(
+                        _hashlib.sha256(_lvl[_i] + _lvl[_i + 1]).digest()
+                    ).digest()
+                    for _i in range(0, len(_lvl), 2)
+                ]
+            if _mutation and _lvl[0] == bytes(_blk.merkle_root):
+                return "bad-txns-duplicate"
+    except Exception:
+        pass  # never let refinement mask the genuine reject
 
     # (a) CheckTransaction (consensus/tx_check.cpp) — context-free, runs on
     #     EVERY transaction including the coinbase, and precedes the coinbase-
