@@ -981,6 +981,29 @@ class BitcoinNode:
                         out["truncated"] = truncated
                     return out
 
+                def _task_stats() -> dict:
+                    """asyncio task census — total + top coro qualnames.
+
+                    Runs on the tracemalloc OS thread, which has no event
+                    loop, so it targets the node's loop explicitly. Best-effort:
+                    any failure degrades to an error marker, never raises into
+                    the snapshot.
+                    """
+                    try:
+                        import asyncio as _a
+                        loop = getattr(self, "_loop", None) or _a.get_event_loop()
+                        tasks = _a.all_tasks(loop)
+                        by_name: dict = {}
+                        for t in tasks:
+                            coro = t.get_coro()
+                            name = getattr(coro, "__qualname__", None) or repr(coro)[:40]
+                            by_name[name] = by_name.get(name, 0) + 1
+                        top = dict(sorted(by_name.items(),
+                                          key=lambda kv: -kv[1])[:10])
+                        return {"total": len(tasks), "by_name": top}
+                    except Exception as _te:
+                        return {"error": f"task-census-failed: {_te}"}
+
                 def _gc_stats() -> dict:
                     """Per-generation collection counters + uncollectable set.
 
@@ -1158,6 +1181,18 @@ class BitcoinNode:
                                 # rather than an unbounded allocation.
                                 "gc": _gc_stats(),
                                 "buf": _buffers(),
+                                # THE datum that distinguishes the two live
+                                # hypotheses for the RSS-flat-heap runaway
+                                # (#24): orphaned receive coroutines vs malloc
+                                # fragmentation. If total task count climbs
+                                # with peer churn and tracks the frame_sites
+                                # count at peer.py receive, the leak is
+                                # un-cancelled receive loops (strong-referenced
+                                # live Tasks — which is why the periodic
+                                # gc.collect at p2p.py cannot reclaim them).
+                                # by_name buckets tasks by coro qualname so the
+                                # leaking loop names itself.
+                                "tasks": _task_stats(),
                             }
                             with open(_tm_log_path, "a") as _lf:
                                 _lf.write(json.dumps(record) + "\n")
