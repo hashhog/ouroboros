@@ -842,6 +842,13 @@ class BitcoinNode:
                 import sys as _wd_sys
                 import threading as _wd_threading
 
+                # Capture the running loop so the tracemalloc OS thread's
+                # task census can target it (get_event_loop() fails off-loop).
+                try:
+                    self._loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    pass
+
                 _wd_beat = [time.monotonic()]
 
                 async def _wd_pulse() -> None:
@@ -991,7 +998,9 @@ class BitcoinNode:
                     """
                     try:
                         import asyncio as _a
-                        loop = getattr(self, "_loop", None) or _a.get_event_loop()
+                        loop = getattr(self, "_loop", None)
+                        if loop is None:
+                            return {"error": "no-loop-captured"}
                         tasks = _a.all_tasks(loop)
                         by_name: dict = {}
                         for t in tasks:
