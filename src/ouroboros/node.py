@@ -821,6 +821,60 @@ class BitcoinNode:
             self.running = True
             logger.info("Bitcoin node started successfully")
 
+            # EVENT-LOOP STARVATION WATCHDOG — ON by default (disable with
+            # OUROBOROS_LOOP_WATCHDOG=0).
+            #
+            # Exists because of the 2026-08-20 20:46Z OOM: the asyncio loop was
+            # starved by the v2 receive path for EIGHTEEN MINUTES — not even
+            # the 1/min height logger ran — while RSS climbed 2.7 GB -> the
+            # 16 GB cgroup cap (~12 MB/s). The only witness was the tracemalloc
+            # OS thread. A starved loop must never be silent again (#24).
+            #
+            # Mechanics: an asyncio task stamps a heartbeat every second; a
+            # daemon OS thread (immune to loop starvation) checks the stamp
+            # every 5 s. Stall > 10 s => WARNING with the stall length, plus a
+            # faulthandler traceback of ALL threads (rate-limited to one dump
+            # per minute) — that traceback names the exact blocking frame, the
+            # datum the 18-minute silence denied us. Cost: one task wake/s and
+            # one thread wake/5 s; no allocation on the happy path.
+            if os.environ.get("OUROBOROS_LOOP_WATCHDOG", "1") != "0":
+                import faulthandler
+                import sys as _wd_sys
+                import threading as _wd_threading
+
+                _wd_beat = [time.monotonic()]
+
+                async def _wd_pulse() -> None:
+                    while True:
+                        _wd_beat[0] = time.monotonic()
+                        await asyncio.sleep(1.0)
+
+                def _wd_watch() -> None:
+                    last_dump = 0.0
+                    while True:
+                        time.sleep(5.0)
+                        stall = time.monotonic() - _wd_beat[0]
+                        if stall > 10.0:
+                            logger.warning(
+                                "EVENT LOOP STARVED for %.1fs — a coroutine is "
+                                "monopolizing the loop (see #24; traceback %s)",
+                                stall,
+                                "follows" if time.monotonic() - last_dump > 60.0
+                                else "suppressed (rate-limited)")
+                            if time.monotonic() - last_dump > 60.0:
+                                last_dump = time.monotonic()
+                                try:
+                                    faulthandler.dump_traceback(
+                                        file=_wd_sys.stderr, all_threads=True)
+                                except Exception:
+                                    pass
+
+                asyncio.create_task(_wd_pulse())
+                _wd_threading.Thread(
+                    target=_wd_watch, name="loop-watchdog", daemon=True
+                ).start()
+                logger.info("Event-loop starvation watchdog armed (10s threshold)")
+
             # Optional tracemalloc profiling thread — OPT-IN only.
             #
             # Set OUROBOROS_TRACEMALLOC=<N> (integer seconds) to start a
