@@ -2170,11 +2170,24 @@ class Peer:
                             f"No handler for {msg.command} from {self.host}:{self.port}"
                         )
 
-                except TimeoutError:
-                    # Timeout is normal, just continue listening
-                    logger.debug(f"Receive timeout from {self.host}:{self.port}")
-                    continue
-
+                # NOTE (#24): there is deliberately NO ``except TimeoutError:
+                # continue`` arm here.  Since the attempt-5 timer-free receive
+                # path, receive_message arms zero timers, so a read can never
+                # produce a benign timeout — the ONLY TimeoutError it can
+                # raise is the fatal OS-level ETIMEDOUT (an OSError subclass,
+                # PEP 3151) that connection_lost stored on the StreamReader
+                # when the kernel gave up retransmitting (half-open/NAT-dead
+                # socket).  StreamReader re-raises that SAME exception object
+                # on every subsequent read, so a catch-and-continue arm spun
+                # this loop at CPU speed without ever yielding: each iteration
+                # appended ~4 traceback links pinning that iteration's fresh
+                # coroutine frames onto the one stored exception — unbounded
+                # RSS growth to the cgroup cap (the 27-episode OOM engine) —
+                # while the starved event loop could run neither the
+                # inactivity sweeper nor the RPC.  Let it fall through to the
+                # dead-socket arm below (TimeoutError IS an OSError), which
+                # disconnects and breaks, matching Core's nBytes==0 /
+                # socket-error handling in CConnman::SocketHandler.
                 except (asyncio.IncompleteReadError, EOFError,
                         ConnectionResetError, ConnectionError,
                         BrokenPipeError, OSError) as e:
