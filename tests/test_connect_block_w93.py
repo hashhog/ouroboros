@@ -131,8 +131,16 @@ class TestBlockSubsidyNetworkAware:
 # spends M's output, the spend resolution must see M's output even
 # though it is not yet on disk.
 #
-# The cross-impl test_reorg_atomic_pattern_d test exercises the end-to-end
-# behaviour against a real datadir; this test documents the contract.
+# End-to-end coverage against a real datadir lives in
+# test_connect_blocks_atomic_intrablock_w93.py, which drives
+# connect_blocks_atomic over a real RocksDB chainstate with a block whose
+# tx N spends tx M's output (M<N) and asserts the coin is absent afterwards.
+#
+# NOTE: this comment previously pointed at test_reorg_atomic_pattern_d as the
+# end-to-end proof. That was false — those blocks are coinbase-only (hardcoded
+# tx-count varint b"\x01"), so they cannot contain an intra-block chain and
+# never exercised this contract at all. The claim outlived the coverage and
+# manufactured confidence in a gap that stayed open until 2026-08-24.
 # ---------------------------------------------------------------------------
 
 class TestIntraBlockUtxoOverlayContract:
@@ -351,11 +359,18 @@ class TestCoinbaseAmountUsesNetworkSubsidy:
 
 def test_bip30_repeat_exceptions_pinned():
     assert set(BIP30_REPEAT_EXCEPTIONS.keys()) == {91842, 91880}
-    # Hashes are stored internal byte order (LE-of-display).
-    # mainnet block 91842 display-hash: 00000000000a4d0a398161ffc163c503...
+    # Hashes are stored in INTERNAL byte order (the reverse of the display
+    # hash), because that is what block.hash carries — see
+    # test_bip30_bip34_coinbase.py::test_repeat_block_91842_hash_prefix,
+    # "stored in internal LE order (starts eccae000...), matching block.hash
+    # so IsBIP30Repeat actually fires".
+    #
+    # This assertion used to compare against the DISPLAY order without the
+    # [::-1], contradicting its own comment one line above, so it failed
+    # against a correct constant. The constant was never wrong; the test was.
     assert BIP30_REPEAT_EXCEPTIONS[91842] == bytes.fromhex(
         "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
-    )
+    )[::-1]
     assert BIP30_REPEAT_EXCEPTIONS[91880] == bytes.fromhex(
         "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"
-    )
+    )[::-1]
