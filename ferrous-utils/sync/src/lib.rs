@@ -4542,68 +4542,110 @@ impl PyBlockchainDB {
                 }
             }
 
-            // For every input, resolve to UTXO bytes via overlay → on-disk.
-            // Misses are tolerated (early blocks may legitimately miss).
-            let mut utxo_bytes_for_input: Vec<Option<Vec<u8>>> =
-                Vec::with_capacity(input_keys.len());
-            // Bulk-fetch on-disk values that AREN'T satisfied by the overlay
-            // to keep the multi_get_cf optimization for the non-overlay case.
-            let mut needs_disk: Vec<usize> = Vec::new();
-            for (idx, key) in input_keys.iter().enumerate() {
-                if in_batch_spent.contains(key) {
-                    // Overlay says this was already spent earlier in the
-                    // batch — that's a double-spend within the batch and
-                    // should never happen in a valid chain.
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!(
-                            "connect_blocks_atomic[{}]: in-batch double-spend on outpoint",
-                            block_idx,
-                        ),
-                    ));
-                }
-                if let Some(bytes) = in_batch_added.get(key) {
-                    utxo_bytes_for_input.push(Some(bytes.clone()));
-                } else {
-                    utxo_bytes_for_input.push(None); // placeholder; filled below
-                    needs_disk.push(idx);
-                }
-            }
-            if !needs_disk.is_empty() {
-                let cf_keys: Vec<_> = needs_disk.iter()
-                    .map(|i| (&*chainstate_cf, input_keys[*i].as_slice()))
+            // For every input, prefetch the ON-DISK UTXO bytes. The
+            // intra-block/in-batch overlay is consulted at USE time in the
+            // interleaved loop below rather than here: this block's own
+            // outputs do not exist yet at this point, and resolving them
+            // here was precisely the bug described below.
+            let mut utxo_disk_for_input: Vec<Option<Vec<u8>>> =
+                vec![None; input_keys.len()];
+            if !input_keys.is_empty() {
+                let cf_keys: Vec<_> = input_keys.iter()
+                    .map(|k| (&*chainstate_cf, k.as_slice()))
                     .collect();
                 let fetched = raw_db.multi_get_cf(cf_keys);
-                for (slot, fetched_val) in needs_disk.iter().zip(fetched.into_iter()) {
+                for (slot, fetched_val) in fetched.into_iter().enumerate() {
                     if let Ok(Some(bytes)) = fetched_val {
-                        utxo_bytes_for_input[*slot] = Some(bytes);
+                        utxo_disk_for_input[slot] = Some(bytes);
                     }
                 }
             }
 
             // ----------------------------------------------------------
-            // Phase 2: Process spends — queue chainstate delete + SPENT_CF
-            // undo entry, and update overlays for subsequent blocks.
-            // ----------------------------------------------------------
-            for (idx, (key, spending_txid)) in input_keys.iter().zip(input_spending_txids.iter()).enumerate() {
-                batch.delete_cf(&chainstate_cf, key);
-                in_batch_spent.insert(*key);
-                in_batch_added.remove(key); // an in-batch creation followed by spend in a later block
-                if let Some(utxo_bytes) = &utxo_bytes_for_input[idx] {
-                    let mut undo_value = Vec::with_capacity(32 + utxo_bytes.len());
-                    undo_value.extend_from_slice(spending_txid);
-                    undo_value.extend_from_slice(utxo_bytes);
-                    batch.put_cf(&spent_cf, key, &undo_value);
-                }
-            }
-
-            // ----------------------------------------------------------
-            // Phase 3: Add outputs + tx index.
-            // ----------------------------------------------------------
+            // Phases 2+3, INTERLEAVED per transaction in block order:
+            //   (a) resolve each spend against the in-batch overlay first,
+            //       then the on-disk prefetch,
+            //   (b) queue the chainstate delete + SPENT_CF undo record,
+            //   (c) add this tx's outputs to the chainstate AND to the
+            //       overlay, so a LATER tx in this SAME block can spend them.
+            //
+            // W93 BUG FIX (Bug C — intra-block undo loss), ported here from
+            // 'connect_block_from_bytes' (:3898), which received this fix
+            // while this function never did.
+            //
+            // The prior three-phase shape queued EVERY delete before ANY put.
+            // Bitcoin permits a tx N to spend an output created by an earlier
+            // tx M (M<N) in the SAME block, and real blocks are full of such
+            // chains (mainnet 963853 has 6,084 chained inputs). For one of
+            // those, the Phase-1 lookup found nothing — the creating tx's
+            // output was neither on disk nor yet in the overlay — so no
+            // SPENT_CF undo record was written, and Phase 3 then queued a
+            // put_cf for that same key. A RocksDB WriteBatch applies in
+            // order, so delete-then-put left the SPENT COIN PRESENT in the
+            // chainstate and spendable again, with no undo record. Because a
+            // miss is tolerated here rather than fatal, that corrupted UTXO
+            // set was committed SILENTLY.
+            //
+            // Interleaving fixes the ordering: the creating tx's put is
+            // queued BEFORE the spending tx's delete, so the delete wins and
+            // the coin is correctly absent. Removing the overlay entry on
+            // spend keeps a coin created-and-spent inside the batch from
+            // being written at all.
+            //
+            // Reference: bitcoin-core/src/validation.cpp ConnectBlock /
+            //            UpdateCoins per-tx loop.
             let store_utxos = height > 0;
+            let mut input_cursor: usize = 0;
             for (tx_pos, tx) in inner.txdata.iter().enumerate() {
                 let txid = tx.compute_txid();
                 let txid_bytes = *txid.as_byte_array();
 
+                // (a)+(b) — spends, per tx, in order.
+                if !tx.is_coinbase() {
+                    for _input in &tx.input {
+                        let key = input_keys[input_cursor];
+                        let spending_txid = input_spending_txids[input_cursor];
+
+                        // Reject an outpoint already spent earlier in this
+                        // batch (or earlier in this block) — Core's
+                        // CCoinsViewCache tombstone semantics.
+                        if in_batch_spent.contains(&key) {
+                            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                                format!(
+                                    "connect_blocks_atomic[{}]: in-batch double-spend on outpoint",
+                                    block_idx,
+                                ),
+                            ));
+                        }
+
+                        // Overlay first — it covers both an earlier block in
+                        // this batch and an earlier tx in THIS block. Remove
+                        // it so a coin created and spent inside the batch is
+                        // never left behind in the chainstate.
+                        let utxo_bytes: Option<Vec<u8>> =
+                            if let Some(b) = in_batch_added.remove(&key) {
+                                Some(b)
+                            } else {
+                                utxo_disk_for_input[input_cursor].clone()
+                            };
+
+                        batch.delete_cf(&chainstate_cf, &key);
+                        in_batch_spent.insert(key);
+
+                        if let Some(bytes) = utxo_bytes {
+                            let mut undo_value = Vec::with_capacity(32 + bytes.len());
+                            undo_value.extend_from_slice(&spending_txid);
+                            undo_value.extend_from_slice(&bytes);
+                            batch.put_cf(&spent_cf, &key, &undo_value);
+                        }
+                        // An outpoint with neither an overlay nor an on-disk
+                        // hit is the same tolerated early-IBD gap as before.
+
+                        input_cursor += 1;
+                    }
+                }
+
+                // (c) — add this tx's outputs, then the tx index.
                 if store_utxos {
                     for (vout, output) in tx.output.iter().enumerate() {
                         if crate::validate::block::is_unspendable_script(
@@ -4633,6 +4675,7 @@ impl PyBlockchainDB {
                 self.db.store_tx_index_batch(&mut batch, &txid_bytes, &block_hash, height, tx_pos as u32)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
             }
+            debug_assert_eq!(input_cursor, input_keys.len());
 
             // Block body + metadata.
             self.db.store_block_batch(&mut batch, &block)
