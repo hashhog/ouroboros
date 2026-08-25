@@ -282,3 +282,136 @@ def missing_mtp_heights(db, heights: Iterable[int]) -> list[int]:
         if any(db.get_block_hash_by_height(h) is None for h in range(start, height + 1)):
             out.append(height)
     return out
+
+
+class HeaderBackfill:
+    """Drives a genesis-to-floor header walk and commits it in one shot.
+
+    Lifecycle, deliberately all-or-nothing:
+
+      1. ``start_locator()`` — the caller sends a getheaders whose locator is
+         this value, so the peer replies from genesis forward.
+      2. ``accept(headers)`` — feed each batch in order. Batches are buffered
+         and linkage-checked incrementally so a lying peer is dropped early,
+         but NOTHING is written yet.
+      3. ``is_complete()`` becomes true once the buffer reaches the floor.
+      4. ``commit(db)`` — re-verifies the WHOLE range (genesis anchor, full
+         linkage, floor anchor, per-header PoW) and only then writes.
+
+    Buffering the entire range before writing is the point, not an oversight.
+    ``verify_chain`` pins the range at both ends; a chunk-at-a-time writer
+    could only pin the near end, so a peer that fed a good prefix and then
+    diverged would leave committed rows behind. At mainnet scale the buffer is
+    ~948k * 80 B = ~76 MB, which is worth paying once at startup for a range
+    that is then permanent.
+
+    The driver is transport-free — the caller owns getheaders and message
+    routing — so the state machine is unit-testable without a network.
+    """
+
+    def __init__(self, floor_height: int, anchor_hash: bytes, network: str = "mainnet"):
+        if floor_height <= 0:
+            raise BackfillError(
+                f"floor_height must be > 0 to have anything to backfill, got {floor_height}"
+            )
+        if len(anchor_hash) != 32:
+            raise BackfillError("anchor_hash must be 32 bytes")
+        self.floor_height = floor_height
+        self.anchor_hash = anchor_hash
+        self.network = network
+        self.headers: list[bytes] = []
+        self.committed = False
+
+    @property
+    def next_height(self) -> int:
+        """Height the next header would occupy."""
+        return len(self.headers)
+
+    def start_locator(self) -> list[bytes]:
+        """Locator for the getheaders that begins the walk.
+
+        Genesis alone: the peer's first unrecognised-successor rule then makes
+        it reply with height 1 onward. Once headers are buffered, the locator
+        becomes the last one we hold so a re-request resumes rather than
+        restarting.
+        """
+        if self.headers:
+            return [block_hash(self.headers[-1])]
+        expected_genesis = GENESIS_HASHES.get(self.network)
+        if expected_genesis is None:
+            raise BackfillError(f"unknown network {self.network!r}")
+        return [expected_genesis]
+
+    def accept(self, headers: Sequence[bytes]) -> int:
+        """Buffer a batch, checking linkage as it arrives. Returns how many were taken.
+
+        Headers already held are skipped (peers re-send overlapping ranges).
+        A header that does not link to the buffer is a hard error: the peer is
+        not serving our chain, and continuing would waste the whole walk.
+        Nothing reaches the database from here.
+        """
+        if self.committed:
+            raise BackfillError("backfill already committed")
+        taken = 0
+        for header in headers:
+            if len(header) != HEADER_SIZE:
+                raise BackfillError(
+                    f"header at height {self.next_height} is {len(header)} bytes"
+                )
+            if self.next_height > self.floor_height:
+                break
+            if not self.headers:
+                # First header must be genesis itself.
+                expected = GENESIS_HASHES.get(self.network)
+                if expected is None:
+                    raise BackfillError(f"unknown network {self.network!r}")
+                if block_hash(header) != expected:
+                    raise BackfillError(
+                        f"first backfill header is not {self.network} genesis: "
+                        f"{block_hash(header)[::-1].hex()}"
+                    )
+            else:
+                _, prev, _, _, _, _ = parse_header(header)
+                if prev != block_hash(self.headers[-1]):
+                    raise BackfillError(
+                        f"header at height {self.next_height} does not link to "
+                        f"the buffered chain"
+                    )
+            self.headers.append(header)
+            taken += 1
+            if self.is_complete():
+                break
+        return taken
+
+    def is_complete(self) -> bool:
+        """True once the buffer holds heights 0..floor_height-1.
+
+        The header AT the floor is already in the index — that is the anchor
+        the range must link into, not something to re-fetch.
+        """
+        return len(self.headers) >= self.floor_height
+
+    def progress(self) -> tuple[int, int]:
+        """``(buffered, target)`` for logging."""
+        return len(self.headers), self.floor_height
+
+    def commit(self, db, *, check_pow: bool = True) -> int:
+        """Verify the whole range, then write it. Returns rows written."""
+        if self.committed:
+            raise BackfillError("backfill already committed")
+        if not self.is_complete():
+            raise BackfillError(
+                f"refusing to commit an incomplete backfill "
+                f"({len(self.headers)}/{self.floor_height})"
+            )
+        written = backfill_metadata(
+            db,
+            self.headers,
+            start_height=0,
+            anchor_hash=self.anchor_hash,
+            network=self.network,
+            check_pow=check_pow,
+        )
+        self.committed = True
+        self.headers = []  # release ~76 MB at mainnet scale
+        return written

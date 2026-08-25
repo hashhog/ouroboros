@@ -291,3 +291,90 @@ def test_get_block_hash_by_height_fallback_returns_none_for_a_missing_block():
     db.get_block_by_height = lambda height: None
 
     assert db.get_block_hash_by_height(123) is None
+
+
+# ------------------------------------------------------------------- driver
+
+from ouroboros.header_backfill import HeaderBackfill  # noqa: E402
+
+
+def _genesis_chain(count: int):
+    """Real mainnet genesis followed by `count` synthetic linked headers."""
+    tail, anchor = make_chain(block_hash(MAINNET_GENESIS_HEADER), count)
+    return [MAINNET_GENESIS_HEADER] + tail, anchor
+
+
+class TestHeaderBackfillDriver:
+    def test_start_locator_is_genesis_then_resumes_from_the_buffer(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        assert bf.start_locator() == [GENESIS_HASHES["mainnet"]]
+        bf.accept(headers[:2])
+        # Re-request resumes rather than restarting the whole walk.
+        assert bf.start_locator() == [block_hash(headers[1])]
+
+    def test_accept_buffers_in_order_and_completes_at_the_floor(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        assert bf.accept(headers[:2]) == 2
+        assert not bf.is_complete()
+        assert bf.progress() == (2, 4)
+        bf.accept(headers[2:])
+        assert bf.is_complete()
+        assert bf.next_height == 4
+
+    def test_first_header_must_be_genesis(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        with pytest.raises(BackfillError, match="not mainnet genesis"):
+            bf.accept(headers[1:])
+
+    def test_a_batch_that_does_not_link_is_rejected(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf.accept(headers[:2])
+        with pytest.raises(BackfillError, match="does not link"):
+            bf.accept([make_header(b"\xee" * 32, 7777)])
+
+    def test_commit_refuses_while_incomplete(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf.accept(headers[:2])
+        db = FakeDB()
+        with pytest.raises(BackfillError, match="incomplete backfill"):
+            bf.commit(db, check_pow=False)
+        assert db.written == []
+
+    def test_commit_writes_every_height_and_releases_the_buffer(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf.accept(headers)
+        db = FakeDB()
+        assert bf.commit(db, check_pow=False) == 4
+        assert [row[0] for row in db.written] == [0, 1, 2, 3]
+        assert bf.committed
+        assert bf.headers == []  # ~76 MB released at mainnet scale
+
+    def test_commit_with_a_wrong_anchor_writes_nothing(self):
+        """A peer that serves a self-consistent chain that is not ours."""
+        headers, _ = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=b"\xab" * 32)
+        bf.accept(headers)
+        db = FakeDB()
+        with pytest.raises(BackfillError, match="does not reach the anchor"):
+            bf.commit(db, check_pow=False)
+        assert db.written == []
+        assert not bf.committed
+
+    def test_double_commit_is_refused(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf.accept(headers)
+        db = FakeDB()
+        bf.commit(db, check_pow=False)
+        with pytest.raises(BackfillError, match="already committed"):
+            bf.commit(db, check_pow=False)
+
+    def test_driver_requires_a_real_floor(self):
+        with pytest.raises(BackfillError, match="must be > 0"):
+            HeaderBackfill(floor_height=0, anchor_hash=bytes(32))
