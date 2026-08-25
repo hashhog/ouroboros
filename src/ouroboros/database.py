@@ -997,14 +997,21 @@ class BlockchainDatabase:
                 return None
             return bytes(block_hash)
         except Exception:
-            # Fallback: get block by height and extract hash
+            # Fallback: get block by height and extract hash.
+            #
+            # `h` used to be bound only inside `if block:`, so a falsy block
+            # fell through to `if h is None` with `h` unbound and raised
+            # UnboundLocalError out of a function whose contract is to return
+            # None when the block is absent — turning "not found" into a crash
+            # on the one path that exists to handle "not found". The trailing
+            # `return None` after the return was also unreachable.
             block = self.get_block_by_height(height)
-            if block:
-                h = getattr(block, "hash", None)
+            if not block:
+                return None
+            h = getattr(block, "hash", None)
             if h is None:
                 return None
             return bytes(h() if callable(h) else h)
-            return None
 
     def get_chainwork_by_height(self, height: int) -> int:
         """Return cumulative chainwork at *height* (from Rust metadata), or 0 if missing."""
