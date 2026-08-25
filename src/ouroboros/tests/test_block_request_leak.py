@@ -182,3 +182,52 @@ class TestBlockRequestLeak(unittest.IsolatedAsyncioTestCase):
 if __name__ == "__main__":
     asyncio.set_event_loop_policy(None)
     unittest.main()
+
+
+class TestLocatorWalkBounded(unittest.IsolatedAsyncioTestCase):
+    """`_build_locator` must stay O(log height) even with a SPARSE index.
+
+    Core doubles the locator step on vHave.size() (chain.cpp:34), and that is
+    equivalent to counting steps there because Core's block index is complete —
+    every probe appends. Ouroboros's index is not always complete: right after a
+    `loadtxoutset` the BLOCK_INDEX_CF has no rows for snapshot-loaded heights,
+    so every probe returns None, the locator never reaches 10 entries, and
+    gating the doubling on len(locator) left `step` at 1 forever — a walk over
+    EVERY height from the tip to genesis, rebuilt once a second during IBD.
+
+    Measured before the fix on a 952,076-height stub: ~950k probes per locator,
+    98.35 ms per handle_inv. After: 0.011 ms.
+    """
+
+    async def test_sparse_index_does_not_walk_the_whole_chain(self):
+        bs, peers = _fresh_block_sync()
+        probes = []
+        real = bs.db.get_block_hash_by_height
+
+        def counting(height):
+            probes.append(height)
+            return real(height)
+
+        bs.db.get_block_hash_by_height = counting
+        locator = bs._build_locator(bs.db._h)
+
+        # The stub answers only at the tip, so this is the fully-sparse case.
+        self.assertLessEqual(
+            len(probes), 250,
+            f"locator walked {len(probes)} heights on a sparse index — the "
+            f"step doubling is not engaging",
+        )
+        # Still produces a usable tip-anchored locator.
+        self.assertGreaterEqual(len(locator), 1)
+        self.assertEqual(locator[0], bs.db._tip)
+
+    async def test_dense_index_still_spaces_exponentially(self):
+        """With a complete index the walk is short AND well spaced."""
+        bs, peers = _fresh_block_sync()
+        tip_h = bs.db._h
+        dense = {h: _dsha(b"h%d" % h) for h in range(tip_h - 3000, tip_h + 1)}
+        bs.db.get_block_hash_by_height = lambda h: dense.get(h)
+        locator = bs._build_locator(tip_h)
+        # ~10 single steps then doubling => far fewer than 3000 entries.
+        self.assertLess(len(locator), 60)
+        self.assertGreater(len(locator), 5)

@@ -110,6 +110,13 @@ MAX_GETDATA_SZ = 1000
 # is torn down on FinalizeNode; there is no unbounded retain-and-retry queue.
 BLOCK_REQUEST_MAX_ATTEMPTS = 10
 
+# Hard bound on how many heights `_build_locator` will probe. A well-formed
+# locator is ~32 entries (tip, then 10 single steps, then exponential), so a
+# walk that has probed far past this is degenerate — which happens when the
+# block index is sparse and the doubling never engages. Without the bound the
+# walk is O(chain height) per locator.
+MAX_LOCATOR_PROBES = 200
+
 # H1 — connect-frontier priority re-request interval (seconds).
 #
 # The strictly-in-order block drain (``_drain_block_buffer_locked``) can only
@@ -5341,16 +5348,40 @@ class BlockSync:
 
         step = 1
         current_height = height - 1  # tip already added above
+        probes = 0
 
         while current_height > 0:
             block_hash = self.db.get_block_hash_by_height(current_height)
             if isinstance(block_hash, bytes) and len(block_hash) == 32:
                 if block_hash not in locator:
                     locator.append(block_hash)
+            probes += 1
 
             # Exponential spacing: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ...
-            if len(locator) >= 10:
+            #
+            # Gate the doubling on PROBES, not on len(locator). Core doubles
+            # on vHave.size() (chain.cpp:34) and the two are the same there
+            # because Core's block index is complete, so every step appends.
+            # Ours is not: right after a `loadtxoutset` the BLOCK_INDEX_CF has
+            # no rows for snapshot-loaded heights (see the note above), so
+            # every lookup returns None, the locator never reaches 10 entries,
+            # `step` stays 1 forever, and this loop walks EVERY height from the
+            # tip to genesis — ~950k database probes per locator, rebuilt once
+            # a second during IBD. Counting probes keeps the walk O(log height)
+            # no matter how sparse the index is.
+            if probes >= 10:
                 step *= 2
+
+            # Belt and braces: a locator is ~32 entries by construction, so a
+            # walk that has probed far past that is malformed however sparse
+            # the index is. Bound it rather than scanning the whole chain.
+            if probes > MAX_LOCATOR_PROBES:
+                logger.warning(
+                    "block locator walk hit the probe cap (%d) at height %d "
+                    "with %d entries — block index is sparse below the tip",
+                    MAX_LOCATOR_PROBES, current_height, len(locator),
+                )
+                break
 
             current_height -= step
 
