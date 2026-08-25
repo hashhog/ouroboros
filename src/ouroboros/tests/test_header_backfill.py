@@ -149,7 +149,22 @@ def test_find_index_floor_short_circuits_on_genesis_regardless_of_tip():
 
 def test_verify_chain_accepts_a_linked_range_that_reaches_the_anchor():
     headers, anchor = make_chain(bytes(32), 5)
-    verify_chain(headers, start_height=10, anchor_hash=anchor, check_pow=False)
+    verify_chain(headers, start_height=10, anchor_hash=anchor, check_pow=False,
+                 prev_anchor=bytes(32))
+
+
+def test_verify_chain_requires_a_lower_anchor_above_genesis():
+    """A non-genesis range with no prev_anchor is unpinned at its lower end."""
+    headers, anchor = make_chain(bytes(32), 5)
+    with pytest.raises(BackfillError, match="needs a prev_anchor"):
+        verify_chain(headers, start_height=10, anchor_hash=anchor, check_pow=False)
+
+
+def test_verify_chain_rejects_a_wrong_lower_anchor():
+    headers, anchor = make_chain(bytes(32), 5)
+    with pytest.raises(BackfillError, match="does not attach to the block below"):
+        verify_chain(headers, start_height=10, anchor_hash=anchor, check_pow=False,
+                     prev_anchor=b"\x5a" * 32)
 
 
 def test_verify_chain_rejects_a_broken_link():
@@ -157,14 +172,16 @@ def test_verify_chain_rejects_a_broken_link():
     # Repoint header 3 at nothing.
     headers[3] = make_header(b"\xee" * 32, 1003)
     with pytest.raises(BackfillError, match="does not link"):
-        verify_chain(headers, start_height=10, anchor_hash=anchor, check_pow=False)
+        verify_chain(headers, start_height=10, anchor_hash=anchor, check_pow=False,
+                     prev_anchor=bytes(32))
 
 
 def test_verify_chain_rejects_a_range_that_misses_the_anchor():
     # THE load-bearing check: a self-consistent chain that simply is not ours.
     headers, _ = make_chain(bytes(32), 5)
     with pytest.raises(BackfillError, match="does not reach the anchor"):
-        verify_chain(headers, start_height=10, anchor_hash=b"\xab" * 32, check_pow=False)
+        verify_chain(headers, start_height=10, anchor_hash=b"\xab" * 32,
+                     check_pow=False, prev_anchor=bytes(32))
 
 
 def test_verify_chain_rejects_a_wrong_genesis_at_height_zero():
@@ -193,7 +210,8 @@ def test_verify_chain_rejects_headers_failing_their_own_pow():
         relinked.append(h)
         prev = block_hash(h)
     with pytest.raises(BackfillError, match="does not meet its own target"):
-        verify_chain(relinked, start_height=10, anchor_hash=prev, check_pow=True)
+        verify_chain(relinked, start_height=10, anchor_hash=prev, check_pow=True,
+                     prev_anchor=bytes(32))
 
 
 def test_verify_chain_rejects_an_empty_range():
@@ -207,7 +225,8 @@ def test_backfill_writes_one_row_per_height_with_cumulative_chainwork():
     headers, anchor = make_chain(bytes(32), 4, first_timestamp=500)
     db = FakeDB()
     written = backfill_metadata(
-        db, headers, start_height=7, anchor_hash=anchor, check_pow=False
+        db, headers, start_height=7, anchor_hash=anchor, check_pow=False,
+        prev_anchor=bytes(32)
     )
     assert written == 4
     assert [row[0] for row in db.written] == [7, 8, 9, 10]
@@ -225,7 +244,7 @@ def test_backfill_honours_a_base_chainwork():
     db = FakeDB()
     backfill_metadata(
         db, headers, start_height=1, anchor_hash=anchor,
-        base_chainwork=1000, check_pow=False,
+        base_chainwork=1000, check_pow=False, prev_anchor=bytes(32),
     )
     unit = block_work(0x207FFFFF)
     assert [row[2] for row in db.written] == [1000 + unit, 1000 + 2 * unit]
@@ -240,7 +259,8 @@ def test_a_rejected_range_writes_nothing():
     headers[4] = make_header(b"\xee" * 32, 9999)
     db = FakeDB()
     with pytest.raises(BackfillError):
-        backfill_metadata(db, headers, start_height=1, anchor_hash=anchor, check_pow=False)
+        backfill_metadata(db, headers, start_height=1, anchor_hash=anchor,
+                          check_pow=False, prev_anchor=bytes(32))
     assert db.written == []
 
 
@@ -307,7 +327,7 @@ def _genesis_chain(count: int):
 class TestHeaderBackfillDriver:
     def test_start_locator_is_genesis_then_resumes_from_the_buffer(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         assert bf.start_locator() == [GENESIS_HASHES["mainnet"]]
         bf.accept(headers[:2])
         # Re-request resumes rather than restarting the whole walk.
@@ -315,7 +335,7 @@ class TestHeaderBackfillDriver:
 
     def test_accept_buffers_in_order_and_completes_at_the_floor(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         assert bf.accept(headers[:2]) == 2
         assert not bf.is_complete()
         assert bf.progress() == (2, 4)
@@ -325,20 +345,20 @@ class TestHeaderBackfillDriver:
 
     def test_first_header_must_be_genesis(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         with pytest.raises(BackfillError, match="not mainnet genesis"):
             bf.accept(headers[1:])
 
     def test_a_batch_that_does_not_link_is_rejected(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         bf.accept(headers[:2])
         with pytest.raises(BackfillError, match="does not link"):
             bf.accept([make_header(b"\xee" * 32, 7777)])
 
     def test_commit_refuses_while_incomplete(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         bf.accept(headers[:2])
         db = FakeDB()
         with pytest.raises(BackfillError, match="incomplete backfill"):
@@ -347,7 +367,7 @@ class TestHeaderBackfillDriver:
 
     def test_commit_writes_every_height_and_releases_the_buffer(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         bf.accept(headers)
         db = FakeDB()
         assert bf.commit(db, check_pow=False) == 4
@@ -358,7 +378,7 @@ class TestHeaderBackfillDriver:
     def test_commit_with_a_wrong_anchor_writes_nothing(self):
         """A peer that serves a self-consistent chain that is not ours."""
         headers, _ = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=b"\xab" * 32)
+        bf = HeaderBackfill(0, 4, b"\xab" * 32)
         bf.accept(headers)
         db = FakeDB()
         with pytest.raises(BackfillError, match="does not reach the anchor"):
@@ -368,16 +388,41 @@ class TestHeaderBackfillDriver:
 
     def test_double_commit_is_refused(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         bf.accept(headers)
         db = FakeDB()
         bf.commit(db, check_pow=False)
         with pytest.raises(BackfillError, match="already committed"):
             bf.commit(db, check_pow=False)
 
-    def test_driver_requires_a_real_floor(self):
-        with pytest.raises(BackfillError, match="must be > 0"):
-            HeaderBackfill(floor_height=0, anchor_hash=bytes(32))
+    def test_driver_rejects_an_empty_range(self):
+        with pytest.raises(BackfillError, match="empty range"):
+            HeaderBackfill(5, 5, bytes(32))
+
+    def test_driver_requires_a_lower_anchor_above_genesis(self):
+        with pytest.raises(BackfillError, match="needs a 32-byte prev_anchor"):
+            HeaderBackfill(108, 200, bytes(32))
+
+    def test_mid_chain_gap_walks_from_the_lower_anchor(self):
+        """The live shape: a gap that does NOT start at genesis."""
+        lower = b"\x5a" * 32
+        headers, upper = make_chain(lower, 4)
+        bf = HeaderBackfill(108, 112, upper, prev_anchor=lower)
+        assert bf.start_locator() == [lower]      # resume from the block below
+        assert bf.wants(headers)
+        assert bf.accept(headers) == 4
+        assert bf.is_complete()
+        assert bf.next_height == 112
+        db = FakeDB()
+        assert bf.commit(db, check_pow=False) == 4
+        assert [row[0] for row in db.written] == [108, 109, 110, 111]
+
+    def test_mid_chain_gap_rejects_a_batch_from_the_wrong_place(self):
+        lower = b"\x5a" * 32
+        _, upper = make_chain(lower, 4)
+        bf = HeaderBackfill(108, 112, upper, prev_anchor=lower)
+        elsewhere, _ = make_chain(b"\x99" * 32, 2)
+        assert not bf.wants(elsewhere)
 
 
 class TestHeaderBackfillRouting:
@@ -385,25 +430,25 @@ class TestHeaderBackfillRouting:
 
     def test_wants_genesis_batch_when_empty(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         assert bf.wants(headers)
 
     def test_does_not_want_an_unrelated_batch(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         unrelated, _ = make_chain(b"\x77" * 32, 2)
         assert not bf.wants(unrelated)
 
     def test_wants_the_continuation_after_a_partial_batch(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         bf.accept(headers[:2])
         assert bf.wants(headers[2:])
         assert not bf.wants(headers[:1])  # already-held prefix
 
     def test_wants_is_false_once_complete_or_committed(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         bf.accept(headers)
         assert not bf.wants(headers)     # complete
         bf.commit(FakeDB(), check_pow=False)
@@ -411,7 +456,46 @@ class TestHeaderBackfillRouting:
 
     def test_wants_is_non_mutating(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf = HeaderBackfill(0, 4, anchor)
         before = bf.next_height
         bf.wants(headers)
         assert bf.next_height == before
+
+
+# ------------------------------------------------------- find_missing_range
+
+from ouroboros.header_backfill import find_missing_range  # noqa: E402
+
+
+class TestFindMissingRange:
+    """The live index is 0..107 present, 108..944183 ABSENT, 944184..tip present.
+
+    `find_index_floor` modelled "empty below a floor", probed height 0, saw
+    genesis and returned 0 — so the backfill shipped inert. These pin the real
+    shape.
+    """
+
+    def test_none_when_contiguous(self):
+        assert find_missing_range(FakeDB(present_heights=range(0, 500)), 499) is None
+
+    def test_finds_the_live_mainnet_shape(self):
+        present = list(range(0, 108)) + list(range(944184, 964055))
+        db = FakeDB(present_heights=present)
+        assert find_missing_range(db, 964054) == (108, 944184)
+
+    def test_finds_a_gap_that_starts_at_genesis(self):
+        db = FakeDB(present_heights=range(948454, 964055))
+        assert find_missing_range(db, 964054) == (0, 948454)
+
+    def test_rejects_an_absent_tip(self):
+        with pytest.raises(BackfillError, match="tip height"):
+            find_missing_range(FakeDB(present_heights=range(0, 10)), 500)
+
+    def test_probe_budget_is_bounded(self):
+        present = list(range(0, 108)) + list(range(944184, 964055))
+        db = FakeDB(present_heights=present)
+        calls = []
+        real = db.get_block_hash_by_height
+        db.get_block_hash_by_height = lambda h: (calls.append(h), real(h))[1]
+        find_missing_range(db, 964054)
+        assert len(calls) < 100, f"{len(calls)} probes to find a gap in a 964k chain"

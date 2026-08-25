@@ -5332,45 +5332,64 @@ class BlockSync:
         has latched ``_backfill_done``. On a genesis-synced node the floor is 0
         and this is a single index probe, once.
         """
-        from ouroboros.header_backfill import HeaderBackfill, find_index_floor
+        from ouroboros.header_backfill import HeaderBackfill, find_missing_range
 
         if self._backfill_done or self._header_backfill is not None:
             return
         try:
             _, tip_height = self.db.get_best_block()
-            floor = find_index_floor(self.db, int(tip_height))
+            gap = find_missing_range(self.db, int(tip_height))
         except Exception as exc:
-            logger.warning("header backfill: could not determine index floor: %s", exc)
+            logger.warning("header backfill: could not survey the block index: %s", exc)
             self._backfill_done = True
             return
 
-        if floor <= 0:
+        if gap is None:
             self._backfill_done = True
             return
 
-        anchor = self.db.get_block_hash_by_height(floor)
+        start_height, end_height = gap
+
+        # Upper pin: the block already known AT end_height.
+        anchor = self.db.get_block_hash_by_height(end_height)
         if not isinstance(anchor, (bytes, bytearray)) or len(anchor) != 32:
             logger.warning(
-                "header backfill: no anchor hash at floor %d — cannot verify a "
-                "backfilled range without it; not starting", floor,
+                "header backfill: no anchor hash at height %d — a range cannot "
+                "be verified without one; not starting", end_height,
             )
             self._backfill_done = True
             return
 
+        # Lower pin: the block already known at start_height - 1. Only genesis
+        # ranges may omit it.
+        prev_anchor = None
+        if start_height > 0:
+            prev_anchor = self.db.get_block_hash_by_height(start_height - 1)
+            if not isinstance(prev_anchor, (bytes, bytearray)) or len(prev_anchor) != 32:
+                logger.warning(
+                    "header backfill: no anchor hash at height %d — the range's "
+                    "lower end would be unpinned; not starting", start_height - 1,
+                )
+                self._backfill_done = True
+                return
+            prev_anchor = bytes(prev_anchor)
+
         network = getattr(self.peer_manager, "network", "mainnet")
         try:
-            self._header_backfill = HeaderBackfill(floor, bytes(anchor), network)
+            self._header_backfill = HeaderBackfill(
+                start_height, end_height, bytes(anchor), prev_anchor, network,
+            )
         except Exception as exc:
             logger.warning("header backfill: refused to start: %s", exc)
             self._backfill_done = True
             return
 
         logger.warning(
-            "header backfill ARMED: block index floor is %d, so heights 0..%d "
-            "have no metadata and every BIP-68 relative TIME lock on a coin "
-            "confirmed below %d is currently being SKIPPED. Walking headers "
-            "from genesis to rebuild it.",
-            floor, floor - 1, floor,
+            "header backfill ARMED: the block index is MISSING heights %d..%d "
+            "(%d blocks). median-time-past cannot be computed there, so every "
+            "BIP-68 relative TIME lock on a coin confirmed in that range is "
+            "currently being SKIPPED. Walking headers to rebuild it.",
+            start_height, end_height - 1, end_height - start_height,
         )
 
     async def _request_backfill_headers(self, peer=None) -> None:

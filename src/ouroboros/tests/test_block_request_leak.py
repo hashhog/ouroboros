@@ -266,12 +266,42 @@ class TestHeaderBackfillWiring(unittest.IsolatedAsyncioTestCase):
         )
         return bs, peers, anchor, GENESIS_HASHES["mainnet"]
 
-    async def test_arms_when_the_index_has_a_floor(self):
+    async def test_arms_when_the_index_has_a_gap(self):
         bs, peers, anchor, _ = self._sync_with_floor(floor=4, tip_height=20)
         await bs._maybe_start_header_backfill()
         self.assertIsNotNone(bs._header_backfill)
-        self.assertEqual(bs._header_backfill.floor_height, 4)
+        self.assertEqual(bs._header_backfill.start_height, 0)
+        self.assertEqual(bs._header_backfill.end_height, 4)
         self.assertEqual(bs._header_backfill.anchor_hash, anchor)
+
+    async def test_arms_on_a_MID_CHAIN_gap_the_live_shape(self):
+        """0..107 present, 108..944183 absent, 944184..tip present.
+
+        This is the shape the live mainnet node actually has, and the shape the
+        original find_index_floor could not see: it probes height 0, finds
+        genesis, returns 0, and reports nothing to backfill.
+        """
+        bs, peers = _fresh_block_sync()
+        low = {h: _dsha(b"lo%d" % h) for h in range(0, 108)}
+        high = {h: _dsha(b"hi%d" % h) for h in range(944184, 964055)}
+
+        class GappyDB(_StubDB):
+            def get_best_block(self_inner):
+                return high[964054], 964054
+
+            def get_block_hash_by_height(self_inner, height):
+                return low.get(height) or high.get(height)
+
+        bs.db = GappyDB(high[964054], 964054)
+        await bs._maybe_start_header_backfill()
+        self.assertIsNotNone(bs._header_backfill, "must arm on a mid-chain gap")
+        self.assertEqual(bs._header_backfill.start_height, 108)
+        self.assertEqual(bs._header_backfill.end_height, 944184)
+        # Lower pin is the block at 107; upper pin is the block at 944184.
+        self.assertEqual(bs._header_backfill.prev_anchor, low[107])
+        self.assertEqual(bs._header_backfill.anchor_hash, high[944184])
+        # And the walk resumes from the block below the gap, not from genesis.
+        self.assertEqual(bs._header_backfill.start_locator(), [low[107]])
 
     async def test_does_not_arm_when_the_index_reaches_genesis(self):
         bs, peers, _, _ = self._sync_with_floor(floor=0, tip_height=20)

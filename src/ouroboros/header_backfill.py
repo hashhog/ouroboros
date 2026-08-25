@@ -178,6 +178,83 @@ def find_index_floor(db, tip_height: int) -> int:
     return present
 
 
+def find_missing_range(
+    db, tip_height: int, *, max_probes: int = 400
+) -> tuple[int, int] | None:
+    """Locate a gap in the block index: ``(first_absent, next_present)``.
+
+    Returns None when the index is contiguous from genesis to the tip.
+
+    This REPLACES the earlier ``find_index_floor``, whose model — "the index is
+    empty below some floor" — is simply not what a snapshot-loaded node looks
+    like. Measured on the live mainnet node:
+
+        heights 0..107      present
+        heights 108..944183 ABSENT      (944,076 heights)
+        heights 944184..tip present
+
+    ``find_index_floor`` probes height 0, finds genesis, returns 0, and the
+    caller concludes there is nothing to backfill. The backfill shipped inert
+    because of exactly that.
+
+    Method: exponential probe upward from 0 for the first absent height, binary
+    search to pin it, then binary search up to the tip for the next present
+    height. LIMITATION, stated because it is real: the exponential phase can
+    step over a gap narrower than its stride at that depth, so this finds a
+    LARGE gap reliably (the assumeUTXO case) and may miss a small one. It is a
+    detector for the snapshot hole, not a general index-integrity audit.
+    """
+    if tip_height < 0:
+        raise BackfillError(f"tip_height must be non-negative, got {tip_height}")
+
+    probes = 0
+
+    def present(h: int) -> bool:
+        nonlocal probes
+        probes += 1
+        if probes > max_probes:
+            raise BackfillError(f"find_missing_range exceeded {max_probes} probes")
+        v = db.get_block_hash_by_height(h)
+        return isinstance(v, (bytes, bytearray)) and len(v) == 32
+
+    if not present(tip_height):
+        raise BackfillError(
+            f"tip height {tip_height} is absent from the index — the index is "
+            "not usable as a reference"
+        )
+
+    if not present(0):
+        first_absent = 0
+    else:
+        lo, step, hi = 0, 1, None
+        while lo + step <= tip_height:
+            probe_at = lo + step
+            if present(probe_at):
+                lo = probe_at
+                step *= 2
+            else:
+                hi = probe_at
+                break
+        if hi is None:
+            return None  # contiguous all the way up
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if present(mid):
+                lo = mid
+            else:
+                hi = mid
+        first_absent = hi
+
+    lo2, hi2 = first_absent, tip_height  # lo2 absent, hi2 present
+    while hi2 - lo2 > 1:
+        mid = (lo2 + hi2) // 2
+        if present(mid):
+            hi2 = mid
+        else:
+            lo2 = mid
+    return (first_absent, hi2)
+
+
 def verify_chain(
     headers: Sequence[bytes],
     start_height: int,
@@ -185,6 +262,7 @@ def verify_chain(
     network: str = "mainnet",
     *,
     check_pow: bool = True,
+    prev_anchor: bytes | None = None,
 ) -> None:
     """Validate a contiguous header range before anything is written.
 
@@ -208,6 +286,23 @@ def verify_chain(
                 f"genesis mismatch for {network}: header 0 hashes to "
                 f"{actual[::-1].hex()}, expected {expected_genesis[::-1].hex()}"
             )
+    elif prev_anchor is not None:
+        # A range that does not start at genesis is pinned at its LOWER end by
+        # the block already known at start_height - 1, exactly as the upper end
+        # is pinned by anchor_hash. Both ends must be blocks we already trust,
+        # or the range is unanchored and a peer could substitute its own.
+        _, first_prev, _, _, _, _ = parse_header(headers[0])
+        if first_prev != prev_anchor:
+            raise BackfillError(
+                f"range does not attach to the block below it at height "
+                f"{start_height - 1}: header prev is {first_prev[::-1].hex()}, "
+                f"expected {prev_anchor[::-1].hex()}"
+            )
+    elif start_height > 0:
+        raise BackfillError(
+            f"a range starting at height {start_height} needs a prev_anchor — "
+            "without it the lower end is unpinned"
+        )
 
     prev_hash_of_previous = None
     for offset, header in enumerate(headers):
@@ -246,6 +341,7 @@ def backfill_metadata(
     *,
     base_chainwork: int = 0,
     check_pow: bool = True,
+    prev_anchor: bytes | None = None,
 ) -> int:
     """Verify then persist per-height metadata for ``headers``.
 
@@ -255,7 +351,10 @@ def backfill_metadata(
 
     Verification runs to completion FIRST, so a bad range writes nothing.
     """
-    verify_chain(headers, start_height, anchor_hash, network, check_pow=check_pow)
+    verify_chain(
+        headers, start_height, anchor_hash, network,
+        check_pow=check_pow, prev_anchor=prev_anchor,
+    )
 
     chainwork = base_chainwork
     written = 0
@@ -285,89 +384,124 @@ def missing_mtp_heights(db, heights: Iterable[int]) -> list[int]:
 
 
 class HeaderBackfill:
-    """Drives a genesis-to-floor header walk and commits it in one shot.
+    """Drives a header walk over ONE gap in the block index and commits it whole.
 
     Lifecycle, deliberately all-or-nothing:
 
-      1. ``start_locator()`` — the caller sends a getheaders whose locator is
-         this value, so the peer replies from genesis forward.
-      2. ``accept(headers)`` — feed each batch in order. Batches are buffered
-         and linkage-checked incrementally so a lying peer is dropped early,
-         but NOTHING is written yet.
-      3. ``is_complete()`` becomes true once the buffer reaches the floor.
-      4. ``commit(db)`` — re-verifies the WHOLE range (genesis anchor, full
-         linkage, floor anchor, per-header PoW) and only then writes.
+      1. ``start_locator()`` — the caller sends a getheaders with this locator,
+         so the peer replies from ``start_height`` forward.
+      2. ``accept(headers)`` — feed batches in order. They are buffered and
+         linkage-checked incrementally so a lying peer is dropped early, but
+         NOTHING is written yet.
+      3. ``is_complete()`` becomes true once the buffer spans the gap.
+      4. ``commit(db)`` — re-verifies the WHOLE range (lower anchor or genesis,
+         full linkage, upper anchor, per-header PoW) and only then writes.
 
-    Buffering the entire range before writing is the point, not an oversight.
-    ``verify_chain`` pins the range at both ends; a chunk-at-a-time writer
-    could only pin the near end, so a peer that fed a good prefix and then
-    diverged would leave committed rows behind. At mainnet scale the buffer is
-    ~948k * 80 B = ~76 MB, which is worth paying once at startup for a range
-    that is then permanent.
+    Buffering the entire range before writing is the point. ``verify_chain``
+    pins the range at BOTH ends; a chunk-at-a-time writer could only pin the
+    near end, so a peer that fed a good prefix and then diverged would leave
+    committed rows behind. At mainnet scale the buffer is ~944k * 80 B =
+    ~76 MB, paid once for a range that is then permanent, and released on
+    commit.
 
-    The driver is transport-free — the caller owns getheaders and message
-    routing — so the state machine is unit-testable without a network.
+    The range is ``[start_height, end_height)``. ``anchor_hash`` is the block
+    already known AT ``end_height`` (the upper pin); ``prev_anchor`` is the
+    block already known at ``start_height - 1`` (the lower pin), and is
+    required unless the range starts at genesis.
+
+    Transport-free — the caller owns getheaders and message routing — so the
+    state machine is unit-testable without a network.
     """
 
-    def __init__(self, floor_height: int, anchor_hash: bytes, network: str = "mainnet"):
-        if floor_height <= 0:
+    def __init__(
+        self,
+        start_height: int,
+        end_height: int,
+        anchor_hash: bytes,
+        prev_anchor: bytes | None = None,
+        network: str = "mainnet",
+    ):
+        if start_height < 0:
+            raise BackfillError(f"start_height must be >= 0, got {start_height}")
+        if end_height <= start_height:
             raise BackfillError(
-                f"floor_height must be > 0 to have anything to backfill, got {floor_height}"
+                f"empty range: end_height {end_height} <= start_height {start_height}"
             )
         if len(anchor_hash) != 32:
             raise BackfillError("anchor_hash must be 32 bytes")
-        self.floor_height = floor_height
+        if start_height > 0 and (prev_anchor is None or len(prev_anchor) != 32):
+            raise BackfillError(
+                f"a range starting at height {start_height} needs a 32-byte "
+                "prev_anchor — without it the lower end is unpinned"
+            )
+        self.start_height = start_height
+        self.end_height = end_height
         self.anchor_hash = anchor_hash
+        self.prev_anchor = prev_anchor
         self.network = network
         self.headers: list[bytes] = []
         self.committed = False
 
     @property
+    def target(self) -> int:
+        """How many headers span the gap."""
+        return self.end_height - self.start_height
+
+    @property
     def next_height(self) -> int:
         """Height the next header would occupy."""
-        return len(self.headers)
+        return self.start_height + len(self.headers)
+
+    def _expected_prev(self) -> bytes | None:
+        """Hash the next header's ``prev`` must equal, or None at genesis."""
+        if self.headers:
+            return block_hash(self.headers[-1])
+        if self.start_height == 0:
+            return None
+        return self.prev_anchor
 
     def start_locator(self) -> list[bytes]:
-        """Locator for the getheaders that begins the walk.
+        """Locator for the getheaders that advances the walk.
 
-        Genesis alone: the peer's first unrecognised-successor rule then makes
-        it reply with height 1 onward. Once headers are buffered, the locator
-        becomes the last one we hold so a re-request resumes rather than
-        restarting.
+        A locator names blocks we HAVE; the peer replies with their successors.
+        So the entry is the block below the next height we need — which makes a
+        re-request resume rather than restart.
         """
         if self.headers:
             return [block_hash(self.headers[-1])]
-        expected_genesis = GENESIS_HASHES.get(self.network)
-        if expected_genesis is None:
-            raise BackfillError(f"unknown network {self.network!r}")
-        return [expected_genesis]
+        if self.start_height == 0:
+            expected_genesis = GENESIS_HASHES.get(self.network)
+            if expected_genesis is None:
+                raise BackfillError(f"unknown network {self.network!r}")
+            return [expected_genesis]
+        return [self.prev_anchor]
 
     def wants(self, headers: Sequence[bytes]) -> bool:
-        """True iff this batch continues the backfill — non-mutating.
+        """True iff this batch continues the walk — non-mutating.
 
         The caller needs this to decide ROUTING before committing to a batch:
-        `accept` raises on a mismatch, which is right for a backfill batch and
-        wrong for an ordinary sync batch that merely happens to arrive while a
-        backfill is in flight. Checking first keeps the two paths from
-        stealing each other's headers.
+        ``accept`` raises on a mismatch, which is right for a backfill batch and
+        wrong for an ordinary sync batch that merely arrives while a backfill is
+        in flight. Checking first keeps the two paths from stealing each other's
+        headers.
         """
         if self.committed or self.is_complete() or not headers:
             return False
         first = headers[0]
         if len(first) != HEADER_SIZE:
             return False
-        if not self.headers:
+        expected_prev = self._expected_prev()
+        if expected_prev is None:
             return block_hash(first) == GENESIS_HASHES.get(self.network)
         _, prev, _, _, _, _ = parse_header(first)
-        return prev == block_hash(self.headers[-1])
+        return prev == expected_prev
 
     def accept(self, headers: Sequence[bytes]) -> int:
         """Buffer a batch, checking linkage as it arrives. Returns how many were taken.
 
-        Headers already held are skipped (peers re-send overlapping ranges).
-        A header that does not link to the buffer is a hard error: the peer is
-        not serving our chain, and continuing would waste the whole walk.
-        Nothing reaches the database from here.
+        A header that does not link is a hard error: the peer is not serving our
+        chain and continuing would waste the walk. Nothing reaches the database
+        from here.
         """
         if self.committed:
             raise BackfillError("backfill already committed")
@@ -377,10 +511,10 @@ class HeaderBackfill:
                 raise BackfillError(
                     f"header at height {self.next_height} is {len(header)} bytes"
                 )
-            if self.next_height > self.floor_height:
+            if self.is_complete():
                 break
-            if not self.headers:
-                # First header must be genesis itself.
+            expected_prev = self._expected_prev()
+            if expected_prev is None:
                 expected = GENESIS_HASHES.get(self.network)
                 if expected is None:
                     raise BackfillError(f"unknown network {self.network!r}")
@@ -391,45 +525,45 @@ class HeaderBackfill:
                     )
             else:
                 _, prev, _, _, _, _ = parse_header(header)
-                if prev != block_hash(self.headers[-1]):
+                if prev != expected_prev:
                     raise BackfillError(
                         f"header at height {self.next_height} does not link to "
                         f"the buffered chain"
                     )
             self.headers.append(header)
             taken += 1
-            if self.is_complete():
-                break
         return taken
 
     def is_complete(self) -> bool:
-        """True once the buffer holds heights 0..floor_height-1.
+        """True once the buffer spans ``[start_height, end_height)``.
 
-        The header AT the floor is already in the index — that is the anchor
+        The header AT ``end_height`` is already in the index — it is the anchor
         the range must link into, not something to re-fetch.
         """
-        return len(self.headers) >= self.floor_height
+        return len(self.headers) >= self.target
 
     def progress(self) -> tuple[int, int]:
         """``(buffered, target)`` for logging."""
-        return len(self.headers), self.floor_height
+        return len(self.headers), self.target
 
-    def commit(self, db, *, check_pow: bool = True) -> int:
+    def commit(self, db, *, check_pow: bool = True, base_chainwork: int = 0) -> int:
         """Verify the whole range, then write it. Returns rows written."""
         if self.committed:
             raise BackfillError("backfill already committed")
         if not self.is_complete():
             raise BackfillError(
                 f"refusing to commit an incomplete backfill "
-                f"({len(self.headers)}/{self.floor_height})"
+                f"({len(self.headers)}/{self.target})"
             )
         written = backfill_metadata(
             db,
             self.headers,
-            start_height=0,
+            start_height=self.start_height,
             anchor_hash=self.anchor_hash,
             network=self.network,
             check_pow=check_pow,
+            prev_anchor=self.prev_anchor,
+            base_chainwork=base_chainwork,
         )
         self.committed = True
         self.headers = []  # release ~76 MB at mainnet scale
