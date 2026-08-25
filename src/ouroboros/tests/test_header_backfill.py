@@ -327,7 +327,7 @@ def _genesis_chain(count: int):
 class TestHeaderBackfillDriver:
     def test_start_locator_is_genesis_then_resumes_from_the_buffer(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         assert bf.start_locator() == [GENESIS_HASHES["mainnet"]]
         bf.accept(headers[:2])
         # Re-request resumes rather than restarting the whole walk.
@@ -335,7 +335,7 @@ class TestHeaderBackfillDriver:
 
     def test_accept_buffers_in_order_and_completes_at_the_floor(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         assert bf.accept(headers[:2]) == 2
         assert not bf.is_complete()
         assert bf.progress() == (2, 4)
@@ -345,20 +345,20 @@ class TestHeaderBackfillDriver:
 
     def test_first_header_must_be_genesis(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         with pytest.raises(BackfillError, match="not mainnet genesis"):
             bf.accept(headers[1:])
 
     def test_a_batch_that_does_not_link_is_rejected(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         bf.accept(headers[:2])
         with pytest.raises(BackfillError, match="does not link"):
             bf.accept([make_header(b"\xee" * 32, 7777)])
 
     def test_commit_refuses_while_incomplete(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         bf.accept(headers[:2])
         db = FakeDB()
         with pytest.raises(BackfillError, match="incomplete backfill"):
@@ -367,7 +367,7 @@ class TestHeaderBackfillDriver:
 
     def test_commit_writes_every_height_and_releases_the_buffer(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         bf.accept(headers)
         db = FakeDB()
         assert bf.commit(db, check_pow=False) == 4
@@ -378,7 +378,7 @@ class TestHeaderBackfillDriver:
     def test_commit_with_a_wrong_anchor_writes_nothing(self):
         """A peer that serves a self-consistent chain that is not ours."""
         headers, _ = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, b"\xab" * 32)
+        bf = HeaderBackfill(0, 3, b"\xab" * 32)
         bf.accept(headers)
         db = FakeDB()
         with pytest.raises(BackfillError, match="does not reach the anchor"):
@@ -388,7 +388,7 @@ class TestHeaderBackfillDriver:
 
     def test_double_commit_is_refused(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         bf.accept(headers)
         db = FakeDB()
         bf.commit(db, check_pow=False)
@@ -407,7 +407,7 @@ class TestHeaderBackfillDriver:
         """The live shape: a gap that does NOT start at genesis."""
         lower = b"\x5a" * 32
         headers, upper = make_chain(lower, 4)
-        bf = HeaderBackfill(108, 112, upper, prev_anchor=lower)
+        bf = HeaderBackfill(108, 111, upper, prev_anchor=lower)
         assert bf.start_locator() == [lower]      # resume from the block below
         assert bf.wants(headers)
         assert bf.accept(headers) == 4
@@ -420,7 +420,7 @@ class TestHeaderBackfillDriver:
     def test_mid_chain_gap_rejects_a_batch_from_the_wrong_place(self):
         lower = b"\x5a" * 32
         _, upper = make_chain(lower, 4)
-        bf = HeaderBackfill(108, 112, upper, prev_anchor=lower)
+        bf = HeaderBackfill(108, 111, upper, prev_anchor=lower)
         elsewhere, _ = make_chain(b"\x99" * 32, 2)
         assert not bf.wants(elsewhere)
 
@@ -430,25 +430,25 @@ class TestHeaderBackfillRouting:
 
     def test_wants_genesis_batch_when_empty(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         assert bf.wants(headers)
 
     def test_does_not_want_an_unrelated_batch(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         unrelated, _ = make_chain(b"\x77" * 32, 2)
         assert not bf.wants(unrelated)
 
     def test_wants_the_continuation_after_a_partial_batch(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         bf.accept(headers[:2])
         assert bf.wants(headers[2:])
         assert not bf.wants(headers[:1])  # already-held prefix
 
     def test_wants_is_false_once_complete_or_committed(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         bf.accept(headers)
         assert not bf.wants(headers)     # complete
         bf.commit(FakeDB(), check_pow=False)
@@ -456,7 +456,7 @@ class TestHeaderBackfillRouting:
 
     def test_wants_is_non_mutating(self):
         headers, anchor = _genesis_chain(3)
-        bf = HeaderBackfill(0, 4, anchor)
+        bf = HeaderBackfill(0, 3, anchor)
         before = bf.next_height
         bf.wants(headers)
         assert bf.next_height == before
@@ -499,3 +499,23 @@ class TestFindMissingRange:
         db.get_block_hash_by_height = lambda h: (calls.append(h), real(h))[1]
         find_missing_range(db, 964054)
         assert len(calls) < 100, f"{len(calls)} probes to find a gap in a 964k chain"
+
+
+def test_walk_includes_the_anchor_block_itself():
+    """Regression: the walk must run THROUGH end_height, not stop below it.
+
+    verify_chain asserts hash(last header) == anchor_hash, and the anchor is the
+    block AT end_height. Stopping at end_height-1 compares one block's hash to
+    the next block's hash and can never match — live mainnet failed with
+    "range does not reach the anchor at height 944184" after buffering all
+    944,076 gap headers.
+    """
+    lower = b"\x5a" * 32
+    headers, last_hash = make_chain(lower, 5)     # heights 108..112
+    bf = HeaderBackfill(108, 112, last_hash, prev_anchor=lower)
+    assert bf.target == 5, "must buffer through end_height inclusive"
+    assert bf.accept(headers) == 5
+    assert bf.is_complete()
+    db = FakeDB()
+    assert bf.commit(db, check_pow=False) == 5
+    assert [row[0] for row in db.written] == [108, 109, 110, 111, 112]

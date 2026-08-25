@@ -444,8 +444,25 @@ class HeaderBackfill:
 
     @property
     def target(self) -> int:
-        """How many headers span the gap."""
-        return self.end_height - self.start_height
+        """How many headers the walk must buffer.
+
+        The gap is ``[start_height, end_height)`` — but the walk deliberately
+        runs one header PAST it, through ``end_height`` itself, so the range
+        ends on a block whose hash we already know from the index.
+
+        That extra header is what makes the upper pin checkable. `verify_chain`
+        asserts hash(last header) == anchor_hash; the anchor is the block AT
+        ``end_height``, so stopping at ``end_height - 1`` compares the hash of
+        one block against the hash of the next and can never match. The live
+        run failed exactly there: "range does not reach the anchor at height
+        944184". The unit tests missed it because `make_chain` hands back the
+        last header's own hash, which I then passed as the anchor — internally
+        consistent, and wrong about a real chain.
+
+        Re-writing the row at ``end_height`` is harmless: it is the same block
+        with the same metadata that is already indexed.
+        """
+        return self.end_height - self.start_height + 1
 
     @property
     def next_height(self) -> int:
@@ -535,10 +552,11 @@ class HeaderBackfill:
         return taken
 
     def is_complete(self) -> bool:
-        """True once the buffer spans ``[start_height, end_height)``.
+        """True once the buffer spans ``[start_height, end_height]`` inclusive.
 
-        The header AT ``end_height`` is already in the index — it is the anchor
-        the range must link into, not something to re-fetch.
+        The header AT ``end_height`` IS fetched: it is the block whose hash the
+        index already holds, so ending the range on it is what lets the upper
+        pin be verified at all. See `target`.
         """
         return len(self.headers) >= self.target
 

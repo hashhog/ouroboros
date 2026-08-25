@@ -317,13 +317,15 @@ class TestHeaderBackfillWiring(unittest.IsolatedAsyncioTestCase):
         tail, anchor = thb.make_chain(bh(thb.MAINNET_GENESIS_HEADER), 3)
         headers = [thb.MAINNET_GENESIS_HEADER] + tail
 
-        bs, peers, _, _ = self._sync_with_floor(floor=4, tip_height=20)
+        # Gap is [0,3] INCLUSIVE — the walk runs through end_height so the
+        # last header is the block whose hash the index already holds.
+        bs, peers, _, _ = self._sync_with_floor(floor=3, tip_height=20)
         # The driver takes its genesis anchor from peer_manager.network; this
         # fixture serves the real MAINNET genesis, so the manager must agree.
         # (The stub defaults to regtest, which correctly made wants() decline.)
         bs.peer_manager.network = "mainnet"
         bs.db.get_block_hash_by_height = (
-            lambda height: None if height < 4 else (anchor if height == 4 else _dsha(b"x"))
+            lambda height: None if height < 3 else (anchor if height == 3 else _dsha(b"x"))
         )
         await bs._maybe_start_header_backfill()
         self.assertIsNotNone(bs._header_backfill)
