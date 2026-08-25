@@ -378,3 +378,40 @@ class TestHeaderBackfillDriver:
     def test_driver_requires_a_real_floor(self):
         with pytest.raises(BackfillError, match="must be > 0"):
             HeaderBackfill(floor_height=0, anchor_hash=bytes(32))
+
+
+class TestHeaderBackfillRouting:
+    """`wants()` must not steal ordinary sync batches, or be stolen from."""
+
+    def test_wants_genesis_batch_when_empty(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        assert bf.wants(headers)
+
+    def test_does_not_want_an_unrelated_batch(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        unrelated, _ = make_chain(b"\x77" * 32, 2)
+        assert not bf.wants(unrelated)
+
+    def test_wants_the_continuation_after_a_partial_batch(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf.accept(headers[:2])
+        assert bf.wants(headers[2:])
+        assert not bf.wants(headers[:1])  # already-held prefix
+
+    def test_wants_is_false_once_complete_or_committed(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        bf.accept(headers)
+        assert not bf.wants(headers)     # complete
+        bf.commit(FakeDB(), check_pow=False)
+        assert not bf.wants(headers)     # committed
+
+    def test_wants_is_non_mutating(self):
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(floor_height=4, anchor_hash=anchor)
+        before = bf.next_height
+        bf.wants(headers)
+        assert bf.next_height == before

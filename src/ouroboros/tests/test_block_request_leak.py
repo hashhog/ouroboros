@@ -231,3 +231,94 @@ class TestLocatorWalkBounded(unittest.IsolatedAsyncioTestCase):
         # ~10 single steps then doubling => far fewer than 3000 entries.
         self.assertLess(len(locator), 60)
         self.assertGreater(len(locator), 5)
+
+
+class TestHeaderBackfillWiring(unittest.IsolatedAsyncioTestCase):
+    """block_sync must arm the #52 backfill and route below-floor headers to it.
+
+    Without the routing these headers are ~950k below the active tip, so the
+    normal connect path classifies them as unconnecting and drops them — the
+    backfill would never receive a single header.
+    """
+
+    def _sync_with_floor(self, floor: int, tip_height: int):
+        from ouroboros.header_backfill import GENESIS_HASHES
+
+        bs, peers = _fresh_block_sync()
+        anchor = _dsha(b"anchor-at-floor")
+        tip = _dsha(b"tip")
+
+        class FloorDB(_StubDB):
+            def get_best_block(self_inner):
+                return tip, tip_height
+
+            def get_block_hash_by_height(self_inner, height):
+                if height < floor:
+                    return None          # snapshot-loaded: no rows below base
+                if height == floor:
+                    return anchor
+                return _dsha(b"h%d" % height)
+
+        bs.db = FloorDB(tip, tip_height)
+        bs.db.written = []
+        bs.db.store_block_metadata_persistent = (
+            lambda h, bh, cw, ts: bs.db.written.append((h, bh, cw, ts))
+        )
+        return bs, peers, anchor, GENESIS_HASHES["mainnet"]
+
+    async def test_arms_when_the_index_has_a_floor(self):
+        bs, peers, anchor, _ = self._sync_with_floor(floor=4, tip_height=20)
+        await bs._maybe_start_header_backfill()
+        self.assertIsNotNone(bs._header_backfill)
+        self.assertEqual(bs._header_backfill.floor_height, 4)
+        self.assertEqual(bs._header_backfill.anchor_hash, anchor)
+
+    async def test_does_not_arm_when_the_index_reaches_genesis(self):
+        bs, peers, _, _ = self._sync_with_floor(floor=0, tip_height=20)
+        await bs._maybe_start_header_backfill()
+        self.assertIsNone(bs._header_backfill)
+        self.assertTrue(bs._backfill_done)  # latched: no repeated probing
+
+    async def test_routes_below_floor_headers_and_commits_at_the_anchor(self):
+        from ouroboros.header_backfill import block_hash as bh
+        import ouroboros.tests.test_header_backfill as thb
+
+        # A real genesis + 3 synthetic headers; the 4th links to the anchor.
+        tail, anchor = thb.make_chain(bh(thb.MAINNET_GENESIS_HEADER), 3)
+        headers = [thb.MAINNET_GENESIS_HEADER] + tail
+
+        bs, peers, _, _ = self._sync_with_floor(floor=4, tip_height=20)
+        # The driver takes its genesis anchor from peer_manager.network; this
+        # fixture serves the real MAINNET genesis, so the manager must agree.
+        # (The stub defaults to regtest, which correctly made wants() decline.)
+        bs.peer_manager.network = "mainnet"
+        bs.db.get_block_hash_by_height = (
+            lambda height: None if height < 4 else (anchor if height == 4 else _dsha(b"x"))
+        )
+        await bs._maybe_start_header_backfill()
+        self.assertIsNotNone(bs._header_backfill)
+        bs._header_backfill.anchor_hash = anchor
+
+        # Disable PoW for synthetic headers; the anchor check still applies.
+        orig_commit = bs._header_backfill.commit
+        bs._header_backfill.commit = lambda db, **kw: orig_commit(db, check_pow=False)
+
+        consumed = await bs._consume_backfill_headers(headers, peers[0])
+        self.assertTrue(consumed, "below-floor batch must be routed to the backfill")
+        self.assertEqual([row[0] for row in bs.db.written], [0, 1, 2, 3])
+        self.assertTrue(bs._backfill_done)
+        self.assertIsNone(bs._header_backfill)
+
+    async def test_ordinary_sync_batch_is_not_swallowed(self):
+        """An unrelated batch arriving mid-backfill must fall through."""
+        bs, peers, _, _ = self._sync_with_floor(floor=4, tip_height=20)
+        await bs._maybe_start_header_backfill()
+        self.assertIsNotNone(bs._header_backfill)
+        unrelated = [
+            b"\x01\x00\x00\x00" + b"\x99" * 32 + bytes(32)
+            + (1234).to_bytes(4, "little") + (0x207FFFFF).to_bytes(4, "little")
+            + bytes(4)
+        ]
+        consumed = await bs._consume_backfill_headers(unrelated, peers[0])
+        self.assertFalse(consumed, "ordinary sync headers must not be consumed")
+        self.assertEqual(bs.db.written, [])

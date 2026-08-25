@@ -342,6 +342,25 @@ class HeaderBackfill:
             raise BackfillError(f"unknown network {self.network!r}")
         return [expected_genesis]
 
+    def wants(self, headers: Sequence[bytes]) -> bool:
+        """True iff this batch continues the backfill — non-mutating.
+
+        The caller needs this to decide ROUTING before committing to a batch:
+        `accept` raises on a mismatch, which is right for a backfill batch and
+        wrong for an ordinary sync batch that merely happens to arrive while a
+        backfill is in flight. Checking first keeps the two paths from
+        stealing each other's headers.
+        """
+        if self.committed or self.is_complete() or not headers:
+            return False
+        first = headers[0]
+        if len(first) != HEADER_SIZE:
+            return False
+        if not self.headers:
+            return block_hash(first) == GENESIS_HASHES.get(self.network)
+        _, prev, _, _, _, _ = parse_header(first)
+        return prev == block_hash(self.headers[-1])
+
     def accept(self, headers: Sequence[bytes]) -> int:
         """Buffer a batch, checking linkage as it arrives. Returns how many were taken.
 

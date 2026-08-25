@@ -467,6 +467,14 @@ class BlockSync:
         # Max blocks to have in-flight at once during headers-first sync.
         self._max_blocks_in_flight: int = 256
 
+        # assumeUTXO header-metadata backfill (#52). A snapshot-bootstrapped
+        # node has no block index below the snapshot base, so
+        # get_median_time_past cannot compute an MTP for any older height and
+        # every BIP-68 relative TIME lock on a pre-floor coin is silently
+        # satisfied. Populated lazily by _maybe_start_header_backfill.
+        self._header_backfill = None
+        self._backfill_done: bool = False
+
         # Per-peer counter of consecutive unconnecting-headers messages.
         # Mirrors Bitcoin Core's ``nUnconnectingHeaders`` accounting in
         # ``net_processing.cpp::ProcessHeadersMessage``.  Keyed by peer
@@ -1191,6 +1199,16 @@ class BlockSync:
             try:
                 # Register handlers for any new peers
                 self._register_new_peers()
+
+                # assumeUTXO header-metadata backfill (#52). Idempotent and
+                # cheap once latched: on a genesis-synced node this is a single
+                # index probe on the first tick and nothing thereafter. Driven
+                # from here rather than start() so it survives a peer set that
+                # is empty at startup.
+                if not self._backfill_done:
+                    await self._maybe_start_header_backfill()
+                    if self._header_backfill is not None:
+                        await self._request_backfill_headers()
 
                 # Check if we're behind
                 best_hash, best_height = self.db.get_best_block()
@@ -3504,6 +3522,16 @@ class BlockSync:
 
             logger.info(f"Received {len(headers_msg.headers)} headers from {peer.host}:{peer.port}")
 
+            # assumeUTXO backfill (#52): these headers sit ~950k below the
+            # active tip, so the normal connect path would classify them as
+            # unconnecting and discard them. Route them to the backfill FIRST;
+            # `wants()` is non-mutating so an ordinary sync batch falls through
+            # untouched.
+            if self._header_backfill is not None:
+                raw_headers = [h.serialize() for h in headers_msg.headers]
+                if await self._consume_backfill_headers(raw_headers, peer):
+                    return
+
             # QUEUE-ANCHOR INVARIANT (must hold before ANY height is derived).
             # Every header height below is computed positionally from the
             # queue: slot i == db_tip_height + 1 + i.  If slot 0 no longer
@@ -5296,6 +5324,119 @@ class BlockSync:
         except Exception as e:
             logger.error(f"Error in catch_up: {e}")
             peer.adjust_score(-2)
+
+    async def _maybe_start_header_backfill(self) -> None:
+        """Arm the pre-snapshot header backfill if the block index has a floor.
+
+        Cheap and idempotent: after the first call it either holds a driver or
+        has latched ``_backfill_done``. On a genesis-synced node the floor is 0
+        and this is a single index probe, once.
+        """
+        from ouroboros.header_backfill import HeaderBackfill, find_index_floor
+
+        if self._backfill_done or self._header_backfill is not None:
+            return
+        try:
+            _, tip_height = self.db.get_best_block()
+            floor = find_index_floor(self.db, int(tip_height))
+        except Exception as exc:
+            logger.warning("header backfill: could not determine index floor: %s", exc)
+            self._backfill_done = True
+            return
+
+        if floor <= 0:
+            self._backfill_done = True
+            return
+
+        anchor = self.db.get_block_hash_by_height(floor)
+        if not isinstance(anchor, (bytes, bytearray)) or len(anchor) != 32:
+            logger.warning(
+                "header backfill: no anchor hash at floor %d — cannot verify a "
+                "backfilled range without it; not starting", floor,
+            )
+            self._backfill_done = True
+            return
+
+        network = getattr(self.peer_manager, "network", "mainnet")
+        try:
+            self._header_backfill = HeaderBackfill(floor, bytes(anchor), network)
+        except Exception as exc:
+            logger.warning("header backfill: refused to start: %s", exc)
+            self._backfill_done = True
+            return
+
+        logger.warning(
+            "header backfill ARMED: block index floor is %d, so heights 0..%d "
+            "have no metadata and every BIP-68 relative TIME lock on a coin "
+            "confirmed below %d is currently being SKIPPED. Walking headers "
+            "from genesis to rebuild it.",
+            floor, floor - 1, floor,
+        )
+
+    async def _request_backfill_headers(self, peer=None) -> None:
+        """Send the getheaders that advances the backfill walk."""
+        bf = self._header_backfill
+        if bf is None or bf.is_complete():
+            return
+        if peer is None:
+            peers = self.peer_manager.get_all_ready_peers()
+            if not peers:
+                return
+            peer = peers[0]
+        try:
+            getheaders = GetHeadersMessage(
+                version=70015,
+                locator_hashes=bf.start_locator(),
+                hash_stop=b"\x00" * 32,
+            )
+            network = getattr(self.peer_manager, "network", "mainnet")
+            await peer.send_message(getheaders.to_network_message(network))
+        except Exception as exc:
+            logger.debug("header backfill: getheaders send failed: %s", exc)
+
+    async def _consume_backfill_headers(self, raw_headers: list[bytes], peer) -> bool:
+        """Route a below-floor batch into the backfill. True if consumed.
+
+        Returns True only when the batch belongs to the backfill, so ordinary
+        sync batches are never swallowed.
+        """
+        bf = self._header_backfill
+        if bf is None or not bf.wants(raw_headers):
+            return False
+        try:
+            bf.accept(raw_headers)
+        except Exception as exc:
+            # A peer that cannot serve our chain from genesis is useless for
+            # this walk; drop the partial buffer and re-arm from scratch rather
+            # than committing anything derived from it.
+            logger.warning("header backfill: rejected a batch (%s); restarting the walk", exc)
+            self._header_backfill = None
+            return True
+
+        buffered, target = bf.progress()
+        if buffered % 20000 < len(raw_headers):
+            logger.info("header backfill: %d/%d headers", buffered, target)
+
+        if bf.is_complete():
+            try:
+                written = bf.commit(self.db)
+            except Exception as exc:
+                logger.error(
+                    "header backfill: COMMIT REFUSED (%s) — no rows written; "
+                    "BIP-68 time locks below the floor remain unevaluated", exc,
+                )
+                self._header_backfill = None
+                return True
+            self._header_backfill = None
+            self._backfill_done = True
+            logger.warning(
+                "header backfill COMPLETE: wrote %d per-height metadata rows; "
+                "median-time-past is now computable below the snapshot base and "
+                "BIP-68 relative time locks are enforced there.", written,
+            )
+        else:
+            await self._request_backfill_headers(peer)
+        return True
 
     def _build_locator(self, height: int) -> list[bytes]:
         """Build block locator (exponential spacing).
