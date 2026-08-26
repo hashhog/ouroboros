@@ -268,3 +268,75 @@ class TestMedianTimePartialWindow(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestMedianTimeNoFabrication(unittest.TestCase):
+    """get_median_time must never answer a SPECIFIC height with the wall clock.
+
+    The body walk asks db.get_block(hash), which returns nothing for heights
+    whose block bodies are absent — every height below an assumeUTXO snapshot
+    base. `timestamps` came back empty and the function fell through to
+    `int(time.time())`.
+
+    Measured on the live mainnet node before the fix: getblockheader at height
+    800000 reported mediantime=1787707124, the wall clock, roughly three years
+    after the block, against Core's 1690165851. A fabricated answer that looks
+    plausible is worse than an error, and at the RPC boundary it is
+    indistinguishable from a real one.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.node = BitcoinNode(data_dir=self.temp_dir, network="regtest")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_specific_height_without_bodies_does_not_return_wall_clock(self):
+        class BodylessDB:
+            """Bodies absent (post-snapshot gap); no metadata window either."""
+            def get_best_block(self):
+                return b"\x00" * 32, 900000
+            def get_block_hash_by_height(self, h):
+                return b"\x11" * 32          # the index knows the hash...
+            def get_block(self, h):
+                return None                  # ...but the body is gone
+
+        self.node.db = BodylessDB()
+        got = self.node.get_median_time(800000)
+        now = int(time.time())
+        self.assertNotAlmostEqual(
+            got, now, delta=86400,
+            msg=f"get_median_time(800000) returned {got}, within a day of now "
+                f"({now}) — that is the wall-clock fabrication",
+        )
+        self.assertEqual(got, 0, "an unanswerable height must be visibly 0")
+
+    def test_metadata_window_is_preferred_over_the_body_walk(self):
+        """When metadata can answer, use it — bodies are not required."""
+        class MetadataDB:
+            def get_best_block(self):
+                return b"\x00" * 32, 900000
+            def get_median_time_past(self, h):
+                return 1690165851            # Core's value for height 800000
+            def get_block_hash_by_height(self, h):
+                return b"\x11" * 32
+            def get_block(self, h):
+                return None                  # body walk would fail
+
+        self.node.db = MetadataDB()
+        self.assertEqual(self.node.get_median_time(800000), 1690165851)
+
+    def test_unspecified_height_may_still_fall_back_to_wall_clock(self):
+        """Tip-on-an-empty-DB keeps its placeholder — only a NAMED height must not."""
+        class EmptyDB:
+            def get_best_block(self):
+                return b"\x00" * 32, 0
+            def get_block_hash_by_height(self, h):
+                return None
+            def get_block(self, h):
+                return None
+
+        self.node.db = EmptyDB()
+        got = self.node.get_median_time()
+        self.assertAlmostEqual(got, int(time.time()), delta=86400)

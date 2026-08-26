@@ -2546,10 +2546,34 @@ class BitcoinNode:
         if not self.db:
             return int(time.time())
 
+        height_was_explicit = height is not None
         try:
             # Get height if not provided
             if height is None:
                 _, height = self.db.get_best_block()
+
+            # Prefer the METADATA-based median: database.get_median_time_past
+            # reads per-height BlockMetadata timestamps (BLOCK_INDEX_CF) and
+            # returns None on an incomplete 11-block window rather than
+            # medianing a partial set. That store survives a restart and, unlike
+            # block BODIES, exists for every height below an assumeUTXO snapshot
+            # base — so this is the only path that answers correctly there.
+            #
+            # The body walk below asks db.get_block(hash), which returns nothing
+            # for those heights, leaving `timestamps` empty and falling through
+            # to `int(time.time())`. Measured on the live mainnet node before
+            # this change: getblockheader at height 800000 reported
+            # mediantime=1787707124 — the WALL CLOCK, roughly three years after
+            # the block — against Core's 1690165851. A fabricated answer that
+            # looks plausible is worse than an error.
+            mtp_getter = getattr(self.db, "get_median_time_past", None)
+            if mtp_getter is not None:
+                try:
+                    mtp = mtp_getter(int(height))
+                except Exception:
+                    mtp = None
+                if mtp is not None:
+                    return int(mtp)
 
             # Get timestamps of last 11 blocks (or fewer if not enough blocks)
             timestamps = []
@@ -2566,7 +2590,19 @@ class BitcoinNode:
                     continue
 
             if not timestamps:
-                # No blocks found, return current time as fallback
+                # No window could be built. For an UNSPECIFIED height (tip on an
+                # empty DB) the wall clock is a defensible placeholder. For a
+                # SPECIFIC height it is not: Core never answers a height query
+                # with the current time, and the fabricated value is
+                # indistinguishable from a real one at the RPC boundary. Return
+                # 0 and say so, so the failure is visible.
+                if height_was_explicit:
+                    logger.warning(
+                        "get_median_time(%s): no timestamps available and no "
+                        "metadata window — returning 0 rather than fabricating "
+                        "a wall-clock median", height,
+                    )
+                    return 0
                 return int(time.time())
 
             # Sort and get median (middle of last 11 blocks, index 5 for 11 blocks)
