@@ -2465,13 +2465,23 @@ class TransactionValidator:
             # Coinbase maturity: coinbase outputs need COINBASE_MATURITY confirmations
             # Ref: Bitcoin Core consensus/tx_verify.cpp:179-182
             #   ("bad-txns-premature-spend-of-coinbase")
-            # If utxo_height is None (e.g. pre-snapshot coins), treat it as 0
-            # so the depth check is conservative rather than silently skipping.
             utxo_height = utxo.get('height')
             is_coinbase_utxo = utxo.get('is_coinbase', False)
             if is_coinbase_utxo:
-                coin_height = utxo_height if utxo_height is not None else 0
-                depth = height - coin_height
+                if utxo_height is None:
+                    # A coinbase coin with unknown height cannot prove
+                    # maturity.  Core's Coin always carries a real nHeight
+                    # (tx_verify.cpp:179); the old height-None -> 0
+                    # fabrication made depth = spend height, silently
+                    # WAIVING maturity for any spend at height >= 100 —
+                    # i.e. always, on mainnet (2026-08-23 audit row, the
+                    # #48 shape).  Post-#52 backfill no live coin lacks a
+                    # height, so refuse rather than fabricate.
+                    return False, (
+                        "bad-txns-premature-spend-of-coinbase: "
+                        "coinbase coin height unknown; cannot verify maturity"
+                    )
+                depth = height - utxo_height
                 if depth < COINBASE_MATURITY:
                     return False, (
                         f"bad-txns-premature-spend-of-coinbase: "

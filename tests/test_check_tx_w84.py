@@ -622,9 +622,11 @@ class TestCoinbaseMaturity:
         assert ok is False
         assert "premature" in err.lower() or "coinbase" in err.lower()
 
-    def test_none_utxo_height_passes_when_depth_ge_100(self):
-        """G15: coin_height=None treated as 0 → depth = spend_height - 0 = spend_height.
-        Spending at height >= 100 with coin_height=None is valid.
+    def test_none_utxo_height_refused_regardless_of_depth(self):
+        """G15 FLIPPED (was the height-None->0 lock-in): a coinbase coin with
+        unknown height cannot prove maturity and must be REFUSED — the old
+        fabrication waived maturity for any spend at height >= 100.
+        FAILS AT PARENT (parent accepted it).
         """
         utxo = {
             'value': 1_000,
@@ -641,9 +643,10 @@ class TestCoinbaseMaturity:
         out = _make_txout(value=500)
         tx = _make_tx(inputs=[inp], outputs=[out])
 
-        ok, _err = tv.validate_transaction(tx, height=100, block_mtp=0,
-                                           skip_scripts=True)
-        assert ok is True
+        ok, err = tv.validate_transaction(tx, height=100, block_mtp=0,
+                                          skip_scripts=True)
+        assert ok is False
+        assert "height unknown" in err
 
 
 # ---------------------------------------------------------------------------
