@@ -458,13 +458,19 @@ class BlockchainDatabase:
         if py_utxo is None:
             return None
 
+        # Direct attribute access, NOT getattr-with-default (#53f): the Rust
+        # PyUtxo has carried height/is_coinbase since the metadata backfill,
+        # so a miss means a stale ferrous-utils wheel.  Defaulting
+        # is_coinbase=False there silently fabricated "ordinary coin" for
+        # consensus consumers (coinbase maturity, BIP-68) — fail loudly and
+        # name the missing field instead (rebuild via reinstall_ouroboros.sh).
         return {
             'txid': py_utxo.txid,
             'vout': py_utxo.vout,
             'value': py_utxo.value,
             'script_pubkey': bytes(py_utxo.script_pubkey),
-            'height': getattr(py_utxo, 'height', None),
-            'is_coinbase': getattr(py_utxo, 'is_coinbase', False),
+            'height': py_utxo.height,
+            'is_coinbase': py_utxo.is_coinbase,
         }
 
     def get_utxo_or_spent(self, txid: bytes, vout: int) -> dict[str, Any] | None:
@@ -487,13 +493,14 @@ class BlockchainDatabase:
         if py_utxo is None:
             return None
 
+        # Direct attribute access — same #53f loud-guard rationale as get_utxo.
         return {
             'txid': py_utxo.txid,
             'vout': py_utxo.vout,
             'value': py_utxo.value,
             'script_pubkey': bytes(py_utxo.script_pubkey),
-            'height': getattr(py_utxo, 'height', None),
-            'is_coinbase': getattr(py_utxo, 'is_coinbase', False),
+            'height': py_utxo.height,
+            'is_coinbase': py_utxo.is_coinbase,
         }
 
     def utxo_count(self) -> int:
