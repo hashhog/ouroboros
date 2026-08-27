@@ -1527,6 +1527,14 @@ class BlockSync:
                     )
                 except Exception as e:
                     logger.error(f"Failed to request blocks: {e}")
+                    # #74 (2026-08-27): the getdata never left — un-mark so
+                    # another peer can request immediately instead of the
+                    # in-flight budget staying consumed until the timeout
+                    # sweep (same revert the dispatch sites at :5110/:6185
+                    # already do).
+                    for _, bh in blocks_to_request:
+                        self.requested_blocks.pop(bh, None)
+                        self._block_request_peer.pop(bh, None)
 
             if txs_to_request:
                 # Cap each GETDATA at MAX_GETDATA_SZ=1000 items (Core protocol.h:482).
