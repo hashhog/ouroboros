@@ -4657,18 +4657,38 @@ class BlockSync:
                 return None
             bodies[h] = raw
 
-        # Strictly-heavier re-check (the active chain may have advanced since
-        # the trigger fired; height-as-work regtest shortcut, mirrors
-        # rpc._attach_side_branch_block :6903).
+        # Strictly-heavier re-check by WORK (#49, 2026-08-27): the active
+        # chain may have advanced since the trigger fired. The old check
+        # was the self-described "height-as-work regtest shortcut" — a
+        # height term deciding chain selection in BOTH directions (it could
+        # wrongly refuse a still-heavier fork after the active chain grew
+        # taller-but-lighter, and wrongly proceed for a taller-but-lighter
+        # fork). Core re-evaluates on cumulative work only
+        # (CBlockIndexWorkComparator); no work basis -> no reorg.
         fork_height = ancestor_height + len(bridge_hashes)
+        fork_cw = self._fork_tip_chainwork(fork_tip_hash)
         try:
             _, active_height = self.db.get_best_block()
         except Exception:
             active_height = -1
-        if fork_height <= active_height:
+        try:
+            active_cw = (
+                self.db.get_chainwork_by_height(active_height)
+                if active_height >= 0 else 0
+            )
+        except Exception:
+            active_cw = 0
+        if fork_cw is None or active_cw <= 0:
+            logger.warning(
+                "fork bridge %s... h=%d vs active h=%d: NO CHAINWORK BASIS "
+                "at re-check — refusing reorg",
+                fork_tip_hash.hex()[:16], fork_height, active_height,
+            )
+            return None
+        if fork_cw <= active_cw:
             logger.debug(
-                f"fork bridge {fork_tip_hash.hex()[:16]}... h={fork_height} no "
-                f"longer heavier than active h={active_height}; not reorging"
+                f"fork bridge {fork_tip_hash.hex()[:16]}... cw=0x{fork_cw:x} no "
+                f"longer heavier than active cw=0x{active_cw:x}; not reorging"
             )
             return None
 

@@ -8126,24 +8126,28 @@ class RPCServer:
                 )
                 return None
         else:
-            # Chainwork unavailable (old datadir): height fallback.
-            if new_height <= active_tip_height:
-                return None
+            # Chainwork basis unavailable (old datadir). REFUSE the reorg
+            # (#49, 2026-08-27): Core selects on cumulative work alone
+            # (CBlockIndexWorkComparator, validation.cpp:3114-3123); a
+            # HEIGHT term must never drive a disconnect. The side branch
+            # stays stored — a later submission with a work basis can still
+            # trigger the reorg through the comparison above.
+            logger.warning(
+                "submitblock: side-branch h=%d vs active h=%d has NO "
+                "CHAINWORK BASIS — refusing height-based reorg; branch "
+                "stored only",
+                new_height, active_tip_height,
+            )
+            return None
 
-        # Strictly heavier — drive the reorg.
-        if fork_cw is not None and active_cw > 0:
-            logger.info(
-                "submitblock: heavier side-branch h=%d cw=0x%064x > "
-                "active_tip h=%d cw=0x%064x, driving reorg to %s",
-                new_height, fork_cw, active_tip_height, active_cw,
-                block_hash.hex()[:16],
-            )
-        else:
-            logger.info(
-                "submitblock: heavier side-branch h=%d > active_tip h=%d, "
-                "driving reorg to %s (height fallback)",
-                new_height, active_tip_height, block_hash.hex()[:16],
-            )
+        # Strictly heavier — drive the reorg. (The height-fallback logging
+        # arm is dead since #49: the no-work-basis path returns above.)
+        logger.info(
+            "submitblock: heavier side-branch h=%d cw=0x%064x > "
+            "active_tip h=%d cw=0x%064x, driving reorg to %s",
+            new_height, fork_cw, active_tip_height, active_cw,
+            block_hash.hex()[:16],
+        )
         return await self._reorg_to_side_branch_tip(db, block_hash)
 
     async def _restore_original_chain(
