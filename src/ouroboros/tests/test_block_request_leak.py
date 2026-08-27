@@ -354,3 +354,66 @@ class TestHeaderBackfillWiring(unittest.IsolatedAsyncioTestCase):
         consumed = await bs._consume_backfill_headers(unrelated, peers[0])
         self.assertFalse(consumed, "ordinary sync headers must not be consumed")
         self.assertEqual(bs.db.written, [])
+
+
+class TestBackfillChainworkSeeding(unittest.IsolatedAsyncioTestCase):
+    """A mid-chain backfill must SEED chainwork from the row below the gap.
+
+    With base_chainwork=0 the committed rows accumulate from zero. The row
+    written at the gap's end (snap_h+1) then comes out near-canonical, which
+    flips detect_snapshot_chainwork_offset's single-height probe to "no offset
+    needed" while the legacy rows ABOVE the base still depend on that offset —
+    the 2026-08-25 incident: tip chainwork read ~9x low and the G8 gate
+    refused every header batch, wedging live mainnet ouroboros at 964076.
+    """
+
+    async def test_mid_chain_commit_continues_the_chain_total(self):
+        from ouroboros.header_backfill import block_hash as bh
+        import ouroboros.tests.test_header_backfill as thb
+
+        BASE_CW = 1_000_000
+
+        bs, peers = _fresh_block_sync()
+        bs.peer_manager.network = "mainnet"
+
+        # Chain rooted at a known lower anchor; gap is [108..111] inclusive.
+        lower = _dsha(b"row-107")
+        headers, upper = thb.make_chain(lower, 4)
+
+        written = []
+
+        class MidChainDB(_StubDB):
+            def get_best_block(self_inner):
+                return _dsha(b"tip"), 964076
+            def get_block_hash_by_height(self_inner, height):
+                if height < 108:
+                    return _dsha(b"low%d" % height)
+                if height <= 111:
+                    return None
+                return _dsha(b"hi%d" % height)
+            def get_chainwork_by_height(self_inner, height):
+                assert height == 107, f"seed must come from start-1, asked {height}"
+                return BASE_CW
+            def store_block_metadata_persistent(self_inner, h, hsh, cw, ts):
+                written.append((h, cw))
+
+        bs.db = MidChainDB(_dsha(b"tip"), 964076)
+        # Install the driver directly: find_missing_range's exponential probe
+        # legitimately steps over a 4-block gap (it is a LARGE-gap detector by
+        # documented design), and the seeding under test lives in
+        # _consume_backfill_headers, which reads self._header_backfill however
+        # it was armed.
+        from ouroboros.header_backfill import HeaderBackfill
+        bs._header_backfill = HeaderBackfill(108, 111, upper, prev_anchor=lower)
+        orig = bs._header_backfill.commit
+        bs._header_backfill.commit = lambda db, **kw: orig(db, check_pow=False, **kw)
+
+        consumed = await bs._consume_backfill_headers(headers, peers[0])
+        self.assertTrue(consumed)
+        self.assertEqual(len(written), 4)
+        for h, cw in written:
+            self.assertGreater(
+                cw, BASE_CW,
+                f"row {h} chainwork {cw} does not continue the chain total "
+                f"(base {BASE_CW}) — it accumulated from zero",
+            )

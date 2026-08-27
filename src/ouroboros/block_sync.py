@@ -5437,8 +5437,31 @@ class BlockSync:
             logger.info("header backfill: %d/%d headers", buffered, target)
 
         if bf.is_complete():
+            # Seed cumulative chainwork from the row BELOW the range, so the
+            # backfilled rows continue the real chain total instead of
+            # accumulating from zero. base_chainwork=0 is what caused the
+            # 2026-08-25 incident: the row written at snap_h+1 (944184) came
+            # out near-canonical-minus-epsilon, which flipped
+            # detect_snapshot_chainwork_offset's single-height probe to "no
+            # offset needed" while the legacy rows ABOVE the base still
+            # depended on that offset — tip chainwork then read ~9x low and
+            # the G8 gate refused every header batch.
+            base_cw = 0
+            if bf.start_height > 0:
+                try:
+                    base_cw = int(self.db.get_chainwork_by_height(bf.start_height - 1))
+                except Exception:
+                    base_cw = 0
+                if base_cw <= 0:
+                    logger.error(
+                        "header backfill: no stored chainwork at height %d to "
+                        "seed from — refusing to commit rows that would "
+                        "accumulate from zero", bf.start_height - 1,
+                    )
+                    self._header_backfill = None
+                    return True
             try:
-                written = bf.commit(self.db)
+                written = bf.commit(self.db, base_chainwork=base_cw)
             except Exception as exc:
                 logger.error(
                     "header backfill: COMMIT REFUSED (%s) — no rows written; "
