@@ -308,8 +308,8 @@ class TestMaybeTriggerForkDownload:
         result = asyncio.run(sm._maybe_trigger_fork_download(fork_tip_hash, peer))
         assert result is False, "lighter fork must NOT trigger reorg"
 
-    def test_chainwork_unavailable_falls_back_to_height(self):
-        """When DB has no chainwork, height fallback applies."""
+    def test_chainwork_unavailable_refuses_reorg_equal_height(self):
+        """No chainwork basis -> refuse reorg regardless of heights (#49)."""
         ancestor_hash = _hash(1)
         fork_tip_hash = _hash(2)
         active_tip_hash = _hash(3)
@@ -324,11 +324,18 @@ class TestMaybeTriggerForkDownload:
 
         peer = self._make_peer()
         result = asyncio.run(sm._maybe_trigger_fork_download(fork_tip_hash, peer))
-        # height fallback: fork h=10 == active h=10 → no reorg
+        # No work basis: refusal is unconditional (heights irrelevant).
         assert result is False
 
-    def test_taller_fork_no_chainwork_triggers_by_height(self):
-        """Chainwork unavailable + fork is taller → height fallback triggers reorg."""
+    def test_taller_fork_no_chainwork_refuses_reorg(self):
+        """FLIPPED (#49, 2026-08-27): this test used to ASSERT the defect —
+        that a TALLER fork with no chainwork basis triggers a reorg by
+        HEIGHT (the #45 length-beats-work class; Core selects on work
+        alone, validation.cpp:3114). A taller min-difficulty fork carrying
+        LESS work would have evicted the heavier active chain. The fix
+        refuses to reorganise without a comparable work basis; this test
+        now pins the refusal and FAILS at the parent commit (which
+        returned True here)."""
         ancestor_hash = _hash(1)
         fork_tip_hash_1 = _hash(2)
         fork_tip_hash_2 = _hash(3)
@@ -351,5 +358,9 @@ class TestMaybeTriggerForkDownload:
 
         peer = self._make_peer()
         result = asyncio.run(sm._maybe_trigger_fork_download(fork_tip_hash_2, peer))
-        # fork h=11 > active h=10 → height fallback triggers reorg
-        assert result is True
+        # fork h=11 > active h=10 but NO WORK BASIS: the refusal must hold —
+        # height never drives a disconnect (pre-fix this asserted True).
+        assert result is False, (
+            "taller fork with no chainwork basis must NOT trigger a reorg "
+            "(height-based selection is the #45 length-beats-work defect)"
+        )

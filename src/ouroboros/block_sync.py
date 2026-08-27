@@ -4383,33 +4383,33 @@ class BlockSync:
                 )
                 return False
         else:
-            # Chainwork unavailable (old datadir / pre-persistence blocks):
-            # fall back to height comparison.
-            if fork_height <= active_height:
-                logger.debug(
-                    "Fork tip %s... h=%d not heavier than active h=%d "
-                    "(height fallback, chainwork unavailable); stored only",
-                    fork_tip_hash.hex()[:16], fork_height, active_height,
-                )
-                return False
+            # Chainwork basis unavailable (old datadir / pre-persistence
+            # rows). REFUSE to reorganise (#49, 2026-08-27): Core selects
+            # chains on cumulative work alone (CBlockIndexWorkComparator,
+            # validation.cpp:3114-3123) — a HEIGHT term must never drive a
+            # disconnect (the #45 length-beats-work class; a taller
+            # min-difficulty fork carrying less work would have evicted the
+            # heavier chain here). Keep the current tip until header sync /
+            # backfill repopulates the work basis; requesting more headers
+            # is the only action height may motivate.
+            logger.warning(
+                "Fork tip %s... h=%d vs active h=%d: NO CHAINWORK BASIS "
+                "(fork_cw=%s, active_cw=%d) — refusing height-based reorg; "
+                "keeping current tip until work data is available",
+                fork_tip_hash.hex()[:16], fork_height, active_height,
+                "None" if fork_cw is None else hex(fork_cw), active_cw,
+            )
+            return False
 
         # Strictly heavier — this fork should become the active chain.
         self._fork_reorg_triggered += 1
-        if fork_cw is not None and active_cw > 0:
-            logger.warning(
-                "Heavier competing fork discovered: tip %s... h=%d "
-                "cw=0x%064x > active h=%d cw=0x%064x — requesting bridging "
-                "bodies for reorg",
-                fork_tip_hash.hex()[:16], fork_height, fork_cw,
-                active_height, active_cw,
-            )
-        else:
-            logger.warning(
-                "Heavier competing fork discovered: tip %s... h=%d > "
-                "active h=%d — requesting bridging bodies for reorg "
-                "(height fallback, chainwork unavailable)",
-                fork_tip_hash.hex()[:16], fork_height, active_height,
-            )
+        logger.warning(
+            "Heavier competing fork discovered: tip %s... h=%d "
+            "cw=0x%064x > active h=%d cw=0x%064x — requesting bridging "
+            "bodies for reorg",
+            fork_tip_hash.hex()[:16], fork_height, fork_cw,
+            active_height, active_cw,
+        )
         # GAP2 hand-off: download the missing bridging bodies, then GAP3
         # routes the completed bridge through the submitblock side-branch
         # reorg path.  ``_request_fork_blocks`` short-circuits to the GAP3
