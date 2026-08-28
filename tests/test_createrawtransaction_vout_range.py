@@ -212,3 +212,126 @@ async def test_control_ordinary_vout_is_accepted_and_lands_in_the_bytes(rpc):
     """Proves the handler still does its normal job, so the rejection tests
     above cannot be satisfied by a reject-everything stub."""
     assert await _first_vout(rpc, [{"txid": TXID, "vout": 7}]) == 7
+
+
+# --------------------------------------------------------------------------
+# THE SECOND REGRESSION: `replaceable=true` contradicted by the sequences.
+#
+# Core's ConstructTransaction ends with (rawtransaction_util.cpp:166-168):
+#
+#     if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+#         !SignalsOptInRBF(CTransaction(rawTx)))
+#         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter
+#             combination: Sequence number(s) contradict replaceable option");
+#
+# with SignalsOptInRBF (util/rbf.cpp) true as soon as ANY input carries
+# nSequence <= MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD).
+#
+# ouroboros silently ACCEPTED the contradiction: the explicit sequence won and
+# the `replaceable` flag was discarded with no error, so the caller got back a
+# transaction that cannot be fee-bumped and only found out when the bump was
+# refused under BIP-125 Rule 1, with the fee already committed.
+#
+# THE SUBTLE PART is that rbf must keep its OPTIONAL-NESS: `absent` and
+# `explicitly true` pick the SAME default sequence but behave DIFFERENTLY in
+# this check (has_value() vs value_or(true)).  The ABSENT and NULL controls
+# below are what stop the check from breaking ordinary calls.
+# --------------------------------------------------------------------------
+
+MAX_BIP125_RBF_SEQUENCE = 0xFFFFFFFD
+MAX_SEQUENCE_NONFINAL = 0xFFFFFFFE
+SEQUENCE_FINAL = 0xFFFFFFFF
+
+CONTRADICTION_MSG = (
+    "Invalid parameter combination: Sequence number(s) contradict "
+    "replaceable option"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "seq",
+    [
+        pytest.param(SEQUENCE_FINAL, id="final-0xffffffff"),
+        pytest.param(MAX_SEQUENCE_NONFINAL, id="nonfinal-0xfffffffe"),
+    ],
+)
+async def test_replaceable_true_contradicted_by_sequence_is_rejected(rpc, seq):
+    code, msg = await _err(
+        rpc, [{"txid": TXID, "vout": 0, "sequence": seq}], replaceable=True,
+    )
+    assert (code, msg) == (-8, CONTRADICTION_MSG)
+
+
+@pytest.mark.asyncio
+async def test_control_replaceable_absent_with_final_sequence_is_accepted(rpc):
+    """rbf.has_value() is FALSE when the argument is omitted, so the check
+    cannot fire — and the explicit sequence still reaches the bytes.  This is
+    the row a plain-bool implementation gets wrong."""
+    raw_hex = await _call(rpc, [{"txid": TXID, "vout": 0,
+                                 "sequence": SEQUENCE_FINAL}])
+    tx = _deserialize_tx(bytes.fromhex(raw_hex))
+    assert tx.inputs[0].sequence == SEQUENCE_FINAL
+
+
+@pytest.mark.asyncio
+async def test_control_replaceable_null_with_final_sequence_is_accepted(rpc):
+    """Core's isNull() is true for an explicit JSON null exactly as for an
+    omitted argument, so null must behave like ABSENT, not like `false`."""
+    raw_hex = await _call(rpc, [{"txid": TXID, "vout": 0,
+                                 "sequence": SEQUENCE_FINAL}], replaceable=None)
+    tx = _deserialize_tx(bytes.fromhex(raw_hex))
+    assert tx.inputs[0].sequence == SEQUENCE_FINAL
+
+
+@pytest.mark.asyncio
+async def test_control_replaceable_true_with_rbf_sequence_is_accepted(rpc):
+    """0xFFFFFFFD IS the BIP-125 signal, so there is no contradiction."""
+    raw_hex = await _call(rpc, [{"txid": TXID, "vout": 0,
+                                 "sequence": MAX_BIP125_RBF_SEQUENCE}],
+                          replaceable=True)
+    tx = _deserialize_tx(bytes.fromhex(raw_hex))
+    assert tx.inputs[0].sequence == MAX_BIP125_RBF_SEQUENCE
+
+
+@pytest.mark.asyncio
+async def test_control_replaceable_false_with_final_sequence_is_accepted(rpc):
+    """rbf.value() is false, so the check is inert however final the sequence."""
+    raw_hex = await _call(rpc, [{"txid": TXID, "vout": 0,
+                                 "sequence": SEQUENCE_FINAL}], replaceable=False)
+    tx = _deserialize_tx(bytes.fromhex(raw_hex))
+    assert tx.inputs[0].sequence == SEQUENCE_FINAL
+
+
+@pytest.mark.asyncio
+async def test_control_replaceable_true_with_no_inputs_is_accepted(rpc):
+    """Core guards on rawTx.vin.size() > 0: an input-less transaction cannot
+    contradict anything.  `all()` over an empty list is True, so a check
+    written without this guard would still pass here — but one written as
+    `not any(signals)` would wrongly reject."""
+    raw_hex = await _call(rpc, [], replaceable=True)
+    tx = _deserialize_tx(bytes.fromhex(raw_hex))
+    assert len(tx.inputs) == 0
+
+
+@pytest.mark.asyncio
+async def test_control_replaceable_true_one_of_two_inputs_signals(rpc):
+    """SignalsOptInRBF is ANY, not ALL: one signalling input is enough, which
+    is BIP-125's multi-party rule.  A check written with `all()` rejects this
+    row."""
+    raw_hex = await _call(rpc, [
+        {"txid": TXID, "vout": 0, "sequence": SEQUENCE_FINAL},
+        {"txid": TXID, "vout": 1, "sequence": 0},
+    ], replaceable=True)
+    tx = _deserialize_tx(bytes.fromhex(raw_hex))
+    assert [i.sequence for i in tx.inputs] == [SEQUENCE_FINAL, 0]
+
+
+@pytest.mark.asyncio
+async def test_control_replaceable_true_with_no_explicit_sequence(rpc):
+    """The default sequence under replaceable=true IS the RBF one, so the
+    ordinary RBF call must keep working — and must emit 0xFFFFFFFD, not
+    merely succeed."""
+    raw_hex = await _call(rpc, [{"txid": TXID, "vout": 0}], replaceable=True)
+    tx = _deserialize_tx(bytes.fromhex(raw_hex))
+    assert tx.inputs[0].sequence == MAX_BIP125_RBF_SEQUENCE

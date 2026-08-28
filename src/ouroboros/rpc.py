@@ -12590,6 +12590,25 @@ class RPCServer:
         from ouroboros.database import TxIn, TxOut
 
         # Core: rbf is std::optional<bool>; unset -> value_or(true).
+        #
+        # The OPTIONAL-NESS is load-bearing and must survive parsing. Core
+        # carries rbf as std::optional<bool> all the way to the end of
+        # ConstructTransaction because its two consumers read it DIFFERENTLY:
+        #
+        #   choosing the default sequence -> rbf.value_or(true)          absent == true
+        #   the contradiction check below -> rbf.has_value() && value()  absent == no check
+        #
+        # So an absent argument still defaults to TRUE for picking the
+        # sequence, yet suppresses the contradiction check entirely: only a
+        # caller who literally typed `replaceable=true` has stated an intent
+        # that a sequence can contradict. Folding the option into a plain
+        # bool destroys the second reading and makes an ordinary call with no
+        # replaceable argument and a final sequence wrongly REJECT.
+        #
+        # An explicit JSON null arrives here as None too, which is correct:
+        # Core's isNull() is true for both an omitted and an explicitly-null
+        # argument (rawtransaction.cpp:398-401).
+        rbf_explicit = replaceable is not None
         rbf = True if replaceable is None else bool(replaceable)
 
         # Default sequence depends on rbf and locktime (Core AddInputs).
@@ -12721,6 +12740,39 @@ class RPCServer:
                     .to_integral_value()
                 )
             tx_outputs.append(TxOut(value=sat_amount, script_pubkey=script))
+
+        # --- replaceable vs. sequence contradiction (ConstructTransaction) ---
+        # The LAST thing Core's ConstructTransaction does, AFTER both AddInputs
+        # and AddOutputs (rawtransaction_util.cpp:166-168):
+        #
+        #   if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+        #       !SignalsOptInRBF(CTransaction(rawTx)))
+        #       throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter
+        #           combination: Sequence number(s) contradict replaceable option");
+        #
+        # SignalsOptInRBF (util/rbf.cpp) is true as soon as ANY input carries
+        # nSequence <= MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD) — one signalling
+        # input is enough, which is BIP-125's multi-party rule: no single
+        # co-signer may opt the whole transaction out of replacement.
+        #
+        # Without this, a caller who explicitly asks for replaceable=true and
+        # also pins a final sequence gets back a well-formed transaction that
+        # CANNOT be fee-bumped, with no error and no log line: the explicit
+        # sequence silently wins and the flag is discarded. Core refuses to
+        # guess which of the two contradicting instructions was meant.
+        #
+        # Placed HERE, after the outputs are parsed, on purpose: Core evaluates
+        # it after AddOutputs, so a bad address or amount must still win over
+        # this error. Moving it earlier would reorder the two.
+        if (
+            rbf_explicit and rbf and tx_inputs
+            and not any(i.sequence <= 0xFFFFFFFD for i in tx_inputs)
+        ):
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "Invalid parameter combination: Sequence number(s) contradict "
+                "replaceable option",
+            )
 
         tx = DbTx(
             txid=b'\x00' * 32, version=2, locktime=lock,
