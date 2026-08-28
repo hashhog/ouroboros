@@ -642,6 +642,17 @@ class BlockSync:
         self._wedge_warn_after: float = 300.0
         self._wedge_warn_every: float = 300.0
         self._last_wedge_warn: float = 0.0
+        # W75-RECOVER (2026-08-28): the watchdog below used to only WARN.  On
+        # 2026-08-28 this node sat wedged for 6760s emitting that warning every
+        # 5 minutes — 22 times — while the fleet moved on 6 blocks, and only a
+        # process restart cleared it.  A watchdog that can name the failure but
+        # not act on it turns an outage into a *documented* outage.  After
+        # _wedge_recover_after seconds of continued stall we now perform the
+        # same in-memory sync-state reset the restart achieved.
+        self._wedge_recover_after: float = 900.0
+        self._wedge_recover_every: float = 900.0
+        self._last_wedge_recover: float = 0.0
+        self._wedge_recoveries: int = 0
 
         # BIP-130 / Core HeadersSyncState (PRESYNC/REDOWNLOAD anti-DoS).
         # Per-peer Rust state machine that tracks cumulative work +
@@ -5247,6 +5258,52 @@ class BlockSync:
             f"con_fail={self._blk_connect_failed}"
         )
         self._last_wedge_warn = now
+        self._maybe_recover_from_wedge(now, stale, best_height)
+
+    def _maybe_recover_from_wedge(
+        self, now: float, stale: float, best_height: int,
+    ) -> bool:
+        """Self-heal a confirmed tip stall by resetting in-memory sync state.
+
+        Only fires once the stall has persisted `_wedge_recover_after` seconds
+        — three times the warn threshold — so a slow-but-progressing sync is
+        never disturbed.  The reset is exactly the seven-map clear the
+        misaligned-block and queue-drop paths already use, and is precisely
+        what a process restart accomplishes: drop the validated-header queue,
+        the block buffer and all in-flight request bookkeeping so the fetcher
+        re-derives them from the chain tip and re-requests from a fresh peer
+        selection.  On-disk state is untouched.
+
+        Returns True if a recovery was performed.
+        """
+        if stale < self._wedge_recover_after:
+            return False
+        if now - self._last_wedge_recover < self._wedge_recover_every:
+            return False
+
+        self._wedge_recoveries += 1
+        logger.warning(
+            "[W75-RECOVER] tip-stall persisted %.0fs (> %.0fs) at tip=%d — "
+            "resetting in-memory sync state (recovery #%d): dropping "
+            "queue=%d buffer=%d in-flight=%d. On-disk state untouched; the "
+            "fetcher re-derives from the chain tip.",
+            stale, self._wedge_recover_after, best_height,
+            self._wedge_recoveries, len(self._validated_headers),
+            len(self._ibd_block_buffer), len(self.requested_blocks),
+        )
+
+        # Same seven maps the sibling reset paths clear — keep in lockstep so
+        # a bulk drop never orphans one of them.
+        self._validated_headers.clear()
+        self._ibd_block_buffer.clear()
+        self._ibd_block_buffer_ts.clear()
+        self.requested_blocks.clear()
+        self._block_request_peer.clear()
+        self._block_source_peer_addr.clear()
+        self._w77_first_request_time.clear()
+
+        self._last_wedge_recover = now
+        return True
 
     async def _announce_block(
         self, block: Block, block_hash: bytes, exclude_peer: Peer | None = None,
