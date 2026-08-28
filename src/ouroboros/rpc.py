@@ -983,6 +983,60 @@ RPC_CLIENT_INVALID_IP_OR_SUBNET = -30
 RPC_CLIENT_P2P_DISABLED = -31        # protocol.h:64 — no valid connection manager instance found
 
 
+# --- univalue integer conversion (bitcoin-core/src/univalue) ---------------
+#
+# Core never reads a JSON number straight into a field. Every RPC argument goes
+# through ``UniValue::getInt<Int>()`` (univalue/include/univalue.h:139-150),
+# which (a) asserts the value really is a JSON *number* via ``checkType(VNUM)``
+# and (b) converts it with ``std::from_chars`` into the DESTINATION width,
+# throwing ``std::runtime_error("JSON integer out of range")`` when the token
+# does not fit or is not an exact integer.
+#
+# The two failure modes land on DIFFERENT error codes (rpc/server.cpp:512-516):
+#   * ``UniValue::type_error`` from checkType  -> RPC_TYPE_ERROR  (-3)
+#   * ``std::runtime_error``  from from_chars  -> RPC_MISC_ERROR  (-1)
+#
+# This matters for ordering: because the width check lives INSIDE the
+# conversion, it fires before any semantic test the handler performs on the
+# converted value (e.g. createrawtransaction's "vout cannot be negative"). See
+# rpc/rawtransaction_util.cpp AddInputs:38-45.
+
+_INT32_MIN = -(2 ** 31)
+_INT32_MAX = 2 ** 31 - 1
+_INT64_MIN = -(2 ** 63)
+_INT64_MAX = 2 ** 63 - 1
+
+
+def _is_json_num(value: Any) -> bool:
+    """``UniValue::isNum()`` — true only for a JSON number.
+
+    Python's ``bool`` is a subclass of ``int``, but JSON ``true``/``false`` are
+    VBOOL in univalue, not VNUM, so they are excluded here.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _uv_get_int(value: Any, name: str, lo: int, hi: int) -> int:
+    """``UniValue::getInt<Int>()`` for a destination of range ``[lo, hi]``.
+
+    ``name`` labels the call site for readability; univalue's own messages do
+    not name the field, so it is deliberately not interpolated. Raises:
+      * RPC_TYPE_ERROR (-3) when *value* is not a JSON number at all;
+      * RPC_MISC_ERROR (-1) "JSON integer out of range" when it is a number but
+        not an exact integer of the destination width (this is univalue's own
+        wording, and the reason a too-large ``vout`` is -1 and not -8).
+    """
+    if not _is_json_num(value):
+        raise RpcError(
+            RPC_TYPE_ERROR,
+            f"JSON value of type {_core_uvtype(value)} "
+            "is not of expected type number",
+        )
+    if not isinstance(value, int) or not (lo <= value <= hi):
+        raise RpcError(RPC_MISC_ERROR, "JSON integer out of range")
+    return value
+
+
 def _is_valid_ip_or_subnet(value: str) -> bool:
     """Return True if *value* is a valid bare IP or CIDR subnet.
 
@@ -12539,7 +12593,20 @@ class RPCServer:
         rbf = True if replaceable is None else bool(replaceable)
 
         # Default sequence depends on rbf and locktime (Core AddInputs).
-        lock = int(locktime) if locktime is not None else 0
+        # ConstructTransaction reads locktime with getInt<int64_t>() BEFORE it
+        # touches the inputs (rawtransaction_util.cpp:151-156), so a bad
+        # locktime is reported ahead of a bad vout. `int(locktime)` used to
+        # accept anything int()-able and then let `to_bytes(4, 'little')` blow
+        # up during serialization, which leaked the CPython message
+        # "can't convert negative int to unsigned" to the wire as -32603.
+        lock = 0
+        if locktime is not None:
+            lock = _uv_get_int(locktime, "locktime", _INT64_MIN, _INT64_MAX)
+            if lock < 0 or lock > 0xFFFFFFFF:   # script.h LOCKTIME_MAX
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, locktime out of range",
+                )
         if rbf:
             default_sequence = 0xFFFFFFFD   # MAX_BIP125_RBF_SEQUENCE
         elif lock != 0:
@@ -12552,21 +12619,54 @@ class RPCServer:
         for inp in inputs:
             # JSON-RPC convention: txids arrive in display order (big-endian
             # hex); wire format stores prev_txid in little-endian. W69.
-            txid_bytes = bytes.fromhex(inp['txid'])[::-1]
+            # ParseHashO runs FIRST in Core (AddInputs:38), so a malformed txid
+            # is reported before anything is said about vout. `bytes.fromhex`
+            # on its own leaked "non-hexadecimal number found..." as -32603.
+            txid_bytes = _parse_hash_v(inp.get('txid'), "txid")[::-1]
+
+            # vout. Core: `if (!vout_v.isNum()) throw ... missing vout key`,
+            # then `vout_v.getInt<int>()` — a THIRTY-TWO-BIT int — and only
+            # then the sign test (rawtransaction_util.cpp:40-45).  The width
+            # check lives inside the conversion, so RANGE BEATS SIGN: 2^31 and
+            # -2^31-1 are both -1 "JSON integer out of range", while -1 (which
+            # does fit in an int32) gets the -8 vout-specific message.
+            #
+            # Without the upper bound, `prev_vout.to_bytes(4, 'little')` in
+            # database.Transaction.serialize() decided the outcome instead:
+            # vout 2^31 serialized happily as 0x80000000 (accepted a spend Core
+            # rejects) and vout 2^32 raised CPython's "int too big to convert",
+            # which the dispatcher surfaced as -32603 with an interpreter
+            # message that describes ouroboros, not the caller's request.
+            vout_v = inp.get('vout')
+            if not _is_json_num(vout_v):
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, missing vout key",
+                )
+            n_output = _uv_get_int(vout_v, "vout", _INT32_MIN, _INT32_MAX)
+            if n_output < 0:
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, vout cannot be negative",
+                )
+
             # Explicit per-input "sequence" wins (Core: range check
             # [0, SEQUENCE_FINAL=0xFFFFFFFF]); otherwise use the default.
+            # Core guards with `if (sequenceObj.isNum())` — a present but
+            # NON-numeric sequence is IGNORED and the default still applies.
             seq_v = inp.get('sequence')
-            if seq_v is not None:
-                seq = int(seq_v)
+            if _is_json_num(seq_v):
+                seq = _uv_get_int(seq_v, "sequence", _INT64_MIN, _INT64_MAX)
                 if seq < 0 or seq > 0xFFFFFFFF:
-                    raise ValueError(
-                        "Invalid parameter, sequence number is out of range"
+                    raise RpcError(
+                        RPC_INVALID_PARAMETER,
+                        "Invalid parameter, sequence number is out of range",
                     )
             else:
                 seq = default_sequence
             tx_inputs.append(TxIn(
                 prev_txid=txid_bytes,
-                prev_vout=inp['vout'],
+                prev_vout=n_output,
                 script_sig=b'',
                 sequence=seq,
             ))
