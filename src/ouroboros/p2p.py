@@ -4370,7 +4370,7 @@ class PeerManager:
             duration: Ban duration in seconds (default: 24 hours)
         """
         self.ban_manager.ban_duration = duration
-        self.ban_manager.ban(addr)
+        self.ban_manager.ban(addr, reason="explicit ban_peer() call")
 
     def _on_peer_banned(self, ip: str) -> None:
         """Disconnect peers whose IP has just been banned.

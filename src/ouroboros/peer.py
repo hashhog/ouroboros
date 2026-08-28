@@ -2423,7 +2423,9 @@ class Peer:
                     f"score clamp (ban count={ban_count})"
                 )
                 try:
-                    self.ban_manager.ban(self.host)
+                    self.ban_manager.ban(
+                        self.host, reason="peer score clamped to 0 (repeated failures)"
+                    )
                 except Exception as exc:  # never let bookkeeping crash the loop
                     logger.error(
                         f"BanManager.ban failed for {self.host}: {exc}"

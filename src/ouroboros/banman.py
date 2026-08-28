@@ -130,7 +130,12 @@ class BanManager:
         # triggers an immediate ban, mirroring Core's MaybeDiscourageAndDisconnect
         # where a single Misbehaving() call sets m_should_discourage=True.
         if score >= self.DISCOURAGEMENT_THRESHOLD or rec.score >= self.ban_threshold:
-            self.ban(ip)
+            # Propagate WHY.  The event that tripped the threshold is the only
+            # thing that makes a ban actionable, and it was previously visible
+            # only at DEBUG.
+            trigger = ("single-event" if score >= self.DISCOURAGEMENT_THRESHOLD
+                       else "cumulative")
+            self.ban(ip, reason=f"{reason} (score +{score} -> {rec.score}, {trigger})")
             return True
         return False
 
@@ -150,12 +155,26 @@ class BanManager:
         """
         return self.record_misbehavior(peer_id, score, reason)
 
-    def ban(self, ip: str, duration: int | None = None) -> None:
-        """Immediately ban *ip* for *duration* seconds (default: ban_duration)."""
+    def ban(self, ip: str, duration: int | None = None,
+            reason: str | None = None) -> None:
+        """Immediately ban *ip* for *duration* seconds (default: ban_duration).
+
+        *reason* is REQUIRED in spirit even though it defaults to None for
+        backwards compatibility with existing call sites: without it a ban is
+        unattributable in production.  record_misbehavior logs the triggering
+        reason at DEBUG, and the daemons run at INFO, so before this parameter
+        existed an operator saw only "Banned <ip> for 86400 s" with no cause.
+        On 2026-08-28 ouroboros emitted 413 such lines in three hours during a
+        live stall and NONE of them could be attributed to anything.
+        """
         ban_time = duration if duration is not None else self.ban_duration
         self.banned[ip] = time.time() + ban_time
         self.scores.pop(ip, None)
-        logger.warning("Banned %s for %d s", ip, ban_time)
+        if reason:
+            logger.warning("Banned %s for %d s: %s", ip, ban_time, reason)
+        else:
+            logger.warning("Banned %s for %d s: <no reason supplied by caller>",
+                           ip, ban_time)
 
         if self._data_dir:
             self._save_bans()
@@ -188,7 +207,7 @@ class BanManager:
                 duration = max(0, int(bantime - time.time()))
             else:
                 duration = bantime
-            self.ban(ip, duration=duration)
+            self.ban(ip, duration=duration, reason="setban RPC")
             return True
         elif command == "remove":
             self.unban(ip)
