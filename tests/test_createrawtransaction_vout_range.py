@@ -335,3 +335,95 @@ async def test_control_replaceable_true_with_no_explicit_sequence(rpc):
     raw_hex = await _call(rpc, [{"txid": TXID, "vout": 0}], replaceable=True)
     tx = _deserialize_tx(bytes.fromhex(raw_hex))
     assert tx.inputs[0].sequence == MAX_BIP125_RBF_SEQUENCE
+
+
+# ---------------------------------------------------------------------------
+# createrawtransaction must HONOUR the `version` argument (#84).
+#
+# Core's createrawtransaction takes a 5th argument, `version`
+# (bitcoin-core/src/rpc/rawtransaction.cpp:122). It reads it as
+# self.Arg<uint32_t>("version"), bounds it to
+# [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+# (src/policy/policy.h:152-153) and ASSIGNS it to the transaction
+# (src/rpc/rawtransaction_util.cpp:158-161).
+#
+# ouroboros did not accept the argument at all: the handler took four
+# parameters, so a five-argument call raised TypeError and the dispatcher
+# reported -32603 with raw CPython text. A caller asking for version 3 could
+# not reach the builder. Version 3 is TRUC (BIP 431) and carries different
+# policy rules.
+#
+# Because the pre-fix behaviour was a REJECTION, an "the call is accepted"
+# assertion would be especially weak here -- it would pass the moment the
+# argument was merely TOLERATED and discarded. Every assertion below decodes
+# the VERSION BYTES off the returned transaction.
+#
+# THE UNSIGNED WIDTH decides which error you get: 2147483648 fits a uint32,
+# survives the conversion and reaches the DOMAIN error (-8), while -1 and
+# 4294967296 fail the CONVERSION first (-1). Both directions asserted.
+#
+# TWO PYTHON HAZARDS, each with its own test:
+#   * int is arbitrary-precision -- nothing truncates, so the explicit range
+#     test is the ONLY thing enforcing Core's bound.
+#   * bool IS A SUBCLASS OF int. isinstance(True, int) is True, so a naive
+#     numeric check accepts version=true and silently builds a VERSION 1
+#     transaction. Core rejects a bool. test_version_bool_is_rejected pins it.
+# ---------------------------------------------------------------------------
+
+
+async def _tx_version(rpc, **kwargs) -> int:
+    """Decode the returned hex with the node's own deserializer and report the
+    version that actually landed in the transaction bytes."""
+    raw_hex = await _call(rpc, [{"txid": TXID, "vout": 0}], **kwargs)
+    return _deserialize_tx(bytes.fromhex(raw_hex)).version
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("want", [1, 2, 3])
+async def test_version_is_emitted_not_forced_to_2(rpc, want):
+    assert await _tx_version(rpc, version=want) == want
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [0, 4, 2147483648])
+async def test_version_outside_1_to_3_is_invalid_parameter(rpc, bad):
+    # Inside uint32, outside the domain: -8, AFTER a successful conversion.
+    assert await _err(rpc, [{"txid": TXID, "vout": 0}], version=bad) == (
+        -8,
+        "Invalid parameter, version out of range(1~3)",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [-1, -2147483649, 4294967296])
+async def test_version_outside_uint32_is_misc_error(rpc, bad):
+    # Outside uint32: the CONVERSION fails first, so -1 and not -8. Paired with
+    # the test above, this pins the boundary in BOTH directions.
+    assert await _err(rpc, [{"txid": TXID, "vout": 0}], version=bad) == (
+        -1,
+        "JSON integer out of range",
+    )
+
+
+@pytest.mark.asyncio
+async def test_version_bool_is_rejected_not_treated_as_1(rpc):
+    # bool is a subclass of int in Python: without an explicit exclusion,
+    # version=True passes a numeric check and builds a version-1 transaction.
+    # This test is the only thing standing between that and a silent wrong
+    # answer, so it is deliberately separate from the range tests.
+    assert await _err(rpc, [{"txid": TXID, "vout": 0}], version=True) == (
+        -1,
+        "JSON integer out of range",
+    )
+
+
+@pytest.mark.asyncio
+async def test_control_absent_version_defaults_to_2(rpc):
+    # CONTROL. Without this, a handler that rejected every version would
+    # satisfy every rejection assertion above.
+    assert await _tx_version(rpc) == 2
+
+
+@pytest.mark.asyncio
+async def test_control_none_version_defaults_to_2(rpc):
+    assert await _tx_version(rpc, version=None) == 2

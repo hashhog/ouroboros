@@ -877,6 +877,44 @@ def _iter_node_wallets(node):
         yield w
 
 
+
+def _parse_createraw_version(value):
+    """Core's ``version`` argument for the createrawtransaction family.
+
+    Core reads it as ``self.Arg<uint32_t>("version")``
+    (rpc/rawtransaction.cpp:122) -- a THIRTY-TWO BIT UNSIGNED parse, unlike the
+    int32 used for ``vout`` -- then bounds it to
+    ``[TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]``
+    (policy/policy.h:152-153) inside ConstructTransaction
+    (rawtransaction_util.cpp:158-161) and ASSIGNS it to the transaction.
+
+    The UNSIGNED width decides which error you get: 2147483648 fits a uint32,
+    survives the conversion and reaches the DOMAIN error (-8), while -1 and
+    4294967296 fail the CONVERSION first (-1).
+
+    TWO PYTHON HAZARDS, both guarded explicitly:
+
+    * ``int`` is arbitrary-precision. Nothing truncates and there is no width
+      to overflow, so the range test below is the ONLY thing enforcing Core's
+      bound -- there is no accidental safety net.
+    * ``bool`` IS A SUBCLASS OF ``int``. ``isinstance(True, int)`` is True, so
+      a naive numeric check accepts ``version=true`` and silently builds a
+      version-1 transaction. Core rejects a bool here, so it is excluded first.
+
+    Returns the version. Raises RPCError with Core's code and message.
+    """
+    if value is None:
+        return 2  # Core DEFAULT_RAWTX_VERSION (CTransaction::CURRENT_VERSION)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RpcError(-1, "JSON integer out of range")
+    if value < 0 or value > 4294967295:
+        raise RpcError(-1, "JSON integer out of range")
+    if value < 1 or value > 3:
+        raise RpcError(-8, "Invalid parameter, version out of range(1~3)")
+    return value
+
+
+
 class _VerifyChainDBProxy:
     """Read-only UTXO overlay over a live ``BlockchainDatabase`` for verifychain.
 
@@ -5978,6 +6016,8 @@ class RPCServer:
         inputs: list[dict[str, Any]],
         outputs: list[dict[str, Any]],
         locktime: int = 0,
+        replaceable: bool = None,
+        version: int = None,
     ) -> str:
         """
         Create an unsigned PSBT from raw inputs and outputs.
@@ -6022,8 +6062,11 @@ class RPCServer:
                     )
                 tx_outputs.append(TxOut(value=int(amount), script_pubkey=spk))
 
+        # Core builds createpsbt from the SAME ConstructTransaction as
+        # createrawtransaction (rpc/rawtransaction.cpp:1642), so it takes the
+        # same 5th `version` argument.
         tx = Transaction(
-            version=2,
+            version=_parse_createraw_version(version),
             inputs=tx_inputs,
             outputs=tx_outputs,
             locktime=locktime,
@@ -12610,7 +12653,7 @@ class RPCServer:
 
     async def rpc_createrawtransaction(
         self, inputs: list[dict], outputs, locktime: int = 0,
-        replaceable: bool = None
+        replaceable: bool = None, version: int = None
     ) -> str:
         """Create a raw transaction (unsigned).
 
@@ -12822,8 +12865,11 @@ class RPCServer:
                 "replaceable option",
             )
 
+        # Was hardcoded 2, and the handler took only four parameters at all,
+        # so a five-argument call raised TypeError and surfaced as -32603.
+        tx_version = _parse_createraw_version(version)
         tx = DbTx(
-            txid=b'\x00' * 32, version=2, locktime=lock,
+            txid=b'\x00' * 32, version=tx_version, locktime=lock,
             inputs=tx_inputs, outputs=tx_outputs,
         )
         return tx.serialize().hex()
