@@ -546,6 +546,7 @@ async def accept_block(
     next_height: int,
     *,
     skip_scripts: bool = False,
+    decoded_block=None,
 ) -> bytes:
     """Unified block-acceptance helper — Core's ProcessNewBlock pipeline.
 
@@ -575,6 +576,15 @@ async def accept_block(
         skip_scripts: When True, skip per-input script verification (used by
                       the IBD drain below the assumevalid checkpoint).  BIP-34,
                       structural checks, and UTXO checks always run regardless.
+        decoded_block: Optional already-parsed ``database.Block`` for
+                      ``block_bytes``.  ``rpc_submitblock`` must run Core's
+                      ``DecodeHexBlk`` (rpc/mining.cpp:1079) BEFORE anything
+                      else so a wire-format failure surfaces as
+                      RPC_DESERIALIZATION_ERROR rather than a BIP-22 string;
+                      handing the parsed block down here keeps that Core-order
+                      decode free instead of costing a second full Python
+                      parse of every submitted block.  Purely an optimisation —
+                      when omitted the block is parsed here exactly as before.
 
     Returns:
         The 32-byte block hash (internal byte order, as returned by
@@ -625,8 +635,11 @@ async def accept_block(
     # and the alternative -- moving the BIP-34 check after the Rust call --
     # would run it after the block had already been connected.
     try:
-        from ouroboros.database import Block as _Block0
-        _blk0 = _Block0.deserialize(block_bytes)
+        if decoded_block is not None:
+            _blk0 = decoded_block
+        else:
+            from ouroboros.database import Block as _Block0
+            _blk0 = _Block0.deserialize(block_bytes)
         # Core checks the merkle root BEFORE any structural gate below, so
         # only emit the structural tokens when the merkle root actually
         # matches; otherwise fall through to the Rust CheckBlock, which
@@ -9074,10 +9087,44 @@ class RPCServer:
             # BIP-22: return canonical string in result field, not a long message.
             return "rejected"
 
+        # --- Core DecodeHexBlk (rpc/mining.cpp:1079-1081) -----------------
+        # Core decodes FIRST — before the duplicate check, before any
+        # prev-hash lookup — and a decode failure is a JSON-RPC error, never
+        # a BIP-22 result string:
+        #     if (!DecodeHexBlk(block, request.params[0].get_str()))
+        #         throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
+        #                            "Block decode failed");
+        # The underlying std::ios_base::failure text — e.g.
+        # "non-canonical ReadCompactSize()" (serialize.h:344/:350/:356) — is
+        # swallowed by DecodeHexBlk and never reaches the client, so the
+        # message is a FIXED string.
+        #
+        # ouroboros previously deferred the parse to accept_block and mapped
+        # the resulting ValueError through bip22_result_string(), whose
+        # fallback is the generic "rejected".  That is the R2 reason-token
+        # divergence measured on all 4 rows of diff-test corpus
+        # _tierc-guards-2026-07-06/C1-noncanonical-compactsize (ouroboros
+        # reject:rejected vs Core reject:block-decode-failed).  The decision
+        # was never in question — both REJECT and the tip never moves — so
+        # this is reason parity, not a consensus split.  decode_varint
+        # (p2p_messages.py:81) already rejects non-canonical CompactSize
+        # correctly; only the surfacing was wrong.
         try:
             block_bytes = bytes.fromhex(hexdata)
         except ValueError:
-            return "rejected"
+            raise RpcError(
+                RPC_DESERIALIZATION_ERROR, "Block decode failed"
+            ) from None
+
+        from ouroboros.database import Block as _DecodedBlock
+        try:
+            decoded_block = _DecodedBlock.deserialize(block_bytes)
+        except Exception as decode_err:
+            # Keep the detail for the operator; Core discards it.
+            logger.debug("submitblock: block decode failed: %s", decode_err)
+            raise RpcError(
+                RPC_DESERIALIZATION_ERROR, "Block decode failed"
+            ) from None
 
         db = getattr(self.node, "db", None)
         if db is None:
@@ -9127,6 +9174,7 @@ class RPCServer:
                     block_bytes,
                     best_height + 1,
                     skip_scripts=False,
+                    decoded_block=decoded_block,
                 )
                 return None
             except Exception as e:

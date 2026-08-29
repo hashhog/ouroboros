@@ -26,7 +26,11 @@ src_dir = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(src_dir))
 
 from ouroboros.node import BitcoinNode  # noqa: E402
-from ouroboros.rpc import RPCServer  # noqa: E402
+from ouroboros.rpc import (  # noqa: E402
+    RPC_DESERIALIZATION_ERROR,
+    RPCServer,
+    RpcError,
+)
 
 
 class _FakeDb:
@@ -167,17 +171,46 @@ class TestRpcSubmitBlockTooShort(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_short_block_rejected(self) -> None:
-        # 79 bytes is one byte short of a header.
+        # 79 bytes is one byte short of a header.  Core's DecodeHexBlk
+        # (rpc/mining.cpp:1079) fails and submitblock throws
+        # RPC_DESERIALIZATION_ERROR (-22) "Block decode failed" — a
+        # JSON-RPC error, NOT a BIP-22 result string.  Updated 2026-08-23
+        # with the C1-noncanonical-compactsize reason-parity fix.
         async def _run():
             return await self.rpc.rpc_submitblock("aa" * 79)
-        result = asyncio.run(_run())
-        self.assertEqual(result, "rejected")
+        with self.assertRaises(RpcError) as ctx:
+            asyncio.run(_run())
+        self.assertEqual(ctx.exception.code, RPC_DESERIALIZATION_ERROR)
+        self.assertEqual(ctx.exception.message, "Block decode failed")
 
     def test_invalid_hex_rejected(self) -> None:
+        # Same Core call site: IsHex() failure inside DecodeHexBlk.
         async def _run():
             return await self.rpc.rpc_submitblock("not-hex-at-all")
-        result = asyncio.run(_run())
-        self.assertEqual(result, "rejected")
+        with self.assertRaises(RpcError) as ctx:
+            asyncio.run(_run())
+        self.assertEqual(ctx.exception.code, RPC_DESERIALIZATION_ERROR)
+        self.assertEqual(ctx.exception.message, "Block decode failed")
+
+    def test_noncanonical_compactsize_is_decode_failure(self) -> None:
+        """Non-canonical CompactSize must surface as Core's decode error.
+
+        Regression guard for diff-test corpus
+        ``_tierc-guards-2026-07-06/C1-noncanonical-compactsize``.  A block
+        whose tx-count is written in the 3-byte 0xfd form for a value < 253
+        is rejected by Core inside ReadCompactSize (serialize.h:344) —
+        DecodeHexBlk swallows the ios_base::failure and submitblock answers
+        -22 "Block decode failed", never a BIP-22 string.
+        """
+        # 80-byte header of zeros + tx count 1 encoded non-canonically.
+        payload = ("00" * 80) + "fd0100"
+
+        async def _run():
+            return await self.rpc.rpc_submitblock(payload)
+        with self.assertRaises(RpcError) as ctx:
+            asyncio.run(_run())
+        self.assertEqual(ctx.exception.code, RPC_DESERIALIZATION_ERROR)
+        self.assertEqual(ctx.exception.message, "Block decode failed")
 
 
 if __name__ == "__main__":
