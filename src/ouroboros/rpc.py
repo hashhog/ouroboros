@@ -878,6 +878,61 @@ def _iter_node_wallets(node):
 
 
 
+def _core_getint(value, lo, hi):
+    """Read an argument the way Core's ``UniValue::getInt<T>()`` does.
+
+    Core parses the raw JSON token with ``std::from_chars`` INTO THE
+    DESTINATION WIDTH, so the width check lives INSIDE the conversion and
+    fires BEFORE the handler's own domain test: out of width is
+    ``RPC_MISC_ERROR`` (-1) "JSON integer out of range", and only values that
+    survive the conversion reach a -8 range check.
+
+    Two Python hazards, both guarded here:
+
+    * ``int`` is arbitrary-precision -- nothing overflows, so this explicit
+      bound is the ONLY thing enforcing Core's width.
+    * ``bool`` IS A SUBCLASS OF ``int``, so ``isinstance(True, int)`` is True
+      and a naive numeric check would accept ``true`` as 1.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RpcError(
+            RPC_TYPE_ERROR,
+            "JSON value of type "
+            f"{_core_uvtype(value)} is not of expected type number",
+        )
+    if value < lo or value > hi:
+        raise RpcError(RPC_MISC_ERROR, "JSON integer out of range")
+    return value
+
+
+def _core_getint32(value):
+    return _core_getint(value, -2147483648, 2147483647)
+
+
+def _check_estimate_mode(mode):
+    """Core validates estimate_mode with ``FeeModeFromString``.
+
+    common/messages.cpp compares against {"unset", "economical",
+    "conservative"} after ``ToUpper``, so the match is case-insensitive and
+    anything else is ``RPC_INVALID_PARAMETER``.  Ignoring the argument
+    returned an estimate for whatever the caller passed.
+    """
+    if mode is None:
+        return
+    if not isinstance(mode, str):
+        raise RpcError(
+            RPC_TYPE_ERROR,
+            "JSON value of type "
+            f"{_core_uvtype(mode)} is not of expected type string",
+        )
+    if mode.upper() not in ("UNSET", "ECONOMICAL", "CONSERVATIVE"):
+        raise RpcError(
+            RPC_INVALID_PARAMETER,
+            'Invalid estimate_mode parameter, must be one of: '
+            '"unset", "economical", "conservative"',
+        )
+
+
 def _parse_createraw_version(value):
     """Core's ``version`` argument for the createrawtransaction family.
 
@@ -2493,6 +2548,8 @@ class RPCServer:
                 "JSON value of type "
                 f"{_core_uvtype(timeout)} is not of expected type number",
             )
+        # getInt<int>'s width check runs BEFORE the negative-timeout test.
+        _core_getint32(timeout)
         if timeout < 0:
             raise RpcError(RPC_MISC_ERROR, "Negative timeout")
         return timeout
@@ -2601,12 +2658,7 @@ class RPCServer:
         an int (type error on non-integral).  ``timeout`` is in milliseconds;
         0 = no timeout.  On timeout returns the current tip.
         """
-        if isinstance(height, bool) or not isinstance(height, int):
-            raise RpcError(
-                RPC_TYPE_ERROR,
-                "JSON value of type "
-                f"{_core_uvtype(height)} is not of expected type number",
-            )
+        _core_getint32(height)
         timeout_ms = self._parse_wait_timeout(timeout)
 
         return await self._wait_for_tip(
@@ -6777,7 +6829,18 @@ class RPCServer:
             {"feerate": <BTC/kB>, "blocks": <conf_target>}
             or {"errors": [...], "blocks": <conf_target>}
         """
-        conf_target = max(1, min(conf_target, 1008))
+        # Core: ParseConfirmTarget (rpc/util.cpp) reads conf_target with
+        # getInt<int> and then REJECTS anything outside
+        # [1, HighestTargetTracked] -- it does not clamp.  Clamping fabricated
+        # an estimate for a horizon the caller never asked about and reported
+        # it as success.
+        _core_getint32(conf_target)
+        if conf_target < 1 or conf_target > 1008:
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "Invalid conf_target, must be between 1 and 1008",
+            )
+        _check_estimate_mode(estimate_mode)
 
         fee_estimator = getattr(self.node, 'fee_estimator', None)
         if fee_estimator is None:
@@ -10751,11 +10814,10 @@ class RPCServer:
                      ipv4|ipv6|onion|i2p|cjdns (case-insensitive); any other
                      string -> RPC error -8 "Network not recognized: <arg>".
         """
-        # count (positional 0): default 1; getInt<int> semantics.
-        try:
-            count_i = int(count) if count is not None else 1
-        except (TypeError, ValueError):
-            raise RpcError(RPC_INVALID_PARAMETER, "Address count out of range")
+        # count (positional 0): default 1; getInt<int> semantics -- the width
+        # check is part of the CONVERSION, so an out-of-int32 count is -1 and
+        # only an in-range negative reaches the -8 domain error below.
+        count_i = 1 if count is None else _core_getint32(count)
         if count_i < 0:
             raise RpcError(RPC_INVALID_PARAMETER, "Address count out of range")
 
@@ -14268,6 +14330,18 @@ class RPCServer:
                      Use -1 to average over the current difficulty epoch.
             height:  Block height to end at (default -1 = chain tip).
         """
+        # Core's GetNetworkHashPS (rpc/mining.cpp) REJECTS both degenerate
+        # arguments rather than substituting a default, and reads them with
+        # getInt<int>.  Substituting meant a request for the hashrate at
+        # height 99999999 came back as the hashrate at the tip.
+        _core_getint32(nblocks)
+        _core_getint32(height)
+        if nblocks < -1 or nblocks == 0:
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "Invalid nblocks. Must be a positive number or -1.",
+            )
+
         if not hasattr(self.node, 'db') or not self.node.db:
             return 0.0
 
@@ -14276,12 +14350,17 @@ class RPCServer:
         except Exception:
             return 0.0
 
-        if height < 0 or height > best_height:
+        if height < -1 or height > best_height:
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "Block does not exist at specified height",
+            )
+        if height < 0:
             height = best_height
 
-        # nblocks == -1 means use the current difficulty epoch length
-        if nblocks <= 0:
-            nblocks = max(height % 2016, 1)
+        # nblocks == -1 means "since the last difficulty change"
+        if nblocks == -1:
+            nblocks = (height % 2016) + 1
 
         # Clamp: don't look back further than genesis
         if nblocks > height:
