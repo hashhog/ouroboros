@@ -1122,6 +1122,19 @@ def _is_json_num(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _is_already_banned(bm: Any, subnet: str) -> bool:
+    """Core's ``banman.IsBanned`` at the setban boundary.
+
+    BanManager keys bans by the exact string it was given, and its own
+    ``is_banned`` already drops entries whose expiry has passed -- so an
+    expired ban is correctly NOT "already banned", matching Core.
+    """
+    try:
+        return bool(bm.is_banned(subnet))
+    except Exception:
+        return False
+
+
 def _uv_get_int(value: Any, name: str, lo: int, hi: int) -> int:
     """``UniValue::getInt<Int>()`` for a destination of range ``[lo, hi]``.
 
@@ -2750,12 +2763,10 @@ class RPCServer:
         # Core: nHeight = request.params[0].getInt<int>() — a non-integer height
         # is a parameter error. Match Core's out-of-range guard against the
         # active-chain tip height (db.get_best_block() -> (hash, height)).
-        try:
-            height = int(height)
-        except (TypeError, ValueError):
-            raise RpcError(
-                RPC_INVALID_PARAMETER, "Block height out of range"
-            ) from None
+        # getInt<int> parses INTO the destination width, so an out-of-int32
+        # height fails in the CONVERSION and never reaches the range test
+        # below -- which answered -8 where Core answers -1.
+        height = _uv_get_int(height, "height", _INT32_MIN, _INT32_MAX)
         _, tip_height = self.node.db.get_best_block()
         if height < 0 or height > tip_height:
             raise RpcError(RPC_INVALID_PARAMETER, "Block height out of range")
@@ -2819,6 +2830,13 @@ class RPCServer:
         # the two Core message forms. A well-formed-but-absent hash falls
         # through to the -5 "Block not found" path below, unchanged.
         block_hash = _parse_hash_v(blockhash, "blockhash")[::-1]
+
+        # The verbosity conversion runs BEFORE the block lookup: an
+        # out-of-int32 value answered -5 "Block not found" where Core answers
+        # -1, because the value survived Python's unbounded int and rode into
+        # the lookup.
+        if verbosity is not None and not isinstance(verbosity, bool):
+            verbosity = _uv_get_int(verbosity, "verbosity", _INT32_MIN, _INT32_MAX)
 
         if not hasattr(self.node, 'db'):
             raise HTTPException(status_code=500, detail="Database not available")
@@ -3130,6 +3148,11 @@ class RPCServer:
         # entry, 2026-05-05). Mirrors how `blockhash` is parsed at :1569
         # and how Bitcoin Core's `rpc/rawtransaction.cpp::ParseHashV` does
         # the same byte reversal at the boundary.
+        # Same ordering as getblock: the verbosity conversion precedes the
+        # lookup, so an out-of-int32 value is -1, not the -5 lookup miss.
+        if verbose is not None and not isinstance(verbose, bool):
+            verbose = _uv_get_int(verbose, "verbosity", _INT32_MIN, _INT32_MAX)
+
         try:
             tx_hash = bytes.fromhex(txid)[::-1]
         except ValueError:
@@ -10713,8 +10736,31 @@ class RPCServer:
                 RPC_CLIENT_INVALID_IP_OR_SUBNET, "Error: Invalid IP/Subnet"
             )
 
+        if command == "add":
+            # Core checks IsBanned FIRST, before bantime is read at all
+            # (rpc/net.cpp). ouroboros had no already-banned check, so a re-ban
+            # silently succeeded where Core answers -23.
+            if _is_already_banned(bm, subnet):
+                raise RpcError(
+                    RPC_CLIENT_NODE_ALREADY_ADDED, "Error: IP/Subnet already banned"
+                )
+            # Core refuses an ABSOLUTE bantime already in the past (strictly
+            # `banTime < GetTime()`) instead of recording an expired ban. This
+            # was found by the differential's CONTROL, not a hostile integer.
+            if absolute and int(bantime) < int(time.time()):
+                raise RpcError(
+                    RPC_INVALID_PARAMETER, "Error: Absolute timestamp is in the past"
+                )
+
         success = bm.setban(subnet, command, bantime, absolute)
         if not success:
+            if command == "remove":
+                # Core: RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) with this wording.
+                raise RpcError(
+                    RPC_CLIENT_INVALID_IP_OR_SUBNET,
+                    "Error: Unban failed. Requested address/subnet was not "
+                    "previously manually banned.",
+                )
             raise ValueError(f"setban failed for {subnet}")
 
     async def rpc_listbanned(self) -> list[dict[str, Any]]:
@@ -11392,10 +11438,9 @@ class RPCServer:
         if nblocks is None:
             blockcount = max(0, min(DEFAULT_NBLOCKS, pindex_height - 1))
         else:
-            try:
-                blockcount = int(nblocks)
-            except (TypeError, ValueError):
-                raise RpcError(RPC_INVALID_PARAMETER, "Invalid block count")
+            # getInt<int> fails in the CONVERSION, so an out-of-int32 nblocks
+            # never reaches the domain test -- which answered -8, not -1.
+            blockcount = _uv_get_int(nblocks, "nblocks", _INT32_MIN, _INT32_MAX)
             if blockcount < 0 or (blockcount > 0 and blockcount >= pindex_height):
                 raise RpcError(
                     RPC_INVALID_PARAMETER,
