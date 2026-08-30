@@ -210,6 +210,14 @@ class BanManager:
             self.ban(ip, duration=duration, reason="setban RPC")
             return True
         elif command == "remove":
+            # Core's BanMan::Unban returns FALSE when the entry was not there,
+            # and setban turns that into RPC_CLIENT_INVALID_IP_OR_SUBNET (-30)
+            # "Error: Unban failed...".  This returned True unconditionally, so
+            # the RPC's -30 branch was DEAD CODE -- a live `setban <never-banned>
+            # remove` answered success.  Caught by a live probe after the unit
+            # test passed against a fake that did report failure.
+            if not self.is_banned(ip) and ip not in self.banned:
+                return False
             self.unban(ip)
             return True
         else:

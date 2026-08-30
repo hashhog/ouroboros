@@ -213,6 +213,39 @@ async def test_control_absolute_timestamp_in_the_future_is_accepted(rpc_with_ban
 
 
 @pytest.mark.asyncio
+async def test_failed_unban_is_minus_30_against_the_REAL_ban_manager(rpc):
+    """The fake above cannot prove this, and that is the point.
+
+    The first version of this fix was DEAD CODE: BanManager.setban("remove")
+    returned True unconditionally (unban() is a no-op for an unknown IP), so
+    the -30 branch could never execute in production.  The unit test passed
+    because the fake DID report failure.  A live probe caught it.  This case
+    drives the real class, so the fake can never hide it again.
+    """
+    from ouroboros.banman import BanManager
+
+    class _PM:
+        pass
+
+    pm = _PM()
+    pm.ban_manager = BanManager()
+    rpc.node.peer_manager = pm
+
+    assert await _err(rpc.rpc_setban("9.9.9.9", "remove")) == (
+        -30,
+        "Error: Unban failed. Requested address/subnet was not previously "
+        "manually banned.",
+    )
+    # CONTROL on the real class: unbanning something actually banned succeeds.
+    await rpc.rpc_setban("9.9.9.9", "add")
+    assert await _err(rpc.rpc_setban("9.9.9.9", "remove")) == (
+        0,
+        "(no error - call succeeded)",
+    )
+    assert not pm.ban_manager.is_banned("9.9.9.9")
+
+
+@pytest.mark.asyncio
 async def test_control_unbanning_something_banned_still_succeeds(rpc_with_bans):
     await rpc_with_bans.rpc_setban("7.7.7.7", "add")
     assert await _err(rpc_with_bans.rpc_setban("7.7.7.7", "remove")) == (
