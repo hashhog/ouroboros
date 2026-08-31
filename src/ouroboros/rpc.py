@@ -10,6 +10,7 @@ import hashlib as _hashlib
 import hmac
 import ipaddress as _ipaddress
 import json
+from importlib import resources
 import logging
 import statistics
 import struct as _struct
@@ -124,6 +125,38 @@ PAYJOIN_V1_LITERAL = '"v": "1"'  # documentation token — see G21
 
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Core's central argument-count gate (#103)
+# ---------------------------------------------------------------------------
+# The table maps method -> (required, declared) and is derived from Core's own
+# `help` signature line by tools/core-arity.py. Coverage is 87 of 103 methods;
+# a method absent from it FAILS OPEN, because treating an unlisted method as
+# zero-arg would reject calls Core accepts.
+_CORE_ARITY: dict[str, tuple[int, int]] | None = None
+
+
+def _core_arity_for(method: str) -> tuple[int, int] | None:
+    """Return (required, declared) for *method*, or None if not in the table."""
+    global _CORE_ARITY
+    if _CORE_ARITY is None:
+        try:
+            raw = json.loads(
+                resources.files("ouroboros.data")
+                .joinpath("core_arity.json")
+                .read_text(encoding="utf-8")
+            )
+            _CORE_ARITY = {
+                k: (int(v["required"]), int(v["declared"])) for k, v in raw.items()
+            }
+        except Exception:
+            # Fail OPEN and say so loudly: a silently empty table would make
+            # every assertion about this gate vacuous.
+            logger.error("core_arity.json unreadable -- arity gate DISABLED", exc_info=True)
+            _CORE_ARITY = {}
+    return _CORE_ARITY.get(method)
+
 
 # Rate limiting
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
@@ -1872,6 +1905,22 @@ class RPCServer:
                     "error": {"code": -32601, "message": f"Method not found: {method}"},
                     "id": req_id
                 }
+
+            # Core validates argument COUNT centrally, after the method lookup
+            # and before the handler runs (rpc/util.cpp:644 -> IsValidNumArgs,
+            # :733): required <= n <= declared, else it throws the help text as
+            # error -1. Verified read-only against the live oracle 2026-08-31:
+            #   getblockhash []           -> -1 "getblockhash height"
+            #   getblockcount ["surplus"] -> -1 "getblockcount"
+            # Ordering matters: an unknown method is -32601 above, never -1.
+            if isinstance(params, list):
+                arity = _core_arity_for(method)
+                if arity is not None and not (arity[0] <= len(params) <= arity[1]):
+                    return {
+                        "jsonrpc": "2.0",
+                        "error": {"code": -1, "message": "Wrong number of arguments"},
+                        "id": req_id
+                    }
 
             # Call method with params
             if isinstance(params, list):
