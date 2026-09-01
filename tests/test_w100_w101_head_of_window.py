@@ -47,6 +47,7 @@ from ouroboros.block_sync import (
     MAX_BLOCKS_IN_FLIGHT_PER_PEER,
     BlockSync,
 )
+from ouroboros.p2p_messages import NODE_WITNESS
 from ouroboros.peer import Peer
 
 # Must match the HEAD_OF_WINDOW literal in both _request_next_blocks and
@@ -88,6 +89,9 @@ def _make_ready_peer(host: str = "10.0.0.1", port: int = 8333) -> MagicMock:
     peer.port = port
     peer.score = 100
     peer.is_connected.return_value = True
+    # block_sync._can_serve_witness_blocks() (Core CanServeWitnesses,
+    # net_processing.cpp:1168) drops non-NODE_WITNESS peers from block download.
+    peer.services = NODE_WITNESS
     peer.send_message = AsyncMock()
     peer.adjust_score = MagicMock()
     return peer

@@ -365,6 +365,9 @@ class TestG10BasicFilterElements(unittest.TestCase):
 
         # Build a mock DB that returns an OP_RETURN UTXO for the spent input
         mock_db = MagicMock()
+        # blockfilter.collect_block_scripts consults get_utxo_or_spent() first
+        # (SPENT_CF undo record, mirroring Core reading CBlockUndo), then get_utxo.
+        mock_db.get_utxo_or_spent.return_value = {"script_pubkey": op_ret_spk}
         mock_db.get_utxo.return_value = {"script_pubkey": op_ret_spk}
 
         # Coinbase (index 0) is skipped, so use a non-coinbase tx

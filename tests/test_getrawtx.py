@@ -75,6 +75,11 @@ class MockTransaction:
     def serialize(self) -> bytes:
         return b"\x00" * self._vsize
 
+    def serialize_with_witness(self) -> bytes:
+        # psbt._tx_to_univ (shared TxToUniv path used by getrawtransaction
+        # verbose) sizes the tx from serialize_with_witness().
+        return self.serialize()
+
 
 class MockBlock:
     """Mock block for testing."""
@@ -226,6 +231,7 @@ class TestGetRawTransactionMempool:
         mock_node.mempool.transactions[sample_tx.get_txid()] = sample_tx
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         result = await rpc.rpc_getrawtransaction(
@@ -246,6 +252,7 @@ class TestGetRawTransactionMempool:
         mock_node.mempool.transactions[sample_tx.get_txid()] = sample_tx
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         result = await rpc.rpc_getrawtransaction(
@@ -281,6 +288,7 @@ class TestGetRawTransactionBlockchain:
         mock_node.db.height_to_hash[50] = block_hash
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         result = await rpc.rpc_getrawtransaction(
@@ -313,6 +321,7 @@ class TestGetRawTransactionBlockchain:
         mock_node.db.height_to_hash[50] = block_hash
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         result = await rpc.rpc_getrawtransaction(
@@ -340,6 +349,7 @@ class TestGetRawTransactionBlockchain:
         mock_node.db.height_to_hash[50] = bytes.fromhex("c" * 64)  # different hash
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         result = await rpc.rpc_getrawtransaction(
@@ -367,6 +377,7 @@ class TestGetRawTransactionErrors:
         from ouroboros.rpc import RPC_INVALID_PARAMETER, RpcError, RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         with pytest.raises(RpcError) as exc_info:
@@ -380,6 +391,7 @@ class TestGetRawTransactionErrors:
         from ouroboros.rpc import RPC_INVALID_PARAMETER, RpcError, RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         with pytest.raises(RpcError) as exc_info:
@@ -397,6 +409,7 @@ class TestGetRawTransactionErrors:
         from ouroboros.rpc import RPC_INVALID_ADDRESS_OR_KEY, RpcError, RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         nonexistent_hash = "d" * 64
@@ -425,6 +438,7 @@ class TestGetRawTransactionErrors:
         mock_node.db.blocks[sample_block.block_hash] = empty_block
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         with pytest.raises(RpcError) as exc_info:
@@ -455,6 +469,7 @@ class TestGetRawTransactionErrors:
         mock_node.db = MockDatabaseNoTxIndex()
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         with pytest.raises(RpcError) as exc_info:
@@ -472,6 +487,7 @@ class TestGetRawTransactionErrors:
         from ouroboros.rpc import RPC_INVALID_ADDRESS_OR_KEY, RpcError, RPCServer
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         with pytest.raises(RpcError) as exc_info:
@@ -501,6 +517,7 @@ class TestGetRawTransactionErrors:
         mock_node.db.height_to_hash[0] = genesis_hash
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         # The display-order txid is the merkle root reversed back to BE.
@@ -527,6 +544,7 @@ class TestGetRawTransactionVerboseOutput:
         mock_node.db.height_to_hash[50] = block_hash
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         result = await rpc.rpc_getrawtransaction(
@@ -548,6 +566,7 @@ class TestGetRawTransactionVerboseOutput:
         mock_node.db.height_to_hash[50] = block_hash
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         result = await rpc.rpc_getrawtransaction(
@@ -588,6 +607,7 @@ class TestGetRawTransactionConfirmations:
         mock_node.db.best_height = 100
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         result = await rpc.rpc_getrawtransaction(
@@ -611,6 +631,7 @@ class TestGetRawTransactionConfirmations:
         mock_node.db.best_height = 100
 
         rpc = RPCServer.__new__(RPCServer)
+        rpc._side_branch_blocks = {}  # __init__ skipped; _get_block_height reads it
         rpc.node = mock_node
 
         result = await rpc.rpc_getrawtransaction(

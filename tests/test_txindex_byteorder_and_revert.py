@@ -161,7 +161,7 @@ def test_getrawtransaction_reverses_display_order_txid_for_get_tx_index():
     )
 
 
-def test_getrawtransaction_compares_against_le_in_block_search():
+def test_getrawtransaction_compares_against_le_in_block_search(monkeypatch):
     """The fallback block-walk at rpc.py:1632 compares ``found_txid == tx_hash``.
 
     ``found_txid`` comes from ``block_tx.get_txid()`` (LE).  After the
@@ -174,10 +174,13 @@ def test_getrawtransaction_compares_against_le_in_block_search():
 
     # Stub a block with a single tx whose internal txid (get_txid) is the
     # LE form.  Using SimpleNamespace because the RPC path only touches
-    # `.transactions[*].get_txid()` and `.serialize()`.
+    # `.transactions[*].get_txid()` / `.txid` and the serializers; the
+    # verbose body is built by psbt._tx_to_univ (stubbed below).
     matching_tx = SimpleNamespace(
+        txid=le_bytes,
         get_txid=lambda b=le_bytes: b,
         serialize=lambda: b"\x02\x00\x00\x00",  # arbitrary bytes
+        serialize_with_witness=lambda: b"\x02\x00\x00\x00",
     )
     fake_block = SimpleNamespace(
         transactions=[matching_tx],
@@ -196,8 +199,10 @@ def test_getrawtransaction_compares_against_le_in_block_search():
     mempool.get_transaction.return_value = None
 
     server = _build_server_with_db(db, mempool)
-    # Patch _tx_to_dict to a stub since the matching_tx isn't a real Tx.
-    server._tx_to_dict = lambda tx: {"txid": "stub"}
+    # Stub the shared TxToUniv helper (rpc imports it from ouroboros.psbt at
+    # call time) since the matching_tx isn't a real Tx.
+    import ouroboros.psbt as psbt_module
+    monkeypatch.setattr(psbt_module, "_tx_to_univ", lambda tx, net: {"txid": "stub"})
 
     result = asyncio.run(server.rpc_getrawtransaction(display_hex, True))
 

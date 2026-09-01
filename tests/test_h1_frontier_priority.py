@@ -41,6 +41,7 @@ from ouroboros.block_sync import (
     BlockSync,
 )
 from ouroboros.p2p_messages import GetDataMessage
+from ouroboros.p2p_messages import NODE_WITNESS
 from ouroboros.peer import Peer
 
 
@@ -65,6 +66,9 @@ def _make_ready_peer(host: str, score: int = 100) -> MagicMock:
     peer.port = 8333
     peer.score = score
     peer.is_connected.return_value = True
+    # block_sync._can_serve_witness_blocks() (Core CanServeWitnesses,
+    # net_processing.cpp:1168) drops non-NODE_WITNESS peers from block download.
+    peer.services = NODE_WITNESS
     peer.send_message = AsyncMock()
     peer.adjust_score = MagicMock()
     return peer

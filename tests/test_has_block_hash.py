@@ -1,20 +1,48 @@
-"""Tests for the PyBlockchainDB.has_block_hash existence probe."""
+"""Tests for the PyBlockchainDB.has_block_hash existence probe.
 
+These run against the REAL Rust ``sync`` extension (ferrous-utils).  The
+suite's conftest.py installs a pure-Python stub as ``sys.modules['sync']``
+before anything imports it, so ``import sync`` here would only ever see the
+stub (which has no ``has_block_hash``).  Instead, locate the built extension
+in site-packages and load it under the private name ``sync.sync`` — the
+PyO3 init symbol is ``PyInit_sync`` so the last path component is what
+matters — without displacing the stub the rest of the suite relies on.
+"""
+
+import glob
+import importlib.util
 import os
+import site
+import sys
 import tempfile
 
 import pytest
 
-try:
-    import sync
-    HAS_SYNC = True
-except ImportError:
-    HAS_SYNC = False
 
+def _load_real_sync():
+    dirs = [site.getusersitepackages(), *site.getsitepackages()]
+    for d in dirs:
+        for so in sorted(glob.glob(os.path.join(d, "sync", "sync*.so"))):
+            spec = importlib.util.spec_from_file_location("sync.sync", so)
+            if spec is None or spec.loader is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.modules.pop("sync.sync", None)  # leave no trace for other tests
+            if hasattr(mod, "PyBlockchainDB"):
+                return mod
+    return None
+
+
+_real_sync = _load_real_sync()
 
 pytestmark = pytest.mark.skipif(
-    not HAS_SYNC,
-    reason="sync module not available (run `maturin develop --release` first)",
+    _real_sync is None,
+    reason=(
+        "ENV-ouroboros-1: real Rust sync extension not found in site-packages "
+        "(conftest.py's sys.modules['sync'] stub has no has_block_hash); "
+        "run `maturin develop --release` / reinstall_ouroboros.sh first"
+    ),
 )
 
 
@@ -24,7 +52,7 @@ def empty_db():
         # PyBlockchainDB writes into the directory directly.
         db_dir = os.path.join(tmpdir, "db")
         os.makedirs(db_dir)
-        yield sync.PyBlockchainDB(db_dir)
+        yield _real_sync.PyBlockchainDB(db_dir)
 
 
 def test_random_hash_returns_false(empty_db):

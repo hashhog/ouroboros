@@ -433,11 +433,12 @@ class TestAddressManagerBIP155(unittest.TestCase):
             time=int(time.time()),
             services=1,
             network_id=BIP155_NET_IPV4,
-            addr=bytes([10, 0, 0, 1]),
+            # Routable: AddressManager rejects RFC-1918 (Core IsRoutable).
+            addr=bytes([8, 8, 8, 8]),
             port=8333,
         )
 
-        result = addrman.add_from_addrv2(entry, source="192.168.1.1:8333")
+        result = addrman.add_from_addrv2(entry, source="93.184.1.1:8333")
 
         self.assertTrue(result)
         self.assertEqual(addrman.size(), 1)

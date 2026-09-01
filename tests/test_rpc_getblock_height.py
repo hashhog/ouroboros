@@ -102,6 +102,12 @@ class _StubDB:
     def get_block(self, block_hash: bytes):
         return self._by_hash.get(bytes(block_hash))
 
+    def get_block_bytes(self, block_hash: bytes):
+        # database.py get_block_bytes: witness-preserving raw bytes, or None
+        # when the block is unknown.  rpc_getblock fetches this once up front.
+        blk = self._by_hash.get(bytes(block_hash))
+        return blk.serialize() if blk is not None else None
+
     def get_best_block(self) -> tuple[bytes, int]:
         return (self._tip_hash, self._tip_height)
 

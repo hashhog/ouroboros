@@ -764,7 +764,8 @@ def _build_fix74_harness():
             self._tip = (self._height_to_block[height - 1].hash, height - 1)
             self._height_to_block.pop(height, None)
 
-        def connect_block_from_bytes(self, raw, height):
+        # database.py connect_block_from_bytes(block_bytes, height, network=None)
+        def connect_block_from_bytes(self, raw, height, network=None):
             # Pick whichever new-chain block corresponds to the height
             # — by harness contract, only B1 is connect-target post-reorg.
             new = B1

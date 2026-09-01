@@ -51,6 +51,12 @@ class TestNetworkGroup:
         assert "2001" in group
 
 
+# NOTE: hosts below are public (routable) addresses.  AddressManager.add()
+# rejects RFC-1918 / loopback etc. (src/ouroboros/addrman.py is_routable,
+# Core addrman.cpp AddSingle + netaddress.cpp CNetAddr::IsRoutable), so the
+# old 192.168.x / 10.x fixtures were silently dropped.  Groups: 93.184, 8.8, 1.1.
+
+
 class TestAddressManagerBucketing:
     """Tests for address manager bucket-based storage."""
 
@@ -64,7 +70,7 @@ class TestAddressManagerBucketing:
     def test_add_to_new(self):
         """Adding an address places it in the new table."""
         addrman = AddressManager()
-        result = addrman.add("192.168.1.1", 8333)
+        result = addrman.add("93.184.1.1", 8333)
         assert result is True
         assert addrman.new_count() == 1
         assert addrman.tried_count() == 0
@@ -72,48 +78,48 @@ class TestAddressManagerBucketing:
     def test_add_duplicate(self):
         """Adding the same address twice returns False."""
         addrman = AddressManager()
-        assert addrman.add("192.168.1.1", 8333) is True
-        assert addrman.add("192.168.1.1", 8333) is False
+        assert addrman.add("93.184.1.1", 8333) is True
+        assert addrman.add("93.184.1.1", 8333) is False
         assert addrman.new_count() == 1
 
     def test_mark_good_moves_to_tried(self):
         """Marking an address good moves it to tried table."""
         addrman = AddressManager()
-        addrman.add("192.168.1.1", 8333)
+        addrman.add("93.184.1.1", 8333)
         assert addrman.new_count() == 1
         assert addrman.tried_count() == 0
 
-        addrman.mark_good("192.168.1.1", 8333)
+        addrman.mark_good("93.184.1.1", 8333)
         assert addrman.new_count() == 0
         assert addrman.tried_count() == 1
 
     def test_source_tracking(self):
         """Addresses track their source peer."""
         addrman = AddressManager()
-        addrman.add("192.168.1.1", 8333, source="10.0.0.1:8333")
+        addrman.add("93.184.1.1", 8333, source="8.8.8.8:8333")
 
-        info = addrman.get_addr_info("192.168.1.1", 8333)
+        info = addrman.get_addr_info("93.184.1.1", 8333)
         assert info is not None
-        assert info.source == "10.0.0.1:8333"
-        assert info.source_group == "10.0"
+        assert info.source == "8.8.8.8:8333"
+        assert info.source_group == "8.8"
 
     def test_deterministic_bucketing(self):
         """Same address always goes to same bucket position."""
         addrman = AddressManager()
-        addrman.add("192.168.1.1", 8333, source="10.0.0.1:8333")
+        addrman.add("93.184.1.1", 8333, source="8.8.8.8:8333")
 
         # Get info and compute bucket
-        info = addrman.get_addr_info("192.168.1.1", 8333)
-        bucket1 = addrman._get_new_bucket(info, "10.0")
-        bucket2 = addrman._get_new_bucket(info, "10.0")
+        info = addrman.get_addr_info("93.184.1.1", 8333)
+        bucket1 = addrman._get_new_bucket(info, "8.8")
+        bucket2 = addrman._get_new_bucket(info, "8.8")
         assert bucket1 == bucket2
 
     def test_different_sources_different_buckets(self):
         """Addresses from different sources may go to different buckets."""
         addrman = AddressManager()
-        info = AddrInfo(host="192.168.1.1", port=8333)
+        info = AddrInfo(host="93.184.1.1", port=8333)
 
-        bucket1 = addrman._get_new_bucket(info, "10.0")
+        bucket1 = addrman._get_new_bucket(info, "8.8")
         bucket2 = addrman._get_new_bucket(info, "172.16")
         # Different sources typically produce different buckets
         # (not guaranteed but very likely)
@@ -130,30 +136,30 @@ class TestAddressSelection:
         addrman = AddressManager()
 
         # Add addresses from different /16 groups
-        addrman.add("192.168.1.1", 8333)
-        addrman.add("10.0.0.1", 8333)
-        addrman.add("172.16.0.1", 8333)
+        addrman.add("93.184.1.1", 8333)
+        addrman.add("8.8.8.8", 8333)
+        addrman.add("1.1.1.1", 8333)
 
         # Exclude 192.168 group
-        exclude_groups = {"192.168"}
+        exclude_groups = {"93.184"}
         selected = addrman.select_for_connection(exclude_groups=exclude_groups)
 
         if selected:
             host = selected.split(":")[0]
-            assert get_network_group(host) != "192.168"
+            assert get_network_group(host) != "93.184"
 
     def test_select_excludes_addresses(self):
         """Selection respects address exclusion."""
         addrman = AddressManager()
 
-        addrman.add("192.168.1.1", 8333)
-        addrman.add("192.168.1.2", 8333)
+        addrman.add("93.184.1.1", 8333)
+        addrman.add("93.184.1.2", 8333)
 
-        exclude = {"192.168.1.1:8333"}
+        exclude = {"93.184.1.1:8333"}
         selected = addrman.select_for_connection(exclude=exclude)
 
         if selected:
-            assert selected != "192.168.1.1:8333"
+            assert selected != "93.184.1.1:8333"
 
     def test_select_for_feeler(self):
         """Feeler selection prefers older new addresses."""
@@ -163,15 +169,15 @@ class TestAddressSelection:
         old_time = time.time() - 86400  # 1 day ago
         new_time = time.time()
 
-        addrman.add("192.168.1.1", 8333, timestamp=old_time)
-        addrman.add("192.168.1.2", 8333, timestamp=new_time)
+        addrman.add("93.184.1.1", 8333, timestamp=old_time)
+        addrman.add("93.184.1.2", 8333, timestamp=new_time)
 
         # Feeler should prefer the older address
         # Run multiple times to check bias
         old_count = 0
         for _ in range(20):
             selected = addrman.select_for_feeler()
-            if selected == "192.168.1.1:8333":
+            if selected == "93.184.1.1:8333":
                 old_count += 1
 
         # Older addresses should be selected more often
@@ -186,9 +192,9 @@ class TestAddressManagerPersistence:
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create and populate addrman
             addrman1 = AddressManager(data_dir=tmpdir)
-            addrman1.add("192.168.1.1", 8333, source="dns.seed.com")
-            addrman1.add("10.0.0.1", 8333)
-            addrman1.mark_good("192.168.1.1", 8333)
+            addrman1.add("93.184.1.1", 8333, source="dns.seed.com")
+            addrman1.add("8.8.8.8", 8333)
+            addrman1.mark_good("93.184.1.1", 8333)
             addrman1.save()
 
             # Load in new instance
@@ -205,8 +211,8 @@ class TestAddressManagerPersistence:
             v1_data = {
                 "version": 1,
                 "new": {
-                    "192.168.1.1:8333": {
-                        "host": "192.168.1.1",
+                    "93.184.1.1:8333": {
+                        "host": "93.184.1.1",
                         "port": 8333,
                         "services": 0,
                         "last_seen": time.time(),
@@ -228,7 +234,7 @@ class TestAddressManagerPersistence:
         with tempfile.TemporaryDirectory() as tmpdir:
             addrman1 = AddressManager(data_dir=tmpdir)
             key1 = addrman1._key
-            addrman1.add("192.168.1.1", 8333)
+            addrman1.add("93.184.1.1", 8333)
             addrman1.save()
 
             addrman2 = AddressManager(data_dir=tmpdir)
@@ -244,7 +250,7 @@ class TestAddressQuality:
         """Addresses not seen in 30 days are terrible."""
         addrman = AddressManager()
         info = AddrInfo(
-            host="192.168.1.1",
+            host="93.184.1.1",
             port=8333,
             last_seen=time.time() - 31 * 24 * 3600,  # 31 days ago
             last_attempt=time.time() - 120,  # 2 minutes ago
@@ -255,7 +261,7 @@ class TestAddressQuality:
         """Addresses with many failures are terrible."""
         addrman = AddressManager()
         info = AddrInfo(
-            host="192.168.1.1",
+            host="93.184.1.1",
             port=8333,
             last_seen=time.time(),
             last_attempt=time.time() - 120,
@@ -268,7 +274,7 @@ class TestAddressQuality:
         """Recently seen addresses are not terrible."""
         addrman = AddressManager()
         info = AddrInfo(
-            host="192.168.1.1",
+            host="93.184.1.1",
             port=8333,
             last_seen=time.time(),
             last_attempt=time.time() - 120,
@@ -281,11 +287,11 @@ class TestAddressQuality:
         addrman = AddressManager()
 
         recent = AddrInfo(
-            host="192.168.1.1", port=8333,
+            host="93.184.1.1", port=8333,
             last_attempt=time.time(),  # just now
         )
         old = AddrInfo(
-            host="192.168.1.2", port=8333,
+            host="93.184.1.2", port=8333,
             last_attempt=time.time() - 3600,  # 1 hour ago
         )
 
@@ -299,12 +305,12 @@ class TestAddressQuality:
         addrman = AddressManager()
 
         many_attempts = AddrInfo(
-            host="192.168.1.1", port=8333,
+            host="93.184.1.1", port=8333,
             last_attempt=time.time() - 3600,
             attempts=5,
         )
         few_attempts = AddrInfo(
-            host="192.168.1.2", port=8333,
+            host="93.184.1.2", port=8333,
             last_attempt=time.time() - 3600,
             attempts=1,
         )
@@ -323,12 +329,12 @@ class TestCollisionHandling:
         addrman = AddressManager()
 
         # Add and mark good - will be in tried
-        addrman.add("192.168.1.1", 8333)
-        addrman.mark_good("192.168.1.1", 8333)
+        addrman.add("93.184.1.1", 8333)
+        addrman.mark_good("93.184.1.1", 8333)
         assert addrman.tried_count() == 1
 
         # The address should have recent success time
-        info = addrman.get_addr_info("192.168.1.1", 8333)
+        info = addrman.get_addr_info("93.184.1.1", 8333)
         assert info is not None
         assert info.last_success > time.time() - 60  # within last minute
 
@@ -340,11 +346,11 @@ class TestNetworkGroupCounts:
         """Can get address counts per network group."""
         addrman = AddressManager()
 
-        addrman.add("192.168.1.1", 8333)
-        addrman.add("192.168.1.2", 8333)
-        addrman.add("10.0.0.1", 8333)
+        addrman.add("93.184.1.1", 8333)
+        addrman.add("93.184.1.2", 8333)
+        addrman.add("8.8.8.8", 8333)
 
         counts = addrman.get_network_group_counts()
 
-        assert counts.get("192.168", 0) == 2
-        assert counts.get("10.0", 0) == 1
+        assert counts.get("93.184", 0) == 2
+        assert counts.get("8.8", 0) == 1
