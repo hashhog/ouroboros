@@ -13,6 +13,12 @@ docker run -v ouroboros-data:/data -p 48350:48350 -p 48340:48340 ouroboros
 
 ### From Source
 
+Requires Python `>=3.11,<3.14` (`pyproject.toml` `requires-python`), a stable Rust
+toolchain + `maturin` for the `ferrous-utils/sync` PyO3 extension (no `rust-version`
+pin; Cargo edition 2021, pyo3 0.27), and system libs `libclang-dev libssl-dev
+librocksdb-dev pkg-config` (see `Dockerfile` / `setup.sh`, which needs interactive
+`sudo` for `apt-get`).
+
 ```bash
 ./setup.sh
 source .venv/bin/activate
