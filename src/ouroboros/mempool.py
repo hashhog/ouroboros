@@ -1354,24 +1354,38 @@ def _validate_inputs_standardness(
             continue
         prev_spk = bytes(prev_spk)
 
-        # G1: prevScript type must be standard.  We treat
-        # _is_standard_output_type() as the Solver-equivalent: it returns
-        # True iff the script matches a known standard pattern (P2PKH, P2SH,
-        # P2WPKH, P2WSH, P2TR, P2A, bare multisig, OP_RETURN).
-        if not _is_standard_output_type(prev_spk):
-            # G2 cousin: a witness program with version != 0/1 and a 2..40
-            # byte program is technically IsStandard returning WITNESS_UNKNOWN
-            # in Core, which is also rejected here.  Since
-            # _is_standard_output_type() already returns False for
-            # witness_unknown (only OP_0 and OP_1 witness-program versions
-            # pass), this branch handles both G1 and G2.
-            wp = _get_witness_program(prev_spk)
-            if wp is not None:
-                ver, _prog = wp
+        # G2: WITNESS_UNKNOWN prevouts.  Mirror Core's Solver() ordering
+        # (script/solver.cpp:156-177) explicitly here rather than leaning on
+        # _is_standard_output_type(): that helper is the IsStandard() proxy for
+        # OUTPUTS, and Core's IsStandard accepts WITNESS_UNKNOWN outputs
+        # (forward-compat), so it returns True for any version != 0 and can
+        # NOT distinguish "spendable-standard" from "witness_unknown".  Solver:
+        #   v0/20 -> P2WPKH, v0/32 -> P2WSH, v1/32 -> P2TR, v1/0x4e73 -> ANCHOR,
+        #   any other version != 0 -> WITNESS_UNKNOWN, v0 other len -> NONSTANDARD.
+        wp = _get_witness_program(prev_spk)
+        if wp is not None:
+            ver, prog = wp
+            is_known = (
+                (ver == 0 and len(prog) in (20, WITNESS_V0_SCRIPTHASH_SIZE))
+                or (ver == 1 and len(prog) == WITNESS_V1_TAPROOT_SIZE)
+                or is_pay_to_anchor_program(ver, prog)
+            )
+            if not is_known:
+                if ver != 0:
+                    # policy.cpp ValidateInputsStandardness WITNESS_UNKNOWN arm
+                    return False, (
+                        f"bad-txns-nonstandard-inputs: input {idx} witness "
+                        f"program is undefined (witness version {ver})"
+                    )
+                # v0 with a non-20/32 program: Solver -> NONSTANDARD
                 return False, (
-                    f"bad-txns-nonstandard-inputs: input {idx} witness "
-                    f"program is undefined (witness version {ver})"
+                    f"bad-txns-nonstandard-inputs: input {idx} script unknown"
                 )
+
+        # G1: prevScript type must be standard.  We treat
+        # _is_standard_output_type() as the Solver-equivalent for the
+        # non-witness patterns (P2PKH, P2SH, bare multisig, OP_RETURN).
+        if not _is_standard_output_type(prev_spk):
             return False, (
                 f"bad-txns-nonstandard-inputs: input {idx} script unknown"
             )
