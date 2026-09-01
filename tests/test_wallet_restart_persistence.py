@@ -289,16 +289,19 @@ def test_manager_notify_swallows_per_wallet_errors():
 
 
 def test_reconcile_on_load_rescans_loaded_wallets():
-    """reconcile_on_load triggers a full-chain rescan of each loaded wallet.
+    """reconcile_on_load rescans each loaded wallet from its scan marker.
 
     Teeth: pre-fix there was no startup reconcile at all, so the in-memory tx
-    history started empty after every restart.
+    history started empty after every restart.  A wallet WITH a marker is
+    rescanned from marker+1; a marker-less (legacy) wallet adopts its
+    birthday at the current tip and is NOT rescanned (Core AttachChain
+    parity: a fresh wallet never auto-rescans history; use rescanblockchain).
     """
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         mgr = WalletManager(str(tmp), network="regtest")
         # Attach a stub db so reconcile_on_load does not early-return.
-        mgr.set_database(SimpleNamespace(get_best_block=lambda: (b"\x00" * 32, 0)))
+        mgr.set_database(SimpleNamespace(get_best_block=lambda: (b"\x00" * 32, 7)))
         mgr.create_wallet("a")
 
         rescans = []
@@ -308,8 +311,17 @@ def test_reconcile_on_load_rescans_loaded_wallets():
             {"start_height": 0, "stop_height": 0}
         )
 
+        # Marker present: resume from marker + 1.
+        w._best_scanned_height = 3
         mgr.reconcile_on_load()
-        assert rescans == [(0, None)]
+        assert rescans == [(4, None)]
+
+        # Marker-less: adopt birthday at tip, no rescan.
+        rescans.clear()
+        w._best_scanned_height = None
+        mgr.reconcile_on_load()
+        assert rescans == []
+        assert w._best_scanned_height == 7
 
 
 def test_reconcile_on_load_noop_without_db():

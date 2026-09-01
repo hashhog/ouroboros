@@ -751,7 +751,9 @@ async def test_submitblock_refuses_while_paused(tmp_path) -> None:
     # Garbage hex is fine: gate runs before deserialization or DB access.
     result = await rpc.rpc_submitblock("00")
     assert isinstance(result, str)
-    assert "paused" in result
+    # BIP-22 canonical result string (Core rpc/mining.cpp submitblock returns
+    # the bare reject token, not prose); rpc.py NetworkDisable gate.
+    assert result == "rejected"
 
 
 @pytest.mark.asyncio
@@ -761,7 +763,7 @@ async def test_submitblockbatch_refuses_while_paused(tmp_path) -> None:
     rpc.block_submission_paused = True
     results = await rpc.rpc_submitblockbatch(["00", "11"])
     assert len(results) == 2
-    assert all(isinstance(r, str) and "paused" in r for r in results)
+    assert all(r == "rejected" for r in results)  # BIP-22 canonical token
 
 
 @pytest.mark.asyncio

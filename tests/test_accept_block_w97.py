@@ -378,8 +378,14 @@ class TestG8MinimumChainWork:
         tip = b"\x11" * 32
         # Use mainnet network so the minimum chain work is nonzero
         bs = _make_block_sync(tip_hash=tip, tip_height=100, network="mainnet")
-        # Zero-work base: the batch must stand on its own (near-zero) work.
-        bs.db.get_chainwork_by_height = MagicMock(return_value=0)
+        # Near-zero base: the batch must stand on its own (near-zero) work.
+        # NOT 0 — block_sync's G8 liveness guard deliberately SKIPS the gate
+        # when the chainwork index reads 0 at a non-zero tip (index gap ->
+        # would brick sync forever); base=1 keeps the gate armed.
+        bs.db.get_chainwork_by_height = MagicMock(return_value=1)
+        # A correctly built datadir has no assumeUTXO chainwork offset; the
+        # MagicMock db must not let detect_snapshot_chainwork_offset invent one.
+        bs._snapshot_offset_cache = 0
         peer = _make_peer()
 
         h1 = _valid_header_extending(tip, bits=REGTEST_BITS)
@@ -395,8 +401,10 @@ class TestG8MinimumChainWork:
         assert len(bs._validated_headers) == 0, (
             "G8: low-work header must not be queued when min_pow_checked=False"
         )
-        # Misbehaviour must fire.
-        peer.adjust_score.assert_called()
+        # Core NEVER punishes a peer for a low-work header chain:
+        # net_processing.cpp:1913 MaybePunishNodeForBlock BLOCK_HEADER_LOW_WORK
+        # is a bare `break` (no Misbehaving) — low-work chains go to presync.
+        peer.adjust_score.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_low_work_batch_accepted_when_min_pow_checked_true(self):

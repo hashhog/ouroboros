@@ -121,7 +121,11 @@ class TestKeyPool:
 
         generated = pool.top_up()
 
-        assert generated == 20  # 10 receive + 10 change
+        # top_up fills EVERY (purpose, is_change) sub-pool (wallet.py KeyPool:
+        # one per PURPOSE_FOR_ADDRESS_TYPE value x receive/change), not just
+        # the legacy bip84 receive/change aliases.
+        assert generated == 10 * len(pool._pools)
+        assert len(pool._pools) == 8  # 4 purposes x {receive, change}
         assert len(pool._receive_pool) == 10
         assert len(pool._change_pool) == 10
 
@@ -299,7 +303,7 @@ class TestWalletHD:
             wallet.init_hd(seed, pool_size=10)
 
             import asyncio
-            addr = asyncio.get_event_loop().run_until_complete(
+            addr = asyncio.run(
                 wallet.generate_new_address(address_type="bech32")
             )
 
@@ -313,7 +317,7 @@ class TestWalletHD:
             wallet.init_hd(seed, pool_size=10)
 
             import asyncio
-            addr = asyncio.get_event_loop().run_until_complete(
+            addr = asyncio.run(
                 wallet.get_change_address(address_type="bech32")
             )
 
@@ -353,7 +357,7 @@ class TestWalletHD:
             wallet1.init_hd(seed, pool_size=5)
 
             import asyncio
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 wallet1.generate_new_address()
             )
 
@@ -373,29 +377,28 @@ class TestWalletHD:
             seed = os.urandom(32)
             wallet.init_hd(seed, pool_size=10)
 
-            import asyncio
-            loop = asyncio.get_event_loop()
+            import asyncio  # py3.13: no implicit loop; use asyncio.run per call
 
             # bech32 (P2WPKH)
-            addr1 = loop.run_until_complete(
+            addr1 = asyncio.run(
                 wallet.generate_new_address(address_type="bech32")
             )
             assert addr1.startswith("bc1q")
 
             # p2sh-segwit
-            addr2 = loop.run_until_complete(
+            addr2 = asyncio.run(
                 wallet.generate_new_address(address_type="p2sh-segwit")
             )
             assert addr2.startswith("3")
 
             # bech32m (P2TR)
-            addr3 = loop.run_until_complete(
+            addr3 = asyncio.run(
                 wallet.generate_new_address(address_type="bech32m")
             )
             assert addr3.startswith("bc1p")
 
             # legacy (P2PKH)
-            addr4 = loop.run_until_complete(
+            addr4 = asyncio.run(
                 wallet.generate_new_address(address_type="legacy")
             )
             assert addr4.startswith("1")

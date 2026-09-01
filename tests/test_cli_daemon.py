@@ -29,7 +29,9 @@ from ouroboros.daemon import (
 from ouroboros.logging_config import (
     _CategoryFilter,
     configure_logging,
+    get_active_categories,
     reopen_log_file,
+    set_active_categories,
 )
 
 
@@ -136,8 +138,18 @@ def test_sd_notify_sends_datagram(tmp_path, monkeypatch):
 # Logging — categories + reopen
 # ---------------------------------------------------------------------------
 
-def test_category_filter_blocks_debug_outside_category():
-    flt = _CategoryFilter({"net"})
+@pytest.fixture
+def _restore_categories():
+    # _CategoryFilter reads the live module-global category set (so the
+    # ``logging`` RPC can toggle at runtime); restore it after each test.
+    saved = get_active_categories()
+    yield
+    set_active_categories(saved)
+
+
+def test_category_filter_blocks_debug_outside_category(_restore_categories):
+    set_active_categories({"net"})
+    flt = _CategoryFilter()
 
     def make(name, level=logging.DEBUG):
         return logging.LogRecord(name, level, __file__, 0, "x", None, None)
@@ -149,8 +161,9 @@ def test_category_filter_blocks_debug_outside_category():
     assert flt.filter(make("ouroboros.mempool", logging.INFO)) is True
 
 
-def test_category_filter_all_passes_through():
-    flt = _CategoryFilter(set(DEBUG_CATEGORIES))
+def test_category_filter_all_passes_through(_restore_categories):
+    set_active_categories(set(DEBUG_CATEGORIES))
+    flt = _CategoryFilter()
     rec = logging.LogRecord("ouroboros.anything", logging.DEBUG,
                             __file__, 0, "x", None, None)
     assert flt.filter(rec) is True
@@ -247,9 +260,9 @@ def test_debug_csv_parsed_in_ctx(runner, tmp_path):
         "Expected a _CategoryFilter to be installed on a handler "
         "by --debug=net,mempool"
     )
-    assert any(
-        not f.all and f.allowed_loggers for f in handler_filters
-    ) or any(f.all for f in handler_filters)
+    # The filter has no per-instance state any more; the parsed CSV lands
+    # in the live category set it reads from.
+    assert {"net", "mempool"} <= get_active_categories()
 
 
 def test_reindex_flag_warns_but_doesnt_crash(runner, tmp_path, monkeypatch):

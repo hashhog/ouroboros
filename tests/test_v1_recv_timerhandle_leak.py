@@ -181,12 +181,16 @@ def test_is_recv_stalled_threshold(monkeypatch):
     whose last successful read is older than its stall timeout, and clears once
     a read updates the monotonic clock."""
     peer = Peer("127.0.0.1", 18444, "regtest", transport_version=1)
-    peer._read_timeout = 60.0
+    # is_recv_stalled() defaults to _inactivity_timeout (the whole-connection
+    # idle bound, Core net.h TIMEOUT_INTERVAL), NOT the per-read _read_timeout,
+    # and never fires inside the 60 s post-connect handshake grace.
+    peer._inactivity_timeout = 60.0
 
     import ouroboros.peer as peer_mod
     fake_now = [1000.0]
     monkeypatch.setattr(peer_mod.time, "monotonic", lambda: fake_now[0])
 
+    peer._connected_monotonic = fake_now[0] - 120.0  # past the handshake grace
     peer._last_recv_monotonic = fake_now[0]
     assert not peer.is_recv_stalled()
 

@@ -243,17 +243,25 @@ def test_get_presync_state_passes_height_and_bits_to_constructor(monkeypatch):
     monkeypatch.setattr(bs_module, "_sync_module", real_sync)
 
 
-def test_get_presync_state_falls_back_zero_bits_when_db_bits_returns_none(monkeypatch):
-    """When the DB's get_block_bits returns None, _get_presync_state passes
-    chain_start_bits=0 (safe default for genesis / tests).
-    The ``or 0`` guard in the implementation converts None to 0.
+@pytest.mark.parametrize("tip_block_present", [True, False])
+def test_get_presync_state_falls_back_zero_bits_when_db_bits_returns_none(
+    monkeypatch, tip_block_present
+):
+    """When the DB's get_block_bits returns None, _get_presync_state seeds
+    chain_start_bits from the tip block header (get_block_bytes / tip
+    Block.bits, then the assumeUTXO base header) and only falls back to 0
+    when none of those sources has the block either.
     """
     TIP_HASH = b"\xcd" * 32
     TIP_HEIGHT = 0
 
     bs = _make_block_sync(tip_hash=TIP_HASH, tip_height=TIP_HEIGHT, tip_bits=0)
-    # Return None from get_block_bits to exercise the "or 0" fallback.
+    # Return None from get_block_bits to exercise the recovery chain.
     bs.db.get_block_bits = MagicMock(return_value=None)
+    bs.db.get_block_bytes = MagicMock(return_value=None)
+    if not tip_block_present:
+        bs.db.get_block = MagicMock(return_value=None)
+    expected_bits = 0x1D00FFFF if tip_block_present else 0
 
     captured: dict = {}
 
@@ -271,9 +279,9 @@ def test_get_presync_state_falls_back_zero_bits_when_db_bits_returns_none(monkey
     peer = _make_peer()
     bs._get_presync_state(peer)
 
-    assert captured.get("chain_start_bits") == 0, (
-        f"Expected 0 as fallback bits when get_block_bits returns None, "
-        f"got {captured.get('chain_start_bits')}"
+    assert captured.get("chain_start_bits") == expected_bits, (
+        f"Expected {expected_bits:#x} (tip Block.bits recovery, else 0) when "
+        f"get_block_bits returns None, got {captured.get('chain_start_bits')}"
     )
 
 

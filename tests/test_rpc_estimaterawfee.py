@@ -75,8 +75,14 @@ async def test_estimaterawfee_returns_pass_bucket_with_data(
     # target 6 by writing the running counters directly.
     bucket_idx = 5
     target = 6
-    fe.total[bucket_idx][target] = 50.0
-    fe.confirmed[bucket_idx][target] = 50.0  # 100 % success
+    # The estimator is per-horizon (short/medium/long stats + totals, Core
+    # shortStats/feeStats/longStats); the "long" horizon indexes by period
+    # = ceil(target / SCALE[LONG]), see FeeEstimator._estimate_from_buckets.
+    from ouroboros.fee_estimator import PERIODS, SCALE, Horizon
+    scale = SCALE[Horizon.LONG]
+    period = min(max(1, (target + scale - 1) // scale), PERIODS[Horizon.LONG])
+    fe.long_totals[bucket_idx][period] = 50.0
+    fe.long_stats[bucket_idx][period] = 50.0  # 100 % success
 
     result = await rpc_with_estimator.rpc_estimaterawfee(target, threshold=0.85)
     assert "long" in result
