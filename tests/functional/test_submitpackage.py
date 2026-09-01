@@ -67,17 +67,30 @@ def _make_tx_via_roundtrip(prev_txid_wire, prev_vout, output_value,
 # ── Stubs ──────────────────────────────────────────────────────────────
 
 
+# The real DB (src/ouroboros/database.py get_utxo) always returns
+# 'script_pubkey'; the mempool's sigop-adjusted-vsize path reads it
+# (mempool.py _pkg_utxo_resolver -> utxo['script_pubkey']).  A P2WPKH spk
+# carries zero legacy sigops, so vsize == plain vsize for these tests.
+_STUB_SPK = bytes([0x00, 0x14]) + b"\x11" * 20
+
+
 class _StubUTXODB:
-    """Maps (prev_txid, prev_vout) -> {'value': int}."""
+    """Maps (prev_txid, prev_vout) -> {'value': int, 'script_pubkey': bytes}."""
 
     def __init__(self, mapping: dict):
-        self._m = dict(mapping)
+        self._m = {k: self._entry(v) for k, v in mapping.items()}
+
+    @staticmethod
+    def _entry(v):
+        if isinstance(v, dict):
+            return {"script_pubkey": _STUB_SPK, **v}
+        return {"value": v, "script_pubkey": _STUB_SPK}
 
     def get_utxo(self, txid, vout):
         return self._m.get((txid, vout))
 
     def add(self, txid, vout, value):
-        self._m[(txid, vout)] = {"value": value}
+        self._m[(txid, vout)] = self._entry(value)
 
 
 class _StubValidator:
@@ -86,7 +99,9 @@ class _StubValidator:
     def __init__(self, utxo_values: dict):
         self.db = _StubUTXODB(utxo_values)
 
-    def validate_transaction(self, tx, height, block_mtp=0):
+    # Signature tracks validation.py Validator.validate_transaction (the
+    # package path passes intra_block_utxos=... by keyword).
+    def validate_transaction(self, tx, height, block_mtp=0, **kwargs):
         return True, ""
 
 
@@ -190,17 +205,21 @@ class TestSubmitPackageCPFP:
 
     @pytest.mark.asyncio
     async def test_cpfp_result_contains_txids(self):
-        """Per-tx results should be keyed by the real computed txid."""
+        """Per-tx results are keyed by wtxid (Core rpc/mempool.cpp:1332)."""
         rpc, _, parent_tx, child_tx, parent_raw, child_raw = _setup_env()
 
         result = await rpc.rpc_submitpackage(
             [parent_raw.hex(), child_raw.hex()]
         )
 
-        parent_txid = parent_tx.get_txid().hex()
-        child_txid = child_tx.get_txid().hex()
-        assert parent_txid in result["tx-results"]
-        assert child_txid in result["tx-results"]
+        # Core rpc/mempool.cpp:1332 — "tx-results" is keyed by wtxid (display
+        # order); each entry also carries the txid.
+        parent_wtxid = parent_tx.get_wtxid()[::-1].hex()
+        child_wtxid = child_tx.get_wtxid()[::-1].hex()
+        assert parent_wtxid in result["tx-results"]
+        assert child_wtxid in result["tx-results"]
+        assert result["tx-results"][parent_wtxid]["txid"] == parent_tx.get_txid()[::-1].hex()
+        assert result["tx-results"][child_wtxid]["txid"] == child_tx.get_txid()[::-1].hex()
 
     @pytest.mark.asyncio
     async def test_cpfp_result_has_vsize(self):
@@ -224,11 +243,12 @@ class TestSubmitPackageCPFP:
             [parent_raw.hex(), child_raw.hex()]
         )
 
-        parent_txid = parent_tx.get_txid().hex()
-        child_txid = child_tx.get_txid().hex()
+        # Keyed by display-order wtxid (Core rpc/mempool.cpp:1332).
+        parent_wtxid = parent_tx.get_wtxid()[::-1].hex()
+        child_wtxid = child_tx.get_wtxid()[::-1].hex()
 
-        parent_fees = result["tx-results"][parent_txid]["fees"]
-        child_fees = result["tx-results"][child_txid]["fees"]
+        parent_fees = result["tx-results"][parent_wtxid]["fees"]
+        child_fees = result["tx-results"][child_wtxid]["fees"]
 
         # Parent: 1 sat fee -> 0.00000001 BTC
         assert abs(parent_fees["base"] - 1 / 1e8) < 1e-12

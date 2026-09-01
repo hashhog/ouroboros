@@ -627,17 +627,30 @@ class TestAncestorDescendantLimits:
 # ── TRUC (v3 Transaction) Policy Tests ──────────────────────────────
 
 
+# The real DB (src/ouroboros/database.py get_utxo) always returns
+# 'script_pubkey'; the mempool's sigop-adjusted-vsize path reads it
+# (mempool.py _pkg_utxo_resolver -> utxo['script_pubkey']).  A P2WPKH spk
+# carries zero legacy sigops, so vsize == plain vsize for these tests.
+_STUB_SPK = bytes([0x00, 0x14]) + b"\x11" * 20
+
+
 class _StubUTXODB:
-    """Maps (prev_txid, prev_vout) -> {'value': int}."""
+    """Maps (prev_txid, prev_vout) -> {'value': int, 'script_pubkey': bytes}."""
 
     def __init__(self, mapping: dict):
-        self._m = dict(mapping)
+        self._m = {k: self._entry(v) for k, v in mapping.items()}
+
+    @staticmethod
+    def _entry(v):
+        if isinstance(v, dict):
+            return {"script_pubkey": _STUB_SPK, **v}
+        return {"value": v, "script_pubkey": _STUB_SPK}
 
     def get_utxo(self, txid, vout):
         return self._m.get((txid, vout))
 
     def add(self, txid, vout, value):
-        self._m[(txid, vout)] = {"value": value}
+        self._m[(txid, vout)] = self._entry(value)
 
 
 class _StubValidator:
@@ -646,7 +659,9 @@ class _StubValidator:
     def __init__(self, utxo_values: dict):
         self.db = _StubUTXODB(utxo_values)
 
-    def validate_transaction(self, tx, height, block_mtp=0):
+    # Signature tracks validation.py Validator.validate_transaction (the
+    # package path passes intra_block_utxos=... by keyword).
+    def validate_transaction(self, tx, height, block_mtp=0, **kwargs):
         return True, ""
 
 
@@ -1224,7 +1239,9 @@ class TestRBF:
         )
         ok, err = pool.add_transaction(barely_higher, height=100)
         assert not ok
-        assert "incremental" in err.lower()
+        # Core policy/rbf.cpp:119 PaysForRBF: "rejecting replacement %s, not
+        # enough additional fees to relay; %s < %s"
+        assert "not enough additional fees to relay" in err
 
         # Replacement with sufficient additional fee
         # Additional fee needed ~= tx_size * 1 sat/vB

@@ -1097,12 +1097,21 @@ class TestBanManager:
     def test_score_accumulation_and_auto_ban(self):
         from ouroboros.banman import BanManager
         bm = BanManager(ban_threshold=100)
-        bm.record_misbehavior("1.2.3.4", 50, "bad headers")
+        # Events below DISCOURAGEMENT_THRESHOLD (50) accumulate; any single
+        # event >= 50 discourages immediately (banman.py, Core PR #25974
+        # MaybeDiscourageAndDisconnect model).
+        bm.record_misbehavior("1.2.3.4", 40, "bad headers")
         assert not bm.is_banned("1.2.3.4")
-        assert bm.get_score("1.2.3.4") == 50
-        bm.record_misbehavior("1.2.3.4", 60, "invalid block")
+        assert bm.get_score("1.2.3.4") == 40
+        bm.record_misbehavior("1.2.3.4", 40, "bad headers")
+        assert not bm.is_banned("1.2.3.4")
+        assert bm.get_score("1.2.3.4") == 80
+        bm.record_misbehavior("1.2.3.4", 30, "invalid block")  # cumulative 110 >= 100
         assert bm.is_banned("1.2.3.4")
         assert bm.get_score("1.2.3.4") == 0  # score cleared on ban
+        # Single-event discourage path.
+        bm.record_misbehavior("2.3.4.5", 50, "bad headers")
+        assert bm.is_banned("2.3.4.5")
 
     def test_instant_ban(self):
         from ouroboros.banman import BanManager
@@ -1610,7 +1619,7 @@ class TestPSBT:
         decoded = psbt.decode()
         assert decoded["tx"]["version"] == 2
         assert len(decoded["inputs"]) == 2
-        assert decoded["inputs"][0]["sighash_type"] == 1
+        assert decoded["inputs"][0]["sighash"] == "ALL"  # Core rpc/rawtransaction.cpp:802
         assert len(decoded["outputs"]) == 2
 
     def test_extract_raises_if_not_finalized(self):
@@ -1876,9 +1885,7 @@ class TestGetBlockTemplate:
                 return 1699999000
 
         server = RPCServer(_MockNode(), port=0, rate_limit=False)
-        template = asyncio.get_event_loop().run_until_complete(
-            server.rpc_getblocktemplate()
-        )
+        template = asyncio.run(server.rpc_getblocktemplate())  # no loop on py3.13 without asyncio.run
         assert template["height"] == 101
         assert template["previousblockhash"] == (b"\xab" * 32).hex()
         assert template["coinbasevalue"] > 0

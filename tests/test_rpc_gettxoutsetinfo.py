@@ -120,7 +120,7 @@ async def test_gettxoutsetinfo_basic_shape() -> None:
     assert isinstance(res["bogosize"], int)
     assert res["bogosize"] > 0
     # 50M + 25M + 12.345678M sats = 0.87345678 BTC
-    assert abs(res["total_amount"] - 0.87345678) < 1e-9
+    assert res["total_amount"].text == "0.87345678"  # BTCAmount, Core %d.%08d
     # Default hash_type is hash_serialized_3 (Core post-#26553).
     assert "hash_serialized_3" in res
     assert "hash_serialized_2" in res
@@ -272,7 +272,7 @@ async def test_gettxoutsetinfo_empty_chainstate() -> None:
     assert res["height"] == 0
     assert res["txouts"] == 0
     assert res["transactions"] == 0
-    assert res["total_amount"] == 0.0
+    assert res["total_amount"].text == "0.00000000"  # BTCAmount, Core %d.%08d
     # Empty SHA256d chain (HashWriter over no input) is still a
     # well-defined 32-byte digest, not absent.
     assert isinstance(res["hash_serialized_3"], str)

@@ -70,7 +70,12 @@ def test_compact_size_roundtrip(n: int, expected_bytes: bytes) -> None:
     _write_compact_size(buf, n)
     assert buf.getvalue() == expected_bytes
     buf.seek(0)
-    assert _read_compact_size(buf) == n
+    if n > 0x02000000:
+        # Core serialize.h:34 MAX_SIZE / :358 ReadCompactSize range check.
+        with pytest.raises(ValueError):
+            _read_compact_size(buf)
+    else:
+        assert _read_compact_size(buf) == n
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +415,11 @@ def test_metadata_rejects_network_mismatch(tmp_path) -> None:
 
 def test_mainnet_assumeutxo_has_all_five_heights() -> None:
     heights = [d.height for d in get_assumeutxo_params("mainnet")]
-    assert heights == [840_000, 880_000, 910_000, 935_000, 944_183]
+    # The five Core chainparams entries come first; snapshot.py also carries
+    # a local Track-B windowed-replay boundary at 481823 (last pre-segwit
+    # block) that is NOT from Core chainparams.
+    assert heights[:5] == [840_000, 880_000, 910_000, 935_000, 944_183]
+    assert heights[5:] == [481_823]
 
 
 def test_mainnet_assumeutxo_944183_entry_present() -> None:

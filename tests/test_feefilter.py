@@ -154,8 +154,8 @@ class TestFeeFilterConstants:
         assert FEE_FILTER_SPACING == 1.1
 
     def test_min_relay_fee_rate(self):
-        """MIN_RELAY_FEE_RATE is 1000 sat/kvB."""
-        assert MIN_RELAY_FEE_RATE == 1000
+        """MIN_RELAY_FEE_RATE is 100 sat/kvB (Core policy.h:70 DEFAULT_MIN_RELAY_TX_FEE{100})."""
+        assert MIN_RELAY_FEE_RATE == 100
 
 
 class TestTrickleQueueFeefilter:

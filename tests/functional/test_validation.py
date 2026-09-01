@@ -30,6 +30,9 @@ def _make_tx(
     tx.outputs = outputs or []
     tx.is_coinbase = is_coinbase
     tx.serialize.return_value = b'\x00' * 200
+    # validation.py _verify_input_signature keys the sigcache envelope on
+    # serialize_with_witness(); a spec'd MagicMock method returns a Mock.
+    tx.serialize_with_witness.return_value = b'\x00' * 200
     tx.get_txid.return_value = b'\xaa' * 32
     return tx
 
@@ -52,12 +55,17 @@ def _make_txout(value=50000, script_pubkey=b'\x76\xa9' + b'\x14' + b'\x00' * 20 
 
 def _mock_db(utxo_value=100000, utxo_height=1, is_coinbase=False):
     db = MagicMock()
-    db.get_utxo.return_value = {
+    utxo = {
         'value': utxo_value,
         'script_pubkey': b'\x76\xa9' + b'\x14' + b'\x00' * 20 + b'\x88\xac',
         'height': utxo_height,
         'is_coinbase': is_coinbase,
     }
+    db.get_utxo.return_value = utxo
+    # validation.py validate_transaction prefers db.get_utxo_batch(outpoints)
+    # (one result per outpoint) when the db has it; a bare MagicMock "has" it
+    # and would yield an empty iterable, so give it real semantics.
+    db.get_utxo_batch.side_effect = lambda outpoints: [dict(utxo) for _ in outpoints]
     db.get_median_time_past.return_value = 1700000000
     return db
 
@@ -110,7 +118,8 @@ class TestCoinbaseMaturity:
 
         valid, msg = self.validator.validate_transaction(tx, height=150)
         assert not valid
-        assert "maturity" in msg.lower()
+        # Core consensus/tx_verify.cpp:180 "bad-txns-premature-spend-of-coinbase"
+        assert "bad-txns-premature-spend-of-coinbase" in msg
 
     def test_mature_coinbase_accepted_at_exact_depth(self):
         inp = _make_txin()
@@ -148,7 +157,9 @@ class TestBIP113MTPLocktime:
 
         valid, msg = self.validator.validate_transaction(tx, height=800000, block_mtp=1700000000)
         assert not valid
-        assert "locktime" in msg.lower() or "BIP 113" in msg
+        # Core validation.cpp ContextualCheckTransaction / MemPoolAccept:
+        # the reject token for an unsatisfied nLockTime is "non-final".
+        assert "non-final" in msg
 
     def test_past_locktime_accepted(self):
         inp = _make_txin(sequence=0x00000001)
@@ -238,19 +249,19 @@ class TestTransactionStructure:
         # mainnet IBD past the snapshot tip on block 944,184 tx 217 (txid
         # 7372defce8713521da62fe0284b4fd23c3f33c8a7a23275788b50762db8fc0a3).
         tx = _make_tx(version=3, inputs=[_make_txin()], outputs=[_make_txout()])
-        assert self.validator._check_structure(tx) is True
+        assert self.validator._check_structure(tx) is None  # None == valid (else Core reject token)
 
     def test_v0_tx_passes_structure_check(self):
         # Per Core, even version=0 is consensus-valid (mempool would
         # reject via IsStandardTx, but block validation does not).
         tx = _make_tx(version=0, inputs=[_make_txin()], outputs=[_make_txout()])
-        assert self.validator._check_structure(tx) is True
+        assert self.validator._check_structure(tx) is None  # None == valid (else Core reject token)
 
     def test_high_version_tx_passes_structure_check(self):
         # Future soft-fork tx versions must be consensus-accepted
         # (forward compatibility).
         tx = _make_tx(version=99, inputs=[_make_txin()], outputs=[_make_txout()])
-        assert self.validator._check_structure(tx) is True
+        assert self.validator._check_structure(tx) is None  # None == valid (else Core reject token)
 
     def test_negative_output_value_rejected(self):
         tx = _make_tx(inputs=[_make_txin()], outputs=[_make_txout(value=-1)])

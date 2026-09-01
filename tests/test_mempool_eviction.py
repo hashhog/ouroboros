@@ -441,7 +441,8 @@ class TestAdmissionRollingFeeGate:
         tx = _make_tx(tx_txid, [(confirmed_txid, 0)], [utxo_value - 100])  # 100 sat fee
         ok, err = pool._add_transaction_inner(tx, height=100)
         assert not ok, "Tx below rolling min fee should be rejected"
-        assert "rolling minimum" in err.lower() or "insufficient" in err.lower(), (
+        # Core validation.cpp:705 PreChecks: "mempool min fee not met"
+        assert "mempool min fee not met" in err, (
             f"Expected rolling min fee rejection, got: {err}"
         )
 
