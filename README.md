@@ -2,6 +2,68 @@
 
 A Bitcoin full node written in Python and Rust.
 
+## Status — v1.0.0
+
+**Label: "Replay-verified — pending the stateless-replay run now in flight"**
+(`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
+deliberately weaker than "Validated", and the scorecard spells out why: it means
+ouroboros agreed with Core on every block the nightly instruments showed it — 169
+distilled real mainnet blocks, 10 block-context corpus entries, and its row in the
+nightly corpus sweep — and that a 26,067-height stateless replay was still running
+when the release was written. **Until that run produces a `summary.json`, this node
+has no from-genesis evidence at all.** The git tag `v0.1.0-beta1`
+(`receipts/RELEASE-v1.0-FREEZE.md`) says the same thing from the other side: `rc`
+is reserved for an independent from-genesis `--assumevalid=0` reproduction of
+Core's UTXO-set commitment, and `beta` means that receipt does not exist
+(`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
+or fund-custody readiness — see `SECURITY.md`.
+
+**ouroboros has not been shown to validate the chain from genesis.** There is no
+ouroboros row in the reproduction ledger (`receipts/TRUST-ANCHOR.md:140-145`) and
+no ouroboros replay ledger in `CORE-PARITY-AUDIT/replay-ledgers/`, which holds
+six files and none for this node. `receipts/TRUST-ANCHOR.md:187-198` (correction,
+2026-09-01) also retracts ouroboros' pre-2026-09-01 M2 boundary-campaign rows as
+script evidence: they ran with the implementation's default assumevalid setting.
+The project's own throughput note (`CHARTER.md`, §"R4 — Proven
+validator", "Honest limit") groups ouroboros with the interpreted
+implementations for which a full from-genesis pass is impractical on the current
+hardware.
+
+**A worse problem, receipted 2026-09-01: ouroboros' assumevalid flag does not
+reach its RPC path at all.** `rpc_submitblock` calls
+`accept_block(skip_scripts=False)` (`rpc.py:9354`) and then `validate_block`
+without `force_check_scripts` (`rpc.py:768-777`), so
+`can_skip_scripts_for_block` returns true below the last checkpoint;
+`--assumevalid 0` sets only `block_sync.force_full_scripts`
+(`node.py:626-646`), which governs the P2P drain. Scripts are therefore skipped
+for every block fed over RPC below mainnet height 850,000, and the flag cannot
+turn them on (`receipts/TRUST-ANCHOR.md:233-242`, filed as a blocker for
+ouroboros script evidence). Any harness that feeds this node blocks over
+`submitblock` and reports agreement is measuring chain selection, not script
+verification. A reader of this repository alone should assume ouroboros'
+from-genesis validation is untested.
+
+**Operator RPC parity: 52 of Bitcoin Core's 85.** From the 103-method R5
+operator probe run 2026-09-01
+(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): ouroboros 52 PASS /
+33 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
+(`SKIP-REGTEST`) for every node including Core. Failures include wrong error
+codes (`decoderawtransaction` on non-hex returns `-32603` where Core returns
+`-22`), a `getblockstats` anchor height reported as 0, and calls that succeed
+where Core errors.
+
+**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
+unit suite went 105 failing → 0 with no skips and no gaps carried. One of those
+was a real bug, mutation-verified: `c759449` — the `WITNESS_UNKNOWN` input gate
+was dead code, so spends of v2+ witness programs passed
+`ValidateInputsStandardness`.
+
+**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the
+[hashhog meta-repo](https://github.com/hashhog/hashhog).
+
+> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
+> the hashhog meta-repo, not to this repository.
+
 ## Quick Start
 
 ### Docker
@@ -136,7 +198,7 @@ Environment variables `OUROBOROS_<KEY>` override config file values.
 
 ## RPC API
 
-Bitcoin Core-compatible JSON-RPC via FastAPI with batch request support and rate limiting.
+JSON-RPC via FastAPI, modelled on Bitcoin Core's, with batch request support and rate limiting. Not behaviourally compatible: on the 2026-09-01 operator probe ouroboros answers 52 of the 103 probed methods correctly against Core's 85, with 33 failures (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`).
 
 | Category | Methods |
 |----------|---------|
@@ -224,7 +286,11 @@ import yappi; yappi.start(builtins=True)
 yappi.stop(); yappi.get_func_stats().print_all()
 ```
 
-**Measured IBD latency** (getblockchaininfo, 50 calls, mainnet IBD ~495k):
+**IBD latency, one probe run, 2026-04-10/11** (getblockchaininfo, 50 calls, mainnet
+IBD at height ~495k). These numbers come from a single ad-hoc run of
+`tests/rpc_latency_probe.py`; no result artifact was committed, and the node now runs
+at the chain tip rather than mid-IBD, so they describe a configuration that no longer
+exists. Re-run the probe rather than quoting the table:
 
 | Date       | Fix                         | p50   | p95     | max     |
 |------------|-----------------------------|-------|---------|---------|
