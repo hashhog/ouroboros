@@ -32,7 +32,7 @@ from ouroboros.rpc import RPCServer
 from ouroboros.snapshot import SnapshotManager, read_snapshot_metadata
 from ouroboros.sync_manager import SyncManager
 from ouroboros.tip_notifier import TipNotifier
-from ouroboros.validation import BlockValidator, TransactionValidator
+from ouroboros.validation import BlockValidator, TransactionValidator, assumevalid_disabled
 from ouroboros.wallet import Wallet, WalletManager
 from ouroboros.zmq_notifier import ZMQNotifier
 
@@ -622,15 +622,22 @@ class BitcoinNode:
             # default / unset) preserves the production skip-below-checkpoint
             # behaviour.  We only special-case "0" — hash-pinned assumevalid is
             # not implemented (the default checkpoint set governs the cut).
-            _assumevalid_raw = self.config.get('assumevalid')
-            force_full_scripts = (
-                _assumevalid_raw is not None
-                and str(_assumevalid_raw).strip() in ('0', 'false', 'False', 'no')
-            )
+            force_full_scripts = assumevalid_disabled(self.config.get('assumevalid'))
+            # Core parity: assumevalid is ONE node-wide setting
+            # (validation.cpp:2345-2347 — ConnectBlock's fScriptChecks is
+            # unconditionally true under -assumevalid=0 on EVERY acceptance
+            # path).  Flip the validator's switch so the RPC paths that reach
+            # validate_block through rpc.accept_block (submitblock,
+            # submitblockbatch, generatetoaddress, the submitblock reorg
+            # connect) honour it too — previously only BlockSync (the P2P
+            # drain) received the flag and a block submitted via submitblock
+            # below the checkpoint still had its scripts skipped.
+            self.validator.force_full_scripts = force_full_scripts
             if force_full_scripts:
                 logger.info(
-                    "-assumevalid=0: full script verification forced on the "
-                    "sync/drain path (assume-valid script-skip DISABLED)"
+                    "-assumevalid=0: full script verification forced on every "
+                    "block-acceptance path — P2P sync/drain AND RPC submitblock "
+                    "(assume-valid script-skip DISABLED)"
                 )
             self.block_sync = BlockSync(
                 self.db, self.validator, self.peer_manager,

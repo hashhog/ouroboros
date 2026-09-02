@@ -638,6 +638,24 @@ def get_virtual_transaction_size(weight: int, sigop_cost: int = 0, bytes_per_sig
     return (adj + WITNESS_SCALE_FACTOR - 1) // WITNESS_SCALE_FACTOR
 
 
+def assumevalid_disabled(raw_value) -> bool:
+    """Return True iff the operator's ``assumevalid`` setting is the literal
+    "off" value (``-assumevalid=0`` in Bitcoin Core).
+
+    Core treats assumevalid as ONE node-wide setting: when
+    ``m_chainman.AssumedValidBlock().IsNull()`` (i.e. ``-assumevalid=0``)
+    ``ConnectBlock`` sets ``script_check_reason = "assumevalid=0 (always
+    verify)"`` and ``fScriptChecks`` is true for EVERY block on EVERY
+    acceptance path — P2P and ``submitblock`` alike (validation.cpp:2345-2347,
+    :2494).  Any other value (unset / default / a hash) keeps the skip
+    heuristic.  Hash-pinned assumevalid is not implemented here; the default
+    checkpoint set governs the cut.
+    """
+    if raw_value is None:
+        return False
+    return str(raw_value).strip() in ("0", "false", "False", "no")
+
+
 class BlockValidator:
     """Validates new blocks"""
 
@@ -649,6 +667,16 @@ class BlockValidator:
     ):
         self.db = db
         self.network = network
+        # Node-wide ``-assumevalid=0`` switch (Core parity, see
+        # ``assumevalid_disabled``).  When True, ``validate_block`` never
+        # consults the checkpoint script-skip heuristic and ALWAYS runs full
+        # per-input script verification, on every path that reaches this
+        # validator (submitblock / submitblockbatch / generatetoaddress via
+        # rpc.accept_block, the P2P drain, the pure-Python reorg fallback).
+        # Set by ``Node.start`` from the operator's config; default False
+        # preserves production skip-below-checkpoint behaviour for every
+        # other constructor (unit tests, the differential shim).
+        self.force_full_scripts = False
         self.tx_validator = TransactionValidator(db, network, snapshot_manager=snapshot_manager)
         # Snapshot manager is consulted when prev_block lookup misses --
         # it lets the validator synthesize the snapshot tip's prev block
@@ -1149,9 +1177,15 @@ class BlockValidator:
         # merkle root already verified above — script verification is the
         # dominant cost and can be safely skipped.
         skip_scripts = False
-        if force_check_scripts:
-            # Differential validate-only harness: never skip scripts, regardless
-            # of the assume-valid / checkpoint cut, so the script gate is live.
+        if force_check_scripts or getattr(self, "force_full_scripts", False):
+            # Differential validate-only harness (force_check_scripts) or the
+            # node-wide -assumevalid=0 switch (self.force_full_scripts): never
+            # skip scripts, regardless of the assume-valid / checkpoint cut, so
+            # the script gate is live.  Core: ConnectBlock's fScriptChecks is
+            # unconditionally true under -assumevalid=0 on every acceptance
+            # path (validation.cpp:2345-2347, :2494) — before this switch the
+            # submitblock path (rpc.accept_block -> validate_block) skipped
+            # scripts below the checkpoint even with --assumevalid 0.
             skip_scripts = False
         elif _has_sync_module:
             try:

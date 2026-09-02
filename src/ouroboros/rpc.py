@@ -765,6 +765,13 @@ async def accept_block(
     # (script.py::_DISABLED) and signature verification always fire when
     # skip_scripts is False.
     # Reference: Bitcoin Core EvalScript() disabled-opcode gate (interpreter.cpp).
+    #
+    # The node-wide -assumevalid=0 switch reaches this call through
+    # ``node.validator.force_full_scripts`` (set by Node.start): validate_block
+    # then never consults the checkpoint script-skip heuristic, matching Core's
+    # ConnectBlock (validation.cpp:2345-2347) where fScriptChecks is true on
+    # EVERY acceptance path, submitblock included.  With the default
+    # (assumevalid unset) validate_block keeps skipping below the checkpoint.
     if not skip_scripts:
         _py_validator = getattr(node, "validator", None)
         if _py_validator is not None:
