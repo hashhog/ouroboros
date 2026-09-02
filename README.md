@@ -4,7 +4,7 @@ A Bitcoin full node written in Python and Rust.
 
 ## Status — v1.0.0
 
-**Label: "Replay-verified — pending the stateless-replay run now in flight"**
+**Label: "Replay-pending — awaiting the stateless-replay run now in flight"**
 (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
 deliberately weaker than "Validated", and the scorecard spells out why: it means
 ouroboros agreed with Core on every block the nightly instruments showed it — 169
@@ -29,19 +29,31 @@ validator", "Honest limit") groups ouroboros with the interpreted
 implementations for which a full from-genesis pass is impractical on the current
 hardware.
 
-**A worse problem, receipted 2026-09-01: ouroboros' assumevalid flag does not
-reach its RPC path at all.** `rpc_submitblock` calls
-`accept_block(skip_scripts=False)` (`rpc.py:9354`) and then `validate_block`
-without `force_check_scripts` (`rpc.py:768-777`), so
-`can_skip_scripts_for_block` returns true below the last checkpoint;
-`--assumevalid 0` sets only `block_sync.force_full_scripts`
-(`node.py:626-646`), which governs the P2P drain. Scripts are therefore skipped
-for every block fed over RPC below mainnet height 850,000, and the flag cannot
-turn them on (`receipts/TRUST-ANCHOR.md:233-242`, filed as a blocker for
-ouroboros script evidence). Any harness that feeds this node blocks over
-`submitblock` and reports agreement is measuring chain selection, not script
-verification. A reader of this repository alone should assume ouroboros'
-from-genesis validation is untested.
+**A worse problem, receipted 2026-09-01 and fixed the next day: ouroboros'
+assumevalid flag did not reach its RPC path.** As receipted at
+`receipts/TRUST-ANCHOR.md:233-242`, `--assumevalid 0` set only
+`block_sync.force_full_scripts` — the P2P drain — so `rpc_submitblock` →
+`accept_block` → `validate_block` ran without `force_check_scripts` and
+`can_skip_scripts_for_block` returned true below the last checkpoint. Scripts were
+skipped for every block fed over RPC below mainnet height 850,000, and the flag
+could not turn them on.
+
+**Fixed in `8743575`** (2026-09-02, "fix: honour -assumevalid=0 on the submitblock
+path, not only the P2P drain"), an ancestor of this README's own commit.
+`Node.start` now sets `self.validator.force_full_scripts`
+(`src/ouroboros/node.py:635`) so every acceptance path honours the switch —
+`submitblock`, `submitblockbatch`, `generatetoaddress` and the submitblock reorg
+connect — matching Core's `ConnectBlock`, where `fScriptChecks` is
+unconditionally true under `-assumevalid=0`
+(`bitcoin-core/src/validation.cpp:2345-2347`). The reasoning is documented at
+`src/ouroboros/rpc.py:768-774` and pinned by
+`tests/test_assumevalid_submitblock_path.py`. Default behaviour with assumevalid
+unset is unchanged: scripts are still skipped below the checkpoint, as in Core.
+
+**What the fix does not undo:** every harness run *before* that commit that fed
+this node blocks over `submitblock` below 850,000 and reported agreement was
+measuring chain selection, not script verification. A reader of this repository
+alone should still assume ouroboros' from-genesis validation is untested.
 
 **Operator RPC parity: 52 of Bitcoin Core's 85.** From the 103-method R5
 operator probe run 2026-09-01
@@ -63,6 +75,12 @@ was dead code, so spends of v2+ witness programs passed
 
 > Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
 > the hashhog meta-repo, not to this repository.
+> **Two notes on the citations above.** The R5 probe JSON is **gitignored** in the
+> meta-repo (`.gitignore:60  tools/diff-test-artifacts/`), so a stranger cloning
+> either repository cannot read it; regenerate it with `python3 tools/r5_probe.py`
+> against a running fleet. The nightly `diffguard-*.log` files are likewise
+> gitignored (`.gitignore:43  *.log`). Paths under `receipts/`, `docs/` and
+> `CORE-PARITY-AUDIT/` are tracked, but in the **meta-repo**, not here.
 
 ## Quick Start
 
