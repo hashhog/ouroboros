@@ -841,13 +841,35 @@ def import_utxo(ctx, snapshot_path, batch_size):
 
     # Resolve height from the assumeutxo blockhash table.
     au_data = get_assumeutxo_by_hash(network, metadata.base_blockhash)
-    if au_data is None and network != "regtest":
+    # HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from the
+    # chainparams assumeutxo whitelist. Core (and this node by default) only
+    # accepts snapshots whose base blockhash is a hardcoded trust anchor,
+    # because loadtxoutset is a trust shortcut for end users. Setting this
+    # variable to the snapshot's base height accepts ANY snapshot and takes
+    # that height on faith -- it exists so the fleet can validate arbitrary
+    # block ranges in parallel from a locally generated snapshot ladder,
+    # where correctness is established by checking the range's OUTPUT utxo
+    # hash against an independent commitment, not by trusting the input.
+    # Unset (the default, and what ships) = unchanged Core-equivalent behaviour.
+    _unsafe_height = os.environ.get("HASHHOG_UNSAFE_SNAPSHOT_HEIGHT")
+    if au_data is None and network != "regtest" and not _unsafe_height:
         console.print(
             f"[red]assumeUTXO blockhash {metadata.base_blockhash_hex()} not "
             f"recognized for network {network}.[/red]"
         )
         sys.exit(1)
-    block_height = au_data.height if au_data else 0
+    if au_data is None and _unsafe_height:
+        console.print(
+            f"[yellow]WARNING: HASHHOG_UNSAFE_SNAPSHOT_HEIGHT="
+            f"{_unsafe_height} -- accepting an UNVERIFIED snapshot whose base "
+            f"blockhash is not a chainparams trust anchor. Development use "
+            f"only; never enable this in production.[/yellow]"
+        )
+    block_height = (
+        au_data.height
+        if au_data
+        else (int(_unsafe_height) if _unsafe_height else 0)
+    )
 
     console.print(
         f"  Version:    [cyan]{metadata.version}[/cyan]\n"
