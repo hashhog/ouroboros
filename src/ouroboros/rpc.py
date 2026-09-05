@@ -739,7 +739,34 @@ async def accept_block(
     # commitment, IsFinalTx, BIP-30, BIP-68, duplicate-txid, sigop budget,
     # block weight.  skip_scripts is honoured by the validator for blocks
     # below the assumevalid checkpoint.
-    if hasattr(db, "validate_block_from_bytes"):
+    #
+    # EXCEPTION — first block above an assumeUTXO snapshot base.  The Rust
+    # validator resolves the parent by reading a full block BODY out of
+    # BLOCKS_CF (validate/block.rs:499-501); a snapshot load persists the
+    # base's index row + 80-byte base_blockheader but no body, so that read
+    # returns None and every submitblock of base+1 answered BIP-22
+    # "inconclusive" ("validate: Previous block not found") no matter how
+    # long the caller retried.  Route that ONE block to the Python
+    # validator, which reconstructs the header-only prev block from the
+    # persisted base header (`_synthesize_snapshot_prev_block`).  Once
+    # base+1 connects its own body IS in BLOCKS_CF, so base+2 onward take
+    # the normal Rust path.  See validation.rust_validator_lacks_prev_body.
+    _snapshot_base_parent = False
+    if len(block_bytes) >= 36:
+        from ouroboros.validation import rust_validator_lacks_prev_body
+        _snapshot_base_parent = rust_validator_lacks_prev_body(
+            db, getattr(node, "validator", None), block_bytes[4:36]
+        )
+        if _snapshot_base_parent:
+            logger.info(
+                "accept_block h=%d: parent is the assumeUTXO snapshot base "
+                "(no block body on disk) — validating with the Python "
+                "validator's synthetic prev block instead of the Rust "
+                "get_block_by_height path",
+                next_height,
+            )
+
+    if hasattr(db, "validate_block_from_bytes") and not _snapshot_base_parent:
         try:
             await asyncio.to_thread(
                 db.validate_block_from_bytes,
@@ -772,7 +799,13 @@ async def accept_block(
     # ConnectBlock (validation.cpp:2345-2347) where fScriptChecks is true on
     # EVERY acceptance path, submitblock included.  With the default
     # (assumevalid unset) validate_block keeps skipping below the checkpoint.
-    if not skip_scripts:
+    # ``or _snapshot_base_parent``: when Step 2 was skipped because the Rust
+    # validator cannot see the snapshot base parent, the Python validator is
+    # the ONLY validator this block gets — it must run even for a caller that
+    # asked for skip_scripts (the IBD drain below the assumevalid cut).  Its
+    # own checkpoint heuristic still decides whether per-input scripts run, so
+    # this costs nothing extra below the cut.
+    if not skip_scripts or _snapshot_base_parent:
         _py_validator = getattr(node, "validator", None)
         if _py_validator is not None:
             from ouroboros.database import Block as _Blk

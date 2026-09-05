@@ -656,6 +656,51 @@ def assumevalid_disabled(raw_value) -> bool:
     return str(raw_value).strip() in ("0", "false", "False", "no")
 
 
+def rust_validator_lacks_prev_body(db, validator, prev_blockhash: bytes) -> bool:
+    """True when the Rust block validator cannot see this block's PARENT but
+    the Python one can synthesize it from the assumeUTXO snapshot base header.
+
+    The Rust ``BlockValidator::validate_header`` resolves the parent with
+    ``db.get_block_by_height(prev_height)`` -> ``get_block(hash)``
+    (ferrous-utils/sync/src/validate/block.rs:499-501,
+    storage/db.rs:277-298), which deserializes a full block BODY out of
+    ``BLOCKS_CF``.  A snapshot load persists the base's ``BLOCK_INDEX_CF``
+    row (hash + chainwork + timestamp) and the 80-byte ``base_blockheader``
+    sibling file, but never a body -- the assumeUTXO wire format does not
+    carry one -- so that lookup returns ``None`` and the Rust validator
+    rejects the FIRST block above the base with
+    ``BlockValidationError::PreviousBlockNotFound`` ("validate: Previous
+    block not found") forever.  On the RPC path that surfaces as BIP-22
+    ``"inconclusive"``; on the P2P drain the block is re-buffered and retried
+    forever, so the node never advances off the snapshot base.
+
+    ``BlockValidator._synthesize_snapshot_prev_block`` exists for exactly this
+    case -- it rebuilds a header-only prev ``Block`` from the persisted base
+    header, which is all the header/difficulty/MTP checks read.  Callers use
+    this predicate to route that ONE block to the Python validator instead of
+    Rust; once it connects, its own body is in ``BLOCKS_CF`` and every later
+    block takes the normal Rust path.
+
+    Conservative by construction: returns False unless the parent body is
+    provably absent AND the synthetic prev block can actually be built.  A
+    block whose parent is a genuine orphan therefore still gets rejected.
+    """
+    if db is None or validator is None or not prev_blockhash:
+        return False
+    try:
+        if hasattr(db, "has_block_hash"):
+            if db.has_block_hash(prev_blockhash):
+                return False
+        elif db.get_block(prev_blockhash) is not None:
+            return False
+    except Exception:
+        return False
+    try:
+        return validator._synthesize_snapshot_prev_block(prev_blockhash) is not None
+    except Exception:
+        return False
+
+
 class BlockValidator:
     """Validates new blocks"""
 

@@ -193,6 +193,7 @@ from ouroboros.validation import (
     SIG_CACHE,
     BlockValidator,
     diffbits_unresolved_fallback_ok,
+    rust_validator_lacks_prev_body as rust_lacks_prev_body,
 )
 
 logger = logging.getLogger(__name__)
@@ -2143,6 +2144,29 @@ class BlockSync:
             # False here keeps every block on the Python validator branch below,
             # where force_check_scripts=True actually invokes the script
             # interpreter per-input.
+            #
+            # Same forced-Python route for the FIRST block above an assumeUTXO
+            # snapshot base: the Rust validator resolves the parent by reading
+            # a full block BODY out of BLOCKS_CF (validate/block.rs:499-501)
+            # and a snapshot load never writes one for the base, so it rejects
+            # base+1 with "Previous block not found" — which this drain treats
+            # as a transient ordering error and re-buffers, retrying forever
+            # while the tip sits on the base.  Below the assumevalid cut (a
+            # snapshot base under the last checkpoint) that is the ONLY route
+            # the block ever takes, so the node can never leave the base.  The
+            # Python validator rebuilds the header-only prev block from the
+            # persisted base_blockheader.  Affects exactly one block per
+            # snapshot load: base+1's body lands in BLOCKS_CF when it connects.
+            if skip_scripts and rust_lacks_prev_body(
+                self.db, self.validator, block.prev_blockhash
+            ):
+                logger.info(
+                    "Height %d: parent is the assumeUTXO snapshot base (no "
+                    "block body on disk) — routing to the Python validator; "
+                    "the Rust validator cannot resolve a bodyless parent",
+                    new_height,
+                )
+                skip_scripts = False
 
             async def _run_rust() -> tuple[bool, str]:
                 try:
