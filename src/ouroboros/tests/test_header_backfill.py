@@ -328,38 +328,63 @@ class TestHeaderBackfillDriver:
     def test_start_locator_is_genesis_then_resumes_from_the_buffer(self):
         headers, anchor = _genesis_chain(3)
         bf = HeaderBackfill(0, 3, anchor)
+        # Genesis is SEEDED from chainparams, never fetched: the locator names
+        # it so the peer answers with height 1 onward.
+        assert bf.headers == [MAINNET_GENESIS_HEADER]
         assert bf.start_locator() == [GENESIS_HASHES["mainnet"]]
-        bf.accept(headers[:2])
+        bf.accept(headers[1:2])
         # Re-request resumes rather than restarting the whole walk.
         assert bf.start_locator() == [block_hash(headers[1])]
+
+    def test_a_genesis_rooted_walk_wants_the_reply_to_its_own_locator(self):
+        """The wedge this seeding fixes.
+
+        ``start_locator`` names genesis, so an honest peer replies with the
+        block at height 1 — never with genesis itself.  Before genesis was
+        seeded, ``wants`` demanded that the batch BEGIN with genesis, so that
+        honest reply was refused, fell through to the ordinary sync path, and
+        was logged as "does not connect" once per tick forever while the walk
+        buffered nothing.
+        """
+        headers, anchor = _genesis_chain(3)
+        bf = HeaderBackfill(0, 3, anchor)
+        peer_reply = headers[1:]          # successors of the locator entry
+        assert bf.wants(peer_reply)
+        assert bf.accept(peer_reply) == 3
+        assert bf.is_complete()
 
     def test_accept_buffers_in_order_and_completes_at_the_floor(self):
         headers, anchor = _genesis_chain(3)
         bf = HeaderBackfill(0, 3, anchor)
-        assert bf.accept(headers[:2]) == 2
+        assert bf.progress() == (1, 4)      # genesis is already seeded
+        assert bf.accept(headers[1:2]) == 1
         assert not bf.is_complete()
         assert bf.progress() == (2, 4)
         bf.accept(headers[2:])
         assert bf.is_complete()
         assert bf.next_height == 4
 
-    def test_first_header_must_be_genesis(self):
-        headers, anchor = _genesis_chain(3)
+    def test_a_genesis_rooted_walk_refuses_a_batch_from_elsewhere(self):
+        """Seeding genesis does not weaken the lower pin: the first fetched
+        header still has to be genesis' own child."""
+        _, anchor = _genesis_chain(3)
         bf = HeaderBackfill(0, 3, anchor)
-        with pytest.raises(BackfillError, match="not mainnet genesis"):
-            bf.accept(headers[1:])
+        elsewhere, _ = make_chain(b"\x77" * 32, 3)
+        assert not bf.wants(elsewhere)
+        with pytest.raises(BackfillError, match="does not link"):
+            bf.accept(elsewhere)
 
     def test_a_batch_that_does_not_link_is_rejected(self):
         headers, anchor = _genesis_chain(3)
         bf = HeaderBackfill(0, 3, anchor)
-        bf.accept(headers[:2])
+        bf.accept(headers[1:2])
         with pytest.raises(BackfillError, match="does not link"):
             bf.accept([make_header(b"\xee" * 32, 7777)])
 
     def test_commit_refuses_while_incomplete(self):
         headers, anchor = _genesis_chain(3)
         bf = HeaderBackfill(0, 3, anchor)
-        bf.accept(headers[:2])
+        bf.accept(headers[1:2])
         db = FakeDB()
         with pytest.raises(BackfillError, match="incomplete backfill"):
             bf.commit(db, check_pow=False)
@@ -368,7 +393,7 @@ class TestHeaderBackfillDriver:
     def test_commit_writes_every_height_and_releases_the_buffer(self):
         headers, anchor = _genesis_chain(3)
         bf = HeaderBackfill(0, 3, anchor)
-        bf.accept(headers)
+        bf.accept(headers[1:])
         db = FakeDB()
         assert bf.commit(db, check_pow=False) == 4
         assert [row[0] for row in db.written] == [0, 1, 2, 3]
@@ -379,7 +404,7 @@ class TestHeaderBackfillDriver:
         """A peer that serves a self-consistent chain that is not ours."""
         headers, _ = _genesis_chain(3)
         bf = HeaderBackfill(0, 3, b"\xab" * 32)
-        bf.accept(headers)
+        bf.accept(headers[1:])
         db = FakeDB()
         with pytest.raises(BackfillError, match="does not reach the anchor"):
             bf.commit(db, check_pow=False)
@@ -389,7 +414,7 @@ class TestHeaderBackfillDriver:
     def test_double_commit_is_refused(self):
         headers, anchor = _genesis_chain(3)
         bf = HeaderBackfill(0, 3, anchor)
-        bf.accept(headers)
+        bf.accept(headers[1:])
         db = FakeDB()
         bf.commit(db, check_pow=False)
         with pytest.raises(BackfillError, match="already committed"):
@@ -428,10 +453,12 @@ class TestHeaderBackfillDriver:
 class TestHeaderBackfillRouting:
     """`wants()` must not steal ordinary sync batches, or be stolen from."""
 
-    def test_wants_genesis_batch_when_empty(self):
+    def test_wants_the_first_fetched_batch_when_only_genesis_is_seeded(self):
         headers, anchor = _genesis_chain(3)
         bf = HeaderBackfill(0, 3, anchor)
-        assert bf.wants(headers)
+        assert bf.wants(headers[1:])
+        # The already-seeded genesis is NOT wanted again.
+        assert not bf.wants(headers[:1])
 
     def test_does_not_want_an_unrelated_batch(self):
         headers, anchor = _genesis_chain(3)
@@ -442,14 +469,14 @@ class TestHeaderBackfillRouting:
     def test_wants_the_continuation_after_a_partial_batch(self):
         headers, anchor = _genesis_chain(3)
         bf = HeaderBackfill(0, 3, anchor)
-        bf.accept(headers[:2])
+        bf.accept(headers[1:2])
         assert bf.wants(headers[2:])
         assert not bf.wants(headers[:1])  # already-held prefix
 
     def test_wants_is_false_once_complete_or_committed(self):
         headers, anchor = _genesis_chain(3)
         bf = HeaderBackfill(0, 3, anchor)
-        bf.accept(headers)
+        bf.accept(headers[1:])
         assert not bf.wants(headers)     # complete
         bf.commit(FakeDB(), check_pow=False)
         assert not bf.wants(headers)     # committed

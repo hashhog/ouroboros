@@ -193,6 +193,7 @@ from ouroboros.validation import (
     SIG_CACHE,
     BlockValidator,
     diffbits_unresolved_fallback_ok,
+    permitted_difficulty_transition,
     rust_validator_lacks_prev_body as rust_lacks_prev_body,
 )
 
@@ -666,6 +667,44 @@ class BlockSync:
         # (host, port); recreated when the sync peer changes or when
         # the state finalizes (success or failure).
         self._presync_states: dict[tuple[str, int], object] = {}
+
+        # ----------------------------------------------------------------
+        # Core TryLowWorkHeadersSync (net_processing.cpp:2765) — the PRESYNC
+        # CONTINUATION the G8 gate below was missing (GEN-OURO-G8-PRESYNC).
+        #
+        # When a batch's total claimed work is under nMinimumChainWork, Core
+        # does NOT stop: it opens a HeadersSyncState, stores nothing, and keeps
+        # asking the same peer for the next batch, accumulating claimed work
+        # until the threshold is crossed; only then are the headers requested
+        # again (REDOWNLOAD) and committed.  Ouroboros rolled the batch back
+        # and returned, so a node whose chain is legitimately below the bar —
+        # a from-genesis IBD, or a datadir bootstrapped from an assumeUTXO
+        # snapshot whose base is far below the tip — re-requested the SAME
+        # 2000 headers every tick forever and never advanced.  That is why
+        # tools/start-genesis-ibd.sh has to set OUROBOROS_MINCHAINWORK_OVERRIDE=0.
+        #
+        # ``_lowwork_presync`` holds, per peer key, the running walk:
+        #   work      cumulative claimed work of chain_start + everything seen
+        #   last_hash hash the next batch must extend
+        #   headers   how many headers the walk has consumed (bounded)
+        #   min_work  the threshold this walk has to cross
+        #   asked_at  monotonic time of the last continuation getheaders
+        # Nothing from a presync batch is stored, so a peer cannot grow our
+        # memory with it; the per-header PoW gate below still applies, so
+        # advancing the walk costs the peer real proof-of-work per header
+        # (Core's HasValidProofOfWork check before TryLowWorkHeadersSync).
+        self._lowwork_presync: dict[str, dict] = {}
+        # Peers whose chain has PROVEN >= nMinimumChainWork during presync.
+        # This is Core's ``already_validated_work`` (net_processing.cpp:3000):
+        # once true, the anti-DoS work gate is skipped for that peer's headers
+        # so the REDOWNLOAD pass can actually commit them.
+        self._lowwork_validated: set[str] = set()
+        # Hard bound on one presync walk.  Core bounds the equivalent state via
+        # the commitment budget in HeadersSyncState; this is the same idea in
+        # one number — a peer that has served this many valid-PoW headers
+        # without crossing the bar is not going to.
+        self._lowwork_presync_max_headers: int = 4_000_000
+
         # Counters for the per-header PoW gate (used by tests + ops).
         self._headers_pow_rejected: int = 0
         self._headers_presync_failures: int = 0
@@ -1131,6 +1170,10 @@ class BlockSync:
             self._peer_handlers.pop(p, None)
 
         self._unconnecting_headers_count.pop(addr, None)
+        # Low-work PRESYNC walk + its `already_validated_work` flag are keyed
+        # by the same host:port string and are per-CONNECTION state.
+        self._lowwork_presync.pop(addr, None)
+        self._lowwork_validated.discard(addr)
 
         # ``_block_request_peer`` is keyed by block-hash but holds Peer
         # values, so a disconnected peer still mid-request stays alive
@@ -3531,6 +3574,241 @@ class BlockSync:
             )
         return self._snapshot_offset_cache
 
+    # ------------------------------------------------------------------
+    # Low-work headers PRESYNC (Bitcoin Core TryLowWorkHeadersSync /
+    # HeadersSyncState, net_processing.cpp:2765 + headerssync.cpp)
+    # ------------------------------------------------------------------
+
+    async def _send_locator_getheaders(self, peer: Peer, locator: list) -> bool:
+        """Send one getheaders with *locator* to *peer*. True if it went out."""
+        if not locator:
+            return False
+        try:
+            msg = GetHeadersMessage(
+                version=70015,
+                locator_hashes=locator,
+                hash_stop=b"\x00" * 32,
+            )
+            network = getattr(self.peer_manager, "network", "mainnet")
+            await peer.send_message(msg.to_network_message(network))
+            self._header_sync_time = time.time()
+            return True
+        except Exception as exc:
+            logger.debug(
+                "low-work presync: getheaders to %s failed: %s",
+                self._peer_key(peer), exc,
+            )
+            return False
+
+    async def _request_lowwork_continuation(
+        self, peer: Peer, *, min_interval: float = 0.0
+    ) -> None:
+        """Ask *peer* for the batch after the presync walk's current head.
+
+        Core's ProcessNextHeaders issues exactly one continuation getheaders per
+        processed presync batch, anchored on the last header it saw
+        (headerssync.cpp).  ``min_interval`` rate-limits the *re*-ask path so a
+        peer that keeps replying with something other than the continuation
+        cannot make us spin.
+        """
+        key = self._peer_key(peer)
+        state = self._lowwork_presync.get(key)
+        if state is None:
+            return
+        now = time.time()
+        if min_interval and now - state.get("asked_at", 0.0) < min_interval:
+            return
+        state["asked_at"] = now
+        await self._send_locator_getheaders(peer, [state["last_hash"]])
+
+    async def _begin_lowwork_presync(
+        self,
+        batch_size: int,
+        resume_hash: bytes | None,
+        resume_height: int,
+        resume_bits: int,
+        peer: Peer,
+        total_work: int,
+        min_work: int,
+    ) -> None:
+        """Open a PRESYNC walk on *peer* after the G8 low-work gate fired.
+
+        Mirrors Core's ``TryLowWorkHeadersSync``: the batch is discarded, a
+        per-peer walk is opened, and the SAME peer is asked for the next batch
+        so claimed work can accumulate.  Core only bothers when the message was
+        full — a short message means the peer has nothing more, so its chain
+        genuinely ends below the threshold and there is nothing to wait for
+        ("Ignoring low-work chain", net_processing.cpp:2799).
+        """
+        key = self._peer_key(peer)
+        if resume_hash is None:
+            return
+        if batch_size < 2000:
+            logger.info(
+                "Ignoring low-work chain from %s: message was not full "
+                "(%d headers) so the peer has no more to give",
+                key, batch_size,
+            )
+            return
+        self._lowwork_presync[key] = {
+            "work": int(total_work),
+            "last_hash": bytes(resume_hash),
+            "height": int(resume_height),
+            "bits": int(resume_bits),
+            "headers": int(batch_size),
+            "min_work": int(min_work),
+            "asked_at": 0.0,
+            "started": time.time(),
+        }
+        logger.warning(
+            "low-work headers PRESYNC opened on %s: chain work %#x < "
+            "nMinimumChainWork %#x — walking the peer's headers WITHOUT "
+            "storing them until the threshold is crossed (Core "
+            "TryLowWorkHeadersSync)",
+            key, int(total_work), int(min_work),
+        )
+        await self._request_lowwork_continuation(peer)
+
+    async def _advance_lowwork_presync(self, headers: list, peer: Peer) -> None:
+        """Consume one PRESYNC batch: verify PoW + linkage, accumulate work.
+
+        Nothing is written and nothing is queued — the walk holds one hash and
+        one integer per peer, so a peer cannot grow our memory with it, and
+        every header it advances us by costs it real proof-of-work.  This is
+        the anti-DoS bargain Core's HeadersSyncState makes; what it adds on top
+        (1-bit commitments over the presynced chain) guards the REDOWNLOAD pass
+        against a peer swapping in a cheaper chain, which here is bounded
+        instead by re-checking PoW, difficulty and continuity on every
+        redownloaded header before it can be committed.
+        """
+        key = self._peer_key(peer)
+        state = self._lowwork_presync.get(key)
+        if state is None or not headers:
+            return
+
+        if getattr(headers[0], "prev_blockhash", None) != state["last_hash"]:
+            # Not the continuation we asked for: a late reply to an earlier
+            # getheaders, or the peer restarted its stream.  Ignore it and
+            # re-ask rather than tearing down a walk that may be 400k headers
+            # in.
+            await self._request_lowwork_continuation(peer, min_interval=5.0)
+            return
+
+        network = getattr(self.peer_manager, "network", "mainnet")
+        work = state["work"]
+        prev = state["last_hash"]
+        height = state["height"]
+        bits = state["bits"]
+        taken = 0
+        for header in headers:
+            if getattr(header, "prev_blockhash", None) != prev:
+                break  # non-continuous tail: keep the prefix that linked
+            # Core headerssync.cpp:189 — PermittedDifficultyTransition is
+            # checked on EVERY presynced header.  Without it, per-header PoW
+            # alone lets a peer hold difficulty at the minimum for the whole
+            # walk, which is what makes a low-work header flood cheap; with it
+            # the peer's chain has to retarget like the real one.
+            next_height = height + 1
+            next_bits = int(header.bits)
+            if bits and not permitted_difficulty_transition(
+                network, next_height, bits, next_bits
+            ):
+                logger.warning(
+                    "low-work presync: header at height %d from %s has an "
+                    "impermissible difficulty transition (%#010x -> %#010x) — "
+                    "dropping the walk and scoring the peer",
+                    next_height, key, bits, next_bits,
+                )
+                peer.adjust_score(-20)
+                if hasattr(self.peer_manager, "misbehaving"):
+                    self.peer_manager.misbehaving(
+                        key, 100, "invalid header received",
+                    )
+                self._lowwork_presync.pop(key, None)
+                return
+            if not self._header_meets_pow(header):
+                # Core checks HasValidProofOfWork BEFORE presync and treats a
+                # failure as misbehaviour (net_processing.cpp:2975).
+                self._headers_pow_rejected += 1
+                logger.warning(
+                    "low-work presync: header from %s does not meet its own "
+                    "target — dropping the walk and scoring the peer", key,
+                )
+                peer.adjust_score(-20)
+                if hasattr(self.peer_manager, "misbehaving"):
+                    self.peer_manager.misbehaving(
+                        key, 100, "header with invalid proof of work",
+                    )
+                self._lowwork_presync.pop(key, None)
+                return
+            work += self._bits_to_work(next_bits)
+            prev = self._header_to_block_hash(header)
+            height = next_height
+            bits = next_bits
+            taken += 1
+
+        if taken == 0:
+            await self._request_lowwork_continuation(peer, min_interval=5.0)
+            return
+
+        state["work"] = work
+        state["last_hash"] = prev
+        state["height"] = height
+        state["bits"] = bits
+        state["headers"] += taken
+        self._header_sync_time = time.time()
+
+        now = time.time()
+        if now - getattr(self, "_last_lowwork_log", 0.0) > 30.0:
+            self._last_lowwork_log = now
+            logger.info(
+                "low-work headers PRESYNC on %s: %d headers walked, work "
+                "%#x / %#x", key, state["headers"], work, state["min_work"],
+            )
+
+        if work >= state["min_work"]:
+            # Core: PRESYNC -> REDOWNLOAD.  The peer's chain has proven enough
+            # work, so its headers may now be stored.  We did not keep them, so
+            # re-request from OUR tip and let the ordinary tip-anchored path
+            # validate and commit them; `_lowwork_validated` is Core's
+            # `already_validated_work`, which exempts that pass from the gate
+            # that sent us here.
+            self._lowwork_presync.pop(key, None)
+            self._lowwork_validated.add(key)
+            self._reset_unconnecting_headers(peer)
+            logger.warning(
+                "low-work headers PRESYNC SATISFIED on %s after %d headers: "
+                "work %#x >= nMinimumChainWork %#x — redownloading from our "
+                "tip and committing (Core PRESYNC -> REDOWNLOAD)",
+                key, state["headers"], work, state["min_work"],
+            )
+            try:
+                _, tip_height = self.db.get_best_block()
+            except Exception:
+                tip_height = 0
+            await self._send_locator_getheaders(
+                peer, self._build_locator(int(tip_height or 0)),
+            )
+            return
+
+        if state["headers"] >= self._lowwork_presync_max_headers:
+            logger.warning(
+                "low-work headers PRESYNC on %s abandoned: %d headers walked "
+                "without reaching nMinimumChainWork", key, state["headers"],
+            )
+            self._lowwork_presync.pop(key, None)
+            return
+
+        if len(headers) >= 2000:
+            await self._request_lowwork_continuation(peer)
+        else:
+            logger.warning(
+                "low-work headers PRESYNC on %s ended below the bar: the peer "
+                "has no more headers (%d walked, work %#x < %#x)",
+                key, state["headers"], work, state["min_work"],
+            )
+            self._lowwork_presync.pop(key, None)
+
     async def handle_headers(self, msg: NetworkMessage, peer: Peer, *, min_pow_checked: bool = True):
         """Handle headers message — headers-first sync.
 
@@ -3574,6 +3852,17 @@ class BlockSync:
                 raw_headers = [h.serialize() for h in headers_msg.headers]
                 if await self._consume_backfill_headers(raw_headers, peer):
                     return
+
+            # Core: IsContinuationOfLowWorkHeadersSync (net_processing.cpp:3007)
+            # runs BEFORE the headers are looked at as ordinary sync headers.
+            # A peer in low-work PRESYNC is serving a chain that is NOT anchored
+            # to our tip — its batches start thousands of blocks above it — so
+            # they must never reach the tip-anchored queue below, where they
+            # would be scored as unconnecting and eventually get the peer
+            # banned.  Nothing here is stored: the walk only accumulates work.
+            if not min_pow_checked and self._peer_key(peer) in self._lowwork_presync:
+                await self._advance_lowwork_presync(headers_msg.headers, peer)
+                return
 
             # QUEUE-ANCHOR INVARIANT (must hold before ANY height is derived).
             # Every header height below is computed positionally from the
@@ -4042,7 +4331,18 @@ class BlockSync:
             # rejecting each header individually when min_pow_checked=False
             # (the batch semantics here are equivalent: all-or-nothing per
             # call, matching ``ProcessNewBlockHeaders``' early-exit semantics).
-            if accepted > 0 and not min_pow_checked and _has_sync_module:
+            # Core: `if (!already_validated_work && TryLowWorkHeadersSync(...))`
+            # (net_processing.cpp:3064).  A peer whose chain crossed the bar in
+            # PRESYNC is exempt for the REDOWNLOAD pass that follows — without
+            # this the redownloaded headers would hit the same gate that sent
+            # us into presync and the walk could never terminate.
+            _already_validated_work = self._peer_key(peer) in self._lowwork_validated
+            if (
+                accepted > 0
+                and not min_pow_checked
+                and not _already_validated_work
+                and _has_sync_module
+            ):
                 try:
                     # Replay-harness escape hatch (default UNSET => production
                     # behaviour BYTE-FOR-BYTE; the chainparams value is used).
@@ -4166,6 +4466,28 @@ class BlockSync:
                             # Roll back: DO NOT COMMIT the headers we just
                             # appended — the candidate chain has not yet proven
                             # enough cumulative work.
+                            # Hash of the last header that actually linked
+                            # into the tip-anchored queue — the point a PRESYNC
+                            # continuation must resume from.  Read BEFORE the
+                            # rollback: `headers[-1]` is not necessarily it (a
+                            # batch can stop short on a fork/unconnecting
+                            # header while `accepted` is still > 0).
+                            _lowwork_resume = (
+                                self._validated_headers[-1][0]
+                                if self._validated_headers else None
+                            )
+                            # Height + nBits of that same header.  The queue is
+                            # tip-anchored (slot i == db_tip + 1 + i), so the
+                            # last slot sits at db_tip + len(queue).  PRESYNC
+                            # needs both to keep checking Core's
+                            # PermittedDifficultyTransition across batches.
+                            _lowwork_resume_height = (
+                                int(_db_tip_height or 0) + len(self._validated_headers)
+                            )
+                            _lowwork_resume_bits = (
+                                int(self._validated_headers[-1][1].bits)
+                                if self._validated_headers else 0
+                            )
                             del self._validated_headers[-accepted:]
                             self._headers_pow_rejected += accepted
                             # WARNING (rate-limited), not DEBUG: this rollback
@@ -4203,6 +4525,17 @@ class BlockSync:
                             # and the presync/HeadersSyncState layer remains the
                             # anti-DoS bound for low-difficulty header floods.
                             self._drop_presync_state(peer)
+                            # Core TryLowWorkHeadersSync: open a PRESYNC walk on
+                            # this peer and KEEP ASKING.  Returning here without
+                            # it — the pre-fix behaviour — is what froze a
+                            # legitimately-below-the-bar node at its tip: the
+                            # same batch was re-requested and re-rolled-back
+                            # every tick, forever.
+                            await self._begin_lowwork_presync(
+                                len(headers_msg.headers), _lowwork_resume,
+                                _lowwork_resume_height, _lowwork_resume_bits, peer,
+                                base_chain_work + headers_work, min_work_int,
+                            )
                             return
                 except Exception as _e:
                     # Defense-in-depth: a Rust-side error in
@@ -5410,6 +5743,25 @@ class BlockSync:
 
     async def _catch_up(self, peer: Peer, our_height: int):
         try:
+            # A peer in low-work PRESYNC drives its own header walk from the
+            # last header it served (Core ProcessNextHeaders).  Re-sending the
+            # tip-anchored locator here would restart that stream from our tip
+            # every tick and the walk could never get past the first batch.
+            key = self._peer_key(peer)
+            state = self._lowwork_presync.get(key)
+            if state is not None:
+                asked = state.get("asked_at", 0.0)
+                if time.time() - asked < 60.0:
+                    return
+                # The peer stopped answering the walk: abandon it and fall
+                # through to an ordinary getheaders so sync can re-arm.
+                logger.warning(
+                    "low-work headers PRESYNC on %s stalled (no batch for 60s "
+                    "after %d headers) — abandoning the walk", key,
+                    state.get("headers", 0),
+                )
+                self._lowwork_presync.pop(key, None)
+
             # Build locator
             locator = self._build_locator(our_height)
 

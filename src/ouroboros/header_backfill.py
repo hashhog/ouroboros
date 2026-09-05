@@ -87,6 +87,46 @@ GENESIS_HASHES: dict[str, bytes] = {
 }
 
 
+# The 80-byte genesis HEADERS, in wire order, for the same networks.
+#
+# Genesis is never fetched from a peer.  A ``getheaders`` locator names blocks
+# we already HAVE and the peer answers with their SUCCESSORS, so a locator of
+# [genesis] returns height 1 onward and there is no locator that yields genesis
+# itself.  Bitcoin Core sidesteps this by hardcoding genesis into the block
+# index at startup (``BlockManager::AddToBlockIndex`` on the chainparams
+# genesis block), so its header walk never has to ask for height 0.  We do the
+# same: a range that starts at genesis is seeded from this table, and the walk
+# then begins at height 1 where a locator does work.
+#
+# Verified at import time against ``GENESIS_HASHES`` (see ``_check_genesis_headers``).
+GENESIS_HEADERS: dict[str, bytes] = {
+    "mainnet": bytes.fromhex(
+        "01000000"
+        "0000000000000000000000000000000000000000000000000000000000000000"
+        "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
+        "29ab5f49" "ffff001d" "1dac2b7c"
+    ),
+    "testnet": bytes.fromhex(
+        "01000000"
+        "0000000000000000000000000000000000000000000000000000000000000000"
+        "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
+        "dae5494d" "ffff001d" "1aa4ae18"
+    ),
+    "testnet4": bytes.fromhex(
+        "01000000"
+        "0000000000000000000000000000000000000000000000000000000000000000"
+        "4e7b2b9128fe0291db0693af2ae418b767e657cd407e80cb1434221eaea7a07a"
+        "046f3566" "ffff001d" "bb0c7817"
+    ),
+    "regtest": bytes.fromhex(
+        "01000000"
+        "0000000000000000000000000000000000000000000000000000000000000000"
+        "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
+        "dae5494d" "ffff7f20" "02000000"
+    ),
+}
+
+
 class BackfillError(Exception):
     """Raised when a candidate header range fails verification.
 
@@ -100,6 +140,21 @@ def block_hash(header: bytes) -> bytes:
     if len(header) != HEADER_SIZE:
         raise BackfillError(f"header must be {HEADER_SIZE} bytes, got {len(header)}")
     return hashlib.sha256(hashlib.sha256(header).digest()).digest()
+
+
+def _check_genesis_headers() -> None:
+    """Assert every entry in ``GENESIS_HEADERS`` hashes to its ``GENESIS_HASHES``
+    twin.  A typo in the table would silently seed a genesis-rooted walk with a
+    header that can never verify, so it is checked once at import."""
+    for net, header in GENESIS_HEADERS.items():
+        expected = GENESIS_HASHES.get(net)
+        if expected is None or block_hash(header) != expected:
+            raise BackfillError(
+                f"GENESIS_HEADERS[{net!r}] does not hash to GENESIS_HASHES[{net!r}]"
+            )
+
+
+_check_genesis_headers()
 
 
 def parse_header(header: bytes) -> tuple[int, bytes, bytes, int, int, int]:
@@ -441,6 +496,27 @@ class HeaderBackfill:
         self.network = network
         self.headers: list[bytes] = []
         self.committed = False
+        if start_height == 0:
+            # A genesis-rooted range is seeded, not fetched.  ``start_locator``
+            # names blocks we HAVE and the peer answers with their SUCCESSORS,
+            # so a locator of [genesis] returns height 1 onward — there is no
+            # locator that makes a peer send genesis itself.  With an empty
+            # buffer ``_expected_prev`` returned None, which makes ``wants``
+            # require the batch to BEGIN with genesis; every honest reply
+            # therefore failed ``wants``, fell through to the ordinary sync
+            # path, and was logged as "does not connect ... dropping remaining
+            # 2000 headers" forever, once per sync tick, while the walk never
+            # buffered a single header.  Seeding genesis from chainparams is
+            # what Bitcoin Core does (``BlockManager::AddToBlockIndex`` puts the
+            # genesis block in the index at startup, so its header walks begin
+            # at height 1).
+            genesis_header = GENESIS_HEADERS.get(network)
+            if genesis_header is None:
+                raise BackfillError(
+                    f"no genesis header for network {network!r} — a range "
+                    "starting at height 0 cannot be seeded"
+                )
+            self.headers.append(genesis_header)
 
     @property
     def target(self) -> int:

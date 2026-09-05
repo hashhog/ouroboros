@@ -313,9 +313,12 @@ class TestHeaderBackfillWiring(unittest.IsolatedAsyncioTestCase):
         from ouroboros.header_backfill import block_hash as bh
         import ouroboros.tests.test_header_backfill as thb
 
-        # A real genesis + 3 synthetic headers; the 4th links to the anchor.
-        tail, anchor = thb.make_chain(bh(thb.MAINNET_GENESIS_HEADER), 3)
-        headers = [thb.MAINNET_GENESIS_HEADER] + tail
+        # 3 synthetic headers building on the REAL genesis; the last links to
+        # the anchor.  Genesis itself is NOT in the batch: a genesis-rooted walk
+        # seeds it from chainparams (Core keeps genesis in the block index) and
+        # its locator asks the peer for genesis' SUCCESSORS, which is what a
+        # peer can actually answer.
+        headers, anchor = thb.make_chain(bh(thb.MAINNET_GENESIS_HEADER), 3)
 
         # Gap is [0,3] INCLUSIVE — the walk runs through end_height so the
         # last header is the block whose hash the index already holds.
