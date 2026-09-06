@@ -50,7 +50,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-sync = pytest.importorskip("sync")
+from tests._real_sync import real_sync_installed, real_sync_or_skip
+
+# The real, compiled extension is REQUIRED: this pin drives the real
+# BlockValidator down to the real script interpreter, and the skip decision it
+# is pinning comes from sync.can_skip_scripts_for_block.  A bare
+# `pytest.importorskip("sync")` could never skip — tests/conftest.py installs a
+# stub under that name for every test in this tree — so the guard found the
+# mock and this test ran against a stubbed checkpoint table.
+sync = real_sync_or_skip()
 coincurve = pytest.importorskip("coincurve")
 
 from ouroboros.database import Block, Transaction, TxIn, TxOut  # noqa: E402
@@ -64,6 +72,22 @@ BELOW_CHECKPOINT_HEIGHT = 1000  # << mainnet last checkpoint (850000)
 # there): the test below is meaningless unless this holds.
 assert sync.can_skip_scripts_for_block("mainnet", BELOW_CHECKPOINT_HEIGHT, b"\x00" * 32) is True
 assert sync.can_skip_scripts_for_block("mainnet", 900000, b"\x00" * 32) is False
+
+
+@pytest.fixture(autouse=True)
+def _use_real_sync():
+    """Make the code under test reach the real extension too.
+
+    ``ouroboros.validation`` binds ``import sync as _sync_module`` at import
+    time and ``ouroboros.script`` re-imports ``sync`` on every ECDSA check, so
+    without this the validator and the interpreter would consult conftest's
+    stub (whose ``verify_ecdsa`` always returns False) even though this module
+    holds the real one.  Scoped and restored, so the rest of the suite keeps
+    the stub.
+    """
+    with real_sync_installed(sync):
+        yield
+
 
 FUNDING_TXID = b"\xaa" * 32
 FUNDING_VALUE = 1_000_000

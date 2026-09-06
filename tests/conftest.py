@@ -12,6 +12,11 @@ from pathlib import Path
 if "sync" not in sys.modules:
     _mock = types.ModuleType("sync")
     _mock.__file__ = "<test-mock>"
+    # Self-identifying: `pytest.importorskip("sync")` cannot tell this stub
+    # from the compiled extension, so a bare importorskip guard never skips
+    # and its test silently runs against the mock.  Tests that must have the
+    # real extension use `tests/_real_sync.py`, which keys off this attribute.
+    _mock.__ouroboros_test_stub__ = True
 
     class _StubDB:
         def __init__(self, *a, **kw):

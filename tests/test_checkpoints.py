@@ -8,9 +8,13 @@ Checkpoints are hardcoded (height, block_hash) pairs that:
 
 import pytest
 
-# Skip all tests if Rust sync module is not available
-pytest.importorskip("sync")
-import sync
+from tests._real_sync import real_sync_or_skip
+
+# Skip all tests if the Rust sync module is not built.  A bare
+# `pytest.importorskip("sync")` cannot skip here: tests/conftest.py always
+# installs a stub under that name, so the guard found the mock and these
+# checkpoint assertions were made against conftest's own hard-coded table.
+sync = real_sync_or_skip()
 
 
 class TestCheckpointRetrieval:

@@ -44,11 +44,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Ensure the (real, compiled) sync module is importable; conftest only
-# installs a stub when sync is genuinely absent.  We REQUIRE the real module
-# because the test relies on the real can_skip_scripts_for_block(mainnet,1000)
-# returning True (below the 850000 checkpoint).
-sync = pytest.importorskip("sync")
+from tests._real_sync import real_sync_installed, real_sync_or_skip
+
+# We REQUIRE the real, compiled module: the test relies on the real
+# can_skip_scripts_for_block(mainnet, 1000) returning True (below the 850000
+# checkpoint).  The comment this replaced claimed "conftest only installs a
+# stub when sync is genuinely absent" — it does not; it installs the stub
+# whenever nothing has already claimed the name, so `pytest.importorskip`
+# found the mock, never skipped, and this test exercised conftest's stubbed
+# checkpoint table instead of the Rust one.
+sync = real_sync_or_skip()
 
 from ouroboros.database import Block, Transaction, TxIn, TxOut  # noqa: E402
 from ouroboros.validation import BlockValidator  # noqa: E402
@@ -60,6 +65,21 @@ BELOW_CHECKPOINT_HEIGHT = 1000  # << mainnet last checkpoint (850000)
 assert sync.can_skip_scripts_for_block("mainnet", BELOW_CHECKPOINT_HEIGHT, b"\x00" * 32) is True
 # ... and does NOT skip above the checkpoint (control).
 assert sync.can_skip_scripts_for_block("mainnet", 900000, b"\x00" * 32) is False
+
+
+@pytest.fixture(autouse=True)
+def _use_real_sync():
+    """Make the code under test reach the real extension too.
+
+    ``ouroboros.validation`` binds ``import sync as _sync_module`` at import
+    time and ``ouroboros.script`` re-imports ``sync`` on every signature check,
+    so without this the validator would consult conftest's stub even though
+    this module holds the real one.  Scoped and restored, so the rest of the
+    suite keeps the stub.
+    """
+    with real_sync_installed(sync):
+        yield
+
 
 
 def _make_prev_block() -> MagicMock:
