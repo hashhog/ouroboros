@@ -1,6 +1,13 @@
 # Changelog
 
-## v1.0.2 (unreleased)
+## v1.0.2 — 2026-09-11
+
+- 74403c5 docs: split the changelog — v1.0.1 shipped 2026-09-07, v1.0.2 is what is new since
+- dea447e fix: gettxoutsetinfo hashed the set from a materialised list of every coin
+- 9a70e19 docs: stall-class diagnosis — 70 CRITICALs are at-tip getdata to unservable peers
+
+
+## v1.0.2 — 2026-09-11
 
 Changes since `v1.0.1`:
 
