@@ -22,13 +22,25 @@ The handler intentionally targets feature parity with
 tools/diff-test.sh:1294-1300) -- not the coinstatsindex / hash_or_height
 branches, which ouroboros has no index for.
 """
+
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
+from ouroboros.muhash import coin_element
 from ouroboros.rpc import RPCServer
+from ouroboros.snapshot import (
+    HashWriter,
+    _stream_utxo_txid_groups_from_iter,
+    compute_utxo_hash,
+    stream_utxo_txid_groups,
+)
+
+_REPO = Path(__file__).resolve().parents[1]
 
 
 @dataclass
@@ -82,21 +94,36 @@ def _make_rpc(db: _StubDB) -> RPCServer:
 
 def _seed(db: _StubDB) -> None:
     """Three coins, two distinct txids -> 2 transactions / 3 txouts."""
-    db.utxos.append(_UTXOEntry(
-        txid=b"\xaa" * 32, vout=0, amount=50_000_000,
-        script_pubkey=_p2pkh(b"\x01" * 20),
-        height=1, is_coinbase=True,
-    ))
-    db.utxos.append(_UTXOEntry(
-        txid=b"\xaa" * 32, vout=1, amount=25_000_000,
-        script_pubkey=_p2pkh(b"\x02" * 20),
-        height=1, is_coinbase=True,
-    ))
-    db.utxos.append(_UTXOEntry(
-        txid=b"\xbb" * 32, vout=0, amount=12_345_678,
-        script_pubkey=_p2pkh(b"\x03" * 20),
-        height=2, is_coinbase=False,
-    ))
+    db.utxos.append(
+        _UTXOEntry(
+            txid=b"\xaa" * 32,
+            vout=0,
+            amount=50_000_000,
+            script_pubkey=_p2pkh(b"\x01" * 20),
+            height=1,
+            is_coinbase=True,
+        )
+    )
+    db.utxos.append(
+        _UTXOEntry(
+            txid=b"\xaa" * 32,
+            vout=1,
+            amount=25_000_000,
+            script_pubkey=_p2pkh(b"\x02" * 20),
+            height=1,
+            is_coinbase=True,
+        )
+    )
+    db.utxos.append(
+        _UTXOEntry(
+            txid=b"\xbb" * 32,
+            vout=0,
+            amount=12_345_678,
+            script_pubkey=_p2pkh(b"\x03" * 20),
+            height=2,
+            is_coinbase=False,
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -232,7 +259,8 @@ async def test_gettxoutsetinfo_hash_serialized_specific_block_rejected() -> None
 
     with pytest.raises(RpcError) as exc:
         await rpc.rpc_gettxoutsetinfo(
-            hash_type="hash_serialized_3", hash_or_height=2,
+            hash_type="hash_serialized_3",
+            hash_or_height=2,
         )
     assert exc.value.code == RPC_INVALID_PARAMETER
     assert "cannot be queried for a specific block" in exc.value.message
@@ -240,7 +268,8 @@ async def test_gettxoutsetinfo_hash_serialized_specific_block_rejected() -> None
     # height 0 is a valid "specific block" too (truthiness must not gate it).
     with pytest.raises(RpcError) as exc0:
         await rpc.rpc_gettxoutsetinfo(
-            hash_type="hash_serialized_3", hash_or_height=0,
+            hash_type="hash_serialized_3",
+            hash_or_height=0,
         )
     assert exc0.value.code == RPC_INVALID_PARAMETER
 
@@ -298,3 +327,171 @@ async def test_gettxoutsetinfo_bestblock_is_display_hex() -> None:
     expected_display = internal[::-1].hex()
     assert res["bestblock"] == expected_display
     assert res["bestblock"] != internal.hex()
+
+
+def test_gettxoutsetinfo_streams_does_not_materialise_the_coin_set() -> None:
+    """Revert control for QUEUES.md ouroboros item 0.
+
+    Pre-fix ``rpc_gettxoutsetinfo`` / ``compute_utxo_hash`` collected every
+    coin into a list and sorted it, and Rust ``iter_utxos`` had already
+    built a Vec of the chainstate. Restoring those lines — or dropping
+    STREAMING-HASH — must fail here. Pattern: haskoin
+    ``dumpTxOutSetFromDB streams``.
+    """
+    rpc_src = inspect.getsource(RPCServer.rpc_gettxoutsetinfo)
+    assert "list(self.node.db.iter_utxos())" not in rpc_src
+    assert "self.node.db.iter_utxos" not in rpc_src
+    assert "utxos.sort" not in rpc_src
+    assert "stream_utxo_txid_groups" in rpc_src
+    assert "STREAMING-HASH" in rpc_src
+
+    rpc_file = (_REPO / "src/ouroboros/rpc.py").read_text(encoding="utf-8")
+    assert "utxos = list(self.node.db.iter_utxos())" not in rpc_file
+
+    hash_src = inspect.getsource(compute_utxo_hash)
+    assert "list(db.iter_utxos())" not in hash_src
+    assert "utxos.sort" not in hash_src
+    assert "stream_utxo_txid_groups" in hash_src
+
+    walk_src = inspect.getsource(stream_utxo_txid_groups)
+    assert "visit_utxo_txid_groups" in walk_src
+    assert "STREAMING-HASH" in walk_src
+    assert "list(db.iter_utxos())" not in walk_src
+
+    db_rs = (_REPO / "ferrous-utils/sync/src/storage/db.rs").read_text(
+        encoding="utf-8",
+    )
+    assert "pub fn stream_utxo_txid_groups" in db_rs
+    assert "BTreeMap<u32, UTXO>" in db_rs
+    lib_rs = (_REPO / "ferrous-utils/sync/src/lib.rs").read_text(encoding="utf-8")
+    assert "fn visit_utxo_txid_groups" in lib_rs
+
+
+def test_stream_utxo_txid_groups_peak_is_the_widest_txid_not_the_set() -> None:
+    """Runtime proof of the RAM bound: 50 singleton txids + one txid
+    with 80 outputs + one txid with vouts {0,1,256} (LE-key order !=
+    numeric). Peak live group must be 80, not 50+80+3. A walk that
+    materialises the set and then reports length as "peak" fails this.
+    """
+    db = _StubDB()
+
+    def coin(tid: bytes, vout: int) -> _UTXOEntry:
+        return _UTXOEntry(
+            txid=tid,
+            vout=vout,
+            amount=1,
+            script_pubkey=_p2pkh(b"\x01" * 20),
+            height=1,
+            is_coinbase=False,
+        )
+
+    for b in range(1, 51):
+        db.utxos.append(coin(bytes([b]) + b"\x00" * 31, 0))
+    wide = b"\xaa" * 32
+    for n in range(80):
+        db.utxos.append(coin(wide, n))
+    le = b"\xbb" * 32
+    for n in (0, 1, 256):
+        db.utxos.append(coin(le, n))
+
+    n, peak = stream_utxo_txid_groups(db, lambda *_: None)
+    assert n == 50 + 80 + 3
+    assert peak == 80
+
+    # LE32 key order visits vout 256 before vout 1; the grouper must
+    # still flush numeric map order (Core std::map<uint32_t, Coin>).
+    le_ordered = sorted(
+        db.utxos,
+        key=lambda u: (u.txid, int(u.vout).to_bytes(4, "little")),
+    )
+    groups: dict[bytes, list[int]] = {}
+
+    def capture(tid, outputs) -> None:
+        groups[tid] = list(outputs)
+
+    n2, peak2 = _stream_utxo_txid_groups_from_iter(le_ordered, capture)
+    assert n2 == n
+    assert peak2 == 80
+    assert groups[le] == [0, 1, 256]
+
+
+def test_compute_utxo_hash_vout_256_is_numeric_map_order_not_le_key_order() -> None:
+    """HASH_SERIALIZED must follow Core's numeric vout map, not RocksDB
+    LE32 key order. vout 256 = 00 01 00 00 sorts before vout 1.
+    """
+    tid = b"\xcc" * 32
+    coins = [
+        _UTXOEntry(
+            txid=tid,
+            vout=0,
+            amount=10,
+            script_pubkey=_p2pkh(b"\x01" * 20),
+            height=7,
+            is_coinbase=False,
+        ),
+        _UTXOEntry(
+            txid=tid,
+            vout=256,
+            amount=30,
+            script_pubkey=_p2pkh(b"\x03" * 20),
+            height=7,
+            is_coinbase=False,
+        ),
+        _UTXOEntry(
+            txid=tid,
+            vout=1,
+            amount=20,
+            script_pubkey=_p2pkh(b"\x02" * 20),
+            height=7,
+            is_coinbase=False,
+        ),
+    ]
+    db = _StubDB()
+    db.utxos = list(coins)
+    by_vout = {c.vout: c for c in coins}
+
+    def feed(order: tuple[int, ...]) -> bytes:
+        h = HashWriter()
+        for v in order:
+            u = by_vout[v]
+            h.update(
+                coin_element(
+                    txid=u.txid,
+                    vout=u.vout,
+                    height=u.height,
+                    is_coinbase=u.is_coinbase,
+                    amount=u.amount,
+                    script_pubkey=u.script_pubkey,
+                )
+            )
+        return h.digest()
+
+    numeric = feed((0, 1, 256))
+    le_order = feed((0, 256, 1))
+    assert numeric != le_order
+    assert compute_utxo_hash(db, hash_type="hash_serialized") == numeric
+
+
+@pytest.mark.asyncio
+async def test_gettxoutsetinfo_hash_matches_numeric_vout_group() -> None:
+    """RPC digest must match compute_utxo_hash on the LE-vs-numeric trap."""
+    tid = b"\xdd" * 32
+    db = _StubDB()
+    db.best_height = 3
+    db.utxos = [
+        _UTXOEntry(
+            txid=tid,
+            vout=v,
+            amount=100 + v,
+            script_pubkey=_p2pkh(b"\x04" * 20),
+            height=3,
+            is_coinbase=True,
+        )
+        for v in (0, 256, 1)
+    ]
+    rpc = _make_rpc(db)
+    res = await rpc.rpc_gettxoutsetinfo()
+    expected = compute_utxo_hash(db, hash_type="hash_serialized")
+    assert res["hash_serialized_3"] == expected[::-1].hex()
+    assert res["transactions"] == 1
+    assert res["txouts"] == 3

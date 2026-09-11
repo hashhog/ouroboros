@@ -549,6 +549,34 @@ class BlockchainDatabase:
                 is_coinbase=bool(getattr(py_utxo, "is_coinbase", False)),
             )
 
+    def visit_utxo_txid_groups(self, write_group):
+        """Stream CHAINSTATE_CF one txid group at a time.
+
+        Peak live set is one txid's outputs (Core ``std::map<uint32_t,
+        Coin>``). Returns ``(coins_emitted, peak_group_size)``.
+        """
+        if not hasattr(self._db, "visit_utxo_txid_groups"):
+            raise NotImplementedError(
+                "Rust extension does not expose visit_utxo_txid_groups; "
+                "rebuild the ferrous-utils/sync extension"
+            )
+
+        def _cb(txid, coins) -> None:
+            txid_b = bytes(txid)
+            group: dict[int, _SnapshotUTXOView] = {}
+            for vout, amount, script, height, is_coinbase in coins:
+                group[int(vout)] = _SnapshotUTXOView(
+                    txid=txid_b,
+                    vout=int(vout),
+                    amount=int(amount),
+                    script_pubkey=bytes(script),
+                    height=int(height),
+                    is_coinbase=bool(is_coinbase),
+                )
+            write_group(txid_b, group)
+
+        return self._db.visit_utxo_txid_groups(_cb)
+
     def add_utxo_raw(
         self,
         *,

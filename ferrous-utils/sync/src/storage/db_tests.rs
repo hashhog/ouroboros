@@ -1755,4 +1755,64 @@ mod tests {
         assert_eq!(tip_hash, [0u8; 32]);
         assert_eq!(tip_height, 0);
     }
+
+    /// Cursor order is `txid || vout_le`: vout 256 sorts before vout 1.
+    /// HASH_SERIALIZED must regroup through a numeric map, not hash this
+    /// order (kernel/coinstats.cpp `std::map<uint32_t, Coin>`).
+    #[test]
+    fn test_for_each_utxo_key_order_is_vout_le_not_numeric() {
+        let (db, _temp_dir) = create_test_db();
+        let tid = bitcoin::Txid::from_byte_array([0xBB; 32]);
+        for n in [0u32, 1, 256] {
+            let (op, utxo) = create_test_utxo(tid, n, 1, Some(1));
+            db.add_utxo(&op, &utxo).unwrap();
+        }
+        let mut vouts = Vec::new();
+        db.for_each_utxo(|txid, vout, _utxo| {
+            if txid == [0xBB; 32] {
+                vouts.push(vout);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(vouts, vec![0, 256, 1]);
+    }
+
+    /// Revert control: peak live group is the widest txid, not the set.
+    /// 50 singletons + one 80-output txid + vouts {0,1,256}. A walk that
+    /// materialises the set and reports length as "peak" fails this.
+    #[test]
+    fn test_stream_utxo_txid_groups_peak_is_widest_txid_not_the_set() {
+        let (db, _temp_dir) = create_test_db();
+        for i in 1..=50u8 {
+            let mut bytes = [0u8; 32];
+            bytes[0] = i;
+            let txid = bitcoin::Txid::from_byte_array(bytes);
+            let (op, utxo) = create_test_utxo(txid, 0, 1, Some(1));
+            db.add_utxo(&op, &utxo).unwrap();
+        }
+        let wide = bitcoin::Txid::from_byte_array([0xAA; 32]);
+        for n in 0..80u32 {
+            let (op, utxo) = create_test_utxo(wide, n, 1, Some(1));
+            db.add_utxo(&op, &utxo).unwrap();
+        }
+        let le = bitcoin::Txid::from_byte_array([0xBB; 32]);
+        for n in [0u32, 1, 256] {
+            let (op, utxo) = create_test_utxo(le, n, 1, Some(1));
+            db.add_utxo(&op, &utxo).unwrap();
+        }
+
+        let mut seen_le: Vec<u32> = Vec::new();
+        let (n, peak) = db
+            .stream_utxo_txid_groups(|txid, group| {
+                if txid == [0xBB; 32] {
+                    seen_le = group.keys().copied().collect();
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(n, 50 + 80 + 3);
+        assert_eq!(peak, 80);
+        assert_eq!(seen_le, vec![0, 1, 256]);
+    }
 }

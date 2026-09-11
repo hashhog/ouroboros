@@ -11760,11 +11760,10 @@ class RPCServer:
             amount   i64 LE
             scriptPubKey CompactSize length + raw bytes
 
-        Iteration order matches Core's CCoinsViewCursor: sorted by
-        ``(txid, vout)``. Core groups outputs by txid and walks the
-        ``std::map<uint32_t, Coin>`` (which sorts by vout); a flat
-        ``(txid, vout)`` sort is equivalent because vout is a u32
-        appended to txid in the key.
+        STREAMING-HASH: walks CHAINSTATE_CF one txid group at a time
+        (Core ``std::map<uint32_t, Coin>``). Never materialises the
+        coin set. Iteration order matches Core's CCoinsViewCursor
+        grouped by txid, flushed in numeric vout order.
 
         Args:
             hash_type: ``"hash_serialized_3"`` (default; SHA256d),
@@ -11785,7 +11784,7 @@ class RPCServer:
         from decimal import Decimal
 
         from ouroboros.muhash import coin_element
-        from ouroboros.snapshot import HashWriter, MuHash3072
+        from ouroboros.snapshot import HashWriter, MuHash3072, stream_utxo_txid_groups
 
         if not hasattr(self.node, "db") or not self.node.db:
             return {}
@@ -11848,7 +11847,11 @@ class RPCServer:
 
         def _walk_utxos() -> dict[str, Any]:
             """Single-pass UTXO walk; runs on a worker thread to avoid
-            stalling the asyncio event loop on large chainstates."""
+            stalling the asyncio event loop on large chainstates.
+
+            STREAMING-HASH: one txid group at a time. Never
+            ``list(iter_utxos())`` of the whole set.
+            """
             use_muhash = hash_type_norm == "muhash"
             use_sha256d = hash_type_norm in (
                 "hash_serialized_3", "hash_serialized_2",
@@ -11860,37 +11863,33 @@ class RPCServer:
             transactions = 0
             total_amount = 0
             bogosize = 0
-            prev_txid: bytes | None = None
 
-            # Sort by (txid, vout) so the digest is deterministic and
-            # matches Core's CCoinsViewCursor leveldb-key ordering.
-            utxos = list(self.node.db.iter_utxos())
-            utxos.sort(key=lambda u: (u.txid, u.vout))
+            def on_group(_txid, outputs) -> None:
+                nonlocal txouts, transactions, total_amount, bogosize
+                transactions += 1
+                for vout in sorted(outputs):
+                    utxo = outputs[vout]
+                    txouts += 1
+                    amount = int(utxo.amount)
+                    total_amount += amount
+                    spk = bytes(utxo.script_pubkey)
+                    # GetBogoSize: 32 + 4 + 4 + 8 + 2 + len(scriptPubKey)
+                    # (kernel/coinstats.cpp:36-43).
+                    bogosize += 32 + 4 + 4 + 8 + 2 + len(spk)
+                    element = coin_element(
+                        txid=bytes(utxo.txid),
+                        vout=int(utxo.vout),
+                        height=int(utxo.height or 0),
+                        is_coinbase=bool(utxo.is_coinbase),
+                        amount=amount,
+                        script_pubkey=spk,
+                    )
+                    if hasher_sha is not None:
+                        hasher_sha.update(element)
+                    if hasher_mu is not None:
+                        hasher_mu.insert(element)
 
-            for utxo in utxos:
-                txouts += 1
-                if utxo.txid != prev_txid:
-                    transactions += 1
-                    prev_txid = utxo.txid
-                amount = int(utxo.amount)
-                total_amount += amount
-                spk = bytes(utxo.script_pubkey)
-                # GetBogoSize: 32 + 4 + 4 + 8 + 2 + len(scriptPubKey)
-                # (kernel/coinstats.cpp:36-43).
-                bogosize += 32 + 4 + 4 + 8 + 2 + len(spk)
-
-                element = coin_element(
-                    txid=utxo.txid,
-                    vout=int(utxo.vout),
-                    height=int(utxo.height),
-                    is_coinbase=bool(utxo.is_coinbase),
-                    amount=amount,
-                    script_pubkey=spk,
-                )
-                if hasher_sha is not None:
-                    hasher_sha.update(element)
-                if hasher_mu is not None:
-                    hasher_mu.insert(element)
+            stream_utxo_txid_groups(self.node.db, on_group)
 
             return {
                 "txouts": txouts,

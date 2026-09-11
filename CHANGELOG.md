@@ -4,6 +4,7 @@
 
 Changes since `v1.0.0`:
 
+- fix: gettxoutsetinfo hash_serialized_3 streams one txid group (was 85.8 GB at 875k)
 - docs: stall-class diagnosis — 70 CRITICALs are at-tip getdata to unservable peers (`docs/STALL-CLASS-70-CRITICALS.md`); no fix until a failing control exists
 - 621ff72 docs: say the cited paths are private before the claims that rest on them
 - c6086f9 fix: make importorskip("sync") able to skip, so those tests stop testing a mock

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use bitcoin::Network;
 use bitcoin::hashes::Hash;
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyList};
 use tokio::sync::Mutex;
 
 use common::{OutPointWrapper, UTXO, BlockWrapper, BlockHeaderWrapper, BlockMetadata, BlockStatus};
@@ -5537,8 +5538,8 @@ impl PyBlockchainDB {
     /// Iterate the entire UTXO set as a vector of PyUTXO.
     ///
     /// Returns a snapshot of every UTXO currently in the chainstate
-    /// column family.  Used by `dumptxoutset` to build the per-txid
-    /// groups required by Core's snapshot wire format.
+    /// column family.  Unbounded at mainnet scale — HASH_SERIALIZED
+    /// (`gettxoutsetinfo`) must use `visit_utxo_txid_groups`.
     fn iter_utxos(&self) -> PyResult<Vec<PyUTXO>> {
         match self.db.iter_utxos() {
             Ok(pairs) => {
@@ -5551,6 +5552,52 @@ impl PyBlockchainDB {
                 format!("Database error: {}", e)
             )),
         }
+    }
+
+    /// Stream CHAINSTATE_CF one txid group at a time.
+    ///
+    /// `callback(txid: bytes, coins)` is invoked once per txid. `coins`
+    /// is a list of `(vout, amount, script_pubkey, height, is_coinbase)`
+    /// in numeric vout order (Core `std::map<uint32_t, Coin>`), not LE32
+    /// key order. Peak live set is one group. Returns
+    /// `(coins_emitted, peak_group_size)`.
+    fn visit_utxo_txid_groups(
+        &self,
+        py: Python<'_>,
+        callback: Bound<'_, PyAny>,
+    ) -> PyResult<(u64, usize)> {
+        let mut cb_err: Option<PyErr> = None;
+        let streamed = self.db.stream_utxo_txid_groups(|txid, group| {
+            let invoked = (|| -> PyResult<()> {
+                let coins = PyList::empty(py);
+                for (vout, utxo) in group {
+                    coins.append((
+                        *vout,
+                        utxo.amount,
+                        PyBytes::new(py, utxo.script_pubkey.as_bytes()),
+                        utxo.height.unwrap_or(0),
+                        utxo.is_coinbase,
+                    ))?;
+                }
+                callback.call1((PyBytes::new(py, &txid[..]), &coins))?;
+                Ok(())
+            })();
+            match invoked {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    cb_err = Some(e);
+                    Err(DbError::InvalidData(
+                        "visit_utxo_txid_groups callback failed".into(),
+                    ))
+                }
+            }
+        });
+        if let Some(e) = cb_err {
+            return Err(e);
+        }
+        streamed.map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", e))
+        })
     }
 
     /// Walk `CHAINSTATE_CF` and delete any orphan UTXO whose

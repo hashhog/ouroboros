@@ -1,6 +1,6 @@
 //! RocksDB database implementation for Bitcoin blockchain storage
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Mutex;
@@ -727,33 +727,87 @@ impl BlockchainDB {
         self.get_utxo_cached(outpoint).map(|opt| opt.is_some()).unwrap_or(false)
     }
 
-    /// Iterate all UTXOs in the chainstate (for address balance/scan).
+    /// Visit every CHAINSTATE_CF coin without collecting the set.
     ///
-    /// Returns a vector of (OutPoint, UTXO) pairs for the entire UTXO set.
-    /// Used by snapshot dumping and balance scanning.
-    pub fn iter_utxos(&self) -> Result<Vec<(OutPoint, UTXO)>> {
+    /// Keys are `txid || vout_le` so RocksDB yields one txid's outputs
+    /// adjacent, but WITHIN a txid the order is LE32 byte order (vout
+    /// 256 sorts before vout 1). Callers that need Core's numeric-vout
+    /// `std::map` order must regroup — see `stream_utxo_txid_groups`.
+    ///
+    /// Malformed rows are skipped (same policy as `iter_utxos`).
+    pub fn for_each_utxo<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut([u8; 32], u32, UTXO) -> Result<()>,
+    {
         let cf = self.db
             .cf_handle(CHAINSTATE_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
-
-        let mut utxos = Vec::new();
         let iter = self.db.iterator_cf(cf, IteratorMode::Start);
-
         for item in iter {
-            let (key, value) = item.map_err(|e| DbError::RocksDb(e))?;
-            if key.len() == 36 {
-                if let Ok((utxo, _)) = UTXO::bitcoin_deserialize(&value) {
-                    // Decode outpoint from key
-                    let mut key_arr = [0u8; 36];
-                    key_arr.copy_from_slice(&key);
-                    let (txid_bytes, vout) = crate::storage::schema::decode_outpoint(&key_arr);
-                    let txid = bitcoin::Txid::from_byte_array(txid_bytes);
-                    let outpoint = OutPoint { txid, vout };
-                    utxos.push((outpoint, utxo));
+            let (key, value) = item.map_err(DbError::RocksDb)?;
+            if key.len() != 36 {
+                continue;
+            }
+            let Ok((utxo, _)) = UTXO::bitcoin_deserialize(&value) else {
+                continue;
+            };
+            let mut key_arr = [0u8; 36];
+            key_arr.copy_from_slice(&key);
+            let (txid_bytes, vout) = crate::storage::schema::decode_outpoint(&key_arr);
+            f(txid_bytes, vout, utxo)?;
+        }
+        Ok(())
+    }
+
+    /// Stream CHAINSTATE_CF one txid group at a time.
+    ///
+    /// Peak live set is one txid's outputs in a `BTreeMap<u32, UTXO>`
+    /// (Core `std::map<uint32_t, Coin>` in kernel/coinstats.cpp
+    /// ComputeUTXOStats). Never a Vec of the whole coin set.
+    ///
+    /// Returns `(coins_emitted, peak_group_size)`.
+    pub fn stream_utxo_txid_groups<F>(&self, mut write_group: F) -> Result<(u64, usize)>
+    where
+        F: FnMut([u8; 32], &BTreeMap<u32, UTXO>) -> Result<()>,
+    {
+        let mut count = 0u64;
+        let mut peak = 0usize;
+        let mut prev: Option<[u8; 32]> = None;
+        let mut group: BTreeMap<u32, UTXO> = BTreeMap::new();
+
+        self.for_each_utxo(|txid, vout, utxo| {
+            if let Some(prev_txid) = prev {
+                if prev_txid != txid {
+                    peak = peak.max(group.len());
+                    write_group(prev_txid, &group)?;
+                    group.clear();
                 }
             }
-        }
+            prev = Some(txid);
+            group.insert(vout, utxo);
+            count += 1;
+            Ok(())
+        })?;
 
+        if let Some(txid) = prev {
+            peak = peak.max(group.len());
+            write_group(txid, &group)?;
+        }
+        Ok((count, peak))
+    }
+
+    /// Iterate all UTXOs in the chainstate (for address balance/scan).
+    ///
+    /// Returns a vector of (OutPoint, UTXO) pairs for the entire UTXO set.
+    /// Unbounded at mainnet scale — `gettxoutsetinfo` / HASH_SERIALIZED
+    /// must use `stream_utxo_txid_groups` instead.
+    pub fn iter_utxos(&self) -> Result<Vec<(OutPoint, UTXO)>> {
+        let mut utxos = Vec::new();
+        self.for_each_utxo(|txid_bytes, vout, utxo| {
+            let txid = bitcoin::Txid::from_byte_array(txid_bytes);
+            utxos.push((OutPoint { txid, vout }, utxo));
+            Ok(())
+        })?;
         Ok(utxos)
     }
 

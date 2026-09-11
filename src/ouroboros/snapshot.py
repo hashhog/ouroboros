@@ -2047,6 +2047,120 @@ class SnapshotManager:
         }
 
 
+@dataclass
+class _StreamCoin:
+    """One coin in a streamed txid group (compute_utxo_hash-compatible)."""
+
+    txid: bytes
+    vout: int
+    amount: int
+    script_pubkey: bytes
+    height: int
+    is_coinbase: bool
+
+
+def _as_txid_bytes(txid) -> bytes:
+    if isinstance(txid, str):
+        return bytes.fromhex(txid)[::-1]
+    return bytes(txid)
+
+
+def _stream_utxo_txid_groups_from_iter(utxos, write_group):
+    """Hold one txid group. Same-txid coins must be adjacent.
+
+    Within a group, coins are regrouped by numeric vout (Core
+    ``std::map<uint32_t, Coin>``), not LE32 key order. Returns
+    ``(coins_emitted, peak_group_size)``.
+    """
+    count = 0
+    peak = 0
+    current_txid: bytes | None = None
+    group: dict[int, Any] = {}
+
+    def _flush() -> None:
+        nonlocal peak, group
+        if current_txid is None or not group:
+            group = {}
+            return
+        peak = max(peak, len(group))
+        ordered = {v: group[v] for v in sorted(group)}
+        write_group(current_txid, ordered)
+        group = {}
+
+    for utxo in utxos:
+        tid = _as_txid_bytes(utxo.txid)
+        if current_txid is not None and tid != current_txid:
+            _flush()
+        current_txid = tid
+        group[int(utxo.vout)] = utxo
+        count += 1
+    _flush()
+    return count, peak
+
+
+def _stream_via_native_visit(visit, write_group):
+    """Adapt ``visit_utxo_txid_groups(callback) -> (n, peak)``."""
+
+    def _cb(txid, coins) -> None:
+        txid_b = bytes(txid)
+        group: dict[int, _StreamCoin] = {}
+        for row in coins:
+            vout, amount, script, height, is_coinbase = row
+            group[int(vout)] = _StreamCoin(
+                txid=txid_b,
+                vout=int(vout),
+                amount=int(amount),
+                script_pubkey=bytes(script),
+                height=int(height),
+                is_coinbase=bool(is_coinbase),
+            )
+        write_group(txid_b, group)
+
+    return visit(_cb)
+
+
+def _stream_utxo_txid_groups_in_memory(db, write_group):
+    """ONLY for stores that already hold every coin (test stubs,
+    BackgroundCoinsStore). Production HASH_SERIALIZED must take the
+    native ``visit_utxo_txid_groups`` path.
+    """
+    coins = list(db.iter_utxos())
+    coins.sort(key=lambda u: (_as_txid_bytes(u.txid), int(u.vout)))
+    return _stream_utxo_txid_groups_from_iter(coins, write_group)
+
+
+def stream_utxo_txid_groups(db, write_group):
+    """Stream the coin keyspace, holding one txid group.
+
+    STREAMING-HASH: prefer ``visit_utxo_txid_groups`` (RocksDB cursor,
+    one BTreeMap). In-memory stubs fall back to a sorted adjacent walk.
+    Never a list of the whole production coin set.
+
+    Returns ``(coins_emitted, peak_group_size)``.
+    """
+    visit = getattr(db, "visit_utxo_txid_groups", None)
+    if callable(visit):
+        return visit(write_group)
+    inner = getattr(db, "_db", None)
+    inner_visit = (
+        getattr(inner, "visit_utxo_txid_groups", None) if inner is not None else None
+    )
+    if callable(inner_visit):
+        return _stream_via_native_visit(inner_visit, write_group)
+    return _stream_utxo_txid_groups_in_memory(db, write_group)
+
+
+def _hash_one_coin(utxo) -> bytes:
+    return coin_element(
+        txid=_as_txid_bytes(utxo.txid),
+        vout=int(utxo.vout),
+        height=int(utxo.height or 0),
+        is_coinbase=bool(utxo.is_coinbase),
+        amount=int(utxo.amount),
+        script_pubkey=bytes(utxo.script_pubkey),
+    )
+
+
 def compute_utxo_hash(db, hash_type: str = "hash_serialized") -> bytes:
     """
     Compute a deterministic 32-byte digest over the UTXO set.
@@ -2066,21 +2180,18 @@ def compute_utxo_hash(db, hash_type: str = "hash_serialized") -> bytes:
       Core's ``gettxoutsetinfo hash_type=muhash`` path. Order-independent
       (multiplicative incremental hash).
 
-    Matches Core's ``ComputeUTXOStats`` switch on ``CoinStatsHashType``
-    (kernel/coinstats.cpp:160-172).
+    STREAMING-HASH: walks via :func:`stream_utxo_txid_groups` (one txid
+    group at a time). Matches Core's ``ComputeUTXOStats`` switch on
+    ``CoinStatsHashType`` (kernel/coinstats.cpp:160-172).
     """
     if hash_type == "muhash":
         muhash = MuHash3072()
-        for utxo in db.iter_utxos():
-            element = coin_element(
-                txid=utxo.txid,
-                vout=utxo.vout,
-                height=utxo.height,
-                is_coinbase=bool(utxo.is_coinbase),
-                amount=int(utxo.amount),
-                script_pubkey=bytes(utxo.script_pubkey),
-            )
-            muhash.insert(element)
+
+        def on_mu(_txid, outputs) -> None:
+            for vout in sorted(outputs):
+                muhash.insert(_hash_one_coin(outputs[vout]))
+
+        stream_utxo_txid_groups(db, on_mu)
         return muhash.digest()
 
     if hash_type != "hash_serialized":
@@ -2089,23 +2200,13 @@ def compute_utxo_hash(db, hash_type: str = "hash_serialized") -> bytes:
             f"expected 'muhash' or 'hash_serialized'"
         )
 
-    # SHA256d via HashWriter, fed in canonical (txid, vout) order so that
-    # the digest matches what Core computes when its CCoinsViewCursor
-    # walks the leveldb sorted by (txid, vout).
     hasher = HashWriter()
-    utxos = list(db.iter_utxos())
-    utxos.sort(key=lambda u: (u.txid, u.vout))
-    for utxo in utxos:
-        hasher.update(
-            coin_element(
-                txid=utxo.txid,
-                vout=utxo.vout,
-                height=utxo.height,
-                is_coinbase=bool(utxo.is_coinbase),
-                amount=int(utxo.amount),
-                script_pubkey=bytes(utxo.script_pubkey),
-            )
-        )
+
+    def on_sha(_txid, outputs) -> None:
+        for vout in sorted(outputs):
+            hasher.update(_hash_one_coin(outputs[vout]))
+
+    stream_utxo_txid_groups(db, on_sha)
     return hasher.digest()
 
 
@@ -2276,8 +2377,13 @@ class BackgroundCoinsStore:
         return len(self._coins)
 
     def iter_utxos(self):
-        """Yield every coin in THIS store (shape: compute_utxo_hash-ready)."""
-        yield from self._coins.values()
+        """Yield every coin in THIS store (shape: compute_utxo_hash-ready).
+
+        Sorted by (txid, vout) so the in-memory HASH_SERIALIZED walk
+        matches Core without a second copy of coin values.
+        """
+        for key in sorted(self._coins):
+            yield self._coins[key]
 
     def get_best_block(self) -> tuple[bytes, int]:
         return self.best_hash, self.best_height
