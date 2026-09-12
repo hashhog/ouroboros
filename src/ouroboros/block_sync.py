@@ -1844,22 +1844,22 @@ class BlockSync:
             # explicitly fetched via getdata) are always buffered regardless of
             # their position relative to tip, mirroring Core's `if (!fRequested)`
             # guard condition.
-            if not was_requested:
+            # Height of this body on the queued header chain (slot 0 == tip+1).
+            # Used for getpeerinfo.synced_blocks (nCommonHeight) on any
+            # delivery whose header we have, and for the unrequested
+            # fTooFarAhead gate below.
+            claimed_height: int | None = None
+            active_height: int = 0
+            try:
                 _, active_height = self.db.get_best_block()
-                # Determine the claimed height from the validated-header queue.
-                # Slot 0 is tip+1, slot 1 is tip+2, etc.
-                claimed_height: int | None = None
                 for _idx, (_bh, _) in enumerate(self._validated_headers):
                     if _bh == block_hash:
                         claimed_height = active_height + 1 + _idx
                         break
-                if claimed_height is not None:
-                    # Core UpdateBlockAvailability on a delivered block whose
-                    # height we know (net_processing.cpp:4529).  Requested
-                    # blocks already had the peer's best-known height recorded
-                    # when their headers arrived; this covers unrequested
-                    # (directly-announced) deliveries.
-                    peer.note_block_height(claimed_height)
+            except Exception:
+                claimed_height = None
+
+            if not was_requested:
                 if (
                     claimed_height is not None
                     and claimed_height > active_height + MIN_BLOCKS_TO_KEEP
@@ -1871,6 +1871,16 @@ class BlockSync:
                         f"from {peer.host}:{peer.port}"
                     )
                     return
+
+            if claimed_height is not None:
+                # Core pindexLastCommonBlock on a delivered body whose
+                # height we know.  A received body implies the header is
+                # also in common (nSyncHeight advances too).
+                _upd = getattr(peer, "update_synced_blocks", None)
+                if callable(_upd):
+                    _upd(claimed_height)
+                else:
+                    peer.note_block_height(claimed_height)
 
             # Buffer the raw payload (keyed by hash) for sequential
             # processing.  `None` sentinel means "not yet deserialized" —
@@ -3667,6 +3677,56 @@ class BlockSync:
         port = getattr(peer, "port", "?")
         return f"{host}:{port}"
 
+    def _height_of_queued_header(self, block_hash: bytes) -> int | None:
+        """Height of *block_hash* if it sits in the validated-header queue.
+
+        Slot i is db_tip + 1 + i (the queue-anchor invariant).  Returns
+        None when the hash is not queued or the tip cannot be read —
+        matching Core GetNodeStateStats skipping a QueuedBlock with a
+        null pindex.
+        """
+        try:
+            _, tip_h = self.db.get_best_block()
+        except Exception:
+            return None
+        if tip_h is None:
+            return None
+        for i, (bh, _) in enumerate(self._validated_headers):
+            if bh == block_hash:
+                return int(tip_h) + 1 + i
+        return None
+
+    def inflight_heights_for_peer(self, peer: Peer) -> list[int]:
+        """getpeerinfo.inflight: heights of blocks requested from *peer*.
+
+        Core GetNodeStateStats walks CNodeState.vBlocksInFlight and
+        emits each QueuedBlock's pindex->nHeight (rpc/net.cpp:273-277).
+        Hashes we do not have a queued header for are omitted.
+        """
+        heights: list[int] = []
+        for bh, p in list(self._block_request_peer.items()):
+            if p is not peer:
+                continue
+            h = self._height_of_queued_header(bh)
+            if h is not None:
+                heights.append(h)
+        heights.sort()
+        return heights
+
+    def presync_height_for_peer(self, peer: Peer) -> int:
+        """getpeerinfo.presynced_headers: PRESYNC height, or -1.
+
+        Core HeadersSyncState::GetPresyncHeight (rpc/net.cpp:270).  -1
+        unless this peer is in the low-work PRESYNC/REDOWNLOAD walk.
+        """
+        state = self._lowwork_presync.get(self._peer_key(peer))
+        if not state:
+            return -1
+        try:
+            return int(state.get("height", -1))
+        except (TypeError, ValueError):
+            return -1
+
     def _note_unconnecting_headers(self, peer: Peer) -> bool:
         """Increment the per-peer unconnecting-headers counter for *peer*.
 
@@ -4255,8 +4315,18 @@ class BlockSync:
                 # Skip duplicates already in our validated queue.  This is
                 # safe because such hashes were chain-validated when first
                 # appended; advancing expected_prev preserves slot ordering.
+                # Core UpdateBlockAvailability still sets pindexBestKnownBlock
+                # (nSyncHeight / getpeerinfo.synced_headers) for an already-
+                # known header this peer announced.
                 if block_hash in known_hashes:
                     expected_prev = block_hash
+                    if _db_tip_height is not None:
+                        _upd = getattr(peer, "update_synced_headers", None)
+                        _h = int(_db_tip_height) + 1 + int(known_hashes[block_hash])
+                        if callable(_upd):
+                            _upd(_h)
+                        else:
+                            peer.note_block_height(_h)
                     continue
 
                 # Per-header PoW gate (BIP-130 anti-DoS).  Pre-2026-05-06
@@ -4865,9 +4935,12 @@ class BlockSync:
                 # selection from relying on the frozen handshake start_height.
                 try:
                     _, _hdr_tip_height = self.db.get_best_block()
-                    peer.note_block_height(
-                        _hdr_tip_height + len(self._validated_headers)
-                    )
+                    _h = _hdr_tip_height + len(self._validated_headers)
+                    _upd = getattr(peer, "update_synced_headers", None)
+                    if callable(_upd):
+                        _upd(_h)
+                    else:
+                        peer.note_block_height(_h)
                 except Exception as _e:
                     logger.debug(
                         f"note_block_height (headers) failed for "

@@ -498,6 +498,14 @@ class Peer:
         # decreases.
         self.best_known_height: int = 0
 
+        # getpeerinfo.synced_headers / synced_blocks (Core nSyncHeight /
+        # nCommonHeight, rpc/net.cpp:271-272).  -1 until this peer announces
+        # a header we also have / delivers a block body.  Not VERSION
+        # startHeight — that field was removed from getpeerinfo in Core
+        # v31.99 and must not leak into these measurements.
+        self.synced_headers: int = -1
+        self.synced_blocks: int = -1
+
         self.last_ping: float = 0
         self.latency: float = 0
         # Running minimum pong round-trip (Core CNode::m_min_ping_time), and the
@@ -2282,6 +2290,40 @@ class Peer:
             return
         if h > self.best_known_height:
             self.best_known_height = h
+
+    def update_synced_headers(self, height: int) -> None:
+        """Record a header this peer announced that we also have.
+
+        Core UpdateBlockAvailability → pindexBestKnownBlock (nSyncHeight).
+        Height is monotonic: a lower announcement does not rewind the
+        best-known header.  Height 0 (genesis) is a valid measurement and
+        must not collapse to the -1 unset sentinel.
+        """
+        try:
+            h = int(height)
+        except (TypeError, ValueError):
+            return
+        if h < 0:
+            return
+        if self.synced_headers < 0 or h > self.synced_headers:
+            self.synced_headers = h
+        self.note_block_height(h)
+
+    def update_synced_blocks(self, height: int) -> None:
+        """Record a block body received from this peer.
+
+        Core pindexLastCommonBlock (nCommonHeight).  A received body implies
+        the header is also in common, so synced_headers advances too.
+        """
+        try:
+            h = int(height)
+        except (TypeError, ValueError):
+            return
+        if h < 0:
+            return
+        if self.synced_blocks < 0 or h > self.synced_blocks:
+            self.synced_blocks = h
+        self.update_synced_headers(h)
 
     async def ping(self):
         """Send ping to peer"""

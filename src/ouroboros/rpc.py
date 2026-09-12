@@ -10123,6 +10123,38 @@ class RPCServer:
                 peer_list.append(peer)
         return peer_list
 
+    def _peer_presynced_headers(self, peer: Any) -> int:
+        """getpeerinfo.presynced_headers: PRESYNC height, or -1.
+
+        Core rpc/net.cpp:270 HeadersSyncState::GetPresyncHeight.
+        """
+        bs = getattr(self.node, "block_sync", None)
+        getter = getattr(bs, "presync_height_for_peer", None) if bs is not None else None
+        if callable(getter):
+            try:
+                return int(getter(peer))
+            except Exception:
+                pass
+        try:
+            return int(getattr(peer, "presynced_headers", -1))
+        except (TypeError, ValueError):
+            return -1
+
+    def _peer_inflight_heights(self, peer: Any) -> list:
+        """getpeerinfo.inflight: heights of blocks requested from *peer*.
+
+        Core rpc/net.cpp:273-277 vBlocksInFlight pindex->nHeight.
+        """
+        bs = getattr(self.node, "block_sync", None)
+        getter = getattr(bs, "inflight_heights_for_peer", None) if bs is not None else None
+        if callable(getter):
+            try:
+                return list(getter(peer))
+            except Exception:
+                pass
+        raw = getattr(peer, "inflight_blocks", [])
+        return list(raw) if isinstance(raw, list) else []
+
     def _resolve_peer_by_id(self, peer_id: int):
         """Resolve a ``getpeerinfo`` ``id`` back to its ``Peer`` object.
 
@@ -10420,10 +10452,10 @@ class RPCServer:
                 # startingheight pushKV (rpc/net.cpp:269-270).  m_starting_height
                 # survives only as a local int in version-message handling and
                 # is no longer surfaced via RPC.
-                "presynced_headers": getattr(peer, 'presynced_headers', -1),
+                "presynced_headers": self._peer_presynced_headers(peer),
                 "synced_headers": getattr(peer, 'synced_headers', -1),
                 "synced_blocks": getattr(peer, 'synced_blocks', -1),
-                "inflight": getattr(peer, 'inflight_blocks', []),
+                "inflight": self._peer_inflight_heights(peer),
                 "addr_relay_enabled": getattr(peer, 'addr_relay_enabled', True),
                 "addr_processed": getattr(peer, 'addr_processed', 0),
                 "addr_rate_limited": getattr(peer, 'addr_rate_limited', 0),
