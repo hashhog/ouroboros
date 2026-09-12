@@ -238,7 +238,8 @@ class TestHandleHeadersDiffbits(unittest.IsolatedAsyncioTestCase):
         await _feed(bs, peer, hdrs)
 
         self.assertEqual(
-            len(bs._validated_headers), 0,
+            len(bs._validated_headers),
+            0,
             "not one difficulty-1 header may be admitted",
         )
         self.assertEqual(bs._headers_diffbits_rejected, 1)
@@ -290,8 +291,7 @@ class TestHandleHeadersDiffbits(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bs._validated_headers), 1, "2015 in, 2016 out")
         self.assertEqual(bs._headers_diffbits_rejected, 1)
         self.assertTrue(
-            any("at height 2016 REJECTED" in m and "expected=0x1d00ffff" in m
-                for m in cm.output),
+            any("at height 2016 REJECTED" in m and "expected=0x1d00ffff" in m for m in cm.output),
             f"boundary branch did not run: {cm.output}",
         )
 
@@ -329,7 +329,8 @@ class TestPoisonImmunity(unittest.IsolatedAsyncioTestCase):
         honest = _mine(prev, HONEST_BITS, ts + 600, b"honest-tip")
         await _feed(bs, peer, [honest])
         self.assertEqual(
-            len(bs._validated_headers), 4,
+            len(bs._validated_headers),
+            4,
             "an index-resolving implementation rejects this honest header",
         )
         self.assertEqual(bs._headers_diffbits_rejected, 0)
@@ -340,7 +341,8 @@ class TestPoisonImmunity(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(BlockSync._header_meets_pow(attack))
         await _feed(bs, peer, [attack])
         self.assertEqual(
-            len(bs._validated_headers), 3,
+            len(bs._validated_headers),
+            3,
             "an index-resolving implementation ACCEPTS this difficulty-1 header",
         )
         self.assertEqual(bs._headers_diffbits_rejected, 1)
@@ -376,9 +378,7 @@ class TestPoisonImmunity(unittest.IsolatedAsyncioTestCase):
         await _feed(bs, peer, [bad])
         self.assertNotIn(_hh(bad), bs._fork_headers)
         self.assertEqual(bs._headers_diffbits_rejected, 1)
-        self.assertTrue(
-            any(c[2] == "bad-diffbits" for c in pm.misbehaving_calls)
-        )
+        self.assertTrue(any(c[2] == "bad-diffbits" for c in pm.misbehaving_calls))
 
 
 class TestFailClosed(unittest.IsolatedAsyncioTestCase):
@@ -420,8 +420,12 @@ class TestFailClosed(unittest.IsolatedAsyncioTestCase):
         # LOUDLY and counted.
         with self.assertLogs("ouroboros.block_sync", level="WARNING") as cm:
             ok, reason, _ = _direct(
-                bs, db, _Blk(MAINNET_REAL_BITS, tip.timestamp + 600), 2016,
-                tip_hash, 2015,
+                bs,
+                db,
+                _Blk(MAINNET_REAL_BITS, tip.timestamp + 600),
+                2016,
+                tip_hash,
+                2015,
             )
         self.assertTrue(ok)
         self.assertEqual(reason, "unresolved-fallback")
@@ -430,7 +434,12 @@ class TestFailClosed(unittest.IsolatedAsyncioTestCase):
 
         # A difficulty-1 claim is far outside the 4x clamp -> still rejected.
         ok2, reason2, _ = _direct(
-            bs, db, _Blk(0x1D00FFFF, tip.timestamp + 600), 2016, tip_hash, 2015,
+            bs,
+            db,
+            _Blk(0x1D00FFFF, tip.timestamp + 600),
+            2016,
+            tip_hash,
+            2015,
         )
         self.assertFalse(ok2)
         self.assertIn("fallback", reason2)
@@ -466,9 +475,12 @@ class TestBoundaryAncestorResolution(unittest.TestCase):
         prev = tip_hash
         for h in range(2016, 4032):
             hdr = BlockHeader(
-                version=4, prev_blockhash=prev,
+                version=4,
+                prev_blockhash=prev,
                 merkle_root=_dsha(b"h" + h.to_bytes(4, "little")),
-                timestamp=t0 + h * 600, bits=MAINNET_REAL_BITS, nonce=h,
+                timestamp=t0 + h * 600,
+                bits=MAINNET_REAL_BITS,
+                nonce=h,
             )
             bs._validated_headers.append((_hh(hdr), hdr))
             prev = _hh(hdr)
@@ -484,8 +496,7 @@ class TestBoundaryAncestorResolution(unittest.TestCase):
         )
         poisoned_timespan = (t0 + 4031 * 600) - t0
         poisoned = _target_to_bits(
-            _bits_to_target(MAINNET_REAL_BITS)
-            * poisoned_timespan // POW_TARGET_TIMESPAN
+            _bits_to_target(MAINNET_REAL_BITS) * poisoned_timespan // POW_TARGET_TIMESPAN
         )
         self.assertNotEqual(expected, poisoned, "fixture must distinguish")
         return bs, db, prev, t0, expected, poisoned
@@ -493,7 +504,12 @@ class TestBoundaryAncestorResolution(unittest.TestCase):
     def test_honest_boundary_header_accepted(self):
         bs, db, prev, t0, expected, poisoned = self._chain_to_boundary()
         ok, reason, exp = _direct(
-            bs, db, _Blk(expected, t0 + 4032 * 600), 4032, prev, 4031,
+            bs,
+            db,
+            _Blk(expected, t0 + 4032 * 600),
+            4032,
+            prev,
+            4031,
         )
         self.assertTrue(ok, f"{reason} exp={exp}")
         self.assertEqual(exp, expected)
@@ -501,20 +517,274 @@ class TestBoundaryAncestorResolution(unittest.TestCase):
     def test_poisoned_index_answer_rejected(self):
         bs, db, prev, t0, expected, poisoned = self._chain_to_boundary()
         ok, reason, exp = _direct(
-            bs, db, _Blk(poisoned, t0 + 4032 * 600), 4032, prev, 4031,
+            bs,
+            db,
+            _Blk(poisoned, t0 + 4032 * 600),
+            4032,
+            prev,
+            4031,
         )
         self.assertFalse(
-            ok, "the value derived from the POISONED index must be rejected",
+            ok,
+            "the value derived from the POISONED index must be rejected",
         )
         self.assertEqual(reason, "bad-diffbits")
 
     def test_difficulty_one_boundary_header_rejected(self):
         bs, db, prev, t0, expected, poisoned = self._chain_to_boundary()
         ok, reason, _ = _direct(
-            bs, db, _Blk(0x1D00FFFF, t0 + 4032 * 600), 4032, prev, 4031,
+            bs,
+            db,
+            _Blk(0x1D00FFFF, t0 + 4032 * 600),
+            4032,
+            prev,
+            4031,
         )
         self.assertFalse(ok)
         self.assertEqual(reason, "bad-diffbits")
+
+
+class TestPeriodFirstIsItselfARetarget(unittest.TestCase):
+    """missing-period-first at a retarget whose period-first is itself a retarget.
+
+    Production (receipts/ouroboros-missing-period-first-284256-2026-09-11.md):
+    range 265000→290000 connected through 284,255, then header 284,256 was
+    REJECTED ``bad-diffbits-unresolved(missing-period-first)`` and the feeder
+    banned.  284,256 = 141×2016; its period-first 282,240 is itself a
+    2016-boundary, is above the snapshot base, and was connected 13 minutes
+    earlier.  Earlier retargets in the same run (268128…282240) passed
+    because their period-first was still sitting in ``_validated_headers``.
+
+    Two invariants collide once the queue is gone (slot-misalign dropped
+    3973 entries at 284,255) and the feeder re-sends a 2000-header window
+    that includes the now-connected tip:
+
+      * P2P ``headers`` messages are at most 2000 long, so a batch ending
+        at the retarget parent can never contain the period-first (always
+        2016 back — 16 blocks before the start of that window).
+      * Those re-sent headers land in ``_batch_headers`` / ``_fork_headers``.
+        ``_header_ancestor_provider`` walked them instead of treating the
+        parent (the active tip) as an active-chain anchor, then asked
+        ``_resolve_active_height`` — which only scans ``MAX_REORG_DEPTH``
+        (288) — to place a cursor ~2000 back.  That miss is reported as
+        ``missing-period-first`` even though ``get_block_by_height(282240)``
+        would have answered.
+
+    Core's ``pindexLast->GetAncestor(nHeightFirst)`` (pow.cpp:42-47) never
+    does this: when pindexLast is on the active chain, the ancestor is
+    height-addressed in that chain.  A 2000-header re-send of the tip must
+    not hide a connected period-first.
+
+    The nBits values are real mainnet compact targets; the rule under test
+    is nBits-vs-required, so we drive ``_check_header_diffbits`` directly
+    (same helper as ``TestBoundaryAncestorResolution``).
+    """
+
+    # A 2000-header walk matches Bitcoin P2P MAX_HEADERS.  Period-first at
+    # 4032 − 2016 = 2016 sits 16 blocks before the start of that window
+    # (2032), so the walk cannot record it.
+    _FORK_WINDOW = 2000
+    _TIP_HEIGHT = 4031
+    _NEW_HEIGHT = 4032
+    _PERIOD_FIRST = 2016
+
+    def _setup(self):
+        t0 = 1_600_000_000
+        bs, db, _peer, _pm, tip_hash, _tip = _fresh(
+            self._TIP_HEIGHT,
+            tip_bits=MAINNET_REAL_BITS,
+            tip_ts=t0 + self._TIP_HEIGHT * 600,
+        )
+        self.assertEqual(len(bs._validated_headers), 0)
+
+        # Period-first is itself a retarget (2016 % 2016 == 0) and is
+        # CONNECTED — in the height index, with a body.  Production had
+        # this at 282,240.
+        first_ts = t0 + self._PERIOD_FIRST * 600
+        first_hash = _dsha(b"period-first-2016")
+        db.by_height[self._PERIOD_FIRST] = _Blk(MAINNET_REAL_BITS, first_ts)
+        db.hash_by_height[self._PERIOD_FIRST] = first_hash
+        db.blocks[first_hash] = db.by_height[self._PERIOD_FIRST]
+
+        # Re-sent 2000-header window ending at the tip, stored in the fork
+        # store the way handle_headers does when the queue has been
+        # dropped and the batch does not start at expected_prev == tip.
+        # Heights covered: (4031-2000+1)=2032 .. 4031.  2016 is not among
+        # them.
+        window_start = self._TIP_HEIGHT - self._FORK_WINDOW + 1
+        self.assertGreater(window_start, self._PERIOD_FIRST)
+        prev = _dsha(b"below-window")
+        for h in range(window_start, self._TIP_HEIGHT):
+            hdr = BlockHeader(
+                version=4,
+                prev_blockhash=prev,
+                merkle_root=_dsha(b"f" + h.to_bytes(4, "little")),
+                timestamp=t0 + h * 600,
+                bits=MAINNET_REAL_BITS,
+                nonce=h,
+            )
+            hh = _hh(hdr)
+            bs._fork_headers[hh] = hdr
+            bs._fork_header_prev[hh] = prev
+            prev = hh
+        # The active tip itself is in the fork store (the production log
+        # line: "Fork header f07dc15a7082b3ff... stored").  Its hash MUST
+        # be the DB tip hash so the provider starts there.
+        tip_hdr = SimpleNamespace(
+            bits=MAINNET_REAL_BITS,
+            timestamp=t0 + self._TIP_HEIGHT * 600,
+            prev_blockhash=prev,
+        )
+        bs._fork_headers[tip_hash] = tip_hdr
+        bs._fork_header_prev[tip_hash] = prev
+        self.assertEqual(len(bs._fork_headers), self._FORK_WINDOW)
+
+        timespan = (t0 + self._TIP_HEIGHT * 600) - first_ts
+        expected = _target_to_bits(
+            _bits_to_target(MAINNET_REAL_BITS) * timespan // POW_TARGET_TIMESPAN
+        )
+        return bs, db, tip_hash, t0, expected
+
+    def test_connected_period_first_is_found_even_when_tip_is_in_fork_store(self):
+        """The production stall: parent is the active tip, the tip hash is
+        also in ``_fork_headers`` as part of a 2000-header re-send, and
+        the period-first (itself a retarget) is connected below the window.
+        Pre-fix this returned ``bad-diffbits-unresolved(missing-period-first)``.
+        """
+        bs, db, tip_hash, t0, expected = self._setup()
+        ok, reason, exp = _direct(
+            bs,
+            db,
+            _Blk(expected, t0 + self._NEW_HEIGHT * 600),
+            self._NEW_HEIGHT,
+            tip_hash,
+            self._TIP_HEIGHT,
+        )
+        self.assertTrue(
+            ok,
+            f"connected period-first {self._PERIOD_FIRST} must resolve; "
+            f"got ok={ok} reason={reason} exp={exp}",
+        )
+        self.assertEqual(reason, "ok")
+        self.assertEqual(exp, expected)
+
+    def test_wrong_bits_at_that_boundary_is_bad_diffbits_not_unresolved(self):
+        """Negative: once the period-first is found, a wrong-nBits header
+        is still REJECTED, and the reason is the resolved rule
+        (``bad-diffbits``), not ``missing-period-first``.  An implementation
+        that fail-opens on the miss would accept this; one that fail-closes
+        without resolving would reject with ``unresolved``.
+        """
+        bs, db, tip_hash, t0, expected = self._setup()
+        ok, reason, exp = _direct(
+            bs,
+            db,
+            _Blk(0x1D00FFFF, t0 + self._NEW_HEIGHT * 600),
+            self._NEW_HEIGHT,
+            tip_hash,
+            self._TIP_HEIGHT,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "bad-diffbits")
+        self.assertEqual(exp, expected)
+        self.assertNotIn("unresolved", reason)
+        self.assertNotIn("missing-period-first", reason)
+
+    def test_fork_retarget_anchors_deeper_than_reorg_depth(self):
+        """A competing-fork retarget whose join to the active chain is
+        deeper than ``MAX_REORG_DEPTH`` (288) must still resolve a
+        connected period-first via the O(1) height-index agreement check.
+
+        ``_resolve_active_height`` only scans 288 blocks (the fork-anchor
+        bound).  Pre-fix a 301-header fork walk then asked that helper to
+        place a cursor 301 back and reported ``missing-period-first``.
+        ``get_block_hash_by_height(h) == cursor`` is Core's proof at any
+        depth and cannot invert.
+        """
+        t0 = 1_600_000_000
+        bs, db, _peer, _pm, tip_hash, _tip = _fresh(
+            self._TIP_HEIGHT,
+            tip_bits=MAINNET_REAL_BITS,
+            tip_ts=t0 + self._TIP_HEIGHT * 600,
+        )
+        first_ts = t0 + self._PERIOD_FIRST * 600
+        db.by_height[self._PERIOD_FIRST] = _Blk(MAINNET_REAL_BITS, first_ts)
+        db.hash_by_height[self._PERIOD_FIRST] = _dsha(b"period-first-2016")
+
+        walk = 301  # one past MAX_REORG_DEPTH
+        join_height = self._TIP_HEIGHT - walk
+        self.assertGreater(join_height, self._PERIOD_FIRST)
+        join_hash = _dsha(b"join")
+        db.hash_by_height[join_height] = join_hash
+        db.by_height[join_height] = _Blk(MAINNET_REAL_BITS, t0 + join_height * 600)
+        db.blocks[join_hash] = db.by_height[join_height]
+
+        prev = join_hash
+        parent_hash = None
+        for h in range(join_height + 1, self._TIP_HEIGHT + 1):
+            hdr = BlockHeader(
+                version=4,
+                prev_blockhash=prev,
+                merkle_root=_dsha(b"k" + h.to_bytes(4, "little")),
+                timestamp=t0 + h * 600,
+                bits=MAINNET_REAL_BITS,
+                nonce=h,
+            )
+            hh = _hh(hdr)
+            bs._fork_headers[hh] = hdr
+            bs._fork_header_prev[hh] = prev
+            prev = hh
+            parent_hash = hh
+        self.assertIsNotNone(parent_hash)
+        self.assertNotEqual(parent_hash, tip_hash)
+
+        timespan = (t0 + self._TIP_HEIGHT * 600) - first_ts
+        expected = _target_to_bits(
+            _bits_to_target(MAINNET_REAL_BITS) * timespan // POW_TARGET_TIMESPAN
+        )
+        ok, reason, exp = _direct(
+            bs,
+            db,
+            _Blk(expected, t0 + self._NEW_HEIGHT * 600),
+            self._NEW_HEIGHT,
+            parent_hash,
+            self._TIP_HEIGHT,
+        )
+        self.assertTrue(
+            ok,
+            f"fork join at {join_height} (>288 back) must still resolve "
+            f"period-first; got ok={ok} reason={reason} exp={exp}",
+        )
+        self.assertEqual(exp, expected)
+
+    def test_empty_queue_connected_period_first_without_fork_store(self):
+        """Baseline: queue empty, period-first in the height index, parent
+        is the tip and is NOT in the fork store.  This is GetAncestor on
+        the active chain and must not depend on the fork-store walk.
+        """
+        t0 = 1_600_000_000
+        bs, db, _peer, _pm, tip_hash, _tip = _fresh(
+            self._TIP_HEIGHT,
+            tip_bits=MAINNET_REAL_BITS,
+            tip_ts=t0 + self._TIP_HEIGHT * 600,
+        )
+        first_ts = t0 + self._PERIOD_FIRST * 600
+        db.by_height[self._PERIOD_FIRST] = _Blk(MAINNET_REAL_BITS, first_ts)
+        db.hash_by_height[self._PERIOD_FIRST] = _dsha(b"period-first-2016")
+        timespan = (t0 + self._TIP_HEIGHT * 600) - first_ts
+        expected = _target_to_bits(
+            _bits_to_target(MAINNET_REAL_BITS) * timespan // POW_TARGET_TIMESPAN
+        )
+        ok, reason, exp = _direct(
+            bs,
+            db,
+            _Blk(expected, t0 + self._NEW_HEIGHT * 600),
+            self._NEW_HEIGHT,
+            tip_hash,
+            self._TIP_HEIGHT,
+        )
+        self.assertTrue(ok, f"{reason} exp={exp}")
+        self.assertEqual(exp, expected)
 
 
 class TestQueueAnchorStaleness(unittest.IsolatedAsyncioTestCase):
@@ -523,8 +793,7 @@ class TestQueueAnchorStaleness(unittest.IsolatedAsyncioTestCase):
         slot 0 no longer extends the DB tip the derivation is wrong and the
         check inverts — drop the queue loudly instead."""
         bs, db, peer, pm, tip_hash, tip = _fresh(900_000)
-        stale = _mine(_dsha(b"some-other-parent"), HONEST_BITS,
-                      tip.timestamp, b"stale")
+        stale = _mine(_dsha(b"some-other-parent"), HONEST_BITS, tip.timestamp, b"stale")
         bs._validated_headers.append((_hh(stale), stale))
         self.assertFalse(bs._queue_anchored_to_tip())
 
@@ -564,9 +833,12 @@ class TestSubmitHeaderLabels(unittest.IsolatedAsyncioTestCase):
         # so this doubles as the ordering assertion.
         h = _mine(tip_hash, EASY_BITS, tip.timestamp + 600, b"hh")
         forged = BlockHeader(
-            version=h.version, prev_blockhash=h.prev_blockhash,
-            merkle_root=h.merkle_root, timestamp=h.timestamp,
-            bits=0x1D00FFFF, nonce=h.nonce,
+            version=h.version,
+            prev_blockhash=h.prev_blockhash,
+            merkle_root=h.merkle_root,
+            timestamp=h.timestamp,
+            bits=0x1D00FFFF,
+            nonce=h.nonce,
         )
         self.assertFalse(BlockSync._header_meets_pow(forged))
         with self.assertRaises(RpcError) as ctx:

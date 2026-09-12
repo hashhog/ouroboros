@@ -2837,12 +2837,20 @@ class BlockSync:
           2. ``_validated_headers`` — linear and tip-anchored, so slot i is
              height ``db_tip_height + 1 + i``; indexed POSITIONALLY, never by
              a height index;
-          3. ``_fork_headers`` / ``_fork_header_prev`` — walk the stored prev
+          3. if the cursor IS the active tip at the walk's height, stop and
+             treat that as the active-chain anchor — do NOT walk
+             ``_fork_headers`` / ``_batch_headers`` from there.  A 2000-header
+             P2P re-send of the tip (MAX_HEADERS) cannot contain the
+             period-first (always 2016 back); walking it and then asking
+             ``_resolve_active_height`` (288-block floor) is how a connected
+             retarget ancestor became ``missing-period-first`` at 284,256;
+          4. ``_fork_headers`` / ``_fork_header_prev`` — walk the stored prev
              edges (the same walk ``_fork_tip_height`` does);
-          4. once the pointer walk reaches a hash that ``_resolve_active_height``
-             places on the active best chain, that hash's ancestry IS the
-             active chain by definition, so BELOW that anchor
-             ``db.get_block_by_height(h)`` is legitimate.
+          5. once the pointer walk reaches a hash that the height index
+             agrees is the active-chain block at the walk's height (or that
+             ``_resolve_active_height`` places on the active best chain),
+             that hash's ancestry IS the active chain by definition, so
+             BELOW that anchor ``db.get_block_by_height(h)`` is legitimate.
 
         Returns ``None`` for any height it cannot reach.  It never substitutes
         an active-chain block for an unproven ancestor.
@@ -2900,7 +2908,24 @@ class BlockSync:
                     st["anchor_height"] = db_tip_height
                     st["anchor_hash"] = db_tip_hash
                     return
-                # (1)/(3) headers we hold: batch member or fork-store member.
+                # (3) Cursor is the active tip at the height the walk claims.
+                # Core's GetAncestor from pindexLast on the best chain does
+                # not detour through a re-sent header batch / fork store:
+                # the ancestry BELOW the tip is the active chain.  Checking
+                # this BEFORE ``_header_for`` is load-bearing — the fork
+                # store and the current batch both commonly contain the tip
+                # hash after a 2000-header re-send, and walking them cannot
+                # reach a period-first 2016 back (MAX_HEADERS is 2000).
+                if (
+                    db_tip_hash is not None
+                    and db_tip_height is not None
+                    and cursor == db_tip_hash
+                    and h == db_tip_height
+                ):
+                    st["anchor_height"] = db_tip_height
+                    st["anchor_hash"] = db_tip_hash
+                    return
+                # (1)/(4) headers we hold: batch member or fork-store member.
                 hdr = _header_for(cursor)
                 if hdr is None:
                     break
@@ -2922,18 +2947,37 @@ class BlockSync:
                 return
             if st["height"] < target_height:
                 return  # target already recorded in `chain`
-            # (4) The walk left the headers we hold.  If the cursor is on the
+            # (5) The walk left the headers we hold.  If the cursor is on the
             # active best chain AT the height our walk says it is, the walk is
             # pointer-proven down to the active chain and height-addressed
             # reads below it are Core's GetAncestor.  The height cross-check
             # is what makes this safe: a hash that resolves to a DIFFERENT
             # height means our derivation is wrong, so we refuse rather than
             # answer with a block from the wrong height.
+            #
+            # Prefer the O(1) height-index agreement check over
+            # ``_resolve_active_height``: that helper only scans
+            # MAX_REORG_DEPTH (288) blocks, which is the right bound for
+            # fork-anchor detection but not for a retarget ancestor 2016
+            # back.  ``get_block_hash_by_height(h) == cursor`` is Core's
+            # proof that this hash is the active-chain block at h, at any
+            # depth, and it cannot invert — a poisoned index row at h
+            # would be a different hash and would not match the pointer.
             cursor = st["cursor"]
+            anchor_h = None
             if db_tip_hash is not None and cursor == db_tip_hash:
                 anchor_h = db_tip_height
-            else:
-                anchor_h = self._resolve_active_height(cursor)
+            elif hasattr(self.db, "get_block_hash_by_height"):
+                try:
+                    candidate = self.db.get_block_hash_by_height(st["height"])
+                except Exception:
+                    candidate = None
+                if candidate is not None and bytes(candidate) == cursor:
+                    anchor_h = st["height"]
+            if anchor_h is None:
+                maybe = self._resolve_active_height(cursor)
+                if maybe is not None:
+                    anchor_h = maybe
             if anchor_h is not None and anchor_h == st["height"]:
                 st["anchor_height"] = anchor_h
                 st["anchor_hash"] = cursor
