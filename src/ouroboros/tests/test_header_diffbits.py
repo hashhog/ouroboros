@@ -43,6 +43,7 @@ from ouroboros.p2p_messages import BlockHeader, HeadersMessage  # noqa: E402
 from ouroboros.peer import Peer, PeerState  # noqa: E402
 from ouroboros.validation import (  # noqa: E402
     DIFFICULTY_ADJUSTMENT_INTERVAL,
+    POW_LIMIT_REGTEST,
     POW_TARGET_TIMESPAN,
     _bits_to_target,
     _target_to_bits,
@@ -174,6 +175,11 @@ def _fresh(tip_height: int, tip_bits: int = HONEST_BITS, tip_ts: int = 1_700_000
     pm = _StubPeerManager([peer])
     bs = BlockSync.__new__(BlockSync)
     BlockSync.__init__(bs, db=db, validator=None, peer_manager=pm, mempool=None)
+    # These fixtures mine at 0x1f7fffff so they can run in-process; that
+    # target is above mainnet powLimit, so Core CheckBlockHeader would
+    # reject them as high-hash. Raise the CheckProofOfWork ceiling so this
+    # suite isolates ContextualCheckBlockHeader (bad-diffbits).
+    bs._header_pow_limit_override = POW_LIMIT_REGTEST
     return bs, db, peer, pm, tip_hash, tip_blk
 
 

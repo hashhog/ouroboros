@@ -176,6 +176,8 @@ from ouroboros.p2p_messages import (
     MSG_WITNESS_BLOCK,
     MSG_WITNESS_TX,
     MSG_WTX,
+    NODE_NETWORK,
+    NODE_NETWORK_LIMITED,
     NODE_WITNESS,
     BlockHeader,
     CmpctBlockMessage,
@@ -192,6 +194,8 @@ from ouroboros.validation import (
     DIFFICULTY_ADJUSTMENT_INTERVAL,
     SIG_CACHE,
     BlockValidator,
+    _bits_to_target_checked,
+    _get_pow_limit,
     diffbits_unresolved_fallback_ok,
     permitted_difficulty_transition,
     rust_validator_lacks_prev_body as rust_lacks_prev_body,
@@ -250,6 +254,32 @@ _MAX_NUM_UNCONNECTING_HEADERS_MSGS: int = 10
 MAX_REORG_DEPTH: int = 288
 
 
+def _peer_services(peer) -> int:
+    """Integer service flags, or 0 if the peer has no usable ``services``."""
+    try:
+        return int(getattr(peer, "services", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _peer_announced_height(peer) -> int:
+    """Best height this peer has revealed, or 0 if we have no signal.
+
+    0 means unknown (handshake not observed / MagicMock tests), not "peer
+    is at genesis".  Callers must not treat 0 as a reason to exclude.
+    """
+    def _as_int(value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    return max(
+        _as_int(getattr(peer, "best_known_height", 0) or 0),
+        _as_int(getattr(peer, "start_height", 0) or 0),
+    )
+
+
 def _can_serve_witness_blocks(peer) -> bool:
     """True if ``peer`` advertises NODE_WITNESS and can serve MSG_WITNESS_BLOCK.
 
@@ -271,7 +301,55 @@ def _can_serve_witness_blocks(peer) -> bool:
     served identically by witness peers, so this filter is safe at every
     height a MSG_WITNESS_BLOCK request is issued.)
     """
-    return bool(getattr(peer, "services", 0) & NODE_WITNESS)
+    return bool(_peer_services(peer) & NODE_WITNESS)
+
+
+def _can_serve_blocks(peer) -> bool:
+    """Core ``CanServeBlocks`` (net_processing.cpp:1152).
+
+    A peer that advertises neither NODE_NETWORK nor NODE_NETWORK_LIMITED
+    cannot serve block bodies.  NODE_WITNESS alone is CanServeWitnesses.
+    """
+    return bool(_peer_services(peer) & (NODE_NETWORK | NODE_NETWORK_LIMITED))
+
+
+# BIP 159: pruned nodes serve only the last 288 blocks.
+# Core net_processing.cpp:153-154 NODE_NETWORK_LIMITED_MIN_BLOCKS.
+NODE_NETWORK_LIMITED_MIN_BLOCKS = 288
+
+
+def _can_serve_block_at(peer, height: int) -> bool:
+    """True if ``peer`` can serve a block body at ``height``.
+
+    Core's pair is CanServeWitnesses ∩ CanServeBlocks, plus the peer's
+    ``pindexBestKnownBlock`` must actually reach that height.  A known
+    height of 0 is "no signal" — those peers stay eligible so unit tests
+    that never set ``start_height`` keep working, and a just-handshaked
+    peer is not locked out of the first getdata.
+
+    The 0.15.99 stall class (docs/STALL-CLASS-70-CRITICALS.md): a
+    long-lived NODE_WITNESS peer with a low frozen ``start_height`` kept
+    score 100 (never picked as header-sync, so never demoted) and won
+    H1, then silently dropped every frontier getdata.
+    """
+    if not _can_serve_witness_blocks(peer):
+        return False
+    if not _can_serve_blocks(peer):
+        return False
+    known = _peer_announced_height(peer)
+    if known > 0 and known < int(height):
+        return False
+    services = _peer_services(peer)
+    is_limited = (
+        not (services & NODE_NETWORK)
+        and bool(services & NODE_NETWORK_LIMITED)
+    )
+    if is_limited and known > 0:
+        # Don't request blocks older than the limited window from a prune
+        # peer (Core FindNextBlocksToDownload, net_processing.cpp:1532).
+        if (known - int(height)) >= (NODE_NETWORK_LIMITED_MIN_BLOCKS - 2):
+            return False
+    return True
 
 
 def _distribute_blocks_round_robin(
@@ -392,6 +470,13 @@ class BlockSync:
 
         # Track which peer each block was last requested from (hash -> Peer)
         self._block_request_peer: dict[bytes, Peer] = {}
+
+        # H1 throttle, SEPARATE from requested_blocks.  Pre-fix H1 wrote
+        # requested_blocks[frontier]=now on every 5s re-issue, so the
+        # size-aware HEAD_TIMEOUT never fired on the connect-frontier
+        # (docs/STALL-CLASS-70-CRITICALS.md).  This map gates the rotation
+        # cadence; requested_blocks keeps the original in-flight timestamp.
+        self._h1_last_issue: dict[bytes, float] = {}
 
         # W77 — peer-timeout instrumentation.  100-block rollup emitted
         # from _drain_block_buffer_locked at the connect point.  The
@@ -964,6 +1049,7 @@ class BlockSync:
         """
         self.requested_blocks.pop(block_hash, None)
         self._block_request_peer.pop(block_hash, None)
+        self._h1_last_issue.pop(block_hash, None)
         self._w77_first_request_time.pop(block_hash, None)
         self._block_request_attempts.pop(block_hash, None)
 
@@ -1057,6 +1143,7 @@ class BlockSync:
         self._ibd_block_buffer_ts.clear()
         self.requested_blocks.clear()
         self._block_request_peer.clear()
+        self._h1_last_issue.clear()
         self._block_source_peer_addr.clear()
         # _w77_first_request_time is the request→connect latency telemetry
         # dict; it pops only on a successful active-chain connect, so a bulk
@@ -1597,6 +1684,7 @@ class BlockSync:
                     for _, bh in blocks_to_request:
                         self.requested_blocks.pop(bh, None)
                         self._block_request_peer.pop(bh, None)
+                        self._h1_last_issue.pop(bh, None)
 
             if txs_to_request:
                 # Cap each GETDATA at MAX_GETDATA_SZ=1000 items (Core protocol.h:482).
@@ -1673,6 +1761,7 @@ class BlockSync:
             if was_requested:
                 del self.requested_blocks[block_hash]
             self._block_request_peer.pop(block_hash, None)
+            self._h1_last_issue.pop(block_hash, None)
 
             # GAP2: competing-fork body delivery.  If this block's hash is a
             # header we admitted into the fork store (handle_headers GAP1), it
@@ -2041,6 +2130,7 @@ class BlockSync:
             self._ibd_block_buffer_ts.clear()
             self.requested_blocks.clear()
             self._block_request_peer.clear()
+            self._h1_last_issue.clear()
             self._block_source_peer_addr.clear()
             self._compact_origin_hashes.clear()
             # Telemetry-only request→connect latency dict; clear with the
@@ -2679,8 +2769,12 @@ class BlockSync:
         return mantissa << (8 * (exponent - 3))
 
     @classmethod
-    def _header_pow_hash(cls, header) -> bytes | None:
-        """Return the header's block hash iff it meets its own target, else None.
+    def _header_pow_hash(cls, header, pow_limit: int | None = None) -> bytes | None:
+        """Return the header's block hash iff it meets CheckProofOfWork.
+
+        Core ``DeriveTarget`` / ``CheckProofOfWorkImpl`` (pow.cpp:146-170):
+        decode nBits; reject negative, overflow, zero, or (when
+        ``pow_limit`` is given) target > powLimit; then hash <= target.
 
         ``_header_meets_pow`` used to hash the header and throw the digest
         away, so every presync header was serialized and double-SHA256'd
@@ -2692,12 +2786,16 @@ class BlockSync:
         to 14.73 s -- 5.31 -> 3.68 us/header, 30.6% off the hot path.
         """
         try:
+            target, is_negative, is_overflow = _bits_to_target_checked(
+                int(header.bits)
+            )
+            if is_negative or is_overflow or target <= 0:
+                return None
+            if pow_limit is not None and target > pow_limit:
+                return None
             block_hash = hashlib.sha256(
                 hashlib.sha256(header.serialize()).digest()
             ).digest()
-            target = cls._bits_to_target(int(header.bits))
-            if target <= 0:
-                return None
             if int.from_bytes(block_hash, "little") > target:
                 return None
             return block_hash
@@ -2706,25 +2804,33 @@ class BlockSync:
             return None
 
     @classmethod
-    def _header_meets_pow(cls, header) -> bool:
-        """Return True iff ``double-SHA256(header)`` interpreted as a
-        little-endian uint256 is ``<=`` the target encoded in
-        ``header.bits``.
+    def _header_meets_pow(cls, header, pow_limit: int | None = None) -> bool:
+        """Return True iff the header passes CheckProofOfWork.
 
-        This is the per-header PoW gate that Bitcoin Core enforces
-        before accepting headers in ``CheckBlockHeader`` — without it,
-        a peer can flood low-difficulty-claimed headers whose hashes
-        do NOT actually meet the claimed target, exhausting our
-        validated-header queue (50K cap) cheaply.  Pairs with the
-        Rust ``HeadersSyncState`` presync state machine which
-        accumulates work from claimed bits but does not itself
-        verify hash≤target on each header.
+        Without ``pow_limit`` this is hash<=claimed-target plus the
+        negative/overflow/zero decode rejects.  With ``pow_limit`` it is
+        full Core ``DeriveTarget`` (pow.cpp:155): target > powLimit is
+        "high-hash", not "bad-diffbits".
 
         Ref: bitcoin/src/pow.cpp ``CheckProofOfWork``;
         CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part2.md
         RED finding #1.
         """
-        return cls._header_pow_hash(header) is not None
+        return cls._header_pow_hash(header, pow_limit=pow_limit) is not None
+
+    def _header_pow_limit(self) -> int:
+        """powLimit for the header-sync CheckProofOfWork gate.
+
+        ``_header_pow_limit_override`` is a test-only ceiling so suites
+        that mine in-process at nBits above mainnet powLimit can isolate
+        ContextualCheckBlockHeader (bad-diffbits) from CheckBlockHeader
+        (high-hash).  Production never sets it.
+        """
+        override = getattr(self, "_header_pow_limit_override", None)
+        if override is not None:
+            return int(override)
+        network = getattr(self.peer_manager, "network", "mainnet") or "mainnet"
+        return _get_pow_limit(network)
 
     def _resolve_active_height(self, block_hash: bytes) -> int | None:
         """Return the active-chain height of ``block_hash``, or ``None`` if it
@@ -3732,7 +3838,9 @@ class BlockSync:
         # defects must report the PoW one, so the passes are not interleaved.
         hashes: list = []
         for header in headers:
-            block_hash = self._header_pow_hash(header)
+            block_hash = self._header_pow_hash(
+                header, pow_limit=self._header_pow_limit(),
+            )
             if block_hash is None:
                 self._headers_pow_rejected += 1
                 _reject("header with invalid proof of work")
@@ -3890,7 +3998,9 @@ class BlockSync:
             else:
                 # Core checks HasValidProofOfWork BEFORE presync and treats a
                 # failure as misbehaviour (net_processing.cpp:2975).
-                next_hash = self._header_pow_hash(header)
+                next_hash = self._header_pow_hash(
+                    header, pow_limit=self._header_pow_limit(),
+                )
                 if next_hash is None:
                     self._headers_pow_rejected += 1
                     logger.warning(
@@ -4001,6 +4111,14 @@ class BlockSync:
         """
         try:
             headers_msg = HeadersMessage.from_payload(msg.payload)
+
+            # Stall-clock: a headers reply from the designated sync peer
+            # (empty, unconnecting, or accepted) proves the peer is alive.
+            # Pre-fix the clock only reset on an *accepted* batch, so every
+            # honest at-tip peer tripped the 30s rotate + adjust_score(-2)
+            # (docs/STALL-CLASS-70-CRITICALS.md).
+            if peer == self._header_sync_peer:
+                self._header_sync_time = time.time()
 
             if not headers_msg.headers:
                 return
@@ -4147,7 +4265,9 @@ class BlockSync:
                 # headers (audit RED #1).  We now require
                 # ``double-SHA256(header) <= target(bits)`` before append.
                 # Mirrors Bitcoin Core's CheckBlockHeader sequence.
-                if not self._header_meets_pow(header):
+                if not self._header_meets_pow(
+                    header, pow_limit=self._header_pow_limit(),
+                ):
                     self._headers_pow_rejected += 1
                     logger.warning(
                         f"Header {block_hash.hex()[:16]}... fails PoW "
@@ -5533,15 +5653,17 @@ class BlockSync:
         # chain-closest work goes to the highest-quality peers.  Computed once
         # here and reused by BOTH the frontier-priority send (H1) and the
         # normal round-robin distribution below.
-        # Block download requires witness-capable peers: ouroboros requests
-        # MSG_WITNESS_BLOCK, which non-witness peers silently drop (Core
-        # CanServeWitnesses gate, net_processing.cpp:1501/2854).  Filtering
-        # here keeps the connect-frontier getdata off peers that will never
-        # deliver it — the near-tip block-body wedge fix.
+        # Block download requires a peer that can actually serve the
+        # connect-frontier: CanServeWitnesses ∩ CanServeBlocks, and
+        # pindexBestKnownBlock >= frontier height.  NODE_WITNESS alone
+        # was the pre-fix filter; a high-score /Satoshi:0.15.99/ with a
+        # 2017-era start_height won H1 and silently dropped every getdata
+        # (docs/STALL-CLASS-70-CRITICALS.md).
+        frontier_height = int(current_height or 0) + 1
         if hasattr(self.peer_manager, 'get_all_ready_peers'):
             candidates = [p for p in self.peer_manager.get_all_ready_peers()
                           if isinstance(p, Peer) and p.is_connected()
-                          and _can_serve_witness_blocks(p)]
+                          and _can_serve_block_at(p, frontier_height)]
         else:
             candidates = []
         candidates.sort(key=lambda p: -getattr(p, 'score', 100))
@@ -5565,8 +5687,12 @@ class BlockSync:
             and candidates
             and frontier_hash not in self._ibd_block_buffer
         ):
-            last_req = self.requested_blocks.get(frontier_hash)
-            if last_req is None or (now - last_req) >= FRONTIER_REQUEST_INTERVAL:
+            last_h1 = self._h1_last_issue.get(frontier_hash)
+            if last_h1 is None:
+                # First H1 after a normal-path request: honour the in-flight
+                # timestamp so we do not re-issue before the interval.
+                last_h1 = self.requested_blocks.get(frontier_hash)
+            if last_h1 is None or (now - last_h1) >= FRONTIER_REQUEST_INTERVAL:
                 current_peer = self._block_request_peer.get(frontier_hash)
                 # Rotate: first top-scoring peer that is NOT the current holder,
                 # so a single unresponsive peer can't hold the frontier hostage.
@@ -5580,9 +5706,14 @@ class BlockSync:
                     await frontier_peer.send_message(
                         getdata.to_network_message(network)
                     )
-                    self.requested_blocks[frontier_hash] = now
+                    # Do NOT reset requested_blocks[frontier] on re-issue —
+                    # that timestamp is the in-flight clock HEAD_TIMEOUT
+                    # reads.  H1 cadence lives in _h1_last_issue.
+                    if frontier_hash not in self.requested_blocks:
+                        self.requested_blocks[frontier_hash] = now
+                        self._record_first_request_time(frontier_hash, now)
+                    self._h1_last_issue[frontier_hash] = now
                     self._block_request_peer[frontier_hash] = frontier_peer
-                    self._record_first_request_time(frontier_hash, now)
                     logger.info(
                         "H1 frontier priority: re-requested tip+1 %s "
                         "from %s:%s (score=%s)",
@@ -5683,6 +5814,7 @@ class BlockSync:
                 for _, bh in items:
                     self.requested_blocks.pop(bh, None)
                     self._block_request_peer.pop(bh, None)
+                    self._h1_last_issue.pop(bh, None)
 
         deferred = len(to_request) - len(assigned)
         extra = f", deferred {deferred} (all peers at cap)" if deferred else ""
@@ -5834,6 +5966,7 @@ class BlockSync:
         self._ibd_block_buffer_ts.clear()
         self.requested_blocks.clear()
         self._block_request_peer.clear()
+        getattr(self, "_h1_last_issue", {}).clear()
         self._block_source_peer_addr.clear()
         self._w77_first_request_time.clear()
 
@@ -6731,10 +6864,13 @@ class BlockSync:
             peer.adjust_score(-1)
 
         # Re-requests are block getdata (MSG_WITNESS_BLOCK) too, so the same
-        # witness-capability gate applies — never re-route a timed-out block to
-        # a non-witness peer that cannot serve it (Core CanServeWitnesses).
-        connected_peers = [p for p in all_peers
-                           if p.is_connected() and _can_serve_witness_blocks(p)]
+        # CanServeBlocks ∩ CanServeWitnesses ∩ height gate applies — never
+        # re-route a timed-out block to a peer that cannot serve the frontier.
+        timeout_frontier_height = int(current_height or 0) + 1
+        connected_peers = [
+            p for p in all_peers
+            if p.is_connected() and _can_serve_block_at(p, timeout_frontier_height)
+        ]
 
         # If no peers available, clear all in-flight requests so they re-queue on reconnect
         if not connected_peers:
@@ -6745,6 +6881,7 @@ class BlockSync:
             for block_hash in timed_out:
                 del self.requested_blocks[block_hash]
                 self._block_request_peer.pop(block_hash, None)
+                self._h1_last_issue.pop(block_hash, None)
                 # Re-queue resets the retry budget; drop the attempt counter so
                 # it cannot orphan-accrete across repeated no-peer windows.
                 # _w77_first_request_time is left as the latency baseline (it is
@@ -6823,6 +6960,7 @@ class BlockSync:
                 for bh in block_hashes:
                     self.requested_blocks.pop(bh, None)
                     self._block_request_peer.pop(bh, None)
+                    self._h1_last_issue.pop(bh, None)
 
     async def _handle_reorg(self, new_block: Block, new_chain_tip: bytes):
         """Handle chain reorganization.

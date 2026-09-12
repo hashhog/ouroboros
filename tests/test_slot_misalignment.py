@@ -227,8 +227,12 @@ async def test_handle_headers_does_not_skip_orphaned_db_hashes(monkeypatch):
     — but the post-fix code accepts it as a one-element extension at slot 0
     instead of skipping 118 orphaned hashes and slotting 938349 there."""
     from ouroboros.p2p_messages import BlockHeader, HeadersMessage
+    from ouroboros.validation import POW_LIMIT_REGTEST
 
     bs = _make_block_sync()
+    # Isolate chain-prev from CheckProofOfWork: this fixture uses
+    # 0x207fffff, which is above mainnet powLimit.
+    bs._header_pow_limit_override = POW_LIMIT_REGTEST
     # Tip = block 938230; old chain hashes 938231..938348 are still in
     # BLOCKS_CF after the rollback, so has_block_hash returns True for
     # ALL of them.  Active chain has tip at 938230.

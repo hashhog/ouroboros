@@ -140,8 +140,9 @@ Not another watchdog. A test that:
   Core `BLOCK_STALLING_TIMEOUT` disconnect-and-refetch of the
   current holder only.
 
-Until that control exists and is red, do not land a scheduler change.
-W75 stays as the production backstop.
+Control: `pytest tests/test_stall_class_control.py`. Landed with the
+header-path `target > powLimit` CheckProofOfWork gate. W75 stays as the
+production backstop.
 
 ## Instruments
 

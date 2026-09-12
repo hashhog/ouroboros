@@ -93,7 +93,11 @@ def _make_block_sync(
     peer_manager.network = network
     peer_manager.misbehaving = MagicMock()
 
-    return BlockSync(db=db, validator=MagicMock(), peer_manager=peer_manager)
+    bs = BlockSync(db=db, validator=MagicMock(), peer_manager=peer_manager)
+    if tip_bits == REGTEST_BITS and network == "mainnet":
+        from ouroboros.validation import POW_LIMIT_REGTEST
+        bs._header_pow_limit_override = POW_LIMIT_REGTEST
+    return bs
 
 
 def _make_peer(host: str = "127.0.0.1", port: int = 8333):

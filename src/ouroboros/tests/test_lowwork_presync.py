@@ -240,6 +240,11 @@ class TestLowWorkPresync(unittest.IsolatedAsyncioTestCase):
         difficulty at the minimum for a cheap million-header flood."""
         bs, db, peer, tip = _fresh()
         bs.peer_manager.network = "mainnet"   # regtest permits any transition
+        # Isolate PermittedDifficultyTransition from CheckProofOfWork's
+        # target>powLimit reject: the cheat header claims REGTEST_BITS so
+        # it can be hashed in-process, which is above mainnet powLimit.
+        from ouroboros.validation import POW_LIMIT_REGTEST
+        bs._header_pow_limit_override = POW_LIMIT_REGTEST
         await bs._begin_lowwork_presync(
             2000, tip, 500, 0x1B04864C, peer, total_work=0, min_work=10 ** 40,
         )

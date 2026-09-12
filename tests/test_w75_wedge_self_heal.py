@@ -29,6 +29,7 @@ def _stalled_manager():
     m._ibd_block_buffer_ts = {b"a": 1.0, b"b": 2.0}
     m.requested_blocks = {b"a": 1.0, b"b": 2.0}
     m._block_request_peer = {b"a": object()}
+    m._h1_last_issue = {b"a": 1.0}
     m._block_source_peer_addr = {b"a": "1.2.3.4:8333"}
     m._w77_first_request_time = {b"a": 1.0}
     return m
@@ -44,6 +45,7 @@ def test_persistent_stall_triggers_a_reset():
     assert not m._ibd_block_buffer, "block buffer must be dropped"
     assert not m.requested_blocks, "in-flight request bookkeeping must be dropped"
     assert not m._block_request_peer
+    assert not m._h1_last_issue
     assert not m._block_source_peer_addr
     assert not m._w77_first_request_time, (
         "the telemetry map must be cleared with its siblings or a bulk drop "

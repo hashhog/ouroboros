@@ -5,6 +5,7 @@
 - 74403c5 docs: split the changelog — v1.0.1 shipped 2026-09-07, v1.0.2 is what is new since
 - dea447e fix: gettxoutsetinfo hashed the set from a materialised list of every coin
 - 9a70e19 docs: stall-class diagnosis — 70 CRITICALs are at-tip getdata to unservable peers
+- fix: CheckProofOfWork target>powLimit on the header path; stall-clock no longer demotes honest tip peers; H1 getdata skips unservable peers and does not reset the in-flight timestamp
 
 
 ## v1.0.2 — 2026-09-11
@@ -12,7 +13,8 @@
 Changes since `v1.0.1`:
 
 - fix: gettxoutsetinfo hash_serialized_3 streams one txid group (was 85.8 GB at 875k)
-- docs: stall-class diagnosis — 70 CRITICALs are at-tip getdata to unservable peers (`docs/STALL-CLASS-70-CRITICALS.md`); no fix until a failing control exists
+- docs: stall-class diagnosis — 70 CRITICALs are at-tip getdata to unservable peers (`docs/STALL-CLASS-70-CRITICALS.md`)
+- fix: header-sync CheckProofOfWork rejects target>powLimit (high-hash); stall-clock resets on empty/unconnecting headers; H1 never getdatas an unservable peer and does not reset the in-flight timestamp. Control: `pytest tests/test_stall_class_control.py`
 
 ## v1.0.1 — 2026-09-07
 
