@@ -103,8 +103,8 @@ class TestGetDeploymentInfoRPC:
                     assert field in dep, f"{name} missing '{field}'"
 
     def test_invalid_blockhash_raises(self, regtest_rpc):
-        """Passing a non-hex blockhash must raise HTTPException (400)."""
-        from fastapi import HTTPException
-        with pytest.raises(HTTPException) as exc_info:
+        """Passing a non-hex blockhash must raise ParseHashV -8."""
+        from ouroboros.rpc import RPC_INVALID_PARAMETER, RpcError
+        with pytest.raises(RpcError) as exc_info:
             asyncio.run(regtest_rpc.rpc_getdeploymentinfo(blockhash="not_valid_hex!!"))
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.code == RPC_INVALID_PARAMETER

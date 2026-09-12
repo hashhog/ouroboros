@@ -65,9 +65,9 @@
   "sig": "deriveaddresses \"descriptor\" ( range )"
  },
  "descriptorprocesspsbt": {
-  "declared": 7,
-  "required": 4,
-  "sig": "descriptorprocesspsbt \"psbt\" [\"\",{\"desc\":\"str\",\"range\":n or [n,n]},...] ( \"sighashtype\" bip32derivs finalize )"
+  "declared": 5,
+  "required": 2,
+  "sig": "descriptorprocesspsbt \"psbt\" [\"descriptor\",...] ( \"sighashtype\" bip32derivs finalize )"
  },
  "disconnectnode": {
   "declared": 2,

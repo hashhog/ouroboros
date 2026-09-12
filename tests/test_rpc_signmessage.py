@@ -184,22 +184,26 @@ async def test_verifymessage_wrong_address_fails(rpc_with_wallet):
 
 @pytest.mark.asyncio
 async def test_verifymessage_rejects_malformed_base64(rpc_with_wallet):
-    from fastapi import HTTPException
+    from ouroboros.rpc import RPC_TYPE_ERROR, RpcError
 
     addr = rpc_with_wallet.node.wallet._key.get_p2pkh_address()
-    with pytest.raises(HTTPException):
+    with pytest.raises(RpcError) as exc_info:
         await rpc_with_wallet.rpc_verifymessage(addr, "@@@notbase64@@@", "x")
+    assert exc_info.value.code == RPC_TYPE_ERROR
+    assert exc_info.value.message == "Malformed base64 encoding"
 
 
 @pytest.mark.asyncio
 async def test_verifymessage_rejects_segwit_address(rpc_with_wallet):
     """verifymessage is P2PKH-only (matches Core's MessageVerify)."""
-    from fastapi import HTTPException
+    from ouroboros.rpc import RPC_TYPE_ERROR, RpcError
 
     p2wpkh = rpc_with_wallet.node.wallet._key.get_p2wpkh_address()
     sig = await rpc_with_wallet.rpc_signmessage(p2wpkh, "msg")
-    with pytest.raises(HTTPException):
+    with pytest.raises(RpcError) as exc_info:
         await rpc_with_wallet.rpc_verifymessage(p2wpkh, sig, "msg")
+    assert exc_info.value.code == RPC_TYPE_ERROR
+    assert exc_info.value.message == "Address does not refer to key"
 
 
 @pytest.mark.asyncio

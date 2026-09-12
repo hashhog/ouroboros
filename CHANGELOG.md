@@ -16,6 +16,7 @@ Changes since `v1.0.1`:
 - docs: stall-class diagnosis — 70 CRITICALs are at-tip getdata to unservable peers (`docs/STALL-CLASS-70-CRITICALS.md`)
 - feat: getpeerinfo reports per-peer synced_headers/synced_blocks/inflight/presynced_headers from CNodeState-equivalent measurements instead of -1 stubs. Control: `pytest tests/test_per_peer_sync_fields.py`
 - fix: header-sync CheckProofOfWork rejects target>powLimit (high-hash); stall-clock resets on empty/unconnecting headers; H1 never getdatas an unservable peer and does not reset the in-flight timestamp. Control: `pytest tests/test_stall_class_control.py`
+- fix: T2 R5 probe parity (error codes, createpsbt ConstructTransaction, analyzepsbt next-role, importmempool / descriptorprocesspsbt). Control: `pytest tests/test_t2_r5_parity.py`
 
 ## v1.0.1 — 2026-09-07
 

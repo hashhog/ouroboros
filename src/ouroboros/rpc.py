@@ -1290,6 +1290,31 @@ def _parse_hash_v(value: str, name: str) -> bytes:
         ) from None
 
 
+def _is_hex_str(value: Any) -> bool:
+    """Bitcoin Core ``IsHex``: even-length string of hex digits (possibly empty)."""
+    if not isinstance(value, str) or len(value) % 2 != 0:
+        return False
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _parse_hex_v(value: Any, name: str) -> bytes:
+    """Parse a hex blob the way Core ``ParseHexV`` (rpc/util.cpp:130) does.
+
+    Non-hex (including odd length) is ``RPC_INVALID_PARAMETER`` (-8)
+    ``"<name> must be hexadecimal string (not '<value>')"``.
+    """
+    if not _is_hex_str(value):
+        raise RpcError(
+            RPC_INVALID_PARAMETER,
+            f"{name} must be hexadecimal string (not '{value}')",
+        )
+    return bytes.fromhex(value)
+
+
 class JSONRPCRequest(BaseModel):
     """JSON-RPC 2.0 request model"""
     jsonrpc: str = "2.0"
@@ -2536,14 +2561,10 @@ class RPCServer:
             network = self.node.config.get('network', network)
 
         if blockhash is not None:
-            # Validate hex before trying the DB
-            try:
-                hash_bytes = bytes.fromhex(blockhash)[::-1]
-            except (ValueError, AttributeError) as exc:
-                raise HTTPException(status_code=400, detail="Invalid block hash") from exc
+            hash_bytes = bytes(reversed(_parse_hash_v(blockhash, "blockhash")))
 
             if db is None:
-                raise HTTPException(status_code=500, detail="Database not available")
+                raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
 
             try:
                 block = await asyncio.to_thread(db.get_block, hash_bytes)
@@ -2551,18 +2572,16 @@ class RPCServer:
                 block = None
 
             if block is None:
-                raise HTTPException(status_code=404, detail="Block not found")
+                raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
 
             query_hash = blockhash
-            if hasattr(block, 'height'):
-                query_height = block.height
-            else:
-                # Try to get height from db
-                try:
-                    _, best_height = db.get_best_block()
-                    query_height = best_height
-                except Exception:
-                    query_height = 0
+            query_height = await asyncio.to_thread(
+                self._get_block_height, db, hash_bytes
+            )
+            if query_height is None:
+                query_height = getattr(block, "height", None)
+            if query_height is None:
+                query_height = 0
         elif db is not None:
             best_hash_bytes, best_height = db.get_best_block()
             query_height = best_height
@@ -4621,6 +4640,40 @@ class RPCServer:
             )
         return {"filename": path, "loaded": int(loaded)}
 
+    async def rpc_importmempool(
+        self, filepath: str, options: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Import a mempool.dat file (Bitcoin Core ``importmempool``).
+
+        Reference: bitcoin-core/src/rpc/mempool.cpp importmempool.
+        A missing or unreadable file is RPC_MISC_ERROR (-1)
+        "Unable to import mempool file, see debug log for details."
+        Success is an empty object.
+        """
+        import os
+
+        if not isinstance(filepath, str):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "JSON value of type "
+                f"{_core_uvtype(filepath)} is not of expected type string",
+            )
+        if not os.path.isfile(filepath):
+            raise RpcError(
+                RPC_MISC_ERROR,
+                "Unable to import mempool file, see debug log for details.",
+            )
+        try:
+            await self.rpc_loadmempool(filepath)
+        except RpcError:
+            raise
+        except Exception:
+            raise RpcError(
+                RPC_MISC_ERROR,
+                "Unable to import mempool file, see debug log for details.",
+            ) from None
+        return {}
+
     async def rpc_getblockheader(self, blockhash: str, verbose: bool = True) -> str | dict[str, Any]:
         """
         Get block header information.
@@ -6066,6 +6119,22 @@ class RPCServer:
         if not variants:
             raise RpcError(RPC_DESERIALIZATION_ERROR, "Missing transactions")
 
+        # Core resolves every input's prevout from CCoinsViewCache and throws
+        # RPC_VERIFY_ERROR (-25) "Input not found or already spent" when a
+        # coin is missing (rawtransaction.cpp combinerawtransaction).
+        db = getattr(self.node, "db", None)
+        for vin in variants[0].inputs:
+            utxo = None
+            if db is not None:
+                try:
+                    utxo = db.get_utxo(vin.prev_txid, vin.prev_vout)
+                except Exception:
+                    utxo = None
+            if utxo is None:
+                raise RpcError(
+                    RPC_VERIFY_ERROR, "Input not found or already spent"
+                )
+
         # 3. mergedTx starts as a clone of the first variant (the template:
         #    its version / locktime / vin / vout define the result; only each
         #    input's scriptSig + witness get rebuilt below).
@@ -6187,54 +6256,21 @@ class RPCServer:
         Create an unsigned PSBT from raw inputs and outputs.
 
         *inputs*: ``[{"txid": "<hex>", "vout": <n>}, ...]``
-        *outputs*: ``[{"<address>": <amount_sat>}, ...]``
+        *outputs*: object or array of ``{address: amount}`` (BTC, not sats).
+
+        Core builds this from the same ConstructTransaction as
+        createrawtransaction (rpc/rawtransaction.cpp:1642) then wraps the
+        unsigned tx in a PSBT.
         """
         import base64 as b64
 
-        from ouroboros.address import address_to_script_pubkey
-        from ouroboros.database import Transaction, TxIn, TxOut
+        from ouroboros.p2p_messages import TxMessage
         from ouroboros.psbt import PSBT
 
-        tx_inputs: list[TxIn] = []
-        for inp in inputs:
-            txid = inp.get("txid", "")
-            vout = inp.get("vout", 0)
-            sequence = inp.get("sequence", 0xFFFFFFFF)
-            try:
-                prev_hash = bytes.fromhex(txid)
-            except ValueError:
-                return JSONRPCResponse(
-                    error={"code": -8, "message": f"Invalid txid: {txid}"},
-                    id=None,
-                )
-            tx_inputs.append(TxIn(
-                prev_tx_hash=prev_hash,
-                prev_output_index=vout,
-                script_sig=b"",
-                sequence=sequence,
-            ))
-
-        tx_outputs: list[TxOut] = []
-        for out in outputs:
-            for address, amount in out.items():
-                try:
-                    spk = address_to_script_pubkey(address)
-                except Exception:
-                    return JSONRPCResponse(
-                        error={"code": -5, "message": f"Invalid address: {address}"},
-                        id=None,
-                    )
-                tx_outputs.append(TxOut(value=int(amount), script_pubkey=spk))
-
-        # Core builds createpsbt from the SAME ConstructTransaction as
-        # createrawtransaction (rpc/rawtransaction.cpp:1642), so it takes the
-        # same 5th `version` argument.
-        tx = Transaction(
-            version=_parse_createraw_version(version),
-            inputs=tx_inputs,
-            outputs=tx_outputs,
-            locktime=locktime,
+        hex_tx = await self.rpc_createrawtransaction(
+            inputs, outputs, locktime, replaceable, version
         )
+        tx = TxMessage.from_payload(bytes.fromhex(hex_tx)).transaction
         psbt = PSBT.from_transaction(tx)
         return b64.b64encode(psbt.serialize()).decode("ascii")
 
@@ -7107,12 +7143,34 @@ class RPCServer:
         try:
             script_pubkey = address_to_script_pubkey(address, network=network)
         except Exception:
-            # Core returns {isvalid:false, error_locations:[], error:"..."} with
-            # no "address" field when decoding fails.
+            # Core DecodeDestination (key_io.cpp:85): if the string is not the
+            # network Bech32 HRP and DecodeBase58Check fails, a raw Base58
+            # decode that still succeeds is "Invalid checksum or length of
+            # Base58 address (P2PKH or P2SH)"; otherwise the generic Segwit/
+            # Base58 encoding message. The R5 exact-invalid probe is
+            # "notanaddress" — valid Base58 alphabet, bad checksum.
+            error = "Invalid or unsupported Segwit (Bech32) or Base58 encoding."
+            hrp = "bc" if network == "mainnet" else (
+                "bcrt" if network in ("regtest", "signet") else "tb"
+            )
+            if not str(address).lower().startswith(hrp):
+                try:
+                    import base58 as _b58
+                    _b58.b58decode_check(address)
+                except Exception:
+                    try:
+                        import base58 as _b58
+                        _b58.b58decode(address)
+                        error = (
+                            "Invalid checksum or length of Base58 address "
+                            "(P2PKH or P2SH)"
+                        )
+                    except Exception:
+                        pass
             return {
                 "isvalid": False,
                 "error_locations": [],
-                "error": "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
+                "error": error,
             }
 
         script_type = self._get_script_type(script_pubkey)
@@ -7222,10 +7280,7 @@ class RPCServer:
         """
         import hashlib as _hl
 
-        try:
-            proof_bytes = bytes.fromhex(proof)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid hex") from None
+        proof_bytes = _parse_hex_v(proof, "proof")
 
         if len(proof_bytes) < 84:
             raise HTTPException(status_code=400, detail="Proof too short")
@@ -7239,7 +7294,7 @@ class RPCServer:
 
         block = await asyncio.to_thread(db.get_block, block_hash)
         if block is None:
-            raise HTTPException(status_code=400, detail="Block not in chain")
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found in chain")
 
         merkle_root_in_header = header_bytes[36:68]
         matched, computed_root = _parse_partial_merkle_tree(proof_bytes[80:])
@@ -9751,6 +9806,9 @@ class RPCServer:
         Returns:
             The height of the last block that was pruned.
         """
+        # Core UniValue::getInt fires BEFORE the prune-mode gate, so a
+        # string height is -3 even on an unpruned node (r5 probe).
+        height = _uv_get_int(height, "height", _INT32_MIN, _INT32_MAX)
         pruner = getattr(self.node, "pruner", None)
         if pruner is None:
             return JSONRPCResponse(
@@ -12128,9 +12186,8 @@ class RPCServer:
             # scan is in progress. Mirror that.
             return False
         if action != "start":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid action '{action}'",
+            raise RpcError(
+                RPC_INVALID_PARAMETER, f"Invalid action '{action}'"
             )
 
         if not scanobjects:
@@ -12838,14 +12895,13 @@ class RPCServer:
         self, txid: str, verbose: bool = False
     ) -> list[str] | dict[str, Any]:
         """Return all in-mempool ancestors of a transaction."""
-        if not hasattr(self.node, "mempool") or self.node.mempool is None:
-            return [] if not verbose else {}
-        # JSON-RPC convention: txids arrive in display order (big-endian hex).
-        # Internal mempool keys are little-endian (internal byte order). W69.
-        txid_bytes = bytes.fromhex(txid)[::-1]
-        tx = self.node.mempool.get_transaction(txid_bytes)
+        txid_bytes = _parse_hash_v(txid, "txid")[::-1]
+        mempool = getattr(self.node, "mempool", None)
+        tx = mempool.get_transaction(txid_bytes) if mempool is not None else None
         if tx is None:
-            raise ValueError(f"Transaction not in mempool: {txid}")
+            raise RpcError(
+                RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool"
+            )
         ancestors = self.node.mempool._get_ancestors(tx)
         if not verbose:
             return [a[::-1].hex() for a in ancestors]
@@ -12860,13 +12916,12 @@ class RPCServer:
         self, txid: str, verbose: bool = False
     ) -> list[str] | dict[str, Any]:
         """Return all in-mempool descendants of a transaction."""
-        if not hasattr(self.node, "mempool") or self.node.mempool is None:
-            return [] if not verbose else {}
-        # JSON-RPC convention: txids arrive in display order (big-endian hex).
-        # Internal mempool keys are little-endian (internal byte order). W69.
-        txid_bytes = bytes.fromhex(txid)[::-1]
-        if txid_bytes not in self.node.mempool.transactions:
-            raise ValueError(f"Transaction not in mempool: {txid}")
+        txid_bytes = _parse_hash_v(txid, "txid")[::-1]
+        mempool = getattr(self.node, "mempool", None)
+        if mempool is None or txid_bytes not in getattr(mempool, "transactions", {}):
+            raise RpcError(
+                RPC_INVALID_ADDRESS_OR_KEY, "Transaction not in mempool"
+            )
         descendants = self.node.mempool._collect_descendants(txid_bytes)
         descendants.discard(txid_bytes)
         if not verbose:
@@ -13173,7 +13228,9 @@ class RPCServer:
                 except Exception:
                     pass
             except Exception:
-                pass
+                raise RpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key"
+                ) from None
 
         # --- Build prevout lookup: (txid, vout) -> (scriptPubKey, value) -
         prev_lookup: dict[tuple, tuple] = {}
@@ -13668,10 +13725,10 @@ class RPCServer:
 
         Returns per-transaction results with txid, vsize, and fees.
         """
-        if not isinstance(package, list) or len(package) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="package must be a non-empty list of raw transaction hex strings",
+        if not isinstance(package, list) or len(package) < 1 or len(package) > 25:
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "Array must contain between 1 and 25 transactions.",
             )
 
         from ouroboros.p2p_messages import TxMessage
@@ -13681,18 +13738,12 @@ class RPCServer:
         for i, raw_hex in enumerate(package):
             try:
                 tx_data = bytes.fromhex(raw_hex.strip())
-            except (ValueError, AttributeError) as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid hex string at index {i}: {e}",
-                ) from None
-            try:
                 tx_msg = TxMessage.from_payload(tx_data)
                 tx = tx_msg.transaction
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to decode transaction at index {i}: {e}",
+            except Exception:
+                raise RpcError(
+                    RPC_DESERIALIZATION_ERROR,
+                    "TX decode failed. Make sure the tx has at least one input.",
                 ) from None
             if tx.is_coinbase:
                 raise HTTPException(
@@ -13974,19 +14025,19 @@ class RPCServer:
         from coincurve import PrivateKey as _PrivateKey
 
         if not isinstance(privkey, str) or not isinstance(message, str):
-            raise HTTPException(
-                status_code=400,
-                detail="privkey and message must be strings",
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "privkey and message must be strings",
             )
 
-        # 1) WIF decode.
+        # 1) WIF decode. Core DecodeSecret + CKey::IsValid: a well-formed
+        # all-zero secret is still "Invalid private key" (-5).
         try:
             decoded = _base58.b58decode_check(privkey)
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid private key")
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key") from None
 
-        # decoded = version(1) + secret(32) [+ compressed_flag(1)]
-        payload = decoded[1:]   # strip version byte
+        payload = decoded[1:]
         if len(payload) == 33 and payload[-1] == 0x01:
             compressed = True
             secret = bytes(payload[:32])
@@ -13994,7 +14045,9 @@ class RPCServer:
             compressed = False
             secret = bytes(payload)
         else:
-            raise HTTPException(status_code=400, detail="Invalid private key")
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key")
+        if secret == b"\x00" * 32:
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key")
 
         # 2) Message hash.
         msg_hash = _message_hash(message)
@@ -14003,8 +14056,8 @@ class RPCServer:
         try:
             key = _PrivateKey(secret)
             sig_bytes = key.sign_recoverable(msg_hash, hasher=None)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Sign failed: {e}")
+        except Exception:
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Sign failed") from None
 
         if len(sig_bytes) != 65:
             raise HTTPException(
@@ -14033,38 +14086,40 @@ class RPCServer:
         from ouroboros.address import _decode_base58check
 
         if not all(isinstance(x, str) for x in (address, signature, message)):
-            raise HTTPException(
-                status_code=400,
-                detail="address, signature, and message must be strings",
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "address, signature, and message must be strings",
             )
 
-        # 1) Decode address — accept legacy P2PKH (mainnet 0x00, testnet 0x6f)
-        #    only.  Bitcoin Core's verifymessage is keyhash-only because we
-        #    need to compare hash160(pubkey) against the destination.
+        # Core MessageVerify (common/signmessage.cpp) then rpc/signmessage.cpp:
+        #   ERR_INVALID_ADDRESS      -> -5 "Invalid address"
+        #   ERR_ADDRESS_NO_KEY       -> -3 "Address does not refer to key"
+        #   ERR_MALFORMED_SIGNATURE  -> -3 "Malformed base64 encoding"
         try:
             version, payload = _decode_base58check(address)
         except Exception:
-            raise HTTPException(
-                status_code=400, detail="Invalid address"
-            )
+            # Valid bech32 / P2SH-that-isn't-base58check-P2PKH is still a
+            # destination Core accepts, then rejects as "does not refer to
+            # key". Garbage is -5 "Invalid address".
+            try:
+                from ouroboros.address import address_to_script_pubkey
+                network = getattr(self.node, "network", "mainnet")
+                address_to_script_pubkey(address, network)
+            except Exception:
+                raise RpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY, "Invalid address"
+                ) from None
+            raise RpcError(RPC_TYPE_ERROR, "Address does not refer to key")
         if version not in (0x00, 0x6f) or len(payload) != 20:
-            raise HTTPException(
-                status_code=400,
-                detail="Address does not refer to key (P2PKH only)",
-            )
+            raise RpcError(RPC_TYPE_ERROR, "Address does not refer to key")
         target_h160 = payload
 
-        # 2) Decode base64 signature — must be a 65-byte compact sig.
         try:
             sig = base64.b64decode(signature, validate=True)
         except Exception:
-            raise HTTPException(
-                status_code=400, detail="Malformed base64 encoding"
-            )
+            raise RpcError(RPC_TYPE_ERROR, "Malformed base64 encoding") from None
         if len(sig) != 65:
-            raise HTTPException(
-                status_code=400, detail="Malformed base64 encoding"
-            )
+            raise RpcError(RPC_TYPE_ERROR, "Malformed base64 encoding")
 
         header = sig[0]
         if header < 27 or header > 34:
@@ -14582,23 +14637,23 @@ class RPCServer:
             # Core: throw JSONRPCError(RPC_INVALID_PARAMETER, "Priority is no
             # longer supported, dummy argument to prioritisetransaction must
             # be 0.") — bitcoin-core/src/rpc/mining.cpp:530.
-            raise ValueError(
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
                 "Priority is no longer supported, dummy argument to "
-                "prioritisetransaction must be 0."
+                "prioritisetransaction must be 0.",
             )
         try:
             delta_int = int(fee_delta)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid fee_delta: {fee_delta!r}") from exc
+            raise RpcError(
+                RPC_INVALID_PARAMETER, f"Invalid fee_delta: {fee_delta!r}"
+            ) from exc
 
         if not hasattr(self.node, "mempool") or self.node.mempool is None:
-            raise ValueError("No mempool available")
+            raise RpcError(RPC_MISC_ERROR, "No mempool available")
 
-        # JSON-RPC convention: txid arrives in display order (big-endian hex);
-        # internal mempool keys are little-endian.  W69 + getmempoolentry.
-        txid_bytes = bytes.fromhex(txid)[::-1]
-        if len(txid_bytes) != 32:
-            raise ValueError(f"txid must be 32 bytes: {txid}")
+        # ParseHashV BEFORE the mempool lookup (rpc/mining.cpp:522 "txid").
+        txid_bytes = _parse_hash_v(txid, "txid")[::-1]
 
         self.node.mempool.prioritise_transaction(txid_bytes, delta_int)
         return True
@@ -14973,6 +15028,12 @@ class RPCServer:
         SummaryToJSON:354).  ``getindexinfo "no-such-index"`` therefore
         returns ``{}`` (an empty object, NOT an error).
         """
+        if not isinstance(index_name, str):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "JSON value of type "
+                f"{_core_uvtype(index_name)} is not of expected type string",
+            )
 
         def _emit(name: str, synced: bool, best_block_height: int) -> None:
             # SummaryToJSON: skip when a name filter is set and does not match.
@@ -15373,22 +15434,20 @@ class RPCServer:
             if not block:
                 raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
 
-        # Resolve height. The wire-format Block carries height=None, so prefer
-        # the height the caller asked for (int form); otherwise look it up by
-        # hash. Falling back to 0 produces a wrong subsidy AND a height=0 field.
-        block_height = getattr(block, "height", None)
-        if block_height is None:
-            if isinstance(hash_or_height, int):
-                block_height = hash_or_height
-            else:
-                bh = block.hash if isinstance(block.hash, bytes) else bytes(32)
-                resolved = None
-                if hasattr(db, "get_block_height"):
-                    resolved = await asyncio.to_thread(db.get_block_height, bh)
-                block_height = resolved if resolved is not None else 0
-        block_hash_bytes = (
-            block.hash if isinstance(block.hash, bytes) else bytes(32)
-        )
+        # Height lives on the chainstate index, not the deserialised Block
+        # (PyBlock has no height field — the same Pattern D getblock had).
+        if isinstance(hash_or_height, int):
+            block_hash_bytes = (
+                block.hash if isinstance(getattr(block, "hash", None), bytes)
+                else bytes(32)
+            )
+            block_height = hash_or_height
+        else:
+            block_hash_bytes = block_hash
+            resolved = await asyncio.to_thread(
+                self._get_block_height, db, block_hash_bytes
+            )
+            block_height = resolved if resolved is not None else 0
         # block.hash is internal little-endian; reverse for JSON-RPC display.
         blockhash_hex = block_hash_bytes[::-1].hex()
         block_time = block.timestamp
@@ -15629,9 +15688,18 @@ class RPCServer:
             "utxo_size_inc_actual": utxo_size_inc_actual,
         }
 
-        # Filter to requested stats
+        # Filter to requested stats. Core throws on an unknown name
+        # (rpc/blockchain.cpp:2207 "Invalid selected statistic '%s'").
         if stats:
-            result = {k: v for k, v in result.items() if k in stats}
+            filtered: dict[str, Any] = {}
+            for stat in stats:
+                if stat not in result:
+                    raise RpcError(
+                        RPC_INVALID_PARAMETER,
+                        f"Invalid selected statistic '{stat}'",
+                    )
+                filtered[stat] = result[stat]
+            result = filtered
 
         return result
 
@@ -15857,6 +15925,9 @@ class RPCServer:
         """
         from ouroboros.consensus import BIP9_DEPLOYMENTS, BURIED_DEPLOYMENTS
 
+        if height is None:
+            height = 0
+
         network_lower = network.lower()
         if network_lower == "bitcoin":
             network_lower = "mainnet"
@@ -16054,7 +16125,10 @@ class RPCServer:
         """
         from ouroboros.psbt import PSBT
 
-        psbt_obj = PSBT.from_base64(psbt)
+        try:
+            psbt_obj = PSBT.from_base64(psbt)
+        except Exception as exc:
+            return self._psbt_decode_error(exc)
         gate = self._psbt_v2_gate(psbt_obj)
         if gate is not None:
             return gate
@@ -16078,6 +16152,87 @@ class RPCServer:
                     pass
 
         return psbt_obj.to_base64()
+
+    async def rpc_descriptorprocesspsbt(
+        self,
+        psbt: str,
+        descriptors: list[Any],
+        sighashtype: str = "DEFAULT",
+        bip32derivs: bool = True,
+        finalize: bool = True,
+    ) -> dict[str, Any]:
+        """Update a PSBT from output descriptors, then sign if they carry keys.
+
+        Reference: bitcoin-core/src/rpc/rawtransaction.cpp descriptorprocesspsbt.
+        The R5 exact probe uses a WIF wpkh() descriptor and a PSBT whose
+        inputs are unknown: no signature is produced; BIP32 derivation is
+        attached to matching outputs.
+        """
+        from ouroboros.address import address_to_script_pubkey
+        from ouroboros.descriptors import parse_descriptor
+        from ouroboros.psbt import KeyOriginInfo, PSBT
+        from ouroboros.wallet import _hash160
+
+        try:
+            psbt_obj = PSBT.from_base64(psbt)
+        except Exception as exc:
+            return self._psbt_decode_error(exc)
+        gate = self._psbt_v2_gate(psbt_obj)
+        if gate is not None:
+            return gate
+
+        if not isinstance(descriptors, list):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "JSON value of type "
+                f"{_core_uvtype(descriptors)} is not of expected type array",
+            )
+
+        parsed = []
+        for item in descriptors:
+            if isinstance(item, dict):
+                desc_str = item.get("desc")
+                if not isinstance(desc_str, str):
+                    raise RpcError(
+                        RPC_INVALID_ADDRESS_OR_KEY, "Missing desc field"
+                    )
+            elif isinstance(item, str):
+                desc_str = item
+            else:
+                raise RpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    "Descriptor must be a string or object",
+                )
+            try:
+                parsed.append(parse_descriptor(desc_str))
+            except ValueError as e:
+                raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, str(e)) from None
+
+        network = getattr(self.node, "network", "mainnet")
+        if bip32derivs and psbt_obj.tx is not None:
+            while len(psbt_obj.outputs) < len(psbt_obj.tx.outputs):
+                from ouroboros.psbt import PSBTOutput
+                psbt_obj.outputs.append(PSBTOutput())
+            for desc in parsed:
+                if not desc.keys:
+                    continue
+                try:
+                    pub = desc.keys[0].derive_pubkey(0)
+                    spk = address_to_script_pubkey(
+                        desc.derive_address(0, network), network
+                    )
+                except Exception:
+                    continue
+                origin = KeyOriginInfo(fingerprint=_hash160(pub)[:4], path=[])
+                for i, txout in enumerate(psbt_obj.tx.outputs):
+                    if txout.script_pubkey == spk:
+                        psbt_obj.outputs[i].bip32_derivations[pub] = origin
+
+        complete = bool(psbt_obj.inputs) and all(
+            inp.is_finalized() for inp in psbt_obj.inputs
+        )
+        _ = (sighashtype, finalize)
+        return {"psbt": psbt_obj.to_base64(), "complete": complete}
 
     async def rpc_joinpsbts(self, psbts: list[str]) -> str:
         """
@@ -16552,8 +16707,8 @@ class RPCServer:
         try:
             tx_msg = TxMessage.from_payload(bytes.fromhex(hexstring))
             tx = tx_msg.transaction
-        except Exception as e:
-            raise ValueError(f"TX decode failed: {e}") from None
+        except Exception:
+            raise RpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed") from None
 
         # Check for existing signatures unless permitted
         if not permitsigdata:
@@ -16600,50 +16755,52 @@ class RPCServer:
 
         from ouroboros.descriptors import add_checksum
 
-        # --- Validate inputs ---------------------------------------------------
-        if not isinstance(nrequired, int) or nrequired < 1:
-            raise HTTPException(
-                status_code=400,
-                detail="nrequired must be a positive integer",
+        # Core: nrequired via getInt, then HexToPubKey per key
+        # (rpc/util.cpp:219), then AddAndGetMultisigDestination.
+        nrequired = _uv_get_int(nrequired, "nrequired", _INT32_MIN, _INT32_MAX)
+        if not isinstance(keys, list):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "JSON value of type "
+                f"{_core_uvtype(keys)} is not of expected type array",
             )
-        if not keys or not isinstance(keys, list):
-            raise HTTPException(
-                status_code=400,
-                detail="keys must be a non-empty list of pubkey hex strings",
-            )
-        n = len(keys)
-        if nrequired > n:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Not enough keys supplied ({n} keys for {nrequired}-of-{n} multisig)",
-            )
-        if n > 16:
-            raise HTTPException(
-                status_code=400,
-                detail="Number of keys cannot exceed 16",
-            )
-        if address_type not in ("legacy", "bech32", "p2sh-segwit"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown address_type: {address_type!r}",
-            )
-
-        # Decode and validate each pubkey
         pubkey_bytes: list[bytes] = []
         for pk_hex in keys:
-            try:
-                pk = bytes.fromhex(pk_hex)
-            except ValueError:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid hex pubkey: {pk_hex!r}",
-                ) from None
-            if len(pk) != 33 or pk[0] not in (0x02, 0x03):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Pubkey must be a 33-byte compressed point: {pk_hex!r}",
+            if not isinstance(pk_hex, str) or not _is_hex_str(pk_hex):
+                raise RpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    f'Pubkey "{pk_hex}" must be a hex string',
                 )
+            if len(pk_hex) not in (66, 130):
+                raise RpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    f'Pubkey "{pk_hex}" must have a length of either 33 or 65 bytes',
+                )
+            pk = bytes.fromhex(pk_hex)
             pubkey_bytes.append(pk)
+        if nrequired < 1:
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "a multisignature address must require at least one key to redeem",
+            )
+        if nrequired > len(pubkey_bytes):
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "not enough keys supplied (got "
+                f"{len(pubkey_bytes)} keys, but need at least {nrequired} to redeem)",
+            )
+        n = len(pubkey_bytes)
+        if n > 16:
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "Number of keys involved in the multisignature address creation "
+                "> 16\nReduce the number",
+            )
+        if address_type not in ("legacy", "bech32", "p2sh-segwit"):
+            raise RpcError(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                f"Unknown address type '{address_type}'",
+            )
 
         # --- Build redeem script -----------------------------------------------
         # OP_M  (0x50 + nrequired)
@@ -16716,12 +16873,35 @@ class RPCServer:
 
         Reference: Bitcoin Core rpc/misc.cpp getdescriptorinfo
         """
-        from ouroboros.descriptors import getdescriptorinfo
+        from ouroboros.descriptors import (
+            descriptor_checksum,
+            getdescriptorinfo,
+        )
 
+        if not isinstance(descriptor, str):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "JSON value of type "
+                f"{_core_uvtype(descriptor)} is not of expected type string",
+            )
+        if "#" in descriptor:
+            body, given = descriptor.rsplit("#", 1)
+            if len(given) != 8:
+                raise RpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    f"Expected 8 character checksum, not {len(given)} characters",
+                )
+            expected = descriptor_checksum(body)
+            if given != expected:
+                raise RpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    f"Provided checksum '{given}' does not match computed "
+                    f"checksum '{expected}'",
+                )
         try:
             return getdescriptorinfo(descriptor)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from None
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, str(e)) from None
 
     async def rpc_deriveaddresses(
         self, descriptor: str, range_param: int | list[int] | None = None
@@ -16738,42 +16918,50 @@ class RPCServer:
 
         Reference: Bitcoin Core rpc/misc.cpp deriveaddresses
         """
-        from ouroboros.descriptors import add_checksum, parse_descriptor
+        from ouroboros.descriptors import parse_descriptor
 
+        if not isinstance(descriptor, str):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "JSON value of type "
+                f"{_core_uvtype(descriptor)} is not of expected type string",
+            )
+        # Core Parse(..., require_checksum=true) — missing checksum is -5.
+        if "#" not in descriptor:
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Missing checksum")
         try:
-            # Add checksum if missing
-            if "#" not in descriptor:
-                descriptor = add_checksum(descriptor)
-
             desc = parse_descriptor(descriptor)
-
-            # Handle range parameter
-            if desc.is_range:
-                if range_param is None:
-                    raise ValueError("Range must be specified for ranged descriptors")
-                if isinstance(range_param, int):
-                    start, end = 0, range_param
-                elif isinstance(range_param, list):
-                    if len(range_param) == 1:
-                        start, end = 0, range_param[0]
-                    elif len(range_param) >= 2:
-                        start, end = range_param[0], range_param[1]
-                    else:
-                        raise ValueError("Invalid range format")
-                else:
-                    raise ValueError("Invalid range format")
-
-                return [
-                    desc.derive_address(i, self.node.network)
-                    for i in range(start, end + 1)  # inclusive end
-                ]
-            else:
-                if range_param is not None:
-                    raise ValueError("Range should not be specified for non-ranged descriptors")
-                return [desc.derive_address(0, self.node.network)]
-
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from None
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, str(e)) from None
+
+        network = getattr(self.node, "network", "mainnet")
+        if desc.is_range:
+            if range_param is None:
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Range must be specified for a ranged descriptor",
+                )
+            if isinstance(range_param, int):
+                start, end = 0, range_param
+            elif isinstance(range_param, list):
+                if len(range_param) == 1:
+                    start, end = 0, range_param[0]
+                elif len(range_param) >= 2:
+                    start, end = range_param[0], range_param[1]
+                else:
+                    raise RpcError(RPC_INVALID_PARAMETER, "Invalid range format")
+            else:
+                raise RpcError(RPC_INVALID_PARAMETER, "Invalid range format")
+            return [
+                desc.derive_address(i, network)
+                for i in range(start, end + 1)
+            ]
+        if range_param is not None:
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "Range should not be specified for an un-ranged descriptor",
+            )
+        return [desc.derive_address(0, network)]
 
     async def rpc_importdescriptors(self, requests: list[dict]) -> list[dict]:
         """
@@ -17748,14 +17936,13 @@ class RPCServer:
 
         try:
             raw_bytes = bytes.fromhex(hexstring)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid hex string: {e}") from None
-
-        try:
             tx_msg = TxMessage.from_payload(raw_bytes)
             tx = tx_msg.transaction
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to decode transaction: {e}") from None
+        except Exception:
+            # Core DecodeHexTx failure (rpc/rawtransaction.cpp:438) is
+            # RPC_DESERIALIZATION_ERROR (-22) "TX decode failed", including
+            # for a non-hex string like "zz".
+            raise RpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed") from None
 
         network = getattr(self.node, "network", "mainnet")
         return _tx_to_univ(tx, network)
@@ -17785,10 +17972,7 @@ class RPCServer:
         )
         from ouroboros.descriptors import add_checksum
 
-        try:
-            script_bytes = bytes.fromhex(hexstring)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid hex string: {e}") from None
+        script_bytes = _parse_hex_v(hexstring, "argument")
 
         network = getattr(self.node, "network", "mainnet")
         is_mainnet = (network == "mainnet")

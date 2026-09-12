@@ -2681,52 +2681,55 @@ def analyzepsbt(psbt_b64: str) -> dict[str, Any]:
     """
     psbt = PSBT.from_base64(psbt_b64)
 
+    # Core node/psbt.cpp AnalyzePSBT + rpc/rawtransaction.cpp analyzepsbt:
+    # per-input {has_utxo, is_final, next} (no has_sig); top-level next is
+    # the minimum of the per-input roles. estimated_vsize / fee only when
+    # every input has a UTXO (calc_fee).
+    _ROLE_RANK = {
+        "updater": 0,
+        "signer": 1,
+        "finalizer": 2,
+        "extractor": 3,
+    }
     inputs_analysis = []
     all_have_utxo = True
-    all_signed = True
-    all_finalized = True
+    min_role = "extractor"
 
-    for _i, psbt_in in enumerate(psbt.inputs):
-        inp_info: dict[str, Any] = {}
-
-        has_utxo = psbt_in.witness_utxo is not None or psbt_in.non_witness_utxo is not None
-        inp_info["has_utxo"] = has_utxo
-        all_have_utxo &= has_utxo
-
+    n_inputs = len(psbt.tx.inputs) if psbt.tx is not None else len(psbt.inputs)
+    for i in range(n_inputs):
+        psbt_in = psbt.inputs[i] if i < len(psbt.inputs) else PSBTInput()
+        has_utxo = (
+            psbt_in.witness_utxo is not None
+            or psbt_in.non_witness_utxo is not None
+        )
         is_final = psbt_in.is_finalized()
-        inp_info["is_final"] = is_final
-        all_finalized &= is_final
-
-        if not is_final:
+        if not has_utxo:
+            role = "updater"
+            is_final = False
+            all_have_utxo = False
+        elif is_final:
+            role = "extractor"
+        else:
             has_sig = bool(psbt_in.partial_sigs) or psbt_in.tap_key_sig is not None
-            inp_info["has_sig"] = has_sig
-            all_signed &= has_sig
-
-        inputs_analysis.append(inp_info)
-
-    # Determine next action
-    if all_finalized:
-        next_role = "extractor"
-    elif all_signed:
-        next_role = "finalizer"
-    elif all_have_utxo:
-        next_role = "signer"
-    else:
-        next_role = "updater"
+            role = "finalizer" if has_sig else "signer"
+        if _ROLE_RANK[role] < _ROLE_RANK[min_role]:
+            min_role = role
+        inputs_analysis.append({
+            "has_utxo": has_utxo,
+            "is_final": is_final,
+            "next": role,
+        })
 
     result: dict[str, Any] = {
         "inputs": inputs_analysis,
-        "next": next_role,
+        "next": min_role,
     }
 
-    # Estimate size if we can
-    if psbt.tx is not None:
-        # Rough vsize estimate
+    if all_have_utxo and psbt.tx is not None:
         base_size = 10 + len(psbt.inputs) * 41 + len(psbt.outputs) * 34
-        witness_size = len(psbt.inputs) * 108  # Approximate P2WPKH witness
+        witness_size = len(psbt.inputs) * 108
         vsize = base_size + (witness_size + 3) // 4
         result["estimated_vsize"] = vsize
-
         fee = psbt._compute_fee()
         if fee is not None and vsize > 0:
             result["estimated_feerate"] = fee / vsize
