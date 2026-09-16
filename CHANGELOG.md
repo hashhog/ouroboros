@@ -12,6 +12,7 @@
 
 Changes since `v1.0.1`:
 
+- fix: do not re-request an in-flight connect-frontier; pop the connected header before yielding so `_prune_validated_headers` cannot drop the queue; IBD-queued / already-connected bodies are not consumed as fork bodies. Control: `pytest tests/test_rerequest_loop.py` (481807→515000 re-request/fork loop).
 - fix: gettxoutsetinfo hash_serialized_3 streams one txid group (was 85.8 GB at 875k)
 - docs: stall-class diagnosis — 70 CRITICALs are at-tip getdata to unservable peers (`docs/STALL-CLASS-70-CRITICALS.md`)
 - feat: getpeerinfo reports per-peer synced_headers/synced_blocks/inflight/presynced_headers from CNodeState-equivalent measurements instead of -1 stubs. Control: `pytest tests/test_per_peer_sync_fields.py`

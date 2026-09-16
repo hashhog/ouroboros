@@ -9,22 +9,24 @@ to 64 s) ``HEAD_TIMEOUT``, so the drain is head-of-line-blocked for minutes
 while ~14 later blocks sit ready.  It is a SCHEDULING problem — budget is ample
 (cap_inflight ~244, in_flight ~12) — not a budget/peer-count one.
 
-Fix (H1 v2, ``_request_next_blocks``): each request cycle, re-issue the
-frontier as a SINGLE getdata to the TOP-scoring ready peer, ROTATING to a
-peer other than its current holder, on a ``FRONTIER_REQUEST_INTERVAL`` cadence
-that is deliberately SHORTER than ``HEAD_TIMEOUT``.  Never a fan-out (the
-reverted FIX-ATTEMPT-1 fanned the frontier to 4 peers with awaited sends and
-caused a ``socket.send()`` flood that stalled the sync loop).
+Fix (H1 v3, ``_request_next_blocks``): first-request the frontier as a SINGLE
+getdata to the TOP-scoring ready peer.  Do NOT re-getdata an in-flight
+frontier whose holder is still connected and servable (the 481807→515000
+single-feeder re-request loop).  Re-issue only when the holder has gone or
+is unservable.  Stalled-holder rotation is ``_handle_timeouts`` /
+HEAD_TIMEOUT.  Never a fan-out (the reverted FIX-ATTEMPT-1 fanned the
+frontier to 4 peers with awaited sends and caused a ``socket.send()`` flood
+that stalled the sync loop).
 
 These tests pin the scheduling invariant:
   1. When the frontier is NOT in the buffer, a request cycle requests it and
      routes it to a ready peer.
   2. Exactly ONE frontier getdata is sent per cycle (no fan-out / duplicate).
-  3. On repeated cycles past the interval, the frontier ROTATES to a peer other
-     than the previous holder.
+  3. When the in-flight holder has disconnected, the next cycle re-issues the
+     frontier to a live peer (still a single send).
   4. The interval throttles re-issue (no re-send before the interval elapses),
      and is strictly shorter than the general HEAD_TIMEOUT.
-  5. A send failure to a marginal peer does NOT drop a validly-tracked
+  5. A send failure to a replacement peer does NOT drop a validly-tracked
      in-flight entry and does NOT block (the anti-flood discipline).
 """
 
@@ -132,35 +134,32 @@ async def test_frontier_requested_and_single_send_when_absent_from_buffer():
 
 @pytest.mark.asyncio
 async def test_frontier_rotates_to_different_peer_on_repeat():
-    """Invariant 3: when the interval has elapsed and the frontier is still
-    unfilled, the next cycle ROTATES it to a peer OTHER than its current holder
-    so one unresponsive peer cannot hold it hostage — still a single send."""
+    """Invariant 3: when the in-flight holder has disconnected, the next
+    cycle re-issues the frontier to a live peer.  A still-connected holder
+    is NOT re-getdata'd (that was the single-feeder re-request loop);
+    stalled-holder rotation is ``_handle_timeouts`` / HEAD_TIMEOUT."""
     tip_hash = _h(0xBEEF)
     bs = _make_block_sync(tip_hash, 900_000)
     frontier = _h(0)
     bs._validated_headers = [(_h(i), MagicMock()) for i in range(0, 40)]
     bs._ibd_block_buffer = {}
 
-    peers = [_make_ready_peer(f"10.0.0.{i}", score=100) for i in range(4)]
-    bs.peer_manager.get_all_ready_peers.return_value = peers
+    dead = _make_ready_peer("10.0.0.0", score=100)
+    dead.is_connected.return_value = False
+    live = [_make_ready_peer(f"10.0.0.{i}", score=100 - i) for i in range(1, 4)]
+    bs.peer_manager.get_all_ready_peers.return_value = live
 
-    # Simulate the frontier already in flight to peers[0], requested longer
-    # ago than the interval (so it is DUE for a rotation this cycle).
     import time as _time
     stale = _time.time() - (FRONTIER_REQUEST_INTERVAL + 1.0)
     bs.requested_blocks[frontier] = stale
-    bs._block_request_peer[frontier] = peers[0]
+    bs._block_request_peer[frontier] = dead
 
     await bs._request_next_blocks()
 
     new_holder = bs._block_request_peer[frontier]
-    assert new_holder is not peers[0], (
-        "H1 regression: frontier was re-requested from its CURRENT holder — "
-        "an unresponsive peer would keep the drain wedged"
-    )
-    assert new_holder in peers
-    # Still exactly one frontier send this cycle (no fan-out on rotation).
-    total = sum(_frontier_sends(p, frontier) for p in peers)
+    assert new_holder is not dead
+    assert new_holder in live
+    total = sum(_frontier_sends(p, frontier) for p in live)
     assert total == 1
 
 
@@ -226,27 +225,25 @@ async def test_frontier_skipped_when_already_in_buffer():
 
 @pytest.mark.asyncio
 async def test_frontier_send_failure_is_nonblocking_and_preserves_inflight():
-    """Invariant 5 (anti-flood): if the rotation send to a marginal peer
-    raises, the cycle does NOT block and does NOT drop the frontier's existing
-    valid in-flight tracking — it will time out / retry normally.  This is the
-    exact discipline that keeps FIX-ATTEMPT-1's socket.send() flood from
-    recurring: one exception-guarded send, no awaited drain on a stuck peer."""
+    """Invariant 5 (anti-flood): if the re-issue send to a replacement peer
+    (previous holder gone) raises, the cycle does NOT block and does NOT drop
+    the frontier's existing in-flight tracking."""
     tip_hash = _h(0x1234)
     bs = _make_block_sync(tip_hash, 900_000)
     frontier = _h(0)
     bs._validated_headers = [(_h(i), MagicMock()) for i in range(0, 40)]
     bs._ibd_block_buffer = {}
 
-    good = _make_ready_peer("10.0.0.0", score=50)   # current holder
-    marginal = _make_ready_peer("10.0.0.1", score=100)  # top score → rotation target
+    good = _make_ready_peer("10.0.0.0", score=50)
+    good.is_connected.return_value = False  # departed holder
+    marginal = _make_ready_peer("10.0.0.1", score=100)
     marginal.send_message = AsyncMock(side_effect=OSError("socket.send() raised"))
-    peers = [marginal, good]  # marginal is top-scoring
-    bs.peer_manager.get_all_ready_peers.return_value = peers
+    bs.peer_manager.get_all_ready_peers.return_value = [marginal]
 
     import time as _time
     stale = _time.time() - (FRONTIER_REQUEST_INTERVAL + 1.0)
     bs.requested_blocks[frontier] = stale
-    bs._block_request_peer[frontier] = good  # currently held by `good`
+    bs._block_request_peer[frontier] = good
 
     # Must not raise.
     await bs._request_next_blocks()
@@ -255,5 +252,4 @@ async def test_frontier_send_failure_is_nonblocking_and_preserves_inflight():
     # failed rotation did not orphan it.
     assert frontier in bs.requested_blocks
     assert bs._block_request_peer[frontier] is good
-    # The marginal peer was penalized, mirroring the normal-path failure path.
     marginal.adjust_score.assert_called_with(-2)

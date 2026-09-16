@@ -468,6 +468,13 @@ class BlockSync:
         # FIXME: race condition if called from multiple threads?
         self.requested_blocks: dict[bytes, float] = {}
 
+        # Hashes the drain is currently deserializing / validating / connecting.
+        # Those are not in requested_blocks (handle_block already popped them)
+        # and not in _ibd_block_buffer (drain removed them), so without this
+        # set H1 treats the frontier as missing and re-getdatas it on every
+        # yield inside the drain — the 481807→515000 re-request loop.
+        self._connecting_hashes: set[bytes] = set()
+
         # Track which peer each block was last requested from (hash -> Peer)
         self._block_request_peer: dict[bytes, Peer] = {}
 
@@ -1052,6 +1059,7 @@ class BlockSync:
         self._h1_last_issue.pop(block_hash, None)
         self._w77_first_request_time.pop(block_hash, None)
         self._block_request_attempts.pop(block_hash, None)
+        self._connecting_hashes.discard(block_hash)
 
     # BIP34 activation height (mainnet).  Below this height the coinbase
     # scriptSig is unconstrained; above it the first push must encode the
@@ -1145,6 +1153,7 @@ class BlockSync:
         self._block_request_peer.clear()
         self._h1_last_issue.clear()
         self._block_source_peer_addr.clear()
+        self._connecting_hashes.clear()
         # _w77_first_request_time is the request→connect latency telemetry
         # dict; it pops only on a successful active-chain connect, so a bulk
         # queue-drop here would otherwise orphan every in-flight entry.
@@ -1774,25 +1783,33 @@ class BlockSync:
             # height the active chain already occupies.  Then re-evaluate whether
             # the bridge is now complete and route it through the submitblock
             # side-branch reorg engine (GAP3 — _complete_fork_bridge).
+            #
+            # IBD wins: a hash that is the connect-frontier, currently being
+            # connected, or already on the active chain is NOT a fork body
+            # even if a locator replay also parked it in ``_fork_headers``.
+            # Taking the fork path first was the "Fork body received" half of
+            # the 481807→515000 loop (H1 kept re-requesting tip+1 because the
+            # body never landed in ``_ibd_block_buffer``).
             if block_hash in self._fork_headers:
-                self._fork_block_bytes[block_hash] = payload
-                logger.info(
-                    f"Fork body {block_hash.hex()[:16]}... received from "
-                    f"{peer.host}:{peer.port} ({len(self._fork_block_bytes)}/"
-                    f"{len(self._fork_headers)} fork bodies present)"
-                )
-                # Continue draining the missing bridging bodies and, once the
-                # bridge to a known active-chain ancestor is complete, attach +
-                # reorg.  Guarded so a malformed bridge cannot wedge the loop.
-                try:
-                    await self._on_fork_body_received(block_hash, peer)
-                except Exception as e:
-                    logger.error(
-                        f"fork-bridge handling for {block_hash.hex()[:16]}... "
-                        f"failed: {e}",
-                        exc_info=True,
+                if not self._is_ibd_wanted(block_hash):
+                    self._fork_block_bytes[block_hash] = payload
+                    logger.info(
+                        f"Fork body {block_hash.hex()[:16]}... received from "
+                        f"{peer.host}:{peer.port} ({len(self._fork_block_bytes)}/"
+                        f"{len(self._fork_headers)} fork bodies present)"
                     )
-                return
+                    # Continue draining the missing bridging bodies and, once the
+                    # bridge to a known active-chain ancestor is complete, attach +
+                    # reorg.  Guarded so a malformed bridge cannot wedge the loop.
+                    try:
+                        await self._on_fork_body_received(block_hash, peer)
+                    except Exception as e:
+                        logger.error(
+                            f"fork-bridge handling for {block_hash.hex()[:16]}... "
+                            f"failed: {e}",
+                            exc_info=True,
+                        )
+                    return
 
             # Already have this block?  Skip duplicate ONLY if we did not
             # request it.  After a chainstate rollback, BLOCKS_CF still
@@ -1991,11 +2008,14 @@ class BlockSync:
                     return
 
             # Try to drain buffered blocks in chain order.
-            connected = await self._drain_block_buffer()
+            await self._drain_block_buffer()
 
-            if connected > 0:
-                # Advance download window after connecting blocks.
-                await self._request_next_blocks()
+            # Advance / refill the download window on every receipt, not only
+            # after a successful connect.  handle_block already popped this
+            # hash from requested_blocks, freeing a slot; fill it now rather
+            # than waiting for the 1s sync_loop tick (and rather than H1
+            # re-requesting the block we just received).
+            await self._request_next_blocks()
 
         except Exception as e:
             self._blk_error += 1
@@ -2143,6 +2163,7 @@ class BlockSync:
             self._h1_last_issue.clear()
             self._block_source_peer_addr.clear()
             self._compact_origin_hashes.clear()
+            self._connecting_hashes.clear()
             # Telemetry-only request→connect latency dict; clear with the
             # sibling maps so a bulk queue-drop doesn't orphan its entries.
             self._w77_first_request_time.clear()
@@ -2152,10 +2173,10 @@ class BlockSync:
             self._header_sync_time = 0.0
             self._w91_last_drain_exit_perf_ns = time.perf_counter_ns()
             return 0
-        header_idx = 0
 
-        while header_idx < len(self._validated_headers):
-            next_hash, _ = self._validated_headers[header_idx]
+        while self._validated_headers:
+            next_hash, _ = self._validated_headers[0]
+            self._connecting_hashes.add(next_hash)
 
             # Is the next block in our buffer?  If not, fall back to bytes
             # already persisted in BLOCKS_CF: a prior run may have STORED the
@@ -2182,11 +2203,12 @@ class BlockSync:
                         logger.info(
                             f"Drain waiting on network for "
                             f"{next_hash.hex()[:16]}... (height "
-                            f"{current_height + 1 + header_idx}; queue="
+                            f"{current_height + 1}; queue="
                             f"{len(self._validated_headers)} buffer="
                             f"{len(self._ibd_block_buffer)} requested="
                             f"{len(self.requested_blocks)}; no disk bytes)"
                         )
+                    self._connecting_hashes.discard(next_hash)
                     break  # genuinely need the network download
                 _now = time.time()
                 if _now - getattr(self, "_last_disk_drain_log", 0.0) > 30.0:
@@ -2195,7 +2217,7 @@ class BlockSync:
                         f"Draining stored-but-unconnected block "
                         f"{next_hash.hex()[:16]}... from BLOCKS_CF "
                         f"(disk fallback; buffer miss at height "
-                        f"{current_height + 1 + header_idx})"
+                        f"{current_height + 1})"
                     )
                 block, raw_payload = None, _disk_bytes
             else:
@@ -2218,6 +2240,7 @@ class BlockSync:
                     # Deserialization failure is unrecoverable for this block —
                     # the bytes are corrupt.  Drop it and let the timeout handler
                     # re-fetch from a different peer.
+                    self._connecting_hashes.discard(next_hash)
                     break
                 deserialize_ns = time.perf_counter_ns() - t0
 
@@ -2241,6 +2264,7 @@ class BlockSync:
             # spinning the drain loop and starving the connect path.
             if self._coinbase_height_mismatch(block, new_height):
                 self._handle_misaligned_block(next_hash, new_height, block)
+                self._connecting_hashes.discard(next_hash)
                 break
 
             t_val = time.perf_counter_ns()
@@ -2552,6 +2576,7 @@ class BlockSync:
                         f"failed validation ({error}); dropping + re-requesting "
                         f"full witness block (not perm-rejecting)"
                     )
+                    self._connecting_hashes.discard(next_hash)
                     break
                 else:
                     self._mark_perm_rejected(next_hash)
@@ -2571,6 +2596,7 @@ class BlockSync:
                                 f"BLOCK_MUTATED/INVALID_HEADER: {error[:80]}"
                             )
                     self._block_source_peer_addr.pop(next_hash, None)
+                self._connecting_hashes.discard(next_hash)
                 break
 
             # Clear peer-address tracking for successfully accepted block
@@ -2592,6 +2618,7 @@ class BlockSync:
                 # DB connect failure is also transient (e.g. chain-tip mismatch
                 # due to a concurrent update).  Put the block back so we retry.
                 self._buffer_put(next_hash, (block, raw_payload))
+                self._connecting_hashes.discard(next_hash)
                 break
             connect_ns = time.perf_counter_ns() - t_con
 
@@ -2611,7 +2638,15 @@ class BlockSync:
 
             connected += 1
             current_height = new_height
-            header_idx += 1
+            # Advance the header queue NOW, before any subsequent await
+            # (block_filter_index / sleep(0) / ...).  Pre-fix the connected
+            # header stayed at slot 0 until a bulk slice at the end of the
+            # drain; every yield between connect and that slice let
+            # _prune_validated_headers see slot0.prev != new tip and drop
+            # the whole queue (630 slot-misaligns on 481807→515000).
+            if self._validated_headers and self._validated_headers[0][0] == next_hash:
+                self._validated_headers = self._validated_headers[1:]
+            self._connecting_hashes.discard(next_hash)
             self._blk_connected += 1
             self._last_tip_advance = time.time()
 
@@ -2734,17 +2769,10 @@ class BlockSync:
             # multi-second RPC latency spikes.
             await asyncio.sleep(0)
 
-        # Prune connected headers to prevent unbounded growth.
-        # `connected` blocks were popped from slot 0 in chain order, so the
-        # first `connected` entries in _validated_headers are the ones we
-        # just stored.  Drop them.  We deliberately do NOT use
-        # has_block_hash to drive pruning: post-rollback BLOCKS_CF still
-        # contains orphaned blocks, and a hash-based prune would silently
-        # drop slots whose blocks are not on the active chain — masking
-        # the slot-misalignment wedge instead of letting the anchor check
-        # at the next drain entry detect and recover.
-        if connected > 0:
-            self._validated_headers = self._validated_headers[connected:]
+        # Connected headers are popped at the connect point above, before
+        # any yield, so the queue stays tip-anchored across awaits.  A
+        # bulk slice here would be too late: the 481807→515000 run dropped
+        # the queue 630 times on that race.
 
         # W91: record drain exit.  No-progress drains (connected==0)
         # are counted separately — they indicate the drain woke up but
@@ -3341,12 +3369,30 @@ class BlockSync:
             )
         return True, "unresolved-fallback", None
 
+    def _is_ibd_wanted(self, block_hash: bytes) -> bool:
+        """True if ``block_hash`` belongs to the active-chain IBD path.
+
+        Used to keep locator-replayed headers/bodies out of the fork store
+        so H1 does not re-request a block the drain already owns.
+        """
+        if block_hash in self._connecting_hashes:
+            return True
+        if any(h == block_hash for h, _ in self._validated_headers):
+            return True
+        return isinstance(self._resolve_active_height(block_hash), int)
+
     def _store_fork_header(self, block_hash: bytes, header, prev_hash: bytes) -> None:
         """Record a competing-fork header (and its prev edge) in the bounded
         fork store.  Does NOT touch ``_validated_headers`` (that queue stays
         linear + tip-anchored).  Idempotent on the hash.
         """
         if block_hash in self._fork_headers:
+            return
+        # A locator replay of an already-connected (or IBD-queued) header is
+        # not a competing fork.  Storing those as forks made handle_block
+        # consume their re-delivered bodies as fork bodies, which is the
+        # other half of the 481807→515000 re-request/fork loop.
+        if self._is_ibd_wanted(block_hash):
             return
         self._fork_headers[block_hash] = header
         self._fork_header_prev[block_hash] = prev_hash
@@ -4227,6 +4273,11 @@ class BlockSync:
             # is wrong, and validating nBits against a fabricated height
             # INVERTS the check.  Drop the stale queue loudly instead.
             if self._validated_headers and not self._queue_anchored_to_tip():
+                if self._drain_lock is not None and self._drain_lock.locked():
+                    # Drain is advancing the queue across an await; do not
+                    # drop it out from under the connect that just landed,
+                    # and do not derive heights from a mid-connect queue.
+                    return
                 logger.error(
                     "[slot-misalign] validated_headers no longer anchors to "
                     "the DB tip at headers-receive time — clearing %d entries "
@@ -5230,10 +5281,16 @@ class BlockSync:
             return
         bridge_hashes, _ancestor_hash, _ancestor_h = chain
 
+        ibd_owned = [h for h in bridge_hashes if self._is_ibd_wanted(h)]
         missing = [
             h for h in bridge_hashes
-            if h not in self._fork_block_bytes and not self._have_fork_body(h)
+            if h not in self._fork_block_bytes
+            and not self._have_fork_body(h)
+            and h not in ibd_owned
         ]
+        if ibd_owned and not missing:
+            # Locator-replayed IBD hashes, not a complete side-branch.
+            return
         if not missing:
             # Every bridging body is in hand — go straight to attach + reorg.
             await self._complete_fork_bridge(fork_tip_hash)
@@ -5746,67 +5803,83 @@ class BlockSync:
         # ------------------------------------------------------------------
         # H1 — CONNECT-FRONTIER PRIORITY (single send, no fan-out).
         #
-        # Re-issue the frontier (tip+1) as ONE getdata to the top-scoring ready
-        # peer, rotating away from its current holder, on the
-        # FRONTIER_REQUEST_INTERVAL cadence.  This bypasses the round-robin that
-        # otherwise pins the frontier to one (possibly unresponsive) peer for a
-        # full size-aware HEAD_TIMEOUT.  The frontier is marked in
-        # requested_blocks here, so the HEAD pass below naturally skips it (no
-        # duplicate send).  Skip when the frontier is already sitting in the IBD
-        # buffer (received, awaiting drain) — re-requesting it would be wasted.
+        # First-request the frontier (tip+1) as ONE getdata to the top-scoring
+        # ready peer.  Do NOT re-getdata an in-flight frontier whose holder is
+        # still connected and servable — that duplicate send to a single
+        # --connect feeder is the 481807→515000 re-request loop.  Rotation of a
+        # stalled download is _handle_timeouts (HEAD_TIMEOUT).  Re-issue only
+        # when the holder is gone or unservable.  Skip when the frontier is in
+        # the IBD buffer or currently being connected by the drain.
         # ------------------------------------------------------------------
         if (
             frontier_hash is not None
             and candidates
             and frontier_hash not in self._ibd_block_buffer
+            and frontier_hash not in self._connecting_hashes
         ):
-            last_h1 = self._h1_last_issue.get(frontier_hash)
-            if last_h1 is None:
-                # First H1 after a normal-path request: honour the in-flight
-                # timestamp so we do not re-issue before the interval.
-                last_h1 = self.requested_blocks.get(frontier_hash)
-            if last_h1 is None or (now - last_h1) >= FRONTIER_REQUEST_INTERVAL:
-                current_peer = self._block_request_peer.get(frontier_hash)
-                # Rotate: first top-scoring peer that is NOT the current holder,
-                # so a single unresponsive peer can't hold the frontier hostage.
-                frontier_peer = next(
-                    (p for p in candidates if p is not current_peer), candidates[0]
-                )
-                try:
-                    getdata = GetDataMessage(
-                        inventory=[(MSG_WITNESS_BLOCK, frontier_hash)]
+            current_peer = self._block_request_peer.get(frontier_hash)
+            holder_live = (
+                current_peer is not None
+                and current_peer in candidates
+                and current_peer.is_connected()
+            )
+            # Don't re-request an in-flight block whose holder can still
+            # serve it.  Rotation of a stalled download is _handle_timeouts
+            # (HEAD_TIMEOUT).  H1 re-getdata to the same --connect feeder
+            # every 5s was the 481807→515000 re-request/fork loop.
+            if frontier_hash in self.requested_blocks and holder_live:
+                pass
+            else:
+                last_h1 = self._h1_last_issue.get(frontier_hash)
+                if last_h1 is None:
+                    # First H1 after a normal-path request: honour the in-flight
+                    # timestamp so we do not re-issue before the interval.
+                    last_h1 = self.requested_blocks.get(frontier_hash)
+                if (
+                    last_h1 is None
+                    or (now - last_h1) >= FRONTIER_REQUEST_INTERVAL
+                    or not holder_live
+                ):
+                    # Rotate: first top-scoring peer that is NOT the current
+                    # holder, so a departed/unservable peer cannot keep the
+                    # frontier.  A still-connected holder never reaches here.
+                    frontier_peer = next(
+                        (p for p in candidates if p is not current_peer),
+                        candidates[0],
                     )
-                    await frontier_peer.send_message(
-                        getdata.to_network_message(network)
-                    )
-                    # Do NOT reset requested_blocks[frontier] on re-issue —
-                    # that timestamp is the in-flight clock HEAD_TIMEOUT
-                    # reads.  H1 cadence lives in _h1_last_issue.
-                    if frontier_hash not in self.requested_blocks:
-                        self.requested_blocks[frontier_hash] = now
-                        self._record_first_request_time(frontier_hash, now)
-                    self._h1_last_issue[frontier_hash] = now
-                    self._block_request_peer[frontier_hash] = frontier_peer
-                    logger.info(
-                        "H1 frontier priority: re-requested tip+1 %s "
-                        "from %s:%s (score=%s)",
-                        frontier_hash.hex()[:12],
-                        frontier_peer.host, frontier_peer.port,
-                        getattr(frontier_peer, 'score', '?'),
-                    )
-                except Exception as e:
-                    # Exactly the existing normal-path failure discipline: log,
-                    # penalize, and DO NOT block or drop a validly-tracked
-                    # in-flight entry.  If the frontier was already in flight to
-                    # its old holder, that tracking is left intact (it will time
-                    # out normally); if it was fresh, we simply didn't add it and
-                    # the next cycle retries.  Never awaits a drain on a stuck
-                    # transport — this is why FIX-ATTEMPT-1's flood cannot recur.
-                    logger.error(
-                        "H1 frontier priority send to %s:%s failed: %s",
-                        frontier_peer.host, frontier_peer.port, e,
-                    )
-                    frontier_peer.adjust_score(-2)
+                    try:
+                        getdata = GetDataMessage(
+                            inventory=[(MSG_WITNESS_BLOCK, frontier_hash)]
+                        )
+                        await frontier_peer.send_message(
+                            getdata.to_network_message(network)
+                        )
+                        # Do NOT reset requested_blocks[frontier] on re-issue —
+                        # that timestamp is the in-flight clock HEAD_TIMEOUT
+                        # reads.  H1 cadence lives in _h1_last_issue.
+                        if frontier_hash not in self.requested_blocks:
+                            self.requested_blocks[frontier_hash] = now
+                            self._record_first_request_time(frontier_hash, now)
+                        self._h1_last_issue[frontier_hash] = now
+                        self._block_request_peer[frontier_hash] = frontier_peer
+                        logger.info(
+                            "H1 frontier priority: re-requested tip+1 %s "
+                            "from %s:%s (score=%s)",
+                            frontier_hash.hex()[:12],
+                            frontier_peer.host, frontier_peer.port,
+                            getattr(frontier_peer, 'score', '?'),
+                        )
+                    except Exception as e:
+                        # Exactly the existing normal-path failure discipline:
+                        # log, penalize, and DO NOT drop a validly-tracked
+                        # in-flight entry.  Never awaits a drain on a stuck
+                        # transport — this is why FIX-ATTEMPT-1's flood cannot
+                        # recur.
+                        logger.error(
+                            "H1 frontier priority send to %s:%s failed: %s",
+                            frontier_peer.host, frontier_peer.port, e,
+                        )
+                        frontier_peer.adjust_score(-2)
 
         to_request: list[tuple[int, bytes]] = []
         seen: set[bytes] = set()
@@ -5826,7 +5899,8 @@ class BlockSync:
                 continue
             if (block_hash in self.requested_blocks
                     or block_hash in seen
-                    or block_hash in self._ibd_block_buffer):
+                    or block_hash in self._ibd_block_buffer
+                    or block_hash in self._connecting_hashes):
                 continue
             to_request.append((MSG_WITNESS_BLOCK, block_hash))
             seen.add(block_hash)
@@ -5842,7 +5916,9 @@ class BlockSync:
                 if tail_budget <= 0:
                     break
                 block_hash, _ = self._validated_headers[i]
-                if block_hash in self.requested_blocks or block_hash in seen:
+                if (block_hash in self.requested_blocks
+                        or block_hash in seen
+                        or block_hash in self._connecting_hashes):
                     continue
                 to_request.append((MSG_WITNESS_BLOCK, block_hash))
                 seen.add(block_hash)
@@ -5942,6 +6018,10 @@ class BlockSync:
         misalignment under `has_block_hash` returning True for orphaned
         blocks.
         """
+        if self._drain_lock is not None and self._drain_lock.locked():
+            # Drain is mid-connect; slot 0 may still be the block that just
+            # became the tip until the drain pops it.  Do not drop the queue.
+            return
         if not self._validated_headers:
             return
         if not self._queue_anchored_to_tip():
@@ -6041,6 +6121,7 @@ class BlockSync:
         self._block_request_peer.clear()
         getattr(self, "_h1_last_issue", {}).clear()
         self._block_source_peer_addr.clear()
+        getattr(self, "_connecting_hashes", set()).clear()
         self._w77_first_request_time.clear()
 
         self._last_wedge_recover = now

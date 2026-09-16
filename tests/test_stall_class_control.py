@@ -362,8 +362,9 @@ async def test_h1_reissue_does_not_reset_inflight_timestamp():
     bs._ibd_block_buffer = {}
 
     holder = _make_ready_peer("10.0.0.1", score=50, start_height=900_010)
+    holder.is_connected.return_value = False  # gone — the only H1 re-issue case
     other = _make_ready_peer("10.0.0.2", score=40, start_height=900_010)
-    bs.peer_manager.get_all_ready_peers.return_value = [holder, other]
+    bs.peer_manager.get_all_ready_peers.return_value = [other]
 
     original = time.time() - (FRONTIER_REQUEST_INTERVAL + 1.0)
     bs.requested_blocks[frontier] = original
