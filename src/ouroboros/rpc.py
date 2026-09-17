@@ -11935,6 +11935,41 @@ class RPCServer:
 
         best_hash_internal, best_height = self.node.db.get_best_block()
 
+        # Snapshot-base cache: loadtxoutset / import-utxo already folded
+        # HASH_SERIALIZED + totals. Serving that here means the campaign
+        # base control does not have to walk ~166M coins (852000/875000:
+        # NO-ORACLE-SURFACE, utxo_hash="-1", curl's 900s scan deadline).
+        # Dropped automatically when the tip hash/height no longer match.
+        sm = getattr(self.node, "snapshot_manager", None)
+        cached = (
+            sm.cached_txoutset_for_tip(best_hash_internal, best_height)
+            if sm is not None and hasattr(sm, "cached_txoutset_for_tip")
+            else None
+        )
+        if cached is not None and hash_type_norm in (
+            "hash_serialized_3", "hash_serialized_2", "none",
+        ):
+            from ouroboros.psbt import BTCAmount
+
+            result: dict[str, Any] = {
+                "height": int(cached.height),
+                "bestblock": (
+                    cached.best_block[::-1].hex()
+                    if isinstance(cached.best_block, (bytes, bytearray))
+                    else ""
+                ),
+                "txouts": int(cached.txouts),
+                "bogosize": int(cached.bogosize),
+            }
+            if hash_type_norm in ("hash_serialized_3", "hash_serialized_2"):
+                digest_hex = cached.hash_serialized[::-1].hex()
+                result["hash_serialized_3"] = digest_hex
+                result["hash_serialized_2"] = digest_hex
+            result["total_amount"] = BTCAmount(int(cached.total_amount))
+            result["transactions"] = int(cached.transactions)
+            result["disk_size"] = 0
+            return result
+
         def _walk_utxos() -> dict[str, Any]:
             """Single-pass UTXO walk; runs on a worker thread to avoid
             stalling the asyncio event loop on large chainstates.

@@ -178,6 +178,24 @@ class AssumeutxoData:
         return self.hash_serialized[::-1].hex()
 
 
+@dataclass(frozen=True)
+class CachedTxOutSet:
+    """Snapshot-base ``gettxoutsetinfo`` surface (HASH_SERIALIZED is internal-order).
+
+    Seeded by ``load_snapshot`` / ``import-utxo`` from the load-time fold.
+    Valid only while the tip is still the snapshot base; dropped on the
+    first height/hash change so a later walk cannot report a stale hash.
+    """
+
+    height: int
+    best_block: bytes
+    hash_serialized: bytes
+    txouts: int
+    transactions: int
+    bogosize: int
+    total_amount: int
+
+
 @dataclass
 class SnapshotMetadata:
     """Metadata from a UTXO snapshot file."""
@@ -1223,6 +1241,9 @@ class SnapshotManager:
         self.snapshot_loaded = False
         self.snapshot_height: int | None = None
         self.snapshot_hash: bytes | None = None
+        # Snapshot-base gettxoutsetinfo cache. Restored from the sibling
+        # file if a previous import-utxo / loadtxoutset left one.
+        self._txoutset_cache: CachedTxOutSet | None = self._read_txoutset_cache_file()
 
         # Background validation state
         self.background_validating = False
@@ -1294,6 +1315,76 @@ class SnapshotManager:
                 f"ignoring (expected 80 bytes)"
             )
         return None
+
+    def _txoutset_cache_path(self) -> Path:
+        return self.get_snapshot_chainstate_dir() / "txoutset_cache.json"
+
+    def get_cached_txoutset(self) -> CachedTxOutSet | None:
+        return self._txoutset_cache
+
+    def cached_txoutset_for_tip(
+        self, tip_hash: bytes, tip_height: int
+    ) -> CachedTxOutSet | None:
+        cached = self._txoutset_cache
+        if cached is None:
+            return None
+        if int(cached.height) != int(tip_height):
+            return None
+        if bytes(cached.best_block) != bytes(tip_hash):
+            return None
+        return cached
+
+    def set_cached_txoutset(self, stats: CachedTxOutSet) -> None:
+        self._txoutset_cache = stats
+        self._write_txoutset_cache_file(stats)
+
+    def clear_cached_txoutset(self) -> None:
+        self._txoutset_cache = None
+        path = self._txoutset_cache_path()
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _read_txoutset_cache_file(self) -> CachedTxOutSet | None:
+        path = self._txoutset_cache_path()
+        if not path.is_file():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            best = bytes.fromhex(str(raw["best_block"]))
+            digest = bytes.fromhex(str(raw["hash_serialized"]))
+            if len(best) != 32 or len(digest) != 32:
+                return None
+            return CachedTxOutSet(
+                height=int(raw["height"]),
+                best_block=best,
+                hash_serialized=digest,
+                txouts=int(raw["txouts"]),
+                transactions=int(raw["transactions"]),
+                bogosize=int(raw["bogosize"]),
+                total_amount=int(raw["total_amount"]),
+            )
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("[snapshot] ignoring unreadable txoutset_cache.json")
+            return None
+
+    def _write_txoutset_cache_file(self, stats: CachedTxOutSet) -> None:
+        snapshot_dir = self.get_snapshot_chainstate_dir()
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        path = self._txoutset_cache_path()
+        tmp = path.with_suffix(".json.tmp")
+        payload = {
+            "height": int(stats.height),
+            "best_block": bytes(stats.best_block).hex(),
+            "hash_serialized": bytes(stats.hash_serialized).hex(),
+            "txouts": int(stats.txouts),
+            "transactions": int(stats.transactions),
+            "bogosize": int(stats.bogosize),
+            "total_amount": int(stats.total_amount),
+        }
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, path)
 
     def write_snapshot_base_blockheader(self, header: bytes) -> None:
         """Write the 80-byte snapshot base header to the snapshot chainstate dir.
@@ -1549,6 +1640,9 @@ class SnapshotManager:
 
             coins_left = metadata.coins_count
             coins_loaded = 0
+            transactions = 0
+            total_amount = 0
+            bogosize = 0
             try:
                 while coins_left > 0:
                     txid = f.read(32)
@@ -1560,6 +1654,7 @@ class SnapshotManager:
                         raise ValueError(
                             f"Invalid coins_per_txid={coins_per_txid} (coins_left={coins_left})"
                         )
+                    transactions += 1
 
                     for _ in range(coins_per_txid):
                         vout = _read_compact_size(f)
@@ -1604,6 +1699,8 @@ class SnapshotManager:
                                 script_pubkey=script,
                             )
                         )
+                        total_amount += amount
+                        bogosize += 32 + 4 + 4 + 8 + 2 + len(script)
 
                         coins_left -= 1
                         coins_loaded += 1
@@ -1761,6 +1858,17 @@ class SnapshotManager:
         self.snapshot_loaded = True
         self.snapshot_height = height
         self.snapshot_hash = metadata.base_blockhash
+        self.set_cached_txoutset(
+            CachedTxOutSet(
+                height=int(height),
+                best_block=bytes(metadata.base_blockhash),
+                hash_serialized=bytes(computed),
+                txouts=int(coins_loaded),
+                transactions=int(transactions),
+                bogosize=int(bogosize),
+                total_amount=int(total_amount),
+            )
+        )
         logger.info(f"[snapshot] Loaded {coins_loaded:,} coins from snapshot")
         return metadata
 

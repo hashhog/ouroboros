@@ -940,6 +940,23 @@ def import_utxo(ctx, snapshot_path, batch_size):
     try:
         sm = SnapshotManager(db, network, data_dir)
         persisted = sm.persist_snapshot_base_index(metadata.base_blockhash)
+        if au_data is not None:
+            from ouroboros.snapshot import CachedTxOutSet
+
+            # Persist the load-time surface so a subsequent `start` on this
+            # datadir can answer gettxoutsetinfo at the snapshot base without
+            # walking the coins DB (campaign 852000/875000 NO-ORACLE-SURFACE).
+            sm.set_cached_txoutset(
+                CachedTxOutSet(
+                    height=int(height),
+                    best_block=bytes(metadata.base_blockhash),
+                    hash_serialized=bytes(au_data.hash_serialized),
+                    txouts=int(loaded),
+                    transactions=0,
+                    bogosize=0,
+                    total_amount=0,
+                )
+            )
         if persisted:
             console.print(
                 "  [dim]Snapshot base index persisted "
