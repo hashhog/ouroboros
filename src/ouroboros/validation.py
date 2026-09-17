@@ -1,6 +1,7 @@
 """Block and transaction validation logic."""
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import struct
@@ -8,6 +9,8 @@ import time as _time
 
 from ouroboros.database import Block, BlockchainDatabase, Transaction, TxIn, TxOut
 from ouroboros.script import (
+    NATIVE_SCRIPT_ENABLED,
+    native_script_context,
     SCRIPT_VERIFY_DERSIG,
     SCRIPT_VERIFY_NONE,
     SCRIPT_VERIFY_NULLDUMMY,
@@ -25,6 +28,24 @@ from ouroboros.consensus import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Thread count for the deferred script-check queue (native interpreter only).
+# OUROBOROS_SCRIPT_THREADS=N; N<=1 keeps the inline serial path. Default 8,
+# capped at the machine's CPU count.
+_SCRIPT_THREADS_ENV = "OUROBOROS_SCRIPT_THREADS"
+
+
+def script_check_threads() -> int:
+    raw = os.environ.get(_SCRIPT_THREADS_ENV, "").strip()
+    if raw:
+        try:
+            n = int(raw)
+        except ValueError:
+            n = 1
+    else:
+        n = 8
+    return max(1, min(n, os.cpu_count() or 1))
 
 # Try to import the Rust sync module for assume-valid / checkpoint skipping
 try:
@@ -1263,6 +1284,13 @@ class BlockValidator:
         #            bitcoin-core/src/validation.cpp:2535.
         spent_in_block: set[tuple[bytes, int]] = set()
         total_fees = 0
+        # Deferred script checks (Core CCheckQueue shape): with the native
+        # interpreter every input's script check is queued during the walk
+        # and joined after the block-level checks, on a thread pool. The
+        # Python interpreter holds the GIL for the whole check, so it gains
+        # nothing from the pool and keeps verifying inline.
+        script_threads = script_check_threads() if (NATIVE_SCRIPT_ENABLED and not skip_scripts) else 1
+        script_check_queue: list | None = [] if script_threads > 1 else None
         for i, tx in enumerate(block.transactions):
             # IsFinalTx check applies to ALL transactions including coinbase.
             # Ref: Bitcoin Core validation.cpp:4144-4148 — iterates block.vtx
@@ -1293,6 +1321,8 @@ class BlockValidator:
                     intra_block_utxos=intra_block_utxos,
                     skip_scripts=skip_scripts,
                     fees_out=tx_fees,
+                    script_check_queue=script_check_queue,
+                    block_tx_index=i,
                 )
                 if not valid:
                     return False, f"Transaction {i} invalid: {error}"
@@ -1330,6 +1360,13 @@ class BlockValidator:
             total_fees
         ):
             return False, "Coinbase amount invalid"
+
+        # Join the deferred script checks last, as Core does (ConnectBlock:
+        # bad-cb-amount is checked before control.Wait()).
+        if script_check_queue:
+            error = self.tx_validator.run_script_check_queue(script_check_queue, script_threads)
+            if error is not None:
+                return False, error
 
         return True, ""
 
@@ -2430,6 +2467,11 @@ class TransactionValidator:
         self.db = db
         self.network = network
         self.script_interpreter = ScriptInterpreter()
+        logger.info(
+            "script interpreter: %s",
+            f"native (Rust), {script_check_threads()} check thread(s)"
+            if NATIVE_SCRIPT_ENABLED else "python (serial)",
+        )
         # Snapshot manager is consulted by the BIP-68 stopgap path
         # (check_sequence_locks) to detect inputs whose prev block is
         # below the snapshot height -- those prev blocks have no header
@@ -2457,8 +2499,19 @@ class TransactionValidator:
         skip_scripts: bool = False,
         fees_out: list | None = None,
         extra_script_flags: int = 0,
+        script_check_queue: list | None = None,
+        block_tx_index: int = 0,
     ) -> tuple[bool, str]:
         """Validate *tx* at *height* (structure, inputs, locktime, scripts); returns ``(ok, error_message)``.
+
+        *script_check_queue*, when given, DEFERS every script check: instead
+        of verifying input *i* inline, ``(block_tx_index, tx, tx_in, utxo, i,
+        flags, input_amounts, input_script_pubkeys)`` is appended and the
+        caller runs the queue with ``run_script_check_queue`` once the whole
+        block has been walked — Core's CCheckQueue shape (ConnectBlock queues
+        CScriptCheck per input and joins at the end). Only ``validate_block``
+        uses it, and only with the native interpreter, whose verification
+        releases the GIL so the checks overlap on a thread pool.
 
         When *skip_scripts* is True (assume-valid during IBD), signature and
         script verification is skipped.  UTXO existence, amounts, coinbase
@@ -2581,7 +2634,12 @@ class TransactionValidator:
 
             # Verify signatures with proper flags (skip during assume-valid IBD)
             if not skip_scripts:
-                if not self._verify_input_signature(
+                if script_check_queue is not None:
+                    script_check_queue.append((
+                        block_tx_index, tx, tx_in, utxo, i, flags,
+                        input_amounts, input_script_pubkeys,
+                    ))
+                elif not self._verify_input_signature(
                     tx, tx_in, utxo, i, flags, input_amounts, input_script_pubkeys
                 ):
                     return False, f"Invalid signature for input {i}"
@@ -2742,6 +2800,48 @@ class TransactionValidator:
                     return "bad-txns-prevout-null"
 
         return None
+
+    def run_script_check_queue(self, queue: list, threads: int) -> str | None:
+        """Run deferred script checks; ``None`` if all pass, else the error
+        string the inline path would have produced for the FIRST failing
+        input in block order (so the reject reason is identical).
+
+        Each worker runs the same ``_verify_input_signature`` (sig cache
+        included; the cache is lock-protected) — nothing is re-implemented
+        here. The native per-transaction contexts are built up front on the
+        calling thread so workers never race to build one.
+        """
+        if not queue:
+            return None
+        for _pos, tx, _tx_in, _utxo, _i, _flags, amts, spks in queue:
+            native_script_context(tx, amts, spks)
+
+        def run_slice(items):
+            fails = []
+            for pos, tx, tx_in, utxo, i, flags, amts, spks in items:
+                try:
+                    ok = self._verify_input_signature(tx, tx_in, utxo, i, flags, amts, spks)
+                except Exception:  # noqa: BLE001 - a crash is a reject, never a pass
+                    logger.exception("script check queue: worker raised")
+                    ok = False
+                if not ok:
+                    fails.append((pos, i))
+            return fails
+
+        threads = max(1, min(int(threads), len(queue)))
+        if threads == 1:
+            fails = run_slice(queue)
+        else:
+            step = -(-len(queue) // threads)
+            slices = [queue[k:k + step] for k in range(0, len(queue), step)]
+            fails = []
+            with ThreadPoolExecutor(max_workers=len(slices)) as ex:
+                for part in ex.map(run_slice, slices):
+                    fails.extend(part)
+        if not fails:
+            return None
+        pos, i = min(fails)
+        return f"Transaction {pos} invalid: Invalid signature for input {i}"
 
     def _verify_input_signature(
         self,

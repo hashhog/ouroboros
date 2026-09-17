@@ -194,6 +194,13 @@ Global options (before command):
 | `--reset` | off | Clear chainstate before syncing |
 | `--limit N` | none | Sync only the first N blocks |
 
+Script verification environment switches:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OUROBOROS_NATIVE_SCRIPT` | unset (Python) | `1` routes `ScriptInterpreter.verify` and the legacy sighash through the Rust port of Bitcoin Core's interpreter in `ferrous-utils/sync/src/validate/interpreter.rs` (`sync.ScriptTx` / `sync.script_verify`). Fail-closed: if the installed `sync` extension has no native interpreter the node refuses to start instead of silently running Python. The pure-Python interpreter stays the default and the oracle (`tests/native_script_differential.py`). |
+| `OUROBOROS_SCRIPT_THREADS` | `8` (capped at CPU count) | With the native interpreter, block validation queues every input's script check and joins them on a thread pool after the block-level checks (Core's CCheckQueue shape; the Rust call releases the GIL). `1` keeps the inline serial path. Ignored by the Python interpreter. |
+
 ### Commands
 
 | Command | Description |

@@ -359,6 +359,70 @@ def run_checkblock(f: Findings, limit, timing):
                                native_err=interp.last_error)
 
 
+PACK_CACHE = Path(os.environ.get("HASHHOG_PACK_CACHE",
+                                 ROOT / "tools" / "diff-test-artifacts" / "stateless-replay-cache"))
+
+
+def run_packs(f: Findings, heights: list[int], timing, tx_limit: int = 0):
+    """Real mainnet blocks from the stateless-replay pack cache (raw block +
+    every spent prevout), verified input by input on both interpreters at
+    that height's block-connect flags."""
+    interp = ScriptInterpreter()
+    for h in heights:
+        path = PACK_CACHE / f"{h:07d}.json"
+        if not path.exists():
+            f.bump(f"pack-{h}", "skipped")
+            continue
+        pack = json.load(open(path))
+        src = f"pack-{h}"
+        block = Block.deserialize(bytes.fromhex(pack["raw_hex"]))
+        flags = _block_flags(int(pack["height"]), pack["hash"])
+        spk_map, amt_map = {}, {}
+        for key, v in pack["prevouts"].items():
+            txid_disp, vout = key.split(":")
+            k = (bytes.fromhex(txid_disp)[::-1], int(vout))
+            spk_map[k] = bytes.fromhex(v["script_hex"])
+            amt_map[k] = int(v["value_sats"])
+        n = 0
+        for tx in block.transactions:
+            if tx.is_coinbase:
+                continue
+            if tx_limit and n >= tx_limit:
+                break
+            spks, amts, ok = [], [], True
+            for tx_in in tx.inputs:
+                k = (bytes(tx_in.prev_txid), tx_in.prev_vout)
+                if k not in spk_map:
+                    ok = False
+                    break
+                spks.append(spk_map[k])
+                amts.append(amt_map[k])
+            for vout, out in enumerate(tx.outputs):
+                spk_map[(bytes(tx.txid), vout)] = bytes(out.script_pubkey)
+                amt_map[(bytes(tx.txid), vout)] = int(out.value)
+            if not ok:
+                f.bump(src, "skipped")
+                continue
+            n += 1
+            f.bump(src, "cases")
+            for i, tx_in in enumerate(tx.inputs):
+                f.bump(src, "inputs")
+                t0 = time.perf_counter()
+                py = interp.verify_python(tx_in.script_sig, spks[i], tx, i, flags=flags, amount=amts[i],
+                                          input_amounts=amts, input_script_pubkeys=spks)
+                t1 = time.perf_counter()
+                nat = interp.verify_native(tx_in.script_sig, spks[i], tx, i, flags=flags, amount=amts[i],
+                                           input_amounts=amts, input_script_pubkeys=spks)
+                t2 = time.perf_counter()
+                timing["py"] += t1 - t0
+                timing["nat"] += t2 - t1
+                f.bump(src, "py_accept", int(py))
+                f.bump(src, "nat_accept", int(nat))
+                if py != nat:
+                    f.mismatch(src, txid=tx.txid[::-1].hex(), input=i, flags=flags, py=py, native=nat,
+                               native_err=interp.last_error)
+
+
 def run_corpus(f: Findings, path: Path, limit, timing):
     d = json.load(open(path))
     cases = d["cases"] if isinstance(d, dict) else d
@@ -381,6 +445,10 @@ def main() -> int:
     ap.add_argument("--bench-repeat", type=int, default=1,
                     help="repeat the real-transaction sources N times for timing")
     ap.add_argument("--show", type=int, default=50, help="findings to print")
+    ap.add_argument("--packs", default="",
+                    help="comma list of mainnet heights from the stateless-replay pack cache "
+                         "(real blocks + prevouts); verified input by input on both sides")
+    ap.add_argument("--pack-tx-limit", type=int, default=0, help="max txs per pack (0 = all)")
     ap.add_argument("--negative-control", action="store_true",
                     help="invert every native decision and require the harness to notice")
     args = ap.parse_args()
@@ -417,6 +485,8 @@ def main() -> int:
         if want("corpus"):
             for c in args.corpus:
                 run_corpus(f, Path(c), args.limit, timing_real)
+        if args.packs and want("packs"):
+            run_packs(f, [int(h) for h in args.packs.split(",") if h], timing_real, args.pack_tx_limit)
         if rep == 0 and args.bench_repeat > 1:
             # keep the per-source counts honest: they count one pass only
             snapshot = {k: dict(v) for k, v in f.per_source.items()}
@@ -428,7 +498,7 @@ def main() -> int:
 
     rc = f.report()
     real_inputs = sum(v["inputs"] for k, v in f.per_source.items()
-                      if k.startswith(("block-", "connecttx", "corpus:")))
+                      if k.startswith(("block-", "connecttx", "corpus:", "pack-")))
     print(f"\nwall: {time.time() - t_start:.1f}s")
     if timing_vec["py"]:
         print(f"vectors  : python {timing_vec['py']:.2f}s  native {timing_vec['nat']:.2f}s  "
