@@ -1,0 +1,71 @@
+# Direct read of the 23 FAIL entries. None is accept-vs-reject.
+# Logs under tools/diff-test-artifacts/corpus-sweep/logs/*ouroboros.log
+# plus 20260917T061508Z-regression-summary.md.
+
+regression / block-weight-too-large:
+  bitcoin-core: reject:bad-blk-length
+  ouroboros:    reject:bad-txns-oversize
+  same_accept_reject: true
+
+regression / cluster-* (9 entries: cluster-fan-26, cluster-linear-26,
+cluster-linear-64, cluster-linear-65, cluster-rbf-frees-room,
+cluster-sibling-72, cluster-sibling-size, cluster-sigop-bound,
+cluster-units-weight-exact):
+  bitcoin-core: accept
+  ouroboros:    accept
+  same_accept_reject: true
+  (FAIL is mempool/cluster shape, not the block decision)
+
+regression / mempool-refill-on-reorg:
+  bitcoin-core: accept
+  ouroboros:    accept
+  same_accept_reject: true
+  (FAIL is mempool contents after reorg)
+
+regression / script-size-too-large:
+  bitcoin-core: reject:bad-txns-inputs-missingorspent
+  ouroboros:    reject:block-script-verify-flag-failed
+  same_accept_reject: true
+
+regression / timestamp-too-old:
+  bitcoin-core: reject:time-too-old
+  ouroboros:    reject:rejected
+  same_accept_reject: true
+
+regression / txindex-revert-on-reorg:
+  bitcoin-core: accept
+  ouroboros:    accept
+  same_accept_reject: true
+  (FAIL is txindex shape after reorg)
+
+ts-mtp / epoch1, far-old, mtp-eq, mtp-minus1 (4):
+  bitcoin-core: reject:time-too-old
+  ouroboros:    reject:rejected
+  same_accept_reject: true
+
+mtp-nonmonotonic-parent / at-mtp-below-parent-reject:
+  bitcoin-core: reject:time-too-old
+  ouroboros:    reject:rejected
+  same_accept_reject: true
+
+B1-scripttests / opreturn-reject:
+  bitcoin-core: reject:bad-txns-inputs-missingorspent
+  ouroboros:    reject:block-script-verify-flag-failed
+  same_accept_reject: true
+
+B2-bad-diffbits / bad-diffbits-direct:
+  bitcoin-core: reject:bad-diffbits
+  ouroboros:    reject:high-hash
+  same_accept_reject: true
+
+tws / weight-one-over-limit:
+  bitcoin-core: reject:bad-blk-weight
+  ouroboros:    reject:bad-blk-length
+  same_accept_reject: true
+
+tws-tail / weight-one-over-limit:
+  bitcoin-core: reject:bad-blk-weight
+  ouroboros:    reject:bad-blk-length
+  same_accept_reject: true
+
+CONSENSUS SPLITS (accept vs reject): 0

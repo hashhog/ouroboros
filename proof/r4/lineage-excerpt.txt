@@ -1,0 +1,31 @@
+# Load-bearing lines from the genesis-IBD log. The full current log is
+# /home/work/genesis-ibd/logs/ouroboros.log (284 MiB,
+# sha256 569bcc7cc3e6c593af851c4d58d2e41d48cfb60950150076a191b1ecfaa5232e)
+# plus the rotated /home/work/genesis-ibd/logs/ouroboros.log-20260722 (1.1 GiB).
+# Not copied into this bundle. grep -ciE 'loadtxoutset|assumeutxo|loading snapshot'
+# on the current log is 0.
+
+# First start (archived log, 2026-07-12):
+2026-07-12 13:09:02,901 [INFO] ouroboros.node: Starting Bitcoin Hybrid Node (mainnet)
+2026-07-12 13:09:02,921 [INFO] ouroboros.node: Genesis block stored (full connect)
+2026-07-12 13:09:04,973 [INFO] ouroboros.node: Initializing peer manager (current height: 0)...
+2026-07-12 13:09:05,043 [INFO] ouroboros.node: -assumevalid=0: full script verification forced on the sync/drain path (assume-valid script-skip DISABLED)
+2026-07-12 13:09:05,154 [INFO] ouroboros.block_sync: [snapshot] Seeded presync prev_bits from tip block header: height=0 bits=0x1d00ffff (no nBits in base-index metadata)
+
+# The "[snapshot] Seeded presync prev_bits" line is an nBits seed at height 0,
+# NOT a UTXO snapshot boot. loadtxoutset matches=0. assumeutxo matches=0.
+# loading snapshot matches=0.
+
+# Last start of the current log (2026-07-30), still the same datadir:
+2026-07-30 15:59:48,906 [INFO] ouroboros.node: Starting Bitcoin Hybrid Node (mainnet)
+2026-07-30 15:59:49,040 [INFO] ouroboros.node: Initializing peer manager (current height: 580755)...
+2026-07-30 15:59:49,085 [INFO] ouroboros.node: -assumevalid=0: full script verification forced on the sync/drain path (assume-valid script-skip DISABLED)
+
+# Stop:
+2026-07-30 22:20:00,316 [INFO] ouroboros.node: Bitcoin node stopped
+
+# Bitcoin genesis hash (not printed by this log; required of any from-genesis
+# lineage and recorded here so verify.sh can require it):
+# 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
+#
+# This run did not reach height 958794 and produced no hash_serialized_3.

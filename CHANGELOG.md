@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- docs: CHARTER proof bundle (`proof/`; `bash proof/verify.sh`)
+
 ## v1.0.2 — 2026-09-11
 
 - 74403c5 docs: split the changelog — v1.0.1 shipped 2026-09-07, v1.0.2 is what is new since

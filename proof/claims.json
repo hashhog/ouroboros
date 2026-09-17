@@ -1,0 +1,90 @@
+{
+  "r4": {
+    "files": [
+      "r4/status.json",
+      "r4/command.txt",
+      "r4/genesis-unit.service",
+      "r4/lineage-excerpt.txt",
+      "r4/no-c958794.txt",
+      "r4/range-coverage.txt",
+      "r4/range-rows.json"
+    ],
+    "status": "UNPROVEN",
+    "snapshot_booted_does_not_count": true,
+    "range_counts_as_r4": false,
+    "range_closed": 25,
+    "range_closed_blocks": 512594,
+    "genesis_ibd_exists": true,
+    "genesis_ibd_reached_c958794": false,
+    "genesis_ibd_last_height": 580755,
+    "lineage_log_sha256": "569bcc7cc3e6c593af851c4d58d2e41d48cfb60950150076a191b1ecfaa5232e",
+    "lineage_log_in_bundle": false,
+    "genesis_block_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+    "assumevalid_required_for_r4": "0"
+  },
+  "r1": {
+    "files": [
+      "r1/results.json",
+      "r1/script.txt",
+      "r1/tx.txt",
+      "r1/sighash.txt",
+      "r1/command.txt"
+    ],
+    "script_pass": 1222,
+    "script_fail": 0,
+    "tx_valid_pass": 121,
+    "tx_invalid_pass": 93,
+    "sighash_pass": 500,
+    "divergences": 0,
+    "decided": 1936,
+    "charter_vector_count": 1936
+  },
+  "r2": {
+    "files": [
+      "r2/results.json",
+      "r2/nightly-report-excerpt.txt",
+      "r2/fail-excerpt.txt",
+      "r2/command.txt"
+    ],
+    "pass": 347,
+    "fail": 23,
+    "err": 0,
+    "consensus_splits_accept_vs_reject": 0
+  },
+  "r5": {
+    "files": [
+      "r5/scorecard.json",
+      "r5/live-20260901T182642Z.json",
+      "r5/t2-after.txt",
+      "r5/command.txt"
+    ],
+    "live_t1_pass": 38,
+    "live_t1_total": 46,
+    "live_t2_pass": 14,
+    "live_t2_total": 41,
+    "live_t1_fail_methods": [
+      "addnode",
+      "disconnectnode",
+      "getblocktemplate",
+      "getnettotals",
+      "getrpcinfo",
+      "sendrawtransaction",
+      "testmempoolaccept"
+    ],
+    "regtest_t3_status": "UNPROVEN"
+  },
+  "provenance": {
+    "files": [
+      "provenance.txt",
+      "runnable-tree.sha256"
+    ],
+    "runtime": "python 3.13.5",
+    "parent_commit": "0c1408500e1053937f12c557cba2240cab8c2699",
+    "interpreted": true,
+    "promote_does_not_apply": true,
+    "launch": "python3 -m ouroboros.cli",
+    "deploy_pin_stale": true,
+    "deploy_wheel_sha256": "52039f392abc8a1555d52c94041aef71c9233e276d47152e56980df2b73c302c",
+    "installed_sync_so_sha256": "807392fb811f0c46d61cd05a2f0760519afc6c78be9faab06a49fe7dc66a6b66"
+  }
+}

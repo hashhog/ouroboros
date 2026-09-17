@@ -1,0 +1,18 @@
+# phaseb_vectors.py --txvectors via tools/phaseb-vectors/ouroboros-shim/verifyscript_shim.py
+# ran 2026-09-17T19:43Z from the hashhog meta-repo against this tree.
+
+##### tx_valid.json : 121 data rows (expect ACCEPT) #####
+cases scored                 : 121
+  PASS (decision matches Core) : 121
+  FAIL (decision diverges)     : 0
+  decision coverage            : 121/121 (100.0% produced a verdict)
+  decision accuracy            : 121/121 (100.0%)
+
+##### tx_invalid.json : 93 data rows (expect REJECT) #####
+cases scored                 : 93
+  PASS (decision matches Core) : 93
+  FAIL (decision diverges)     : 0
+  BADTX rows seen            : 9
+  rejected by checktx (good) : 9/9
+  decision coverage            : 93/93 (100.0% produced a verdict)
+  decision accuracy            : 93/93 (100.0%)

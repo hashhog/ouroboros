@@ -1,0 +1,12 @@
+# AFTER T2 in-repo parity (tests/test_t2_r5_parity.py) plus the assumevalid
+# submitblock control. Re-run live by proof/verify.sh.
+
+$ python3 -m pytest -q tests/test_t2_r5_parity.py --tb=no
+collected 41 items
+tests/test_t2_r5_parity.py .........................................     [100%]
+============================== 41 passed in 0.37s ==============================
+
+$ python3 -m pytest -q tests/test_assumevalid_submitblock_path.py --tb=no
+collected 14 items
+tests/test_assumevalid_submitblock_path.py ..............                [100%]
+============================== 14 passed in 0.35s ==============================

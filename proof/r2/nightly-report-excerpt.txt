@@ -1,0 +1,22 @@
+  jobs recorded: 440   corpora x impls
+  IMPL           PASS   FAIL   ERR   AGREEMENT
+  ----------------------------------------------
+  ouroboros       347     23     0       93.8%
+
+  DIVERGENCES (ouroboros rows only):
+    ouroboros    regression                       14 failed
+    ouroboros    ts-mtp                           4 failed
+    ouroboros    mtp-nonmonotonic-parent          1 failed
+    ouroboros    _tierb-guards-2026-07-06/B1-scripttests/scripttests 1 failed
+    ouroboros    _tierb-guards-2026-07-06/B2-bad-diffbits 1 failed
+    ouroboros    tws                              1 failed
+    ouroboros    tws-tail                         1 failed
+
+  CONSENSUS SPLITS (accept vs reject -- chain-split risk): 0
+  (The nightly classifier's split count has an accounting gap on the full
+   10-impl report; the 23 ouroboros FAIL logs were read directly and each is
+   same-decision. See r2/results.json and r2/fail-excerpt.txt.)
+
+Source: tools/diff-test-artifacts/corpus-sweep/nightly-history.jsonl
+(table also printed at 2026-08-30T07:30:01Z and 2026-09-01T07:30:05Z) and
+results.20260916T045125Z.jsonl (passed sum 347, failed sum 23).

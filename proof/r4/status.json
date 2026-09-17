@@ -1,0 +1,20 @@
+{
+  "status": "UNPROVEN",
+  "commitment": null,
+  "hash_serialized_3": null,
+  "snapshot_booted_does_not_count": true,
+  "range_counts_as_r4": false,
+  "range_closed": 25,
+  "range_closed_blocks": 512594,
+  "genesis_ibd_exists": true,
+  "genesis_ibd_reached_c958794": false,
+  "genesis_ibd_last_height": 580755,
+  "genesis_ibd_stopped_utc": "2026-07-30T22:20:00Z",
+  "lineage_log_path": "/home/work/genesis-ibd/logs/ouroboros.log",
+  "lineage_log_sha256": "569bcc7cc3e6c593af851c4d58d2e41d48cfb60950150076a191b1ecfaa5232e",
+  "lineage_log_bytes": 297795584,
+  "lineage_log_in_bundle": false,
+  "blocker": "No from-genesis C(H) hash_serialized_3 capture. A genesis-IBD unit exists (hashhog-genesis-ouroboros.service, --noassumevalid) and its log starts at height 0 with Genesis block stored, but the run stopped around height 580755 on 2026-07-30 and never produced C(958794). The 284 MiB lineage log is not in this bundle (size). Snapshot-booted range-runner CLOSED rows are not a substitute. There is no ouroboros-av0-danger-ledger.",
+  "genesis_block_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+  "assumevalid_required_for_r4": "0"
+}

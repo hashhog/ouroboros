@@ -1,0 +1,71 @@
+{
+  "live": {
+    "artifact": "r5/live-20260901T182642Z.json",
+    "command": "python3 tools/r5_probe.py --impl ouroboros -v",
+    "T1": {
+      "pass": 38,
+      "total": 46
+    },
+    "T2": {
+      "pass": 14,
+      "total": 41
+    },
+    "T3": {
+      "pass": 0,
+      "total": 16,
+      "note": "SKIP-REGTEST on the live lane"
+    },
+    "fails_t1": [
+      "addnode",
+      "disconnectnode",
+      "getblocktemplate",
+      "getnettotals",
+      "getrpcinfo",
+      "sendrawtransaction",
+      "testmempoolaccept"
+    ],
+    "fails_t2": [
+      "analyzepsbt",
+      "combinerawtransaction",
+      "converttopsbt",
+      "createmultisig",
+      "createpsbt",
+      "decoderawtransaction",
+      "decodescript",
+      "deriveaddresses",
+      "descriptorprocesspsbt",
+      "getblockstats",
+      "getdeploymentinfo",
+      "getdescriptorinfo",
+      "getindexinfo",
+      "getmempoolancestors",
+      "getmempooldescendants",
+      "importmempool",
+      "prioritisetransaction",
+      "pruneblockchain",
+      "scantxoutset",
+      "signmessagewithprivkey",
+      "signrawtransactionwithkey",
+      "submitpackage",
+      "utxoupdatepsbt",
+      "validateaddress",
+      "verifymessage",
+      "verifytxoutproof"
+    ],
+    "note": "Captured 2026-09-01T18:26Z against the then-running mainnet unit. The unit is now maintenance-paused; this commit does not restart it. T3 is unmeasured on this lane. In-repo T2 parity (tests/test_t2_r5_parity.py) is 41/41 on this tree and is re-run by verify.sh; that is not a live-lane claim."
+  },
+  "regtest": {
+    "artifact": null,
+    "T3": {
+      "pass": null,
+      "total": 16,
+      "status": "UNPROVEN"
+    },
+    "note": "No ouroboros regtest-lane r5_probe artifact is in this bundle. Do not read T3 0/16 as a measured 0; it is SKIP-REGTEST on the live lane."
+  },
+  "in_repo_live_rerun": {
+    "command": "python3 -m pytest -q tests/test_t2_r5_parity.py tests/test_assumevalid_submitblock_path.py",
+    "why": "test_t2_r5_parity.py is the in-repo encoding of the T2 operator-subset (41 tests). test_assumevalid_submitblock_path.py is the in-repo control for the R4-adjacent bug that --assumevalid 0 used to skip scripts on submitblock below 850000. Both are fully in-repo (no live node).",
+    "t2_after": "r5/t2-after.txt"
+  }
+}

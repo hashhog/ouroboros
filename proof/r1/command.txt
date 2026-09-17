@@ -1,0 +1,18 @@
+# Re-run R1 (interpreter) for ouroboros.
+#
+# In-repo (no meta-repo required) — this is what proof/verify.sh re-runs
+# alongside the assumevalid submitblock control:
+#   python3 -m pytest -q tests/test_t2_r5_parity.py tests/test_assumevalid_submitblock_path.py
+#   python3 tests/test_script_vectors.py
+#
+# Core script_tests.json / sighash.json:
+#   python3 tests/test_script_vectors.py
+#   # sighash.json is not vendored; point at sibling bitcoin-core:
+#   # bitcoin-core/src/test/data/sighash.json
+#
+# tx_valid / tx_invalid (needs the hashhog meta-repo shim):
+#   cd tools/phaseb-vectors
+#   python3 phaseb_vectors.py --driver='python3 ./ouroboros-shim/verifyscript_shim.py' --txvectors
+#
+# Full CHARTER reject-bar (script + tx + sighash) from the meta-repo:
+#   bash tools/phaseb-vectors/run-regression.sh   # includes shim:ouroboros:{script,tx,sighash}

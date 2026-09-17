@@ -1,0 +1,643 @@
+{
+  "ts": "20260901T182642Z",
+  "source": "tools/diff-test-artifacts/r5-probe/20260901T182642Z.json (ouroboros slice)",
+  "note": "Last live-lane probe while the mainnet unit was answering. The unit has been maintenance-paused since 2026-09-10 (tools/maintenance/ouroboros.maintenance). Later probes are connection-refused and are not evidence. In-repo T2 is 41/41 after 3fa11acb; that is not this live artifact.",
+  "impls": {
+    "ouroboros": {
+      "tiers": {
+        "T1": {
+          "pass": 38,
+          "total": 46
+        },
+        "T2": {
+          "pass": 14,
+          "total": 41
+        },
+        "T3": {
+          "pass": 0,
+          "total": 16
+        }
+      },
+      "rows": [
+        {
+          "method": "getblockcount",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getbestblockhash",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getblockhash",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getblockheader",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getblockchaininfo",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "decoderawtransaction",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "nonhex: error code -32603 != Core's -22"
+        },
+        {
+          "method": "validateaddress",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "exact-invalid: mismatch vs Core (impl={'isvalid': False, 'error_locations': [], 'error': 'Invalid \u2026 core={'isvalid': False, 'error_locations': [], 'error': 'Inv"
+        },
+        {
+          "method": "createwallet",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "getblock",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getchaintips",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getdifficulty",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "gettxout",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "gettxoutsetinfo",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "verifychain",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "preciousblock",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getmempoolentry",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getmempoolinfo",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getrawmempool",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "waitforblock",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "waitforblockheight",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "waitfornewblock",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getblockstats",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "success-shape+anchor: anchor height: 0 != Core 965063; invalid-stat: expected error, call succeeded"
+        },
+        {
+          "method": "getchaintxstats",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getdeploymentinfo",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "success-shape+anchor: errored: -32603:'>=' not supported between instances of 'NoneType' and 'int'; notfound: error code -32603 != Core's -5"
+        },
+        {
+          "method": "getblockfilter",
+          "tier": "T2",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "getblockfrompeer",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getmempoolancestors",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "not-in-mempool: error code -32603 != Core's -5"
+        },
+        {
+          "method": "getmempooldescendants",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "not-in-mempool: error code -32603 != Core's -5"
+        },
+        {
+          "method": "gettxoutproof",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "verifytxoutproof",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "success-exact-block100000-coinbase: errored: -32603:Block not in chain; nonhex: error code -32603 != Core's -8"
+        },
+        {
+          "method": "gettxspendingprevout",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getchainstates",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "importmempool",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "bad-path: error code -32601 != Core's -1"
+        },
+        {
+          "method": "savemempool",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "prioritisetransaction",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "bad-txid: error code -32603 != Core's -8"
+        },
+        {
+          "method": "getprioritisedtransactions",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "scanblocks",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "scantxoutset",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "bad-action: error code -32603 != Core's -8"
+        },
+        {
+          "method": "pruneblockchain",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "height-type-error: error code -1 != Core's -3"
+        },
+        {
+          "method": "getmemoryinfo",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getrpcinfo",
+          "tier": "T1",
+          "status": "FAIL",
+          "detail": "success-shape: missing field logpath"
+        },
+        {
+          "method": "help",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "logging",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "stop",
+          "tier": "T1",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "uptime",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "addnode",
+          "tier": "T1",
+          "status": "FAIL",
+          "detail": "invalid-command: expected error, call succeeded"
+        },
+        {
+          "method": "clearbanned",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "disconnectnode",
+          "tier": "T1",
+          "status": "FAIL",
+          "detail": "no-target: error code -29 != Core's -32602"
+        },
+        {
+          "method": "getaddednodeinfo",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getaddrmaninfo",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getconnectioncount",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getnettotals",
+          "tier": "T1",
+          "status": "FAIL",
+          "detail": "success-shape: missing field uploadtarget"
+        },
+        {
+          "method": "getnetworkinfo",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getnodeaddresses",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getpeerinfo",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "listbanned",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "ping",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "setban",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "setnetworkactive",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getmininginfo",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getnetworkhashps",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getblocktemplate",
+          "tier": "T1",
+          "status": "FAIL",
+          "detail": "missing-segwit-rule: expected error, call succeeded"
+        },
+        {
+          "method": "submitblock",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "submitheader",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "sendrawtransaction",
+          "tier": "T1",
+          "status": "FAIL",
+          "detail": "decode-error: error code -32603 != Core's -22"
+        },
+        {
+          "method": "testmempoolaccept",
+          "tier": "T1",
+          "status": "FAIL",
+          "detail": "missing-inputs-exact: mismatch vs Core (impl=[{'txid': '5df91f99045afe09848faea0ccad4f30937be5775bf19044c\u2026 core=[{'txid': '5df91f99045afe09848faea0ccad4f30937be"
+        },
+        {
+          "method": "getrawtransaction",
+          "tier": "T1",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "createrawtransaction",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "decodescript",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "nonhex: error code -32603 != Core's -8"
+        },
+        {
+          "method": "combinerawtransaction",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "unknown-input: expected error, call succeeded"
+        },
+        {
+          "method": "converttopsbt",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "nonhex: error code -32603 != Core's -22"
+        },
+        {
+          "method": "createpsbt",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "canonical-exact: errored: -32603:TxIn.__init__() got an unexpected keyword argument 'prev_tx_"
+        },
+        {
+          "method": "decodepsbt",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "analyzepsbt",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "analyze-exact: mismatch vs Core (impl={'inputs': [{'has_utxo': False, 'is_final': False, 'has_sig'\u2026 core={'inputs': [{'has_utxo': False, 'is_final': False, 'nex"
+        },
+        {
+          "method": "combinepsbt",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "finalizepsbt",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "joinpsbts",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "utxoupdatepsbt",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "bad-base64: error code -32603 != Core's -22"
+        },
+        {
+          "method": "descriptorprocesspsbt",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "update-exact: errored: -32601:Method not found: descriptorprocesspsbt; bad-descriptor: error code -32601 != Core's -5"
+        },
+        {
+          "method": "signrawtransactionwithkey",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "bad-privkey: expected error, call succeeded"
+        },
+        {
+          "method": "submitpackage",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "empty-array: error code -32603 != Core's -8; nonhex: error code -32603 != Core's -22"
+        },
+        {
+          "method": "createmultisig",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "invalid-pubkey: error code -32603 != Core's -5; not-enough-keys: error code -32603 != Core's -8"
+        },
+        {
+          "method": "deriveaddresses",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "missing-checksum: expected error, call succeeded; range-on-unranged: error code -32603 != Core's -8"
+        },
+        {
+          "method": "estimatesmartfee",
+          "tier": "T2",
+          "status": "PASS",
+          "detail": ""
+        },
+        {
+          "method": "getdescriptorinfo",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "invalid-descriptor: error code -32603 != Core's -5; bad-checksum: expected error, call succeeded"
+        },
+        {
+          "method": "getindexinfo",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "wrong-type-arg: expected error, call succeeded"
+        },
+        {
+          "method": "signmessagewithprivkey",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "zero-privkey: error code -32603 != Core's -5"
+        },
+        {
+          "method": "verifymessage",
+          "tier": "T2",
+          "status": "FAIL",
+          "detail": "malformed-sig: error code -32603 != Core's -3; invalid-address: error code -32603 != Core's -5"
+        },
+        {
+          "method": "getwalletinfo",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "getnewaddress",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "getaddressinfo",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "getbalances",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "listunspent",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "listtransactions",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "sendtoaddress",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "send",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "walletcreatefundedpsbt",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "walletprocesspsbt",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "backupwallet",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "listwallets",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "unloadwallet",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "loadwallet",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        },
+        {
+          "method": "restorewallet",
+          "tier": "T3",
+          "status": "SKIP-REGTEST",
+          "detail": ""
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,183 @@
+{
+  "source": "tools/diff-test-artifacts/corpus-sweep/results.20260916T045125Z.jsonl (passed sum 347, failed sum 23) and nightly-history.jsonl table ouroboros 347 PASS / 23 FAIL / 0 ERR (93.8%). Fail list read from the per-corpus logs and 20260917T061508Z-regression-summary.md.",
+  "impl": "ouroboros",
+  "pass": 347,
+  "fail": 23,
+  "err": 0,
+  "agreement_pct": 93.8,
+  "consensus_splits_accept_vs_reject": 0,
+  "fails": [
+    {
+      "corpus": "regression",
+      "entry": "block-weight-too-large",
+      "core": "reject:bad-blk-length",
+      "ouroboros": "reject:bad-txns-oversize",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "regression",
+      "entry": "cluster-fan-26",
+      "core": "accept",
+      "ouroboros": "accept",
+      "same_accept_reject": true,
+      "note": "mempool-policy / cluster shape, not accept-vs-reject"
+    },
+    {
+      "corpus": "regression",
+      "entry": "cluster-linear-26",
+      "core": "accept",
+      "ouroboros": "accept",
+      "same_accept_reject": true,
+      "note": "mempool-policy / cluster shape, not accept-vs-reject"
+    },
+    {
+      "corpus": "regression",
+      "entry": "cluster-linear-64",
+      "core": "accept",
+      "ouroboros": "accept",
+      "same_accept_reject": true,
+      "note": "mempool-policy / cluster shape, not accept-vs-reject"
+    },
+    {
+      "corpus": "regression",
+      "entry": "cluster-linear-65",
+      "core": "accept",
+      "ouroboros": "accept",
+      "same_accept_reject": true,
+      "note": "mempool-policy / cluster shape, not accept-vs-reject"
+    },
+    {
+      "corpus": "regression",
+      "entry": "cluster-rbf-frees-room",
+      "core": "accept",
+      "ouroboros": "accept",
+      "same_accept_reject": true,
+      "note": "mempool-policy / cluster shape, not accept-vs-reject"
+    },
+    {
+      "corpus": "regression",
+      "entry": "cluster-sibling-72",
+      "core": "accept",
+      "ouroboros": "accept",
+      "same_accept_reject": true,
+      "note": "mempool-policy / cluster shape, not accept-vs-reject"
+    },
+    {
+      "corpus": "regression",
+      "entry": "cluster-sibling-size",
+      "core": "accept",
+      "ouroboros": "accept",
+      "same_accept_reject": true,
+      "note": "mempool-policy / cluster shape, not accept-vs-reject"
+    },
+    {
+      "corpus": "regression",
+      "entry": "cluster-sigop-bound",
+      "core": "accept",
+      "ouroboros": "accept",
+      "same_accept_reject": true,
+      "note": "mempool-policy / cluster shape, not accept-vs-reject"
+    },
+    {
+      "corpus": "regression",
+      "entry": "cluster-units-weight-exact",
+      "core": "accept",
+      "ouroboros": "accept",
+      "same_accept_reject": true,
+      "note": "mempool-policy / cluster shape, not accept-vs-reject"
+    },
+    {
+      "corpus": "regression",
+      "entry": "mempool-refill-on-reorg",
+      "core": "accept",
+      "ouroboros": "accept",
+      "same_accept_reject": true,
+      "note": "mempool contents after reorg, not accept-vs-reject"
+    },
+    {
+      "corpus": "regression",
+      "entry": "script-size-too-large",
+      "core": "reject:bad-txns-inputs-missingorspent",
+      "ouroboros": "reject:block-script-verify-flag-failed",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "regression",
+      "entry": "timestamp-too-old",
+      "core": "reject:time-too-old",
+      "ouroboros": "reject:rejected",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "regression",
+      "entry": "txindex-revert-on-reorg",
+      "core": "accept",
+      "ouroboros": "accept",
+      "same_accept_reject": true,
+      "note": "txindex shape after reorg, not accept-vs-reject"
+    },
+    {
+      "corpus": "ts-mtp",
+      "entry": "epoch1",
+      "core": "reject:time-too-old",
+      "ouroboros": "reject:rejected",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "ts-mtp",
+      "entry": "far-old",
+      "core": "reject:time-too-old",
+      "ouroboros": "reject:rejected",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "ts-mtp",
+      "entry": "mtp-eq",
+      "core": "reject:time-too-old",
+      "ouroboros": "reject:rejected",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "ts-mtp",
+      "entry": "mtp-minus1",
+      "core": "reject:time-too-old",
+      "ouroboros": "reject:rejected",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "mtp-nonmonotonic-parent",
+      "entry": "at-mtp-below-parent-reject",
+      "core": "reject:time-too-old",
+      "ouroboros": "reject:rejected",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "_tierb-guards-2026-07-06/B1-scripttests/scripttests",
+      "entry": "opreturn-reject",
+      "core": "reject:bad-txns-inputs-missingorspent",
+      "ouroboros": "reject:block-script-verify-flag-failed",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "_tierb-guards-2026-07-06/B2-bad-diffbits",
+      "entry": "bad-diffbits-direct",
+      "core": "reject:bad-diffbits",
+      "ouroboros": "reject:high-hash",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "tws",
+      "entry": "weight-one-over-limit",
+      "core": "reject:bad-blk-weight",
+      "ouroboros": "reject:bad-blk-length",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "tws-tail",
+      "entry": "weight-one-over-limit",
+      "core": "reject:bad-blk-weight",
+      "ouroboros": "reject:bad-blk-length",
+      "same_accept_reject": true
+    }
+  ]
+}

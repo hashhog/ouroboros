@@ -1,0 +1,19 @@
+# What a real R4 receipt would take (NOT claimed here).
+#
+# 1. Launch this node's own validation from height 0 on Bitcoin genesis
+#    000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
+#    with --noassumevalid / --assumevalid=0 (scripts on), no loadtxoutset /
+#    assumeutxo / snapshot boot, fed by a capped blk-replay peer.
+# 2. Freeze at some height H and capture gettxoutsetinfo hash_serialized_3
+#    against Core's C(H).
+# 3. Keep the lineage log and prove it starts at height=0, contains no
+#    snapshot-boot lines, and the capture hash matches Core.
+#
+# A genesis-IBD unit already exists (r4/genesis-unit.service) and did start
+# at height 0 with --noassumevalid on 2026-07-12. It stopped around height
+# 580755 on 2026-07-30 without a C(H) capture. The 284 MiB log lives at
+# /home/work/genesis-ibd/logs/ouroboros.log (sha256 in r4/status.json) and
+# is not copied into this bundle.
+#
+# Do not treat r4/range-rows.json as a substitute. Those boots start from a
+# Core-format UTXO snapshot and the campaign stamps scripts_ack=p2p-only.

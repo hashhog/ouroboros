@@ -1,0 +1,19 @@
+impl          closed       blocks  % of chain  other verdicts
+ouroboros         25      512,594      53.04%  NO-ORACLE-SURFACE:2, STALLED:2
+
+TRUST-ANCHOR: these rows are snapshot-booted (range-runner.sh loads a
+Core-format UTXO snapshot at the range base). They are NOT a from-genesis
+AV=0 lineage and MUST NOT be counted as R4. Listed so the holes are visible:
+  STALLED 481807->515000 (re-request/fork loop on 3fa11acb; later 664558c
+    closed the in-repo control but this range has not been re-run to CLOSED)
+  STALLED 515000->550000 (tip stuck at 525854 for 240s on 588a51bb)
+  NO-ORACLE-SURFACE 852000->875000 (gettxoutsetinfo no usable height at base)
+  NO-ORACLE-SURFACE 875000->900000 (gettxoutsetinfo no usable height at base)
+
+Every row is stamped scripts_ack=p2p-only (the campaign classifier still
+overwrites ouroboros to that value). Do not read CLOSED as script evidence.
+
+25 CLOSED / 512,594 blocks is 53.04% of the ladder tip as summed by
+`bash tools/range-runner.sh coverage ouroboros`. Two CLOSED files overlap
+(227914-230909 and 230909-265000 inside 227914-265000), so unique span is
+smaller. Six nodes already carry C(958794) from genesis; this node does not.

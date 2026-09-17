@@ -1,0 +1,35 @@
+[Unit]
+Description=HashHog genesis IBD — ouroboros (mainnet, from-genesis, AV=0, archival)
+Documentation=https://github.com/hashhog receipts/SYNCS.md (O.3 Ignition)
+After=network-online.target
+
+[Service]
+Type=simple
+# OUROBOROS_MINCHAINWORK_OVERRIDE=0 is MANDATORY: without it the G8 low-work
+# gate rolls back the first header batch forever and the node wedges at genesis
+# (a from-genesis chain's cumulative work is below mainnet nMinimumChainWork by
+# definition). It is an IBD-liveness knob only; it weakens no per-header PoW /
+# continuity consensus check. --noassumevalid => full per-input script check
+# from block 0. No prune flag => full archival (~800 GiB on root).
+Environment=OUROBOROS_MINCHAINWORK_OVERRIDE=0
+ExecStart=/usr/bin/python3 -m ouroboros.cli \
+  --network mainnet \
+  --data-dir /home/work/genesis-ibd/ouroboros \
+  start \
+  --noassumevalid \
+  --force \
+  --rpc-port 8361 \
+  --p2p-port 8461 \
+  --connect 127.0.0.1:28620 \
+  --nodnsseed \
+  --nolisten
+WorkingDirectory=/home/work/hashhog/ouroboros
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=300
+LimitNOFILE=524288
+StandardOutput=append:/home/work/genesis-ibd/logs/ouroboros.log
+StandardError=append:/home/work/genesis-ibd/logs/ouroboros.log
+
+[Install]
+WantedBy=default.target

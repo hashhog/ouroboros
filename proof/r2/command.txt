@@ -1,0 +1,11 @@
+# Re-run R2 (validator decision parity) for ouroboros. Needs the hashhog
+# meta-repo (tools/diff-test-corpus, tools/corpus-sweep.sh, a live bitcoind
+# as oracle). Hours, not minutes. Do not run against production ports.
+#
+#   SWEEP_IMPLS=ouroboros bash tools/corpus-sweep.sh
+#   bash tools/corpus-sweep.sh --report
+#
+# The numbers in results.json are from results.20260916T045125Z.jsonl
+# (ouroboros 347 PASS / 23 FAIL / 0 ERR, 93.8%), matching the nightly
+# table row. All 23 FAILs are same-decision (reject-vs-reject or
+# accept-vs-accept on mempool/txindex shape). consensus_splits_accept_vs_reject: 0.

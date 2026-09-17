@@ -94,9 +94,12 @@ meta-repo, which is **not public** — see the note below.
 > nightly `diffguard-*.log` files (`.gitignore:43  *.log`). Regenerate the probe
 > JSON with `python3 tools/r5_probe.py` against a running fleet.
 >
-> **What you can check from this repository alone:** build it, run its own test
-> suite, and reproduce its behaviour against Bitcoin Core yourself. That is the
-> evidence this repo actually ships.
+> **What you can check from this repository alone:** `bash proof/verify.sh`
+> (CHARTER proof bundle: every claim cites a file here, R4 stays UNPROVEN,
+> snapshot-booted ranges are refused, and an in-repo T2 + assumevalid test
+> is re-run live), build it, run its own test suite, and reproduce its
+> behaviour against Bitcoin Core yourself. That is the evidence this repo
+> actually ships.
 
 ## Quick Start
 

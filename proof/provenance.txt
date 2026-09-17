@@ -1,0 +1,37 @@
+# Provenance — ouroboros proof bundle
+assembled_utc: 2026-09-17T19:49:56Z
+repo: https://github.com/hashhog/ouroboros
+branch: master
+commit: 0c1408500e1053937f12c557cba2240cab8c2699
+commit_short: 0c1408500e10
+subject: fix: serve snapshot-base gettxoutsetinfo without a second coins walk
+tree_clean: NO
+interpreted: yes
+promote_does_not_apply: yes (start_mainnet.sh runs python3 -m ouroboros.cli from this tree)
+launch: python3 -m ouroboros.cli
+runnable_tree: proof/runnable-tree.sha256
+runnable_files: 101
+runtime: Python 3.13.5
+runtime_path: /usr/bin/python3
+rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
+maturin: maturin 1.12.6
+target: Linux amd64
+native_extension: ferrous-utils/sync (PyO3 module sync)
+installed_sync_so: /home/work/.local/lib/python3.13/site-packages/sync/sync.cpython-313-x86_64-linux-gnu.so
+installed_sync_so_sha256: 807392fb811f0c46d61cd05a2f0760519afc6c78be9faab06a49fe7dc66a6b66
+deploy_pin: deploy/ouroboros/MANIFEST (wheel sha256 52039f392abc8a1555d52c94041aef71c9233e276d47152e56980df2b73c302c)
+deploy_pin_stale: yes (reinstall_ouroboros.sh rebuilds the wheel from this tree on every start; the pin is unused)
+unit: hashhog-ouroboros-mainnet (maintenance-paused since 2026-09-10; no live PID)
+
+# Honest caveats
+ouroboros is interpreted Python plus a native Rust extension. There is no
+relocatable deploy pin that start_mainnet.sh uses: promote_mainnet.sh refuses
+this node, and tools/reinstall_ouroboros.sh rebuilds sync from source on every
+launch. The attested artifact is the production source tree hashed in
+runnable-tree.sha256 plus the currently installed sync .so (informational;
+maturin rebuilds are not bit-stable). The mainnet unit is maintenance-paused,
+so this bundle does not claim a live PID matches these bytes today.
+The deploy/ouroboros wheel sha256 is recorded as STALE, not as the running
+binary. Do not treat it as nimrod-style pin closure.
+This script refreshes provenance + runnable-tree + MANIFEST only. Frozen
+evidence in r1/ r2/ r4/ r5/ is not regenerated from outside this repository.

@@ -1,0 +1,10 @@
+# Core sighash.json via ouroboros ScriptInterpreter._calculate_signature_hash.
+# tests/test_sighash_vectors.py looks for ouroboros/bitcoin/src/test/data/sighash.json
+# (absent). Re-run against the sibling bitcoin-core copy:
+#   bitcoin-core/src/test/data/sighash.json
+# ran 2026-09-17T19:43Z on this tree.
+
+Sighash test vectors: 500 total
+  PASSED : 500
+  FAILED : 0
+  ERRORS : 0

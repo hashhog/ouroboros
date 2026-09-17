@@ -1,0 +1,34 @@
+{
+  "ran_utc": "2026-09-17T19:42:00Z",
+  "script_tests": {
+    "driver": "python3 tests/test_script_vectors.py (Python ScriptInterpreter; mocks the sync extension)",
+    "seen": 1222,
+    "pass": 1222,
+    "fail": 0,
+    "skipped_comments": 51,
+    "parse_errors": 0,
+    "note": "In-repo harness over Core script_tests.json. 51 skipped are comment rows. 1222/1222 data rows PASS, 0 parse errors. This is the Python interpreter (src/ouroboros/script.py), which is also what the phaseb shim drives."
+  },
+  "tx_valid": {
+    "scored": 121,
+    "pass": 121,
+    "fail": 0,
+    "driver": "phaseb_vectors.py --txvectors via ouroboros-shim"
+  },
+  "tx_invalid": {
+    "scored": 93,
+    "pass": 93,
+    "fail": 0,
+    "badtx_rejected_by_checktx": "9/9",
+    "driver": "phaseb_vectors.py --txvectors via ouroboros-shim"
+  },
+  "sighash": {
+    "scored": 500,
+    "exact_match": 500,
+    "skipped_header": 1,
+    "driver": "tests/test_sighash_vectors.py against bitcoin-core/src/test/data/sighash.json (in-repo path ouroboros/bitcoin/... is absent; Core sibling used)"
+  },
+  "charter_r1_total_vectors": 1936,
+  "decided": 1936,
+  "divergences": 0
+}

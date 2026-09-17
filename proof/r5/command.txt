@@ -1,0 +1,13 @@
+# Re-run R5 (operator RPC subset). Needs the hashhog meta-repo instruments
+# and a running node (live fleet or the regtest harness).
+#
+# Live lane (T1/T2; T3 is SKIP-REGTEST here). The mainnet unit is currently
+# maintenance-paused; this will connection-refuse until it is started:
+#   python3 tools/r5_probe.py --impl ouroboros -v
+#
+# Regtest lane (T3 wallet + stop/getblockfilter):
+#   REGTEST_SLOTS=1 REGTEST_MEM=8G bash tools/regtest-slot.sh \
+#     bash tools/regtest-harness.sh --r5-lane=ouroboros
+#
+# In-repo control re-run by proof/verify.sh (no live node required):
+#   python3 -m pytest -q tests/test_t2_r5_parity.py tests/test_assumevalid_submitblock_path.py

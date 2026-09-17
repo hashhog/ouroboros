@@ -1,0 +1,16 @@
+# There is no ouroboros C(958794) capture.
+#
+# receipts/TRUST-ANCHOR.md has no ouroboros row in the C(958794) table.
+# CORE-PARITY-AUDIT/replay-ledgers/ has no ouroboros-av0-danger-ledger.
+# This bundle therefore contains no r4/C958794.json. verify.sh FAILS if
+# that file appears without a matching from-genesis lineage log.
+#
+# A genesis-IBD unit exists (hashhog-genesis-ouroboros.service) with
+# --noassumevalid and no loadtxoutset. Its log starts:
+#   2026-07-12 13:09:02 Starting Bitcoin Hybrid Node (mainnet)
+#   2026-07-12 13:09:02 Genesis block stored (full connect)
+#   2026-07-12 13:09:04 Initializing peer manager (current height: 0)...
+#   2026-07-12 13:09:05 -assumevalid=0: full script verification forced
+# It ended 2026-07-30 22:20:00 at about height 580755. That is not C(H).
+#
+# Snapshot-booted range-runner rows (r4/range-rows.json) are not that receipt.

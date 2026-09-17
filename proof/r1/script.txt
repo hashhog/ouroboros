@@ -1,0 +1,5 @@
+# In-repo Core script_tests.json harness (Python ScriptInterpreter).
+# python3 tests/test_script_vectors.py
+# ran 2026-09-17T19:42Z on this tree.
+
+script_tests.json results: 1222 passed, 0 failed, 51 skipped, 0 parse errors
