@@ -26,7 +26,7 @@ from ouroboros.metrics import (
     update_chain_metrics,
     update_mempool_metrics,
 )
-from ouroboros.p2p import PeerManager
+from ouroboros.p2p import DEFAULT_MAX_OUTBOUND_FULL_RELAY, PeerManager
 from ouroboros.pruning import BlockPruner
 from ouroboros.rpc import RPCServer
 from ouroboros.snapshot import SnapshotManager, read_snapshot_metadata
@@ -353,7 +353,19 @@ class BitcoinNode:
             # Initialize peer manager
             _, best_height = self.db.get_best_block()
             logger.info(f"Initializing peer manager (current height: {best_height})...")
-            max_peers = self.config.get('max_connections', 8)
+            # Core: nMaxInbound = nMaxConnections - nMaxOutbound.  The old
+            # code treated maxconnections as the outbound cap (so a default
+            # 125 opened 125 outbound dials).  Reserve DEFAULT_MAX_OUTBOUND
+            # FULL_RELAY slots for outbound sync; inbound gets the rest so
+            # an inbound flood cannot starve IBD.
+            try:
+                max_connections = int(self.config.get('max_connections', 125) or 125)
+            except (TypeError, ValueError):
+                max_connections = 125
+            if max_connections < 1:
+                max_connections = 1
+            max_peers = min(DEFAULT_MAX_OUTBOUND_FULL_RELAY, max_connections)
+            max_inbound = max(0, max_connections - max_peers)
             # v2transport may arrive as bool (NodeConfig.to_dict normalises)
             # or as a raw "0"/"1"/"true"/"false" string (CLI/dict override
             # before normalisation).  Treat the same way we handle ``listen``
@@ -587,9 +599,19 @@ class BitcoinNode:
                 dns_seed_enabled = dns_raw.lower() in ("1", "true", "yes", "on")
             else:
                 dns_seed_enabled = bool(dns_raw)
+            # --bind / bind= (Core -bind).  Empty means all interfaces
+            # (0.0.0.0 and ::).  A non-empty list restricts the listener.
+            bind_raw = self.config.get('bind') or []
+            if isinstance(bind_raw, str):
+                bind_hosts = [p.strip() for p in bind_raw.split(',') if p.strip()]
+            elif isinstance(bind_raw, (list, tuple)):
+                bind_hosts = [str(p).strip() for p in bind_raw if str(p).strip()]
+            else:
+                bind_hosts = []
             self.peer_manager = PeerManager(
                 self.network,
                 max_peers=max_peers,
+                max_inbound=max_inbound,
                 data_dir=self.data_dir,
                 transport_version=p2p_transport,
                 listen=bool(listen_enabled),
@@ -597,6 +619,7 @@ class BitcoinNode:
                 node_compact_filters=self._compact_filters_advertised,
                 connect_addrs=connect_addrs,
                 dns_seed=dns_seed_enabled,
+                bind=bind_hosts or None,
             )
             # BIP 152: Provide mempool and database for compact block relay
             self.peer_manager.set_mempool(self.mempool)

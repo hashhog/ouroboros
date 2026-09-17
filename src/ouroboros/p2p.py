@@ -550,6 +550,52 @@ FIXED_SEEDS_MAINNET = [
 
 
 MAX_INBOUND = 117  # Bitcoin Core default max inbound connections
+# Core net.h: DEFAULT_MAX_PEER_CONNECTIONS=125, MAX_OUTBOUND_FULL_RELAY=8
+# so inbound = 125 - 8 = 117.  Outbound full-relay slots are reserved so an
+# inbound flood cannot starve sync (net.cpp nMaxInbound = nMaxConnections -
+# nMaxOutbound).
+DEFAULT_MAX_OUTBOUND_FULL_RELAY = 8
+# Core net.cpp InitBinds: when -bind is omitted, bind IPv4 any (0.0.0.0) and
+# IPv6 any (::) with IPV6_V6ONLY=1.  Loopback is a restriction (--bind), not
+# the default.
+DEFAULT_BIND_HOSTS: tuple[str, ...] = ("0.0.0.0", "::")
+
+
+def parse_bind_spec(spec: str, default_port: int) -> tuple[str, int]:
+    """Parse a Bitcoin Core ``-bind=<addr>[:port]`` spec into ``(host, port)``.
+
+    Accepts ``0.0.0.0``, ``127.0.0.1:8334``, ``::``, ``[::]``, ``[::1]``,
+    ``[::]:8333``.  Bare IPv6 without brackets is accepted when it contains
+    more than one colon (so ``::1`` is not confused with ``host:port``).
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("empty bind spec")
+    if spec.startswith("["):
+        end = spec.find("]")
+        if end < 0:
+            raise ValueError(f"invalid IPv6 bind spec: {spec!r}")
+        host = spec[1:end]
+        rest = spec[end + 1:]
+        if rest.startswith(":") and rest[1:]:
+            return host, int(rest[1:])
+        return host, default_port
+    if spec.count(":") == 1:
+        host, port_s = spec.rsplit(":", 1)
+        if port_s.isdigit():
+            return host, int(port_s)
+    return spec, default_port
+
+
+def _is_ipv6_host(host: str) -> bool:
+    return ":" in host.strip("[]")
+
+
+def _format_sockname(sa) -> str:
+    host, port = sa[0], sa[1]
+    if ":" in str(host):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
 
 # Bitcoin Core maintains 2 additional outbound connections that relay only
 # blocks (no transactions, no addr gossip).  These protect against eclipse
@@ -589,6 +635,8 @@ class PeerManager:
         node_network_limited: bool = False,
         connect_addrs: "list[tuple[str, int]] | None" = None,
         dns_seed: bool = True,
+        max_inbound: int | None = None,
+        bind: "list[str] | tuple[str, ...] | None" = None,
     ):
         """Initialize peer manager.
 
@@ -602,12 +650,27 @@ class PeerManager:
                 False, DNS-seed resolution is suppressed even without
                 ``-connect`` (mirrors clearbit ``--nodnsseed``).  ``-connect``
                 forces this off regardless (Core's implied ``-dnsseed=0``).
+            max_inbound: inbound connection cap (Core nMaxInbound).  Default
+                ``MAX_INBOUND`` (117).  Independent of ``max_peers`` so an
+                inbound flood cannot consume outbound sync slots.
+            bind: P2P listen addresses (Core ``-bind``).  Empty/None binds
+                ``DEFAULT_BIND_HOSTS`` (0.0.0.0 and ::).  Pass
+                ``["127.0.0.1"]`` to restrict to IPv4 loopback.
         """
         self.network = network
         self.max_peers = max_peers
         self.max_block_relay_only = max_block_relay_only
+        self.max_inbound = (
+            MAX_INBOUND if max_inbound is None else max(0, int(max_inbound))
+        )
         self.transport_version = transport_version
         self._listen_enabled = listen
+        if bind:
+            self._bind_hosts = [str(b) for b in bind if str(b).strip()]
+            self._bind_explicit = True
+        else:
+            self._bind_hosts = list(DEFAULT_BIND_HOSTS)
+            self._bind_explicit = False
         self.proxy = proxy    # global SOCKS5 proxy for all outbound
         self.onion = onion    # SOCKS5 proxy specifically for .onion peers
         self.i2psam = i2psam  # I2P SAM bridge (host:port)
@@ -669,6 +732,7 @@ class PeerManager:
         self.running = False
         self._maintenance_task: asyncio.Task | None = None
         self._server: asyncio.AbstractServer | None = None
+        self._servers: list[asyncio.AbstractServer] = []
         self._start_height: int = 0
 
         # Node-global "P2P network active" flag (Core CConnman.fNetworkActive,
@@ -847,7 +911,7 @@ class PeerManager:
 
         Args:
             start_height: Our blockchain height for version messages
-            p2p_port: Port to listen on for inbound connections (0 = default)
+            p2p_port: Port to listen on for inbound connections (0 = ephemeral)
         """
         if self.running:
             logger.warning("PeerManager already running")
@@ -861,17 +925,21 @@ class PeerManager:
         self._start_ts = time.time()
         logger.info(f"Starting PeerManager for {self.network} (max_peers={self.max_peers})")
 
-        # Start listening for inbound connections
-        if self._listen_enabled and p2p_port:
+        # Start listening for inbound connections.  Port 0 is an OS-assigned
+        # ephemeral port (tests; Core-style "any free port"), not "don't
+        # listen" — ``--nolisten`` is the flag that skips this.  Dual-stack
+        # default is 0.0.0.0 + ::; ``bind`` restricts it.
+        if self._listen_enabled:
             await self._start_listening(p2p_port)
+            listen_port = self.listen_port if self.listen_port is not None else p2p_port
 
             # Start Tor hidden service for inbound .onion connections
-            if self.torcontrol:
-                await self._start_tor_hidden_service(p2p_port)
+            if self.torcontrol and listen_port:
+                await self._start_tor_hidden_service(listen_port)
 
             # Start I2P SAM session for inbound/outbound I2P connections
-            if self.i2psam:
-                await self._start_i2p_session(p2p_port)
+            if self.i2psam and listen_port:
+                await self._start_i2p_session(listen_port)
 
         if self._connect_only:
             # Core/clearbit -connect: dial ONLY the pinned peers.  No DNS
@@ -956,11 +1024,13 @@ class PeerManager:
         logger.info("Stopping PeerManager...")
         self.running = False
 
-        # Stop listening server
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
+        # Stop listening server(s) (IPv4 + IPv6)
+        for server in self._servers:
+            server.close()
+        for server in self._servers:
+            await server.wait_closed()
+        self._servers = []
+        self._server = None
 
         # Cancel maintenance task
         if self._maintenance_task:
@@ -1151,16 +1221,88 @@ class PeerManager:
 
     # Inbound connection handling
 
-    async def _start_listening(self, port: int):
+    def listening_sockets(self) -> list:
+        """Sockets currently bound by the P2P listener (IPv4 and/or IPv6)."""
+        socks = []
+        for srv in self._servers:
+            if srv.sockets:
+                socks.extend(srv.sockets)
+        return socks
+
+    @property
+    def listen_port(self) -> int | None:
+        socks = self.listening_sockets()
+        if not socks:
+            return None
+        return socks[0].getsockname()[1]
+
+    async def _bind_one(self, host: str, port: int) -> asyncio.AbstractServer:
+        """Bind a single listen socket.  IPv6 sockets get IPV6_V6ONLY=1 so
+        they do not steal IPv4 (Core net.cpp BindListenPort)."""
+        family = socket.AF_INET6 if _is_ipv6_host(host) else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
         try:
-            self._server = await asyncio.start_server(
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind((host.strip("[]"), port))
+            sock.setblocking(False)
+            return await asyncio.start_server(
                 self._handle_inbound_connection,
-                host="0.0.0.0",
-                port=port,
+                sock=sock,
             )
-            logger.info(f"Listening for inbound connections on port {port}")
-        except OSError as e:
-            logger.warning(f"Failed to listen on port {port}: {e}")
+        except Exception:
+            sock.close()
+            raise
+
+    async def _start_listening(self, port: int):
+        """Bind the P2P listener.
+
+        Default (no ``--bind``): 0.0.0.0 and :: on *port* (port 0 = ephemeral).
+        An IPv6-any failure is non-fatal when the operator did not ask for it
+        (Core InitBinds BF_NONE on ::).  IPv4-any failure is logged; if nothing
+        bound we warn and continue as an outbound-only node.
+        """
+        specs: list[tuple[str, int]] = []
+        for raw in self._bind_hosts:
+            try:
+                specs.append(parse_bind_spec(raw, port))
+            except ValueError as e:
+                logger.warning(f"Ignoring malformed --bind {raw!r}: {e}")
+        if not specs:
+            logger.warning("No valid P2P bind addresses; inbound listen disabled")
+            return
+
+        bound_port = port
+        self._servers = []
+        for host, spec_port in specs:
+            use_port = spec_port if spec_port else bound_port
+            try:
+                server = await self._bind_one(host, use_port)
+            except OSError as e:
+                # Core: failure to bind :: is not fatal unless the operator
+                # explicitly passed -bind.
+                if host == "::" and not self._bind_explicit:
+                    logger.warning(
+                        f"Failed to listen on [::]:{use_port}: {e} "
+                        "(continuing without IPv6 inbound)"
+                    )
+                    continue
+                logger.warning(f"Failed to listen on {host}:{use_port}: {e}")
+                continue
+            self._servers.append(server)
+            if bound_port == 0:
+                socks = server.sockets or []
+                if socks:
+                    bound_port = socks[0].getsockname()[1]
+            addrs = ", ".join(
+                _format_sockname(s.getsockname()) for s in (server.sockets or [])
+            )
+            logger.info(f"Listening for inbound connections on {addrs}")
+
+        self._server = self._servers[0] if self._servers else None
+        if not self._servers:
+            logger.warning(f"Failed to bind any P2P listen address on port {port}")
 
     async def _handle_inbound_connection(
         self,
@@ -1194,10 +1336,12 @@ class PeerManager:
         is_new_group = peer_group not in self._inbound_netgroups
 
         # Calculate effective limit (reserve slots for new groups)
-        effective_limit = MAX_INBOUND
+        effective_limit = self.max_inbound
         if not is_new_group:
             # Not a new group - reduce limit by reserved slots
-            effective_limit = MAX_INBOUND - RESERVED_INBOUND_SLOTS_FOR_NEW_GROUPS
+            effective_limit = max(
+                0, self.max_inbound - RESERVED_INBOUND_SLOTS_FOR_NEW_GROUPS
+            )
 
         # Check inbound limit — try to evict the worst peer first
         if len(self.inbound_peers) >= effective_limit:
@@ -1610,7 +1754,7 @@ class PeerManager:
         addr = f"{host}:{port}"
 
         # Check inbound limit
-        if len(self.inbound_peers) >= MAX_INBOUND:
+        if len(self.inbound_peers) >= self.max_inbound:
             if not await self._evict_inbound_peer():
                 logger.debug(f"Rejected I2P peer {addr}: max inbound reached")
                 writer.close()

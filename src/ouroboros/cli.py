@@ -365,6 +365,17 @@ def sync(ctx, reset, limit):
 @click.option("--rpc-port", default=8332, type=int, help="RPC server port")
 @click.option("--p2p-port", default=8333, type=int, help="P2P network port")
 @click.option("--listen/--nolisten", default=True, help="Accept inbound P2P connections")
+@click.option(
+    "--bind",
+    "bind",
+    multiple=True,
+    help=(
+        "Bind the P2P listener to this address[:port] (repeatable). "
+        "Default: 0.0.0.0 and :: (all interfaces). "
+        "Pass --bind 127.0.0.1 to restrict to IPv4 loopback "
+        "(Bitcoin Core -bind)."
+    ),
+)
 @click.option("--connect", multiple=True, help="Connect to ONLY these peer(s) host:port (repeatable). Implies -nodnsseed and disables addrman/auto-outbound dialing (Bitcoin Core -connect semantics).")
 @click.option(
     "--dnsseed/--nodnsseed",
@@ -518,7 +529,7 @@ def sync(ctx, reset, limit):
 )
 @click.pass_context
 def start(
-    ctx, rpc_port, p2p_port, listen, connect, dnsseed, force, v2transport,
+    ctx, rpc_port, p2p_port, listen, bind, connect, dnsseed, force, v2transport,
     peerbloomfilters, blockfilterindex, cfilter, coinstatsindex,
     txospenderindex, assumevalid, noassumevalid, daemon,
     pid_path, reindex, rpc_tls_cert, rpc_tls_key,
@@ -585,6 +596,8 @@ def start(
             "listen": listen,
             "config_path": config_path,
         }
+        if bind:
+            config["bind"] = list(bind)
         if connect:
             config["connect"] = list(connect)
         # --dnsseed/--nodnsseed: only override the conf-file value when the

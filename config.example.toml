@@ -25,7 +25,10 @@ rpc_allow_ip = "127.0.0.1"
 p2p_port = 8333
 # Accept inbound P2P connections
 listen = true
-# Maximum peer connections
+# P2P listen addresses. Empty / omitted = all interfaces (0.0.0.0 and ::).
+# Restrict with e.g. bind = "127.0.0.1" (Bitcoin Core -bind).
+# bind = "127.0.0.1"
+# Maximum peer connections (inbound = this minus 8 reserved outbound slots)
 maxconnections = 125
 
 [mempool]

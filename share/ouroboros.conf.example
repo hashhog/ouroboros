@@ -29,8 +29,12 @@ rpcallowip=127.0.0.1
 # ------------------------------------------------------------------------------
 # P2P / Connections
 # ------------------------------------------------------------------------------
-# Maximum number of peer connections
+# Maximum number of peer connections (inbound = this minus 8 reserved outbound)
 maxconnections=125
+
+# P2P listen addresses (Core -bind). Empty = all interfaces (0.0.0.0 and ::).
+# Repeat or comma-separate to bind several, e.g. bind=127.0.0.1
+# bind=127.0.0.1
 
 # BIP 324 v2 encrypted P2P transport (1=enabled, 0=v1-only).
 # Default is enabled.  The cipher + handshake are Core-compatible

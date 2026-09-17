@@ -160,6 +160,10 @@ class NodeConfig:
             'onion': None,
             # Whether to accept inbound P2P connections (1/0)
             'listen': '1',
+            # P2P listen addresses (Core -bind).  Empty = all interfaces
+            # (0.0.0.0 and ::).  Comma-separated, e.g. "127.0.0.1" or
+            # "127.0.0.1,[::1]" to restrict to loopback.
+            'bind': '',
             # Enable REST interface (1/0)
             'rest': '0',
             # ZMQ notification endpoints (per-topic, Bitcoin Core style)
@@ -322,6 +326,18 @@ class NodeConfig:
             return default == '1' or default.lower() in ('true', 'yes', 'on')
         return value.lower() in ('1', 'true', 'yes', 'on')
 
+    def _bind_list(self) -> list[str]:
+        """Parse ``bind`` as a list of address specs.
+
+        Empty / unset means "all interfaces" (PeerManager default 0.0.0.0
+        and ::).  Comma-separated values are accepted so a conf file can
+        write ``bind=127.0.0.1,[::1]``.
+        """
+        raw = self.get('bind') or ''
+        if isinstance(raw, (list, tuple)):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        return [p.strip() for p in str(raw).split(',') if p.strip()]
+
     def to_dict(self) -> dict[str, Any]:
         """Return all config values as a dictionary."""
         return {
@@ -339,6 +355,7 @@ class NodeConfig:
             'proxy': self.get('proxy'),
             'onion': self.get('onion'),
             'listen': self.getboolean('listen'),
+            'bind': self._bind_list(),
             'i2psam': self.get('i2psam'),
             'torcontrol': self.get('torcontrol'),
             'torpassword': self.get('torpassword'),
