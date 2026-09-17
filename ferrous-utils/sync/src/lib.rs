@@ -2414,6 +2414,177 @@ fn read_snapshot_metadata(path: String, network: String) -> PyResult<PySnapshotM
     })
 }
 
+// ---------------------------------------------------------------------------
+// Native script interpreter (validate::interpreter) — Python bindings.
+//
+// `ouroboros.script.ScriptInterpreter` routes here when
+// OUROBOROS_NATIVE_SCRIPT=1. The contract with the Python side:
+//   * `ScriptTx(tx_bytes, spent_amounts, spent_script_pubkeys)` is built ONCE
+//     per transaction (the Python side caches it on the Transaction object)
+//     from the extended transport encoding `ouroboros.script._native_tx_bytes`
+//     emits (BIP-144 layout with marker/flag + witness section ALWAYS present).
+//   * `script_verify(ctx, n, scriptSig, scriptPubKey, flags, amount)` is
+//     Core's VerifyScript over input n: (accepted, error_code, error_name).
+//   * `script_sighash_legacy` is Core's BASE SignatureHash (the shim's
+//     `sighash` op).
+//   * `script_eval` is EvalScript alone, for the Python-vs-native differential.
+// ---------------------------------------------------------------------------
+
+use crate::validate::interpreter as native_interp;
+
+/// Bump when the Python-facing contract of the functions below changes; the
+/// Python side refuses to enable the native path against an older ABI.
+const NATIVE_SCRIPT_ABI: u32 = 1;
+
+#[pyfunction]
+fn script_native_abi() -> u32 {
+    NATIVE_SCRIPT_ABI
+}
+
+/// Per-transaction precomputed context for the native script interpreter
+/// (Core `PrecomputedTransactionData`).
+#[pyclass(name = "ScriptTx")]
+pub struct PyScriptTx {
+    inner: Arc<native_interp::TxContext>,
+}
+
+#[pymethods]
+impl PyScriptTx {
+    #[new]
+    #[pyo3(signature = (tx_bytes, spent_amounts=None, spent_script_pubkeys=None))]
+    fn new(
+        tx_bytes: &[u8],
+        spent_amounts: Option<Vec<i64>>,
+        spent_script_pubkeys: Option<Vec<Vec<u8>>>,
+    ) -> PyResult<Self> {
+        let tx = native_interp::Tx::decode_extended(tx_bytes)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.0))?;
+        let spent = match (spent_amounts, spent_script_pubkeys) {
+            (Some(a), Some(s)) => {
+                if a.len() != s.len() {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "spent_amounts ({}) and spent_script_pubkeys ({}) differ in length",
+                        a.len(),
+                        s.len()
+                    )));
+                }
+                Some(
+                    a.into_iter()
+                        .zip(s)
+                        .map(|(value, script_pubkey)| native_interp::TxOut { value, script_pubkey })
+                        .collect(),
+                )
+            }
+            (None, None) => None,
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "spent_amounts and spent_script_pubkeys must be given together",
+                ))
+            }
+        };
+        let ctx = native_interp::TxContext::new(tx, spent)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.0))?;
+        Ok(PyScriptTx { inner: Arc::new(ctx) })
+    }
+
+    #[getter]
+    fn num_inputs(&self) -> usize {
+        self.inner.tx.inputs.len()
+    }
+
+    #[getter]
+    fn num_outputs(&self) -> usize {
+        self.inner.tx.outputs.len()
+    }
+}
+
+/// Core `VerifyScript` for input `input_index` of `ctx`.
+/// Returns (accepted, error_code, error_name) — the code/name are Core's
+/// `ScriptError` enumerator (SCRIPT_ERR_OK on acceptance).
+#[pyfunction]
+#[pyo3(signature = (ctx, input_index, script_sig, script_pubkey, flags, amount=0))]
+fn script_verify(
+    py: Python<'_>,
+    ctx: PyRef<'_, PyScriptTx>,
+    input_index: usize,
+    script_sig: &[u8],
+    script_pubkey: &[u8],
+    flags: u32,
+    amount: i64,
+) -> PyResult<(bool, u32, &'static str)> {
+    let inner = ctx.inner.clone();
+    if input_index >= inner.tx.inputs.len() {
+        return Err(PyErr::new::<pyo3::exceptions::PyIndexError, _>(format!(
+            "input_index {} out of range for a transaction with {} inputs",
+            input_index,
+            inner.tx.inputs.len()
+        )));
+    }
+    let ssig = script_sig.to_vec();
+    let spk = script_pubkey.to_vec();
+    let err = py.detach(move || {
+        match native_interp::verify_input(&inner, input_index, &ssig, &spk, flags, amount) {
+            Ok(()) => native_interp::ScriptError::Ok,
+            Err(e) => e,
+        }
+    });
+    Ok((err == native_interp::ScriptError::Ok, err.code(), err.name()))
+}
+
+/// Core `EvalScript` alone (BASE=0 / WITNESS_V0=1 semantics) over
+/// `initial_stack`; returns (ok, error_code, error_name, resulting_stack).
+/// Differential-test instrument only.
+#[pyfunction]
+#[pyo3(signature = (ctx, input_index, script, flags, sigversion, initial_stack, amount=0))]
+fn script_eval(
+    py: Python<'_>,
+    ctx: PyRef<'_, PyScriptTx>,
+    input_index: usize,
+    script: &[u8],
+    flags: u32,
+    sigversion: u32,
+    initial_stack: Vec<Vec<u8>>,
+    amount: i64,
+) -> PyResult<(bool, u32, &'static str, Vec<Py<PyBytes>>)> {
+    let sv = match sigversion {
+        0 => native_interp::SigVersion::Base,
+        1 => native_interp::SigVersion::WitnessV0,
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "sigversion must be 0 (BASE) or 1 (WITNESS_V0)",
+            ))
+        }
+    };
+    let inner = ctx.inner.clone();
+    let script = script.to_vec();
+    let (r, stack) = py.detach(move || {
+        native_interp::eval_script_standalone(&inner, input_index, &script, flags, sv, amount, initial_stack)
+    });
+    let err = match r {
+        Ok(()) => native_interp::ScriptError::Ok,
+        Err(e) => e,
+    };
+    let out: Vec<Py<PyBytes>> = stack.iter().map(|v| PyBytes::new(py, v).unbind()).collect();
+    Ok((err == native_interp::ScriptError::Ok, err.code(), err.name(), out))
+}
+
+/// Core legacy `SignatureHash(scriptCode, tx, nIn, nHashType, SigVersion::BASE)`.
+/// `hash_type` is the raw (possibly negative) int32; returns the 32-byte
+/// digest in internal byte order.
+#[pyfunction]
+fn script_sighash_legacy(
+    py: Python<'_>,
+    tx_bytes: &[u8],
+    input_index: usize,
+    script_code: &[u8],
+    hash_type: i64,
+) -> PyResult<Py<PyBytes>> {
+    let tx = native_interp::Tx::decode_extended(tx_bytes)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.0))?;
+    let h = native_interp::signature_hash_legacy(&tx, script_code, input_index, hash_type as i32);
+    Ok(PyBytes::new(py, &h).unbind())
+}
+
 /// Fast sync module for Bitcoin blockchain synchronization
 #[pymodule]
 fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2502,6 +2673,12 @@ fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(snapshot_magic_bytes, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(snapshot_format_version, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(read_snapshot_metadata, m)?)?;
+    // Native script interpreter (OUROBOROS_NATIVE_SCRIPT=1)
+    m.add_class::<PyScriptTx>()?;
+    m.add_function(pyo3::wrap_pyfunction!(script_native_abi, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(script_verify, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(script_eval, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(script_sighash_legacy, m)?)?;
     Ok(())
 }
 

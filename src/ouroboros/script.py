@@ -15,10 +15,187 @@ Taproot support (BIP 340/341/342):
 """
 
 import hashlib
+import logging
+import os
 import struct
 from enum import IntEnum
 
 from ouroboros.database import Transaction
+
+_log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Native (Rust) script interpreter switch
+#
+# ``OUROBOROS_NATIVE_SCRIPT=1`` routes ``ScriptInterpreter.verify`` and the
+# legacy sighash through the byte-exact Core port in
+# ferrous-utils/sync/src/validate/interpreter.rs (exposed by the ``sync``
+# extension as ``ScriptTx`` / ``script_verify`` / ``script_sighash_legacy``).
+# The default is the pure-Python interpreter below, which stays intact as the
+# fallback and as the oracle for the Python-vs-native differential
+# (``tests/native_script_differential.py``).
+#
+# FAIL-CLOSED: when the operator asks for native and the extension does not
+# provide it (stale wheel, ABI drift), import fails loudly instead of quietly
+# running Python — a green run that silently measured the wrong interpreter
+# is worse than no run.
+# ---------------------------------------------------------------------------
+
+_NATIVE_SCRIPT_ENV = "OUROBOROS_NATIVE_SCRIPT"
+_NATIVE_SCRIPT_ABI = 1
+
+
+def _env_truthy(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _load_native_script():
+    """Return the ``sync`` module once its native script API is verified."""
+    try:
+        import sync as _sync  # noqa: WPS433 (ferrous-utils extension)
+    except ImportError as e:  # pragma: no cover - environment failure
+        raise RuntimeError(
+            f"{_NATIVE_SCRIPT_ENV} is set but the ferrous-utils `sync` "
+            f"extension is not importable: {e}"
+        ) from e
+    abi_fn = getattr(_sync, "script_native_abi", None)
+    missing = [
+        name for name in ("ScriptTx", "script_verify", "script_sighash_legacy")
+        if not hasattr(_sync, name)
+    ]
+    if abi_fn is None or missing:
+        raise RuntimeError(
+            f"{_NATIVE_SCRIPT_ENV} is set but the installed `sync` extension "
+            f"({getattr(_sync, '__file__', '?')}) has no native script "
+            f"interpreter (missing: {missing or ['script_native_abi']}); "
+            "rebuild ferrous-utils/sync (maturin build --release) and "
+            "reinstall the wheel"
+        )
+    abi = abi_fn()
+    if abi != _NATIVE_SCRIPT_ABI:
+        raise RuntimeError(
+            f"{_NATIVE_SCRIPT_ENV} is set but the `sync` native script ABI is "
+            f"{abi}, this code expects {_NATIVE_SCRIPT_ABI}"
+        )
+    return _sync
+
+
+_NATIVE_SCRIPT_REQUESTED = _env_truthy(os.environ.get(_NATIVE_SCRIPT_ENV, ""))
+_native_sync = _load_native_script() if _NATIVE_SCRIPT_REQUESTED else None
+#: True when ``ScriptInterpreter.verify`` runs the Rust port.
+NATIVE_SCRIPT_ENABLED = _native_sync is not None
+if NATIVE_SCRIPT_ENABLED:
+    _log.info(
+        "native script interpreter ENABLED (%s=%s, sync=%s)",
+        _NATIVE_SCRIPT_ENV, os.environ.get(_NATIVE_SCRIPT_ENV),
+        getattr(_native_sync, "__file__", "?"),
+    )
+
+
+def _native_sync_module():
+    """The ``sync`` module with the native script API, loaded on demand.
+
+    Used by the differential harness to reach the native interpreter even
+    when the switch is off (the node itself only consults
+    ``NATIVE_SCRIPT_ENABLED``).
+    """
+    global _native_sync
+    if _native_sync is None:
+        _native_sync = _load_native_script()
+    return _native_sync
+
+
+def _varint(value: int) -> bytes:
+    if value < 0xfd:
+        return bytes([value])
+    if value <= 0xffff:
+        return b"\xfd" + value.to_bytes(2, "little")
+    if value <= 0xffffffff:
+        return b"\xfe" + value.to_bytes(4, "little")
+    return b"\xff" + value.to_bytes(8, "little")
+
+
+def _native_tx_bytes(tx: Transaction) -> bytes:
+    """Encode ``tx`` for the native interpreter.
+
+    BIP-144 layout with the marker/flag and the per-input witness section
+    ALWAYS present (even when every witness stack is empty), so a
+    ``Transaction`` whose inputs carry witness stacks is transported
+    faithfully regardless of its ``has_witness`` attribute. Integer fields
+    are written as Core stores them (uint32 version/sequence/locktime, int64
+    output value), masking so that negative Python values round-trip to the
+    same bit patterns Core would hold.
+    """
+    out = bytearray()
+    out += (tx.version & 0xFFFFFFFF).to_bytes(4, "little")
+    out += b"\x00\x01"
+    out += _varint(len(tx.inputs))
+    for tx_in in tx.inputs:
+        out += bytes(tx_in.prev_txid)
+        out += (tx_in.prev_vout & 0xFFFFFFFF).to_bytes(4, "little")
+        script_sig = bytes(tx_in.script_sig)
+        out += _varint(len(script_sig))
+        out += script_sig
+        out += (tx_in.sequence & 0xFFFFFFFF).to_bytes(4, "little")
+    out += _varint(len(tx.outputs))
+    for tx_out in tx.outputs:
+        out += (tx_out.value & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+        spk = bytes(tx_out.script_pubkey)
+        out += _varint(len(spk))
+        out += spk
+    for tx_in in tx.inputs:
+        witness = tx_in.witness or []
+        out += _varint(len(witness))
+        for item in witness:
+            item = bytes(item)
+            out += _varint(len(item))
+            out += item
+    out += (tx.locktime & 0xFFFFFFFF).to_bytes(4, "little")
+    return bytes(out)
+
+
+def native_script_context(
+    tx: Transaction,
+    input_amounts: "list[int] | None" = None,
+    input_script_pubkeys: "list[bytes] | None" = None,
+):
+    """Build (or reuse) the per-transaction native context (``sync.ScriptTx``).
+
+    Cached on the ``Transaction`` object keyed by the IDENTITY of the spent
+    data lists, which validation.py builds once per transaction and reuses
+    for every input; a different pair of lists rebuilds the context.
+    Spent data is only attached when it covers every input (Core asserts
+    ``spent_outputs.size() == vin.size()``); otherwise BIP-341 signature
+    hashing has no data and taproot inputs fail, exactly as Core's
+    ``MissingDataBehavior::FAIL``.
+    """
+    cached = getattr(tx, "_native_script_ctx", None)
+    if cached is not None:
+        ctx, amts, spks = cached
+        if amts is input_amounts and spks is input_script_pubkeys:
+            return ctx
+    sync_mod = _native_sync_module()
+    tx_bytes = _native_tx_bytes(tx)
+    n = len(tx.inputs)
+    if (
+        input_amounts is not None
+        and input_script_pubkeys is not None
+        and len(input_amounts) == n
+        and len(input_script_pubkeys) == n
+    ):
+        ctx = sync_mod.ScriptTx(
+            tx_bytes,
+            [int(a) for a in input_amounts],
+            [bytes(s) for s in input_script_pubkeys],
+        )
+    else:
+        ctx = sync_mod.ScriptTx(tx_bytes)
+    try:
+        tx._native_script_ctx = (ctx, input_amounts, input_script_pubkeys)
+    except AttributeError:  # __slots__ / frozen representations
+        pass
+    return ctx
 
 
 class SigVersion(IntEnum):
@@ -513,10 +690,80 @@ def _get_witness_version_and_program(script_pubkey: bytes) -> tuple[int, bytes] 
 class ScriptInterpreter:
     """Interprets and verifies Bitcoin scripts"""
 
+    #: Number of native-path exceptions still logged at WARNING before the
+    #: log line is suppressed (a systematic fault would otherwise flood).
+    _native_exc_log_budget = 20
+
     def __init__(self):
-        pass
+        #: Core ``SCRIPT_ERR_*`` name of the last native rejection, or
+        #: ``None``; the Python path never sets it.
+        self.last_error = None
 
     def verify(
+        self,
+        script_sig: bytes,
+        script_pubkey: bytes,
+        tx: Transaction,
+        input_index: int,
+        flags: int = SCRIPT_VERIFY_NONE,
+        amount: int = 0,
+        input_amounts: list[int] | None = None,
+        input_script_pubkeys: list[bytes] | None = None,
+    ) -> bool:
+        """Verify one input (Core ``VerifyScript``), Python or native.
+
+        Dispatches on ``NATIVE_SCRIPT_ENABLED`` (``OUROBOROS_NATIVE_SCRIPT``);
+        both paths share this signature and return only the decision.
+        """
+        if NATIVE_SCRIPT_ENABLED:
+            return self.verify_native(
+                script_sig, script_pubkey, tx, input_index,
+                flags=flags, amount=amount,
+                input_amounts=input_amounts,
+                input_script_pubkeys=input_script_pubkeys,
+            )
+        return self.verify_python(
+            script_sig, script_pubkey, tx, input_index,
+            flags=flags, amount=amount,
+            input_amounts=input_amounts,
+            input_script_pubkeys=input_script_pubkeys,
+        )
+
+    def verify_native(
+        self,
+        script_sig: bytes,
+        script_pubkey: bytes,
+        tx: Transaction,
+        input_index: int,
+        flags: int = SCRIPT_VERIFY_NONE,
+        amount: int = 0,
+        input_amounts: list[int] | None = None,
+        input_script_pubkeys: list[bytes] | None = None,
+    ) -> bool:
+        """``VerifyScript`` via the Rust port (``sync.script_verify``).
+
+        Mirrors ``verify_python``'s contract: any exception on the way to a
+        decision is a rejection (logged, budgeted), never a crash.
+        """
+        try:
+            ctx = native_script_context(tx, input_amounts, input_script_pubkeys)
+            ok, _code, name = _native_sync_module().script_verify(
+                ctx, input_index, bytes(script_sig), bytes(script_pubkey),
+                int(flags), int(amount),
+            )
+        except Exception as e:  # noqa: BLE001 - decision boundary
+            self.last_error = f"native-exception:{type(e).__name__}"
+            if ScriptInterpreter._native_exc_log_budget > 0:
+                ScriptInterpreter._native_exc_log_budget -= 1
+                _log.warning(
+                    "native script interpreter raised for input %d "
+                    "(treated as reject): %r", input_index, e,
+                )
+            return False
+        self.last_error = None if ok else name
+        return ok
+
+    def verify_python(
         self,
         script_sig: bytes,
         script_pubkey: bytes,
@@ -2040,6 +2287,33 @@ class ScriptInterpreter:
         return script, 0
 
     def _calculate_signature_hash(
+        self,
+        transaction: Transaction,
+        input_index: int,
+        script_code: bytes,
+        sighash_type: int
+    ) -> bytes:
+        """Legacy ``SignatureHash`` (BASE); native when enabled."""
+        if NATIVE_SCRIPT_ENABLED:
+            return self._calculate_signature_hash_native(
+                transaction, input_index, script_code, sighash_type)
+        return self._calculate_signature_hash_python(
+            transaction, input_index, script_code, sighash_type)
+
+    def _calculate_signature_hash_native(
+        self,
+        transaction: Transaction,
+        input_index: int,
+        script_code: bytes,
+        sighash_type: int
+    ) -> bytes:
+        """Legacy ``SignatureHash`` via ``sync.script_sighash_legacy``."""
+        return _native_sync_module().script_sighash_legacy(
+            _native_tx_bytes(transaction), int(input_index),
+            bytes(script_code), int(sighash_type),
+        )
+
+    def _calculate_signature_hash_python(
         self,
         transaction: Transaction,
         input_index: int,
