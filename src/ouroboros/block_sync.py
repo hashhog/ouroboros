@@ -1132,7 +1132,9 @@ class BlockSync:
         self._h1_last_issue.pop(block_hash, None)
         return old
 
-    def _evict_far_ahead_slot(self, peer: Peer, head_set: set[bytes]) -> bool:
+    def _evict_far_ahead_slot(
+        self, peer: Peer, head_set: set[bytes], *, log: bool = True,
+    ) -> bool:
         """Drop one non-head in-flight request from *peer* to free a cap slot.
 
         Head-of-window hashes are never evicted — they are the only blocks
@@ -1146,19 +1148,48 @@ class BlockSync:
             if bh in self._connecting_hashes:
                 continue
             self._reclaim_inflight_slot(bh)
-            logger.info(
-                "evicted far-ahead in-flight %s from %s:%s to free a "
-                "head-of-window slot",
-                bh.hex()[:12], peer.host, peer.port,
-            )
+            if log:
+                logger.info(
+                    "evicted far-ahead in-flight %s from %s:%s to free a "
+                    "head-of-window slot",
+                    bh.hex()[:12], peer.host, peer.port,
+                )
             return True
         return False
+
+    def _evict_all_far_ahead(self, peer: Peer, head_set: set[bytes]) -> int:
+        """Drop every non-head in-flight request from *peer*.
+
+        Evicting a single far-ahead slot (``98ac21b``) lets tip+1 fit
+        under ``MAX_BLOCKS_IN_FLIGHT_PER_PEER``, but the remaining 15
+        keep older timestamps.  A FIFO feeder — the campaign replay
+        peer included — then spends minutes serving those bodies
+        before the connect cursor.  That is the halved-throughput
+        stall, not a hang.  Clearing the far-ahead pipeline makes HOL
+        the next delivery on this peer.
+        """
+        n = 0
+        while self._evict_far_ahead_slot(peer, head_set, log=False):
+            n += 1
+        if n:
+            logger.info(
+                "evicted %d far-ahead in-flight from %s:%s so the "
+                "connect cursor is next on the wire",
+                n, peer.host, peer.port,
+            )
+        return n
 
     def _pick_peer_for_head(
         self, candidates: list, head_set: set[bytes],
         *, allow_over_cap: bool = False,
     ) -> Peer | None:
         """Choose a peer that can take a HOL re-request, evicting if needed.
+
+        Far-ahead in-flight on the chosen peer is always cleared so the
+        connect cursor is the next body that peer delivers — not only
+        when the peer is already at cap.  A free slot in front of 15
+        older far-ahead requests is the campaign rate bug: HOL is
+        requested (eventual completion) but is the 16th FIFO delivery.
 
         ``allow_over_cap`` is the last-resort campaign-rig escape: if every
         candidate is at cap and every in-flight hash is itself a head-of-
@@ -1170,9 +1201,10 @@ class BlockSync:
         load = Counter(self._block_request_peer.values())
         for p in candidates:
             if load.get(p, 0) < MAX_BLOCKS_IN_FLIGHT_PER_PEER:
+                self._evict_all_far_ahead(p, head_set)
                 return p
         for p in candidates:
-            if self._evict_far_ahead_slot(p, head_set):
+            if self._evict_all_far_ahead(p, head_set):
                 return p
         if allow_over_cap:
             return candidates[0]
@@ -6055,7 +6087,11 @@ class BlockSync:
             # (HEAD_TIMEOUT).  H1 re-getdata to the same --connect feeder
             # every 5s was the 481807→515000 re-request/fork loop.
             if frontier_hash in self.requested_blocks and holder_live:
-                pass
+                # HOL is already assigned, but may be sitting behind
+                # far-ahead in-flight (98ac21b requested it as the 16th
+                # FIFO body).  Drop those so the holder delivers tip+1
+                # next; do not send a duplicate getdata.
+                self._evict_all_far_ahead(current_peer, head_set)
             else:
                 last_h1 = self._h1_last_issue.get(frontier_hash)
                 if last_h1 is None:
@@ -6153,7 +6189,25 @@ class BlockSync:
         # Budget is what's left of cap_inflight after the head pass, clamped
         # by cap_buffer (the W93 throttle) -- this is the W85 over-fetch
         # guard, unchanged for speculative tail fetches.
-        tail_budget = min(cap_inflight - len(to_request), cap_buffer)
+        #
+        # Skip bodies we already hold (Core FindNextBlocks HAVE_DATA).  The
+        # pre-fix tail pass re-getdata'd buffered far-ahead and filled the
+        # per-peer cap with duplicates — campaign log "deferred N (all
+        # peers at cap)" with buf=725.  Do not prefetch past a hole: if
+        # any head-of-window slot is neither buffered, in-flight, nor in
+        # this cycle's to_request, tail_budget is 0 so the only peer's
+        # pipeline stays on the connect cursor.
+        heads_covered = all(
+            h in self.requested_blocks
+            or h in self._ibd_block_buffer
+            or h in self._connecting_hashes
+            or h in seen
+            for h in head_set
+        )
+        tail_budget = (
+            min(cap_inflight - len(to_request), cap_buffer)
+            if heads_covered else 0
+        )
         if tail_budget > 0:
             for i in range(start, len(self._validated_headers)):
                 if tail_budget <= 0:
@@ -6161,6 +6215,7 @@ class BlockSync:
                 block_hash, _ = self._validated_headers[i]
                 if (block_hash in self.requested_blocks
                         or block_hash in seen
+                        or block_hash in self._ibd_block_buffer
                         or block_hash in self._connecting_hashes):
                     continue
                 to_request.append((MSG_WITNESS_BLOCK, block_hash))
