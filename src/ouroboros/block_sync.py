@@ -369,6 +369,7 @@ def _distribute_blocks_round_robin(
     candidates: list,
     peer_load: dict,
     max_per_peer: int,
+    avoid: dict | None = None,
 ) -> tuple[dict, list]:
     """Round-robin distribute items across candidates, respecting per-peer cap.
 
@@ -378,6 +379,11 @@ def _distribute_blocks_round_robin(
     candidate (possibly with empty lists) and ``assigned`` is the subset of
     ``items`` that was placed.  Any remaining items are deferred — all
     candidates were at cap when iteration stopped.
+
+    ``avoid`` is an optional ``block_hash -> peer`` map: when another
+    candidate has a free slot, that hash is not handed back to the avoided
+    peer (HOL stall rotation).  If every other candidate is at cap the
+    avoided peer is still used as a last resort when it has room.
     """
     per_peer: dict = {c: [] for c in candidates}
     assigned: list = []
@@ -386,17 +392,33 @@ def _distribute_blocks_round_robin(
     n = len(candidates)
     peer_idx = 0
     for item in items:
+        key = item[1] if isinstance(item, tuple) and len(item) >= 2 else item
+        avoid_peer = avoid.get(key) if avoid else None
+        placed = False
         for attempt in range(n):
             target = candidates[(peer_idx + attempt) % n]
+            if target is avoid_peer and n > 1:
+                continue
             if peer_load.get(target, 0) < max_per_peer:
                 per_peer[target].append(item)
                 peer_load[target] = peer_load.get(target, 0) + 1
                 assigned.append(item)
                 peer_idx = (peer_idx + attempt + 1) % n
+                placed = True
                 break
-        else:
-            # All candidates at cap — stop trying further items this round.
-            break
+        if placed:
+            continue
+        if (
+            avoid_peer is not None
+            and avoid_peer in per_peer
+            and peer_load.get(avoid_peer, 0) < max_per_peer
+        ):
+            per_peer[avoid_peer].append(item)
+            peer_load[avoid_peer] = peer_load.get(avoid_peer, 0) + 1
+            assigned.append(item)
+            continue
+        # All candidates at cap — stop trying further items this round.
+        break
     return per_peer, assigned
 
 
@@ -489,6 +511,10 @@ class BlockSync:
 
         # Track which peer each block was last requested from (hash -> Peer)
         self._block_request_peer: dict[bytes, Peer] = {}
+        # Peer that most recently HOL/general-timed-out a given hash.  The
+        # next getdata for that hash prefers a different peer (Core
+        # BLOCK_STALLING_TIMEOUT then FindNextBlocksToDownload on others).
+        self._last_stalled_peer: dict[bytes, Peer] = {}
 
         # H1 throttle, SEPARATE from requested_blocks.  Pre-fix H1 wrote
         # requested_blocks[frontier]=now on every 5s re-issue, so the
@@ -1074,9 +1100,60 @@ class BlockSync:
         self.requested_blocks.pop(block_hash, None)
         self._block_request_peer.pop(block_hash, None)
         self._h1_last_issue.pop(block_hash, None)
+        self._last_stalled_peer.pop(block_hash, None)
         self._w77_first_request_time.pop(block_hash, None)
         self._block_request_attempts.pop(block_hash, None)
         self._connecting_hashes.discard(block_hash)
+
+    def _reclaim_inflight_slot(self, block_hash: bytes) -> Peer | None:
+        """Free *block_hash*'s in-flight slot.  Returns the previous holder.
+
+        Timed-out and disconnected downloads must not keep occupying the
+        per-peer cap or the global 256-slot window — that is the live
+        "all peers at cap" / 137-deferred leak.  Attempt counter and
+        first-request telemetry stay so MAX_ATTEMPTS / W77 still work.
+        """
+        old = self._block_request_peer.pop(block_hash, None)
+        self.requested_blocks.pop(block_hash, None)
+        self._h1_last_issue.pop(block_hash, None)
+        return old
+
+    def _evict_far_ahead_slot(self, peer: Peer, head_set: set[bytes]) -> bool:
+        """Drop one non-head in-flight request from *peer* to free a cap slot.
+
+        Head-of-window hashes are never evicted — they are the only blocks
+        the in-order drain can advance on.  Newest (farthest) first.
+        """
+        for bh, p in reversed(list(self._block_request_peer.items())):
+            if p is not peer:
+                continue
+            if bh in head_set:
+                continue
+            if bh in self._connecting_hashes:
+                continue
+            self._reclaim_inflight_slot(bh)
+            logger.info(
+                "evicted far-ahead in-flight %s from %s:%s to free a "
+                "head-of-window slot",
+                bh.hex()[:12], peer.host, peer.port,
+            )
+            return True
+        return False
+
+    def _pick_peer_for_head(
+        self, candidates: list, head_set: set[bytes],
+    ) -> Peer | None:
+        """Choose a peer that can take a HOL re-request, evicting if needed."""
+        if not candidates:
+            return None
+        load = Counter(self._block_request_peer.values())
+        for p in candidates:
+            if load.get(p, 0) < MAX_BLOCKS_IN_FLIGHT_PER_PEER:
+                return p
+        for p in candidates:
+            if self._evict_far_ahead_slot(p, head_set):
+                return p
+        return None
 
     # BIP34 activation height (mainnet).  Below this height the coinbase
     # scriptSig is unconstrained; above it the first push must encode the
@@ -1169,6 +1246,7 @@ class BlockSync:
         self.requested_blocks.clear()
         self._block_request_peer.clear()
         self._h1_last_issue.clear()
+        self._last_stalled_peer.clear()
         self._block_source_peer_addr.clear()
         self._connecting_hashes.clear()
         # _w77_first_request_time is the request→connect latency telemetry
@@ -1305,6 +1383,11 @@ class BlockSync:
         ]
         for bh in hashes_to_drop:
             self._block_request_peer.pop(bh, None)
+            # Reclaim the global in-flight slot too — leaving the hash in
+            # requested_blocks after the holder is gone is the 87-in-flight
+            # / empty-holder leak: HEAD pass skips it until HEAD_TIMEOUT.
+            self.requested_blocks.pop(bh, None)
+            self._h1_last_issue.pop(bh, None)
             # Drop the source-addr breadcrumb too so the next delivery
             # of the same block from a different peer is not credited
             # to the disconnected one.
@@ -2178,6 +2261,7 @@ class BlockSync:
             self.requested_blocks.clear()
             self._block_request_peer.clear()
             self._h1_last_issue.clear()
+            self._last_stalled_peer.clear()
             self._block_source_peer_addr.clear()
             self._compact_origin_hashes.clear()
             self._connecting_hashes.clear()
@@ -5961,12 +6045,21 @@ class BlockSync:
                     or not holder_live
                 ):
                     # Rotate: first top-scoring peer that is NOT the current
-                    # holder, so a departed/unservable peer cannot keep the
-                    # frontier.  A still-connected holder never reaches here.
+                    # holder and NOT the peer that just HOL-timed-out this
+                    # hash, so a departed/unservable/stalling peer cannot keep
+                    # the frontier.  A still-connected holder never reaches
+                    # here.
+                    stalled = self._last_stalled_peer.get(frontier_hash)
                     frontier_peer = next(
-                        (p for p in candidates if p is not current_peer),
-                        candidates[0],
+                        (p for p in candidates
+                         if p is not current_peer and p is not stalled),
+                        None,
                     )
+                    if frontier_peer is None:
+                        frontier_peer = next(
+                            (p for p in candidates if p is not current_peer),
+                            candidates[0],
+                        )
                     try:
                         getdata = GetDataMessage(
                             inventory=[(MSG_WITNESS_BLOCK, frontier_hash)]
@@ -6059,6 +6152,7 @@ class BlockSync:
         peer_load = Counter(self._block_request_peer.values())
         per_peer, assigned = _distribute_blocks_round_robin(
             to_request, candidates, peer_load, MAX_BLOCKS_IN_FLIGHT_PER_PEER,
+            avoid=self._last_stalled_peer,
         )
 
         if not assigned:
@@ -6240,6 +6334,7 @@ class BlockSync:
         self.requested_blocks.clear()
         self._block_request_peer.clear()
         getattr(self, "_h1_last_issue", {}).clear()
+        getattr(self, "_last_stalled_peer", {}).clear()
         self._block_source_peer_addr.clear()
         getattr(self, "_connecting_hashes", set()).clear()
         self._w77_first_request_time.clear()
@@ -6956,6 +7051,7 @@ class BlockSync:
         # is done.  Drop the attempt counter so it cannot accrete across the
         # process lifetime (it is bumped per timeout in _handle_timeouts).
         self._block_request_attempts.pop(block_hash, None)
+        self._last_stalled_peer.pop(block_hash, None)
         if first_req is not None:
             lat_s = connect_time - first_req
             if lat_s < 0:
@@ -7021,9 +7117,9 @@ class BlockSync:
         # next-expected block with the buffer holding 150-290 future
         # blocks — the chain-closest slot was held hostage by a slow
         # peer while later blocks piled up.  Rescue the first 8 unfetched
-        # slots at HEAD_TIMEOUT so the drain can advance; penalize peer
-        # score only on the general path (optimistic reroutes aren't a
-        # verdict on peer quality).
+        # slots at HEAD_TIMEOUT so the drain can advance.  HOL stallers
+        # are penalised too — HEAD_TIMEOUT is size-aware (up to 64s), not
+        # the old 2s optimistic reroute.
         # HEAD_TIMEOUT=2s matches Bitcoin Core's BLOCK_STALLING_TIMEOUT
         # (net_processing.cpp).  Tightened from 10s in W94b (fc63a2f).
         #
@@ -7141,20 +7237,17 @@ class BlockSync:
             all_peers = [p for p in raw if isinstance(p, Peer)]
 
         # Penalize each failed peer only ONCE per cycle (not per block).
-        # Only peers holding general (60s) timeouts get a score penalty;
-        # head-of-window rescues at HEAD_TIMEOUT (2s) are optimistic
-        # reroutes, not verdicts on peer quality — a legitimately-serving
-        # peer might need >2s to deliver a 2 MB block.
-        general_set = set(general_timed_out)
+        # HEAD_TIMEOUT is size-aware (live ~37s at 1.47 MB, capped at Core's
+        # BLOCK_STALLING_TIMEOUT_MAX=64s) — a miss at that budget is a stall,
+        # not an optimistic 2s reroute, so HOL holders are penalised too.
         failed_peers: set[Peer] = set()
-        penalize_peers: set[Peer] = set()
         for block_hash in timed_out:
             failed_peer = self._block_request_peer.get(block_hash)
             if failed_peer is not None:
                 failed_peers.add(failed_peer)
-                if block_hash in general_set:
-                    penalize_peers.add(failed_peer)
-        for peer in penalize_peers:
+                self._last_stalled_peer[block_hash] = failed_peer
+        penalized = 0
+        for peer in failed_peers:
             # Pinned-peer exemption (Core NoBan parity) — same rationale as
             # the header-stall path above: a manually-pinned (-connect /
             # -addnode / whitelisted) peer is never scored for slowness; a
@@ -7165,6 +7258,7 @@ class BlockSync:
                     or getattr(peer, "noban", False)):
                 continue
             peer.adjust_score(-1)
+            penalized += 1
 
         # Re-requests are block getdata (MSG_WITNESS_BLOCK) too, so the same
         # CanServeBlocks ∩ CanServeWitnesses ∩ height gate applies — never
@@ -7175,16 +7269,20 @@ class BlockSync:
             if p.is_connected() and _can_serve_block_at(p, timeout_frontier_height)
         ]
 
-        # If no peers available, clear all in-flight requests so they re-queue on reconnect
+        # Reclaim every timed-out slot BEFORE reassignment so the per-peer
+        # cap and the global 256 window reflect live downloads only.  Pre-fix
+        # deferred HOL re-requests stayed in `_block_request_peer` on the
+        # staller ("all peers at cap", 137 deferred, zero blocks connected).
+        for block_hash in timed_out:
+            self._reclaim_inflight_slot(block_hash)
+
+        # If no peers available, leave slots free so they re-queue on reconnect
         if not connected_peers:
             logger.warning(
                 f"{len(timed_out)} block requests timed out with 0 available peers, "
                 f"clearing in-flight requests for re-queue"
             )
             for block_hash in timed_out:
-                del self.requested_blocks[block_hash]
-                self._block_request_peer.pop(block_hash, None)
-                self._h1_last_issue.pop(block_hash, None)
                 # Re-queue resets the retry budget; drop the attempt counter so
                 # it cannot orphan-accrete across repeated no-peer windows.
                 # _w77_first_request_time is left as the latency baseline (it is
@@ -7197,7 +7295,7 @@ class BlockSync:
             f"(head={len(head_timed_out)}/{len(head_set)}@{HEAD_TIMEOUT:.0f}s, "
             f"general={len(general_timed_out)} [W95 avg_mb={avg_mb:.2f}], "
             f"failed peers: {len(failed_peers)}, "
-            f"penalized: {len(penalize_peers)}, "
+            f"penalized: {penalized}, "
             f"available peers: {len(connected_peers)})"
         )
 
@@ -7207,39 +7305,55 @@ class BlockSync:
         for fp in failed_peers:
             self._w77_failed_peers.add(f"{fp.host}:{fp.port}")
 
-        # Batch re-requests: round-robin across available peers, preferring non-failed ones
         preferred = [p for p in connected_peers if p not in failed_peers]
         if not preferred:
-            preferred = connected_peers
-        # W92: sort preferred by score (descending) so rescued head-of-
-        # window blocks go to the highest-quality peers first.
+            preferred = list(connected_peers)
         preferred.sort(key=lambda p: -getattr(p, 'score', 100))
 
-        # Group re-requests by target peer, respecting the per-peer in-flight
-        # cap.  `peer_load` starts from the live in-flight map minus the blocks
-        # we're about to re-assign (they're still in _block_request_peer but
-        # their old peer slot no longer counts toward capacity).
+        peer_batches: dict = defaultdict(list)
+
+        # HOL: must land on a DIFFERENT peer than the staller.  If every
+        # other peer is at the per-peer cap with far-ahead in-flight,
+        # evict a far-ahead slot (Core always fetches the window-head).
+        for bh in head_timed_out:
+            old = self._last_stalled_peer.get(bh)
+            others = [p for p in connected_peers if p is not old]
+            others.sort(key=lambda p: -getattr(p, 'score', 100))
+            target = self._pick_peer_for_head(others, head_set)
+            if target is None and old is not None and old in connected_peers:
+                # Single-peer catch-up: retry the only peer, still evicting
+                # far-ahead so the head is not stuck behind a full window.
+                target = self._pick_peer_for_head([old], head_set)
+            if target is None:
+                target = self._pick_peer_for_head(connected_peers, head_set)
+            if target is None:
+                continue
+            peer_batches[target].append(bh)
+            self.requested_blocks[bh] = now
+            self._block_request_peer[bh] = target
+
+        # GENERAL: assign to preferred under cap; unreassigned hashes stay
+        # reclaimed (they do not occupy the window).  Avoid handing a hash
+        # straight back to the peer that just timed it out.
+        general_items = [(MSG_WITNESS_BLOCK, bh) for bh in general_timed_out]
         peer_load = Counter(self._block_request_peer.values())
-        for bh in timed_out:
-            old_peer = self._block_request_peer.get(bh)
-            if old_peer is not None and peer_load[old_peer] > 0:
-                peer_load[old_peer] -= 1
-
-        to_items = [(MSG_WITNESS_BLOCK, bh) for bh in timed_out]
         per_peer, assigned = _distribute_blocks_round_robin(
-            to_items, preferred, peer_load, MAX_BLOCKS_IN_FLIGHT_PER_PEER,
+            general_items, preferred, peer_load, MAX_BLOCKS_IN_FLIGHT_PER_PEER,
+            avoid=self._last_stalled_peer,
         )
-        assigned_hashes = {bh for _, bh in assigned}
-        peer_batches: dict = {peer: [bh for _, bh in items] for peer, items in per_peer.items()}
+        for target_peer, items in per_peer.items():
+            for _, bh in items:
+                peer_batches[target_peer].append(bh)
+                self.requested_blocks[bh] = now
+                self._block_request_peer[bh] = target_peer
 
-        deferred_count = len(timed_out) - len(assigned_hashes)
+        assigned_count = sum(len(v) for v in peer_batches.values())
+        deferred_count = len(timed_out) - assigned_count
         if deferred_count:
-            # Leave deferred blocks' timestamps alone so the next cycle re-tries
-            # them as soon as a peer frees a slot; don't drop them from the
-            # in-flight map (they're still "ours" to reassign).
             logger.debug(
-                f"Deferring re-request of {deferred_count} blocks: all peers "
-                f"at per-peer cap ({MAX_BLOCKS_IN_FLIGHT_PER_PEER})"
+                "Reclaimed %d timed-out block(s) that could not be re-sent "
+                "(peers at per-peer cap %d); slots freed",
+                deferred_count, MAX_BLOCKS_IN_FLIGHT_PER_PEER,
             )
 
         network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
@@ -7252,9 +7366,6 @@ class BlockSync:
                 getdata = GetDataMessage(inventory=inventory)
                 getdata_msg = getdata.to_network_message(network)
                 await peer.send_message(getdata_msg)
-                for bh in block_hashes:
-                    self.requested_blocks[bh] = now
-                    self._block_request_peer[bh] = peer
                 # W77: track re-request distribution across peers.
                 self._w77_rerequest_peer_counts[f"{peer.host}:{peer.port}"] += len(block_hashes)
                 logger.info(f"Re-requested {len(block_hashes)} blocks from {peer.host}:{peer.port}")
