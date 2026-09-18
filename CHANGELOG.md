@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: resume after a long offline gap — locator starts at the header-queue tip, `_catch_up` does not re-request a gap already queued, and a stall guard forces getdata when N header batches accept nothing and request no bodies. Control: `pytest tests/test_resume_after_long_gap.py`
 - docs: CHARTER proof bundle (`proof/`; `bash proof/verify.sh`)
 
 ## v1.0.2 — 2026-09-11

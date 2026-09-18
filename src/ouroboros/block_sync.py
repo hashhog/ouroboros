@@ -117,6 +117,18 @@ BLOCK_REQUEST_MAX_ATTEMPTS = 10
 # walk is O(chain height) per locator.
 MAX_LOCATOR_PROBES = 200
 
+# Consecutive header batches with zero new headers accepted AND zero block
+# bodies requested before we force the header→block transition.
+# Live 2026-09-18: after an 8-day pause the node re-requested the same
+# 1171-header gap (~1/s) for 20+ minutes and never sent getdata.  Three
+# useless batches is enough to distinguish a single duplicate re-send
+# from that loop; a restart was previously the only way out.
+HEADER_STALL_BATCHES = 3
+
+# Bitcoin Core MAX_HEADERS_RESULTS (net_processing.cpp).  A headers
+# message shorter than this means the peer has no more headers to give.
+MAX_HEADERS_RESULTS = 2000
+
 # H1 — connect-frontier priority re-request interval (seconds).
 #
 # The strictly-in-order block drain (``_drain_block_buffer_locked``) can only
@@ -583,6 +595,11 @@ class BlockSync:
         # ``CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md``
         # (Pattern B), extended to Part-2 impls.
         self._unconnecting_headers_count: dict[str, int] = {}
+
+        # Consecutive useless header batches (accepted == 0 and no getdata
+        # in flight) — the resume-after-long-gap stall guard.  Reset on any
+        # accepted header or any block request.
+        self._stalled_header_batches: int = 0
 
         # Single sync peer for header downloads (Bitcoin Core pattern).
         # Only one peer is sent getheaders at a time to prevent out-of-order
@@ -5071,7 +5088,7 @@ class BlockSync:
                 #       a PRESYNC→REDOWNLOAD transition that requires a
                 #       continuation even on a sub-2000 batch.
                 # Core: ProcessNextHeaders request_more logic — headerssync.cpp:84-89.
-                if len(headers_msg.headers) >= 2000 or _presync_request_more:
+                if len(headers_msg.headers) >= MAX_HEADERS_RESULTS or _presync_request_more:
                     # Send continuation to the SAME peer (which is the sync
                     # peer).  This ensures sequential header batches from one
                     # peer, avoiding out-of-order interleaving.
@@ -5089,6 +5106,33 @@ class BlockSync:
                         logger.info(f"Requesting more headers after {last_hash.hex()[:16]}... from {target.host}")
                     except Exception as e:
                         logger.error(f"Failed to request continuation headers: {e}")
+            elif self._validated_headers:
+                # Duplicate re-send of a gap we already queued (the live
+                # 1171-header loop): Core still calls FindNextBlocksToDownload
+                # after a known-headers message.  Do not wait for accepted>0.
+                await self._request_next_blocks()
+
+            # Resume-after-long-gap stall guard.  If N consecutive batches
+            # accept nothing new AND we still have not requested a body,
+            # force tip+1 getdata on this peer rather than looping forever.
+            if (
+                accepted == 0
+                and self._validated_headers
+                and not self.requested_blocks
+            ):
+                self._stalled_header_batches += 1
+                if self._stalled_header_batches >= HEADER_STALL_BATCHES:
+                    logger.warning(
+                        "[header-stall-guard] %d consecutive header batches "
+                        "from %s:%s accepted 0 new headers and requested 0 "
+                        "blocks (queue=%d) — forcing header→block transition",
+                        self._stalled_header_batches,
+                        peer.host, peer.port,
+                        len(self._validated_headers),
+                    )
+                    await self._force_block_download_from(peer)
+            else:
+                self._stalled_header_batches = 0
 
             # GAP1 → GAP2/GAP3 trigger: if this batch admitted competing-fork
             # headers, evaluate whether the fork is now STRICTLY HEAVIER than
@@ -5705,6 +5749,71 @@ class BlockSync:
                 if k not in self._fork_headers:
                     del self._fork_recheck_state[k]
 
+    def _block_download_fallback_peer(self) -> Peer | None:
+        """Peer to request bodies from when no one passes CanServeBlocks.
+
+        After a long offline gap the only connected peers may be
+        NODE_NETWORK_LIMITED (BIP-159 288-block window) while we are
+        1000+ blocks behind.  They served the headers; asking them for
+        bodies is better than looping getheaders forever.  Prefer the
+        designated header-sync peer, then any connected ready peer.
+        """
+        def _ok(p) -> bool:
+            return isinstance(p, Peer) and p.is_connected()
+
+        sync = self._header_sync_peer
+        if _ok(sync):
+            return sync
+        if hasattr(self.peer_manager, "get_all_ready_peers"):
+            for p in self.peer_manager.get_all_ready_peers():
+                if _ok(p):
+                    return p
+        return None
+
+    async def _force_block_download_from(self, peer: Peer) -> None:
+        """Send tip+1 getdata to *peer*, ignoring CanServeBlocks.
+
+        Last-resort exit from the resume-after-gap header loop.  Does
+        not go through ``_request_next_blocks`` so a no-op / empty
+        candidate set cannot swallow it.
+        """
+        if not self._validated_headers:
+            return
+        if peer is None or not peer.is_connected():
+            return
+        frontier_hash = self._validated_headers[0][0]
+        if (
+            frontier_hash in self._ibd_block_buffer
+            or frontier_hash in self._connecting_hashes
+        ):
+            return
+        network = (
+            self.peer_manager.network
+            if hasattr(self.peer_manager, "network")
+            else "mainnet"
+        )
+        try:
+            getdata = GetDataMessage(
+                inventory=[(MSG_WITNESS_BLOCK, frontier_hash)]
+            )
+            await peer.send_message(getdata.to_network_message(network))
+        except Exception as e:
+            logger.error(
+                "stall-guard getdata to %s:%s failed: %s",
+                peer.host, peer.port, e,
+            )
+            return
+        now = time.time()
+        if frontier_hash not in self.requested_blocks:
+            self.requested_blocks[frontier_hash] = now
+            self._record_first_request_time(frontier_hash, now)
+        self._h1_last_issue[frontier_hash] = now
+        self._block_request_peer[frontier_hash] = peer
+        logger.warning(
+            "[header-stall-guard] forced tip+1 getdata %s from %s:%s",
+            frontier_hash.hex()[:12], peer.host, peer.port,
+        )
+
     async def _request_next_blocks(self):
         """Request blocks from the validated header queue up to the in-flight limit.
 
@@ -5796,6 +5905,17 @@ class BlockSync:
                           and _can_serve_block_at(p, frontier_height)]
         else:
             candidates = []
+        if not candidates:
+            fallback = self._block_download_fallback_peer()
+            if fallback is not None:
+                logger.warning(
+                    "no CanServeBlocks peer for frontier height %d "
+                    "(queue=%d) — requesting bodies from %s:%s anyway "
+                    "(resume-after-gap fallback)",
+                    frontier_height, len(self._validated_headers),
+                    fallback.host, fallback.port,
+                )
+                candidates = [fallback]
         candidates.sort(key=lambda p: -getattr(p, 'score', 100))
 
         now = time.time()
@@ -6227,6 +6347,19 @@ class BlockSync:
                 )
                 self._lowwork_presync.pop(key, None)
 
+            # Already have every header this peer has advertised: the
+            # remaining work is block download, not another getheaders.
+            # Pre-fix this ran every IBD tick (1s) from the *block* tip,
+            # which is the 2026-09-18 resume loop (same 1171 headers
+            # forever, never getdata).
+            try:
+                _, block_height = self.db.get_best_block()
+            except Exception:
+                block_height = our_height
+            header_height = int(block_height or 0) + len(self._validated_headers)
+            if self._validated_headers and self._peer_known_height(peer) <= header_height:
+                return
+
             # Build locator
             locator = self._build_locator(our_height)
 
@@ -6410,12 +6543,13 @@ class BlockSync:
         """Build block locator (exponential spacing).
 
         Mirrors Bitcoin Core's ``LocatorEntries`` (chain.cpp:26):
-        the FIRST entry is always the chain tip, and the rest walk back
-        exponentially.  The peer iterates the locator front-to-back and
-        sends headers starting from the child of the FIRST hash it
-        recognises on its best chain — so if our tip is missing, the peer
-        falls back to a much older block and we get a stream of headers
-        whose ``prev_blockhash`` does not match our actual tip.
+        the FIRST entry is the header-chain tip (queued headers, else the
+        connected block tip), and the rest walk back exponentially.  The
+        peer iterates the locator front-to-back and sends headers starting
+        from the child of the FIRST hash it recognises on its best chain —
+        so if our tip is missing, the peer falls back to a much older
+        block and we get a stream of headers whose ``prev_blockhash`` does
+        not match our actual tip.
 
         Uses the cheap Rust-side ``get_block_hash_by_height`` which returns the
         32-byte hash directly, instead of the full block (which would force a
@@ -6439,16 +6573,31 @@ class BlockSync:
         """
         locator: list[bytes] = []
 
-        # Tip-first anchor (Bitcoin Core chain.cpp:34).  This is the
+        # Header-chain tip first (Core LocatorEntries from pindexBestHeader,
+        # chain.cpp:26).  After a long offline gap the connected *block* tip
+        # is 1000+ headers behind; starting the locator there makes every
+        # peer re-send the same gap forever (the 2026-09-18 resume loop).
+        # The queued header tip is what we already have — the peer's first
+        # recognised hash then yields headers AFTER the queue, or an empty
+        # batch if they have nothing more.
+        if self._validated_headers and self._queue_anchored_to_tip():
+            hdr_tip = self._validated_headers[-1][0]
+            if isinstance(hdr_tip, (bytes, bytearray)) and len(hdr_tip) == 32:
+                locator.append(bytes(hdr_tip))
+
+        # Block-tip anchor (Bitcoin Core chain.cpp:34).  This is the
         # authoritative tip from META_CF, NOT a BLOCK_INDEX_CF lookup, so
         # it survives snapshot loads and rollbacks where the per-height
-        # index is stale or missing.
+        # index is stale or missing.  Second in the locator so a peer that
+        # does not have our header-queue tip falls back to the connected
+        # chain rather than an ancient hash.
         try:
             best_hash, best_height = self.db.get_best_block()
         except Exception:
             best_hash, best_height = None, height
         if isinstance(best_hash, (bytes, bytearray)) and len(best_hash) == 32:
-            locator.append(bytes(best_hash))
+            if bytes(best_hash) not in locator:
+                locator.append(bytes(best_hash))
 
         # Use the authoritative tip height as the start of the walk so we
         # don't walk past it from a stale ``height`` argument.
