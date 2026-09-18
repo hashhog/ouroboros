@@ -135,7 +135,7 @@ MAX_HEADERS_RESULTS = 2000
 # advance on the CONNECT FRONTIER — slot 0 of ``_validated_headers`` == tip+1.
 # Peers reliably flood the IBD buffer with FAR-AHEAD blocks, but the single
 # round-robin-assigned peer for the frontier frequently fails to serve it
-# within ``HEAD_TIMEOUT`` (size-aware, up to 64 s), head-of-line-blocking the
+# within ``HEAD_TIMEOUT`` (size-aware, 128 s floor for mainnet-size), head-of-line-blocking the
 # drain for minutes while ~14 later blocks sit ready.  This is a SCHEDULING
 # problem (budget is ample), not a budget/peer-count one.
 #
@@ -153,6 +153,20 @@ MAX_HEADERS_RESULTS = 2000
 # awaited send to a marginal/closing transport caused the FIX-ATTEMPT-1
 # socket.send() flood + sync-loop stall; reverted).
 FRONTIER_REQUEST_INTERVAL = 5.0
+
+# HOL download timeout (blockbrew 09695ad / Core BLOCK_DOWNLOAD_TIMEOUT_BASE).
+#
+# A mute-vs-slow discriminator has to finish a real body at a live peer's
+# byte rate before rotating.  Live soak 2026-09-18 (block 967495 / 967513-
+# 967519, ≈1.54 MB, weight ≥3.99M): p90 38.1 s / worst 56.0 s at ~32 KiB/s.
+# The previous ``max(2, min(64, ema_mb * 25))`` budget was ~37 s at
+# ema=1.47 MB and aborted those fetches.  Size for MaxBlockSerializedSize
+# (4 MiB) at 32 KiB/s: 4_000_000 / 32768 ≈ 122 s, rounded to 128 s.
+# Core's BLOCK_DOWNLOAD_TIMEOUT_BASE is one block interval (600 s).
+MIN_LIVE_BLOCK_THROUGHPUT = 32 * 1024  # bytes/s
+MAX_BLOCK_SERIALIZED_SIZE = 4_000_000
+HEAD_TIMEOUT_MIN = 2.0
+HEAD_TIMEOUT_MAX_WEIGHT = 128.0  # seconds; 4 MiB @ 32 KiB/s
 
 # Hard cap on the ``_w77_first_request_time`` telemetry map.  It is
 # diagnostic-only (request->connect latency rollup) and must NEVER be
@@ -1142,8 +1156,15 @@ class BlockSync:
 
     def _pick_peer_for_head(
         self, candidates: list, head_set: set[bytes],
+        *, allow_over_cap: bool = False,
     ) -> Peer | None:
-        """Choose a peer that can take a HOL re-request, evicting if needed."""
+        """Choose a peer that can take a HOL re-request, evicting if needed.
+
+        ``allow_over_cap`` is the last-resort campaign-rig escape: if every
+        candidate is at cap and every in-flight hash is itself a head-of-
+        window slot (nothing to evict), grant the connect cursor one slot
+        above the cap rather than defer it forever.
+        """
         if not candidates:
             return None
         load = Counter(self._block_request_peer.values())
@@ -1153,6 +1174,8 @@ class BlockSync:
         for p in candidates:
             if self._evict_far_ahead_slot(p, head_set):
                 return p
+        if allow_over_cap:
+            return candidates[0]
         return None
 
     # BIP34 activation height (mainnet).  Below this height the coinbase
@@ -6044,55 +6067,62 @@ class BlockSync:
                     or (now - last_h1) >= FRONTIER_REQUEST_INTERVAL
                     or not holder_live
                 ):
-                    # Rotate: first top-scoring peer that is NOT the current
-                    # holder and NOT the peer that just HOL-timed-out this
-                    # hash, so a departed/unservable/stalling peer cannot keep
-                    # the frontier.  A still-connected holder never reaches
-                    # here.
+                    # Rotate: a peer that is NOT the current holder and NOT
+                    # the peer that just HOL-timed-out this hash.  Evict a
+                    # far-ahead in-flight slot if every candidate is at the
+                    # per-peer cap — otherwise a one-peer campaign rig
+                    # wedges with tip+1 as a 17th getdata (866210, buf=725).
                     stalled = self._last_stalled_peer.get(frontier_hash)
-                    frontier_peer = next(
-                        (p for p in candidates
-                         if p is not current_peer and p is not stalled),
-                        None,
+                    others = [
+                        p for p in candidates
+                        if p is not current_peer and p is not stalled
+                    ]
+                    frontier_peer = self._pick_peer_for_head(
+                        others, head_set, allow_over_cap=False,
                     )
                     if frontier_peer is None:
-                        frontier_peer = next(
-                            (p for p in candidates if p is not current_peer),
-                            candidates[0],
+                        rest = [p for p in candidates if p is not current_peer]
+                        frontier_peer = self._pick_peer_for_head(
+                            rest, head_set, allow_over_cap=False,
                         )
-                    try:
-                        getdata = GetDataMessage(
-                            inventory=[(MSG_WITNESS_BLOCK, frontier_hash)]
+                    if frontier_peer is None:
+                        frontier_peer = self._pick_peer_for_head(
+                            candidates, head_set, allow_over_cap=True,
                         )
-                        await frontier_peer.send_message(
-                            getdata.to_network_message(network)
-                        )
-                        # Do NOT reset requested_blocks[frontier] on re-issue —
-                        # that timestamp is the in-flight clock HEAD_TIMEOUT
-                        # reads.  H1 cadence lives in _h1_last_issue.
-                        if frontier_hash not in self.requested_blocks:
-                            self.requested_blocks[frontier_hash] = now
-                            self._record_first_request_time(frontier_hash, now)
-                        self._h1_last_issue[frontier_hash] = now
-                        self._block_request_peer[frontier_hash] = frontier_peer
-                        logger.info(
-                            "H1 frontier priority: re-requested tip+1 %s "
-                            "from %s:%s (score=%s)",
-                            frontier_hash.hex()[:12],
-                            frontier_peer.host, frontier_peer.port,
-                            getattr(frontier_peer, 'score', '?'),
-                        )
-                    except Exception as e:
-                        # Exactly the existing normal-path failure discipline:
-                        # log, penalize, and DO NOT drop a validly-tracked
-                        # in-flight entry.  Never awaits a drain on a stuck
-                        # transport — this is why FIX-ATTEMPT-1's flood cannot
-                        # recur.
-                        logger.error(
-                            "H1 frontier priority send to %s:%s failed: %s",
-                            frontier_peer.host, frontier_peer.port, e,
-                        )
-                        frontier_peer.adjust_score(-2)
+                    if frontier_peer is not None:
+                        try:
+                            getdata = GetDataMessage(
+                                inventory=[(MSG_WITNESS_BLOCK, frontier_hash)]
+                            )
+                            await frontier_peer.send_message(
+                                getdata.to_network_message(network)
+                            )
+                            # Do NOT reset requested_blocks[frontier] on re-issue —
+                            # that timestamp is the in-flight clock HEAD_TIMEOUT
+                            # reads.  H1 cadence lives in _h1_last_issue.
+                            if frontier_hash not in self.requested_blocks:
+                                self.requested_blocks[frontier_hash] = now
+                                self._record_first_request_time(frontier_hash, now)
+                            self._h1_last_issue[frontier_hash] = now
+                            self._block_request_peer[frontier_hash] = frontier_peer
+                            logger.info(
+                                "H1 frontier priority: re-requested tip+1 %s "
+                                "from %s:%s (score=%s)",
+                                frontier_hash.hex()[:12],
+                                frontier_peer.host, frontier_peer.port,
+                                getattr(frontier_peer, 'score', '?'),
+                            )
+                        except Exception as e:
+                            # Exactly the existing normal-path failure discipline:
+                            # log, penalize, and DO NOT drop a validly-tracked
+                            # in-flight entry.  Never awaits a drain on a stuck
+                            # transport — this is why FIX-ATTEMPT-1's flood cannot
+                            # recur.
+                            logger.error(
+                                "H1 frontier priority send to %s:%s failed: %s",
+                                frontier_peer.host, frontier_peer.port, e,
+                            )
+                            frontier_peer.adjust_score(-2)
 
         to_request: list[tuple[int, bytes]] = []
         seen: set[bytes] = set()
@@ -6140,25 +6170,55 @@ class BlockSync:
         if not to_request:
             return
 
-        # Distribute across connected peers round-robin, respecting the
-        # per-peer in-flight cap.  ``candidates`` was already gathered and
-        # score-sorted above (shared with the H1 frontier-priority send); it
-        # is the same insertion-order-then-score-desc list the round-robin
-        # relied on (W91: sorting hands the chain-closest blocks to the
-        # highest-quality peers first).
+        # Head-of-window items MUST land even when every peer is at the
+        # per-peer cap: evict a far-ahead in-flight slot (same primitive
+        # as ``_handle_timeouts``).  Tail items stay under the cap.
+        # Without this a one-peer campaign rig wedges: 16 far-ahead
+        # in-flight, 725 buffered, connect cursor deferred forever
+        # ("all peers at cap", height 866210).
         if not candidates:
             return
 
+        head_items = [it for it in to_request if it[1] in head_set]
+        tail_items = [it for it in to_request if it[1] not in head_set]
+        per_peer: dict = {c: [] for c in candidates}
+        assigned: list = []
+
+        for item in head_items:
+            bh = item[1]
+            stalled = self._last_stalled_peer.get(bh)
+            others = [p for p in candidates if p is not stalled]
+            over_cap = bh == frontier_hash
+            target = self._pick_peer_for_head(
+                others, head_set, allow_over_cap=False,
+            )
+            if target is None:
+                target = self._pick_peer_for_head(
+                    candidates, head_set, allow_over_cap=over_cap,
+                )
+            if target is None:
+                continue
+            per_peer[target].append(item)
+            assigned.append(item)
+            # Account immediately so the next head item evicts another
+            # far-ahead slot instead of stacking above the cap.
+            self.requested_blocks[bh] = now
+            self._record_first_request_time(bh, now)
+            self._block_request_peer[bh] = target
+
         peer_load = Counter(self._block_request_peer.values())
-        per_peer, assigned = _distribute_blocks_round_robin(
-            to_request, candidates, peer_load, MAX_BLOCKS_IN_FLIGHT_PER_PEER,
+        tail_per_peer, tail_assigned = _distribute_blocks_round_robin(
+            tail_items, candidates, peer_load, MAX_BLOCKS_IN_FLIGHT_PER_PEER,
             avoid=self._last_stalled_peer,
         )
+        for target_peer, items in tail_per_peer.items():
+            per_peer.setdefault(target_peer, []).extend(items)
+        assigned.extend(tail_assigned)
 
         if not assigned:
             return
 
-        for _, bh in assigned:
+        for _, bh in tail_assigned:
             self.requested_blocks[bh] = now
             self._record_first_request_time(bh, now)
 
@@ -7085,6 +7145,28 @@ class BlockSync:
             self._w77_latency_max_s = 0.0
 
     @staticmethod
+    def _compute_head_timeout(avg_mb: float) -> float:
+        """Size-aware HOL download timeout.
+
+        Must be strictly longer than the time to fetch a block of
+        ``avg_mb`` at ``MIN_LIVE_BLOCK_THROUGHPUT``, and for mainnet-size
+        blocks never shorter than a max-serialized body at that rate
+        (``HEAD_TIMEOUT_MAX_WEIGHT`` = 128 s).  Mute-peer rotation still
+        happens; it just waits long enough that a live body is not aborted.
+
+        Small IBD blocks (ema < 1 MB) keep a tight timeout so a mute peer
+        is rotated in seconds, not minutes.
+        """
+        mb = max(0.1, float(avg_mb))
+        fetch_s = (mb * 1_000_000.0) / float(MIN_LIVE_BLOCK_THROUGHPUT)
+        # 2× so a body arriving at exactly 32 KiB/s is not aborted on the
+        # last byte (blockbrew soak worst 56 s vs 1.54 MB ≈ 47 s raw).
+        sized = max(HEAD_TIMEOUT_MIN, 2.0 * fetch_s)
+        if mb >= 1.0:
+            return max(sized, HEAD_TIMEOUT_MAX_WEIGHT)
+        return min(sized, HEAD_TIMEOUT_MAX_WEIGHT)
+
+    @staticmethod
     def _w95_compute_general_timeout(avg_mb: float, n_in_flight: int) -> float:
         """W95: size-aware general-path block-download timeout.
 
@@ -7118,8 +7200,9 @@ class BlockSync:
         # blocks — the chain-closest slot was held hostage by a slow
         # peer while later blocks piled up.  Rescue the first 8 unfetched
         # slots at HEAD_TIMEOUT so the drain can advance.  HOL stallers
-        # are penalised too — HEAD_TIMEOUT is size-aware (up to 64s), not
-        # the old 2s optimistic reroute.
+        # are penalised too — HEAD_TIMEOUT is sized for a real body at a
+        # real byte rate (128 s floor for mainnet-size), not the old 2s
+        # optimistic reroute.
         # HEAD_TIMEOUT=2s matches Bitcoin Core's BLOCK_STALLING_TIMEOUT
         # (net_processing.cpp).  Tightened from 10s in W94b (fc63a2f).
         #
@@ -7133,20 +7216,13 @@ class BlockSync:
         # with the recent-payload EMA and the per-peer in-flight count;
         # clamped to [MIN,MAX] so an outlier block can't wedge the loop.
         HEAD_OF_WINDOW = 8
-        # W96b: size-aware head rescue. The fixed 2s (W94b) WEDGED mainnet
-        # at-tip (2026-07-09): a ~1.5 MB block cannot download in 2s, so the
-        # optimistic head rescue re-requested the same block every 2s across
-        # all peers forever and it never completed (recurring live wedge at
-        # h=957257). A small IBD block still finishes in <1s so it keeps the
-        # fast 2s floor (rescue preserved); mainnet-size blocks get enough time
-        # to actually finish before we rotate. Scale with the recent-payload
-        # EMA. Floor 2s (fast small-block rescue), cap 64s to MATCH Core's
-        # BLOCK_STALLING_TIMEOUT_MAX (net_processing.cpp:135) — the first
-        # 15s-cap pass still re-wedged at h=957262 (a ~1.5MB block needs more
-        # than 9s from typical peers, and the head rescue resets the window on
-        # every re-request so a block never gets a long-enough download). At
-        # avg_mb=1.5 the *25 factor gives ~37s; small IBD blocks keep the 2s floor.
-        HEAD_TIMEOUT = max(2.0, min(64.0, max(0.1, self._w95_block_mb_ema) * 25.0))
+        # HOL timeout is sized for a real body at a real byte rate
+        # (``_compute_head_timeout``): 2 s floor for small IBD blocks,
+        # 128 s floor for mainnet-size (4 MiB @ 32 KiB/s).  The previous
+        # ``ema*25`` cap at Core's BLOCK_STALLING_TIMEOUT_MAX=64 s aborted
+        # healthy 1.54 MB fetches at ~37 s (campaign wedge 866210;
+        # blockbrew 09695ad soak p90 38.1 s / worst 56.0 s).
+        HEAD_TIMEOUT = self._compute_head_timeout(self._w95_block_mb_ema)
 
         # Build the head-of-window set: the first HEAD_OF_WINDOW headers
         # that are NOT yet on the active chain.  Active-chain membership
@@ -7237,9 +7313,10 @@ class BlockSync:
             all_peers = [p for p in raw if isinstance(p, Peer)]
 
         # Penalize each failed peer only ONCE per cycle (not per block).
-        # HEAD_TIMEOUT is size-aware (live ~37s at 1.47 MB, capped at Core's
-        # BLOCK_STALLING_TIMEOUT_MAX=64s) — a miss at that budget is a stall,
-        # not an optimistic 2s reroute, so HOL holders are penalised too.
+        # HEAD_TIMEOUT is sized for a real body at 32 KiB/s (128 s floor
+        # for mainnet-size; Core BLOCK_DOWNLOAD_TIMEOUT_BASE is 600 s) —
+        # a miss at that budget is a stall, not an optimistic 2s reroute,
+        # so HOL holders are penalised too.
         failed_peers: set[Peer] = set()
         for block_hash in timed_out:
             failed_peer = self._block_request_peer.get(block_hash)
@@ -7325,7 +7402,9 @@ class BlockSync:
                 # far-ahead so the head is not stuck behind a full window.
                 target = self._pick_peer_for_head([old], head_set)
             if target is None:
-                target = self._pick_peer_for_head(connected_peers, head_set)
+                target = self._pick_peer_for_head(
+                    connected_peers, head_set, allow_over_cap=True,
+                )
             if target is None:
                 continue
             peer_batches[target].append(bh)

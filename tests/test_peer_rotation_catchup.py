@@ -53,10 +53,11 @@ from ouroboros.peer import Peer, PeerState
 
 LONG_GAP = 1001  # operator-visible 8-day resume was 1171 headers
 HEAD_OF_WINDOW = 8
-# Size-aware HEAD_TIMEOUT = max(2, min(64, ema_mb * 25)).  Live log was
-# avg_mb=1.47 → ~37 s.  Elapsed must beat that.
+# Size-aware HEAD_TIMEOUT is ``_compute_head_timeout(ema)``: for
+# mainnet-size blocks (ema >= 1 MB) that is 128 s (4 MiB @ 32 KiB/s).
+# Elapsed must beat that so these tests actually hit the timeout path.
 LIVE_EMA_MB = 1.47
-STALE_S = 40.0
+STALE_S = 130.0
 
 
 def _h(tag: int) -> bytes:
