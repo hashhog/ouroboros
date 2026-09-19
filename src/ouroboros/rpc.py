@@ -607,8 +607,10 @@ async def accept_block(
         block_bytes:  Raw Bitcoin wire-format block.
         next_height:  Height this block will occupy (= ``best_height + 1``).
         skip_scripts: When True, skip per-input script verification (used by
-                      the IBD drain below the assumevalid checkpoint).  BIP-34,
-                      structural checks, and UTXO checks always run regardless.
+                      the IBD drain below the assumevalid checkpoint).  Ignored
+                      when ``node.validator.force_full_scripts`` is True
+                      (``-assumevalid=0``): Core's fScriptChecks is node-wide.
+                      BIP-34, structural checks, and UTXO checks always run.
         decoded_block: Optional already-parsed ``database.Block`` for
                       ``block_bytes``.  ``rpc_submitblock`` must run Core's
                       ``DecodeHexBlk`` (rpc/mining.cpp:1079) BEFORE anything
@@ -634,6 +636,15 @@ async def accept_block(
     """
     network = getattr(node, "network", "mainnet")
     best_height = next_height - 1
+    # Core: assumevalid is ONE node-wide setting (validation.cpp:2345-2347).
+    # ``-assumevalid=0`` => fScriptChecks true on every path, so a caller
+    # that passes skip_scripts=True (the IBD-drain argument) must not
+    # bypass the Python validator.  TRUST-ANCHOR.md (2026-09-01) named this
+    # call site as the reason campaign rows were stamped p2p-only.
+    _py_validator = getattr(node, "validator", None)
+    _force_scripts = bool(getattr(_py_validator, "force_full_scripts", False))
+    if _force_scripts:
+        skip_scripts = False
 
     # Step 0 — CheckBlock structural gates, BEFORE the BIP-34 height check,
     # in Core's exact first-failure order (validation.cpp CheckBlock):
@@ -793,12 +804,14 @@ async def accept_block(
     # skip_scripts is False.
     # Reference: Bitcoin Core EvalScript() disabled-opcode gate (interpreter.cpp).
     #
-    # The node-wide -assumevalid=0 switch reaches this call through
-    # ``node.validator.force_full_scripts`` (set by Node.start): validate_block
-    # then never consults the checkpoint script-skip heuristic, matching Core's
-    # ConnectBlock (validation.cpp:2345-2347) where fScriptChecks is true on
-    # EVERY acceptance path, submitblock included.  With the default
-    # (assumevalid unset) validate_block keeps skipping below the checkpoint.
+    # The node-wide -assumevalid=0 switch reaches this call two ways:
+    # ``node.validator.force_full_scripts`` (set by Node.start) AND the
+    # ``force_check_scripts=_force_scripts`` kwarg below (TRUST-ANCHOR named
+    # hole: this call used to omit the kwarg, so a skip_scripts=True caller
+    # never reached validate_block at all).  Matching Core's ConnectBlock
+    # (validation.cpp:2345-2347) where fScriptChecks is true on EVERY
+    # acceptance path, submitblock included.  With the default (assumevalid
+    # unset) validate_block keeps skipping below the checkpoint.
     # ``or _snapshot_base_parent``: when Step 2 was skipped because the Rust
     # validator cannot see the snapshot base parent, the Python validator is
     # the ONLY validator this block gets — it must run even for a caller that
@@ -806,7 +819,6 @@ async def accept_block(
     # own checkpoint heuristic still decides whether per-input scripts run, so
     # this costs nothing extra below the cut.
     if not skip_scripts or _snapshot_base_parent:
-        _py_validator = getattr(node, "validator", None)
         if _py_validator is not None:
             from ouroboros.database import Block as _Blk
             _blk_obj = _Blk.deserialize(block_bytes)
@@ -814,6 +826,7 @@ async def accept_block(
                 _py_validator.validate_block,
                 _blk_obj,
                 next_height,
+                force_check_scripts=_force_scripts,
             )
             if not _valid:
                 # Same reason-refinement as the Rust arm above: the buried

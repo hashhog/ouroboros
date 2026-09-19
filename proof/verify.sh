@@ -107,6 +107,11 @@ if ! grep -q 'force_check_scripts or getattr(self, "force_full_scripts"' "$ROOT/
 else
   say "R4: validation.py consults force_full_scripts"
 fi
+if ! grep -q 'force_check_scripts=_force_scripts' "$ROOT/src/ouroboros/rpc.py"; then
+  die "accept_block no longer passes force_check_scripts into validate_block (TRUST-ANCHOR named hole)"
+else
+  say "R4: accept_block passes force_check_scripts from validator.force_full_scripts"
+fi
 if ! grep -q '850000' "$ROOT/tests/test_assumevalid_submitblock_path.py"; then
   die "test_assumevalid_submitblock_path.py no longer names the 850000 checkpoint"
 else

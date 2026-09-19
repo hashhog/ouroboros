@@ -1,16 +1,16 @@
 # Provenance — ouroboros proof bundle
-assembled_utc: 2026-09-17T19:49:56Z
+assembled_utc: 2026-09-19T21:44:21Z
 repo: https://github.com/hashhog/ouroboros
 branch: master
-commit: 0c1408500e1053937f12c557cba2240cab8c2699
-commit_short: 0c1408500e10
-subject: fix: serve snapshot-base gettxoutsetinfo without a second coins walk
+commit: 4d9e9c70fc1005c18a72b613a2df4b2f50acec41
+commit_short: 4d9e9c70fc10
+subject: test: corpus 1-vs-N script-pool identity; native default still blocked
 tree_clean: NO
 interpreted: yes
 promote_does_not_apply: yes (start_mainnet.sh runs python3 -m ouroboros.cli from this tree)
 launch: python3 -m ouroboros.cli
 runnable_tree: proof/runnable-tree.sha256
-runnable_files: 101
+runnable_files: 102
 runtime: Python 3.13.5
 runtime_path: /usr/bin/python3
 rustc: rustc 1.97.1 (8bab26f4f 2026-07-14)
@@ -18,7 +18,8 @@ maturin: maturin 1.12.6
 target: Linux amd64
 native_extension: ferrous-utils/sync (PyO3 module sync)
 installed_sync_so: /home/work/.local/lib/python3.13/site-packages/sync/sync.cpython-313-x86_64-linux-gnu.so
-installed_sync_so_sha256: 807392fb811f0c46d61cd05a2f0760519afc6c78be9faab06a49fe7dc66a6b66
+installed_sync_so_sha256: ab8faffb2b84cacd6a1b143c6deb5506b8e0fd37ea14b68ba24036f32b755750
+bundle_recorded_sync_so_sha256: 807392fb811f0c46d61cd05a2f0760519afc6c78be9faab06a49fe7dc66a6b66
 deploy_pin: deploy/ouroboros/MANIFEST (wheel sha256 52039f392abc8a1555d52c94041aef71c9233e276d47152e56980df2b73c302c)
 deploy_pin_stale: yes (reinstall_ouroboros.sh rebuilds the wheel from this tree on every start; the pin is unused)
 unit: hashhog-ouroboros-mainnet (maintenance-paused since 2026-09-10; no live PID)

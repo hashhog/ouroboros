@@ -114,21 +114,33 @@ def _legacy_sighash_all(tx: Transaction, input_index: int, script_code: bytes) -
     other-inputs blanking is a no-op)."""
     ins = []
     for i, tx_in in enumerate(tx.inputs):
-        ins.append(TxIn(
-            prev_txid=tx_in.prev_txid, prev_vout=tx_in.prev_vout,
-            script_sig=script_code if i == input_index else b"",
-            sequence=tx_in.sequence,
-        ))
-    tmp = Transaction(txid=b"", version=tx.version, locktime=tx.locktime,
-                      inputs=ins, outputs=list(tx.outputs))
+        ins.append(
+            TxIn(
+                prev_txid=tx_in.prev_txid,
+                prev_vout=tx_in.prev_vout,
+                script_sig=script_code if i == input_index else b"",
+                sequence=tx_in.sequence,
+            )
+        )
+    tmp = Transaction(
+        txid=b"", version=tx.version, locktime=tx.locktime, inputs=ins, outputs=list(tx.outputs)
+    )
     return _dsha256(tmp.serialize() + SIGHASH_ALL.to_bytes(4, "little"))
 
 
 def _make_coinbase() -> Transaction:
     tx = Transaction(
-        txid=b"", version=1, locktime=0,
-        inputs=[TxIn(prev_txid=bytes(32), prev_vout=0xFFFFFFFF,
-                     script_sig=b"\x04" + b"\x00" * 4, sequence=0xFFFFFFFF)],
+        txid=b"",
+        version=1,
+        locktime=0,
+        inputs=[
+            TxIn(
+                prev_txid=bytes(32),
+                prev_vout=0xFFFFFFFF,
+                script_sig=b"\x04" + b"\x00" * 4,
+                sequence=0xFFFFFFFF,
+            )
+        ],
         outputs=[TxOut(value=50_00000000, script_pubkey=b"\x51")],
     )
     tx.txid = _dsha256(tx.serialize())
@@ -137,7 +149,9 @@ def _make_coinbase() -> Transaction:
 
 def _make_p2pk_spend(*, flip_signature_byte: bool) -> Transaction:
     tx = Transaction(
-        txid=b"", version=1, locktime=0,
+        txid=b"",
+        version=1,
+        locktime=0,
         inputs=[TxIn(prev_txid=FUNDING_TXID, prev_vout=0, script_sig=b"", sequence=0xFFFFFFFF)],
         outputs=[TxOut(value=900_000, script_pubkey=b"\x51")],
     )
@@ -159,9 +173,15 @@ def _build_block_bytes(*, flip_signature_byte: bool) -> bytes:
     spend = _make_p2pk_spend(flip_signature_byte=flip_signature_byte)
     merkle = _dsha256(cb.txid + spend.txid)
     blk = Block(
-        version=1, prev_blockhash=b"\x11" * 32, merkle_root=merkle,
-        timestamp=1_600_001_000, bits=0x1D00FFFF, nonce=0,
-        transactions=[cb, spend], hash=b"", height=BELOW_CHECKPOINT_HEIGHT,
+        version=1,
+        prev_blockhash=b"\x11" * 32,
+        merkle_root=merkle,
+        timestamp=1_600_001_000,
+        bits=0x1D00FFFF,
+        nonce=0,
+        transactions=[cb, spend],
+        hash=b"",
+        height=BELOW_CHECKPOINT_HEIGHT,
     )
     raw = blk.serialize()
     # Round-trip sanity: the deserialised block must carry the txids and the
@@ -174,14 +194,18 @@ def _build_block_bytes(*, flip_signature_byte: bool) -> bytes:
 
 def _funding_utxo() -> dict:
     return {
-        "txid": FUNDING_TXID, "vout": 0, "value": FUNDING_VALUE,
-        "script_pubkey": P2PK_SPK, "height": 500, "is_coinbase": False,
+        "txid": FUNDING_TXID,
+        "vout": 0,
+        "value": FUNDING_VALUE,
+        "script_pubkey": P2PK_SPK,
+        "height": 500,
+        "is_coinbase": False,
     }
 
 
 def _make_db() -> MagicMock:
     db = MagicMock()
-    db.get_utxo.return_value = None                 # BIP-30 probe misses
+    db.get_utxo.return_value = None  # BIP-30 probe misses
     db.get_utxo_batch.return_value = [_funding_utxo()]
     db.validate_block_from_bytes.return_value = None  # Rust structural pass
     db.connect_block_from_bytes.return_value = b"\x22" * 32
@@ -211,10 +235,14 @@ def _patched_gates(v: BlockValidator):
     )
 
 
-def _submit(*, assumevalid_zero: bool, flip_signature_byte: bool):
-    """Drive the REAL rpc.accept_block exactly as rpc_submitblock does
-    (rpc.py: accept_block(db, node, block_bytes, best_height + 1,
-    skip_scripts=False)).  Returns (accepted: bool, error: str, sig_calls)."""
+def _submit(*, assumevalid_zero: bool, flip_signature_byte: bool, skip_scripts: bool = False):
+    """Drive the REAL rpc.accept_block.
+
+    Default skip_scripts=False matches rpc_submitblock.  The IBD-drain
+    parameter skip_scripts=True is the TRUST-ANCHOR hole: before the pin
+    below, that argument skipped the Python validator even when
+    validator.force_full_scripts was set (--assumevalid 0).
+    Returns (accepted: bool, error: str, sig_calls, db)."""
     db = _make_db()
     node = _make_node(db, assumevalid_zero=assumevalid_zero)
     v = node.validator
@@ -224,13 +252,20 @@ def _submit(*, assumevalid_zero: bool, flip_signature_byte: bool):
         p.start()
     try:
         with patch.object(
-            v.tx_validator, "_verify_input_signature",
+            v.tx_validator,
+            "_verify_input_signature",
             wraps=v.tx_validator._verify_input_signature,
         ) as spy:
             try:
-                asyncio.run(accept_block(
-                    db, node, raw, BELOW_CHECKPOINT_HEIGHT, skip_scripts=False,
-                ))
+                asyncio.run(
+                    accept_block(
+                        db,
+                        node,
+                        raw,
+                        BELOW_CHECKPOINT_HEIGHT,
+                        skip_scripts=skip_scripts,
+                    )
+                )
                 accepted, err = True, ""
             except ValueError as e:
                 accepted, err = False, str(e)
@@ -248,7 +283,9 @@ def _submit(*, assumevalid_zero: bool, flip_signature_byte: bool):
 # ---------------------------------------------------------------------------
 def test_control_default_assumevalid_skips_scripts_and_accepts_bad_signature():
     accepted, err, sig_calls, db = _submit(assumevalid_zero=False, flip_signature_byte=True)
-    assert accepted, f"default assumevalid must skip scripts below the checkpoint; got reject: {err!r}"
+    assert accepted, (
+        f"default assumevalid must skip scripts below the checkpoint; got reject: {err!r}"
+    )
     assert sig_calls == 0, "assume-valid skip must NOT invoke the script interpreter"
     db.connect_block_from_bytes.assert_called_once()
 
@@ -283,11 +320,20 @@ def test_control_assumevalid_zero_accepts_good_signature():
 # Wiring: Node.start resolves the operator's assumevalid setting and flips the
 # validator's node-wide switch (the P2P BlockSync flag keeps its own copy).
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("raw,expected", [
-    (None, False), ("", False), ("1", False),
-    ("00000000000000000001d5e8fbe28e3f5ef2b5e1f5a8f8b1f4f3d9b8f6f2c1a0", False),
-    ("0", True), (0, True), (" 0 ", True), ("false", True), ("no", True),
-])
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, False),
+        ("", False),
+        ("1", False),
+        ("00000000000000000001d5e8fbe28e3f5ef2b5e1f5a8f8b1f4f3d9b8f6f2c1a0", False),
+        ("0", True),
+        (0, True),
+        (" 0 ", True),
+        ("false", True),
+        ("no", True),
+    ],
+)
 def test_assumevalid_disabled_parses_like_core(raw, expected):
     assert assumevalid_disabled(raw) is expected
 
@@ -299,7 +345,56 @@ def test_block_validator_default_is_skip_heuristic():
 
 def test_node_start_wires_switch_into_validator():
     from ouroboros.node import BitcoinNode as Node
+
     src = inspect.getsource(Node.start)
     assert "force_full_scripts = assumevalid_disabled(self.config.get('assumevalid'))" in src
     assert "self.validator.force_full_scripts = force_full_scripts" in src
     assert "force_full_scripts=force_full_scripts" in src  # BlockSync keeps its copy
+
+
+# ---------------------------------------------------------------------------
+# TRUST-ANCHOR (receipts/TRUST-ANCHOR.md 2026-09-01): the campaign classifier
+# stamps ouroboros `scripts_ack=p2p-only` because accept_block step 3 called
+# validate_block WITHOUT force_check_scripts, so a skip_scripts=True caller
+# (and, before d50d8d7, even skip_scripts=False) re-derived the checkpoint
+# skip.  Range-runner is P2P and already honours --assumevalid 0 on the drain;
+# this pin is the named submitblock/accept_block hole.
+# ---------------------------------------------------------------------------
+def test_pin_assumevalid_zero_rejects_bad_signature_even_if_caller_passes_skip_scripts():
+    accepted, err, sig_calls, db = _submit(
+        assumevalid_zero=True,
+        flip_signature_byte=True,
+        skip_scripts=True,
+    )
+    assert not accepted, (
+        "assumevalid=0 MUST verify scripts on accept_block even when the "
+        "caller passes skip_scripts=True (Core: fScriptChecks is node-wide, "
+        "not a per-caller override). got accept"
+    )
+    assert "Invalid signature for input 0" in err, f"expected the interpreter's reject, got {err!r}"
+    assert sig_calls >= 1, "the script interpreter must actually run"
+    db.connect_block_from_bytes.assert_not_called()
+
+
+def test_control_default_assumevalid_skip_scripts_true_still_skips():
+    accepted, err, sig_calls, db = _submit(
+        assumevalid_zero=False,
+        flip_signature_byte=True,
+        skip_scripts=True,
+    )
+    assert accepted, f"default assumevalid + skip_scripts=True must still skip; got reject: {err!r}"
+    assert sig_calls == 0
+    db.connect_block_from_bytes.assert_called_once()
+
+
+def test_accept_block_passes_force_check_scripts_into_validate_block():
+    """Named fix location: accept_block step 3 must pass force_check_scripts
+    from the validator's node-wide switch, not rely on the instance attribute
+    alone (TRUST-ANCHOR.md: 'pass force_check_scripts from the node's
+    assumevalid config')."""
+    src = inspect.getsource(accept_block)
+    assert "force_check_scripts=" in src, (
+        "accept_block must pass force_check_scripts= into validate_block "
+        "(TRUST-ANCHOR named hole; campaign classifier cites this call site)"
+    )
+    assert "force_full_scripts" in src
