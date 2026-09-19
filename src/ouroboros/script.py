@@ -34,7 +34,9 @@ _log = logging.getLogger(__name__)
 # extension as ``ScriptTx`` / ``script_verify`` / ``script_sighash_legacy``).
 # The default is the pure-Python interpreter below, which stays intact as the
 # fallback and as the oracle for the Python-vs-native differential
-# (``tests/native_script_differential.py``).
+# (``tests/native_script_differential.py``). ``--par`` is a no-op on this
+# path (GIL). What it would take to make native the default, and what still
+# blocks it, is ``docs/NATIVE-SCRIPT-DEFAULT.md``.
 #
 # FAIL-CLOSED: when the operator asks for native and the extension does not
 # provide it (stale wheel, ABI drift), import fails loudly instead of quietly
