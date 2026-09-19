@@ -1,7 +1,6 @@
 """Block and transaction validation logic."""
 
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import struct
@@ -30,22 +29,70 @@ from ouroboros.consensus import (
 logger = logging.getLogger(__name__)
 
 
-# Thread count for the deferred script-check queue (native interpreter only).
-# OUROBOROS_SCRIPT_THREADS=N; N<=1 keeps the inline serial path. Default 8,
-# capped at the machine's CPU count.
+# Script-check thread count (Bitcoin Core `-par`).
+# 0 = auto (one per core, extra workers capped at 15), 1 = serial, <0 =
+# leave that many cores free. Honours OUROBOROS_PAR, then the legacy
+# OUROBOROS_SCRIPT_THREADS, then the value set by init_script_check_threads
+# (CLI `--par` / conf `par=`), then Core's default 0.
+_PAR_ENV = "OUROBOROS_PAR"
 _SCRIPT_THREADS_ENV = "OUROBOROS_SCRIPT_THREADS"
+_requested_par: int | None = None
+
+
+def resolve_script_check_threads(par: int | None = None) -> int:
+    """Core `-par` → total script-check threads (always ≥ 1).
+
+    Mirrors `chainstatemanager_args.cpp:53-60` plus the Core check-queue
+    clamp at `validation.cpp:6136`. Falls back to the same formula in
+    pure Python when the `sync` extension is missing.
+    """
+    if par is None:
+        par = _par_from_env_or_init()
+    try:
+        import sync as _sync  # noqa: WPS433
+        fn = getattr(_sync, "resolve_script_check_threads", None)
+        if fn is not None:
+            return int(fn(int(par)))
+    except ImportError:
+        pass
+    cores = os.cpu_count() or 1
+    script_threads = int(par)
+    if script_threads <= 0:
+        script_threads += cores
+    extra = min(max(script_threads - 1, 0), 15)
+    return extra + 1
+
+
+def init_script_check_threads(par: int) -> int:
+    """Record `--par` and return the resolved thread count."""
+    global _requested_par
+    _requested_par = int(par)
+    try:
+        import sync as _sync  # noqa: WPS433
+        fn = getattr(_sync, "init_script_check_threads", None)
+        if fn is not None:
+            return int(fn(int(par)))
+    except ImportError:
+        pass
+    return resolve_script_check_threads(int(par))
+
+
+def _par_from_env_or_init() -> int:
+    for key in (_PAR_ENV, _SCRIPT_THREADS_ENV):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                return 0
+    if _requested_par is not None:
+        return _requested_par
+    return 0
 
 
 def script_check_threads() -> int:
-    raw = os.environ.get(_SCRIPT_THREADS_ENV, "").strip()
-    if raw:
-        try:
-            n = int(raw)
-        except ValueError:
-            n = 1
-    else:
-        n = 8
-    return max(1, min(n, os.cpu_count() or 1))
+    """Resolved script-check thread count (1 = serial)."""
+    return resolve_script_check_threads()
 
 # Try to import the Rust sync module for assume-valid / checkpoint skipping
 try:
@@ -1284,13 +1331,15 @@ class BlockValidator:
         #            bitcoin-core/src/validation.cpp:2535.
         spent_in_block: set[tuple[bytes, int]] = set()
         total_fees = 0
-        # Deferred script checks (Core CCheckQueue shape): with the native
-        # interpreter every input's script check is queued during the walk
-        # and joined after the block-level checks, on a thread pool. The
-        # Python interpreter holds the GIL for the whole check, so it gains
-        # nothing from the pool and keeps verifying inline.
-        script_threads = script_check_threads() if (NATIVE_SCRIPT_ENABLED and not skip_scripts) else 1
-        script_check_queue: list | None = [] if script_threads > 1 else None
+        # Deferred script checks (Core ConnectBlock check-queue shape): with the native
+        # interpreter every input is queued during the walk and drained
+        # off-GIL after the block-level checks. `--par=1` still uses this
+        # drain (serial inside Rust) so 1-vs-N identity shares a path.
+        # The Python interpreter holds the GIL for the whole check, so a
+        # thread pool around it would be a fake — it stays inline serial.
+        use_native_queue = NATIVE_SCRIPT_ENABLED and not skip_scripts
+        script_threads = resolve_script_check_threads() if use_native_queue else 1
+        script_check_queue: list | None = [] if use_native_queue else None
         for i, tx in enumerate(block.transactions):
             # IsFinalTx check applies to ALL transactions including coinbase.
             # Ref: Bitcoin Core validation.cpp:4144-4148 — iterates block.vtx
@@ -2469,8 +2518,8 @@ class TransactionValidator:
         self.script_interpreter = ScriptInterpreter()
         logger.info(
             "script interpreter: %s",
-            f"native (Rust), {script_check_threads()} check thread(s)"
-            if NATIVE_SCRIPT_ENABLED else "python (serial)",
+            f"native (Rust), {resolve_script_check_threads()} check thread(s)"
+            if NATIVE_SCRIPT_ENABLED else "python (serial; GIL, --par is a no-op)",
         )
         # Snapshot manager is consulted by the BIP-68 stopgap path
         # (check_sequence_locks) to detect inputs whose prev block is
@@ -2508,7 +2557,7 @@ class TransactionValidator:
         of verifying input *i* inline, ``(block_tx_index, tx, tx_in, utxo, i,
         flags, input_amounts, input_script_pubkeys)`` is appended and the
         caller runs the queue with ``run_script_check_queue`` once the whole
-        block has been walked — Core's CCheckQueue shape (ConnectBlock queues
+        block has been walked — Core's ConnectBlock check-queue shape (queues
         CScriptCheck per input and joins at the end). Only ``validate_block``
         uses it, and only with the native interpreter, whose verification
         releases the GIL so the checks overlap on a thread pool.
@@ -2804,44 +2853,50 @@ class TransactionValidator:
     def run_script_check_queue(self, queue: list, threads: int) -> str | None:
         """Run deferred script checks; ``None`` if all pass, else the error
         string the inline path would have produced for the FIRST failing
-        input in block order (so the reject reason is identical).
+        input in block order (so the reject reason is identical at 1
+        worker and at N).
 
-        Each worker runs the same ``_verify_input_signature`` (sig cache
-        included; the cache is lock-protected) — nothing is re-implemented
-        here. The native per-transaction contexts are built up front on the
-        calling thread so workers never race to build one.
+        Native interpreter: one FFI drain into the Rust check-queue pool
+        (GIL released for the whole batch; per-worker buffer ≤ 128).
+        Python interpreter: serial on this thread — the GIL would make a
+        worker pool a fake, so we do not ship one.
         """
         if not queue:
             return None
-        for _pos, tx, _tx_in, _utxo, _i, _flags, amts, spks in queue:
-            native_script_context(tx, amts, spks)
-
-        def run_slice(items):
-            fails = []
-            for pos, tx, tx_in, utxo, i, flags, amts, spks in items:
-                try:
-                    ok = self._verify_input_signature(tx, tx_in, utxo, i, flags, amts, spks)
-                except Exception:  # noqa: BLE001 - a crash is a reject, never a pass
-                    logger.exception("script check queue: worker raised")
-                    ok = False
-                if not ok:
-                    fails.append((pos, i))
-            return fails
-
-        threads = max(1, min(int(threads), len(queue)))
-        if threads == 1:
-            fails = run_slice(queue)
-        else:
-            step = -(-len(queue) // threads)
-            slices = [queue[k:k + step] for k in range(0, len(queue), step)]
-            fails = []
-            with ThreadPoolExecutor(max_workers=len(slices)) as ex:
-                for part in ex.map(run_slice, slices):
-                    fails.extend(part)
-        if not fails:
-            return None
-        pos, i = min(fails)
-        return f"Transaction {pos} invalid: Invalid signature for input {i}"
+        threads = max(1, int(threads))
+        if NATIVE_SCRIPT_ENABLED:
+            try:
+                import sync as _sync  # noqa: WPS433
+                parallel = getattr(_sync, "script_verify_parallel", None)
+            except ImportError:
+                parallel = None
+            if parallel is not None:
+                jobs = []
+                for _pos, tx, tx_in, utxo, i, flags, amts, spks in queue:
+                    ctx = native_script_context(tx, amts, spks)
+                    jobs.append((
+                        ctx,
+                        int(i),
+                        bytes(tx_in.script_sig),
+                        bytes(utxo["script_pubkey"]),
+                        int(flags),
+                        int(utxo["value"]),
+                    ))
+                ok, fail_idx, _name = parallel(jobs, threads)
+                if ok:
+                    return None
+                pos, _tx, _tx_in, _utxo, i, *_rest = queue[int(fail_idx)]
+                return f"Transaction {pos} invalid: Invalid signature for input {i}"
+        # GIL: serial. First failure in queue order = block order.
+        for pos, tx, tx_in, utxo, i, flags, amts, spks in queue:
+            try:
+                ok = self._verify_input_signature(tx, tx_in, utxo, i, flags, amts, spks)
+            except Exception:  # noqa: BLE001 - a crash is a reject, never a pass
+                logger.exception("script check queue: serial path raised")
+                ok = False
+            if not ok:
+                return f"Transaction {pos} invalid: Invalid signature for input {i}"
+        return None
 
     def _verify_input_signature(
         self,

@@ -126,44 +126,23 @@ class TestG1NoCheckQueue(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestG2NoPar(unittest.TestCase):
     """
-    BUG-G2: ouroboros has no -par (nScriptCheckThreads) option.
-
-    Core (init.cpp:513-514):
-      argsman.AddArg("-par=<n>", ..., MAX_SCRIPTCHECK_THREADS, DEFAULT_SCRIPTCHECK_THREADS)
-      validation.h: static constexpr int MAX_SCRIPTCHECK_THREADS{15}
-
-    ouroboros config.py has no script_check_threads, par, or related option.
-    The node always runs single-threaded script verification regardless of CPU count.
+    G2 closed 2026-09-19: `--par` matches Core (0=auto, 1=serial, cap 15 extra).
     """
 
-    def test_no_par_option_in_config(self):
-        """config.py does not expose a -par / script check threads option."""
+    def test_par_option_in_config(self):
+        """config.py exposes par= (Core -par)."""
         import ouroboros.config as cfg_mod
         import inspect
         src = inspect.getsource(cfg_mod)
-        for needle in ("script_check_thread", "nScriptCheckThread",
-                       "par", "MAX_SCRIPTCHECK", "worker_threads"):
-            if needle in src and "par" in needle:
-                # 'par' may match 'parameter' — check carefully
-                if "script" not in src[src.index(needle)-30:src.index(needle)+60]:
-                    continue
-            self.assertNotIn(
-                needle.lower(),
-                src.lower(),
-                f"BUG-G2 (unexpected): config.py contains '{needle}' — "
-                "would indicate -par equivalent was added"
-            ) if needle in ("script_check_thread", "nScriptCheckThread",
-                            "MAX_SCRIPTCHECK", "worker_threads") else None
+        self.assertIn("'par'", src)
 
-    def test_no_par_cli_option(self):
-        """CLI entrypoint (cli.py) has no -par argument."""
+    def test_par_cli_option(self):
+        """CLI entrypoint exposes --par and rewrites Core's single-dash -par."""
         import ouroboros.cli as cli_mod
         import inspect
         src = inspect.getsource(cli_mod)
-        self.assertNotIn("script-check-thread", src,
-            "BUG-G2 (unexpected): CLI has script-check-threads")
-        self.assertNotIn("par=", src,
-            "BUG-G2 (unexpected): CLI has --par option")
+        self.assertIn("--par", src)
+        self.assertIn("rewrite_core_par_flags", src)
 
 
 # ---------------------------------------------------------------------------

@@ -527,12 +527,25 @@ def sync(ctx, reset, limit):
         "See --rpc-tls-cert for usage; the two flags must be set together."
     ),
 )
+@click.option(
+    "--par",
+    "par",
+    type=int,
+    default=None,
+    help=(
+        "Script verification threads (Bitcoin Core -par). 0 = auto (one per "
+        "core, extra workers capped at 15), 1 = serial, <0 = leave that many "
+        "cores free. Default: 0. Only the native interpreter "
+        "(OUROBOROS_NATIVE_SCRIPT=1) actually parallelises — the Python "
+        "interpreter holds the GIL, so --par is a no-op there."
+    ),
+)
 @click.pass_context
 def start(
     ctx, rpc_port, p2p_port, listen, bind, connect, dnsseed, force, v2transport,
     peerbloomfilters, blockfilterindex, cfilter, coinstatsindex,
     txospenderindex, assumevalid, noassumevalid, daemon,
-    pid_path, reindex, rpc_tls_cert, rpc_tls_key,
+    pid_path, reindex, rpc_tls_cert, rpc_tls_key, par,
 ):
     """Start the Bitcoin node"""
     global _node, _cancelled, _pid_file
@@ -649,6 +662,8 @@ def start(
             config["assumevalid"] = "0"
         elif assumevalid is not None:
             config["assumevalid"] = str(assumevalid)
+        if par is not None:
+            config["par"] = int(par)
 
         # FIX-64: HTTPS/TLS termination flags.  Reject mismatched pairs at
         # the CLI layer so the operator sees a clean Click error rather than
@@ -1126,8 +1141,34 @@ def import_blocks(ctx, source):
     )
 
 
+def rewrite_core_par_flags(argv: list[str]) -> list[str]:
+    """Rewrite Bitcoin Core's ``-par`` / ``-par=N`` to Click's ``--par``.
+
+    Core's argsman accepts a single dash; Click does not. Applied in
+    ``main`` before Click sees argv so ``ouroboros start -par=4`` matches
+    ``bitcoind -par=4``.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-par", "--par"):
+            out.append("--par")
+            if i + 1 < len(argv):
+                i += 1
+                out.append(argv[i])
+        elif a.startswith("-par=") or a.startswith("--par="):
+            out.append("--par")
+            out.append(a.split("=", 1)[1])
+        else:
+            out.append(a)
+        i += 1
+    return out
+
+
 def main() -> None:
     """Main entry point."""
+    sys.argv = rewrite_core_par_flags(sys.argv)
     cli()
 
 

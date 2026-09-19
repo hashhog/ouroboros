@@ -10,6 +10,7 @@ pub mod sighash;
 pub mod sequence_lock;
 pub mod sigop;
 pub mod interpreter;
+pub mod checkqueue;
 pub mod headers_presync;
 
 // Re-export functions for convenience

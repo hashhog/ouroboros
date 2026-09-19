@@ -228,6 +228,8 @@ class NodeConfig:
             # as a filesystem path; relative paths are resolved relative to
             # the datadir (Core parity, init.cpp:1591-1593).
             'asmap': '',
+            # Script verification threads (Bitcoin Core -par). 0 = auto.
+            'par': '0',
         }
 
         if self.config_path.exists():
@@ -387,6 +389,8 @@ class NodeConfig:
             # ASMap file path (Core: -asmap).  Empty string disables ASMap.
             # Relative paths are resolved relative to datadir at startup.
             'asmap': self.get('asmap') or '',
+            # Script verification threads (Core: -par).  0 = auto.
+            'par': self.getint('par'),
         }
 
 

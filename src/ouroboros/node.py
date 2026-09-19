@@ -645,6 +645,19 @@ class BitcoinNode:
             # default / unset) preserves the production skip-below-checkpoint
             # behaviour.  We only special-case "0" — hash-pinned assumevalid is
             # not implemented (the default checkpoint set governs the cut).
+            par_raw = self.config.get('par', 0)
+            try:
+                par_n = int(par_raw if par_raw is not None else 0)
+            except (TypeError, ValueError):
+                par_n = 0
+            from ouroboros.validation import init_script_check_threads
+            script_threads = init_script_check_threads(par_n)
+            logger.info(
+                "script verification threads: %d (--par=%s; native pool "
+                "only when OUROBOROS_NATIVE_SCRIPT=1, else GIL-serial)",
+                script_threads, par_n,
+            )
+
             force_full_scripts = assumevalid_disabled(self.config.get('assumevalid'))
             # Core parity: assumevalid is ONE node-wide setting
             # (validation.cpp:2345-2347 — ConnectBlock's fScriptChecks is

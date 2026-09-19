@@ -2431,6 +2431,10 @@ fn read_snapshot_metadata(path: String, network: String) -> PyResult<PySnapshotM
 // ---------------------------------------------------------------------------
 
 use crate::validate::interpreter as native_interp;
+use crate::validate::checkqueue::{
+    self as script_check_queue, ScriptCheck, DEFAULT_SCRIPTCHECK_THREADS, MAX_SCRIPTCHECK_THREADS,
+    SCRIPT_CHECK_BATCH_SIZE,
+};
 
 /// Bump when the Python-facing contract of the functions below changes; the
 /// Python side refuses to enable the native path against an older ABI.
@@ -2529,6 +2533,83 @@ fn script_verify(
         }
     });
     Ok((err == native_interp::ScriptError::Ok, err.code(), err.name()))
+}
+
+/// Core `-par` mapping: 0 = auto, 1 = serial, cap 15 extra workers.
+#[pyfunction]
+fn resolve_script_check_threads(par: i32) -> usize {
+    script_check_queue::resolve_script_check_threads(par)
+}
+
+/// Record `--par` for subsequent ConnectBlock drains.
+#[pyfunction]
+fn init_script_check_threads(par: i32) -> usize {
+    script_check_queue::init_script_check_threads(par)
+}
+
+#[pyfunction]
+fn script_check_thread_count() -> usize {
+    script_check_queue::script_check_thread_count()
+}
+
+#[pyfunction]
+fn max_scriptcheck_threads() -> usize {
+    MAX_SCRIPTCHECK_THREADS
+}
+
+#[pyfunction]
+fn default_scriptcheck_threads() -> i32 {
+    DEFAULT_SCRIPTCHECK_THREADS
+}
+
+#[pyfunction]
+fn script_check_batch_size() -> usize {
+    SCRIPT_CHECK_BATCH_SIZE
+}
+
+/// Parallel `VerifyScript` over a list of jobs.
+///
+/// Each job is `(ScriptTx, input_index, script_sig, script_pubkey, flags, amount)`.
+/// `n_workers` is the pool size (1 = serial). Returns
+/// `(ok, fail_index, error_name)` where `fail_index` is `-1` on success and
+/// otherwise the **lowest** job index that failed — identical at 1 worker
+/// and at N.
+///
+/// Releases the GIL for the whole drain (native interpreter only).
+#[pyfunction]
+fn script_verify_parallel(
+    py: Python<'_>,
+    jobs: Vec<(Py<PyScriptTx>, usize, Vec<u8>, Vec<u8>, u32, i64)>,
+    n_workers: usize,
+) -> PyResult<(bool, i64, &'static str)> {
+    let mut checks: Vec<ScriptCheck> = Vec::with_capacity(jobs.len());
+    for (i, (ctx, n_in, script_sig, script_pubkey, flags, amount)) in jobs.into_iter().enumerate()
+    {
+        let inner = ctx.bind(py).borrow().inner.clone();
+        if n_in >= inner.tx.inputs.len() {
+            return Err(PyErr::new::<pyo3::exceptions::PyIndexError, _>(format!(
+                "input_index {} out of range for a transaction with {} inputs",
+                n_in,
+                inner.tx.inputs.len()
+            )));
+        }
+        checks.push(ScriptCheck {
+            ctx: inner,
+            n_in,
+            script_sig,
+            script_pubkey,
+            flags,
+            amount,
+            index: i,
+        });
+    }
+    let result = py.detach(move || {
+        script_check_queue::run_script_checks_with_n(n_workers.max(1), &checks)
+    });
+    match result {
+        Ok(()) => Ok((true, -1, "SCRIPT_ERR_OK")),
+        Err((idx, err)) => Ok((false, idx as i64, err.name())),
+    }
 }
 
 /// Core `EvalScript` alone (BASE=0 / WITNESS_V0=1 semantics) over
@@ -2679,6 +2760,13 @@ fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(script_verify, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(script_eval, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(script_sighash_legacy, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(resolve_script_check_threads, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(init_script_check_threads, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(script_check_thread_count, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(max_scriptcheck_threads, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(default_scriptcheck_threads, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(script_check_batch_size, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(script_verify_parallel, m)?)?;
     Ok(())
 }
 
