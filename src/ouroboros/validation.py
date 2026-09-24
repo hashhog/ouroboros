@@ -1274,6 +1274,14 @@ class BlockValidator:
             enforce_bip30 = True
 
         if enforce_bip30:
+            # Same lookups as the loop below (nearly all misses), issued in
+            # parallel first so the loop reads them from the cache.  Perf
+            # only — the verdict is still the serial loop's.
+            self._prefetch_outpoints([
+                (tx.get_txid(), v)
+                for tx in block.transactions
+                for v in range(len(tx.outputs))
+            ])
             for tx in block.transactions:
                 txid = tx.get_txid()
                 for vout_idx in range(len(tx.outputs)):
@@ -1846,6 +1854,24 @@ class BlockValidator:
         swallowed: the authoritative per-input lookups that follow re-read
         and surface real errors exactly as before.
         """
+        txs = block.transactions
+        if len(txs) < 2:
+            return
+        in_block = {tx.get_txid() for tx in txs}
+        self._prefetch_outpoints([
+            (inp.prev_txid, inp.prev_vout)
+            for tx in txs[1:]
+            for inp in tx.inputs
+            if inp.prev_txid not in in_block
+        ])
+
+    def _prefetch_outpoints(self, outpoints: list) -> None:
+        """Warm the UTXO read cache for *outpoints* (hits and misses alike).
+
+        Performance hint only; see ``_prefetch_block_inputs``.
+        """
+        if not outpoints:
+            return
         prefetch = getattr(self.db, "prefetch_utxos", None)
         if prefetch is None:
             return
@@ -1854,18 +1880,6 @@ class BlockValidator:
         except ValueError:
             threads = 16
         if threads <= 0:
-            return
-        txs = block.transactions
-        if len(txs) < 2:
-            return
-        in_block = {tx.get_txid() for tx in txs}
-        outpoints = [
-            (inp.prev_txid, inp.prev_vout)
-            for tx in txs[1:]
-            for inp in tx.inputs
-            if inp.prev_txid not in in_block
-        ]
-        if not outpoints:
             return
         try:
             prefetch(outpoints, threads)
