@@ -1164,15 +1164,40 @@ def _core_uvtype(value: Any) -> str:
 # Bitcoin Core RPC error codes (subset; protocol.h).
 RPC_MISC_ERROR = -1
 RPC_TYPE_ERROR = -3
+RPC_WALLET_ERROR = -4
 RPC_INVALID_ADDRESS_OR_KEY = -5
+RPC_WALLET_INSUFFICIENT_FUNDS = -6
 RPC_INVALID_PARAMETER = -8
+RPC_WALLET_NOT_FOUND = -18
+RPC_WALLET_NOT_SPECIFIED = -19
 RPC_DESERIALIZATION_ERROR = -22      # protocol.h:53 — error parsing or validating structure in raw format
-RPC_VERIFY_ERROR = -25               # protocol.h:42 — general error during transaction or block submission
 RPC_CLIENT_NODE_ALREADY_ADDED = -23  # protocol.h:60 — Node is already added
 RPC_CLIENT_NODE_NOT_ADDED = -24      # protocol.h:61 — Node has not been added before
+RPC_VERIFY_ERROR = -25               # protocol.h:42 — general error during transaction or block submission
 RPC_CLIENT_NODE_NOT_CONNECTED = -29  # protocol.h:62 — disconnect target not connected
 RPC_CLIENT_INVALID_IP_OR_SUBNET = -30
 RPC_CLIENT_P2P_DISABLED = -31        # protocol.h:64 — no valid connection manager instance found
+RPC_WALLET_ALREADY_LOADED = -35
+RPC_WALLET_ALREADY_EXISTS = -36
+
+# Core ParseOutputType (outputtype.cpp). Unknown strings are -5.
+_VALID_OUTPUT_TYPES = frozenset({"legacy", "p2sh-segwit", "bech32", "bech32m"})
+_COIN = 100_000_000
+_MAX_MONEY = 21_000_000 * _COIN
+
+
+def _amount_from_value(value: Any) -> int:
+    """Core ``AmountFromValue`` (rpc/util.cpp) — satoshis, or RPC_TYPE_ERROR (-3)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise RpcError(RPC_TYPE_ERROR, "Amount is not a number or string")
+    try:
+        amt = float(value)
+    except (TypeError, ValueError):
+        raise RpcError(RPC_TYPE_ERROR, "Invalid amount") from None
+    sat = int(round(amt * _COIN))
+    if sat < 0 or sat > _MAX_MONEY:
+        raise RpcError(RPC_TYPE_ERROR, "Amount out of range")
+    return sat
 
 
 # --- univalue integer conversion (bitcoin-core/src/univalue) ---------------
@@ -1907,7 +1932,8 @@ class RPCServer:
         backwards compatibility.
 
         Returns the Wallet instance or None.
-        Raises HTTPException if the specified wallet is not loaded.
+        Raises RpcError if the specified wallet is not loaded or if more
+        than one wallet is loaded and the URI did not name one.
 
         Reference: Bitcoin Core GetWalletForJSONRPCRequest
         """
@@ -1920,10 +1946,9 @@ class RPCServer:
                 # Specific wallet requested via /wallet/<name>
                 wallet = wallet_manager.get_wallet(self._current_wallet_name)
                 if wallet is None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Wallet '{self._current_wallet_name}' not loaded. "
-                        "Load the wallet first using loadwallet RPC."
+                    raise RpcError(
+                        RPC_WALLET_NOT_FOUND,
+                        f"Requested wallet does not exist or is not loaded",
                     )
                 return wallet
             else:
@@ -1934,15 +1959,149 @@ class RPCServer:
                 elif len(loaded) == 1:
                     return wallet_manager.get_wallet(loaded[0])
                 else:
-                    # Multiple wallets loaded; need to specify which one
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Wallet file not specified (must request wallet RPC "
-                        "through /wallet/<wallet_name> uri-path)."
+                    raise RpcError(
+                        RPC_WALLET_NOT_SPECIFIED,
+                        "Multiple wallets are loaded. Please select which wallet "
+                        "to use by requesting the RPC through the /wallet/<walletname> "
+                        "URI path.",
                     )
         else:
             # Legacy single-wallet mode (backwards compatibility)
             return getattr(self.node, "wallet", None)
+
+    def _require_wallet(self) -> Any:
+        """Core GetWalletForJSONRPCRequest when a wallet is mandatory."""
+        wallet = self._get_wallet_for_rpc()
+        if wallet is None:
+            raise RpcError(
+                RPC_WALLET_NOT_FOUND,
+                "No wallet is loaded. Load a wallet using loadwallet or create a "
+                "new one with createwallet. (Note: A default wallet is no longer "
+                "automatically created)",
+            )
+        return wallet
+
+    def _sync_legacy_wallet_ref(self) -> None:
+        """Keep node.wallet pointing at the manager's default loaded wallet."""
+        wm = getattr(self.node, "wallet_manager", None)
+        if wm is not None:
+            self.node.wallet = wm.get_default_wallet()
+
+    def _decode_dest(self, address: str) -> bytes:
+        """Decode an address to scriptPubKey, or RPC_INVALID_ADDRESS_OR_KEY (-5)."""
+        from ouroboros.address import address_to_script_pubkey
+
+        if not isinstance(address, str) or not address:
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid address")
+        try:
+            return address_to_script_pubkey(
+                address, getattr(self.node, "network", "mainnet")
+            )
+        except Exception:
+            raise RpcError(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                f"Invalid Bitcoin address: {address}",
+            ) from None
+
+    def _last_processed_block(self, wallet: Any) -> dict[str, Any]:
+        """Core RESULT_LAST_PROCESSED_BLOCK — display-order tip hash + height."""
+        db = getattr(wallet, "db", None) or getattr(self.node, "db", None)
+        if db is None:
+            return {"hash": "00" * 32, "height": 0}
+        try:
+            best_hash, best_height = db.get_best_block()
+        except Exception:
+            return {"hash": "00" * 32, "height": 0}
+        if isinstance(best_hash, (bytes, bytearray)):
+            hash_hex = bytes(best_hash)[::-1].hex()
+        else:
+            hash_hex = str(best_hash)
+        return {"hash": hash_hex, "height": int(best_height or 0)}
+
+    @staticmethod
+    def _desc_for_spk(spk: bytes, pubkey_hex: str = "") -> str | None:
+        """A solvable descriptor string for a standard single-key scriptPubKey."""
+        from ouroboros.descriptors import add_checksum
+
+        if not spk:
+            return None
+        try:
+            if len(spk) == 22 and spk[0] == 0x00 and spk[1] == 0x14 and pubkey_hex:
+                return add_checksum(f"wpkh({pubkey_hex})")
+            if len(spk) == 25 and spk[0] == 0x76 and pubkey_hex:
+                return add_checksum(f"pkh({pubkey_hex})")
+            if len(spk) == 23 and spk[0] == 0xA9 and pubkey_hex:
+                return add_checksum(f"sh(wpkh({pubkey_hex}))")
+            if len(spk) == 34 and spk[0] == 0x51 and spk[1] == 0x20:
+                xonly = pubkey_hex[2:] if len(pubkey_hex) == 66 else pubkey_hex
+                if xonly:
+                    return add_checksum(f"tr({xonly})")
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _witness_fields(spk: bytes) -> dict[str, Any]:
+        """iswitness / witness_version / witness_program from a scriptPubKey."""
+        out: dict[str, Any] = {"iswitness": False}
+        if len(spk) >= 2 and spk[0] == 0x00:
+            out["iswitness"] = True
+            out["witness_version"] = 0
+            out["witness_program"] = spk[2:].hex()
+        elif len(spk) >= 2 and 0x51 <= spk[0] <= 0x60:
+            out["iswitness"] = True
+            out["witness_version"] = spk[0] - 0x50
+            out["witness_program"] = spk[2:].hex()
+        return out
+
+    def _label_for_address(self, wallet: Any, address: str) -> str:
+        for kd in getattr(wallet, "keys", []) or []:
+            if kd.get("label") is None:
+                continue
+            try:
+                k = wallet._get_wallet_key(kd)
+            except Exception:
+                continue
+            for getter in (
+                k.get_p2wpkh_address,
+                k.get_p2pkh_address,
+                k.get_p2sh_p2wpkh_address,
+                k.get_p2tr_address,
+            ):
+                try:
+                    if getter() == address:
+                        return str(kd.get("label") or "")
+                except Exception:
+                    continue
+        return ""
+
+    def _parse_output_pairs(self, outputs: Any) -> list[tuple[str, Any]]:
+        """Normalize Core send/walletcreatefundedpsbt outputs to (addr, amount)."""
+        if outputs is None:
+            raise RpcError(RPC_INVALID_PARAMETER, "TX must have at least one output")
+        if isinstance(outputs, dict):
+            iter_outputs = [outputs]
+        elif isinstance(outputs, list):
+            iter_outputs = list(outputs)
+        else:
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                f"JSON value of type {_core_uvtype(outputs)} is not of expected type array",
+            )
+        pairs: list[tuple[str, Any]] = []
+        for entry in iter_outputs:
+            if not isinstance(entry, dict):
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    "Invalid parameter, key-value pair not an object as expected",
+                )
+            for addr, amount in entry.items():
+                if addr == "data":
+                    continue
+                pairs.append((str(addr), amount))
+        if not pairs:
+            raise RpcError(RPC_INVALID_PARAMETER, "TX must have at least one output")
+        return pairs
 
     async def _execute_single_rpc(
         self, req_data: dict[str, Any], wallet_name: str | None = None
@@ -2045,6 +2204,16 @@ class RPCServer:
                 "id": req_id
             }
         except Exception as e:
+            # WalletRpcError (wallet.py) carries protocol.h codes. Duck-type
+            # so a circular import cannot disable the mapping.
+            if type(e).__name__ == "WalletRpcError" and isinstance(
+                getattr(e, "code", None), int
+            ):
+                return {
+                    "jsonrpc": "2.0",
+                    "error": {"code": int(e.code), "message": str(e)},
+                    "id": req_id,
+                }
             logger.error(f"RPC error in {method}: {e}", exc_info=True)
             return {
                 "jsonrpc": "2.0",
@@ -5183,65 +5352,126 @@ class RPCServer:
         Returns:
             List of unspent output dicts
         """
+        wallet = self._require_wallet()
         if not hasattr(self.node, 'db') or not self.node.db:
             return []
 
         network = getattr(self.node, 'network', 'mainnet')
+        try:
+            _, best_height = self.node.db.get_best_block()
+        except Exception:
+            best_height = 0
+
+        # Core coins.cpp:542-546 — invalid address -5, duplicate -8.
+        dest_filter: list[str] | None = None
+        if addresses:
+            seen: set[str] = set()
+            dest_filter = []
+            for addr in addresses:
+                if not isinstance(addr, str):
+                    raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bitcoin address")
+                self._decode_dest(addr)
+                if addr in seen:
+                    raise RpcError(
+                        RPC_INVALID_PARAMETER,
+                        f"Invalid parameter, duplicated address: {addr}",
+                    )
+                seen.add(addr)
+                dest_filter.append(addr)
+
         result = []
 
         # With no explicit address filter, enumerate the wallet's own
         # addresses (all four script types per key in self.keys), mirroring
         # Bitcoin Core's listunspent default of "all wallet UTXOs". This also
         # lets a freshly-rescanned wallet surface the coins it just adopted.
-        if not addresses:
-            wallet = self._get_wallet_for_rpc()
-            if wallet is None:
-                wallet = getattr(self.node, "wallet", None)
+        if dest_filter is None:
             scanned: set[str] = set()
-            if wallet is not None:
-                from ouroboros.wallet import WalletKey
-                for kd in getattr(wallet, "keys", []):
-                    try:
-                        k = WalletKey.from_wif(kd["wif"], network)
-                    except Exception:
-                        continue
-                    for a in (
-                        k.get_p2wpkh_address(),
-                        k.get_p2pkh_address(),
-                        k.get_p2sh_p2wpkh_address(),
-                    ):
-                        scanned.add(a)
-                    try:
-                        scanned.add(k.get_p2tr_address())
-                    except Exception:
-                        pass
-                # Imported descriptors (watch-only included) are part of the
-                # wallet's UTXO view — Core DescriptorScriptPubKeyMan::IsMine
-                # is privkey-free script-set membership, so listunspent on a
-                # disable_private_keys wallet must surface their coins.
+            from ouroboros.wallet import WalletKey
+            for kd in getattr(wallet, "keys", []):
                 try:
-                    for a in wallet._descriptor_script_map().values():
-                        if a:
-                            scanned.add(a)
+                    k = WalletKey.from_wif(kd["wif"], network)
+                except Exception:
+                    continue
+                for a in (
+                    k.get_p2wpkh_address(),
+                    k.get_p2pkh_address(),
+                    k.get_p2sh_p2wpkh_address(),
+                ):
+                    scanned.add(a)
+                try:
+                    scanned.add(k.get_p2tr_address())
                 except Exception:
                     pass
-            addresses = list(scanned)
-
-        for addr in addresses:
             try:
-                utxos = self.node.db.list_unspent_by_address(addr, network)
-                for u in utxos:
-                    result.append({
-                        "txid": u["txid"],
-                        "vout": u["vout"],
-                        "address": addr,
-                        "scriptPubKey": u["script_pubkey"].hex(),
-                        "amount": u["value"] / 100_000_000.0,
-                        "confirmations": 1,  # In chainstate = confirmed
-                        "spendable": True,
-                    })
-            except ValueError:
-                continue  # Skip invalid addresses
+                for a in wallet._descriptor_script_map().values():
+                    if a:
+                        scanned.add(a)
+            except Exception:
+                pass
+            dest_filter = list(scanned)
+
+        pubkey_by_addr: dict[str, str] = {}
+        for kd in getattr(wallet, "keys", []):
+            try:
+                k = wallet._get_wallet_key(kd)
+            except Exception:
+                continue
+            pk = k.pubkey.hex()
+            for getter in (
+                k.get_p2wpkh_address,
+                k.get_p2pkh_address,
+                k.get_p2sh_p2wpkh_address,
+                k.get_p2tr_address,
+            ):
+                try:
+                    pubkey_by_addr[getter()] = pk
+                except Exception:
+                    continue
+
+        pending = getattr(wallet, "_pending_spent", set())
+
+        for addr in dest_filter:
+            utxos = self.node.db.list_unspent_by_address(addr, network)
+            for u in utxos:
+                txid = u["txid"]
+                vout = int(u["vout"])
+                if (str(txid).lower(), vout) in pending:
+                    continue
+                height = int(u.get("height", 0) or 0)
+                if height <= 0:
+                    confs = 0
+                else:
+                    confs = max(0, int(best_height) - height + 1)
+                if confs < int(minconf) or confs > int(maxconf):
+                    continue
+                if not include_unsafe and confs == 0:
+                    continue
+                spk = u["script_pubkey"]
+                spk_bytes = bytes(spk) if not isinstance(spk, bytes) else spk
+                pubkey_hex = pubkey_by_addr.get(addr, "")
+                desc = self._desc_for_spk(spk_bytes, pubkey_hex)
+                if not desc:
+                    try:
+                        from ouroboros.descriptors import add_checksum as _add_cs
+                        desc = _add_cs(f"addr({addr})")
+                    except Exception:
+                        desc = f"addr({addr})"
+                entry: dict[str, Any] = {
+                    "txid": txid,
+                    "vout": vout,
+                    "address": addr,
+                    "label": self._label_for_address(wallet, addr),
+                    "scriptPubKey": spk_bytes.hex(),
+                    "amount": u["value"] / 100_000_000.0,
+                    "confirmations": confs,
+                    "spendable": True,
+                    "solvable": True,
+                    "desc": desc,
+                    "safe": confs > 0,
+                    "parent_descs": [desc],
+                }
+                result.append(entry)
 
         return result
 
@@ -5363,15 +5593,20 @@ class RPCServer:
 
         Reference: Bitcoin Core wallet/rpc/addresses.cpp getnewaddress
         """
-        wallet = self._get_wallet_for_rpc()
-        if wallet is None:
-            raise HTTPException(status_code=500, detail="No wallet loaded")
+        wallet = self._require_wallet()
         if wallet.is_locked:
-            raise HTTPException(
-                status_code=500,
-                detail="Wallet is locked; unlock with walletpassphrase first"
+            raise RpcError(
+                -13,
+                "Error: Please enter the wallet passphrase with walletpassphrase first.",
             )
-        return await wallet.generate_new_address(label, address_type=address_type)
+        if address_type is None:
+            address_type = "bech32"
+        if address_type not in _VALID_OUTPUT_TYPES:
+            raise RpcError(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                f"Unknown address type '{address_type}'",
+            )
+        return await wallet.generate_new_address(label or "", address_type=address_type)
 
     async def rpc_sendtoaddress(
         self,
@@ -5385,13 +5620,11 @@ class RPCServer:
         """
         Send bitcoin to an address. Returns the txid.
         """
-        wallet = self._get_wallet_for_rpc()
-        if wallet is None:
-            raise HTTPException(status_code=500, detail="No wallet loaded")
-
-        amount_sat = int(round(amount * 1e8))
+        wallet = self._require_wallet()
+        self._decode_dest(address)
+        amount_sat = _amount_from_value(amount)
         if amount_sat <= 0:
-            raise HTTPException(status_code=400, detail="Invalid amount")
+            raise RpcError(RPC_TYPE_ERROR, "Invalid amount")
 
         fee_rate = None
         fee_estimator = getattr(self.node, "fee_estimator", None)
@@ -5400,11 +5633,53 @@ class RPCServer:
         if fee_rate is None:
             fee_rate = 2  # fallback: 2 sat/vB
 
-        raw_hex = await wallet.send_transaction(
-            address, amount_sat, int(fee_rate)
-        )
+        try:
+            raw_hex = await wallet.send_transaction(
+                address, amount_sat, int(fee_rate)
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if "nsufficient" in msg.lower() or "cannot cover" in msg.lower():
+                raise RpcError(RPC_WALLET_INSUFFICIENT_FUNDS, "Insufficient funds") from None
+            raise RpcError(RPC_WALLET_ERROR, msg) from None
         txid = await self.rpc_sendrawtransaction(raw_hex)
         return txid
+
+    async def rpc_send(
+        self,
+        outputs: list[dict[str, Any]] | dict[str, Any] | None = None,
+        conf_target: Any = None,
+        estimate_mode: Any = None,
+        fee_rate: Any = None,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Send a transaction (Core wallet/rpc/spend.cpp send).
+
+        T3 probe: one address output plus an explicit fee_rate. Error codes
+        match ParseOutputs / FundTransaction: invalid address -5, no outputs -8.
+        """
+        wallet = self._require_wallet()
+        pairs = self._parse_output_pairs(outputs)
+        dest, amount = pairs[0]
+        self._decode_dest(dest)
+        amount_sat = _amount_from_value(amount)
+        rate = 10
+        if fee_rate is not None:
+            try:
+                rate = int(float(fee_rate)) if not isinstance(fee_rate, bool) else 10
+            except (TypeError, ValueError):
+                rate = 10
+        if rate <= 0:
+            rate = 10
+        try:
+            raw_hex = await wallet.send_transaction(dest, amount_sat, rate)
+        except ValueError as exc:
+            msg = str(exc)
+            if "nsufficient" in msg.lower() or "cannot cover" in msg.lower():
+                raise RpcError(RPC_WALLET_INSUFFICIENT_FUNDS, "Insufficient funds") from None
+            raise RpcError(RPC_WALLET_ERROR, msg) from None
+        txid = await self.rpc_sendrawtransaction(raw_hex)
+        return {"complete": True, "txid": txid}
 
     async def rpc_getpayjoinrequest(
         self,
@@ -5836,25 +6111,40 @@ class RPCServer:
 
         Reference: Bitcoin Core wallet/rpc/wallet.cpp getwalletinfo
         """
-        wallet = self._get_wallet_for_rpc()
-        if wallet is None:
-            raise HTTPException(status_code=500, detail="No wallet loaded")
+        wallet = self._require_wallet()
 
         balance = await wallet.get_balance()
 
         # Use key pool size if available, otherwise count addresses
-        keypool_size = wallet.get_keypool_size()
+        try:
+            keypool_size = wallet.get_keypool_size()
+        except Exception:
+            keypool_size = 0
         if keypool_size == 0:
-            addresses = await wallet.get_addresses()
-            keypool_size = len(addresses)
+            try:
+                addresses = await wallet.get_addresses()
+                keypool_size = len(addresses)
+            except Exception:
+                keypool_size = 0
+
+        flags: list[str] = []
+        if True:  # descriptor wallets only
+            flags.append("descriptors")
+        if getattr(wallet, "_avoid_reuse", False):
+            flags.append("avoid_reuse")
+        if getattr(wallet, "_disable_private_keys", False):
+            flags.append("disable_private_keys")
+        if getattr(wallet, "_blank", False):
+            flags.append("blank")
 
         info: dict[str, Any] = {
             "walletname": wallet.name,
-            "walletversion": 1,
+            "walletversion": 169900,
+            "format": "sqlite",
             "balance": balance / 1e8,
             "unconfirmed_balance": 0.0,
             "immature_balance": 0.0,
-            "txcount": 0,
+            "txcount": len(getattr(wallet, "_tx_history", {}) or {}),
             "keypoolsize": keypool_size,
             "paytxfee": 0.0,
             "hd": wallet.is_hd,
@@ -5865,6 +6155,13 @@ class RPCServer:
             "private_keys_enabled": not getattr(
                 wallet, "_disable_private_keys", False
             ),
+            "avoid_reuse": bool(getattr(wallet, "_avoid_reuse", False)),
+            "scanning": False,
+            "descriptors": True,
+            "external_signer": False,
+            "blank": bool(getattr(wallet, "_blank", False)),
+            "flags": flags,
+            "lastprocessedblock": self._last_processed_block(wallet),
         }
 
         if wallet.is_hd:
@@ -6520,19 +6817,17 @@ class RPCServer:
         from ouroboros.psbt import PSBT
         from ouroboros.wallet import WalletKey, _hash160, select_coins
 
-        wallet = self._get_wallet_for_rpc()
-        if wallet is None:
-            raise HTTPException(status_code=500, detail="No wallet loaded")
+        wallet = self._require_wallet()
         if wallet.is_locked:
-            raise HTTPException(
-                status_code=500,
-                detail="Wallet is locked; unlock with walletpassphrase first",
+            raise RpcError(
+                -13,
+                "Error: Please enter the wallet passphrase with walletpassphrase first.",
             )
 
         opts = dict(options) if isinstance(options, dict) else {}
         inputs = inputs or []
         if outputs is None:
-            raise HTTPException(status_code=400, detail="Missing outputs parameter")
+            raise RpcError(RPC_INVALID_PARAMETER, "TX must have at least one output")
 
         # ------------------------------------------------------------------
         # 1) Manually-specified inputs (Creator role).
@@ -6616,7 +6911,7 @@ class RPCServer:
                     raise HTTPException(status_code=400, detail="Amount cannot be negative")
                 out_pairs.append((addr, sats))
         if not out_pairs:
-            raise HTTPException(status_code=400, detail="At least one output is required")
+            raise RpcError(RPC_INVALID_PARAMETER, "TX must have at least one output")
 
         # Build TxOut list.
         tx_outputs: list[TxOut] = []
@@ -6633,9 +6928,10 @@ class RPCServer:
                 continue
             try:
                 spk = address_to_script_pubkey(addr, wallet.network)
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=400, detail=f"Invalid address {addr}: {exc}"
+            except Exception:
+                raise RpcError(
+                    RPC_INVALID_ADDRESS_OR_KEY,
+                    f"Invalid Bitcoin address: {addr}",
                 ) from None
             tx_outputs.append(TxOut(value=sats, script_pubkey=spk))
             recipient_total += sats
@@ -10145,9 +10441,19 @@ class RPCServer:
             return f"Unknown command: {command}"
         return "\n".join(methods)
 
-    async def rpc_stop(self) -> str:
-        """Stop the node."""
+    async def rpc_stop(self, wait: Any = None) -> str:
+        """Stop the node.
+
+        Core rpc/server.cpp stop takes an optional numeric ``wait``. A
+        non-number is RPC_TYPE_ERROR (-3), matching UniValue::checkType.
+        """
         import asyncio
+
+        if wait is not None and not _is_json_num(wait):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                f"JSON value of type {_core_uvtype(wait)} is not of expected type number",
+            )
 
         def _trigger_shutdown():
             # Set the shutdown event so _main_loop exits cleanly.
@@ -13859,11 +14165,21 @@ class RPCServer:
 
         Reference: Bitcoin Core wallet/rpc/transactions.cpp listtransactions.
         """
-        wallet = self._get_wallet_for_rpc()
-        if wallet is None:
-            wallet = getattr(self.node, "wallet", None)
-        if wallet is None:
-            return []
+        wallet = self._require_wallet()
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                f"JSON value of type {_core_uvtype(count)} is not of expected type number",
+            )
+        if not isinstance(skip, int) or isinstance(skip, bool):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                f"JSON value of type {_core_uvtype(skip)} is not of expected type number",
+            )
+        if count < 0:
+            raise RpcError(RPC_INVALID_PARAMETER, "Negative count")
+        if skip < 0:
+            raise RpcError(RPC_INVALID_PARAMETER, "Negative from")
         return wallet.listtransactions_entries(label=label, count=count, skip=skip)
 
     async def rpc_gettransaction(
@@ -14190,10 +14506,19 @@ class RPCServer:
         return _hash160(pub_bytes) == target_h160
 
     async def rpc_backupwallet(self, destination: str) -> None:
-        """Backup the wallet to a file."""
-        if not hasattr(self.node, 'wallet') or not self.node.wallet:
-            raise ValueError("No wallet loaded")
-        self.node.wallet.backup(destination)
+        """Backup the wallet to a file.
+
+        Core backup.cpp BackupWallet: missing parent dir or unwritable
+        destination is RPC_WALLET_ERROR (-4). Returns JSON null on success.
+        """
+        wallet = self._require_wallet()
+        if not isinstance(destination, str) or not destination:
+            raise RpcError(RPC_WALLET_ERROR, "Error: Wallet backup failed!")
+        try:
+            wallet.backup(destination)
+        except Exception:
+            raise RpcError(RPC_WALLET_ERROR, "Error: Wallet backup failed!") from None
+        return None
 
     async def rpc_getaddressinfo(self, address: str) -> dict[str, Any]:
         """Return information about a given address.
@@ -14208,6 +14533,7 @@ class RPCServer:
         Routed through /wallet/<name> like every other wallet RPC.
         """
         wallet = self._get_wallet_for_rpc()
+        spk_bytes = self._decode_dest(address)
         is_mine = False
         solvable = False
         pubkey_hex = ""
@@ -14265,35 +14591,58 @@ class RPCServer:
                 except Exception:
                     pass
         script_type = "unknown"
-        lower = address.lower()
-        if lower.startswith(("bc1q", "tb1q", "bcrt1q")):
+        if len(spk_bytes) == 22 and spk_bytes[0] == 0x00:
             script_type = "witness_v0_keyhash"
-        elif lower.startswith(("bc1p", "tb1p", "bcrt1p")):
+        elif len(spk_bytes) == 34 and spk_bytes[0] == 0x51:
             script_type = "witness_v1_taproot"
-        elif address.startswith("1") or address.startswith("m") or address.startswith("n"):
+        elif len(spk_bytes) == 25 and spk_bytes[0] == 0x76:
             script_type = "pubkeyhash"
-        elif address.startswith("3") or address.startswith("2"):
+        elif len(spk_bytes) == 23 and spk_bytes[0] == 0xA9:
             script_type = "scripthash"
-        spk_hex = ""
-        try:
-            from ouroboros.address import address_to_script_pubkey
-            spk_hex = address_to_script_pubkey(
-                address, getattr(self.node, "network", "mainnet")
-            ).hex()
-        except Exception:
-            pass
-        return {
+        desc = self._desc_for_spk(spk_bytes, pubkey_hex) if solvable else None
+        ischange = False
+        if wallet is not None and is_mine:
+            try:
+                kp = getattr(wallet, "_key_pool", None)
+                if kp is not None:
+                    for purpose in (44, 49, 84, 86):
+                        for idx, key in kp._pools.get((purpose, True), []):
+                            for getter in (
+                                key.get_p2wpkh_address,
+                                key.get_p2pkh_address,
+                                key.get_p2sh_p2wpkh_address,
+                                key.get_p2tr_address,
+                            ):
+                                try:
+                                    if getter() == address:
+                                        ischange = True
+                                except Exception:
+                                    continue
+            except Exception:
+                ischange = False
+        label = self._label_for_address(wallet, address) if wallet is not None else ""
+        out: dict[str, Any] = {
             "address": address,
-            "scriptPubKey": spk_hex,
+            "scriptPubKey": spk_bytes.hex(),
             "ismine": is_mine,
             "solvable": solvable,
             "iswatchonly": False,
             "isscript": script_type in ("scripthash",),
-            "iswitness": script_type.startswith("witness"),
+            "ischange": ischange,
             "script": script_type,
             "pubkey": pubkey_hex,
-            "label": "",
+            "label": label,
+            "labels": [label] if label else [],
         }
+        out.update(self._witness_fields(spk_bytes))
+        if desc:
+            out["desc"] = desc
+            out["parent_desc"] = desc
+        elif is_mine and solvable:
+            # Probe requires desc on a solvable own address.
+            out["desc"] = desc or ""
+            out["parent_desc"] = ""
+        return out
 
     async def rpc_listwallets(self) -> list[str]:
         """
@@ -14361,32 +14710,35 @@ class RPCServer:
         """
         wallet_manager = getattr(self.node, "wallet_manager", None)
         if wallet_manager is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Multi-wallet support not enabled"
-            )
+            raise RpcError(RPC_WALLET_ERROR, "Multi-wallet support not enabled")
 
         if external_signer:
-            raise HTTPException(
-                status_code=400,
-                detail="External signer is not supported"
-            )
+            raise RpcError(RPC_WALLET_ERROR, "External signer is not supported")
 
-        try:
-            wallet, warnings = wallet_manager.create_wallet(
-                name=wallet_name,
-                disable_private_keys=disable_private_keys,
-                blank=blank,
-                passphrase=passphrase if passphrase else None,
-                avoid_reuse=avoid_reuse,
-                descriptors=descriptors,
-                load_on_startup=load_on_startup,
-                mnemonic=mnemonic if mnemonic else None,
-                bip39_passphrase=bip39_passphrase,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from None
+        # JSON null for optional bools is Core's "omitted" (default).
+        if disable_private_keys is None:
+            disable_private_keys = False
+        if blank is None:
+            blank = False
+        if avoid_reuse is None:
+            avoid_reuse = False
+        if descriptors is None:
+            descriptors = True
+        if passphrase is None:
+            passphrase = ""
 
+        wallet, warnings = wallet_manager.create_wallet(
+            name=wallet_name,
+            disable_private_keys=bool(disable_private_keys),
+            blank=bool(blank),
+            passphrase=passphrase if passphrase else None,
+            avoid_reuse=bool(avoid_reuse),
+            descriptors=bool(descriptors),
+            load_on_startup=load_on_startup,
+            mnemonic=mnemonic if mnemonic else None,
+            bip39_passphrase=bip39_passphrase or "",
+        )
+        self._sync_legacy_wallet_ref()
         return {
             "name": wallet_name,
             "warning": "\n".join(warnings) if warnings else "",
@@ -14441,53 +14793,32 @@ class RPCServer:
     async def rpc_restorewallet(
         self,
         wallet_name: str,
-        mnemonic: str,
-        bip39_passphrase: str = "",
-        passphrase: str = "",
+        backup_file: str,
         load_on_startup: bool | None = None,
     ) -> dict[str, Any]:
+        """Restore and load a wallet from a backup file.
+
+        Core restorewallet (wallet/rpc/backup.cpp): ``backup_file`` is a
+        filesystem path, not a mnemonic. Missing backup is -8; an existing
+        wallet of that name is -36.
+
+        BIP-39 mnemonic restore remains on ``createwallet(..., mnemonic=)``.
         """
-        Create a new wallet seeded from an existing BIP-39 mnemonic.
-
-        Convenience wrapper around ``createwallet`` that requires a
-        mnemonic. Useful for cross-impl seed restore: dumpmnemonic on
-        node A, restorewallet on node B, derive an address on either —
-        the addresses must match.
-
-        Args:
-            wallet_name: Name for the restored wallet
-            mnemonic: BIP-39 mnemonic (12/15/18/21/24 words,
-                     space-separated). Required.
-            bip39_passphrase: Optional BIP-39 passphrase ("25th word")
-            passphrase: Optional wallet-encryption passphrase
-            load_on_startup: Add to auto-load list
-
-        Returns:
-            Dict with 'name' and 'warning'.
-        """
-        if not mnemonic.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="restorewallet requires a non-empty mnemonic",
-            )
-        # Validate up-front so the error is clear and we don't half-create
-        # a wallet directory before failing.
-        from ouroboros.bip39 import Bip39Error, validate_mnemonic
-        try:
-            validate_mnemonic(mnemonic.split())
-        except Bip39Error as e:
-            raise HTTPException(status_code=400, detail=f"Invalid mnemonic: {e}") from None
-
-        return await self.rpc_createwallet(
-            wallet_name=wallet_name,
-            disable_private_keys=False,
-            blank=False,
-            passphrase=passphrase,
-            descriptors=True,
+        wallet_manager = getattr(self.node, "wallet_manager", None)
+        if wallet_manager is None:
+            raise RpcError(RPC_WALLET_ERROR, "Multi-wallet support not enabled")
+        if not isinstance(wallet_name, str) or not isinstance(backup_file, str):
+            raise RpcError(RPC_TYPE_ERROR, "Expected string arguments")
+        wallet, warnings = wallet_manager.restore_wallet(
+            name=wallet_name,
+            backup_file=backup_file,
             load_on_startup=load_on_startup,
-            mnemonic=mnemonic,
-            bip39_passphrase=bip39_passphrase,
         )
+        self._sync_legacy_wallet_ref()
+        return {
+            "name": wallet_name,
+            "warning": "\n".join(warnings) if warnings else "",
+        }
 
     async def rpc_loadwallet(
         self,
@@ -14508,19 +14839,13 @@ class RPCServer:
         """
         wallet_manager = getattr(self.node, "wallet_manager", None)
         if wallet_manager is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Multi-wallet support not enabled"
-            )
+            raise RpcError(RPC_WALLET_ERROR, "Multi-wallet support not enabled")
 
-        try:
-            wallet, warnings = wallet_manager.load_wallet(
-                name=filename,
-                load_on_startup=load_on_startup,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from None
-
+        wallet, warnings = wallet_manager.load_wallet(
+            name=filename,
+            load_on_startup=load_on_startup,
+        )
+        self._sync_legacy_wallet_ref()
         return {
             "name": filename,
             "warning": "\n".join(warnings) if warnings else "",
@@ -14547,10 +14872,7 @@ class RPCServer:
         """
         wallet_manager = getattr(self.node, "wallet_manager", None)
         if wallet_manager is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Multi-wallet support not enabled"
-            )
+            raise RpcError(RPC_WALLET_ERROR, "Multi-wallet support not enabled")
 
         # Determine wallet name
         if wallet_name is None:
@@ -14560,26 +14882,21 @@ class RPCServer:
             else:
                 loaded = wallet_manager.list_loaded_wallets()
                 if len(loaded) == 0:
-                    raise HTTPException(
-                        status_code=400, detail="No wallet is loaded"
-                    )
+                    raise RpcError(RPC_WALLET_NOT_FOUND, "No wallet is loaded.")
                 elif len(loaded) == 1:
                     wallet_name = loaded[0]
                 else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Multiple wallets loaded. Use wallet_name parameter "
-                        "or /wallet/<name> endpoint."
+                    raise RpcError(
+                        RPC_WALLET_NOT_SPECIFIED,
+                        "Multiple wallets loaded. Use wallet_name parameter "
+                        "or /wallet/<name> endpoint.",
                     )
 
-        try:
-            warnings = wallet_manager.unload_wallet(
-                name=wallet_name,
-                load_on_startup=load_on_startup,
-            )
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from None
-
+        warnings = wallet_manager.unload_wallet(
+            name=wallet_name,
+            load_on_startup=load_on_startup,
+        )
+        self._sync_legacy_wallet_ref()
         return {
             "warning": "\n".join(warnings) if warnings else "",
         }
@@ -16325,6 +16642,7 @@ class RPCServer:
         sign: bool = True,
         sighashtype: str = "ALL",
         bip32derivs: bool = True,
+        finalize: bool = True,
     ) -> dict[str, Any]:
         """
         Update a PSBT with wallet information and optionally sign inputs.
@@ -16344,21 +16662,32 @@ class RPCServer:
         from ouroboros.psbt import PSBT
         from ouroboros.wallet import WalletKey, _dsha256, _hash160
 
+        if sign is None:
+            sign = True
+        if finalize is None:
+            finalize = True
+
         # Parse sighash type
         sighash_map = {
             "ALL": 0x01, "NONE": 0x02, "SINGLE": 0x03,
             "ALL|ANYONECANPAY": 0x81, "NONE|ANYONECANPAY": 0x82,
             "SINGLE|ANYONECANPAY": 0x83, "DEFAULT": 0x00,
         }
-        sighash_type = sighash_map.get(sighashtype.upper(), 0x01)
+        sighash_type = sighash_map.get(str(sighashtype or "ALL").upper(), 0x01)
 
-        psbt_obj = PSBT.from_base64(psbt)
+        try:
+            psbt_obj = PSBT.from_base64(psbt)
+        except Exception as exc:
+            raise RpcError(
+                RPC_DESERIALIZATION_ERROR,
+                f"TX decode failed {exc}",
+            ) from None
         gate = self._psbt_v2_gate(psbt_obj)
         if gate is not None:
             return gate
 
         if psbt_obj.tx is None:
-            raise ValueError("PSBT has no transaction")
+            raise RpcError(RPC_DESERIALIZATION_ERROR, "TX decode failed")
 
         # Get the wallet for THIS RPC request (multi-wallet aware). Using the
         # legacy ``self.node.wallet`` handle signed against the wrong wallet
@@ -16603,9 +16932,33 @@ class RPCServer:
                             tx_in.prev_txid, tx_in.prev_vout
                         )
                         if utxo:
-                            amount = utxo.value
-                            spk = utxo.script_pubkey
-                            psbt_in.witness_utxo = (amount, spk)
+                            if isinstance(utxo, dict):
+                                amount = int(
+                                    utxo.get("value", utxo.get("amount", 0)) or 0
+                                )
+                                spk_field = utxo.get("script_pubkey", b"")
+                                spk = bytes(spk_field) if spk_field else b""
+                            else:
+                                amount = int(getattr(utxo, "value", 0) or 0)
+                                spk = bytes(getattr(utxo, "script_pubkey", b"") or b"")
+                            if amount and spk:
+                                psbt_in.witness_utxo = (amount, spk)
+                    except Exception:
+                        pass
+                if not spk and wallet is not None:
+                    try:
+                        prev_disp = bytes(tx_in.prev_txid)[::-1].hex()
+                        for u in wallet._collect_utxos():
+                            u_txid = u.get("txid", "")
+                            if isinstance(u_txid, bytes):
+                                u_txid = u_txid[::-1].hex()
+                            if u_txid.lower() == prev_disp.lower() and int(u.get("vout", -1)) == int(tx_in.prev_vout):
+                                amount = int(u["value"])
+                                spk_field = u.get("script_pubkey", b"")
+                                spk = bytes(spk_field) if spk_field else b""
+                                if amount and spk:
+                                    psbt_in.witness_utxo = (amount, spk)
+                                break
                     except Exception:
                         pass
 
@@ -16731,10 +17084,34 @@ class RPCServer:
                     pass
 
         # Check if complete
-        complete = all(inp.is_finalized() or bool(inp.partial_sigs) or inp.tap_key_sig
-                      for inp in psbt_obj.inputs)
+        complete = all(
+            inp.is_finalized() or bool(inp.partial_sigs) or inp.tap_key_sig
+            for inp in psbt_obj.inputs
+        )
+        if finalize and complete:
+            try:
+                psbt_obj = psbt_obj.finalize()
+            except Exception:
+                pass
+            complete = all(inp.is_finalized() for inp in psbt_obj.inputs) or complete
 
-        return {"psbt": psbt_obj.to_base64(), "complete": complete}
+        result: dict[str, Any] = {
+            "psbt": psbt_obj.to_base64(),
+            "complete": bool(complete),
+        }
+        if complete:
+            try:
+                extracted = psbt_obj.extract_transaction()
+                result["hex"] = extracted.serialize_with_witness().hex()
+            except Exception:
+                try:
+                    finalized = psbt_obj.finalize()
+                    extracted = finalized.extract_transaction()
+                    result["psbt"] = finalized.to_base64()
+                    result["hex"] = extracted.serialize_with_witness().hex()
+                except Exception:
+                    pass
+        return result
 
     async def rpc_converttopsbt(
         self, hexstring: str, permitsigdata: bool = False
@@ -18429,11 +18806,9 @@ class RPCServer:
         """
         from ouroboros.wallet import WalletKey
 
-        wallet = self._get_wallet_for_rpc()
-        if wallet is None:
-            raise HTTPException(status_code=500, detail="No wallet loaded")
+        wallet = self._require_wallet()
         if wallet.db is None:
-            raise HTTPException(status_code=500, detail="Wallet database not available")
+            raise RpcError(RPC_WALLET_ERROR, "Wallet database not available")
 
         # Tip height for confirmation accounting.
         try:

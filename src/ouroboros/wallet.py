@@ -1217,6 +1217,8 @@ class Wallet:
         self._encrypted_blob: bytes | None = None
         self._key_pool: KeyPool | None = None  # BIP84 key pool
         self._disable_private_keys: bool = False  # watch-only mode
+        self._blank: bool = False
+        self._avoid_reuse: bool = False
         # Locked outpoints — see Bitcoin Core wallet/wallet.cpp LockCoin/IsLockedCoin.
         # Stored as {(txid_hex, vout): persistent_bool}. Persistent locks survive
         # restart (written to disk); non-persistent locks are memory-only and
@@ -1236,6 +1238,11 @@ class Wallet:
         # debit (send) without needing the already-deleted UTXO. Keyed by
         # (txid_display_hex, vout). Mirrors which coins are "from me".
         self._owned_outpoints: dict[tuple[str, int], dict] = {}
+        # Outpoints spent by wallet-created txs that are not yet in a block.
+        # Coin selection / listunspent skip these so a subsequent send cannot
+        # double-spend the same chainstate UTXO. Mirrors Core mapWallet spent
+        # flags between CommitTransaction and BlockConnected.
+        self._pending_spent: set[tuple[str, int]] = set()
         # Highest chain height this wallet has scanned (persisted in
         # wallet.dat as "best_scanned_height").  The wallet's Core-parity
         # "locator": reconcile_on_load rescans only the gap ABOVE this
@@ -3056,10 +3063,17 @@ class Wallet:
         return addr
 
     def backup(self, backup_path: str) -> str:
-        """Create a backup of the wallet file."""
+        """Create a backup of the wallet file.
+
+        Does not create missing parent directories — Core's BackupWallet
+        fails with RPC_WALLET_ERROR when the destination cannot be opened.
+        """
         import shutil
         dest = Path(backup_path)
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.parent.exists() or not dest.parent.is_dir():
+            raise OSError("backup destination directory does not exist")
+        if dest.exists() and dest.is_dir():
+            raise OSError("backup destination is a directory")
         shutil.copy2(self.wallet_path, dest)
         logger.info(f"Wallet backed up to {dest}")
         return str(dest)
@@ -3126,6 +3140,8 @@ class Wallet:
                     txid_field = u.get("txid", "")
                     txid_str = txid_field if isinstance(txid_field, str) else txid_field.hex()
                     if self.is_locked_coin(txid_str, int(u.get("vout", 0))):
+                        continue
+                    if (txid_str.lower(), int(u.get("vout", 0))) in self._pending_spent:
                         continue
                     u["_key"] = k
                     utxos.append(u)
@@ -3328,6 +3344,10 @@ class Wallet:
         tx.txid = _dsha256(tx.serialize())
 
         raw_hex = tx.serialize_with_witness().hex()
+        for utxo in selected:
+            txid_field = utxo.get("txid", "")
+            txid_str = txid_field if isinstance(txid_field, str) else bytes(txid_field)[::-1].hex()
+            self._pending_spent.add((txid_str.lower(), int(utxo["vout"])))
         logger.info(
             f"Built transaction {tx.txid.hex()[:16]}... "
             f"sending {amount} sat to {to_address}, fee ~{est_fee} sat"
@@ -3588,21 +3608,26 @@ class WalletManager:
 
         # Validate name
         if not name:
-            raise ValueError("Wallet name cannot be empty")
+            raise WalletRpcError(-4, "Wallet name cannot be empty")
 
-        # Only descriptor wallets supported
+        # Only descriptor wallets supported. Core createwallet (wallet.cpp:403-404)
+        # throws RPC_WALLET_ERROR (-4) when descriptors=false.
         if not descriptors:
-            raise ValueError("Legacy wallets are not supported; descriptors must be True")
+            raise WalletRpcError(
+                -4,
+                'descriptors argument must be set to "true"; it is no longer '
+                "possible to create a legacy wallet.",
+            )
 
-        # Check if already loaded
+        # Check if already loaded / exists on disk. CreateWallet maps both
+        # FAILED_ALREADY_EXISTS and the subsequent FAILED_VERIFY overwrite
+        # to RPC_WALLET_ERROR (-4), not -35/-36 (those are load/restore).
         if name in self._wallets:
-            raise ValueError(f"Wallet '{name}' is already loaded")
-
-        # Check if exists on disk
+            raise WalletRpcError(-4, f"Wallet '{name}' already exists.")
         wallet_dir = self._wallet_dir(name)
         wallet_file = self._wallet_file(name)
         if wallet_file.exists():
-            raise ValueError(f"Wallet '{name}' already exists")
+            raise WalletRpcError(-4, f"Wallet '{name}' already exists.")
 
         # Passphrase validation
         if passphrase is not None and disable_private_keys:
@@ -3624,6 +3649,8 @@ class WalletManager:
 
         # Set disable_private_keys flag
         wallet._disable_private_keys = disable_private_keys
+        wallet._blank = bool(blank)
+        wallet._avoid_reuse = bool(avoid_reuse)
 
         # Initialize HD seed if not blank and not watch-only.
         # As of W21, fresh wallets are seeded from a BIP-39 mnemonic by
@@ -3700,9 +3727,9 @@ class WalletManager:
         """
         warnings: list[str] = []
 
-        # Check if already loaded
+        # Check if already loaded. Core loadwallet -> FAILED_ALREADY_LOADED -> -35.
         if name in self._wallets:
-            raise ValueError(f"Wallet '{name}' is already loaded")
+            raise WalletRpcError(-35, f"Wallet '{name}' is already loaded.")
 
         # Check if exists
         wallet_dir = self._wallet_dir(name)
@@ -3717,7 +3744,7 @@ class WalletManager:
                 legacy_path.rename(wallet_file)
                 warnings.append(f"Migrated wallet '{name}' to new directory format")
             else:
-                raise ValueError(f"Wallet '{name}' not found")
+                raise WalletRpcError(-18, f"Wallet '{name}' not found.")
 
         # Load wallet
         wallet = Wallet(
@@ -3767,7 +3794,7 @@ class WalletManager:
         warnings: list[str] = []
 
         if name not in self._wallets:
-            raise ValueError(f"Wallet '{name}' is not loaded")
+            raise WalletRpcError(-18, f"Wallet {name} not found.")
 
         wallet = self._wallets[name]
 
@@ -3790,6 +3817,35 @@ class WalletManager:
 
         logger.info(f"Unloaded wallet '{name}'")
         return warnings
+
+    def restore_wallet(
+        self,
+        name: str,
+        backup_file: str,
+        load_on_startup: bool | None = None,
+    ) -> tuple["Wallet", list[str]]:
+        """Restore a wallet from a backup file and load it.
+
+        Core RestoreWallet (wallet.cpp): missing backup is
+        FAILED_INVALID_BACKUP_FILE -> RPC_INVALID_PARAMETER (-8);
+        an existing wallet.dat is FAILED_ALREADY_EXISTS -> -36.
+        """
+        import shutil
+
+        src = Path(backup_file)
+        if not src.is_file():
+            raise WalletRpcError(-8, "Backup file does not exist")
+
+        if self.wallet_exists(name) or name in self._wallets:
+            raise WalletRpcError(
+                -36,
+                f"Failed to restore wallet. Database file exists '{name}'.",
+            )
+
+        wallet_dir = self._wallet_dir(name)
+        wallet_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, self._wallet_file(name))
+        return self.load_wallet(name, load_on_startup)
 
     def _update_load_on_startup(self, name: str, enabled: bool) -> None:
         """Update the load_on_startup setting for a wallet."""
