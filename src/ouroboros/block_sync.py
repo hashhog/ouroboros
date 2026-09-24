@@ -6170,12 +6170,20 @@ class BlockSync:
         # the wedge is, by definition, NOT in the buffer (that is the
         # deadlock), so it survives this skip and is requested.
         head_budget = cap_inflight
+        # Only head_set members can be appended here, so stop once every one
+        # of them has been visited.  Without this bound the loop walked the
+        # WHOLE remaining header queue (tens of thousands of entries) on every
+        # call whenever the head slots were already in flight — measured at
+        # ~15% of the event-loop thread's wall time on range slices, holding
+        # the GIL the validation worker needs.  Same output, same order.
+        head_unvisited = set(head_set)
         for i in range(start, len(self._validated_headers)):
-            if head_budget <= 0:
+            if head_budget <= 0 or not head_unvisited:
                 break
             block_hash, _ = self._validated_headers[i]
             if block_hash not in head_set:
                 continue
+            head_unvisited.discard(block_hash)
             if (block_hash in self.requested_blocks
                     or block_hash in seen
                     or block_hash in self._ibd_block_buffer
