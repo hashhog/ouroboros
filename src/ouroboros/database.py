@@ -744,6 +744,21 @@ class BlockchainDatabase:
             return False
         return bool(self._db.has_snapshot_load_marker())
 
+    def prefetch_utxos(self, outpoints: list[tuple[bytes, int]], threads: int) -> int:
+        """Warm the Rust read-through UTXO cache for *outpoints* in parallel.
+
+        Pure performance hint: issues the same CHAINSTATE_CF reads that the
+        per-input lookups during validation would, but concurrently and with
+        the GIL released, so the later ``get_utxo`` / ``get_utxo_batch`` /
+        ``connect_block_from_bytes`` lookups hit the cache instead of disk.
+        Returns the number of outpoints found (informational only). A no-op
+        returning 0 on Rust builds without ``prefetch_utxos``.
+        """
+        fn = getattr(self._db, "prefetch_utxos", None)
+        if fn is None or threads <= 0 or not outpoints:
+            return 0
+        return int(fn(outpoints, threads))
+
     def get_utxo_batch(self, outpoints: list[tuple[bytes, int]]) -> list[dict[str, Any] | None]:
         """Batch-fetch UTXOs for a list of (txid, vout) pairs in one FFI call.
 

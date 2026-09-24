@@ -3621,6 +3621,75 @@ impl PyBlockchainDB {
         Ok(results)
     }
 
+    /// Warm the read-through UTXO cache for `outpoints` with `threads`
+    /// parallel CHAINSTATE_CF point reads, GIL released.
+    ///
+    /// Why: on a from-genesis scripts-on replay the chainstate is far larger
+    /// than RAM left over on the host, so nearly every input's first lookup is
+    /// a random disk read. Validation used to issue those reads ONE AT A TIME
+    /// (per input, holding the GIL) — measured at 59-68% of slice wall time.
+    /// Core fetches each input once through CCoinsViewCache::FetchCoin
+    /// (coins.cpp:68-80) and keeps it in the view for the rest of ConnectBlock
+    /// (validation.cpp:2568 sigops, :2600 UpdateCoins); this is the same
+    /// read, issued for the whole block up front and in parallel, because
+    /// NVMe serves concurrent reads at far lower aggregate latency than
+    /// serial ones.
+    ///
+    /// Consensus-neutral by construction: this only calls `get_utxo_cached`,
+    /// the same function every later lookup goes through. A populate that
+    /// races a chainstate commit is dropped by the generation guard, and a
+    /// read error is ignored here (the authoritative lookup that follows
+    /// re-reads and surfaces it). Nothing is returned to the caller except
+    /// the count of outpoints found, which is informational.
+    #[pyo3(signature = (outpoints, threads=16))]
+    fn prefetch_utxos(
+        &self,
+        py: Python,
+        outpoints: Vec<(Vec<u8>, u32)>,
+        threads: usize,
+    ) -> PyResult<usize> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ops: Vec<bitcoin::OutPoint> = outpoints
+            .iter()
+            .filter(|(t, _)| t.len() == 32)
+            .map(|(t, vout)| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(t);
+                bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array(arr), vout: *vout }
+            })
+            .collect();
+        if ops.is_empty() {
+            return Ok(0);
+        }
+        let n_threads = threads.clamp(1, 64).min(ops.len());
+        let db = Arc::clone(&self.db);
+        let found = py.detach(|| {
+            let next = AtomicUsize::new(0);
+            let found = AtomicUsize::new(0);
+            let work = || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= ops.len() {
+                    break;
+                }
+                if let Ok(Some(_)) = db.get_utxo_cached(&ops[i]) {
+                    found.fetch_add(1, Ordering::Relaxed);
+                }
+            };
+            if n_threads == 1 {
+                work();
+            } else {
+                std::thread::scope(|s| {
+                    for _ in 0..n_threads {
+                        s.spawn(&work);
+                    }
+                });
+            }
+            found.load(Ordering::Relaxed)
+        });
+        Ok(found)
+    }
+
     /// Store block
     fn store_block(&self, _block: &PyBlock) -> PyResult<()> {
         // This would require reconstructing BlockWrapper from PyBlock

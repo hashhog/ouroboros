@@ -1177,6 +1177,15 @@ class BlockValidator:
         if not self._verify_merkle_root(block):
             return False, "Invalid merkle root"
 
+        # 4b. Prefetch every spent coin of this block in parallel (perf only).
+        #     Steps 5 and 9 and connect_block_from_bytes each look the same
+        #     inputs up; the first lookup used to be a serial, GIL-held random
+        #     disk read per input — 59-68% of from-genesis replay wall time.
+        #     This warms the Rust read-through cache with the identical
+        #     CHAINSTATE_CF reads, concurrently and off-GIL, so those lookups
+        #     return the same values from memory.  No verdict depends on it.
+        self._prefetch_block_inputs(block)
+
         # 5. Validate block weight and sigops limits.
         #    height + hash are threaded in so P2SH/witness sigop counting is
         #    gated on the FINAL exception-aware script flags, exactly as Core's
@@ -1827,6 +1836,42 @@ class BlockValidator:
         return root
 
     # Block weight / sigops
+    def _prefetch_block_inputs(self, block: Block) -> None:
+        """Warm the UTXO read cache for every non-coinbase input of *block*.
+
+        Performance hint only — never affects a verdict.  Outpoints created
+        earlier in the same block are skipped (they are not in the chainstate
+        yet).  Thread count: ``OUROBOROS_UTXO_PREFETCH_THREADS`` (default 16;
+        0 disables — the A/B and differential switch).  Any failure is
+        swallowed: the authoritative per-input lookups that follow re-read
+        and surface real errors exactly as before.
+        """
+        prefetch = getattr(self.db, "prefetch_utxos", None)
+        if prefetch is None:
+            return
+        try:
+            threads = int(os.environ.get("OUROBOROS_UTXO_PREFETCH_THREADS", "16"))
+        except ValueError:
+            threads = 16
+        if threads <= 0:
+            return
+        txs = block.transactions
+        if len(txs) < 2:
+            return
+        in_block = {tx.get_txid() for tx in txs}
+        outpoints = [
+            (inp.prev_txid, inp.prev_vout)
+            for tx in txs[1:]
+            for inp in tx.inputs
+            if inp.prev_txid not in in_block
+        ]
+        if not outpoints:
+            return
+        try:
+            prefetch(outpoints, threads)
+        except Exception as e:  # pragma: no cover - hint only
+            logger.debug("UTXO prefetch failed (ignored): %s", e)
+
     def _validate_block_limits(
         self,
         block: Block,
