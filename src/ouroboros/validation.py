@@ -1962,6 +1962,22 @@ class BlockValidator:
         total_weight = block_weight(block.transactions)
         total_sigops_cost = 0
 
+        # In-block coin view for P2SH/witness sigop prevout lookups.
+        #
+        # Core's ConnectBlock (validation.cpp:2568) calls
+        # GetTransactionSigOpCost(tx, view, flags) against a CCoinsViewCache
+        # into which UpdateCoins (validation.cpp:2600) has already added every
+        # EARLIER transaction's outputs.  A tx that spends an output created
+        # earlier in the same block therefore has its P2SH redeemScript and
+        # witness sigops counted.  Looking the prevout up in the chainstate
+        # alone returns None for such an input, and the old `continue` silently
+        # dropped its sigops: a block Core rejects `bad-blk-sigops` was
+        # ACCEPTED on the P2P path (the Rust submitblock pre-check has its own
+        # in-block view and was unaffected).  The view is filled AFTER each tx
+        # is counted, so a tx never sees its own outputs; an outpoint no view
+        # holds is a missing/spent input that tx validation rejects anyway.
+        in_block_spks: dict[tuple[bytes, int], bytes] = {}
+
         for tx in block.transactions:
             tx_sigops_cost = 0
 
@@ -1980,10 +1996,12 @@ class BlockValidator:
             # --- P2SH + witness sigops (both flag-gated, tx_verify.cpp:143-162) ---
             if not tx.is_coinbase and (verify_p2sh or verify_witness):
                 for inp in tx.inputs:
-                    utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
-                    if utxo is None:
-                        continue
-                    prev_spk = bytes(utxo["script_pubkey"])
+                    prev_spk = in_block_spks.get((inp.prev_txid, inp.prev_vout))
+                    if prev_spk is None:
+                        utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
+                        if utxo is None:
+                            continue
+                        prev_spk = bytes(utxo["script_pubkey"])
 
                     # --- P2SH sigops × WITNESS_SCALE_FACTOR ---
                     # Core: `if (flags & SCRIPT_VERIFY_P2SH)` (tx_verify.cpp:150)
@@ -2013,6 +2031,12 @@ class BlockValidator:
             # Ref: Bitcoin Core policy/policy.h, validation.cpp AcceptToMemoryPool
 
             total_sigops_cost += tx_sigops_cost
+
+            # Make this tx's outputs visible to LATER txs (Core UpdateCoins).
+            if verify_p2sh or verify_witness:
+                _txid = tx.get_txid()
+                for _vout, _out in enumerate(tx.outputs):
+                    in_block_spks[(_txid, _vout)] = bytes(_out.script_pubkey)
 
         if total_weight > MAX_BLOCK_WEIGHT:
             return False, f"Block weight {total_weight} exceeds {MAX_BLOCK_WEIGHT}"
