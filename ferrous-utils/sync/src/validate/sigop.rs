@@ -441,6 +441,16 @@ pub fn get_transaction_sigop_cost(
 ///
 /// Returns the sum of sigop costs for all transactions in the block.
 /// This value must not exceed MAX_BLOCK_SIGOPS_COST (80,000).
+///
+/// Prevouts are resolved against an IN-BLOCK view first (outputs of every
+/// EARLIER tx in the block), then the chainstate. Core's ConnectBlock
+/// (validation.cpp:2568) runs `GetTransactionSigOpCost(tx, view, flags)`
+/// against a view that `UpdateCoins` (validation.cpp:2600) has already filled
+/// with the earlier txs' outputs, so the P2SH (BIP16) and witness (BIP141)
+/// sigops of an in-block spend are counted. A chainstate-only lookup misses
+/// such coins and under-counts: a block Core rejects `bad-blk-sigops` would
+/// pass. An outpoint neither view holds contributes nothing (tx validation
+/// rejects it as missing/spent).
 pub fn get_block_sigop_cost(
     transactions: &[Transaction],
     db: &BlockchainDB,
@@ -448,9 +458,41 @@ pub fn get_block_sigop_cost(
     verify_witness: bool,
 ) -> i64 {
     let mut total_cost = 0i64;
+    let mut in_block: std::collections::HashMap<bitcoin::OutPoint, bitcoin::ScriptBuf> =
+        std::collections::HashMap::new();
 
     for tx in transactions {
-        total_cost += get_transaction_sigop_cost(tx, db, verify_p2sh, verify_witness);
+        if tx.is_coinbase() || !(verify_p2sh || verify_witness) {
+            total_cost += get_transaction_sigop_cost(tx, db, verify_p2sh, verify_witness);
+        } else {
+            let scripts: Vec<bitcoin::ScriptBuf> = tx
+                .input
+                .iter()
+                .map(|input| match in_block.get(&input.previous_output) {
+                    Some(spk) => spk.clone(),
+                    None => match db.get_utxo(&input.previous_output) {
+                        Ok(Some(utxo)) => utxo.script_pubkey.clone(),
+                        // Not found: an empty script is neither P2SH nor a
+                        // witness program, so it adds 0 — the old `skip`.
+                        _ => bitcoin::ScriptBuf::new(),
+                    },
+                })
+                .collect();
+            total_cost += get_transaction_sigop_cost_with_scripts(
+                tx, &scripts, verify_p2sh, verify_witness,
+            );
+        }
+
+        // Make this tx's outputs visible to LATER txs (Core UpdateCoins).
+        if verify_p2sh || verify_witness {
+            let txid = tx.compute_txid();
+            for (vout, out) in tx.output.iter().enumerate() {
+                in_block.insert(
+                    bitcoin::OutPoint { txid, vout: vout as u32 },
+                    out.script_pubkey.clone(),
+                );
+            }
+        }
     }
 
     total_cost
@@ -1186,5 +1228,124 @@ mod tests {
         let pref_cost =
             get_transaction_sigop_cost_with_scripts(&tx, &[prev_spk], true, true);
         assert_eq!(db_cost, pref_cost);
+    }
+
+    // -------------------------------------------------------------------------
+    // In-block spends: Core ConnectBlock counts sigops against a view that
+    // already holds EARLIER txs' outputs (validation.cpp:2568 + :2600).
+    // -------------------------------------------------------------------------
+
+    /// 100 x (OP_0 OP_0 OP_0 OP_CHECKMULTISIG OP_DROP) + OP_1 — 2,000 accurate sigops.
+    fn unit_script() -> ScriptBuf {
+        let mut v = Vec::new();
+        for _ in 0..100 {
+            v.extend_from_slice(&[0x00, 0x00, 0x00, 0xae, 0x75]);
+        }
+        v.push(0x51);
+        ScriptBuf::from_bytes(v)
+    }
+
+    /// [coinbase (0 sigops), T1 creating `n` outputs of `spk`, T2 spending them].
+    fn inblock_block(n: u32, p2sh: bool) -> Vec<Transaction> {
+        use bitcoin::hashes::{hash160, sha256};
+        let us = unit_script();
+        let spk = if p2sh {
+            let h = hash160::Hash::hash(us.as_bytes());
+            let mut v = vec![0xa9, 0x14];
+            v.extend_from_slice(h.as_byte_array());
+            v.push(0x87);
+            ScriptBuf::from_bytes(v)
+        } else {
+            let h = sha256::Hash::hash(us.as_bytes());
+            let mut v = vec![0x00, 0x20];
+            v.extend_from_slice(h.as_byte_array());
+            ScriptBuf::from_bytes(v)
+        };
+        let cb = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x6f]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::from_sat(0), script_pubkey: ScriptBuf::from_bytes(vec![0x51]) }],
+        };
+        let t1 = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: bitcoin::OutPoint::new(bitcoin::Txid::from_byte_array([0xf0; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: (0..n).map(|_| TxOut { value: Amount::from_sat(1_000), script_pubkey: spk.clone() }).collect(),
+        };
+        let t1id = t1.compute_txid();
+        let mut push = Vec::new();
+        let len = us.len();
+        assert!(len > 0xff && len <= 0xffff);
+        push.push(0x4d);
+        push.extend_from_slice(&(len as u16).to_le_bytes());
+        push.extend_from_slice(us.as_bytes());
+        let t2 = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: (0..n)
+                .map(|i| TxIn {
+                    previous_output: bitcoin::OutPoint::new(t1id, i),
+                    script_sig: if p2sh { ScriptBuf::from_bytes(push.clone()) } else { ScriptBuf::new() },
+                    sequence: Sequence::MAX,
+                    witness: if p2sh { Witness::new() } else { Witness::from_slice(&[us.as_bytes()]) },
+                })
+                .collect(),
+            output: vec![TxOut { value: Amount::from_sat(1), script_pubkey: ScriptBuf::from_bytes(vec![0x51]) }],
+        };
+        vec![cb, t1, t2]
+    }
+
+    #[test]
+    fn test_inblock_p2sh_spend_sigops_counted() {
+        // Empty chainstate: T1's outputs exist only in-block.
+        let (_tmp, db) = create_test_db();
+        assert_eq!(get_block_sigop_cost(&inblock_block(11, true), &db, true, true), 88_000);
+        assert!(get_block_sigop_cost(&inblock_block(11, true), &db, true, true) > MAX_BLOCK_SIGOPS_COST);
+        assert_eq!(get_block_sigop_cost(&inblock_block(10, true), &db, true, true), MAX_BLOCK_SIGOPS_COST);
+        // SCRIPT_VERIFY_P2SH clear (exception-block flags): not counted.
+        assert_eq!(get_block_sigop_cost(&inblock_block(11, true), &db, false, false), 0);
+    }
+
+    #[test]
+    fn test_inblock_p2wsh_spend_sigops_counted() {
+        let (_tmp, db) = create_test_db();
+        assert_eq!(get_block_sigop_cost(&inblock_block(41, false), &db, true, true), 82_000);
+        assert_eq!(get_block_sigop_cost(&inblock_block(40, false), &db, true, true), MAX_BLOCK_SIGOPS_COST);
+        assert_eq!(get_block_sigop_cost(&inblock_block(41, false), &db, true, false), 0);
+    }
+
+    #[test]
+    fn test_inblock_view_only_holds_earlier_txs() {
+        // Spender placed BEFORE the creator: Core's view does not hold the
+        // coin yet (tx validation rejects it), so it must add nothing here.
+        let (_tmp, db) = create_test_db();
+        let mut txs = inblock_block(11, true);
+        txs.swap(1, 2);
+        assert_eq!(get_block_sigop_cost(&txs, &db, true, true), 0);
+    }
+
+    #[test]
+    fn test_inblock_matches_prefetched_intra_view() {
+        // validate_block_with_flags feeds its intra-block view's scripts to the
+        // prefetched variant; the DB variant must now agree with it.
+        let (_tmp, db) = create_test_db();
+        let txs = inblock_block(11, true);
+        let spk = txs[1].output[0].script_pubkey.clone();
+        let pref = vec![Vec::new(), vec![ScriptBuf::new()], vec![spk; 11]];
+        assert_eq!(
+            get_block_sigop_cost(&txs, &db, true, true),
+            get_block_sigop_cost_with_prefetched_scripts(&txs, &pref, true, true)
+        );
     }
 }
