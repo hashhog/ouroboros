@@ -1936,6 +1936,7 @@ class BitcoinNode:
                 try:
                     from ouroboros.p2p_messages import (
                         INV_TYPE_BLOCK,
+                        INV_TYPE_COMPACT_BLOCK,
                         INV_TYPE_TX,
                         MSG_WITNESS_BLOCK,
                         MSG_WITNESS_TX,
@@ -1989,7 +1990,16 @@ class BitcoinNode:
                                 logger.debug(f"Sent wtx {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
                             else:
                                 not_found.append((inv_type, inv_hash))
-                        elif inv_type in (INV_TYPE_BLOCK, MSG_WITNESS_BLOCK):
+                        # MSG_CMPCT_BLOCK (4): how a Core peer fetches a
+                        # single freshly announced tip once we sent
+                        # sendcmpct (HeadersDirectFetchBlocks). It used to
+                        # fall through every branch -- no block, no
+                        # notfound -- and the peer waited out its block
+                        # download timeout on that one block (regtest relay
+                        # test 2026-09-26: Core B stuck at height 1). Serve
+                        # the full witness block, which is Core's own reply
+                        # outside MAX_CMPCTBLOCK_DEPTH (ProcessGetBlockData).
+                        elif inv_type in (INV_TYPE_BLOCK, MSG_WITNESS_BLOCK, INV_TYPE_COMPACT_BLOCK):
                             # Off-load the full-block FFI deserialize
                             # (~1 MB PyO3 round-trip per call) to a worker
                             # thread.  Otherwise a peer requesting a
@@ -2026,7 +2036,7 @@ class BitcoinNode:
                                 # legacy MSG_BLOCK request gets the stripped form.
                                 from ouroboros.p2p_messages import BlockMessage
                                 payload = None
-                                if inv_type == MSG_WITNESS_BLOCK:
+                                if inv_type in (MSG_WITNESS_BLOCK, INV_TYPE_COMPACT_BLOCK):
                                     payload = await asyncio.to_thread(
                                         self.db.get_block_bytes, inv_hash,
                                     )

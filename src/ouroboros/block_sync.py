@@ -229,6 +229,19 @@ from ouroboros.validation import (
 
 logger = logging.getLogger(__name__)
 
+# Core DEFAULT_MAX_TIP_AGE (kernel/chainstatemanager_opts.h:24).
+ANNOUNCE_MAX_TIP_AGE_SECS = 24 * 60 * 60
+
+
+def should_announce_tip(tip_time: int, now: float) -> bool:
+    """Whether a freshly connected tip should be relayed to peers.
+
+    Core's PeerManagerImpl::UpdatedBlockTip (net_processing.cpp:2162) does not
+    relay while fInitialDownload; on a synced node the deciding IBD clause is
+    the tip age against DEFAULT_MAX_TIP_AGE.
+    """
+    return tip_time + ANNOUNCE_MAX_TIP_AGE_SECS >= now
+
 
 class _HdrInfo:
     """Ancestor view used by ``BlockValidator._get_expected_bits``.
@@ -2924,6 +2937,20 @@ class BlockSync:
                     self._tip_notifier.notify()
                 except Exception:
                     pass
+
+            # Block relay: announce the new tip to peers (cmpctblock / headers
+            # / inv per peer preference). Core: UpdatedBlockTip ->
+            # SendMessages, skipped during IBD. _announce_block used to be
+            # reached only from the orphan-resolution path, so ouroboros
+            # connected P2P blocks here but never relayed them: two Core peers
+            # linked only through ouroboros never converged (regtest relay
+            # test 2026-09-26). Best-effort: an announce fault must never
+            # stall block connection.
+            if should_announce_tip(block.timestamp, time.time()):
+                try:
+                    await self._announce_block(block, next_hash)
+                except Exception as e:
+                    logger.debug(f"announce of block {new_height} failed: {e}")
 
             # Log progress every 1000 blocks
             if new_height % 1000 == 0 or connected == 1:
