@@ -39,9 +39,10 @@ KNOWN_BLOCKHASH_INTERNAL_LE = bytes.fromhex(KNOWN_BLOCKHASH_BE)[::-1]
 class FakePeer:
     """Minimal stand-in for ouroboros.peer.Peer capturing outbound messages."""
 
-    def __init__(self, host="127.0.0.1", port=8333):
+    def __init__(self, host="127.0.0.1", port=8333, services=0x1 | 0x8):
         self.host = host
         self.port = port
+        self.services = services  # NODE_NETWORK | NODE_WITNESS by default
         self.sent = []  # list of NetworkMessage objects
 
     async def send_message(self, msg):
@@ -218,4 +219,20 @@ def test_body_present_raises_block_already_downloaded():
 
     assert ei.value.code == -1
     assert ei.value.message == "Block already downloaded"
+    assert peer.sent == []
+
+
+# ---------------------------------------------------------------------------
+# Core FetchBlock (net_processing.cpp:1969): pre-segwit peer -> "Pre-SegWit peer"
+# ---------------------------------------------------------------------------
+def test_pre_segwit_peer_rejected():
+    peer = FakePeer(services=0x1)  # NODE_NETWORK only (e.g. a 70002 inbound)
+    pm = FakePeerManager(peers=[peer])
+    rpc = make_rpc(body_present=False, header_known=True, pm=pm)
+
+    with pytest.raises(RpcError) as ei:
+        run(rpc.rpc_getblockfrompeer(KNOWN_BLOCKHASH_BE, 0))
+
+    assert ei.value.code == RPC_MISC_ERROR
+    assert ei.value.message == "Pre-SegWit peer"
     assert peer.sent == []

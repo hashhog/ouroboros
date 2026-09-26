@@ -1724,6 +1724,10 @@ class BlockSync:
             # Lazily read our tip height only when a block inv needs it, so
             # tx-only inv batches stay on the cheap path.
             _our_tip_height: int | None = None
+            # Core CanServeWitnesses / GetFetchFlags (net_processing.cpp:1166,
+            # :2589): block fetches require NODE_WITNESS, and tx fetches only
+            # carry MSG_WITNESS_FLAG for a witness-capable peer.
+            _peer_can_witness = _can_serve_witness_blocks(peer)
             for inv_type, inv_hash in inv.inventory:
                 if inv_type == INV_TYPE_BLOCK:
                     if not self.db.has_block_hash(inv_hash):
@@ -1756,8 +1760,13 @@ class BlockSync:
                         # part of our active chain, so they never reach the
                         # connect path that pops them (at-tip RSS-leak path,
                         # 2026-06-02/03 OOMs).
+                        #
+                        # Core CanServeWitnesses: never request a block body
+                        # from a peer without NODE_WITNESS (the announce still
+                        # counts -- getheaders below -- just not the fetch).
                         if (
-                            inv_hash not in self.requested_blocks
+                            _peer_can_witness
+                            and inv_hash not in self.requested_blocks
                             and inv_hash not in self._perm_rejected_blocks
                             and len(self.requested_blocks) < self._max_blocks_in_flight
                         ):
@@ -1788,7 +1797,11 @@ class BlockSync:
                             request_item = (MSG_WTX, inv_hash)
                         else:
                             have = self.mempool.get_transaction(inv_hash)
-                            request_item = (MSG_WITNESS_TX, inv_hash)
+                            request_item = (
+                                MSG_WITNESS_TX if _peer_can_witness
+                                else INV_TYPE_TX,
+                                inv_hash,
+                            )
                         if not have:
                             txs_to_request.append(request_item)
                             self._requested_txs[inv_hash] = now
@@ -5464,6 +5477,13 @@ class BlockSync:
             return
         bridge_hashes, _ancestor_hash, _ancestor_h = chain
 
+        # Core CanServeWitnesses: bodies are only fetched from NODE_WITNESS
+        # peers.  A pre-segwit peer may still announce the fork (headers
+        # above), but the body getdata waits for a witness-capable peer
+        # (the per-tick _recheck_forks re-evaluation).
+        if not _can_serve_witness_blocks(peer):
+            return
+
         ibd_owned = [h for h in bridge_hashes if self._is_ibd_wanted(h)]
         missing = [
             h for h in bridge_hashes
@@ -5898,7 +5918,10 @@ class BlockSync:
         designated header-sync peer, then any connected ready peer.
         """
         def _ok(p) -> bool:
-            return isinstance(p, Peer) and p.is_connected()
+            # CanServeBlocks is relaxed here, CanServeWitnesses is NOT: a
+            # peer without NODE_WITNESS can never serve MSG_WITNESS_BLOCK.
+            return (isinstance(p, Peer) and p.is_connected()
+                    and _can_serve_witness_blocks(p))
 
         sync = self._header_sync_peer
         if _ok(sync):
@@ -5919,6 +5942,9 @@ class BlockSync:
         if not self._validated_headers:
             return
         if peer is None or not peer.is_connected():
+            return
+        if not _can_serve_witness_blocks(peer):
+            # Core CanServeWitnesses: never a block getdata to a pre-segwit peer.
             return
         frontier_hash = self._validated_headers[0][0]
         if (

@@ -185,6 +185,8 @@ class _FakeReorgServer:
 def _make_peer(i: int) -> Peer:
     p = Peer("10.0.0.%d" % i, 18444, network="regtest")
     p.state = PeerState.READY
+    # Fork bodies are only fetched from NODE_WITNESS peers (CanServeWitnesses).
+    p.services = 0x1 | 0x8  # NODE_NETWORK | NODE_WITNESS
     p.adjust_score = lambda d: None
     p.note_block_height = lambda h: None
     p.sent = []

@@ -2,9 +2,10 @@
 Tests for peer handshake state machine and pre-handshake filtering.
 
 Phase 16: Pre-Handshake Peer Filtering
-- Only VERSION and VERACK messages are accepted until handshake is complete
+- Only the Core pre-verack set (version, verack, sendheaders, sendcmpct,
+  wtxidrelay, sendaddrv2, sendtxrcncl) is processed before verack
 - Handshake timeout of 60 seconds
-- Reject peers with version < 70015 (segwit required)
+- Reject peers with version < 31800 (Core MIN_PEER_PROTO_VERSION)
 - WTXIDRELAY and SENDADDRV2 must be sent before VERACK
 """
 
@@ -48,8 +49,8 @@ class TestMinPeerVersion(unittest.TestCase):
     """Tests for minimum peer version requirement."""
 
     def test_min_version_constant(self):
-        """MIN_PEER_VERSION should be 70015 for segwit support."""
-        self.assertEqual(MIN_PEER_VERSION, 70015)
+        """MIN_PEER_VERSION is Core's MIN_PEER_PROTO_VERSION (31800)."""
+        self.assertEqual(MIN_PEER_VERSION, 31800)
 
     def test_handshake_timeout_constant(self):
         """HANDSHAKE_TIMEOUT should be 60 seconds."""
@@ -67,6 +68,10 @@ class TestPreHandshakeFiltering(unittest.TestCase):
         self.assertTrue(peer._is_handshake_message("verack"))
         self.assertTrue(peer._is_handshake_message("wtxidrelay"))
         self.assertTrue(peer._is_handshake_message("sendaddrv2"))
+        # Core processes these pre-verack too (net_processing.cpp:3896/3901)
+        self.assertTrue(peer._is_handshake_message("sendheaders"))
+        self.assertTrue(peer._is_handshake_message("sendcmpct"))
+        self.assertTrue(peer._is_handshake_message("sendtxrcncl"))
 
     def test_non_handshake_messages_blocked(self):
         """Other messages should be rejected before handshake complete."""
@@ -83,8 +88,6 @@ class TestPreHandshakeFiltering(unittest.TestCase):
         self.assertFalse(peer._is_handshake_message("addr"))
         self.assertFalse(peer._is_handshake_message("getaddr"))
         self.assertFalse(peer._is_handshake_message("mempool"))
-        self.assertFalse(peer._is_handshake_message("sendheaders"))
-        self.assertFalse(peer._is_handshake_message("sendcmpct"))
         self.assertFalse(peer._is_handshake_message("feefilter"))
 
 
@@ -129,7 +132,7 @@ class TestVersionValidation(unittest.TestCase):
         peer = Peer("10.0.0.1", 8333, "regtest")
 
         # Simulate receiving an old version
-        peer.version = 70014
+        peer.version = 31799
         self.assertLess(peer.version, MIN_PEER_VERSION)
 
 

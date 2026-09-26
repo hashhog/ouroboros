@@ -270,8 +270,23 @@ class PeerState(Enum):
     READY = 4
 
 
-# Minimum protocol version for segwit support (BIP 144)
-MIN_PEER_VERSION = 70015
+# Minimum peer protocol version.  Bitcoin Core MIN_PEER_PROTO_VERSION
+# (node/protocol_version.h:18), checked for EVERY peer, inbound and outbound
+# (net_processing.cpp:3619).  Segwit capability is NOT a version question: it
+# is the NODE_WITNESS service bit, required only of automatic outbound peers
+# (ExpectServicesFromConn, net_processing.cpp:3609) and of any peer we fetch a
+# block from (CanServeWitnesses).  A 70002 inbound peer is kept.
+MIN_PEER_VERSION = 31800
+
+# Feature-message version gates (node/protocol_version.h).  Every message we
+# send whose meaning post-dates the peer's protocol version is gated on the
+# common version (min(ours, theirs)) exactly as Core does.
+BIP0031_VERSION = 60000           # ping carries a nonce / pong exists
+SENDHEADERS_VERSION = 70012       # BIP 130
+FEEFILTER_VERSION = 70013         # BIP 133
+SHORT_IDS_BLOCKS_VERSION = 70014  # BIP 152
+WTXID_RELAY_VERSION = 70016       # BIP 339 (also our gate for addrv2 / erlay / packages)
+OUR_PROTOCOL_VERSION = 70016
 
 # Handshake timeout in seconds
 HANDSHAKE_TIMEOUT = 60.0
@@ -539,6 +554,17 @@ class Peer:
         # cache the raw payload here so the post-handshake on_sendtxrcncl
         # handler in p2p.py can replay it once it has been registered.
         self._pending_sendtxrcncl_payload: bytes | None = None
+        # Same replay mechanism for a pre-verack BIP 152 ``sendcmpct``: Core
+        # processes SENDCMPCT before verack (net_processing.cpp:3901); we
+        # record it on the Peer during the handshake and PeerManager's
+        # on_sendcmpct replays the payload for its cmpct_peers bookkeeping.
+        self._pending_sendcmpct_payload: bytes | None = None
+        # Core CNode::ExpectServicesFromConn: True only for connections WE
+        # chose automatically (full-relay / block-relay-only / anchors), which
+        # must offer the desirable services (NODE_WITNESS).  Inbound, manual
+        # (addnode / -connect) and feeler connections are not held to it.
+        # PeerManager._dial_outbound sets it per connection type.
+        self.expect_services: bool = False
 
         # BIP 331: package relay (sendpackages negotiation)
         # ``package_relay_version`` is 0 until we receive a sendpackages from
@@ -960,7 +986,7 @@ class Peer:
 
         Message sequence (matching Bitcoin Core net_processing.cpp):
         1. Receive VERSION from peer
-        2. Validate peer version (must be >= MIN_PEER_VERSION for segwit)
+        2. Validate peer version (>= MIN_PEER_VERSION = Core's 31800)
         3. Send our VERSION
         4. Send WTXIDRELAY (BIP 339) if version >= 70016
         5. Send SENDADDRV2 (BIP 155) if version >= 70016
@@ -970,10 +996,7 @@ class Peer:
         self.state = PeerState.HANDSHAKING
 
         from ouroboros.p2p_messages import (
-            FeeFilterMessage,
             SendAddrV2Message,
-            SendCmpctMessage,
-            SendHeadersMessage,
             WtxidRelayMessage,
         )
 
@@ -995,23 +1018,20 @@ class Peer:
         self._note_addr_local(version.addr_recv)
         self._version_received = True
 
-        # Reject peers with version < MIN_PEER_VERSION (no segwit support)
+        # Core net_processing.cpp:3619: disconnect only peers older than
+        # MIN_PEER_PROTO_VERSION (31800).  Inbound peers are never held to a
+        # service requirement (ExpectServicesFromConn is false for INBOUND);
+        # a peer without NODE_WITNESS is simply never asked for blocks
+        # (block_sync._can_serve_witness_blocks / Core CanServeWitnesses).
         if self.version < MIN_PEER_VERSION:
             raise Exception(
-                f"Inbound peer {self.host}:{self.port} version {self.version} < {MIN_PEER_VERSION} "
-                "(segwit required)"
-            )
-
-        # Validate peer service flags
-        if not (self.services & NODE_NETWORK):
-            logger.warning(
-                f"Inbound peer {self.host}:{self.port} lacks NODE_NETWORK — "
-                "may not serve full blocks"
+                f"Inbound peer {self.host}:{self.port} using obsolete version "
+                f"{self.version} < {MIN_PEER_VERSION}"
             )
         if not (self.services & NODE_WITNESS):
-            logger.warning(
-                f"Inbound peer {self.host}:{self.port} lacks NODE_WITNESS — "
-                "will not relay witness data"
+            logger.debug(
+                f"Inbound peer {self.host}:{self.port} lacks NODE_WITNESS "
+                f"(version {self.version}) — kept; never used for block download"
             )
 
         # 2. Send our version
@@ -1036,7 +1056,7 @@ class Peer:
         self._version_sent = True
 
         # Calculate greatest common version for feature negotiation
-        greatest_common_version = min(70016, self.version)
+        greatest_common_version = self.common_version
 
         # 3. BIP 339: Send WTXIDRELAY before VERACK if version >= 70016
         if greatest_common_version >= 70016 and self.relay_txs:
@@ -1061,64 +1081,25 @@ class Peer:
         await self.send_message(verack)
         self._verack_sent = True
 
-        # 6. Receive verack with handshake timeout.
-        # The remote peer may send any of the legal pre-verack negotiation
-        # messages (BIP 339 wtxidrelay, BIP 155 sendaddrv2, BIP 330
-        # sendtxrcncl) before its verack.  Per bitcoin-core
-        # net_processing.cpp ProcessMessage, anything else received before
-        # verack is logged and ignored (NOT a disconnect-worthy offense).
-        for _attempt in range(20):
-            msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
-            if msg.command == "verack":
-                break
-            if msg.command == "wtxidrelay":
-                self.wtxid_relay = True
-                logger.debug(f"Received wtxidrelay from {self.host}:{self.port} during inbound handshake")
-                continue
-            if msg.command == "sendaddrv2":
-                self.addrv2 = True
-                logger.debug(f"Received sendaddrv2 from {self.host}:{self.port} during inbound handshake")
-                continue
-            if msg.command == "sendtxrcncl":
-                # BIP 330: peer is offering Erlay reconciliation.  Mark
-                # the peer; the actual salt-exchange handler is wired
-                # post-handshake in p2p.py (_register_erlay_handlers).
-                # Stash the raw payload so the handler can replay it
-                # once the peer transitions to the connected state.
-                self.erlay_enabled = True
-                self._pending_sendtxrcncl_payload = msg.payload
-                logger.debug(f"Received sendtxrcncl from {self.host}:{self.port} during inbound handshake")
-                continue
-            # Unknown / unsupported pre-verack message.  Match Core
-            # behaviour: log and ignore rather than disconnecting,
-            # which keeps us forward-compatible with new BIPs.
-            logger.debug(
-                f"Ignoring unsupported pre-verack message {msg.command!r} "
-                f"from {self.host}:{self.port}"
-            )
-        else:
-            raise Exception("Did not receive verack within expected message count")
+        # 6. Receive verack.  Messages between VERSION and VERACK are handled
+        # like Core (see _handle_pre_verack_message): negotiation messages are
+        # recorded, everything else is logged and ignored.  There is no
+        # message-count cap -- Core has none; the whole handshake is bounded
+        # by the single asyncio.timeout(HANDSHAKE_TIMEOUT) around it
+        # (accept_inbound), Core's -peertimeout connect bound
+        # (net.cpp InactivityCheck, "version handshake timeout").
+        while not self._handle_pre_verack_message(
+            await self.receive_message(timeout=HANDSHAKE_TIMEOUT),
+            "inbound handshake",
+        ):
+            pass
         self._verack_received = True
 
         # Handshake is now complete
         self.handshake_complete = True
 
         # Post-handshake feature negotiation (sent AFTER verack exchange)
-        try:
-            await self.send_message(
-                SendHeadersMessage().to_network_message(self.network))
-            if self.relay_txs:
-                await self.send_message(
-                    SendCmpctMessage(announce=False, version=2).to_network_message(self.network))
-                await self.send_message(
-                    FeeFilterMessage(feerate=1000).to_network_message(self.network))
-            else:
-                logger.debug(
-                    f"Block-relay-only inbound peer {self.host}:{self.port} — "
-                    "skipping sendcmpct/feefilter"
-                )
-        except Exception as feat_err:
-            logger.debug(f"Feature negotiation error (non-fatal): {feat_err}")
+        await self._send_post_verack_features()
 
     async def _negotiate_v2(self) -> None:
         """Drive the outbound BIP 324 v2 ElligatorSwift handshake.
@@ -1497,7 +1478,8 @@ class Peer:
         Message sequence (matching Bitcoin Core net_processing.cpp):
         1. Send VERSION
         2. Receive VERSION
-        3. Validate peer version (must be >= MIN_PEER_VERSION for segwit)
+        3. Validate peer services (automatic outbound: NODE_WITNESS) and
+           version (>= MIN_PEER_VERSION = Core's 31800)
         4. Send WTXIDRELAY (BIP 339) if version >= 70016
         5. Send SENDADDRV2 (BIP 155) if version >= 70016
         6. Send VERACK
@@ -1506,10 +1488,7 @@ class Peer:
         self.state = PeerState.HANDSHAKING
 
         from ouroboros.p2p_messages import (
-            FeeFilterMessage,
             SendAddrV2Message,
-            SendCmpctMessage,
-            SendHeadersMessage,
             WtxidRelayMessage,
         )
 
@@ -1556,27 +1535,32 @@ class Peer:
         self._note_addr_local(version.addr_recv)
         self._version_received = True
 
-        # Reject peers with version < MIN_PEER_VERSION (no segwit support)
+        # Core net_processing.cpp:3609: an automatic outbound connection
+        # (ExpectServicesFromConn) must offer the desirable services; we
+        # require NODE_WITNESS (the part of Core's NODE_NETWORK|NODE_WITNESS /
+        # NODE_NETWORK_LIMITED|NODE_WITNESS set that does not depend on tip
+        # depth).  Manual (addnode / -connect) and feeler connections are
+        # exempt, exactly as in Core.  This service check precedes the
+        # version check, matching Core's order.
+        if self.expect_services and not (self.services & NODE_WITNESS):
+            raise Exception(
+                f"Peer {self.host}:{self.port} does not offer the expected "
+                f"services ({self.services:08x} offered, NODE_WITNESS expected)"
+            )
+        # Core net_processing.cpp:3619: MIN_PEER_PROTO_VERSION floor.
         if self.version < MIN_PEER_VERSION:
             raise Exception(
-                f"Peer {self.host}:{self.port} version {self.version} < {MIN_PEER_VERSION} "
-                "(segwit required)"
+                f"Peer {self.host}:{self.port} using obsolete version "
+                f"{self.version} < {MIN_PEER_VERSION}"
             )
-
-        # Validate peer service flags
         if not (self.services & NODE_NETWORK):
             logger.warning(
                 f"Peer {self.host}:{self.port} lacks NODE_NETWORK — "
                 "may not serve full blocks"
             )
-        if not (self.services & NODE_WITNESS):
-            logger.warning(
-                f"Peer {self.host}:{self.port} lacks NODE_WITNESS — "
-                "will not relay witness data"
-            )
 
         # Calculate greatest common version for feature negotiation
-        greatest_common_version = min(70016, self.version)
+        greatest_common_version = self.common_version
 
         # BIP 339: Send WTXIDRELAY before VERACK if version >= 70016
         # (must be sent during handshake, not after)
@@ -1600,62 +1584,52 @@ class Peer:
         await self.send_message(verack)
         self._verack_sent = True
 
-        # Receive verack with handshake timeout.
-        # The remote peer may send any of the legal pre-verack negotiation
-        # messages (BIP 339 wtxidrelay, BIP 155 sendaddrv2, BIP 330
-        # sendtxrcncl) before its verack.  Per bitcoin-core
-        # net_processing.cpp ProcessMessage, anything else received before
-        # verack is logged and ignored (NOT a disconnect-worthy offense).
-        for _attempt in range(20):  # safety bound
-            msg = await self.receive_message(timeout=HANDSHAKE_TIMEOUT)
-            if msg.command == "verack":
-                break
-            if msg.command == "wtxidrelay":
-                self.wtxid_relay = True
-                logger.debug(f"Received wtxidrelay from {self.host}:{self.port} during handshake")
-                continue
-            if msg.command == "sendaddrv2":
-                self.addrv2 = True
-                logger.debug(f"Received sendaddrv2 from {self.host}:{self.port} during handshake")
-                continue
-            if msg.command == "sendtxrcncl":
-                # BIP 330: peer is offering Erlay reconciliation.  Mark
-                # the peer; the actual salt-exchange handler is wired
-                # post-handshake in p2p.py (_register_erlay_handlers).
-                # Stash the raw payload so the handler can replay it
-                # once the peer transitions to the connected state.
-                self.erlay_enabled = True
-                self._pending_sendtxrcncl_payload = msg.payload
-                logger.debug(f"Received sendtxrcncl from {self.host}:{self.port} during handshake")
-                continue
-            # Unknown / unsupported pre-verack message.  Match Core
-            # behaviour: log and ignore rather than disconnecting,
-            # which keeps us forward-compatible with new BIPs.
-            logger.debug(
-                f"Ignoring unsupported pre-verack message {msg.command!r} "
-                f"from {self.host}:{self.port}"
-            )
-        else:
-            raise Exception("Did not receive verack within expected message count")
+        # Receive verack.  Pre-verack messages are handled like Core (see
+        # _handle_pre_verack_message); no message-count cap -- the handshake
+        # is bounded by the single asyncio.timeout(HANDSHAKE_TIMEOUT) in
+        # connect(), Core's "version handshake timeout" (net.cpp).
+        while not self._handle_pre_verack_message(
+            await self.receive_message(timeout=HANDSHAKE_TIMEOUT),
+            "handshake",
+        ):
+            pass
         self._verack_received = True
 
         # Handshake is now complete
         self.handshake_complete = True
 
-        # Post-handshake feature negotiation messages
-        # These are sent AFTER verack exchange
-        try:
-            # sendheaders is always sent — we want header announcements
-            # even on block-relay-only connections
-            await self.send_message(
-                SendHeadersMessage().to_network_message(self.network))
+        # Post-handshake feature negotiation messages (sent AFTER verack)
+        await self._send_post_verack_features()
 
+    async def _send_post_verack_features(self) -> None:
+        """Send the post-verack feature messages, each gated on the common
+        version exactly as Bitcoin Core gates them, so an old peer is never
+        sent a message from a protocol version it predates:
+
+        * sendheaders  >= SENDHEADERS_VERSION (70012)  net_processing.cpp:5525
+        * sendcmpct    >= SHORT_IDS_BLOCKS_VERSION (70014)          :3864
+        * feefilter    >= FEEFILTER_VERSION (70013)                 :5543
+
+        sendheaders goes to block-relay-only peers too (we want header
+        announcements); sendcmpct/feefilter only to tx-relay peers.
+        """
+        from ouroboros.p2p_messages import (
+            FeeFilterMessage,
+            SendCmpctMessage,
+            SendHeadersMessage,
+        )
+        cv = self.common_version
+        try:
+            if cv >= SENDHEADERS_VERSION:
+                await self.send_message(
+                    SendHeadersMessage().to_network_message(self.network))
             if self.relay_txs:
-                # Full-relay peers get the complete feature set
-                await self.send_message(
-                    SendCmpctMessage(announce=False, version=2).to_network_message(self.network))
-                await self.send_message(
-                    FeeFilterMessage(feerate=1000).to_network_message(self.network))
+                if cv >= SHORT_IDS_BLOCKS_VERSION:
+                    await self.send_message(
+                        SendCmpctMessage(announce=False, version=2).to_network_message(self.network))
+                if cv >= FEEFILTER_VERSION:
+                    await self.send_message(
+                        FeeFilterMessage(feerate=1000).to_network_message(self.network))
             else:
                 logger.debug(
                     f"Block-relay-only peer {self.host}:{self.port} — "
@@ -2070,10 +2044,86 @@ class Peer:
             )
 
     def _is_handshake_message(self, command: str) -> bool:
-        """Check if message is allowed during handshake (before handshake_complete)."""
-        # Bitcoin Core net_processing.cpp: only version/verack/wtxidrelay/sendaddrv2
-        # are allowed before handshake completes
-        return command in ("version", "verack", "wtxidrelay", "sendaddrv2")
+        """Check if message is processed during handshake (before verack).
+
+        Bitcoin Core net_processing.cpp ProcessMessage processes VERSION,
+        VERACK, SENDHEADERS (:3896), SENDCMPCT (:3901), WTXIDRELAY,
+        SENDADDRV2 and SENDTXRCNCL before ``fSuccessfullyConnected``;
+        anything else is logged and ignored (:4010).
+        """
+        return command in (
+            "version", "verack", "sendheaders", "sendcmpct",
+            "wtxidrelay", "sendaddrv2", "sendtxrcncl",
+        )
+
+    @property
+    def common_version(self) -> int:
+        """Core ``CNode::GetCommonVersion``: min(our version, theirs)."""
+        return min(OUR_PROTOCOL_VERSION, int(self.version or 0))
+
+    def _handle_pre_verack_message(self, msg: NetworkMessage, where: str) -> bool:
+        """Process one message received between VERSION and VERACK.
+
+        Returns True when ``msg`` is the peer's verack.  Mirrors Bitcoin
+        Core net_processing.cpp ProcessMessage for a peer that is not yet
+        ``fSuccessfullyConnected``: the negotiation messages are RECORDED
+        (sendheaders :3896, sendcmpct :3901, wtxidrelay :3920, sendaddrv2
+        :3941, sendtxrcncl :3953) and every other message is logged and
+        ignored (:4010) -- never a disconnect, never a misbehaviour score.
+        """
+        cmd = msg.command
+        if cmd == "verack":
+            return True
+        if cmd == "wtxidrelay":
+            if self.common_version >= WTXID_RELAY_VERSION:
+                self.wtxid_relay = True
+                logger.debug(f"Received wtxidrelay from {self.host}:{self.port} during {where}")
+            else:
+                logger.debug(
+                    f"Ignoring wtxidrelay due to old common version "
+                    f"{self.common_version} from {self.host}:{self.port}"
+                )
+            return False
+        if cmd == "sendaddrv2":
+            self.addrv2 = True
+            logger.debug(f"Received sendaddrv2 from {self.host}:{self.port} during {where}")
+            return False
+        if cmd == "sendtxrcncl":
+            # BIP 330: peer is offering Erlay reconciliation.  Mark the peer;
+            # the salt-exchange handler is wired post-handshake in p2p.py
+            # (_register_erlay_handlers), which replays the stashed payload.
+            self.erlay_enabled = True
+            self._pending_sendtxrcncl_payload = msg.payload
+            logger.debug(f"Received sendtxrcncl from {self.host}:{self.port} during {where}")
+            return False
+        if cmd == "sendheaders":
+            # Core: peer.m_prefers_headers = true (no version gate).
+            self.wants_headers = True
+            logger.debug(f"Received sendheaders from {self.host}:{self.port} during {where}")
+            return False
+        if cmd == "sendcmpct":
+            from ouroboros.compact_blocks import CMPCTBLOCKS_VERSION
+            from ouroboros.p2p_messages import SendCmpctMessage
+            try:
+                sc = SendCmpctMessage.from_payload(msg.payload)
+            except Exception as e:
+                # Core: a short read throws inside ProcessMessage, which the
+                # caller catches and logs -- the connection is kept.
+                logger.debug(f"Malformed pre-verack sendcmpct from {self.host}:{self.port}: {e}")
+                return False
+            # Core: only compact-block version 2 (witness) is supported.
+            if sc.version != CMPCTBLOCKS_VERSION:
+                return False
+            self.wants_cmpctblock = bool(sc.announce)
+            self._pending_sendcmpct_payload = msg.payload
+            logger.debug(f"Received sendcmpct from {self.host}:{self.port} during {where}")
+            return False
+        # Core: "Unsupported message prior to verack" -- log and ignore.
+        logger.debug(
+            f"Ignoring unsupported pre-verack message {cmd!r} "
+            f"from {self.host}:{self.port}"
+        )
+        return False
 
     async def listen(self):
         """Message receive loop: dispatches to registered handlers until disconnected.
@@ -2110,11 +2160,12 @@ class Peer:
                     # handshake, but included for safety and protocol correctness
                     if not self.handshake_complete:
                         if not self._is_handshake_message(msg.command):
-                            logger.warning(
-                                f"Dropping non-handshake message '{msg.command}' "
-                                f"before handshake complete from {self.host}:{self.port}"
+                            # Core net_processing.cpp:4010 logs and ignores;
+                            # no misbehaviour score.
+                            logger.debug(
+                                f"Ignoring unsupported message '{msg.command}' "
+                                f"prior to verack from {self.host}:{self.port}"
                             )
-                            self.adjust_score(-10)
                             continue
 
                     # Handle feature negotiation messages (BIP 339, BIP 155)
@@ -2171,6 +2222,11 @@ class Peer:
 
                     # Handle ping/pong automatically
                     if msg.command == "ping":
+                        # Core net_processing.cpp:4883: a pong (echoing the
+                        # nonce) only exists above BIP0031_VERSION; older
+                        # peers send an empty ping that gets no reply.
+                        if self.common_version <= BIP0031_VERSION:
+                            continue
                         ping = PingMessage.from_payload(msg.payload)
                         pong = PongMessage(nonce=ping.nonce)
                         pong_msg = pong.to_network_message(self.network)
@@ -2362,6 +2418,14 @@ class Peer:
         # Mark the ping as outstanding (Core PingStart / m_ping_start). Cleared
         # when the matching pong arrives; getpeerinfo reports the elapsed wait as
         # ``pingwait`` while it is non-None.
+        if self.common_version <= BIP0031_VERSION:
+            # Core net_processing.cpp:5431: pre-BIP0031 peers get an empty
+            # ping (no nonce) and never answer with a pong, so no ping is
+            # marked outstanding.
+            self.ping_wait_since = None
+            await self.send_message(NetworkMessage(
+                command="ping", payload=b"", magic=get_magic(self.network)))
+            return
         self.ping_wait_since = now
         ping = PingMessage(nonce=nonce)
         ping_msg = ping.to_network_message(self.network)

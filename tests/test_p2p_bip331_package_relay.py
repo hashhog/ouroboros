@@ -96,6 +96,9 @@ def _make_peer(addr: str = "10.0.0.1:18333") -> Peer:
     socket I/O is bypassed via send_message stub in the tests below.
     """
     p = Peer("10.0.0.1", 18333, "regtest", relay_txs=True)
+    # Post-handshake modern peer: sendpackages is gated on wtxid-relay
+    # capable (protocol >= 70016) peers.
+    p.version = 70016
     return p
 
 

@@ -1786,6 +1786,7 @@ class PeerManager:
             relay_txs=False,  # feelers don't relay
             start_height=self._start_height,
             retry=False,
+            expect_services=False,  # Core: FEELER is not ExpectServicesFromConn
         )
         self._feeler_peer = peer
 
@@ -2268,6 +2269,7 @@ class PeerManager:
         relay_txs: bool,
         start_height: int,
         retry: bool = False,
+        expect_services: bool = True,
     ) -> Peer | None:
         """Dial an outbound peer with BIP 324 v2-first + v1 fall-back.
 
@@ -2280,6 +2282,11 @@ class PeerManager:
         Centralises the transport-negotiation policy so all outbound
         construction sites (full-relay, block-relay-only, anchor,
         feeler, manual addnode) get identical behaviour.
+
+        ``expect_services`` is Core's ``ExpectServicesFromConn``: automatic
+        outbound connections (full-relay, block-relay-only, anchors) must
+        offer NODE_WITNESS; manual (addnode / -connect) and feeler
+        connections pass False and are not held to it.
         """
         addr = f"{host}:{port}"
         peer_proxy = self._proxy_for_host(host)
@@ -2298,6 +2305,7 @@ class PeerManager:
             node_network_limited=self.node_network_limited,
             on_disconnect=self._handle_peer_disconnected,
         )
+        peer.expect_services = expect_services
         ok = await peer.connect(start_height, retry=retry)
         if ok:
             self._note_version_addr_recv(peer)
@@ -2320,6 +2328,7 @@ class PeerManager:
                 node_network_limited=self.node_network_limited,
                 on_disconnect=self._handle_peer_disconnected,
             )
+            v1_peer.expect_services = expect_services
             if await v1_peer.connect(start_height, retry=retry):
                 self._note_version_addr_recv(v1_peer)
                 return v1_peer
@@ -2467,6 +2476,7 @@ class PeerManager:
             relay_txs=True,
             start_height=self._start_height,
             retry=False,
+            expect_services=False,  # Core: MANUAL is not ExpectServicesFromConn
         )
 
         if peer is not None:
@@ -2870,7 +2880,12 @@ class PeerManager:
         # a failed send just means the next inv/announce re-triggers it.
         try:
             from ouroboros.p2p_messages import MSG_WITNESS_BLOCK, GetDataMessage
-            ready = self.get_all_ready_peers()
+            # Only a NODE_WITNESS peer can serve MSG_WITNESS_BLOCK (Core
+            # CanServeWitnesses) -- never pick a pre-segwit inbound peer.
+            ready = [
+                p for p in self.get_all_ready_peers()
+                if getattr(p, "services", 0) & NODE_WITNESS
+            ]
             if ready:
                 target = ready[0]
                 for h, _addr in expired:
@@ -3204,6 +3219,10 @@ class PeerManager:
             # Skip block-relay-only peers (they don't relay transactions)
             if not p.relay_txs:
                 continue
+            # Core MaybeSendFeefilter (net_processing.cpp:5543): only peers
+            # at FEEFILTER_VERSION (70013) or newer understand feefilter.
+            if getattr(p, "common_version", 70016) < 70013:
+                continue
 
             await self._maybe_send_feefilter(p, current_filter, current_time)
 
@@ -3314,6 +3333,10 @@ class PeerManager:
 
     async def negotiate_compact_blocks(self, peer: Peer) -> None:
         """Send ``sendcmpct`` to a newly-connected peer."""
+        # Core net_processing.cpp:3864: only if the common version is at
+        # least SHORT_IDS_BLOCKS_VERSION (70014).
+        if getattr(peer, "common_version", 70016) < 70014:
+            return
         msg = SendCmpctMessage(announce=False, version=self.compact_block_version)
         try:
             await peer.send_message(msg.to_network_message(self.network))
@@ -3348,6 +3371,16 @@ class PeerManager:
                 CompactBlock,
                 ReadStatus,
             )
+            # Block data is only ever requested from peers that can serve
+            # witnesses (Core CanServeWitnesses, net_processing.cpp:1166).
+            # Completing a cmpctblock means a getblocktxn / full-block getdata
+            # to THIS peer, and a pre-segwit peer's prefilled txs carry no
+            # witness (the reconstructed block would fail the witness
+            # commitment and be perm-rejected).  Non-witness peers are now
+            # accepted inbound (MIN_PEER_VERSION 31800), so ignore theirs.
+            if not (getattr(peer, "services", 0) & NODE_WITNESS):
+                logger.debug(f"Ignoring cmpctblock from non-NODE_WITNESS peer {addr}")
+                return
             try:
                 cb = CompactBlock.deserialize(msg.payload)
             except (ValueError, Exception) as exc:
@@ -3676,6 +3709,16 @@ class PeerManager:
 
         peer.register_handler("sendcmpct", on_sendcmpct)
         peer.register_handler("cmpctblock", on_cmpctblock)
+        # A sendcmpct received between VERSION and VERACK was recorded on the
+        # Peer (Core processes SENDCMPCT pre-verack, net_processing.cpp:3901);
+        # replay it now that the handler is wired so cmpct_peers is updated.
+        pending_sc = getattr(peer, "_pending_sendcmpct_payload", None)
+        if pending_sc is not None:
+            peer._pending_sendcmpct_payload = None
+            asyncio.ensure_future(on_sendcmpct(NetworkMessage(
+                command="sendcmpct", payload=pending_sc,
+                magic=get_magic(self.network),
+            )))
         peer.register_handler("blocktxn", on_blocktxn)
         peer.register_handler("getblocktxn", on_getblocktxn)
         peer.register_handler("sendheaders", on_sendheaders)
@@ -4062,6 +4105,10 @@ class PeerManager:
         if not peer.relay_txs:
             # Block-relay-only peers don't participate in tx reconciliation
             return
+        # BIP 330 requires wtxid relay; Core only offers reconciliation to a
+        # peer whose common version is >= WTXID_RELAY_VERSION (70016).
+        if getattr(peer, "common_version", 70016) < 70016:
+            return
         try:
             salt = random.getrandbits(64)
             self._erlay_local_salts[addr] = salt
@@ -4320,6 +4367,10 @@ class PeerManager:
         same.  Block-relay-only peers don't do tx relay so we skip them.
         """
         if not peer.relay_txs:
+            return
+        # BIP 331 builds on wtxid relay (BIP 339, protocol 70016); never send
+        # it to a peer that predates that version.
+        if getattr(peer, "common_version", 70016) < 70016:
             return
         try:
             msg = SendPackagesMessage(

@@ -10636,6 +10636,11 @@ class RPCServer:
         if block is not None:
             raise RpcError(RPC_MISC_ERROR, "Block already downloaded")
 
+        # Core FetchBlock (net_processing.cpp:1969): "Ignore pre-segwit peers".
+        from ouroboros.p2p_messages import NODE_WITNESS
+        if not (getattr(peer, "services", 0) & NODE_WITNESS):
+            raise RpcError(RPC_MISC_ERROR, "Pre-SegWit peer")
+
         # ----------------------------------------------------------------
         # (4) Schedule the fetch: send a witness-block getdata to the peer.
         #     Core: CInv(MSG_BLOCK | MSG_WITNESS_FLAG, hash) -> GETDATA

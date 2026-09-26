@@ -81,6 +81,10 @@ class _StubPeerManager:
 def _make_peer() -> Peer:
     p = Peer("10.0.0.1", 18444, network="regtest")
     p.state = PeerState.READY
+    # A modern segwit peer (Core GetFetchFlags adds MSG_WITNESS_FLAG only
+    # for CanServeWitnesses peers).
+    p.services = 0x1 | 0x8  # NODE_NETWORK | NODE_WITNESS
+    p.version = 70016
     p.adjust_score = lambda d: None
     p.note_block_height = lambda h: None
     p.sent = []
