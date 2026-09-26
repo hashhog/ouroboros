@@ -376,6 +376,24 @@ def sync(ctx, reset, limit):
         "(Bitcoin Core -bind)."
     ),
 )
+@click.option(
+    "--externalip",
+    "externalip",
+    multiple=True,
+    help=(
+        "Advertise this public address to peers: <ip>[:port] (repeatable or "
+        "comma-separated). A bare IP gets the real P2P listen port. Implies "
+        "--nodiscover unless --discover is passed (Bitcoin Core -externalip)."
+    ),
+)
+@click.option(
+    "--discover/--nodiscover",
+    default=None,
+    help=(
+        "Learn our own public address from outbound peers (default on; off "
+        "when --externalip is given unless passed explicitly; Core -discover)."
+    ),
+)
 @click.option("--connect", multiple=True, help="Connect to ONLY these peer(s) host:port (repeatable). Implies -nodnsseed and disables addrman/auto-outbound dialing (Bitcoin Core -connect semantics).")
 @click.option(
     "--dnsseed/--nodnsseed",
@@ -542,7 +560,8 @@ def sync(ctx, reset, limit):
 )
 @click.pass_context
 def start(
-    ctx, rpc_port, p2p_port, listen, bind, connect, dnsseed, force, v2transport,
+    ctx, rpc_port, p2p_port, listen, bind, externalip, discover, connect,
+    dnsseed, force, v2transport,
     peerbloomfilters, blockfilterindex, cfilter, coinstatsindex,
     txospenderindex, assumevalid, noassumevalid, daemon,
     pid_path, reindex, rpc_tls_cert, rpc_tls_key, par,
@@ -613,6 +632,13 @@ def start(
             config["bind"] = list(bind)
         if connect:
             config["connect"] = list(connect)
+        # -externalip / -discover: only override the conf-file value when the
+        # operator passed the flag.  node.py resolves the Core default
+        # (-discover off when -externalip is set, init.cpp).
+        if externalip:
+            config["externalip"] = list(externalip)
+        if discover is not None:
+            config["discover"] = bool(discover)
         # --dnsseed/--nodnsseed: only override the conf-file value when the
         # operator explicitly passed the flag (Click leaves it None otherwise).
         # -connect forces DNS off downstream regardless of this value.

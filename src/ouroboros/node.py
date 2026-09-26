@@ -608,6 +608,21 @@ class BitcoinNode:
                 bind_hosts = [str(p).strip() for p in bind_raw if str(p).strip()]
             else:
                 bind_hosts = []
+            # -externalip / -discover (Core init.cpp:815: -discover defaults
+            # on, but off when -externalip is given unless set explicitly).
+            from ouroboros.localaddr import parse_externalip_list
+            external_ips: list[tuple[str, int]] = []
+            try:
+                external_ips = parse_externalip_list(self.config.get('externalip'))
+            except ValueError as e:
+                logger.warning(f"Ignoring malformed -externalip: {e}")
+            discover_raw = self.config.get('discover')
+            if discover_raw is None:
+                discover_enabled = not external_ips
+            elif isinstance(discover_raw, str):
+                discover_enabled = discover_raw.lower() in ("1", "true", "yes", "on")
+            else:
+                discover_enabled = bool(discover_raw)
             self.peer_manager = PeerManager(
                 self.network,
                 max_peers=max_peers,
@@ -620,6 +635,9 @@ class BitcoinNode:
                 connect_addrs=connect_addrs,
                 dns_seed=dns_seed_enabled,
                 bind=bind_hosts or None,
+                external_ips=external_ips,
+                discover=discover_enabled,
+                is_ibd=self.is_initial_block_download,
             )
             # BIP 152: Provide mempool and database for compact block relay
             self.peer_manager.set_mempool(self.mempool)
@@ -2482,6 +2500,56 @@ class BitcoinNode:
     def is_synced(self) -> bool:
         """Return True when the node has completed initial block synchronisation."""
         return self.synced
+
+    # Core DEFAULT_MAX_TIP_AGE (validation.h): a tip older than this keeps the
+    # node in initial block download.
+    MAX_TIP_AGE = 24 * 60 * 60
+
+    def is_initial_block_download(self) -> bool:
+        """Core ChainstateManager::IsInitialBlockDownload, LATCHING: once it
+        returns False it never returns True again (m_cached_finished_ibd).
+
+        Out of IBD requires a tip younger than MAX_TIP_AGE (Core's
+        nMaxTipAge check).  Off regtest it additionally requires the node's
+        existing sync gate (``self.synced``), the same signal getblockchaininfo
+        reports; on regtest nMinimumChainWork is 0, so tip age alone decides
+        (a fresh regtest chain at its 2011 genesis is in IBD until a block is
+        mined, exactly like Core).  Used to gate self-address advertisement.
+        """
+        if getattr(self, "_ibd_finished", False):
+            return False
+        tip_time = self._tip_time()
+        if tip_time <= 0 or time.time() - tip_time > self.MAX_TIP_AGE:
+            return True
+        if self.network != "regtest" and not self.synced:
+            return True
+        self._ibd_finished = True
+        logger.info("Leaving InitialBlockDownload (latching to false)")
+        return False
+
+    def _tip_time(self) -> int:
+        """Timestamp of the active tip (0 if unknown)."""
+        db = self.db
+        if db is None:
+            return 0
+        ts = int(getattr(db, "_tip_timestamp", 0) or 0)
+        if ts > 0:
+            return ts
+        # No block connected since boot: read the tip header once per tip.
+        try:
+            tip_hash, _ = db.get_best_block()
+            cached = getattr(self, "_tip_time_cache", None)
+            if cached and cached[0] == tip_hash:
+                return cached[1]
+            raw = db.get_block_bytes(tip_hash)
+            if raw and len(raw) >= 80:
+                import struct as _struct
+                ts = _struct.unpack_from("<I", raw, 68)[0]
+                self._tip_time_cache = (tip_hash, ts)
+                return ts
+        except Exception:
+            pass
+        return 0
 
     def _active_chain_tip_height(self) -> int | None:
         """Return the active chain tip height, or ``None`` if unknown.

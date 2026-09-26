@@ -573,6 +573,14 @@ class Peer:
         # BIP 155: peer supports addrv2
         self.addrv2: bool = False
 
+        # Self-address advertisement (Core MaybeSendAddr).  ``addr_local`` is
+        # the peer's VERSION addr_recv -- how it sees us -- as (ip, port), or
+        # None.  ``next_local_addr_send`` is the monotonic time of the next
+        # self-announcement to this peer; 0.0 = never sent (the first send
+        # goes out as soon as we are listening and out of IBD).
+        self.addr_local: tuple[str, int] | None = None
+        self.next_local_addr_send: float = 0.0
+
         # ---- getaddr / addr anti-DoS state (Core net_processing.cpp Peer) ----
         # GETADDR-once: whether we have already answered a ``getaddr`` from this
         # peer.  Core ``peer.m_getaddr_recvd`` (net_processing.cpp:4833): only the
@@ -984,6 +992,7 @@ class Peer:
         # header-sync peer selection reads, NOT the frozen start_height.
         self.note_block_height(version.start_height)
         self.time_offset = int(version.timestamp - time.time())
+        self._note_addr_local(version.addr_recv)
         self._version_received = True
 
         # Reject peers with version < MIN_PEER_VERSION (no segwit support)
@@ -1007,11 +1016,11 @@ class Peer:
 
         # 2. Send our version
         addr_recv = self._create_network_address(self.host, self.port)
-        addr_from = self._create_network_address("0.0.0.0", 8333)
 
         # Assemble the services we advertise (see _assemble_our_services).
         our_services = self._assemble_our_services()
         self.our_services = our_services
+        addr_from = self._version_addr_from(our_services)
         version_msg = VersionMessage(
             version=70016,
             services=our_services,
@@ -1506,7 +1515,6 @@ class Peer:
 
         # Create network addresses
         addr_recv = self._create_network_address(self.host, self.port)
-        addr_from = self._create_network_address("0.0.0.0", 8333)
 
         # Send version message
         # Block-relay-only connections set relay=False (BIP 37) to signal
@@ -1514,6 +1522,7 @@ class Peer:
         # Assemble the services we advertise (see _assemble_our_services).
         our_services = self._assemble_our_services()
         self.our_services = our_services
+        addr_from = self._version_addr_from(our_services)
         version_msg = VersionMessage(
             version=70016,
             services=our_services,
@@ -1544,6 +1553,7 @@ class Peer:
         # header-sync peer selection reads, NOT the frozen start_height.
         self.note_block_height(version.start_height)
         self.time_offset = int(version.timestamp - time.time())
+        self._note_addr_local(version.addr_recv)
         self._version_received = True
 
         # Reject peers with version < MIN_PEER_VERSION (no segwit support)
@@ -1653,6 +1663,25 @@ class Peer:
                 )
         except Exception as feat_err:
             logger.debug(f"Feature negotiation error (non-fatal): {feat_err}")
+
+    @staticmethod
+    def _version_addr_from(our_services: int) -> NetworkAddress:
+        """VERSION ``addr_from``: Core sends an empty CService here
+        (net_processing.cpp PushNodeVersion: ``CNetAddr::V1(CService{})``) --
+        all-zero IP, port 0.  This previously carried a hardcoded
+        ``0.0.0.0:8333``, a wrong port on every network.  Our real address is
+        advertised separately via addr/addrv2 (see ouroboros.localaddr)."""
+        return NetworkAddress(services=our_services, ip=b"\x00" * 16, port=0)
+
+    def _note_addr_local(self, addr_recv: NetworkAddress) -> None:
+        """Remember the peer's view of our address (Core CNode::SetAddrLocal,
+        net_processing.cpp:3670) -- VERSION ``addr_recv``."""
+        try:
+            from ouroboros.localaddr import ip_from_netaddr_bytes
+            ip = ip_from_netaddr_bytes(bytes(addr_recv.ip))
+        except Exception:
+            ip = None
+        self.addr_local = (ip, int(addr_recv.port)) if ip else None
 
     def _create_network_address(self, host: str, port: int) -> NetworkAddress:
         """Create network address from host and port."""

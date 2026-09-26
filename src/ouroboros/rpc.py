@@ -4320,14 +4320,16 @@ class RPCServer:
                 net_info["proxy_randomize_credentials"] = nc.get("proxy_randomize_credentials", False)
             networks.append(net_info)
 
-        # Local addresses
+        # Local addresses (Core mapLocalHost): PeerManager.local_addresses is
+        # [{address, port, score}] with port = the REAL P2P listen port (or
+        # the -externalip port), never a chain-default fallback.
         local_addresses = []
         if pm and hasattr(pm, 'local_addresses'):
             for addr_info in pm.local_addresses:
                 local_addresses.append({
-                    "address": addr_info.get("address", ""),
-                    "port": addr_info.get("port", 8333),
-                    "score": addr_info.get("score", 0),
+                    "address": addr_info["address"],
+                    "port": int(addr_info["port"]),
+                    "score": int(addr_info["score"]),
                 })
 
         from ouroboros.psbt import BTCAmount

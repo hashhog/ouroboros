@@ -25,7 +25,16 @@ import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 
-from ouroboros.addrman import AddressManager, get_network_group
+from ouroboros.addrman import NET_IPV4, NET_IPV6, AddressManager, get_network_group
+from ouroboros.localaddr import (
+    LOCAL_ADDR_CHECK_INTERVAL,
+    LocalAddrTable,
+    build_self_announcement,
+    is_routable_ip,
+    local_addr_for_peer,
+    next_local_addr_delay,
+    normalize_ip,
+)
 from ouroboros.banman import (
     BanManager,
 )
@@ -637,6 +646,9 @@ class PeerManager:
         dns_seed: bool = True,
         max_inbound: int | None = None,
         bind: "list[str] | tuple[str, ...] | None" = None,
+        external_ips: "list[tuple[str, int]] | None" = None,
+        discover: bool = True,
+        is_ibd: "Callable[[], bool] | None" = None,
     ):
         """Initialize peer manager.
 
@@ -656,6 +668,12 @@ class PeerManager:
             bind: P2P listen addresses (Core ``-bind``).  Empty/None binds
                 ``DEFAULT_BIND_HOSTS`` (0.0.0.0 and ::).  Pass
                 ``["127.0.0.1"]`` to restrict to IPv4 loopback.
+            external_ips: Core ``-externalip`` as ``[(ip, port)]``; port 0
+                means "our P2P listen port" (resolved once listening).
+            discover: Core ``-discover`` -- learn our address from outbound
+                peers' VERSION addr_recv.
+            is_ibd: Core ``IsInitialBlockDownload``; self-advertisement is
+                suppressed while it returns True.
         """
         self.network = network
         self.max_peers = max_peers
@@ -885,6 +903,15 @@ class PeerManager:
         # to this list, so we copy rather than alias the caller's list.
         self._connect_addrs: list[tuple[str, int]] = list(connect_addrs or [])
 
+        # Self-address advertisement (Core mapLocalHost / MaybeSendAddr; see
+        # ouroboros.localaddr).  -externalip entries are added in start() once
+        # the listen port is known.
+        self.local_addrs = LocalAddrTable()
+        self._external_ips: list[tuple[str, int]] = list(external_ips or [])
+        self._discover: bool = bool(discover)
+        self._is_ibd_func = is_ibd
+        self._local_addr_task: asyncio.Task | None = None
+
         # -connect mode: a non-empty pin list disables DNS-seed resolution
         # and all addrman/auto-outbound dialing.  Latched once at construction
         # (the pins are fixed for the node's lifetime).  Mirrors clearbit
@@ -941,6 +968,10 @@ class PeerManager:
             if self.i2psam and listen_port:
                 await self._start_i2p_session(listen_port)
 
+            # -externalip: bare IPs take the REAL listen port (Core AddLocal
+            # with GetListenPort()), never a chain default.
+            self._add_external_ips()
+
         if self._connect_only:
             # Core/clearbit -connect: dial ONLY the pinned peers.  No DNS
             # seeding, no anchors, no addrman-driven auto-outbound fill, no
@@ -995,6 +1026,12 @@ class PeerManager:
 
         # Start transaction trickle loop
         self._trickle_task = asyncio.create_task(self._trickle_loop())
+
+        # Self-address re-announcement timer (Core MaybeSendAddr, 24h Poisson
+        # per peer).  Also delivers the first announcement to peers whose
+        # handshake-time send was suppressed by IBD.
+        if self._self_listen_port():
+            self._local_addr_task = asyncio.create_task(self._local_addr_loop())
 
         # Start feeler connection loop (eclipse protection).  Feelers dial
         # addrman-selected addresses, which is exactly the auto-outbound
@@ -1055,6 +1092,15 @@ class PeerManager:
                 await self._trickle_task
             except asyncio.CancelledError:
                 pass
+
+        # Cancel self-address announcement task
+        if self._local_addr_task:
+            self._local_addr_task.cancel()
+            try:
+                await self._local_addr_task
+            except asyncio.CancelledError:
+                pass
+            self._local_addr_task = None
 
         # Cancel feeler task
         if self._feeler_task:
@@ -1236,6 +1282,134 @@ class PeerManager:
             return None
         return socks[0].getsockname()[1]
 
+    # ------------------------------------------------------------------
+    # Self-address advertisement (Core AddLocal / SeenLocal /
+    # GetLocalAddrForPeer / MaybeSendAddr).  Pure logic in
+    # ouroboros.localaddr; this is the wiring.
+    # ------------------------------------------------------------------
+
+    def _self_listen_port(self) -> int:
+        """Core GetListenPort() when fListen, else 0 (not listening)."""
+        if not self._listen_enabled:
+            return 0
+        port = self.listen_port
+        return int(port) if port else 0
+
+    def _add_external_ips(self) -> None:
+        port = self._self_listen_port()
+        if not port:
+            if self._external_ips:
+                logger.warning("-externalip ignored: not listening")
+            return
+        for ip, ext_port in self._external_ips:
+            use_port = ext_port or port
+            if self.local_addrs.add_manual(ip, use_port):
+                logger.info(f"AddLocal({ip}:{use_port}, score=4) [-externalip]")
+            else:
+                logger.warning(f"-externalip {ip} ignored: not a routable address")
+
+    @property
+    def local_addresses(self) -> list[dict]:
+        """getnetworkinfo.localaddresses: ``[{address, port, score}]``."""
+        return [a.to_dict() for a in self.local_addrs.list()]
+
+    def _in_initial_block_download(self) -> bool:
+        if self._is_ibd_func is not None:
+            try:
+                return bool(self._is_ibd_func())
+            except Exception as e:
+                logger.debug(f"is_ibd callback failed ({e}); assuming IBD")
+                return True
+        return bool(getattr(self, "_in_ibd", False))
+
+    @staticmethod
+    def _ip_netgroup(ip: str) -> str:
+        norm = normalize_ip(ip) or ip
+        return get_network_group(norm, NET_IPV6 if ":" in norm else NET_IPV4)
+
+    def _note_version_addr_recv(self, peer: Peer) -> None:
+        """Discovery from a peer's VERSION addr_recv (Core SeenLocal +
+        IsPeerAddrLocalGood).  Outbound peers may create an entry; inbound
+        peers only score an existing one.  Both the peer and the reported
+        address must be publicly routable.  Stored with OUR listen port."""
+        try:
+            if not self._discover:
+                return
+            port = self._self_listen_port()
+            if not port or not peer.addr_local:
+                return
+            seen_ip = peer.addr_local[0]
+            if not is_routable_ip(peer.host) or not is_routable_ip(seen_ip):
+                return
+            self.local_addrs.confirm(
+                seen_ip, port, self._ip_netgroup(peer.host),
+                create=not peer.inbound,
+            )
+        except Exception as e:
+            logger.debug(f"addr_recv discovery failed for {peer.host}: {e}")
+
+    def _self_adv_relay_peer(self, peer: Peer) -> bool:
+        """Core ``peer.m_addr_relay_enabled``: inbound peers and full-relay
+        outbound peers only -- never block-relay-only or feeler connections."""
+        if peer.inbound:
+            return True
+        if not peer.relay_txs or peer is self._feeler_peer:
+            return False
+        return any(p is peer for p in self.peers.values())
+
+    async def _maybe_send_local_addr(self, peer: Peer, now: float | None = None) -> bool:
+        """Core MaybeSendAddr self-announcement block.  Returns True when an
+        addr/addrv2 carrying our address was sent to ``peer``."""
+        try:
+            if peer is None or not peer.is_connected():
+                return False
+            listen_port = self._self_listen_port()
+            if not listen_port or not self._self_adv_relay_peer(peer):
+                return False
+            if self._in_initial_block_download():
+                # Timer untouched: the first send happens once out of IBD.
+                return False
+            mono = time.monotonic() if now is None else now
+            if peer.next_local_addr_send and mono < peer.next_local_addr_send:
+                return False
+            peer.next_local_addr_send = mono + next_local_addr_delay()
+            choice = local_addr_for_peer(
+                self.local_addrs,
+                peer_ip=peer.host,
+                peer_inbound=peer.inbound,
+                addr_local=peer.addr_local,
+                listen_port=listen_port,
+                discover=self._discover,
+            )
+            if choice is None:
+                return False
+            ip, port = choice
+            msg = build_self_announcement(
+                ip, port, peer.our_services, int(time.time()),
+                addrv2=peer.addrv2, network=self.network,
+            )
+            await asyncio.wait_for(
+                peer.send_message(msg), timeout=ADDR_RELAY_SEND_TIMEOUT
+            )
+            logger.debug(
+                f"Advertising address {ip}:{port} to peer "
+                f"{peer.host}:{peer.port} ({msg.command})"
+            )
+            return True
+        except Exception as e:
+            logger.debug(f"self-announcement to {getattr(peer, 'host', '?')} failed: {e}")
+            return False
+
+    async def _local_addr_loop(self) -> None:
+        """Re-announce our address to each peer on its Poisson timer."""
+        try:
+            while self.running:
+                await asyncio.sleep(LOCAL_ADDR_CHECK_INTERVAL)
+                for peer in list(self.peers.values()) + list(self.inbound_peers.values()):
+                    await self._maybe_send_local_addr(peer)
+        except asyncio.CancelledError:
+            pass
+
     async def _bind_one(self, host: str, port: int) -> asyncio.AbstractServer:
         """Bind a single listen socket.  IPv6 sockets get IPV6_V6ONLY=1 so
         they do not steal IPv4 (Core net.cpp BindListenPort)."""
@@ -1369,6 +1543,8 @@ class PeerManager:
             self._register_compact_handlers(peer, addr)
             self._register_bloom_handlers(peer, addr)
             self._register_addr_handlers(peer, addr)
+            self._note_version_addr_recv(peer)
+            asyncio.ensure_future(self._maybe_send_local_addr(peer))
             asyncio.ensure_future(self.negotiate_compact_blocks(peer))
             # Negotiate Erlay for inbound peers
             if self.erlay_enabled:
@@ -1773,6 +1949,8 @@ class PeerManager:
             self._register_compact_handlers(peer, addr)
             self._register_bloom_handlers(peer, addr)
             self._register_addr_handlers(peer, addr)
+            self._note_version_addr_recv(peer)
+            asyncio.ensure_future(self._maybe_send_local_addr(peer))
             asyncio.ensure_future(self.negotiate_compact_blocks(peer))
 
             if self.erlay_enabled:
@@ -2122,6 +2300,7 @@ class PeerManager:
         )
         ok = await peer.connect(start_height, retry=retry)
         if ok:
+            self._note_version_addr_recv(peer)
             return peer
 
         # If the failure was specifically a v2-handshake failure, mark
@@ -2142,6 +2321,7 @@ class PeerManager:
                 on_disconnect=self._handle_peer_disconnected,
             )
             if await v1_peer.connect(start_height, retry=retry):
+                self._note_version_addr_recv(v1_peer)
                 return v1_peer
         return None
 
@@ -2237,6 +2417,8 @@ class PeerManager:
                 asyncio.ensure_future(self.negotiate_compact_blocks(peer))
                 # Request addresses from new outbound peers
                 asyncio.ensure_future(self._send_getaddr(peer))
+                # Advertise our own address (Core MaybeSendAddr)
+                asyncio.ensure_future(self._maybe_send_local_addr(peer))
                 # Negotiate Erlay reconciliation for full-relay peers
                 if self.erlay_enabled:
                     self._register_erlay_handlers(peer, addr)
@@ -2300,6 +2482,8 @@ class PeerManager:
             self._register_addr_handlers(peer, addr)
             asyncio.ensure_future(self.negotiate_compact_blocks(peer))
             asyncio.ensure_future(self._send_getaddr(peer))
+            # Advertise our own address (Core MaybeSendAddr)
+            asyncio.ensure_future(self._maybe_send_local_addr(peer))
             if self.erlay_enabled:
                 self._register_erlay_handlers(peer, addr)
                 asyncio.ensure_future(self._negotiate_erlay(peer, addr))

@@ -164,6 +164,11 @@ class NodeConfig:
             # (0.0.0.0 and ::).  Comma-separated, e.g. "127.0.0.1" or
             # "127.0.0.1,[::1]" to restrict to loopback.
             'bind': '',
+            # Core -externalip (comma-separated <ip>[:port]) and -discover.
+            # 'discover' unset (None) = Core default: on, unless externalip
+            # is set.
+            'externalip': '',
+            'discover': None,
             # Enable REST interface (1/0)
             'rest': '0',
             # ZMQ notification endpoints (per-topic, Bitcoin Core style)
@@ -358,6 +363,11 @@ class NodeConfig:
             'onion': self.get('onion'),
             'listen': self.getboolean('listen'),
             'bind': self._bind_list(),
+            'externalip': [p.strip() for p in str(self.get('externalip') or '').split(',') if p.strip()],
+            'discover': (
+                None if self.get('discover') is None
+                else self.getboolean('discover')
+            ),
             'i2psam': self.get('i2psam'),
             'torcontrol': self.get('torcontrol'),
             'torpassword': self.get('torpassword'),
