@@ -448,14 +448,46 @@ class BlockMessage:
         return cls(block=block)
 
 
+def inv_wants_witness(inv_type: int) -> bool:
+    """Whether a getdata reply for ``inv_type`` is serialized WITH witness.
+
+    Bitcoin Core net_processing.cpp ProcessGetData:
+        // WTX and WITNESS_TX imply we serialize with witness
+        maybe_with_witness = inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS
+    and for blocks ``IsMsgBlk() -> TX_NO_WITNESS``,
+    ``IsMsgWitnessBlk() -> TX_WITH_WITNESS``.  Only the bare legacy types
+    MSG_TX(1) / MSG_BLOCK(2) get the stripped form; MSG_WTX(5) and anything
+    carrying MSG_WITNESS_FLAG get the full BIP144 serialization.
+    """
+    if inv_type == MSG_WTX:
+        return True
+    return bool(inv_type & MSG_WITNESS_FLAG)
+
+
 @dataclass
 class TxMessage:
-    """Transaction delivery"""
+    """Transaction delivery.
+
+    ``with_witness`` selects the BIP144 wire form.  It defaults to True: the
+    witness-stripped form is only correct as a reply to a legacy MSG_TX(1)
+    getdata (see :func:`inv_wants_witness`).  Serving a stripped segwit tx to
+    a MSG_WTX / MSG_WITNESS_TX request makes the peer reject it with
+    "Witness program hash mismatch" — segwit txs never propagated from us.
+    """
     transaction: Transaction
+    with_witness: bool = True
+
+    @classmethod
+    def for_inv(cls, transaction: Transaction, inv_type: int) -> "TxMessage":
+        """Build the reply to a getdata item of ``inv_type`` (Core parity)."""
+        return cls(transaction=transaction, with_witness=inv_wants_witness(inv_type))
 
     def to_network_message(self, network: str = "mainnet") -> NetworkMessage:
         """Convert to network message"""
-        payload = self.transaction.serialize()
+        if self.with_witness and hasattr(self.transaction, "serialize_with_witness"):
+            payload = self.transaction.serialize_with_witness()
+        else:
+            payload = self.transaction.serialize()
         return NetworkMessage(command="tx", payload=payload, magic=get_magic(network))
 
     @classmethod

@@ -1964,7 +1964,9 @@ class BitcoinNode:
                         if inv_type in (INV_TYPE_TX, MSG_WITNESS_TX) and self.mempool is not None:
                             tx = self.mempool.get_transaction(inv_hash)
                             if tx:
-                                tx_msg = TxMessage(transaction=tx)
+                                # Core: MSG_TX -> TX_NO_WITNESS, MSG_WITNESS_TX
+                                # -> TX_WITH_WITNESS (ProcessGetData).
+                                tx_msg = TxMessage.for_inv(tx, inv_type)
                                 await peer.send_message(tx_msg.to_network_message(network))
                                 logger.debug(f"Sent tx {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
                             else:
@@ -1978,7 +1980,11 @@ class BitcoinNode:
                             # that we lack a tx we actually hold.
                             tx = self.mempool.get_transaction_by_wtxid(inv_hash)
                             if tx:
-                                tx_msg = TxMessage(transaction=tx)
+                                # MSG_WTX implies witness serialization (Core
+                                # ProcessGetData); a stripped segwit tx fails
+                                # the peer's script check with "Witness program
+                                # hash mismatch" and never propagates.
+                                tx_msg = TxMessage.for_inv(tx, inv_type)
                                 await peer.send_message(tx_msg.to_network_message(network))
                                 logger.debug(f"Sent wtx {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
                             else:
