@@ -1147,79 +1147,36 @@ class BlockSync:
         self._h1_last_issue.pop(block_hash, None)
         return old
 
-    def _evict_far_ahead_slot(
-        self, peer: Peer, head_set: set[bytes], *, log: bool = True,
-    ) -> bool:
-        """Drop one non-head in-flight request from *peer* to free a cap slot.
-
-        Head-of-window hashes are never evicted — they are the only blocks
-        the in-order drain can advance on.  Newest (farthest) first.
-        """
-        for bh, p in reversed(list(self._block_request_peer.items())):
-            if p is not peer:
-                continue
-            if bh in head_set:
-                continue
-            if bh in self._connecting_hashes:
-                continue
-            self._reclaim_inflight_slot(bh)
-            if log:
-                logger.info(
-                    "evicted far-ahead in-flight %s from %s:%s to free a "
-                    "head-of-window slot",
-                    bh.hex()[:12], peer.host, peer.port,
-                )
-            return True
-        return False
-
-    def _evict_all_far_ahead(self, peer: Peer, head_set: set[bytes]) -> int:
-        """Drop every non-head in-flight request from *peer*.
-
-        Evicting a single far-ahead slot (``98ac21b``) lets tip+1 fit
-        under ``MAX_BLOCKS_IN_FLIGHT_PER_PEER``, but the remaining 15
-        keep older timestamps.  A FIFO feeder — the campaign replay
-        peer included — then spends minutes serving those bodies
-        before the connect cursor.  That is the halved-throughput
-        stall, not a hang.  Clearing the far-ahead pipeline makes HOL
-        the next delivery on this peer.
-        """
-        n = 0
-        while self._evict_far_ahead_slot(peer, head_set, log=False):
-            n += 1
-        if n:
-            logger.info(
-                "evicted %d far-ahead in-flight from %s:%s so the "
-                "connect cursor is next on the wire",
-                n, peer.host, peer.port,
-            )
-        return n
-
     def _pick_peer_for_head(
-        self, candidates: list, head_set: set[bytes],
+        self, candidates: list, head_set: set[bytes] | None = None,
         *, allow_over_cap: bool = False,
     ) -> Peer | None:
-        """Choose a peer that can take a HOL re-request, evicting if needed.
+        """Choose a peer for a head-of-window request.  Never evicts.
 
-        Far-ahead in-flight on the chosen peer is always cleared so the
-        connect cursor is the next body that peer delivers — not only
-        when the peer is already at cap.  A free slot in front of 15
-        older far-ahead requests is the campaign rate bug: HOL is
-        requested (eventual completion) but is the 16th FIFO delivery.
+        Core (net_processing.cpp FindNextBlocksToDownload) hands a peer
+        new blocks only while it has fewer than
+        MAX_BLOCKS_IN_TRANSIT_PER_PEER in flight, and never cancels or
+        re-requests a block that is still in flight except on a stall /
+        download timeout.  ``7e55946`` / ``98ac21b`` instead "evicted"
+        far-ahead in-flight entries to make the connect cursor the next
+        body on the wire.  A getdata cannot be withdrawn: the peer still
+        serves every evicted body, and the tail pass immediately
+        re-getdata'd the evicted hashes because they had left
+        ``requested_blocks``.  With ``_request_next_blocks`` running on
+        every received block that loop re-downloaded up to 15 blocks per
+        delivery (R4 slices: 131,859 served for 10,706 connected).
 
-        ``allow_over_cap`` is the last-resort campaign-rig escape: if every
-        candidate is at cap and every in-flight hash is itself a head-of-
-        window slot (nothing to evict), grant the connect cursor one slot
-        above the cap rather than defer it forever.
+        ``allow_over_cap`` lets a head-of-window request that has NO live
+        request anywhere (first request of tip+1, or a stall-timeout
+        reassignment) take one slot above the cap rather than wait.  It
+        never duplicates a live request; it is bounded by HEAD_OF_WINDOW.
+        ``head_set`` is accepted for call-site compatibility and unused.
         """
         if not candidates:
             return None
         load = Counter(self._block_request_peer.values())
         for p in candidates:
             if load.get(p, 0) < MAX_BLOCKS_IN_FLIGHT_PER_PEER:
-                self._evict_all_far_ahead(p, head_set)
-                return p
-        for p in candidates:
-            if self._evict_all_far_ahead(p, head_set):
                 return p
         if allow_over_cap:
             return candidates[0]
@@ -6158,11 +6115,13 @@ class BlockSync:
             # (HEAD_TIMEOUT).  H1 re-getdata to the same --connect feeder
             # every 5s was the 481807→515000 re-request/fork loop.
             if frontier_hash in self.requested_blocks and holder_live:
-                # HOL is already assigned, but may be sitting behind
-                # far-ahead in-flight (98ac21b requested it as the 16th
-                # FIFO body).  Drop those so the holder delivers tip+1
-                # next; do not send a duplicate getdata.
-                self._evict_all_far_ahead(current_peer, head_set)
+                # HOL is already in flight on a live peer: wait for it (or
+                # for _handle_timeouts' stall timeout).  No duplicate
+                # getdata, and no "eviction" of that peer's other
+                # in-flight bodies -- they are already on the wire and
+                # will be delivered regardless (Core never cancels an
+                # in-flight block to reorder the queue).
+                pass
             else:
                 last_h1 = self._h1_last_issue.get(frontier_hash)
                 if last_h1 is None:
@@ -6175,10 +6134,11 @@ class BlockSync:
                     or not holder_live
                 ):
                     # Rotate: a peer that is NOT the current holder and NOT
-                    # the peer that just HOL-timed-out this hash.  Evict a
-                    # far-ahead in-flight slot if every candidate is at the
-                    # per-peer cap — otherwise a one-peer campaign rig
-                    # wedges with tip+1 as a 17th getdata (866210, buf=725).
+                    # the peer that just HOL-timed-out this hash.  If every
+                    # candidate is at the per-peer cap, tip+1 (which has no
+                    # live request anywhere) takes one slot above the cap
+                    # rather than wait -- the one-peer campaign rig must not
+                    # defer the connect cursor (866210, buf=725).
                     stalled = self._last_stalled_peer.get(frontier_hash)
                     others = [
                         p for p in candidates
@@ -6304,12 +6264,11 @@ class BlockSync:
         if not to_request:
             return
 
-        # Head-of-window items MUST land even when every peer is at the
-        # per-peer cap: evict a far-ahead in-flight slot (same primitive
-        # as ``_handle_timeouts``).  Tail items stay under the cap.
-        # Without this a one-peer campaign rig wedges: 16 far-ahead
-        # in-flight, 725 buffered, connect cursor deferred forever
-        # ("all peers at cap", height 866210).
+        # Tail items stay under the per-peer cap.  Head-of-window items
+        # prefer a peer under the cap; the connect cursor (tip+1) may take
+        # one slot above it so a one-peer campaign rig with 16 far-ahead
+        # in flight never defers it ("all peers at cap", height 866210).
+        # Nothing already in flight is evicted or re-requested here.
         if not candidates:
             return
 
@@ -6334,8 +6293,8 @@ class BlockSync:
                 continue
             per_peer[target].append(item)
             assigned.append(item)
-            # Account immediately so the next head item evicts another
-            # far-ahead slot instead of stacking above the cap.
+            # Account immediately so the next head item sees this slot
+            # as taken when checking the per-peer cap.
             self.requested_blocks[bh] = now
             self._record_first_request_time(bh, now)
             self._block_request_peer[bh] = target
@@ -7574,18 +7533,27 @@ class BlockSync:
 
         peer_batches: dict = defaultdict(list)
 
-        # HOL: must land on a DIFFERENT peer than the staller.  If every
-        # other peer is at the per-peer cap with far-ahead in-flight,
-        # evict a far-ahead slot (Core always fetches the window-head).
+        # HOL: must land on a DIFFERENT peer than the staller.  This is a
+        # stall-timeout reassignment (Core BLOCK_STALLING_TIMEOUT), the one
+        # case where a head block is re-requested; the timed-out slot was
+        # reclaimed above so it is not a duplicate of a live request.  If
+        # every other peer is at the per-peer cap, the head takes one slot
+        # above it rather than evicting (and so re-downloading) anything
+        # already on the wire.
         for bh in head_timed_out:
             old = self._last_stalled_peer.get(bh)
             others = [p for p in connected_peers if p is not old]
             others.sort(key=lambda p: -getattr(p, 'score', 100))
             target = self._pick_peer_for_head(others, head_set)
+            if target is None:
+                target = self._pick_peer_for_head(
+                    others, head_set, allow_over_cap=True,
+                )
             if target is None and old is not None and old in connected_peers:
-                # Single-peer catch-up: retry the only peer, still evicting
-                # far-ahead so the head is not stuck behind a full window.
-                target = self._pick_peer_for_head([old], head_set)
+                # Single-peer catch-up: retry the only peer.
+                target = self._pick_peer_for_head(
+                    [old], head_set, allow_over_cap=True,
+                )
             if target is None:
                 target = self._pick_peer_for_head(
                     connected_peers, head_set, allow_over_cap=True,

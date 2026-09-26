@@ -31,12 +31,28 @@ Asks (blockbrew ``09695ad`` / Core ``FindNextBlocksToDownload``):
   (d) Assert a RATE, not just eventual completion.
 
 Receipt: ``receipts/ouroboros-campaign-wedge-866210-2026-09-18.md``.
+
+Correction (2026-09-26): ask (a) as implemented by ``98ac21b`` /
+``7e55946`` -- "evict far-ahead in-flight so HOL is the next body" --
+is impossible on a real wire.  A getdata cannot be withdrawn: the peer
+serves every body it was asked for, in order.  "Evicting" only removed
+the hashes from ``requested_blocks``, so the tail pass re-getdata'd them
+on the next ``_request_next_blocks`` (which runs on every delivery).
+R4 slices: the replay feeder served 131,859 blocks for 10,706 connected
+(632k) and 31,889 for 1,069 (650k).  The old rate tests modelled the
+peer as serving "the oldest block we still track", which is exactly the
+fiction that made eviction look effective.  The tests below model the
+peer as a FIFO of every getdata sent, and assert Core's invariant: a
+block that is in flight or held is never requested again
+(net_processing.cpp FindNextBlocksToDownload; re-request only after a
+stall timeout).
 """
 
 from __future__ import annotations
 
 import hashlib
 import time
+from collections import Counter
 from unittest.mock import MagicMock
 
 import pytest
@@ -135,21 +151,16 @@ async def test_single_peer_at_cap_still_requests_connect_cursor():
     """Live campaign wedge: one replay peer, 16 far-ahead in-flight, 725
     buffered, connect cursor (tip+1) not in-flight.
 
-    Pre-fix, ``_request_next_blocks`` either defers tip+1 ("all peers at
-    cap") or getdata's it as a 17th in-flight.  Either way the cursor
-    does not get a real slot: the feeder is already at 16 and the drain
-    cannot advance on the 725 far-ahead bodies.
-
-    After: tip+1 is getdata'd AND a far-ahead slot is evicted so the
-    per-peer load stays <= 16.
+    The connect cursor must be getdata'd (not deferred as "all peers at
+    cap"), and NOTHING already in flight may be dropped from tracking:
+    those 16 bodies are on the wire and will arrive regardless, so
+    forgetting them only makes the tail pass request them a second time.
+    tip+1 takes at most one slot above the cap.
     """
     peer = _peer()
     bs = _fresh([peer])
     queued = _queue(bs, BUFFERED_FAR_AHEAD + MAX_BLOCKS_IN_FLIGHT_PER_PEER + 16)
     hol = queued[0]
-    # Head-of-window is slots 0..7.  Park 725 far-ahead bodies in the
-    # buffer the way the live log did (slots 8..732), and fill the only
-    # peer's cap with still-further-ahead in-flight (not HOL, not buffered).
     for h in queued[8 : 8 + BUFFERED_FAR_AHEAD]:
         bs._ibd_block_buffer[h] = (None, b"x")
     far_inflight = queued[
@@ -157,10 +168,8 @@ async def test_single_peer_at_cap_still_requests_connect_cursor():
     ]
     _assign(bs, peer, far_inflight, age_s=1.0)
 
-    assert len(bs._ibd_block_buffer) == BUFFERED_FAR_AHEAD
     assert _load(bs, peer) == MAX_BLOCKS_IN_FLIGHT_PER_PEER
     assert hol not in bs.requested_blocks
-    assert hol not in bs._ibd_block_buffer
 
     peer.sent.clear()
     await bs._request_next_blocks()
@@ -174,16 +183,15 @@ async def test_single_peer_at_cap_still_requests_connect_cursor():
         "connect cursor was tracked in-flight but no getdata went out"
     )
     assert bs._block_request_peer.get(hol) is peer
-    assert _load(bs, peer) <= MAX_BLOCKS_IN_FLIGHT_PER_PEER, (
-        f"HOL was requested as in-flight #{_load(bs, peer)} on the only "
-        f"peer (cap {MAX_BLOCKS_IN_FLIGHT_PER_PEER}); a 17th getdata is "
-        "how the campaign feeder never delivered tip+1.  Evict a "
-        "far-ahead slot so the cursor fits under the cap."
+    assert _load(bs, peer) <= MAX_BLOCKS_IN_FLIGHT_PER_PEER + 1
+    dropped = [h for h in far_inflight if h not in bs._block_request_peer]
+    assert not dropped, (
+        f"{len(dropped)} far-ahead in-flight request(s) were dropped from "
+        "tracking while their getdata is still on the wire — the next "
+        "request cycle re-getdatas them (the R4 12-30x re-download)"
     )
-    still_far = [h for h in far_inflight if h in bs._block_request_peer]
-    assert len(still_far) < MAX_BLOCKS_IN_FLIGHT_PER_PEER, (
-        "no far-ahead in-flight slot was evicted to make room for tip+1"
-    )
+    again = [h for h in _getdata_hashes(peer) if h in far_inflight]
+    assert not again, f"re-getdata'd {len(again)} in-flight far-ahead bodies"
 
 
 # ---------------------------------------------------------------------------
@@ -251,29 +259,14 @@ async def test_inflight_hol_inside_realistic_fetch_is_not_stalled():
 
 
 # ---------------------------------------------------------------------------
-# (d) RATE, not eventual completion
+# (d) RATE and REDUNDANCY on a truthful FIFO wire
 #
-# 98ac21b evicts one far-ahead slot so HOL is requested under the cap.
-# The campaign feeder (tools/blk-replay-server.py) then still serves the
-# remaining far-ahead getdata FIFO before the HOL getdata — minutes of
-# zero connects with 725 bodies already buffered.  Model the peer as
-# delivering the oldest currently-assigned in-flight body each tick
-# (the scheduler's view of what that peer is working on).  HEAD_TIMEOUT
-# is 128 s and is not consulted: a timeout rescue is the stall.
+# The peer model is the campaign feeder (tools/blk-replay-server.py): it
+# serves every getdata it has received, in order, one body per tick,
+# including requests we have since stopped tracking.  After each
+# delivery the harness does what handle_block does -- pop the request
+# maps, buffer or connect, then run _request_next_blocks.
 # ---------------------------------------------------------------------------
-
-TICKS = 32  # well under HEAD_TIMEOUT_MAX_WEIGHT (128 s); 1 delivery/tick
-# Healthy is 1 connect per delivery.  The live defect was ~half that.
-# Require 3/4 so "eventual completion after 15 far-ahead drain" stays red.
-MIN_CONNECT_RATE = (TICKS * 3) // 4  # 24
-
-
-def _oldest_inflight(bs: BlockSync) -> bytes | None:
-    """Oldest assigned in-flight hash (timestamp, then insertion order)."""
-    if not bs.requested_blocks:
-        return None
-    # min() is stable: equal timestamps keep dict insertion order.
-    return min(bs.requested_blocks, key=bs.requested_blocks.get)
 
 
 def _fresh_chain(peer: Peer, tip_height: int, n_headers: int):
@@ -292,133 +285,147 @@ def _fresh_chain(peer: Peer, tip_height: int, n_headers: int):
     return bs, state, hashes
 
 
-def _connect_frontier(bs: BlockSync, state: dict, block_hash: bytes) -> int:
-    """Connect *block_hash* as tip+1 and drain any now-consecutive buffer.
-
-    Returns how many headers were consumed (1 + drained).
-    """
+def _drain(bs: BlockSync, state: dict) -> int:
+    """Connect tip+1 while it is buffered (the in-order drain)."""
     n = 0
-    while bs._validated_headers and (
-        bs._validated_headers[0][0] == block_hash
-        or bs._validated_headers[0][0] in bs._ibd_block_buffer
-    ):
+    while bs._validated_headers and bs._validated_headers[0][0] in bs._ibd_block_buffer:
         h, _ = bs._validated_headers.pop(0)
         state["height"] += 1
         state["hash"] = h
         state["by_h"][state["height"]] = h
         bs._ibd_block_buffer.pop(h, None)
-        bs.requested_blocks.pop(h, None)
-        bs._block_request_peer.pop(h, None)
-        bs._h1_last_issue.pop(h, None)
         n += 1
-        block_hash = None  # only the first call may connect a just-delivered hash
     return n
 
 
+class _FifoWire:
+    """Every getdata the node ever sent, served strictly in order."""
+
+    def __init__(self, peer: Peer, preloaded: list[bytes]):
+        self.peer = peer
+        self.queue: list[bytes] = list(preloaded)
+        self.requested_total = list(preloaded)
+        self._seen_msgs = 0
+
+    def pull(self) -> None:
+        new = self.peer.sent[self._seen_msgs:]
+        self._seen_msgs = len(self.peer.sent)
+        for m in new:
+            if getattr(m, "command", None) != "getdata":
+                continue
+            for _t, h in GetDataMessage.from_payload(m.payload).inventory:
+                self.queue.append(h)
+                self.requested_total.append(h)
+
+    def deliver(self) -> bytes | None:
+        self.pull()
+        return self.queue.pop(0) if self.queue else None
+
+
+async def _run_fifo(bs, state, wire, ticks):
+    served = 0
+    connects = 0
+    first_connect_at = None
+    for tick in range(ticks):
+        h = wire.deliver()
+        if h is None:
+            await bs._request_next_blocks()
+            continue
+        served += 1
+        # handle_block: pop request maps, buffer (a delivery we already
+        # hold or have connected is simply discarded), drain, refill.
+        bs.requested_blocks.pop(h, None)
+        bs._block_request_peer.pop(h, None)
+        bs._h1_last_issue.pop(h, None)
+        if any(h == q for q, _ in bs._validated_headers):
+            bs._ibd_block_buffer[h] = (None, b"x")
+        n = _drain(bs, state)
+        if n and first_connect_at is None:
+            first_connect_at = tick + 1
+        connects += n
+        await bs._request_next_blocks()
+    wire.pull()
+    return served, connects, first_connect_at
+
+
 @pytest.mark.asyncio
-async def test_next_inflight_delivery_is_the_connect_cursor():
-    """After one request cycle, the oldest in-flight body on the only
-    peer must be tip+1.  Pre-fix the 16 far-ahead keep older timestamps
-    so FIFO delivers them first — HOL is requested (98ac21b) but is the
-    16th delivery, which is the rate bug not the hang.
+async def test_fifo_feeder_never_serves_a_block_twice():
+    """R4 slice shape: one FIFO feeder, window already full of far-ahead,
+    HOL missing.  Every hash may be getdata'd at most once, and the feeder
+    must not serve materially more bodies than the node connects.
+
+    538c517 (evict-all-far-ahead): every delivery evicted the peer's
+    in-flight far-ahead and the tail pass re-requested them -- ~15
+    duplicate getdata per delivery.
     """
     peer = _peer()
-    bs, _state, queued = _fresh_chain(peer, TIP_HEIGHT, BUFFERED_FAR_AHEAD + 32)
-    hol = queued[0]
-    far_inflight = queued[16 : 16 + MAX_BLOCKS_IN_FLIGHT_PER_PEER]
+    n_headers = 400
+    bs, state, queued = _fresh_chain(peer, TIP_HEIGHT, n_headers)
+    far_inflight = queued[64 : 64 + MAX_BLOCKS_IN_FLIGHT_PER_PEER]
     _assign(bs, peer, far_inflight, age_s=1.0)
-    assert _load(bs, peer) == MAX_BLOCKS_IN_FLIGHT_PER_PEER
-    assert hol not in bs.requested_blocks
+    wire = _FifoWire(peer, far_inflight)
 
-    peer.sent.clear()
-    await bs._request_next_blocks()
+    served, connects, first = await _run_fifo(bs, state, wire, 300)
 
-    assert hol in bs.requested_blocks, (
-        "connect cursor was not requested — 98ac21b eventual-completion "
-        "path regressed"
+    counts = Counter(wire.requested_total)
+    dups = {h: c for h, c in counts.items() if c > 1}
+    assert not dups, (
+        f"{len(dups)} hashes getdata'd more than once (worst "
+        f"{max(dups.values())}x); served={served} connected={connects}.  "
+        "An in-flight block was re-requested without a stall timeout."
     )
-    oldest = _oldest_inflight(bs)
-    assert oldest == hol, (
-        "next FIFO delivery on the only peer is "
-        f"{queued.index(oldest) if oldest in queued else oldest!r}, not "
-        f"tip+1 (slot 0).  HOL is in-flight but behind far-ahead — that "
-        f"is the halved-throughput stall (campaign 866210, buf=725, "
-        f"in-flight 15+1).  load={_load(bs, peer)}"
+    assert connects >= 250, (
+        f"only {connects} connects for {served} deliveries (first at "
+        f"tick {first}) — the connect cursor is starved"
+    )
+    assert served <= connects + MAX_BLOCKS_IN_FLIGHT_PER_PEER + 8, (
+        f"served {served} bodies for {connects} connected"
     )
 
 
 @pytest.mark.asyncio
 async def test_connect_cursor_rate_when_only_peer_is_at_cap():
-    """32 deliveries, one per tick, no timeout rescue.
+    """16 far-ahead already on the wire, HOL missing, empty buffer.
 
-    Empty buffer so filling a hole cannot dump 725 buffered bodies and
-    masquerade as a healthy rate.  Far-ahead occupies the only peer's
-    16-slot cap.  Broken scheduler: ~1 connect per 16 deliveries
-    (far-ahead FIFO, then the hole).  Healthy: ~1 connect per delivery.
+    On a FIFO wire those 16 bodies arrive first no matter what the node
+    does; the most a scheduler can do is ask for tip+1 immediately and
+    keep the window in order afterwards.  Require: tip+1 requested in the
+    first cycle, first connect no later than the 17th delivery, then about
+    one connect per delivery, and no duplicate getdata.
     """
     peer = _peer()
-    n_headers = TICKS + MAX_BLOCKS_IN_FLIGHT_PER_PEER + 16
+    ticks = 96
+    n_headers = ticks + MAX_BLOCKS_IN_FLIGHT_PER_PEER + 64
     bs, state, queued = _fresh_chain(peer, TIP_HEIGHT, n_headers)
-    far_inflight = queued[TICKS : TICKS + MAX_BLOCKS_IN_FLIGHT_PER_PEER]
+    far_inflight = queued[32 : 32 + MAX_BLOCKS_IN_FLIGHT_PER_PEER]
     _assign(bs, peer, far_inflight, age_s=1.0)
+    wire = _FifoWire(peer, far_inflight)
 
-    connects = 0
-    first_connect_at = None
-    longest_zero = 0
-    zero_run = 0
+    await bs._request_next_blocks()
+    assert queued[0] in bs.requested_blocks, "tip+1 not requested at cap"
 
-    for tick in range(TICKS):
-        await bs._request_next_blocks()
-        delivered = _oldest_inflight(bs)
-        n_this = 0
-        if delivered is not None:
-            bs.requested_blocks.pop(delivered, None)
-            bs._block_request_peer.pop(delivered, None)
-            bs._h1_last_issue.pop(delivered, None)
-            if bs._validated_headers and bs._validated_headers[0][0] == delivered:
-                n_this = _connect_frontier(bs, state, delivered)
-            else:
-                bs._ibd_block_buffer[delivered] = (None, b"x")
-                n_this = _connect_frontier(bs, state, None)
-        if n_this:
-            connects += n_this
-            if first_connect_at is None:
-                first_connect_at = tick + 1
-            zero_run = 0
-        else:
-            zero_run += 1
-            longest_zero = max(longest_zero, zero_run)
-
-    assert first_connect_at is not None and first_connect_at <= 2, (
-        f"first connect at tick {first_connect_at} — connect cursor waited "
-        f"behind far-ahead FIFO (campaign stall is minutes of zero connects "
-        f"with bodies already buffered).  connects={connects}/{TICKS} "
-        f"longest_zero={longest_zero}"
+    served, connects, first = await _run_fifo(bs, state, wire, ticks)
+    assert first is not None and first <= MAX_BLOCKS_IN_FLIGHT_PER_PEER + 1, (
+        f"first connect at delivery {first}; tip+1 should be right behind "
+        "the bodies that were already on the wire"
     )
-    assert longest_zero <= 2, (
-        f"longest zero-connect run is {longest_zero} ticks; the live "
-        f"defect was multi-minute stalls, not a hang.  connects="
-        f"{connects}/{TICKS} first={first_connect_at}"
+    assert connects >= ticks - MAX_BLOCKS_IN_FLIGHT_PER_PEER - 8, (
+        f"connects={connects}/{ticks} deliveries (first={first})"
     )
-    assert connects >= MIN_CONNECT_RATE, (
-        f"connect rate {connects}/{TICKS} blk/tick is the halved-"
-        f"throughput defect (healthy ≈{TICKS}; 98ac21b eventual-"
-        f"completion tests pass on this).  first_connect={first_connect_at} "
-        f"longest_zero={longest_zero}"
-    )
+    dups = [h for h, c in Counter(wire.requested_total).items() if c > 1]
+    assert not dups, f"{len(dups)} duplicate getdata"
 
 
 @pytest.mark.asyncio
 async def test_campaign_buffer_shape_does_not_stall_the_cursor():
     """The 866210 shape: 725 buffered far-ahead, 16 far in-flight, HOL
-    missing.  Eventual completion is free once the hole fills — those
-    725 drain in one go — so total-connects is the wrong metric.  The
-    next FIFO delivery after one request cycle must be tip+1, and the
-    first 8 ticks must not be a zero-connect stall.
+    missing.  tip+1 is requested in the first cycle; once the bodies
+    already on the wire are through, the hole fills and the 725 buffered
+    bodies drain.  No block is requested twice.
     """
     peer = _peer()
     bs, state, queued = _fresh_chain(
-        peer, TIP_HEIGHT, BUFFERED_FAR_AHEAD + MAX_BLOCKS_IN_FLIGHT_PER_PEER + 16
+        peer, TIP_HEIGHT, BUFFERED_FAR_AHEAD + MAX_BLOCKS_IN_FLIGHT_PER_PEER + 64
     )
     hol = queued[0]
     for h in queued[8 : 8 + BUFFERED_FAR_AHEAD]:
@@ -427,44 +434,16 @@ async def test_campaign_buffer_shape_does_not_stall_the_cursor():
         8 + BUFFERED_FAR_AHEAD : 8 + BUFFERED_FAR_AHEAD + MAX_BLOCKS_IN_FLIGHT_PER_PEER
     ]
     _assign(bs, peer, far_inflight, age_s=1.0)
+    wire = _FifoWire(peer, far_inflight)
 
     await bs._request_next_blocks()
-    oldest = _oldest_inflight(bs)
-    assert oldest == hol, (
-        "campaign shape: 725 buffered, peer at cap, next FIFO delivery "
-        f"is slot {queued.index(oldest) if oldest in queued else oldest!r} "
-        f"not tip+1 — HOL waits behind far-ahead (6 min of zero connects)"
-    )
+    assert hol in bs.requested_blocks, "tip+1 deferred in the campaign shape"
 
-    connects = 0
-    longest_zero = 0
-    zero_run = 0
-    for _tick in range(8):
-        await bs._request_next_blocks()
-        delivered = _oldest_inflight(bs)
-        n_this = 0
-        if delivered is not None:
-            bs.requested_blocks.pop(delivered, None)
-            bs._block_request_peer.pop(delivered, None)
-            bs._h1_last_issue.pop(delivered, None)
-            if bs._validated_headers and bs._validated_headers[0][0] == delivered:
-                n_this = _connect_frontier(bs, state, delivered)
-            else:
-                bs._ibd_block_buffer[delivered] = (None, b"x")
-                n_this = _connect_frontier(bs, state, None)
-        if n_this:
-            connects += n_this
-            zero_run = 0
-        else:
-            zero_run += 1
-            longest_zero = max(longest_zero, zero_run)
-
-    assert longest_zero == 0, (
-        f"campaign shape stalled {longest_zero} ticks before the hole "
-        f"moved; live was ≥6 min of zero connects at 866210.  "
-        f"connects={connects}"
+    served, connects, first = await _run_fifo(
+        bs, state, wire, MAX_BLOCKS_IN_FLIGHT_PER_PEER + 16
     )
-    assert connects >= 8, (
-        f"first 8 deliveries connected {connects} blocks; healthy is 8 "
-        f"(then the 725 buffered bodies drain).  longest_zero={longest_zero}"
+    assert connects >= BUFFERED_FAR_AHEAD, (
+        f"hole never filled: connects={connects} served={served} first={first}"
     )
+    dups = [h for h, c in Counter(wire.requested_total).items() if c > 1]
+    assert not dups, f"{len(dups)} duplicate getdata in the campaign shape"
