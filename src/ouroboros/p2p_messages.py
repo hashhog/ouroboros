@@ -491,9 +491,17 @@ class TxMessage:
         return NetworkMessage(command="tx", payload=payload, magic=get_magic(network))
 
     @classmethod
-    def from_payload(cls, payload: bytes) -> TxMessage:
+    def from_payload(cls, payload: bytes, start: int = 0) -> TxMessage:
         """
         Deserialize transaction message from payload.
+
+        *start* parses the transaction beginning at ``payload[start]`` without
+        copying the tail: ``Block.deserialize`` used to pass
+        ``data[offset:]`` for every tx, re-copying the rest of the block once
+        per transaction (quadratic in block size).  Every bounds check below
+        compares an absolute offset with ``len(payload)``, so parsing at
+        *start* is byte-for-byte the parse of ``payload[start:]``;
+        ``bytes_consumed`` stays relative to *start*.
 
         Format:
         - version (4 bytes, little-endian)
@@ -513,14 +521,14 @@ class TxMessage:
         """
         from ouroboros.database import Transaction, TxIn, TxOut
 
-        offset = 0
+        offset = start
 
         # Parse version (4 bytes).  Core treats CTransaction::version as a
         # uint32_t on the wire (primitives/transaction.h), so read it
         # UNSIGNED and keep it consistent with serialize() — otherwise a
         # negative version (e.g. 0xFFFFFFFF) round-trips to -1 and crashes
         # the unsigned serializer used to compute the txid below.
-        if len(payload) < 4:
+        if len(payload) < start + 4:
             raise ValueError("Payload too short for version")
         version = int.from_bytes(payload[offset:offset+4], byteorder='little', signed=False)
         offset += 4
@@ -530,6 +538,9 @@ class TxMessage:
         if len(payload) > offset + 2 and payload[offset] == 0x00 and payload[offset+1] == 0x01:
             has_witness = True
             offset += 2
+        # Start of the vin/vout section: the part of the stripped (txid)
+        # serialization that sits between nVersion and nLockTime.
+        body_start = offset
 
         # Parse inputs count (varint)
         if len(payload) <= offset:
@@ -606,6 +617,8 @@ class TxMessage:
                 script_pubkey=script_pubkey
             ))
 
+        body_end = offset
+
         # Parse witness data if present (for SegWit transactions)
         if has_witness:
             for i in range(inputs_count):
@@ -654,17 +667,25 @@ class TxMessage:
             has_witness=has_witness,
         )
 
-        # Calculate actual txid from transaction
-        # Transaction ID is double SHA256 of the non-witness serialization
+        # txid = SHA256d of the non-witness serialization.  Hash the wire bytes
+        # it consists of — nVersion, the vin/vout section, nLockTime — instead
+        # of re-serializing the parsed tx.  Identical bytes: every field is
+        # copied or read as the same fixed-width unsigned integer that
+        # serialize() writes back, and decode_varint rejects non-canonical
+        # CompactSizes, so re-encoding a count always reproduces the wire
+        # bytes.  (A segwit tx's stripped form just omits marker/flag and the
+        # witness section, which lie outside these three ranges.)
         import hashlib
-        tx_bytes = transaction.serialize()
-        txid = hashlib.sha256(hashlib.sha256(tx_bytes).digest()).digest()
-        transaction.txid = txid
+        h = hashlib.sha256()
+        h.update(payload[start:start + 4])
+        h.update(payload[body_start:body_end])
+        h.update(payload[offset - 4:offset])
+        transaction.txid = hashlib.sha256(h.digest()).digest()
 
         # Store the wire-format byte count so callers (like Block.deserialize)
         # can advance their offset correctly past witness data.
         result = cls(transaction=transaction)
-        result.bytes_consumed = offset
+        result.bytes_consumed = offset - start
         return result
 
 

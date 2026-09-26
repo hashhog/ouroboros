@@ -800,6 +800,30 @@ class BlockValidator:
         # bytes are pruned).  May be None for unit tests.
         self.snapshot_manager = snapshot_manager
 
+    def _lookup_header_block(self, block_hash: bytes) -> "Block | None":
+        """Stored block *block_hash* for a HEADER-ONLY read (bits / time / prev).
+
+        The prev-block consumers in this validator read header fields only, so
+        a real ``BlockchainDatabase`` answers from ``get_block_header`` — same
+        None-iff-not-stored contract and same header fields as ``get_block``,
+        without deserializing the whole parent block into Python objects on
+        every connect (Core reads these from ``CBlockIndex``).  Test doubles,
+        and a real DB whose ``get_block`` a test has patched on the instance,
+        keep going through ``get_block`` so they stay in control of the lookup
+        (the class-identity test also sends spec'd mocks and subclasses that
+        override ``get_block`` down that path).
+        """
+        db = self.db
+        cls = type(db)
+        if (
+            getattr(cls, "get_block", None) is BlockchainDatabase.get_block
+            and getattr(cls, "get_block_header", None)
+            is BlockchainDatabase.get_block_header
+            and "get_block" not in getattr(db, "__dict__", {})
+        ):
+            return db.get_block_header(block_hash)
+        return db.get_block(block_hash)
+
     def _synthesize_snapshot_prev_block(
         self, prev_blockhash: bytes
     ) -> "Block | None":
@@ -1097,7 +1121,7 @@ class BlockValidator:
         # CBlockIndex from the header sync that runs before snapshot
         # load -- the full block bytes are not required for the
         # prev-link header check.
-        prev_block = self.db.get_block(block.prev_blockhash)
+        prev_block = self._lookup_header_block(block.prev_blockhash)
         if not prev_block:
             prev_block = self._synthesize_snapshot_prev_block(block.prev_blockhash)
         if not prev_block:
@@ -1357,6 +1381,8 @@ class BlockValidator:
         use_native_queue = NATIVE_SCRIPT_ENABLED and not skip_scripts
         script_threads = resolve_script_check_threads() if use_native_queue else 1
         script_check_queue: list | None = [] if use_native_queue else None
+        # Coin-MTP memo for BIP68 time locks, shared by every tx of this block.
+        bip68_mtp_cache: dict[int, int | None] = {}
         for i, tx in enumerate(block.transactions):
             # IsFinalTx check applies to ALL transactions including coinbase.
             # Ref: Bitcoin Core validation.cpp:4144-4148 — iterates block.vtx
@@ -1389,6 +1415,7 @@ class BlockValidator:
                     fees_out=tx_fees,
                     script_check_queue=script_check_queue,
                     block_tx_index=i,
+                    mtp_cache=bip68_mtp_cache,
                 )
                 if not valid:
                     return False, f"Transaction {i} invalid: {error}"
@@ -1727,7 +1754,7 @@ class BlockValidator:
                     else:
                         # Core walks ``pindex = pindex->pprev`` (pow.cpp:33);
                         # the by-hash read is the same pointer hop.
-                        pindex = self.db.get_block(pindex.prev_blockhash)
+                        pindex = self._lookup_header_block(pindex.prev_blockhash)
                     walk_height -= 1
                 if pindex:
                     return pindex.bits, DIFFBITS_OK
@@ -2633,6 +2660,7 @@ class TransactionValidator:
         extra_script_flags: int = 0,
         script_check_queue: list | None = None,
         block_tx_index: int = 0,
+        mtp_cache: dict | None = None,
     ) -> tuple[bool, str]:
         """Validate *tx* at *height* (structure, inputs, locktime, scripts); returns ``(ok, error_message)``.
 
@@ -2790,7 +2818,11 @@ class TransactionValidator:
             return False, "bad-txns-fee-outofrange"
 
         # 5. BIP 68 relative lock-time
-        if not self.check_sequence_locks(tx, height, block_mtp, network=self.network, intra_block_utxos=intra_block_utxos):
+        if not self.check_sequence_locks(
+            tx, height, block_mtp, network=self.network,
+            intra_block_utxos=intra_block_utxos,
+            input_utxos=input_utxos, mtp_cache=mtp_cache,
+        ):
             return False, "BIP 68 sequence lock not satisfied"
 
         # Phase 1.2: surface the fee to the caller so block-validate doesn't
@@ -3214,6 +3246,8 @@ class TransactionValidator:
         self, tx: Transaction, block_height: int, block_mtp: int,
         network: str = "mainnet",
         intra_block_utxos: dict | None = None,
+        input_utxos: list | None = None,
+        mtp_cache: dict | None = None,
     ) -> bool:
         """
         BIP 68: verify relative lock-time constraints on every input.
@@ -3234,6 +3268,23 @@ class TransactionValidator:
         snapshot loader does not import the prior 11 headers needed for
         MTP computation.  See ``_log_bip68_stopgap_skip``.  Long-term
         fix is Option 1 (backwards-header-sync after snapshot load).
+
+        *input_utxos*: the coins ``validate_transaction`` already resolved for
+        ``tx.inputs`` (same order; DB first, then the intra-block view — the
+        identical lookup this method would otherwise repeat per input over
+        FFI).  Core likewise evaluates the lock from the coins view it already
+        holds (``CalculateSequenceLocks`` over ``prevHeights`` built from the
+        same ``CCoinsViewCache``).
+
+        *mtp_cache*: optional ``{height: mtp}`` memo shared by every tx of one
+        block (the chain below the block does not move while it validates).
+
+        Coin MTP is read ONLY for inputs whose lock is enforced AND time-based.
+        ``CalculateSequenceLocks`` (Core consensus/tx_verify.cpp:39-104, and
+        the Rust ``calculate_sequence_locks`` this calls) skips DISABLE-flag
+        inputs entirely and never reads ``prev_median_time`` for height-based
+        ones, so the value handed over for those is unused; passing 0 instead
+        of an 11-block MTP computation per input is verdict-identical.
         """
         # BIP68 only applies to version 2+ transactions (compared unsigned).
         if not bip68_version_active(tx.version):
@@ -3259,10 +3310,17 @@ class TransactionValidator:
         # Build input info for Rust: list of (sequence, prev_height, prev_median_time)
         input_infos = []
         stopgap_enabled = self._bip68_stopgap_enabled()
-        for inp in tx.inputs:
-            utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
-            if utxo is None and intra_block_utxos:
-                utxo = intra_block_utxos.get((inp.prev_txid, inp.prev_vout))
+        if mtp_cache is None:
+            mtp_cache = {}
+        if input_utxos is not None and len(input_utxos) != len(tx.inputs):
+            input_utxos = None  # misaligned hint: fall back to the lookups
+        for idx, inp in enumerate(tx.inputs):
+            if input_utxos is not None:
+                utxo = input_utxos[idx]
+            else:
+                utxo = self.db.get_utxo(inp.prev_txid, inp.prev_vout)
+                if utxo is None and intra_block_utxos:
+                    utxo = intra_block_utxos.get((inp.prev_txid, inp.prev_vout))
             if utxo is None:
                 return False
 
@@ -3301,11 +3359,24 @@ class TransactionValidator:
             # (coin time is MTP of block at height-1)
             # Ref: Bitcoin Core consensus/tx_verify.cpp:74
             #   nCoinTime = block.GetAncestor(max(nCoinHeight-1, 0))->GetMedianTimePast()
-            utxo_mtp = self.db.get_median_time_past(max(utxo_height - 1, 0))
+            #
+            # Only an enforced TIME lock reads the coin MTP (see docstring):
+            # DISABLE-flag inputs are skipped and height locks read only
+            # prev_height, so they get 0 without computing an MTP.
+            seq = inp.sequence
+            if (seq & self.SEQUENCE_DISABLE) or not (seq & self.SEQUENCE_TYPE):
+                input_infos.append((seq, utxo_height, 0))
+                continue
+            coin_mtp_height = max(utxo_height - 1, 0)
+            if coin_mtp_height in mtp_cache:
+                utxo_mtp = mtp_cache[coin_mtp_height]
+            else:
+                utxo_mtp = self.db.get_median_time_past(coin_mtp_height)
+                mtp_cache[coin_mtp_height] = utxo_mtp
             if utxo_mtp is None:
                 utxo_mtp = 0  # Fallback
 
-            input_infos.append((inp.sequence, utxo_height, utxo_mtp))
+            input_infos.append((seq, utxo_height, utxo_mtp))
 
         # Use Rust implementation if available
         try:

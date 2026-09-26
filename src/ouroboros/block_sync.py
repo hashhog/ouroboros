@@ -620,6 +620,21 @@ class BlockSync:
         # satisfied. Populated lazily by _maybe_start_header_backfill.
         self._header_backfill = None
         self._backfill_done: bool = False
+        # One backfill getheaders in flight at a time (Core MaybeSendGetHeaders
+        # / HEADERS_RESPONSE_TIME, net_processing.cpp:2823-2835).  sync_loop
+        # used to re-send the SAME locator every 1 s tick; a replay peer that
+        # is busy streaming blocks answers each one, and every duplicate reply
+        # after the first no longer continued the walk, fell through to the
+        # tip-anchored path and was scored as "does not connect" (825 dropped
+        # 2,000-header batches in 20 min on the 650000 R4 slice, ~17% CPU).
+        self._backfill_req_locator: list[bytes] | None = None
+        self._backfill_req_time: float = 0.0
+        self._backfill_req_peer = None
+        # Locator anchors of backfill getheaders we sent (bounded).  A reply
+        # whose first header builds on one of them answers OUR backfill
+        # request; if the walk has moved past it, it is a stale duplicate and
+        # is dropped here instead of being treated as an unconnecting batch.
+        self._backfill_sent_anchors: deque[bytes] = deque(maxlen=64)
 
         # Per-peer counter of consecutive unconnecting-headers messages.
         # Mirrors Bitcoin Core's ``nUnconnectingHeaders`` accounting in
@@ -1503,6 +1518,37 @@ class BlockSync:
         if new_count:
             logger.info(f"Registered block_sync handlers for {new_count} new peers (total: {len(self._peer_handlers)})")
 
+    def _check_tip_parent_height(self, best_hash: bytes, best_height) -> bool:
+        """True unless the index says the tip's parent is not at tip-1.
+
+        Header-index only (no block bodies): the tip header comes from
+        ``db.get_block_header`` (served from the connect-time header cache),
+        heights from the hash-keyed block index.  Any lookup that cannot be
+        answered is "no evidence", not an anomaly.
+        """
+        get_header = getattr(self.db, "get_block_header", None)
+        get_height = getattr(self.db, "get_block_height_by_hash", None)
+        if get_header is None or get_height is None or not best_height:
+            return True
+        try:
+            tip = get_header(best_hash)
+            if tip is None:
+                return True
+            prev_height = get_height(tip.prev_blockhash)
+            if not isinstance(prev_height, int) or not isinstance(best_height, int):
+                return True
+        except Exception:
+            return True
+        if prev_height >= best_height - 1:
+            return True
+        logger.warning(
+            f"Tip/parent height mismatch in the block index: tip "
+            f"{best_hash[::-1].hex()[:16]}... at height {best_height}, parent "
+            f"{bytes(tip.prev_blockhash)[::-1].hex()[:16]}... at height "
+            f"{prev_height}"
+        )
+        return False
+
     async def sync_loop(self):
         """Main synchronization loop"""
         while self.running:
@@ -1523,30 +1569,29 @@ class BlockSync:
                 # Check if we're behind
                 best_hash, best_height = self.db.get_best_block()
 
-                # Detect reorgs.  Off-load the two full-block FFI
-                # deserializes so a tip flip in the sync_loop tick does
-                # not stall the event loop for the ~1-2 ms × block_size
-                # PyO3 round-trip — the sync_loop sleeps only 1 s between
-                # ticks during IBD, so even one stalled tick visibly
-                # extends the RPC latency tail.
+                # Tip-parent consistency probe (header index only).
+                #
+                # This used to read the FULL tip block and its FULL parent out
+                # of BLOCKS_CF and convert both to Python Blocks on every tick
+                # where the tip moved — i.e. on nearly every tick of IBD — only
+                # to compare ``prev_block.height`` with the tip height.  That
+                # comparison could never fire: ``db.get_block`` returns
+                # ``height=None`` (PyBlock carries no height), so the
+                # ``prev_block.height and ...`` guard was always False and
+                # ``_handle_reorg`` was unreachable from here; real reorgs are
+                # driven by the headers / block paths.  It was pure cost —
+                # two multi-MB reads + two PyO3 conversions per tick (~10% of
+                # a scripts-on R4 slice's CPU).
+                #
+                # What remains is the question it meant to ask, answered the
+                # way Core does (CBlockIndex: pprev->nHeight == nHeight - 1)
+                # from the header cache and the hash-keyed height index, with
+                # no block-body read.  A violation is logged loudly; it does
+                # not re-drive a reorg, since the old path never did either.
                 if self.last_best_hash and self.last_best_hash != best_hash:
-                    # Check if this is a reorg
-                    current_block = await asyncio.to_thread(
-                        self.db.get_block, best_hash,
+                    await asyncio.to_thread(
+                        self._check_tip_parent_height, best_hash, best_height,
                     )
-                    if current_block:
-                        prev_block = await asyncio.to_thread(
-                            self.db.get_block, current_block.prev_blockhash,
-                        )
-                        if prev_block and prev_block.height and best_height:
-                            if prev_block.height < best_height - 1:
-                                logger.warning(
-                                    f"Possible reorg detected: height {best_height}, "
-                                    f"prev height {prev_block.height}"
-                                )
-                                # Get the block that's causing the reorg
-                                # For now, use the best block as the new tip
-                                await self._handle_reorg(prev_block, best_hash)
 
                 self.last_best_hash = best_hash
 
@@ -4405,7 +4450,7 @@ class BlockSync:
             # unconnecting and discard them. Route them to the backfill FIRST;
             # `wants()` is non-mutating so an ordinary sync batch falls through
             # untouched.
-            if self._header_backfill is not None:
+            if self._header_backfill is not None or self._backfill_sent_anchors:
                 raw_headers = [h.serialize() for h in headers_msg.headers]
                 if await self._consume_backfill_headers(raw_headers, peer):
                     return
@@ -6695,11 +6740,37 @@ class BlockSync:
             start_height, end_height - 1, end_height - start_height,
         )
 
+    # Core HEADERS_RESPONSE_TIME (net_processing.cpp:100): how long a sent
+    # getheaders counts as in flight before the same request may be re-sent.
+    _BACKFILL_RESPONSE_TIME = 120.0
+
     async def _request_backfill_headers(self, peer=None) -> None:
-        """Send the getheaders that advances the backfill walk."""
+        """Send the getheaders that advances the backfill walk.
+
+        At most one request per walk position is in flight (Core
+        MaybeSendGetHeaders).  The sync_loop tick calls this every second; it
+        only re-sends the same locator once ``_BACKFILL_RESPONSE_TIME`` has
+        passed without progress or the peer it went to is gone.  A new
+        position (the walk advanced) always goes out immediately.
+        """
         bf = self._header_backfill
         if bf is None or bf.is_complete():
             return
+        try:
+            locator = bf.start_locator()
+        except Exception as exc:
+            logger.debug("header backfill: no locator: %s", exc)
+            return
+        if locator == self._backfill_req_locator:
+            prev_peer = self._backfill_req_peer
+            prev_alive = prev_peer is not None and (
+                not hasattr(prev_peer, "is_connected") or prev_peer.is_connected()
+            )
+            if (
+                prev_alive
+                and time.time() - self._backfill_req_time < self._BACKFILL_RESPONSE_TIME
+            ):
+                return  # the same request is still in flight
         if peer is None:
             peers = self.peer_manager.get_all_ready_peers()
             if not peers:
@@ -6708,13 +6779,28 @@ class BlockSync:
         try:
             getheaders = GetHeadersMessage(
                 version=70015,
-                locator_hashes=bf.start_locator(),
+                locator_hashes=locator,
                 hash_stop=b"\x00" * 32,
             )
             network = getattr(self.peer_manager, "network", "mainnet")
             await peer.send_message(getheaders.to_network_message(network))
         except Exception as exc:
             logger.debug("header backfill: getheaders send failed: %s", exc)
+            return
+        self._backfill_req_locator = list(locator)
+        self._backfill_req_time = time.time()
+        self._backfill_req_peer = peer
+        if locator and locator[0] not in self._backfill_sent_anchors:
+            self._backfill_sent_anchors.append(bytes(locator[0]))
+
+    def _is_stale_backfill_reply(self, raw_headers: list[bytes]) -> bool:
+        """True iff this batch answers a backfill getheaders we already moved past."""
+        if not raw_headers or not self._backfill_sent_anchors:
+            return False
+        first = raw_headers[0]
+        if len(first) < 36:
+            return False
+        return bytes(first[4:36]) in self._backfill_sent_anchors
 
     async def _consume_backfill_headers(self, raw_headers: list[bytes], peer) -> bool:
         """Route a below-floor batch into the backfill. True if consumed.
@@ -6724,6 +6810,16 @@ class BlockSync:
         """
         bf = self._header_backfill
         if bf is None or not bf.wants(raw_headers):
+            if self._is_stale_backfill_reply(raw_headers):
+                # A duplicate answer to a backfill locator the walk has
+                # already advanced past (or completed).  It is ours, not an
+                # unconnecting tip batch: drop it without scoring the peer.
+                logger.debug(
+                    "header backfill: dropping stale duplicate reply "
+                    "(%d headers) from %s", len(raw_headers),
+                    getattr(peer, "host", "?"),
+                )
+                return True
             return False
         try:
             bf.accept(raw_headers)

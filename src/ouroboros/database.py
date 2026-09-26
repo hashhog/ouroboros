@@ -19,6 +19,15 @@ import sync  # Rust extension module (required)
 # at tip — contributing to the at-tip RSS climb.
 _CHAINWORK_CACHE_MAX = 5_000
 
+# Bound on the recently-connected header cache (hash -> 80-byte header).  The
+# only hot consumer is the next block's prev-header lookup, which needs the
+# block connected immediately before it; a small window also covers a short
+# re-request / out-of-order connect.  Entries are immutable facts (a block hash
+# commits to its header), so the cache can never serve a wrong header — only
+# block PRESENCE is time-varying, and that is always re-checked against
+# BLOCKS_CF (see get_block_header).
+_HEADER_CACHE_MAX = 64
+
 
 @dataclass
 class Block:
@@ -148,10 +157,11 @@ class Block:
             # Store offset before parsing this transaction
             tx_start_offset = offset
 
-            # Parse transaction using TxMessage.from_payload
-            tx_data = data[offset:]
+            # Parse transaction using TxMessage.from_payload, in place at
+            # `offset` (no data[offset:] tail copy per tx — that made block
+            # parsing quadratic in block size).
             try:
-                tx_msg = TxMessage.from_payload(tx_data)
+                tx_msg = TxMessage.from_payload(data, offset)
                 tx = tx_msg.transaction
 
                 # Use the exact byte count consumed by the parser (including
@@ -227,8 +237,10 @@ class Transaction:
         This is a simplified serialization for size estimation.
         For full Bitcoin protocol serialization, use the Rust layer.
         """
-        # Version (4 bytes)
-        data = self.version.to_bytes(4, 'little')
+        # Version (4 bytes).  A bytearray, not bytes: ``bytes +=`` copies the
+        # whole prefix on every append (quadratic in tx size, and this runs
+        # several times per tx per block); the returned bytes are identical.
+        data = bytearray(self.version.to_bytes(4, 'little'))
 
         # Input count (varint)
         data += self._encode_varint(len(self.inputs))
@@ -253,7 +265,7 @@ class Transaction:
         # Locktime (4 bytes)
         data += self.locktime.to_bytes(4, 'little')
 
-        return data
+        return bytes(data)
 
     def serialize_with_witness(self) -> bytes:
         """
@@ -393,6 +405,10 @@ class BlockchainDatabase:
         # block for the entire chain.  Persisted Rust metadata is always
         # preferred (get_block_chainwork checks that path first).
         self._chainwork_cache: OrderedDict[bytes, int] = OrderedDict()
+        # Headers of recently connected blocks, keyed by block hash.  Serves
+        # get_block_header() without a full-block BLOCKS_CF read + PyO3
+        # conversion.  Bounded by _HEADER_CACHE_MAX (oldest evicted).
+        self._header_cache: OrderedDict[bytes, bytes] = OrderedDict()
         try:
             self._cached_tip = self.get_best_block()
         except Exception:
@@ -408,6 +424,95 @@ class BlockchainDatabase:
             return None
 
         return self._py_block_to_block(py_block)
+
+    def _remember_header(self, header: bytes) -> None:
+        """Cache an 80-byte header under its own double-SHA256 hash."""
+        header = bytes(header[:80])
+        if len(header) != 80:
+            return
+        block_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()
+        cache = self._header_cache
+        cache.pop(block_hash, None)
+        cache[block_hash] = header
+        while len(cache) > _HEADER_CACHE_MAX:
+            cache.popitem(last=False)
+
+    def get_block_header(self, block_hash: bytes) -> Block | None:
+        """Header-only view of a STORED block: ``transactions=[]``, ``height=None``.
+
+        Same presence contract as :meth:`get_block` — returns None exactly
+        when ``get_block`` would (no body in BLOCKS_CF) — and the same header
+        fields: ``hash`` is the double-SHA256 of the 80-byte header, exactly
+        what ``PyBlock.hash`` computes, and ``height`` is None because PyBlock
+        carries no height either.  What it avoids is the cost: ``get_block``
+        deserializes the whole block in Rust and then builds a Python object
+        per tx / input / output (``_py_block_to_block``) only for the caller
+        to read ``bits`` / ``timestamp`` / ``prev_blockhash``.  Bitcoin Core
+        answers the same question from ``CBlockIndex`` without touching the
+        block file.
+
+        Source order: the recently-connected header cache (filled by
+        ``connect_block_from_bytes``; a hit costs one pinned existence probe),
+        then the stored block's raw bytes (Rust-side only, no per-tx Python
+        objects), then — for an extension lacking ``get_block_bytes`` — the
+        full ``get_block``.
+        """
+        if len(block_hash) != 32:
+            raise ValueError("Block hash must be 32 bytes")
+        block_hash = bytes(block_hash)
+
+        header = (
+            self._header_cache.get(block_hash)
+            if hasattr(self._db, "has_block_hash") else None
+        )
+        if header is not None:
+            # Presence is the only time-varying fact; re-check it so a pruned
+            # body answers None exactly as get_block would.
+            if not self._db.has_block_hash(block_hash):
+                return None
+        else:
+            if not hasattr(self._db, "get_block_bytes"):
+                full = self.get_block(block_hash)
+                if full is None:
+                    return None
+                full.transactions = []
+                return full
+            raw = self._db.get_block_bytes(block_hash)
+            if raw is None:
+                return None
+            header = bytes(raw[:80])
+            if len(header) != 80:
+                return None
+
+        return Block(
+            version=int.from_bytes(header[0:4], "little", signed=True),
+            prev_blockhash=header[4:36],
+            merkle_root=header[36:68],
+            timestamp=int.from_bytes(header[68:72], "little"),
+            bits=int.from_bytes(header[72:76], "little"),
+            nonce=int.from_bytes(header[76:80], "little"),
+            transactions=[],
+            hash=hashlib.sha256(hashlib.sha256(header).digest()).digest(),
+            height=None,
+        )
+
+    def get_block_height_by_hash(self, block_hash: bytes) -> int | None:
+        """Height of any known block (active chain or fork) from the hash index.
+
+        O(1) point read of BLOCK_INDEX_BY_HASH_CF metadata — Core's
+        ``LookupBlockIndex(hash)->nHeight`` — with no block-body read.
+        Returns None when the hash is unknown or the extension predates the
+        hash-keyed index.
+        """
+        if len(block_hash) != 32:
+            raise ValueError("Block hash must be 32 bytes")
+        fn = getattr(self._db, "get_block_metadata_by_hash", None)
+        if fn is None:
+            return None
+        meta = fn(bytes(block_hash))
+        if meta is None:
+            return None
+        return int(meta[0])
 
     def has_block_hash(self, block_hash: bytes) -> bool:
         """Return True if *block_hash* is present in the block store.
@@ -1156,6 +1261,11 @@ class BlockchainDatabase:
         # Invalidate cache so next get_best_block() re-reads from Rust.
         # We don't know the hash here without parsing, so just invalidate.
         self._cached_tip = None
+
+        # The next block's prev-header lookup (validate_block) reads this
+        # header; keep it so that lookup needs no full-block read.
+        if len(block_bytes) >= 80:
+            self._remember_header(block_bytes[:80])
 
         # Extract header-level fields from the raw block bytes so that
         # RPC handlers can serve them without a full-block FFI round-trip.
