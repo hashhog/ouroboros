@@ -1047,18 +1047,11 @@ def test_w138_g29_rust_assumeutxo_data_matches_core() -> None:
     )
 
 
-@pytest.mark.xfail(
-    reason="W138 BUG-20b (P0-CVE-class): "
-    "`PyBlockchainDB::import_core_snapshot` "
-    "(`lib.rs:4679-4881`) is the operator-facing fast path. It "
-    "validates ONLY snapshot magic + version + (optional) network "
-    "magic. Skips: per-coin `coin_height > base_height`, "
-    "MoneyRange, trailing-bytes-after-coins, HASH_SERIALIZED "
-    "commitment. An operator running "
-    "`ouroboros import-snapshot` against a malicious file gets "
-    "their chainstate poisoned with no warning.",
-    strict=True,
-)
+# W138 BUG-20b (P0-CVE-class) — FIXED: `import_core_snapshot` used to check
+# only magic/version/network before writing coins. It now enforces Core's
+# PopulateAndValidateSnapshot per-coin bounds, the left-over-bytes check and
+# the HASH_SERIALIZED commitment, and verifies all of it before the chainstate
+# is touched.
 def test_w138_g29_import_core_snapshot_enforces_per_coin_bounds() -> None:
     """G29 (BUG-20b): import_core_snapshot must enforce the same
     per-coin bounds as the Python loader.

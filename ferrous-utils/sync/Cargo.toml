@@ -25,6 +25,7 @@ primitive-types = { version = "0.13", features = ["serde"] }
 rand = "0.8"
 siphasher = "1.0"
 hex = "0.4"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempdir = "0.3"

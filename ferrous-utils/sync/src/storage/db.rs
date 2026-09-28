@@ -850,6 +850,94 @@ impl BlockchainDB {
         Ok(())
     }
 
+    /// Filesystem directory of the underlying RocksDB instance.
+    pub fn path(&self) -> std::path::PathBuf {
+        self.db.path().to_path_buf()
+    }
+
+    /// Column-family options used to build CHAINSTATE_CF SST files outside
+    /// the DB for bulk ingestion (same compression / filter / index layout the
+    /// CF itself writes, so an ingested file is indistinguishable from a
+    /// compaction output).
+    pub fn chainstate_sst_options() -> Options {
+        create_cf_options(CHAINSTATE_CF)
+    }
+
+    /// True when CHAINSTATE_CF holds no SST files, no memtable entries and no
+    /// visible key — i.e. a fresh datadir. Lets a bulk import skip the clear
+    /// (whose flush + compaction would cost two fsyncs for nothing).
+    fn chainstate_cf_is_pristine(&self) -> Result<bool> {
+        let cf = self.db.cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+        if self.db.live_files()?.iter().any(|f| f.column_family_name == CHAINSTATE_CF) {
+            return Ok(false);
+        }
+        for prop in [
+            "rocksdb.num-entries-active-mem-table",
+            "rocksdb.num-entries-imm-mem-tables",
+            "rocksdb.num-deletes-active-mem-table",
+            "rocksdb.num-deletes-imm-mem-tables",
+        ] {
+            if self.db.property_int_value_cf(cf, prop)?.unwrap_or(0) != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(self.db.iterator_cf(cf, IteratorMode::Start).next().is_none())
+    }
+
+    /// Replace the whole UTXO set with pre-built SST files and set the tip.
+    ///
+    /// `files` must be sorted, internally strictly increasing, and mutually
+    /// non-overlapping (the Core snapshot's canonical (txid, vout) order gives
+    /// exactly that). Crash safety reuses the FIX-D snapshot-load protocol:
+    ///
+    ///   1. `SNAPSHOT_LOAD_IN_PROGRESS` marker is written FIRST;
+    ///   2. the old chainstate is emptied (skipped on a pristine CF; otherwise
+    ///      whole files are dropped, the rest range-deleted and compacted away
+    ///      so the ingested files land in the bottommost level instead of on
+    ///      top of a tombstone in L0);
+    ///   3. the files are ingested (moved/hard-linked, fsynced by RocksDB);
+    ///   4. ONE synced WriteBatch sets the tip and deletes the marker.
+    ///
+    /// A crash anywhere before (4) leaves the marker, and the next open's
+    /// `recover_from_crash` clears the chainstate and resets the tip — the
+    /// same incomplete-import detection `loadtxoutset` already relies on.
+    pub fn replace_chainstate_with_ssts(
+        &self,
+        files: &[std::path::PathBuf],
+        base_blockhash: &[u8; 32],
+        base_height: u32,
+    ) -> Result<()> {
+        self.write_snapshot_load_marker(base_blockhash, base_height)?;
+
+        let cf = self.db.cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+        if !self.chainstate_cf_is_pristine()? {
+            let start = [0u8; 36];
+            let end = [0xFFu8; 37];
+            self.db.delete_file_in_range_cf(cf, &start[..], &end[..])?;
+            self.clear_chainstate()?;
+            self.db.flush_cf(cf)?;
+            self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+        }
+
+        if !files.is_empty() {
+            let mut io = rocksdb::IngestExternalFileOptions::default();
+            io.set_move_files(true);
+            self.db.ingest_external_file_cf_opts(cf, &io, files.to_vec())?;
+        }
+        self.clear_utxo_read_cache();
+
+        let mut batch = WriteBatch::default();
+        self.update_best_block_batch(&mut batch, base_blockhash, base_height)?;
+        self.delete_snapshot_load_marker_batch(&mut batch)?;
+        let mut wo = rocksdb::WriteOptions::default();
+        wo.set_sync(true);
+        self.db.write_opt(batch, &wo)?;
+        self.clear_utxo_read_cache();
+        Ok(())
+    }
+
     /// Walk every entry in `CHAINSTATE_CF` and delete any whose
     /// `script_pubkey` is provably unspendable (OP_RETURN / oversize) per
     /// `validate::block::is_unspendable_script` (mirrors Core's

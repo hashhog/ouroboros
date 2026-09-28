@@ -1660,6 +1660,7 @@ dependencies = [
  "rocksdb",
  "secp256k1 0.31.1",
  "serde",
+ "sha2",
  "siphasher",
  "tempdir",
  "tempfile",

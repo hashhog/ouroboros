@@ -853,9 +853,9 @@ def getbalance(ctx, address, network):
 @click.argument("snapshot_path", type=click.Path(exists=True))
 @click.option(
     "--batch-size",
-    default=100_000,
+    default=1_000_000,
     type=int,
-    help="Number of UTXOs per WriteBatch flush (default 100K)",
+    help="Number of UTXOs per staged SST file (default 1M)",
 )
 @click.pass_context
 def import_utxo(ctx, snapshot_path, batch_size):
@@ -960,17 +960,68 @@ def import_utxo(ctx, snapshot_path, batch_size):
     expected_magic = NETWORK_MAGIC.get(network)
     expected_magic_arg = list(expected_magic) if expected_magic is not None else None
 
+    # The Rust importer parses + hashes the whole file and stages sorted SST
+    # files BEFORE touching the chainstate; with a known commitment it refuses
+    # a mismatching snapshot (Core validation.cpp:5902-5915) and the datadir
+    # is left as it was.  Without one (regtest / HASHHOG_UNSAFE_SNAPSHOT_HEIGHT)
+    # the digest is still computed and reported, but nothing is compared.
+    expected_hash = bytes(au_data.hash_serialized) if au_data is not None else None
+
+    # An extension built before the SST importer only takes 4 arguments and
+    # neither hashes nor checks anything; keep this CLI usable with it (the
+    # live tree can move ahead of the installed wheel) but say so loudly.
+    _sig = getattr(type(db._db).import_core_snapshot, "__text_signature__", "") or ""
+    native_verify = "expected_hash_serialized" in _sig
+
     start_time = time.time()
+    computed_hash = None
+    n_transactions = total_amount = bogosize = 0
     try:
-        block_hash_hex, height, loaded = db._db.import_core_snapshot(
-            snapshot_path, block_height, expected_magic_arg, batch_size
-        )
+        if native_verify:
+            (
+                block_hash_hex,
+                height,
+                loaded,
+                computed_hash,
+                n_transactions,
+                total_amount,
+                bogosize,
+            ) = db._db.import_core_snapshot(
+                snapshot_path,
+                block_height,
+                expected_magic_arg,
+                batch_size,
+                expected_hash,
+            )
+        else:
+            block_hash_hex, height, loaded = db._db.import_core_snapshot(
+                snapshot_path, block_height, expected_magic_arg, batch_size
+            )
     except KeyboardInterrupt:
         console.print("\n[yellow]Import interrupted[/yellow]")
         sys.exit(1)
     except Exception as e:
         console.print(f"[red]Import failed: {e}[/red]")
         sys.exit(1)
+
+    if computed_hash is None:
+        console.print(
+            "  [yellow]WARNING: installed ferrous-utils extension predates the "
+            "verifying importer — HASH_SERIALIZED was NOT computed or checked, "
+            "and the cached gettxoutsetinfo surface below is the commitment, "
+            "not a measurement. Rebuild the extension.[/yellow]"
+        )
+    elif expected_hash is not None:
+        computed_hash = bytes(computed_hash)
+        console.print(
+            f"  HASH_SERIALIZED commitment OK: [cyan]{computed_hash[::-1].hex()}[/cyan]"
+        )
+    else:
+        computed_hash = bytes(computed_hash)
+        console.print(
+            f"  [yellow]No assumeUTXO commitment for this snapshot; computed "
+            f"hash_serialized {computed_hash[::-1].hex()} (not checked)[/yellow]"
+        )
 
     # The Rust import writes only the UTXO set + tip pointer.  Persist the
     # snapshot base block index (sibling header files + BLOCK_INDEX
@@ -987,15 +1038,24 @@ def import_utxo(ctx, snapshot_path, batch_size):
             # Persist the load-time surface so a subsequent `start` on this
             # datadir can answer gettxoutsetinfo at the snapshot base without
             # walking the coins DB (campaign 852000/875000 NO-ORACLE-SURFACE).
+            # Every field is what the importer COMPUTED from the loaded coins
+            # (the hash has just been checked equal to the commitment) — not
+            # the commitment echoed back, which would make the range-runner's
+            # base control compare the chainparams value with itself. Only a
+            # pre-SST extension (warned above) still caches the commitment.
             sm.set_cached_txoutset(
                 CachedTxOutSet(
                     height=int(height),
                     best_block=bytes(metadata.base_blockhash),
-                    hash_serialized=bytes(au_data.hash_serialized),
+                    hash_serialized=(
+                        computed_hash
+                        if computed_hash is not None
+                        else bytes(au_data.hash_serialized)
+                    ),
                     txouts=int(loaded),
-                    transactions=0,
-                    bogosize=0,
-                    total_amount=0,
+                    transactions=int(n_transactions),
+                    bogosize=int(bogosize),
+                    total_amount=int(total_amount),
                 )
             )
         if persisted:

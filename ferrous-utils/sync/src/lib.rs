@@ -5247,27 +5247,67 @@ impl PyBlockchainDB {
     ///     Script:        ScriptCompression -- VARINT(nSize) + body
     /// ```
     ///
-    /// Clears existing chainstate, loads all UTXOs using WriteBatch (flushed
-    /// every `batch_size` entries), and sets the chain tip.
+    /// The coins are parsed, bounds-checked and hashed on this thread, while
+    /// a small pool of writer threads turns fixed-size chunks of them into
+    /// sorted SST files outside the DB. Only after the WHOLE file has been
+    /// read and its HASH_SERIALIZED commitment checked is anything written to
+    /// the chainstate: the SST files are then ingested in one step (see
+    /// `BlockchainDB::replace_chainstate_with_ssts` for the crash-safety
+    /// protocol). A bad snapshot therefore leaves the datadir untouched.
     ///
-    /// `expected_network_magic`, when provided, is the 4-byte pchMessageStart
-    /// the caller expects. If it does not match, the import aborts before
-    /// any writes. Pass `None` to accept any network magic (regtest helper).
+    /// Why not WriteBatches: the previous loader pushed every coin through
+    /// the WAL + memtable, so the CF's two 64 MiB memtables stalled writes on
+    /// every flush and the level compactions rewrote the set several times;
+    /// 66M coins took 37 min at ~30k coins/s, almost all of it waiting on I/O.
     ///
-    /// Returns `(block_hash_hex, height, utxo_count)`. Note that the
-    /// snapshot itself does NOT carry the height -- the caller must supply
-    /// it via `base_height`, which is then verified to match the assumeutxo
-    /// blockhash table on the Python side.
+    /// Per-coin checks mirror Core `PopulateAndValidateSnapshot`
+    /// (validation.cpp:5797-5883): `coin_height > base_height` (only when a
+    /// commitment is supplied, i.e. the base height is known, as in the
+    /// Python loader), `vout == u32::MAX`, MoneyRange (`MAX_MONEY`), and the
+    /// left_over trailing-byte check. The HASH_SERIALIZED digest is Core's
+    /// `TxOutSer` stream (kernel/coinstats.cpp:46-56) SHA256d'd, in (txid,
+    /// vout) order.
+    ///
+    /// The fast path needs the snapshot in canonical (txid asc, vout asc)
+    /// order, which is what every `dumptxoutset` emits (it walks the coins
+    /// DB cursor). Out-of-order input is refused rather than silently
+    /// mis-hashed.
+    ///
+    /// `expected_network_magic`: 4-byte pchMessageStart, or `None` to accept
+    /// any. `batch_size`: coins per SST file (default 1,000,000).
+    /// `expected_hash_serialized`: 32-byte commitment in internal byte order;
+    /// on mismatch the import fails before touching the DB.
+    ///
+    /// Returns `(block_hash_hex, height, utxo_count, hash_serialized,
+    /// transactions, total_amount, bogosize)` — `hash_serialized` is the
+    /// digest COMPUTED from the file's coins (internal byte order).
+    #[pyo3(signature = (
+        path, base_height, expected_network_magic = None, batch_size = None,
+        expected_hash_serialized = None, writer_threads = None
+    ))]
     fn import_core_snapshot(
         &self,
+        py: Python<'_>,
         path: String,
         base_height: u32,
         expected_network_magic: Option<[u8; 4]>,
         batch_size: Option<u64>,
-    ) -> PyResult<(String, u32, u64)> {
+        expected_hash_serialized: Option<Vec<u8>>,
+        writer_threads: Option<usize>,
+    ) -> PyResult<(String, u32, u64, Vec<u8>, u64, u64, u64)> {
         use std::io::{BufReader, Read};
 
-        let batch_size = batch_size.unwrap_or(100_000);
+        const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+        let coins_per_file = batch_size.unwrap_or(1_000_000).max(1);
+        let n_writers = writer_threads.unwrap_or(4).clamp(1, 16);
+        let expected_hash: Option<[u8; 32]> = match expected_hash_serialized {
+            None => None,
+            Some(v) => Some(v.as_slice().try_into().map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "expected_hash_serialized must be 32 bytes",
+                )
+            })?),
+        };
 
         let file = std::fs::File::open(&path).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Cannot open {}: {}", path, e))
@@ -5319,147 +5359,288 @@ impl PyBlockchainDB {
         display_hash.reverse();
         let block_hash_hex = hex::encode(display_hash);
 
-        log::info!(
-            "[snapshot] Importing core snapshot: height={}, utxo_count={}, block={}",
-            base_height, utxo_count, block_hash_hex,
-        );
-
-        // ---------------- Clear & set up ----------------
-        log::info!("[snapshot] Clearing existing chainstate...");
-        self.db.clear_chainstate().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to clear chainstate: {}", e))
-        })?;
-
-        let cf = self.db.raw_db().cf_handle(crate::storage::schema::CHAINSTATE_CF)
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("chainstate CF not found"))?;
-
-        let mut batch = self.db.create_batch();
-        let mut loaded: u64 = 0;
-        let start_time = std::time::Instant::now();
-        let mut last_log_time = start_time;
-
-        // ---------------- Per-coin loop ----------------
-        let mut coins_left = utxo_count;
-        while coins_left > 0 {
-            let mut txid = [0u8; 32];
-            reader.read_exact(&mut txid).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyIOError, _>(
-                    format!("Failed to read txid at coin {}: {}", loaded, e),
-                )
-            })?;
-
-            let coins_per_txid = read_compact_size(&mut reader).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Bad coins_per_txid at coin {}: {}", loaded, e),
-                )
-            })?;
-            if coins_per_txid == 0 || coins_per_txid > coins_left {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Invalid coins_per_txid={} (coins_left={})", coins_per_txid, coins_left),
-                ));
-            }
-
-            for _ in 0..coins_per_txid {
-                let vout = read_compact_size(&mut reader).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("Bad vout at coin {}: {}", loaded, e),
-                    )
-                })? as u32;
-                let code = read_varint(&mut reader).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("Bad code at coin {}: {}", loaded, e),
-                    )
-                })?;
-                let coin_height = (code >> 1) as u32;
-                let is_coinbase = (code & 1) != 0;
-
-                let amount_compressed = read_varint(&mut reader).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("Bad amount at coin {}: {}", loaded, e),
-                    )
-                })?;
-                let amount = decompress_amount(amount_compressed);
-
-                let script = read_compressed_script(&mut reader).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("Bad script at coin {}: {}", loaded, e),
-                    )
-                })?;
-                let script_len = script.len();
-
-                // Build the RocksDB key: [32-byte txid LE] + [4-byte vout LE]
-                let key = crate::storage::schema::encode_outpoint(&txid, vout);
-
-                // Build the RocksDB value using the same serialization as UTXO::to_bytes():
-                // [OutPoint consensus (txid LE 32 + vout LE 4)] + [amount u64 LE 8]
-                // + [script_pubkey (varint len + bytes)] + [1 byte height flag] + [4 bytes height] + [1 byte is_coinbase]
-                let mut value = Vec::with_capacity(36 + 8 + 1 + script_len + 1 + 4 + 1);
-                value.extend_from_slice(&txid);
-                value.extend_from_slice(&vout.to_le_bytes());
-                value.extend_from_slice(&amount.to_le_bytes());
-                let script_len_varint = common::encode_varint(script_len as u64);
-                value.extend_from_slice(&script_len_varint);
-                value.extend_from_slice(&script);
-                value.push(1u8);
-                value.extend_from_slice(&coin_height.to_le_bytes());
-                value.push(if is_coinbase { 1u8 } else { 0u8 });
-
-                batch.put_cf(&cf, key, value);
-                loaded += 1;
-                coins_left -= 1;
-
-                if loaded % batch_size == 0 {
-                    self.db.apply_batch(batch).map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                            format!("WriteBatch failed at UTXO {}: {}", loaded, e),
-                        )
-                    })?;
-                    batch = rocksdb::WriteBatch::default();
-
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_log_time).as_secs() >= 5 || loaded % 1_000_000 == 0 {
-                        let elapsed = now.duration_since(start_time).as_secs_f64();
-                        let rate = loaded as f64 / elapsed;
-                        let eta = (utxo_count.saturating_sub(loaded)) as f64 / rate.max(1.0);
-                        log::info!(
-                            "[snapshot] Loaded {}/{} UTXOs ({:.1}%) -- {:.0} utxo/s -- ETA {:.0}s",
-                            loaded, utxo_count,
-                            loaded as f64 / utxo_count.max(1) as f64 * 100.0,
-                            rate, eta,
-                        );
-                        last_log_time = now;
-                    }
-                }
-            }
-        }
-
-        if batch.len() > 0 {
-            self.db.apply_batch(batch).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    format!("Final WriteBatch failed: {}", e),
-                )
-            })?;
-        }
-
-        let elapsed = start_time.elapsed().as_secs_f64();
-        let rate = loaded as f64 / elapsed.max(1e-3);
-        log::info!(
-            "[snapshot] Loaded all {} UTXOs in {:.1}s ({:.0} utxo/s)",
-            loaded, elapsed, rate,
-        );
-
-        self.db.update_best_block(&block_hash, base_height).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Failed to update chain tip: {}", e),
+        // SST staging dir: inside the DB directory (same filesystem, so the
+        // ingest is a hard link, not a copy). RocksDB never touches subdirs.
+        // A leftover from an interrupted import is simply discarded.
+        let sst_dir = self.db.path().join("snapshot-import.tmp");
+        let _ = std::fs::remove_dir_all(&sst_dir);
+        std::fs::create_dir_all(&sst_dir).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                format!("Cannot create {}: {}", sst_dir.display(), e),
             )
         })?;
 
-        log::info!(
-            "[snapshot] Chain tip set to height {} ({})",
-            base_height, block_hash_hex,
-        );
+        let start_time = std::time::Instant::now();
+        let db = Arc::clone(&self.db);
 
-        Ok((block_hash_hex, base_height, loaded))
+        // Everything below runs without the GIL.
+        let result: Result<(u64, [u8; 32], u64, u64, u64), String> = py.detach(|| {
+            use std::sync::mpsc::{sync_channel, Receiver};
+
+            // A chunk is a flat record stream: [key 36][u32 LE vlen][value].
+            type Chunk = (usize, Vec<u8>);
+            let (tx, rx) = sync_channel::<Chunk>(n_writers);
+            let rx: Arc<StdMutex<Receiver<Chunk>>> = Arc::new(StdMutex::new(rx));
+            let mut writers = Vec::with_capacity(n_writers);
+            for _ in 0..n_writers {
+                let rx = Arc::clone(&rx);
+                let dir = sst_dir.clone();
+                writers.push(std::thread::spawn(move || -> Result<Vec<(usize, PathBuf)>, String> {
+                    let opts = crate::storage::db::BlockchainDB::chainstate_sst_options();
+                    let mut out = Vec::new();
+                    loop {
+                        let msg = rx.lock().map_err(|_| "writer queue poisoned".to_string())?.recv();
+                        let (idx, buf) = match msg {
+                            Ok(m) => m,
+                            Err(_) => return Ok(out), // sender dropped: done
+                        };
+                        let fpath = dir.join(format!("{:08}.sst", idx));
+                        let w = rocksdb::SstFileWriter::create(&opts);
+                        w.open(&fpath).map_err(|e| format!("SST open {}: {}", fpath.display(), e))?;
+                        let mut w = w;
+                        let mut p = 0usize;
+                        while p < buf.len() {
+                            let k = &buf[p..p + 36];
+                            let vlen = u32::from_le_bytes(buf[p + 36..p + 40].try_into().unwrap()) as usize;
+                            let v = &buf[p + 40..p + 40 + vlen];
+                            w.put(k, v).map_err(|e| format!("SST put {}: {}", fpath.display(), e))?;
+                            p += 40 + vlen;
+                        }
+                        w.finish().map_err(|e| format!("SST finish {}: {}", fpath.display(), e))?;
+                        out.push((idx, fpath));
+                    }
+                }));
+            }
+
+            let parsed = (|| -> Result<([u8; 32], u64, u64, u64, u64), String> {
+                // sha2 (not common::crypto::sha256::Sha256): the in-house
+                // streaming type returns wrong digests across multiple
+                // update() calls — observed while building this importer;
+                // its one-shot sha256() is unaffected.
+                use sha2::Digest as _;
+                let mut hasher = sha2::Sha256::new();
+                let mut loaded: u64 = 0;
+                let mut transactions: u64 = 0;
+                let mut total_amount: u64 = 0;
+                let mut bogosize: u64 = 0;
+                let mut coins_left = utxo_count;
+                let mut prev_txid: Option<[u8; 32]> = None;
+                let mut chunk: Vec<u8> = Vec::with_capacity((coins_per_file as usize) * 120);
+                let mut chunk_coins: u64 = 0;
+                let mut chunk_idx: usize = 0;
+                // One txid group: (vout, height, is_coinbase, amount, script).
+                let mut group: Vec<(u32, u32, bool, u64, Vec<u8>)> = Vec::new();
+                let mut ser: Vec<u8> = Vec::with_capacity(256);
+                let mut last_log = std::time::Instant::now();
+
+                while coins_left > 0 {
+                    let mut txid = [0u8; 32];
+                    reader.read_exact(&mut txid).map_err(|e| {
+                        format!("Bad snapshot format or truncated snapshot after deserializing {} coins: txid: {}", loaded, e)
+                    })?;
+                    if let Some(p) = prev_txid {
+                        if txid <= p {
+                            return Err(format!(
+                                "snapshot not in canonical txid order after {} coins (a txid group repeats or \
+                                 goes backwards); refusing to import",
+                                loaded
+                            ));
+                        }
+                    }
+                    prev_txid = Some(txid);
+
+                    let coins_per_txid = read_compact_size(&mut reader)
+                        .map_err(|e| format!("Bad coins_per_txid at coin {}: {}", loaded, e))?;
+                    if coins_per_txid == 0 || coins_per_txid > coins_left {
+                        return Err(format!(
+                            "Invalid coins_per_txid={} (coins_left={})", coins_per_txid, coins_left
+                        ));
+                    }
+                    transactions += 1;
+
+                    group.clear();
+                    for i in 0..coins_per_txid {
+                        let vout = read_compact_size(&mut reader)
+                            .map_err(|e| format!("Bad vout at coin {}: {}", loaded + i, e))? as u32;
+                        let code = read_varint(&mut reader)
+                            .map_err(|e| format!("Bad code at coin {}: {}", loaded + i, e))?;
+                        let coin_height = (code >> 1) as u32;
+                        let is_coinbase = (code & 1) != 0;
+                        let amount_compressed = read_varint(&mut reader)
+                            .map_err(|e| format!("Bad amount at coin {}: {}", loaded + i, e))?;
+                        let amount = decompress_amount(amount_compressed);
+                        let script = read_compressed_script(&mut reader)
+                            .map_err(|e| format!("Bad script at coin {}: {}", loaded + i, e))?;
+
+                        // Core validation.cpp:5814-5823.
+                        if expected_hash.is_some() && coin_height > base_height {
+                            return Err(format!(
+                                "Bad snapshot data after deserializing {} coins: coin.height={} > base_height={}",
+                                loaded + i, coin_height, base_height
+                            ));
+                        }
+                        if vout == u32::MAX {
+                            return Err(format!(
+                                "Bad snapshot data after deserializing {} coins: bad tx out index", loaded + i
+                            ));
+                        }
+                        if amount > MAX_MONEY {
+                            return Err(format!(
+                                "Bad snapshot data after deserializing {} coins - bad tx out value", loaded + i
+                            ));
+                        }
+                        group.push((vout, coin_height, is_coinbase, amount, script));
+                    }
+
+                    // Hash in numeric vout order (the coins DB cursor order);
+                    // Core emits the group already in that order.
+                    if group.windows(2).any(|w| w[0].0 >= w[1].0) {
+                        group.sort_by_key(|c| c.0);
+                        if group.windows(2).any(|w| w[0].0 == w[1].0) {
+                            return Err(format!("duplicate vout in txid group after {} coins", loaded));
+                        }
+                    }
+                    for (vout, coin_height, is_coinbase, amount, script) in group.iter() {
+                        // TxOutSer (kernel/coinstats.cpp:46-51).
+                        ser.clear();
+                        ser.extend_from_slice(&txid);
+                        ser.extend_from_slice(&vout.to_le_bytes());
+                        let code32: u32 = (coin_height << 1) | (*is_coinbase as u32);
+                        ser.extend_from_slice(&code32.to_le_bytes());
+                        ser.extend_from_slice(&(*amount as i64).to_le_bytes());
+                        ser.extend_from_slice(&common::encode_varint(script.len() as u64));
+                        ser.extend_from_slice(script);
+                        hasher.update(&ser);
+                        total_amount += *amount;
+                        // GetBogoSize (kernel/coinstats.cpp:36-43).
+                        bogosize += 32 + 4 + 4 + 8 + 2 + script.len() as u64;
+                    }
+
+                    // SST order is key-byte order: vout is stored LE, so sort
+                    // by the byte-swapped value (identity for vout < 256).
+                    if group.iter().any(|c| c.0 > 0xff) {
+                        group.sort_by_key(|c| c.0.swap_bytes());
+                    }
+                    for (vout, coin_height, is_coinbase, amount, script) in group.drain(..) {
+                        // Value layout == UTXO::to_bytes() (unchanged from
+                        // the WriteBatch loader): outpoint (txid 32 + vout
+                        // LE 4) + amount u64 LE + varint len + script +
+                        // height flag 1 + height LE 4 + is_coinbase 1.
+                        let len_varint = common::encode_varint(script.len() as u64);
+                        let vlen = 36 + 8 + len_varint.len() + script.len() + 1 + 4 + 1;
+                        chunk.extend_from_slice(&txid);
+                        chunk.extend_from_slice(&vout.to_le_bytes());
+                        chunk.extend_from_slice(&(vlen as u32).to_le_bytes());
+                        chunk.extend_from_slice(&txid);
+                        chunk.extend_from_slice(&vout.to_le_bytes());
+                        chunk.extend_from_slice(&amount.to_le_bytes());
+                        chunk.extend_from_slice(&len_varint);
+                        chunk.extend_from_slice(&script);
+                        chunk.push(1u8);
+                        chunk.extend_from_slice(&coin_height.to_le_bytes());
+                        chunk.push(if is_coinbase { 1u8 } else { 0u8 });
+                        chunk_coins += 1;
+                    }
+                    loaded += coins_per_txid;
+                    coins_left -= coins_per_txid;
+
+                    // Cut files only at txid-group boundaries.
+                    if chunk_coins >= coins_per_file {
+                        let full = std::mem::replace(
+                            &mut chunk,
+                            Vec::with_capacity((coins_per_file as usize) * 120),
+                        );
+                        tx.send((chunk_idx, full)).map_err(|_| "SST writer pool died".to_string())?;
+                        chunk_idx += 1;
+                        chunk_coins = 0;
+                        if last_log.elapsed().as_secs() >= 15 {
+                            let el = start_time.elapsed().as_secs_f64();
+                            eprintln!(
+                                "[snapshot] parsed {}/{} coins ({:.1}%) -- {:.0} coins/s",
+                                loaded, utxo_count,
+                                loaded as f64 * 100.0 / utxo_count.max(1) as f64,
+                                loaded as f64 / el.max(1e-3),
+                            );
+                            last_log = std::time::Instant::now();
+                        }
+                    }
+                }
+                if chunk_coins > 0 {
+                    tx.send((chunk_idx, chunk)).map_err(|_| "SST writer pool died".to_string())?;
+                }
+
+                // Core validation.cpp:5872-5883: no coins left over.
+                let mut left_over = [0u8; 1];
+                match reader.read(&mut left_over) {
+                    Ok(0) => {}
+                    Ok(_) => {
+                        return Err(format!(
+                            "Bad snapshot - coins left over after deserializing {} coins", loaded
+                        ))
+                    }
+                    Err(e) => return Err(format!("read error at end of snapshot: {}", e)),
+                }
+
+                // HashWriter::GetHash == SHA256d.
+                let first: [u8; 32] = hasher.finalize().into();
+                let digest: [u8; 32] = sha2::Sha256::digest(first).into();
+                Ok((digest, loaded, transactions, total_amount, bogosize))
+            })();
+            drop(tx);
+
+            let mut files: Vec<(usize, PathBuf)> = Vec::new();
+            let mut writer_err: Option<String> = None;
+            for h in writers {
+                match h.join() {
+                    Ok(Ok(v)) => files.extend(v),
+                    Ok(Err(e)) => writer_err = writer_err.or(Some(e)),
+                    Err(_) => writer_err = writer_err.or(Some("SST writer thread panicked".into())),
+                }
+            }
+            // A writer failure explains a parser "pool died" error, so it wins.
+            if let Some(e) = writer_err {
+                return Err(e);
+            }
+            let (digest, loaded, transactions, total_amount, bogosize) = parsed?;
+
+            // HASH_SERIALIZED commitment (validation.cpp:5902-5915) — checked
+            // BEFORE the chainstate is touched.
+            if let Some(want) = expected_hash {
+                if digest != want {
+                    let mut got = digest;
+                    got.reverse();
+                    let mut w = want;
+                    w.reverse();
+                    return Err(format!(
+                        "Bad snapshot content hash: expected {}, got {}",
+                        hex::encode(w), hex::encode(got)
+                    ));
+                }
+            }
+
+            files.sort_by_key(|(i, _)| *i);
+            let files: Vec<PathBuf> = files.into_iter().map(|(_, p)| p).collect();
+            let parse_secs = start_time.elapsed().as_secs_f64();
+            db.replace_chainstate_with_ssts(&files, &block_hash, base_height)
+                .map_err(|e| format!("chainstate ingest failed: {}", e))?;
+            eprintln!(
+                "[snapshot] {} coins: parse+hash+SST {:.1}s, ingest+commit {:.1}s",
+                loaded, parse_secs, start_time.elapsed().as_secs_f64() - parse_secs,
+            );
+            Ok((loaded, digest, transactions, total_amount, bogosize))
+        });
+        let _ = std::fs::remove_dir_all(&sst_dir);
+
+        let (loaded, digest, transactions, total_amount, bogosize) = result
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?;
+        if loaded != utxo_count {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Mismatch in coins count: header {} loaded {}", utxo_count, loaded
+            )));
+        }
+
+        // hash_serialized is returned so the caller caches the COMPUTED value.
+        Ok((block_hash_hex, base_height, loaded, digest.to_vec(), transactions, total_amount, bogosize))
     }
 
     /// Update UTXO set atomically
