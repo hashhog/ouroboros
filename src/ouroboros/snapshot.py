@@ -509,6 +509,61 @@ def _campaign_builtin_entries() -> list[AssumeutxoData]:
     )
 
 
+def _merge_campaign_confirmation(
+    path: str,
+    index: int,
+    builtin_rows: list[AssumeutxoData],
+    entry: AssumeutxoData,
+) -> AssumeutxoData:
+    """Merge a campaign entry that CONFIRMS builtin row(s) into one row.
+
+    The caller has already proven the commitment (height, block_hash,
+    hash_serialized, chain_tx_count) is identical in every row. The returned
+    row keeps that commitment and fills ONLY the supplemental fields the
+    builtin lacks (``base_header``, ``chainwork_hex``). A supplemental value
+    that contradicts one a builtin row already pins raises, and a supplied
+    ``base_header`` must hash to ``block_hash`` -- it is about to become part
+    of a production row's base block index, so it is not taken on faith.
+    The builtin table objects themselves are never mutated.
+    """
+    where = f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {index} (height={entry.height})"
+    if entry.base_header is not None:
+        if len(entry.base_header) != 80:
+            raise ValueError(f"{where} base_header must be 80 bytes")
+        got = hashlib.sha256(hashlib.sha256(entry.base_header).digest()).digest()
+        if got != entry.block_hash:
+            raise ValueError(
+                f"{where} base_header does not hash to the entry blockhash "
+                f"(got {got[::-1].hex()})"
+            )
+    base_header = None
+    chainwork_hex = None
+    for b in builtin_rows:
+        if b.base_header is not None:
+            if entry.base_header is not None and b.base_header != entry.base_header:
+                raise ValueError(
+                    f"{where} base_header contradicts the builtin row's base_header"
+                )
+            base_header = b.base_header
+        if b.chainwork_hex is not None:
+            if entry.chainwork_hex is not None and int(b.chainwork_hex, 16) != int(
+                entry.chainwork_hex, 16
+            ):
+                raise ValueError(
+                    f"{where} chainwork {entry.chainwork_hex} contradicts the builtin "
+                    f"row's chainwork {b.chainwork_hex}"
+                )
+            chainwork_hex = b.chainwork_hex
+    return AssumeutxoData(
+        height=entry.height,
+        block_hash=entry.block_hash,
+        hash_serialized=entry.hash_serialized,
+        chain_tx_count=entry.chain_tx_count,
+        base_header=base_header if base_header is not None else entry.base_header,
+        chainwork_hex=chainwork_hex if chainwork_hex is not None else entry.chainwork_hex,
+    )
+
+
 def _load_campaign_assumeutxo() -> list[AssumeutxoData]:
     """Read `HASHHOG_CAMPAIGN_ASSUMEUTXO` exactly once and cache the result.
 
@@ -520,7 +575,11 @@ def _load_campaign_assumeutxo() -> list[AssumeutxoData]:
     `ValueError` (refusing to start) on a malformed fixture or on any
     collision with a builtin entry (matching blockhash OR height), since
     campaign data must never be able to shadow or override a production
-    trust-table entry.
+    trust-table entry. The one exception is an entry whose commitment
+    (height, blockhash, hash_serialized, m_chain_tx_count) is IDENTICAL to
+    a builtin row: a confirmation, kept with the builtin commitment and
+    only gap-filling supplemental fields (``_merge_campaign_confirmation``;
+    a contradiction with a value the builtin pins still raises).
     """
     global _CAMPAIGN_ASSUMEUTXO_LOADED, _CAMPAIGN_ASSUMEUTXO_ENTRIES
     if _CAMPAIGN_ASSUMEUTXO_LOADED:
@@ -595,12 +654,6 @@ def _load_campaign_assumeutxo() -> list[AssumeutxoData]:
         block_hash = _hex_to_hash_le(blockhash_hex)
         hash_serialized = _hex_to_hash_le(hash_serialized_hex)
 
-        if block_hash in builtin_hashes or height in builtin_heights:
-            raise ValueError(
-                f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {i} (height={height}, "
-                f"blockhash={blockhash_hex}) collides with a builtin assumeUTXO "
-                "entry; campaign data may never override a production hash"
-            )
         if block_hash in seen_hashes or height in seen_heights:
             raise ValueError(
                 f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {i} (height={height}, "
@@ -615,16 +668,54 @@ def _load_campaign_assumeutxo() -> list[AssumeutxoData]:
 
         chainwork_hex = item.get("chainwork")
 
-        entries.append(
-            AssumeutxoData(
-                height=height,
-                block_hash=block_hash,
-                hash_serialized=hash_serialized,
-                chain_tx_count=chain_tx_count,
-                base_header=base_header,
-                chainwork_hex=chainwork_hex,
-            )
+        candidate = AssumeutxoData(
+            height=height,
+            block_hash=block_hash,
+            hash_serialized=hash_serialized,
+            chain_tx_count=chain_tx_count,
+            base_header=base_header,
+            chainwork_hex=chainwork_hex,
         )
+
+        if block_hash in builtin_hashes or height in builtin_heights:
+            # The ONE non-refusal: an entry whose whole commitment (height,
+            # blockhash, hash_serialized, m_chain_tx_count) is IDENTICAL to a
+            # builtin row is not an override but a second source agreeing with
+            # the first -- R4's rung at 910,000 was minted by dumping a Core
+            # clone there and equals Core's own hardcoded anchor. It is kept
+            # as a CONFIRMATION (the builtin commitment stands; only gaps in
+            # the builtin row are filled, see _merge_campaign_confirmation).
+            # Anything else that touches a builtin height or hash is refused.
+            same = [
+                b for b in builtin
+                if b.height == height or b.block_hash == block_hash
+            ]
+            identical = all(
+                b.height == height
+                and b.block_hash == block_hash
+                and b.hash_serialized == hash_serialized
+                and b.chain_tx_count == chain_tx_count
+                for b in same
+            )
+            if not identical:
+                raise ValueError(
+                    f"[CAMPAIGN-ASSUMEUTXO] {path}: entry {i} (height={height}, "
+                    f"blockhash={blockhash_hex}) collides with a builtin assumeUTXO "
+                    "entry; campaign data may never override a production hash"
+                )
+            merged = _merge_campaign_confirmation(path, i, same, candidate)
+            logger.warning(
+                "[CAMPAIGN-ASSUMEUTXO] entry %d height=%d is IDENTICAL to the "
+                "builtin commitment -- accepted as a confirmation (builtin "
+                "commitment kept; chainwork %s, base_header %s)",
+                i,
+                height,
+                "filled" if merged.chainwork_hex and not same[0].chainwork_hex else "unchanged",
+                "filled" if merged.base_header and not same[0].base_header else "unchanged",
+            )
+            candidate = merged
+
+        entries.append(candidate)
 
     logger.warning(
         "[CAMPAIGN-ASSUMEUTXO] loaded %d entries from %s heights=%s",
@@ -659,7 +750,22 @@ def get_assumeutxo_params(network: str) -> list[AssumeutxoData]:
     else:
         # Signet etc.: no builtin entries.
         base = []
-    base.extend(_load_campaign_assumeutxo())
+    campaign = _load_campaign_assumeutxo()
+    if campaign:
+        # A campaign entry that CONFIRMS a builtin row (identical commitment,
+        # see _load_campaign_assumeutxo) replaces that row in place with the
+        # merged copy rather than adding a second row at the same height.
+        by_hash = {d.block_hash: d for d in campaign}
+        replaced = set()
+        merged_base = []
+        for d in base:
+            c = by_hash.get(d.block_hash)
+            if c is not None and c.height == d.height and c.hash_serialized == d.hash_serialized:
+                merged_base.append(c)
+                replaced.add(c.block_hash)
+            else:
+                merged_base.append(d)
+        base = merged_base + [d for d in campaign if d.block_hash not in replaced]
     return base
 
 
