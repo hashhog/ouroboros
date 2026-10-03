@@ -784,16 +784,21 @@ class TestBlockMutatedMisbehaving(unittest.TestCase):
         import inspect
         from ouroboros.block_sync import BlockSync
 
+        from ouroboros.block_sync import classify_block_reject
+
         src = inspect.getsource(BlockSync._drain_block_buffer_locked)
-        # The fix stores peer addr and calls misbehaving on merkle failure.
-        self.assertIn("Invalid merkle root", src,
-            "_drain_block_buffer_locked must check for 'Invalid merkle root'")
-        self.assertIn("misbehaving", src,
-            "_drain_block_buffer_locked must call misbehaving on BLOCK_MUTATED")
-        self.assertIn("SCORE_INVALID_BLOCK", src,
-            "_drain_block_buffer_locked must use SCORE_INVALID_BLOCK (100)")
-        self.assertIn("_block_source_peer_addr", src,
-            "_drain_block_buffer_locked must look up delivering peer addr")
+        # "Invalid merkle root" is classified BLOCK_MUTATED and the drain
+        # punishes the delivering peer for it (the behaviour itself is pinned
+        # by test_invalid_block_p2p.test_drain_mutated_block_is_not_marked_failed).
+        self.assertEqual(classify_block_reject("Invalid merkle root"), "mutated")
+        self.assertIn('kind == "mutated"', src)
+        self.assertIn("_punish_block_source", src,
+            "_drain_block_buffer_locked must punish the sender on BLOCK_MUTATED")
+        helper = inspect.getsource(BlockSync._punish_block_source)
+        self.assertIn("SCORE_INVALID_BLOCK", helper,
+            "the punishment must use SCORE_INVALID_BLOCK (100)")
+        self.assertIn("_block_source_peer_addr", helper,
+            "the punishment must look up the delivering peer addr")
 
     def test_block_source_peer_addr_cleared_on_success(self):
         """
@@ -842,19 +847,14 @@ class TestBlockInvalidHeaderMisbehaving(unittest.TestCase):
         from ouroboros.block_sync import BlockSync
 
         src = inspect.getsource(BlockSync._drain_block_buffer_locked)
-        self.assertIn("Invalid header", src,
-            "_drain_block_buffer_locked must check for 'Invalid header'")
-        self.assertIn("Invalid merkle root", src,
-            "_drain_block_buffer_locked must check for 'Invalid merkle root'")
-        # Both strings must appear inside the _misbehav_errors tuple.
-        # Find the tuple definition and confirm both strings are in it.
-        tuple_pos = src.find("_misbehav_errors")
-        self.assertGreater(tuple_pos, 0,
-            "_misbehav_errors tuple not found in _drain_block_buffer_locked")
-        # The misbehaving call must appear after the tuple definition.
-        misbehav_call_pos = src.find("misbehaving(", tuple_pos)
-        self.assertGreater(misbehav_call_pos, tuple_pos,
-            "misbehaving() call must appear after _misbehav_errors definition")
+        # "Invalid header" is forced to a verdict (marked failed + sender
+        # punished) ahead of the generic classifier.
+        hdr_pos = src.find('error.startswith("Invalid header")')
+        self.assertGreater(hdr_pos, 0,
+            "_drain_block_buffer_locked must special-case 'Invalid header'")
+        punish_pos = src.find("_punish_block_source(", hdr_pos)
+        self.assertGreater(punish_pos, hdr_pos,
+            "the sender must be punished after the 'Invalid header' verdict")
 
     def test_non_misbehav_errors_not_scored(self):
         """

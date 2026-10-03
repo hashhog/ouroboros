@@ -2482,7 +2482,18 @@ class BitcoinNode:
                         peer.register_handler("getcfcheckpt", _make_getcfcheckpt_handler(peer))
 
         # Register callback for future inbound peers so they get handlers too
+        def _register_block_sync(peer):
+            # Block announcements from this peer must reach block_sync from
+            # its first message (see BlockSync.register_peer).
+            bs = getattr(self, "block_sync", None)
+            if bs is not None and hasattr(bs, "register_peer"):
+                try:
+                    bs.register_peer(peer)
+                except Exception as e:
+                    logger.warning(f"block_sync handler registration failed: {e}")
+
         async def _on_inbound_peer(peer):
+            _register_block_sync(peer)
             peer.register_handler("tx", _make_tx_handler(peer))
             peer.register_handler("getdata", _make_getdata_handler(peer))
             peer.register_handler("getheaders", _make_getheaders_handler(peer))
@@ -2501,6 +2512,7 @@ class BitcoinNode:
         # only the --connect peers).  See PARITY-MATRIX.md Category B.
         if hasattr(self.peer_manager, "set_outbound_peer_handler"):
             async def _on_outbound_peer(peer):
+                _register_block_sync(peer)
                 peer.register_handler("tx", _make_tx_handler(peer))
                 peer.register_handler("getdata", _make_getdata_handler(peer))
                 peer.register_handler("getheaders", _make_getheaders_handler(peer))

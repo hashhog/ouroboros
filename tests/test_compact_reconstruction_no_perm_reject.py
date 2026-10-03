@@ -102,13 +102,17 @@ async def test_compact_origin_validation_failure_is_not_perm_rejected(monkeypatc
 async def test_full_block_validation_failure_is_still_perm_rejected(monkeypatch):
     """Control: a solicited *full* block (not compact origin) that fails
     validation is still perm-rejected — the fix narrows the perm-reject to
-    genuine full-block failures, it does not disable it."""
+    genuine full-block failures, it does not disable it.
+
+    (Uses a consensus failure: since the invalid-block-over-P2P fix a full
+    block failing "Invalid merkle root" is BLOCK_MUTATED and, as in Core, is
+    re-fetched rather than marked — see test_invalid_block_p2p.)"""
     monkeypatch.setenv("OUROBOROS_DISABLE_RUST_VALIDATE", "1")
     bs = _make_block_sync()
     block_hash = b"\x22" * 32
     _stage_next_block(bs, block_hash)
     bs.validator.validate_block = MagicMock(
-        return_value=(False, "Invalid merkle root")
+        return_value=(False, "Coinbase amount invalid")
     )
     # NOT in _compact_origin_hashes — this came from a full-block getdata.
 

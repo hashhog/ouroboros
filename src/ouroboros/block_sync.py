@@ -234,6 +234,66 @@ logger = logging.getLogger(__name__)
 # of the (bool, str) validator contract: a HOLD, never a reject.
 _MISSING_ANCESTOR_PREFIX = "missing-ancestor-header: "
 
+# BIP-22 tokens Core reports as BLOCK_MUTATED (CheckMerkleRoot /
+# CheckWitnessMalleation, validation.cpp).  The bytes do not match the header,
+# so they say nothing about the block the header names: punish the sender,
+# re-fetch, never mark the hash failed (InvalidBlockFound skips BLOCK_MUTATED).
+_MUTATED_REJECT_TOKENS = frozenset({
+    "bad-txnmrklroot", "bad-txns-duplicate", "bad-witness-merkle-match",
+    "bad-witness-nonce-size", "unexpected-witness",
+})
+# Rejects that are not a verdict on the block at all: we could not decide
+# (missing parent / ancestor header / common ancestor), a local engine limit,
+# or Core's BLOCK_TIME_FUTURE (not marked failed, retried later).
+_NONVERDICT_REJECT_MARKERS = (
+    "missing-ancestor-header", "previous block not found",
+    "prev-blk-not-found", "inconclusive", "missing common ancestor",
+    "no common ancestor", "side-branch", "too deep", "reorg-disconnect-failed",
+    "time-too-new", "too far in the future",
+)
+_NONVERDICT_REJECT_TOKENS = frozenset({
+    "rejected", "inconclusive", "duplicate", "duplicate-invalid",
+    "time-too-new",
+})
+
+
+def classify_block_reject(error: str) -> str:
+    """Classify a block-validation failure the way Core's InvalidBlockFound /
+    MaybePunishNodeForBlock do.
+
+    Returns ``"verdict"`` (BLOCK_CONSENSUS: mark failed, punish the sender),
+    ``"mutated"`` (BLOCK_MUTATED: punish, do not mark) or ``"nonverdict"``
+    (cannot decide / local failure / unclassified: neither).  Unclassified
+    errors are deliberately non-verdicts: a hash is only poisoned on a reason
+    that maps to a known consensus token.
+    """
+    s = (error or "").strip()
+    for _ffi_prefix in ("validate: ", "deserialize: "):
+        if s.startswith(_ffi_prefix):
+            s = s[len(_ffi_prefix):]
+            break
+    low = s.lower()
+    if not low or any(m in low for m in _NONVERDICT_REJECT_MARKERS):
+        return "nonverdict"
+    # In-block duplicate tx (CVE-2012-2459) is a merkle MUTATION in Core
+    # (bad-txns-duplicate, BLOCK_MUTATED).  bip22_result_string maps the Rust
+    # "Duplicate transaction detected" text to the ConnectBlock token, so test
+    # it before the mapping.  BIP30 ("duplicate unspent txid") is a verdict.
+    if ("merkle root" in low and "witness" not in low) or (
+        "duplicate transaction" in low
+    ):
+        return "mutated"
+    from ouroboros.rpc import bip22_result_string  # local: rpc imports us
+    try:
+        token = bip22_result_string(s)
+    except Exception:
+        return "nonverdict"
+    if token in _MUTATED_REJECT_TOKENS:
+        return "mutated"
+    if token in _NONVERDICT_REJECT_TOKENS:
+        return "nonverdict"
+    return "verdict"
+
 # Core DEFAULT_MAX_TIP_AGE (kernel/chainstatemanager_opts.h:24).
 ANNOUNCE_MAX_TIP_AGE_SECS = 24 * 60 * 60
 
@@ -818,6 +878,15 @@ class BlockSync:
         self._perm_rejected_blocks: set[bytes] = set()
         self._perm_rejected_order: list[bytes] = []
         self._perm_rejected_max: int = 10000
+        # Core BLOCK_FAILED_VALID / BLOCK_FAILED_CHILD: the subset of
+        # perm-rejected hashes that carry a consensus VERDICT (a block that
+        # failed validation, or one that descends from such a block).  Only
+        # these gate headers (duplicate-invalid / bad-prevblk) and punish.
+        # ``_perm_rejected_blocks`` additionally holds non-verdict
+        # give-ups (abandoned requests), which must never punish a peer.
+        self._failed_blocks: set[bytes] = set()
+        self._failed_order: deque[bytes] = deque()
+        self.invalid_blocks_found: int = 0
         # Hashes whose buffered bytes came from BIP152 compact-block
         # reconstruction (node.py _compact_block_handler), not a solicited
         # full-block getdata.  A reconstruction that fails validation (short-id
@@ -1042,6 +1111,10 @@ class BlockSync:
             # block_sync DB so the fork path can call it without threading db
             # through every call site.
             self._reorg_db = self.db
+            # Read back WHICH bridging block the engine's connect loop failed
+            # on (rpc ``_last_reorg_failure``) so the fork path can run
+            # InvalidBlockFound on that block instead of forgetting the fork.
+            self._reorg_rpc_server = rpc_server
         except AttributeError as e:
             logger.warning(
                 f"set_reorg_handler: rpc_server missing reorg method ({e}); "
@@ -1106,6 +1179,89 @@ class BlockSync:
             self._perm_rejected_blocks.discard(evicted)
         self._perm_rejected_blocks.add(block_hash)
         self._perm_rejected_order.append(block_hash)
+
+    def _mark_block_failed(self, block_hash: bytes) -> None:
+        """BLOCK_FAILED_VALID / BLOCK_FAILED_CHILD for *block_hash*: never
+        fetched again (perm-reject gate) and its header is refused
+        (``duplicate-invalid`` / ``bad-prevblk``).  Bounded FIFO like the
+        perm-reject set."""
+        self._mark_perm_rejected(block_hash)
+        if block_hash in self._failed_blocks:
+            return
+        if len(self._failed_order) >= self._perm_rejected_max:
+            self._failed_blocks.discard(self._failed_order.popleft())
+        self._failed_blocks.add(block_hash)
+        self._failed_order.append(block_hash)
+
+    def _invalid_block_found(
+        self, block_hash: bytes, reason: str, descendants=()
+    ) -> int:
+        """Core ``Chainstate::InvalidBlockFound`` + ``InvalidChainFound``
+        (validation.cpp): mark the block that failed a consensus check
+        BLOCK_FAILED_VALID and every known descendant BLOCK_FAILED_CHILD, and
+        drop them from block selection — the tip-anchored header queue (linear:
+        every slot after the failed one builds on it) and the fork store.  The
+        next most-work VALID header chain (e.g. a same-height competitor) is
+        then free to be queued and fetched.
+
+        Callers MUST only pass a consensus verdict (``classify_block_reject``
+        == "verdict"); BLOCK_MUTATED and cannot-decide errors are not marked.
+        Returns the number of hashes marked.
+        """
+        failed: list[bytes] = [block_hash]
+        for idx, (h, _hdr) in enumerate(self._validated_headers):
+            if h == block_hash:
+                failed.extend(x for x, _ in self._validated_headers[idx + 1:])
+                self._validated_headers = self._validated_headers[:idx]
+                break
+        failed.extend(descendants)
+        children: dict[bytes, list[bytes]] = defaultdict(list)
+        for child, prev in self._fork_header_prev.items():
+            children[prev].append(child)
+        seen: set[bytes] = set()
+        stack = list(failed)
+        while stack:
+            h = stack.pop()
+            if h in seen:
+                continue
+            seen.add(h)
+            stack.extend(children.get(h, ()))
+        for h in seen:
+            self._mark_block_failed(h)
+            self._buffer_remove(h)
+            self._compact_origin_hashes.discard(h)
+            self._fork_headers.pop(h, None)
+            self._fork_block_bytes.pop(h, None)
+            self._fork_header_prev.pop(h, None)
+            self._fork_getheaders_sent.pop(h, None)
+            self._fork_recheck_state.pop(h, None)
+            if self._side_branch_buffer is not None:
+                self._side_branch_buffer.pop(h, None)
+        self._fork_store_generation += 1
+        self.invalid_blocks_found += 1
+        logger.warning(
+            "InvalidBlockFound: block %s... failed validation (%s); marked "
+            "failed with %d descendant(s) — never re-requested",
+            block_hash.hex()[:16], reason, len(seen) - 1,
+        )
+        return len(seen)
+
+    def _punish_block_source(self, block_hash: bytes, reason: str) -> None:
+        """Core ``MaybePunishNodeForBlock`` (net_processing.cpp) for a block we
+        requested and that failed BLOCK_CONSENSUS / BLOCK_MUTATED: Misbehaving
+        the peer that delivered it (``mapBlockSource``).  The ban manager's
+        ``_on_peer_banned`` disconnects it; a local address is disconnected
+        but not discouraged, and noban/manual peers are exempt there."""
+        addr = self._block_source_peer_addr.pop(block_hash, None)
+        if not addr or not hasattr(self.peer_manager, "misbehaving"):
+            return
+        from ouroboros.banman import SCORE_INVALID_BLOCK
+        try:
+            self.peer_manager.misbehaving(
+                addr, SCORE_INVALID_BLOCK, f"invalid block: {reason[:80]}"
+            )
+        except Exception as e:
+            logger.debug(f"misbehaving({addr}) failed: {e}")
 
     def _record_first_request_time(self, block_hash: bytes, now: float) -> None:
         """Record the original request time for *block_hash* with a hard FIFO
@@ -1488,21 +1644,33 @@ class BlockSync:
                 peers = list(peers.values())
         new_count = 0
         for peer in peers:
-            if not isinstance(peer, Peer):
-                continue
-            if peer in self._peer_handlers:
-                continue
-            peer.register_handler("inv", self._make_inv_handler(peer))
-            peer.register_handler("block", self._make_block_handler(peer))
-            peer.register_handler("headers", self._make_headers_handler(peer))
-            self._peer_handlers[peer] = {
-                "inv": self._make_inv_handler(peer),
-                "block": self._make_block_handler(peer),
-                "headers": self._make_headers_handler(peer),
-            }
-            new_count += 1
+            if self.register_peer(peer):
+                new_count += 1
         if new_count:
             logger.info(f"Registered block_sync handlers for {new_count} new peers (total: {len(self._peer_handlers)})")
+
+    def register_peer(self, peer) -> bool:
+        """Attach the inv / block / headers handlers to *peer*.  Idempotent.
+
+        Called by the node the moment a peer finishes its handshake (inbound
+        and outbound hooks), and by the sync_loop sweep as a backstop.  Core
+        processes a peer's messages from the first one after VERACK; when
+        registration waited for the next sync_loop tick (up to ~10 s) every
+        ``headers`` / ``inv`` / ``block`` the peer sent first hit
+        "No handler" and was dropped — a block announced by a freshly
+        connected peer was never fetched.
+        """
+        if not isinstance(peer, Peer) or peer in self._peer_handlers:
+            return False
+        handlers = {
+            "inv": self._make_inv_handler(peer),
+            "block": self._make_block_handler(peer),
+            "headers": self._make_headers_handler(peer),
+        }
+        for cmd, fn in handlers.items():
+            peer.register_handler(cmd, fn)
+        self._peer_handlers[peer] = handlers
+        return True
 
     def _check_tip_parent_height(self, best_hash: bytes, best_height) -> bool:
         """True unless the index says the tip's parent is not at tip-1.
@@ -1992,6 +2160,9 @@ class BlockSync:
             if block_hash in self._fork_headers:
                 if not self._is_ibd_wanted(block_hash):
                     self._fork_block_bytes[block_hash] = payload
+                    # mapBlockSource: who to punish if the reorg engine finds
+                    # this body consensus-invalid (_complete_fork_bridge).
+                    self._block_source_peer_addr[block_hash] = f"{peer.host}:{peer.port}"
                     logger.info(
                         f"Fork body {block_hash.hex()[:16]}... received from "
                         f"{peer.host}:{peer.port} ({len(self._fork_block_bytes)}/"
@@ -2834,22 +3005,38 @@ class BlockSync:
                     self._connecting_hashes.discard(next_hash)
                     break
                 else:
-                    self._mark_perm_rejected(next_hash)
-                    # G16/G17 (W99): Bitcoin Core's ProcessNewBlock calls
-                    # Misbehaving(100) for BLOCK_MUTATED (merkle tree with
-                    # duplicate txids) and BLOCK_INVALID_HEADER (bad PoW,
-                    # bad prev-hash, bad bits, etc.).  Score the delivering
-                    # peer so the ban manager can disconnect and ban it.
-                    # Ref: net_processing.cpp — ProcessNewBlock path.
-                    _misbehav_errors = ("Invalid merkle root", "Invalid header")
-                    if error.startswith(_misbehav_errors):
-                        _src_addr = self._block_source_peer_addr.get(next_hash)
-                        if _src_addr and hasattr(self.peer_manager, "misbehaving"):
-                            from ouroboros.banman import SCORE_INVALID_BLOCK
-                            self.peer_manager.misbehaving(
-                                _src_addr, SCORE_INVALID_BLOCK,
-                                f"BLOCK_MUTATED/INVALID_HEADER: {error[:80]}"
-                            )
+                    # Core BlockChecked -> MaybePunishNodeForBlock and
+                    # InvalidBlockFound (net_processing.cpp / validation.cpp):
+                    #   BLOCK_CONSENSUS (and an invalid header) -> mark the
+                    #     block failed + descendants, punish the sender, and
+                    #     drop it from the header queue so the competing
+                    #     valid chain is queued and fetched instead.  Before
+                    #     this the hash stayed in slot 0 of the queue: the
+                    #     head-of-window re-requested it, every redelivery was
+                    #     dropped as perm-rejected, the same-height competitor
+                    #     was never queued, and the sender was never punished.
+                    #   BLOCK_MUTATED -> punish and re-fetch, never mark: the
+                    #     bytes do not match the header, so they say nothing
+                    #     about the block the header names.
+                    #   anything unclassified -> perm-rejected only (the
+                    #     pre-existing behaviour), no punishment.
+                    kind = (
+                        "verdict" if error.startswith("Invalid header")
+                        else classify_block_reject(error)
+                    )
+                    if kind == "verdict":
+                        self._punish_block_source(next_hash, error)
+                        self._invalid_block_found(next_hash, error)
+                    elif kind == "mutated":
+                        self._punish_block_source(next_hash, error)
+                        self._abandon_block_request(next_hash)
+                        logger.warning(
+                            f"Mutated block {next_hash.hex()[:16]}... "
+                            f"({error}); sender punished, NOT marked failed — "
+                            f"will re-fetch"
+                        )
+                    else:
+                        self._mark_perm_rejected(next_hash)
                     self._block_source_peer_addr.pop(next_hash, None)
                 self._connecting_hashes.discard(next_hash)
                 break
@@ -4649,6 +4836,39 @@ class BlockSync:
                             peer.note_block_height(_h)
                     continue
 
+                # Core AcceptBlockHeader (validation.cpp) against the failed
+                # set: a header we already marked BLOCK_FAILED_VALID is
+                # "duplicate-invalid" (BLOCK_CACHED_INVALID — MaybePunish
+                # punishes only an OUTBOUND peer: an inbound one may simply
+                # not know yet), and a header whose parent is failed is
+                # "bad-prevblk" (BLOCK_INVALID_PREV — always punished, and
+                # never added to the index; we mark it failed so its body is
+                # never fetched).  ProcessNewBlockHeaders stops at the first
+                # invalid header, so the rest of the batch is dropped.
+                _hdr_prev = getattr(header, "prev_blockhash", None)
+                if block_hash in self._failed_blocks or (
+                    _hdr_prev is not None and bytes(_hdr_prev) in self._failed_blocks
+                ):
+                    cached = block_hash in self._failed_blocks
+                    if not cached:
+                        self._mark_block_failed(block_hash)
+                    logger.info(
+                        f"Header {block_hash.hex()[:16]}... from "
+                        f"{peer.host}:{peer.port} "
+                        f"{'is marked invalid (duplicate-invalid)' if cached else 'builds on an invalid block (bad-prevblk)'}"
+                        f" — dropping batch"
+                    )
+                    if (not cached or not getattr(peer, "inbound", False)) and hasattr(
+                        self.peer_manager, "misbehaving"
+                    ):
+                        from ouroboros.banman import SCORE_INVALID_BLOCK
+                        self.peer_manager.misbehaving(
+                            f"{peer.host}:{peer.port}", SCORE_INVALID_BLOCK,
+                            "duplicate-invalid" if cached else "bad-prevblk",
+                        )
+                        self._drop_presync_state(peer)
+                    return
+
                 # Per-header PoW gate (BIP-130 anti-DoS).  Pre-2026-05-06
                 # this loop only checked chain continuity, letting a peer
                 # flood our 50K-slot queue with valid-prev forged-PoW
@@ -5848,6 +6068,9 @@ class BlockSync:
         # Attach the tip — its height > active tip, so this is the call that
         # drives the single reorg through the engine.
         tip_prev = self._fork_header_prev.get(fork_tip_hash, ancestor_hash)
+        _rpc = getattr(self, "_reorg_rpc_server", None)
+        if _rpc is not None:
+            _rpc._last_reorg_failure = None
         try:
             result: str | None = await self._attach_side_branch_block(
                 self._reorg_db, bodies[fork_tip_hash], fork_tip_hash,
@@ -5860,6 +6083,34 @@ class BlockSync:
                 exc_info=True,
             )
             return None
+        # Which block failed, and was it a verdict?  The connect loop records
+        # (hash, error); a reject with no record came from the attach-time
+        # CheckBlock/contextual-header gates, which judge the TIP itself.
+        failure = getattr(_rpc, "_last_reorg_failure", None) if _rpc is not None else None
+        if failure is not None:
+            failed_hash, failed_err = failure
+        elif result is not None:
+            failed_hash, failed_err = fork_tip_hash, result
+        else:
+            failed_hash, failed_err = None, None
+        if (
+            failed_hash is not None
+            and failed_hash in bridge_hashes
+            and classify_block_reject(failed_err) == "verdict"
+        ):
+            # Core InvalidBlockFound + MaybePunishNodeForBlock: mark the
+            # failing block and every bridge block above it failed (so the
+            # same announcement can never re-drive the fetch + reorg), and
+            # punish the peer that delivered the failing body.
+            idx = bridge_hashes.index(failed_hash)
+            self._punish_block_source(failed_hash, failed_err)
+            self._invalid_block_found(
+                failed_hash, failed_err, descendants=bridge_hashes[idx + 1:]
+            )
+        elif failed_hash is not None and failed_hash in bridge_hashes and (
+            classify_block_reject(failed_err) == "mutated"
+        ):
+            self._punish_block_source(failed_hash, failed_err)
         if result is not None:
             # The reorg engine rejected the heavier fork (invalid block in the
             # connect loop, missing ancestor, too-deep, etc.).  Drop the bridge
@@ -5906,6 +6157,7 @@ class BlockSync:
             self._fork_block_bytes.pop(cursor, None)
             self._fork_getheaders_sent.pop(cursor, None)
             self._fork_recheck_state.pop(cursor, None)
+            self._block_source_peer_addr.pop(cursor, None)
             prev = self._fork_header_prev.pop(cursor, None)
             if prev is None:
                 break

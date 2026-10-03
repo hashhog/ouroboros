@@ -9029,6 +9029,9 @@ class RPCServer:
         side-branch buffer and that the new chain is strictly heavier
         than the current active chain.
         """
+        # (hash, error) of the block whose connect failed, if any — read by
+        # the P2P fork path (BlockSync._complete_fork_bridge).
+        self._last_reorg_failure = None
         # Walk backwards from the new tip through the side-branch buffer
         # until we hit a block that's on the active chain — that's the
         # common ancestor. Build the connect list (ancestor's child →
@@ -9306,6 +9309,7 @@ class RPCServer:
                 _bip34_depl.height if _bip34_depl is not None else 227_931
             )
 
+            _preflight_hash: bytes | None = None
             try:
                 # Pre-flight validation pass (each block validates against
                 # the post-disconnect on-disk chainstate). This catches
@@ -9318,6 +9322,12 @@ class RPCServer:
                 # is a safe failure (false-reject of a legitimate side
                 # branch is recoverable; consensus violation would not be).
                 for blk_hash, blk_height, raw_bytes in chain_to_connect:
+                    # Only the FIRST block is validated against its true
+                    # chainstate here (later ones tolerate in-batch misses), so
+                    # only a first-block failure is attributable as a verdict.
+                    _preflight_hash = (
+                        blk_hash if blk_hash == chain_to_connect[0][0] else None
+                    )
                     # BIP-34 byte-prefix check (network-aware).
                     if blk_height >= _bip34_activation:
                         try:
@@ -9393,6 +9403,7 @@ class RPCServer:
                         except Exception:
                             pass
 
+                _preflight_hash = None
                 # Single-batch connect — Rust accumulates every block's
                 # writes into one WriteBatch and commits atomically.
                 blocks_arg: list[tuple[bytes, int]] = [
@@ -9423,9 +9434,11 @@ class RPCServer:
                         except Exception:
                             pass
             except Exception as e:
+                if _preflight_hash is not None:
+                    self._last_reorg_failure = (_preflight_hash, str(e))
                 logger.error(
                     "submitblock reorg: connect_blocks_atomic failed: %s",
-                    e, exc_info=True,
+                    e, exc_info=not isinstance(e, ValueError),
                 )
                 # ATOMICITY (S5): the disconnect-side commit already landed,
                 # so the disk state is now a prefix of the competitor (0 blocks
@@ -9462,9 +9475,21 @@ class RPCServer:
                     )
                     connected_hashes.append(blk_hash)
                 except Exception as e:
+                    # Record WHICH block failed so the P2P fork path can run
+                    # InvalidBlockFound on it (BlockSync._complete_fork_bridge).
+                    # A MissingAncestorHeaderError is a hold, not a verdict:
+                    # carry it with the prefix the classifier treats as one.
+                    _err_s = str(e)
+                    if isinstance(e, MissingAncestorHeaderError):
+                        _err_s = f"missing-ancestor-header: {_err_s}"
+                    self._last_reorg_failure = (blk_hash, _err_s)
+                    # A consensus reject is an expected outcome (Core logs one
+                    # line, ConnectBlock/InvalidChainFound) — a traceback only
+                    # for an unexpected exception type.
                     logger.error(
                         "submitblock reorg: accept_block at h=%d failed: %s",
-                        blk_height, e, exc_info=True,
+                        blk_height, e,
+                        exc_info=not isinstance(e, ValueError),
                     )
                     # ATOMICITY (S5) + Core-parity keep/rollback (issue #118):
                     # we have disconnected the original chain and connected
