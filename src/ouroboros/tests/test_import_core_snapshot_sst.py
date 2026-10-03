@@ -140,6 +140,24 @@ def _all_coins(db) -> set:
     }
 
 
+def test_core_stats_literals(tmp_path, db):
+    """txouts / total_amount / bogosize are Core's counters, not aliases.
+
+    kernel/coinstats.cpp ApplyStats: one txid group is one transaction,
+    each coin is one txout, total_amount sums nValue, GetBogoSize is
+    ``32+4+4+8+2+scriptPubKey.size()`` (50 + script length). One 25-byte
+    P2PKH of 50_000 sats is therefore (txouts=1, transactions=1,
+    total_amount=50000, bogosize=75).
+    """
+    spk = b"\x76\xa9\x14" + b"\x11" * 20 + b"\x88\xac"
+    assert len(spk) == 25
+    coins = [(b"\x11" * 32, 0, 1, False, 50_000, spk)]
+    path = _write(tmp_path, "one.dat", _snapshot_bytes(coins))
+    _bh, _h, n, digest, ntx, total, bogo = _import(db, path, _expected_hash(coins))
+    assert bytes(digest) == _expected_hash(coins)
+    assert (n, ntx, total, bogo) == (1, 1, 50_000, 50 + 25)
+
+
 def test_round_trip_hash_and_coins(tmp_path, db):
     coins = _coins(1)
     want = _expected_hash(coins)

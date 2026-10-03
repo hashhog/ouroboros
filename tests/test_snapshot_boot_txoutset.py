@@ -179,6 +179,10 @@ async def test_loadtxoutset_then_gettxoutsetinfo_reports_height_eq_base(
     assert len(res["hash_serialized_3"]) == 64
     assert res["txouts"] == 1
     assert res["transactions"] == 1
+    # Core gettxoutsetinfo: total_amount is nValue in BTC, bogosize is
+    # GetBogoSize = 50 + script size. This coin is 12345 sats, 25-byte P2PKH.
+    assert res["total_amount"].text == "0.00012345"
+    assert res["bogosize"] == 50 + 25
 
 
 @pytest.mark.asyncio

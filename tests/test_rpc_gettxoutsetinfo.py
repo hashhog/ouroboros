@@ -144,8 +144,10 @@ async def test_gettxoutsetinfo_basic_shape() -> None:
     assert res["bestblock"] == (b"\xcc" * 32)[::-1].hex()
     assert res["txouts"] == 3
     assert res["transactions"] == 2  # two distinct txids
-    assert isinstance(res["bogosize"], int)
-    assert res["bogosize"] > 0
+    # Core GetBogoSize (kernel/coinstats.cpp:36-43) is 50 + scriptPubKey
+    # size, not "some positive integer". Each seeded output is a 25-byte
+    # P2PKH. total_amount is the sum of nValue (50e6 + 25e6 + 12345678).
+    assert res["bogosize"] == 3 * (50 + 25)
     # 50M + 25M + 12.345678M sats = 0.87345678 BTC
     assert res["total_amount"].text == "0.87345678"  # BTCAmount, Core %d.%08d
     # Default hash_type is hash_serialized_3 (Core post-#26553).

@@ -19,10 +19,10 @@ use tokio::sync::Mutex;
 
 use common::{OutPointWrapper, UTXO, BlockWrapper, BlockHeaderWrapper, BlockMetadata, BlockStatus};
 use common::verify_ecdsa_signature_der;
-// Hardware-accelerated crypto
+// SHA-256 via sha2 (the old SHA-NI compressor returned wrong digests).
 use common::crypto::sha256::{
     sha256 as hw_sha256, double_sha256 as hw_double_sha256,
-    detect_implementation as sha256_detect_impl, implementation_string as sha256_impl_string,
+    implementation_string as sha256_impl_string,
 };
 use common::crypto::secp::{
     verify_ecdsa_compact as secp_verify_ecdsa_compact,
@@ -68,22 +68,20 @@ fn verify_ecdsa(der_sig: Vec<u8>, pubkey: Vec<u8>, msg_hash: Vec<u8>) -> PyResul
 // Hardware-accelerated cryptographic functions
 // ============================================================================
 
-/// Get the detected SHA256 implementation (hardware-accelerated or software).
-/// Returns one of: "sha256:x86_shani", "sha256:arm_sha2", "sha256:software"
+/// Digest implementation. Always `sha256:sha2`. CPU feature detection is not
+/// a compressor: the old SHA-NI path returned wrong digests.
 #[pyfunction]
 fn crypto_sha256_implementation() -> String {
     sha256_impl_string()
 }
 
-/// Compute SHA256 hash using hardware acceleration when available.
-/// Uses SHA-NI on x86 (Intel/AMD) or SHA2 extensions on ARM (Apple Silicon).
+/// SHA-256 (`sha2`).
 #[pyfunction]
 fn crypto_sha256(data: Vec<u8>) -> Vec<u8> {
     hw_sha256(&data).to_vec()
 }
 
-/// Compute double SHA256 (SHA256(SHA256(data))) using hardware acceleration.
-/// This is Bitcoin's primary hash function for block headers, merkle trees, etc.
+/// Double SHA-256 (SHA256(SHA256(data))). Bitcoin's hash for headers and txids.
 #[pyfunction]
 fn crypto_double_sha256(data: Vec<u8>) -> Vec<u8> {
     hw_double_sha256(&data).to_vec()
@@ -5436,10 +5434,9 @@ impl PyBlockchainDB {
             }
 
             let parsed = (|| -> Result<([u8; 32], u64, u64, u64, u64), String> {
-                // sha2 (not common::crypto::sha256::Sha256): the in-house
-                // streaming type returns wrong digests across multiple
-                // update() calls — observed while building this importer;
-                // its one-shot sha256() is unaffected.
+                // sha2 directly. `common::crypto::sha256::Sha256` is the same
+                // digest (it delegates to sha2); this scan does not go
+                // through that wrapper.
                 use sha2::Digest as _;
                 let mut hasher = sha2::Sha256::new();
                 let mut loaded: u64 = 0;

@@ -7,8 +7,8 @@
 //! or MuHash3072 over the same elements (`crypto/muhash.cpp`).
 //!
 //! Hashing lives here, not in a Python callback, so the scan can run
-//! without the GIL. Do not use `common::crypto::sha256::Sha256` — its
-//! streaming `update` disagrees with SHA-256.
+//! without the GIL. Digests are `sha2` (the same construction as
+//! `common::crypto::sha256::Sha256`, which delegates to `sha2`).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};

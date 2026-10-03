@@ -1859,6 +1859,9 @@ mod tests {
         assert_eq!(stats.txouts, 3);
         assert_eq!(stats.transactions, 1);
         assert_eq!(stats.total_amount, 60);
+        // Core GetBogoSize (kernel/coinstats.cpp:36-43): 32+4+4+8+2+script
+        // = 50 + script.len(). Three coins, each script 5 bytes.
+        assert_eq!(stats.bogosize, 3 * (50 + spk.len() as u64));
         assert_eq!(stats.hash_serialized, Some(good));
         assert_ne!(good, le_order);
 
