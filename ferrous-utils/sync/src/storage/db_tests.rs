@@ -1815,4 +1815,84 @@ mod tests {
         assert_eq!(peak, 80);
         assert_eq!(seen_le, vec![0, 1, 256]);
     }
+
+    #[test]
+    fn compute_utxo_stats_is_one_snapshot_and_numeric_vout_order() {
+        use sha2::{Digest, Sha256};
+
+        use crate::storage::coinstats::{self, txout_ser, UtxoStatsKind};
+
+        let (db, _tmp) = create_test_db();
+        let txid = bitcoin::Txid::from_byte_array([0xCC; 32]);
+        let spk = vec![0x76u8, 0xa9, 0x14, 0x88, 0xac];
+        // Insert 256 before 1. RocksDB key order is vout LE, which is not
+        // numeric; the digest must still be vout 0, 1, 256.
+        for (vout, amount) in [(0u32, 10u64), (256, 30u64), (1, 20u64)] {
+            let outpoint = OutPoint::new(txid, vout);
+            let utxo = UTXO::new(
+                OutPointWrapper::new(outpoint),
+                amount,
+                ScriptBuf::from_bytes(spk.clone()),
+                Some(7),
+                false,
+            );
+            db.add_utxo(&outpoint, &utxo).unwrap();
+        }
+        let tip = [0x11u8; 32];
+        db.update_best_block(&tip, 7).unwrap();
+
+        let hash_order = |order: &[(u32, u64)]| -> [u8; 32] {
+            let mut sha = Sha256::new();
+            for (vout, amount) in order {
+                sha.update(txout_ser(&[0xCC; 32], *vout, 7, false, *amount, &spk));
+            }
+            Sha256::digest(sha.finalize()).into()
+        };
+        let good = hash_order(&[(0, 10), (1, 20), (256, 30)]);
+        let le_order = hash_order(&[(0, 10), (256, 30), (1, 20)]);
+
+        let stats = db
+            .compute_utxo_stats(UtxoStatsKind::HashSerialized)
+            .unwrap();
+        assert_eq!(stats.best_hash, tip);
+        assert_eq!(stats.best_height, 7);
+        assert_eq!(stats.txouts, 3);
+        assert_eq!(stats.transactions, 1);
+        assert_eq!(stats.total_amount, 60);
+        assert_eq!(stats.hash_serialized, Some(good));
+        assert_ne!(good, le_order);
+
+        coinstats::arm_utxo_stats_walk_gate();
+        let mid = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                db.compute_utxo_stats(UtxoStatsKind::HashSerialized).unwrap()
+            });
+            let start = std::time::Instant::now();
+            while coinstats::utxo_stats_walk_phase() != 1 {
+                if start.elapsed() > std::time::Duration::from_secs(5) {
+                    coinstats::release_utxo_stats_walk_gate();
+                    panic!("snapshot walk did not pause");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            let extra = bitcoin::Txid::from_byte_array([0xEE; 32]);
+            let (op, utxo) = create_test_utxo(extra, 0, 9, Some(8));
+            db.add_utxo(&op, &utxo).unwrap();
+            db.update_best_block(&[0x22; 32], 8).unwrap();
+            coinstats::release_utxo_stats_walk_gate();
+            handle.join().unwrap()
+        });
+        assert_eq!(mid.txouts, 3);
+        assert_eq!(mid.best_height, 7);
+        assert_eq!(mid.best_hash, tip);
+        assert_eq!(mid.hash_serialized, Some(good));
+
+        let after = db
+            .compute_utxo_stats(UtxoStatsKind::HashSerialized)
+            .unwrap();
+        assert_eq!(after.txouts, 4);
+        assert_eq!(after.best_height, 8);
+        assert_eq!(after.best_hash, [0x22; 32]);
+        assert_ne!(after.hash_serialized, Some(good));
+    }
 }

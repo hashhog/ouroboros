@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitcoin::OutPoint;
 use bitcoin::hashes::Hash;
-use rocksdb::{BlockBasedOptions, Cache, ColumnFamilyDescriptor, DataBlockIndexType, IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DataBlockIndexType, IteratorMode, Options,
+    ReadOptions, WriteBatch, DB,
+};
 use thiserror::Error;
 
 use common::{
@@ -136,6 +139,40 @@ pub struct BlockchainDB {
 /// Soft cap on read-through cache entries; on overflow the cache is cleared
 /// (bounded memory, no per-entry eviction needed — the next reads repopulate).
 const UTXO_READ_CACHE_MAX_ENTRIES: usize = 4_000_000;
+
+/// Decode the META_CF best-block pair. Shared by the live read and the
+/// snapshot read so a torn `(hash, height)` is rejected the same way on
+/// both paths.
+fn decode_tip(hash: Option<Vec<u8>>, height: Option<Vec<u8>>) -> Result<([u8; 32], u32)> {
+    let hash_bytes = match hash {
+        Some(data) if data.len() == 32 => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&data);
+            out
+        }
+        Some(data) => {
+            return Err(DbError::InvalidData(format!(
+                "Invalid block hash length: {}",
+                data.len()
+            )))
+        }
+        None => return Err(DbError::BlockNotFound),
+    };
+    let height_n = match height {
+        Some(data) if data.len() == 4 => {
+            let bytes: [u8; 4] = data.as_slice().try_into().unwrap();
+            decode_height(&bytes)
+        }
+        Some(data) => {
+            return Err(DbError::InvalidData(format!(
+                "Invalid height length: {}",
+                data.len()
+            )))
+        }
+        None => return Err(DbError::BlockNotFound),
+    };
+    Ok((hash_bytes, height_n))
+}
 
 impl BlockchainDB {
     /// Attempt to repair a corrupted database at the given path.
@@ -796,6 +833,48 @@ impl BlockchainDB {
         Ok((count, peak))
     }
 
+    /// UTXO-set stats over ONE RocksDB snapshot.
+    ///
+    /// The best-block marker (META_CF) and the coin cursor (CHAINSTATE_CF)
+    /// are read from the same snapshot, so a commit that lands after the
+    /// snapshot is opened is in neither the label nor the hash. Core does
+    /// the same with `CCoinsViewCursor` (`ComputeUTXOStats`). The cursor
+    /// does not fill the block cache: a full-set scan must not evict the
+    /// blocks validation is reading.
+    ///
+    /// Callers that need the GIL released wrap this in `Python::allow_threads`.
+    /// The scan itself does not call back into Python.
+    pub fn compute_utxo_stats(
+        &self,
+        kind: crate::storage::coinstats::UtxoStatsKind,
+    ) -> Result<crate::storage::coinstats::UtxoStats> {
+        use crate::storage::coinstats::UtxoStats;
+
+        let snap = self.db.snapshot();
+        let meta_cf = self
+            .db
+            .cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        let chain_cf = self
+            .db
+            .cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+        let (best_hash, best_height) = decode_tip(
+            snap.get_cf(meta_cf, meta_keys::BEST_BLOCK_HASH)?,
+            snap.get_cf(meta_cf, meta_keys::BEST_HEIGHT)?,
+        )?;
+        // Snapshot is already pinned. The test hook pauses here, before
+        // the cursor moves, so a commit from another thread is visible to
+        // a later snapshot and invisible to this one. Production never
+        // arms the hook.
+        crate::storage::coinstats::pause_if_armed();
+        let mut readopts = ReadOptions::default();
+        readopts.fill_cache(false);
+        let iter = snap.iterator_cf_opt(chain_cf, readopts, IteratorMode::Start);
+        let digest = crate::storage::coinstats::accumulate(iter, kind)?;
+        Ok(UtxoStats::from_parts(best_hash, best_height, digest))
+    }
+
     /// Iterate all UTXOs in the chainstate (for address balance/scan).
     ///
     /// Returns a vector of (OutPoint, UTXO) pairs for the entire UTXO set.
@@ -1025,39 +1104,10 @@ impl BlockchainDB {
     pub fn get_best_block(&self) -> Result<([u8; 32], u32)> {
         let cf = self.db.cf_handle(META_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
-
-        // Get best block hash
-        let hash = match self.db.get_cf(cf, meta_keys::BEST_BLOCK_HASH)? {
-            Some(data) => {
-                if data.len() != 32 {
-                    return Err(DbError::InvalidData(format!(
-                        "Invalid block hash length: {}",
-                        data.len()
-                    )));
-                }
-                let mut hash_bytes = [0u8; 32];
-                hash_bytes.copy_from_slice(&data);
-                hash_bytes
-            }
-            None => return Err(DbError::BlockNotFound),
-        };
-
-        // Get best block height
-        let height = match self.db.get_cf(cf, meta_keys::BEST_HEIGHT)? {
-            Some(data) => {
-                if data.len() != 4 {
-                    return Err(DbError::InvalidData(format!(
-                        "Invalid height length: {}",
-                        data.len()
-                    )));
-                }
-                let height_bytes: [u8; 4] = data.try_into().unwrap();
-                decode_height(&height_bytes)
-            }
-            None => return Err(DbError::BlockNotFound),
-        };
-
-        Ok((hash, height))
+        decode_tip(
+            self.db.get_cf(cf, meta_keys::BEST_BLOCK_HASH)?,
+            self.db.get_cf(cf, meta_keys::BEST_HEIGHT)?,
+        )
     }
 
     /// Update the best block hash and height **atomically**.

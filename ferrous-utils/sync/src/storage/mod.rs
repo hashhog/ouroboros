@@ -16,6 +16,7 @@
 //! 5. **UTXO snapshots** (`snapshot.rs`): BIP305 assumeUTXO snapshot loading and creation
 //!    for fast node startup.
 
+pub mod coinstats;
 pub mod db;
 pub mod schema;
 pub mod undo;

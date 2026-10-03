@@ -988,6 +988,44 @@ class BlockchainDatabase:
         self._db.update_best_block(block_hash, height)
         self._cached_tip = (bytes(block_hash), height)
 
+    def utxo_stats_snapshot(self, hash_type: str) -> dict:
+        """UTXO-set stats from one RocksDB snapshot, GIL released in Rust.
+
+        The best-block label and the coin cursor come from the same
+        snapshot (Core ``CCoinsViewCursor`` / ``ComputeUTXOStats``). A
+        commit that lands after the snapshot opens is in neither the
+        label nor the hash. Digests are internal byte order, or ``None``
+        when that hash type was not requested.
+
+        The Python ``_cached_tip`` is not consulted: it can disagree with
+        the DB, and the reply must name the cursor's block.
+        """
+        native = getattr(self._db, "utxo_stats_snapshot", None)
+        if not callable(native):
+            raise AttributeError("utxo_stats_snapshot")
+        (
+            best_hash,
+            height,
+            txouts,
+            transactions,
+            total_amount,
+            bogosize,
+            sha_digest,
+            muhash_digest,
+        ) = native(hash_type)
+        return {
+            "best_hash": bytes(best_hash),
+            "height": int(height),
+            "txouts": int(txouts),
+            "transactions": int(transactions),
+            "total_amount": int(total_amount),
+            "bogosize": int(bogosize),
+            "sha_digest": bytes(sha_digest) if sha_digest is not None else None,
+            "muhash_digest": (
+                bytes(muhash_digest) if muhash_digest is not None else None
+            ),
+        }
+
     def get_median_time_past(self, height: int) -> int | None:
         """Median timestamp of the 11 blocks up to *height* (BIP 68 / BIP 113 MTP).
 

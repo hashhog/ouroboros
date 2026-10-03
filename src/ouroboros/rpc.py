@@ -12259,19 +12259,19 @@ class RPCServer:
             )
         _ = use_index
 
-        best_hash_internal, best_height = self.node.db.get_best_block()
-
         # Snapshot-base cache: loadtxoutset / import-utxo already folded
         # HASH_SERIALIZED + totals. Serving that here means the campaign
         # base control does not have to walk ~166M coins (852000/875000:
         # NO-ORACLE-SURFACE, utxo_hash="-1", curl's 900s scan deadline).
         # Dropped automatically when the tip hash/height no longer match.
+        # The live walk below does NOT sample the tip first: its label
+        # comes from the same RocksDB snapshot as the coins.
         sm = getattr(self.node, "snapshot_manager", None)
-        cached = (
-            sm.cached_txoutset_for_tip(best_hash_internal, best_height)
-            if sm is not None and hasattr(sm, "cached_txoutset_for_tip")
-            else None
-        )
+        if sm is not None and hasattr(sm, "cached_txoutset_for_tip"):
+            best_hash_internal, best_height = self.node.db.get_best_block()
+            cached = sm.cached_txoutset_for_tip(best_hash_internal, best_height)
+        else:
+            cached = None
         if cached is not None and hash_type_norm in (
             "hash_serialized_3", "hash_serialized_2", "none",
         ):
@@ -12353,7 +12353,17 @@ class RPCServer:
                 ),
             }
 
-        stats = await asyncio.to_thread(_walk_utxos)
+        # Production path: one snapshot, hashed in Rust, GIL released.
+        # The Python walk stays for stub databases that have no
+        # ``utxo_stats_snapshot`` (unit tests, in-memory chainstate).
+        native = getattr(self.node.db, "utxo_stats_snapshot", None)
+        if callable(native):
+            stats = await asyncio.to_thread(native, hash_type_norm)
+            best_hash_internal = stats["best_hash"]
+            best_height = stats["height"]
+        else:
+            best_hash_internal, best_height = self.node.db.get_best_block()
+            stats = await asyncio.to_thread(_walk_utxos)
 
         # Core's uint256.GetHex() emits big-endian display hex (reverses
         # the internal byte order). Apply the same flip for both the

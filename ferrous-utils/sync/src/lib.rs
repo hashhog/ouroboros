@@ -2666,6 +2666,26 @@ fn script_sighash_legacy(
     Ok(PyBytes::new(py, &h).unbind())
 }
 
+/// Test hook for `gettxoutsetinfo`: arm a one-shot pause after the
+/// snapshot is opened and before the cursor moves. Production never calls
+/// this. See `storage/coinstats.rs`.
+#[pyfunction]
+fn arm_utxo_stats_walk_gate() {
+    crate::storage::coinstats::arm_utxo_stats_walk_gate();
+}
+
+/// 0 idle, 1 paused (GIL released), 2 released, 3 timed out.
+#[pyfunction]
+fn utxo_stats_walk_phase() -> u8 {
+    crate::storage::coinstats::utxo_stats_walk_phase()
+}
+
+/// Let a paused `utxo_stats_snapshot` finish.
+#[pyfunction]
+fn release_utxo_stats_walk_gate() {
+    crate::storage::coinstats::release_utxo_stats_walk_gate();
+}
+
 /// Fast sync module for Bitcoin blockchain synchronization
 #[pymodule]
 fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -2754,6 +2774,9 @@ fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(snapshot_magic_bytes, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(snapshot_format_version, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(read_snapshot_metadata, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(arm_utxo_stats_walk_gate, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(utxo_stats_walk_phase, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(release_utxo_stats_walk_gate, m)?)?;
     // Native script interpreter (OUROBOROS_NATIVE_SCRIPT=1)
     m.add_class::<PyScriptTx>()?;
     m.add_function(pyo3::wrap_pyfunction!(script_native_abi, m)?)?;
@@ -6113,6 +6136,49 @@ impl PyBlockchainDB {
         streamed.map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", e))
         })
+    }
+
+    /// UTXO-set stats over one RocksDB snapshot. The GIL is released for
+    /// the scan: hashing runs in Rust, not in a Python callback.
+    ///
+    /// Returns `(best_hash, height, txouts, transactions, total_amount,
+    /// bogosize, hash_serialized | None, muhash | None)`. `best_hash` is
+    /// the META_CF tip from the same snapshot as the coin cursor, internal
+    /// byte order. Digests are internal byte order too.
+    fn utxo_stats_snapshot(
+        &self,
+        py: Python<'_>,
+        hash_type: &str,
+    ) -> PyResult<(
+        Py<PyBytes>,
+        u32,
+        u64,
+        u64,
+        u64,
+        u64,
+        Option<Py<PyBytes>>,
+        Option<Py<PyBytes>>,
+    )> {
+        let kind = crate::storage::coinstats::UtxoStatsKind::parse(hash_type).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(e)
+        })?;
+        // Clone the Arc so the walk is not tied to this PyRef's lifetime
+        // across `allow_threads`. Connect/RPC can still take `&self` on
+        // the same object while the scan sleeps inside the test gate.
+        let db = Arc::clone(&self.db);
+        let stats = py.detach(move || db.compute_utxo_stats(kind)).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", e))
+        })?;
+        Ok((
+            PyBytes::new(py, &stats.best_hash).unbind(),
+            stats.best_height,
+            stats.txouts,
+            stats.transactions,
+            stats.total_amount,
+            stats.bogosize,
+            stats.hash_serialized.map(|d| PyBytes::new(py, &d).unbind()),
+            stats.muhash.map(|d| PyBytes::new(py, &d).unbind()),
+        ))
     }
 
     /// Walk `CHAINSTATE_CF` and delete any orphan UTXO whose
