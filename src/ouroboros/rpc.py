@@ -44,6 +44,7 @@ from ouroboros.validation import (
     _is_p2sh,
 )
 from ouroboros.validation import DIFFBITS_OK as _DIFFBITS_OK
+from ouroboros.validation import MissingAncestorHeaderError
 from ouroboros.validation import (
     diffbits_unresolved_fallback_ok as _diffbits_unresolved_fallback_ok,
 )
@@ -8337,10 +8338,28 @@ class RPCServer:
                 except Exception:
                     return None
             if blk is None:
-                # Ran off the end of what we can see. If we already have at
-                # least one ancestor this mirrors Core hitting the genesis
-                # block (pindex becomes null and the loop stops early);
-                # with none at all we cannot compute anything.
+                # No body for this hash.  The old code ``break``-ed here and
+                # medianed whatever it had — a PARTIAL window, which skews
+                # large and can turn a valid block into time-too-old (the
+                # snapshot-base class: bodies never exist below the base).
+                # Core's pprev walk only stops at genesis.  Continue on the
+                # active chain from body-free header metadata if this hash is
+                # an active-chain block; otherwise the window is unknown.
+                try:
+                    hh = db.get_block_height_by_hash(h)
+                except Exception:
+                    return None
+                if not isinstance(hh, int) or db.get_block_hash_by_height(hh) != h:
+                    return None
+                while len(times) < MEDIAN_TIME_SPAN and hh >= 0:
+                    try:
+                        ts = db.get_block_timestamp_by_height(hh)
+                    except Exception:
+                        return None
+                    if not isinstance(ts, int):
+                        return None
+                    times.append(ts)
+                    hh -= 1
                 break
             times.append(int(blk.timestamp))
             h = blk.prev_blockhash
@@ -9366,6 +9385,11 @@ class RPCServer:
                                     raise ValueError(_err)
                         except ValueError:
                             raise
+                        except MissingAncestorHeaderError as _mae:
+                            # Not evaluable without the pre-snapshot header
+                            # chain: refuse rather than fall through to the
+                            # swallow below, which would ACCEPT unvalidated.
+                            raise ValueError(f"missing-ancestor-header: {_mae}")
                         except Exception:
                             pass
 

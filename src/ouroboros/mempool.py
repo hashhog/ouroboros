@@ -2594,10 +2594,15 @@ class Mempool:
                 # to consensus-only verification (current behavior).
                 extra_flags = 0
 
+        from ouroboros.validation import MissingAncestorHeaderError
         try:
             valid, error = self.validator.validate_transaction(
                 tx, next_height, mempool_mtp, extra_script_flags=extra_flags,
             )
+        except MissingAncestorHeaderError:
+            # BIP68 coin MTP not computable yet (pre-snapshot headers still
+            # backfilling): refuse the tx, without a consensus verdict.
+            return False, "missing-ancestor-header"
         except TypeError:
             # Older test doubles do not implement the extra_script_flags
             # parameter — fall back through progressively simpler signatures.
@@ -5349,10 +5354,14 @@ class Mempool:
         pkg_utxo_view: dict = {}
         for tx in txs:
             txid = tx.get_txid()
-            valid, error = self.validator.validate_transaction(
-                tx, height, pkg_mtp,
-                intra_block_utxos=pkg_utxo_view if pkg_utxo_view else None,
-            )
+            from ouroboros.validation import MissingAncestorHeaderError
+            try:
+                valid, error = self.validator.validate_transaction(
+                    tx, height, pkg_mtp,
+                    intra_block_utxos=pkg_utxo_view if pkg_utxo_view else None,
+                )
+            except MissingAncestorHeaderError:
+                valid, error = False, "missing-ancestor-header"
             if not valid:
                 return False, f"Package tx {txid.hex()[:16]}... invalid: {error}"
             # Register this tx's outputs so subsequent (child) txs can find them.

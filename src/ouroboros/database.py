@@ -514,6 +514,28 @@ class BlockchainDatabase:
             return None
         return int(meta[0])
 
+    def get_block_timestamp_by_height(self, height: int) -> int | None:
+        """Header timestamp of the ACTIVE-chain block at *height*, body-free.
+
+        Reads the height->hash index, then the hash-keyed block-index
+        metadata — the rows the pre-snapshot header backfill writes (it never
+        writes bodies).  Returns None when either is absent.  Used by the
+        retarget rule's period-first lookup (pow.cpp:45) below a snapshot
+        base, where ``get_block_by_height`` can never answer.
+        """
+        block_hash = self.get_block_hash_by_height(height)
+        if block_hash is None:
+            return None
+        fn = getattr(self._db, "get_block_metadata_by_hash", None)
+        if fn is None:
+            return None
+        meta = fn(bytes(block_hash))
+        if meta is None:
+            return None
+        if int(meta[0]) != int(height):
+            return None
+        return int(meta[2])
+
     def has_block_hash(self, block_hash: bytes) -> bool:
         """Return True if *block_hash* is present in the block store.
 

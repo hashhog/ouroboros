@@ -238,6 +238,12 @@ class TestTimeTimewarpAttack(unittest.TestCase):
         # returns None (skips the bits check) rather than hitting a MagicMock
         # DB that some other test may have injected into the sync module.
         v.db.get_block_by_height = lambda h: None
+        # The bits gate must not be what decides these tests.  An
+        # unresolvable retarget ancestor now FAILS CLOSED (raises
+        # MissingAncestorHeaderError) instead of passing on a fallback, so
+        # pin the bits rule to "block's own bits are expected" — the timewarp
+        # gate is then the only thing under test.
+        v._get_expected_bits = lambda h, p, b, ancestor_at=None: (b.bits, "ok")
         return v
 
     def test_timewarp_rejected_on_testnet4(self):

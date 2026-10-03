@@ -25,7 +25,7 @@ import pytest
 
 from ouroboros.database import Block, BlockchainDatabase, Transaction, TxIn, TxOut
 from ouroboros.p2p_messages import TxMessage, encode_varint
-from ouroboros.validation import BlockValidator, TransactionValidator
+from ouroboros.validation import BlockValidator, MissingAncestorHeaderError, TransactionValidator
 
 
 def _sha256d(b: bytes) -> bytes:
@@ -325,7 +325,7 @@ def sync_impl(request):
 def test_bip68_new_path_is_verdict_identical_to_the_eager_path(sync_impl):
     rng = random.Random(0xB1768)
     base_h = 700_000
-    checked = fired = 0
+    checked = fired = missing = 0
     for trial in range(3000):
         coins, intra, inputs = {}, {}, []
         n_in = rng.randrange(1, 6)
@@ -353,21 +353,47 @@ def test_bip68_new_path_is_verdict_identical_to_the_eager_path(sync_impl):
         old_db = _CoinDB(coins, mtps)
         old = _old_check_sequence_locks(TransactionValidator(old_db), tx, block_h,
                                         block_mtp, "mainnet", intra)
+        # The eager path's ``mtp = 0`` for an unknown coin MTP was the
+        # fail-OPEN this suite now forbids: an ENFORCED time lock whose coin
+        # MTP is unknown must raise MissingAncestorHeaderError (fail closed),
+        # in input order, after any earlier missing-coin ``False``.
+        from ouroboros.validation import bip68_version_active
+        expected = old
+        if bip68_version_active(version):
+            for i in inputs:
+                c = coins.get((i.prev_txid, i.prev_vout)) or intra.get((i.prev_txid, i.prev_vout))
+                if c is None:
+                    break
+                if (c["height"] is not None and not (i.sequence & DISABLE)
+                        and (i.sequence & TYPE)
+                        and mtps.get(max(c["height"] - 1, 0)) is None):
+                    expected = "MISSING"
+                    break
+
+        def _run(fn):
+            try:
+                return fn()
+            except MissingAncestorHeaderError:
+                return "MISSING"
+
         # (a) no hint — the non-block callers
         new_db = _CoinDB(coins, mtps)
-        new_a = TransactionValidator(new_db).check_sequence_locks(
-            tx, block_h, block_mtp, network="mainnet", intra_block_utxos=intra)
+        new_a = _run(lambda: TransactionValidator(new_db).check_sequence_locks(
+            tx, block_h, block_mtp, network="mainnet", intra_block_utxos=intra))
         # (b) validate_transaction's hint + a shared per-block memo
         resolved = [coins.get((i.prev_txid, i.prev_vout))
                     or intra.get((i.prev_txid, i.prev_vout)) for i in inputs]
         hint_db = _CoinDB(coins, mtps)
         memo: dict = {}
-        new_b = TransactionValidator(hint_db).check_sequence_locks(
+        new_b = _run(lambda: TransactionValidator(hint_db).check_sequence_locks(
             tx, block_h, block_mtp, network="mainnet", intra_block_utxos=intra,
-            input_utxos=resolved, mtp_cache=memo)
-        assert old == new_a == new_b, (trial, version, [hex(i.sequence) for i in inputs])
+            input_utxos=resolved, mtp_cache=memo))
+        assert expected == new_a == new_b, (trial, version, [hex(i.sequence) for i in inputs])
         checked += 1
-        fired += (old is False)
+        fired += (expected is False)
+        missing += (expected == "MISSING")
+        if expected == "MISSING":
+            continue
         # Work actually removed: no per-input UTXO re-read with the hint, and
         # an MTP only for an enforced TIME lock, each height at most once.
         assert hint_db.utxo_calls == 0
@@ -379,6 +405,7 @@ def test_bip68_new_path_is_verdict_identical_to_the_eager_path(sync_impl):
                       and (i.sequence & TYPE)}
             assert set(hint_db.mtp_calls) == wanted
     assert checked == 3000 and 0 < fired < checked  # both verdicts exercised
+    assert 0 < missing  # the fail-closed branch is exercised too
 
 
 def test_bip68_all_disabled_v2_tx_reads_no_mtp():

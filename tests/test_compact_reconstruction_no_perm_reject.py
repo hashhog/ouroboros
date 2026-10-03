@@ -40,7 +40,11 @@ from ouroboros.block_sync import BlockSync
 def _make_block_sync() -> BlockSync:
     db = MagicMock()
     db.get_best_block.return_value = (b"\x00" * 32, 0)
-    return BlockSync(db=db, validator=MagicMock(), peer_manager=MagicMock())
+    bs = BlockSync(db=db, validator=MagicMock(), peer_manager=MagicMock())
+    # A genesis-synced node: the pre-snapshot header gate is open (this mock
+    # index cannot answer the survey, which would otherwise hold the drain).
+    bs._prebase_headers_complete = True
+    return bs
 
 
 def _stage_next_block(bs: BlockSync, block_hash: bytes) -> None:

@@ -351,6 +351,40 @@ DIFFBITS_MISSING_PERIOD_FIRST = "missing-period-first"
 DIFFBITS_WALKBACK_INCOMPLETE = "walkback-incomplete"
 
 
+class _AncestorTimestamp:
+    """Header-metadata stand-in for an ancestor whose body is not stored."""
+
+    __slots__ = ("timestamp", "bits")
+
+    def __init__(self, timestamp: int, bits: int | None = None) -> None:
+        self.timestamp = timestamp
+        self.bits = bits
+
+
+class MissingAncestorHeaderError(RuntimeError):
+    """A consensus value needs an ancestor header this node does not hold.
+
+    Bitcoin Core never reaches this state: it validates the FULL header chain
+    from genesis before it loads an assumeUTXO snapshot, so
+    ``pindex->GetAncestor(h)`` and ``GetMedianTimePast()`` are always
+    answerable (consensus/tx_verify.cpp:74 CalculateSequenceLocks,
+    validation.cpp:4135 nLockTimeCutoff, pow.cpp:45 GetNextWorkRequired).
+
+    A snapshot-booted ouroboros holds no index rows below the base until the
+    header backfill (``header_backfill.py``) commits.  Every substitute value
+    used before this class existed was wrong in one direction or the other:
+    a partial 11-header median skews LARGE (rejects valid blocks — the 948464
+    wedge), coin time 0 skips the relative time lock (accepts invalid
+    blocks), the base timestamp as prev-MTP over-accepts BIP113 locktimes and
+    can reject a valid block as time-too-old, and the 4x retarget clamp
+    admits any nBits within a factor of four.
+
+    So the lookup FAILS CLOSED: it raises this.  It is NOT a verdict on the
+    block — callers must hold the block and retry once the headers exist,
+    never mark it invalid and never punish the peer that sent it.
+    """
+
+
 def diffbits_unresolved_fallback_ok(
     network: str, height: int, prev_bits: int, actual_bits: int
 ) -> bool:
@@ -1171,9 +1205,21 @@ class BlockValidator:
         # real MTP is 1775650208 and the base timestamp is 1775651930 (gap
         # 1722s); both time-locked txs in 944184 are final under either, and
         # zero txs sit in the [realMTP, baseTime) over-accept window.
+        #
+        # SUPERSEDED (fail-closed): the base-timestamp approximation above is
+        # an UPPER bound, so it over-accepted BIP113 time locktimes and could
+        # reject a valid block as time-too-old (block.time in (realMTP,
+        # baseTime]); the trailing ``or 0`` disabled time-too-old and made
+        # every time locktime non-final.  The prev MTP is now either Core's
+        # value (the header backfill has filled the window) or the block is
+        # HELD — see MissingAncestorHeaderError.
         block_mtp = self.db.get_median_time_past(expected_height - 1)
         if block_mtp is None:
-            block_mtp = self._snapshot_base_mtp_fallback(prev_block, expected_height) or 0
+            raise MissingAncestorHeaderError(
+                f"prev median-time-past at height {expected_height - 1} needs "
+                f"headers {max(0, expected_height - 11)}..{expected_height - 1}, "
+                f"not all held (pre-snapshot header backfill incomplete?)"
+            )
 
         # 2b. Compute nLockTimeCutoff per Bitcoin Core validation.cpp:4135-4142.
         #
@@ -1577,17 +1623,33 @@ class BlockValidator:
                 if block.bits != expected_bits:
                     return False
             else:
+                # Block-connect is the authoritative gate, and it now runs
+                # only with the full header chain present (block_sync holds
+                # the drain until the pre-snapshot backfill commits).  An
+                # unresolvable ancestor here therefore means "not yet
+                # evaluable", not "valid within a 4x clamp": the narrow
+                # fallback admitted any nBits inside [prev/4, prev*4] at the
+                # first retarget above every snapshot base (observed in every
+                # R4 slice log).  On mainnet/signet the 4x clamp
+                # (PermittedDifficultyTransition, pow.cpp:89-136) remains a
+                # sound NECESSARY condition — GetNextWorkRequired can never
+                # leave it — so a value outside it is invalid whatever the
+                # ancestor says.  On min-difficulty networks no such bound
+                # holds (the walk-back can land on any earlier nBits), so
+                # nothing is decided without the ancestor.
                 _prev_bits = getattr(prev_block, "bits", None)
                 if _prev_bits is None:
                     return False
-                if not diffbits_unresolved_fallback_ok(
-                    self.network, height, int(_prev_bits), int(block.bits)
+                if (
+                    self.network not in _POW_ALLOW_MIN_DIFFICULTY_NETWORKS
+                    and not diffbits_unresolved_fallback_ok(
+                        self.network, height, int(_prev_bits), int(block.bits)
+                    )
                 ):
                     return False
-                logger.warning(
-                    "bad-diffbits ancestors unresolvable at height %d (%s); "
-                    "accepted on the narrow fallback (bits=%#010x prev=%#010x)",
-                    height, bits_status, int(block.bits), int(_prev_bits),
+                raise MissingAncestorHeaderError(
+                    f"bad-diffbits not evaluable at height {height} "
+                    f"({bits_status}): retarget ancestor not held"
                 )
 
         # 2. time-too-old: timestamp must strictly exceed MTP of previous 11 blocks.
@@ -1667,6 +1729,33 @@ class BlockValidator:
 
         return True
 
+    def _active_ancestor_header(self, height: int):
+        """Active-chain ancestor at *height* for the retarget rule.
+
+        Prefers the stored block; falls back to the per-height block-index
+        METADATA (hash + timestamp), which is what the pre-snapshot header
+        backfill writes — it never writes bodies.  Without this fallback the
+        period-first block of the first retarget above a snapshot base stays
+        unresolvable forever, even with the full header chain present.
+
+        The metadata stub carries ``timestamp`` but no ``bits``; the only
+        consumer of the period-first block's bits is the BIP94 (testnet4)
+        branch, which treats a stub as unresolved.
+        """
+        blk = self.db.get_block_by_height(height)
+        if blk is not None:
+            return blk
+        fn = getattr(self.db, "get_block_timestamp_by_height", None)
+        if fn is None:
+            return None
+        try:
+            ts = fn(height)
+        except Exception:
+            return None
+        if not isinstance(ts, int):
+            return None
+        return _AncestorTimestamp(timestamp=ts)
+
     def _get_expected_bits(
         self,
         height: int,
@@ -1712,7 +1801,7 @@ class BlockValidator:
         _ancestor = (
             ancestor_at
             if ancestor_at is not None
-            else (lambda h: self.db.get_block_by_height(h))
+            else self._active_ancestor_header
         )
 
         # fPowNoRetargeting: regtest always stays at the minimum difficulty.
@@ -1804,6 +1893,8 @@ class BlockValidator:
         if self.network == "testnet4":
             # Same height as the timespan lookup above — reuse the resolved
             # ancestor instead of a second, independently-failable read.
+            if getattr(first_block, "bits", None) is None:
+                return None, DIFFBITS_MISSING_PERIOD_FIRST
             old_target = _bits_to_target(first_block.bits)
         else:
             old_target = _bits_to_target(prev_block.bits)
@@ -3372,9 +3463,20 @@ class TransactionValidator:
                 utxo_mtp = mtp_cache[coin_mtp_height]
             else:
                 utxo_mtp = self.db.get_median_time_past(coin_mtp_height)
-                mtp_cache[coin_mtp_height] = utxo_mtp
+                if utxo_mtp is not None:
+                    mtp_cache[coin_mtp_height] = utxo_mtp
             if utxo_mtp is None:
-                utxo_mtp = 0  # Fallback
+                # FAIL CLOSED.  This used to be ``utxo_mtp = 0``, which makes
+                # coin_time + lock*512 tiny and SKIPS the relative time lock:
+                # a snapshot-booted node accepted any time-locked spend of a
+                # coin confirmed within ~11 blocks of (or below) the index
+                # floor.  Core always has this header
+                # (tx_verify.cpp:74 GetAncestor(max(nCoinHeight-1,0))).
+                raise MissingAncestorHeaderError(
+                    f"BIP68 coin MTP at height {coin_mtp_height} (coin height "
+                    f"{utxo_height}) needs headers "
+                    f"{max(0, coin_mtp_height - 10)}..{coin_mtp_height}, not all held"
+                )
 
             input_infos.append((seq, utxo_height, utxo_mtp))
 
@@ -3453,12 +3555,12 @@ class TransactionValidator:
                 required = (inp.sequence & self.SEQUENCE_MASK) * 512
                 utxo_mtp = self.db.get_median_time_past(max(utxo_height - 1, 0))
                 if utxo_mtp is None:
-                    # No MTP available for coin block — cannot verify time-based
-                    # lock.  Treat as 0 (same as the Rust path's None→0 fallback)
-                    # so the lock is effectively skipped.  The BIP-68 stopgap
-                    # (OUROBOROS_BIP68_STOPGAP=1) is the recommended guard for
-                    # post-snapshot nodes.
-                    continue
+                    # FAIL CLOSED (was ``continue`` = lock skipped).  See
+                    # check_sequence_locks / MissingAncestorHeaderError.
+                    raise MissingAncestorHeaderError(
+                        f"BIP68 coin MTP at height {max(utxo_height - 1, 0)} "
+                        f"(coin height {utxo_height}) not computable"
+                    )
                 if block_mtp - utxo_mtp < required:
                     return False
             else:

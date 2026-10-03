@@ -217,6 +217,7 @@ from ouroboros.config import MIN_BLOCKS_TO_KEEP
 from ouroboros.peer import Peer
 from ouroboros.validation import (
     DIFFBITS_OK,
+    MissingAncestorHeaderError,
     DIFFICULTY_ADJUSTMENT_INTERVAL,
     SIG_CACHE,
     BlockValidator,
@@ -228,6 +229,10 @@ from ouroboros.validation import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Error-string prefix the drain uses to carry a MissingAncestorHeaderError out
+# of the (bool, str) validator contract: a HOLD, never a reject.
+_MISSING_ANCESTOR_PREFIX = "missing-ancestor-header: "
 
 # Core DEFAULT_MAX_TIP_AGE (kernel/chainstatemanager_opts.h:24).
 ANNOUNCE_MAX_TIP_AGE_SECS = 24 * 60 * 60
@@ -633,6 +638,14 @@ class BlockSync:
         # satisfied. Populated lazily by _maybe_start_header_backfill.
         self._header_backfill = None
         self._backfill_done: bool = False
+        # True only once the block index is PROVEN contiguous from genesis
+        # (survey found no gap, or a backfill committed).  Distinct from
+        # ``_backfill_done``, which also latches on the give-up paths.  While
+        # False the drain connects NOTHING: Core validates the full header
+        # chain before it ever uses a snapshot, and every ancestor-dependent
+        # consensus value (BIP68 coin MTP, BIP113 cutoff, time-too-old, the
+        # retarget period-first) is only defined with that chain present.
+        self._prebase_headers_complete: bool = False
         # One backfill getheaders in flight at a time (Core MaybeSendGetHeaders
         # / HEADERS_RESPONSE_TIME, net_processing.cpp:2823-2835).  sync_loop
         # used to re-send the SAME locator every 1 s tick; a replay peer that
@@ -2295,8 +2308,44 @@ class BlockSync:
         async with self._drain_lock:
             return await self._drain_block_buffer_locked()
 
+    async def _prebase_headers_ready(self) -> bool:
+        """Core-parity gate: is the full header chain below the tip held?
+
+        Arms the survey/backfill on demand (the drain can run before the first
+        sync_loop tick).  Returns False — and the caller connects nothing —
+        until the block index is proven contiguous from genesis.
+        """
+        if self._prebase_headers_complete:
+            return True
+        if not self._backfill_done and self._header_backfill is None:
+            await self._maybe_start_header_backfill()
+        if self._prebase_headers_complete:
+            return True
+        _now = time.time()
+        if _now - getattr(self, "_last_prebase_hold_log", 0.0) > 60.0:
+            self._last_prebase_hold_log = _now
+            bf = self._header_backfill
+            if bf is not None:
+                buffered, target = bf.progress()
+                logger.warning(
+                    "block connection HELD: pre-snapshot header backfill "
+                    "%d/%d — ancestor-dependent consensus checks (BIP68 coin "
+                    "MTP, BIP113, time-too-old, retarget) need the full header "
+                    "chain, as in Core", buffered, target,
+                )
+            else:
+                logger.warning(
+                    "block connection HELD: block index below the tip is not "
+                    "contiguous from genesis and no header backfill is "
+                    "running (backfill_done=%s) — fail-closed; a restart "
+                    "re-surveys", self._backfill_done,
+                )
+        return False
+
     async def _drain_block_buffer_locked(self) -> int:
         connected = 0
+        if not await self._prebase_headers_ready():
+            return 0
         # W91: record drain entry — idle since previous exit, and buffer
         # size at the moment we start draining.
         _w91_entry_ns = time.perf_counter_ns()
@@ -2540,12 +2589,16 @@ class BlockSync:
                     return False, str(e)
 
             async def _run_python() -> tuple[bool, str]:
-                return await asyncio.to_thread(
-                    self.validator.validate_block,
-                    block,
-                    known_height=new_height,
-                    force_check_scripts=self.force_full_scripts,
-                )
+                try:
+                    return await asyncio.to_thread(
+                        self.validator.validate_block,
+                        block,
+                        known_height=new_height,
+                        force_check_scripts=self.force_full_scripts,
+                    )
+                except MissingAncestorHeaderError as e:
+                    # Not a verdict: hold the block (see the dispatch below).
+                    return False, _MISSING_ANCESTOR_PREFIX + str(e)
 
             validated_via_rust = False
             # Tracks whether one of the branches below has already assigned a
@@ -2718,6 +2771,21 @@ class BlockSync:
                     if error.startswith(_ffi_prefix):
                         error = error[len(_ffi_prefix):]
                         break
+            if not valid and error and error.startswith(_MISSING_ANCESTOR_PREFIX):
+                # FAIL CLOSED without a verdict: an ancestor header this check
+                # needs is not held.  Re-buffer and stop — never perm-reject,
+                # never score the peer (Core would simply have the header).
+                _now = time.time()
+                if _now - getattr(self, "_last_missing_ancestor_log", 0.0) > 30.0:
+                    self._last_missing_ancestor_log = _now
+                    logger.warning(
+                        "block %s... at height %d HELD (not rejected): %s",
+                        next_hash.hex()[:16], new_height,
+                        error[len(_MISSING_ANCESTOR_PREFIX):],
+                    )
+                self._buffer_put(next_hash, (block, raw_payload))
+                self._connecting_hashes.discard(next_hash)
+                break
             if not valid:
                 self._blk_validate_rejected += 1
                 logger.warning(
@@ -6018,6 +6086,15 @@ class BlockSync:
         """
         if not self._validated_headers:
             return
+        # Nothing can connect until the pre-snapshot header chain is held
+        # (see _prebase_headers_ready); requesting bodies now only fills the
+        # buffer and competes with the backfill walk for the peer.
+        # Gate only once the survey has spoken (a backfill is armed, or it
+        # gave up): before the first survey the drain's own gate arms it.
+        if not self._prebase_headers_complete and (
+            self._header_backfill is not None or self._backfill_done
+        ):
+            return
 
         network = self.peer_manager.network if hasattr(self.peer_manager, 'network') else "mainnet"
 
@@ -6674,12 +6751,21 @@ class BlockSync:
             _, tip_height = self.db.get_best_block()
             gap = find_missing_range(self.db, int(tip_height))
         except Exception as exc:
-            logger.warning("header backfill: could not survey the block index: %s", exc)
-            self._backfill_done = True
+            # Do NOT latch: the drain stays held (fail closed) and the survey
+            # is retried on the next tick.  Latching here used to mean "skip
+            # the backfill forever and validate with missing ancestors".
+            _now = time.time()
+            if _now - getattr(self, "_last_backfill_survey_err_log", 0.0) > 60.0:
+                self._last_backfill_survey_err_log = _now
+                logger.warning(
+                    "header backfill: could not survey the block index: %s "
+                    "(block connection held; retrying)", exc,
+                )
             return
 
         if gap is None:
             self._backfill_done = True
+            self._prebase_headers_complete = True
             return
 
         start_height, end_height = gap
@@ -6856,6 +6942,7 @@ class BlockSync:
                 return True
             self._header_backfill = None
             self._backfill_done = True
+            self._prebase_headers_complete = True
             logger.warning(
                 "header backfill COMPLETE: wrote %d per-height metadata rows; "
                 "median-time-past is now computable below the snapshot base and "

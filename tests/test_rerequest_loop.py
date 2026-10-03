@@ -55,7 +55,11 @@ def _make_block_sync(tip_hash: bytes, tip_height: int) -> BlockSync:
     db.get_block_bytes.return_value = None
     pm = MagicMock()
     pm.network = "regtest"
-    return BlockSync(db=db, validator=MagicMock(), peer_manager=pm)
+    bs = BlockSync(db=db, validator=MagicMock(), peer_manager=pm)
+    # A genesis-synced node: the pre-snapshot header gate is open (this mock
+    # index cannot answer the survey, which would otherwise hold the drain).
+    bs._prebase_headers_complete = True
+    return bs
 
 
 def _make_ready_peer(host: str, score: int = 100) -> MagicMock:
