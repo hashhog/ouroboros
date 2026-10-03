@@ -627,6 +627,43 @@ def test_backfill_request_is_not_resent_every_tick():
     assert len(q.sent) == 2
 
 
+def test_backfill_retry_rotates_away_from_a_silent_peer():
+    # The drain is gated on the backfill: re-asking the peer that never
+    # answered (peers[0] every time) held block connection indefinitely.
+    p, q = _Peer(), _Peer()
+    bs, hdrs = _bs_with_backfill([p, q])
+    run = asyncio.run
+    run(bs._request_backfill_headers())
+    assert (len(p.sent), len(q.sent)) == (1, 0)
+    bs._backfill_req_time -= bs._BACKFILL_RESPONSE_TIME + 1
+    run(bs._request_backfill_headers())
+    assert (len(p.sent), len(q.sent)) == (1, 1)      # rotated, not p again
+    bs._backfill_req_time -= bs._BACKFILL_RESPONSE_TIME + 1
+    run(bs._request_backfill_headers())
+    assert (len(p.sent), len(q.sent)) == (2, 1)      # and back
+
+
+def test_backfill_restart_after_rejected_batch_asks_another_peer():
+    from ouroboros.header_backfill import HeaderBackfill
+    p, q = _Peer(), _Peer()
+    bs, hdrs = _bs_with_backfill([p, q])
+    run = asyncio.run
+    run(bs._request_backfill_headers())
+    assert len(p.sent) == 1
+    # p answers with a batch that starts right but breaks linkage.
+    bad = [hdrs[0], hdrs[2]]
+    assert run(bs._consume_backfill_headers(bad, p)) is True
+    assert bs._header_backfill is None                # walk restarted
+    bs._header_backfill = HeaderBackfill(10, 12, bs_anchor(hdrs), bytes([0x11]) * 32, "mainnet")
+    run(bs._request_backfill_headers())
+    assert len(q.sent) == 1 and len(p.sent) == 1      # q, not the peer that lied
+
+
+def bs_anchor(hdrs):
+    from ouroboros.header_backfill import block_hash
+    return block_hash(hdrs[-1])
+
+
 def test_stale_duplicate_backfill_reply_is_dropped_not_scored():
     p = _Peer()
     bs, hdrs = _bs_with_backfill([p])

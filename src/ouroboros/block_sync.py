@@ -656,6 +656,9 @@ class BlockSync:
         self._backfill_req_locator: list[bytes] | None = None
         self._backfill_req_time: float = 0.0
         self._backfill_req_peer = None
+        # Peer whose backfill batch was last rejected: the restarted walk asks
+        # someone else first (see _request_backfill_headers).
+        self._backfill_bad_peer = None
         # Locator anchors of backfill getheaders we sent (bounded).  A reply
         # whose first header builds on one of them answers OUR backfill
         # request; if the walk has moved past it, it is a stale duplicate and
@@ -6847,7 +6850,27 @@ class BlockSync:
             peers = self.peer_manager.get_all_ready_peers()
             if not peers:
                 return
-            peer = peers[0]
+            # ROTATE on a retry: the same position re-sent after
+            # _BACKFILL_RESPONSE_TIME went unanswered, so asking that peer
+            # again (peers[0] every time) can hold block connection forever —
+            # the drain is gated on this walk.  Also skip the peer whose batch
+            # was last rejected.  lunarblock e4b11ef / blockbrew needed the
+            # same rotation.
+            avoid = {id(self._backfill_bad_peer)} if self._backfill_bad_peer is not None else set()
+            if locator == self._backfill_req_locator and self._backfill_req_peer is not None:
+                avoid.add(id(self._backfill_req_peer))
+            others = [p for p in peers if id(p) not in avoid]
+            peer = others[0] if others else peers[0]
+            if (
+                locator == self._backfill_req_locator
+                and self._backfill_req_peer is not None
+                and peer is not self._backfill_req_peer
+            ):
+                logger.warning(
+                    "header backfill: no reply from %s in %.0fs, rotating to %s",
+                    getattr(self._backfill_req_peer, "host", "?"),
+                    self._BACKFILL_RESPONSE_TIME, getattr(peer, "host", "?"),
+                )
         try:
             getheaders = GetHeadersMessage(
                 version=70015,
@@ -6901,6 +6924,11 @@ class BlockSync:
             # than committing anything derived from it.
             logger.warning("header backfill: rejected a batch (%s); restarting the walk", exc)
             self._header_backfill = None
+            self._backfill_bad_peer = peer
+            # The answered request is no longer in flight: let the restarted
+            # walk ask (another peer) at once instead of waiting out
+            # _BACKFILL_RESPONSE_TIME on an identical first locator.
+            self._backfill_req_locator = None
             return True
 
         buffered, target = bf.progress()
