@@ -76,6 +76,26 @@ pub enum BlockValidationError {
     WitnessCommitmentMismatch,
 }
 
+impl BlockValidationError {
+    /// A storage failure, not a verdict on the block (gate 6).
+    ///
+    /// Core routes a coins-DB / block-index read error to AbortNode
+    /// (coins.cpp:415-427 CCoinsViewErrorCatcher, validation.cpp:2136
+    /// FatalError) — it never becomes a BlockValidationResult.  The FFI layer
+    /// raises these as RuntimeError so the Python callers retry or halt
+    /// instead of marking the block failed and punishing its sender.
+    pub fn is_system_error(&self) -> bool {
+        matches!(
+            self,
+            BlockValidationError::Database(_)
+                | BlockValidationError::HeaderValidation(HeaderValidationError::Database(_))
+                | BlockValidationError::TransactionValidation(
+                    TransactionValidationError::Database(_)
+                )
+        )
+    }
+}
+
 /// Result type for block validation
 pub type Result<T> = std::result::Result<T, BlockValidationError>;
 

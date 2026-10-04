@@ -19,6 +19,7 @@ from ouroboros.block_sync import BlockSync
 from ouroboros.config import NodeConfig
 from ouroboros.cookie_auth import delete_cookie, generate_cookie
 from ouroboros.database import BlockchainDatabase
+from ouroboros.fatal import EXIT_CODE_FATAL, is_internal_error_text, set_abort_hook
 from ouroboros.fee_estimator import FeeEstimator
 from ouroboros.mempool import Mempool
 from ouroboros.metrics import (
@@ -198,6 +199,23 @@ class BitcoinNode:
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
+
+        # Gate 6 / Core AbortNode: a system fault during validation that
+        # recurs after one retry latches ``fatal`` and calls this hook, which
+        # requests the same orderly shutdown as SIGTERM.  The CLI then exits
+        # with EXIT_CODE_FATAL so systemd restarts the node.
+        def _on_abort(reason: str) -> None:
+            def _request_stop() -> None:
+                logger.critical(
+                    "AbortNode: shutting down (exit status %d): %s",
+                    EXIT_CODE_FATAL, reason,
+                )
+                self._shutdown_event.set()
+                asyncio.create_task(self.stop())
+
+            loop.call_soon_threadsafe(_request_stop)
+
+        set_abort_hook(_on_abort)
 
         try:
             # Initialize database
@@ -1912,7 +1930,11 @@ class BitcoinNode:
                         logger.debug(f"Rejected transaction: {error}")
                         # Record misbehavior for invalid transactions
                         # Invalid tx = 10 points (requires 10 violations to ban)
-                        if hasattr(self, "peer_manager") and self.peer_manager:
+                        # Gate 6: a system fault on our side (DB read error,
+                        # node halted) is not the sender's misbehaviour.
+                        if is_internal_error_text(error):
+                            pass
+                        elif hasattr(self, "peer_manager") and self.peer_manager:
                             addr = f"{sender_peer.host}:{sender_peer.port}"
                             self.peer_manager.misbehaving(
                                 addr, 10, f"invalid tx: {error}"

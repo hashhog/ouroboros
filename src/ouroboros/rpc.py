@@ -33,6 +33,18 @@ from ouroboros.blockfilter import (
     gcs_match_any,
 )
 from ouroboros.database import Block, Transaction, TxIn, TxOut
+from ouroboros.fatal import (
+    INTERNAL_ERROR_MARKER,
+    InternalValidationError,
+    abort_node,
+    as_internal,
+    fatal_reason,
+    is_fatal,
+    is_internal_error_text,
+    is_system_error,
+    raise_if_fatal,
+    retry_once_async,
+)
 from ouroboros.metrics import record_rpc_request
 from ouroboros.script import disassemble_script
 from ouroboros.validation import (
@@ -181,6 +193,13 @@ def bip22_result_string(error: str) -> str:
       - Python-side checks in rpc_submitblock
     """
     s = error.lower()
+
+    # Gate 6: a system fault is never a consensus reason.  Without this, the
+    # keyword rules below relabelled e.g. "Database error: ... input ..." as
+    # bad-txns-inputs-missingorspent and "Transaction validation error:
+    # Database error" as block-script-verify-flag-failed — both verdicts.
+    if is_internal_error_text(s) or "database error" in s:
+        return INTERNAL_ERROR_MARKER
 
     # Already-canonical strings pass through unchanged
     if s in ("duplicate", "inconclusive", "duplicate-invalid",
@@ -635,6 +654,18 @@ async def accept_block(
     Closed gaps: O1 (rpc_submitblockbatch), O2 (rpc_generatetoaddress),
     O3 (import_blocks_from_file via Rust companion change).
     """
+    # Core AbortNode: after a fatal system error nothing more is connected.
+    raise_if_fatal("accept_block")
+
+    async def _checked(make_coro, where: str):
+        """Gate 6: retry a system fault once, then halt (AbortNode).  Never a
+        verdict — the InternalValidationError raised here is not a ValueError,
+        so no caller maps it to a BIP-22 reject token."""
+        try:
+            return await retry_once_async(make_coro, where=where)
+        except InternalValidationError as ie:
+            raise abort_node(f"accept_block h={next_height}: {ie}", ie) from ie
+
     network = getattr(node, "network", "mainnet")
     best_height = next_height - 1
     # Core: assumevalid is ONE node-wide setting (validation.cpp:2345-2347).
@@ -716,7 +747,11 @@ async def accept_block(
                     raise ValueError("bad-cb-length")
     except ValueError:
         raise
-    except Exception:
+    except Exception as _s0_exc:
+        if is_system_error(_s0_exc):
+            raise abort_node(
+                f"accept_block h={next_height}: structural pre-check", _s0_exc
+            ) from _s0_exc
         # Undecodable block: leave it to the Rust CheckBlock, which produces
         # the correct structural reason. Never invent a rejection here.
         pass
@@ -743,7 +778,11 @@ async def accept_block(
                         raise ValueError("bad-cb-height")
         except ValueError:
             raise
-        except Exception:
+        except Exception as _s1_exc:
+            if is_system_error(_s1_exc):
+                raise abort_node(
+                    f"accept_block h={next_height}: BIP-34 pre-check", _s1_exc
+                ) from _s1_exc
             pass  # deserialization failures fall through to Rust
 
     # Step 2 — Rust structural + contextual validation (off-GIL).
@@ -780,13 +819,21 @@ async def accept_block(
 
     if hasattr(db, "validate_block_from_bytes") and not _snapshot_base_parent:
         try:
-            await asyncio.to_thread(
-                db.validate_block_from_bytes,
-                block_bytes,
-                best_height,  # prev_height = best_height (= next_height - 1)
-                skip_scripts,
-                network,
+            await _checked(
+                lambda: asyncio.to_thread(
+                    db.validate_block_from_bytes,
+                    block_bytes,
+                    best_height,  # prev_height = best_height (= next_height - 1)
+                    skip_scripts,
+                    network,
+                ),
+                "Rust validate_block_from_bytes",
             )
+        except InternalValidationError:
+            # A storage failure in the Rust validator is not a verdict: it
+            # used to be re-raised as ValueError(<refined reason>) and so
+            # reach every caller as a BIP-22 reject token.
+            raise
         except Exception as _rust_err:
             # Reject decision unchanged — sharpen the reason to Core's exact
             # BIP-22 token (bad-txns-vout-empty / bad-txns-inputs-duplicate /
@@ -823,11 +870,14 @@ async def accept_block(
         if _py_validator is not None:
             from ouroboros.database import Block as _Blk
             _blk_obj = _Blk.deserialize(block_bytes)
-            _valid, _err = await asyncio.to_thread(
-                _py_validator.validate_block,
-                _blk_obj,
-                next_height,
-                force_check_scripts=_force_scripts,
+            _valid, _err = await _checked(
+                lambda: asyncio.to_thread(
+                    _py_validator.validate_block,
+                    _blk_obj,
+                    next_height,
+                    force_check_scripts=_force_scripts,
+                ),
+                "Python validate_block",
             )
             if not _valid:
                 # Same reason-refinement as the Rust arm above: the buried
@@ -843,8 +893,13 @@ async def accept_block(
     # Step 4 — Connect block (UTXO mutation + persistence, Rust).
     # Pass network so the inline IsFinalTx cutoff uses the correct BIP-113/CSV
     # activation height (block header time pre-CSV, previous-block MTP post-CSV).
-    block_hash: bytes = await asyncio.to_thread(
-        db.connect_block_from_bytes, block_bytes, next_height, network
+    # A failed WriteBatch commits nothing, so one retry is safe; a second
+    # failure halts (Core: a failed flush/write is FatalError -> AbortNode).
+    block_hash: bytes = await _checked(
+        lambda: asyncio.to_thread(
+            db.connect_block_from_bytes, block_bytes, next_height, network
+        ),
+        "connect_block_from_bytes",
     )
 
     # Deserialize once for the mempool-eviction and wallet-history steps.
@@ -9032,6 +9087,9 @@ class RPCServer:
         # (hash, error) of the block whose connect failed, if any — read by
         # the P2P fork path (BlockSync._complete_fork_bridge).
         self._last_reorg_failure = None
+        # Core AbortNode: no chain switch after a fatal system error.
+        if is_fatal():
+            return f"{INTERNAL_ERROR_MARKER}: reorg refused: node halted ({fatal_reason()})"
         # Walk backwards from the new tip through the side-branch buffer
         # until we hit a block that's on the active chain — that's the
         # common ancestor. Build the connect list (ancestor's child →
@@ -9342,8 +9400,13 @@ class RPCServer:
                                         raise ValueError("bad-cb-height")
                         except ValueError:
                             raise
-                        except Exception:
-                            pass
+                        except Exception as _bip34_exc:
+                            if is_system_error(_bip34_exc):
+                                raise as_internal(
+                                    _bip34_exc, "reorg pre-flight BIP-34"
+                                ) from _bip34_exc
+                            # Undecodable: the Rust CheckBlock below reports
+                            # the structural reason.
 
                     # Rust heavy validation (best-effort: skip the input-
                     # lookup-driven checks for non-first batch blocks by
@@ -9352,13 +9415,18 @@ class RPCServer:
                     # commit-time).
                     if hasattr(db, "validate_block_from_bytes"):
                         try:
-                            await asyncio.to_thread(
-                                db.validate_block_from_bytes,
-                                raw_bytes,
-                                blk_height - 1,
-                                False,
-                                network,
+                            await retry_once_async(
+                                lambda: asyncio.to_thread(
+                                    db.validate_block_from_bytes,
+                                    raw_bytes,
+                                    blk_height - 1,
+                                    False,
+                                    network,
+                                ),
+                                where=f"reorg pre-flight Rust validate h={blk_height}",
                             )
+                        except InternalValidationError:
+                            raise
                         except Exception as ve:
                             ve_msg = str(ve).lower()
                             # Tolerate intra-batch UTXO-miss false-rejects
@@ -9375,33 +9443,49 @@ class RPCServer:
                     # Python validator (disabled-opcode + script verify) —
                     # same tolerance for input-lookup misses on non-first
                     # batch blocks.
+                    #
+                    # GATE 6 (was: ``except Exception: pass``).  This is the
+                    # ONLY script check the batch gets — ``connect_blocks_
+                    # atomic`` verifies no scripts — so swallowing an
+                    # exception here connected the whole batch WITHOUT
+                    # script checks (fail-open: an invalid block accepted).
+                    # A system fault (DB read, MemoryError, "can't start new
+                    # thread") is retried once, then aborts the reorg as a
+                    # NON-verdict and halts the node (Core FatalError ->
+                    # AbortNode).  Any other unexpected exception is also a
+                    # refusal, never a skip.
                     _py_validator = getattr(self.node, "validator", None)
                     if _py_validator is not None:
                         try:
                             from ouroboros.database import Block as _Blk
                             _blk_obj = _Blk.deserialize(raw_bytes)
-                            _valid, _err = await asyncio.to_thread(
-                                _py_validator.validate_block,
-                                _blk_obj,
-                                blk_height,
+                            _valid, _err = await retry_once_async(
+                                lambda: asyncio.to_thread(
+                                    _py_validator.validate_block,
+                                    _blk_obj,
+                                    blk_height,
+                                ),
+                                where=f"reorg pre-flight validate_block h={blk_height}",
                             )
-                            if not _valid:
-                                _err_lower = (str(_err) or "").lower()
-                                is_first_in_batch = chain_to_connect[0][0] == blk_hash
-                                if is_first_in_batch or (
-                                    "input not found" not in _err_lower
-                                    and "missing utxo" not in _err_lower
-                                ):
-                                    raise ValueError(_err)
-                        except ValueError:
-                            raise
                         except MissingAncestorHeaderError as _mae:
                             # Not evaluable without the pre-snapshot header
-                            # chain: refuse rather than fall through to the
-                            # swallow below, which would ACCEPT unvalidated.
+                            # chain: a HOLD, never a verdict, never a skip.
                             raise ValueError(f"missing-ancestor-header: {_mae}")
-                        except Exception:
-                            pass
+                        except InternalValidationError:
+                            raise
+                        except Exception as _pf_exc:
+                            raise as_internal(
+                                _pf_exc,
+                                f"reorg pre-flight validate_block h={blk_height}",
+                            ) from _pf_exc
+                        if not _valid:
+                            _err_lower = (str(_err) or "").lower()
+                            is_first_in_batch = chain_to_connect[0][0] == blk_hash
+                            if is_first_in_batch or (
+                                "input not found" not in _err_lower
+                                and "missing utxo" not in _err_lower
+                            ):
+                                raise ValueError(_err)
 
                 _preflight_hash = None
                 # Single-batch connect — Rust accumulates every block's
@@ -9434,12 +9518,34 @@ class RPCServer:
                         except Exception:
                             pass
             except Exception as e:
-                if _preflight_hash is not None:
+                _internal = isinstance(e, InternalValidationError) or (
+                    is_system_error(e)
+                )
+                if _preflight_hash is not None and not _internal:
                     self._last_reorg_failure = (_preflight_hash, str(e))
                 logger.error(
                     "submitblock reorg: connect_blocks_atomic failed: %s",
                     e, exc_info=not isinstance(e, ValueError),
                 )
+                if _internal:
+                    # Gate 6: not a verdict on any block of the batch (no
+                    # _last_reorg_failure, so the P2P fork path marks and
+                    # punishes nothing).  Restore the original chain, then
+                    # halt — Core FatalError/AbortNode.
+                    _reason = f"{INTERNAL_ERROR_MARKER}: reorg aborted: {e}"
+                    try:
+                        await self._finalize_failed_reorg(
+                            db, common_ancestor_height, disconnected_active,
+                            new_tip_hash, connected_hashes, chain_to_connect,
+                            _reason,
+                        )
+                    except Exception as _rb_exc:  # noqa: BLE001 - halting anyway
+                        logger.critical(
+                            "submitblock reorg: rollback after a system fault "
+                            "also failed: %r", _rb_exc,
+                        )
+                    abort_node(f"multi-block reorg to {new_tip_hash[::-1].hex()[:16]}: {e}", e)
+                    return _reason
                 # ATOMICITY (S5): the disconnect-side commit already landed,
                 # so the disk state is now a prefix of the competitor (0 blocks
                 # for the atomic all-or-nothing batch, i.e. the bare common
@@ -9482,7 +9588,18 @@ class RPCServer:
                     _err_s = str(e)
                     if isinstance(e, MissingAncestorHeaderError):
                         _err_s = f"missing-ancestor-header: {_err_s}"
-                    self._last_reorg_failure = (blk_hash, _err_s)
+                    _sys_fault = isinstance(e, InternalValidationError) or (
+                        is_system_error(e)
+                    )
+                    if _sys_fault:
+                        # Gate 6: accept_block already retried once and
+                        # latched AbortNode; carry the marker so no caller
+                        # classifies it as a verdict, and record no failure.
+                        _err_s = f"{INTERNAL_ERROR_MARKER}: {_err_s}"
+                        if not isinstance(e, InternalValidationError):
+                            abort_node(f"reorg connect h={blk_height}: {e}", e)
+                    else:
+                        self._last_reorg_failure = (blk_hash, _err_s)
                     # A consensus reject is an expected outcome (Core logs one
                     # line, ConnectBlock/InvalidChainFound) — a traceback only
                     # for an unexpected exception type.
@@ -9506,7 +9623,7 @@ class RPCServer:
                     # appended only on success, so its prefix count is exact.)
                     return await self._finalize_failed_reorg(
                         db, common_ancestor_height, disconnected_active,
-                        new_tip_hash, connected_hashes, chain_to_connect, str(e),
+                        new_tip_hash, connected_hashes, chain_to_connect, _err_s if _sys_fault else str(e),
                     )
 
         # Successful flip: drop the connected blocks from the side-branch
@@ -9810,7 +9927,17 @@ class RPCServer:
                     decoded_block=decoded_block,
                 )
                 return None
+            except InternalValidationError as e:
+                # Core BIP22ValidationResult: state.IsError() (a system
+                # failure, AbortNode) is a JSON-RPC RPC_VERIFY_ERROR, never a
+                # BIP-22 reject string (rpc/mining.cpp).
+                raise RpcError(RPC_VERIFY_ERROR, str(e)) from None
             except Exception as e:
+                if is_system_error(e):
+                    raise RpcError(
+                        RPC_VERIFY_ERROR, str(abort_node(
+                            f"submitblock h={best_height + 1}: {e}", e))
+                    ) from None
                 # Log before mapping. bip22_result_string collapses any
                 # unrecognised message to the generic "rejected", which erases
                 # the only description of WHY the block failed — there was no
@@ -9837,13 +9964,17 @@ class RPCServer:
             )
 
         new_height = parent_height + 1
-        return await self._attach_side_branch_block(
+        _side_result = await self._attach_side_branch_block(
             db,
             block_bytes,
             block_hash,
             prev_hash,
             new_height,
         )
+        if is_internal_error_text(_side_result):
+            # A reorg aborted on a system fault (gate 6): RPC error, not BIP-22.
+            raise RpcError(RPC_VERIFY_ERROR, _side_result)
+        return _side_result
 
     async def rpc_submitheader(self, hexdata: str) -> None:
         """

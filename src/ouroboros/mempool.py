@@ -16,6 +16,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ouroboros.database import Transaction
+from ouroboros.fatal import (
+    INTERNAL_ERROR_MARKER,
+    fatal_reason,
+    is_fatal,
+    is_system_error,
+)
 from ouroboros.validation import (
     TransactionValidator,
     WITNESS_SCALE_FACTOR,
@@ -2299,6 +2305,9 @@ class Mempool:
         be an orphan) so ``OrphanPool.erase_for_peer`` can drop it on
         disconnect.  ``None`` for RPC / reorg-refill / package callers.
         """
+        if is_fatal():
+            # Core AbortNode: no mempool acceptance after a fatal system error.
+            return False, f"{INTERNAL_ERROR_MARKER}: node halted ({fatal_reason()})"
         with self._lock:
             return self._add_transaction_inner(tx, height, peer=peer)
 
@@ -2565,7 +2574,12 @@ class Mempool:
         next_height = height + 1
         try:
             mempool_mtp: int = self.validator.db.get_median_time_past(height) or 0
-        except Exception:
+        except Exception as _mtp_exc:
+            if is_system_error(_mtp_exc):
+                # Gate 6: a READ FAILURE is not MTP 0 (which made every
+                # time-locked tx "non-final" — a reject the relay path then
+                # scored against the sender).  Refuse without a verdict.
+                return False, f"{INTERNAL_ERROR_MARKER}: mempool MTP read: {_mtp_exc}"
             mempool_mtp = 0
 
         # STANDARD_SCRIPT_VERIFY_FLAGS — extra policy flags that mempool/relay
@@ -5343,7 +5357,9 @@ class Mempool:
         # AcceptToMemoryPool in Core validation.cpp:164).
         try:
             pkg_mtp: int = self.validator.db.get_median_time_past(height) or 0
-        except Exception:
+        except Exception as _mtp_exc:
+            if is_system_error(_mtp_exc):
+                raise  # gate 6: a read failure is not MTP 0
             pkg_mtp = 0
         # Build a rolling intra_block_utxos view of package parent outputs so
         # that child transactions can find outputs that are not yet in the UTXO

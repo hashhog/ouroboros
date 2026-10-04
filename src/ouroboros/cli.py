@@ -762,6 +762,15 @@ def start(
                     _pid_file.remove()
                 except Exception:
                     pass
+        # Gate 6 / Core AbortNode: a halted node exits non-zero so the
+        # supervisor restarts it and the halt is visible (Core: EXIT_FAILURE).
+        from ouroboros import fatal as _fatal
+        if _fatal.is_fatal():
+            console.print(
+                f"[red]✗ Node halted on a fatal system error: "
+                f"{_fatal.fatal_reason()}[/red]"
+            )
+            sys.exit(_fatal.EXIT_CODE_FATAL)
 
     except Exception as e:
         console.print(f"[red]✗ Error starting node: {e}[/red]")

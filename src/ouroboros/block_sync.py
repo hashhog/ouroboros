@@ -215,6 +215,15 @@ from ouroboros.p2p_messages import (
 )
 from ouroboros.config import MIN_BLOCKS_TO_KEEP
 from ouroboros.peer import Peer
+from ouroboros.fatal import (
+    INTERNAL_ERROR_MARKER,
+    InternalValidationError,
+    abort_node,
+    is_fatal,
+    is_internal_error_text,
+    is_system_error,
+    retry_once_async,
+)
 from ouroboros.validation import (
     DIFFBITS_OK,
     MissingAncestorHeaderError,
@@ -246,6 +255,11 @@ _MUTATED_REJECT_TOKENS = frozenset({
 # (missing parent / ancestor header / common ancestor), a local engine limit,
 # or Core's BLOCK_TIME_FUTURE (not marked failed, retried later).
 _NONVERDICT_REJECT_MARKERS = (
+    # Gate 6: a system fault (storage read/write, OOM, thread exhaustion) is
+    # never a verdict — checked BEFORE any keyword mapping, so the text of a
+    # wrapped DB error ("Transaction validation error: Database error: ...")
+    # cannot be relabelled as a script / missing-inputs reason.
+    INTERNAL_ERROR_MARKER, "database error",
     "missing-ancestor-header", "previous block not found",
     "prev-blk-not-found", "inconclusive", "missing common ancestor",
     "no common ancestor", "side-branch", "too deep", "reorg-disconnect-failed",
@@ -2390,7 +2404,10 @@ class BlockSync:
         except Exception as e:
             self._blk_error += 1
             logger.error(f"Error handling block from {peer.host}:{peer.port}: {e}", exc_info=True)
-            peer.adjust_score(-5)
+            # Gate 6: a system fault on OUR side says nothing about the peer
+            # (Core ProcessMessages logs a caught exception, never punishes).
+            if not is_system_error(e):
+                peer.adjust_score(-5)
 
     def _buffer_put(self, block_hash: bytes, value) -> None:
         """Insert *value* (a ``(block, raw_payload)`` tuple) into the IBD
@@ -2582,6 +2599,10 @@ class BlockSync:
             return 0
 
         while self._validated_headers:
+            if is_fatal():
+                # Core AbortNode: nothing more is connected once a system
+                # fault has halted the node (gate 6).
+                break
             next_hash, _ = self._validated_headers[0]
             self._connecting_hashes.add(next_hash)
 
@@ -2764,15 +2785,23 @@ class BlockSync:
 
             async def _run_python() -> tuple[bool, str]:
                 try:
-                    return await asyncio.to_thread(
-                        self.validator.validate_block,
-                        block,
-                        known_height=new_height,
-                        force_check_scripts=self.force_full_scripts,
+                    # Gate 6: a system fault (DB read error, MemoryError,
+                    # thread exhaustion) is retried once; a second one comes
+                    # back as an INTERNAL result, never a verdict.
+                    return await retry_once_async(
+                        lambda: asyncio.to_thread(
+                            self.validator.validate_block,
+                            block,
+                            known_height=new_height,
+                            force_check_scripts=self.force_full_scripts,
+                        ),
+                        where=f"validate_block h={new_height}",
                     )
                 except MissingAncestorHeaderError as e:
                     # Not a verdict: hold the block (see the dispatch below).
                     return False, _MISSING_ANCESTOR_PREFIX + str(e)
+                except InternalValidationError as e:
+                    return False, str(e)
 
             validated_via_rust = False
             # Tracks whether one of the branches below has already assigned a
@@ -2945,6 +2974,15 @@ class BlockSync:
                     if error.startswith(_ffi_prefix):
                         error = error[len(_ffi_prefix):]
                         break
+            if not valid and is_internal_error_text(error):
+                # GATE 6: the node could not decide (a system fault recurred
+                # after one retry).  Core FatalError -> AbortNode: never mark
+                # the block failed, never punish its sender, never connect.
+                # Keep the block buffered and halt.
+                abort_node(f"block {next_hash.hex()[:16]}... h={new_height}: {error}")
+                self._buffer_put(next_hash, (block, raw_payload))
+                self._connecting_hashes.discard(next_hash)
+                break
             if not valid and error and error.startswith(_MISSING_ANCESTOR_PREFIX):
                 # FAIL CLOSED without a verdict: an ancestor header this check
                 # needs is not held.  Re-buffer and stop — never perm-reject,
@@ -3049,11 +3087,23 @@ class BlockSync:
             t_con = time.perf_counter_ns()
             try:
                 if hasattr(self.db, 'connect_block_from_bytes'):
-                    await asyncio.to_thread(
-                        self.db.connect_block_from_bytes, raw_payload, new_height, network
+                    # A failed WriteBatch commits nothing: retry once, then
+                    # halt (Core: a failed flush/write is FatalError).
+                    await retry_once_async(
+                        lambda: asyncio.to_thread(
+                            self.db.connect_block_from_bytes,
+                            raw_payload, new_height, network,
+                        ),
+                        where=f"connect_block_from_bytes h={new_height}",
                     )
                 else:
                     await asyncio.to_thread(self.validator.apply_block, block)
+            except InternalValidationError as e:
+                self._blk_connect_failed += 1
+                abort_node(f"connect h={new_height}: {e}", e)
+                self._buffer_put(next_hash, (block, raw_payload))
+                self._connecting_hashes.discard(next_hash)
+                break
             except Exception as e:
                 self._blk_connect_failed += 1
                 logger.error(f"Failed to connect block at height {new_height}: {e}")
@@ -5621,6 +5671,12 @@ class BlockSync:
 
         except Exception as e:
             logger.error(f"Error handling headers from {peer.host}:{peer.port}: {e}")
+            # Gate 6: a system fault (header-store write, DB read, OOM, a
+            # reorg that hit one) is not the peer's misbehaviour.  Core's
+            # ProcessMessages catch never punishes; header verdicts are
+            # scored on their own explicit paths above.
+            if is_system_error(e):
+                return
             peer.adjust_score(-2)
             if hasattr(self.peer_manager, 'misbehaving'):
                 addr = f"{peer.host}:{peer.port}"

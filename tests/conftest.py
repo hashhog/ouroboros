@@ -315,3 +315,14 @@ def event_loop():
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_fatal_latch():
+    """``ouroboros.fatal`` keeps a process-wide AbortNode latch; a test that
+    trips it must not make every later test's connect/mempool refuse."""
+    from ouroboros import fatal
+
+    fatal._reset_for_tests()
+    yield
+    fatal._reset_for_tests()

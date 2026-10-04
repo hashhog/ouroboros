@@ -7,6 +7,7 @@ import struct
 import time as _time
 
 from ouroboros.database import Block, BlockchainDatabase, Transaction, TxIn, TxOut
+from ouroboros.fatal import InternalValidationError, is_system_error, retry_once
 from ouroboros.script import (
     NATIVE_SCRIPT_ENABLED,
     native_script_context,
@@ -383,6 +384,10 @@ class MissingAncestorHeaderError(RuntimeError):
     block — callers must hold the block and retry once the headers exist,
     never mark it invalid and never punish the peer that sent it.
     """
+
+    #: A HOLD, not a system fault: ``fatal.is_system_error`` skips it even
+    #: though it subclasses RuntimeError.
+    _ouroboros_hold = True
 
 
 def diffbits_unresolved_fallback_ok(
@@ -1750,7 +1755,11 @@ class BlockValidator:
             return None
         try:
             ts = fn(height)
-        except Exception:
+        except Exception as e:
+            if is_system_error(e):
+                # A read FAILURE is not "ancestor unknown": an unresolved
+                # retarget can end in "Invalid header" (a verdict).
+                raise
             return None
         if not isinstance(ts, int):
             return None
@@ -3094,9 +3103,24 @@ class TransactionValidator:
                 pos, _tx, _tx_in, _utxo, i, *_rest = queue[int(fail_idx)]
                 return f"Transaction {pos} invalid: Invalid signature for input {i}"
         # GIL: serial. First failure in queue order = block order.
+        #
+        # Three outcomes, not two (gate 6; Core's script-check queue reports only
+        # ScriptError values from checkqueue.h; bad_alloc terminates).  A SYSTEM fault
+        # (fatal.is_system_error: MemoryError, OSError, RuntimeError, thread
+        # exhaustion ...) is re-run once here in the caller — the beamchain
+        # 30fdcfb pattern — and if it recurs raises InternalValidationError:
+        # never a reject (which would mark the block failed and punish the
+        # sender), never a pass.  Any OTHER exception is an interpreter-level
+        # failure on this input and stays a reject, never a pass.
         for pos, tx, tx_in, utxo, i, flags, amts, spks in queue:
             try:
-                ok = self._verify_input_signature(tx, tx_in, utxo, i, flags, amts, spks)
+                ok = retry_once(
+                    self._verify_input_signature,
+                    tx, tx_in, utxo, i, flags, amts, spks,
+                    where=f"script check (tx {pos} input {i})",
+                )
+            except InternalValidationError:
+                raise
             except Exception:  # noqa: BLE001 - a crash is a reject, never a pass
                 logger.exception("script check queue: serial path raised")
                 ok = False

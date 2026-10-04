@@ -21,6 +21,7 @@ import struct
 from enum import IntEnum
 
 from ouroboros.database import Transaction
+from ouroboros.fatal import is_system_error
 
 _log = logging.getLogger(__name__)
 
@@ -744,8 +745,11 @@ class ScriptInterpreter:
     ) -> bool:
         """``VerifyScript`` via the Rust port (``sync.script_verify``).
 
-        Mirrors ``verify_python``'s contract: any exception on the way to a
-        decision is a rejection (logged, budgeted), never a crash.
+        Mirrors ``verify_python``'s contract: an exception on the way to a
+        decision is a rejection (logged, budgeted) — EXCEPT a system fault
+        (``fatal.is_system_error``: MemoryError, OSError, RuntimeError, ...),
+        which propagates so the caller retries or halts.  Gate 6: a resource
+        failure is never a script result.
         """
         try:
             ctx = native_script_context(tx, input_amounts, input_script_pubkeys)
@@ -754,6 +758,8 @@ class ScriptInterpreter:
                 int(flags), int(amount),
             )
         except Exception as e:  # noqa: BLE001 - decision boundary
+            if is_system_error(e):
+                raise  # gate 6: a system fault is never a script result
             self.last_error = f"native-exception:{type(e).__name__}"
             if ScriptInterpreter._native_exc_log_budget > 0:
                 ScriptInterpreter._native_exc_log_budget -= 1
@@ -882,7 +888,9 @@ class ScriptInterpreter:
 
             return True
 
-        except Exception:
+        except Exception as _exc:
+            if is_system_error(_exc):
+                raise  # gate 6: a system fault is never a script result
             return False
 
     def _is_p2sh(self, script: bytes) -> bool:
@@ -1800,7 +1808,9 @@ class ScriptInterpreter:
                     stack.append(b'\x01' if ok else b'')
                 except ValueError:
                     raise
-                except Exception:
+                except Exception as _exc:
+                    if is_system_error(_exc):
+                        raise  # gate 6: a system fault is never a script result
                     stack.append(b'')
                 continue
 
@@ -1922,7 +1932,9 @@ class ScriptInterpreter:
                         raise ValueError("OP_CHECKSIGVERIFY failed")
                 except ValueError:
                     raise
-                except Exception:
+                except Exception as _exc:
+                    if is_system_error(_exc):
+                        raise  # gate 6: a system fault is never a script result
                     raise ValueError("OP_CHECKSIGVERIFY failed") from None
                 continue
 
@@ -2477,7 +2489,9 @@ class ScriptInterpreter:
                 if s_int > order // 2:
                     s_int = order - s_int
             return r_int.to_bytes(32, 'big') + s_int.to_bytes(32, 'big')
-        except Exception:
+        except Exception as _exc:
+            if is_system_error(_exc):
+                raise  # gate 6: a system fault is never a script result
             return None
 
     def _verify_ecdsa_signature(self, message_hash: bytes, der_sig: bytes, pubkey: bytes) -> bool:
@@ -2511,13 +2525,17 @@ class ScriptInterpreter:
         # rely on this to not wedge verification (block 851204 tx 26).
         try:
             pk = PublicKey(pubkey)
-        except Exception:
+        except Exception as _exc:
+            if is_system_error(_exc):
+                raise  # gate 6: a system fault is never a script result
             return False
 
         try:
             if pk.verify(der_sig, message_hash, hasher=None):
                 return True
-        except Exception:
+        except Exception as _exc:
+            if is_system_error(_exc):
+                raise  # gate 6: a system fault is never a script result
             pass
         # Strict DER failed or returned False — try lax parsing
         # First try without S normalization (preserves original S)
@@ -2529,7 +2547,9 @@ class ScriptInterpreter:
                 canonical_der = cdata_to_der(raw_sig)
                 if pk.verify(canonical_der, message_hash, hasher=None):
                     return True
-            except Exception:
+            except Exception as _exc:
+                if is_system_error(_exc):
+                    raise  # gate 6: a system fault is never a script result
                 pass
         # Try again with S normalization (for high-S sigs)
         compact_norm = self._lax_der_to_compact(der_sig, normalize_s=True)
@@ -2540,7 +2560,9 @@ class ScriptInterpreter:
                 canonical_der2 = cdata_to_der(raw_sig2)
                 if pk.verify(canonical_der2, message_hash, hasher=None):
                     return True
-            except Exception:
+            except Exception as _exc:
+                if is_system_error(_exc):
+                    raise  # gate 6: a system fault is never a script result
                 pass
         return False
 
@@ -2686,7 +2708,9 @@ class ScriptInterpreter:
             return pk.verify(signature, message_hash)
         except ImportError:
             pass
-        except Exception:
+        except Exception as _exc:
+            if is_system_error(_exc):
+                raise  # gate 6: a system fault is never a script result
             return False
 
         return False
@@ -2891,7 +2915,9 @@ class ScriptInterpreter:
                     default_sighash=sighash,
                     witness_weight=w_weight,
                 )
-            except (ValueError, Exception):
+            except Exception as _exc:
+                if is_system_error(_exc):
+                    raise  # gate 6: a system fault is never a script result
                 return False
             # Core interpreter.cpp:1866-1868 ExecuteWitnessScript:
             #   if (stack.size() != 1) return SCRIPT_ERR_CLEANSTACK;
@@ -2930,7 +2956,9 @@ class ScriptInterpreter:
             return pk.format(), int(pk.parity)
         except ImportError:
             return None
-        except Exception:
+        except Exception as _exc:
+            if is_system_error(_exc):
+                raise  # gate 6: a system fault is never a script result
             return None
 
     def _ser_script_size(self, script: bytes) -> bytes:

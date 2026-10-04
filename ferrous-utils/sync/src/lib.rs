@@ -38,6 +38,14 @@ use crate::network::peer_manager::PeerManager;
 use crate::network::header_sync::HeaderSync;
 use crate::network::block_sync::{BlockSync, BlockProgressCache};
 
+/// Gate 6: a storage failure surfaces to Python as ``RuntimeError("Database
+/// error: ...")`` — never folded into "absent", "default" or a partial result.
+/// The Python side (``ouroboros.fatal.is_system_error``) retries once, then
+/// halts the node (Core AbortNode); it never marks a block failed for it.
+fn storage_err(ctx: &str, e: impl std::fmt::Display) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}: {}", ctx, e))
+}
+
 /// Initialize logging. If RUST_LOG is not set, defaults to sync=warn.
 /// When OUROBOROS_VERBOSE=1, sets RUST_LOG=sync=debug for verbose output.
 fn init_logging() {
@@ -3528,6 +3536,9 @@ impl PyBlockchainDB {
         let expected = (height - start + 1) as usize;
         let mut timestamps = Vec::with_capacity(11);
         for h in start..=height {
+            // Gate 6: a read FAILURE is not a missing header.  Folding it into
+            // the incomplete-window None let a DB error waive a relative time
+            // lock (coin time 0) or make the mempool see MTP 0.
             match self.db.get_block_metadata(h) {
                 Ok(Some(meta)) => timestamps.push(meta.timestamp),
                 Ok(None) => {
@@ -3535,10 +3546,14 @@ impl PyBlockchainDB {
                     match self.db.get_block_by_height(h) {
                         Ok(Some(block)) => timestamps.push(block.header().time),
                         Ok(None) => {}
-                        Err(_) => {}
+                        Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            format!("Database error: get_median_time_past({}): {}", h, e)
+                        )),
                     }
                 }
-                Err(_) => {}
+                Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Database error: get_median_time_past({}): {}", h, e)
+                )),
             }
         }
         // Incomplete window — at least one block in [start ..= height] is not
@@ -3597,20 +3612,25 @@ impl PyBlockchainDB {
         let outpoint = bitcoin::OutPoint { txid: bitcoin_txid, vout };
 
         // 1. Try live chainstate first (cheaper — UTXO may still be unspent).
-        if let Ok(Some(utxo)) = self.db.get_utxo(&outpoint) {
-            return Ok(Some(PyUTXO::from(&utxo)));
+        //    A read failure is reported, never folded into "not found"
+        //    (gate 6: callers include the coinstats and compact-filter indexes).
+        match self.db.get_utxo(&outpoint) {
+            Ok(Some(utxo)) => return Ok(Some(PyUTXO::from(&utxo))),
+            Ok(None) => {}
+            Err(e) => {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Database error: get_utxo_or_spent: {}", e)
+                ))
+            }
         }
 
         // 2. Fall back to SPENT_CF (spent UTXOs retained for reorg undo).
         match self.db.get_spent_utxo(&outpoint) {
             Ok(Some((_spending_txid, utxo))) => Ok(Some(PyUTXO::from(&utxo))),
             Ok(None) => Ok(None),
-            Err(e) => {
-                // Non-fatal: SPENT_CF lookup failure should not crash the RPC.
-                // Swallow the error and report the UTXO as not found.
-                let _ = e;
-                Ok(None)
-            }
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: get_utxo_or_spent (spent): {}", e)
+            )),
         }
     }
 
@@ -3636,7 +3656,16 @@ impl PyBlockchainDB {
             match self.db.get_utxo(&outpoint) {
                 Ok(Some(utxo)) => results.push(Some(PyUTXO::from(&utxo))),
                 Ok(None) => results.push(None),
-                Err(_) => results.push(None),
+                // Gate 6: a READ FAILURE is not "coin absent".  Reporting it
+                // as None became "Input not found" -> bad-txns-inputs-
+                // missingorspent -> block marked failed + sender banned.
+                // Core: CCoinsViewErrorCatcher aborts the node
+                // (coins.cpp:415-427).
+                Err(e) => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        format!("Database error: get_utxo_batch: {}", e)
+                    ))
+                }
             }
         }
         Ok(results)
@@ -3839,9 +3868,20 @@ impl PyBlockchainDB {
                 ))?;
             validator
                 .validate_block_with_flags(&block, prev_height, skip_scripts)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("validate: {}", e)
-                ))
+                .map_err(|e| {
+                    // Gate 6: a storage failure is not a verdict.  RuntimeError
+                    // (not ValueError) so the Python callers retry or halt
+                    // instead of marking the block failed + punishing.
+                    if e.is_system_error() {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            format!("validate: {}", e)
+                        )
+                    } else {
+                        PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                            format!("validate: {}", e)
+                        )
+                    }
+                })
         })
     }
 
@@ -4030,10 +4070,16 @@ impl PyBlockchainDB {
             let start = if prev_height >= 10 { prev_height - 10 } else { 0 };
             let mut ts_buf: Vec<u32> = Vec::with_capacity(11);
             for h in start..=prev_height {
-                if let Ok(Some(meta)) = self.db.get_block_metadata(h) {
-                    ts_buf.push(meta.timestamp);
-                } else if let Ok(Some(block)) = self.db.get_block_by_height(h) {
-                    ts_buf.push(block.header().time);
+                // Gate 6: a read FAILURE aborts the connect; it must not
+                // shrink the MTP window (a partial median is not the MTP).
+                match self.db.get_block_metadata(h) {
+                    Ok(Some(meta)) => ts_buf.push(meta.timestamp),
+                    Ok(None) => match self.db.get_block_by_height(h) {
+                        Ok(Some(block)) => ts_buf.push(block.header().time),
+                        Ok(None) => {}
+                        Err(e) => return Err(storage_err("connect_block_from_bytes: MTP block read", e)),
+                    },
+                    Err(e) => return Err(storage_err("connect_block_from_bytes: MTP metadata read", e)),
                 }
             }
             if !ts_buf.is_empty() {
@@ -4212,7 +4258,8 @@ impl PyBlockchainDB {
         let (old_tip_hash, old_tip_height) = if height == 0 {
             ([0u8; 32], 0u32)
         } else {
-            self.db.get_best_block().unwrap_or(([0u8; 32], 0))
+            self.db.get_best_block()
+                .map_err(|e| storage_err("connect_block_from_bytes: best block read", e))?
         };
         self.db.write_head_blocks_batch(&mut batch, &old_tip_hash, old_tip_height, &block_hash, height)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
@@ -4327,7 +4374,15 @@ impl PyBlockchainDB {
                     } else {
                         match &utxo_values_disk[input_cursor] {
                             Ok(Some(disk_bytes)) => Some(disk_bytes.clone()),
-                            _ => None,
+                            Ok(None) => None,
+                            // Gate 6: a read FAILURE is not an absent coin —
+                            // folding it into None silently dropped the
+                            // SPENT_CF undo record for this spend.
+                            Err(e) => {
+                                return Err(storage_err(
+                                    "connect_block_from_bytes: coin read", e,
+                                ))
+                            }
                         }
                     };
 
@@ -4404,8 +4459,8 @@ impl PyBlockchainDB {
             [0u8; 32]
         } else {
             self.db.get_block_metadata(height - 1)
-                .ok()
-                .and_then(|opt| opt.map(|m| m.chainwork))
+                .map_err(|e| storage_err("connect_block_from_bytes: parent chainwork read", e))?
+                .map(|m| m.chainwork)
                 .unwrap_or([0u8; 32])
         };
         let chainwork = crate::chainwork::compute_chainwork(&prev_chainwork, bits);
@@ -4568,7 +4623,9 @@ impl PyBlockchainDB {
         let mut prev_tip_hash: [u8; 32] = if first_height == 0 {
             [0u8; 32]
         } else {
-            self.db.get_best_block().unwrap_or(([0u8; 32], 0)).0
+            self.db.get_best_block()
+                .map_err(|e| storage_err("connect_blocks_atomic: best block read", e))?
+                .0
         };
         let initial_old_tip_hash = prev_tip_hash;
         let initial_old_tip_height = if first_height == 0 {
@@ -4730,10 +4787,16 @@ impl PyBlockchainDB {
                         // batch is large enough to span 11 blocks.)
                         continue;
                     }
-                    if let Ok(Some(meta)) = self.db.get_block_metadata(h) {
-                        ts_buf.push(meta.timestamp);
-                    } else if let Ok(Some(blk)) = self.db.get_block_by_height(h) {
-                        ts_buf.push(blk.header().time);
+                    // Gate 6: a read FAILURE aborts the connect; it must not
+                    // shrink the MTP window (a partial median is not the MTP).
+                    match self.db.get_block_metadata(h) {
+                        Ok(Some(meta)) => ts_buf.push(meta.timestamp),
+                        Ok(None) => match self.db.get_block_by_height(h) {
+                            Ok(Some(blk)) => ts_buf.push(blk.header().time),
+                            Ok(None) => {}
+                            Err(e) => return Err(storage_err("connect_blocks_atomic: MTP block read", e)),
+                        },
+                        Err(e) => return Err(storage_err("connect_blocks_atomic: MTP metadata read", e)),
                     }
                 }
                 if !ts_buf.is_empty() {
@@ -4911,8 +4974,15 @@ impl PyBlockchainDB {
                     .collect();
                 let fetched = raw_db.multi_get_cf(cf_keys);
                 for (slot, fetched_val) in fetched.into_iter().enumerate() {
-                    if let Ok(Some(bytes)) = fetched_val {
-                        utxo_disk_for_input[slot] = Some(bytes);
+                    match fetched_val {
+                        Ok(Some(bytes)) => utxo_disk_for_input[slot] = Some(bytes),
+                        Ok(None) => {}
+                        // Gate 6: a read FAILURE is not an absent coin.
+                        Err(e) => {
+                            return Err(storage_err(
+                                "connect_blocks_atomic: coin read", e,
+                            ))
+                        }
                     }
                 }
             }
@@ -5047,8 +5117,8 @@ impl PyBlockchainDB {
                 // back to DB is incorrect for later batch blocks if their
                 // parent is also in the batch — re-derive on the fly.
                 self.db.get_block_metadata(height - 1)
-                    .ok()
-                    .and_then(|opt| opt.map(|m| m.chainwork))
+                    .map_err(|e| storage_err("connect_blocks_atomic: parent chainwork read", e))?
+                    .map(|m| m.chainwork)
                     .unwrap_or([0u8; 32])
             };
             let chainwork = crate::chainwork::compute_chainwork(&prev_chainwork, bits);
