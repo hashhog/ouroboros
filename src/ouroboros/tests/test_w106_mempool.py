@@ -1682,8 +1682,10 @@ class TestBugRbfNewFeeIgnoresMempoolParents(unittest.TestCase):
             or ("parent_entry" in fee_loop and "self.transactions" in fee_loop
                 and "inp.prev_txid" in fee_loop)
         )
-        self.assertFalse(has_mempool_lookup,
-                         "BUG G18 FIXED if this fails: fee calc now includes in-mempool parent lookup")
+        # G18 fixed 2026-10-05 (runtime pin: tests/test_tx_reject_punishment.py
+        # ::test_rbf_replacement_spending_mempool_parent_counts_its_value).
+        self.assertTrue(has_mempool_lookup,
+                        "BUG G18 regressed: RBF fee calc ignores in-mempool parents")
 
 
 # ---------------------------------------------------------------------------

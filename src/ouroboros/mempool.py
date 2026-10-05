@@ -2381,6 +2381,32 @@ class Mempool:
             return "missing-inputs"
         return reason
 
+    def _mempool_parent_coins(self, tx: Transaction, coin_height: int) -> dict:
+        """Coins this tx spends from in-mempool parents (CCoinsViewMemPool).
+
+        Keyed ``(prev_txid, prev_vout)`` in the same shape the validator's
+        ``intra_block_utxos`` overlay takes.  Only outpoints the chain UTXO
+        set does not hold are included; *coin_height* is tip + 1 (Core
+        MEMPOOL_HEIGHT resolved by CalculateLockPointsAtTip).
+        """
+        coins: dict = {}
+        for tx_in in tx.inputs:
+            parent = self.transactions.get(tx_in.prev_txid)
+            if parent is None or tx_in.prev_vout >= len(parent.tx.outputs):
+                continue
+            if self.validator.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout) is not None:
+                continue
+            out = parent.tx.outputs[tx_in.prev_vout]
+            coins[(tx_in.prev_txid, tx_in.prev_vout)] = {
+                'txid': tx_in.prev_txid,
+                'vout': tx_in.prev_vout,
+                'value': out.value,
+                'script_pubkey': out.script_pubkey,
+                'height': coin_height,
+                'is_coinbase': False,
+            }
+        return coins
+
     def _add_transaction_inner(
         self, tx: Transaction, height: int, test_accept: bool = False,
         peer: object = None,
@@ -2608,11 +2634,30 @@ class Mempool:
                 # to consensus-only verification (current behavior).
                 extra_flags = 0
 
+        # CCoinsViewMemPool: outputs of in-mempool parents are spendable
+        # coins for this tx (Core validation.cpp PreChecks resolves inputs
+        # through m_viewmempool = CCoinsViewMemPool(&CoinsTip(), m_pool)).
+        # The orphan gate above already treats a mempool parent as present,
+        # so without this view every child of an unconfirmed parent reached
+        # the chain-only TransactionValidator and failed "Input not found" —
+        # rejected as invalid and its (honest) relayer punished.  A mempool
+        # coin carries Core's MEMPOOL_HEIGHT semantics: height = tip + 1 for
+        # BIP68 (CalculateLockPointsAtTip), never a coinbase.
+        mempool_coins = self._mempool_parent_coins(tx, next_height)
+
         from ouroboros.validation import MissingAncestorHeaderError
         try:
-            valid, error = self.validator.validate_transaction(
-                tx, next_height, mempool_mtp, extra_script_flags=extra_flags,
-            )
+            if mempool_coins:
+                valid, error = self.validator.validate_transaction(
+                    tx, next_height, mempool_mtp,
+                    extra_script_flags=extra_flags,
+                    intra_block_utxos=mempool_coins,
+                )
+            else:
+                valid, error = self.validator.validate_transaction(
+                    tx, next_height, mempool_mtp,
+                    extra_script_flags=extra_flags,
+                )
         except MissingAncestorHeaderError:
             # BIP68 coin MTP not computable yet (pre-snapshot headers still
             # backfilling): refuse the tx, without a consensus verdict.
@@ -2717,6 +2762,8 @@ class Mempool:
         total_input = 0
         for tx_in in tx.inputs:
             utxo = self.validator.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+            if not utxo:
+                utxo = mempool_coins.get((tx_in.prev_txid, tx_in.prev_vout))
             if utxo:
                 total_input += utxo['value']
             else:
@@ -4247,6 +4294,12 @@ class Mempool:
             utxo = self.validator.db.get_utxo(inp.prev_txid, inp.prev_vout)
             if utxo:
                 total_input += utxo['value']
+            else:
+                # Input from an in-mempool parent (CCoinsViewMemPool) — was
+                # silently counted as 0, under-stating the replacement fee.
+                parent_entry = self.transactions.get(inp.prev_txid)
+                if parent_entry is not None and inp.prev_vout < len(parent_entry.tx.outputs):
+                    total_input += parent_entry.tx.outputs[inp.prev_vout].value
         total_output = sum(out.value for out in new_tx.outputs)
         new_fee = total_input - total_output
 

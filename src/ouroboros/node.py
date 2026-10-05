@@ -19,7 +19,7 @@ from ouroboros.block_sync import BlockSync
 from ouroboros.config import NodeConfig
 from ouroboros.cookie_auth import delete_cookie, generate_cookie
 from ouroboros.database import BlockchainDatabase
-from ouroboros.fatal import EXIT_CODE_FATAL, is_internal_error_text, set_abort_hook
+from ouroboros.fatal import EXIT_CODE_FATAL, set_abort_hook
 from ouroboros.fee_estimator import FeeEstimator
 from ouroboros.mempool import Mempool
 from ouroboros.metrics import (
@@ -33,6 +33,7 @@ from ouroboros.rpc import RPCServer
 from ouroboros.snapshot import SnapshotManager, read_snapshot_metadata
 from ouroboros.sync_manager import SyncManager
 from ouroboros.tip_notifier import TipNotifier
+from ouroboros.tx_reject import classify_mempool_reject, should_punish_tx_reject
 from ouroboros.validation import BlockValidator, TransactionValidator, assumevalid_disabled
 from ouroboros.wallet import Wallet, WalletManager
 from ouroboros.zmq_notifier import ZMQNotifier
@@ -1927,14 +1928,25 @@ class BitcoinNode:
                                     except Exception:
                                         pass
                     else:
-                        logger.debug(f"Rejected transaction: {error}")
-                        # Record misbehavior for invalid transactions
-                        # Invalid tx = 10 points (requires 10 violations to ban)
-                        # Gate 6: a system fault on our side (DB read error,
-                        # node halted) is not the sender's misbehaviour.
-                        if is_internal_error_text(error):
-                            pass
-                        elif hasattr(self, "peer_manager") and self.peer_manager:
+                        # Core TxValidationResult classification: only a
+                        # consensus-invalid tx is the sender's misbehaviour.
+                        # Policy (fee, RBF, standardness, cluster/TRUC),
+                        # already-known, premature-spend and missing-inputs
+                        # are what honest Core peers relay every second, and
+                        # a system fault on our side (gate 6) is ours.
+                        # Core <=v27 MaybePunishNodeForTx punished only
+                        # TX_CONSENSUS; the reference tree (post-v28
+                        # ProcessInvalidTx) punishes no tx at all.
+                        reject_class = classify_mempool_reject(error)
+                        logger.debug(
+                            f"Rejected transaction ({reject_class.value}): "
+                            f"{error}"
+                        )
+                        if (
+                            should_punish_tx_reject(reject_class)
+                            and hasattr(self, "peer_manager")
+                            and self.peer_manager
+                        ):
                             addr = f"{sender_peer.host}:{sender_peer.port}"
                             self.peer_manager.misbehaving(
                                 addr, 10, f"invalid tx: {error}"

@@ -346,23 +346,25 @@ class TestAncestorCountLimit:
         assert ok, f"26-level chain must be accepted under the cluster mempool; err={err}"
 
     def test_no_ancestor_gate_preempts_the_utxo_lookup(self):
-        """With the ancestor gate gone, a missing UTXO is what this now reports.
+        """With the ancestor gate gone, nothing stops the 26th link.
 
         Pre-v31 the 25-ancestor check ran before the UTXO lookup and shadowed
-        it.  The surviving reject proves no generic ancestor gate remains in
-        front of the fee/UTXO path.
+        it.  This test used to expect "UTXO not found" here — but that was a
+        second bug: the fee/UTXO path read only the chain coin set, so EVERY
+        child of an in-mempool parent was refused (and its relayer punished;
+        mainnet 2026-10-05).  Core resolves inputs through CCoinsViewMemPool,
+        so with no chain coin seeded for the tip the 26-level chain is
+        accepted on the strength of the mempool parent alone.
         """
-        pool = _pool()  # No UTXOs seeded
+        pool = _pool()  # No UTXOs seeded for the chain tip
         chain = _build_chain(pool, 25)
         tip = chain[-1]
         txid_26 = _txid(9001)
         tx_26 = _make_tx(txid_26, [(tip, 0)], [49_980])
 
         ok, err = pool._add_transaction_inner(tx_26, height=100)
-        assert not ok
-        assert "utxo not found" in err.lower(), (
-            f"Expected the UTXO lookup to be the first failing gate, got: {err}"
-        )
+        assert ok, f"mempool parent must resolve the input; err={err}"
+        assert pool.transactions[txid_26].ancestor_count == 26
 
 
 # ---------------------------------------------------------------------------
