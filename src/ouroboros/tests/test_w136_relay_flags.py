@@ -566,7 +566,9 @@ def test_w136_g25_block_announce_precedence() -> None:
     # Find _announce_block.
     idx = src.find("async def _announce_block")
     assert idx != -1
-    next_def = src.find("async def ", idx + 1)
+    # The per-peer sender is a nested ``async def _announce_to``; the body
+    # ends at the next METHOD, not the next ``async def``.
+    next_def = src.find("\n    async def ", idx + 1)
     body = src[idx:next_def if next_def != -1 else len(src)]
     # The cmpctblock branch must precede the wants_headers branch in source.
     cmpct = body.find("wants_cmpctblock")

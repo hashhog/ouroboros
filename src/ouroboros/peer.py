@@ -291,6 +291,18 @@ OUR_PROTOCOL_VERSION = 70016
 # Handshake timeout in seconds
 HANDSHAKE_TIMEOUT = 60.0
 
+# Longest a single send may wait for a peer to drain our write buffer.  Core
+# never blocks on a peer's socket: SocketSendData is non-blocking, a full send
+# buffer only sets fPauseSend for THAT peer, and CConnman::InactivityCheck
+# (net.cpp) disconnects a peer whose sends make no progress ("socket sending
+# timeout").  asyncio's ``await writer.drain()`` instead parks the CALLER until
+# the peer reads — forever, if it never does.  Callers are other peers' message
+# handlers (tx INV relay) and the block-connect loop (tip announce), so one
+# peer that stopped reading wedged the whole node (mainnet 2026-10-05:
+# 969990 → 45 min stall).  A send that cannot drain within this bound
+# hard-aborts that peer's transport and raises.
+SEND_STALL_TIMEOUT = 30.0
+
 
 class _PrefixedStreamReader:
     """Adapter that prepends a fixed prefix to an :class:`asyncio.StreamReader`.
@@ -1719,12 +1731,80 @@ class Peer:
             data = msg.serialize()
 
         self.writer.write(data)
-        await self.writer.drain()
+        await self._bounded_drain()
 
         self.bytes_sent += len(data)
         self.last_send = time.time()
 
         logger.debug(f"Sent {msg.command} to {self.host}:{self.port}")
+
+    async def _bounded_drain(self) -> None:
+        """``writer.drain()`` that can never park the caller indefinitely.
+
+        Below the transport's high-water mark drain returns at once, so no
+        timer is armed on the hot path (O(stalls), not O(messages) — the
+        TimerHandle-leak constraint documented on ``_read_exactly``).  Only a
+        paused transport (peer not reading) waits, for at most
+        ``SEND_STALL_TIMEOUT``; then the transport is aborted and the peer is
+        marked disconnected so no other caller queues behind it again.
+        """
+        writer = self.writer
+        if writer is None:
+            raise ConnectionError(f"{self.host}:{self.port} not connected")
+        transport = getattr(writer, "transport", None)
+        if transport is None:
+            await writer.drain()  # not a socket-backed StreamWriter
+            return
+        try:
+            paused = transport.get_write_buffer_size() > transport.get_write_buffer_limits()[1]
+        except Exception:
+            paused = True  # unknown transport shape: take the bounded path
+        if not paused:
+            await writer.drain()  # returns without waiting (raises if lost)
+            return
+        timeout = getattr(self, "_send_stall_timeout", SEND_STALL_TIMEOUT)
+        unsent = transport.get_write_buffer_size()
+        while True:
+            try:
+                await asyncio.wait_for(writer.drain(), timeout)
+                return
+            except TimeoutError:
+                now_unsent = transport.get_write_buffer_size()
+                if now_unsent < unsent:
+                    # Slow but moving (e.g. a block served over a thin
+                    # link): Core drops only a peer whose sends make NO
+                    # progress, so keep waiting while the buffer shrinks.
+                    unsent = now_unsent
+                    continue
+            logger.warning(
+                "Send stalled to %s:%s (%d B unsent, no progress in %.0fs, "
+                "peer not reading) — aborting connection",
+                self.host, self.port, unsent, timeout,
+            )
+            self._abort_transport()
+            raise ConnectionError(
+                f"send to {self.host}:{self.port} stalled {timeout:.0f}s"
+            ) from None
+
+    def _abort_transport(self) -> None:
+        """Hard-close the socket now (no flush) and leave READY.
+
+        ``writer.close()`` waits to flush the write buffer first, which never
+        happens for a peer that stopped reading; ``abort()`` drops it and
+        fires ``connection_lost`` so the listen loop and every pending drain
+        unblock.
+        """
+        self.state = PeerState.DISCONNECTED
+        writer = self.writer
+        if writer is None:
+            return
+        try:
+            transport = getattr(writer, "transport", None)
+            if transport is not None:
+                transport.abort()
+        except Exception:
+            logger.debug("transport.abort raised for %s:%s", self.host,
+                         self.port, exc_info=True)
 
     async def _read_exactly(self, n: int) -> bytes:
         """Read exactly ``n`` bytes with NO per-read timeout (Core parity).
@@ -2435,6 +2515,13 @@ class Peer:
     async def disconnect(self):
         """Disconnect from peer"""
         if getattr(self, "_disconnect_started", False):
+            # A repeat call must still make progress.  The first call can be
+            # parked (it awaits the listen task and the socket close), and a
+            # peer whose teardown never finished must not stay READY: the
+            # inactivity sweep "disconnected" one such peer every 30 s for
+            # hours on mainnet 2026-10-05 while relays kept writing to it.
+            if self.state != PeerState.DISCONNECTED:
+                self._abort_transport()
             return
         self._disconnect_started = True
         logger.info(f"Disconnecting from {self.host}:{self.port}")
@@ -2467,7 +2554,12 @@ class Peer:
         if self.writer:
             try:
                 self.writer.close()
-                await self.writer.wait_closed()
+                # close() flushes first; a peer that stopped reading never
+                # lets it finish, so bound the wait and then abort.
+                try:
+                    await asyncio.wait_for(self.writer.wait_closed(), 5.0)
+                except TimeoutError:
+                    self._abort_transport()
             except Exception as e:
                 logger.debug(f"Error closing connection to {self.host}:{self.port}: {e}")
 

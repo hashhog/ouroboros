@@ -24,7 +24,9 @@ def test_primary_connect_path_announces():
     src = inspect.getsource(block_sync)
     notify = src.index("self._tip_notifier.notify()")
     progress = src.index('f"✓ Block {new_height} connected "')
-    call = src.find("await self._announce_block(block, next_hash)", notify)
+    # Scheduled, not awaited: the drain holds _drain_lock (2026-10-05 wedge;
+    # behaviour pinned at runtime in test_send_stall_no_wedge.py).
+    call = src.find("self._schedule_announce(block, next_hash, new_height)", notify)
     assert notify < call < progress, "drain connect loop must announce the new tip"
 
 

@@ -864,6 +864,9 @@ class BlockSync:
         # against the pre-mutation UTXO and Python against the post-
         # mutation UTXO.  Lazy-init: asyncio.Lock() needs a running loop.
         self._drain_lock: asyncio.Lock | None = None
+        self._drain_lock_since: float = 0.0
+        self._drain_lock_holder: asyncio.Task | None = None
+        self._announce_tasks: set = set()
 
         # W75-WATCHDOG: block-accept outcome counters + staleness guard.
         # Motivated by the 2026-04-14..19 wedge where the running
@@ -2497,7 +2500,13 @@ class BlockSync:
         if self._drain_lock.locked():
             return 0
         async with self._drain_lock:
-            return await self._drain_block_buffer_locked()
+            self._drain_lock_since = time.time()
+            self._drain_lock_holder = asyncio.current_task()
+            try:
+                return await self._drain_block_buffer_locked()
+            finally:
+                self._drain_lock_since = 0.0
+                self._drain_lock_holder = None
 
     async def _prebase_headers_ready(self) -> bool:
         """Core-parity gate: is the full header chain below the tip held?
@@ -3254,11 +3263,17 @@ class BlockSync:
             # linked only through ouroboros never converged (regtest relay
             # test 2026-09-26). Best-effort: an announce fault must never
             # stall block connection.
+            #
+            # NOT awaited here: this loop runs under _drain_lock, and every
+            # other drain call returns 0 while the lock is held.  On mainnet
+            # 2026-10-05 the announce of 969990 parked on one peer's socket
+            # (writer.drain() on a peer that stopped reading), so the lock was
+            # never released: blocks kept being buffered but nothing connected
+            # for 45 min, and W75-RECOVER's map reset could not help because
+            # the wedge was the lock-holding coroutine itself.  Core announces
+            # from SendMessages, per peer, decoupled from ActivateBestChain.
             if should_announce_tip(block.timestamp, time.time()):
-                try:
-                    await self._announce_block(block, next_hash)
-                except Exception as e:
-                    logger.debug(f"announce of block {new_height} failed: {e}")
+                self._schedule_announce(block, next_hash, new_height)
 
             # Log progress every 1000 blocks
             if new_height % 1000 == 0 or connected == 1:
@@ -6838,6 +6853,30 @@ class BlockSync:
         stale = now - self._last_tip_advance
         if stale < self._wedge_warn_after:
             return
+        # A drain that never returns holds _drain_lock, and every other drain
+        # call then returns 0 without connecting anything — no map reset can
+        # fix that (2026-10-05: the holder was parked in a block announce for
+        # 45 min; the buffer/queue preconditions below kept this watchdog
+        # silent until a new peer happened to deliver a block).  Name the
+        # holder and where it is suspended, regardless of buffer state.
+        held_since = getattr(self, "_drain_lock_since", 0.0)
+        if held_since and now - held_since >= self._wedge_warn_after:
+            holder = getattr(self, "_drain_lock_holder", None)
+            where = "?"
+            try:
+                frames = holder.get_stack() if holder is not None else []
+                if frames:
+                    f = frames[-1]
+                    where = f"{f.f_code.co_filename}:{f.f_lineno} in {f.f_code.co_name}"
+            except Exception:
+                pass
+            logger.warning(
+                "[W75-WATCHDOG] drain lock held %.0fs (tip frozen %.0fs) — "
+                "the connect loop is suspended at %s; no other drain can run",
+                now - held_since, stale, where,
+            )
+            self._last_wedge_warn = now
+            return
         if not self._validated_headers:
             return  # caught up — stalling here is just "no new blocks to fetch"
         if not self._ibd_block_buffer:
@@ -6910,17 +6949,43 @@ class BlockSync:
         self._last_wedge_recover = now
         return True
 
+    def _schedule_announce(
+        self, block: Block, block_hash: bytes, height: int,
+    ) -> asyncio.Task:
+        """Announce *block* in the background, off the connect path.
+
+        The task is held in ``_announce_tasks`` until it finishes so it is
+        not garbage-collected mid-flight; failures are logged, never raised.
+        """
+        tasks = getattr(self, "_announce_tasks", None)
+        if tasks is None:
+            tasks = self._announce_tasks = set()
+
+        async def _run() -> None:
+            try:
+                await self._announce_block(block, block_hash)
+            except Exception as e:
+                logger.debug(f"announce of block {height} failed: {e}")
+
+        task = asyncio.get_running_loop().create_task(_run())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
     async def _announce_block(
         self, block: Block, block_hash: bytes, exclude_peer: Peer | None = None,
     ) -> None:
-        """Announce a validated block to peers based on their preferences."""
+        """Announce a validated block to peers based on their preferences.
+
+        Peers are sent to concurrently, so one peer whose socket is not
+        draining (bounded by Peer.SEND_STALL_TIMEOUT) cannot delay the
+        announcement to every peer after it in the list.
+        """
         if not hasattr(self.peer_manager, 'get_all_ready_peers'):
             return
         network = getattr(self.peer_manager, 'network', 'mainnet')
 
-        for p in self.peer_manager.get_all_ready_peers():
-            if p is exclude_peer:
-                continue
+        async def _announce_to(p) -> None:
             try:
                 if p.wants_cmpctblock:
                     import os
@@ -6946,6 +7011,13 @@ class BlockSync:
                     await p.send_message(inv.to_network_message(network))
             except Exception as e:
                 logger.debug(f"Failed to announce block to {p.host}:{p.port}: {e}")
+
+        targets = [
+            p for p in self.peer_manager.get_all_ready_peers()
+            if p is not exclude_peer
+        ]
+        if targets:
+            await asyncio.gather(*(_announce_to(p) for p in targets))
 
     async def _process_orphans(self, applied_block_hash: bytes) -> None:
         """Process orphan blocks that may now have their parent in our chain.
