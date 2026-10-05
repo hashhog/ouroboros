@@ -139,5 +139,12 @@ def classify_mempool_reject(reason: str | None) -> TxValidationResult:
 
 
 def should_punish_tx_reject(result: TxValidationResult) -> bool:
-    """Strict allow-list: only consensus-invalid transactions are punished."""
-    return result is TxValidationResult.TX_CONSENSUS
+    """A rejected relayed transaction never punishes its peer.
+
+    Current Core (net_processing.cpp ProcessInvalidTx, v28+) punishes no
+    relayed transaction for any TxValidationResult -- not even TX_CONSENSUS.
+    Up to v27 MaybePunishNodeForTx scored TX_CONSENSUS only; ouroboros used
+    that allow-list from c71f579 until Max ruled (2026-10-05) to match
+    current Core. The classification above is kept for logging/metrics.
+    """
+    return False

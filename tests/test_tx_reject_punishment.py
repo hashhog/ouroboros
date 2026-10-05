@@ -144,16 +144,28 @@ def test_orphan_is_not_punished():
     assert _run_tx_handler("orphan") == []
 
 
-# Negative control: the instrument above must be able to SEE a punishment.
-# Consensus-invalid reasons (Core TX_CONSENSUS) are still scored.
-@pytest.mark.parametrize("reason", [
+_CONSENSUS_INVALID = [
     "coinbase",
     "bad-txns-inputs-duplicate",
     "bad-txns-vout-negative",
     "bad-txns-in-belowout: value in (100) < value out (200)",
     "bad-txns-inputvalues-outofrange",
-])
-def test_consensus_invalid_is_punished(reason):
+]
+
+
+# Current Core (ProcessInvalidTx, v28+) punishes NO relayed tx, not even
+# consensus-invalid ones (Max ruling 2026-10-05).
+@pytest.mark.parametrize("reason", _CONSENSUS_INVALID)
+def test_consensus_invalid_is_not_punished(reason):
+    assert _run_tx_handler(reason) == []
+
+
+# Negative control: the instrument above must be able to SEE a punishment,
+# so force the decision to "punish" and require the handler to score the peer.
+@pytest.mark.parametrize("reason", _CONSENSUS_INVALID)
+def test_instrument_sees_a_forced_punishment(reason, monkeypatch):
+    import ouroboros.node as node_mod
+    monkeypatch.setattr(node_mod, "should_punish_tx_reject", lambda _r: True)
     calls = _run_tx_handler(reason)
     assert len(calls) == 1, calls
     addr, score, why = calls[0]
