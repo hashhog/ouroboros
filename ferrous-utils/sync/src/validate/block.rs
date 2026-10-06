@@ -366,8 +366,20 @@ impl BlockValidator {
 
         // Seed the view with the coinbase's outputs (coinbase maturity still
         // applies to anyone trying to spend them).
+        //
+        // Core CCoinsViewCache::AddCoin (coins.cpp:84-91) returns early for an
+        // unspendable output (OP_RETURN or > MAX_SCRIPT_SIZE), so such an
+        // output never enters ANY view — including the per-block connect
+        // view. A later tx in this block that spends it must fail HaveInputs
+        // (bad-txns-inputs-missingorspent), with or without script checks.
+        // connect_block_from_bytes already skips them; this overlay must
+        // agree or a skip-scripts (assumevalid) block that spends one passes
+        // here and its input silently resolves to nothing at connect.
         let cb_txid = coinbase_tx.compute_txid();
         for (vout, out) in coinbase_tx.output.iter().enumerate() {
+            if is_unspendable_script(out.script_pubkey.as_bytes()) {
+                continue;
+            }
             let op = OutPoint { txid: cb_txid, vout: vout as u32 };
             let outpoint_wrapper = common::OutPointWrapper::new(op);
             intra_utxos.insert(op, UTXO::new(
@@ -439,9 +451,13 @@ impl BlockValidator {
                 intra_utxos.remove(&input.previous_output);
             }
 
-            // Register this tx's outputs for subsequent txs in the same block.
+            // Register this tx's outputs for subsequent txs in the same block
+            // (unspendable outputs never enter a view — AddCoin, see above).
             let txid = tx.compute_txid();
             for (vout, out) in tx.output.iter().enumerate() {
+                if is_unspendable_script(out.script_pubkey.as_bytes()) {
+                    continue;
+                }
                 let op = OutPoint { txid, vout: vout as u32 };
                 let outpoint_wrapper = common::OutPointWrapper::new(op);
                 intra_utxos.insert(op, UTXO::new(

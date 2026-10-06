@@ -1485,9 +1485,17 @@ class BlockValidator:
                     spent_in_block.add(key)
 
             # Register this tx's outputs in the intra-block view for
-            # subsequent transactions.
+            # subsequent transactions.  Core CCoinsViewCache::AddCoin
+            # (coins.cpp:84-91) returns early for an unspendable output
+            # (OP_RETURN-led or > MAX_SCRIPT_SIZE): it never enters any view,
+            # so a later in-block spend of it is missing-or-spent — before,
+            # and independent of, any script check.  The Rust connect already
+            # skips them; this view must agree.
             txid = tx.get_txid()
             for vout_idx, out in enumerate(tx.outputs):
+                _spk = out.script_pubkey
+                if (len(_spk) > 0 and _spk[0] == 0x6A) or len(_spk) > 10_000:
+                    continue
                 intra_block_utxos[(txid, vout_idx)] = {
                     'txid': txid,
                     'vout': vout_idx,
