@@ -612,37 +612,32 @@ def _parent_is_tip(db, block_bytes: bytes, next_height: int) -> bool:
     return bytes(block_bytes[4:36]) == bytes(tip_hash) and tip_height == next_height - 1
 
 
-async def accept_block(
-    db,
-    node,
-    block_bytes: bytes,
-    next_height: int,
-    *,
-    skip_scripts: bool = False,
-    decoded_block=None,
-) -> bytes:
-    """Validate + connect under the chain lock (Core ``cs_main``).
+def _accept_under_chain_lock(fn):
+    """Run ``accept_block`` under the chain lock (Core ``cs_main``).
 
     Every chainstate writer takes :func:`ouroboros.chainlock.chain_lock`, so no
     other block can be connected between this block's validation and its
     connect.  The parent is re-checked against the tip INSIDE the lock: a
     caller that read the tip before waiting for the lock (submitblock,
     generate*) and lost the race gets ``inconclusive`` instead of a block
-    connected on top of a tip it was never validated against.  See
-    :func:`_accept_block_locked` for the pipeline.
+    connected on top of a tip it was never validated against.
     """
-    from ouroboros.chainlock import chain_lock
+    import functools
 
-    async with chain_lock(node if node is not None else db):
-        if not _parent_is_tip(db, block_bytes, next_height):
-            raise ValueError("inconclusive")
-        return await _accept_block_locked(
-            db, node, block_bytes, next_height,
-            skip_scripts=skip_scripts, decoded_block=decoded_block,
-        )
+    @functools.wraps(fn)
+    async def wrapper(db, node, block_bytes, next_height, *args, **kwargs):
+        from ouroboros.chainlock import chain_lock
+
+        async with chain_lock(node if node is not None else db):
+            if not _parent_is_tip(db, block_bytes, next_height):
+                raise ValueError("inconclusive")
+            return await fn(db, node, block_bytes, next_height, *args, **kwargs)
+
+    return wrapper
 
 
-async def _accept_block_locked(
+@_accept_under_chain_lock
+async def accept_block(
     db,
     node,
     block_bytes: bytes,
