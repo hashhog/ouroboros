@@ -3746,6 +3746,25 @@ class Mempool:
                 if txid in self.transactions:
                     self.remove_transaction(txid, _skip_recount=True)
                     removed_ids.append(txid)
+                # removeConflicts (txmempool.cpp removeForBlock): a pool tx
+                # that spends an outpoint THIS block tx spends is a spend of a
+                # coin the chain has now consumed — remove it with all its
+                # descendants (removeRecursive, CONFLICT) and clear its
+                # prioritisation.  Without this the pool kept it and
+                # getblocktemplate handed out an invalid block.
+                for tx_in in tx.inputs:
+                    conflict = self.spender_by_outpoint.get(
+                        (tx_in.prev_txid, tx_in.prev_vout)
+                    )
+                    if conflict is None or conflict == txid:
+                        continue
+                    for doomed in self._collect_descendants(conflict):
+                        if doomed in self.transactions:
+                            self.remove_transaction(
+                                doomed, _skip_recount=True, _reason="conflict"
+                            )
+                            removed_ids.append(doomed)
+                    self.map_deltas.pop(conflict, None)
                 # ClearPrioritisation on block confirm (matches Core
                 # removeForBlock — txmempool.cpp:420). Delta is dropped for
                 # every block-included tx whether or not it was in mempool.
