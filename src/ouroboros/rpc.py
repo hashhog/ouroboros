@@ -17982,22 +17982,20 @@ class RPCServer:
         state. The actual rewind→dump→replay implementation lives in
         :meth:`_rpc_dumptxoutset_impl`.
         """
-        # The rollback modes disconnect and reconnect blocks (Core holds
-        # cs_main + NetworkDisable across TemporaryRollback): take the chain
-        # lock so the P2P drain cannot connect a block into the rewound
-        # chainstate, and no other writer can move the tip mid-dance.  The
-        # plain "latest" dump reads one RocksDB snapshot and needs no lock.
-        _rollback = (type == "rollback") or (
-            isinstance(options, dict) and options.get("rollback") is not None
-        )
+        # Hold the chain lock for the whole dump (Core: cs_main across
+        # PrepareUTXOSnapshot, whose cursor is a LevelDB snapshot read with
+        # the base block from the SAME cursor).  dump_snapshot reads the tip,
+        # the coin count and the coins as three separate live-DB reads, and
+        # the rollback modes disconnect/reconnect blocks; without the lock a
+        # block connected by the drain in between produced a file labelled
+        # with one tip and holding another tip's coins.  Cost: the drain
+        # waits for the dump.
+        _n = getattr(self, "node", None)
         try:
-            if _rollback:
-                _n = getattr(self, "node", None)
-                async with chain_lock(_n if _n is not None else self):
-                    return await self._rpc_dumptxoutset_impl(
-                        path, type=type, options=options
-                    )
-            return await self._rpc_dumptxoutset_impl(path, type=type, options=options)
+            async with chain_lock(_n if _n is not None else self):
+                return await self._rpc_dumptxoutset_impl(
+                    path, type=type, options=options
+                )
         finally:
             self.block_submission_paused = False
 
