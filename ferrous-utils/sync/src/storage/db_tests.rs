@@ -262,6 +262,61 @@ mod tests {
             "STALE POSITIVE: deleted coin still cached as present");
     }
 
+    /// F0 / I5 — the resurrection race, injected deterministically.
+    ///
+    /// A reader misses the cache and reads coin C from RocksDB; BEFORE it
+    /// installs the result, a block spends C and its batch commits (the
+    /// production `apply_batch` path: write, then clear + generation bump).
+    /// The reader must NOT then install its pre-spend copy: a later lookup
+    /// would serve C as unspent and a block re-spending it would validate.
+    /// Core cannot do this — FetchCoin runs under cs_main and a spent coin
+    /// stays a DIRTY-spent entry until it reaches the parent (coins.cpp
+    /// 63-82, 142-171). Guard: `cache_generation` (db.rs get_utxo_cached
+    /// step 3) + clear-after-write in `apply_batch`.
+    #[test]
+    fn test_f0_read_install_race_cannot_resurrect_spent_coin() {
+        let (db, _temp_dir) = create_test_db();
+        let txid = bitcoin::Txid::from_byte_array([0xf0; 32]);
+        let (outpoint, utxo) = create_test_utxo(txid, 0, 50_000_000, Some(100));
+        db.add_utxo(&outpoint, &utxo).unwrap();
+
+        // The commit that lands between the reader's get_cf and its install.
+        let op = outpoint;
+        crate::storage::db::read_install_hook::arm(move |db| {
+            let mut batch = db.create_batch();
+            db.delete_utxo_batch(&mut batch, &op).unwrap();
+            db.apply_batch(batch).unwrap();
+        });
+        // The in-flight reader saw the pre-spend coin (a read that began
+        // before the spend may return it — Core's equivalent ran before
+        // ConnectBlock took cs_main) ...
+        assert!(db.get_utxo(&outpoint).unwrap().is_some(), "reader started pre-spend");
+        // ... but must not have INSTALLED it.
+        assert!(db.get_utxo(&outpoint).unwrap().is_none(),
+            "RESURRECTED: the spent coin was installed by a read that straddled \
+             the spend's commit and is now served as unspent");
+        assert!(!db.utxo_exists(&outpoint), "RESURRECTED (exists)");
+    }
+
+    /// Same race, absent direction: a reader that saw C ABSENT must not cache
+    /// that negative over a commit that CREATED C (a false missing-inputs
+    /// reject of a valid spend).
+    #[test]
+    fn test_f0_read_install_race_cannot_hide_created_coin() {
+        let (db, _temp_dir) = create_test_db();
+        let txid = bitcoin::Txid::from_byte_array([0xf1; 32]);
+        let (outpoint, utxo) = create_test_utxo(txid, 0, 25_000_000, Some(101));
+        let (op, u) = (outpoint, utxo.clone());
+        crate::storage::db::read_install_hook::arm(move |db| {
+            let mut batch = db.create_batch();
+            db.add_utxo_batch(&mut batch, &op, &u).unwrap();
+            db.apply_batch(batch).unwrap();
+        });
+        assert!(db.get_utxo(&outpoint).unwrap().is_none(), "reader started pre-create");
+        assert!(db.get_utxo(&outpoint).unwrap().is_some(),
+            "STALE NEGATIVE: a straddling read cached 'absent' over the create");
+    }
+
     /// Read-through cache must never serve a STALE NEGATIVE: a `get_utxo` miss
     /// caches `None`, but a subsequent `add_utxo` (a freshly-created coin) must
     /// invalidate that negative so the new coin is visible. A stale negative

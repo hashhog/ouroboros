@@ -740,6 +740,12 @@ impl BlockchainDB {
             None => None,
         };
 
+        // Test seam (F0 I5): run a commit between the read and the install.
+        #[cfg(test)]
+        if let Some(hook) = read_install_hook::take() {
+            hook(self);
+        }
+
         // 3. Populate iff no commit happened during the get_cf (gen unchanged).
         {
             let mut map = self.utxo_read_cache.lock().unwrap();
@@ -3349,4 +3355,26 @@ fn create_cf_options(cf_name: &str) -> Options {
     }
 
     opts
+}
+
+/// Test-only seam: a closure run inside `get_utxo_cached` after the RocksDB
+/// read and before the cache install, on the arming thread only.
+#[cfg(test)]
+pub(crate) mod read_install_hook {
+    use super::BlockchainDB;
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce(&BlockchainDB)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm(hook: impl FnOnce(&BlockchainDB) + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn take() -> Option<Hook> {
+        HOOK.with(|h| h.borrow_mut().take())
+    }
 }
