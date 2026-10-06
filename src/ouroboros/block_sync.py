@@ -1092,6 +1092,14 @@ class BlockSync:
         # so a reconnect is re-probed.  Bounded by the peer count.
         self._initial_getheaders_sent: set = set()
 
+    def _chain_lock(self):
+        """The process chain lock (shared with the RPC server's node once
+        :meth:`set_reorg_handler` has run; private before that)."""
+        from ouroboros.chainlock import chain_lock
+
+        holder = getattr(self, "_chain_lock_holder", None)
+        return chain_lock(holder if holder is not None else self)
+
     def set_reorg_handler(self, rpc_server) -> None:
         """Wire the P2P fork path through the EXISTING submitblock side-branch
         reorg machinery on *rpc_server*.
@@ -1105,6 +1113,9 @@ class BlockSync:
         lunarblock pattern: route the P2P fork through the same code path
         submitblock uses, never a second reorg engine.
         """
+        _node = getattr(rpc_server, "node", None)
+        if _node is not None:
+            self._chain_lock_holder = _node
         try:
             self._attach_side_branch_block = rpc_server._attach_side_branch_block
             self._reorg_to_side_branch_tip = rpc_server._reorg_to_side_branch_tip
@@ -2503,7 +2514,17 @@ class BlockSync:
             self._drain_lock_since = time.time()
             self._drain_lock_holder = asyncio.current_task()
             try:
-                return await self._drain_block_buffer_locked()
+                # Core cs_main: the drain validates and connects under the
+                # chain lock shared with submitblock / the reorg engine /
+                # invalidate / reconsider / precious / dumptxoutset rollback
+                # (ouroboros.chainlock), handing it over between blocks.
+                _lock = self._chain_lock()
+                async with _lock:
+                    self._held_chain_lock = _lock
+                    try:
+                        return await self._drain_block_buffer_locked()
+                    finally:
+                        self._held_chain_lock = None
             finally:
                 self._drain_lock_since = 0.0
                 self._drain_lock_holder = None
@@ -3289,6 +3310,11 @@ class BlockSync:
             # for the entire drain (potentially hundreds of blocks), causing
             # multi-second RPC latency spikes.
             await asyncio.sleep(0)
+            # Between blocks: let a waiting chainstate writer (submitblock,
+            # invalidateblock, ...) run; the next iteration re-reads the tip.
+            _held = getattr(self, "_held_chain_lock", None)
+            if _held is not None:
+                await _held.yield_if_contended()
 
         # Connected headers are popped at the connect point above, before
         # any yield, so the queue stays tip-anchored across awaits.  A

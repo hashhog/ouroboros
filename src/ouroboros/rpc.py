@@ -45,6 +45,7 @@ from ouroboros.fatal import (
     raise_if_fatal,
     retry_once_async,
 )
+from ouroboros.chainlock import chain_lock, holds_chain_lock
 from ouroboros.metrics import record_rpc_request
 from ouroboros.script import disassemble_script
 from ouroboros.validation import (
@@ -592,7 +593,56 @@ def _refine_block_reject_reason(
 MAX_REORG_DEPTH: int = 288
 
 
+def _parent_is_tip(db, block_bytes: bytes, next_height: int) -> bool:
+    """True when *block_bytes* extends the CURRENT tip at *next_height*.
+
+    Checked under the chain lock, immediately before validation: Core only
+    ever runs ConnectBlock on a block whose pprev is the active tip.  A DB
+    whose tip cannot be read as ``(bytes, int)`` (test doubles) is not
+    second-guessed.
+    """
+    try:
+        tip_hash, tip_height = db.get_best_block()
+    except Exception:
+        return True
+    if not isinstance(tip_hash, (bytes, bytearray)) or not isinstance(tip_height, int):
+        return True
+    if len(block_bytes) < 36:
+        return True  # undecodable: the structural checks below reject it
+    return bytes(block_bytes[4:36]) == bytes(tip_hash) and tip_height == next_height - 1
+
+
 async def accept_block(
+    db,
+    node,
+    block_bytes: bytes,
+    next_height: int,
+    *,
+    skip_scripts: bool = False,
+    decoded_block=None,
+) -> bytes:
+    """Validate + connect under the chain lock (Core ``cs_main``).
+
+    Every chainstate writer takes :func:`ouroboros.chainlock.chain_lock`, so no
+    other block can be connected between this block's validation and its
+    connect.  The parent is re-checked against the tip INSIDE the lock: a
+    caller that read the tip before waiting for the lock (submitblock,
+    generate*) and lost the race gets ``inconclusive`` instead of a block
+    connected on top of a tip it was never validated against.  See
+    :func:`_accept_block_locked` for the pipeline.
+    """
+    from ouroboros.chainlock import chain_lock
+
+    async with chain_lock(node if node is not None else db):
+        if not _parent_is_tip(db, block_bytes, next_height):
+            raise ValueError("inconclusive")
+        return await _accept_block_locked(
+            db, node, block_bytes, next_height,
+            skip_scripts=skip_scripts, decoded_block=decoded_block,
+        )
+
+
+async def _accept_block_locked(
     db,
     node,
     block_bytes: bytes,
@@ -8426,6 +8476,7 @@ class RPCServer:
         times.sort()
         return times[len(times) // 2]
 
+    @holds_chain_lock
     async def _attach_side_branch_block(
         self,
         db,
@@ -9070,6 +9121,7 @@ class RPCServer:
             db, common_ancestor_height, disconnected_active, new_tip_hash, reason,
         )
 
+    @holds_chain_lock
     async def _reorg_to_side_branch_tip(
         self,
         db,
@@ -9807,6 +9859,7 @@ class RPCServer:
                     "preciousblock: txospenderindex resync failed: %s", e
                 )
 
+    @holds_chain_lock
     async def rpc_submitblock(self, hexdata: str) -> str | None:
         """
         Submit a mined block to the network.
@@ -10318,6 +10371,7 @@ class RPCServer:
         logger.info(f"RPC pruneblockchain: pruned up to height {actual_height}")
         return actual_height
 
+    @holds_chain_lock
     async def rpc_invalidateblock(self, blockhash: str) -> None:
         """
         Mark a block as invalid and disconnect it from the active chain.
@@ -10432,6 +10486,7 @@ class RPCServer:
 
         return None
 
+    @holds_chain_lock
     async def rpc_reconsiderblock(self, blockhash: str) -> None:
         """
         Remove invalidity status from a block and reconsider it for activation.
@@ -10514,6 +10569,7 @@ class RPCServer:
 
         return None
 
+    @holds_chain_lock
     async def rpc_preciousblock(self, blockhash: str) -> None:
         """
         Treats a block as if it were received before others with the same work.
@@ -17666,6 +17722,7 @@ class RPCServer:
     # assumeUTXO (BIP305) RPC methods
     # ==========================================================================
 
+    @holds_chain_lock
     async def rpc_loadtxoutset(self, path: str) -> dict[str, Any]:
         """
         Load a UTXO snapshot to enable fast startup (BIP305 assumeUTXO).
@@ -17925,7 +17982,21 @@ class RPCServer:
         state. The actual rewind→dump→replay implementation lives in
         :meth:`_rpc_dumptxoutset_impl`.
         """
+        # The rollback modes disconnect and reconnect blocks (Core holds
+        # cs_main + NetworkDisable across TemporaryRollback): take the chain
+        # lock so the P2P drain cannot connect a block into the rewound
+        # chainstate, and no other writer can move the tip mid-dance.  The
+        # plain "latest" dump reads one RocksDB snapshot and needs no lock.
+        _rollback = (type == "rollback") or (
+            isinstance(options, dict) and options.get("rollback") is not None
+        )
         try:
+            if _rollback:
+                _n = getattr(self, "node", None)
+                async with chain_lock(_n if _n is not None else self):
+                    return await self._rpc_dumptxoutset_impl(
+                        path, type=type, options=options
+                    )
             return await self._rpc_dumptxoutset_impl(path, type=type, options=options)
         finally:
             self.block_submission_paused = False
