@@ -4392,15 +4392,30 @@ impl PyBlockchainDB {
                     // that doesn't exist on disk.
                     batch.delete_cf(&chainstate_cf, key);
 
-                    if let Some(bytes) = utxo_bytes {
-                        let mut undo_value = Vec::with_capacity(32 + bytes.len());
-                        undo_value.extend_from_slice(spending_txid);
-                        undo_value.extend_from_slice(&bytes);
-                        batch.put_cf(&spent_cf, key, &undo_value);
-                    }
-                    // Note: an outpoint with no on-disk hit AND no overlay
-                    // hit indicates an early-IBD missing UTXO (the same
-                    // tolerated gap as the original implementation).
+                    // An input that is in neither the intra-block overlay nor
+                    // the coins DB is not a coin. Core cannot connect such a
+                    // block: UpdateCoins does `assert(inputs.SpendCoin(...))`
+                    // (validation.cpp) after CheckTxInputs rejected it as
+                    // bad-txns-inputs-missingorspent. This used to be
+                    // "tolerated" (no undo record, delete of a non-key), so
+                    // whenever the validator's view disagreed with the store
+                    // — an unspendable in-block output it wrongly held, or a
+                    // second writer that spent the coin after validation — the
+                    // block was COMMITTED anyway. Nothing has been written:
+                    // the batch is dropped with this error.
+                    let Some(bytes) = utxo_bytes else {
+                        let (t, v) = crate::storage::schema::decode_outpoint(key);
+                        let mut disp = t;
+                        disp.reverse();
+                        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                            "bad-txns-inputs-missingorspent: connect: input {}:{} is not in the coins view",
+                            hex::encode(disp), v,
+                        )));
+                    };
+                    let mut undo_value = Vec::with_capacity(32 + bytes.len());
+                    undo_value.extend_from_slice(spending_txid);
+                    undo_value.extend_from_slice(&bytes);
+                    batch.put_cf(&spent_cf, key, &undo_value);
 
                     // Mark as spent so any later tx in this block that tries
                     // to re-spend the same outpoint is caught above.
