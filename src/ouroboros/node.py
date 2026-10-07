@@ -737,6 +737,13 @@ class BitcoinNode:
             # its socket buffers + BIP-324 transport state) for every peer
             # that ever disconnected.
             self.peer_manager.block_sync = self.block_sync
+            # invalidateblock must survive a restart (Core persists
+            # BLOCK_FAILED_VALID in the block index).
+            try:
+                self.block_sync.load_rpc_invalidated(
+                    os.path.join(self.data_dir, "invalidated_blocks.json"))
+            except Exception as e:
+                logger.warning(f"could not load invalidated_blocks.json: {e}")
             # Wire the tip-change notifier (Core WaitTipChanged) so the IBD/P2P
             # connect drain and the reorg path can wake the wait-family RPCs.
             try:

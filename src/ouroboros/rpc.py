@@ -9943,6 +9943,17 @@ class RPCServer:
             _hashlib.sha256(block_bytes[:80]).digest()
         ).digest()
 
+        # Core submitblock / AcceptBlockHeader: a block flagged BLOCK_FAILED_*
+        # (a validation verdict or RPC invalidateblock) answers
+        # "duplicate-invalid"; a block whose parent is failed is
+        # BLOCK_INVALID_PREV "bad-prevblk".  Neither is ever reconnected.
+        _bs = getattr(self.node, "block_sync", None)
+        if _bs is not None and hasattr(_bs, "is_block_failed"):
+            if _bs.is_block_failed(block_hash):
+                return "duplicate-invalid"
+            if _bs.is_block_failed(bytes(prev_hash)):
+                return "bad-prevblk"
+
         # Duplicate-submission short-circuit. Core returns "duplicate" for
         # blocks already on the active chain, "duplicate-inconclusive" for
         # blocks already stored as side-branch.
@@ -10403,15 +10414,84 @@ class RPCServer:
         block_hash = _parse_hash_v(blockhash, "blockhash")  # display order; -8 on malformed
         block_hash_internal = bytes(reversed(block_hash))   # internal little-endian
 
-        # Check if block exists
         db = self.node.db
+        rust = getattr(db, '_db', None) or getattr(db, 'rust_db', None)
+        if rust is None or not hasattr(rust, 'invalidate_block'):
+            raise HTTPException(
+                status_code=500,
+                detail="invalidateblock requires Rust database bindings"
+            )
+        bs = getattr(self.node, "block_sync", None)
+
+        # Core LookupBlockIndex: O(1) by hash (BLOCK_INDEX_BY_HASH_CF), not
+        # a height scan.  Then: is it on the active chain?
+        target_h = None
         try:
-            # Resolve the Rust DB handle.  BlockchainDatabase wraps the
-            # PyBlockchainDB as ``_db`` (older drafts referenced a ``rust_db``
-            # attribute that never existed, so invalidateblock always errored
-            # — fixed here so the reorg primitive actually runs).
-            rust = getattr(db, '_db', None) or getattr(db, 'rust_db', None)
-            if rust is not None and hasattr(rust, 'invalidate_block'):
+            meta = rust.get_block_metadata_by_hash(block_hash_internal) \
+                if hasattr(rust, 'get_block_metadata_by_hash') else None
+            if meta is not None:
+                target_h = int(meta[0])
+        except Exception:
+            meta = None
+        best_hash, best_height = db.get_best_block()
+        is_active = False
+        if target_h is not None and target_h <= best_height:
+            try:
+                ah = db.get_block_hash_by_height(target_h)
+                is_active = ah is not None and bytes(ah) == block_hash_internal
+            except Exception:
+                is_active = False
+        known_elsewhere = bool(
+            bs is not None and (
+                block_hash_internal in getattr(bs, "_fork_headers", {})
+                or bs.is_block_failed(block_hash_internal)
+                or any(h == block_hash_internal for h, _ in getattr(bs, "_validated_headers", ()))
+            )
+        ) or block_hash_internal in getattr(self, "_side_branch_blocks", {})
+        if target_h is None and not known_elsewhere:
+            raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
+        if is_active and target_h == 0:
+            raise HTTPException(status_code=400, detail="Cannot invalidate genesis block")
+
+        # Capture the blocks Core's InvalidateBlock will DisconnectTip (the
+        # target and everything above it on the active chain): their hashes
+        # + parents for the sync layer, and their transactions for the
+        # mempool (DisconnectedBlockTransactions).  O(blocks disconnected).
+        target_prev = None
+        disconnected: list[tuple[bytes, bytes, object]] = []  # ascending height
+        if is_active:
+            for h in range(target_h, int(best_height) + 1):
+                try:
+                    hh = db.get_block_hash_by_height(h)
+                    blk = db.get_block_by_height(h)
+                except Exception:
+                    hh, blk = None, None
+                if hh is None:
+                    continue
+                prev = None
+                if blk is not None:
+                    try:
+                        prev = bytes(blk.prev_blockhash)
+                    except Exception:
+                        prev = None
+                if prev is None:
+                    try:
+                        raw = db.get_block_bytes(bytes(hh))
+                        prev = bytes(raw[4:36]) if raw else None
+                    except Exception:
+                        prev = None
+                disconnected.append((bytes(hh), prev, blk))
+            if disconnected and disconnected[0][0] == block_hash_internal:
+                target_prev = disconnected[0][1]
+        elif target_h is not None:
+            try:
+                raw = db.get_block_bytes(block_hash_internal)
+                target_prev = bytes(raw[4:36]) if raw else None
+            except Exception:
+                target_prev = None
+
+        if is_active:
+            try:
                 new_tip_height = rust.invalidate_block(block_hash_internal)
                 logger.info(
                     f"invalidateblock: Invalidated block {blockhash[:16]}... "
@@ -10439,18 +10519,51 @@ class RPCServer:
                         f"invalidateblock: tip reconcile to {new_tip_height} "
                         f"failed: {_e}"
                     )
-            else:
-                # Fallback: Python-only implementation
-                raise HTTPException(
-                    status_code=500,
-                    detail="invalidateblock requires Rust database bindings"
-                )
-        except Exception as e:
-            if "not found" in str(e).lower():
-                raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found") from None
-            if "genesis" in str(e).lower():
-                raise HTTPException(status_code=400, detail="Cannot invalidate genesis block") from None
-            raise HTTPException(status_code=500, detail=str(e)) from None
+            except Exception as e:
+                if "not found" in str(e).lower():
+                    raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found") from None
+                if "genesis" in str(e).lower():
+                    raise HTTPException(status_code=400, detail="Cannot invalidate genesis block") from None
+                raise HTTPException(status_code=500, detail=str(e)) from None
+        else:
+            # Not on the active chain (a side branch or a header-only
+            # block): Core just marks it (and its descendants) failed —
+            # nothing to disconnect.
+            logger.info(
+                f"invalidateblock: {blockhash[:16]}... is not on the active "
+                f"chain — marked failed, no disconnect"
+            )
+
+        # Core InvalidChainFound + RecalculateBestHeader for the sync layer:
+        # the block is BLOCK_FAILED_VALID, its descendants BLOCK_FAILED_CHILD;
+        # the header queue / fork store drop them, a header that is (or builds
+        # on) one of them is refused, and the downloader never asks for them
+        # again — so the next announcement cannot undo the invalidation.
+        desc_pairs = [(h, p) for (h, p, _b) in disconnected
+                      if h != block_hash_internal and p is not None]
+        if bs is not None and hasattr(bs, "invalidate_from_rpc"):
+            bs.invalidate_from_rpc(block_hash_internal, desc_pairs, prev=target_prev)
+            # fsync can take seconds on a loaded box: keep it off the loop.
+            await asyncio.to_thread(self._persist_rpc_invalidated, bs)
+        failed_now = {block_hash_internal} | {h for h, _ in desc_pairs}
+        # Side-branch buffer: drop the failed blocks and anything built on them.
+        changed = True
+        while changed:
+            changed = False
+            _sbb = getattr(self, "_side_branch_blocks", {})
+            for h, entry in list(_sbb.items()):
+                if h in failed_now or bytes(entry[0]) in failed_now:
+                    _sbb.pop(h, None)
+                    if h not in failed_now:
+                        failed_now.add(h)
+                        changed = True
+
+        # Core InvalidateBlock -> MaybeUpdateMempoolForReorg(disconnectpool,
+        # true): the disconnected blocks' transactions go back to the mempool
+        # (valid against the new tip), then removeForReorg drops pool txs
+        # whose inputs no longer exist or whose coinbase input is immature.
+        if is_active and disconnected:
+            await self._update_mempool_after_disconnect(db, [b for _h, _p, b in disconnected])
 
         # The Rust layer performed the chainstate reorg WITHOUT firing the
         # Python connect/disconnect index hooks, so re-align the coin-stats
@@ -10480,6 +10593,74 @@ class RPCServer:
                 )
 
         return None
+
+    def _persist_rpc_invalidated(self, bs) -> None:
+        """Persist the operator's invalidateblock roots (Core keeps
+        BLOCK_FAILED_VALID in the on-disk block index), so a restart cannot
+        undo an invalidation.  Best effort."""
+        path = getattr(bs, "rpc_invalidated_path", None)
+        if path and hasattr(bs, "save_rpc_invalidated"):
+            try:
+                bs.save_rpc_invalidated(path)
+            except Exception as e:
+                logger.warning(f"invalidateblock: could not persist {path}: {e}")
+
+    async def _update_mempool_after_disconnect(self, db, blocks) -> None:
+        """Core MaybeUpdateMempoolForReorg(disconnectpool, fAddToMempool=true)
+        after DisconnectTip(s): re-admit the disconnected blocks' non-coinbase
+        transactions (oldest block first) against the new tip, then
+        removeForReorg — drop pool transactions that spend a coin that is no
+        longer in the UTXO set or the pool (e.g. an output of a disconnected
+        coinbase) or an immature coinbase, with their descendants."""
+        mempool = getattr(self.node, "mempool", None)
+        if mempool is None:
+            return
+        try:
+            _, tip_h = db.get_best_block()
+        except Exception:
+            return
+        readded = total = 0
+        for blk in blocks:
+            if blk is None:
+                continue
+            for tx in getattr(blk, "transactions", []) or []:
+                if getattr(tx, "is_coinbase", False):
+                    continue
+                total += 1
+                try:
+                    ok, _reason = mempool.add_transaction(tx, tip_h)
+                    readded += 1 if ok else 0
+                except Exception as e:
+                    logger.debug(f"invalidateblock: re-add failed: {e}")
+        # removeForReorg
+        doomed: set[bytes] = set()
+        with mempool._lock:
+            for txid, entry in list(mempool.transactions.items()):
+                if txid in doomed:
+                    continue
+                bad = False
+                for tx_in in entry.tx.inputs:
+                    if tx_in.prev_txid in mempool.transactions:
+                        continue
+                    try:
+                        coin = db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                    except Exception:
+                        coin = None
+                    if coin is None:
+                        bad = True
+                        break
+                    if coin.get("is_coinbase") and (tip_h + 1) - int(coin.get("height", 0)) < 100:
+                        bad = True
+                        break
+                if bad:
+                    doomed |= set(mempool._collect_descendants(txid))
+            for txid in doomed:
+                if txid in mempool.transactions:
+                    mempool._remove_transaction_inner(txid, _reason="reorg")
+        logger.info(
+            f"invalidateblock: mempool re-added {readded}/{total} disconnected "
+            f"txs, removeForReorg dropped {len(doomed)}"
+        )
 
     @holds_chain_lock
     async def rpc_reconsiderblock(self, blockhash: str) -> None:
@@ -10519,10 +10700,54 @@ class RPCServer:
 
         # Reconsider the block
         db = self.node.db
+        bs = getattr(self.node, "block_sync", None)
+
+        # Core ResetBlockFailureFlags: clear the block, its descendants and its
+        # ancestors in the header/download layer first, so the branch can be
+        # requested again once ActivateBestChain needs it.
+        def _prev_from_store(h):
+            raw = db.get_block_bytes(h)
+            return bytes(raw[4:36]) if raw else None
+
+        cleared: set = set()
+        if bs is not None and hasattr(bs, "reconsider_from_rpc"):
+            cleared = bs.reconsider_from_rpc(block_hash_internal, _prev_from_store)
+            # fsync can take seconds on a loaded box: keep it off the loop.
+            await asyncio.to_thread(self._persist_rpc_invalidated, bs)
+        try:
+            _, height_before = db.get_best_block()
+        except Exception:
+            height_before = None
         try:
             rust = getattr(db, '_db', None) or getattr(db, 'rust_db', None)
             if rust is not None and hasattr(rust, 'reconsider_block'):
                 new_tip_height = rust.reconsider_block(block_hash_internal)
+                # The Rust flag reset only scans 1,000 heights above the tip,
+                # so the far end of a deeper invalidated branch can keep
+                # BLOCK_FAILED_CHILD.  Core ResetBlockFailureFlags clears every
+                # descendant: reconsider the highest still-flagged descendant
+                # the sync layer just cleared (its call clears its ancestors).
+                if cleared and hasattr(rust, 'get_block_metadata_by_hash'):
+                    _still: list[tuple[int, bytes]] = []
+                    for _h in cleared:
+                        try:
+                            _m = rust.get_block_metadata_by_hash(_h)
+                        except Exception:
+                            _m = None
+                        if _m is not None and int(_m[3]) & 0x60:  # BLOCK_FAILED_MASK
+                            _still.append((int(_m[0]), _h))
+                    if _still:
+                        new_tip_height = rust.reconsider_block(max(_still)[1])
+                # The Rust ActivateBestChain analog only looks 1,000 heights
+                # above the current tip (SCAN_HORIZON); a deeper invalidated
+                # branch needs more passes to reach its most-work stored leaf
+                # (Core ActivateBestChain loops until no better chain).
+                if hasattr(rust, 'reactivate_best_chain'):
+                    for _ in range(100000):
+                        nh = rust.reactivate_best_chain()
+                        if int(nh) <= int(new_tip_height):
+                            break
+                        new_tip_height = nh
                 logger.info(
                     f"reconsiderblock: Reconsidered block {blockhash[:16]}... "
                     f"tip height: {new_tip_height}"
@@ -10536,8 +10761,29 @@ class RPCServer:
                 )
         except Exception as e:
             if "not found" in str(e).lower():
+                # A header-only / side-branch block known only to the sync
+                # layer: clearing its flags there IS the reconsider.
+                if cleared:
+                    return None
                 raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found") from None
             raise HTTPException(status_code=500, detail=str(e)) from None
+
+        # ActivateBestChain reconnected stored blocks: Core's ConnectTip runs
+        # removeForBlock for each, so their transactions leave the mempool.
+        try:
+            _, height_after = db.get_best_block()
+        except Exception:
+            height_after = None
+        mempool = getattr(self.node, "mempool", None)
+        if (mempool is not None and height_before is not None
+                and height_after is not None and height_after > height_before):
+            for h in range(int(height_before) + 1, int(height_after) + 1):
+                try:
+                    blk = db.get_block_by_height(h)
+                    if blk is not None:
+                        mempool.remove_block_transactions(blk)
+                except Exception as e:
+                    logger.debug(f"reconsiderblock: mempool removeForBlock h={h}: {e}")
 
         # reconsiderblock can re-activate (and reorg onto) a previously
         # invalidated branch in the Rust layer without firing the Python index

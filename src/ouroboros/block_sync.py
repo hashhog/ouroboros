@@ -903,6 +903,17 @@ class BlockSync:
         # give-ups (abandoned requests), which must never punish a peer.
         self._failed_blocks: set[bytes] = set()
         self._failed_order: deque[bytes] = deque()
+        # prev hash of each failed block where known, so ReconsiderBlock can
+        # find the failed descendants / ancestors of a block (Core walks
+        # m_block_index with GetAncestor; we walk the bounded failed set).
+        self._failed_prev: dict[bytes, bytes] = {}
+        # Roots invalidated by the operator (RPC invalidateblock).  Never
+        # FIFO-evicted (an operator's invalidation must not be forgotten
+        # because 10k peer-invalid blocks arrived later) and persisted by
+        # the RPC layer across restarts (Core keeps BLOCK_FAILED_VALID in
+        # the block index on disk).
+        self._rpc_invalidated: set[bytes] = set()
+        self.rpc_invalidated_path: str | None = None
         self.invalid_blocks_found: int = 0
         # Hashes whose buffered bytes came from BIP152 compact-block
         # reconstruction (node.py _compact_block_handler), not a solicited
@@ -1208,21 +1219,150 @@ class BlockSync:
         self._perm_rejected_blocks.add(block_hash)
         self._perm_rejected_order.append(block_hash)
 
-    def _mark_block_failed(self, block_hash: bytes) -> None:
+    def _mark_block_failed(self, block_hash: bytes, prev: bytes | None = None) -> None:
         """BLOCK_FAILED_VALID / BLOCK_FAILED_CHILD for *block_hash*: never
         fetched again (perm-reject gate) and its header is refused
         (``duplicate-invalid`` / ``bad-prevblk``).  Bounded FIFO like the
         perm-reject set."""
         self._mark_perm_rejected(block_hash)
+        if prev is not None:
+            self._failed_prev[block_hash] = bytes(prev)
         if block_hash in self._failed_blocks:
             return
         if len(self._failed_order) >= self._perm_rejected_max:
-            self._failed_blocks.discard(self._failed_order.popleft())
+            ev = self._failed_order.popleft()
+            self._failed_blocks.discard(ev)
+            self._failed_prev.pop(ev, None)
         self._failed_blocks.add(block_hash)
         self._failed_order.append(block_hash)
 
+    def is_block_failed(self, block_hash: bytes) -> bool:
+        """Core ``nStatus & BLOCK_FAILED_MASK`` for a hash this node knows."""
+        return block_hash in self._failed_blocks or block_hash in self._rpc_invalidated
+
+    def invalidate_from_rpc(self, block_hash: bytes, descendants=(), prev=None) -> int:
+        """RPC ``invalidateblock`` -> Core ``InvalidateBlock`` +
+        ``InvalidChainFound`` + ``RecalculateBestHeader`` for the sync layer.
+
+        The RPC has already disconnected the active-chain part (Rust).  Here
+        the block becomes BLOCK_FAILED_VALID and every known descendant
+        BLOCK_FAILED_CHILD in the header/download layer: dropped from the
+        tip-anchored header queue and the fork store, never requested again,
+        and a header that is (or builds on) one of them is refused
+        (``duplicate-invalid`` / ``bad-prevblk``), so the next announcement
+        of the invalidated branch cannot reconnect it.  ``descendants`` is a
+        sequence of ``(hash, prev)`` pairs (the disconnected blocks, in
+        height order).  Cost: O(fork + failed set), no chain walk.
+        """
+        self._rpc_invalidated.add(block_hash)
+        for h, p in descendants:
+            self._failed_prev[h] = bytes(p)
+        if prev is not None:
+            self._failed_prev[block_hash] = bytes(prev)
+        n = self._invalid_block_found(
+            block_hash, "invalidateblock (RPC)",
+            descendants=[h for h, _ in descendants], verdict=False,
+        )
+        # The queue was anchored to the old tip; the drain's slot-misalign
+        # check would drop it on its next pass anyway — do it now so nothing
+        # buffered for the invalidated branch is drained first.
+        self._validated_headers.clear()
+        self._header_sync_peer = None
+        self._header_sync_time = 0.0
+        return n
+
+    def save_rpc_invalidated(self, path: str) -> None:
+        """Atomically write the operator-invalidated roots (hex, internal
+        byte order) to *path*."""
+        import json as _json
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            _json.dump(sorted(h.hex() for h in self._rpc_invalidated), f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
+    def load_rpc_invalidated(self, path: str) -> int:
+        """Restore operator-invalidated roots at startup: each is failed again
+        in the header/download layer (its descendants are refused on header
+        arrival as ``bad-prevblk``).  Missing file = none."""
+        import json as _json
+        self.rpc_invalidated_path = path
+        try:
+            with open(path) as f:
+                roots = [bytes.fromhex(x) for x in _json.load(f)]
+        except FileNotFoundError:
+            return 0
+        except Exception as e:
+            logger.warning(f"invalidated-blocks file {path} unreadable: {e}")
+            return 0
+        for h in roots:
+            if len(h) == 32:
+                self._rpc_invalidated.add(h)
+                self._mark_block_failed(h)
+        if roots:
+            logger.info(f"Restored {len(roots)} invalidateblock root(s) from {path}")
+        return len(roots)
+
+    def reconsider_from_rpc(self, block_hash: bytes, get_prev=None) -> set:
+        """RPC ``reconsiderblock`` -> Core ``ResetBlockFailureFlags``: clear
+        the failure marks of *block_hash*, of every failed descendant and of
+        every failed ancestor, in the header/download layer, so the branch
+        can be fetched / connected again.  ``get_prev(hash)`` resolves a
+        parent the failed set does not know (block store header).
+        Returns the set of hashes whose marks were cleared."""
+        failed = self._failed_blocks | self._rpc_invalidated
+
+        def prev_of(h):
+            p = self._failed_prev.get(h)
+            if p is None and get_prev is not None:
+                try:
+                    p = get_prev(h)
+                except Exception:
+                    p = None
+                if p is not None:
+                    self._failed_prev[h] = bytes(p)
+            return p
+
+        children: dict[bytes, list[bytes]] = defaultdict(list)
+        for h in failed:
+            p = prev_of(h)
+            if p is not None:
+                children[bytes(p)].append(h)
+        clear: set[bytes] = {block_hash}
+        stack = [block_hash]
+        while stack:  # descendants
+            for c in children.get(stack.pop(), ()):
+                if c not in clear:
+                    clear.add(c)
+                    stack.append(c)
+        cur = prev_of(block_hash)  # ancestors
+        while cur is not None and cur in failed and cur not in clear:
+            clear.add(cur)
+            cur = prev_of(cur)
+        cleared: set[bytes] = set()
+        for h in clear:
+            if h in failed or h in self._perm_rejected_blocks:
+                cleared.add(h)
+            self._failed_blocks.discard(h)
+            self._rpc_invalidated.discard(h)
+            self._failed_prev.pop(h, None)
+            if h in self._perm_rejected_blocks:
+                self._perm_rejected_blocks.discard(h)
+                try:
+                    self._perm_rejected_order.remove(h)
+                except ValueError:
+                    pass
+            self._block_request_attempts.pop(h, None)
+        if cleared:
+            self._failed_order = deque(x for x in self._failed_order if x in self._failed_blocks)
+            self._validated_headers.clear()
+            self._header_sync_peer = None
+            self._header_sync_time = 0.0
+        return cleared
+
     def _invalid_block_found(
-        self, block_hash: bytes, reason: str, descendants=()
+        self, block_hash: bytes, reason: str, descendants=(), verdict: bool = True
     ) -> int:
         """Core ``Chainstate::InvalidBlockFound`` + ``InvalidChainFound``
         (validation.cpp): mark the block that failed a consensus check
@@ -1239,7 +1379,11 @@ class BlockSync:
         failed: list[bytes] = [block_hash]
         for idx, (h, _hdr) in enumerate(self._validated_headers):
             if h == block_hash:
-                failed.extend(x for x, _ in self._validated_headers[idx + 1:])
+                _prev = block_hash
+                for x, _xh in self._validated_headers[idx + 1:]:
+                    failed.append(x)
+                    self._failed_prev[x] = _prev
+                    _prev = x
                 self._validated_headers = self._validated_headers[:idx]
                 break
         failed.extend(descendants)
@@ -1255,7 +1399,7 @@ class BlockSync:
             seen.add(h)
             stack.extend(children.get(h, ()))
         for h in seen:
-            self._mark_block_failed(h)
+            self._mark_block_failed(h, self._fork_header_prev.get(h))
             self._buffer_remove(h)
             self._compact_origin_hashes.discard(h)
             self._fork_headers.pop(h, None)
@@ -1266,11 +1410,14 @@ class BlockSync:
             if self._side_branch_buffer is not None:
                 self._side_branch_buffer.pop(h, None)
         self._fork_store_generation += 1
-        self.invalid_blocks_found += 1
+        if verdict:
+            self.invalid_blocks_found += 1
         logger.warning(
-            "InvalidBlockFound: block %s... failed validation (%s); marked "
+            "InvalidBlockFound: block %s... %s (%s); marked "
             "failed with %d descendant(s) — never re-requested",
-            block_hash.hex()[:16], reason, len(seen) - 1,
+            block_hash.hex()[:16],
+            "failed validation" if verdict else "marked invalid",
+            reason, len(seen) - 1,
         )
         return len(seen)
 
@@ -2241,7 +2388,7 @@ class BlockSync:
             # Permanently rejected on a prior validation pass?  Drop without
             # re-buffering and dock the redelivering peer.  Without this guard,
             # peer redeliveries of the same bad bytes spin the drain loop.
-            if block_hash in self._perm_rejected_blocks:
+            if block_hash in self._perm_rejected_blocks or block_hash in self._rpc_invalidated:
                 self._blk_perm_rejected_dropped += 1
                 logger.debug(
                     f"Dropping perm-rejected block {block_hash.hex()[:16]}... "
@@ -2634,6 +2781,14 @@ class BlockSync:
                 # fault has halted the node (gate 6).
                 break
             next_hash, _ = self._validated_headers[0]
+            # Core FindMostWorkChain / AcceptBlock: a block flagged
+            # BLOCK_FAILED_* (by a validation verdict or by RPC
+            # invalidateblock) is never connected, nor is anything built on
+            # it.  Drop it and the rest of the queue (every later slot
+            # descends from it) — no punishment: the bytes were not judged.
+            if self.is_block_failed(next_hash):
+                self._invalid_block_found(next_hash, "cached-invalid in drain", verdict=False)
+                break
             self._connecting_hashes.add(next_hash)
 
             # Is the next block in our buffer?  If not, fall back to bytes
@@ -3935,6 +4090,11 @@ class BlockSync:
         """
         if block_hash in self._fork_headers:
             return
+        # Core AcceptBlockHeader: a failed header, or one whose parent is
+        # failed (BLOCK_INVALID_PREV), never enters the block index.
+        if self.is_block_failed(block_hash) or self.is_block_failed(bytes(prev_hash)):
+            self._mark_block_failed(block_hash, prev_hash)
+            return
         # A locator replay of an already-connected (or IBD-queued) header is
         # not a competing fork.  Storing those as forks made handle_block
         # consume their re-delivered bodies as fork bodies, which is the
@@ -4937,12 +5097,12 @@ class BlockSync:
                 # never fetched).  ProcessNewBlockHeaders stops at the first
                 # invalid header, so the rest of the batch is dropped.
                 _hdr_prev = getattr(header, "prev_blockhash", None)
-                if block_hash in self._failed_blocks or (
-                    _hdr_prev is not None and bytes(_hdr_prev) in self._failed_blocks
+                if self.is_block_failed(block_hash) or (
+                    _hdr_prev is not None and self.is_block_failed(bytes(_hdr_prev))
                 ):
-                    cached = block_hash in self._failed_blocks
+                    cached = self.is_block_failed(block_hash)
                     if not cached:
-                        self._mark_block_failed(block_hash)
+                        self._mark_block_failed(block_hash, _hdr_prev)
                     logger.info(
                         f"Header {block_hash.hex()[:16]}... from "
                         f"{peer.host}:{peer.port} "
