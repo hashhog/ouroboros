@@ -523,6 +523,10 @@ async def test_dumptxoutset_reconsiders_on_dump_failure(tmp_path, monkeypatch) -
     monkeypatch.setattr(
         rpc.node.snapshot_manager, "dump_snapshot", _kaboom
     )
+    # the RPC dumps through dump_snapshot_with_stats (coins + hash in one pass)
+    monkeypatch.setattr(
+        rpc.node.snapshot_manager, "dump_snapshot_with_stats", _kaboom
+    )
 
     with pytest.raises(Exception):
         await rpc.rpc_dumptxoutset(
@@ -806,3 +810,52 @@ async def test_dumptxoutset_latest_does_not_pause(tmp_path) -> None:
     out_path = tmp_path / "latest-no-pause.dat"
     await rpc.rpc_dumptxoutset(str(out_path), type="latest")
     assert rpc.block_submission_paused is False
+
+
+# ---------------------------------------------------------------------------
+# Rollback lands EXACTLY at the target (sweep 2026-10-07: landed target+1).
+# ---------------------------------------------------------------------------
+
+
+class _RealRustInvalidateStub(_RustDBStub):
+    """Models the production Rust ``invalidate_block`` (storage/db.rs
+    invalidate_block): it disconnects only the blocks ABOVE the invalidated
+    block and leaves the invalidated block itself CONNECTED (while returning
+    height-1).  ``disconnect_block(height)`` disconnects the tip."""
+
+    def invalidate_block(self, block_hash: bytes) -> int:
+        self.invalidate_calls.append(bytes(block_hash))
+        self._seed_index()
+        target_height = next(h for h, hb in self._parent.chain.items()
+                             if hb == bytes(block_hash))
+        for h in sorted(self._parent.chain.keys()):
+            if h > target_height:
+                self._parent.chain.pop(h, None)
+            if h >= target_height:
+                self._invalid.add(h)
+        self._parent.best_height = target_height          # still connected
+        self._parent.best_hash = self._parent.chain[target_height]
+        return target_height - 1
+
+    def disconnect_block(self, height: int) -> bytes:
+        assert height == self._parent.best_height
+        self._parent.chain.pop(height)
+        self._parent.best_height = height - 1
+        self._parent.best_hash = self._parent.chain[height - 1]
+        return b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("depth", [1, 2, 3])
+async def test_dumptxoutset_rollback_lands_exactly_at_target(tmp_path, depth) -> None:
+    db = _make_db_with_chain(tip_height=8)
+    db._db = _RealRustInvalidateStub(db)
+    rpc = _make_rpc(db, tmp_path=tmp_path)
+    target = 8 - depth
+    res = await rpc.rpc_dumptxoutset(
+        str(tmp_path / f"d{depth}.dat"), options={"rollback": target})
+    assert res["base_height"] == target
+    assert res["base_hash"] == db._db._index[target][::-1].hex()
+    assert "txoutset_hash" in res and len(res["txoutset_hash"]) == 64
+    assert res["chain_restored"] is True
+    assert db.best_height == 8

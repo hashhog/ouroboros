@@ -44,7 +44,7 @@ class _ConnectDuringDump:
         self._start_connect = start_connect
         self.fired = False
 
-    def iter_utxos(self, *a, **k):
+    def _fire(self):
         if not self.fired:
             self.fired = True
             fut = self._start_connect()
@@ -52,7 +52,15 @@ class _ConnectDuringDump:
                 fut.result(timeout=2)
             except Exception:
                 pass
+
+    def iter_utxos(self, *a, **k):
+        self._fire()
         return self._real.iter_utxos(*a, **k)
+
+    def visit_utxo_txid_groups(self, *a, **k):
+        # the streaming dump walks the native cursor; same seam
+        self._fire()
+        return self._real.visit_utxo_txid_groups(*a, **k)
 
     def __getattr__(self, name):
         return getattr(self._real, name)

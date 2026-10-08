@@ -2163,13 +2163,38 @@ class SnapshotManager:
         output_path: str,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> int:
+        """Dump the current UTXO set; returns the number of coins written.
+
+        Thin wrapper over :meth:`dump_snapshot_with_stats` (kept for callers
+        that only want the count).
         """
-        Dump the current UTXO set to a snapshot file.
+        return self.dump_snapshot_with_stats(output_path, progress_callback)[
+            "coins_written"
+        ]
+
+    def dump_snapshot_with_stats(
+        self,
+        output_path: str,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Dump the current UTXO set to a snapshot file and return
+        ``{coins_written, base_hash (internal bytes), hash_serialized
+        (internal bytes)}``.
 
         Wire format matches Core's `dumptxoutset` exactly. UTXOs are grouped
         by txid (sorted by raw txid bytes, ascending) and within each group
         by vout. Header uses SnapshotMetadata; each coin is encoded with
         VARINT(code) + VARINT(compress(value)) + ScriptCompression.
+
+        Core (rpc/blockchain.cpp WriteUTXOSnapshot / PrepareUTXOSnapshot):
+        the coins, the count and the HASH_SERIALIZED digest reported as
+        ``txoutset_hash`` all come from ONE cursor at the base.  Here the
+        same streaming pass (``stream_utxo_txid_groups`` -- one txid group
+        at a time, never the whole set in Python; was a dict of every coin,
+        audit OU-1) writes each coin AND feeds its TxOutSer element into
+        the HashWriter, so the digest describes exactly the bytes written.
+        The caller holds the chain lock, so the tip read here is the base.
 
         Atomic-write protocol: bytes go to ``<output_path>.incomplete``,
         the fd is fsynced, then renamed to ``<output_path>``. Mirrors
@@ -2187,36 +2212,40 @@ class SnapshotManager:
 
         temp_path = output_path + ".incomplete"
         coins_written = 0
+        hasher = HashWriter()
         try:
             with open(temp_path, "wb") as f:
                 _write_metadata_header(f, self.network, best_hash, total_coins)
 
-                # Group UTXOs by txid; sort by raw txid bytes (Core's
-                # leveldb cursor delivers them in lexicographic order
-                # over the COutPoint key, which is txid || vout LE --
-                # so a per-txid bucketed sort plus a per-bucket vout
-                # sort matches the on-the-fly stream).
-                utxo_groups: dict[bytes, list[tuple[int, Any]]] = {}
-                for utxo in self.db.iter_utxos():
-                    utxo_groups.setdefault(utxo.txid, []).append((utxo.vout, utxo))
-
-                for txid in sorted(utxo_groups.keys()):
-                    coins = utxo_groups[txid]
-                    coins.sort(key=lambda x: x[0])
-                    f.write(txid)
-                    _write_compact_size(f, len(coins))
-                    for vout, utxo in coins:
+                def on_group(txid, outputs) -> None:
+                    nonlocal coins_written
+                    txid_b = _as_txid_bytes(txid)
+                    vouts = sorted(outputs)
+                    f.write(txid_b)
+                    _write_compact_size(f, len(vouts))
+                    for vout in vouts:
+                        utxo = outputs[vout]
                         _write_compact_size(f, vout)
                         serialize_coin(
                             f,
-                            height=utxo.height,
+                            height=int(utxo.height or 0),
                             is_coinbase=bool(utxo.is_coinbase),
                             amount=int(utxo.amount),
                             script=bytes(utxo.script_pubkey),
                         )
+                        hasher.update(_hash_one_coin(utxo))
                         coins_written += 1
                         if progress_callback and coins_written % 100_000 == 0:
                             progress_callback(coins_written, total_coins)
+
+                stream_utxo_txid_groups(self.db, on_group)
+
+                # Core: CHECK_NONFATAL(written_coins_count == maybe_stats->coins_count)
+                if coins_written != total_coins:
+                    raise RuntimeError(
+                        f"snapshot coin count mismatch: header {total_coins}, "
+                        f"wrote {coins_written}"
+                    )
 
                 # Durability barrier: flush the user-space buffer and
                 # fsync the fd BEFORE the rename. Without this, a power
@@ -2243,7 +2272,11 @@ class SnapshotManager:
             raise
 
         logger.info(f"[snapshot] Wrote {coins_written:,} coins to {output_path}")
-        return coins_written
+        return {
+            "coins_written": coins_written,
+            "base_hash": bytes(best_hash),
+            "hash_serialized": hasher.digest(),
+        }
 
     def get_status(self) -> dict[str, Any]:
         """Get the current snapshot status."""
