@@ -409,9 +409,7 @@ class TestW125_RpcErrorParity(unittest.TestCase):
         self.assertIn("RPC_DATABASE_ERROR", rpc_py)
 
     # G23 — RPC_DESERIALIZATION_ERROR (-22) -------------------------------
-    @pytest.mark.xfail(reason="W125 BUG-12: bad hex to sendrawtransaction "
-                              "emits -32603; Core -22",
-                       strict=False)
+    # FIXED (rpc-gate8): a decode failure is -22, not -32603. xfail removed.
     def test_g23_deserialization_error_bad_hex(self):
         resp = _dispatch(self.rpc, "sendrawtransaction", ["notvalidhex"])
         self.assertEqual(_error_code(resp), RPC_DESERIALIZATION_ERROR)

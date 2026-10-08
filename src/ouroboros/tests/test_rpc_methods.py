@@ -155,16 +155,23 @@ class TestRPCMethods(unittest.TestCase):
         self.assertTrue(callable(getattr(self.rpc_server, 'rpc_sendrawtransaction', None)))
 
     def test_sendrawtransaction_invalid_hex(self):
-        """Test sendrawtransaction rejects invalid hex"""
+        """Test sendrawtransaction rejects invalid hex.
+
+        Core rpc/mempool.cpp:96: RPC_DESERIALIZATION_ERROR (-22)
+        "TX decode failed. Make sure the tx has at least one input."
+        """
         import asyncio
 
-        from fastapi import HTTPException
+        from ouroboros.rpc import RpcError
 
         async def test():
-            with self.assertRaises(HTTPException) as ctx:
+            with self.assertRaises(RpcError) as ctx:
                 await self.rpc_server.rpc_sendrawtransaction("nothex")
-            self.assertEqual(ctx.exception.status_code, 400)
-            self.assertIn("Invalid hex", ctx.exception.detail)
+            self.assertEqual(ctx.exception.code, -22)
+            self.assertEqual(
+                ctx.exception.message,
+                "TX decode failed. Make sure the tx has at least one input.",
+            )
 
         asyncio.run(test())
 

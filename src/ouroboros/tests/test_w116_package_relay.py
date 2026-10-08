@@ -423,19 +423,20 @@ class TestG6TestMempoolAcceptWtxid(unittest.TestCase):
     deduplication (BIP-339) will silently get wrong behavior.
     """
 
-    def test_testmempoolaccept_response_missing_wtxid(self):
-        """Document that testmempoolaccept response lacks wtxid field."""
+    def test_testmempoolaccept_response_has_wtxid(self):
+        """FIXED (rpc-gate8): every testmempoolaccept row carries wtxid.
+
+        The behavioural check (the row's value) is in test_r5_gate8_t1.py;
+        this pin only guards the source against the field being dropped.
+        """
         import inspect
         try:
             from ouroboros.rpc import RPCServer
             src = inspect.getsource(RPCServer.rpc_testmempoolaccept)
         except Exception:
             self.skipTest("Cannot import RPCServer")
-        # Document the bug: 'wtxid' is absent from the response dict
-        bug_present = "wtxid" not in src
-        self.assertTrue(bug_present,
-                        "BUG CONFIRMED: testmempoolaccept response is missing 'wtxid' field. "
-                        "Core rpc/mempool.cpp:359: result_inner.pushKV(\"wtxid\", tx->GetWitnessHash().GetHex())")
+        self.assertIn('"wtxid"', src,
+                      "Core rpc/mempool.cpp:354: result_inner.pushKV(\"wtxid\", tx->GetWitnessHash().GetHex())")
 
 
 # ---------------------------------------------------------------------------
