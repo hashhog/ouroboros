@@ -18266,6 +18266,7 @@ class RPCServer:
                     await asyncio.to_thread(
                         self._dumptxoutset_rewind,
                         rust_db,
+                        db,
                         invalidate_target_hash,
                         target_height,
                     )
@@ -18406,7 +18407,7 @@ class RPCServer:
         return result
 
     @staticmethod
-    def _dumptxoutset_rewind(rust_db, child_hash: bytes, target_height: int) -> None:
+    def _dumptxoutset_rewind(rust_db, db, child_hash: bytes, target_height: int) -> None:
         """Disconnect tip-first down to EXACTLY ``target_height``.
 
         Core TemporaryRollback: InvalidateBlock(Next(target)) disconnects the
@@ -18419,11 +18420,16 @@ class RPCServer:
         one block at a time from the tip (same reconcile rpc_invalidateblock
         performs).
         """
+        def tip_height() -> int:
+            if hasattr(db, "_cached_tip"):
+                db._cached_tip = None
+            return int(db.get_best_block()[1])
+
         rust_db.invalidate_block(child_hash)
-        _, h = rust_db.get_best_block()
-        while int(h) > int(target_height):
-            rust_db.disconnect_block(int(h))
-            _, h2 = rust_db.get_best_block()
+        h = tip_height()
+        while h > int(target_height):
+            rust_db.disconnect_block(h)
+            h2 = tip_height()
             if int(h2) >= int(h):
                 raise RuntimeError(f"disconnect_block({h}) did not lower the tip")
             h = h2

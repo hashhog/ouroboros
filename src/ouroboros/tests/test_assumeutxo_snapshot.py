@@ -961,6 +961,8 @@ class TestG28_DumpSnapshot:
         mock_db.get_best_block.return_value = (b"\x00" * 32, 0)
         mock_db.utxo_count.return_value = 0
         mock_db.iter_utxos.side_effect = RuntimeError("disk full")
+        # the dump streams through the native cursor when the DB has one
+        mock_db.visit_utxo_txid_groups.side_effect = RuntimeError("disk full")
 
         sm = SnapshotManager(mock_db, "mainnet", str(tmp_path))
         output = str(tmp_path / "snap.dat")
