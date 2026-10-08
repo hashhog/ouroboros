@@ -498,7 +498,7 @@ class TestW125_RpcErrorParity(unittest.TestCase):
         """disconnectnode on a non-connected peer emits -29."""
         self.node.peer_manager = _PeerManagerStub()  # no peers connected
         resp = _dispatch(self.rpc, "disconnectnode",
-                         ["127.0.0.1:65535", -1])
+                         ["127.0.0.1:65535"])
         self.assertEqual(_error_code(resp), RPC_CLIENT_NODE_NOT_CONNECTED)
 
     # G30 — RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) and other operator-surface

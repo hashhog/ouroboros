@@ -123,7 +123,7 @@ def _build_rpc(snap_txs: dict, snap_fee_rate: list,
     rpc = RPCServer.__new__(RPCServer)
     rpc.node = mock_node
 
-    return asyncio.run(rpc.rpc_getblocktemplate({}))
+    return asyncio.run(rpc.rpc_getblocktemplate({"rules": ["segwit"]}))
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ class TestB1PreviousBlockHash(unittest.TestCase):
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
 
-        result = asyncio.run(rpc.rpc_getblocktemplate({}))
+        result = asyncio.run(rpc.rpc_getblocktemplate({"rules": ["segwit"]}))
         expected = best_hash_le[::-1].hex()
         self.assertEqual(result["previousblockhash"], expected,
                          "previousblockhash must be byte-reversed (display order / BE)")
@@ -407,7 +407,7 @@ class TestB7BlockVersion(unittest.TestCase):
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
 
-        result = asyncio.run(rpc.rpc_getblocktemplate({}))
+        result = asyncio.run(rpc.rpc_getblocktemplate({"rules": ["segwit"]}))
         self.assertEqual(result["version"], 0x20000007,
                          "get_next_block_version() hook must be used when available")
 
@@ -444,7 +444,7 @@ class TestB8Bits(unittest.TestCase):
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
 
-        result = asyncio.run(rpc.rpc_getblocktemplate({}))
+        result = asyncio.run(rpc.rpc_getblocktemplate({"rules": ["segwit"]}))
         self.assertEqual(result["bits"], "1a00ffff",
                          "get_next_bits() hook must be used when available")
 

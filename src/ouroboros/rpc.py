@@ -172,6 +172,14 @@ def _core_arity_for(method: str) -> tuple[int, int] | None:
     return _CORE_ARITY.get(method)
 
 
+# In-flight RPC commands, for getrpcinfo's ``active_commands``. Mirrors Core's
+# g_rpc_server_info (rpc/server.cpp): an RPCCommandExecution entry is pushed
+# once the method is found and removed when the call returns, so getrpcinfo
+# lists itself. Keyed by a per-call token; value = (method, monotonic start).
+_ACTIVE_RPC_COMMANDS: dict[int, tuple[str, float]] = {}
+_ACTIVE_RPC_SEQ = 0
+
+
 # Rate limiting
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
 _rate_limit_window = 60.0  # 1 minute
@@ -1276,6 +1284,7 @@ RPC_CLIENT_NODE_ALREADY_ADDED = -23  # protocol.h:60 — Node is already added
 RPC_CLIENT_NODE_NOT_ADDED = -24      # protocol.h:61 — Node has not been added before
 RPC_VERIFY_ERROR = -25               # protocol.h:42 — general error during transaction or block submission
 RPC_CLIENT_NODE_NOT_CONNECTED = -29  # protocol.h:62 — disconnect target not connected
+RPC_INVALID_PARAMS = -32602          # protocol.h:31 — JSON-RPC "Invalid params"
 RPC_CLIENT_INVALID_IP_OR_SUBNET = -30
 RPC_CLIENT_P2P_DISABLED = -31        # protocol.h:64 — no valid connection manager instance found
 RPC_WALLET_ALREADY_LOADED = -35
@@ -2224,6 +2233,7 @@ class RPCServer:
         self._current_wallet_name = wallet_name
 
         t0 = time.monotonic()
+        active_token: int | None = None
         try:
             # Validate request structure
             if not method or not isinstance(method, str):
@@ -2243,6 +2253,13 @@ class RPCServer:
                     "error": {"code": -32601, "message": f"Method not found: {method}"},
                     "id": req_id
                 }
+
+            # Core ExecuteCommand: RPCCommandExecution registers the call in
+            # g_rpc_server_info.active_commands for its whole duration.
+            global _ACTIVE_RPC_SEQ
+            _ACTIVE_RPC_SEQ += 1
+            active_token = _ACTIVE_RPC_SEQ
+            _ACTIVE_RPC_COMMANDS[active_token] = (method, time.monotonic())
 
             # Core validates argument COUNT centrally, after the method lookup
             # and before the handler runs (rpc/util.cpp:644 -> IsValidNumArgs,
@@ -2322,6 +2339,8 @@ class RPCServer:
                 "id": req_id
             }
         finally:
+            if active_token is not None:
+                _ACTIVE_RPC_COMMANDS.pop(active_token, None)
             if method:
                 record_rpc_request(method, time.monotonic() - t0)
 
@@ -3999,14 +4018,23 @@ class RPCServer:
         Raises:
             HTTPException: On validation failure with detailed reject reason
         """
-        # 1. Deserialize the hex-encoded raw transaction
+        # 1. Deserialize the hex-encoded raw transaction. Core rpc/mempool.cpp
+        # sendrawtransaction: any DecodeHexTx failure (bad hex or bad
+        # serialization) is RPC_DESERIALIZATION_ERROR (-22) "TX decode failed.
+        # Make sure the tx has at least one input." -- not an internal error.
+        _decode_failed = RpcError(
+            RPC_DESERIALIZATION_ERROR,
+            "TX decode failed. Make sure the tx has at least one input.",
+        )
+        if not isinstance(hexstring, str):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                f"JSON value of type {_core_uvtype(hexstring)} is not of expected type string",
+            )
         try:
-            tx_data = bytes.fromhex(hexstring.strip())
-        except ValueError as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"TX decode failed: {e}"
-            ) from None
+            tx_data = bytes.fromhex(hexstring)
+        except ValueError:
+            raise _decode_failed from None
 
         try:
             from ouroboros.p2p_messages import TxMessage
@@ -4019,11 +4047,8 @@ class RPCServer:
         try:
             tx_msg = TxMessage.from_payload(tx_data)
             tx = tx_msg.transaction
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"TX decode failed. Make sure the tx has at least one input. {e}"
-            ) from None
+        except Exception:
+            raise _decode_failed from None
 
         txid = tx.get_txid()
         # JSON-RPC convention: txids in responses are display-order (BE).
@@ -7814,6 +7839,53 @@ class RPCServer:
         import hashlib as _hl
         import time as _time
 
+        # Core rpc/mining.cpp getblocktemplate parses template_request BEFORE
+        # building anything: template_request is a required object (RPCHelpMan
+        # type check, -3); "mode" must be a string or absent (else -8 "Invalid
+        # mode"); every element of an array "rules" must be a string (get_str,
+        # -3); then a mode other than "template" is -8 "Invalid mode", and the
+        # client's rules must include "signet" on signet and "segwit" always
+        # (-8). Before this, the request was ignored and {} got a template.
+        if not isinstance(template_request, dict):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                "Wrong type passed:\n{\n    \"Position 1 (template_request)\": "
+                f"\"JSON value of type {_core_uvtype(template_request)} is not of "
+                "expected type object\"\n}",
+            )
+        gbt_mode = template_request.get("mode")
+        if gbt_mode is None:
+            gbt_mode = "template"
+        elif not isinstance(gbt_mode, str):
+            raise RpcError(RPC_INVALID_PARAMETER, "Invalid mode")
+        client_rules: set[str] = set()
+        if gbt_mode != "proposal":
+            raw_rules = template_request.get("rules")
+            if isinstance(raw_rules, list):
+                for rule in raw_rules:
+                    if not isinstance(rule, str):
+                        raise RpcError(
+                            RPC_TYPE_ERROR,
+                            f"JSON value of type {_core_uvtype(rule)} is not of "
+                            "expected type string",
+                        )
+                    client_rules.add(rule)
+            if gbt_mode != "template":
+                raise RpcError(RPC_INVALID_PARAMETER, "Invalid mode")
+            if getattr(self.node, "network", "mainnet") == "signet" and \
+                    "signet" not in client_rules:
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    "getblocktemplate must be called with the signet rule set "
+                    '(call with {"rules": ["segwit", "signet"]})',
+                )
+            if "segwit" not in client_rules:
+                raise RpcError(
+                    RPC_INVALID_PARAMETER,
+                    "getblocktemplate must be called with the segwit rule set "
+                    '(call with {"rules": ["segwit"]})',
+                )
+
         # W87 constants matching bitcoin-core/src/node/miner.cpp +
         # bitcoin-core/src/policy/policy.h
         MAX_BLOCK_WEIGHT = 4_000_000          # consensus/consensus.h MAX_BLOCK_WEIGHT
@@ -11512,6 +11584,17 @@ class RPCServer:
         ``remove`` is fast (in-process state mutation only) so it stays
         synchronous, matching Core's ``RemoveAddedNode``.
         """
+        # Core rpc/net.cpp addnode checks the command before anything else and
+        # answers an unknown one with the method help as a runtime_error, i.e.
+        # RPC_MISC_ERROR (-1) whose message starts with the signature line.
+        if command not in ("onetry", "add", "remove"):
+            raise RpcError(
+                RPC_MISC_ERROR,
+                'addnode "node" "command" ( v2transport )\n\n'
+                "Attempts to add or remove a node from the addnode list.\n"
+                "Or try a connection to a node once.\n",
+            )
+
         pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
         if pm is None:
             raise ValueError("No peer manager available")
@@ -11620,7 +11703,7 @@ class RPCServer:
                     await peer.disconnect() if asyncio.iscoroutinefunction(peer.disconnect) else peer.disconnect()
                 del peers[addr]
 
-    async def rpc_disconnectnode(self, address: str = "", nodeid: int = -1) -> None:
+    async def rpc_disconnectnode(self, address: Any = None, nodeid: Any = None) -> None:
         """Disconnect a peer by address or node id.
 
         Reference: Bitcoin Core rpc/net.cpp disconnectnode (net.cpp:458-482).
@@ -11633,7 +11716,34 @@ class RPCServer:
         not expose — so disconnectnode silently returned success (null) for any
         input. Mirror Core: locate the connected peer, sever it, and raise -29
         on a miss.
+
+        Argument selection is Core's (net.cpp:463-475), with JSON null meaning
+        absent (MaybeArg): an address and no nodeid disconnects by address; a
+        nodeid with no (or an empty) address disconnects by id; anything else,
+        including no arguments at all or both, is RPC_INVALID_PARAMS (-32602)
+        "Only one of address and nodeid should be provided." -- that check
+        comes before the peer lookup, so it never turns into -29.
         """
+        if address is not None and not isinstance(address, str):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                f"JSON value of type {_core_uvtype(address)} is not of expected type string",
+            )
+        if nodeid is not None and (isinstance(nodeid, bool) or not isinstance(nodeid, int)):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                f"JSON value of type {_core_uvtype(nodeid)} is not of expected type number",
+            )
+        if address is not None and nodeid is None:
+            by_id = False
+        elif nodeid is not None and not address:
+            by_id = True
+        else:
+            raise RpcError(
+                RPC_INVALID_PARAMS,
+                "Only one of address and nodeid should be provided.",
+            )
+
         pm = getattr(self.node, 'peer_manager', None) or getattr(self.node, 'p2p', None)
         if pm is None:
             raise RpcError(
@@ -11652,12 +11762,12 @@ class RPCServer:
         ]
 
         matched = None
-        if address:
+        if not by_id:
             for pmap in peer_maps:
                 if address in pmap:
                     matched = (pmap, address, pmap[address])
                     break
-        if matched is None and nodeid is not None and nodeid >= 0:
+        else:
             for pmap in peer_maps:
                 for addr, peer in list(pmap.items()):
                     if getattr(peer, 'node_id', None) == nodeid:
@@ -11773,11 +11883,31 @@ class RPCServer:
         logger.info("Cleared all bans")
 
     async def rpc_getnettotals(self) -> dict[str, Any]:
-        """Return network traffic statistics."""
+        """Return network traffic statistics.
+
+        Core rpc/net.cpp getnettotals: process-lifetime byte totals, the wall
+        clock in ms, and the ``uploadtarget`` object. ouroboros has no
+        -maxuploadtarget, which is Core's default (0 = unlimited); for that
+        case Core reports timeframe 86400 (MAX_UPLOAD_TIMEFRAME, 24 h), target
+        0, target_reached false (OutboundTargetReached returns false when the
+        target is 0), serve_historical_blocks true, and 0 bytes / 0 s left in
+        the cycle (GetOutboundTargetBytesLeft / GetMaxOutboundTimeLeftInCycle
+        return 0 when the target is 0).
+        """
+        from ouroboros.peer import NET_TOTALS
+
         return {
-            "totalbytesrecv": getattr(self.node, 'bytes_recv', 0),
-            "totalbytessent": getattr(self.node, 'bytes_sent', 0),
+            "totalbytesrecv": NET_TOTALS["recv"],
+            "totalbytessent": NET_TOTALS["sent"],
             "timemillis": int(time.time() * 1000),
+            "uploadtarget": {
+                "timeframe": 86400,
+                "target": 0,
+                "target_reached": False,
+                "serve_historical_blocks": True,
+                "bytes_left_in_cycle": 0,
+                "time_left_in_cycle": 0,
+            },
         }
 
     def _get_addrman(self):
@@ -14526,22 +14656,54 @@ class RPCServer:
         Reference: bitcoin-core/src/policy/policy.cpp IsStandardTx +
         validation.cpp PreChecks (the testmempoolaccept path).
         """
+        from ouroboros.p2p_messages import TxMessage
+
+        # Core rpc/mempool.cpp testmempoolaccept: the array must hold 1..25
+        # (MAX_PACKAGE_COUNT) transactions (-8), and EVERY entry is decoded
+        # before any is validated -- an undecodable one fails the whole call
+        # with RPC_DESERIALIZATION_ERROR (-22) "TX decode failed: <hex> Make
+        # sure the tx has at least one input." rather than a per-tx reject row.
+        if not isinstance(rawtxs, list):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                f"JSON value of type {_core_uvtype(rawtxs)} is not of expected type array",
+            )
+        if len(rawtxs) < 1 or len(rawtxs) > 25:
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                "Array must contain between 1 and 25 transactions.",
+            )
+        decoded: list = []
+        for raw in rawtxs:
+            if not isinstance(raw, str):
+                raise RpcError(
+                    RPC_TYPE_ERROR,
+                    f"JSON value of type {_core_uvtype(raw)} is not of expected type string",
+                )
+            try:
+                decoded.append(TxMessage.from_payload(bytes.fromhex(raw)).transaction)
+            except Exception:
+                raise RpcError(
+                    RPC_DESERIALIZATION_ERROR,
+                    f"TX decode failed: {raw} Make sure the tx has at least one input.",
+                ) from None
+
         mempool = getattr(self.node, "mempool", None)
         results: list[dict[str, Any]] = []
-        for raw in rawtxs:
+        for tx in decoded:
             try:
-                from ouroboros.p2p_messages import TxMessage
-                tx_msg = TxMessage.from_payload(bytes.fromhex(raw))
-                tx = tx_msg.transaction
                 # JSON-RPC convention: txids in responses are display-order
                 # (BE). get_txid() returns LE (internal). Reverse for JSON. W69.
+                # Core reports txid AND wtxid on every row (mempool.cpp:353-354).
                 txid_be = tx.get_txid()[::-1].hex()
+                wtxid_be = tx.get_wtxid()[::-1].hex()
                 if mempool is None or getattr(self.node, "db", None) is None:
                     # Node not far enough through init to validate -- return a
                     # clean structured reject rather than a NoneType/attribute
                     # error.
                     results.append({
                         "txid": txid_be,
+                        "wtxid": wtxid_be,
                         "allowed": False,
                         "reject-reason": "node-not-ready",
                     })
@@ -14553,12 +14715,14 @@ class RPCServer:
                 allowed = bool(res.get("accepted"))
                 results.append({
                     "txid": txid_be,
+                    "wtxid": wtxid_be,
                     "allowed": allowed,
                     "reject-reason": None if allowed else res.get("reject_reason"),
                 })
             except Exception as e:
                 results.append({
-                    "txid": "",
+                    "txid": tx.get_txid()[::-1].hex(),
+                    "wtxid": tx.get_wtxid()[::-1].hex(),
                     "allowed": False,
                     "reject-reason": str(e),
                 })
@@ -15855,9 +16019,31 @@ class RPCServer:
         return mantissa << (8 * (exponent - 3))
 
     async def rpc_getrpcinfo(self) -> dict[str, Any]:
-        """Return info about the RPC server."""
+        """Return details of the RPC server.
+
+        Core rpc/server.cpp getrpcinfo: ``active_commands`` lists every
+        in-flight call (this one included) as {method, duration} with the
+        duration in microseconds, and ``logpath`` is the absolute path of the
+        debug log file (LogInstance().m_file_path).
+        """
+        from pathlib import Path
+
+        from ouroboros import logging_config
+
+        now = time.monotonic()
+        active = [
+            {"method": m, "duration": int((now - start) * 1_000_000)}
+            for m, start in list(_ACTIVE_RPC_COMMANDS.values())
+        ]
+        log_path = logging_config._LOG_FILE_PATH
+        if log_path is None:
+            data_dir = getattr(getattr(self.node, "config", None), "data_dir", None)
+            log_path = str(Path(data_dir) / "ouroboros.log") if data_dir else ""
+        if log_path:
+            log_path = str(Path(log_path).resolve())
         return {
-            "active_commands": [],
+            "active_commands": active,
+            "logpath": log_path,
         }
 
     async def rpc_getindexinfo(self, index_name: str = "") -> dict[str, Any]:

@@ -1885,7 +1885,7 @@ class TestGetBlockTemplate:
                 return 1699999000
 
         server = RPCServer(_MockNode(), port=0, rate_limit=False)
-        template = asyncio.run(server.rpc_getblocktemplate())  # no loop on py3.13 without asyncio.run
+        template = asyncio.run(server.rpc_getblocktemplate({"rules": ["segwit"]}))  # no loop on py3.13 without asyncio.run
         assert template["height"] == 101
         assert template["previousblockhash"] == (b"\xab" * 32).hex()
         assert template["coinbasevalue"] > 0

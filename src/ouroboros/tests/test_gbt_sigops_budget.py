@@ -105,7 +105,7 @@ def _run_template(snap_txs, snap_fee_rate):
     rpc = RPCServer.__new__(RPCServer)
     rpc.node = mock_node
 
-    return asyncio.run(rpc.rpc_getblocktemplate({}))
+    return asyncio.run(rpc.rpc_getblocktemplate({"rules": ["segwit"]}))
 
 
 class TestGBTSigopsBudget(unittest.TestCase):

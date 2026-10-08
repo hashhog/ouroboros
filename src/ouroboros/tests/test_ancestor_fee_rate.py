@@ -113,7 +113,7 @@ class TestAncestorFeeRateOrdering(unittest.TestCase):
         rpc = RPCServer.__new__(RPCServer)
         rpc.node = mock_node
 
-        return asyncio.run(rpc.rpc_getblocktemplate({}))
+        return asyncio.run(rpc.rpc_getblocktemplate({"rules": ["segwit"]}))
 
     # ------------------------------------------------------------------ #
     # Build the three transactions described above

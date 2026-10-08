@@ -216,7 +216,7 @@ class TestW125PortedErrorCodes(unittest.TestCase):
         nodes' (net.cpp:478; protocol.h:62).
         """
         self.node.peer_manager = _PeerManagerStub()  # no peers connected
-        resp = _dispatch(self.rpc, "disconnectnode", ["127.0.0.1:65535", -1])
+        resp = _dispatch(self.rpc, "disconnectnode", ["127.0.0.1:65535"])
         self.assertEqual(_code(resp), RPC_CLIENT_NODE_NOT_CONNECTED)
         self.assertEqual(
             resp["error"]["message"], "Node not found in connected nodes"
@@ -228,7 +228,7 @@ class TestW125PortedErrorCodes(unittest.TestCase):
         peer = _PeerStub()
         pm = _PeerManagerStub(peers={"127.0.0.1:8333": peer})
         self.node.peer_manager = pm
-        resp = _dispatch(self.rpc, "disconnectnode", ["127.0.0.1:8333", -1])
+        resp = _dispatch(self.rpc, "disconnectnode", ["127.0.0.1:8333"])
         self.assertIsNone(_code(resp))
         self.assertTrue(peer.disconnected)
         self.assertNotIn("127.0.0.1:8333", pm.peers)

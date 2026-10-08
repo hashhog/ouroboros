@@ -94,7 +94,7 @@ def _make_rpc(height: int = 800_000, mempool=None, network: str = "mainnet") -> 
 
 
 def _run_gbt(rpc: RPCServer, template_request: dict | None = None) -> dict:
-    return asyncio.run(rpc.rpc_getblocktemplate(template_request or {}))
+    return asyncio.run(rpc.rpc_getblocktemplate(template_request or {"rules": ["segwit"]}))
 
 
 # ---------------------------------------------------------------------------

@@ -363,6 +363,12 @@ class _PrefixedStreamReader:
         return getattr(self._reader, name)
 
 
+# Process-wide P2P byte totals, for getnettotals. Core keeps these on CConnman
+# (nTotalBytesRecv / nTotalBytesSent) and never decrements them when a peer
+# disconnects; a sum over the currently-connected peers would go backwards.
+NET_TOTALS: dict[str, int] = {"recv": 0, "sent": 0}
+
+
 class RelayType(Enum):
     """Peer relay type — determines what messages we exchange."""
     FULL_RELAY = "full_relay"
@@ -1734,6 +1740,7 @@ class Peer:
         await self._bounded_drain()
 
         self.bytes_sent += len(data)
+        NET_TOTALS["sent"] += len(data)
         self.last_send = time.time()
 
         logger.debug(f"Sent {msg.command} to {self.host}:{self.port}")
@@ -1965,6 +1972,7 @@ class Peer:
         logger.debug(f"Received {command} from {self.host}:{self.port} ({len(payload)} bytes)")
 
         self.bytes_recv += 24 + len(payload)
+        NET_TOTALS["recv"] += 24 + len(payload)
         self.last_recv = time.time()
 
         return NetworkMessage(command=command, payload=payload, magic=magic)
@@ -2059,6 +2067,7 @@ class Peer:
                 ) from e
 
             self.bytes_recv += wire_bytes_this_call
+            NET_TOTALS["recv"] += wire_bytes_this_call
             self.last_recv = time.time()
 
             if is_decoy:

@@ -101,7 +101,7 @@ def _make_rpc(height: int = 800_000, mempool=None, network: str = "mainnet") -> 
 
 
 def _run_gbt(rpc: RPCServer, template_request: dict | None = None) -> dict:
-    return asyncio.run(rpc.rpc_getblocktemplate(template_request or {}))
+    return asyncio.run(rpc.rpc_getblocktemplate(template_request or {"rules": ["segwit"]}))
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +414,8 @@ class TestG13SignetChallenge(unittest.TestCase):
 
     def test_signet_challenge_absent(self):
         rpc = _make_rpc(network="signet")
-        result = _run_gbt(rpc)
+        # Core requires the "signet" rule on signet (mining.cpp:850).
+        result = _run_gbt(rpc, {"rules": ["segwit", "signet"]})
         self.assertNotIn("signet_challenge", result,
                          "signet_challenge missing for signet network")
 
@@ -614,15 +615,15 @@ class TestG19SubmitBlockDuplicateInvalid(unittest.TestCase):
 # Ouroboros: never validates template_request["rules"] for "segwit"
 # ---------------------------------------------------------------------------
 class TestG20SegwitRulesRequired(unittest.TestCase):
-    """BUG: GBT does not enforce that client must declare segwit support."""
+    """FIXED (rpc-gate8): GBT rejects a request whose rules omit segwit."""
 
-    def test_no_segwit_rule_not_rejected(self):
+    def test_no_segwit_rule_rejected(self):
+        from ouroboros.rpc import RpcError
         rpc = _make_rpc()
         # Core: if !setClientRules.contains("segwit") → RPC_INVALID_PARAMETER
-        # Ouroboros: template_request never read → no enforcement
-        result = _run_gbt(rpc, {"rules": []})  # segwit not declared
-        self.assertIn("height", result,
-                       "GBT must reject when client doesn't declare segwit support (Core)")
+        with self.assertRaises(RpcError) as cm:
+            _run_gbt(rpc, {"rules": []})  # segwit not declared
+        self.assertEqual(cm.exception.code, -8)
 
 
 # ---------------------------------------------------------------------------
