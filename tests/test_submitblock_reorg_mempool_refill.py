@@ -260,17 +260,17 @@ def test_reorg_to_side_branch_tip_refills_mempool_with_disconnected_txs(monkeypa
     )
 
     # *** The Pattern B assertion ***
-    # mempool.add_transaction was called for T1 and T2 exactly once each.
-    # Coinbase txs MUST NOT be refilled (Core never does, and they'd fail
-    # standardness).
-    refilled_txs = [c.args[0] for c in mempool.add_transaction.call_args_list]
-    refilled_txids = {tx.get_txid() for tx in refilled_txs}
-    assert refilled_txids == {t1.get_txid(), t2.get_txid()}, (
-        f"expected mempool refill of {{T1, T2}}; got "
+    # The disconnected non-coinbase txs go to Mempool.update_for_reorg (Core
+    # MaybeUpdateMempoolForReorg) exactly once, EARLIEST FIRST: T1 (h=111)
+    # before T2 (h=112).  Coinbase txs are never refilled.
+    calls = mempool.update_for_reorg.call_args_list
+    assert len(calls) == 1, f"expected one update_for_reorg call; got {calls}"
+    refilled_txs = list(calls[0].args[0])
+    assert [tx.get_txid() for tx in refilled_txs] == [t1.get_txid(), t2.get_txid()], (
+        f"expected mempool refill [T1, T2] (earliest first); got "
         f"{[tx.get_txid().hex()[:8] for tx in refilled_txs]}"
     )
-
-    # Coinbase txs must NOT have been refilled.
+    assert calls[0].args[1] == 113, "refill must run at the NEW tip height"
     for tx in refilled_txs:
         assert not getattr(tx, "is_coinbase", False), (
             "coinbase tx leaked into mempool refill — violates Core parity"

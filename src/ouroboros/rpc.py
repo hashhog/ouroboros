@@ -9068,6 +9068,29 @@ class RPCServer:
         )
         return bip22_result_string(reason)
 
+    def _reorg_mempool_refill(self, db, disconnected_txs, what: str) -> None:
+        """Core MaybeUpdateMempoolForReorg at the end of
+        ActivateBestChainStep (after every disconnect and connect; ConnectTip's
+        removeForBlock already ran per connected block via accept_block):
+        re-accept *disconnected_txs* (earliest first) at the new tip,
+        removeRecursive the ones that fail — e.g. A1, double-spent by the new
+        branch, takes its in-pool child M2 with it — then removeForReorg.
+        Runs even with no disconnected txs: removeForReorg still applies."""
+        mempool = getattr(self.node, "mempool", None)
+        if mempool is None or not hasattr(mempool, "update_for_reorg"):
+            return
+        try:
+            _, final_height = db.get_best_block()
+        except Exception as e:
+            logger.warning("%s: mempool refill skipped, no tip: %s", what, e)
+            return
+        try:
+            mempool.update_for_reorg(list(disconnected_txs), int(final_height))
+        except Exception as e:
+            if is_system_error(e):
+                raise
+            logger.warning("%s: mempool refill failed: %s", what, e)
+
     async def _finalize_failed_reorg(
         self,
         db,
@@ -9180,13 +9203,49 @@ class RPCServer:
                 reason, n_connected, kept_h,
                 common_ancestor_height, len(disconnected_active),
             )
+            # The original blocks stay disconnected: their txs go back to the
+            # pool (Core MaybeUpdateMempoolForReorg runs on this path too).
+            self._reorg_mempool_refill(
+                db, self._raw_blocks_txs(original_raws), "reorg (kept prefix)"
+            )
             return bip22_result_string(reason)
 
         # Original tip is at least as heavy (or nothing connected) — roll back
         # to it, exactly as before.
-        return await self._restore_original_chain(
+        result = await self._restore_original_chain(
             db, common_ancestor_height, disconnected_active, new_tip_hash, reason,
         )
+        # Mempool, Core-shaped: the re-connected original blocks are
+        # ConnectTip'd (removeForBlock: their txs + conflicts admitted while
+        # they were off the chain), the connected-then-unwound prefix blocks
+        # were DisconnectTip'd (their txs are refilled).
+        _mp = getattr(self.node, "mempool", None)
+        if _mp is not None:
+            for _blk in self._raw_blocks(original_raws):
+                try:
+                    _mp.remove_block_transactions(_blk)
+                except Exception as _e:
+                    logger.debug("reorg rollback: removeForBlock: %s", _e)
+        self._reorg_mempool_refill(
+            db, self._raw_blocks_txs(prefix_raws), "reorg rollback"
+        )
+        return result
+
+    @staticmethod
+    def _raw_blocks(raws) -> list:
+        from ouroboros.database import Block as _Blk
+        out = []
+        for raw in raws:
+            try:
+                out.append(_Blk.deserialize(bytes(raw)))
+            except Exception as e:
+                logger.debug("reorg mempool: undecodable block: %s", e)
+        return out
+
+    @classmethod
+    def _raw_blocks_txs(cls, raws) -> list:
+        return [tx for blk in cls._raw_blocks(raws)
+                for tx in blk.transactions if not tx.is_coinbase]
 
     @holds_chain_lock
     async def _reorg_to_side_branch_tip(
@@ -9367,10 +9426,13 @@ class RPCServer:
                     "for rollback/retain: %s",
                     h, e,
                 )
-            for tx in getattr(blk, "transactions", []) or []:
-                if getattr(tx, "is_coinbase", False):
-                    continue
-                disconnected_txs.append(tx)
+            # Prepended block-by-block: the walk is descending, the refill
+            # wants EARLIEST FIRST (Core iterates DisconnectedBlockTransactions
+            # in reverse: lowest block first, block order within it).
+            disconnected_txs[:0] = [
+                tx for tx in (getattr(blk, "transactions", []) or [])
+                if not getattr(tx, "is_coinbase", False)
+            ]
         # Order ascending by height (ancestor+1 → original tip) for re-connect.
         disconnected_active.reverse()
 
@@ -9790,31 +9852,7 @@ class RPCServer:
         # the "Pattern B miswire" identified in
         # CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
         # ----------------------------------------------------------
-        mempool = getattr(self.node, "mempool", None)
-        if mempool is not None and disconnected_txs:
-            try:
-                _, final_height = db.get_best_block()
-            except Exception:
-                final_height = -1
-            refilled = 0
-            for tx in disconnected_txs:
-                try:
-                    success, reason = mempool.add_transaction(tx, final_height)
-                    if success:
-                        refilled += 1
-                    else:
-                        logger.debug(
-                            "submitblock reorg: tx %s not re-added: %s",
-                            tx.get_txid().hex()[:16], reason,
-                        )
-                except Exception as e:
-                    logger.debug(
-                        "submitblock reorg: error re-adding tx: %s", e,
-                    )
-            logger.info(
-                "submitblock reorg: refilled %d/%d disconnected txs to mempool",
-                refilled, len(disconnected_txs),
-            )
+        self._reorg_mempool_refill(db, disconnected_txs, "submitblock reorg")
 
         return None
 
@@ -10679,60 +10717,79 @@ class RPCServer:
 
     async def _update_mempool_after_disconnect(self, db, blocks) -> None:
         """Core MaybeUpdateMempoolForReorg(disconnectpool, fAddToMempool=true)
-        after DisconnectTip(s): re-admit the disconnected blocks' non-coinbase
-        transactions (oldest block first) against the new tip, then
-        removeForReorg — drop pool transactions that spend a coin that is no
-        longer in the UTXO set or the pool (e.g. an output of a disconnected
-        coinbase) or an immature coinbase, with their descendants."""
+        after InvalidateBlock's DisconnectTip(s).  *blocks*: the disconnected
+        blocks, ASCENDING height (earliest first, Core's reverse iteration of
+        the disconnect pool).  Re-accept, removeRecursive the failures,
+        removeForReorg (non-final / BIP68 / immature / missing inputs, with
+        descendants) — see ``Mempool.update_for_reorg``."""
         mempool = getattr(self.node, "mempool", None)
-        if mempool is None:
+        if mempool is None or not hasattr(mempool, "update_for_reorg"):
             return
         try:
             _, tip_h = db.get_best_block()
         except Exception:
             return
-        readded = total = 0
-        for blk in blocks:
-            if blk is None:
-                continue
-            for tx in getattr(blk, "transactions", []) or []:
-                if getattr(tx, "is_coinbase", False):
-                    continue
-                total += 1
+        txs = [tx for blk in blocks if blk is not None
+               for tx in (getattr(blk, "transactions", None) or [])]
+        mempool.update_for_reorg(txs, int(tip_h))
+
+    def _mempool_follow_rust_reorg(self, db, old_tip_hash, old_tip_height) -> None:
+        """The Rust layer moved the active chain (reconsiderblock's
+        ActivateBestChain) without the Python mempool hooks.  Mirror Core's
+        ActivateBestChainStep: walk the OLD chain back from *old_tip_hash*
+        until it meets the new active chain (the fork); the blocks walked
+        were DisconnectTip'd, the new active blocks above the fork were
+        ConnectTip'd.  removeForBlock each connected block (ascending), then
+        MaybeUpdateMempoolForReorg with the disconnected blocks' txs
+        (earliest first)."""
+        mempool = getattr(self.node, "mempool", None)
+        if mempool is None or old_tip_hash is None or old_tip_height is None:
+            return
+        try:
+            _, new_h = db.get_best_block()
+            new_h = int(new_h)
+        except Exception:
+            return
+        from ouroboros.database import Block as _Blk
+        disconnected: list = []  # descending height
+        h, cur = int(old_tip_height), bytes(old_tip_hash)
+        while h >= 0:
+            ah = None
+            if h <= new_h:
                 try:
-                    ok, _reason = mempool.add_transaction(tx, tip_h)
-                    readded += 1 if ok else 0
-                except Exception as e:
-                    logger.debug(f"invalidateblock: re-add failed: {e}")
-        # removeForReorg
-        doomed: set[bytes] = set()
-        with mempool._lock:
-            for txid, entry in list(mempool.transactions.items()):
-                if txid in doomed:
-                    continue
-                bad = False
-                for tx_in in entry.tx.inputs:
-                    if tx_in.prev_txid in mempool.transactions:
-                        continue
-                    try:
-                        coin = db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
-                    except Exception:
-                        coin = None
-                    if coin is None:
-                        bad = True
-                        break
-                    if coin.get("is_coinbase") and (tip_h + 1) - int(coin.get("height", 0)) < 100:
-                        bad = True
-                        break
-                if bad:
-                    doomed |= set(mempool._collect_descendants(txid))
-            for txid in doomed:
-                if txid in mempool.transactions:
-                    mempool._remove_transaction_inner(txid, _reason="reorg")
-        logger.info(
-            f"invalidateblock: mempool re-added {readded}/{total} disconnected "
-            f"txs, removeForReorg dropped {len(doomed)}"
-        )
+                    ah = db.get_block_hash_by_height(h)
+                except Exception:
+                    ah = None
+            if ah is not None and bytes(ah) == cur:
+                break
+            try:
+                raw = db.get_block_bytes(cur)
+            except Exception:
+                raw = None
+            if not raw:
+                logger.warning(
+                    f"mempool reorg follow: block {cur[::-1].hex()[:16]} at "
+                    f"h={h} unreadable; stopping the old-chain walk"
+                )
+                break
+            try:
+                disconnected.append(_Blk.deserialize(bytes(raw)))
+            except Exception as e:
+                logger.warning(f"mempool reorg follow: deserialize h={h}: {e}")
+            cur = bytes(raw[4:36])
+            h -= 1
+        fork = h
+        for hh in range(fork + 1, new_h + 1):
+            try:
+                blk = db.get_block_by_height(hh)
+                if blk is not None:
+                    mempool.remove_block_transactions(blk)
+            except Exception as e:
+                logger.debug(f"mempool reorg follow: removeForBlock h={hh}: {e}")
+        if disconnected and hasattr(mempool, "update_for_reorg"):
+            disconnected.reverse()
+            txs = [tx for blk in disconnected for tx in blk.transactions]
+            mempool.update_for_reorg(txs, new_h)
 
     @holds_chain_lock
     async def rpc_reconsiderblock(self, blockhash: str) -> None:
@@ -10787,9 +10844,9 @@ class RPCServer:
             # fsync can take seconds on a loaded box: keep it off the loop.
             await asyncio.to_thread(self._persist_rpc_invalidated, bs)
         try:
-            _, height_before = db.get_best_block()
+            hash_before, height_before = db.get_best_block()
         except Exception:
-            height_before = None
+            hash_before, height_before = None, None
         try:
             rust = getattr(db, '_db', None) or getattr(db, 'rust_db', None)
             if rust is not None and hasattr(rust, 'reconsider_block'):
@@ -10840,22 +10897,17 @@ class RPCServer:
                 raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found") from None
             raise HTTPException(status_code=500, detail=str(e)) from None
 
-        # ActivateBestChain reconnected stored blocks: Core's ConnectTip runs
-        # removeForBlock for each, so their transactions leave the mempool.
+        # ActivateBestChain may have disconnected the old tip's branch and
+        # connected another: Core's ConnectTip runs removeForBlock for each
+        # connected block and MaybeUpdateMempoolForReorg returns the
+        # disconnected blocks' txs (with removeForReorg) — not only the
+        # height-increase case.
         try:
-            _, height_after = db.get_best_block()
-        except Exception:
-            height_after = None
-        mempool = getattr(self.node, "mempool", None)
-        if (mempool is not None and height_before is not None
-                and height_after is not None and height_after > height_before):
-            for h in range(int(height_before) + 1, int(height_after) + 1):
-                try:
-                    blk = db.get_block_by_height(h)
-                    if blk is not None:
-                        mempool.remove_block_transactions(blk)
-                except Exception as e:
-                    logger.debug(f"reconsiderblock: mempool removeForBlock h={h}: {e}")
+            self._mempool_follow_rust_reorg(db, hash_before, height_before)
+        except Exception as e:
+            if is_system_error(e):
+                raise
+            logger.warning(f"reconsiderblock: mempool update failed: {e}")
 
         # reconsiderblock can re-activate (and reorg onto) a previously
         # invalidated branch in the Rust layer without firing the Python index
