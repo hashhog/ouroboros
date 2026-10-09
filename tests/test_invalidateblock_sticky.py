@@ -155,38 +155,55 @@ def test_drain_never_connects_a_failed_block(tmp_path):
     assert bdb.get_best_block() == (hashes[X - 1], X - 1)
 
 
-class _StubMempool:
-    """Just the surface rpc._update_mempool_after_disconnect uses."""
+def _real_mempool(bdb):
+    """The real Mempool over the real chain view; consensus script checks
+    stubbed (the coins are OP_TRUE).  rpc._update_mempool_after_disconnect
+    now drives Mempool.update_for_reorg, so a duck-typed stub would test
+    nothing."""
+    from ouroboros.mempool import Mempool
+    from ouroboros.validation import TransactionValidator
 
-    def __init__(self):
-        import threading
-        self._lock = threading.RLock()
-        self.transactions = {}
-        self.readded = []
+    class _V(TransactionValidator):
+        def __init__(self, db):
+            self.db = db
+            self.network = "regtest"
+            self.snapshot_manager = None
 
-    def add_transaction(self, tx, height):
-        self.readded.append(tx)
-        return True, ""
+        def validate_transaction(self, tx, height, *a, **k):
+            return True, ""
 
-    def _collect_descendants(self, txid):
-        return {txid}
+    return Mempool(_V(bdb), require_standard=False)
 
-    def _remove_transaction_inner(self, txid, _skip_recount=False, _reason=""):
-        self.transactions.pop(txid, None)
+
+def _spend(prev_txid: bytes, value: int, tag: int):
+    import hashlib
+    from ouroboros.database import Transaction, TxIn, TxOut
+    tx = Transaction(
+        txid=bytes(32), version=2, locktime=0,
+        inputs=[TxIn(prev_txid=prev_txid, prev_vout=0,
+                     script_sig=b"\x51" + bytes([tag]), sequence=0xFFFFFFFE)],
+        outputs=[TxOut(value=value, script_pubkey=b"\x51")],
+    )
+    tx.txid = hashlib.sha256(hashlib.sha256(tx.serialize()).digest()).digest()
+    return tx
 
 
 def test_invalidate_updates_mempool_for_reorg(tmp_path):
-    """Core MaybeUpdateMempoolForReorg: disconnected txs are re-offered to the
-    pool, and a pool tx spending a coin the disconnect removed (an output of
-    an invalidated block's coinbase) is dropped; one spending a coin still in
-    the UTXO set stays."""
+    """Core MaybeUpdateMempoolForReorg: a pool tx spending a coin the
+    disconnect removed (an output of an invalidated block's coinbase) is
+    dropped by removeForReorg; one spending a coin still in the UTXO set
+    stays."""
     bdb, chain, bs, server, hashes = _setup(tmp_path)
-    mp = _StubMempool()
+    mp = _real_mempool(bdb)
     server.node.mempool = mp
     cb_x = bdb.get_block_by_height(X).transactions[0].get_txid()
-    gone = SimpleNamespace(tx=SimpleNamespace(inputs=[SimpleNamespace(prev_txid=cb_x, prev_vout=0)]))
-    kept = SimpleNamespace(tx=SimpleNamespace(inputs=[SimpleNamespace(prev_txid=chain.fund[0], prev_vout=0)]))
-    mp.transactions = {b"g" * 32: gone, b"k" * 32: kept}
+    gone = _spend(cb_x, 1_000, 1)
+    kept = _spend(chain.fund[0], 1_000, 2)
+    for t in (gone, kept):
+        # Bypass ATMP's coinbase-maturity view: the point is what the
+        # invalidate does to entries already in the pool.
+        ok, err = mp._add_transaction_inner(t, TIP, bypass_limits=True)
+        assert ok, err
     asyncio.run(server.rpc_invalidateblock(_disp(hashes[X])))
-    assert b"g" * 32 not in mp.transactions, "spend of a disconnected coin left in the pool"
-    assert b"k" * 32 in mp.transactions
+    assert gone.get_txid() not in mp.transactions, "spend of a disconnected coin left in the pool"
+    assert kept.get_txid() in mp.transactions
