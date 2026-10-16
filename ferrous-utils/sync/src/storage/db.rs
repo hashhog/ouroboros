@@ -26,6 +26,21 @@ use crate::storage::schema::{
 };
 use crate::storage::undo::{BlockUndo, Coin, TxUndo};
 
+/// Counts from `BlockchainDB::reconcile_headers_ntx_provenance`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HeadersNtxReconcileStats {
+    /// HEADERS_CF entries visited.
+    pub scanned: u64,
+    /// Non-zero nTx kept: the block was connected here.
+    pub kept: u64,
+    /// nTx rewritten from the body held in BLOCKS_CF.
+    pub recounted: u64,
+    /// nTx reset to 0: no body, not connected here.
+    pub zeroed: u64,
+    /// Extended (Core-tool) records cut back to 84 bytes.
+    pub stripped_extended: u64,
+}
+
 /// Mirror of Bitcoin Core's `DisconnectResult` enum (validation.h:451-455).
 ///
 /// * `Ok`      — the disconnect was consistent with the on-disk UTXO snapshot.
@@ -223,11 +238,27 @@ impl BlockchainDB {
 
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)?;
 
-        Ok(Self {
+        let this = Self {
             db: Arc::new(db),
             utxo_read_cache: Mutex::new(HashMap::new()),
             cache_generation: AtomicU64::new(0),
-        })
+        };
+
+        // One-time removal of Core-sourced nTx from HEADERS_CF. Never fatal:
+        // on error the marker is not written and the next open retries.
+        match this.reconcile_headers_ntx_provenance() {
+            Ok(Some(s)) => log::warn!(
+                "HEADERS_CF nTx provenance reconcile: scanned={} kept={} recounted={} \
+                 zeroed={} stripped_extended={}",
+                s.scanned, s.kept, s.recounted, s.zeroed, s.stripped_extended
+            ),
+            Ok(None) => {}
+            Err(e) => log::error!(
+                "HEADERS_CF nTx provenance reconcile failed: {} — will retry next open", e
+            ),
+        }
+
+        Ok(this)
     }
 
     // ========== Block Storage Methods ==========
@@ -509,6 +540,133 @@ impl BlockchainDB {
             }
             _ => Ok(None),
         }
+    }
+
+    /// One-time reconcile of HEADERS_CF nTx provenance (R3: answer only from
+    /// own state).
+    ///
+    /// The disarmed populate tools wrote Bitcoin Core's nTx into HEADERS_CF,
+    /// and the corpus tool also wrote Core's chainwork/height/mediantime/
+    /// nexthash as a 156-byte record that getblockheader served. The 80-byte
+    /// header is proof-of-work self-verifying; none of the rest is, and the
+    /// datadir does not record who wrote an entry. Core's rule for a block
+    /// whose transactions were never received is nTx = 0 (chain.h
+    /// CBlockIndex::nTx, set in ReceivedBlockTransactions).
+    ///
+    /// Per entry with a non-zero nTx or an extended record:
+    /// - extended record (> 84 bytes) -> cut back to 84 bytes; no in-tree
+    ///   writer except the Core tool produces it.
+    /// - not extended, and connected here (genesis, or on the active chain
+    ///   with undo data at its height) -> keep: connect_block_from_bytes
+    ///   wrote it from the body it connected.
+    /// - body held in BLOCKS_CF -> nTx recounted from the body.
+    /// - otherwise -> nTx = 0 (unknown to this node).
+    ///
+    /// The 80 header bytes and the entry itself are never removed, so every
+    /// header getblockheader could find before is still found.
+    ///
+    /// Returns `None` when the marker is already present (one point read).
+    /// Limitation: a block this node connected whose body was later pruned
+    /// AND whose undo was deleted cannot be vouched for and reads nTx = 0.
+    pub fn reconcile_headers_ntx_provenance(&self) -> Result<Option<HeadersNtxReconcileStats>> {
+        let meta_cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        if self.db.get_pinned_cf(meta_cf, meta_keys::HEADERS_NTX_RECONCILED_V1)?.is_some() {
+            return Ok(None);
+        }
+        let headers_cf = self.db.cf_handle(HEADERS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(HEADERS_CF.to_string()))?;
+        let blocks_cf = self.db.cf_handle(BLOCKS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
+
+        const FLUSH_EVERY: usize = 10_000;
+        let mut stats = HeadersNtxReconcileStats::default();
+        let mut batch = WriteBatch::default();
+        let mut pending = 0usize;
+
+        for item in self.db.iterator_cf(headers_cf, IteratorMode::Start) {
+            let (key, value) = item?;
+            stats.scanned += 1;
+            if key.len() != 32 || value.len() < 80 {
+                continue;
+            }
+            let stored_ntx = if value.len() >= 84 {
+                u32::from_le_bytes([value[80], value[81], value[82], value[83]])
+            } else {
+                0
+            };
+            let extended = value.len() > 84;
+            if stored_ntx == 0 && !extended {
+                continue;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&key);
+
+            let new_ntx = if !extended && self.header_connected_here(&hash, &value[4..36])? {
+                stats.kept += 1;
+                stored_ntx
+            } else if let Some(n) = self.body_tx_count(blocks_cf, &hash)? {
+                stats.recounted += 1;
+                n
+            } else {
+                stats.zeroed += 1;
+                0
+            };
+            if extended {
+                stats.stripped_extended += 1;
+            }
+            if extended || new_ntx != stored_ntx {
+                let mut new_value = Vec::with_capacity(84);
+                new_value.extend_from_slice(&value[0..80]);
+                new_value.extend_from_slice(&new_ntx.to_le_bytes());
+                batch.put_cf(headers_cf, hash, new_value);
+                pending += 1;
+                if pending >= FLUSH_EVERY {
+                    self.db.write(std::mem::take(&mut batch))?;
+                    pending = 0;
+                }
+            }
+        }
+
+        batch.put_cf(meta_cf, meta_keys::HEADERS_NTX_RECONCILED_V1, [1u8]);
+        self.db.write(batch)?;
+        Ok(Some(stats))
+    }
+
+    /// True when this node connected the block: genesis (all-zero prev), or
+    /// the active-chain block at its height with undo data at that height.
+    fn header_connected_here(&self, hash: &[u8; 32], prev: &[u8]) -> Result<bool> {
+        if prev.iter().all(|&b| b == 0) {
+            return Ok(true);
+        }
+        let height = match self.get_block_metadata_by_hash(hash)? {
+            Some(m) => m.height,
+            None => return Ok(false),
+        };
+        if self.get_block_hash_by_height(height)?.as_ref() != Some(hash) {
+            return Ok(false);
+        }
+        self.has_block_undo(height)
+    }
+
+    /// Transaction count of a body held in BLOCKS_CF: the CompactSize right
+    /// after the 80-byte header, read without deserialising the block.
+    fn body_tx_count(&self, blocks_cf: &rocksdb::ColumnFamily, hash: &[u8; 32]) -> Result<Option<u32>> {
+        let data = match self.db.get_pinned_cf(blocks_cf, hash)? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let b = &data[..];
+        if b.len() < 81 {
+            return Ok(None);
+        }
+        let n: u64 = match b[80] {
+            0xfd if b.len() >= 83 => u16::from_le_bytes([b[81], b[82]]) as u64,
+            0xfe if b.len() >= 85 => u32::from_le_bytes([b[81], b[82], b[83], b[84]]) as u64,
+            0xfd | 0xfe | 0xff => return Ok(None),
+            x => x as u64,
+        };
+        Ok(u32::try_from(n).ok())
     }
 
     // ========== Transaction Index Methods ==========

@@ -194,6 +194,16 @@ pub mod meta_keys {
     /// the chainstate, deletes this marker, and logs loudly so the
     /// operator knows to re-run `loadtxoutset`.
     pub const SNAPSHOT_LOAD_IN_PROGRESS: &[u8] = b"snapshot_load_in_progress";
+
+    /// Marker: the one-time HEADERS_CF nTx provenance reconcile has run.
+    ///
+    /// `tools/populate_headers_cf.py` and `tools/populate_corpus_headers.py`
+    /// used to write Bitcoin Core's nTx (and, for the corpus tool, Core's
+    /// chainwork/height/mediantime/nexthash in a 156-byte record) into
+    /// HEADERS_CF. `BlockchainDB::reconcile_headers_ntx_provenance` cleans
+    /// that out once and writes this key; later opens cost one point read.
+    /// Value: 1 byte, `1`.
+    pub const HEADERS_NTX_RECONCILED_V1: &[u8] = b"headers_ntx_reconciled_v1";
 }
 
 /// Encode a block hash as a 32-byte key
