@@ -123,3 +123,13 @@ Thumbs.db
 # Project-meta audit artifacts live in the meta-repo (audit-archive/).
 audit/
 CORE-PARITY-AUDIT/
+
+# Local node state and logs from running in the repo directory
+*.log
+*.crashdump
+peers.json
+anchors.dat
+fee_estimates.json
+
+# Bitcoin Core checkout used for test vectors (see docs/status.md)
+/bitcoin/
