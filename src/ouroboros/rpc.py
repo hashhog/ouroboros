@@ -5036,8 +5036,11 @@ class RPCServer:
             # HEADERS_CF fallback: when the full block body is absent (e.g.
             # because an assumeutxo snapshot load gapped BLOCKS_CF for heights
             # between genesis sync and the snapshot base), try the lightweight
-            # header-only store populated by connect_block_from_bytes and by
-            # the migration helper (populate_corpus_headers.py).
+            # header-only store populated by connect_block_from_bytes. The
+            # old Core-RPC populate tools are disarmed and their nTx/extended
+            # fields are reconciled away at DB open
+            # (reconcile_headers_ntx_provenance), so nTx here is 0 unless this
+            # node held the block's body or undo data.
             # ------------------------------------------------------------------
             raw_header_bytes: bytes | None = None
             raw_n_tx: int = 0

@@ -1953,4 +1953,146 @@ mod tests {
         assert_eq!(after.best_hash, [0x22; 32]);
         assert_ne!(after.hash_serialized, Some(good));
     }
+
+    // ========== HEADERS_CF nTx provenance reconcile ==========
+    //
+    // tools/populate_headers_cf.py and tools/populate_corpus_headers.py wrote
+    // Bitcoin Core's nTx (and, for the corpus tool, Core's chainwork/height/
+    // mediantime/nexthash) into HEADERS_CF. Opening a datadir that predates
+    // the reconcile marker must zero nTx this node cannot vouch for, keep the
+    // nTx it wrote itself, and never drop or alter the 80 header bytes.
+
+    const NTX_MARKER: &[u8] = b"headers_ntx_reconciled_v1";
+
+    fn header80(block: &BlockWrapper) -> [u8; 80] {
+        let v = bitcoin::consensus::encode::serialize(block.header());
+        let mut out = [0u8; 80];
+        out.copy_from_slice(&v);
+        out
+    }
+
+    /// Reopen `path` through a raw RocksDB handle and delete the reconcile
+    /// marker, so the next `BlockchainDB::open` sees a datadir written by a
+    /// binary that predates the reconcile. Returns whether it was present.
+    fn strip_ntx_marker(path: &str) -> bool {
+        let opts = rocksdb::Options::default();
+        let raw = rocksdb::DB::open_cf(
+            &opts,
+            path,
+            crate::storage::schema::get_column_families(),
+        )
+        .unwrap();
+        let meta = raw.cf_handle(crate::storage::schema::META_CF).unwrap();
+        let had = raw.get_cf(meta, NTX_MARKER).unwrap().is_some();
+        raw.delete_cf(meta, NTX_MARKER).unwrap();
+        had
+    }
+
+    fn ntx_marker_present(path: &str) -> bool {
+        let opts = rocksdb::Options::default();
+        let raw = rocksdb::DB::open_cf(
+            &opts,
+            path,
+            crate::storage::schema::get_column_families(),
+        )
+        .unwrap();
+        let meta = raw.cf_handle(crate::storage::schema::META_CF).unwrap();
+        let present = raw.get_cf(meta, NTX_MARKER).unwrap().is_some();
+        present
+    }
+
+    #[test]
+    fn test_headers_ntx_reconcile_zeroes_foreign_ntx_and_is_idempotent() {
+        let temp_dir = TempDir::new("headers_ntx_reconcile").unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let some_prev = BlockHash::from_byte_array([7u8; 32]);
+
+        // A: header-only, Core nTx, no body, unknown to the index.
+        let a = create_test_block(500, some_prev);
+        // B: corpus-tool extended record (Core nTx/chainwork/height/mt/next).
+        let b = create_test_block(800_000, some_prev);
+        // C: body held, stored nTx wrong -> recounted from the body (1 tx).
+        let c = create_test_block(600, some_prev);
+        // D: connected here (active chain + undo), body pruned -> kept.
+        let d = create_test_block(10, some_prev);
+        // E: on the active index (header backfill) but no undo, no body.
+        let e = create_test_block(11, some_prev);
+        // F: genesis-shaped (all-zero prev) -> kept.
+        let f = create_test_block(0, BlockHash::all_zeros());
+        // G: header-only with nTx 0 -> untouched.
+        let g = create_test_block(12, some_prev);
+
+        let h = |blk: &BlockWrapper| *blk.block_hash().as_byte_array();
+        {
+            let db = BlockchainDB::open(&path).unwrap();
+            db.store_raw_header(&h(&a), &header80(&a), 2500).unwrap();
+            db.store_raw_header_with_chainwork(
+                &h(&b), &header80(&b), 3721, &[0x11u8; 32], 800_000, 1_690_165_851, &[0x22u8; 32],
+            ).unwrap();
+            db.store_block(&c).unwrap();
+            db.store_raw_header(&h(&c), &header80(&c), 77).unwrap();
+            let md_d = BlockMetadata::new(10, [1u8; 32], d.header().time);
+            db.store_block_metadata(10, &h(&d), &md_d).unwrap();
+            db.store_block_undo(10, &crate::storage::undo::BlockUndo::new(), &[7u8; 32]).unwrap();
+            db.store_raw_header(&h(&d), &header80(&d), 42).unwrap();
+            let md_e = BlockMetadata::new(11, [1u8; 32], e.header().time);
+            db.store_block_metadata(11, &h(&e), &md_e).unwrap();
+            db.store_raw_header(&h(&e), &header80(&e), 1234).unwrap();
+            db.store_raw_header(&h(&f), &header80(&f), 1).unwrap();
+            db.store_raw_header(&h(&g), &header80(&g), 0).unwrap();
+        }
+        // Simulate a datadir written before the reconcile existed.
+        strip_ntx_marker(&path);
+
+        {
+            let db = BlockchainDB::open(&path).unwrap();
+            let ntx = |blk: &BlockWrapper| {
+                let (hdr, n) = db.get_raw_header(&h(blk)).unwrap()
+                    .expect("reconcile must never drop a HEADERS_CF entry");
+                assert_eq!(hdr, header80(blk), "header bytes must be untouched");
+                n
+            };
+            assert_eq!(ntx(&a), 0, "foreign nTx without body/undo must be zeroed");
+            assert_eq!(ntx(&b), 0, "Core-tool extended record nTx must be zeroed");
+            assert_eq!(ntx(&c), 1, "nTx must be recounted from the held body");
+            assert_eq!(ntx(&d), 42, "nTx of a block connected here must be kept");
+            assert_eq!(ntx(&e), 0, "index-only (no undo, no body) nTx must be zeroed");
+            assert_eq!(ntx(&f), 1, "genesis nTx must be kept");
+            assert_eq!(ntx(&g), 0);
+
+            let (_, n, cw, ht, mt, nh) =
+                db.get_raw_header_with_chainwork(&h(&b)).unwrap().unwrap();
+            assert_eq!((n, cw, ht, mt, nh), (0, [0u8; 32], 0, 0, [0u8; 32]),
+                "Core-sourced chainwork/height/mediantime/nexthash must be stripped");
+
+            // Written after the reconcile ran: must survive the next open.
+            db.store_raw_header(&h(&a), &header80(&a), 999).unwrap();
+        }
+        assert!(ntx_marker_present(&path), "reconcile must leave its marker");
+
+        {
+            let db = BlockchainDB::open(&path).unwrap();
+            let (_, n) = db.get_raw_header(&h(&a)).unwrap().unwrap();
+            assert_eq!(n, 999, "marker must make the reconcile one-time");
+            let (_, n) = db.get_raw_header(&h(&d)).unwrap().unwrap();
+            assert_eq!(n, 42);
+        }
+    }
+
+    #[test]
+    fn test_headers_ntx_reconcile_keeps_connect_path_ntx_on_fresh_db() {
+        // A fresh datadir gets the marker at first open, and nTx written by
+        // the normal connect path afterwards is never touched.
+        let temp_dir = TempDir::new("headers_ntx_fresh").unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let blk = create_test_block(5, BlockHash::from_byte_array([9u8; 32]));
+        let hash = *blk.block_hash().as_byte_array();
+        {
+            let db = BlockchainDB::open(&path).unwrap();
+            db.store_raw_header(&hash, &header80(&blk), 3).unwrap();
+        }
+        assert!(ntx_marker_present(&path), "first open must write the marker");
+        let db = BlockchainDB::open(&path).unwrap();
+        assert_eq!(db.get_raw_header(&hash).unwrap().unwrap().1, 3);
+    }
 }
