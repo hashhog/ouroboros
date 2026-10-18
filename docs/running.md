@@ -67,7 +67,7 @@ The RPC server always listens on `127.0.0.1`. There is no option to bind it else
 
 ## Config file
 
-The config file is read with Python's `configparser`, so it must have at least one `[section]` header; a file of bare `key=value` lines is ignored with a warning in the log. Keys are looked up in these sections only: `[rpc]`, `[p2p]`, `[network]`, `[logging]` and `[mainnet]`. Keys in `[DEFAULT]`, `[regtest]`, `[testnet4]` or any other section are not read, whatever `--network` says. The section name does not need to match the key; `[rpc]` is a safe place for all of them.
+The config file is read with Python's `configparser`, so it must have at least one `[section]` header; a file of bare `key=value` lines is ignored with a warning in the log. Keys are looked up in these sections only: `[rpc]`, `[p2p]`, `[network]`, `[logging]` and `[mainnet]`. Keys in `[regtest]`, `[testnet4]` or any other section are not read, whatever `--network` says. Keys in `[DEFAULT]` are read only when the file also has one of the five sections above, because `configparser` copies `[DEFAULT]` values into every section; in a file whose only section is `[DEFAULT]` they are ignored. The section name does not need to match the key; `[rpc]` is a safe place for all of them.
 
 These keys take effect:
 
