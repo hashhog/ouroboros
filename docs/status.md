@@ -89,7 +89,7 @@ curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"help","params":[]}' ht
 ## Known limitations
 
 - The REST interface, ZMQ notifications and pruning exist in the code but cannot be turned on: no command-line option sets them, and the config-file keys for them are not read.
-- The config file is only read from the `[rpc]`, `[p2p]`, `[network]`, `[logging]` and `[mainnet]` sections; `[DEFAULT]` and per-network sections such as `[regtest]` are ignored ([running.md](running.md#config-file)).
+- The config file is only read from the `[rpc]`, `[p2p]`, `[network]`, `[logging]` and `[mainnet]` sections; per-network sections such as `[regtest]` are ignored, and `[DEFAULT]` is ignored when it is the only section ([running.md](running.md#config-file)).
 - `--rpc-port` and `--p2p-port` default to 8332 and 8333 on every network.
 - `proxy`, `onion`, `i2psam`, `torcontrol` and `asmap` are parsed from the config file but not used, so Tor, I2P and ASMap bucketing cannot be enabled.
 - The RPC server only listens on `127.0.0.1`.
