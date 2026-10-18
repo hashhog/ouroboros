@@ -1,347 +1,91 @@
 # ouroboros
 
-A Bitcoin full node written in Python and Rust.
+A Bitcoin full node written from scratch in Python, with its storage and hot paths in Rust. One of the ten [hashhog](https://github.com/hashhog) nodes.
 
-## Status — v1.0.2
+> **Experimental.** hashhog nodes are independent re-implementations of Bitcoin Core for research and testing. Do not use them with real funds.
 
-> **Every `receipts/…`, `tools/…`, `docs/…` and `CORE-PARITY-AUDIT/…` path cited in
-> this section is in the hashhog meta-repo, which is permanently private.** Those
-> citations are maintainer provenance, not evidence you can check. The full note on
-> what that does and does not leave verifiable is further down this section.
+## Status
 
-**Label: "Replay-verified"**
-(`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That label is
-deliberately weaker than "Validated", and the scorecard spells out why: it means
-ouroboros agreed with Core on every block the nightly instruments showed it — 169
-distilled real mainnet blocks, 10 block-context corpus entries, and its row in the
-nightly corpus sweep — and that the 26,067-height stateless replay has since
-COMPLETED: 26,067 distinct heights, `accept` on every one, 0 disagreements, 0
-harness-limit rows, against 51,512 rejected control twins (scorecard footnote
-[1], which also records that the first run silently compared only 65% of its
-input and had to be re-run).
-> **What that does and does not mean.** It is a *stateless* re-check of each block
-> against Core's rules with scripts on. It is **not** a from-genesis reproduction
-> of Core's UTXO set, and this node still has **no from-genesis evidence at all**. The git tag `v0.1.0-beta1`
-(`receipts/RELEASE-v1.0-FREEZE.md`) says the same thing from the other side: `rc`
-is reserved for an independent from-genesis `--assumevalid=0` reproduction of
-Core's UTXO-set commitment, and `beta` means that receipt does not exist
-(`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
-or fund-custody readiness — see `SECURITY.md`.
+| Area | State |
+|---|---|
+| Mainnet validation | Blocks 0 to 958,794 were validated with script checks on, as 48 consecutive block ranges. Each range began from the UTXO set the previous one ended with, and the set at 958,794 matched Bitcoin Core's `hash_serialized_3` (`29692050…6e7af0`, 166,180,925 coins). The ranges ran on several commits of this repo, not on one build. See [docs/status.md](docs/status.md) for how to check this yourself. |
+| Script interpreter | Passes all 1,222 vectors in Bitcoin Core v31.1's `script_tests.json` and all 500 in `sighash.json` ([docs/status.md](docs/status.md#script-interpreter)). |
+| UTXO set vs Core on regtest | After syncing a chain from Bitcoin Core v31.1 over P2P, `gettxoutsetinfo` returns the same `hash_serialized_3` as Core ([docs/status.md](docs/status.md#utxo-set-against-core-on-regtest)). |
+| RPC | 142 JSON-RPC methods; 130 have Core's names. Some error codes and messages differ. See [docs/rpc.md](docs/rpc.md). |
+| Test suite | `python -m pytest`: 3,953 passed, 4 failed, 83 skipped, 58 expected failures ([docs/status.md](docs/status.md#test-suite)). |
+| Wallet | Descriptor HD wallets, PSBT and coin selection work on regtest. Not reviewed for custody: see [SECURITY.md](SECURITY.md). |
 
-**ouroboros has not been shown to validate the chain from genesis.** There is no
-ouroboros row in the reproduction ledger (`receipts/TRUST-ANCHOR.md:140-145`) and
-no ouroboros replay ledger in `CORE-PARITY-AUDIT/replay-ledgers/`, which holds
-six files and none for this node. `receipts/TRUST-ANCHOR.md:187-198` (correction,
-2026-09-01) also retracts ouroboros' pre-2026-09-01 M2 boundary-campaign rows as
-script evidence: they ran with the implementation's default assumevalid setting.
-The project's own throughput note (`CHARTER.md`, §"R4 — Proven
-validator", "Honest limit") groups ouroboros with the interpreted
-implementations for which a full from-genesis pass is impractical on the current
-hardware.
+Last updated: 2026-10-17.
 
-**A worse problem, receipted 2026-09-01 and fixed the next day: ouroboros'
-assumevalid flag did not reach its RPC path.** As receipted at
-`receipts/TRUST-ANCHOR.md:233-242`, `--assumevalid 0` set only
-`block_sync.force_full_scripts` — the P2P drain — so `rpc_submitblock` →
-`accept_block` → `validate_block` ran without `force_check_scripts` and
-`can_skip_scripts_for_block` returned true below the last checkpoint. Scripts were
-skipped for every block fed over RPC below mainnet height 850,000, and the flag
-could not turn them on.
+## Quick start
 
-**Fixed in `8743575`** (2026-09-02, "fix: honour -assumevalid=0 on the submitblock
-path, not only the P2P drain"), an ancestor of this README's own commit.
-`Node.start` now sets `self.validator.force_full_scripts`
-(`src/ouroboros/node.py:635`) so every acceptance path honours the switch —
-`submitblock`, `submitblockbatch`, `generatetoaddress` and the submitblock reorg
-connect — matching Core's `ConnectBlock`, where `fScriptChecks` is
-unconditionally true under `-assumevalid=0`
-(`bitcoin-core/src/validation.cpp:2345-2347`). The reasoning is documented at
-`src/ouroboros/rpc.py:768-774` and pinned by
-`tests/test_assumevalid_submitblock_path.py`. Default behaviour with assumevalid
-unset is unchanged: scripts are still skipped below the checkpoint, as in Core.
-
-**What the fix does not undo:** every harness run *before* that commit that fed
-this node blocks over `submitblock` below 850,000 and reported agreement was
-measuring chain selection, not script verification. A reader of this repository
-alone should still assume ouroboros' from-genesis validation is untested.
-
-**Operator RPC parity: 52 of Bitcoin Core's 85.** From the 103-method R5
-operator probe run 2026-09-01
-(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): ouroboros 52 PASS /
-33 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
-(`SKIP-REGTEST`) for every node including Core. Failures include wrong error
-codes (`decoderawtransaction` on non-hex returns `-32603` where Core returns
-`-22`), a `getblockstats` anchor height reported as 0, and calls that succeed
-where Core errors.
-
-**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
-unit suite went 105 failing → 0 with no skips and no gaps carried. One of those
-was a real bug, mutation-verified: `c759449` — the `WITNESS_UNKNOWN` input gate
-was dead code, so spends of v2+ witness programs passed
-`ValidateInputsStandardness`.
-
-**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the hashhog
-meta-repo, which is **not public** — see the note below.
-
-> **The cited paths are NOT publicly readable — do not treat them as evidence.**
-> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
-> the hashhog meta-repo, which is a **permanently private** repository, not to
-> this one. They are provenance for the maintainers. From outside, any claim
-> resting only on such a path is **unverified**, and you should read it as such.
->
-> Two of those paths are unreadable even with the meta-repo in hand: the R5 probe
-> JSON is gitignored (`.gitignore:60  tools/diff-test-artifacts/`) and so are the
-> nightly `diffguard-*.log` files (`.gitignore:43  *.log`). Regenerate the probe
-> JSON with `python3 tools/r5_probe.py` against a running fleet.
->
-> **What you can check from this repository alone:** `bash proof/verify.sh`
-> (CHARTER proof bundle: every claim cites a file here, R4 stays UNPROVEN,
-> snapshot-booted ranges are refused, and an in-repo T2 + assumevalid test
-> is re-run live), build it, run its own test suite, and reproduce its
-> behaviour against Bitcoin Core yourself. That is the evidence this repo
-> actually ships.
-
-## Quick Start
-
-### Docker
+Tested on Debian 13 with Python 3.13 and Rust 1.99. Python 3.11 to 3.13 is supported. The Rust build compiles RocksDB from source: about 27 CPU-minutes, two minutes of wall time on a 16-core machine.
 
 ```bash
-docker build -t ouroboros .
-docker run -v ouroboros-data:/data -p 48350:48350 -p 48340:48340 ouroboros
+sudo apt-get install -y build-essential clang libclang-dev pkg-config python3-dev python3-venv git curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"
+git clone https://github.com/hashhog/ouroboros.git && cd ouroboros
+python3 -m venv .venv && . .venv/bin/activate && pip install maturin
+maturin build --release --manifest-path ferrous-utils/sync/Cargo.toml && pip install target/wheels/*.whl && pip install -e '.[dev]'
+DATADIR=$(mktemp -d)
+ouroboros --network regtest --data-dir "$DATADIR" start --rpc-port 18443 --p2p-port 18444 &
+sleep 5
+curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"getblockchaininfo","params":[]}' http://127.0.0.1:18443/
+curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"stop","params":[]}' http://127.0.0.1:18443/
 ```
 
-### From Source
+The first `curl` prints the regtest genesis state (`"chain":"regtest","blocks":0`). Always pass `--rpc-port` and `--p2p-port`: the defaults are 8332 and 8333 on every network, so without them a regtest node would try to take mainnet's ports.
 
-Requires Python `>=3.11,<3.14` (`pyproject.toml` `requires-python`), a stable Rust
-toolchain + `maturin` for the `ferrous-utils/sync` PyO3 extension (no `rust-version`
-pin; Cargo edition 2021, pyo3 0.27), and system libs `libclang-dev libssl-dev
-librocksdb-dev pkg-config` (see `Dockerfile` / `setup.sh`, which needs interactive
-`sudo` for `apt-get`).
+## Running
+
+`--network` selects `mainnet` (the default), `testnet4`, `testnet3` (or `testnet`), `regtest` or `signet`. Global options such as `--network` and `--data-dir` go before the subcommand; node options go after `start`.
+
+| Network | Flag | Suggested `--p2p-port` | Suggested `--rpc-port` |
+|---|---|---|---|
+| mainnet | (none) | 8333 | 8332 |
+| testnet4 | `--network testnet4` | 48333 | 48332 |
+| testnet3 | `--network testnet3` | 18333 | 18332 |
+| regtest | `--network regtest` | 18444 | 18443 |
+| signet | `--network signet` (not tested) | 38333 | 38332 |
+
+The suggested ports are Bitcoin Core's. Data goes directly into `--data-dir` (default `~/.ouroboros`), with no per-network subdirectory, so give each network its own datadir. Blocks, the block index and the UTXO set live in one RocksDB database there. For mainnet, plan for at least the disk of an unpruned Bitcoin Core node and a few GB of RAM. By default scripts are not checked for blocks at or below the last checkpoint (mainnet height 850,000); `--noassumevalid` checks every script. A from-genesis mainnet sync is slow, because most validation runs in Python.
+
+`start` syncs the chain and serves RPC. Every flag, the config file, environment variables and the datadir layout are in [docs/running.md](docs/running.md).
+
+## RPC
+
+ouroboros serves a JSON-RPC interface modelled on Bitcoin Core's, on `127.0.0.1` at `--rpc-port`. On startup it writes a cookie to `<datadir>/.cookie`. With the quick-start node running (before the final `stop`):
 
 ```bash
-./setup.sh
-source .venv/bin/activate
-
-# Sync the blockchain
-ouroboros --network testnet4 sync
-
-# Start the node
-ouroboros --network testnet4 start --rpc-port=48350 --p2p-port=48340
-
-# Check status
-ouroboros status
+curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"createwallet","params":["demo"]}' http://127.0.0.1:18443/
+curl -s --user "$(cat "$DATADIR/.cookie")" -d '{"method":"getnewaddress","params":[]}' http://127.0.0.1:18443/wallet/demo
 ```
 
-## Features
+As in Core, wallet calls go to a named wallet through the `/wallet/<name>` URL path. Responses always carry `"jsonrpc":"2.0"` and leave out `error` on success, even for JSON-RPC 1.0 requests. The method list and known differences from Core are in [docs/rpc.md](docs/rpc.md).
 
-- Full block and transaction validation (SegWit P2WPKH/P2WSH, Taproot, BIP65/66/68 time locks, sigop counting)
-- Script interpreter (all standard opcodes, P2PKH, P2SH, P2WPKH, P2WSH, P2TR, NULLFAIL, MINIMALIF, WITNESS_PUBKEYTYPE, witness cleanstack, FindAndDelete, OP_CODESEPARATOR)
-- Header-first sync with full PoW validation
-- Block download with Rust-accelerated sync engine (PyO3 bindings)
-- Mempool with ancestor/descendant limits (25 txs, 101KB)
-- Full RBF (BIP-125) with mempoolfullrbf support
-- TRUC (v3 transaction) policy and ephemeral dust
-- Package relay and CPFP (BIP-331 P2P messages: sendpackages, getpkgtxns, pkgtxns, ancpkginfo)
-- BIP-339 WTXIDRELAY and BIP-155 SENDADDRV2 negotiation
-- BIP-155 ADDRv2 (Tor v3, I2P, CJDNS addresses)
-- BIP-324 v2 encrypted transport
-- Eclipse attack mitigations (bucketed addrman, /16 diversity, anchors, feelers)
-- Stale tip detection and peer eviction (ConsiderEviction, extra outbound connection)
-- Transaction trickling (Poisson-timed relay for privacy)
-- Pre-handshake peer filtering (protocol version check, timeout)
-- Compact blocks (BIP-152)
-- Minisketch-based Erlay reconciliation
-- PSBT (BIP-174/370, creation, signing, combining, finalization, taproot fields)
-- Output descriptors (BIP380-386: pk, pkh, wpkh, tr, sh, wsh, multi, sortedmulti, combo, addr, raw)
-- Miniscript (BIP-379: parsing, type checking, compilation to Script, witness size analysis)
-- Signature verification cache (LRU, cleared on reorg)
-- Fee estimation (confirmation targets, bucketed tracking)
-- Block template construction (getblocktemplate with segwit rules)
-- REST interface for block explorers (block, tx, headers, utxos, mempool, chaininfo)
-- ZMQ notifications (hashblock, hashtx, rawblock, rawtx, sequence)
-- Tor SOCKS5 proxy support
-- Block pruning (pruneblockchain RPC)
-- Chain management (invalidateblock, reconsiderblock RPCs)
-- Regtest mode (generatetoaddress, generateblock RPCs)
-- Multi-wallet support (createwallet, loadwallet, unloadwallet)
-- Wallet encryption (encryptwallet, walletpassphrase, walletlock, walletpassphrasechange)
-
-## Configuration
-
-### CLI Flags
-
-Global options (before command):
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--data-dir DIR` | `~/.ouroboros` | Data directory (env: `OUROBOROS_DATADIR`) |
-| `--config FILE` | `$datadir/ouroboros.conf` | Path to config file |
-| `--network NET` | `mainnet` | Network: mainnet, testnet, testnet3, testnet4, regtest, signet |
-| `--debug` | off | Enable debug logging (also sets `OUROBOROS_VERBOSE=1`) |
-| `--log-json` | off | Emit structured JSON log lines |
-
-`start` command options:
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--rpc-port PORT` | `8332` | RPC server port |
-| `--p2p-port PORT` | `8333` | P2P network port |
-| `--listen/--nolisten` | listen | Accept inbound P2P connections |
-| `--connect ADDR` | none | Connect to specific peer (repeatable) |
-| `--force` | off | Skip sync check prompt |
-
-`sync` command options:
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--reset` | off | Clear chainstate before syncing |
-| `--limit N` | none | Sync only the first N blocks |
-
-Script verification environment switches:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OUROBOROS_NATIVE_SCRIPT` | unset (Python) | `1` routes `ScriptInterpreter.verify` and the legacy sighash through the Rust port of Bitcoin Core's interpreter in `ferrous-utils/sync/src/validate/interpreter.rs` (`sync.ScriptTx` / `sync.script_verify`). Fail-closed: if the installed `sync` extension has no native interpreter the node refuses to start instead of silently running Python. The pure-Python interpreter stays the default and the oracle (`tests/native_script_differential.py`). `--par` only parallelises this native path; what it would take to make native the default, and what still blocks it, is `docs/NATIVE-SCRIPT-DEFAULT.md`. |
-| `OUROBOROS_SCRIPT_THREADS` | `8` (capped at CPU count) | With the native interpreter, block validation queues every input's script check and joins them on a thread pool after the block-level checks (Core's CCheckQueue shape; the Rust call releases the GIL). `1` keeps the inline serial path. Ignored by the Python interpreter. |
-
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `sync` | Synchronize blockchain (initial block download) |
-| `start` | Start the Bitcoin node |
-| `status` | Show node status |
-| `getbalance` | Get balance for an address |
-| `import-utxo` | Import UTXO snapshot in Bitcoin Core dumptxoutset v2 format |
-| `import-blocks` | Import blocks from framed binary file or stdin |
-
-### Config File
-
-`ouroboros.conf` in the data directory (key=value format with optional `[section]` headers):
-
-```ini
-network=testnet4
-rpcport=48350
-rpcuser=myuser
-rpcpassword=mypass
-p2pport=48340
-maxconnections=125
-listen=1
-rest=1
-proxy=127.0.0.1:9050
-zmqpubhashblock=tcp://127.0.0.1:28332
-zmqpubhashtx=tcp://127.0.0.1:28333
-i2psam=127.0.0.1:7656
-torcontrol=127.0.0.1:9051
-
-[testnet4]
-rpcport=48350
-```
-
-Environment variables `OUROBOROS_<KEY>` override config file values.
-
-## RPC API
-
-JSON-RPC via FastAPI, modelled on Bitcoin Core's, with batch request support and rate limiting. Not behaviourally compatible: on the 2026-09-01 operator probe ouroboros answers 52 of the 103 probed methods correctly against Core's 85, with 33 failures (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`).
-
-| Category | Methods |
-|----------|---------|
-| Blockchain | `getblockchaininfo`, `getblock`, `getblockhash`, `getblockheader`, `getblockcount`, `getbestblockhash`, `getchaintips`, `getchaintxstats`, `getdifficulty`, `gettxout`, `gettxoutsetinfo`, `getblockfilter`, `verifychain` |
-| Transactions | `getrawtransaction`, `sendrawtransaction`, `decoderawtransaction`, `decodescript`, `createrawtransaction`, `signrawtransactionwithkey`, `testmempoolaccept`, `submitpackage`, `gettxoutproof`, `verifytxoutproof` |
-| Mempool | `getmempoolinfo`, `getrawmempool`, `getmempoolancestors`, `getmempooldescendants`, `prioritisetransaction` |
-| Mining | `getblocktemplate`, `submitblock`, `submitblockbatch`, `getmininginfo`, `getnetworkhashps`, `generatetoaddress`, `generateblock` |
-| Network | `getpeerinfo`, `getnetworkinfo`, `getconnectioncount`, `addnode`, `disconnectnode`, `setban`, `listbanned`, `clearbanned`, `getnettotals` |
-| Wallet | `createwallet`, `loadwallet`, `unloadwallet`, `listwallets`, `listwalletdir`, `getnewaddress`, `getrawchangeaddress`, `getbalance`, `sendtoaddress`, `listunspent`, `listtransactions`, `gettransaction`, `getwalletinfo`, `getaddressinfo`, `keypoolrefill`, `sethdseed`, `importprivkey`, `dumpprivkey`, `backupwallet`, `bumpfee` |
-| Wallet Security | `encryptwallet`, `walletpassphrase`, `walletlock`, `walletpassphrasechange` |
-| Descriptors | `getdescriptorinfo`, `deriveaddresses`, `importdescriptors`, `listdescriptors` |
-| PSBT | `createpsbt`, `decodepsbt`, `combinepsbt`, `finalizepsbt` |
-| Util | `validateaddress`, `estimatesmartfee` |
-| Chain Mgmt | `invalidateblock`, `reconsiderblock`, `pruneblockchain` |
-| Control | `help`, `stop`, `uptime`, `getrpcinfo`, `getindexinfo` |
-
-REST interface available when `rest=1` is set in config, with endpoints for blocks, transactions, headers, UTXOs, mempool, and chain info.
-
-## Monitoring
-
-Built-in Prometheus metrics exporter (requires `prometheus_client` package). Starts an HTTP server on port 9332 by default.
-
-Exported metrics include:
-- `ouroboros_block_height` -- current chain tip height
-- `ouroboros_chain_difficulty` -- current chain difficulty
-- `ouroboros_peers_connected` -- number of connected peers
-- `ouroboros_mempool_size` / `ouroboros_mempool_tx_count` -- mempool statistics
-- `ouroboros_utxo_cache_size` / `ouroboros_utxo_cache_hit_rate` -- UTXO cache performance
-- `ouroboros_blocks_received` / `ouroboros_tx_received` -- cumulative counters
-- `ouroboros_rpc_requests` / `ouroboros_rpc_duration` -- RPC server metrics
-- `ouroboros_stale_tip_detected` / `ouroboros_peer_evictions` -- health indicators
-
-## Architecture
-
-ouroboros uses a hybrid Python/Rust architecture. The performance-critical block sync engine, chain validation, and UTXO set management are implemented in Rust and exposed to Python via PyO3 bindings (built with maturin). This allows the Rust layer to handle the computationally intensive initial block download at native speed while Python provides the application logic, RPC server, mempool, and P2P networking through an asyncio event loop.
-
-The Python layer uses FastAPI to serve the JSON-RPC interface, providing automatic request validation and async request handling. The Click library structures the CLI with subcommands (sync, start, status) and Rich provides formatted terminal output with progress bars and status tables. Configuration follows Bitcoin Core conventions with a `ouroboros.conf` file supporting `[section]` headers for per-network settings, with environment variable overrides.
-
-The P2P networking layer runs on Python asyncio, managing peer connections, protocol handshakes, and message dispatch. Eclipse attack mitigations include bucketed address management with /16 netgroup diversity, anchor connections for restart resilience, and feeler connections to probe new addresses. Stale tip detection follows Bitcoin Core's ConsiderEviction logic, opening extra outbound connections when the chain tip falls behind.
-
-The mempool enforces ancestor and descendant limits (25 transactions, 101KB aggregate virtual size), with full RBF support and TRUC (v3) policy for topologically restricted transactions. Package relay implements BIP-331 with child-pays-for-parent fee evaluation across package boundaries. The Prometheus metrics module provides optional observability with gauges for chain height, peer count, and UTXO cache performance, plus histograms for RPC latency.
-
-## Performance Architecture
-
-ouroboros separates work into two layers to minimise Python overhead during
-Initial Block Download (IBD):
-
-**Rust hot paths (ferrous-utils/sync)**
-
-- Block and transaction storage — RocksDB-backed UTXO set and block index via
-  `PyBlockchainDB`
-- Cryptographic primitives — SHA-NI-accelerated double-SHA256, secp256k1
-  ECDSA/Schnorr via libsecp256k1 with batch Schnorr verification
-- Batch UTXO lookup — `get_utxo_batch()` fetches all inputs for a transaction
-  in a single FFI call, replacing N individual calls and halving GIL
-  re-acquisition overhead in the validation inner loop
-- Script flags, difficulty retarget, checkpoint and assume-valid logic
-
-**Python coordination layer**
-
-- asyncio event loop driving FastAPI (RPC), P2P peer sockets, and mempool
-- `block_sync._drain_block_buffer` runs `validate_block` and
-  `connect_block_from_bytes` via `asyncio.to_thread` so the event loop stays
-  free to service incoming RPC requests between block connections
-- An `await asyncio.sleep(0)` yield after each connected block lets the
-  scheduler dispatch any pending coroutines before the next validation begins
-- `RPCServer._get_deployment_state_cached` caches BIP9 deployment state by
-  chain height so `getblockchaininfo` never calls Rust FFI on the hot path,
-  eliminating GIL contention with the validation thread pool workers
-- `size_on_disk` is recomputed at most once per 30 seconds to avoid
-  repeated filesystem walks
-
-**Profiling recipe**
+## Development
 
 ```bash
-# Attach py-spy to a running node (non-invasive, no code changes required)
-sudo py-spy record -o /tmp/ouroboros-prof.svg -d 60 -p $(pgrep -f 'ouroboros.cli')
-
-# 50-call RPC latency probe
-python3 tests/rpc_latency_probe.py --port 8359 --cookie ~/.ouroboros/.cookie --calls 50
-
-# Profile with yappi inside the process (add to cli.py startup)
-import yappi; yappi.start(builtins=True)
-# ... run workload ...
-yappi.stop(); yappi.get_func_stats().print_all()
+git clone --depth 1 --branch v31.1 https://github.com/bitcoin/bitcoin.git bitcoin   # Core's test vectors, used by some tests
+python -m pytest                 # about 4,100 tests; under two minutes
 ```
 
-**IBD latency, one probe run, 2026-04-10/11** (getblockchaininfo, 50 calls, mainnet
-IBD at height ~495k). These numbers come from a single ad-hoc run of
-`tests/rpc_latency_probe.py`; no result artifact was committed, and the node now runs
-at the chain tip rather than mid-IBD, so they describe a configuration that no longer
-exists. Re-run the probe rather than quoting the table:
+```
+src/ouroboros/             the Python node: CLI, node startup, P2P, sync, validation, mempool, RPC, wallet
+src/ouroboros/cli.py       command line (click)
+src/ouroboros/node.py      wires the components together and starts them
+src/ouroboros/rpc.py       JSON-RPC server (FastAPI) and every RPC method
+ferrous-utils/sync/        Rust extension (PyO3): RocksDB storage, block and script validation, header sync
+ferrous-utils/common/      shared Rust helpers
+tests/                     pytest suite; tests/functional/ holds regtest functional tests
+```
 
-| Date       | Fix                         | p50   | p95     | max     |
-|------------|-----------------------------|-------|---------|---------|
-| 2026-04-10 | baseline (async.to_thread)  | 4998ms | 10010ms | 10010ms |
-| 2026-04-10 | +sleep(0) yield + tip cache | 1ms   | 1635ms  | 1635ms  |
-| 2026-04-11 | +deployment cache + batch UTXO | 1ms | <100ms | <400ms |
+[docs/architecture.md](docs/architecture.md) describes how the parts fit together, [docs/building.md](docs/building.md) covers the toolchain and build options, and [CONTRIBUTING.md](CONTRIBUTING.md) explains how to send changes.
+
+## Security
+
+Please report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
