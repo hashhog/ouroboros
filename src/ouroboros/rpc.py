@@ -10740,8 +10740,11 @@ class RPCServer:
         # <= 10 ("a very deep invalidation ... keeping the mempool up to date
         # is probably futile"): the 10 highest blocks come back, the deeper
         # ones do not — but removeForReorg still runs, and spenders of their
-        # outputs are removeRecursive'd.  Deeper first, so their outputs are
-        # already gone when the top 10 are re-accepted.
+        # outputs are removeRecursive'd.  One update_for_reorg call: the
+        # deeper blocks' spenders go first, then the top 10 are re-accepted,
+        # and only then does removeForReorg run — so a pool spender of a
+        # re-added tx is linked to it and kept (Core's removeForReorg for a
+        # block runs after that block's txs are back).
         blocks = [b for b in blocks if b is not None]
         deep, top = blocks[:-INVALIDATE_READD_MAX_BLOCKS], blocks[-INVALIDATE_READD_MAX_BLOCKS:]
 
@@ -10749,9 +10752,7 @@ class RPCServer:
             return [tx for blk in bs
                     for tx in (getattr(blk, "transactions", None) or [])]
 
-        if deep:
-            mempool.update_for_reorg(_txs(deep), int(tip_h), add_to_mempool=False)
-        mempool.update_for_reorg(_txs(top), int(tip_h))
+        mempool.update_for_reorg(_txs(top), int(tip_h), not_readded_txs=_txs(deep))
 
     def _mempool_follow_rust_reorg(self, db, old_tip_hash, old_tip_height) -> None:
         """The Rust layer moved the active chain (reconsiderblock's

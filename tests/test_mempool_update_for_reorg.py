@@ -592,6 +592,41 @@ def test_deep_invalidate_readds_only_top_ten_blocks():
         "spender of a not-re-added tx goes")
 
 
+def test_deep_invalidate_keeps_linked_child_of_readded_tx():
+    """12 blocks disconnected; C12 spends t_12 (the tip block's tx) and C3
+    spends t_3 (the deepest re-added block), both already in the pool.  Core
+    runs removeForReorg per DisconnectTip only after that block's txs are
+    back, so C12 and C3 keep their re-added parents and stay, linked.
+    Deployed 0408dde ran removeForReorg on the deep pass before any re-add
+    and dropped both.  M (spending t_1, not re-added) still goes."""
+    sdb = _StubDB(tip=112)
+    coins = [(bytes([0xa0 + i]) * 32, 0) for i in range(12)]
+    txs = [_tx([coins[i]], 99_000_000, 110 + i) for i in range(12)]
+    for t in txs:
+        sdb.utxos[(t.get_txid(), 0)] = _coin(101)
+    mp = Mempool(_Validator(sdb), require_standard=False)
+    c12 = _tx([(txs[11].get_txid(), 0)], 98_000_000, 130)
+    c3 = _tx([(txs[2].get_txid(), 0)], 98_000_000, 131)
+    m = _tx([(txs[0].get_txid(), 0)], 98_000_000, 132)
+    for t in (c12, c3, m):
+        ok, err = mp.add_transaction(t, height=112)
+        assert ok, err
+    for i, t in enumerate(txs):
+        del sdb.utxos[(t.get_txid(), 0)]
+        sdb.utxos[coins[i]] = _coin(5)
+    blocks = [SimpleNamespace(transactions=[_coinbase(140 + i), t])
+              for i, t in enumerate(txs)]                    # ascending
+    _invalidate_refill(mp, sdb, blocks, 100)
+    want = {t.get_txid() for t in txs[2:]} | {c12.get_txid(), c3.get_txid()}
+    assert _ids(mp) == want, (
+        "an in-pool spender of a re-added tx must survive a >10-block "
+        "invalidate; the spender of a not-re-added tx must not")
+    for child, parent in ((c12, txs[11]), (c3, txs[2])):
+        assert child.get_txid() in mp.transactions[parent.get_txid()].children
+        assert parent.get_txid() in mp.transactions[child.get_txid()].parents
+        assert mp.transactions[child.get_txid()].ancestor_count == 2
+
+
 class _MtpDownDB(_StubDB):
     down = False
 

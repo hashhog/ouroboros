@@ -4127,7 +4127,8 @@ class Mempool:
         return self._remove_with_descendants(bad_roots, "reorg")
 
     def update_for_reorg(
-        self, disconnected_txs, tip_height: int, add_to_mempool: bool = True
+        self, disconnected_txs, tip_height: int, add_to_mempool: bool = True,
+        not_readded_txs=(),
     ) -> dict:
         """Core ``MaybeUpdateMempoolForReorg`` (validation.cpp), run after the
         chain has moved (DisconnectTip/ConnectTip done, removeForBlock already
@@ -4140,19 +4141,29 @@ class Mempool:
         bypass_limits; one that fails is removeRecursive'd: its in-pool
         spenders leave with their descendants.  Re-added txs get their
         existing in-pool children linked (UpdateTransactionsFromBlock).  Then
-        removeForReorg, then LimitMempoolSize.  All under the mempool lock;
+        removeForReorg, then LimitMempoolSize.
+
+        *not_readded_txs*: transactions of disconnected blocks that are NOT
+        re-submitted (InvalidateBlock's blocks below the top 10, Core's
+        fAddToMempool=false).  They are removeRecursive'd first, before any
+        re-add, and removeForReorg runs once, after the re-adds: Core runs
+        removeForReorg per DisconnectTip only once that block's txs are back,
+        so an in-pool spender of a re-added tx keeps its parent.  All under
+        the mempool lock;
         callers hold the chain lock, so no reader sees the pool disagree
         with the tip."""
         readded: list[bytes] = []
         failed = 0
         dropped: set[bytes] = set()
         with self._lock:
-            for tx in disconnected_txs:
+            work = [(tx, False) for tx in not_readded_txs]
+            work += [(tx, add_to_mempool) for tx in disconnected_txs]
+            for tx, readd in work:
                 if getattr(tx, "is_coinbase", False):
                     continue
                 txid = tx.get_txid()
                 ok = False
-                if add_to_mempool:
+                if readd:
                     try:
                         wtxid = tx.get_wtxid()
                     except Exception:
