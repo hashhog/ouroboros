@@ -23,6 +23,8 @@ from ouroboros.fatal import (
     is_system_error,
 )
 from ouroboros.validation import (
+    COINBASE_MATURITY,
+    MissingAncestorHeaderError,
     TransactionValidator,
     WITNESS_SCALE_FACTOR,
     DEFAULT_BYTES_PER_SIGOP,
@@ -1704,6 +1706,17 @@ def _is_witness_standard(
     return True, ""
 
 
+def _lock_constrained(tx: Transaction) -> bool:
+    """Whether nLockTime (BIP113) or a relative lock (BIP68) applies to *tx*:
+    an active nLockTime (non-zero, some input not SEQUENCE_FINAL), or a v2+ tx
+    with an input whose sequence-lock disable flag (bit 31) is clear."""
+    if tx.locktime != 0 and any(i.sequence != 0xFFFFFFFF for i in tx.inputs):
+        return True
+    return tx.version >= 2 and any(
+        not (i.sequence & (1 << 31)) for i in tx.inputs
+    )
+
+
 @dataclass
 class MempoolEntry:
     """Entry in the mempool.
@@ -2409,9 +2422,17 @@ class Mempool:
 
     def _add_transaction_inner(
         self, tx: Transaction, height: int, test_accept: bool = False,
-        peer: object = None,
+        peer: object = None, bypass_limits: bool = False,
+        store_orphan: bool = True,
     ) -> tuple[bool, str]:
         """Unlocked implementation of add_transaction.
+
+        *bypass_limits* (Core ``MemPoolAccept::ATMPArgs::m_bypass_limits``, set
+        only by the reorg refill ``update_for_reorg``) skips the fee-rate floor
+        (``CheckFeeRate``: min relay fee + rolling mempool min fee) and the
+        size-limit eviction; every other check still runs.  *store_orphan*
+        False keeps a missing-inputs tx out of the orphan pool (Core's reorg
+        refill never touches the orphanage — that is net_processing's).
 
         When *test_accept* is True every relay/standardness/consensus gate is
         evaluated exactly as on the live path (coinbase, duplicate, IsStandardTx,
@@ -2511,7 +2532,7 @@ class Mempool:
                 if self.validator.db.get_utxo(txid, _vout) is not None:
                     return False, "txn-already-known"
             # Dry-run (testmempoolaccept) must not mutate the orphan pool.
-            if not test_accept:
+            if not test_accept and store_orphan:
                 self.orphan_pool.add(tx, missing_parents, peer=peer)
             # Internal control token: node.py's tx handler branches on
             # ``error == "orphan"`` to store the orphan and request its parents.
@@ -2755,7 +2776,8 @@ class Mempool:
 
         # Check mempool size. Eviction mutates the pool, so skip it in dry-run
         # mode — testmempoolaccept must not change mempool state.
-        if not test_accept and self.current_size + tx_size > self.max_size:
+        if (not test_accept and not bypass_limits
+                and self.current_size + tx_size > self.max_size):
             self._evict_low_fee_txs(tx_size)
 
         # Calculate fee
@@ -2799,7 +2821,7 @@ class Mempool:
         # Minimum relay fee check uses vsize (same source as fee_rate).
         # DEFAULT_MIN_RELAY_TX_FEE is in sat/kB; convert to sat for this tx.
         min_relay = (tx_vsize * DEFAULT_MIN_RELAY_TX_FEE) // 1000
-        if fee < min_relay:
+        if fee < min_relay and not bypass_limits:
             # Bare Core token (validation.cpp:708 "min relay fee not met").
             return False, "min relay fee not met"
 
@@ -2811,7 +2833,7 @@ class Mempool:
         #           return state.Invalid(...)
         # Reference: validation.cpp AcceptToMemoryPoolWorker (fee-filter gate).
         rolling_min_kvb = self._get_min_fee_inner()  # sat/kvB
-        if rolling_min_kvb > DEFAULT_MIN_RELAY_TX_FEE:
+        if rolling_min_kvb > DEFAULT_MIN_RELAY_TX_FEE and not bypass_limits:
             rolling_min_fee = (tx_vsize * rolling_min_kvb) // 1000
             if fee < rolling_min_fee:
                 # Bare Core token (validation.cpp:705 "mempool min fee not met")
@@ -2842,6 +2864,7 @@ class Mempool:
             sigop_cost=tx_sigop_cost,
             ancestor_count=len(ancestors) + 1,
             ancestor_size=ancestor_size + tx_size,
+            descendant_size=tx_size,  # Core: includes itself
             parents=direct_parents,
             children=set(),
         )
@@ -3740,10 +3763,24 @@ class Mempool:
 
     def _remove_block_transactions_inner(self, block):
         removed_ids: list[bytes] = []
+        # Links of every removed entry, captured before removal, so the
+        # ancestor/descendant recount below touches only the entries whose
+        # sets can have changed (Core removeForBlock -> RemoveStaged ->
+        # UpdateForRemoveFromMempool) instead of the whole pool (OU-3).
+        touched_children: set[bytes] = set()
+        touched_parents: set[bytes] = set()
+
+        def _note(tid: bytes) -> None:
+            e = self.transactions.get(tid)
+            if e is not None:
+                touched_children.update(e.children)
+                touched_parents.update(e.parents)
+
         for tx in block.transactions:
             if not tx.is_coinbase:
                 txid = tx.get_txid()
                 if txid in self.transactions:
+                    _note(txid)
                     self.remove_transaction(txid, _skip_recount=True)
                     removed_ids.append(txid)
                 # removeConflicts (txmempool.cpp removeForBlock): a pool tx
@@ -3760,6 +3797,7 @@ class Mempool:
                         continue
                     for doomed in self._collect_descendants(conflict):
                         if doomed in self.transactions:
+                            _note(doomed)
                             self.remove_transaction(
                                 doomed, _skip_recount=True, _reason="conflict"
                             )
@@ -3770,21 +3808,9 @@ class Mempool:
                 # every block-included tx whether or not it was in mempool.
                 self.map_deltas.pop(txid, None)
 
-        # Single-pass recount for all remaining affected transactions
+        # Single-pass recount over the affected entries only.
         if removed_ids:
-            # Collect all remaining txs and recalculate their counts
-            for txid in list(self.transactions):
-                self._recalculate_ancestors(txid)
-            # Rebuild descendant counts from scratch (more efficient for
-            # batch removals than per-tx updates)
-            for txid, entry in self.transactions.items():
-                descs = self._collect_descendants(txid)
-                descs.discard(txid)
-                entry.descendant_count = len(descs) + 1
-                entry.descendant_size = entry.size + sum(
-                    self.transactions[d].size
-                    for d in descs if d in self.transactions
-                )
+            self._recount_after_batch_removal(touched_children, touched_parents)
             logger.info(
                 f"Removed {len(removed_ids)} transactions from mempool "
                 f"(included in block)"
@@ -3796,6 +3822,394 @@ class Mempool:
         #   blockSinceLastRollingFeeBump = true;
         self._last_rolling_fee_update = time.time()
         self._block_since_last_rolling_fee_bump = True
+
+    def _recount_after_batch_removal(
+        self, touched_children: set[bytes], touched_parents: set[bytes]
+    ) -> None:
+        """Recompute ancestor/descendant state after a batch of
+        ``_skip_recount`` removals.  Only two groups can have changed: the
+        surviving descendants of a removed entry (their ancestor sets shrank)
+        and the surviving ancestors of a removed entry (their descendant sets
+        shrank).  Every such entry is reachable from the removed entries'
+        former children / parents, so nothing else is touched."""
+        desc_side: set[bytes] = set()
+        for c in touched_children:
+            if c in self.transactions:
+                desc_side |= self._collect_descendants(c)
+        for t in desc_side:
+            self._recalculate_ancestors(t)
+        anc_side: set[bytes] = set()
+        for p in touched_parents:
+            e = self.transactions.get(p)
+            if e is not None:
+                anc_side.add(p)
+                anc_side |= self._get_ancestors(e.tx)
+        for t in anc_side:
+            self._recount_descendants(t)
+
+    def _recount_descendants(self, txid: bytes) -> None:
+        entry = self.transactions.get(txid)
+        if entry is None:
+            return
+        descs = self._collect_descendants(txid)
+        descs.discard(txid)
+        entry.descendant_count = len(descs) + 1
+        entry.descendant_size = entry.size + sum(
+            self.transactions[d].size for d in descs if d in self.transactions
+        )
+
+    def _remove_with_descendants(self, roots, reason: str) -> set[bytes]:
+        """Core ``removeRecursive`` / ``RemoveStaged`` over in-pool *roots*:
+        the roots and every in-pool descendant leave, links fixed, counts of
+        the survivors recomputed once."""
+        doomed: set[bytes] = set()
+        for r in roots:
+            if r in self.transactions and r not in doomed:
+                doomed |= self._collect_descendants(r)
+        if not doomed:
+            return doomed
+        touched_children: set[bytes] = set()
+        touched_parents: set[bytes] = set()
+        for t in doomed:
+            e = self.transactions.get(t)
+            if e is not None:
+                touched_children.update(e.children)
+                touched_parents.update(e.parents)
+        for t in doomed:
+            if t in self.transactions:
+                self._remove_transaction_inner(t, _skip_recount=True, _reason=reason)
+        self._recount_after_batch_removal(
+            touched_children - doomed, touched_parents - doomed
+        )
+        return doomed
+
+    def _in_pool_spenders(self, tx: Transaction) -> list[bytes]:
+        """In-pool transactions spending any output of *tx* (Core mapNextTx
+        lookup over ``COutPoint(tx.GetHash(), i)``)."""
+        txid = tx.get_txid()
+        out: list[bytes] = []
+        for i in range(len(tx.outputs)):
+            sp = self.spender_by_outpoint.get((txid, i))
+            if sp is not None and sp != txid and sp in self.transactions:
+                out.append(sp)
+        return out
+
+    def _link_existing_children(self, readded: list[bytes]) -> set[bytes]:
+        """Core ``UpdateTransactionsFromBlock``: a tx re-added from a
+        disconnected block may already have in-pool children (they were
+        accepted while it was confirmed).  ATMP inserted it with no children,
+        so wire the parent/child links and recompute the affected counts.
+        Then enforce the cluster limits the new links can break (Core
+        ``m_txgraph->Trim()`` + ``removeUnchecked(SIZELIMIT)``): ATMP's
+        cluster gate ran before these children were linked, so it never saw
+        them.  Returns the txs the trim removed."""
+        new_deps: list[tuple[bytes, bytes]] = []
+        for txid in readded:
+            entry = self.transactions.get(txid)
+            if entry is None:
+                continue
+            for child in self._in_pool_spenders(entry.tx):
+                if child not in entry.children:
+                    new_deps.append((txid, child))
+        if not new_deps:
+            return set()
+        # Trim works on the clusters as they were linearized BEFORE the new
+        # dependencies: snapshot them while the links are still absent.
+        pre = self._snapshot_cluster_linearizations(
+            {t for dep in new_deps for t in dep}
+        )
+        for parent, child in new_deps:
+            self.transactions[parent].children.add(child)
+            self.transactions[child].parents.add(parent)
+        desc_side: set[bytes] = set()
+        for txid in readded:
+            if txid in self.transactions:
+                desc_side |= self._collect_descendants(txid)
+        for t in desc_side:
+            self._recalculate_ancestors(t)
+        anc_side: set[bytes] = set(desc_side)
+        for t in desc_side:
+            anc_side |= self._get_ancestors(self.transactions[t].tx)
+        for t in anc_side:
+            self._recount_descendants(t)
+        self._cluster_manager.rebuild()
+        return self._trim_oversized_clusters(pre, new_deps)
+
+    def _snapshot_cluster_linearizations(self, txids) -> dict:
+        """Per tx of every cluster containing one of *txids*: its chunk
+        feerate (fee, size) and its predecessor in the cluster's
+        linearization (Core TrimTxData + the implicit consecutive-element
+        dependency Trim adds per existing cluster)."""
+        cm = self._cluster_manager
+        info: dict[bytes, tuple[int, int, bytes | None]] = {}
+        seen: set[int] = set()
+        for t in txids:
+            cid = cm.get_cluster_id(t)
+            if cid is None or cid in seen:
+                continue
+            seen.add(cid)
+            cluster = cm._clusters.get(cid)
+            if cluster is None:
+                continue
+            lin = cm.get_linearization(cluster)
+            feerate: dict[bytes, tuple[int, int]] = {}
+            for chunk in cm.get_chunks(cluster):
+                for c in chunk.txids:
+                    feerate[c] = (chunk.total_fee, chunk.total_size)
+            prev = None
+            for c in lin:
+                fee, size = feerate.get(c, (0, 1))
+                info[c] = (fee, size, prev)
+                prev = c
+        return info
+
+    def _trim_oversized_clusters(self, pre: dict, new_deps) -> set[bytes]:
+        """Core ``TxGraphImpl::Trim`` for the clusters the reorg links made:
+        a cluster over MAX_CLUSTER_COUNT txs or MAX_CLUSTER_SIZE_WEIGHT is
+        rebuilt greedily — repeatedly take the highest chunk-feerate tx whose
+        dependencies (the new links plus each old cluster's linearization
+        order) are all taken, skip it if the would-be cluster it joins would
+        break a limit.  Every tx not taken is removed (reason ``sizelimit``);
+        nothing is taken before its parents, so a removed tx's descendants
+        are removed with it."""
+        import heapq
+        from fractions import Fraction
+
+        cm = self._cluster_manager
+        doomed: set[bytes] = set()
+        for cluster in list(cm._clusters.values()):
+            members = set(cluster.txids)
+            weight = sum(self.transactions[t].sigop_adjusted_weight
+                         for t in members)
+            if (len(members) <= MAX_CLUSTER_COUNT
+                    and weight <= MAX_CLUSTER_SIZE_WEIGHT):
+                continue
+            parents_of: dict[bytes, set[bytes]] = {t: set() for t in members}
+            for t in members:
+                p = pre.get(t, (0, 1, None))[2]
+                if p is not None and p in members:
+                    parents_of[t].add(p)
+            for p, c in new_deps:
+                if p in members and c in members:
+                    parents_of[c].add(p)
+            children_of: dict[bytes, set[bytes]] = {t: set() for t in members}
+            for c, ps in parents_of.items():
+                for p in ps:
+                    children_of[p].add(c)
+            left = {t: len(ps) for t, ps in parents_of.items()}
+
+            def _key(t):
+                fee, size, _ = pre.get(t, (self.transactions[t].fee,
+                                           self.transactions[t].size, None))
+                return -Fraction(fee, size if size > 0 else 1)
+
+            heap: list = []
+            seq = 0
+
+            def _push(t):
+                nonlocal seq
+                if self.transactions[t].sigop_adjusted_weight <= MAX_CLUSTER_SIZE_WEIGHT:
+                    heapq.heappush(heap, (_key(t), seq, t))
+                    seq += 1
+
+            for t, n in left.items():
+                if n == 0:
+                    _push(t)
+            # Union-find over the would-be clusters of the taken txs.
+            uf: dict[bytes, bytes] = {}
+            uf_count: dict[bytes, int] = {}
+            uf_weight: dict[bytes, int] = {}
+
+            def _find(t):
+                while uf[t] != t:
+                    uf[t] = uf[uf[t]]
+                    t = uf[t]
+                return t
+
+            taken: set[bytes] = set()
+            while heap:
+                _, _, t = heapq.heappop(heap)
+                roots = {_find(p) for p in parents_of[t]}
+                w = self.transactions[t].sigop_adjusted_weight
+                count = 1 + sum(uf_count[r] for r in roots)
+                size = w + sum(uf_weight[r] for r in roots)
+                if count > MAX_CLUSTER_COUNT or size > MAX_CLUSTER_SIZE_WEIGHT:
+                    continue
+                uf[t] = t
+                uf_count[t] = count
+                uf_weight[t] = size
+                for r in roots:
+                    uf[r] = t
+                taken.add(t)
+                for c in children_of[t]:
+                    left[c] -= 1
+                    if left[c] == 0:
+                        _push(c)
+            doomed |= members - taken
+        if doomed:
+            self._remove_with_descendants(doomed, "sizelimit")
+            logger.info(
+                f"reorg cluster trim: removed {len(doomed)} txs to keep "
+                f"clusters within {MAX_CLUSTER_COUNT} txs / "
+                f"{MAX_CLUSTER_SIZE_WEIGHT} weight"
+            )
+        return doomed
+
+    def _remove_for_reorg_inner(self, tip_height: int) -> set[bytes]:
+        """Core ``CTxMemPool::removeForReorg`` with ``check_final_and_mature``
+        (validation.cpp MaybeUpdateMempoolForReorg): every entry that at
+        tip+1 is non-final (CheckFinalTxAtTip, BIP113 MTP of the tip),
+        sequence-locked (CheckSequenceLocksAtTip, BIP68; in-pool parents count
+        at tip+1 like Core's MEMPOOL_HEIGHT), spends a coinbase immature at
+        tip+1, or spends a coin that is in neither the chain nor the pool,
+        leaves with all its descendants.  Applies to EVERY entry, not only the
+        re-added ones: a tx accepted at the old tip may not be valid at the
+        new, lower one."""
+        db = self.validator.db
+        next_h = tip_height + 1
+        try:
+            mtp = db.get_median_time_past(tip_height)
+        except Exception as e:
+            if is_system_error(e):
+                raise
+            # Without the tip's MTP no nLockTime / BIP68 verdict is possible.
+            # Fail closed: every entry those rules constrain is dropped below
+            # (keeping one that is non-final at tip+1 would hand it to
+            # getblocktemplate); a valid one dropped only loses its fee.
+            logger.error(
+                f"removeForReorg: median-time-past of tip {tip_height} "
+                f"unavailable ({e}); dropping every lock-constrained entry"
+            )
+            mtp = None
+        network = getattr(self.validator, "network", "mainnet")
+        is_final = getattr(self.validator, "_is_final_tx", None)
+        seq_locks = getattr(self.validator, "check_sequence_locks", None)
+        bad_roots: list[bytes] = []
+        for txid, entry in list(self.transactions.items()):
+            tx = entry.tx
+            bad = False
+            coins: list = []
+            for tx_in in tx.inputs:
+                parent = self.transactions.get(tx_in.prev_txid)
+                if parent is not None:
+                    if tx_in.prev_vout >= len(parent.tx.outputs):
+                        bad = True
+                        break
+                    coins.append({"height": next_h, "is_coinbase": False})
+                    continue
+                coin = db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+                if coin is None:
+                    bad = True
+                    break
+                if coin.get("is_coinbase") and (
+                    next_h - int(coin.get("height", 0)) < COINBASE_MATURITY
+                ):
+                    bad = True
+                    break
+                coins.append(coin)
+            if not bad and mtp is None and _lock_constrained(tx):
+                bad = True
+            if not bad and mtp is not None and is_final is not None:
+                if not is_final(tx, next_h, int(mtp)):
+                    bad = True
+            if not bad and mtp is not None and seq_locks is not None:
+                try:
+                    if not seq_locks(tx, next_h, int(mtp), network=network,
+                                     input_utxos=coins):
+                        bad = True
+                except MissingAncestorHeaderError:
+                    # A coin's MTP is below the header floor: no verdict.
+                    # ATMP refuses such a tx ("missing-ancestor-header"), so
+                    # removeForReorg does too — fail closed.
+                    bad = True
+            if bad:
+                bad_roots.append(txid)
+        return self._remove_with_descendants(bad_roots, "reorg")
+
+    def update_for_reorg(
+        self, disconnected_txs, tip_height: int, add_to_mempool: bool = True,
+        not_readded_txs=(),
+    ) -> dict:
+        """Core ``MaybeUpdateMempoolForReorg`` (validation.cpp), run after the
+        chain has moved (DisconnectTip/ConnectTip done, removeForBlock already
+        applied to every connected block).
+
+        *disconnected_txs*: the disconnected blocks' transactions EARLIEST
+        FIRST (lowest block first, block order within it) — Core iterates
+        DisconnectedBlockTransactions in reverse so parents precede children.
+        Each non-coinbase tx is re-submitted to ATMP at the new tip with
+        bypass_limits; one that fails is removeRecursive'd: its in-pool
+        spenders leave with their descendants.  Re-added txs get their
+        existing in-pool children linked (UpdateTransactionsFromBlock).  Then
+        removeForReorg, then LimitMempoolSize.
+
+        *not_readded_txs*: transactions of disconnected blocks that are NOT
+        re-submitted (InvalidateBlock's blocks below the top 10, Core's
+        fAddToMempool=false).  They are removeRecursive'd first, before any
+        re-add, and removeForReorg runs once, after the re-adds: Core runs
+        removeForReorg per DisconnectTip only once that block's txs are back,
+        so an in-pool spender of a re-added tx keeps its parent.  All under
+        the mempool lock;
+        callers hold the chain lock, so no reader sees the pool disagree
+        with the tip."""
+        readded: list[bytes] = []
+        failed = 0
+        dropped: set[bytes] = set()
+        with self._lock:
+            work = [(tx, False) for tx in not_readded_txs]
+            work += [(tx, add_to_mempool) for tx in disconnected_txs]
+            for tx, readd in work:
+                if getattr(tx, "is_coinbase", False):
+                    continue
+                txid = tx.get_txid()
+                ok = False
+                if readd:
+                    try:
+                        wtxid = tx.get_wtxid()
+                    except Exception:
+                        wtxid = txid
+                    if self.orphan_pool.has_wtxid(wtxid):
+                        self.orphan_pool.remove_by_txid(txid)
+                    try:
+                        ok, _reason = self._add_transaction_inner(
+                            tx, tip_height, bypass_limits=True,
+                            store_orphan=False,
+                        )
+                    except Exception as e:
+                        if is_system_error(e):
+                            raise
+                        logger.debug(f"reorg refill: {txid.hex()[:16]} raised {e}")
+                        ok = False
+                if ok:
+                    readded.append(txid)
+                elif txid not in self.transactions:
+                    failed += 1
+                    # removeRecursive(tx): its in-pool spenders lose their
+                    # input.  Core never gets here for a tx the new branch
+                    # re-confirmed (ConnectTip took it out of the disconnect
+                    # pool); here such a tx fails ATMP as already-known, and
+                    # its outputs are in the chain view — a spender of one of
+                    # those is fine and stays.
+                    spenders = []
+                    db = self.validator.db
+                    for i in range(len(tx.outputs)):
+                        sp = self.spender_by_outpoint.get((txid, i))
+                        if (sp is None or sp not in self.transactions
+                                or db.get_utxo(txid, i) is not None):
+                            continue
+                        spenders.append(sp)
+                    dropped |= self._remove_with_descendants(spenders, "reorg")
+            if readded:
+                dropped |= self._link_existing_children(readded)
+            dropped |= self._remove_for_reorg_inner(tip_height)
+            if self.current_size > self.max_size:
+                self._evict_low_fee_txs(self.current_size - self.max_size)
+        logger.info(
+            f"mempool reorg update: re-added {len(readded)}, "
+            f"not re-added {failed}, removed {len(dropped)} "
+            f"(removeRecursive + removeForReorg) at tip {tip_height}"
+        )
+        return {"readded": readded, "failed": failed, "removed": dropped}
 
     def get_transaction(self, txid: bytes) -> Transaction | None:
         """
@@ -4446,6 +4860,7 @@ class Mempool:
             size=new_size, time_added=time.time(), height_added=height,
             ancestor_count=len(ancestors) + 1,
             ancestor_size=ancestor_size + new_size,
+            descendant_size=new_size,
             parents=direct_parents,
             children=set(),
         )
@@ -5503,6 +5918,7 @@ class Mempool:
                 height_added=height,
                 ancestor_count=len(ancestors) + 1,
                 ancestor_size=ancestor_size + tx_size,
+                descendant_size=tx_size,
                 parents=direct_parents,
                 children=set(),
                 has_ephemeral_dust=has_dust,

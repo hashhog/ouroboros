@@ -8336,12 +8336,12 @@ class BlockSync:
         important for any subsequent re-reorg that needs to disconnect
         the freshly connected blocks.
 
-        Mempool refill: each non-coinbase tx from the disconnected
-        side-chain is re-evaluated against the new tip via
-        ``mempool.add_transaction`` (which runs BIP-113 / BIP-68
-        / standardness against the current chain state).  Children of
-        rejected txs are dropped implicitly because their parents are
-        not in the UTXO set any more.
+        Mempool refill: the disconnected blocks' non-coinbase txs go
+        through ``mempool.update_for_reorg`` (Core
+        MaybeUpdateMempoolForReorg): re-accepted earliest first at the new
+        tip, in-pool descendants of a tx that cannot return removed with
+        it, re-added parents linked to their in-pool children, then
+        removeForReorg over the whole pool.
         """
         logger.warning(f"Handling chain reorganization to new tip: {new_chain_tip.hex()[:16]}...")
 
@@ -8812,40 +8812,35 @@ class BlockSync:
             final_hash, final_height = self.db.get_best_block()
 
             # ----------------------------------------------------------
-            # Mempool refill: re-add disconnected-block txs to the
-            # mempool subject to the new tip's policy. ``add_transaction``
-            # runs the same checks as a freshly received tx (BIP-113
-            # IsFinalTx, BIP-68 SequenceLocks, standardness, double-spend
-            # against new-chain UTXOs), so this is policy-correct against
-            # the new tip.
+            # Mempool refill: Core MaybeUpdateMempoolForReorg after the
+            # disconnects and connects (ConnectTip's removeForBlock already
+            # ran per connected block above).  ``update_for_reorg`` re-accepts
+            # the disconnected txs EARLIEST FIRST against the new tip
+            # (bypass_limits), removeRecursive's the in-pool descendants of
+            # one that cannot return, links a re-added parent to its existing
+            # in-pool children (UpdateTransactionsFromBlock + cluster Trim),
+            # then removeForReorg over the whole pool — the per-tx
+            # add_transaction loop this replaces did none of those, so a
+            # child of a tx the new branch double-spent stayed in the pool.
             #
-            # Off-load each ATMP via asyncio.to_thread: with up to ~200
-            # tx per block × tens of blocks on a deep reorg, doing the
-            # refill on the event loop would freeze RPC + P2P dispatch
-            # for the entire refill window.  Mirrors the off-load done
-            # in node._make_tx_handler / rpc_sendrawtransaction.
+            # Off the event loop: a deep reorg re-accepts hundreds of txs.
             # ----------------------------------------------------------
-            if self.mempool:
-                for _, curr_block, _ in reversed(blocks_to_disconnect):
-                    for tx in curr_block.transactions:
-                        if tx.is_coinbase:
-                            continue
-                        try:
-                            success, reason = await asyncio.to_thread(
-                                self.mempool.add_transaction, tx, final_height,
-                            )
-                            if success:
-                                logger.debug(
-                                    f"Re-added tx {tx.get_txid().hex()[:16]}... to mempool"
-                                )
-                            else:
-                                logger.debug(
-                                    f"Tx {tx.get_txid().hex()[:16]}... not re-added to mempool: {reason}"
-                                )
-                        except Exception as e:
-                            logger.debug(
-                                f"Error re-adding tx {tx.get_txid().hex()[:16]}...: {e}"
-                            )
+            if self.mempool is not None and hasattr(self.mempool, "update_for_reorg"):
+                disconnected_txs = [
+                    tx
+                    for _, curr_block, _ in reversed(blocks_to_disconnect)
+                    for tx in curr_block.transactions
+                    if not tx.is_coinbase
+                ]
+                try:
+                    await asyncio.to_thread(
+                        self.mempool.update_for_reorg,
+                        disconnected_txs, int(final_height),
+                    )
+                except Exception as e:
+                    if is_system_error(e):
+                        raise
+                    logger.warning(f"Reorg mempool refill failed: {e}")
 
             logger.info(f"Reorg handled: new tip at height {final_height}")
             self.reorg_depth += 1
