@@ -179,6 +179,10 @@ def _core_arity_for(method: str) -> tuple[int, int] | None:
 _ACTIVE_RPC_COMMANDS: dict[int, tuple[str, float]] = {}
 _ACTIVE_RPC_SEQ = 0
 
+# Core InvalidateBlock: MaybeUpdateMempoolForReorg(..., ++disconnected <= 10)
+# (validation.cpp) — only the 10 highest disconnected blocks are re-added.
+INVALIDATE_READD_MAX_BLOCKS = 10
+
 
 # Rate limiting
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
@@ -10732,9 +10736,22 @@ class RPCServer:
             _, tip_h = db.get_best_block()
         except Exception:
             return
-        txs = [tx for blk in blocks if blk is not None
-               for tx in (getattr(blk, "transactions", None) or [])]
-        mempool.update_for_reorg(txs, int(tip_h))
+        # Core disconnects tip-first and re-adds only while ++disconnected
+        # <= 10 ("a very deep invalidation ... keeping the mempool up to date
+        # is probably futile"): the 10 highest blocks come back, the deeper
+        # ones do not — but removeForReorg still runs, and spenders of their
+        # outputs are removeRecursive'd.  Deeper first, so their outputs are
+        # already gone when the top 10 are re-accepted.
+        blocks = [b for b in blocks if b is not None]
+        deep, top = blocks[:-INVALIDATE_READD_MAX_BLOCKS], blocks[-INVALIDATE_READD_MAX_BLOCKS:]
+
+        def _txs(bs):
+            return [tx for blk in bs
+                    for tx in (getattr(blk, "transactions", None) or [])]
+
+        if deep:
+            mempool.update_for_reorg(_txs(deep), int(tip_h), add_to_mempool=False)
+        mempool.update_for_reorg(_txs(top), int(tip_h))
 
     def _mempool_follow_rust_reorg(self, db, old_tip_hash, old_tip_height) -> None:
         """The Rust layer moved the active chain (reconsiderblock's

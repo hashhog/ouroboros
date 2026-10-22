@@ -1706,6 +1706,17 @@ def _is_witness_standard(
     return True, ""
 
 
+def _lock_constrained(tx: Transaction) -> bool:
+    """Whether nLockTime (BIP113) or a relative lock (BIP68) applies to *tx*:
+    an active nLockTime (non-zero, some input not SEQUENCE_FINAL), or a v2+ tx
+    with an input whose sequence-lock disable flag (bit 31) is clear."""
+    if tx.locktime != 0 and any(i.sequence != 0xFFFFFFFF for i in tx.inputs):
+        return True
+    return tx.version >= 2 and any(
+        not (i.sequence & (1 << 31)) for i in tx.inputs
+    )
+
+
 @dataclass
 class MempoolEntry:
     """Entry in the mempool.
@@ -3883,23 +3894,33 @@ class Mempool:
                 out.append(sp)
         return out
 
-    def _link_existing_children(self, readded: list[bytes]) -> bool:
+    def _link_existing_children(self, readded: list[bytes]) -> set[bytes]:
         """Core ``UpdateTransactionsFromBlock``: a tx re-added from a
         disconnected block may already have in-pool children (they were
         accepted while it was confirmed).  ATMP inserted it with no children,
-        so wire the parent/child links and recompute the affected counts."""
-        linked = False
+        so wire the parent/child links and recompute the affected counts.
+        Then enforce the cluster limits the new links can break (Core
+        ``m_txgraph->Trim()`` + ``removeUnchecked(SIZELIMIT)``): ATMP's
+        cluster gate ran before these children were linked, so it never saw
+        them.  Returns the txs the trim removed."""
+        new_deps: list[tuple[bytes, bytes]] = []
         for txid in readded:
             entry = self.transactions.get(txid)
             if entry is None:
                 continue
             for child in self._in_pool_spenders(entry.tx):
                 if child not in entry.children:
-                    entry.children.add(child)
-                    self.transactions[child].parents.add(txid)
-                    linked = True
-        if not linked:
-            return False
+                    new_deps.append((txid, child))
+        if not new_deps:
+            return set()
+        # Trim works on the clusters as they were linearized BEFORE the new
+        # dependencies: snapshot them while the links are still absent.
+        pre = self._snapshot_cluster_linearizations(
+            {t for dep in new_deps for t in dep}
+        )
+        for parent, child in new_deps:
+            self.transactions[parent].children.add(child)
+            self.transactions[child].parents.add(parent)
         desc_side: set[bytes] = set()
         for txid in readded:
             if txid in self.transactions:
@@ -3912,7 +3933,127 @@ class Mempool:
         for t in anc_side:
             self._recount_descendants(t)
         self._cluster_manager.rebuild()
-        return True
+        return self._trim_oversized_clusters(pre, new_deps)
+
+    def _snapshot_cluster_linearizations(self, txids) -> dict:
+        """Per tx of every cluster containing one of *txids*: its chunk
+        feerate (fee, size) and its predecessor in the cluster's
+        linearization (Core TrimTxData + the implicit consecutive-element
+        dependency Trim adds per existing cluster)."""
+        cm = self._cluster_manager
+        info: dict[bytes, tuple[int, int, bytes | None]] = {}
+        seen: set[int] = set()
+        for t in txids:
+            cid = cm.get_cluster_id(t)
+            if cid is None or cid in seen:
+                continue
+            seen.add(cid)
+            cluster = cm._clusters.get(cid)
+            if cluster is None:
+                continue
+            lin = cm.get_linearization(cluster)
+            feerate: dict[bytes, tuple[int, int]] = {}
+            for chunk in cm.get_chunks(cluster):
+                for c in chunk.txids:
+                    feerate[c] = (chunk.total_fee, chunk.total_size)
+            prev = None
+            for c in lin:
+                fee, size = feerate.get(c, (0, 1))
+                info[c] = (fee, size, prev)
+                prev = c
+        return info
+
+    def _trim_oversized_clusters(self, pre: dict, new_deps) -> set[bytes]:
+        """Core ``TxGraphImpl::Trim`` for the clusters the reorg links made:
+        a cluster over MAX_CLUSTER_COUNT txs or MAX_CLUSTER_SIZE_WEIGHT is
+        rebuilt greedily — repeatedly take the highest chunk-feerate tx whose
+        dependencies (the new links plus each old cluster's linearization
+        order) are all taken, skip it if the would-be cluster it joins would
+        break a limit.  Every tx not taken is removed (reason ``sizelimit``);
+        nothing is taken before its parents, so a removed tx's descendants
+        are removed with it."""
+        import heapq
+        from fractions import Fraction
+
+        cm = self._cluster_manager
+        doomed: set[bytes] = set()
+        for cluster in list(cm._clusters.values()):
+            members = set(cluster.txids)
+            weight = sum(self.transactions[t].sigop_adjusted_weight
+                         for t in members)
+            if (len(members) <= MAX_CLUSTER_COUNT
+                    and weight <= MAX_CLUSTER_SIZE_WEIGHT):
+                continue
+            parents_of: dict[bytes, set[bytes]] = {t: set() for t in members}
+            for t in members:
+                p = pre.get(t, (0, 1, None))[2]
+                if p is not None and p in members:
+                    parents_of[t].add(p)
+            for p, c in new_deps:
+                if p in members and c in members:
+                    parents_of[c].add(p)
+            children_of: dict[bytes, set[bytes]] = {t: set() for t in members}
+            for c, ps in parents_of.items():
+                for p in ps:
+                    children_of[p].add(c)
+            left = {t: len(ps) for t, ps in parents_of.items()}
+
+            def _key(t):
+                fee, size, _ = pre.get(t, (self.transactions[t].fee,
+                                           self.transactions[t].size, None))
+                return -Fraction(fee, size if size > 0 else 1)
+
+            heap: list = []
+            seq = 0
+
+            def _push(t):
+                nonlocal seq
+                if self.transactions[t].sigop_adjusted_weight <= MAX_CLUSTER_SIZE_WEIGHT:
+                    heapq.heappush(heap, (_key(t), seq, t))
+                    seq += 1
+
+            for t, n in left.items():
+                if n == 0:
+                    _push(t)
+            # Union-find over the would-be clusters of the taken txs.
+            uf: dict[bytes, bytes] = {}
+            uf_count: dict[bytes, int] = {}
+            uf_weight: dict[bytes, int] = {}
+
+            def _find(t):
+                while uf[t] != t:
+                    uf[t] = uf[uf[t]]
+                    t = uf[t]
+                return t
+
+            taken: set[bytes] = set()
+            while heap:
+                _, _, t = heapq.heappop(heap)
+                roots = {_find(p) for p in parents_of[t]}
+                w = self.transactions[t].sigop_adjusted_weight
+                count = 1 + sum(uf_count[r] for r in roots)
+                size = w + sum(uf_weight[r] for r in roots)
+                if count > MAX_CLUSTER_COUNT or size > MAX_CLUSTER_SIZE_WEIGHT:
+                    continue
+                uf[t] = t
+                uf_count[t] = count
+                uf_weight[t] = size
+                for r in roots:
+                    uf[r] = t
+                taken.add(t)
+                for c in children_of[t]:
+                    left[c] -= 1
+                    if left[c] == 0:
+                        _push(c)
+            doomed |= members - taken
+        if doomed:
+            self._remove_with_descendants(doomed, "sizelimit")
+            logger.info(
+                f"reorg cluster trim: removed {len(doomed)} txs to keep "
+                f"clusters within {MAX_CLUSTER_COUNT} txs / "
+                f"{MAX_CLUSTER_SIZE_WEIGHT} weight"
+            )
+        return doomed
 
     def _remove_for_reorg_inner(self, tip_height: int) -> set[bytes]:
         """Core ``CTxMemPool::removeForReorg`` with ``check_final_and_mature``
@@ -3931,6 +4072,14 @@ class Mempool:
         except Exception as e:
             if is_system_error(e):
                 raise
+            # Without the tip's MTP no nLockTime / BIP68 verdict is possible.
+            # Fail closed: every entry those rules constrain is dropped below
+            # (keeping one that is non-final at tip+1 would hand it to
+            # getblocktemplate); a valid one dropped only loses its fee.
+            logger.error(
+                f"removeForReorg: median-time-past of tip {tip_height} "
+                f"unavailable ({e}); dropping every lock-constrained entry"
+            )
             mtp = None
         network = getattr(self.validator, "network", "mainnet")
         is_final = getattr(self.validator, "_is_final_tx", None)
@@ -3958,6 +4107,8 @@ class Mempool:
                     bad = True
                     break
                 coins.append(coin)
+            if not bad and mtp is None and _lock_constrained(tx):
+                bad = True
             if not bad and mtp is not None and is_final is not None:
                 if not is_final(tx, next_h, int(mtp)):
                     bad = True
@@ -3967,7 +4118,10 @@ class Mempool:
                                      input_utxos=coins):
                         bad = True
                 except MissingAncestorHeaderError:
-                    pass  # unverifiable below the header floor: keep
+                    # A coin's MTP is below the header floor: no verdict.
+                    # ATMP refuses such a tx ("missing-ancestor-header"), so
+                    # removeForReorg does too — fail closed.
+                    bad = True
             if bad:
                 bad_roots.append(txid)
         return self._remove_with_descendants(bad_roots, "reorg")
@@ -4035,7 +4189,7 @@ class Mempool:
                         spenders.append(sp)
                     dropped |= self._remove_with_descendants(spenders, "reorg")
             if readded:
-                self._link_existing_children(readded)
+                dropped |= self._link_existing_children(readded)
             dropped |= self._remove_for_reorg_inner(tip_height)
             if self.current_size > self.max_size:
                 self._evict_low_fee_txs(self.current_size - self.max_size)

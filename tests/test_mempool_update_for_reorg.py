@@ -400,3 +400,251 @@ def test_reconsider_branch_switch_follows_rust_reorg():
     assert _ids(mp) == {w.get_txid()}, (
         "after the branch switch: y confirmed (removeForBlock), w back in "
         "the pool (its block 111' was disconnected)")
+
+
+# --------------------------------------------------------------------------
+# Warden #124 review, point 1: cluster limits after the re-added parent is
+# linked (Core UpdateTransactionsFromBlock -> m_txgraph->Trim() ->
+# removeUnchecked(SIZELIMIT)), and the byte cap after the link.
+# --------------------------------------------------------------------------
+
+def _fan_tx(prevout, n_out: int, out_value: int, tag: int,
+            spk: bytes = b"\x51") -> Transaction:
+    tx = Transaction(
+        txid=bytes(32), version=2, locktime=0,
+        inputs=[TxIn(prev_txid=prevout[0], prev_vout=prevout[1],
+                     script_sig=b"\x51" + bytes([tag & 0xFF, tag >> 8]),
+                     sequence=SEQ_FINAL_RBF)],
+        outputs=[TxOut(value=out_value, script_pubkey=spk) for _ in range(n_out)],
+    )
+    tx.txid = hashlib.sha256(hashlib.sha256(tx.serialize()).digest()).digest()
+    return tx
+
+
+def _confirmed_parent_with_children(n_children: int, child_fee, spk=b"\x51"):
+    """P (confirmed at 111) fans out to *n_children* outputs; child i, in the
+    pool, spends P:i paying child_fee(i)."""
+    sdb = _StubDB(tip=111)
+    p = _fan_tx(COIN_O, n_children, 1_000_000, 0x700)
+    for i in range(n_children):
+        sdb.utxos[(p.get_txid(), i)] = _coin(111)
+    mp = Mempool(_Validator(sdb), require_standard=False)
+    kids = []
+    for i in range(n_children):
+        c = _fan_tx((p.get_txid(), i), 1, 1_000_000 - child_fee(i), 0x800 + i, spk)
+        ok, err = mp.add_transaction(c, height=111)
+        assert ok, err
+        kids.append(c)
+    # invalidateblock 111: P's outputs leave the chain, COIN_O is unspent.
+    for i in range(n_children):
+        del sdb.utxos[(p.get_txid(), i)]
+    sdb.utxos[COIN_O] = _coin(5)
+    return sdb, mp, p, kids
+
+
+def _assert_clusters_within_limits(mp: Mempool) -> None:
+    from ouroboros.mempool import MAX_CLUSTER_COUNT, MAX_CLUSTER_SIZE_WEIGHT
+    mp._cluster_manager.rebuild()
+    for cl in mp._cluster_manager.get_all_clusters():
+        assert cl.size() <= MAX_CLUSTER_COUNT
+        assert sum(mp.transactions[t].sigop_adjusted_weight
+                   for t in cl.txids) <= MAX_CLUSTER_SIZE_WEIGHT
+
+
+def test_reorg_readded_parent_trims_65_tx_cluster():
+    """P comes back from a disconnected block onto 64 in-pool children: a
+    65-tx cluster.  ATMP's cluster gate ran before the children were linked,
+    so it passed.  Core Trim keeps P (no unmet dependency) and the 63
+    best-feerate children, and drops the lowest-feerate child (SIZELIMIT)."""
+    sdb, mp, p, kids = _confirmed_parent_with_children(
+        64, lambda i: 2_000 + 10 * i)          # kid 0 pays least
+    _invalidate_refill(mp, sdb, [SimpleNamespace(transactions=[_coinbase(1), p])], 110)
+    assert p.get_txid() in mp.transactions, "P must be re-added"
+    assert len(mp.transactions) == 64, (
+        f"pool holds {len(mp.transactions)} txs in one cluster; Core trims "
+        f"the 65-tx cluster to 64")
+    assert kids[0].get_txid() not in mp.transactions, \
+        "the lowest-feerate child is the one Core's Trim drops"
+    assert all(k.get_txid() in mp.transactions for k in kids[1:])
+    assert mp.transactions[p.get_txid()].descendant_count == 64
+    _assert_clusters_within_limits(mp)
+
+
+def test_reorg_readded_parent_trims_cluster_over_weight_limit():
+    """Same hole on the size limit: 10 children of ~41.8k weight each plus P
+    exceed 404,000 weight.  The lowest-feerate child goes."""
+    big = b"\x6a" + b"\x00" * 10_400               # ~10.45 kvB per child
+    sdb, mp, p, kids = _confirmed_parent_with_children(
+        10, lambda i: 20_000 + 100 * i, spk=big)
+    _invalidate_refill(mp, sdb, [SimpleNamespace(transactions=[_coinbase(1), p])], 110)
+    assert p.get_txid() in mp.transactions
+    assert kids[0].get_txid() not in mp.transactions
+    assert all(k.get_txid() in mp.transactions for k in kids[1:])
+    _assert_clusters_within_limits(mp)
+
+
+def test_reorg_size_limit_evicts_readded_parent_with_its_in_pool_child():
+    """After the reorg the pool is over its byte cap.  P (re-added, lowest
+    feerate) and its in-pool child C form one chunk once linked, so the
+    size-limit eviction takes them together; the bystander B stays.  An
+    unlinked P would be evicted alone and leave C spending a coin that
+    exists nowhere."""
+    sdb = _StubDB(tip=111)
+    p = _tx([COIN1], 100_000_000 - 300, 50)        # ~1 sat/B
+    sdb.utxos[(p.get_txid(), 0)] = _coin(111)
+    sdb.utxos[COIN_O] = _coin(5)
+    mp = Mempool(_Validator(sdb), require_standard=False)
+    c = _tx([(p.get_txid(), 0)], 100_000_000 - 300 - 2_000, 51)
+    b = _tx([COIN_O], 100_000_000 - 50_000, 52)
+    for t in (c, b):
+        ok, err = mp.add_transaction(t, height=111)
+        assert ok, err
+    del sdb.utxos[(p.get_txid(), 0)]
+    sdb.utxos[COIN1] = _coin(5)
+    mp.max_size = mp.current_size + mp.transactions[c.get_txid()].size - 1
+    _invalidate_refill(mp, sdb, [SimpleNamespace(transactions=[_coinbase(1), p])], 110)
+    assert _ids(mp) == {b.get_txid()}, (
+        "the byte cap must evict the low-feerate parent together with its "
+        "in-pool child; the bystander stays")
+
+
+# --------------------------------------------------------------------------
+# Warden #124 review, point 2: BlockSync._handle_reorg (the P2P orphan path)
+# refills through update_for_reorg, not one add_transaction per tx.
+# --------------------------------------------------------------------------
+
+def _p2p_reorg(old_tip_txs, new_tip_txs, mp):
+    from tests.test_w121_compact_filters import _build_fix74_harness
+    sync, _idx, _a0, a1, b1 = _build_fix74_harness()
+    a1.transactions = [_coinbase(60)] + old_tip_txs
+    b1.transactions = [_coinbase(61)] + new_tip_txs
+    sync.mempool = mp
+    assert asyncio.run(sync._handle_reorg(b1, b1.hash)) is True
+
+
+def test_p2p_reorg_failed_readd_removes_in_pool_child():
+    """A1 (old tip) is double-spent by X in the new tip: A1 cannot return,
+    so its in-pool child M2 leaves with it; bystander M1 stays.  The old
+    per-tx add_transaction refill kept M2 (and parked A1 as an orphan)."""
+    sdb = _StubDB(tip=1)
+    a1 = _tx([COIN1], 99_000_000, 62)
+    sdb.utxos[(a1.get_txid(), 0)] = _coin(1)
+    sdb.utxos[COIN_O] = _coin(0)
+    mp = Mempool(_Validator(sdb), require_standard=False)
+    m2 = _tx([(a1.get_txid(), 0)], 98_000_000, 63)
+    m1 = _tx([COIN_O], 99_000_000, 64)
+    for t in (m2, m1):
+        ok, err = mp.add_transaction(t, height=1)
+        assert ok, err
+    x = _tx([COIN1], 97_000_000, 65)
+    del sdb.utxos[(a1.get_txid(), 0)]               # COIN1 spent by X now
+    _p2p_reorg([a1], [x], mp)
+    assert _ids(mp) == {m1.get_txid()}
+    assert not mp.orphan_pool.has(a1.get_txid())
+
+
+def test_p2p_reorg_readded_parent_links_in_pool_child():
+    """A1 returns (the new tip does not touch COIN1): it is linked to its
+    in-pool child M2, so the template orders A1 before M2."""
+    sdb = _StubDB(tip=1)
+    a1 = _tx([COIN1], 99_000_000, 66)
+    sdb.utxos[(a1.get_txid(), 0)] = _coin(1)
+    mp = Mempool(_Validator(sdb), require_standard=False)
+    m2 = _tx([(a1.get_txid(), 0)], 98_000_000, 67)
+    ok, err = mp.add_transaction(m2, height=1)
+    assert ok, err
+    del sdb.utxos[(a1.get_txid(), 0)]
+    sdb.utxos[COIN1] = _coin(0)
+    _p2p_reorg([a1], [], mp)
+    assert _ids(mp) == {a1.get_txid(), m2.get_txid()}
+    assert mp.transactions[m2.get_txid()].parents == {a1.get_txid()}
+    order = [t.get_txid() for t in mp.get_block_template_txs()[0]]
+    assert order.index(a1.get_txid()) < order.index(m2.get_txid())
+
+
+# --------------------------------------------------------------------------
+# Warden #124 review, point 3: invalidateblock re-adds only the 10 highest
+# disconnected blocks; an unavailable MTP and a missing ancestor header fail
+# closed in removeForReorg.
+# --------------------------------------------------------------------------
+
+def test_deep_invalidate_readds_only_top_ten_blocks():
+    """12 blocks disconnected, each confirming t_i.  Core re-adds while
+    ++disconnected <= 10, tip first: t_3..t_12 come back, t_1/t_2 do not,
+    and M (in the pool, spending t_1:0) leaves by removeRecursive."""
+    sdb = _StubDB(tip=112)
+    coins = [(bytes([0x90 + i]) * 32, 0) for i in range(12)]
+    txs = [_tx([coins[i]], 99_000_000, 70 + i) for i in range(12)]
+    for t in txs:
+        sdb.utxos[(t.get_txid(), 0)] = _coin(101)
+    mp = Mempool(_Validator(sdb), require_standard=False)
+    m = _tx([(txs[0].get_txid(), 0)], 98_000_000, 90)
+    ok, err = mp.add_transaction(m, height=112)
+    assert ok, err
+    for i, t in enumerate(txs):
+        del sdb.utxos[(t.get_txid(), 0)]
+        sdb.utxos[coins[i]] = _coin(5)
+    blocks = [SimpleNamespace(transactions=[_coinbase(100 + i), t])
+              for i, t in enumerate(txs)]                    # ascending
+    _invalidate_refill(mp, sdb, blocks, 100)
+    assert _ids(mp) == {t.get_txid() for t in txs[2:]}, (
+        "only the 10 highest disconnected blocks are re-added; the in-pool "
+        "spender of a not-re-added tx goes")
+
+
+class _MtpDownDB(_StubDB):
+    down = False
+
+    def get_median_time_past(self, height: int):
+        if self.down:
+            raise KeyError("block index row missing")
+        return super().get_median_time_past(height)
+
+
+def test_remove_for_reorg_fails_closed_without_tip_mtp():
+    """If the new tip's MTP cannot be read, nLockTime / BIP68 cannot be
+    judged.  LT (non-final at the new tip) and S (sequence-locked there)
+    must not survive on a skipped check; the unconstrained tx stays."""
+    sdb = _MtpDownDB(tip=111)
+    sdb.utxos[COIN_L] = _coin(5)
+    sdb.utxos[COIN_S] = _coin(107)
+    sdb.utxos[COIN_O] = _coin(5)
+    mp = Mempool(_Validator(sdb), require_standard=False)
+    lt = _tx([COIN_L], 99_000_000, 91, locktime=111)
+    s = _tx([COIN_S], 99_000_000, 92, sequence=5)
+    plain = _tx([COIN_O], 99_000_000, 93)
+    for t in (lt, s, plain):
+        ok, err = mp.add_transaction(t, height=111)
+        assert ok, err
+    sdb.down = True
+    _invalidate_refill(mp, sdb, [SimpleNamespace(transactions=[_coinbase(1)])], 110)
+    assert _ids(mp) == {plain.get_txid()}
+
+
+def test_remove_for_reorg_fails_closed_on_missing_ancestor_header():
+    """BIP68 for S needs an ancestor header below the header floor
+    (MissingAncestorHeaderError).  ATMP refuses such a tx; removeForReorg
+    drops it rather than keep an unverified relative lock."""
+    from ouroboros.validation import MissingAncestorHeaderError
+
+    class _NoHeaderValidator(_Validator):
+        missing = None   # txid whose relative lock is unverifiable
+
+        def check_sequence_locks(self, tx, *a, **k):
+            if tx.get_txid() == self.missing:
+                raise MissingAncestorHeaderError("below the header floor")
+            return super().check_sequence_locks(tx, *a, **k)
+
+    sdb = _StubDB(tip=111)
+    sdb.utxos[COIN_S] = _coin(100)
+    sdb.utxos[COIN_O] = _coin(5)
+    v = _NoHeaderValidator(sdb)
+    mp = Mempool(v, require_standard=False)
+    s = _tx([COIN_S], 99_000_000, 94, sequence=5)
+    plain = _tx([COIN_O], 99_000_000, 95)
+    for t in (s, plain):
+        ok, err = mp.add_transaction(t, height=111)
+        assert ok, err
+    v.missing = s.get_txid()
+    _invalidate_refill(mp, sdb, [SimpleNamespace(transactions=[_coinbase(1)])], 110)
+    assert _ids(mp) == {plain.get_txid()}
