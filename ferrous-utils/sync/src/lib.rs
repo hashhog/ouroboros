@@ -6147,8 +6147,13 @@ impl PyBlockchainDB {
     // which is what the snapshot loader has after parsing the wire format.
 
     /// Count the number of UTXOs in the chainstate.
-    fn utxo_count(&self) -> PyResult<u64> {
-        self.db.utxo_count().map_err(|e| {
+    ///
+    /// Full CHAINSTATE_CF scan, so the GIL is released for it: dumptxoutset
+    /// calls this on a worker thread, and holding the GIL for the whole
+    /// scan froze the asyncio RPC loop (getblockcount, getpeerinfo, stop).
+    fn utxo_count(&self, py: Python<'_>) -> PyResult<u64> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.utxo_count()).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 format!("Database error: {}", e)
             )
@@ -6181,36 +6186,47 @@ impl PyBlockchainDB {
     /// in numeric vout order (Core `std::map<uint32_t, Coin>`), not LE32
     /// key order. Peak live set is one group. Returns
     /// `(coins_emitted, peak_group_size)`.
+    ///
+    /// The GIL is released for the cursor scan and re-taken only to build
+    /// each group's coin list and run the callback, so other Python
+    /// threads (the asyncio RPC loop during dumptxoutset) run between
+    /// groups. Holding it for the whole scan froze the loop for the rest
+    /// of the stream.
     fn visit_utxo_txid_groups(
         &self,
         py: Python<'_>,
         callback: Bound<'_, PyAny>,
     ) -> PyResult<(u64, usize)> {
-        let mut cb_err: Option<PyErr> = None;
-        let streamed = self.db.stream_utxo_txid_groups(|txid, group| {
-            let invoked = (|| -> PyResult<()> {
-                let coins = PyList::empty(py);
-                for (vout, utxo) in group {
-                    coins.append((
-                        *vout,
-                        utxo.amount,
-                        PyBytes::new(py, utxo.script_pubkey.as_bytes()),
-                        utxo.height.unwrap_or(0),
-                        utxo.is_coinbase,
-                    ))?;
+        let db = Arc::clone(&self.db);
+        let callback = callback.unbind();
+        let (streamed, cb_err) = py.detach(move || {
+            let mut cb_err: Option<PyErr> = None;
+            let streamed = db.stream_utxo_txid_groups(|txid, group| {
+                let invoked = Python::attach(|py| -> PyResult<()> {
+                    let coins = PyList::empty(py);
+                    for (vout, utxo) in group {
+                        coins.append((
+                            *vout,
+                            utxo.amount,
+                            PyBytes::new(py, utxo.script_pubkey.as_bytes()),
+                            utxo.height.unwrap_or(0),
+                            utxo.is_coinbase,
+                        ))?;
+                    }
+                    callback.call1(py, (PyBytes::new(py, &txid[..]), &coins))?;
+                    Ok(())
+                });
+                match invoked {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        cb_err = Some(e);
+                        Err(DbError::InvalidData(
+                            "visit_utxo_txid_groups callback failed".into(),
+                        ))
+                    }
                 }
-                callback.call1((PyBytes::new(py, &txid[..]), &coins))?;
-                Ok(())
-            })();
-            match invoked {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    cb_err = Some(e);
-                    Err(DbError::InvalidData(
-                        "visit_utxo_txid_groups callback failed".into(),
-                    ))
-                }
-            }
+            });
+            (streamed, cb_err)
         });
         if let Some(e) = cb_err {
             return Err(e);
