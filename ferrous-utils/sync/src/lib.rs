@@ -6147,8 +6147,13 @@ impl PyBlockchainDB {
     // which is what the snapshot loader has after parsing the wire format.
 
     /// Count the number of UTXOs in the chainstate.
-    fn utxo_count(&self) -> PyResult<u64> {
-        self.db.utxo_count().map_err(|e| {
+    ///
+    /// Full CHAINSTATE_CF scan, so the GIL is released for it: dumptxoutset
+    /// calls this on a worker thread, and holding the GIL for the whole
+    /// scan froze the asyncio RPC loop (getblockcount, getpeerinfo, stop).
+    fn utxo_count(&self, py: Python<'_>) -> PyResult<u64> {
+        let db = Arc::clone(&self.db);
+        py.detach(move || db.utxo_count()).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 format!("Database error: {}", e)
             )
