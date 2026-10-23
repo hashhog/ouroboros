@@ -130,3 +130,35 @@ async def test_getblockcount_responsive_during_dumptxoutset(seeded, tmp_path) ->
           f"{rpc*1000:.0f}ms, ticks {ticks}")
     assert ticks > 3, "dump finished before the probe could observe it"
     assert gap < MAX_LOOP_STALL_S and rpc < MAX_LOOP_STALL_S
+
+
+@pytest.mark.asyncio
+async def test_visit_utxo_txid_groups_releases_gil_between_groups(seeded) -> None:
+    """The native visitor must drop the GIL between txid groups.
+
+    dumptxoutset's own write path does buffered file I/O, which releases
+    the GIL now and then, so the dump test above only stalls under load.
+    Here the callback does no I/O and the switch interval is raised to
+    1 s, so bytecode preemption cannot hand the loop the GIL either: the
+    loop only runs if the visitor itself releases it between groups.
+    """
+    import sys
+
+    db, srv = seeded
+    seen = [0]
+
+    def cb(_txid, coins) -> None:
+        seen[0] += len(coins)
+
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1.0)
+    try:
+        gap, _, ticks = await _measure(
+            srv, lambda: asyncio.to_thread(db._db.visit_utxo_txid_groups, cb)
+        )
+    finally:
+        sys.setswitchinterval(old)
+    print(f"visit_utxo_txid_groups: max loop gap {gap*1000:.0f}ms, ticks {ticks}")
+    assert seen[0] == N_COINS
+    assert ticks > 3, "visit finished before the probe could observe it"
+    assert gap < MAX_LOOP_STALL_S
