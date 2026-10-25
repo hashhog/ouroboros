@@ -396,7 +396,9 @@ async def test_walletcreatefundedpsbt_rejects_unfundable_when_add_inputs_false(r
         await rpc_with_wallet.rpc_walletcreatefundedpsbt(
             inputs=[],
             outputs=[{other: 1.0}],
-            options={"add_inputs": False},
+            # Explicit rate: with no estimate and no -fallbackfee the call
+            # now fails on fees first (as in Core), not on funding.
+            options={"add_inputs": False, "fee_rate": 2},
         )
 
 

@@ -2083,6 +2083,35 @@ class RPCServer:
             # Legacy single-wallet mode (backwards compatibility)
             return getattr(self.node, "wallet", None)
 
+    def _resolve_wallet_fee_rate(self, conf_target: int = 6) -> float:
+        """Fee rate (sat/vB) for a wallet RPC that got no explicit rate.
+
+        Core (wallet/fees.cpp GetMinimumFeeRate): estimator first, then
+        -fallbackfee (BTC/kvB, default 0 = disabled).  With neither it fails
+        with RPC_WALLET_ERROR rather than guessing a rate.
+        """
+        fee_rate = None
+        fee_estimator = getattr(self.node, "fee_estimator", None)
+        if fee_estimator is not None:
+            try:
+                fee_rate = fee_estimator.estimate_fee(int(conf_target))
+            except Exception:
+                fee_rate = None
+        if fee_rate is not None:
+            return fee_rate
+        config = getattr(self.node, "config", None) or {}
+        try:
+            fallback = float(config.get("fallbackfee", 0) or 0)
+        except (TypeError, ValueError):
+            fallback = 0.0
+        if fallback <= 0:
+            raise RpcError(
+                RPC_WALLET_ERROR,
+                "Fee estimation failed. Fallbackfee is disabled. "
+                "Wait a few blocks or enable -fallbackfee.",
+            )
+        return fallback * 100_000.0  # BTC/kvB -> sat/vB
+
     def _require_wallet(self) -> Any:
         """Core GetWalletForJSONRPCRequest when a wallet is mandatory."""
         wallet = self._get_wallet_for_rpc()
@@ -5761,16 +5790,11 @@ class RPCServer:
         if amount_sat <= 0:
             raise RpcError(RPC_TYPE_ERROR, "Invalid amount")
 
-        fee_rate = None
-        fee_estimator = getattr(self.node, "fee_estimator", None)
-        if fee_estimator is not None:
-            fee_rate = fee_estimator.estimate_fee(conf_target)
-        if fee_rate is None:
-            fee_rate = 2  # fallback: 2 sat/vB
+        fee_rate = self._resolve_wallet_fee_rate(conf_target)
 
         try:
             raw_hex = await wallet.send_transaction(
-                address, amount_sat, int(fee_rate)
+                address, amount_sat, max(1, int(fee_rate))
             )
         except ValueError as exc:
             msg = str(exc)
@@ -5798,14 +5822,14 @@ class RPCServer:
         dest, amount = pairs[0]
         self._decode_dest(dest)
         amount_sat = _amount_from_value(amount)
-        rate = 10
+        rate = None
         if fee_rate is not None:
             try:
-                rate = int(float(fee_rate)) if not isinstance(fee_rate, bool) else 10
+                rate = int(float(fee_rate)) if not isinstance(fee_rate, bool) else None
             except (TypeError, ValueError):
-                rate = 10
-        if rate <= 0:
-            rate = 10
+                rate = None
+        if rate is None or rate <= 0:
+            rate = max(1, int(self._resolve_wallet_fee_rate()))
         try:
             raw_hex = await wallet.send_transaction(dest, amount_sat, rate)
         except ValueError as exc:
@@ -6757,16 +6781,9 @@ class RPCServer:
             except (TypeError, ValueError):
                 fee_rate_sat_vb = None
         if fee_rate_sat_vb is None:
-            fee_estimator = getattr(self.node, "fee_estimator", None)
-            if fee_estimator is not None:
-                try:
-                    fee_rate_sat_vb = fee_estimator.estimate_fee(
-                        int(opts.get("conf_target", 6))
-                    )
-                except Exception:
-                    fee_rate_sat_vb = None
-        if fee_rate_sat_vb is None:
-            fee_rate_sat_vb = 2.0  # match send_transaction fallback
+            fee_rate_sat_vb = self._resolve_wallet_fee_rate(
+                int(opts.get("conf_target", 6))
+            )
         try:
             fee_rate_sat_vb = max(1.0, float(fee_rate_sat_vb))
         except (TypeError, ValueError):

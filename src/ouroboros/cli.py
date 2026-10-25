@@ -558,13 +558,25 @@ def sync(ctx, reset, limit):
         "interpreter holds the GIL, so --par is a no-op there."
     ),
 )
+@click.option(
+    "--fallbackfee",
+    "fallbackfee",
+    type=float,
+    default=None,
+    help=(
+        "Fee rate (BTC/kvB) the wallet uses when fee estimation is "
+        "unavailable. Default: 0 (disabled: sendtoaddress and friends fail "
+        "with 'Fee estimation failed. Fallbackfee is disabled...'). Mirrors "
+        "Bitcoin Core's -fallbackfee."
+    ),
+)
 @click.pass_context
 def start(
     ctx, rpc_port, p2p_port, listen, bind, externalip, discover, connect,
     dnsseed, force, v2transport,
     peerbloomfilters, blockfilterindex, cfilter, coinstatsindex,
     txospenderindex, assumevalid, noassumevalid, daemon,
-    pid_path, reindex, rpc_tls_cert, rpc_tls_key, par,
+    pid_path, reindex, rpc_tls_cert, rpc_tls_key, par, fallbackfee,
 ):
     """Start the Bitcoin node"""
     global _node, _cancelled, _pid_file
@@ -690,6 +702,10 @@ def start(
             config["assumevalid"] = str(assumevalid)
         if par is not None:
             config["par"] = int(par)
+        if fallbackfee is not None:
+            if fallbackfee < 0:
+                raise click.BadParameter("--fallbackfee must be >= 0")
+            config["fallbackfee"] = float(fallbackfee)
 
         # FIX-64: HTTPS/TLS termination flags.  Reject mismatched pairs at
         # the CLI layer so the operator sees a clean Click error rather than
