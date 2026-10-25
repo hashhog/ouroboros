@@ -2018,6 +2018,14 @@ class RPCServer:
         self._side_branch_blocks: dict[bytes, tuple[bytes, int, bytes]] = {}
         self._side_branch_max_entries: int = 1024
 
+        # getchaintips-only record of blocks the submitblock path saw FAIL
+        # (Core keeps them in m_block_index with BLOCK_FAILED_VALID; the RPC
+        # path here drops them).  hash -> (prev_hash, height).  Read by
+        # ``_collect_chain_tips`` and nothing else: no validation or
+        # chain-selection decision consults it.  Bounded FIFO, in memory.
+        self._chaintips_failed: dict[bytes, tuple[bytes, int]] = {}
+        self._chaintips_failed_max: int = 1024
+
         # preciousblock (Bitcoin Core CChainState::PreciousBlock) bookkeeping.
         # Mirrors ChainstateManager::nLastPreciousChainwork /
         # nBlockReverseSequenceId (validation.cpp:3490). A precious block is
@@ -8477,6 +8485,116 @@ class RPCServer:
                     return h
         return None
 
+    # BIP-22 tokens of the failures Core records in m_block_index as
+    # BLOCK_FAILED_VALID for a submitblock'd block: ContextualCheckBlock and
+    # ConnectBlock consensus rejects (validation.cpp AcceptBlock /
+    # InvalidBlockFound).  CheckBlock / CheckTransaction / header failures are
+    # absent on purpose: ProcessNewBlock runs CheckBlock before AcceptBlock,
+    # so those blocks never get an index entry; BLOCK_MUTATED ones are not
+    # marked failed.  Unknown tokens are not recorded.
+    _CHAINTIPS_FAILED_TOKENS = frozenset({
+        "bad-cb-amount",
+        "bad-cb-height",
+        "bad-blk-weight",
+        "bad-txns-nonfinal",
+        "bad-txns-BIP30",
+        "bad-txns-inputs-missingorspent",
+        "bad-txns-premature-spend-of-coinbase",
+        "bad-txns-inputvalues-outofrange",
+        "bad-txns-in-belowout",
+        "bad-txns-fee-outofrange",
+    })
+    _CHAINTIPS_FAILED_PREFIXES = (
+        "mandatory-script-verify-flag-failed",
+        "block-script-verify-flag-failed",
+    )
+
+    def _chaintips_failed_path(self) -> str | None:
+        data_dir = getattr(getattr(self, "node", None), "data_dir", None)
+        if not isinstance(data_dir, str) or not data_dir:
+            return None
+        import os as _os
+        return _os.path.join(data_dir, "chaintips_failed.json")
+
+    def _chaintips_failed_record(self) -> dict[bytes, tuple[bytes, int]]:
+        """The getchaintips failed record, loaded from the datadir on first
+        use (Core keeps BLOCK_FAILED_VALID entries in the on-disk block
+        index, so they are listed after a restart too).  Reporting only."""
+        d = self.__dict__.setdefault("_chaintips_failed", {})
+        if not self.__dict__.get("_chaintips_failed_loaded"):
+            self.__dict__["_chaintips_failed_loaded"] = True
+            path = self._chaintips_failed_path()
+            if path:
+                try:
+                    with open(path) as f:
+                        rows = json.load(f)
+                    for h, prev, height in rows:
+                        h, prev = bytes.fromhex(h), bytes.fromhex(prev)
+                        if len(h) == 32 and len(prev) == 32 and h not in d:
+                            d[h] = (prev, int(height))
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"getchaintips: {path} unreadable: {e}")
+        return d
+
+    def _save_chaintips_failed(self) -> None:
+        """Atomically rewrite the record (best effort, at most
+        ``_chaintips_failed_max`` rows)."""
+        path = self._chaintips_failed_path()
+        if not path:
+            return
+        import os as _os
+        rows = [[h.hex(), prev.hex(), height]
+                for h, (prev, height) in self._chaintips_failed_record().items()]
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(rows, f)
+            _os.replace(tmp, path)
+        except Exception as e:
+            logger.warning(f"getchaintips: could not persist {path}: {e}")
+
+    def _note_failed_for_tips(
+        self, block_hash: bytes, prev_hash: bytes, height: int, save: bool = True
+    ) -> None:
+        """Record a failed block for ``getchaintips`` (reporting only)."""
+        d = self._chaintips_failed_record()
+        key = bytes(block_hash)
+        entry = (bytes(prev_hash), int(height))
+        if d.get(key) == entry:
+            return
+        if key not in d and len(d) >= getattr(self, "_chaintips_failed_max", 1024):
+            d.pop(next(iter(d)), None)
+        d[key] = entry
+        if save:
+            self._save_chaintips_failed()
+
+    def _forget_failed_for_tips(self, block_hash: bytes) -> None:
+        """reconsiderblock (Core ResetBlockFailureFlags): drop the block, its
+        recorded descendants and its recorded ancestors from the
+        ``getchaintips`` failed record."""
+        d = self._chaintips_failed_record()
+        if not d:
+            return
+        target = bytes(block_hash)
+        drop = {target}
+        changed = True
+        while changed:  # descendants
+            changed = False
+            for h, (prev, _height) in d.items():
+                if h not in drop and prev in drop:
+                    drop.add(h)
+                    changed = True
+        cur = d.get(target)
+        while cur is not None and cur[0] not in drop:  # ancestors
+            drop.add(cur[0])
+            cur = d.get(cur[0])
+        if any(h in d for h in drop):
+            for h in drop:
+                d.pop(h, None)
+            self._save_chaintips_failed()
+
     def _evict_side_branch_if_full(self) -> None:
         """Soft-cap the in-memory side-branch buffer.
 
@@ -9157,6 +9275,23 @@ class RPCServer:
         (e.g. old datadir), we fall back to a height comparison, matching the
         strictly-heavier reorg gate's own height fallback at rpc.py:7667-7669.
         """
+        # getchaintips record (reporting only): Core leaves the block whose
+        # ConnectTip failed, and every descendant, in m_block_index as
+        # BLOCK_FAILED_VALID.  Both exits below drop the competing tip from
+        # the side-branch buffer, so note the failed part of the branch first.
+        # A system fault or a missing-ancestor hold is not a verdict.
+        if not is_internal_error_text(reason) and not str(reason).startswith(
+            "missing-ancestor-header"
+        ):
+            _fail = getattr(self, "_last_reorg_failure", None)
+            _fail_hash = bytes(_fail[0]) if _fail else None
+            _hashes = [bytes(h) for h, _, _ in chain_to_connect]
+            _start = _hashes.index(_fail_hash) if _fail_hash in _hashes else None
+            for _i, (_h, _hh, _raw) in enumerate(chain_to_connect):
+                if (_start is not None and _i >= _start) or bytes(_h) == bytes(new_tip_hash):
+                    self._note_failed_for_tips(bytes(_h), bytes(_raw[4:36]), int(_hh), save=False)
+            self._save_chaintips_failed()
+
         n_connected = len(connected_hashes)
         prefix_raws = [raw for _, _, raw in chain_to_connect[:n_connected]]
         original_raws = [raw for _, _, raw in disconnected_active]
@@ -10145,7 +10280,13 @@ class RPCServer:
                     "submitblock rejected block %s at height %d: %s",
                     block_hash[::-1].hex()[:16], best_height + 1, e,
                 )
-                return bip22_result_string(str(e))
+                _token = bip22_result_string(str(e))
+                if _token in self._CHAINTIPS_FAILED_TOKENS or (
+                    isinstance(_token, str)
+                    and _token.startswith(self._CHAINTIPS_FAILED_PREFIXES)
+                ):
+                    self._note_failed_for_tips(block_hash, prev_hash, best_height + 1)
+                return _token
 
         # Side-branch path: parent is not the active tip. Resolve its
         # height (via active chain or side-branch buffer); if unknown,
@@ -10593,6 +10734,7 @@ class RPCServer:
         # mempool (DisconnectedBlockTransactions).  O(blocks disconnected).
         target_prev = None
         disconnected: list[tuple[bytes, bytes, object]] = []  # ascending height
+        _disc_heights: dict[bytes, int] = {}
         if is_active:
             for h in range(target_h, int(best_height) + 1):
                 try:
@@ -10615,6 +10757,7 @@ class RPCServer:
                     except Exception:
                         prev = None
                 disconnected.append((bytes(hh), prev, blk))
+                _disc_heights[bytes(hh)] = h
             if disconnected and disconnected[0][0] == block_hash_internal:
                 target_prev = disconnected[0][1]
         elif target_h is not None:
@@ -10679,6 +10822,11 @@ class RPCServer:
             bs.invalidate_from_rpc(block_hash_internal, desc_pairs, prev=target_prev)
             # fsync can take seconds on a loaded box: keep it off the loop.
             await asyncio.to_thread(self._persist_rpc_invalidated, bs)
+        # getchaintips (reporting only): Core keeps the disconnected blocks in
+        # m_block_index, failed, across restarts; the leaf is the listed tip.
+        for _h, _p, _b in disconnected:
+            if _p is not None and _h in _disc_heights:
+                self._note_failed_for_tips(_h, _p, _disc_heights[_h], save=False)
         failed_now = {block_hash_internal} | {h for h, _ in desc_pairs}
         # Side-branch buffer: drop the failed blocks and anything built on them.
         changed = True
@@ -10688,9 +10836,12 @@ class RPCServer:
             for h, entry in list(_sbb.items()):
                 if h in failed_now or bytes(entry[0]) in failed_now:
                     _sbb.pop(h, None)
+                    # Core keeps them in m_block_index, failed: getchaintips.
+                    self._note_failed_for_tips(h, bytes(entry[0]), int(entry[1]), save=False)
                     if h not in failed_now:
                         failed_now.add(h)
                         changed = True
+        self._save_chaintips_failed()
 
         # Core InvalidateBlock -> MaybeUpdateMempoolForReorg(disconnectpool,
         # true): the disconnected blocks' transactions go back to the mempool
@@ -10876,6 +11027,7 @@ class RPCServer:
             raw = db.get_block_bytes(h)
             return bytes(raw[4:36]) if raw else None
 
+        self._forget_failed_for_tips(block_hash_internal)
         cleared: set = set()
         if bs is not None and hasattr(bs, "reconsider_from_rpc"):
             cleared = bs.reconsider_from_rpc(block_hash_internal, _prev_from_store)
@@ -12719,132 +12871,250 @@ class RPCServer:
             raise HTTPException(status_code=500, detail="Database not available")
 
         db = self.node.db
+        return self._collect_chain_tips(db, getattr(self.node, "block_sync", None))
+
+    def _collect_chain_tips(self, db: Any, bs: Any) -> list[dict[str, Any]]:
+        """Core ``getchaintips`` over ouroboros's split block index.
+
+        Core walks ``m_block_index``: every entry not on the active chain whose
+        hash is nobody's ``pprev`` is a tip, plus the active tip
+        (rpc/blockchain.cpp getchaintips).  ouroboros has no single in-memory
+        index to walk, so the entries are gathered from every store that holds
+        one, each keyed by hash with its parent edge:
+
+          * the submitblock side-branch buffer (``_side_branch_blocks``) —
+            blocks with data off the active chain;
+          * the failed sets in block_sync (``_failed_blocks``,
+            ``_rpc_invalidated``, parents in ``_failed_prev``) — the
+            BLOCK_FAILED_VALID entries, including the active-chain blocks an
+            ``invalidateblock`` disconnected — and ``_chaintips_failed``, the
+            blocks the submitblock path saw fail ConnectBlock;
+          * the competing-fork header store (``_fork_headers``) and the
+            tip-anchored header queue (``_validated_headers``) — header-only
+            entries unless their body is buffered.
+
+        Status follows Core's order: active, then ``invalid`` (the tip or an
+        ancestor below the fork point is failed — Core's v31 InvalidateBlock /
+        InvalidBlockFound mark every descendant BLOCK_FAILED_VALID), then
+        ``headers-only`` (the tip or an ancestor has no data:
+        !HaveNumChainTxs), then ``valid-fork`` (the block was connected once:
+        the hash-keyed Rust index carries BLOCK_HAVE_DATA only for blocks
+        ``connect_block_from_bytes`` wrote, i.e. IsValid(BLOCK_VALID_SCRIPTS)),
+        else ``valid-headers`` (data, never connected).  branchlen is
+        ``height - FindFork(active).height``.
+
+        Read-only: nothing here feeds validation or chain selection.
+        """
         tips: list[dict[str, Any]] = []
 
-        # Active chain tip ---------------------------------------------------
-        best_hash, best_height = db.get_best_block()
-        tip_hash_hex: str
-        # Core emits the DISPLAY (big-endian / byte-reversed) hash here, same as
-        # getbestblockhash/getblockheader. The internal hash is little-endian.
-        if isinstance(best_hash, bytes):
-            tip_hash_hex = best_hash[::-1].hex()
-        else:
-            tip_hash_hex = str(best_hash)
+        def _disp(h: Any) -> str:
+            # Core emits the DISPLAY (byte-reversed) hash, like getbestblockhash.
+            return bytes(h)[::-1].hex() if isinstance(h, (bytes, bytearray)) else str(h)
 
+        best_hash, best_height = db.get_best_block()
+        best_hash = bytes(best_hash) if isinstance(best_hash, (bytes, bytearray)) else best_hash
+        best_height = int(best_height)
         tips.append({
             "height": best_height,
-            "hash": tip_hash_hex,
+            "hash": _disp(best_hash),
             "branchlen": 0,
             "status": "active",
         })
 
-        # Collect orphan/stale tips from block index -------------------------
-        # A tip is a block with no known children in the block index.
-        # We identify tips by finding blocks that are not referenced as
-        # prev_blockhash by any other block.
+        rust = getattr(db, "_db", None) or getattr(db, "rust_db", None)
+        meta_fn = getattr(rust, "get_block_metadata_by_hash", None)
+        meta_cache: dict[bytes, Any] = {}
 
-        # Get all known block hashes
-        all_blocks: dict[bytes, Any] = {}
-        parent_refs: set = set()  # blocks that are someone's parent
+        def _meta(h: bytes):
+            if h not in meta_cache:
+                m = None
+                if meta_fn is not None:
+                    try:
+                        m = meta_fn(h)
+                    except Exception:
+                        m = None
+                meta_cache[h] = m
+            return meta_cache[h]
 
-        # If the database has a block index, iterate it
-        if hasattr(db, 'get_all_block_hashes'):
-            for block_hash in db.get_all_block_hashes():
-                block = await asyncio.to_thread(db.get_block, block_hash)
-                if block:
-                    all_blocks[block_hash] = block
-                    if block.prev_blockhash and block.prev_blockhash != bytes(32):
-                        parent_refs.add(block.prev_blockhash)
+        active_cache: dict[int, bytes | None] = {}
 
-        elif hasattr(db, 'block_index'):
-            # Direct access to block index
-            for block_hash, _block_info in db.block_index.items():
-                block = await asyncio.to_thread(db.get_block, block_hash)
-                if block:
-                    all_blocks[block_hash] = block
-                    if block.prev_blockhash and block.prev_blockhash != bytes(32):
-                        parent_refs.add(block.prev_blockhash)
+        def _active_at(height: int) -> bytes | None:
+            if height < 0 or height > best_height:
+                return None
+            if height not in active_cache:
+                try:
+                    a = db.get_block_hash_by_height(height)
+                except Exception:
+                    a = None
+                active_cache[height] = bytes(a) if a is not None else None
+            return active_cache[height]
 
-        # Blocks that are tips (not referenced as parent by anyone)
-        for block_hash, block in all_blocks.items():
-            if block_hash == best_hash:
-                continue  # Already added as active tip
+        # Off-active-chain index entries: hash -> [prev, height|None, has_data].
+        entries: dict[bytes, list] = {}
+        failed: set[bytes] = set()
+        # Header-queue entries are never in the Rust index: no point reads.
+        queue_hashes: set[bytes] = set()
 
-            if block_hash not in parent_refs:
-                # This is a tip
-                block_height = getattr(block, 'height', 0) or 0
+        def _add(h: bytes, prev: bytes | None, height: int | None, has_data: bool) -> None:
+            e = entries.get(h)
+            if e is None:
+                entries[h] = [prev, height, has_data]
+                return
+            if e[0] is None and prev is not None:
+                e[0] = prev
+            if e[1] is None and height is not None:
+                e[1] = height
+            e[2] = e[2] or has_data
 
-                # Determine status
-                status = "headers-only"
-                branchlen = 0
+        for h, entry in list(getattr(self, "_side_branch_blocks", {}).items()):
+            try:
+                prev, height = bytes(entry[0]), int(entry[1])
+            except Exception:
+                continue
+            _add(bytes(h), prev, height, True)
 
-                # Check if block has full data
-                has_data = hasattr(block, 'transactions') and block.transactions
+        for h, (prev, height) in list(self._chaintips_failed_record().items()):
+            failed.add(bytes(h))
+            _add(bytes(h), bytes(prev), int(height), True)
 
-                # Check if block is marked invalid
-                is_invalid = getattr(block, 'is_invalid', False)
-                if hasattr(db, 'is_block_invalid'):
-                    is_invalid = db.is_block_invalid(block_hash)
+        if bs is not None:
+            failed_prev = getattr(bs, "_failed_prev", {}) or {}
+            for h in set(getattr(bs, "_failed_blocks", ())) | set(getattr(bs, "_rpc_invalidated", ())):
+                h = bytes(h)
+                failed.add(h)
+                prev = failed_prev.get(h)
+                if prev is None:
+                    try:
+                        raw = db.get_block_bytes(h)
+                        prev = bytes(raw[4:36]) if raw else None
+                    except Exception:
+                        prev = None
+                _add(h, bytes(prev) if prev is not None else None, None, False)
 
-                if is_invalid:
-                    status = "invalid"
-                elif has_data:
-                    # Check if fully validated
-                    is_validated = getattr(block, 'is_validated', True)
-                    if hasattr(db, 'is_block_validated'):
-                        is_validated = db.is_block_validated(block_hash)
+            fork_bytes = getattr(bs, "_fork_block_bytes", {}) or {}
+            fork_prev = getattr(bs, "_fork_header_prev", {}) or {}
+            for h, hdr in list((getattr(bs, "_fork_headers", {}) or {}).items()):
+                prev = fork_prev.get(h)
+                if prev is None:
+                    prev = getattr(hdr, "prev_blockhash", None)
+                _add(bytes(h), bytes(prev) if prev is not None else None, None, h in fork_bytes)
 
-                    if is_validated:
-                        status = "valid-fork"
-                    else:
-                        status = "valid-headers"
+            queue = list(getattr(bs, "_validated_headers", ()) or ())
+            queue_hashes = {bytes(h) for h, _ in queue}
+            if queue and queue[0][1] is not None and bytes(queue[0][1].prev_blockhash) == best_hash:
+                # Linear and anchored on the active tip: slot i is height tip+1+i.
+                for i, (h, hdr) in enumerate(queue):
+                    _add(bytes(h), bytes(hdr.prev_blockhash), best_height + 1 + i, False)
+
+        def _on_active(h: bytes, height: int | None) -> bool:
+            return height is not None and _active_at(height) == h
+
+        def _height(h: bytes) -> int | None:
+            # Iterative: entry height, else Rust index height, else parent + 1.
+            path: list[bytes] = []
+            cur: bytes | None = h
+            base: int | None = None
+            seen: set[bytes] = set()
+            while cur is not None and cur not in seen:
+                seen.add(cur)
+                e = entries.get(cur)
+                if e is not None and e[1] is not None:
+                    base = e[1]
+                    break
+                m = _meta(cur)
+                if m is not None:
+                    base = int(m[0])
+                    if e is not None:
+                        e[1] = base
+                    break
+                if e is None:
+                    return None
+                path.append(cur)
+                cur = e[0]
+            if base is None:
+                return None
+            for node_hash in reversed(path):
+                base += 1
+                entries[node_hash][1] = base
+            return entries[h][1] if h in entries else base
+
+        for h in list(entries):
+            _height(h)
+
+        # An entry that is (again) on the active chain is not a fork entry.
+        off_active = {h: e for h, e in entries.items() if e[1] is not None and not _on_active(h, e[1])}
+        parents = {e[0] for e in off_active.values() if e[0] is not None}
+
+        def _stored_entry(h: bytes, height: int) -> list | None:
+            # An off-chain ancestor only the Rust hash index still holds (e.g.
+            # a side block connected during a failed reorg, then rolled back):
+            # Core has it in m_block_index too, so walk through it.
+            m = _meta(h)
+            if m is None or int(m[0]) != height:
+                return None
+            prev = None
+            try:
+                raw = db.get_block_bytes(h)
+                prev = bytes(raw[4:36]) if raw else None
+            except Exception:
+                prev = None
+            if prev is None:
+                return None
+            e = [prev, height, bool(int(m[3]) & 0x08)]
+            off_active[h] = e
+            return e
+
+        for h, (_prev, height, _has_data) in list(off_active.items()):
+            if h in parents:
+                continue
+            invalid = False
+            no_data = False
+            cur, cur_e = h, off_active[h]
+            fork_height = height - 1
+            steps = 0
+            while True:
+                if cur in failed:
+                    invalid = True
+                elif cur in queue_hashes:
+                    no_data = no_data or not cur_e[2]
                 else:
-                    status = "headers-only"
+                    m = _meta(cur)
+                    if m is not None and int(m[3]) & 0x60:  # BLOCK_FAILED_MASK
+                        invalid = True
+                    if not cur_e[2] and (m is None or not int(m[3]) & 0x08):  # BLOCK_HAVE_DATA
+                        no_data = True
+                p = cur_e[0]
+                p_height = cur_e[1] - 1
+                if p is None or p_height < 0:
+                    fork_height = max(p_height, 0)
+                    break
+                if _active_at(p_height) == p:
+                    fork_height = p_height
+                    break
+                nxt = off_active.get(p)
+                if nxt is None:
+                    nxt = _stored_entry(p, p_height)
+                steps += 1
+                if nxt is None or steps > 1_000_000:
+                    fork_height = p_height
+                    break
+                cur, cur_e = p, nxt
 
-                # Calculate branch length by walking back to find fork point
-                # Fork point is where this branch meets the active chain
-                fork_height = 0
-                current = block
-                visited = set()
-                while current and current.prev_blockhash != bytes(32):
-                    if current.prev_blockhash in visited:
-                        break
-                    visited.add(current.prev_blockhash)
+            if invalid:
+                status = "invalid"
+            elif no_data:
+                status = "headers-only"
+            else:
+                m = _meta(h)
+                connected = m is not None and bool(int(m[3]) & 0x08)
+                status = "valid-fork" if connected else "valid-headers"
 
-                    # Check if prev is on active chain
-                    prev_hash = current.prev_blockhash
-                    prev_height = None
-
-                    # Try to get height from active chain
-                    if hasattr(db, 'get_block_height'):
-                        prev_height = db.get_block_height(prev_hash)
-                    elif prev_hash in all_blocks:
-                        prev_height = getattr(all_blocks[prev_hash], 'height', None)
-
-                    if prev_height is not None:
-                        # Check if this hash is in active chain at this height
-                        active_hash = await asyncio.to_thread(db.get_block_hash_by_height, prev_height)
-                        if active_hash == prev_hash:
-                            fork_height = prev_height
-                            break
-
-                    # Move to parent
-                    if prev_hash in all_blocks:
-                        current = all_blocks[prev_hash]
-                    else:
-                        current = await asyncio.to_thread(db.get_block, prev_hash)
-                        if current:
-                            all_blocks[prev_hash] = current
-
-                branchlen = max(0, block_height - fork_height)
-
-                tips.append({
-                    "height": block_height,
-                    # Display (byte-reversed) hash, matching Core.
-                    "hash": block_hash[::-1].hex() if isinstance(block_hash, bytes) else str(block_hash),
-                    "branchlen": branchlen,
-                    "status": status,
-                })
+            tips.append({
+                "height": height,
+                "hash": _disp(h),
+                "branchlen": max(0, height - fork_height),
+                "status": status,
+            })
 
         # Sort by height descending (Bitcoin Core behavior)
         tips.sort(key=lambda x: (-x["height"], x["hash"]))
