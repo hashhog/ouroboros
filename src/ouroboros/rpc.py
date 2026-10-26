@@ -13287,6 +13287,7 @@ class RPCServer:
             """Single-pass UTXO walk on a worker thread (large chainstates
             must not stall the asyncio event loop)."""
             from decimal import Decimal
+            from ouroboros.psbt import _infer_descriptor, _spk_to_address
 
             # Active tip height, captured once for per-coin confirmations
             # (Core: tip->nHeight - coin.nHeight + 1, blockchain.cpp:2464).
@@ -13298,9 +13299,11 @@ class RPCServer:
             for utxo in self.node.db.iter_utxos():
                 txouts += 1
                 spk = bytes(utxo.script_pubkey)
-                desc = needles.get(spk)
-                if desc is None:
+                if spk not in needles:
                     continue
+                # Core reports InferDescriptor(coin script), not the scan
+                # object that matched (rpc/blockchain.cpp scantxoutset).
+                desc = _infer_descriptor(spk, _spk_to_address(spk, network))
                 amount = int(utxo.amount)
                 total_in += amount
                 # iter_utxos yields txid in internal (little-endian) byte
