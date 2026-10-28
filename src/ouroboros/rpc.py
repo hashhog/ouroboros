@@ -10850,6 +10850,13 @@ class RPCServer:
         if is_active and disconnected:
             await self._update_mempool_after_disconnect(db, [b for _h, _p, b in disconnected])
 
+        # Core rpc invalidateblock -> ActivateBestChain: InvalidateBlock put
+        # every block with at least the new tip's work back into
+        # setBlockIndexCandidates, so a stored side branch with more work
+        # than the invalidated block's parent becomes the tip.
+        if is_active:
+            await self._activate_best_side_branch(db)
+
         # The Rust layer performed the chainstate reorg WITHOUT firing the
         # Python connect/disconnect index hooks, so re-align the coin-stats
         # index with the new active chain (rewind reorged-away heights, then
@@ -10878,6 +10885,95 @@ class RPCServer:
                 )
 
         return None
+
+    async def _activate_best_side_branch(self, db) -> None:
+        """ActivateBestChain over the submitblock side-branch buffer.
+
+        Core ``ActivateBestChain`` loops ``FindMostWorkChain`` ->
+        ``ActivateBestChainStep`` until the tip is the most-work valid
+        candidate.  A block that fails ``ConnectTip`` is ``InvalidBlockFound``
+        (descendants FAILED_CHILD) and the next pass selects again, so a
+        valid prefix of a failed branch still wins when it has more work
+        than the tip (validation.cpp:3234-3260).  Here a candidate is a
+        buffered leaf whose branch work is STRICTLY greater than the active
+        tip's (equal work: the tip was received first and stays).  The reorg
+        engine (``_reorg_to_side_branch_tip``) disconnects, connects, keeps a
+        heavier connected prefix or rolls back, and drops the failed tip; this
+        loop drops the failed block's other buffered descendants and selects
+        again.  A system fault or a missing-ancestor hold is not a verdict:
+        stop, mark nothing.
+        """
+        bs = getattr(self.node, "block_sync", None)
+        sbb = getattr(self, "_side_branch_blocks", None)
+        if not sbb:
+            return
+        for _ in range(len(sbb) + 1):
+            if is_fatal():
+                return
+            try:
+                _, tip_h = db.get_best_block()
+                active_cw = self.node._calculate_chainwork_at_height(int(tip_h))
+            except Exception as e:
+                logger.warning("invalidateblock: no tip work, not activating: %s", e)
+                return
+            parents = {bytes(e[0]) for e in sbb.values()}
+            best: tuple[int, bytes] | None = None
+            for h, (_prev, hh, _raw) in list(sbb.items()):
+                if h in parents:
+                    continue
+                if bs is not None and self._branch_has_failed_block(bs, h):
+                    continue
+                cw = self._side_branch_chainwork(db, h, int(hh))
+                if cw is None or cw <= active_cw:
+                    continue
+                if best is None or cw > best[0]:
+                    best = (cw, h)
+            if best is None:
+                return
+            logger.info(
+                "invalidateblock: activating side-branch tip %s (work 0x%x > 0x%x)",
+                best[1][::-1].hex()[:16], best[0], active_cw,
+            )
+            result = await self._reorg_to_side_branch_tip(db, best[1])
+            if result is None:
+                continue
+            if is_internal_error_text(result) or str(result).startswith(
+                "missing-ancestor-header"
+            ):
+                logger.warning("invalidateblock: activation stopped: %s", result)
+                return
+            # The engine dropped the failed tip; drop the rest of the failed
+            # block's buffered descendants (Core BLOCK_FAILED_CHILD) so the
+            # next pass cannot select them.
+            _fail = getattr(self, "_last_reorg_failure", None)
+            failed = {bytes(_fail[0])} if _fail else {best[1]}
+            changed = True
+            while changed:
+                changed = False
+                for h, entry in list(sbb.items()):
+                    if h in failed or bytes(entry[0]) in failed:
+                        sbb.pop(h, None)
+                        self._note_failed_for_tips(h, bytes(entry[0]), int(entry[1]), save=False)
+                        if h not in failed:
+                            failed.add(h)
+                            changed = True
+            self._save_chaintips_failed()
+
+    def _branch_has_failed_block(self, bs, tip_hash: bytes) -> bool:
+        """True when a buffered block on the branch ending at ``tip_hash`` is
+        failed in the sync layer (Core: not a candidate)."""
+        cursor = tip_hash
+        for _ in range(len(self._side_branch_blocks) + 1):
+            entry = self._side_branch_blocks.get(cursor)
+            if entry is None:
+                return False
+            try:
+                if bs.is_block_failed(cursor):
+                    return True
+            except Exception:
+                return False
+            cursor = bytes(entry[0])
+        return False
 
     def _persist_rpc_invalidated(self, bs) -> None:
         """Persist the operator's invalidateblock roots (Core keeps
