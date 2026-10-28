@@ -224,17 +224,42 @@ def test_reconsider_after_restart_keeps_the_tip_on_a_tie(tmp_path):
 
 
 def test_invalidate_prefers_equal_work_candidate_received_first(tmp_path):
-    """Among equal-work candidates Core picks the lower nSequenceId: two
-    side branches 7'-8' and 7''-8'' off 6 tie after invalidateblock 7a;
-    7'-8' arrived first and becomes the tip."""
+    """After invalidateblock Core re-adds every block with at least the new
+    tip's work and picks the lower nSequenceId on a tie.  a7-a8 arrive
+    first, 7'-8' and 7''-8'' tie them, 9' on 8' reorgs onto the ' branch.
+    invalidateblock 9': the tip is 8', and a8 (arrived before 8') beats it;
+    8'' arrived after 8' and does not."""
     bdb, server, hashes = _setup(tmp_path)
     raw7, a7 = _block(hashes[TIP], TIP + 1, b"\x93\xb7")
     raw8, a8 = _block(a7, TIP + 2, b"\x94\xb7")
-    raw9, _a9 = _block(a8, TIP + 3, b"\x95\xb7")
-    for raw in (raw7, raw8, raw9):
+    for raw in (raw7, raw8):
         assert asyncio.run(server.rpc_submitblock(raw.hex())) is None
-    first = _side_branch(server, hashes[TIP], TIP + 1, 2, 0xB0)
-    second = _side_branch(server, hashes[TIP], TIP + 1, 2, 0xC0)
-    asyncio.run(server.rpc_invalidateblock(_disp(a7)))
-    assert bdb.get_best_block() == (first[-1], TIP + 2)
-    assert second[-1] in server._side_branch_blocks
+    side = _side_branch(server, hashes[TIP], TIP + 1, 2, 0xB0)
+    _side_branch(server, hashes[TIP], TIP + 1, 2, 0xC0)
+    raw9, s9 = _block(side[-1], TIP + 3, b"\xb9\xb7")
+    assert asyncio.run(server.rpc_submitblock(raw9.hex())) is None
+    assert bdb.get_best_block() == (s9, TIP + 3)
+    asyncio.run(server.rpc_invalidateblock(_disp(s9)))
+    assert bdb.get_best_block() == (a8, TIP + 2)
+    assert bytes(bdb.get_block_hash_by_height(TIP + 1)) == a7
+
+
+def test_invalidate_never_activates_a_branch_with_an_invalid_block(tmp_path):
+    """Consensus guard: the heavier side branch 4'-5'-6' off 3 has an invalid
+    FIRST block (4' pays 51 BTC).  invalidateblock 5 selects it, 4' fails
+    ConnectBlock, and Core stays on 4 with 6' an invalid tip; nothing of the
+    bad branch is connected or left as a candidate."""
+    bdb, server, hashes = _setup(tmp_path)
+    prev, side = hashes[TIP - 3], []
+    for i in range(3):
+        raw, h = _block(prev, TIP - 2 + i, bytes([0xD0 + i, 0xB7]),
+                        value=51 * COIN if i == 0 else 50 * COIN)
+        assert asyncio.run(server.rpc_submitblock(raw.hex())) is None
+        side.append(h)
+        prev = h
+    asyncio.run(server.rpc_invalidateblock(_disp(hashes[TIP - 1])))
+    assert bdb.get_best_block() == (hashes[TIP - 2], TIP - 2)
+    assert not any(h in server._side_branch_blocks for h in side)
+    tips = _tips(server)
+    assert tips[_disp(hashes[TIP - 2])]["status"] == "active"
+    assert tips[_disp(side[-1])]["status"] == "invalid"
