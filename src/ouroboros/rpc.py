@@ -5280,7 +5280,9 @@ class RPCServer:
             # Next block hash (not present for tip).
             # Primary: BLOCK_INDEX_CF lookup at height+1.
             # Fallback: nexthash stored in HEADERS_CF extended record.
-            if block_height is not None:
+            # Core blockheaderToJSON: pnext = active_chain.Next(blockindex),
+            # nullptr for a block off the active chain (confirmations -1).
+            if block_height is not None and confirmations != -1:
                 next_hash = await self._get_next_block_hash(block_height)
                 if next_hash:
                     result["nextblockhash"] = next_hash
@@ -10898,7 +10900,8 @@ class RPCServer:
         return None
 
     async def _activate_best_side_branch(self, db) -> None:
-        """ActivateBestChain over the submitblock side-branch buffer.
+        """ActivateBestChain over the submitblock side-branch buffer, after
+        invalidateblock or reconsiderblock.
 
         Core ``ActivateBestChain`` loops ``FindMostWorkChain`` ->
         ``ActivateBestChainStep`` until the tip is the most-work valid
@@ -10926,7 +10929,7 @@ class RPCServer:
                 tip_hash = bytes(tip_hash)
                 active_cw = self.node._calculate_chainwork_at_height(int(tip_h))
             except Exception as e:
-                logger.warning("invalidateblock: no tip work, not activating: %s", e)
+                logger.warning("activate best chain: no tip work, not activating: %s", e)
                 return
             parents = {bytes(e[0]) for e in sbb.values()}
             best: tuple[int, bytes] | None = None
@@ -10947,7 +10950,7 @@ class RPCServer:
             if best is None:
                 return
             logger.info(
-                "invalidateblock: activating side-branch tip %s (work 0x%x > 0x%x)",
+                "activate best chain: side-branch tip %s (work 0x%x, tip 0x%x)",
                 best[1][::-1].hex()[:16], best[0], active_cw,
             )
             result = await self._reorg_to_side_branch_tip(db, best[1])
@@ -10956,7 +10959,7 @@ class RPCServer:
             if is_internal_error_text(result) or str(result).startswith(
                 "missing-ancestor-header"
             ):
-                logger.warning("invalidateblock: activation stopped: %s", result)
+                logger.warning("activate best chain: stopped: %s", result)
                 return
             # The engine dropped the failed tip; drop the rest of the failed
             # block's buffered descendants (Core BLOCK_FAILED_CHILD) so the
@@ -11030,64 +11033,26 @@ class RPCServer:
             cursor = prev
         return None
 
-    async def _activate_reconsidered_tie(self, db, candidates) -> None:
-        """reconsiderblock's ActivateBestChain for an EQUAL-work candidate.
-
-        Core ResetBlockFailureFlags puts the reconsidered blocks back into
-        setBlockIndexCandidates and ActivateBestChain switches to the best one
-        under CBlockIndexWorkComparator: more work, then the lower sequence
-        id.  The Rust reactivation handles strictly more work; this handles
-        the tie, which Core resolves to the block that arrived first (the
-        failed_reorg C round trip: 4a and 4' tie, 4a arrived first, Core goes
-        back to 4a).  The branch is connected by the reorg engine, which
-        validates every block.
-
-        Every reconsidered block left off the active chain is staged in the
-        side-branch buffer first: Core keeps it in m_block_index as a
-        candidate (getchaintips lists it, a child of it can reorg onto it),
-        while here the cleared flags were its only record.
-        """
+    def _stage_reconsidered(self, db, candidates) -> None:
+        """Core ResetBlockFailureFlags leaves every reconsidered block in
+        m_block_index, with data, as a setBlockIndexCandidates entry: stage
+        each one left off the active chain, with its stored ancestors, in the
+        side-branch buffer so ``_activate_best_side_branch`` can select it
+        and getchaintips lists it.  Its only record here was the failed flag
+        (the height-keyed Rust reconsider cannot reach a block whose height
+        slot another branch holds)."""
         bs = getattr(self.node, "block_sync", None)
         sbb = self._side_branch_blocks
-        try:
-            tip_hash, tip_h = db.get_best_block()
-            tip_hash = bytes(tip_hash)
-            active_cw = self.node._calculate_chainwork_at_height(int(tip_h))
-        except Exception:
-            return
-        branches = {}
         for cand in candidates:
             found = self._stored_branch(db, cand)
             if not found or not found[1]:
                 continue
             if bs is not None and any(bs.is_block_failed(h) for h, _, _ in found[1]):
                 continue
-            branches[cand] = found
             for h, height, raw in found[1]:
                 sbb.setdefault(h, (raw[4:36], height, raw))
-        self._evict_side_branch_if_full()
-        best = None
-        for cand, (anc_h, branch) in branches.items():
-            if not self._seq_before(cand, tip_hash):
-                continue
-            if best is not None and not self._seq_before(cand, best[0]):
-                continue
-            if cand not in sbb:
-                continue
-            try:
-                cw = self.node._calculate_chainwork_at_height(anc_h) + sum(
-                    self.node._calculate_block_work(int.from_bytes(raw[72:76], "little"))
-                    for _, _, raw in branch
-                )
-            except Exception:
-                continue
-            if cw == active_cw:
-                best = (cand, branch)
-        if best is None:
-            return
-        result = await self._reorg_to_side_branch_tip(db, best[0])
-        if result is not None:
-            logger.warning("reconsiderblock: equal-work activation failed: %s", result)
+        if hasattr(self, "_side_branch_max_entries"):
+            self._evict_side_branch_if_full()
 
     def _branch_has_failed_block(self, bs, tip_hash: bytes) -> bool:
         """True when a buffered block on the branch ending at ``tip_hash`` is
@@ -11312,6 +11277,10 @@ class RPCServer:
                 # ActivateBestChain (the equal-work step below).
                 if not cleared:
                     raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found") from None
+                # The first Rust reconsider may already have moved the tip
+                # before a later one (a cleared descendant) raised.
+                if hasattr(db, '_cached_tip'):
+                    db._cached_tip = None
             else:
                 raise HTTPException(status_code=500, detail=str(e)) from None
 
@@ -11327,15 +11296,17 @@ class RPCServer:
                 raise
             logger.warning(f"reconsiderblock: mempool update failed: {e}")
 
-        # Equal-work tie-break the Rust reactivation does not make (the
-        # reorg engine updates the mempool itself).
+        # Core reconsiderblock -> ActivateBestChain over every candidate,
+        # including the reconsidered blocks the Rust reactivation could not
+        # reach and an equal-work tie it does not break (the reorg engine
+        # updates the mempool itself).
         if getattr(self, "_side_branch_blocks", None) is not None:
             reconsidered = getattr(self, "_reconsidered_blocks", None)
             if reconsidered is None:
                 reconsidered = self._reconsidered_blocks = set()
             reconsidered.update({block_hash_internal, *cleared})
-            await self._activate_reconsidered_tie(
-                db, [block_hash_internal, *sorted(cleared)])
+            self._stage_reconsidered(db, [block_hash_internal, *sorted(cleared)])
+            await self._activate_best_side_branch(db)
 
         # reconsiderblock can re-activate (and reorg onto) a previously
         # invalidated branch in the Rust layer without firing the Python index

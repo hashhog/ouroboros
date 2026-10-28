@@ -219,6 +219,9 @@ def test_reconsider_after_restart_keeps_the_tip_on_a_tie(tmp_path):
     asyncio.run(server.rpc_invalidateblock(_disp(a8)))
     assert bdb.get_best_block() == (side[-1], TIP + 2)
     fresh = _restarted_server(server)
+    fresh.node._calculate_chainwork_at_height = server.node._calculate_chainwork_at_height
+    fresh.node._calculate_block_work = server.node._calculate_block_work
+    fresh._side_branch_max_entries = 1024
     asyncio.run(fresh.rpc_reconsiderblock(_disp(a8)))
     assert bdb.get_best_block() == (side[-1], TIP + 2)
 
@@ -292,3 +295,57 @@ def test_reconsidered_block_off_the_active_chain_is_listed(tmp_path):
         "status": "valid-fork"}
     assert _disp(a7) not in tips
     assert len(tips) == 2
+
+
+def test_reconsider_ancestor_reactivates_the_most_work_branch(tmp_path):
+    """warden_invalidated_submit invalidate-100 / reconsider-100: 7m on 6 is
+    invalidated, 7-8 connect on 6, then invalidateblock 6 (tip 5) and
+    reconsiderblock 6.  Core clears 6 and every descendant -- 7m too -- and
+    ActivateBestChain returns to 8; 7m is a valid-fork tip, branchlen 1."""
+    bdb, server, hashes = _setup(tmp_path)
+    rawm, m7 = _block(hashes[TIP], TIP + 1, b"\xf1\xb7")
+    assert asyncio.run(server.rpc_submitblock(rawm.hex())) is None
+    asyncio.run(server.rpc_invalidateblock(_disp(m7)))
+    raw7, b7 = _block(hashes[TIP], TIP + 1, b"\xf2\xb7")
+    raw8, b8 = _block(b7, TIP + 2, b"\xf3\xb7")
+    for raw in (raw7, raw8):
+        assert asyncio.run(server.rpc_submitblock(raw.hex())) is None
+    assert bdb.get_best_block() == (b8, TIP + 2)
+    asyncio.run(server.rpc_invalidateblock(_disp(hashes[TIP])))
+    assert bdb.get_best_block() == (hashes[TIP - 1], TIP - 1)
+    asyncio.run(server.rpc_reconsiderblock(_disp(hashes[TIP])))
+    assert bdb.get_best_block() == (b8, TIP + 2)
+    tips = _tips(server)
+    assert tips.get(_disp(m7)) == {
+        "height": TIP + 1, "hash": _disp(m7), "branchlen": 1,
+        "status": "valid-fork"}
+    assert len(tips) == 2
+
+
+def test_displaced_block_header_has_no_nextblockhash(tmp_path):
+    """failed_reorg d-reconsider/displaced-header: a block off the active
+    chain has confirmations -1 and no nextblockhash (Core blockheaderToJSON:
+    active_chain.Next() is null for it), even when the active chain has a
+    block at its height + 1.  Scenario D's shape: 8 is invalidated,
+    reconsidered, and displaced by 7'-8'-9'."""
+    bdb, server, hashes = _setup(tmp_path)
+    raw7, a7 = _block(hashes[TIP], TIP + 1, b"\xe1\xb7")
+    raw8, a8 = _block(a7, TIP + 2, b"\xe2\xb7")
+    for raw in (raw7, raw8):
+        assert asyncio.run(server.rpc_submitblock(raw.hex())) is None
+    asyncio.run(server.rpc_invalidateblock(_disp(a8)))
+    prev = hashes[TIP]
+    for i in range(3):
+        raw, prev = _block(prev, TIP + 1 + i, bytes([0xE8 + i, 0xB7]))
+        asyncio.run(server.rpc_submitblock(raw.hex()))
+    asyncio.run(server.rpc_reconsiderblock(_disp(a8)))
+    assert bdb.get_best_block() == (prev, TIP + 3)
+    server.node.get_chainwork_at_height = lambda h: f"{(h + 1) * 2:064x}"
+    server.node.get_median_time = lambda h: BASE_TIME
+    server.node.get_difficulty = lambda bits: 1
+    hdr = asyncio.run(server.rpc_getblockheader(_disp(a8)))
+    assert hdr["confirmations"] == -1
+    assert "nextblockhash" not in hdr
+    on_chain = asyncio.run(server.rpc_getblockheader(_disp(prev)))
+    assert on_chain["confirmations"] == 1
+    assert "nextblockhash" not in on_chain
