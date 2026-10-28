@@ -175,3 +175,66 @@ def test_invalidate_off_chain_block_does_not_move_the_tip(tmp_path):
     asyncio.run(server.rpc_invalidateblock(_disp(side[0])))
     assert bdb.get_best_block() == (hashes[TIP], TIP)
     assert side[1] not in server._side_branch_blocks
+
+
+def _round_trip(server, hashes):
+    """failed_reorg scenario C on the fixture tip: a7-a8 connected on 6,
+    then the equal-work side 7'-8' off 6 is stored (submitted later)."""
+    raw7, a7 = _block(hashes[TIP], TIP + 1, b"\x91\xb7")
+    raw8, a8 = _block(a7, TIP + 2, b"\x92\xb7")
+    assert asyncio.run(server.rpc_submitblock(raw7.hex())) is None
+    assert asyncio.run(server.rpc_submitblock(raw8.hex())) is None
+    side = _side_branch(server, hashes[TIP], TIP + 1, 2, 0xA0)
+    return a7, a8, side
+
+
+def test_reconsider_returns_to_equal_work_block_received_first(tmp_path):
+    """Scenario C: invalidateblock 8 moves to 8' (more work than 7);
+    reconsiderblock 8: 8 and 8' tie and 8 arrived first (lower
+    nSequenceId), so Core goes back to 8 and 8' is a valid-fork tip."""
+    bdb, server, hashes = _setup(tmp_path)
+    a7, a8, side = _round_trip(server, hashes)
+    assert bdb.get_best_block() == (a8, TIP + 2)
+    asyncio.run(server.rpc_invalidateblock(_disp(a8)))
+    assert bdb.get_best_block() == (side[-1], TIP + 2)
+    asyncio.run(server.rpc_reconsiderblock(_disp(a8)))
+    assert bdb.get_best_block() == (a8, TIP + 2)
+    assert bytes(bdb.get_block_hash_by_height(TIP + 1)) == a7
+    tips = _tips(server)
+    assert tips[_disp(a8)]["status"] == "active"
+    assert tips.get(_disp(side[-1])) == {
+        "height": TIP + 2, "hash": _disp(side[-1]), "branchlen": 2,
+        "status": "valid-fork"}
+    assert len(tips) == 2
+
+
+def test_reconsider_after_restart_keeps_the_tip_on_a_tie(tmp_path):
+    """Scenario E: a restart resets the sequence ids (Core loads every block
+    with the same id), so after it the tie no longer goes to 8: Core stays
+    on 8'."""
+    from tests.test_getchaintips_fleet_regtest import _restarted_server
+
+    bdb, server, hashes = _setup(tmp_path)
+    a7, a8, side = _round_trip(server, hashes)
+    asyncio.run(server.rpc_invalidateblock(_disp(a8)))
+    assert bdb.get_best_block() == (side[-1], TIP + 2)
+    fresh = _restarted_server(server)
+    asyncio.run(fresh.rpc_reconsiderblock(_disp(a8)))
+    assert bdb.get_best_block() == (side[-1], TIP + 2)
+
+
+def test_invalidate_prefers_equal_work_candidate_received_first(tmp_path):
+    """Among equal-work candidates Core picks the lower nSequenceId: two
+    side branches 7'-8' and 7''-8'' off 6 tie after invalidateblock 7a;
+    7'-8' arrived first and becomes the tip."""
+    bdb, server, hashes = _setup(tmp_path)
+    raw7, a7 = _block(hashes[TIP], TIP + 1, b"\x93\xb7")
+    raw8, a8 = _block(a7, TIP + 2, b"\x94\xb7")
+    raw9, _a9 = _block(a8, TIP + 3, b"\x95\xb7")
+    for raw in (raw7, raw8, raw9):
+        assert asyncio.run(server.rpc_submitblock(raw.hex())) is None
+    first = _side_branch(server, hashes[TIP], TIP + 1, 2, 0xB0)
+    second = _side_branch(server, hashes[TIP], TIP + 1, 2, 0xC0)
+    asyncio.run(server.rpc_invalidateblock(_disp(a7)))
+    assert bdb.get_best_block() == (first[-1], TIP + 2)
+    assert second[-1] in server._side_branch_blocks
