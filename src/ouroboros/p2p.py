@@ -3613,7 +3613,8 @@ class PeerManager:
 
                     payload = build_blocktxn_payload(
                         raw, req.block_hash, list(req.indices))
-                    if payload is None:
+                    out_of_bounds = payload is None
+                    if out_of_bounds:
                         # Core: Misbehaving "getblocktxn with out-of-bounds
                         # tx indices"; nothing is sent.
                         logger.warning(
