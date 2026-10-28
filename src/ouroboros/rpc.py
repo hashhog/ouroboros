@@ -10928,8 +10928,9 @@ class RPCServer:
         (descendants FAILED_CHILD) and the next pass selects again, so a
         valid prefix of a failed branch still wins when it has more work
         than the tip (validation.cpp:3234-3260).  Here a candidate is a
-        buffered leaf whose branch work is STRICTLY greater than the active
-        tip's (equal work: the tip was received first and stays).  The reorg
+        buffered leaf that beats the tip under CBlockIndexWorkComparator:
+        more branch work, or equal work and an earlier sequence id
+        (``_seq_before``; unknown ids keep the tip).  The reorg
         engine (``_reorg_to_side_branch_tip``) disconnects, connects, keeps a
         heavier connected prefix or rolls back, and drops the failed tip; this
         loop drops the failed block's other buffered descendants and selects
@@ -11293,7 +11294,7 @@ class RPCServer:
                 # A header-only / side-branch block known only to the sync
                 # layer, or one whose height slot the other branch now holds:
                 # clearing its flags there IS the reconsider, then
-                # ActivateBestChain (the equal-work step below).
+                # ActivateBestChain (the side-branch activation below).
                 if not cleared:
                     raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found") from None
                 # The first Rust reconsider may already have moved the tip
