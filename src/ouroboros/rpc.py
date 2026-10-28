@@ -2822,18 +2822,37 @@ class RPCServer:
         # with %.16g, so wrap in _CoreFloat for the 16-sig-digit serialization.
         difficulty = _CoreFloat(self.node.get_difficulty(bits)) if hasattr(self.node, 'get_difficulty') else _CoreFloat(1.0)
 
-        # Median time from cached recent timestamps (no FFI needed)
-        recent_ts = getattr(db, '_recent_timestamps', [])
-        if len(recent_ts) >= 1:
-            sorted_ts = sorted(recent_ts)
-            mediantime = sorted_ts[len(sorted_ts) // 2]
-        else:
-            mediantime = block_time
+        # Median time and chainwork of the ACTIVE TIP (Core: tip->
+        # GetMedianTimePast(), tip->nChainWork).  The database's incremental
+        # caches (_recent_timestamps, _cached_chainwork) only ever grow on a
+        # connect, so after any disconnect (invalidateblock, a reorg, a
+        # rolled-back failed reorg) they describe blocks no longer on the
+        # chain; they are the fallback only.
+        mediantime = None
+        if hasattr(self.node, 'get_median_time'):
+            try:
+                mediantime = int(await asyncio.to_thread(self.node.get_median_time, best_height))
+            except Exception:
+                mediantime = None
+        if mediantime is None:
+            recent_ts = getattr(db, '_recent_timestamps', [])
+            if len(recent_ts) >= 1:
+                sorted_ts = sorted(recent_ts)
+                mediantime = sorted_ts[len(sorted_ts) // 2]
+            else:
+                mediantime = block_time
 
-        # Chainwork — use incrementally-cached value (no FFI needed).
         # Core emits nChainWork.GetHex(): a 64-char zero-padded hex string with
         # NO "0x" prefix (uint256 hex). Match that exactly.
-        cached_cw = getattr(db, '_cached_chainwork', 0)
+        cached_cw = 0
+        if hasattr(self.node, '_calculate_chainwork_at_height'):
+            try:
+                cached_cw = int(await asyncio.to_thread(
+                    self.node._calculate_chainwork_at_height, best_height))
+            except Exception:
+                cached_cw = 0
+        if cached_cw <= 0:
+            cached_cw = getattr(db, '_cached_chainwork', 0)
         if cached_cw <= 0:
             try:
                 _cw_raw = await asyncio.to_thread(self.node.get_chainwork)

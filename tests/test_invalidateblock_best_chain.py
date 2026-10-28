@@ -349,3 +349,29 @@ def test_displaced_block_header_has_no_nextblockhash(tmp_path):
     on_chain = asyncio.run(server.rpc_getblockheader(_disp(prev)))
     assert on_chain["confirmations"] == 1
     assert "nextblockhash" not in on_chain
+
+
+def test_blockchaininfo_reports_the_tip_after_a_disconnect(tmp_path):
+    """warden_invalidated_submit after-accept-child: getblockchaininfo's
+    chainwork and mediantime are the active tip's (Core tip->nChainWork,
+    tip->GetMedianTimePast()).  The database's incremental caches only grow
+    on a connect, so after invalidateblock and a reorg they count blocks
+    that are no longer on the chain."""
+    bdb, server, hashes = _setup(tmp_path)
+    a7, a8, side = _round_trip(server, hashes)
+    asyncio.run(server.rpc_invalidateblock(_disp(a8)))
+    asyncio.run(server.rpc_reconsiderblock(_disp(a8)))
+    assert bdb.get_best_block() == (a8, TIP + 2)
+    mtp = {"h": None}
+
+    def _mtp(height):
+        mtp["h"] = height
+        return 1_700_000_000 + height
+
+    server.node.get_median_time = _mtp
+    server.node.get_difficulty = lambda bits: 1
+    server._get_deployment_state_cached = lambda height, network: {}
+    info = asyncio.run(server.rpc_getblockchaininfo())
+    assert info["chainwork"] == f"{(TIP + 3) * 2:064x}"
+    assert mtp["h"] == TIP + 2
+    assert info["mediantime"] == 1_700_000_000 + TIP + 2
