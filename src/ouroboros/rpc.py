@@ -10849,6 +10849,9 @@ class RPCServer:
                     if h not in failed_now:
                         failed_now.add(h)
                         changed = True
+        _reconsidered = getattr(self, "_reconsidered_blocks", None)
+        if _reconsidered:
+            _reconsidered.difference_update(failed_now)
         self._save_chaintips_failed()
 
         # Core InvalidateBlock -> MaybeUpdateMempoolForReorg(disconnectpool,
@@ -11036,27 +11039,40 @@ class RPCServer:
         id.  The Rust reactivation handles strictly more work; this handles
         the tie, which Core resolves to the block that arrived first (the
         failed_reorg C round trip: 4a and 4' tie, 4a arrived first, Core goes
-        back to 4a).  The branch is staged in the side-branch buffer and
-        connected by the reorg engine, which validates every block.
+        back to 4a).  The branch is connected by the reorg engine, which
+        validates every block.
+
+        Every reconsidered block left off the active chain is staged in the
+        side-branch buffer first: Core keeps it in m_block_index as a
+        candidate (getchaintips lists it, a child of it can reorg onto it),
+        while here the cleared flags were its only record.
         """
         bs = getattr(self.node, "block_sync", None)
+        sbb = self._side_branch_blocks
         try:
             tip_hash, tip_h = db.get_best_block()
             tip_hash = bytes(tip_hash)
             active_cw = self.node._calculate_chainwork_at_height(int(tip_h))
         except Exception:
             return
-        best = None
+        branches = {}
         for cand in candidates:
+            found = self._stored_branch(db, cand)
+            if not found or not found[1]:
+                continue
+            if bs is not None and any(bs.is_block_failed(h) for h, _, _ in found[1]):
+                continue
+            branches[cand] = found
+            for h, height, raw in found[1]:
+                sbb.setdefault(h, (raw[4:36], height, raw))
+        self._evict_side_branch_if_full()
+        best = None
+        for cand, (anc_h, branch) in branches.items():
             if not self._seq_before(cand, tip_hash):
                 continue
             if best is not None and not self._seq_before(cand, best[0]):
                 continue
-            found = self._stored_branch(db, cand)
-            if not found or not found[1]:
-                continue
-            anc_h, branch = found
-            if bs is not None and any(bs.is_block_failed(h) for h, _, _ in branch):
+            if cand not in sbb:
                 continue
             try:
                 cw = self.node._calculate_chainwork_at_height(anc_h) + sum(
@@ -11069,9 +11085,6 @@ class RPCServer:
                 best = (cand, branch)
         if best is None:
             return
-        sbb = self._side_branch_blocks
-        for h, height, raw in best[1]:
-            sbb.setdefault(h, (raw[4:36], height, raw))
         result = await self._reorg_to_side_branch_tip(db, best[0])
         if result is not None:
             logger.warning("reconsiderblock: equal-work activation failed: %s", result)
@@ -11317,6 +11330,10 @@ class RPCServer:
         # Equal-work tie-break the Rust reactivation does not make (the
         # reorg engine updates the mempool itself).
         if getattr(self, "_side_branch_blocks", None) is not None:
+            reconsidered = getattr(self, "_reconsidered_blocks", None)
+            if reconsidered is None:
+                reconsidered = self._reconsidered_blocks = set()
+            reconsidered.update({block_hash_internal, *cleared})
             await self._activate_reconsidered_tie(
                 db, [block_hash_internal, *sorted(cleared)])
 
@@ -13170,6 +13187,11 @@ class RPCServer:
                 active_cache[height] = bytes(a) if a is not None else None
             return active_cache[height]
 
+        # reconsiderblock cleared these in the RPC/sync layer; the Rust
+        # hash-keyed flag of a block whose height slot another branch holds
+        # stays set (its height-keyed reconsider cannot find it).
+        reconsidered = getattr(self, "_reconsidered_blocks", None) or set()
+
         # Off-active-chain index entries: hash -> [prev, height|None, has_data].
         entries: dict[bytes, list] = {}
         failed: set[bytes] = set()
@@ -13300,7 +13322,7 @@ class RPCServer:
                     no_data = no_data or not cur_e[2]
                 else:
                     m = _meta(cur)
-                    if m is not None and int(m[3]) & 0x60:  # BLOCK_FAILED_MASK
+                    if m is not None and int(m[3]) & 0x60 and cur not in reconsidered:  # BLOCK_FAILED_MASK
                         invalid = True
                     if not cur_e[2] and (m is None or not int(m[3]) & 0x08):  # BLOCK_HAVE_DATA
                         no_data = True

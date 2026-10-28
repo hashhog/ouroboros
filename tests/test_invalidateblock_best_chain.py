@@ -263,3 +263,32 @@ def test_invalidate_never_activates_a_branch_with_an_invalid_block(tmp_path):
     tips = _tips(server)
     assert tips[_disp(hashes[TIP - 2])]["status"] == "active"
     assert tips[_disp(side[-1])]["status"] == "invalid"
+
+
+def test_reconsidered_block_off_the_active_chain_is_listed(tmp_path):
+    """Scenario D: invalidateblock 8 with no side branch (tip 7), then a
+    heavier 7'-8'-9' off 6 becomes the tip.  reconsiderblock 8: 9' has more
+    work, Core stays on it, and 8 is back in m_block_index as a valid-fork
+    tip (branchlen 2) -- its parent 7 has a child again and is not a tip."""
+    bdb, server, hashes = _setup(tmp_path)
+    raw7, a7 = _block(hashes[TIP], TIP + 1, b"\xe1\xb7")
+    raw8, a8 = _block(a7, TIP + 2, b"\xe2\xb7")
+    for raw in (raw7, raw8):
+        assert asyncio.run(server.rpc_submitblock(raw.hex())) is None
+    asyncio.run(server.rpc_invalidateblock(_disp(a8)))
+    assert bdb.get_best_block() == (a7, TIP + 1)
+    prev, side = hashes[TIP], []
+    for i in range(3):
+        raw, h = _block(prev, TIP + 1 + i, bytes([0xE8 + i, 0xB7]))
+        asyncio.run(server.rpc_submitblock(raw.hex()))
+        side.append(h)
+        prev = h
+    assert bdb.get_best_block() == (side[-1], TIP + 3)
+    asyncio.run(server.rpc_reconsiderblock(_disp(a8)))
+    assert bdb.get_best_block() == (side[-1], TIP + 3)
+    tips = _tips(server)
+    assert tips.get(_disp(a8)) == {
+        "height": TIP + 2, "hash": _disp(a8), "branchlen": 2,
+        "status": "valid-fork"}
+    assert _disp(a7) not in tips
+    assert len(tips) == 2
