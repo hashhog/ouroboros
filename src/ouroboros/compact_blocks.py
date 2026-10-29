@@ -516,3 +516,43 @@ class BlockTransactions:
             off += tx_len
             txs.append(tx)
         return cls(block_hash=block_hash, transactions=txs)
+
+
+# ---------------------------------------------------------------------------
+# Serving side (Core ProcessGetBlockData / SendBlockTransactions)
+# ---------------------------------------------------------------------------
+
+def build_cmpctblock_payload(raw_block: bytes, nonce: int | None = None) -> bytes:
+    """``cmpctblock`` payload for a stored block, from its raw witness bytes.
+
+    The parsed ``Block`` the database hands back drops witnesses, which would
+    make every short ID a txid-based hash instead of the wtxid-based one BIP 152
+    specifies and so never match the receiver's mempool for a segwit tx.  The
+    raw bytes keep them.  Core prefills only the coinbase
+    (``CBlockHeaderAndShortTxIDs(block, m_rng.rand64())``).
+    """
+    import os
+    from ouroboros.database import Block
+
+    if nonce is None:
+        nonce = int.from_bytes(os.urandom(8), "little")
+    block = Block.deserialize(bytes(raw_block))
+    return CompactBlock.from_block(block, nonce).serialize()
+
+
+def build_blocktxn_payload(
+    raw_block: bytes, block_hash: bytes, indices: list[int]
+) -> bytes | None:
+    """``blocktxn`` payload for ``indices`` of a stored block; witnesses kept.
+
+    Returns None when any index is out of range (Core: Misbehaving
+    "getblocktxn with out-of-bounds tx indices", nothing is sent).
+    """
+    from ouroboros.database import Block
+
+    txs = Block.deserialize(bytes(raw_block)).transactions
+    if any(i >= len(txs) for i in indices):
+        return None
+    return BlockTransactions(
+        block_hash=block_hash, transactions=[txs[i] for i in indices]
+    ).serialize()

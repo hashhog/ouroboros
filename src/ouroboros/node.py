@@ -1822,6 +1822,35 @@ class BitcoinNode:
         except Exception as e:  # pragma: no cover - defensive
             logger.warning(f"Failed to seed genesis coinstats snapshot: {e}")
 
+    def _build_cmpctblock_payload(self, block_hash: bytes) -> bytes | None:
+        """cmpctblock payload for getdata(MSG_CMPCT_BLOCK), or None to fall back
+        to the full witness block.
+
+        Core ProcessGetBlockData: a compact block only for a block on the active
+        chain at most MAX_CMPCTBLOCK_DEPTH below the tip; anything else gets the
+        full block.  Blocking (DB reads); call via asyncio.to_thread.
+        """
+        from ouroboros.compact_blocks import (
+            MAX_CMPCTBLOCK_DEPTH,
+            build_cmpctblock_payload,
+        )
+        try:
+            height = self.db.get_block_height_by_hash(block_hash)
+            _, tip_height = self.db.get_best_block()
+            if height is None or tip_height is None:
+                return None
+            if tip_height - height > MAX_CMPCTBLOCK_DEPTH:
+                return None
+            if self.db.get_block_hash_by_height(height) != block_hash:
+                return None  # side-branch block
+            raw = self.db.get_block_bytes(block_hash)
+            if raw is None:
+                return None
+            return build_cmpctblock_payload(raw)
+        except Exception as e:
+            logger.debug(f"cmpctblock build failed for {block_hash.hex()[:16]}: {e}")
+            return None
+
     def _check_synced(self) -> bool:
         if not self.db:
             return False
@@ -2037,9 +2066,10 @@ class BitcoinNode:
                         # fall through every branch -- no block, no
                         # notfound -- and the peer waited out its block
                         # download timeout on that one block (regtest relay
-                        # test 2026-09-26: Core B stuck at height 1). Serve
-                        # the full witness block, which is Core's own reply
-                        # outside MAX_CMPCTBLOCK_DEPTH (ProcessGetBlockData).
+                        # test 2026-09-26: Core B stuck at height 1). Within
+                        # MAX_CMPCTBLOCK_DEPTH of the tip on the active chain
+                        # answer cmpctblock; otherwise the full witness block,
+                        # as Core's ProcessGetBlockData does.
                         elif inv_type in (INV_TYPE_BLOCK, MSG_WITNESS_BLOCK, INV_TYPE_COMPACT_BLOCK):
                             # Off-load the full-block FFI deserialize
                             # (~1 MB PyO3 round-trip per call) to a worker
@@ -2056,6 +2086,23 @@ class BitcoinNode:
                                 bh = getattr(block, 'height', None)
                                 if bh is not None and bh < prune_horizon:
                                     not_found.append((inv_type, inv_hash))
+                                    continue
+                            if block and inv_type == INV_TYPE_COMPACT_BLOCK:
+                                cmpct = await asyncio.to_thread(
+                                    self._build_cmpctblock_payload, inv_hash,
+                                )
+                                if cmpct is not None:
+                                    from ouroboros.p2p_messages import (
+                                        CmpctBlockMessage,
+                                    )
+                                    await peer.send_message(
+                                        CmpctBlockMessage(payload_bytes=cmpct)
+                                        .to_network_message(network)
+                                    )
+                                    logger.debug(
+                                        f"Sent cmpctblock {inv_hash.hex()[:16]}... "
+                                        f"to {peer.host}:{peer.port}"
+                                    )
                                     continue
                             if block:
                                 # BIP144: a MSG_WITNESS_BLOCK getdata MUST be

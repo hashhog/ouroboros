@@ -3574,8 +3574,8 @@ class PeerManager:
             """
             from ouroboros.compact_blocks import (
                 MAX_BLOCKTXN_DEPTH,
-                BlockTransactions,
                 BlockTransactionsRequest,
+                build_blocktxn_payload,
             )
             try:
                 req = BlockTransactionsRequest.deserialize(msg.payload)
@@ -3584,56 +3584,46 @@ class PeerManager:
                     f"{req.block_hash.hex()} ({len(req.indices)} indices)")
                 # Look up the full block in our database
                 if self._database is not None:
-                    block = self._database.get_block(req.block_hash)
-                    if block is None:
+                    # Raw bytes, not get_block(): the parsed Block drops
+                    # witnesses, and blocktxn must carry them (BIP 144).
+                    raw = await asyncio.to_thread(
+                        self._database.get_block_bytes, req.block_hash)
+                    if raw is None:
                         logger.debug(
                             f"getblocktxn: block not found "
                             f"{req.block_hash.hex()}")
                         return
 
-                    # Bitcoin Core net_processing.cpp line 4276:
-                    #   if (pindex->nHeight >= tip_height - MAX_BLOCKTXN_DEPTH)
-                    # Only serve requests within MAX_BLOCKTXN_DEPTH of tip.
-                    try:
-                        _, tip_height = self._database.get_best_block()
-                        block_height = getattr(block, 'height', None)
-                        if block_height is not None and tip_height is not None:
-                            if block_height < tip_height - MAX_BLOCKTXN_DEPTH:
-                                logger.debug(
-                                    f"getblocktxn: block {req.block_hash.hex()} "
-                                    f"at height {block_height} is > "
-                                    f"{MAX_BLOCKTXN_DEPTH} below tip "
-                                    f"{tip_height}; not serving"
-                                )
-                                return
-                    except Exception:
-                        pass  # depth check is best-effort
-
-                    txs = block.transactions
-                    requested_txs = []
-                    out_of_bounds = False
-                    for idx in req.indices:
-                        if idx >= len(txs):
-                            # Bitcoin Core SendBlockTransactions:
-                            #   Misbehaving(peer, "getblocktxn with out-of-bounds tx indices")
-                            logger.warning(
-                                f"getblocktxn from {addr}: out-of-bounds "
-                                f"index {idx} (block has {len(txs)} txs); "
-                                "dropping response"
-                            )
-                            out_of_bounds = True
-                            break
-                        requested_txs.append(txs[idx])
-                    if out_of_bounds:
+                    # Core SendBlockTransactions: within MAX_BLOCKTXN_DEPTH of
+                    # the tip answer blocktxn; deeper, send the full witness
+                    # block instead (the requester is on a stale branch).
+                    block_height = self._database.get_block_height_by_hash(
+                        req.block_hash)
+                    _, tip_height = self._database.get_best_block()
+                    if (block_height is not None and tip_height is not None
+                            and block_height < tip_height - MAX_BLOCKTXN_DEPTH):
+                        logger.debug(
+                            f"getblocktxn: {req.block_hash.hex()} at height "
+                            f"{block_height} is > {MAX_BLOCKTXN_DEPTH} below "
+                            f"tip {tip_height}; sending full block")
+                        await peer.send_message(NetworkMessage(
+                            command="block", payload=bytes(raw),
+                            magic=get_magic(self.network)))
                         return
 
-                    bt_resp = BlockTransactions(
-                        block_hash=req.block_hash,
-                        transactions=requested_txs)
-                    bt_msg = BlockTxnMessage(
-                        payload_bytes=bt_resp.serialize())
+                    payload = build_blocktxn_payload(
+                        raw, req.block_hash, list(req.indices))
+                    out_of_bounds = payload is None
+                    if out_of_bounds:
+                        # Core: Misbehaving "getblocktxn with out-of-bounds
+                        # tx indices"; nothing is sent.
+                        logger.warning(
+                            f"getblocktxn from {addr}: out-of-bounds "
+                            "index; dropping response")
+                        return
                     await peer.send_message(
-                        bt_msg.to_network_message(self.network))
+                        BlockTxnMessage(payload_bytes=payload)
+                        .to_network_message(self.network))
             except Exception as e:
                 logger.warning(f"Error handling getblocktxn from {addr}: {e}")
 

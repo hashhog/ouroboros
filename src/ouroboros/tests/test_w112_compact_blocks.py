@@ -658,31 +658,19 @@ class TestW112_G18_GetBlockTxnDeepBlockFallback(unittest.TestCase):
     Fix: when depth > MAX_BLOCKTXN_DEPTH, queue a MSG_WITNESS_BLOCK response.
     """
 
-    def test_deep_block_fallback_missing(self):
-        """Confirms no MSG_WITNESS_BLOCK fallback for deep blocks (documents BUG-7)."""
+    def test_deep_block_fallback_present(self):
+        """getblocktxn deeper than MAX_BLOCKTXN_DEPTH is answered with the full
+        witness block, as Core's SendBlockTransactions does (BUG-7 fixed)."""
         import inspect
         from ouroboros import p2p
         src = inspect.getsource(p2p.PeerManager._register_compact_handlers)
-        # Extract only the on_getblocktxn function body for analysis.
-        # Then check whether it sends a full block (MSG_BLOCK/WITNESS_BLOCK) in the
-        # deep-block branch.  The docstring mentions MSG_WITNESS_BLOCK as what Core
-        # does but ouroboros doesn't; we must ignore docstring/comment content.
         start = src.find('async def on_getblocktxn')
         self.assertNotEqual(start, -1, "on_getblocktxn not found")
         func_src = src[start:]
-        # End at the next function or handler registration
         next_boundary = func_src.find('\n        async def', 10)
-        if next_boundary == -1:
-            next_boundary = func_src.find('\n        peer.register_handler')
         func_body = func_src[:next_boundary] if next_boundary != -1 else func_src
-
-        # An actual fallback would call send_message with a block-type message
-        has_actual_fallback = (
-            'send_message' in func_body and
-            ('MSG_BLOCK' in func_body or 'BlockMessage' in func_body)
-        )
-        self.assertFalse(has_actual_fallback,
-                         "BUG-7 fixed: full-block fallback present (update test)")
+        self.assertIn('command="block"', func_body)
+        self.assertIn('send_message', func_body)
 
 
 # ---------------------------------------------------------------------------
