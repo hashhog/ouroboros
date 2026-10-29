@@ -10988,7 +10988,9 @@ class RPCServer:
         heavier connected prefix or rolls back, and drops the failed tip; this
         loop drops the failed block's other buffered descendants and selects
         again.  A result that is not a ConnectBlock verdict on a recorded
-        block (``classify_block_reject``) judges nothing: stop, mark nothing.
+        block (``classify_block_reject``) judges nothing: that leaf is
+        skipped for this call only (kept buffered, marked nothing, so a later
+        activation retries it) and the next candidate is selected.
         """
         from ouroboros.block_sync import classify_block_reject  # block_sync imports rpc
 
@@ -10996,7 +10998,9 @@ class RPCServer:
         sbb = getattr(self, "_side_branch_blocks", None)
         if not sbb:
             return
-        for _ in range(len(sbb) + 1):
+        # Leaves whose reorg judged nothing this call (see below).
+        skipped: set[bytes] = set()
+        for _ in range(2 * len(sbb) + 2):
             if is_fatal():
                 return
             try:
@@ -11009,7 +11013,7 @@ class RPCServer:
             parents = {bytes(e[0]) for e in sbb.values()}
             best: tuple[int, bytes] | None = None
             for h, (_prev, hh, _raw) in list(sbb.items()):
-                if h in parents:
+                if h in parents or h in skipped:
                     continue
                 if bs is not None and self._branch_has_failed_block(bs, h):
                     continue
@@ -11035,13 +11039,17 @@ class RPCServer:
             # InvalidBlockFound.  Everything else the engine returns before
             # judging a block (a pruned node's reorg-too-deep, a disconnect
             # fault, a missing ancestor or height gap, a bare "rejected" from
-            # a failed tip read, a system fault) judges nothing: stop, mark
+            # a failed tip read, a system fault) judges nothing: mark
             # nothing, keep the branch buffered (the P2P fork path applies
-            # the same classify_block_reject rule).
+            # the same classify_block_reject rule), and skip this leaf for
+            # this call only so a lighter candidate that beats the tip is
+            # still tried.  A later activation retries the skipped leaf.
             _fail = getattr(self, "_last_reorg_failure", None)
             if _fail is None or classify_block_reject(str(result)) != "verdict":
-                logger.warning("activate best chain: stopped: %s", result)
-                return
+                logger.warning("activate best chain: skipped %s: %s",
+                               best[1][::-1].hex()[:16], result)
+                skipped.add(best[1])
+                continue
             # The engine dropped the failed block; drop the rest of its
             # buffered descendants (Core BLOCK_FAILED_CHILD) so the next pass
             # cannot select them.
