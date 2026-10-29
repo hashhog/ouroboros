@@ -1160,6 +1160,20 @@ class BlockSync:
                 f"P2P fork reorg disabled"
             )
 
+    def _note_received_block(self, block_hash: bytes) -> None:
+        """Give a block whose data arrived over P2P its arrival-order id in
+        the RPC server's equal-work tie-break (Core ReceivedBlockTransactions
+        assigns nSequenceId on every path, not only submitblock).  No-op
+        until ``set_reorg_handler`` has run."""
+        _rpc = getattr(self, "_reorg_rpc_server", None)
+        note = getattr(_rpc, "_note_block_seq", None)
+        if note is None:
+            return
+        try:
+            note(bytes(block_hash))
+        except Exception:
+            pass
+
     def _evict_fork_headers_if_full(self) -> None:
         """Bound the fork-header store (evict-oldest FIFO).
 
@@ -3315,6 +3329,7 @@ class BlockSync:
 
             connected += 1
             current_height = new_height
+            self._note_received_block(next_hash)
             # Advance the header queue NOW, before any subsequent await
             # (block_filter_index / sleep(0) / ...).  Pre-fix the connected
             # header stayed at slot 0 until a bulk slice at the end of the
@@ -6316,6 +6331,7 @@ class BlockSync:
                     continue  # the tip is attached (validated + reorg) below
                 prev = self._fork_header_prev.get(h, ancestor_hash)
                 self._side_branch_buffer[h] = (prev, height, bodies[h])
+                self._note_received_block(h)
             if self._evict_side_branch_if_full is not None:
                 try:
                     self._evict_side_branch_if_full()

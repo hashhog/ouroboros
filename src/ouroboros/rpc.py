@@ -2018,7 +2018,8 @@ class RPCServer:
         self._side_branch_blocks: dict[bytes, tuple[bytes, int, bytes]] = {}
         self._side_branch_max_entries: int = 1024
 
-        # Core CBlockIndex::nSequenceId for blocks submitted since start:
+        # Core CBlockIndex::nSequenceId for blocks received since start
+        # (submitblock, the side-branch stash, P2P connect and fork bridge):
         # the order their data arrived, the tie-break between equal-work
         # candidates (CBlockIndexWorkComparator).  In memory only: Core
         # loads every block from disk with the same id, so after a restart
@@ -8623,6 +8624,56 @@ class RPCServer:
                 d.pop(h, None)
             self._save_chaintips_failed()
 
+    def _reconsidered_record(self) -> set[bytes]:
+        """Blocks reconsiderblock cleared whose Rust ``BLOCK_FAILED`` flag
+        stays set (the height-keyed Rust reconsider cannot reach a block
+        whose height slot another branch holds).  Core's
+        ResetBlockFailureFlags clears the flag in the on-disk block index,
+        so the clear is persisted next to the failed record and loaded on
+        first use: after a restart such a block is still a valid fork, not
+        invalid again.  Reporting only."""
+        s = self.__dict__.setdefault("_reconsidered_blocks", set())
+        if not self.__dict__.get("_reconsidered_loaded"):
+            self.__dict__["_reconsidered_loaded"] = True
+            path = self._chaintips_failed_path()
+            if path:
+                path = path.replace("chaintips_failed.json", "chaintips_reconsidered.json")
+                try:
+                    with open(path) as f:
+                        for h in json.load(f):
+                            h = bytes.fromhex(h)
+                            if len(h) == 32:
+                                s.add(h)
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"getchaintips: {path} unreadable: {e}")
+        return s
+
+    def _save_reconsidered(self) -> None:
+        """Atomically rewrite the reconsidered record (best effort, at most
+        ``_chaintips_failed_max`` rows; past the cap the excess is dropped,
+        which only lets such a block read as invalid again)."""
+        path = self._chaintips_failed_path()
+        if not path:
+            return
+        import os as _os
+        path = path.replace("chaintips_failed.json", "chaintips_reconsidered.json")
+        s = self._reconsidered_record()
+        rows = sorted(h.hex() for h in s)
+        cap = getattr(self, "_chaintips_failed_max", 1024)
+        if len(rows) > cap:
+            for h in rows[: len(rows) - cap]:
+                s.discard(bytes.fromhex(h))
+            rows = rows[len(rows) - cap:]
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(rows, f)
+            _os.replace(tmp, path)
+        except Exception as e:
+            logger.warning(f"getchaintips: could not persist {path}: {e}")
+
     def _evict_side_branch_if_full(self) -> None:
         """Soft-cap the in-memory side-branch buffer.
 
@@ -9094,6 +9145,7 @@ class RPCServer:
         # whose prev points at this hash can chain off it without needing
         # the block index to know it.
         self._side_branch_blocks[block_hash] = (prev_hash, new_height, block_bytes)
+        self._note_block_seq(block_hash)
         self._evict_side_branch_if_full()
         logger.debug(
             "side-branch stash blk=%s prev=%s h=%d",
@@ -10870,9 +10922,10 @@ class RPCServer:
                     if h not in failed_now:
                         failed_now.add(h)
                         changed = True
-        _reconsidered = getattr(self, "_reconsidered_blocks", None)
-        if _reconsidered:
+        _reconsidered = self._reconsidered_record()
+        if _reconsidered & failed_now:
             _reconsidered.difference_update(failed_now)
+            self._save_reconsidered()
         self._save_chaintips_failed()
 
         # Core InvalidateBlock -> MaybeUpdateMempoolForReorg(disconnectpool,
@@ -10934,9 +10987,11 @@ class RPCServer:
         engine (``_reorg_to_side_branch_tip``) disconnects, connects, keeps a
         heavier connected prefix or rolls back, and drops the failed tip; this
         loop drops the failed block's other buffered descendants and selects
-        again.  A system fault or a missing-ancestor hold is not a verdict:
-        stop, mark nothing.
+        again.  A result that is not a ConnectBlock verdict on a recorded
+        block (``classify_block_reject``) judges nothing: stop, mark nothing.
         """
+        from ouroboros.block_sync import classify_block_reject  # block_sync imports rpc
+
         bs = getattr(self.node, "block_sync", None)
         sbb = getattr(self, "_side_branch_blocks", None)
         if not sbb:
@@ -10976,16 +11031,21 @@ class RPCServer:
             result = await self._reorg_to_side_branch_tip(db, best[1])
             if result is None:
                 continue
-            if is_internal_error_text(result) or str(result).startswith(
-                "missing-ancestor-header"
-            ):
+            # Only a ConnectBlock verdict on a recorded block is
+            # InvalidBlockFound.  Everything else the engine returns before
+            # judging a block (a pruned node's reorg-too-deep, a disconnect
+            # fault, a missing ancestor or height gap, a bare "rejected" from
+            # a failed tip read, a system fault) judges nothing: stop, mark
+            # nothing, keep the branch buffered (the P2P fork path applies
+            # the same classify_block_reject rule).
+            _fail = getattr(self, "_last_reorg_failure", None)
+            if _fail is None or classify_block_reject(str(result)) != "verdict":
                 logger.warning("activate best chain: stopped: %s", result)
                 return
-            # The engine dropped the failed tip; drop the rest of the failed
-            # block's buffered descendants (Core BLOCK_FAILED_CHILD) so the
-            # next pass cannot select them.
-            _fail = getattr(self, "_last_reorg_failure", None)
-            failed = {bytes(_fail[0])} if _fail else {best[1]}
+            # The engine dropped the failed block; drop the rest of its
+            # buffered descendants (Core BLOCK_FAILED_CHILD) so the next pass
+            # cannot select them.
+            failed = {bytes(_fail[0])}
             changed = True
             while changed:
                 changed = False
@@ -10998,12 +11058,24 @@ class RPCServer:
                             changed = True
             self._save_chaintips_failed()
 
+    # Sequence ids kept: far more than the side-branch buffer, so only deep
+    # ancestors no tie can involve are forgotten (an unknown id keeps the tip).
+    _BLOCK_SEQ_MAX = 16_384
+
     def _note_block_seq(self, block_hash: bytes) -> None:
-        """Core ReceivedBlockTransactions: nSequenceId = nBlockSequenceId++."""
-        seqs = getattr(self, "_block_seq", None)
-        if seqs is None:
-            seqs = self._block_seq = {}
-        seqs.setdefault(block_hash, len(seqs) + 1)
+        """Core ReceivedBlockTransactions: nSequenceId = nBlockSequenceId++,
+        for a block whose data arrived over any path (submitblock, the
+        side-branch stash, the P2P connect and fork-bridge paths).  The
+        first arrival keeps its id; bounded, oldest forgotten first."""
+        seqs = self.__dict__.setdefault("_block_seq", {})
+        block_hash = bytes(block_hash)
+        if block_hash in seqs:
+            return
+        nxt = self.__dict__.get("_block_seq_next", 0) + 1
+        self.__dict__["_block_seq_next"] = nxt
+        seqs[block_hash] = nxt
+        while len(seqs) > self._BLOCK_SEQ_MAX:
+            seqs.pop(next(iter(seqs)))
 
     def _seq_of(self, block_hash: bytes) -> int | None:
         """nSequenceId: preciousblock's (negative) id first, then arrival."""
@@ -11015,7 +11087,7 @@ class RPCServer:
     def _seq_before(self, a: bytes, b: bytes) -> bool:
         """CBlockIndexWorkComparator's equal-work tie-break: ``a`` arrived
         before ``b``.  False when either id is unknown (a block loaded from
-        disk, or one that came over P2P), so an unknown tie keeps the tip."""
+        disk before this start), so an unknown tie keeps the tip."""
         sa, sb = self._seq_of(a), self._seq_of(b)
         return sa is not None and sb is not None and sa < sb
 
@@ -11321,10 +11393,8 @@ class RPCServer:
         # reach and an equal-work tie it does not break (the reorg engine
         # updates the mempool itself).
         if getattr(self, "_side_branch_blocks", None) is not None:
-            reconsidered = getattr(self, "_reconsidered_blocks", None)
-            if reconsidered is None:
-                reconsidered = self._reconsidered_blocks = set()
-            reconsidered.update({block_hash_internal, *cleared})
+            self._reconsidered_record().update({block_hash_internal, *cleared})
+            self._save_reconsidered()
             self._stage_reconsidered(db, [block_hash_internal, *sorted(cleared)])
             await self._activate_best_side_branch(db)
 
@@ -13181,7 +13251,7 @@ class RPCServer:
         # reconsiderblock cleared these in the RPC/sync layer; the Rust
         # hash-keyed flag of a block whose height slot another branch holds
         # stays set (its height-keyed reconsider cannot find it).
-        reconsidered = getattr(self, "_reconsidered_blocks", None) or set()
+        reconsidered = self._reconsidered_record()
 
         # Off-active-chain index entries: hash -> [prev, height|None, has_data].
         entries: dict[bytes, list] = {}
@@ -13210,6 +13280,20 @@ class RPCServer:
         for h, (prev, height) in list(self._chaintips_failed_record().items()):
             failed.add(bytes(h))
             _add(bytes(h), bytes(prev), int(height), True)
+
+        # A reconsidered block left off the active chain is in Core's
+        # m_block_index after a restart too; here its only persistent record
+        # is the Rust hash index (the side-branch buffer is in memory).
+        for h in list(reconsidered):
+            m = _meta(h)
+            if m is None:
+                continue
+            try:
+                raw = db.get_block_bytes(h)
+            except Exception:
+                raw = None
+            if raw:
+                _add(h, bytes(raw[4:36]), int(m[0]), bool(int(m[3]) & 0x08))
 
         if bs is not None:
             failed_prev = getattr(bs, "_failed_prev", {}) or {}
