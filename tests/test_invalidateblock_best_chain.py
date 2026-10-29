@@ -455,3 +455,41 @@ def test_p2p_connected_and_bridged_blocks_get_a_sequence_id(tmp_path):
     bs._note_received_block(a)
     assert server._seq_before(a, b)
     assert not server._seq_before(b, a)
+
+
+@pytest.mark.parametrize("non_verdict", [
+    "rejected", "reorg-too-deep", "reorg-disconnect-failed",
+    "missing common ancestor", "side-branch height gap",
+])
+def test_non_verdict_on_heaviest_leaf_still_tries_the_next(tmp_path, non_verdict):
+    """Two stored branches off block 3: 4'-5'-6' and 4''-5''.  invalidateblock
+    4 leaves the tip at 3.  The heavier leaf 6' comes back with a result that
+    judges no block (a pruned node's depth cap, a disconnect fault, ...);
+    Core's FindMostWorkChain would still reach the next candidate, so 5''
+    (more work than 3) becomes the tip.  6' is only skipped for this call:
+    it stays buffered, is not recorded failed, and a later activation that
+    can connect it does."""
+    bdb, server, hashes = _setup(tmp_path)
+    heavy = _side_branch(server, hashes[TIP - 3], TIP - 2, 3, 0x50)
+    light = _side_branch(server, hashes[TIP - 3], TIP - 2, 2, 0x60)
+    assert bdb.get_best_block() == (hashes[TIP], TIP)
+    real = server._reorg_to_side_branch_tip
+    calls = []
+
+    async def _stub(db, tip_hash):
+        calls.append(tip_hash)
+        if tip_hash == heavy[-1]:
+            server._last_reorg_failure = None
+            return non_verdict
+        return await real(db, tip_hash)
+
+    server._reorg_to_side_branch_tip = _stub
+    asyncio.run(server.rpc_invalidateblock(_disp(hashes[TIP - 2])))
+    assert calls[:2] == [heavy[-1], light[-1]]
+    assert bdb.get_best_block() == (light[-1], TIP - 1)
+    assert all(h in server._side_branch_blocks for h in heavy)
+    assert not any(h in server._chaintips_failed_record() for h in heavy)
+    assert _tips(server)[_disp(heavy[-1])]["status"] != "invalid"
+    server._reorg_to_side_branch_tip = real
+    asyncio.run(server._activate_best_side_branch(bdb))
+    assert bdb.get_best_block() == (heavy[-1], TIP)
