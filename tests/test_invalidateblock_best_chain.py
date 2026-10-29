@@ -295,6 +295,16 @@ def test_reconsidered_block_off_the_active_chain_is_listed(tmp_path):
         "status": "valid-fork"}
     assert _disp(a7) not in tips
     assert len(tips) == 2
+    # Core keeps the cleared flag in the on-disk block index: after a
+    # restart 8 is still a valid-fork tip, not invalid again.
+    from tests.test_getchaintips_fleet_regtest import _restarted_server
+    fresh = _restarted_server(server)
+    assert bdb.get_best_block() == (side[-1], TIP + 3)
+    tips = _tips(fresh)
+    assert tips.get(_disp(a8)) == {
+        "height": TIP + 2, "hash": _disp(a8), "branchlen": 2,
+        "status": "valid-fork"}
+    assert len(tips) == 2
 
 
 def test_reconsider_ancestor_reactivates_the_most_work_branch(tmp_path):
@@ -375,3 +385,73 @@ def test_blockchaininfo_reports_the_tip_after_a_disconnect(tmp_path):
     assert info["chainwork"] == f"{(TIP + 3) * 2:064x}"
     assert mtp["h"] == TIP + 2
     assert info["mediantime"] == 1_700_000_000 + TIP + 2
+
+
+@pytest.mark.parametrize("non_verdict", [
+    "rejected", "reorg-too-deep", "reorg-disconnect-failed",
+    "missing common ancestor", "side-branch height gap",
+])
+def test_non_verdict_reorg_result_marks_nothing(tmp_path, non_verdict):
+    """A reorg-engine result that is not a ConnectBlock verdict (a pruned
+    node's depth cap, a disconnect fault, a missing ancestor, a bare
+    ``rejected`` from a failed tip read) judges no block: the heavier valid
+    side branch stays buffered, is not listed invalid, and a later
+    activation still connects it (Core marks only an InvalidBlockFound
+    block failed)."""
+    bdb, server, hashes = _setup(tmp_path)
+    side = _side_branch(server, hashes[TIP - 2], TIP - 1, 2, 0x45)
+    real = server._reorg_to_side_branch_tip
+    calls = []
+
+    async def _stub(db, tip_hash):
+        calls.append(tip_hash)
+        server._last_reorg_failure = None
+        return non_verdict
+
+    server._reorg_to_side_branch_tip = _stub
+    asyncio.run(server.rpc_invalidateblock(_disp(hashes[TIP])))
+    assert calls == [side[-1]]
+    assert bdb.get_best_block() == (hashes[TIP - 1], TIP - 1)
+    assert all(h in server._side_branch_blocks for h in side)
+    assert not any(h in server._chaintips_failed_record() for h in side)
+    tips = _tips(server)
+    assert tips[_disp(side[-1])]["status"] != "invalid"
+    server._reorg_to_side_branch_tip = real
+    asyncio.run(server._activate_best_side_branch(bdb))
+    assert bdb.get_best_block() == (side[-1], TIP)
+
+
+def test_invalidate_prefers_earlier_p2p_branch_on_a_tie(tmp_path):
+    """nSequenceId is assigned when a block's data arrives over ANY path
+    (Core ReceivedBlockTransactions), not only submitblock.  p6 off 5
+    arrives first through the side-branch stash the P2P fork path uses,
+    then a6-a7 are submitted and a7 reorgs onto them.  invalidateblock a7:
+    p6 and a6 tie and p6 arrived first, so Core's tip is p6."""
+    bdb, server, hashes = _setup(tmp_path)
+    rawp, p6 = _block(hashes[TIP - 1], TIP, b"\x31\xb8")
+    assert asyncio.run(server._attach_side_branch_block(
+        bdb, rawp, p6, hashes[TIP - 1], TIP)) is None
+    assert bdb.get_best_block() == (hashes[TIP], TIP)
+    a6 = _side_branch(server, hashes[TIP - 1], TIP, 1, 0x32)[0]
+    raw7, a7 = _block(a6, TIP + 1, b"\x33\xb8")
+    assert asyncio.run(server.rpc_submitblock(raw7.hex())) is None
+    assert bdb.get_best_block() == (a7, TIP + 1)
+    # Take the fixture's own 6 out of the race (a block loaded from disk).
+    asyncio.run(server.rpc_invalidateblock(_disp(hashes[TIP])))
+    asyncio.run(server.rpc_invalidateblock(_disp(a7)))
+    assert bdb.get_best_block() == (p6, TIP)
+
+
+def test_p2p_connected_and_bridged_blocks_get_a_sequence_id(tmp_path):
+    """The P2P connect path and the fork bridge's pre-populated blocks
+    record their arrival order in the RPC server's sequence ids, through
+    the handler BlockSync is wired to."""
+    bdb, server, hashes = _setup(tmp_path)
+    bs = server.node.block_sync
+    bs.set_reorg_handler(server)
+    a, b = b"\x01" * 32, b"\x02" * 32
+    bs._note_received_block(a)
+    bs._note_received_block(b)
+    bs._note_received_block(a)
+    assert server._seq_before(a, b)
+    assert not server._seq_before(b, a)
