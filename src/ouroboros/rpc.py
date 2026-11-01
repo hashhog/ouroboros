@@ -9665,6 +9665,13 @@ class RPCServer:
                     "for rollback/retain: %s",
                     h, e,
                 )
+            # The refill needs the txs WITH their witnesses, which blk (the
+            # Rust PyTxIn round-trip) has dropped; the raw bytes keep them.
+            if disconnected_active and disconnected_active[-1][1] == h:
+                try:
+                    blk = Block.deserialize(disconnected_active[-1][2])
+                except ValueError:
+                    pass
             # Prepended block-by-block: the walk is descending, the refill
             # wants EARLIEST FIRST (Core iterates DisconnectedBlockTransactions
             # in reverse: lowest block first, block order within it).
@@ -10820,7 +10827,11 @@ class RPCServer:
             for h in range(target_h, int(best_height) + 1):
                 try:
                     hh = db.get_block_hash_by_height(h)
-                    blk = db.get_block_by_height(h)
+                    # With witnesses: these txs go back to the mempool, and
+                    # get_block_by_height drops them.
+                    _read = getattr(db, "get_block_with_witness", None)
+                    blk = (_read(bytes(hh)) if _read is not None and hh is not None
+                           else db.get_block_by_height(h))
                 except Exception:
                     hh, blk = None, None
                 if hh is None:
