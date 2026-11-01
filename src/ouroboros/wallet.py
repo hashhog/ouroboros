@@ -1299,6 +1299,12 @@ class Wallet:
         # double-spend the same chainstate UTXO. Mirrors Core mapWallet spent
         # flags between CommitTransaction and BlockConnected.
         self._pending_spent: set[tuple[str, int]] = set()
+        # (txid display hex, vout) of the change outputs this wallet built.
+        # Core OutputIsChange (wallet/receive.cpp): the details of a tx we
+        # funded skip its change output.  Core decides that by the address
+        # book; this wallet pays change to keys[0], an address that is in
+        # the book, so it remembers which output it made change instead.
+        self._change_outputs: set[tuple[str, int]] = set()
         # Highest chain height this wallet has scanned (persisted in
         # wallet.dat as "best_scanned_height").  The wallet's Core-parity
         # "locator": reconcile_on_load rescans only the gap ABOVE this
@@ -2375,41 +2381,58 @@ class Wallet:
             # For each output: when we sent the tx (nDebit>0) every output is a
             # "send" entry EXCEPT change/owned outputs (listtransactions uses
             # include_change=false). When an output pays us it is a "receive".
+            # Core CachedTxGetAmounts: on a tx we funded the change output is
+            # skipped, and every other output is a "send" -- a payment to one
+            # of our own addresses as well, which is then ALSO a "receive".
             sent_details: list[dict] = []
             recv_details: list[dict] = []
+            change_details: list[dict] = []
             credit = 0
             for vout_i, out in enumerate(tx.outputs):
                 addr = owned.get(bytes(out.script_pubkey))
                 ismine = addr is not None
                 if ismine:
                     credit += int(out.value)
-                    recv_details.append({
-                        "address": addr,
-                        "vout": int(vout_i),
-                        "value": int(out.value),
-                    })
                     # Track the new owned outpoint so a future spend resolves it.
                     self._owned_outpoints[(txid_hex, vout_i)] = {
                         "value": int(out.value),
                         "address": addr,
                         "script_pubkey": bytes(out.script_pubkey),
                     }
-                elif is_from_me:
-                    # Non-owned output of a tx we funded ⇒ a real payment out.
-                    from ouroboros.address import script_pubkey_to_address
-                    try:
-                        out_addr = script_pubkey_to_address(
-                            bytes(out.script_pubkey), self.network
-                        ) or ""
-                    except Exception:
-                        out_addr = ""
+                is_change = (
+                    is_from_me and ismine
+                    and (txid_hex, vout_i) in self._change_outputs
+                )
+                if is_change:
+                    change_details.append({
+                        "address": addr,
+                        "vout": int(vout_i),
+                        "value": int(out.value),
+                    })
+                    continue
+                if ismine:
+                    recv_details.append({
+                        "address": addr,
+                        "vout": int(vout_i),
+                        "value": int(out.value),
+                    })
+                if is_from_me:
+                    out_addr = addr
+                    if out_addr is None:
+                        from ouroboros.address import script_pubkey_to_address
+                        try:
+                            out_addr = script_pubkey_to_address(
+                                bytes(out.script_pubkey), self.network
+                            ) or ""
+                        except Exception:
+                            out_addr = ""
                     sent_details.append({
                         "address": out_addr,
                         "vout": int(vout_i),
                         "value": int(out.value),
                     })
 
-            if not recv_details and not sent_details:
+            if not recv_details and not sent_details and not change_details:
                 continue  # not ours
 
             # Fee (Core: nFee = nDebit - GetValueOut, positive sats paid).
@@ -2434,6 +2457,7 @@ class Wallet:
                 "fee": int(fee),
                 "recv": recv_details,
                 "sent": sent_details,
+                "change": change_details,
                 "hex": tx.serialize_with_witness().hex(),
             }
 
@@ -2450,7 +2474,7 @@ class Wallet:
         ]
         for txid in drop:
             rec = self._tx_history.pop(txid)
-            for d in rec.get("recv", []):
+            for d in rec.get("recv", []) + rec.get("change", []):
                 self._owned_outpoints.pop((txid, int(d["vout"])), None)
 
     def _confirmations(self, rec: dict, tip: int) -> int:
@@ -3408,6 +3432,8 @@ class Wallet:
 
         # Compute real txid from non-witness serialization
         tx.txid = _dsha256(tx.serialize())
+        if len(outputs) > 1:
+            self._change_outputs.add((tx.txid[::-1].hex(), len(outputs) - 1))
 
         raw_hex = tx.serialize_with_witness().hex()
         for utxo in selected:
