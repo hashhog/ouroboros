@@ -396,6 +396,106 @@ class ClusterLinearizer:
         return result
 
 
+def _max_weight_closure(
+    nodes: list[bytes],
+    weight: dict[bytes, int],
+    parents: dict[bytes, set[bytes]],
+    forced: bytes | None = None,
+) -> set[bytes]:
+    """The smallest parent-closed subset of *nodes* with maximum total weight.
+
+    Picard's reduction to a minimum s-t cut: source -> v (weight > 0),
+    v -> sink (weight < 0), v -> parent (infinite); the closure is what the
+    source still reaches in the residual graph.  *forced* is joined to the
+    source with infinite capacity, so the result must contain it.  Integer
+    capacities, Edmonds-Karp; a cluster is at most a few dozen txs.
+    """
+    inf = sum(abs(w) for w in weight.values()) + 1
+    cap: dict[object, dict[object, int]] = {"s": {}, "t": {}}
+    for v in nodes:
+        cap.setdefault(v, {})
+    for v in nodes:
+        w = weight[v]
+        if v == forced:
+            cap["s"][v] = inf
+        elif w > 0:
+            cap["s"][v] = w
+        if w < 0 and v != forced:
+            cap[v]["t"] = -w
+        for p in parents[v]:
+            cap[v][p] = inf
+            cap[p].setdefault(v, 0)
+        cap[v].setdefault("s", 0)
+        cap["t"].setdefault(v, 0)
+    while True:
+        prev: dict[object, object] = {"s": None}
+        queue = ["s"]
+        while queue and "t" not in prev:
+            u = queue.pop(0)
+            for v, c in cap[u].items():
+                if c > 0 and v not in prev:
+                    prev[v] = u
+                    queue.append(v)
+        if "t" not in prev:
+            return {v for v in prev if v != "s"}
+        flow, v = inf, "t"
+        while prev[v] is not None:
+            flow = min(flow, cap[prev[v]][v])
+            v = prev[v]
+        v = "t"
+        while prev[v] is not None:
+            u = prev[v]
+            cap[u][v] -= flow
+            cap[v][u] = cap[v].get(u, 0) + flow
+            v = u
+
+
+def optimal_chunks(
+    txids: set[bytes], fee: dict[bytes, int], size: dict[bytes, int],
+    parents: dict[bytes, set[bytes]],
+) -> list[tuple[set[bytes], int, int]]:
+    """Chunk a cluster the way an optimal linearization does.
+
+    Core v31.1 linearizes each cluster optimally (cluster_linearize.h) and
+    chunks it with ChunkLinearizationInfo, which merges a chunk into the
+    previous one only when its feerate is strictly higher, so equal-feerate
+    chunks stay apart.  Each chunk of that result is the smallest
+    highest-feerate parent-closed set of what is left.  Found here exactly:
+    Dinkelbach iteration over max-weight closures, then the smallest closure
+    at the optimal feerate.  Returns ``[(txids, fee, size), ...]`` best first.
+    """
+    remaining = set(txids)
+    out: list[tuple[set[bytes], int, int]] = []
+    while remaining:
+        order = sorted(remaining)
+        par = {v: parents.get(v, set()) & remaining for v in order}
+        best = set(remaining)
+        f, s = sum(fee[v] for v in best), sum(size[v] for v in best)
+        while True:
+            w = {v: fee[v] * s - f * size[v] for v in order}
+            cand = _max_weight_closure(order, w, par)
+            if not cand or sum(w[v] for v in cand) <= 0:
+                break
+            best = cand
+            f, s = sum(fee[v] for v in best), sum(size[v] for v in best)
+        if len(best) > 1:
+            w = {v: fee[v] * s - f * size[v] for v in order}
+            for v in sorted(best):
+                if v not in best:
+                    continue
+                inner = sorted(best)
+                smaller = _max_weight_closure(
+                    inner, {u: w[u] for u in inner},
+                    {u: par[u] & best for u in inner}, forced=v,
+                )
+                if len(smaller) < len(best) and sum(w[u] for u in smaller) == 0:
+                    best = smaller
+            f, s = sum(fee[v] for v in best), sum(size[v] for v in best)
+        out.append((best, f, s))
+        remaining -= best
+    return out
+
+
 class ClusterManager:
     """Manages clusters of transactions in the mempool.
 
@@ -2054,6 +2154,17 @@ class Mempool:
         #            mapDeltas, ApplyDelta, GetModifiedFee.
         self.map_deltas: dict[bytes, int] = {}
 
+        # m_unbroadcast_txids (txmempool.h): txids submitted locally
+        # (BroadcastTransaction, i.e. sendrawtransaction and the wallet) that
+        # no peer has fetched yet.  Dropped when a peer getdata's the tx or
+        # the tx leaves the pool.  Reported as entryToJSON "unbroadcast" and
+        # getmempoolinfo "unbroadcastcount".
+        self.unbroadcast_txids: set[bytes] = set()
+
+        # Chunk feerates per txid, valid for one (sequence, deltas) state.
+        self._chunk_cache_key: object = None
+        self._chunk_cache: dict[bytes, tuple[int, int]] = {}
+
     def __len__(self) -> int:
         """Return the number of transactions in the mempool."""
         return len(self.transactions)
@@ -3705,6 +3816,8 @@ class Mempool:
             self.by_fee_rate.remove(txid)
 
         del self.transactions[txid]
+        # Core removeUnchecked -> RemoveUnbroadcastTx.
+        self.unbroadcast_txids.discard(txid)
         # BIP 152 / BIP 339 dual index — drop the wtxid mapping.  Compute
         # wtxid from the entry we still have a handle on; for non-segwit
         # transactions wtxid == txid.
@@ -4129,6 +4242,7 @@ class Mempool:
     def update_for_reorg(
         self, disconnected_txs, tip_height: int, add_to_mempool: bool = True,
         not_readded_txs=(),
+        entry_heights: dict[bytes, int] | None = None,
     ) -> dict:
         """Core ``MaybeUpdateMempoolForReorg`` (validation.cpp), run after the
         chain has moved (DisconnectTip/ConnectTip done, removeForBlock already
@@ -4148,7 +4262,12 @@ class Mempool:
         fAddToMempool=false).  They are removeRecursive'd first, before any
         re-add, and removeForReorg runs once, after the re-adds: Core runs
         removeForReorg per DisconnectTip only once that block's txs are back,
-        so an in-pool spender of a re-added tx keeps its parent.  All under
+        so an in-pool spender of a re-added tx keeps its parent.
+
+        *entry_heights*: txid -> the tip height Core re-adds that tx at
+        (InvalidateBlock re-adds per DisconnectTip, so a tx from block h gets
+        entry height h - 1); a re-added tx's ``height_added`` is set to it.
+        Absent, the entry height is *tip_height*.  All under
         the mempool lock;
         callers hold the chain lock, so no reader sees the pool disagree
         with the tip."""
@@ -4182,6 +4301,8 @@ class Mempool:
                         ok = False
                 if ok:
                     readded.append(txid)
+                    if entry_heights and txid in entry_heights:
+                        self.transactions[txid].height_added = entry_heights[txid]
                 elif txid not in self.transactions:
                     failed += 1
                     # removeRecursive(tx): its in-pool spenders lose their
@@ -4984,6 +5105,7 @@ class Mempool:
             self.spent_outputs.clear()
             self.spender_by_outpoint.clear()
             self.by_fee_rate.clear()
+            self.unbroadcast_txids.clear()
             self._cluster_manager.rebuild()  # Clear cluster data
             self.current_size = 0
             logger.info(f"Cleared mempool ({count} transactions removed)")
@@ -5396,6 +5518,81 @@ class Mempool:
             MempoolEntry or None if not found
         """
         return self.transactions.get(txid)
+
+    # --- entryToJSON support (rpc/mempool.cpp) ---
+
+    def add_unbroadcast(self, txid: bytes) -> None:
+        """Core AddUnbroadcastTx: only a txid that is in the pool."""
+        with self._lock:
+            if txid in self.transactions:
+                self.unbroadcast_txids.add(txid)
+
+    def remove_unbroadcast(self, txid: bytes) -> None:
+        """Core RemoveUnbroadcastTx: a peer fetched it (ProcessGetData)."""
+        with self._lock:
+            self.unbroadcast_txids.discard(txid)
+
+    def is_unbroadcast(self, txid: bytes) -> bool:
+        return txid in self.unbroadcast_txids
+
+    def is_bip125_replaceable(self, txid: bytes) -> bool:
+        """entryToJSON "bip125-replaceable": Core IsRBFOptIn (policy/rbf.cpp)
+        for a tx in the pool -- it, or any in-pool ancestor, has an input
+        with nSequence <= 0xfffffffd.  Signalling only: unlike
+        :meth:`is_rbf_opt_in` (replacement policy), TRUC does not count."""
+        with self._lock:
+            entry = self.transactions.get(txid)
+            if entry is None:
+                return False
+            if self.signals_rbf(entry.tx):
+                return True
+            for a in self._get_ancestors(entry.tx):
+                a_entry = self.transactions.get(a)
+                if a_entry is not None and self.signals_rbf(a_entry.tx):
+                    return True
+            return False
+
+    def main_chunk_feerate(self, txid: bytes) -> tuple[int, int] | None:
+        """Core GetMainChunkFeerate: (fee, weight) of the chunk holding
+        *txid* in its cluster's optimal linearization.
+
+        TxGraph is fed the MODIFIED fee and the sigop-adjusted WEIGHT
+        (txmempool.cpp StageAddition / PrioritiseTransaction), so that is
+        what is chunked here.  None when the tx is not in the pool.
+        """
+        with self._lock:
+            if txid not in self.transactions:
+                return None
+            key = (
+                self._mempool_sequence,
+                len(self.transactions),
+                sum(len(e.children) for e in self.transactions.values()),
+                tuple(sorted(self.map_deltas.items())),
+            )
+            if key != self._chunk_cache_key:
+                self._chunk_cache_key = key
+                self._chunk_cache = {}
+            hit = self._chunk_cache.get(txid)
+            if hit is not None:
+                return hit
+            cluster: set[bytes] = set()
+            stack = [txid]
+            while stack:
+                t = stack.pop()
+                if t in cluster or t not in self.transactions:
+                    continue
+                cluster.add(t)
+                e = self.transactions[t]
+                stack.extend(e.parents)
+                stack.extend(e.children)
+            fee = {t: int(self.transactions[t].fee) + int(self.map_deltas.get(t, 0))
+                   for t in cluster}
+            size = {t: int(self.transactions[t].sigop_adjusted_weight) for t in cluster}
+            parents = {t: set(self.transactions[t].parents) & cluster for t in cluster}
+            for chunk, f, s in optimal_chunks(cluster, fee, size, parents):
+                for t in chunk:
+                    self._chunk_cache[t] = (f, s)
+            return self._chunk_cache[txid]
 
     # --- BIP 152 Compact Block Support ---
 

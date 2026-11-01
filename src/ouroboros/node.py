@@ -2039,6 +2039,8 @@ class BitcoinNode:
                                 # -> TX_WITH_WITNESS (ProcessGetData).
                                 tx_msg = TxMessage.for_inv(tx, inv_type)
                                 await peer.send_message(tx_msg.to_network_message(network))
+                                # Core ProcessGetData: RemoveUnbroadcastTx.
+                                self.mempool.remove_unbroadcast(tx.get_txid())
                                 logger.debug(f"Sent tx {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
                             else:
                                 not_found.append((inv_type, inv_hash))
@@ -2057,6 +2059,7 @@ class BitcoinNode:
                                 # hash mismatch" and never propagates.
                                 tx_msg = TxMessage.for_inv(tx, inv_type)
                                 await peer.send_message(tx_msg.to_network_message(network))
+                                self.mempool.remove_unbroadcast(tx.get_txid())
                                 logger.debug(f"Sent wtx {inv_hash.hex()[:16]}... to {peer.host}:{peer.port}")
                             else:
                                 not_found.append((inv_type, inv_hash))
