@@ -3382,7 +3382,11 @@ class PeerManager:
                 logger.debug(f"Ignoring cmpctblock from non-NODE_WITNESS peer {addr}")
                 return
             try:
-                cb = CompactBlock.deserialize(msg.payload)
+                # Off the event loop: a 4 MB cmpctblock is ~65k txs of
+                # pure-Python parsing, and every peer and the RPC wait
+                # behind the loop (Core parses on its message thread).
+                cb = await asyncio.to_thread(
+                    CompactBlock.deserialize, msg.payload)
             except (ValueError, Exception) as exc:
                 logger.warning(f"Malformed cmpctblock from {addr}: {exc}")
                 return
@@ -3503,18 +3507,31 @@ class PeerManager:
 
         async def on_blocktxn(msg: NetworkMessage):
             from ouroboros.compact_blocks import BlockTransactions
+            # Look the 32-byte block hash up before parsing the body: an
+            # unsolicited blocktxn is a cheap miss in Core
+            # (ProcessCompactBlockTxns, mapBlocksInFlight), not a 4 MB parse.
+            block_hash = bytes(msg.payload[:32])
+            if (len(block_hash) < 32
+                    or block_hash not in self._partial_cmpct_blocks):
+                logger.debug(
+                    f"blocktxn from {addr}: no matching in-flight cmpctblock "
+                    f"for {block_hash.hex()[:16]}...; ignoring"
+                )
+                return
             try:
-                bt = BlockTransactions.deserialize(msg.payload)
+                bt = await asyncio.to_thread(
+                    BlockTransactions.deserialize, msg.payload)
             except (ValueError, Exception) as exc:
                 logger.warning(f"Malformed blocktxn from {addr}: {exc}")
                 return
 
-            # Look up the in-flight partial block stored by on_cmpctblock.
+            # Pop after the parse: the entry may have been completed, swept
+            # or dropped on disconnect while the parse ran in its thread.
             partial_entry = self._partial_cmpct_blocks.pop(bt.block_hash, None)
             if partial_entry is None:
                 logger.debug(
-                    f"blocktxn from {addr}: no matching in-flight cmpctblock "
-                    f"for {bt.block_hash.hex()[:16]}...; ignoring"
+                    f"blocktxn from {addr}: in-flight cmpctblock "
+                    f"{bt.block_hash.hex()[:16]}... gone during parse; ignoring"
                 )
                 return
 

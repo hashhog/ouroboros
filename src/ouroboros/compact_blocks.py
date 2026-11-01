@@ -379,6 +379,13 @@ class CompactBlock:
 
         sid_count, consumed = decode_varint(payload, off)
         off += consumed
+        # Refuse an over-count before reading any short id: the uint16
+        # ceiling below (Core: "indexes overflowed 16 bits") already holds
+        # for sid_count alone, and MAX_CMPCTBLOCK_TX_COUNT is looser.
+        if sid_count > 0xFFFF:
+            raise ValueError(
+                f"cmpctblock: BlockTxCount {sid_count} overflows uint16_t"
+            )
         short_ids = []
         for _ in range(sid_count):
             if off + 6 > len(payload):
@@ -408,10 +415,13 @@ class CompactBlock:
             off += consumed
             abs_idx = last_abs + 1 + diff
 
-            tx_msg = TxMessage.from_payload(payload[off:])
+            # Parse in place at ``off``: slicing ``payload[off:]`` copied the
+            # rest of the message per tx (quadratic; a 4 MB cmpctblock of
+            # 65k prefilled txs copied ~129 GB), and the parser already
+            # reports the wire length, so no re-serialize either.
+            tx_msg = TxMessage.from_payload(payload, off)
             tx = tx_msg.transaction
-            tx_len = len(tx.serialize_with_witness())
-            off += tx_len
+            off += tx_msg.bytes_consumed
 
             # Store the absolute position in .index (consistent with
             # from_block() which stores 0 for the coinbase).
@@ -510,11 +520,10 @@ class BlockTransactions:
         off += consumed
         txs = []
         for _ in range(count):
-            tx_msg = TxMessage.from_payload(payload[off:])
-            tx = tx_msg.transaction
-            tx_len = len(tx.serialize_with_witness())
-            off += tx_len
-            txs.append(tx)
+            # In place, as in CompactBlock.deserialize (no tail copy per tx).
+            tx_msg = TxMessage.from_payload(payload, off)
+            off += tx_msg.bytes_consumed
+            txs.append(tx_msg.transaction)
         return cls(block_hash=block_hash, transactions=txs)
 
 
