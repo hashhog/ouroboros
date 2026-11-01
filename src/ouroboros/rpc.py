@@ -8152,7 +8152,8 @@ class RPCServer:
 
                     # B6: correct BIP-141 weight (miner.cpp AddToBlock:267)
                     tw = e.tx.get_weight()
-                    raw = e.tx.serialize()
+                    # Core EncodeHexTx: TX_WITH_WITNESS (core_io.cpp).
+                    raw = e.tx.serialize_with_witness()
 
                     tx_sigops_cost = 0
 
