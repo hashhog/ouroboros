@@ -17101,8 +17101,11 @@ class RPCServer:
             "descendantsize": entry.descendant_size,
             "ancestorcount": entry.ancestor_count,
             "ancestorsize": entry.ancestor_size,
-            "wtxid": _display_hash(entry.tx.get_wtxid())
-                if hasattr(entry.tx, "get_wtxid") else _display_txid(txid_bytes),
+            # Display order (reversed), like every other hash at the RPC
+            # boundary.  The _display_hash/_display_txid helpers are local to
+            # other methods; naming them here raised NameError (-32603).
+            "wtxid": (entry.tx.get_wtxid() if hasattr(entry.tx, "get_wtxid")
+                      else txid_bytes)[::-1].hex(),
             "fees": {
                 "base": base_fee_btc,
                 "modified": modified_fee_btc,

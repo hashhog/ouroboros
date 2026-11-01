@@ -174,3 +174,25 @@ def test_get_block_with_witness_matches_the_stored_bytes(tmp_path):
     assert blk.transactions[1].get_wtxid() == wtxid
     assert blk.hash == bh
 
+
+
+def test_verbose_mempool_rpcs_report_the_readded_tx(tmp_path):
+    """Once the refill puts a tx back, the verbose mempool RPCs must describe
+    it.  ``_format_mempool_entry`` called helpers (``_display_hash`` /
+    ``_display_txid``) that are local to other methods, so both RPCs raised
+    NameError -> -32603 for any tx in the pool (Core v31.1 regtest rows
+    warden_invalidated_submit/after-invalidate-tip/pool, warden_d/e entry-*).
+    Core entryToJSON: ``wtxid`` is the display-order (reversed) wtxid."""
+    bdb, chain, _bs, server, mempool, fund = _setup(tmp_path)
+    txid, wtxid, bh = _mine_segwit_spend(bdb, chain, fund)
+    asyncio.run(server.rpc_invalidateblock(bh[::-1].hex()))
+    assert txid in mempool.transactions
+
+    pool = asyncio.run(server.rpc_getrawmempool(True))
+    assert list(pool) == [txid[::-1].hex()]
+    assert pool[txid[::-1].hex()]["wtxid"] == wtxid[::-1].hex()
+
+    entry = asyncio.run(server.rpc_getmempoolentry(txid[::-1].hex()))
+    assert entry["wtxid"] == wtxid[::-1].hex()
+    assert entry["wtxid"] != txid[::-1].hex(), "segwit wtxid must differ from txid"
+    assert entry == pool[txid[::-1].hex()]
