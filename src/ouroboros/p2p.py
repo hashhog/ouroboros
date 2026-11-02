@@ -48,6 +48,8 @@ from ouroboros.p2p_messages import (
     MSG_WTX,
     NODE_NETWORK,
     NODE_WITNESS,
+    MAX_ADDR_TO_SEND,
+    AddrCountExceeded,
     AddrMessage,
     AddrV2Message,
     BlockTxnMessage,
@@ -3824,6 +3826,13 @@ class PeerManager:
         async def on_addr(msg: NetworkMessage):
             try:
                 am = AddrMessage.from_payload(msg.payload)
+            except AddrCountExceeded as e:
+                self._misbehave_oversize_addr(peer, e)
+                return
+            except Exception as e:
+                logger.debug(f"Error parsing addr from {addr}: {e}")
+                return
+            try:
                 if not self._rate_limit_addr_relay(addr, len(am.addresses)):
                     return
                 # INBOUND-addr token bucket (Core ProcessAddrs:5644-5671): cap how
@@ -3831,6 +3840,7 @@ class PeerManager:
                 # dropped (rate-limited).  Shared per-peer bucket across addr/addrv2.
                 admit = self._admit_addrs_token_bucket(peer, len(am.addresses))
                 added = 0
+                relay: list = []
                 _now = time.time()
                 for ts, net_addr in am.addresses[:admit]:
                     # Core net_processing.cpp:5678-5680: clamp timestamps that
@@ -3851,16 +3861,27 @@ class PeerManager:
                         ):
                             added += 1
                         self._add_known_addr(f"{host_str}:{net_addr.port}")
+                        relay.append((ts, net_addr))
                 if added:
                     logger.debug(f"Learned {added} new addresses from {addr}")
-                    # Relay to 1-2 random peers
-                    await self._relay_addr(msg, exclude=addr)
+                    # Relay to 1-2 random peers: a fresh message holding only
+                    # the entries we admitted and processed, never the raw
+                    # inbound bytes (which carry everything the bucket dropped).
+                    await self._relay_addr(
+                        AddrMessage(addresses=relay).to_network_message(
+                            self.network),
+                        exclude=addr,
+                    )
             except Exception as e:
-                logger.debug(f"Error parsing addr from {addr}: {e}")
+                logger.debug(f"Error handling addr from {addr}: {e}")
 
         async def on_addrv2(msg: NetworkMessage):
             try:
-                am = AddrV2Message.from_payload(msg.payload)
+                try:
+                    am = AddrV2Message.from_payload(msg.payload)
+                except AddrCountExceeded as e:
+                    self._misbehave_oversize_addr(peer, e)
+                    return
                 if not self._rate_limit_addr_relay(addr, len(am.addresses)):
                     return
                 # INBOUND-addr token bucket (Core ProcessAddrs:5644-5671): same
@@ -3868,6 +3889,7 @@ class PeerManager:
                 # from ``peer.addr_token_bucket``.
                 admit = self._admit_addrs_token_bucket(peer, len(am.addresses))
                 added = 0
+                relay = []
                 _now = time.time()
                 for entry in am.addresses[:admit]:
                     # AddrV2Entry is a @dataclass — use attribute access, not
@@ -3896,9 +3918,15 @@ class PeerManager:
                         ):
                             added += 1
                         self._add_known_addr(f"{host_str}:{port}")
+                        relay.append(entry)
                 if added:
                     logger.debug(f"Learned {added} new addresses (v2) from {addr}")
-                    await self._relay_addr(msg, exclude=addr)
+                    # Same as on_addr: relay re-serialized admitted entries only.
+                    await self._relay_addr(
+                        AddrV2Message(addresses=relay).to_network_message(
+                            self.network),
+                        exclude=addr,
+                    )
             except (ValueError, struct.error) as e:
                 # Expected for malformed wire payloads (truncated, bad varint,
                 # oversize address).  ``AddrV2Message.from_payload`` raises
@@ -3972,6 +4000,22 @@ class PeerManager:
             logger.debug(f"Sent getaddr to {peer.host}:{peer.port}")
         except Exception as e:
             logger.debug(f"Failed to send getaddr to {peer.host}:{peer.port}: {e}")
+
+    def _misbehave_oversize_addr(self, peer: Peer, err: AddrCountExceeded) -> None:
+        """Core ProcessAddrs (net_processing.cpp:5635-5638): an addr/addrv2
+        with more than MAX_ADDR_TO_SEND entries is ``Misbehaving`` and is
+        neither processed nor relayed.  Core v31 Misbehaving always
+        discourages + disconnects, so score at the instant-ban level; the
+        ban manager's callback does the disconnect (honouring noban/manual)."""
+        logger.warning(
+            f"{err.command} message size = {err.count} from "
+            f"{peer.host}:{peer.port} (> {MAX_ADDR_TO_SEND}) "
+            "— misbehaving"
+        )
+        self.misbehaving(
+            peer.host, 100,
+            f"{err.command} message size = {err.count}",
+        )
 
     async def _relay_addr(self, msg: NetworkMessage, exclude: str = "") -> None:
         all_items = list(self.peers.items()) + list(self.inbound_peers.items())
