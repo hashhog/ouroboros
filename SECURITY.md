@@ -34,7 +34,7 @@ You will get an acknowledgement, a fix and disclosure timeline agreed with you, 
 
 ## Configuration to check
 
-- The RPC server listens on `127.0.0.1` only. It uses the cookie in `<datadir>/.cookie` unless both `rpcuser` and `rpcpassword` are set in the config file. `GET /health`, `GET /getblockstats` and `GET /getblockfilter` on the RPC port answer without authentication.
+- The RPC server listens on `127.0.0.1` only. It uses the cookie in `<datadir>/.cookie` unless both `rpcuser` and `rpcpassword` are set in the config file. Every request on the RPC port needs those credentials, and the port sends no CORS headers.
 - The P2P port listens on all interfaces by default. Use `--bind 127.0.0.1` or `--nolisten` to restrict it.
 
 ## Wallet caveats

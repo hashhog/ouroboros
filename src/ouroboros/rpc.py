@@ -19,7 +19,6 @@ from collections import defaultdict
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
@@ -1953,14 +1952,10 @@ class RPCServer:
 
         self.app = FastAPI(title="Bitcoin Hybrid Node RPC")
 
-        # Add CORS middleware
-        self.app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
+        # No CORS middleware: Core sends no CORS headers on the RPC port. The
+        # wildcard-origin, credentials-allowed policy that used to sit here
+        # made Starlette reflect any Origin, so any web page could read RPC
+        # replies.
 
         # Setup security if credentials provided
         self.security = None
@@ -2505,62 +2500,6 @@ class RPCServer:
             from urllib.parse import unquote
             wallet_name = unquote(wallet_name)
             return await _handle_rpc_common(http_request, wallet_name=wallet_name)
-
-        @self.app.get("/health")
-        async def health():
-            """Health check endpoint"""
-            return {"status": "healthy", "service": "bitcoin-rpc"}
-
-        @self.app.get("/getblockstats")
-        async def getblockstats(
-            hash_or_height: str,
-            stats: str | None = None,
-            http_request: Request = None,
-        ):
-            """GET endpoint for getblockstats.
-
-            ``hash_or_height`` is passed as a query parameter (string).
-            If it looks like an integer it is treated as a block height,
-            otherwise it is treated as a block hash.
-
-            ``stats`` is an optional comma-separated list of stat names to
-            return.
-            """
-            # Coerce to int when possible
-            parsed: int | str
-            try:
-                parsed = int(hash_or_height)
-            except ValueError:
-                parsed = hash_or_height
-
-            stats_list: list[str] | None = None
-            if stats:
-                stats_list = [s.strip() for s in stats.split(",") if s.strip()]
-
-            return await self.rpc_getblockstats(parsed, stats_list)
-
-        @self.app.get("/getblockfilter")
-        async def getblockfilter_get(
-            blockhash: str,
-            filtertype: str = "basic",
-        ):
-            """GET endpoint for getblockfilter (BIP 157/158).
-
-            ``blockhash`` is the hex-encoded block hash.
-            ``filtertype`` is the filter type name (only ``basic`` supported).
-            """
-            # rpc_getblockfilter raises RpcError with Core-coded numeric
-            # codes (-5/-1/-8) for the JSON-RPC path.  Translate to the
-            # nearest HTTP status for this REST GET surface.
-            try:
-                return await self.rpc_getblockfilter(blockhash, filtertype)
-            except RpcError as e:
-                _status = {
-                    RPC_INVALID_ADDRESS_OR_KEY: 404,
-                    RPC_MISC_ERROR: 400,
-                    RPC_INVALID_PARAMETER: 400,
-                }.get(e.code, 500)
-                raise HTTPException(status_code=_status, detail=e.message) from None
 
         # BIP-78 PayJoin receiver endpoint (FIX-65).
         #

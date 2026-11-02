@@ -143,7 +143,7 @@ On mainnet, plan for at least the disk space of an unpruned Bitcoin Core node, p
 
 Logs go to `<datadir>/ouroboros.log` and, unless turned off, to stderr. `--debug=<categories>` uses Core's category names (`net`, `mempool`, `validation`, and so on); the `logging` RPC changes them at run time.
 
-The Prometheus exporter on port 9332 reports, among others, `ouroboros_block_height`, `ouroboros_peers_connected`, `ouroboros_mempool_size`, `ouroboros_utxo_cache_hit_rate` and `ouroboros_rpc_duration_seconds`. The RPC port also answers `GET /health` with `{"status":"healthy",...}`.
+The Prometheus exporter on port 9332 reports, among others, `ouroboros_block_height`, `ouroboros_peers_connected`, `ouroboros_mempool_size`, `ouroboros_utxo_cache_hit_rate` and `ouroboros_rpc_duration_seconds`.
 
 ## Stopping
 

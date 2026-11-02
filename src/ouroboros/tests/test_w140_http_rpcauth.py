@@ -638,11 +638,6 @@ def test_w140_g20_mixed_v1_v2_batch() -> None:
 # ===========================================================================
 
 
-@pytest.mark.xfail(
-    reason="W140 BUG-20 (P2): CORS is wildcard-open with credentials. "
-           "rpc.py:904-910 allow_origins=['*'] AND allow_credentials=True.",
-    strict=True,
-)
 def test_w140_g21_cors_not_wildcard_with_credentials() -> None:
     """G21: CORS must not advertise allow_origins=['*'] with credentials=True.
 
@@ -660,31 +655,19 @@ def test_w140_g21_cors_not_wildcard_with_credentials() -> None:
     )
 
 
-@pytest.mark.xfail(
-    reason="W140 BUG-21 (P2): GET endpoints (/health, /getblockstats, "
-           "/getblockfilter) bypass auth. Core: REST is a separate listener "
-           "gated by -rest=1.",
-    strict=True,
-)
 def test_w140_g22_get_endpoints_authenticated() -> None:
-    """G22: GET endpoints on the JSON-RPC port must require auth.
+    """G22: no GET endpoint on the JSON-RPC port may bypass auth.
 
-    /health, /getblockstats, /getblockfilter are registered as @get
-    decorators with no `await self._get_credentials(http_request)`
-    call. An unauth'd client can probe block state and node health.
+    /health, /getblockstats and /getblockfilter used to be registered as
+    @get routes with no `_get_credentials` call, so an unauth'd client
+    could probe block state and node health. They were removed (the
+    JSON-RPC methods remain); Core has no such routes on the RPC port.
     """
     src = (SRC_OUROBOROS / "rpc.py").read_text(encoding="utf-8")
-    # Scan /health declaration for an auth call inside its body.
-    m = re.search(
-        r'@self\.app\.get\("/health"\)\s*\n.*?(?=@self\.app\.|\nclass )',
-        src,
-        re.DOTALL,
-    )
-    body = m.group(0) if m else ""
-    has_auth = "_get_credentials" in body
-    assert has_auth, (
-        "G22: /health (and other GET endpoints) must run _get_credentials"
-    )
+    for path in ("/health", "/getblockstats", "/getblockfilter"):
+        assert f'@self.app.get("{path}")' not in src, (
+            f"G22: GET {path} must not be served on the RPC port without auth"
+        )
 
 
 @pytest.mark.xfail(
