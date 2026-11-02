@@ -718,6 +718,11 @@ class PeerManager:
         self.peers: dict[str, Peer] = {}  # addr -> Peer (full-relay outbound)
         self.block_relay_peers: dict[str, Peer] = {}  # addr -> Peer (block-relay-only outbound)
         self.inbound_peers: dict[str, Peer] = {}  # addr -> Peer (inbound)
+        # Inbound connections still in their handshake.  Each holds an
+        # inbound slot from accept until it is registered in inbound_peers or
+        # fails, as Core counts an accepted socket against nMaxInbound at
+        # once (CConnman::CreateNodeFromAcceptedSocket).
+        self._pending_inbound = 0
         # Parallel "every host:port ever gossiped" set.  Kept as a set so
         # the existing set-difference / membership / discard call sites are
         # untouched, but bounded as a FIFO via the companion insertion-order
@@ -1517,8 +1522,10 @@ class PeerManager:
                 0, self.max_inbound - RESERVED_INBOUND_SLOTS_FOR_NEW_GROUPS
             )
 
-        # Check inbound limit — try to evict the worst peer first
-        if len(self.inbound_peers) >= effective_limit:
+        # Check inbound limit — try to evict the worst peer first.  Pending
+        # handshakes count: otherwise any number of sockets can sit in the
+        # handshake unseen (audit H1).
+        if len(self.inbound_peers) + self._pending_inbound >= effective_limit:
             if not await self._evict_inbound_peer():
                 logger.debug(f"Rejected inbound peer {addr}: max inbound reached, no eviction candidate")
                 writer.close()
@@ -1538,7 +1545,16 @@ class PeerManager:
                     node_compact_filters=self.node_compact_filters,
                     node_network_limited=self.node_network_limited,
                     on_disconnect=self._handle_peer_disconnected)
-        if await peer.accept_inbound(reader, writer, self._start_height):
+        # Reserve the slot before the first read; give it back however the
+        # handshake ends (success moves it into inbound_peers below).
+        self._pending_inbound += 1
+        try:
+            accepted = await peer.accept_inbound(
+                reader, writer, self._start_height
+            )
+        finally:
+            self._pending_inbound -= 1
+        if accepted:
             self.inbound_peers[addr] = peer
             self._register_compact_handlers(peer, addr)
             self._register_bloom_handlers(peer, addr)
