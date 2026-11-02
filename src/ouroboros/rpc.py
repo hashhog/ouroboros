@@ -3818,7 +3818,9 @@ class RPCServer:
         # verbosity == 2: add fee at top level and prevout per non-coinbase input.
         # Reference: Bitcoin Core getrawtransaction verbosity=2 path,
         #            rpc/rawtransaction.cpp TxToUniv(tx, …, verbosity=2).
-        if verbosity >= 2 and not witness_tx.is_coinbase:
+        # Core only has undo data for a tx found in a block (rawtransaction.cpp
+        # :365-371), so a mempool tx gets neither fee nor prevout.
+        if verbosity >= 2 and not in_mempool and not witness_tx.is_coinbase:
             input_total_sats = 0
             vin_list = result.get("vin", [])
             for j, tx_in in enumerate(witness_tx.inputs):
