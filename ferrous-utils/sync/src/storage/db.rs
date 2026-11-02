@@ -1567,6 +1567,39 @@ impl BlockchainDB {
         Ok(())
     }
 
+    /// Phase 1 of a snapshot load: set the SNAPSHOT_LOAD_IN_PROGRESS marker
+    /// and clear the chainstate in ONE WriteBatch.
+    ///
+    /// These used to be two writes, the clear first (audit L10,
+    /// 2026-10-30): a crash between them left an empty chainstate and no
+    /// marker, so the next boot could not tell the UTXO set was gone. In
+    /// one batch the marker and the clear land together or not at all.
+    pub fn begin_snapshot_load(
+        &self,
+        base_blockhash: &[u8; 32],
+        base_height: u32,
+    ) -> Result<()> {
+        let meta = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        let chainstate = self.db.cf_handle(CHAINSTATE_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(CHAINSTATE_CF.to_string()))?;
+        let mut value = Vec::with_capacity(36);
+        value.extend_from_slice(base_blockhash);
+        value.extend_from_slice(&base_height.to_le_bytes());
+
+        let mut batch = WriteBatch::default();
+        batch.put_cf(meta, meta_keys::SNAPSHOT_LOAD_IN_PROGRESS, &value);
+        // Same key range as clear_chainstate: delete_range is exclusive on
+        // the end key, so the max key is deleted separately.
+        let start = [0u8; 36];
+        let end = [0xFFu8; 36];
+        batch.delete_range_cf(chainstate, &start, &end);
+        batch.delete_cf(chainstate, &end);
+        self.db.write(batch)?;
+        self.clear_utxo_read_cache();
+        Ok(())
+    }
+
     /// Accumulate a delete of SNAPSHOT_LOAD_IN_PROGRESS onto a WriteBatch.
     /// Used by `snapshot_load_commit` so the marker deletion lands atomically
     /// with the final tip + metadata update.
