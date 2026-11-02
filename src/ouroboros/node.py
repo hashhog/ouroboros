@@ -2178,48 +2178,57 @@ class BitcoinNode:
 
                     # Find the fork point: walk through the locator hashes
                     # and find the first one we have in our chain.
-                    # Off-load each FFI get_block to a worker thread —
-                    # a long locator can otherwise stall the loop for
-                    # tens of ms per probe.
+                    # get_block_header has get_block's presence contract
+                    # (None exactly when the body is absent) and, like
+                    # get_block, carries height=None, so start_height is
+                    # what the full-block probe produced.  Off-load each
+                    # FFI probe to a worker thread — a long locator can
+                    # otherwise stall the loop for tens of ms.
                     start_height = 0
                     for locator_hash in getheaders.locator_hashes:
                         block = await asyncio.to_thread(
-                            self.db.get_block, locator_hash,
+                            self.db.get_block_header, locator_hash,
                         )
                         if block is not None:
                             start_height = (block.height if block.height else 0) + 1
                             break
 
-                    # Collect up to 2000 headers starting from start_height.
-                    # Each db.get_block_by_height call is a full Rust-side
-                    # block materialise + PyO3 deserialise; serving the
-                    # max 2000-block batch synchronously holds the event
-                    # loop for several seconds and is the most expensive
-                    # single P2P handler.  Run inside a worker thread so
-                    # RPC + other peer dispatch continues meanwhile.
+                    # Collect up to 2000 headers starting from start_height,
+                    # from the height->hash index and the header-only path
+                    # (audit H4).  This used to be db.get_block_by_height:
+                    # a full block read, a PyO3 object per tx/input/output
+                    # and _py_block_to_block, all to copy six fields —
+                    # >= 23 s of GIL-held CPU for one 82-byte request on
+                    # mainnet-sized blocks.  Core copies them out of
+                    # CBlockIndex (ProcessGetHeaders).  The batch still runs
+                    # in one worker thread so RPC + peer dispatch continue.
                     _, best_height = self.db.get_best_block()
-                    headers = []
-                    for h in range(start_height, min(start_height + 2000, best_height + 1)):
-                        block = await asyncio.to_thread(
-                            self.db.get_block_by_height, h,
-                        )
-                        if block is None:
-                            break
-                        header = BlockHeader(
-                            version=block.version,
-                            prev_blockhash=block.prev_blockhash,
-                            merkle_root=block.merkle_root,
-                            timestamp=block.timestamp,
-                            bits=block.bits,
-                            nonce=block.nonce,
-                        )
-                        headers.append(header)
+                    hash_stop = getheaders.hash_stop
 
-                        # Stop if we've reached hash_stop.
-                        if getheaders.hash_stop != b'\x00' * 32:
-                            block_hash = block.hash
-                            if block_hash == getheaders.hash_stop:
+                    def _collect_headers():
+                        out = []
+                        for h in range(start_height, min(start_height + 2000, best_height + 1)):
+                            block_hash = self.db.get_block_hash_by_height(h)
+                            if block_hash is None:
                                 break
+                            block = self.db.get_block_header(block_hash)
+                            if block is None:
+                                break
+                            out.append(BlockHeader(
+                                version=block.version,
+                                prev_blockhash=block.prev_blockhash,
+                                merkle_root=block.merkle_root,
+                                timestamp=block.timestamp,
+                                bits=block.bits,
+                                nonce=block.nonce,
+                            ))
+
+                            # Stop if we've reached hash_stop.
+                            if hash_stop != b'\x00' * 32 and block.hash == hash_stop:
+                                break
+                        return out
+
+                    headers = await asyncio.to_thread(_collect_headers)
 
                     if headers:
                         headers_msg = HeadersMessage(headers=headers)
