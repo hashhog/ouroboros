@@ -1403,7 +1403,7 @@ class AddrV2Message:
 
         # Enforce limit
         if count > MAX_ADDRV2_ADDRESSES:
-            raise ValueError(f"addrv2 contains {count} addresses, max is {MAX_ADDRV2_ADDRESSES}")
+            raise AddrCountExceeded("addrv2", count)
 
         addresses = []
         for _ in range(count):
@@ -1533,6 +1533,12 @@ class AddrMessage:
         offset = 0
         count, consumed = decode_varint(payload, offset)
         offset += consumed
+        # Core ProcessAddrs (net_processing.cpp:5635): more than
+        # MAX_ADDR_TO_SEND entries is misbehaviour.  Refuse on the count,
+        # before reading any entry, so a 4 MB frame cannot make us parse
+        # ~133k entries on the event loop.
+        if count > MAX_ADDR_TO_SEND:
+            raise AddrCountExceeded("addr", count)
         addresses = []
         for _ in range(count):
             ts = struct.unpack('<I', payload[offset:offset+4])[0]
@@ -1616,8 +1622,24 @@ BIP155_ADDR_SIZES = {
     BIP155_NET_CJDNS: 16,
 }
 
-# Maximum addresses per addrv2 message
-MAX_ADDRV2_ADDRESSES = 1000
+# Maximum addresses per addr / addrv2 message (Core MAX_ADDR_TO_SEND)
+MAX_ADDR_TO_SEND = 1000
+MAX_ADDRV2_ADDRESSES = MAX_ADDR_TO_SEND
+
+
+class AddrCountExceeded(ValueError):
+    """An addr / addrv2 message declares more than MAX_ADDR_TO_SEND entries.
+
+    A ValueError so existing malformed-payload handling still catches it;
+    its own type lets the handler Misbehave the sender, as Core does.
+    """
+
+    def __init__(self, command: str, count: int):
+        super().__init__(
+            f"{command} contains {count} addresses, max is {MAX_ADDR_TO_SEND}"
+        )
+        self.command = command
+        self.count = count
 
 # Maximum address size per BIP155
 MAX_ADDRV2_ADDR_SIZE = 512
