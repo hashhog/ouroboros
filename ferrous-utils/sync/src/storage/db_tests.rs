@@ -1738,9 +1738,9 @@ mod tests {
     }
 
     /// `recover_from_crash` MUST detect a SNAPSHOT_LOAD_IN_PROGRESS marker,
-    /// clear the (potentially partial) chainstate, and reset the tip pointer
-    /// to all-zeros. The marker must be deleted so subsequent boots don't
-    /// re-trigger.
+    /// clear the (potentially partial) chainstate, and drop the tip record
+    /// (never leave an all-zero tip). The marker must be deleted so
+    /// subsequent boots don't re-trigger.
     #[test]
     fn test_recover_from_crash_handles_snapshot_marker() {
         let (db, _temp_dir) = create_test_db();
@@ -1772,11 +1772,15 @@ mod tests {
         let count = db.utxo_count().unwrap();
         assert_eq!(count, 0, "chainstate should be cleared by snapshot recovery");
 
-        // Tip must be reset to all-zeros / height 0 so callers see a clean
-        // slate and the operator knows to re-run loadtxoutset.
-        let (tip_hash, tip_height) = db.get_best_block().unwrap();
-        assert_eq!(tip_hash, [0u8; 32]);
-        assert_eq!(tip_height, 0);
+        // The tip record must be GONE, not reset to an all-zero hash: a
+        // zero tip decodes as a real tip at height 0, boot skips genesis
+        // init, and no block 1 can ever connect (audit H8). A missing tip
+        // is what a fresh datadir looks like, so boot connects genesis.
+        assert!(
+            matches!(db.get_best_block(), Err(crate::storage::db::DbError::BlockNotFound)),
+            "tip record must be dropped, got {:?}",
+            db.get_best_block(),
+        );
 
         // Idempotent: second call sees nothing to do.
         let recovered_again = db.recover_from_crash().unwrap();
@@ -1806,9 +1810,7 @@ mod tests {
         assert!(db.get_snapshot_load_marker().unwrap().is_none());
         assert!(db.get_head_blocks().unwrap().is_none());
 
-        let (tip_hash, tip_height) = db.get_best_block().unwrap();
-        assert_eq!(tip_hash, [0u8; 32]);
-        assert_eq!(tip_height, 0);
+        assert!(matches!(db.get_best_block(), Err(crate::storage::db::DbError::BlockNotFound)));
     }
 
     /// Cursor order is `txid || vout_le`: vout 256 sorts before vout 1.

@@ -1143,7 +1143,7 @@ impl BlockchainDB {
     ///   4. ONE synced WriteBatch sets the tip and deletes the marker.
     ///
     /// A crash anywhere before (4) leaves the marker, and the next open's
-    /// `recover_from_crash` clears the chainstate and resets the tip — the
+    /// `recover_from_crash` clears the chainstate and drops the tip — the
     /// same incomplete-import detection `loadtxoutset` already relies on.
     pub fn replace_chainstate_with_ssts(
         &self,
@@ -1612,7 +1612,8 @@ impl BlockchainDB {
     ///    partial-snapshot and partial-old UTXOs that cannot be safely
     ///    recovered (the per-coin chunks have half-overwritten the chainstate
     ///    with no per-block undo records to replay). We `clear_chainstate()`,
-    ///    reset the best-block pointer to all-zeros, and delete the marker.
+    ///    delete the best-block record (boot then connects the real genesis,
+    ///    as on a fresh datadir), and delete the marker.
     ///    The operator must re-run `loadtxoutset` from the snapshot file to
     ///    restore the chainstate.
     ///
@@ -1645,26 +1646,33 @@ impl BlockchainDB {
             );
 
             self.clear_chainstate()?;
-            // Reset best-block to all-zeros so callers see a clean slate
-            // and don't try to validate blocks above a missing UTXO set.
-            self.update_best_block(&[0u8; 32], 0)?;
 
-            // Delete the marker in its own write so a follow-on
-            // HEAD_BLOCKS check still runs.
+            // Drop the tip record instead of pointing it anywhere. With the
+            // UTXO set gone there is no block the chainstate matches, and the
+            // old all-zero "sentinel" tip decoded as a real tip at height 0:
+            // boot then skipped genesis init and every block 1 failed with
+            // "Previous block hash mismatch", wedging the node for good.
+            // Without a tip record the next open looks like a fresh datadir,
+            // so boot connects the network's real genesis and syncs from it.
+            //
+            // One batch with the marker deletion: a crash before it commits
+            // leaves the marker, and this branch simply runs again.
             let cf = self.db.cf_handle(META_CF)
                 .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
-            self.db.delete_cf(cf, meta_keys::SNAPSHOT_LOAD_IN_PROGRESS)?;
+            let mut batch = self.create_batch();
+            batch.delete_cf(cf, meta_keys::BEST_BLOCK_HASH);
+            batch.delete_cf(cf, meta_keys::BEST_HEIGHT);
+            batch.delete_cf(cf, meta_keys::SNAPSHOT_LOAD_IN_PROGRESS);
+            // A stale HEAD_BLOCKS cannot be honored against a cleared
+            // chainstate either.
+            self.delete_head_blocks_batch(&mut batch)?;
+            self.apply_batch(batch)?;
 
             log::warn!(
                 "Snapshot-load crash recovery complete. Chainstate \
-                 cleared; tip reset to genesis-sentinel. Re-run \
-                 loadtxoutset to restore the snapshot.",
+                 cleared and tip record dropped; the node restarts from \
+                 genesis. Re-run loadtxoutset to restore the snapshot.",
             );
-            // Also clear any stale HEAD_BLOCKS — it cannot be honored
-            // against a cleared chainstate.
-            if self.get_head_blocks()?.is_some() {
-                self.delete_head_blocks()?;
-            }
             return Ok(true);
         }
 

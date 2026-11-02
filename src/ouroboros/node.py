@@ -284,12 +284,14 @@ class BitcoinNode:
             # Reload persisted mempool (if available)
             mempool_path = os.path.join(self.data_dir, "mempool.dat")
             try:
-                _, chain_height = self.db.get_best_block()
+                tip_hash, chain_height = self.db.get_best_block()
             except RuntimeError:
                 # Empty database — initialize genesis block
                 logger.info("Empty database, initializing genesis block...")
                 self._init_genesis_block()
-                _, chain_height = self.db.get_best_block()
+                tip_hash, chain_height = self.db.get_best_block()
+            if bytes(tip_hash) == bytes(32):
+                tip_hash, chain_height = self._handle_zero_tip(chain_height)
             self.mempool.load_from_file(mempool_path, chain_height)
 
             # Initialize fee estimator
@@ -1649,6 +1651,35 @@ class BitcoinNode:
             title="[bold]Ouroboros Node Status[/bold]",
             border_style="green",
         ))
+
+    def _handle_zero_tip(self, height: int) -> tuple[bytes, int]:
+        """Deal with a best-block hash of all zeros at boot.
+
+        No block hashes to zero, so this tip names no block and no block can
+        connect on top of it. Older builds' snapshot-load crash recovery wrote
+        exactly this (zero hash, height 0, chainstate cleared), which left the
+        node unable to connect block 1 forever. That exact state is restarted
+        from genesis, as a fresh datadir would be. Any other zero tip (a
+        non-empty chainstate or a non-zero height) is an unknown tip and boot
+        refuses rather than serve it as a chain.
+        """
+        if height == 0 and self.db.utxo_count() == 0:
+            logger.warning(
+                "Chain tip is the all-zero hash over an empty chainstate (left "
+                "by an earlier snapshot-load crash recovery); restarting from "
+                "genesis. Re-run loadtxoutset to restore a snapshot."
+            )
+            self._init_genesis_block()
+            tip_hash, height = self.db.get_best_block()
+            if bytes(tip_hash) != bytes(32):
+                return bytes(tip_hash), height
+        raise RuntimeError(
+            f"Refusing to start: the chain tip is the all-zero hash at height "
+            f"{height}, which names no block, and the datadir is not the empty "
+            f"state an older snapshot-load recovery left (height 0, no coins). "
+            f"Its chain state is unknown; restore it from a backup or "
+            f"resync it from scratch."
+        )
 
     def _init_genesis_block(self):
         """Initialize the chain tip to the genesis block for the current network.
