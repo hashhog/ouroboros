@@ -184,14 +184,12 @@ class TestG4TxRequestTrackerAbsent(unittest.TestCase):
 
     def test_g4_no_tx_request_tracker_python(self):
         """Python pipeline: block_sync.py sends getdata immediately in handle_inv,
-        no delayed/prioritized scheduling, no per-peer in-flight limits for txs."""
+        no delayed/prioritized scheduling.  (The 60 s GETDATA_TX_INTERVAL
+        window and per-peer in-flight limits now exist in tx_request.py,
+        audit 2026-10-30 H3; the request delays below are still absent.)"""
         import inspect
         from ouroboros import block_sync
         src = inspect.getsource(block_sync)
-        self.assertNotIn("GETDATA_TX_INTERVAL", src, (
-            "BUG-G4 Python: GETDATA_TX_INTERVAL not present — confirms no "
-            "TxRequestTracker-style 60s retry window."
-        ))
         self.assertNotIn("NONPREF_PEER_TX_DELAY", src, (
             "BUG-G4 Python: NONPREF_PEER_TX_DELAY absent."
         ))
@@ -223,23 +221,23 @@ class TestG4TxRequestTrackerAbsent(unittest.TestCase):
 
 class TestG5MaxPeerTxAnnouncements(unittest.TestCase):
     """G5: Core limits per-peer queued tx announcements to 5000
-    (MAX_PEER_TX_ANNOUNCEMENTS).  ouroboros has no such cap.
+    (MAX_PEER_TX_ANNOUNCEMENTS).
 
     Core txdownloadman.h:30: static constexpr int32_t MAX_PEER_TX_ANNOUNCEMENTS = 5000;
-    BUG-G5: handle_inv in block_sync.py will fill _requested_txs unbounded.
+    Fixed by tx_request.TxRequestTracker (audit 2026-10-30 H3); behaviour is
+    covered by tests/test_txrequest_per_peer.py.
     """
 
-    def test_g5_no_per_peer_announcement_cap(self):
-        import inspect
-        from ouroboros import block_sync
-        src = inspect.getsource(block_sync)
-        self.assertNotIn("MAX_PEER_TX_ANNOUNCEMENTS", src, (
-            "BUG-G5: MAX_PEER_TX_ANNOUNCEMENTS (5000) per-peer cap absent. "
-            "ouroboros will accept unlimited tx announcements from one peer."
-        ))
-        self.assertNotIn("5000", src or "", (
-            "BUG-G5: No 5000-item per-peer announcement limit found."
-        ))
+    def test_g5_per_peer_announcement_cap(self):
+        from ouroboros.tx_request import (
+            MAX_PEER_TX_ANNOUNCEMENTS,
+            TxRequestTracker,
+        )
+        self.assertEqual(MAX_PEER_TX_ANNOUNCEMENTS, 5000)
+        tr = TxRequestTracker()
+        for i in range(MAX_PEER_TX_ANNOUNCEMENTS + 10):
+            tr.announce("p", _bytes32(i), i, now=0.0)
+        self.assertEqual(tr.peer_count("p"), 5000)
 
 
 # ---------------------------------------------------------------------------
@@ -248,23 +246,25 @@ class TestG5MaxPeerTxAnnouncements(unittest.TestCase):
 
 class TestG6MaxPeerTxRequestInFlight(unittest.TestCase):
     """G6: Core limits in-flight tx getdata per peer to 100
-    (MAX_PEER_TX_REQUEST_IN_FLIGHT).  ouroboros has no such limit.
+    (MAX_PEER_TX_REQUEST_IN_FLIGHT).
 
     Core txdownloadman.h:25: static constexpr int32_t MAX_PEER_TX_REQUEST_IN_FLIGHT = 100;
-    BUG-G6: _requested_txs in block_sync.py is a global dict, not per-peer.
-    A single peer can drive 1000s of simultaneous in-flight tx requests.
+    Fixed by tx_request.TxRequestTracker (audit 2026-10-30 H3).
     """
 
-    def test_g6_requested_txs_is_not_per_peer(self):
-        import inspect
-        from ouroboros import block_sync
-        src = inspect.getsource(block_sync)
-        # The _requested_txs dict is global (shared across all peers)
-        self.assertIn("_requested_txs", src)
-        self.assertNotIn("MAX_PEER_TX_REQUEST_IN_FLIGHT", src, (
-            "BUG-G6: MAX_PEER_TX_REQUEST_IN_FLIGHT (100) cap absent. "
-            "_requested_txs is a global dict, not per-peer."
-        ))
+    def test_g6_requested_txs_is_per_peer(self):
+        from ouroboros.tx_request import (
+            MAX_PEER_TX_REQUEST_IN_FLIGHT,
+            TxRequestTracker,
+        )
+        self.assertEqual(MAX_PEER_TX_REQUEST_IN_FLIGHT, 100)
+        tr = TxRequestTracker()
+        for i in range(250):
+            tr.announce("a", _bytes32(i), i, now=0.0)
+        tr.announce("b", _bytes32(1000), 1000, now=0.0)
+        self.assertEqual(len(tr.pop_requests("a", now=0.0)), 100)
+        self.assertEqual(tr.pop_requests("a", now=0.0), [])
+        self.assertEqual(tr.pop_requests("b", now=0.0), [1000])
 
 
 # ---------------------------------------------------------------------------
@@ -955,19 +955,16 @@ class TestG27NoKnownTxFilterOnReceive(unittest.TestCase):
         self.assertFalse(should_request_2)
 
     def test_g27_no_per_peer_known_filter(self):
-        """_requested_txs is shared across all peers — not per-peer.
-        BUG-G27: If peer A and peer B both announce the same txid, both
-        will trigger a getdata (first from A, then B's announce arrives
-        after expiry or before expiry). Core tracks per-peer known state.
+        """_requested_txs now tracks each announcement against its peer
+        (TxRequestTracker, audit 2026-10-30 H3), but a txid is still
+        tracked for one announcer only: there is no per-peer known-tx
+        filter (Core AddKnownTx), so this gap stays open.
         """
-        import inspect
-        from ouroboros import block_sync
-        src = inspect.getsource(block_sync)
-        # _requested_txs is instance-level (one per BlockSync), not per-peer
-        self.assertIn("_requested_txs: dict[bytes, float]", src, (
-            "BUG-G27: _requested_txs is a single global dict shared across "
-            "all peers. Core uses per-peer known-tx tracking."
-        ))
+        from ouroboros.tx_request import TxRequestTracker
+        tr = TxRequestTracker()
+        self.assertTrue(tr.announce("a", _bytes32(1), 1, now=0.0))
+        self.assertFalse(tr.announce("b", _bytes32(1), 1, now=0.0))
+        self.assertEqual(tr.peer_count("b"), 0)
 
 
 # ---------------------------------------------------------------------------
