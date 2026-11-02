@@ -278,6 +278,17 @@ _SIGHASH_DECODE_MAP: dict[int, str] = {
 }
 
 
+def _script_num_decode(data: bytes) -> int:
+    """CScriptNum(vch, fRequireMinimal=false).getint() for len(vch) <= 4."""
+    if not data:
+        return 0
+    n = int.from_bytes(data, "little")
+    if data[-1] & 0x80:
+        n &= ~(0x80 << (8 * (len(data) - 1)))
+        return -n
+    return n
+
+
 def _script_asm_sighash(script: bytes) -> str:
     """Disassemble a scriptSig with sighash-type decode annotations.
 
@@ -341,6 +352,11 @@ def _script_asm_sighash(script: bytes) -> str:
             data = script[i:i + size]; i += size
 
         if data is not None:
+            # Core prints a push of <= 4 bytes as a CScriptNum integer
+            # (core_io.cpp:371-373), e.g. a lone 0x51 byte is "81", not "51".
+            if len(data) <= 4:
+                parts.append(str(_script_num_decode(data)))
+                continue
             # Attempt sighash decode: if data looks like a DER signature
             # (starts with 0x30, length > 4) and the last byte is a known
             # sighash type, strip the last byte and annotate with [TYPE].
