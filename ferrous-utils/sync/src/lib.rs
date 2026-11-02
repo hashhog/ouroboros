@@ -6368,11 +6368,12 @@ impl PyBlockchainDB {
 
     /// Phase 1 of an atomic snapshot load.
     ///
-    /// Clears the chainstate, writes the `SNAPSHOT_LOAD_IN_PROGRESS` marker
-    /// to META_CF. Done as two writes (delete_range + put) — the marker
-    /// MUST land before any per-coin chunk writes so a crash between Phase 1
-    /// and Phase 2 is detectable. Returns an error if `base_blockhash` is
-    /// not exactly 32 bytes.
+    /// Clears the chainstate and writes the `SNAPSHOT_LOAD_IN_PROGRESS`
+    /// marker to META_CF in one WriteBatch (`begin_snapshot_load`), so a
+    /// crash can never leave the chainstate cleared without the marker.
+    /// The caller must have verified the snapshot's HASH_SERIALIZED before
+    /// calling this: from here on the old UTXO set is gone. Returns an
+    /// error if `base_blockhash` is not exactly 32 bytes.
     fn snapshot_load_begin(
         &self,
         base_blockhash: &[u8],
@@ -6386,17 +6387,11 @@ impl PyBlockchainDB {
         let mut hash_arr = [0u8; 32];
         hash_arr.copy_from_slice(base_blockhash);
 
-        self.db.clear_chainstate().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("snapshot_load_begin: clear_chainstate failed: {}", e),
-            )
-        })?;
-
         self.db
-            .write_snapshot_load_marker(&hash_arr, base_height)
+            .begin_snapshot_load(&hash_arr, base_height)
             .map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    format!("snapshot_load_begin: write marker failed: {}", e),
+                    format!("snapshot_load_begin: {}", e),
                 )
             })?;
 

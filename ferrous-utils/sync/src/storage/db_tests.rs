@@ -1737,6 +1737,33 @@ mod tests {
         assert!(db.get_snapshot_load_marker().unwrap().is_none());
     }
 
+    /// `begin_snapshot_load` sets the marker and clears the chainstate
+    /// together (audit L10). Both effects must be visible after the one
+    /// call, and the old coins must be gone even past the read cache.
+    #[test]
+    fn test_begin_snapshot_load_sets_marker_and_clears_chainstate() {
+        let (db, _temp_dir) = create_test_db();
+        let mut ops = Vec::new();
+        for i in 0..5u8 {
+            let txid = bitcoin::Txid::from_byte_array([i; 32]);
+            let (op, utxo) = create_test_utxo(txid, 0, 1_000 * (i as u64 + 1), Some(10));
+            db.add_utxo(&op, &utxo).unwrap();
+            assert!(db.utxo_exists(&op));
+            ops.push(op);
+        }
+        assert_eq!(db.utxo_count().unwrap(), 5);
+        assert!(db.get_snapshot_load_marker().unwrap().is_none());
+
+        let base_hash = [0xEF; 32];
+        db.begin_snapshot_load(&base_hash, 299).unwrap();
+
+        assert_eq!(db.get_snapshot_load_marker().unwrap(), Some((base_hash, 299)));
+        assert_eq!(db.utxo_count().unwrap(), 0);
+        for op in &ops {
+            assert!(!db.utxo_exists(op), "old coin survived begin_snapshot_load");
+        }
+    }
+
     /// `recover_from_crash` MUST detect a SNAPSHOT_LOAD_IN_PROGRESS marker,
     /// clear the (potentially partial) chainstate, and reset the tip pointer
     /// to all-zeros. The marker must be deleted so subsequent boots don't
