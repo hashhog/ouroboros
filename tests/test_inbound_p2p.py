@@ -154,6 +154,14 @@ class _FakeDB:
             return self._genesis
         return None
 
+    def get_block_header(self, block_hash: bytes):
+        return self.get_block(block_hash)
+
+    def get_block_hash_by_height(self, height: int):
+        if height == 0:
+            return self._genesis.hash
+        return None
+
     def get_best_block(self):
         return self._genesis.hash, 0
 
