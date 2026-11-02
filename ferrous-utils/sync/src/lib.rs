@@ -3222,9 +3222,14 @@ impl PyBlockchainDB {
                 format!("Failed to open database: {}", e)
             ))?;
 
-        // Check for and recover from a crash during the previous apply_block()
+        // Recover from a crash during the previous apply_block() or
+        // loadtxoutset. A failed recovery is fatal: continuing would boot a
+        // half-recovered chainstate with its crash markers still set.
         if let Err(e) = db.recover_from_crash() {
-            log::error!("Crash recovery failed: {} — continuing anyway", e);
+            log::error!("Crash recovery failed: {}", e);
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Crash recovery failed: {}", e)
+            ));
         }
 
         Ok(Self {
@@ -6849,9 +6854,13 @@ impl FastSync {
             ))?,
         );
 
-        // Check for and recover from a crash during the previous apply_block()
+        // Recover from a crash during the previous apply_block() or
+        // loadtxoutset; a failed recovery is fatal (see PyBlockchainDB::new).
         if let Err(e) = db.recover_from_crash() {
-            log::error!("Crash recovery failed: {} — continuing anyway", e);
+            log::error!("Crash recovery failed: {}", e);
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Crash recovery failed: {}", e)
+            ));
         }
 
         // Create validator components
