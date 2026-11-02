@@ -3670,9 +3670,17 @@ class PeerManager:
             logger.debug(f"Peer {addr} supports addrv2")
 
         async def on_notfound(msg: NetworkMessage):
-            from ouroboros.p2p_messages import NotFoundMessage
+            from ouroboros.p2p_messages import MSG_WITNESS_TX, NotFoundMessage
             nf = NotFoundMessage.from_payload(msg.payload)
             logger.debug(f"Peer {addr} notfound: {len(nf.inventory)} items")
+            # A notfound answers the tx requests it names (Core
+            # ReceivedResponse): free their per-peer in-flight slots.
+            blk_sync = getattr(self, "block_sync", None)
+            if blk_sync is not None and hasattr(blk_sync, "on_tx_answered"):
+                await blk_sync.on_tx_answered(
+                    peer, [h for t, h in nf.inventory
+                           if t in (INV_TYPE_TX, MSG_WITNESS_TX, MSG_WTX)]
+                )
 
         async def on_mempool(msg: NetworkMessage):
             # BIP-35: gate the MEMPOOL handler on whether *we* advertised

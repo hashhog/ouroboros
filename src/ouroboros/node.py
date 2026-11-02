@@ -1896,6 +1896,13 @@ class BitcoinNode:
                     tx_msg = TxMessage.from_payload(msg.payload)
                     tx = tx_msg.transaction
 
+                    # Free this request's per-peer in-flight slot and ask
+                    # the peer for its next queued announcements.
+                    if self.block_sync is not None:
+                        await self.block_sync.on_tx_answered(
+                            sender_peer, (tx.get_txid(), tx.get_wtxid())
+                        )
+
                     _, height = self.db.get_best_block()
                     # Off-load ATMP to a worker thread so the asyncio event
                     # loop stays responsive while script verification + UTXO
