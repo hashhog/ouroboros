@@ -1898,8 +1898,9 @@ class BitcoinNode:
 
                     # Free this request's per-peer in-flight slot and ask
                     # the peer for its next queued announcements.
-                    if self.block_sync is not None:
-                        await self.block_sync.on_tx_answered(
+                    _bs = getattr(self, "block_sync", None)
+                    if _bs is not None:
+                        await _bs.on_tx_answered(
                             sender_peer, (tx.get_txid(), tx.get_wtxid())
                         )
 

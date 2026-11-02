@@ -215,6 +215,73 @@ class TestTxRequestPerPeer(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TestAnswerWiring(unittest.IsolatedAsyncioTestCase):
+    """The real tx and notfound handlers release the answered request."""
+
+    async def test_node_tx_handler_frees_slot(self):
+        from types import SimpleNamespace
+        from ouroboros.database import Transaction, TxIn, TxOut
+        from ouroboros.node import BitcoinNode
+        from ouroboros.p2p_messages import TxMessage
+
+        bs, peer = _bs(), _peer()
+        tx = Transaction(
+            txid=b"", version=2, locktime=0,
+            inputs=[TxIn(prev_txid=b"\x11" * 32, prev_vout=0,
+                         script_sig=b"", sequence=0xFFFFFFFF)],
+            outputs=[TxOut(value=1000, script_pubkey=b"\x51")],
+        )
+        import hashlib
+        tx.txid = hashlib.sha256(hashlib.sha256(tx.serialize()).digest()).digest()
+        txid = tx.get_txid()
+        self.assertEqual(len(txid), 32)
+        bs._requested_txs.max_in_flight = 1
+        bs._requested_txs.announce(_addr(peer), txid, (1, txid), 0.0)
+        bs._requested_txs.announce(_addr(peer), _h(7), (MSG_WTX, _h(7)), 0.0)
+        bs._requested_txs.pop_requests(_addr(peer), 0.0)
+
+        class _Mempool:
+            transactions = {}
+
+            def __len__(self):
+                return 0
+
+            def add_transaction(self, tx, height, peer=None):
+                return False, "txn-already-in-mempool"
+
+        handlers = {}
+        peer.register_handler = lambda cmd, fn: handlers.__setitem__(cmd, fn)
+        fake = SimpleNamespace(
+            peer_manager=SimpleNamespace(
+                get_all_ready_peers=lambda: [peer],
+                set_inbound_peer_handler=lambda fn: None,
+                misbehaving=lambda *a: None,
+            ),
+            block_filter_index=None, mempool=_Mempool(),
+            db=SimpleNamespace(get_best_block=lambda: (b"\x00" * 32, 100)),
+            pruner=None, zmq_notifier=None, network="regtest", block_sync=bs,
+        )
+        BitcoinNode._register_handlers(fake)
+        await handlers["tx"](TxMessage(transaction=tx).to_network_message("regtest"))
+        self.assertNotIn(txid, bs._requested_txs)
+        self.assertEqual(_requested(peer), [_h(7)])
+
+    async def test_notfound_frees_slot(self):
+        from ouroboros.p2p import PeerManager
+        from ouroboros.p2p_messages import NotFoundMessage
+
+        bs, peer = _bs(), _peer()
+        await bs.handle_inv(_inv(1, 101), peer)
+        peer.sent.clear()
+        pm = PeerManager(network="regtest", listen=False)
+        pm.block_sync = bs
+        pm._register_compact_handlers(peer, _addr(peer))
+        nf = NotFoundMessage([(MSG_WTX, _h(1))]).to_network_message("regtest")
+        await peer.message_handlers["notfound"](nf)
+        self.assertNotIn(_h(1), bs._requested_txs)
+        self.assertEqual(_requested(peer), [_h(101)])
+
+
 class TestTxRequestTrackerExpiry(unittest.TestCase):
     def test_expire_pops_only_expired(self):
         from ouroboros.tx_request import TxRequestTracker
