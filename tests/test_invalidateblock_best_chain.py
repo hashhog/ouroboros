@@ -88,7 +88,9 @@ def _side_branch(server, prev: bytes, first_height: int, n: int, tag: int,
         bad = bad_last and i == n - 1
         raw, h = _block(prev, first_height + i, bytes([tag + i, 0xB7]),
                         value=51 * COIN if bad else 50 * COIN)
-        assert asyncio.run(server.rpc_submitblock(raw.hex())) is None
+        # Stored, never connected: Core submitblock answers "inconclusive"
+        # (no BlockChecked for it; rpc/mining.cpp).
+        assert asyncio.run(server.rpc_submitblock(raw.hex())) == "inconclusive"
         out.append(h)
         prev = h
     return out
@@ -257,7 +259,8 @@ def test_invalidate_never_activates_a_branch_with_an_invalid_block(tmp_path):
     for i in range(3):
         raw, h = _block(prev, TIP - 2 + i, bytes([0xD0 + i, 0xB7]),
                         value=51 * COIN if i == 0 else 50 * COIN)
-        assert asyncio.run(server.rpc_submitblock(raw.hex())) is None
+        # Off the tip (not more work), so stored only: "inconclusive".
+        assert asyncio.run(server.rpc_submitblock(raw.hex())) == "inconclusive"
         side.append(h)
         prev = h
     asyncio.run(server.rpc_invalidateblock(_disp(hashes[TIP - 1])))
