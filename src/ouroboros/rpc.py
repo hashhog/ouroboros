@@ -8722,9 +8722,9 @@ class RPCServer:
         ``ActivateBestChain``):
 
         * **Stored, not heavier** — block lives in the side-branch buffer;
-          tip stays put. Core surfaces this as ``"inconclusive"`` on
-          submitblock; ouroboros returns ``None`` (accept), matching the
-          existing fleet convention used by other impls.
+          tip stays put. Returns ``None``; ``rpc_submitblock`` answers
+          ``"inconclusive"`` for it, like Core (the P2P fork bridge reads
+          any non-None result as a reject, so the mapping lives there).
         * **Stored, heavier** — drives a reorg: disconnect from active
           tip back to the common ancestor, then connect each side-branch
           block (which we have buffered by hash) up to the new tip.
@@ -9119,12 +9119,9 @@ class RPCServer:
         if fork_cw is not None and active_cw > 0:
             # Chainwork available: exact 256-bit comparison.
             if fork_cw <= active_cw:
-                # Same-or-lighter side-branch: stored, no tip flip. Core's
-                # ``rpc/mining.cpp`` returns ``"inconclusive"`` here; the
-                # diff-test harness treats both ``None`` (accept) and
-                # ``reject:inconclusive`` as "context successfully ingested",
-                # so returning None keeps wire-compat with the rest of the
-                # fleet's submitblock semantics.
+                # Same-or-lighter side-branch: stored, no tip flip.
+                # rpc_submitblock turns this None into Core's
+                # ``"inconclusive"`` (rpc/mining.cpp: no BlockChecked).
                 logger.debug(
                     "submitblock: side-branch h=%d cw=0x%064x not strictly "
                     "heavier than active_tip h=%d cw=0x%064x; stored only",
@@ -10244,16 +10241,18 @@ class RPCServer:
             if _bs.is_block_failed(bytes(prev_hash)):
                 return "bad-prevblk"
 
-        # Duplicate-submission short-circuit. Core returns "duplicate" for
-        # blocks already on the active chain, "duplicate-inconclusive" for
-        # blocks already stored as side-branch.
+        # Duplicate-submission short-circuit. Core submitblock returns
+        # "duplicate" for any block it already has and accepted
+        # (``!new_block && accepted``: AcceptBlock's fAlreadyHave), whether
+        # it is on the active chain or stored on a side branch.  v31.1 only
+        # emits "duplicate-inconclusive" from getblocktemplate proposal mode.
         try:
             if hasattr(db, "has_block_hash") and db.has_block_hash(block_hash):
                 return "duplicate"
         except Exception:
             pass
         if block_hash in self._side_branch_blocks:
-            return "duplicate-inconclusive"
+            return "duplicate"
 
         try:
             tip_hash, best_height = db.get_best_block()
@@ -10330,6 +10329,19 @@ class RPCServer:
         if is_internal_error_text(_side_result):
             # A reorg aborted on a system fault (gate 6): RPC error, not BIP-22.
             raise RpcError(RPC_VERIFY_ERROR, _side_result)
+        if _side_result is None:
+            # Core rpc/mining.cpp submitblock: ``if (!sc->found) return
+            # "inconclusive"``.  BlockChecked only fires from ConnectBlock, so
+            # a block AcceptBlock stored without connecting it (no more work
+            # than the tip, or no work basis) is "inconclusive", not null.
+            # The engine itself keeps returning None for that case: the P2P
+            # fork bridge reads any non-None result as a reject.
+            try:
+                _tip_after, _ = db.get_best_block()
+            except Exception:
+                _tip_after = None
+            if _tip_after is None or bytes(_tip_after) != bytes(block_hash):
+                return "inconclusive"
         return _side_result
 
     async def rpc_submitheader(self, hexdata: str) -> None:
