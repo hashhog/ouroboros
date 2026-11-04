@@ -310,3 +310,33 @@ def test_submitpackage_parents_depending_on_each_other_is_rpc_error():
             _rpc(pool, db), [_hex(a), _hex(b), _hex(c)]))
     assert exc.value.code == -25
     assert len(pool.transactions) == 0
+
+
+def test_testmempoolaccept_script_failure_keeps_earlier_results():
+    """Core AcceptMultipleTransactions: PreChecks for all txs, then script
+    checks in order; in a test accept the txs before the script failure
+    already have their (allowed) result."""
+    pool, db = _pool()
+    coin = _funded(db, 13)
+    parent = _tx([(coin, 0)], [99_000])
+    child = _tx([(parent.get_txid(), 0)], [98_000], script_sig=b"BAD")
+    res = asyncio.run(RPCServer.rpc_testmempoolaccept(
+        _rpc(pool, db), [_hex(parent), _hex(child)]))
+    assert res[0]["allowed"] is True
+    assert res[0]["vsize"] == parent.get_vsize()
+    assert res[1]["allowed"] is False
+    assert res[1]["reject-reason"] == "mandatory-script-verify-flag-failed"
+
+
+def test_testmempoolaccept_later_prechecks_failure_beats_earlier_script_failure():
+    """A later tx failing PreChecks (missing input) is reported instead of an
+    earlier tx's script failure, as Core runs every PreChecks first."""
+    pool, db = _pool()
+    coin = _funded(db, 14)
+    parent = _tx([(coin, 0)], [99_000], script_sig=b"BAD")
+    child = _tx([(parent.get_txid(), 0), (b"\x33" * 32, 0)], [98_000])
+    res = asyncio.run(RPCServer.rpc_testmempoolaccept(
+        _rpc(pool, db), [_hex(parent), _hex(child)]))
+    assert set(res[0]) == {"txid", "wtxid"}
+    assert res[1]["allowed"] is False
+    assert res[1]["reject-reason"] == "missing-inputs"

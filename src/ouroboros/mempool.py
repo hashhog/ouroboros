@@ -5695,6 +5695,15 @@ class Mempool:
         )
 
     @staticmethod
+    def _is_script_failure(reason: str) -> bool:
+        """A failure of the script checks (Core PolicyScriptChecks), as
+        opposed to the PreChecks gates that run before them."""
+        return (
+            reason.startswith("Invalid signature for input")
+            or "script-verify-flag-failed" in reason
+        )
+
+    @staticmethod
     def _feerate_per_kvb(fee: int, vsize: int) -> int:
         """Core ``CFeeRate(fee, vsize).GetFeePerK()``: sat/kvB, rounded down."""
         return (fee * 1000) // vsize if vsize > 0 else 0
@@ -5927,18 +5936,26 @@ class Mempool:
         results: dict[bytes, PackageTxResult] = {}
         package_coins: dict = {}
         workspaces: list[dict] = []
-        for tx in txs:
+        # Core runs PreChecks for every tx first and the script checks only
+        # afterwards.  This node validates each tx in one pass, so a script
+        # failure is held while the later txs are still checked: a later
+        # non-script failure is what Core reports instead.
+        script_failure: tuple[int, PackageTxResult] | None = None
+        for i, tx in enumerate(txs):
             ws: dict = {}
             ok, reason = self._add_transaction_inner(
                 tx, height, test_accept=True, store_orphan=False,
                 package_coins=package_coins, package_feerate=package_feerates,
                 workspace=ws,
             )
-            if not ok:
+            if not ok and not (script_failure is None
+                               and self._is_script_failure(reason)):
                 res = self._package_failure(tx, reason, ws)
-                results[res.wtxid] = res
                 return PackageAcceptResult(
-                    state="tx", message="transaction failed", results=results)
+                    state="tx", message="transaction failed",
+                    results={res.wtxid: res})
+            if not ok:
+                script_failure = (i, self._package_failure(tx, reason, ws))
             workspaces.append(ws)
             txid = tx.get_txid()
             for vout, out in enumerate(tx.outputs):
@@ -5947,6 +5964,22 @@ class Mempool:
                     'script_pubkey': out.script_pubkey,
                     'height': height + 1, 'is_coinbase': False,
                 }
+        if script_failure is not None:
+            # Core PolicyScriptChecks loop: in a test accept the txs before
+            # the failing one have already been given their result.
+            fail_at, failed = script_failure
+            if test_accept:
+                for tx, ws in zip(txs[:fail_at], workspaces[:fail_at], strict=True):
+                    w = self._tx_wtxid(tx)
+                    results[w] = PackageTxResult(
+                        kind="valid", txid=tx.get_txid(), wtxid=w,
+                        vsize=ws["vsize"], fee=ws["fee"],
+                        effective_feerate=self._feerate_per_kvb(ws["fee"], ws["vsize"]),
+                        effective_includes=[w],
+                    )
+            results[failed.wtxid] = failed
+            return PackageAcceptResult(
+                state="tx", message="transaction failed", results=results)
 
         truc_ok, truc_err = self._check_package_truc_policy(txs)
         if not truc_ok:
