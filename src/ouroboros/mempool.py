@@ -2078,6 +2078,10 @@ class Mempool:
 
         # Orphan transaction pool
         self.orphan_pool = OrphanPool()
+        # Set while a package is being submitted: an insert does not resolve
+        # orphans until the package has committed (Core resolves orphans in
+        # net_processing after AcceptPackage returns, never inside it).
+        self._defer_orphan_resolution: bool = False
 
         # Cluster mempool manager
         self._cluster_manager = ClusterManager(self.transactions)
@@ -3034,8 +3038,12 @@ class Mempool:
             except Exception as e:
                 logger.warning(f"on_tx_added callback error: {e}")
 
-        # Try to resolve orphans that were waiting on this transaction
-        self._resolve_orphans(txid, height)
+        # Try to resolve orphans that were waiting on this transaction.  A
+        # package submit defers this until the package has committed (see
+        # _accept_package_inner): resolving mid-package could admit a later
+        # package tx on the single-tx path, outside the package rollback.
+        if not self._defer_orphan_resolution:
+            self._resolve_orphans(txid, height)
 
         return True, ""
 
@@ -5799,7 +5807,39 @@ class Mempool:
         if len(txs) > 1 and not self.is_child_with_parents(txs):
             return PackageAcceptResult(
                 state="policy", message="package-not-child-with-parents")
+        if len(txs) > 1 and not self.is_child_with_parents_tree(txs):
+            # Parents spending each other.  Core's submitpackage RPC refuses
+            # this topology before validation; this path also serves BIP 331
+            # pkgtxns, which has no such RPC gate in front of it, so the
+            # refusal lives here (the package path before #145 refused it).
+            return PackageAcceptResult(
+                state="policy", message="package-not-child-with-parents-tree")
 
+        prev_defer = self._defer_orphan_resolution
+        self._defer_orphan_resolution = True
+        try:
+            result = self._submit_package_inner(txs, height)
+        finally:
+            self._defer_orphan_resolution = prev_defer
+        if not prev_defer:
+            # Core ProcessPackageResult: accepted package txs leave the
+            # orphan pool, then orphans waiting on them are reconsidered --
+            # only now, with the package committed or fully rolled back.
+            for tx in txs:
+                txid = tx.get_txid()
+                if txid not in self.transactions:
+                    continue
+                wtxid = self._tx_wtxid(tx)
+                if self.orphan_pool.has_wtxid(wtxid):
+                    self.orphan_pool.remove(wtxid)
+                self._resolve_orphans(txid, height)
+        return result
+
+    def _submit_package_inner(
+        self, txs: list[Transaction], height: int,
+    ) -> "PackageAcceptResult":
+        """Core ``AcceptPackage`` body for a well-formed child-with-parents
+        tree; orphan resolution is deferred by the caller."""
         results_final: dict[bytes, PackageTxResult] = {}
         individual_nonfinal: dict[bytes, PackageTxResult] = {}
         quit_early = False
@@ -6060,7 +6100,14 @@ class Mempool:
             ok, reason = self._add_transaction_inner(
                 tx, height, store_orphan=False, package_feerate=True)
             if not ok:
-                for t in reversed(inserted):
+                # Undo every insert, and anything that came to depend on one
+                # (nothing should: orphan resolution is deferred, but a tx
+                # left spending a removed parent would be a dangling spend).
+                extra: set[bytes] = set()
+                for t in inserted:
+                    extra |= self._collect_descendants(t)
+                extra.difference_update(inserted)
+                for t in [*extra, *reversed(inserted)]:
                     self._remove_transaction_inner(t, _reason="package-rollback")
                 if reason == "too-large-cluster":
                     return PackageAcceptResult(state="policy", message=reason)
