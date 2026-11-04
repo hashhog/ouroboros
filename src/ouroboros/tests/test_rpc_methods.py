@@ -819,7 +819,11 @@ class TestSubmitPackage(unittest.TestCase):
             result = await self.rpc_server.rpc_submitpackage([tx_hex])
             # Should fail with error message
             self.assertNotEqual(result["package_msg"], "success")
-            self.assertEqual(result["tx-results"], {})
+            # Core submitpackage reports every tx: the missing input is the
+            # tx's own error (rpc/mempool.cpp, TxValidationState::ToString()).
+            self.assertEqual(len(result["tx-results"]), 1)
+            (only,) = result["tx-results"].values()
+            self.assertEqual(only["error"], "bad-txns-inputs-missingorspent")
 
         asyncio.run(test())
 
