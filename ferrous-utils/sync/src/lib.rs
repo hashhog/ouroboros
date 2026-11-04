@@ -3365,6 +3365,68 @@ impl PyBlockchainDB {
         }
     }
 
+    /// Hash-index entry for any known block (BLOCK_INDEX_BY_HASH_CF).
+    ///
+    /// Returns ``(height, chainwork_bytes, timestamp, status_bits,
+    /// header_bytes_or_None, n_tx)`` or ``None``.  ``header_bytes`` is the
+    /// 80-byte header (its bytes 4..36 are the parent hash) for a v2 entry,
+    /// ``None`` for a legacy entry the migration could not upgrade.
+    fn get_block_index_entry(
+        &self,
+        block_hash: &[u8],
+    ) -> PyResult<Option<(u32, Vec<u8>, u32, u32, Option<Vec<u8>>, u32)>> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes.copy_from_slice(block_hash);
+        match self.db.get_block_index_entry(&hash_bytes) {
+            Ok(Some(e)) => Ok(Some((
+                e.metadata.height,
+                e.metadata.chainwork.to_vec(),
+                e.metadata.timestamp,
+                e.metadata.status.bits(),
+                e.header.map(|h| h.to_vec()),
+                e.n_tx,
+            ))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )),
+        }
+    }
+
+    /// ``(total, v2, legacy)`` entry counts of the hash index (full scan).
+    fn block_index_summary(&self) -> PyResult<(u64, u64, u64)> {
+        self.db.block_index_summary().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", e))
+        })
+    }
+
+    /// Run the hash-index v2 migration (``open`` already runs it once).
+    ///
+    /// Returns ``None`` when it has already completed, else a dict of counts
+    /// (scanned, already_v2, from_headers, from_body, no_header,
+    /// hash_mismatch, malformed).
+    fn migrate_block_index_v2(&self) -> PyResult<Option<std::collections::HashMap<String, u64>>> {
+        match self.db.migrate_block_index_v2() {
+            Ok(Some(s)) => Ok(Some(index_migration_stats_map(&s))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Database error: {}", e)
+            )),
+        }
+    }
+
+    /// Counts from the hash-index v2 migration that opening this database
+    /// ran (same keys as ``migrate_block_index_v2``), or ``None`` when an
+    /// earlier open had already completed it.
+    fn block_index_open_migration_stats(&self) -> Option<std::collections::HashMap<String, u64>> {
+        self.db.open_index_migration_stats().map(|s| index_migration_stats_map(&s))
+    }
+
     /// Check whether any block with the given hash has metadata stored
     /// (active chain OR competing fork).  O(1) lookup.
     fn has_block_metadata_by_hash(&self, block_hash: &[u8]) -> PyResult<bool> {
@@ -4489,7 +4551,18 @@ impl PyBlockchainDB {
         let mut status = BlockStatus::new();
         status.set_has_data();
         let metadata = BlockMetadata::with_status(height, chainwork, timestamp, status);
-        self.db.store_block_metadata_batch(&mut batch, height, &block_hash, &metadata)
+        // Hash-index entry written as v2 (header + nTx) in this same batch.
+        let index_header: [u8; 80] = {
+            use bitcoin::consensus::Encodable;
+            let mut buf = Vec::with_capacity(80);
+            inner.header.consensus_encode(&mut buf).ok();
+            buf.as_slice().try_into().map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "connect_block_from_bytes: header did not encode to 80 bytes"))?
+        };
+        self.db.store_block_metadata_batch_with_header(
+            &mut batch, height, &block_hash, &metadata,
+            Some((&index_header, inner.txdata.len() as u32)),
+        )
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
         // Store 80-byte header in HEADERS_CF for `getblockheader` lookups.
@@ -5147,7 +5220,18 @@ impl PyBlockchainDB {
             let mut status = BlockStatus::new();
             status.set_has_data();
             let metadata = BlockMetadata::with_status(height, chainwork, timestamp, status);
-            self.db.store_block_metadata_batch(&mut batch, height, &block_hash, &metadata)
+            // Hash-index entry written as v2 (header + nTx) in this same batch.
+            let index_header: [u8; 80] = {
+                use bitcoin::consensus::Encodable;
+                let mut buf = Vec::with_capacity(80);
+                inner.header.consensus_encode(&mut buf).ok();
+                buf.as_slice().try_into().map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "connect_blocks_atomic: header did not encode to 80 bytes"))?
+            };
+            self.db.store_block_metadata_batch_with_header(
+                &mut batch, height, &block_hash, &metadata,
+                Some((&index_header, inner.txdata.len() as u32)),
+            )
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
             // Store 80-byte header in HEADERS_CF.
@@ -7295,4 +7379,19 @@ mod tests {
         let result = read_compressed_script(&mut cur);
         assert!(result.is_err(), "off-curve x must fail closed");
     }
+}
+
+/// Python dict form of `BlockIndexMigrationStats`.
+fn index_migration_stats_map(
+    s: &crate::storage::db::BlockIndexMigrationStats,
+) -> std::collections::HashMap<String, u64> {
+    std::collections::HashMap::from([
+        ("scanned".to_string(), s.scanned),
+        ("already_v2".to_string(), s.already_v2),
+        ("from_headers".to_string(), s.from_headers),
+        ("from_body".to_string(), s.from_body),
+        ("no_header".to_string(), s.no_header),
+        ("hash_mismatch".to_string(), s.hash_mismatch),
+        ("malformed".to_string(), s.malformed),
+    ])
 }

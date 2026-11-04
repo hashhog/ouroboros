@@ -102,8 +102,27 @@ pub const BLOCK_INDEX_CF: &str = "block_index";
 /// competing forks.  Mirrors Core's `BlockMap = std::unordered_map<uint256, CBlockIndex>`.
 ///
 /// Key:   block_hash (32 bytes, internal byte order)
-/// Value: Serialized `BlockMetadata` (44 bytes, same encoding as BlockMetadata::to_bytes())
+/// Value, two encodings (both decode with `BlockMetadata::from_bytes`, which
+/// reads the first 44 bytes and ignores the rest):
+/// - legacy (44 bytes, or 40 from before status existed):
+///   `BlockMetadata` = `[height u32][chainwork 32][timestamp u32][status u32]`
+/// - v2 (`BLOCK_INDEX_ENTRY_V2_LEN` = 128 bytes):
+///   `[BlockMetadata 44][80-byte header][nTx u32 LE]`
+///
+/// The v2 tail carries what Core's `CBlockIndex` keeps beside height, work and
+/// status: the header (so `pprev` is the header's prev-hash and the entry can
+/// be served without a second store) and `nTx` (0 = transactions never
+/// received, chain.h `CBlockIndex::nTx`).  The header's sha256d is always
+/// checked against the key before a tail is written, so a tail can never
+/// describe another block.  `BlockchainDB::migrate_block_index_v2` upgrades
+/// legacy entries in place at open.
 pub const BLOCK_INDEX_BY_HASH_CF: &str = "block_index_by_hash";
+
+/// Length of a serialized `BlockMetadata` (the legacy hash-index value).
+pub const BLOCK_METADATA_LEN: usize = 44;
+
+/// Length of a v2 hash-index value: `BlockMetadata` + 80-byte header + nTx.
+pub const BLOCK_INDEX_ENTRY_V2_LEN: usize = BLOCK_METADATA_LEN + 80 + 4;
 
 /// Column family name for chainstate (UTXO set)
 pub const CHAINSTATE_CF: &str = "chainstate";
@@ -204,6 +223,13 @@ pub mod meta_keys {
     /// that out once and writes this key; later opens cost one point read.
     /// Value: 1 byte, `1`.
     pub const HEADERS_NTX_RECONCILED_V1: &[u8] = b"headers_ntx_reconciled_v1";
+
+    /// Marker: the one-time upgrade of BLOCK_INDEX_BY_HASH_CF entries to the
+    /// v2 encoding (header + nTx tail) has finished a full pass.
+    /// `BlockchainDB::migrate_block_index_v2` writes it; later opens cost one
+    /// point read.  Deleting it makes the next open re-run the pass, which is
+    /// idempotent (v2 entries are skipped).  Value: 1 byte, `2`.
+    pub const BLOCK_INDEX_V2_MIGRATED: &[u8] = b"block_index_v2_migrated";
 }
 
 /// Encode a block hash as a 32-byte key

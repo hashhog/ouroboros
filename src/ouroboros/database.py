@@ -514,6 +514,38 @@ class BlockchainDatabase:
             return None
         return int(meta[0])
 
+    def get_block_index_entry(self, block_hash: bytes) -> dict[str, Any] | None:
+        """Hash-index entry for any known block: Core's ``CBlockIndex``.
+
+        One point read of BLOCK_INDEX_BY_HASH_CF.  Keys: ``height``,
+        ``chainwork`` (int), ``timestamp``, ``status`` (BlockStatus bits),
+        ``header`` (80 bytes, or None for a legacy entry the v2 migration
+        could not upgrade), ``prev_hash`` (the header's parent hash, internal
+        byte order, or None) and ``n_tx`` (0 = transactions never received).
+        None when the hash is unknown or the extension predates the v2 index.
+        Nothing reads this yet; it is the record later block-index work moves
+        chain-state readers onto.
+        """
+        if len(block_hash) != 32:
+            raise ValueError("Block hash must be 32 bytes")
+        fn = getattr(self._db, "get_block_index_entry", None)
+        if fn is None:
+            return None
+        entry = fn(bytes(block_hash))
+        if entry is None:
+            return None
+        height, chainwork, timestamp, status, header, n_tx = entry
+        header = bytes(header) if header is not None else None
+        return {
+            "height": int(height),
+            "chainwork": int.from_bytes(bytes(chainwork), "big"),
+            "timestamp": int(timestamp),
+            "status": int(status),
+            "header": header,
+            "prev_hash": header[4:36] if header is not None else None,
+            "n_tx": int(n_tx),
+        }
+
     def get_block_timestamp_by_height(self, height: int) -> int | None:
         """Header timestamp of the ACTIVE-chain block at *height*, body-free.
 
