@@ -404,3 +404,21 @@ def test_package_with_parents_spending_each_other_rejected_pool_unchanged():
 
     assert not ok
     assert len(pool.transactions) == 0
+
+
+def test_validate_package_reports_the_package_stage_failure():
+    """When the package evaluation fails, validate_package's message names
+    that failure (here the package feerate, on the child), not the stale
+    individual failure of a parent that was then retried in the package.
+    On #145's first head it reported the parent's individual "0 < 10"."""
+    pool, db = _pool()
+    coin = _funded(db, 22)
+    parent = _tx([(coin, 0)], [100_000])                # fee 0
+    child = _tx([(parent.get_txid(), 0)], [99_995])     # fee 5: package below relay
+    res = pool.accept_package([parent, child], 100)
+    pkg_fail = res.results[child.get_wtxid()]
+    assert pkg_fail.kind == "invalid"
+    ok, err = pool.validate_package([parent, child], 100)
+    assert not ok
+    assert err == f"transaction failed: {pkg_fail.reject_details}"
+    assert len(pool.transactions) == 0
