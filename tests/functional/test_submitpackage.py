@@ -308,15 +308,25 @@ class TestSubmitPackageErrors:
 
         result = await rpc.rpc_submitpackage([raw.hex()])
         assert result["package_msg"] != "success"
-        assert result["tx-results"] == {}
+        # Core submitpackage reports every tx: the missing input is the tx's
+        # own error (rpc/mempool.cpp, TxValidationState::ToString()).
+        wtxid_be = tx.get_wtxid()[::-1].hex()
+        assert result["tx-results"] == {
+            wtxid_be: {"txid": tx.get_txid()[::-1].hex(),
+                       "error": "bad-txns-inputs-missingorspent"},
+        }
 
     @pytest.mark.asyncio
     async def test_wrong_topological_order_rejected(self):
         """A package with child before parent (wrong order) should fail."""
         rpc, _, parent_tx, child_tx, parent_raw, child_raw = _setup_env()
 
-        # Submit in wrong order: child before parent
-        result = await rpc.rpc_submitpackage(
-            [child_raw.hex(), parent_raw.hex()]
-        )
-        assert result["package_msg"] != "success"
+        # Submit in wrong order: child before parent.  Core submitpackage
+        # refuses it before validation: the last tx is not a child of the
+        # others (IsChildWithParentsTree -> JSONRPCTransactionError
+        # INVALID_PACKAGE, code -25).
+        from ouroboros.rpc import RpcError
+        with pytest.raises(RpcError) as exc_info:
+            await rpc.rpc_submitpackage([child_raw.hex(), parent_raw.hex()])
+        assert exc_info.value.code == -25
+        assert "package topology disallowed" in str(exc_info.value)

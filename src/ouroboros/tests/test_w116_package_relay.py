@@ -230,7 +230,8 @@ class TestG1MaxPackageCount(unittest.TestCase):
             txs.append(tx)
         ok, err = mp.validate_package(txs, height=101)
         self.assertFalse(ok, "Package with >MAX_PACKAGE_COUNT txs must be rejected")
-        self.assertIn("26", err)
+        # Core IsWellFormedPackage token (policy/packages.cpp).
+        self.assertEqual(err, "package-too-many-transactions")
 
     def test_package_at_limit_accepted_if_fees_ok(self):
         """Single-tx package (size=1) should not fail on count check."""
@@ -256,8 +257,9 @@ class TestG2MaxPackageWeight(unittest.TestCase):
                          f"MAX_PACKAGE_WEIGHT must be 404000, got {MAX_PACKAGE_WEIGHT}")
 
     def test_package_weight_check_exists(self):
-        """validate_package must check total weight against MAX_PACKAGE_WEIGHT."""
-        src = inspect.getsource(__import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._validate_package_inner)
+        """The package well-formedness check (Core IsWellFormedPackage) must
+        check total weight against MAX_PACKAGE_WEIGHT."""
+        src = inspect.getsource(__import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool.package_well_formed_error)
         self.assertIn("MAX_PACKAGE_WEIGHT", src,
                       "Package weight limit check must reference MAX_PACKAGE_WEIGHT")
 
@@ -520,16 +522,15 @@ class TestG9TestMempoolAcceptMultiTxPackageSemantics(unittest.TestCase):
             src = inspect.getsource(RPCServer.rpc_testmempoolaccept)
         except Exception:
             self.skipTest("Cannot import RPCServer")
-        # Core calls ProcessNewPackage for multi-tx. ouroboros loops individually.
-        lacks_package_validation = (
-            "validate_package" not in src and "ProcessNewPackage" not in src
-        )
-        self.assertTrue(
-            lacks_package_validation,
-            "BUG CONFIRMED: testmempoolaccept validates each tx individually instead of "
-            "using package validation for multi-tx arrays. "
+        # Core calls ProcessNewPackage for multi-tx; so does ouroboros now
+        # (accept_package(test_accept=True)).  This test asserted the bug
+        # before the package-staging fix; flipped with it.
+        self.assertIn(
+            "accept_package", src,
+            "testmempoolaccept must use package validation for multi-tx arrays. "
             "Core rpc/mempool.cpp:345: if (txns.size() > 1) return ProcessNewPackage(..., test_accept=true)"
         )
+        self.assertIn("test_accept=True", src)
 
 
 # ---------------------------------------------------------------------------
@@ -571,9 +572,12 @@ class TestG11SubmitPackageTxResultsKeyedByWtxid(unittest.TestCase):
     def test_submitpackage_tx_results_keyed_by_wtxid(self):
         import inspect
         try:
-            from ouroboros.rpc import RPCServer
+            from ouroboros.rpc import RPCServer, _format_submitpackage
             src = inspect.getsource(RPCServer.rpc_submitpackage)
-        except Exception:
+            # The result map is built by the formatter the handler returns.
+            self.assertIn("_format_submitpackage", src)
+            src = inspect.getsource(_format_submitpackage)
+        except ImportError:
             self.skipTest("Cannot import RPCServer")
         # Fix verified: tx_results keyed by wtxid_hex (get_wtxid), not txid alone.
         keys_by_wtxid = "get_wtxid" in src and "tx_results[" in src
@@ -709,20 +713,15 @@ class TestG16PackageFeerateUsesVirtualSize(unittest.TestCase):
     """
 
     def test_package_feerate_uses_raw_serialize_not_vsize(self):
+        # Asserted the bug until the package-staging fix; flipped with it.
+        # The package feerate is now the sum of the members' (sigop-adjusted)
+        # vsizes from their workspaces, as Core's m_total_vsize.
         src = inspect.getsource(
-            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._validate_package_inner
+            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._accept_multiple
         )
-        # Bug: ouroboros uses len(tx.serialize()), not tx.get_vsize() / virtual size
-        # Core uses m_total_vsize which applies witness discount
-        uses_raw_size = "tx.serialize()" in src
-        uses_vsize = "get_vsize()" in src and "total_vsize" in src
-        # If raw serialize is used without vsize, the bug is present
-        bug_present = uses_raw_size and not uses_vsize
-        self.assertTrue(
-            bug_present,
-            "BUG CONFIRMED: Package fee rate uses raw serialize() size, not virtual size. "
-            "Core uses m_total_vsize (virtual). Segwit transactions have wrong fee check."
-        )
+        self.assertIn("total_vsize", src)
+        self.assertNotIn("serialize()", src,
+                         "Package fee rate must use virtual size, not raw serialize() size.")
 
 
 # ---------------------------------------------------------------------------
@@ -740,15 +739,18 @@ class TestG17PackageStandardnessChecks(unittest.TestCase):
     """
 
     def test_package_validation_skips_standardness(self):
+        # Every package member now runs the single-tx PreChecks
+        # (_add_transaction_inner: IsStandardTx, input/witness standardness,
+        # sigops) with a package coin overlay, as Core's
+        # AcceptMultipleTransactions runs PreChecks per tx.
         src = inspect.getsource(
-            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._validate_package_inner
+            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._accept_multiple
         )
-        self.assertNotIn(
-            "_is_standard_tx", src,
-            "BUG: _validate_package_inner does not call _is_standard_tx. "
-            "Non-standard transactions bypass policy checks in package path. "
-            "Core applies standardness per-tx in AcceptMultipleTransactions."
+        self.assertIn("_add_transaction_inner", src)
+        inner = inspect.getsource(
+            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._add_transaction_inner
         )
+        self.assertIn("_is_standard_tx", inner)
 
 
 # ---------------------------------------------------------------------------
@@ -772,7 +774,7 @@ class TestG18PackageValidationMissingParentContext(unittest.TestCase):
 
     def test_validate_transaction_called_without_package_utxos(self):
         src = inspect.getsource(
-            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._validate_package_inner
+            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._add_transaction_inner
         )
         # The call to validate_transaction must pass package_outputs or intra_block_utxos
         # to allow child tx to find parent outputs
@@ -866,15 +868,29 @@ class TestG20PackageMempoolConflict(unittest.TestCase):
         ok, err = mp.add_transaction(mempool_tx, height=101)
         self.assertTrue(ok, f"Baseline mempool add failed: {err}")
 
-        # Package tx tries to spend the same UTXO — should be rejected
+        # A one-tx package is the single-tx accept (Core AcceptSubPackage
+        # ({tx}) with SingleInPackageAccept args, replacement allowed), so a
+        # conflict is an RBF attempt: a same-fee conflict is rejected...
+        same_fee = _make_tx(
+            txid=_bytes32(21),
+            inputs=[TxIn(prev_txid=shared_utxo, prev_vout=0)],
+            value_out=90_000,
+        )
+        ok2, err2 = mp.validate_package([same_fee], height=101)
+        self.assertFalse(ok2, "Package conflicting with mempool must be rejected")
+        self.assertIn(mempool_txid, mp.transactions)
+
+        # ...and one paying enough more replaces the pool tx.
         pkg_txid = _bytes32(20)
         pkg_tx = _make_tx(
             txid=pkg_txid,
             inputs=[TxIn(prev_txid=shared_utxo, prev_vout=0)],
             value_out=88_000,
         )
-        ok2, err2 = mp.validate_package([pkg_tx], height=101)
-        self.assertFalse(ok2, "Package conflicting with mempool must be rejected")
+        ok3, err3 = mp.validate_package([pkg_tx], height=101)
+        self.assertTrue(ok3, err3)
+        self.assertNotIn(mempool_txid, mp.transactions)
+        self.assertIn(pkg_txid, mp.transactions)
 
 
 # ---------------------------------------------------------------------------
@@ -935,10 +951,10 @@ class TestG22CpfpFeeCalculationPackageOutputs(unittest.TestCase):
 
     def test_fee_calculation_builds_package_outputs(self):
         src = inspect.getsource(
-            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._validate_package_inner
+            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._accept_multiple
         )
-        self.assertIn("package_outputs", src,
-                      "Package fee calculation must build package_outputs map for cross-tx input resolution")
+        self.assertIn("package_coins", src,
+                      "Package fee calculation must build a package coin map for cross-tx input resolution")
 
 
 # ---------------------------------------------------------------------------
@@ -998,10 +1014,10 @@ class TestG24TrucPackagePolicy(unittest.TestCase):
 
     def test_truc_package_check_called_in_validate(self):
         src = inspect.getsource(
-            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._validate_package_inner
+            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._accept_multiple
         )
         self.assertIn("_check_package_truc_policy", src,
-                      "_validate_package_inner must call _check_package_truc_policy")
+                      "_accept_multiple must call _check_package_truc_policy")
 
     def test_truc_v3_child_exceeding_max_vsize_rejected(self):
         """v3 child with unconfirmed parent exceeding TRUC_CHILD_MAX_VSIZE must be rejected."""
@@ -1051,7 +1067,7 @@ class TestG25SingleTxPackageWeightCheck(unittest.TestCase):
 
     def test_single_tx_weight_check_should_have_multi_tx_guard(self):
         src = inspect.getsource(
-            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool._validate_package_inner
+            __import__("ouroboros.mempool", fromlist=["Mempool"]).Mempool.package_well_formed_error
         )
         # Document: Core only applies package weight limit when package_count > 1
         # ouroboros should have: if len(txs) > 1 and total_weight > MAX_PACKAGE_WEIGHT
