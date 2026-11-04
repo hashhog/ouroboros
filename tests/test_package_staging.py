@@ -340,3 +340,67 @@ def test_testmempoolaccept_later_prechecks_failure_beats_earlier_script_failure(
     assert set(res[0]) == {"txid", "wtxid"}
     assert res[1]["allowed"] is False
     assert res[1]["reject-reason"] == "missing-inputs"
+
+
+# --------------------------------------------------------------------------
+# Warden review of #145: orphan-pool child, non-tree child-with-parents
+# --------------------------------------------------------------------------
+
+def _dangling_spends(pool, db) -> list:
+    """Pool txs with an input that is neither a chain coin nor an output of a
+    tx in the pool."""
+    out = []
+    for txid, entry in pool.transactions.items():
+        for inp in entry.tx.inputs:
+            if db.get_utxo(inp.prev_txid, inp.prev_vout) is not None:
+                continue
+            parent = pool.transactions.get(inp.prev_txid)
+            if parent is None or inp.prev_vout >= len(parent.tx.outputs):
+                out.append((txid, inp.prev_txid, inp.prev_vout))
+    return out
+
+
+def test_package_child_waiting_in_orphan_pool_is_committed_with_parent():
+    """The package child is already in the orphan pool.  Inserting the parent
+    must not resolve that orphan mid-package (Core resolves orphans only
+    after AcceptPackage returns, in net_processing): on #145's first head the
+    orphan path admitted the child, the package insert of the same child then
+    failed, the rollback removed the parent, and the child stayed in the pool
+    spending a parent that was gone.  The same package with the child not an
+    orphan admits both, so this one must too, and the pool must never hold a
+    tx spending a missing parent."""
+    pool, db = _pool()
+    coin = _funded(db, 20)
+    parent = _tx([(coin, 0)], [99_999])               # fee 1: below relay alone
+    child = _tx([(parent.get_txid(), 0)], [80_000])   # fee 19_999
+    ok, _err = pool.add_transaction(child, 100)
+    assert not ok
+    assert pool.orphan_pool.has_wtxid(child.get_wtxid()), "setup: child is an orphan"
+
+    ok, err = pool.validate_package([parent, child], 100)
+
+    assert _dangling_spends(pool, db) == []
+    assert ok, err
+    assert parent.get_txid() in pool.transactions
+    assert child.get_txid() in pool.transactions
+    assert not pool.orphan_pool.has_wtxid(child.get_wtxid())
+
+
+def test_package_with_parents_spending_each_other_rejected_pool_unchanged():
+    """Child-with-parents but not a tree (parent2 spends parent1): the old
+    package path refused it, and so does Core's submitpackage RPC
+    (IsChildWithParentsTree).  validate_package (BIP 331 pkgtxns) must refuse
+    it too, not admit two parents that are below the min relay fee alone."""
+    pool, db = _pool()
+    coin = _funded(db, 21)
+    parent1 = _tx([(coin, 0)], [50_000, 49_999])                   # fee 1
+    parent2 = _tx([(parent1.get_txid(), 0)], [49_999])             # fee 1
+    child = _tx([(parent1.get_txid(), 1), (parent2.get_txid(), 0)], [60_000])
+    pkg = [parent1, parent2, child]
+    assert Mempool.is_child_with_parents(pkg)
+    assert not Mempool.is_child_with_parents_tree(pkg)
+
+    ok, _err = pool.validate_package(pkg, 100)
+
+    assert not ok
+    assert len(pool.transactions) == 0
