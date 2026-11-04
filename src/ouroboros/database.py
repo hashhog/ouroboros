@@ -1157,6 +1157,18 @@ class BlockchainDatabase:
         script_pubkey = address_to_script_pubkey(address, network)
         return self._list_unspent_for_script_pubkey(script_pubkey)
 
+    def iter_unspent_for_scripts(self, script_pubkeys: set[bytes]):
+        """Yield every chainstate coin whose script is in *script_pubkeys*.
+
+        One walk of the UTXO set for a whole set of scripts.  The wallet uses
+        it once, to build its coin store for a wallet file written before the
+        store existed; afterwards the wallet reads its own store.
+        """
+        wanted = {bytes(s) for s in script_pubkeys}
+        if not wanted:
+            return
+        yield from self._iter_utxos_where(lambda spk: spk in wanted)
+
     def _balance_for_script_pubkey(self, script_pubkey: bytes) -> int:
         total = 0
         for utxo in self._iter_matching_utxos(script_pubkey):
@@ -1167,6 +1179,9 @@ class BlockchainDatabase:
         return list(self._iter_matching_utxos(script_pubkey))
 
     def _iter_matching_utxos(self, script_pubkey: bytes):
+        yield from self._iter_utxos_where(lambda spk: spk == script_pubkey)
+
+    def _iter_utxos_where(self, match):
         # Walk the REAL chainstate UTXO set (``iter_utxos`` reads
         # CHAINSTATE_CF), not the demo-only ``get_utxos`` stub which returned
         # three hardcoded example coins and therefore never matched a wallet
@@ -1187,7 +1202,7 @@ class BlockchainDatabase:
             return
         for py_utxo in py_utxos:
             spk = bytes(py_utxo.script_pubkey)
-            if spk != script_pubkey:
+            if not match(spk):
                 continue
             # PyUTXO.txid is the display (big-endian) hex string produced by
             # Txid::to_string(); keep it in that form so listunspent/getbalance

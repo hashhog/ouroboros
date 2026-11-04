@@ -5498,7 +5498,6 @@ class RPCServer:
         if not hasattr(self.node, 'db') or not self.node.db:
             return []
 
-        network = getattr(self.node, 'network', 'mainnet')
         try:
             _, best_height = self.node.db.get_best_block()
         except Exception:
@@ -5523,35 +5522,9 @@ class RPCServer:
 
         result = []
 
-        # With no explicit address filter, enumerate the wallet's own
-        # addresses (all four script types per key in self.keys), mirroring
-        # Bitcoin Core's listunspent default of "all wallet UTXOs". This also
-        # lets a freshly-rescanned wallet surface the coins it just adopted.
-        if dest_filter is None:
-            scanned: set[str] = set()
-            from ouroboros.wallet import WalletKey
-            for kd in getattr(wallet, "keys", []):
-                try:
-                    k = WalletKey.from_wif(kd["wif"], network)
-                except Exception:
-                    continue
-                for a in (
-                    k.get_p2wpkh_address(),
-                    k.get_p2pkh_address(),
-                    k.get_p2sh_p2wpkh_address(),
-                ):
-                    scanned.add(a)
-                try:
-                    scanned.add(k.get_p2tr_address())
-                except Exception:
-                    pass
-            try:
-                for a in wallet._descriptor_script_map().values():
-                    if a:
-                        scanned.add(a)
-            except Exception:
-                pass
-            dest_filter = list(scanned)
+        # The wallet's own coins, from its persistent store (Core
+        # AvailableCoins over mapWallet).  No chainstate walk.
+        want = set(dest_filter) if dest_filter is not None else None
 
         pubkey_by_addr: dict[str, str] = {}
         for kd in getattr(wallet, "keys", []):
@@ -5573,47 +5546,47 @@ class RPCServer:
 
         pending = getattr(wallet, "_pending_spent", set())
 
-        for addr in dest_filter:
-            utxos = self.node.db.list_unspent_by_address(addr, network)
-            for u in utxos:
-                txid = u["txid"]
-                vout = int(u["vout"])
-                if (str(txid).lower(), vout) in pending:
-                    continue
-                height = int(u.get("height", 0) or 0)
-                if height <= 0:
-                    confs = 0
-                else:
-                    confs = max(0, int(best_height) - height + 1)
-                if confs < int(minconf) or confs > int(maxconf):
-                    continue
-                if not include_unsafe and confs == 0:
-                    continue
-                spk = u["script_pubkey"]
-                spk_bytes = bytes(spk) if not isinstance(spk, bytes) else spk
-                pubkey_hex = pubkey_by_addr.get(addr, "")
-                desc = self._desc_for_spk(spk_bytes, pubkey_hex)
-                if not desc:
-                    try:
-                        from ouroboros.descriptors import add_checksum as _add_cs
-                        desc = _add_cs(f"addr({addr})")
-                    except Exception:
-                        desc = f"addr({addr})"
-                entry: dict[str, Any] = {
-                    "txid": txid,
-                    "vout": vout,
-                    "address": addr,
-                    "label": self._label_for_address(wallet, addr),
-                    "scriptPubKey": spk_bytes.hex(),
-                    "amount": u["value"] / 100_000_000.0,
-                    "confirmations": confs,
-                    "spendable": True,
-                    "solvable": True,
-                    "desc": desc,
-                    "safe": confs > 0,
-                    "parent_descs": [desc],
-                }
-                result.append(entry)
+        for u in wallet.wallet_coins(int(best_height)):
+            addr = u["address"]
+            if want is not None and addr not in want:
+                continue
+            txid = u["txid"]
+            vout = int(u["vout"])
+            if (str(txid).lower(), vout) in pending:
+                continue
+            # Core AvailableCoins: an immature coinbase is not listed.
+            if u["immature"]:
+                continue
+            confs = int(u["depth"])
+            if confs < int(minconf) or confs > int(maxconf):
+                continue
+            safe = bool(u["trusted"])
+            if not include_unsafe and not safe:
+                continue
+            spk_bytes = bytes(u["script_pubkey"])
+            pubkey_hex = pubkey_by_addr.get(addr, "")
+            desc = self._desc_for_spk(spk_bytes, pubkey_hex)
+            if not desc:
+                try:
+                    from ouroboros.descriptors import add_checksum as _add_cs
+                    desc = _add_cs(f"addr({addr})")
+                except Exception:
+                    desc = f"addr({addr})"
+            entry: dict[str, Any] = {
+                "txid": txid,
+                "vout": vout,
+                "address": addr,
+                "label": self._label_for_address(wallet, addr),
+                "scriptPubKey": spk_bytes.hex(),
+                "amount": u["value"] / 100_000_000.0,
+                "confirmations": confs,
+                "spendable": True,
+                "solvable": True,
+                "desc": desc,
+                "safe": safe,
+                "parent_descs": [desc],
+            }
+            result.append(entry)
 
         return result
 
@@ -20100,65 +20073,10 @@ class RPCServer:
         if wallet.db is None:
             raise HTTPException(status_code=500, detail="Wallet database not available")
 
-        # Get current best height for confirmation counting
-        best_hash, best_height = wallet.db.get_best_block() if wallet.db else (None, 0)
-
-        total_balance = 0
-
-        # Get all wallet addresses
-        addresses = set()
-
-        # From imported keys
-        for key_data in wallet.keys:
-            from ouroboros.wallet import WalletKey
-            try:
-                key = WalletKey.from_wif(key_data["wif"], wallet.network)
-                # Add all address types for the key
-                addresses.add(key.get_p2wpkh_address())
-                addresses.add(key.get_p2pkh_address())
-                addresses.add(key.get_p2sh_p2wpkh_address())
-            except Exception:
-                continue
-
-        # From descriptors
-        for entry in wallet.descriptors:
-            if not entry.active:
-                continue
-            try:
-                end = max(entry.next_index, entry.range_start + 1)
-                for i in range(entry.range_start, end):
-                    addr = entry.descriptor.derive_address(i, wallet.network)
-                    addresses.add(addr)
-            except Exception:
-                continue
-
-        # Maturity threshold for coinbase outputs (Core COINBASE_MATURITY).
-        COINBASE_MATURITY = 100
-
-        # Sum UTXOs for all addresses, enforcing both confirmation count and
-        # coinbase maturity. Iterating list_unspent_by_address (which now reads
-        # the REAL chainstate and carries height + is_coinbase per coin) lets us
-        # exclude immature coinbase exactly as Core's available-balance does.
-        # Reference: Bitcoin Core wallet GetBalance / IsImmatureCoinBase.
-        for addr in addresses:
-            try:
-                utxos = wallet.db.list_unspent_by_address(addr, wallet.network)
-            except Exception:
-                continue
-            for utxo in utxos:
-                utxo_height = utxo.get('height', 0) or 0
-                if utxo_height == 0:
-                    confs = 0
-                else:
-                    confs = max(0, best_height - utxo_height + 1)
-                if confs < minconf:
-                    continue
-                # Immature coinbase is excluded from the spendable balance.
-                if utxo.get('is_coinbase', False) and confs < (COINBASE_MATURITY + 1):
-                    continue
-                total_balance += utxo.get('value', 0)
-
-        # Convert satoshis to BTC
+        # Trusted balance from the wallet's coin store (Core GetBalance
+        # m_mine_trusted at min_depth): immature coinbase and untrusted
+        # unconfirmed coins are excluded.
+        total_balance = wallet.get_balances_sat(int(minconf))["trusted"]
         return total_balance / 100_000_000
 
     async def rpc_getbalances(self) -> dict[str, Any]:
@@ -20176,7 +20094,6 @@ class RPCServer:
         ``getbalance`` handler folds them into the main balance. This
         matches Core's behavior when a wallet has no watch-only keys.
         """
-        from ouroboros.wallet import WalletKey
 
         wallet = self._require_wallet()
         if wallet.db is None:
@@ -20188,61 +20105,11 @@ class RPCServer:
         except Exception:
             best_hash, best_height = None, 0
 
-        # COINBASE_MATURITY = 100 (consensus-wide).
-        COINBASE_MATURITY = 100
-
-        # Build address set, mirroring rpc_getbalance.
-        addresses: set[str] = set()
-        for key_data in wallet.keys:
-            try:
-                key = WalletKey.from_wif(key_data["wif"], wallet.network)
-                addresses.add(key.get_p2wpkh_address())
-                addresses.add(key.get_p2pkh_address())
-                addresses.add(key.get_p2sh_p2wpkh_address())
-            except Exception:
-                continue
-        for entry in wallet.descriptors:
-            if not entry.active:
-                continue
-            try:
-                end = max(entry.next_index, entry.range_start + 1)
-                for i in range(entry.range_start, end):
-                    addresses.add(entry.descriptor.derive_address(i, wallet.network))
-            except Exception:
-                continue
-
-        trusted_sat = 0
-        untrusted_pending_sat = 0
-        immature_sat = 0
-
-        for addr in addresses:
-            utxos: list[dict[str, Any]] = []
-            if hasattr(wallet.db, "get_utxos_for_address"):
-                try:
-                    utxos = wallet.db.get_utxos_for_address(addr, wallet.network) or []
-                except Exception:
-                    utxos = []
-            elif hasattr(wallet.db, "list_unspent_by_address"):
-                try:
-                    utxos = wallet.db.list_unspent_by_address(addr, wallet.network) or []
-                except Exception:
-                    utxos = []
-
-            for utxo in utxos:
-                value = int(utxo.get("value", utxo.get("amount", 0)) or 0)
-                height = utxo.get("height", 0) or 0
-                is_coinbase = bool(
-                    utxo.get("is_coinbase", utxo.get("coinbase", False))
-                )
-                if height <= 0:
-                    untrusted_pending_sat += value
-                    continue
-                if is_coinbase:
-                    confs = max(0, best_height - height + 1)
-                    if confs < COINBASE_MATURITY:
-                        immature_sat += value
-                        continue
-                trusted_sat += value
+        # Core GetBalance (wallet/receive.cpp) over the wallet's coin store.
+        bal = wallet.get_balances_sat(0)
+        trusted_sat = bal["trusted"]
+        untrusted_pending_sat = bal["untrusted_pending"]
+        immature_sat = bal["immature"]
 
         balances: dict[str, Any] = {
             "mine": {
