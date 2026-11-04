@@ -2000,6 +2000,10 @@ class PackageAcceptResult:
     state: str
     message: str
     results: dict = field(default_factory=dict)
+    # wtxids whose result decided a failed package evaluation (Core: the
+    # results AcceptMultipleTransactions returned, as opposed to the
+    # individual results AcceptPackage merges in for the other txs).
+    failed_wtxids: list = field(default_factory=list)
 
 
 class Mempool:
@@ -5916,6 +5920,10 @@ class Mempool:
                         reject_reason="mempool full", reject_details="mempool full")
             elif wtxid in individual_nonfinal:
                 results_final[wtxid] = individual_nonfinal[wtxid]
+        multi.failed_wtxids = [
+            w for w, r in results_final.items()
+            if r.kind == "invalid"
+            and (w in multi.results or r.reject_reason == "mempool full")]
         multi.results = {self._tx_wtxid(tx): results_final[self._tx_wtxid(tx)]
                          for tx in txs if self._tx_wtxid(tx) in results_final}
         return multi
@@ -6136,7 +6144,9 @@ class Mempool:
         res = self.accept_package(txs, height)
         if res.state == "valid":
             return True, ""
-        for r in res.results.values():
+        # The failure that decided the package first, then any other.
+        decisive = [res.results[w] for w in res.failed_wtxids if w in res.results]
+        for r in [*decisive, *res.results.values()]:
             if r.kind == "invalid":
                 return False, f"{res.message}: {r.reject_details or r.reject_reason}"
         return False, res.message
