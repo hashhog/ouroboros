@@ -568,6 +568,24 @@ class BlockchainDatabase:
             return None
         return bytes(result)
 
+    def get_block_with_witness(self, block_hash: bytes) -> Block | None:
+        """The stored block with its witnesses (Core ReadBlock).
+
+        :meth:`get_block` / :meth:`get_block_by_height` go through the Rust
+        ``PyTxIn``, which has no witness field, so every segwit input comes
+        back with an empty witness.  A transaction rebuilt that way is not
+        the one the block confirmed: re-submitted to the mempool it fails
+        its script check.  This decodes the raw bytes instead and falls back
+        to :meth:`get_block` only when they are unreadable.
+        """
+        raw = self.get_block_bytes(block_hash)
+        if raw:
+            try:
+                return Block.deserialize(raw)
+            except ValueError:
+                pass
+        return self.get_block(block_hash)
+
     def get_block_by_height(self, height: int) -> Block | None:
         """Look up a block by height; returns None if not found."""
         py_block = self._db.get_block_by_height(height)

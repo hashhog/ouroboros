@@ -4161,6 +4161,13 @@ class RPCServer:
                 detail=reject_reason
             )
 
+        # Core BroadcastTransaction (MEMPOOL_AND_BROADCAST_TO_ALL): "the
+        # mempool tracks locally submitted transactions to make a
+        # best-effort of initial broadcast" -> AddUnbroadcastTx.
+        add_unbroadcast = getattr(self.node.mempool, "add_unbroadcast", None)
+        if add_unbroadcast is not None:
+            add_unbroadcast(txid)
+
         # 6. Relay INV to all connected peers via trickle queue (privacy)
         # Use privacy-preserving relay via INV messages
         wtxid = tx.get_wtxid() if hasattr(tx, 'get_wtxid') else txid
@@ -8093,7 +8100,8 @@ class RPCServer:
 
                     # B6: correct BIP-141 weight (miner.cpp AddToBlock:267)
                     tw = e.tx.get_weight()
-                    raw = e.tx.serialize()
+                    # Core EncodeHexTx: TX_WITH_WITNESS (core_io.cpp).
+                    raw = e.tx.serialize_with_witness()
 
                     tx_sigops_cost = 0
 
@@ -9603,6 +9611,13 @@ class RPCServer:
                     "for rollback/retain: %s",
                     h, e,
                 )
+            # The refill needs the txs WITH their witnesses, which blk (the
+            # Rust PyTxIn round-trip) has dropped; the raw bytes keep them.
+            if disconnected_active and disconnected_active[-1][1] == h:
+                try:
+                    blk = Block.deserialize(disconnected_active[-1][2])
+                except ValueError:
+                    pass
             # Prepended block-by-block: the walk is descending, the refill
             # wants EARLIEST FIRST (Core iterates DisconnectedBlockTransactions
             # in reverse: lowest block first, block order within it).
@@ -10773,7 +10788,11 @@ class RPCServer:
             for h in range(target_h, int(best_height) + 1):
                 try:
                     hh = db.get_block_hash_by_height(h)
-                    blk = db.get_block_by_height(h)
+                    # With witnesses: these txs go back to the mempool, and
+                    # get_block_by_height drops them.
+                    _read = getattr(db, "get_block_with_witness", None)
+                    blk = (_read(bytes(hh)) if _read is not None and hh is not None
+                           else db.get_block_by_height(h))
                 except Exception:
                     hh, blk = None, None
                 if hh is None:
@@ -11157,6 +11176,15 @@ class RPCServer:
         # and only then does removeForReorg run — so a pool spender of a
         # re-added tx is linked to it and kept (Core's removeForReorg for a
         # block runs after that block's txs are back).
+        # Core re-adds each block's txs right after ITS DisconnectTip, so an
+        # entry's height is the tip at that moment: the block's height - 1
+        # (ATMP StageAddition takes m_chain.Height()).  The blocks are the
+        # ones above the new tip, ascending.
+        heights = {}
+        for i, blk in enumerate(blocks):
+            for tx in (getattr(blk, "transactions", None) or []) if blk is not None else []:
+                if not getattr(tx, "is_coinbase", False):
+                    heights[tx.get_txid()] = int(tip_h) + i
         blocks = [b for b in blocks if b is not None]
         deep, top = blocks[:-INVALIDATE_READD_MAX_BLOCKS], blocks[-INVALIDATE_READD_MAX_BLOCKS:]
 
@@ -11164,7 +11192,8 @@ class RPCServer:
             return [tx for blk in bs
                     for tx in (getattr(blk, "transactions", None) or [])]
 
-        mempool.update_for_reorg(_txs(top), int(tip_h), not_readded_txs=_txs(deep))
+        mempool.update_for_reorg(_txs(top), int(tip_h), not_readded_txs=_txs(deep),
+                                 entry_heights=heights)
 
     def _mempool_follow_rust_reorg(self, db, old_tip_hash, old_tip_height) -> None:
         """The Rust layer moved the active chain (reconsiderblock's
@@ -17001,33 +17030,40 @@ class RPCServer:
         }
 
     def _format_mempool_entry(self, entry, txid_bytes: bytes) -> dict[str, Any]:
-        """Format a MempoolEntry into the standard mempool dict."""
+        """Format a MempoolEntry the way Core v31.1 entryToJSON
+        (rpc/mempool.cpp) does."""
         mempool = self.node.mempool
 
-        # -- depends: unconfirmed parents of this tx -----------------------
+        # -- depends: Core collects the in-pool parents into a
+        # std::set<std::string> of display hex, so sorted and unique.
         # inp.prev_txid is internal LE; JSON-RPC emits display-order (BE). W69.
-        depends: list[str] = []
-        for inp in entry.tx.inputs:
-            if inp.prev_txid in mempool.transactions:
-                depends.append(inp.prev_txid[::-1].hex())
+        depends = sorted({
+            inp.prev_txid[::-1].hex() for inp in entry.tx.inputs
+            if inp.prev_txid in mempool.transactions
+        })
 
-        # -- spentby: unconfirmed children spending this tx's outputs ------
-        spentby: list[str] = []
+        # -- spentby: Core GetChildren sorts by CompareIteratorByHash, i.e.
+        # uint256 order of the txid, which compares the INTERNAL bytes.
+        children = set()
         for other_txid, other_entry in mempool.transactions.items():
             if other_txid == txid_bytes:
                 continue
             for inp in other_entry.tx.inputs:
                 if inp.prev_txid == txid_bytes:
-                    spentby.append(other_txid[::-1].hex())
+                    children.add(other_txid)
                     break  # one match per child tx is enough
+        spentby = [c[::-1].hex() for c in sorted(children)]
 
-        # -- weight / vsize ------------------------------------------------
+        # -- weight / vsize: Core GetTxSize is the sigop-adjusted vsize.
         weight = entry.tx.get_weight()
-        vsize = (weight + 3) // 4
+        vsize = entry.vsize
 
         # -- ancestor / descendant fees ------------------------------------
         # Use Core GetModifiedFee semantics for fees.modified / ancestorfees /
         # descendantfees so that prioritisetransaction is reflected (FIX-72).
+        # Core CalculateAncestorData / CalculateDescendantData sum GetTxSize
+        # (vsize) over the set including the tx itself; entry.ancestor_size /
+        # descendant_size count stripped bytes, so they are not used here.
         map_deltas = getattr(mempool, "map_deltas", {})
 
         def _mod_fee(t: bytes, e) -> int:
@@ -17036,24 +17072,33 @@ class RPCServer:
         own_modified_fee = _mod_fee(txid_bytes, entry)
 
         ancestor_fees = own_modified_fee
+        ancestor_size = vsize
         for a_txid in mempool._get_ancestors(entry.tx):
             a_entry = mempool.transactions.get(a_txid)
             if a_entry is not None:
                 ancestor_fees += _mod_fee(a_txid, a_entry)
+                ancestor_size += a_entry.vsize
 
         descendant_fees = own_modified_fee
+        descendant_size = vsize
         for d_txid in mempool._collect_descendants(txid_bytes):
             if d_txid == txid_bytes:
                 continue
             d_entry = mempool.transactions.get(d_txid)
             if d_entry is not None:
                 descendant_fees += _mod_fee(d_txid, d_entry)
+                descendant_size += d_entry.vsize
 
         base_fee_btc = entry.fee / 1e8
         modified_fee_btc = own_modified_fee / 1e8
 
+        # Core GetMainChunkFeerate: the tx's chunk in its cluster's optimal
+        # linearization, as (modified fee, sigop-adjusted weight).
+        chunk_fee, chunk_weight = mempool.main_chunk_feerate(txid_bytes) or (0, 0)
+
         # Core entryToJSON order (rpc/mempool.cpp): vsize, weight, time, height,
-        # descendant*/ancestor*, wtxid, fees{}, depends, spentby, unbroadcast.
+        # descendant*/ancestor*, wtxid, chunkweight, fees{}, depends, spentby,
+        # bip125-replaceable, unbroadcast.
         # Fees are ONLY in the nested fees{} object — the old flat fee/modifiedfee/
         # ancestorfees/descendantfees top-level fields are NOT part of Core's shape.
         return {
@@ -17062,20 +17107,27 @@ class RPCServer:
             "time": int(entry.time_added),
             "height": entry.height_added,
             "descendantcount": entry.descendant_count,
-            "descendantsize": entry.descendant_size,
+            "descendantsize": descendant_size,
             "ancestorcount": entry.ancestor_count,
-            "ancestorsize": entry.ancestor_size,
-            "wtxid": _display_hash(entry.tx.get_wtxid())
-                if hasattr(entry.tx, "get_wtxid") else _display_txid(txid_bytes),
+            "ancestorsize": ancestor_size,
+            # Display order (reversed), like every other hash at the RPC
+            # boundary.  The _display_hash/_display_txid helpers are local to
+            # other methods; naming them here raised NameError (-32603).
+            "wtxid": (entry.tx.get_wtxid() if hasattr(entry.tx, "get_wtxid")
+                      else txid_bytes)[::-1].hex(),
+            "chunkweight": chunk_weight,
             "fees": {
                 "base": base_fee_btc,
                 "modified": modified_fee_btc,
                 "ancestor": ancestor_fees / 1e8,
                 "descendant": descendant_fees / 1e8,
+                "chunk": chunk_fee / 1e8,
             },
             "depends": depends,
             "spentby": spentby,
-            "unbroadcast": False,
+            # Core IsRBFOptIn: the tx or an in-pool ancestor signals BIP125.
+            "bip125-replaceable": mempool.is_bip125_replaceable(txid_bytes),
+            "unbroadcast": mempool.is_unbroadcast(txid_bytes),
         }
 
     async def rpc_getmempoolentry(self, txid: str) -> dict[str, Any]:
