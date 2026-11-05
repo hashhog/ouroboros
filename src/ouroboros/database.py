@@ -427,31 +427,56 @@ class BlockchainDatabase:
     # restart they read the 0x1d00ffff / 0 defaults until the next block
     # connected, and after a disconnect they described the block that was
     # taken off.  These properties resolve the tip's own 80-byte header,
-    # memoised per tip hash; the last-connected values (and, before any
-    # connect, the defaults) remain the fallback when no header is readable.
-    # Assigning still sets the last-connected value.
+    # memoised per tip hash.  When no header is readable the last-connected
+    # values stand in only while that block is still the tip; otherwise (and
+    # before any connect) the defaults 0x1d00ffff / 0 are returned, never
+    # another block's fields.  Assigning still sets the last-connected value.
     # ------------------------------------------------------------------
     @property
     def _tip_bits(self) -> int:
         fields = self._tip_header_fields()
         if fields is not None:
             return fields[0]
+        if not self._last_connect_is_tip():
+            return 0x1d00ffff
         return self.__dict__.get("_last_connect_bits", 0x1d00ffff)
 
     @_tip_bits.setter
     def _tip_bits(self, value: int) -> None:
         self.__dict__["_last_connect_bits"] = value
+        self.__dict__["_last_connect_hash"] = None
 
     @property
     def _tip_timestamp(self) -> int:
         fields = self._tip_header_fields()
         if fields is not None:
             return fields[1]
+        if not self._last_connect_is_tip():
+            return 0
         return self.__dict__.get("_last_connect_timestamp", 0)
 
     @_tip_timestamp.setter
     def _tip_timestamp(self, value: int) -> None:
         self.__dict__["_last_connect_timestamp"] = value
+        self.__dict__["_last_connect_hash"] = None
+
+    def _last_connect_is_tip(self) -> bool:
+        """Whether the last-connected values may stand in for the tip.
+
+        connect_block_from_bytes records the hash it connected; once the tip
+        is another block (a disconnect, a reorg through the Rust layer) those
+        values describe the wrong block and the defaults are returned
+        instead, so a reader never gets another block's bits or time (the
+        block_sync header-admission fallback treats time 0 as "unknown").
+        Values assigned directly carry no hash and are always used.
+        """
+        connected = self.__dict__.get("_last_connect_hash")
+        if connected is None:
+            return True
+        try:
+            return bytes(self.get_best_block()[0]) == connected
+        except Exception:
+            return False
 
     def _tip_header_fields(self) -> tuple[int, int] | None:
         """``(bits, time)`` of the current tip's header, or None if unreadable."""
@@ -1427,6 +1452,11 @@ class BlockchainDatabase:
             bits = struct.unpack_from("<I", block_bytes, 72)[0]
             self._tip_bits = bits
             self._tip_timestamp = ts
+            # After both setters: the values belong to this block.
+            try:
+                self.__dict__["_last_connect_hash"] = bytes(result)
+            except Exception:
+                self.__dict__["_last_connect_hash"] = None
             self._recent_timestamps.append(ts)
             # Keep only the last 11 timestamps for median-time calculation
             if len(self._recent_timestamps) > 11:

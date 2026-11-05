@@ -117,11 +117,14 @@ def test_tip_time_follows_invalidateblock(tmp_path):
     bdb.connect_block_from_bytes(raw, height, "regtest")
     assert bdb.get_best_block() == (new_hash, height)
     assert bdb._tip_timestamp == BASE_TIME + height * 600 + 7
+    connected = bdb.__dict__.get("_last_connect_hash")
     asyncio.run(server.rpc_invalidateblock(new_hash[::-1].hex()))
     assert bdb.get_best_block() == (tip_hash, TIP)
     assert bdb._tip_timestamp == BASE_TIME + TIP * 600
     info = asyncio.run(server.rpc_getblockchaininfo())
     assert info["time"] == BASE_TIME + TIP * 600
+    # The connect recorded which block its fallback values belong to.
+    assert connected == new_hash
 
 
 def test_assigned_value_is_the_fallback_when_no_header_is_readable():
@@ -137,3 +140,45 @@ def test_assigned_value_is_the_fallback_when_no_header_is_readable():
     db._tip_bits = 0x207fffff
     db._tip_timestamp = 1234
     assert (db._tip_bits, db._tip_timestamp) == (0x207fffff, 1234)
+
+
+class _HeaderlessRust:
+    """A Rust handle that knows the tip but can read no header for it (an
+    assumeutxo-style tip with no body and no header-only record)."""
+
+    def __init__(self, tip: bytes, height: int):
+        self.tip = (tip, height)
+
+    def get_best_block(self):
+        return self.tip
+
+    def get_block_bytes(self, _h):
+        return None
+
+    def get_raw_header_with_chainwork(self, _h):
+        return None
+
+
+def test_unreadable_tip_header_never_reports_another_blocks_fields():
+    """block_sync's header-admission fallback (``ancestor_at`` for the active
+    tip) reads ``_tip_bits`` / ``_tip_timestamp`` and treats time 0 as unknown.
+    With no readable header the last-connected values may stand in only while
+    that block is still the tip; after the tip moves the defaults come back."""
+    from collections import OrderedDict
+
+    from ouroboros.database import BlockchainDatabase
+
+    a, b = b"\xaa" * 32, b"\xbb" * 32
+    db = BlockchainDatabase.__new__(BlockchainDatabase)
+    db._db = _HeaderlessRust(a, 7)
+    db._cached_tip = None
+    db._header_cache = OrderedDict()
+    # What connect_block_from_bytes records for block A.
+    db._tip_bits = 0x207fffff
+    db._tip_timestamp = 1_700_000_007
+    db.__dict__["_last_connect_hash"] = a
+    assert (db._tip_bits, db._tip_timestamp) == (0x207fffff, 1_700_000_007)
+    # The tip moves to B (a disconnect or a Rust-side reorg).
+    db._db.tip = (b, 6)
+    db._cached_tip = None
+    assert (db._tip_bits, db._tip_timestamp) == (0x1d00ffff, 0)
