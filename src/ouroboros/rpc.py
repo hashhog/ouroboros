@@ -11823,6 +11823,12 @@ class RPCServer:
         # Core returns an empty JSON object (UniValue::VOBJ) on success.
         return {}
 
+    @staticmethod
+    def _format_hostport(host: str, port: int) -> str:
+        """``host:port`` with IPv6 literals bracketed (Core CService::ToStringAddrPort)."""
+        host = str(host)
+        return f"[{host}]:{int(port)}" if ":" in host else f"{host}:{int(port)}"
+
     async def rpc_getpeerinfo(self) -> list[dict[str, Any]]:
         """Return information about connected peers.
 
@@ -12017,11 +12023,28 @@ class RPCServer:
             if pingwait is not None and pingwait > 0:
                 info["pingwait"] = pingwait
 
-            # Bytes per message type (if tracked)
-            if hasattr(peer, 'bytes_sent_per_msg'):
-                info["bytessent_per_msg"] = peer.bytes_sent_per_msg
-            if hasattr(peer, 'bytes_recv_per_msg'):
-                info["bytesrecv_per_msg"] = peer.bytes_recv_per_msg
+            # Bytes per message type.  Core always emits both maps ({} when
+            # nothing was exchanged) -- rpc/net.cpp getpeerinfo.
+            info["bytessent_per_msg"] = dict(
+                getattr(peer, 'bytes_sent_per_msg', None) or {})
+            info["bytesrecv_per_msg"] = dict(
+                getattr(peer, 'bytes_recv_per_msg', None) or {})
+
+            # addrbind: our local socket address for this connection (Core
+            # emits it when the CNode has a valid addrBind).  addrlocal: how
+            # the peer sees us (its VERSION addr_recv), emitted only when
+            # known (Core: !addrLocal.empty()).
+            _writer = getattr(peer, 'writer', None)
+            _sockname = None
+            try:
+                _sockname = _writer.get_extra_info('sockname') if _writer else None
+            except Exception:
+                _sockname = None
+            if _sockname and len(_sockname) >= 2:
+                info["addrbind"] = self._format_hostport(_sockname[0], _sockname[1])
+            _al = getattr(peer, 'addr_local', None)
+            if _al and _al[0]:
+                info["addrlocal"] = self._format_hostport(_al[0], _al[1])
 
             # Ban score (legacy)
             banscore = getattr(peer, 'ban_score', 0)
