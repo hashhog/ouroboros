@@ -393,10 +393,12 @@ class BlockchainDatabase:
         # RPC reads this instead of calling into Rust FFI, avoiding lock
         # contention during IBD.
         self._cached_tip: tuple[bytes, int] | None = None
-        # Lightweight header-field cache for RPC — avoids full-block
-        # deserialisation in getblockchaininfo.  Updated on connect.
-        self._tip_bits: int = 0x1d00ffff
-        self._tip_timestamp: int = 0
+        # Header fields of the last CONNECTED block (connect_block_from_bytes).
+        # Readers use the _tip_bits / _tip_timestamp properties, which answer
+        # for the CURRENT tip and fall back to these only when the tip's
+        # header cannot be read.
+        self._tip_bits = 0x1d00ffff
+        self._tip_timestamp = 0
         self._recent_timestamps: list = []  # last 11 block timestamps
         self._cached_chainwork: int = 0  # cumulative chain work, updated on connect
         # Bounded FIFO cache for in-memory chainwork fallback (keyed by 32-byte
@@ -413,6 +415,76 @@ class BlockchainDatabase:
             self._cached_tip = self.get_best_block()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Tip header fields (bits, time) for RPC.
+    #
+    # Core answers getblockchaininfo / getmininginfo bits, target,
+    # difficulty and time from the active tip's CBlockIndex (rpc/
+    # blockchain.cpp getblockchaininfo: tip.nBits, tip.GetBlockTime()), so
+    # they describe the tip whatever moved it there.  The old plain
+    # attributes were written only by connect_block_from_bytes: after a
+    # restart they read the 0x1d00ffff / 0 defaults until the next block
+    # connected, and after a disconnect they described the block that was
+    # taken off.  These properties resolve the tip's own 80-byte header,
+    # memoised per tip hash; the last-connected values (and, before any
+    # connect, the defaults) remain the fallback when no header is readable.
+    # Assigning still sets the last-connected value.
+    # ------------------------------------------------------------------
+    @property
+    def _tip_bits(self) -> int:
+        fields = self._tip_header_fields()
+        if fields is not None:
+            return fields[0]
+        return self.__dict__.get("_last_connect_bits", 0x1d00ffff)
+
+    @_tip_bits.setter
+    def _tip_bits(self, value: int) -> None:
+        self.__dict__["_last_connect_bits"] = value
+
+    @property
+    def _tip_timestamp(self) -> int:
+        fields = self._tip_header_fields()
+        if fields is not None:
+            return fields[1]
+        return self.__dict__.get("_last_connect_timestamp", 0)
+
+    @_tip_timestamp.setter
+    def _tip_timestamp(self, value: int) -> None:
+        self.__dict__["_last_connect_timestamp"] = value
+
+    def _tip_header_fields(self) -> tuple[int, int] | None:
+        """``(bits, time)`` of the current tip's header, or None if unreadable."""
+        try:
+            tip_hash = bytes(self.get_best_block()[0])
+        except Exception:
+            return None
+        memo = self.__dict__.get("_tip_fields_memo")
+        if memo is not None and memo[0] == tip_hash:
+            return memo[1], memo[2]
+        header: bytes | None = None
+        try:
+            block = self.get_block_header(tip_hash)
+            if block is not None:
+                fields = (int(block.bits), int(block.timestamp))
+                self.__dict__["_tip_fields_memo"] = (tip_hash, *fields)
+                return fields
+            # No body (e.g. an assumeutxo snapshot base): the header-only
+            # store still holds the 80 bytes.
+            raw_fn = getattr(self._db, "get_raw_header_with_chainwork", None)
+            raw = raw_fn(tip_hash) if raw_fn is not None else None
+            if raw is not None and raw[0] is not None:
+                header = bytes(raw[0])
+        except Exception:
+            return None
+        if header is None or len(header) < 80:
+            return None
+        fields = (
+            int.from_bytes(header[72:76], "little"),
+            int.from_bytes(header[68:72], "little"),
+        )
+        self.__dict__["_tip_fields_memo"] = (tip_hash, *fields)
+        return fields
 
     def get_block(self, block_hash: bytes) -> Block | None:
         """Look up a block by its 32-byte hash; returns None if not found."""
