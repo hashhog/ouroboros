@@ -2794,6 +2794,12 @@ class Mempool:
                     tx, next_height,
                 )
         if not valid:
+            if workspace is not None and self._is_script_failure(error):
+                # Core names the script error (SCRIPT_ERR_*) in the reject
+                # reason; the validator's interpreter recorded it for this
+                # thread's verify call, the one that just failed.
+                interp = getattr(self.validator, "script_interpreter", None)
+                workspace["script_error"] = getattr(interp, "last_error", None)
             return False, error
 
         # Check for conflicts (double spends) — attempt BIP 125 RBF
@@ -5766,11 +5772,42 @@ class Mempool:
             details = f"{reason}, {ws['fee']} < {self._min_fee_ceil(ws['vsize'], DEFAULT_MIN_RELAY_TX_FEE)}"
         elif reason == "mempool min fee not met" and "mempool_min_fee" in ws:
             details = f"{reason}, {ws['fee']} < {ws['mempool_min_fee']}"
+        elif self._is_script_failure(reason):
+            reason, details = self._core_script_failure(tx, reason, ws)
         return PackageTxResult(
             kind="invalid", txid=tx.get_txid(), wtxid=self._tx_wtxid(tx),
             reject_reason=reason, reject_details=details,
             missing_inputs=(reason == "orphan"),
         )
+
+    _SCRIPT_INPUT_PREFIX = "Invalid signature for input "
+
+    def _core_script_failure(
+        self, tx: Transaction, reason: str, ws: dict,
+    ) -> tuple[str, str]:
+        """Core's reject reason and ``TxValidationState::ToString()`` for a
+        script failure (validation.cpp PolicyScriptChecks / CheckInputScripts):
+        ``mempool-script-verify-flag-failed (<ScriptErrorString>)``, then
+        ``, input <n> of <txid> (wtxid <wtxid>), spending <prevtxid>:<vout>``.
+        Without a recorded script error, or an input index, the node's own
+        reason is kept for both."""
+        from ouroboros.script import SCRIPT_ERROR_STRINGS
+
+        text = SCRIPT_ERROR_STRINGS.get(ws.get("script_error") or "")
+        if text is None or not reason.startswith(self._SCRIPT_INPUT_PREFIX):
+            return reason, reason
+        try:
+            n = int(reason[len(self._SCRIPT_INPUT_PREFIX):])
+            prevout = tx.inputs[n]
+        except (ValueError, IndexError):
+            return reason, reason
+        core_reason = f"mempool-script-verify-flag-failed ({text})"
+        details = (
+            f"{core_reason}, input {n} of {tx.get_txid()[::-1].hex()} "
+            f"(wtxid {self._tx_wtxid(tx)[::-1].hex()}), "
+            f"spending {prevout.prev_txid[::-1].hex()}:{prevout.prev_vout}"
+        )
+        return core_reason, details
 
     @staticmethod
     def _min_fee_ceil(vsize: int, rate_kvb: int) -> int:
