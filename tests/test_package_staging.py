@@ -610,8 +610,12 @@ def test_python_p2wpkh_nullfail_records_core_script_error():
     signature, NULLFAIL set.  Core's script error is SCRIPT_ERR_SIG_NULLFAIL;
     the Python interpreter now records that name (it recorded nothing)."""
     from ouroboros.script import (
-        SCRIPT_VERIFY_DERSIG, SCRIPT_VERIFY_NULLFAIL, SCRIPT_VERIFY_P2SH,
-        SCRIPT_VERIFY_STRICTENC, SCRIPT_VERIFY_WITNESS, ScriptInterpreter,
+        SCRIPT_VERIFY_DERSIG,
+        SCRIPT_VERIFY_NULLFAIL,
+        SCRIPT_VERIFY_P2SH,
+        SCRIPT_VERIFY_STRICTENC,
+        SCRIPT_VERIFY_WITNESS,
+        ScriptInterpreter,
     )
     bad_sig = b"\x30\x06\x02\x01\x01\x02\x01\x01\x01"  # DER r=1 s=1, ALL
     tx, spk = _p2wpkh_spend(bad_sig)
