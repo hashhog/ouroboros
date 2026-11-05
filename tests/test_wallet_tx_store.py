@@ -462,11 +462,16 @@ def test_failed_migration_walk_stays_pending(tmp_path):
     chain.tip = 1
     real_iter = chain.iter_unspent_for_scripts
 
-    def _broken(scripts):
-        raise RuntimeError("chainstate UTXO walk failed: iterator open")
-        yield  # pragma: no cover
+    # The real database walk over an extension whose UTXO iterator fails
+    # to open (a stale wheel, a RocksDB error).
+    from ouroboros.database import BlockchainDatabase
 
-    chain.iter_unspent_for_scripts = _broken
+    def _fail():
+        raise OSError("iterator open")
+
+    real_db = BlockchainDatabase.__new__(BlockchainDatabase)
+    real_db._db = SimpleNamespace(iter_utxos=_fail)
+    chain.iter_unspent_for_scripts = real_db.iter_unspent_for_scripts
     mgr = WalletManager(str(tmp_path), "regtest")
     mgr.set_database(chain)
     wallet, _warn = mgr.load_wallet("w")
