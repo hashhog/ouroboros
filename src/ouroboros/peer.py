@@ -651,6 +651,11 @@ class Peer:
         # include v1 header framing and v2 AEAD tags.
         self.bytes_sent: int = 0
         self.bytes_recv: int = 0
+        # Core CNode::mapSendBytesPerMsgType / mapRecvBytesPerMsgType, surfaced
+        # as getpeerinfo bytessent_per_msg / bytesrecv_per_msg (wire bytes,
+        # keyed by message command).
+        self.bytes_sent_per_msg: dict[str, int] = {}
+        self.bytes_recv_per_msg: dict[str, int] = {}
         self.last_send: float = 0.0
         self.last_recv: float = 0.0
         # Coarse per-connection inactivity clock (Core parity:
@@ -1741,6 +1746,8 @@ class Peer:
         await self._bounded_drain()
 
         self.bytes_sent += len(data)
+        self.bytes_sent_per_msg[msg.command] = (
+            self.bytes_sent_per_msg.get(msg.command, 0) + len(data))
         NET_TOTALS["sent"] += len(data)
         self.last_send = time.time()
 
@@ -1973,6 +1980,8 @@ class Peer:
         logger.debug(f"Received {command} from {self.host}:{self.port} ({len(payload)} bytes)")
 
         self.bytes_recv += 24 + len(payload)
+        self.bytes_recv_per_msg[command] = (
+            self.bytes_recv_per_msg.get(command, 0) + 24 + len(payload))
         NET_TOTALS["recv"] += 24 + len(payload)
         self.last_recv = time.time()
 
@@ -2116,6 +2125,8 @@ class Peer:
                 continue
 
             command, payload = decoded
+            self.bytes_recv_per_msg[command] = (
+                self.bytes_recv_per_msg.get(command, 0) + wire_bytes_this_call)
             # RSS-leak mitigation (2026-07-06, ouroboros OOM-loop root-cause):
             # the v2 receive path was retaining ~1 coroutine frame + its byte
             # buffers per inbound message (tracemalloc soaks 2026-06-21), climbing
