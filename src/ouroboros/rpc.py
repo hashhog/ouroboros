@@ -2630,7 +2630,7 @@ class RPCServer:
         """Register REST interface endpoints (no authentication required)."""
         from ouroboros.rest import RESTInterface
 
-        rest_interface = RESTInterface(self.node)
+        rest_interface = RESTInterface(self.node, rpc=self)
         self.app.include_router(rest_interface.router)
         logger.info("REST interface enabled at /rest/*")
 

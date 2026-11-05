@@ -401,6 +401,10 @@ class NodeConfig:
             'asmap': self.get('asmap') or '',
             # Script verification threads (Core: -par).  0 = auto.
             'par': self.getint('par'),
+            # REST interface (Core: -rest).  Without this key BitcoinNode
+            # read its '0' default and never mounted /rest/*, even with
+            # rest=1 in ouroboros.conf or OUROBOROS_REST=1 in the env.
+            'rest': self.getboolean('rest'),
         }
 
 

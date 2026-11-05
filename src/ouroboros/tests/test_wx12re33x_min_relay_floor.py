@@ -172,8 +172,11 @@ class TestDisplayEqualsPolicy(unittest.TestCase):
         self.assertNotIn("incrementalrelayfee\": 0.00001", _REST_SRC)
 
     def test_rest_reads_constant(self):
-        self.assertIn("DEFAULT_MIN_RELAY_TX_FEE / 1e8", _REST_SRC)
-        self.assertIn("DEFAULT_INCREMENTAL_RELAY_FEE / 1e8", _REST_SRC)
+        # /rest/mempool/info.json no longer formats the fees itself: it
+        # serves the getmempoolinfo RPC object (Core: MempoolInfoToJSON), so
+        # the floor is read from the constants in exactly one place.
+        self.assertIn("rpc_getmempoolinfo()", _REST_SRC)
+        self.assertNotIn("0.00001", _REST_SRC)
 
     def test_display_value_matches_policy_0_00000100(self):
         """The BTC token every site emits for the floor is 0.00000100."""
