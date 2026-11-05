@@ -217,7 +217,8 @@ class TestPackageValidation:
 
         success, error = mempool.validate_package(txs, height=100)
         assert not success
-        assert "too large" in error.lower() or str(MAX_PACKAGE_COUNT) in error
+        # Core IsWellFormedPackage token (policy/packages.cpp).
+        assert error == "package-too-many-transactions"
 
     def test_duplicate_tx_rejected(self):
         """Packages with duplicate transactions are rejected."""
@@ -232,7 +233,7 @@ class TestPackageValidation:
 
         success, error = mempool.validate_package([tx, tx], height=100)
         assert not success
-        assert "Duplicate" in error
+        assert error == "package-contains-duplicates"  # Core IsWellFormedPackage
 
     def test_double_spend_in_package_rejected(self):
         """Packages with double-spends are rejected."""
@@ -259,7 +260,7 @@ class TestPackageValidation:
 
         success, error = mempool.validate_package([tx1, tx2, child], height=100)
         assert not success
-        assert "Double-spend" in error
+        assert error == "conflict-in-package"  # Core IsWellFormedPackage
 
     def test_not_topological_order_rejected(self):
         """Packages not in topological order are rejected."""
@@ -279,7 +280,7 @@ class TestPackageValidation:
         # Submit in wrong order: child before parent
         success, error = mempool.validate_package([child, parent], height=100)
         assert not success
-        assert "topological" in error.lower()
+        assert error == "package-not-sorted"  # Core IsWellFormedPackage
 
     def test_not_child_with_parents_rejected(self):
         """Packages that aren't child-with-parents are rejected."""

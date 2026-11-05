@@ -1427,7 +1427,8 @@ class TestG26PackageCount(unittest.TestCase):
 
         ok, err = mp.validate_package(txs, height=101)
         self.assertFalse(ok)
-        self.assertIn("large", err.lower())
+        # Core IsWellFormedPackage token (policy/packages.cpp).
+        self.assertEqual(err, "package-too-many-transactions")
 
 
 # ---------------------------------------------------------------------------
@@ -1494,7 +1495,8 @@ class TestG29PackageInternalDoubleSpend(unittest.TestCase):
 
         ok, err = mp.validate_package([tx1, tx2], height=101)
         self.assertFalse(ok, "Package with internal double-spend must be rejected")
-        self.assertIn("double", err.lower())
+        # Core IsWellFormedPackage token (policy/packages.cpp).
+        self.assertEqual(err, "conflict-in-package")
 
 
 # ---------------------------------------------------------------------------
@@ -1625,8 +1627,11 @@ class TestBugPackageValidationSkipsStandardness(unittest.TestCase):
     def test_package_applies_standardness(self):
         from ouroboros.mempool import Mempool
         import inspect
-        # The package path must now run the standardness PreChecks per member.
-        src = inspect.getsource(Mempool._validate_package_inner)
+        # The package path must now run the standardness PreChecks per member:
+        # every member goes through _add_transaction_inner (with a package
+        # coin overlay), which runs them.
+        self.assertIn("_add_transaction_inner", inspect.getsource(Mempool._accept_multiple))
+        src = inspect.getsource(Mempool._add_transaction_inner)
         self.assertIn("_is_standard_tx", src,
                       "package path must apply IsStandardTx per member (relay-policy parity)")
         self.assertIn("_validate_inputs_standardness", src,
@@ -1635,10 +1640,11 @@ class TestBugPackageValidationSkipsStandardness(unittest.TestCase):
     def test_package_skips_minrelayfee_per_tx(self):
         from ouroboros.mempool import Mempool
         import inspect
-        src = inspect.getsource(Mempool._validate_package_inner)
+        src = inspect.getsource(Mempool._accept_multiple)
         # package validates aggregate fee but not per-tx minimum relay fee
         # (this is correct for CPFP; the aggregate check is the right one)
-        self.assertIn("package_fee_rate", src)
+        self.assertIn("package_feerate=package_feerates", src)
+        self.assertIn("total_fee < min_relay", src)
 
 
 class TestBugRbfNewFeeIgnoresMempoolParents(unittest.TestCase):

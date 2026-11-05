@@ -1466,6 +1466,114 @@ def _parse_hex_v(value: Any, name: str) -> bytes:
     return bytes.fromhex(value)
 
 
+
+def _btc(sats: int) -> float:
+    """Core ``ValueFromAmount`` for a satoshi amount (8 decimals)."""
+    return round(sats / 1e8, 8)
+
+
+def _package_fees_obj(res: Any, with_effective: bool) -> dict[str, Any]:
+    fees: dict[str, Any] = {"base": _btc(res.fee)}
+    if with_effective:
+        fees["effective-feerate"] = _btc(res.effective_feerate)
+        fees["effective-includes"] = [w[::-1].hex() for w in res.effective_includes]
+    return fees
+
+
+def _format_testmempoolaccept_package(txs: list, pkg: Any, maxfeerate: Any) -> list[dict[str, Any]]:
+    """Core rpc/mempool.cpp testmempoolaccept result for a package.
+
+    Per tx: txid/wtxid, ``package-error`` on a package-policy failure, and a
+    verdict only for txs the package evaluation reached.  Allowed txs carry
+    vsize and fees{base, effective-feerate, effective-includes}; rejected ones
+    ``reject-reason`` (``missing-inputs`` with no details, as Core) and
+    ``reject-details``.  A tx over *maxfeerate* is ``max-fee-exceeded`` and
+    leaves the later txs without a verdict.
+    """
+    try:
+        max_kvb = int(round(float(maxfeerate) * 1e8)) if maxfeerate is not None else 0
+    except (TypeError, ValueError):
+        max_kvb = 0
+    out: list[dict[str, Any]] = []
+    exit_early = False
+    for tx in txs:
+        try:
+            wtxid = tx.get_wtxid()
+        except Exception:
+            wtxid = tx.get_txid()
+        inner: dict[str, Any] = {
+            "txid": tx.get_txid()[::-1].hex(),
+            "wtxid": wtxid[::-1].hex(),
+        }
+        if pkg.state == "policy":
+            inner["package-error"] = pkg.message
+        res = pkg.results.get(wtxid)
+        if exit_early or res is None:
+            out.append(inner)
+            continue
+        if res.kind == "valid":
+            max_fee = -((-max_kvb * res.vsize) // 1000) if max_kvb else 0
+            if max_fee and res.fee > max_fee:
+                inner["allowed"] = False
+                inner["reject-reason"] = "max-fee-exceeded"
+                exit_early = True
+            else:
+                inner["allowed"] = True
+                inner["vsize"] = res.vsize
+                inner["fees"] = _package_fees_obj(res, True)
+        else:
+            inner["allowed"] = False
+            if res.missing_inputs:
+                inner["reject-reason"] = "missing-inputs"
+            else:
+                inner["reject-reason"] = res.reject_reason
+                inner["reject-details"] = res.reject_details or res.reject_reason
+        out.append(inner)
+    return out
+
+
+def _format_submitpackage(txs: list, pkg: Any) -> dict[str, Any]:
+    """Core rpc/mempool.cpp submitpackage result.
+
+    ``package_msg`` is "success" or the package state's message;
+    ``tx-results`` is keyed by wtxid with, per tx, ``other-wtxid`` (same txid
+    with another witness in the pool), ``error`` (Core TxValidationState::
+    ToString(); missing inputs read "bad-txns-inputs-missingorspent"), or
+    vsize + fees (effective feerate only for txs accepted by this call), and
+    ``replaced-transactions`` lists the txids replaced.  A package refused
+    before any per-tx verdict (``per_tx_results`` False: it needs package
+    RBF, which this node lacks) gets no tx-results entries.
+    """
+    tx_results: dict[str, Any] = {}
+    replaced: set[bytes] = set()
+    for tx in (txs if getattr(pkg, "per_tx_results", True) else []):
+        try:
+            wtxid = tx.get_wtxid()
+        except Exception:
+            wtxid = tx.get_txid()
+        inner: dict[str, Any] = {"txid": tx.get_txid()[::-1].hex()}
+        res = pkg.results.get(wtxid)
+        if res is None:
+            inner["error"] = "package-not-validated"
+        elif res.kind == "different-witness":
+            inner["other-wtxid"] = res.other_wtxid[::-1].hex()
+        elif res.kind == "invalid":
+            if res.missing_inputs:
+                inner["error"] = "bad-txns-inputs-missingorspent"
+            else:
+                inner["error"] = res.reject_details or res.reject_reason
+        else:
+            inner["vsize"] = res.vsize
+            inner["fees"] = _package_fees_obj(res, res.kind == "valid")
+            replaced.update(res.replaced)
+        tx_results[wtxid[::-1].hex()] = inner
+    return {
+        "package_msg": "success" if pkg.state == "valid" else pkg.message,
+        "tx-results": tx_results,
+        # Core std::set<Txid>: ordered by the internal (little-endian) bytes.
+        "replaced-transactions": [t[::-1].hex() for t in sorted(replaced)],
+    }
+
 class JSONRPCRequest(BaseModel):
     """JSON-RPC 2.0 request model"""
     jsonrpc: str = "2.0"
@@ -15383,6 +15491,17 @@ class RPCServer:
                 ) from None
 
         mempool = getattr(self.node, "mempool", None)
+        if (len(decoded) > 1 and mempool is not None
+                and getattr(self.node, "db", None) is not None
+                and hasattr(mempool, "accept_package")):
+            # Core: more than one tx is evaluated as a package
+            # (ProcessNewPackage test_accept=true ->
+            # AcceptMultipleTransactions): a child resolves its parent from
+            # the package, and the first failure leaves the later txs with no
+            # verdict.  One tx keeps the single-tx path below.
+            _, best_height = self.node.db.get_best_block()
+            pkg = mempool.accept_package(decoded, best_height, test_accept=True)
+            return _format_testmempoolaccept_package(decoded, pkg, maxfeerate)
         results: list[dict[str, Any]] = []
         for tx in decoded:
             try:
@@ -15458,51 +15577,31 @@ class RPCServer:
                 )
             txs.append(tx)
 
+        # Core rpc/mempool.cpp submitpackage: a multi-tx package must be a
+        # child with its parents and the parents must not depend on each
+        # other, else JSONRPCTransactionError(INVALID_PACKAGE) before any
+        # validation.
+        if len(txs) > 1:
+            from ouroboros.mempool import Mempool as _Mempool
+            if not _Mempool.is_child_with_parents_tree(txs):
+                raise RpcError(
+                    RPC_VERIFY_ERROR,
+                    "package topology disallowed. not child-with-parents or "
+                    "parents depend on each other.",
+                )
+
         if not hasattr(self.node, "mempool") or self.node.mempool is None:
             raise HTTPException(status_code=500, detail="Mempool not available")
         if not hasattr(self.node, "db") or not self.node.db:
             raise HTTPException(status_code=500, detail="Database not available")
 
+        # Staged acceptance (Core ProcessNewPackage -> AcceptPackage): txs
+        # already in the pool are reported, the rest are tried one at a time
+        # and only fee/missing-input failures are retried at the package
+        # feerate.  Height is the tip, as for sendrawtransaction.
         _, best_height = self.node.db.get_best_block()
-        success, error = self.node.mempool.validate_package(txs, best_height + 1)
-
-        if not success:
-            return {
-                "package_msg": error,
-                "tx-results": {},
-            }
-
-        # Build per-transaction results from the mempool entries that were
-        # just inserted by validate_package.
-        # JSON-RPC convention: txids/wtxids in responses are display-order (BE).
-        # get_txid()/get_wtxid() return LE (internal byte order); reverse for JSON.
-        # BUG-5 fix: Core keys tx-results by wtxid (GetWitnessHash().GetHex()),
-        # not txid — rpc/mempool.cpp:1464. For segwit txs (txid != wtxid) client
-        # tools keying by wtxid would otherwise get an empty miss.
-        tx_results: dict[str, Any] = {}
-        for tx in txs:
-            txid_hex = tx.get_txid()[::-1].hex()
-            wtxid_hex = tx.get_wtxid()[::-1].hex()
-            entry = self.node.mempool.get_transaction_entry(tx.get_txid())
-            if entry is not None:
-                tx_results[wtxid_hex] = {
-                    "txid": txid_hex,
-                    "vsize": tx.get_vsize(),
-                    "fees": {
-                        "base": entry.fee / 1e8,
-                    },
-                }
-            else:
-                tx_results[wtxid_hex] = {
-                    "txid": txid_hex,
-                    "vsize": tx.get_vsize(),
-                    "fees": {"base": 0},
-                }
-
-        return {
-            "package_msg": "success",
-            "tx-results": tx_results,
-        }
+        pkg = self.node.mempool.accept_package(txs, best_height)
+        return _format_submitpackage(txs, pkg)
 
     async def rpc_listtransactions(
         self, label: str = "*", count: int = 10, skip: int = 0,

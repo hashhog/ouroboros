@@ -1074,7 +1074,9 @@ class TestEphemeralDust:
 
         ok, err = pool.validate_package([parent, child], height=100)
         assert not ok, "Package with unspent ephemeral dust should be rejected"
-        assert "ephemeral dust" in err.lower()
+        # The parent pays a fee, so Core's PreCheckEphemeralTx token "dust"
+        # ("tx with dust output must be 0-fee") fires before the spend check.
+        assert "dust" in err.lower()
 
     # ── Test 4: non-v3 tx with dust is still rejected normally ──────
 
@@ -1898,7 +1900,9 @@ class TestTRUCPackagePolicy:
         # This should fail because the v3 parent already has a child
         ok, err = pool.validate_package([child2], height=100)
         assert not ok, "Second child of v3 parent should be rejected"
-        assert "descendant" in err.lower()
+        # A one-tx package is the single-tx accept (Core AcceptSubPackage
+        # ({tx})), which tries TRUC sibling eviction; equal fee fails it.
+        assert "descendant" in err.lower() or "sibling eviction" in err.lower()
 
 
 # ── Ephemeral Dust Policy Tests (Extended) ──────────────────────────────

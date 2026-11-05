@@ -18,6 +18,7 @@ import hashlib
 import logging
 import os
 import struct
+import threading
 from enum import IntEnum
 
 from ouroboros.database import Transaction
@@ -690,6 +691,77 @@ def _get_witness_version_and_program(script_pubkey: bytes) -> tuple[int, bytes] 
     return version, script_pubkey[2:]
 
 
+#: Core ``ScriptErrorString`` (script/script_error.cpp), keyed by the
+#: ``SCRIPT_ERR_*`` name ``ScriptInterpreter.last_error`` carries.  The
+#: mempool uses it for Core's "mempool-script-verify-flag-failed (<text>)"
+#: reject reason.
+SCRIPT_ERROR_STRINGS: dict[str, str] = {
+    "SCRIPT_ERR_OK": "No error",
+    "SCRIPT_ERR_EVAL_FALSE": "Script evaluated without error but finished with a false/empty top stack element",
+    "SCRIPT_ERR_VERIFY": "Script failed an OP_VERIFY operation",
+    "SCRIPT_ERR_EQUALVERIFY": "Script failed an OP_EQUALVERIFY operation",
+    "SCRIPT_ERR_CHECKMULTISIGVERIFY": "Script failed an OP_CHECKMULTISIGVERIFY operation",
+    "SCRIPT_ERR_CHECKSIGVERIFY": "Script failed an OP_CHECKSIGVERIFY operation",
+    "SCRIPT_ERR_NUMEQUALVERIFY": "Script failed an OP_NUMEQUALVERIFY operation",
+    "SCRIPT_ERR_SCRIPT_SIZE": "Script is too big",
+    "SCRIPT_ERR_PUSH_SIZE": "Push value size limit exceeded",
+    "SCRIPT_ERR_OP_COUNT": "Operation limit exceeded",
+    "SCRIPT_ERR_STACK_SIZE": "Stack size limit exceeded",
+    "SCRIPT_ERR_SIG_COUNT": "Signature count negative or greater than pubkey count",
+    "SCRIPT_ERR_PUBKEY_COUNT": "Pubkey count negative or limit exceeded",
+    "SCRIPT_ERR_BAD_OPCODE": "Opcode missing or not understood",
+    "SCRIPT_ERR_DISABLED_OPCODE": "Attempted to use a disabled opcode",
+    "SCRIPT_ERR_INVALID_STACK_OPERATION": "Operation not valid with the current stack size",
+    "SCRIPT_ERR_INVALID_ALTSTACK_OPERATION": "Operation not valid with the current altstack size",
+    "SCRIPT_ERR_OP_RETURN": "OP_RETURN was encountered",
+    "SCRIPT_ERR_UNBALANCED_CONDITIONAL": "Invalid OP_IF construction",
+    "SCRIPT_ERR_NEGATIVE_LOCKTIME": "Negative locktime",
+    "SCRIPT_ERR_UNSATISFIED_LOCKTIME": "Locktime requirement not satisfied",
+    "SCRIPT_ERR_SIG_HASHTYPE": "Signature hash type missing or not understood",
+    "SCRIPT_ERR_SIG_DER": "Non-canonical DER signature",
+    "SCRIPT_ERR_MINIMALDATA": "Data push larger than necessary",
+    "SCRIPT_ERR_SIG_PUSHONLY": "Only push operators allowed in signatures",
+    "SCRIPT_ERR_SIG_HIGH_S": "Non-canonical signature: S value is unnecessarily high",
+    "SCRIPT_ERR_SIG_NULLDUMMY": "Dummy CHECKMULTISIG argument must be zero",
+    "SCRIPT_ERR_MINIMALIF": "OP_IF/NOTIF argument must be minimal",
+    "SCRIPT_ERR_SIG_NULLFAIL": "Signature must be zero for failed CHECK(MULTI)SIG operation",
+    "SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS": "NOPx reserved for soft-fork upgrades",
+    "SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM": "Witness version reserved for soft-fork upgrades",
+    "SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION": "Taproot version reserved for soft-fork upgrades",
+    "SCRIPT_ERR_DISCOURAGE_OP_SUCCESS": "OP_SUCCESSx reserved for soft-fork upgrades",
+    "SCRIPT_ERR_DISCOURAGE_UPGRADABLE_PUBKEYTYPE": "Public key version reserved for soft-fork upgrades",
+    "SCRIPT_ERR_PUBKEYTYPE": "Public key is neither compressed or uncompressed",
+    "SCRIPT_ERR_CLEANSTACK": "Stack size must be exactly one after execution",
+    "SCRIPT_ERR_WITNESS_PROGRAM_WRONG_LENGTH": "Witness program has incorrect length",
+    "SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY": "Witness program was passed an empty witness",
+    "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH": "Witness program hash mismatch",
+    "SCRIPT_ERR_WITNESS_MALLEATED": "Witness requires empty scriptSig",
+    "SCRIPT_ERR_WITNESS_MALLEATED_P2SH": "Witness requires only-redeemscript scriptSig",
+    "SCRIPT_ERR_WITNESS_UNEXPECTED": "Witness provided for non-witness script",
+    "SCRIPT_ERR_WITNESS_PUBKEYTYPE": "Using non-compressed keys in segwit",
+    "SCRIPT_ERR_SCHNORR_SIG_SIZE": "Invalid Schnorr signature size",
+    "SCRIPT_ERR_SCHNORR_SIG_HASHTYPE": "Invalid Schnorr signature hash type",
+    "SCRIPT_ERR_SCHNORR_SIG": "Invalid Schnorr signature",
+    "SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE": "Invalid Taproot control block size",
+    "SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT": "Too much signature validation relative to witness weight",
+    "SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG": "OP_CHECKMULTISIG(VERIFY) is not available in tapscript",
+    "SCRIPT_ERR_TAPSCRIPT_MINIMALIF": "OP_IF/NOTIF argument must be minimal in tapscript",
+    "SCRIPT_ERR_TAPSCRIPT_EMPTY_PUBKEY": "Empty public key in tapscript",
+    "SCRIPT_ERR_OP_CODESEPARATOR": "Using OP_CODESEPARATOR in non-witness script",
+    "SCRIPT_ERR_SIG_FINDANDDELETE": "Signature is found in scriptCode",
+    "SCRIPT_ERR_SCRIPTNUM": "Script number overflowed or is non-minimally encoded",
+}
+
+#: Python-path exception prefixes whose Core script error is unambiguous.
+#: Every ``raise ValueError("NULLFAIL: ...")`` is Core's SCRIPT_ERR_SIG_NULLFAIL
+#: and every ``"NULLDUMMY: ..."`` its SCRIPT_ERR_SIG_NULLDUMMY; other Python
+#: failures have no recorded name (``last_error`` stays ``None``).
+_PY_ERROR_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("NULLFAIL:", "SCRIPT_ERR_SIG_NULLFAIL"),
+    ("NULLDUMMY:", "SCRIPT_ERR_SIG_NULLDUMMY"),
+)
+
+
 class ScriptInterpreter:
     """Interprets and verifies Bitcoin scripts"""
 
@@ -698,9 +770,26 @@ class ScriptInterpreter:
     _native_exc_log_budget = 20
 
     def __init__(self):
-        #: Core ``SCRIPT_ERR_*`` name of the last native rejection, or
-        #: ``None``; the Python path never sets it.
-        self.last_error = None
+        # One validator's interpreter is shared by the block script-check
+        # threads, so the last error is kept per thread: a reader sees the
+        # error of the verify call its own thread made.
+        self._error_tls = threading.local()
+
+    @property
+    def last_error(self) -> str | None:
+        """Core ``SCRIPT_ERR_*`` name of this thread's last rejection, or
+        ``None``.  The native path names every rejection; the Python path
+        only the ones in ``_PY_ERROR_PREFIXES`` (P2WPKH NULLFAIL included).
+        """
+        tls = self.__dict__.get("_error_tls")
+        return getattr(tls, "value", None) if tls is not None else None
+
+    @last_error.setter
+    def last_error(self, value: str | None) -> None:
+        tls = self.__dict__.get("_error_tls")
+        if tls is None:
+            tls = self._error_tls = threading.local()
+        tls.value = value
 
     def verify(
         self,
@@ -795,6 +884,18 @@ class ScriptInterpreter:
         7. If witness program detected, verify witness
         8. Enforce clean stack
         """
+        self.last_error = None
+        ok = self._verify_python_inner(
+            script_sig, script_pubkey, tx, input_index, flags, amount,
+            input_amounts, input_script_pubkeys)
+        if ok:
+            self.last_error = None
+        return ok
+
+    def _verify_python_inner(
+        self, script_sig, script_pubkey, tx, input_index, flags, amount,
+        input_amounts, input_script_pubkeys,
+    ) -> bool:
         try:
             # SIGPUSHONLY: scriptSig must contain only data pushes
             if (flags & SCRIPT_VERIFY_SIGPUSHONLY) and not _is_push_only_simple(script_sig):
@@ -891,6 +992,11 @@ class ScriptInterpreter:
         except Exception as _exc:
             if is_system_error(_exc):
                 raise  # gate 6: a system fault is never a script result
+            msg = str(_exc)
+            for prefix, name in _PY_ERROR_PREFIXES:
+                if msg.startswith(prefix):
+                    self.last_error = name
+                    break
             return False
 
     def _is_p2sh(self, script: bytes) -> bool:
@@ -995,9 +1101,10 @@ class ScriptInterpreter:
         msg = self._compute_segwit_v0_sighash(
             tx, input_index, script_code, amount, sighash_type)
         if not self._verify_ecdsa_signature(msg, der_sig, pubkey):
-            # NULLFAIL: non-empty sig must not be present on failure.
+            # NULLFAIL: non-empty sig must not be present on failure (the sig
+            # is non-empty here: an empty one returned above).
             if flags & SCRIPT_VERIFY_NULLFAIL:
-                return False
+                self.last_error = "SCRIPT_ERR_SIG_NULLFAIL"
             return False
         return True
 
