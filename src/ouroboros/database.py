@@ -1181,11 +1181,15 @@ class BlockchainDatabase:
         One walk of the UTXO set for a whole set of scripts.  The wallet uses
         it once, to build its coin store for a wallet file written before the
         store existed; afterwards the wallet reads its own store.
+
+        Unlike the per-address walks, it raises when the walk cannot run (no
+        ``iter_utxos`` in the extension, or the iterator fails to open): an
+        empty result would be recorded as a completed migration with no coins.
         """
         wanted = {bytes(s) for s in script_pubkeys}
         if not wanted:
             return
-        yield from self._iter_utxos_where(lambda spk: spk in wanted)
+        yield from self._iter_utxos_where(lambda spk: spk in wanted, strict=True)
 
     def _balance_for_script_pubkey(self, script_pubkey: bytes) -> int:
         total = 0
@@ -1199,7 +1203,7 @@ class BlockchainDatabase:
     def _iter_matching_utxos(self, script_pubkey: bytes):
         yield from self._iter_utxos_where(lambda spk: spk == script_pubkey)
 
-    def _iter_utxos_where(self, match):
+    def _iter_utxos_where(self, match, strict: bool = False):
         # Walk the REAL chainstate UTXO set (``iter_utxos`` reads
         # CHAINSTATE_CF), not the demo-only ``get_utxos`` stub which returned
         # three hardcoded example coins and therefore never matched a wallet
@@ -1213,10 +1217,14 @@ class BlockchainDatabase:
         # and ``is_coinbase`` so callers can enforce coinbase maturity.
         iter_fn = getattr(self._db, "iter_utxos", None)
         if iter_fn is None:
+            if strict:
+                raise RuntimeError("chainstate UTXO walk unavailable (no iter_utxos)")
             return
         try:
             py_utxos = iter_fn()
-        except Exception:
+        except Exception as e:
+            if strict:
+                raise RuntimeError(f"chainstate UTXO walk failed: {e}") from e
             return
         for py_utxo in py_utxos:
             spk = bytes(py_utxo.script_pubkey)

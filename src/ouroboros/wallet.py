@@ -1745,6 +1745,10 @@ class Wallet:
         elif self._hd_seed is not None:
             self._key_pool = KeyPool(self._hd_seed, self.network)
             self._key_pool.top_up()
+        # Read the scan marker BEFORE the wallet reads as unlocked: from the
+        # next line on, live block notifications reach this wallet again and
+        # advance the marker past the blocks it missed while locked.
+        marker = self._best_scanned_height
         self._passphrase = passphrase
         self._encrypted_blob = None
         self._owned_spk_cache = None
@@ -1755,6 +1759,32 @@ class Wallet:
             self.migrate_store_if_needed()
         except Exception as e:
             logger.warning(f"wallet '{self.name}' store migration failed: {e}")
+        try:
+            self._catch_up_store_after_unlock(marker)
+        except Exception as e:
+            logger.warning(f"wallet '{self.name}' store catch-up failed: {e}")
+
+    def _catch_up_store_after_unlock(self, marker: int | None) -> None:
+        """Bring the store up to the chain after a locked period.
+
+        A locked wallet has no scripts in memory, so the block connect and
+        disconnect notifications skip it.  Before the store that did not
+        matter for coins, because every balance read walked the chainstate
+        with the unlocked keys.  The store only knows what it was told, so on
+        unlock it unwinds blocks the chain lost while the wallet was locked
+        and then rescans the blocks above the scan marker, as the startup
+        reconcile does for an unlocked wallet.
+        """
+        if self.db is None or self._store is None:
+            return
+        undone = self.reconcile_store_with_chain()
+        if undone is not None and marker is not None and marker >= undone:
+            marker = undone - 1
+        if marker is None:
+            # No marker: birthday at the current tip (reconcile_on_load's
+            # rule); a migration has already seeded the current coins.
+            return
+        self.rescan_chain(marker + 1, None)
 
     def lock(self) -> None:
         """Re-lock the wallet: save encrypted and wipe in-memory keys."""

@@ -212,7 +212,7 @@ def test_wallet_coins_and_history_survive_restart(tmp_path):
     txid3 = _coinbase(3, spk).txid[::-1].hex()
     assert w.gettransaction_entry(txid3) is not None
     w._save()
-    w.close_store()
+    getattr(w, "close_store", lambda: None)()
 
     w2 = _wallet(tmp_path)
     w2.set_database(chain)
@@ -397,6 +397,105 @@ def test_migration_waits_for_background_reconcile_at_startup(tmp_path):
 
 
 def test_store_file_is_owner_only(tmp_path):
+    _wallet(tmp_path)
+    path = tmp_path / "wallets" / "w" / "txstore.sqlite"
+    assert path.exists(), "no persistent wallet store"
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+def test_unlock_catches_up_blocks_connected_and_lost_while_locked(tmp_path):
+    """A locked wallet has no scripts in memory, so block notifications skip
+    it.  Before the store its coins still showed up after unlock, because
+    every read walked the chainstate with the unlocked keys; the store has
+    to catch up on unlock instead: drop coins from blocks the chain lost
+    while locked, and add coins from blocks connected while locked."""
+    from ouroboros.wallet import WalletManager
+
+    w, chain, _addr, spk = _funded_wallet(tmp_path, blocks=101)
+    mgr = WalletManager(str(tmp_path), "regtest")
+    mgr._wallets["w"] = w
+    via_mgr = SimpleNamespace(scan_block_connect=mgr.notify_block_connected)
+
+    stale = _spend(_h("foreign"), 0, [(spk, 3 * COIN)], tag="stale")
+    chain.connect(via_mgr, 102, [_coinbase(102, FOREIGN_SPK), stale], tag="A")
+    assert 3 * COIN in {c["value"] for c in w.wallet_coins()}
+
+    w.encrypt("pw")
+    w.lock()
+    # Reorg while locked: 102A is replaced by 102B, then 103 pays the wallet.
+    chain.utxos.pop((stale.txid, 0), None)
+    chain.connect(via_mgr, 102, [_coinbase(102, FOREIGN_SPK)], tag="B")
+    pay = _spend(_h("foreign2"), 0, [(spk, 7 * COIN)], tag="pay")
+    chain.connect(via_mgr, 103, [_coinbase(103, FOREIGN_SPK), pay])
+
+    w.unlock("pw")
+    values = [c["value"] for c in w.wallet_coins()]
+    assert 3 * COIN not in values
+    assert 7 * COIN in values
+    # tip 103: coinbases 1..3 are mature (150) plus the 7 BTC payment.
+    assert asyncio.run(w.get_balance()) == 3 * 50 * COIN + 7 * COIN
+
+
+def test_failed_migration_walk_stays_pending(tmp_path):
+    """A chainstate walk that cannot run must not be recorded as a finished
+    migration with no coins: the balance would read 0 for good.  The store
+    stays pending and the next attempt migrates."""
+    from ouroboros.address import address_to_script_pubkey
+    from ouroboros.wallet import WalletManager
+
     w = _wallet(tmp_path)
-    mode = stat.S_IMODE(os.stat(w._store_path()).st_mode)
-    assert mode == 0o600
+    w.init_hd(seed=bytes(range(32)))
+    addr = asyncio.run(w.generate_new_address(address_type="bech32"))
+    w._save()
+    getattr(w, "close_store", lambda: None)()
+    for suffix in ("", "-wal", "-shm"):
+        p = tmp_path / "wallets" / "w" / f"txstore.sqlite{suffix}"
+        if p.exists():
+            p.unlink()
+
+    spk = address_to_script_pubkey(addr, "regtest")
+    chain = FakeChain()
+    tx = _coinbase(1, spk, value=5 * COIN)
+    chain.utxos[(tx.txid, 0)] = {"value": 5 * COIN, "script_pubkey": spk,
+                                 "height": 1, "is_coinbase": False}
+    chain.blocks[1] = SimpleNamespace(hash=_h("blk", 1), timestamp=0, transactions=[tx])
+    chain.tip = 1
+    real_iter = chain.iter_unspent_for_scripts
+
+    def _broken(scripts):
+        raise RuntimeError("chainstate UTXO walk failed: iterator open")
+        yield  # pragma: no cover
+
+    chain.iter_unspent_for_scripts = _broken
+    mgr = WalletManager(str(tmp_path), "regtest")
+    mgr.set_database(chain)
+    wallet, _warn = mgr.load_wallet("w")
+    assert wallet.store_migration_pending
+
+    chain.iter_unspent_for_scripts = real_iter
+    assert wallet.migrate_store_if_needed() == 1
+    assert not wallet.store_migration_pending
+    assert asyncio.run(wallet.get_balance()) == 5 * COIN
+
+
+def test_database_script_walk_raises_when_the_walk_cannot_run():
+    """``BlockchainDatabase.iter_unspent_for_scripts`` (the migration's walk) raises
+    instead of yielding nothing when the extension has no ``iter_utxos`` or
+    the iterator fails to open; the per-address walks keep their old
+    yield-nothing fallback."""
+    import pytest
+
+    from ouroboros.database import BlockchainDatabase
+
+    db = BlockchainDatabase.__new__(BlockchainDatabase)
+    db._db = SimpleNamespace()
+    with pytest.raises(RuntimeError):
+        list(db.iter_unspent_for_scripts({b"\x51"}))
+
+    def _fail():
+        raise OSError("iterator open")
+
+    db._db = SimpleNamespace(iter_utxos=_fail)
+    with pytest.raises(RuntimeError):
+        list(db.iter_unspent_for_scripts({b"\x51"}))
+    assert list(db._iter_matching_utxos(b"\x51")) == []
