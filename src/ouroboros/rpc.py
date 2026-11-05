@@ -1466,6 +1466,114 @@ def _parse_hex_v(value: Any, name: str) -> bytes:
     return bytes.fromhex(value)
 
 
+
+def _btc(sats: int) -> float:
+    """Core ``ValueFromAmount`` for a satoshi amount (8 decimals)."""
+    return round(sats / 1e8, 8)
+
+
+def _package_fees_obj(res: Any, with_effective: bool) -> dict[str, Any]:
+    fees: dict[str, Any] = {"base": _btc(res.fee)}
+    if with_effective:
+        fees["effective-feerate"] = _btc(res.effective_feerate)
+        fees["effective-includes"] = [w[::-1].hex() for w in res.effective_includes]
+    return fees
+
+
+def _format_testmempoolaccept_package(txs: list, pkg: Any, maxfeerate: Any) -> list[dict[str, Any]]:
+    """Core rpc/mempool.cpp testmempoolaccept result for a package.
+
+    Per tx: txid/wtxid, ``package-error`` on a package-policy failure, and a
+    verdict only for txs the package evaluation reached.  Allowed txs carry
+    vsize and fees{base, effective-feerate, effective-includes}; rejected ones
+    ``reject-reason`` (``missing-inputs`` with no details, as Core) and
+    ``reject-details``.  A tx over *maxfeerate* is ``max-fee-exceeded`` and
+    leaves the later txs without a verdict.
+    """
+    try:
+        max_kvb = int(round(float(maxfeerate) * 1e8)) if maxfeerate is not None else 0
+    except (TypeError, ValueError):
+        max_kvb = 0
+    out: list[dict[str, Any]] = []
+    exit_early = False
+    for tx in txs:
+        try:
+            wtxid = tx.get_wtxid()
+        except Exception:
+            wtxid = tx.get_txid()
+        inner: dict[str, Any] = {
+            "txid": tx.get_txid()[::-1].hex(),
+            "wtxid": wtxid[::-1].hex(),
+        }
+        if pkg.state == "policy":
+            inner["package-error"] = pkg.message
+        res = pkg.results.get(wtxid)
+        if exit_early or res is None:
+            out.append(inner)
+            continue
+        if res.kind == "valid":
+            max_fee = -((-max_kvb * res.vsize) // 1000) if max_kvb else 0
+            if max_fee and res.fee > max_fee:
+                inner["allowed"] = False
+                inner["reject-reason"] = "max-fee-exceeded"
+                exit_early = True
+            else:
+                inner["allowed"] = True
+                inner["vsize"] = res.vsize
+                inner["fees"] = _package_fees_obj(res, True)
+        else:
+            inner["allowed"] = False
+            if res.missing_inputs:
+                inner["reject-reason"] = "missing-inputs"
+            else:
+                inner["reject-reason"] = res.reject_reason
+                inner["reject-details"] = res.reject_details or res.reject_reason
+        out.append(inner)
+    return out
+
+
+def _format_submitpackage(txs: list, pkg: Any) -> dict[str, Any]:
+    """Core rpc/mempool.cpp submitpackage result.
+
+    ``package_msg`` is "success" or the package state's message;
+    ``tx-results`` is keyed by wtxid with, per tx, ``other-wtxid`` (same txid
+    with another witness in the pool), ``error`` (Core TxValidationState::
+    ToString(); missing inputs read "bad-txns-inputs-missingorspent"), or
+    vsize + fees (effective feerate only for txs accepted by this call), and
+    ``replaced-transactions`` lists the txids replaced.  A package refused
+    before any per-tx verdict (``per_tx_results`` False: it needs package
+    RBF, which this node lacks) gets no tx-results entries.
+    """
+    tx_results: dict[str, Any] = {}
+    replaced: set[bytes] = set()
+    for tx in (txs if getattr(pkg, "per_tx_results", True) else []):
+        try:
+            wtxid = tx.get_wtxid()
+        except Exception:
+            wtxid = tx.get_txid()
+        inner: dict[str, Any] = {"txid": tx.get_txid()[::-1].hex()}
+        res = pkg.results.get(wtxid)
+        if res is None:
+            inner["error"] = "package-not-validated"
+        elif res.kind == "different-witness":
+            inner["other-wtxid"] = res.other_wtxid[::-1].hex()
+        elif res.kind == "invalid":
+            if res.missing_inputs:
+                inner["error"] = "bad-txns-inputs-missingorspent"
+            else:
+                inner["error"] = res.reject_details or res.reject_reason
+        else:
+            inner["vsize"] = res.vsize
+            inner["fees"] = _package_fees_obj(res, res.kind == "valid")
+            replaced.update(res.replaced)
+        tx_results[wtxid[::-1].hex()] = inner
+    return {
+        "package_msg": "success" if pkg.state == "valid" else pkg.message,
+        "tx-results": tx_results,
+        # Core std::set<Txid>: ordered by the internal (little-endian) bytes.
+        "replaced-transactions": [t[::-1].hex() for t in sorted(replaced)],
+    }
+
 class JSONRPCRequest(BaseModel):
     """JSON-RPC 2.0 request model"""
     jsonrpc: str = "2.0"
@@ -4160,6 +4268,13 @@ class RPCServer:
                 status_code=400,
                 detail=reject_reason
             )
+
+        # Core BroadcastTransaction (MEMPOOL_AND_BROADCAST_TO_ALL): "the
+        # mempool tracks locally submitted transactions to make a
+        # best-effort of initial broadcast" -> AddUnbroadcastTx.
+        add_unbroadcast = getattr(self.node.mempool, "add_unbroadcast", None)
+        if add_unbroadcast is not None:
+            add_unbroadcast(txid)
 
         # 6. Relay INV to all connected peers via trickle queue (privacy)
         # Use privacy-preserving relay via INV messages
@@ -8066,7 +8181,8 @@ class RPCServer:
 
                     # B6: correct BIP-141 weight (miner.cpp AddToBlock:267)
                     tw = e.tx.get_weight()
-                    raw = e.tx.serialize()
+                    # Core EncodeHexTx: TX_WITH_WITNESS (core_io.cpp).
+                    raw = e.tx.serialize_with_witness()
 
                     tx_sigops_cost = 0
 
@@ -9576,6 +9692,13 @@ class RPCServer:
                     "for rollback/retain: %s",
                     h, e,
                 )
+            # The refill needs the txs WITH their witnesses, which blk (the
+            # Rust PyTxIn round-trip) has dropped; the raw bytes keep them.
+            if disconnected_active and disconnected_active[-1][1] == h:
+                try:
+                    blk = Block.deserialize(disconnected_active[-1][2])
+                except ValueError:
+                    pass
             # Prepended block-by-block: the walk is descending, the refill
             # wants EARLIEST FIRST (Core iterates DisconnectedBlockTransactions
             # in reverse: lowest block first, block order within it).
@@ -10746,7 +10869,11 @@ class RPCServer:
             for h in range(target_h, int(best_height) + 1):
                 try:
                     hh = db.get_block_hash_by_height(h)
-                    blk = db.get_block_by_height(h)
+                    # With witnesses: these txs go back to the mempool, and
+                    # get_block_by_height drops them.
+                    _read = getattr(db, "get_block_with_witness", None)
+                    blk = (_read(bytes(hh)) if _read is not None and hh is not None
+                           else db.get_block_by_height(h))
                 except Exception:
                     hh, blk = None, None
                 if hh is None:
@@ -11130,6 +11257,15 @@ class RPCServer:
         # and only then does removeForReorg run — so a pool spender of a
         # re-added tx is linked to it and kept (Core's removeForReorg for a
         # block runs after that block's txs are back).
+        # Core re-adds each block's txs right after ITS DisconnectTip, so an
+        # entry's height is the tip at that moment: the block's height - 1
+        # (ATMP StageAddition takes m_chain.Height()).  The blocks are the
+        # ones above the new tip, ascending.
+        heights = {}
+        for i, blk in enumerate(blocks):
+            for tx in (getattr(blk, "transactions", None) or []) if blk is not None else []:
+                if not getattr(tx, "is_coinbase", False):
+                    heights[tx.get_txid()] = int(tip_h) + i
         blocks = [b for b in blocks if b is not None]
         deep, top = blocks[:-INVALIDATE_READD_MAX_BLOCKS], blocks[-INVALIDATE_READD_MAX_BLOCKS:]
 
@@ -11137,7 +11273,8 @@ class RPCServer:
             return [tx for blk in bs
                     for tx in (getattr(blk, "transactions", None) or [])]
 
-        mempool.update_for_reorg(_txs(top), int(tip_h), not_readded_txs=_txs(deep))
+        mempool.update_for_reorg(_txs(top), int(tip_h), not_readded_txs=_txs(deep),
+                                 entry_heights=heights)
 
     def _mempool_follow_rust_reorg(self, db, old_tip_hash, old_tip_height) -> None:
         """The Rust layer moved the active chain (reconsiderblock's
@@ -11688,6 +11825,12 @@ class RPCServer:
         # Core returns an empty JSON object (UniValue::VOBJ) on success.
         return {}
 
+    @staticmethod
+    def _format_hostport(host: str, port: int) -> str:
+        """``host:port`` with IPv6 literals bracketed (Core CService::ToStringAddrPort)."""
+        host = str(host)
+        return f"[{host}]:{int(port)}" if ":" in host else f"{host}:{int(port)}"
+
     async def rpc_getpeerinfo(self) -> list[dict[str, Any]]:
         """Return information about connected peers.
 
@@ -11882,11 +12025,28 @@ class RPCServer:
             if pingwait is not None and pingwait > 0:
                 info["pingwait"] = pingwait
 
-            # Bytes per message type (if tracked)
-            if hasattr(peer, 'bytes_sent_per_msg'):
-                info["bytessent_per_msg"] = peer.bytes_sent_per_msg
-            if hasattr(peer, 'bytes_recv_per_msg'):
-                info["bytesrecv_per_msg"] = peer.bytes_recv_per_msg
+            # Bytes per message type.  Core always emits both maps ({} when
+            # nothing was exchanged) -- rpc/net.cpp getpeerinfo.
+            info["bytessent_per_msg"] = dict(
+                getattr(peer, 'bytes_sent_per_msg', None) or {})
+            info["bytesrecv_per_msg"] = dict(
+                getattr(peer, 'bytes_recv_per_msg', None) or {})
+
+            # addrbind: our local socket address for this connection (Core
+            # emits it when the CNode has a valid addrBind).  addrlocal: how
+            # the peer sees us (its VERSION addr_recv), emitted only when
+            # known (Core: !addrLocal.empty()).
+            _writer = getattr(peer, 'writer', None)
+            _sockname = None
+            try:
+                _sockname = _writer.get_extra_info('sockname') if _writer else None
+            except Exception:
+                _sockname = None
+            if _sockname and len(_sockname) >= 2:
+                info["addrbind"] = self._format_hostport(_sockname[0], _sockname[1])
+            _al = getattr(peer, 'addr_local', None)
+            if _al and _al[0]:
+                info["addrlocal"] = self._format_hostport(_al[0], _al[1])
 
             # Ban score (legacy)
             banscore = getattr(peer, 'ban_score', 0)
@@ -15304,6 +15464,17 @@ class RPCServer:
                 ) from None
 
         mempool = getattr(self.node, "mempool", None)
+        if (len(decoded) > 1 and mempool is not None
+                and getattr(self.node, "db", None) is not None
+                and hasattr(mempool, "accept_package")):
+            # Core: more than one tx is evaluated as a package
+            # (ProcessNewPackage test_accept=true ->
+            # AcceptMultipleTransactions): a child resolves its parent from
+            # the package, and the first failure leaves the later txs with no
+            # verdict.  One tx keeps the single-tx path below.
+            _, best_height = self.node.db.get_best_block()
+            pkg = mempool.accept_package(decoded, best_height, test_accept=True)
+            return _format_testmempoolaccept_package(decoded, pkg, maxfeerate)
         results: list[dict[str, Any]] = []
         for tx in decoded:
             try:
@@ -15379,51 +15550,31 @@ class RPCServer:
                 )
             txs.append(tx)
 
+        # Core rpc/mempool.cpp submitpackage: a multi-tx package must be a
+        # child with its parents and the parents must not depend on each
+        # other, else JSONRPCTransactionError(INVALID_PACKAGE) before any
+        # validation.
+        if len(txs) > 1:
+            from ouroboros.mempool import Mempool as _Mempool
+            if not _Mempool.is_child_with_parents_tree(txs):
+                raise RpcError(
+                    RPC_VERIFY_ERROR,
+                    "package topology disallowed. not child-with-parents or "
+                    "parents depend on each other.",
+                )
+
         if not hasattr(self.node, "mempool") or self.node.mempool is None:
             raise HTTPException(status_code=500, detail="Mempool not available")
         if not hasattr(self.node, "db") or not self.node.db:
             raise HTTPException(status_code=500, detail="Database not available")
 
+        # Staged acceptance (Core ProcessNewPackage -> AcceptPackage): txs
+        # already in the pool are reported, the rest are tried one at a time
+        # and only fee/missing-input failures are retried at the package
+        # feerate.  Height is the tip, as for sendrawtransaction.
         _, best_height = self.node.db.get_best_block()
-        success, error = self.node.mempool.validate_package(txs, best_height + 1)
-
-        if not success:
-            return {
-                "package_msg": error,
-                "tx-results": {},
-            }
-
-        # Build per-transaction results from the mempool entries that were
-        # just inserted by validate_package.
-        # JSON-RPC convention: txids/wtxids in responses are display-order (BE).
-        # get_txid()/get_wtxid() return LE (internal byte order); reverse for JSON.
-        # BUG-5 fix: Core keys tx-results by wtxid (GetWitnessHash().GetHex()),
-        # not txid — rpc/mempool.cpp:1464. For segwit txs (txid != wtxid) client
-        # tools keying by wtxid would otherwise get an empty miss.
-        tx_results: dict[str, Any] = {}
-        for tx in txs:
-            txid_hex = tx.get_txid()[::-1].hex()
-            wtxid_hex = tx.get_wtxid()[::-1].hex()
-            entry = self.node.mempool.get_transaction_entry(tx.get_txid())
-            if entry is not None:
-                tx_results[wtxid_hex] = {
-                    "txid": txid_hex,
-                    "vsize": tx.get_vsize(),
-                    "fees": {
-                        "base": entry.fee / 1e8,
-                    },
-                }
-            else:
-                tx_results[wtxid_hex] = {
-                    "txid": txid_hex,
-                    "vsize": tx.get_vsize(),
-                    "fees": {"base": 0},
-                }
-
-        return {
-            "package_msg": "success",
-            "tx-results": tx_results,
-        }
+        pkg = self.node.mempool.accept_package(txs, best_height)
+        return _format_submitpackage(txs, pkg)
 
     async def rpc_listtransactions(
         self, label: str = "*", count: int = 10, skip: int = 0,
@@ -16951,33 +17102,40 @@ class RPCServer:
         }
 
     def _format_mempool_entry(self, entry, txid_bytes: bytes) -> dict[str, Any]:
-        """Format a MempoolEntry into the standard mempool dict."""
+        """Format a MempoolEntry the way Core v31.1 entryToJSON
+        (rpc/mempool.cpp) does."""
         mempool = self.node.mempool
 
-        # -- depends: unconfirmed parents of this tx -----------------------
+        # -- depends: Core collects the in-pool parents into a
+        # std::set<std::string> of display hex, so sorted and unique.
         # inp.prev_txid is internal LE; JSON-RPC emits display-order (BE). W69.
-        depends: list[str] = []
-        for inp in entry.tx.inputs:
-            if inp.prev_txid in mempool.transactions:
-                depends.append(inp.prev_txid[::-1].hex())
+        depends = sorted({
+            inp.prev_txid[::-1].hex() for inp in entry.tx.inputs
+            if inp.prev_txid in mempool.transactions
+        })
 
-        # -- spentby: unconfirmed children spending this tx's outputs ------
-        spentby: list[str] = []
+        # -- spentby: Core GetChildren sorts by CompareIteratorByHash, i.e.
+        # uint256 order of the txid, which compares the INTERNAL bytes.
+        children = set()
         for other_txid, other_entry in mempool.transactions.items():
             if other_txid == txid_bytes:
                 continue
             for inp in other_entry.tx.inputs:
                 if inp.prev_txid == txid_bytes:
-                    spentby.append(other_txid[::-1].hex())
+                    children.add(other_txid)
                     break  # one match per child tx is enough
+        spentby = [c[::-1].hex() for c in sorted(children)]
 
-        # -- weight / vsize ------------------------------------------------
+        # -- weight / vsize: Core GetTxSize is the sigop-adjusted vsize.
         weight = entry.tx.get_weight()
-        vsize = (weight + 3) // 4
+        vsize = entry.vsize
 
         # -- ancestor / descendant fees ------------------------------------
         # Use Core GetModifiedFee semantics for fees.modified / ancestorfees /
         # descendantfees so that prioritisetransaction is reflected (FIX-72).
+        # Core CalculateAncestorData / CalculateDescendantData sum GetTxSize
+        # (vsize) over the set including the tx itself; entry.ancestor_size /
+        # descendant_size count stripped bytes, so they are not used here.
         map_deltas = getattr(mempool, "map_deltas", {})
 
         def _mod_fee(t: bytes, e) -> int:
@@ -16986,24 +17144,33 @@ class RPCServer:
         own_modified_fee = _mod_fee(txid_bytes, entry)
 
         ancestor_fees = own_modified_fee
+        ancestor_size = vsize
         for a_txid in mempool._get_ancestors(entry.tx):
             a_entry = mempool.transactions.get(a_txid)
             if a_entry is not None:
                 ancestor_fees += _mod_fee(a_txid, a_entry)
+                ancestor_size += a_entry.vsize
 
         descendant_fees = own_modified_fee
+        descendant_size = vsize
         for d_txid in mempool._collect_descendants(txid_bytes):
             if d_txid == txid_bytes:
                 continue
             d_entry = mempool.transactions.get(d_txid)
             if d_entry is not None:
                 descendant_fees += _mod_fee(d_txid, d_entry)
+                descendant_size += d_entry.vsize
 
         base_fee_btc = entry.fee / 1e8
         modified_fee_btc = own_modified_fee / 1e8
 
+        # Core GetMainChunkFeerate: the tx's chunk in its cluster's optimal
+        # linearization, as (modified fee, sigop-adjusted weight).
+        chunk_fee, chunk_weight = mempool.main_chunk_feerate(txid_bytes) or (0, 0)
+
         # Core entryToJSON order (rpc/mempool.cpp): vsize, weight, time, height,
-        # descendant*/ancestor*, wtxid, fees{}, depends, spentby, unbroadcast.
+        # descendant*/ancestor*, wtxid, chunkweight, fees{}, depends, spentby,
+        # bip125-replaceable, unbroadcast.
         # Fees are ONLY in the nested fees{} object — the old flat fee/modifiedfee/
         # ancestorfees/descendantfees top-level fields are NOT part of Core's shape.
         return {
@@ -17012,20 +17179,27 @@ class RPCServer:
             "time": int(entry.time_added),
             "height": entry.height_added,
             "descendantcount": entry.descendant_count,
-            "descendantsize": entry.descendant_size,
+            "descendantsize": descendant_size,
             "ancestorcount": entry.ancestor_count,
-            "ancestorsize": entry.ancestor_size,
-            "wtxid": _display_hash(entry.tx.get_wtxid())
-                if hasattr(entry.tx, "get_wtxid") else _display_txid(txid_bytes),
+            "ancestorsize": ancestor_size,
+            # Display order (reversed), like every other hash at the RPC
+            # boundary.  The _display_hash/_display_txid helpers are local to
+            # other methods; naming them here raised NameError (-32603).
+            "wtxid": (entry.tx.get_wtxid() if hasattr(entry.tx, "get_wtxid")
+                      else txid_bytes)[::-1].hex(),
+            "chunkweight": chunk_weight,
             "fees": {
                 "base": base_fee_btc,
                 "modified": modified_fee_btc,
                 "ancestor": ancestor_fees / 1e8,
                 "descendant": descendant_fees / 1e8,
+                "chunk": chunk_fee / 1e8,
             },
             "depends": depends,
             "spentby": spentby,
-            "unbroadcast": False,
+            # Core IsRBFOptIn: the tx or an in-pool ancestor signals BIP125.
+            "bip125-replaceable": mempool.is_bip125_replaceable(txid_bytes),
+            "unbroadcast": mempool.is_unbroadcast(txid_bytes),
         }
 
     async def rpc_getmempoolentry(self, txid: str) -> dict[str, Any]:

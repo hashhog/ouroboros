@@ -396,6 +396,106 @@ class ClusterLinearizer:
         return result
 
 
+def _max_weight_closure(
+    nodes: list[bytes],
+    weight: dict[bytes, int],
+    parents: dict[bytes, set[bytes]],
+    forced: bytes | None = None,
+) -> set[bytes]:
+    """The smallest parent-closed subset of *nodes* with maximum total weight.
+
+    Picard's reduction to a minimum s-t cut: source -> v (weight > 0),
+    v -> sink (weight < 0), v -> parent (infinite); the closure is what the
+    source still reaches in the residual graph.  *forced* is joined to the
+    source with infinite capacity, so the result must contain it.  Integer
+    capacities, Edmonds-Karp; a cluster is at most a few dozen txs.
+    """
+    inf = sum(abs(w) for w in weight.values()) + 1
+    cap: dict[object, dict[object, int]] = {"s": {}, "t": {}}
+    for v in nodes:
+        cap.setdefault(v, {})
+    for v in nodes:
+        w = weight[v]
+        if v == forced:
+            cap["s"][v] = inf
+        elif w > 0:
+            cap["s"][v] = w
+        if w < 0 and v != forced:
+            cap[v]["t"] = -w
+        for p in parents[v]:
+            cap[v][p] = inf
+            cap[p].setdefault(v, 0)
+        cap[v].setdefault("s", 0)
+        cap["t"].setdefault(v, 0)
+    while True:
+        prev: dict[object, object] = {"s": None}
+        queue = ["s"]
+        while queue and "t" not in prev:
+            u = queue.pop(0)
+            for v, c in cap[u].items():
+                if c > 0 and v not in prev:
+                    prev[v] = u
+                    queue.append(v)
+        if "t" not in prev:
+            return {v for v in prev if v != "s"}
+        flow, v = inf, "t"
+        while prev[v] is not None:
+            flow = min(flow, cap[prev[v]][v])
+            v = prev[v]
+        v = "t"
+        while prev[v] is not None:
+            u = prev[v]
+            cap[u][v] -= flow
+            cap[v][u] = cap[v].get(u, 0) + flow
+            v = u
+
+
+def optimal_chunks(
+    txids: set[bytes], fee: dict[bytes, int], size: dict[bytes, int],
+    parents: dict[bytes, set[bytes]],
+) -> list[tuple[set[bytes], int, int]]:
+    """Chunk a cluster the way an optimal linearization does.
+
+    Core v31.1 linearizes each cluster optimally (cluster_linearize.h) and
+    chunks it with ChunkLinearizationInfo, which merges a chunk into the
+    previous one only when its feerate is strictly higher, so equal-feerate
+    chunks stay apart.  Each chunk of that result is the smallest
+    highest-feerate parent-closed set of what is left.  Found here exactly:
+    Dinkelbach iteration over max-weight closures, then the smallest closure
+    at the optimal feerate.  Returns ``[(txids, fee, size), ...]`` best first.
+    """
+    remaining = set(txids)
+    out: list[tuple[set[bytes], int, int]] = []
+    while remaining:
+        order = sorted(remaining)
+        par = {v: parents.get(v, set()) & remaining for v in order}
+        best = set(remaining)
+        f, s = sum(fee[v] for v in best), sum(size[v] for v in best)
+        while True:
+            w = {v: fee[v] * s - f * size[v] for v in order}
+            cand = _max_weight_closure(order, w, par)
+            if not cand or sum(w[v] for v in cand) <= 0:
+                break
+            best = cand
+            f, s = sum(fee[v] for v in best), sum(size[v] for v in best)
+        if len(best) > 1:
+            w = {v: fee[v] * s - f * size[v] for v in order}
+            for v in sorted(best):
+                if v not in best:
+                    continue
+                inner = sorted(best)
+                smaller = _max_weight_closure(
+                    inner, {u: w[u] for u in inner},
+                    {u: par[u] & best for u in inner}, forced=v,
+                )
+                if len(smaller) < len(best) and sum(w[u] for u in smaller) == 0:
+                    best = smaller
+            f, s = sum(fee[v] for v in best), sum(size[v] for v in best)
+        out.append((best, f, s))
+        remaining -= best
+    return out
+
+
 class ClusterManager:
     """Manages clusters of transactions in the mempool.
 
@@ -1962,6 +2062,54 @@ class OrphanPool:
         self.remove(victim)
 
 
+@dataclass
+class PackageTxResult:
+    """One package tx's outcome (Core ``MempoolAcceptResult``).
+
+    *kind*: ``valid`` (accepted now; for a test accept, would be accepted),
+    ``mempool`` (already in the pool, Core MEMPOOL_ENTRY),
+    ``different-witness`` (same txid, other witness in the pool) or
+    ``invalid``.  ``effective_feerate`` is sat/kvB.  ``reject_reason`` is the
+    internal token (``"orphan"`` for missing inputs); ``reject_details`` is
+    Core's ``TxValidationState::ToString()`` text where this node has it.
+    """
+
+    kind: str
+    txid: bytes
+    wtxid: bytes
+    vsize: int | None = None
+    fee: int | None = None
+    effective_feerate: int | None = None
+    effective_includes: list = field(default_factory=list)
+    reject_reason: str | None = None
+    reject_details: str | None = None
+    missing_inputs: bool = False
+    other_wtxid: bytes | None = None
+    replaced: list = field(default_factory=list)
+
+
+@dataclass
+class PackageAcceptResult:
+    """Core ``PackageMempoolAcceptResult``: package state + per-tx results.
+
+    *state*: ``valid`` (PCKG_RESULT_UNSET), ``tx`` (PCKG_TX) or ``policy``
+    (PCKG_POLICY).  *message* is Core's ``PackageValidationState::
+    ToString()``.  *results* is keyed by wtxid (internal byte order).
+    """
+
+    state: str
+    message: str
+    results: dict = field(default_factory=dict)
+    # wtxids whose result decided a failed package evaluation (Core: the
+    # results AcceptMultipleTransactions returned, as opposed to the
+    # individual results AcceptPackage merges in for the other txs).
+    failed_wtxids: list = field(default_factory=list)
+    # False when the package was refused before any per-tx verdict that a
+    # caller may report (package RBF, which this node does not implement):
+    # submitpackage then returns no tx-results entries.
+    per_tx_results: bool = True
+
+
 class Mempool:
     """Unconfirmed transaction pool"""
 
@@ -2038,6 +2186,10 @@ class Mempool:
 
         # Orphan transaction pool
         self.orphan_pool = OrphanPool()
+        # Set while a package is being submitted: an insert does not resolve
+        # orphans until the package has committed (Core resolves orphans in
+        # net_processing after AcceptPackage returns, never inside it).
+        self._defer_orphan_resolution: bool = False
 
         # Cluster mempool manager
         self._cluster_manager = ClusterManager(self.transactions)
@@ -2053,6 +2205,17 @@ class Mempool:
         # Reference: bitcoin-core/src/txmempool.{h,cpp} PrioritiseTransaction,
         #            mapDeltas, ApplyDelta, GetModifiedFee.
         self.map_deltas: dict[bytes, int] = {}
+
+        # m_unbroadcast_txids (txmempool.h): txids submitted locally
+        # (BroadcastTransaction, i.e. sendrawtransaction and the wallet) that
+        # no peer has fetched yet.  Dropped when a peer getdata's the tx or
+        # the tx leaves the pool.  Reported as entryToJSON "unbroadcast" and
+        # getmempoolinfo "unbroadcastcount".
+        self.unbroadcast_txids: set[bytes] = set()
+
+        # Chunk feerates per txid, valid for one (sequence, deltas) state.
+        self._chunk_cache_key: object = None
+        self._chunk_cache: dict[bytes, tuple[int, int]] = {}
 
     def __len__(self) -> int:
         """Return the number of transactions in the mempool."""
@@ -2424,8 +2587,36 @@ class Mempool:
         self, tx: Transaction, height: int, test_accept: bool = False,
         peer: object = None, bypass_limits: bool = False,
         store_orphan: bool = True,
+        package_coins: dict | None = None,
+        package_feerate: bool = False,
+        workspace: dict | None = None,
+        package_member: bool = False,
     ) -> tuple[bool, str]:
         """Unlocked implementation of add_transaction.
+
+        Package staging (Core ``MemPoolAccept`` with a package view, used only
+        by :meth:`_accept_package_inner`):
+
+        * *package_coins* -- outputs of earlier package transactions that are
+          not in the pool, keyed ``(txid, vout)`` in the validator's
+          ``intra_block_utxos`` shape (Core ``CCoinsViewMemPool::
+          PackageAddTransaction``).  Inputs resolve from the chain, then the
+          pool, then this overlay.
+        * *package_feerate* -- the individual fee floors (min relay fee and the
+          rolling mempool minimum) are not applied, nor is the size-limit
+          eviction: the caller checks the package feerate and trims afterwards
+          (Core ``m_package_feerates`` + ``LimitMempoolSize`` at the end of
+          ``AcceptPackage``).  The individual ephemeral-dust "must be submitted
+          in a package" gate is skipped too: the caller runs the package-level
+          ephemeral checks instead.
+        * *workspace* -- when given, receives ``fee`` and ``vsize`` as soon as
+          they are known (Core ``Workspace::m_base_fees`` / ``m_vsize``), even
+          when a later fee gate rejects the transaction.
+        * *package_member* -- the tx is evaluated as part of a package (also
+          implied by the two package arguments above): a copy of it waiting in
+          the orphan pool does not block it, since the package supplies the
+          parents the orphan was waiting for (Core's package path never
+          consults the orphanage).
 
         *bypass_limits* (Core ``MemPoolAccept::ATMPArgs::m_bypass_limits``, set
         only by the reorg refill ``update_for_reorg``) skips the fee-rate floor
@@ -2488,7 +2679,8 @@ class Mempool:
 
         # Already known as orphan — check by wtxid (primary key) so that
         # two malleable variants of the same txid are not conflated.
-        if self.orphan_pool.has_wtxid(wtxid):
+        in_package = package_member or package_feerate or package_coins is not None
+        if not in_package and self.orphan_pool.has_wtxid(wtxid):
             return False, "Already in orphan pool"
 
         # Standardness checks (policy, not consensus)
@@ -2505,7 +2697,7 @@ class Mempool:
 
         # Ephemeral dust: reject v3 txs with dust when submitted
         # individually (ephemeral dust is only valid inside packages).
-        if tx.version == 3:
+        if tx.version == 3 and not package_feerate:
             dust_indices = _has_ephemeral_dust(tx)
             if dust_indices:
                 return False, (
@@ -2519,7 +2711,9 @@ class Mempool:
             parent_txid = tx_in.prev_txid
             # Parent available if UTXO exists in chain or parent is in mempool
             utxo = self.validator.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
-            if utxo is None and parent_txid not in self.transactions:
+            if (utxo is None and parent_txid not in self.transactions
+                    and not (package_coins
+                             and (tx_in.prev_txid, tx_in.prev_vout) in package_coins)):
                 missing_parents.add(parent_txid)
         if missing_parents:
             # Distinguish "already known" from a genuine orphan.  Mirrors Bitcoin
@@ -2559,6 +2753,10 @@ class Mempool:
                             prevscripts[idx] = parent_entry.tx.outputs[tx_in.prev_vout].script_pubkey
                         except IndexError:
                             pass  # malformed parent; consensus check will catch it
+                    elif package_coins:
+                        pkg_coin = package_coins.get((tx_in.prev_txid, tx_in.prev_vout))
+                        if pkg_coin is not None:
+                            prevscripts[idx] = pkg_coin["script_pubkey"]
 
             # Input-side standardness — every prevout type must be standard
             # and P2SH redeem scripts must respect MAX_P2SH_SIGOPS.  Mirrors
@@ -2595,6 +2793,10 @@ class Mempool:
                 if parent_entry is not None and prev_vout < len(parent_entry.tx.outputs):
                     out = parent_entry.tx.outputs[prev_vout]
                     return {"script_pubkey": out.script_pubkey}
+                if package_coins:
+                    pkg_coin = package_coins.get((prev_txid, prev_vout))
+                    if pkg_coin is not None:
+                        return {"script_pubkey": pkg_coin["script_pubkey"]}
                 return None
 
             tx_sigop_cost = _compute_tx_sigop_cost(tx, _utxo_resolver)
@@ -2665,6 +2867,14 @@ class Mempool:
         # coin carries Core's MEMPOOL_HEIGHT semantics: height = tip + 1 for
         # BIP68 (CalculateLockPointsAtTip), never a coinbase.
         mempool_coins = self._mempool_parent_coins(tx, next_height)
+        if package_coins:
+            # Package parents not in the pool (CCoinsViewMemPool::
+            # PackageAddTransaction): only the outpoints this tx spends, and
+            # never one the chain or the pool already resolves.
+            for tx_in in tx.inputs:
+                op = (tx_in.prev_txid, tx_in.prev_vout)
+                if op in package_coins and op not in mempool_coins:
+                    mempool_coins[op] = package_coins[op]
 
         from ouroboros.validation import MissingAncestorHeaderError
         try:
@@ -2695,6 +2905,12 @@ class Mempool:
                     tx, next_height,
                 )
         if not valid:
+            if workspace is not None and self._is_script_failure(error):
+                # Core names the script error (SCRIPT_ERR_*) in the reject
+                # reason; the validator's interpreter recorded it for this
+                # thread's verify call, the one that just failed.
+                interp = getattr(self.validator, "script_interpreter", None)
+                workspace["script_error"] = getattr(interp, "last_error", None)
             return False, error
 
         # Check for conflicts (double spends) — attempt BIP 125 RBF
@@ -2702,6 +2918,15 @@ class Mempool:
             (tx_in.prev_txid, tx_in.prev_vout) in self.spent_outputs
             for tx_in in tx.inputs
         )
+        if has_conflict and package_coins is not None:
+            # Package evaluation (Core AcceptMultipleTransactions) does not
+            # replace in-pool transactions here: Core's PackageTestAccept
+            # disallows replacement (PreChecks "bad-txns-spends-conflicting-tx")
+            # and package RBF (PackageRBFChecks) is not implemented by this
+            # node, so a conflicting package member is refused instead of
+            # being sent down the single-transaction RBF path, which cannot
+            # see the package overlay.
+            return False, "bad-txns-spends-conflicting-tx"
         if has_conflict:
             # _add_transaction_inner already runs unlocked under the caller's
             # lock; call the unlocked replacement helper directly. In test_accept
@@ -2776,7 +3001,7 @@ class Mempool:
 
         # Check mempool size. Eviction mutates the pool, so skip it in dry-run
         # mode — testmempoolaccept must not change mempool state.
-        if (not test_accept and not bypass_limits
+        if (not test_accept and not bypass_limits and not package_feerate
                 and self.current_size + tx_size > self.max_size):
             self._evict_low_fee_txs(tx_size)
 
@@ -2796,6 +3021,13 @@ class Mempool:
 
         if fee < 0:
             return False, "Negative fee"
+
+        # fee and vsize are known from here on (Core Workspace m_base_fees /
+        # m_vsize); the package orchestrator needs them even when a fee
+        # floor below rejects the transaction individually.
+        if workspace is not None:
+            workspace["fee"] = fee
+            workspace["vsize"] = tx_vsize
 
         # PreCheckEphemeralTx — a non-zero-fee transaction may not have dust
         # outputs (the dust output must be CPFP'd by a child in a package).
@@ -2821,7 +3053,9 @@ class Mempool:
         # Minimum relay fee check uses vsize (same source as fee_rate).
         # DEFAULT_MIN_RELAY_TX_FEE is in sat/kB; convert to sat for this tx.
         min_relay = (tx_vsize * DEFAULT_MIN_RELAY_TX_FEE) // 1000
-        if fee < min_relay and not bypass_limits:
+        if workspace is not None:
+            workspace["min_relay_fee"] = min_relay
+        if fee < min_relay and not bypass_limits and not package_feerate:
             # Bare Core token (validation.cpp:708 "min relay fee not met").
             return False, "min relay fee not met"
 
@@ -2833,8 +3067,11 @@ class Mempool:
         #           return state.Invalid(...)
         # Reference: validation.cpp AcceptToMemoryPoolWorker (fee-filter gate).
         rolling_min_kvb = self._get_min_fee_inner()  # sat/kvB
-        if rolling_min_kvb > DEFAULT_MIN_RELAY_TX_FEE and not bypass_limits:
+        if (rolling_min_kvb > DEFAULT_MIN_RELAY_TX_FEE and not bypass_limits
+                and not package_feerate):
             rolling_min_fee = (tx_vsize * rolling_min_kvb) // 1000
+            if workspace is not None:
+                workspace["mempool_min_fee"] = rolling_min_fee
             if fee < rolling_min_fee:
                 # Bare Core token (validation.cpp:705 "mempool min fee not met")
                 # for the dynamic rolling-floor case, distinct from the static
@@ -2867,6 +3104,11 @@ class Mempool:
             descendant_size=tx_size,  # Core: includes itself
             parents=direct_parents,
             children=set(),
+            # Ephemeral-dust bookkeeping is only reachable through a package
+            # (an individual tx with dust is either 0-fee v3, refused above,
+            # or refused by PreCheckEphemeralTx), so it is recorded for
+            # package members only, as the old package insert did.
+            has_ephemeral_dust=bool(package_feerate and _has_ephemeral_dust(tx)),
         )
 
         self.transactions[txid] = entry
@@ -2889,7 +3131,10 @@ class Mempool:
         # Update parent entries to add this txid as a child
         for parent_txid in direct_parents:
             if parent_txid in self.transactions:
-                self.transactions[parent_txid].children.add(txid)
+                parent_entry = self.transactions[parent_txid]
+                parent_entry.children.add(txid)
+                if parent_entry.has_ephemeral_dust:
+                    parent_entry.ephemeral_child = txid
 
         # Update ancestor descendant counts
         for a_txid in ancestors:
@@ -2918,8 +3163,12 @@ class Mempool:
             except Exception as e:
                 logger.warning(f"on_tx_added callback error: {e}")
 
-        # Try to resolve orphans that were waiting on this transaction
-        self._resolve_orphans(txid, height)
+        # Try to resolve orphans that were waiting on this transaction.  A
+        # package submit defers this until the package has committed (see
+        # _accept_package_inner): resolving mid-package could admit a later
+        # package tx on the single-tx path, outside the package rollback.
+        if not self._defer_orphan_resolution:
+            self._resolve_orphans(txid, height)
 
         return True, ""
 
@@ -3705,6 +3954,8 @@ class Mempool:
             self.by_fee_rate.remove(txid)
 
         del self.transactions[txid]
+        # Core removeUnchecked -> RemoveUnbroadcastTx.
+        self.unbroadcast_txids.discard(txid)
         # BIP 152 / BIP 339 dual index — drop the wtxid mapping.  Compute
         # wtxid from the entry we still have a handle on; for non-segwit
         # transactions wtxid == txid.
@@ -4129,6 +4380,7 @@ class Mempool:
     def update_for_reorg(
         self, disconnected_txs, tip_height: int, add_to_mempool: bool = True,
         not_readded_txs=(),
+        entry_heights: dict[bytes, int] | None = None,
     ) -> dict:
         """Core ``MaybeUpdateMempoolForReorg`` (validation.cpp), run after the
         chain has moved (DisconnectTip/ConnectTip done, removeForBlock already
@@ -4148,7 +4400,12 @@ class Mempool:
         fAddToMempool=false).  They are removeRecursive'd first, before any
         re-add, and removeForReorg runs once, after the re-adds: Core runs
         removeForReorg per DisconnectTip only once that block's txs are back,
-        so an in-pool spender of a re-added tx keeps its parent.  All under
+        so an in-pool spender of a re-added tx keeps its parent.
+
+        *entry_heights*: txid -> the tip height Core re-adds that tx at
+        (InvalidateBlock re-adds per DisconnectTip, so a tx from block h gets
+        entry height h - 1); a re-added tx's ``height_added`` is set to it.
+        Absent, the entry height is *tip_height*.  All under
         the mempool lock;
         callers hold the chain lock, so no reader sees the pool disagree
         with the tip."""
@@ -4182,6 +4439,8 @@ class Mempool:
                         ok = False
                 if ok:
                     readded.append(txid)
+                    if entry_heights and txid in entry_heights:
+                        self.transactions[txid].height_added = entry_heights[txid]
                 elif txid not in self.transactions:
                     failed += 1
                     # removeRecursive(tx): its in-pool spenders lose their
@@ -4984,6 +5243,7 @@ class Mempool:
             self.spent_outputs.clear()
             self.spender_by_outpoint.clear()
             self.by_fee_rate.clear()
+            self.unbroadcast_txids.clear()
             self._cluster_manager.rebuild()  # Clear cluster data
             self.current_size = 0
             logger.info(f"Cleared mempool ({count} transactions removed)")
@@ -5397,6 +5657,81 @@ class Mempool:
         """
         return self.transactions.get(txid)
 
+    # --- entryToJSON support (rpc/mempool.cpp) ---
+
+    def add_unbroadcast(self, txid: bytes) -> None:
+        """Core AddUnbroadcastTx: only a txid that is in the pool."""
+        with self._lock:
+            if txid in self.transactions:
+                self.unbroadcast_txids.add(txid)
+
+    def remove_unbroadcast(self, txid: bytes) -> None:
+        """Core RemoveUnbroadcastTx: a peer fetched it (ProcessGetData)."""
+        with self._lock:
+            self.unbroadcast_txids.discard(txid)
+
+    def is_unbroadcast(self, txid: bytes) -> bool:
+        return txid in self.unbroadcast_txids
+
+    def is_bip125_replaceable(self, txid: bytes) -> bool:
+        """entryToJSON "bip125-replaceable": Core IsRBFOptIn (policy/rbf.cpp)
+        for a tx in the pool -- it, or any in-pool ancestor, has an input
+        with nSequence <= 0xfffffffd.  Signalling only: unlike
+        :meth:`is_rbf_opt_in` (replacement policy), TRUC does not count."""
+        with self._lock:
+            entry = self.transactions.get(txid)
+            if entry is None:
+                return False
+            if self.signals_rbf(entry.tx):
+                return True
+            for a in self._get_ancestors(entry.tx):
+                a_entry = self.transactions.get(a)
+                if a_entry is not None and self.signals_rbf(a_entry.tx):
+                    return True
+            return False
+
+    def main_chunk_feerate(self, txid: bytes) -> tuple[int, int] | None:
+        """Core GetMainChunkFeerate: (fee, weight) of the chunk holding
+        *txid* in its cluster's optimal linearization.
+
+        TxGraph is fed the MODIFIED fee and the sigop-adjusted WEIGHT
+        (txmempool.cpp StageAddition / PrioritiseTransaction), so that is
+        what is chunked here.  None when the tx is not in the pool.
+        """
+        with self._lock:
+            if txid not in self.transactions:
+                return None
+            key = (
+                self._mempool_sequence,
+                len(self.transactions),
+                sum(len(e.children) for e in self.transactions.values()),
+                tuple(sorted(self.map_deltas.items())),
+            )
+            if key != self._chunk_cache_key:
+                self._chunk_cache_key = key
+                self._chunk_cache = {}
+            hit = self._chunk_cache.get(txid)
+            if hit is not None:
+                return hit
+            cluster: set[bytes] = set()
+            stack = [txid]
+            while stack:
+                t = stack.pop()
+                if t in cluster or t not in self.transactions:
+                    continue
+                cluster.add(t)
+                e = self.transactions[t]
+                stack.extend(e.parents)
+                stack.extend(e.children)
+            fee = {t: int(self.transactions[t].fee) + int(self.map_deltas.get(t, 0))
+                   for t in cluster}
+            size = {t: int(self.transactions[t].sigop_adjusted_weight) for t in cluster}
+            parents = {t: set(self.transactions[t].parents) & cluster for t in cluster}
+            for chunk, f, s in optimal_chunks(cluster, fee, size, parents):
+                for t in chunk:
+                    self._chunk_cache[t] = (f, s)
+            return self._chunk_cache[txid]
+
     # --- BIP 152 Compact Block Support ---
 
     def get_transaction_by_wtxid(self, wtxid: bytes) -> Transaction | None:
@@ -5556,408 +5891,545 @@ class Mempool:
 
         return True
 
+    # ------------------------------------------------------------------
+    # Package acceptance (Core MemPoolAccept::AcceptPackage /
+    # AcceptSubPackage / AcceptMultipleTransactionsInternal)
+    # ------------------------------------------------------------------
+
+    # Individual failures that package evaluation can still turn around:
+    # Core retries a tx "as a package" only when it failed for its feerate
+    # (TX_RECONSIDERABLE, CheckFeeRate) or for missing inputs (its parent is
+    # an earlier package tx that failed for its feerate).  A 0-fee v3 parent
+    # with ephemeral dust is the same case: Core rejects it individually at
+    # CheckFeeRate, this node at its "must be submitted in a package" gate.
+    _RECONSIDERABLE_REASONS = frozenset({
+        "min relay fee not met", "mempool min fee not met", "orphan",
+    })
+
+    @classmethod
+    def _is_reconsiderable(cls, reason: str) -> bool:
+        return (
+            reason in cls._RECONSIDERABLE_REASONS
+            or reason.startswith("v3 transaction has ephemeral dust")
+        )
+
+    @staticmethod
+    def _is_script_failure(reason: str) -> bool:
+        """A failure of the script checks (Core PolicyScriptChecks), as
+        opposed to the PreChecks gates that run before them."""
+        return (
+            reason.startswith("Invalid signature for input")
+            or "script-verify-flag-failed" in reason
+        )
+
+    @staticmethod
+    def _feerate_per_kvb(fee: int, vsize: int) -> int:
+        """Core ``CFeeRate(fee, vsize).GetFeePerK()``: sat/kvB, rounded down."""
+        return (fee * 1000) // vsize if vsize > 0 else 0
+
+    @staticmethod
+    def _tx_wtxid(tx: Transaction) -> bytes:
+        try:
+            return tx.get_wtxid()
+        except Exception:
+            return tx.get_txid()
+
+    @staticmethod
+    def package_well_formed_error(txs: list[Transaction]) -> str | None:
+        """Core ``IsWellFormedPackage`` (policy/packages.cpp): the reject
+        token for a malformed package, or ``None``.  Order matches Core."""
+        if len(txs) > MAX_PACKAGE_COUNT:
+            return "package-too-many-transactions"
+        if len(txs) > 1 and sum(tx.get_weight() for tx in txs) > MAX_PACKAGE_WEIGHT:
+            return "package-too-large"
+        txids = [tx.get_txid() for tx in txs]
+        if len(set(txids)) != len(txids):
+            return "package-contains-duplicates"
+        later = set(txids)
+        for tx in txs:
+            later.discard(tx.get_txid())
+            if any(inp.prev_txid in later for inp in tx.inputs):
+                return "package-not-sorted"
+        spent: set[OutPoint] = set()
+        for tx in txs:
+            for inp in tx.inputs:
+                op: OutPoint = (inp.prev_txid, inp.prev_vout)
+                if op in spent:
+                    return "conflict-in-package"
+                spent.add(op)
+        return None
+
+    def _package_failure(
+        self, tx: Transaction, reason: str, ws: dict | None = None,
+    ) -> "PackageTxResult":
+        ws = ws or {}
+        details = reason
+        if reason == "min relay fee not met" and "min_relay_fee" in ws:
+            # Core CheckFeeRate debug string: "<fee> < <required fee>".
+            details = f"{reason}, {ws['fee']} < {self._min_fee_ceil(ws['vsize'], DEFAULT_MIN_RELAY_TX_FEE)}"
+        elif reason == "mempool min fee not met" and "mempool_min_fee" in ws:
+            details = f"{reason}, {ws['fee']} < {ws['mempool_min_fee']}"
+        elif self._is_script_failure(reason):
+            reason, details = self._core_script_failure(tx, reason, ws)
+        return PackageTxResult(
+            kind="invalid", txid=tx.get_txid(), wtxid=self._tx_wtxid(tx),
+            reject_reason=reason, reject_details=details,
+            missing_inputs=(reason == "orphan"),
+        )
+
+    _SCRIPT_INPUT_PREFIX = "Invalid signature for input "
+
+    def _core_script_failure(
+        self, tx: Transaction, reason: str, ws: dict,
+    ) -> tuple[str, str]:
+        """Core's reject reason and ``TxValidationState::ToString()`` for a
+        script failure (validation.cpp PolicyScriptChecks / CheckInputScripts):
+        ``mempool-script-verify-flag-failed (<ScriptErrorString>)``, then
+        ``, input <n> of <txid> (wtxid <wtxid>), spending <prevtxid>:<vout>``.
+        Without a recorded script error, or an input index, the node's own
+        reason is kept for both."""
+        from ouroboros.script import SCRIPT_ERROR_STRINGS
+
+        text = SCRIPT_ERROR_STRINGS.get(ws.get("script_error") or "")
+        if text is None or not reason.startswith(self._SCRIPT_INPUT_PREFIX):
+            return reason, reason
+        try:
+            n = int(reason[len(self._SCRIPT_INPUT_PREFIX):])
+            prevout = tx.inputs[n]
+        except (ValueError, IndexError):
+            return reason, reason
+        core_reason = f"mempool-script-verify-flag-failed ({text})"
+        details = (
+            f"{core_reason}, input {n} of {tx.get_txid()[::-1].hex()} "
+            f"(wtxid {self._tx_wtxid(tx)[::-1].hex()}), "
+            f"spending {prevout.prev_txid[::-1].hex()}:{prevout.prev_vout}"
+        )
+        return core_reason, details
+
+    @staticmethod
+    def _min_fee_ceil(vsize: int, rate_kvb: int) -> int:
+        """Core ``CFeeRate::GetFee`` (rounds up)."""
+        return -((-vsize * rate_kvb) // 1000)
+
+    def accept_package(
+        self, txs: list[Transaction], height: int, test_accept: bool = False,
+    ) -> "PackageAcceptResult":
+        """Staged package acceptance (Core ``ProcessNewPackage``).
+
+        *height* is the tip height, as for :meth:`add_transaction`.
+
+        * ``test_accept=True`` -- Core ``AcceptMultipleTransactions`` with
+          ``PackageTestAccept`` args (the testmempoolaccept path for more than
+          one tx): every tx is checked in order against the chain, the pool
+          and the outputs of the earlier package txs, each at its OWN feerate,
+          and the first failure ends the evaluation (later txs get no result).
+          The pool is not changed.
+        * ``test_accept=False`` -- Core ``AcceptPackage`` (submitpackage):
+          txs already in the pool are de-duplicated, the rest are first tried
+          one at a time (and stay in the pool if they pass), and only those
+          that failed for their feerate or for missing inputs are evaluated
+          again together at the package feerate.
+
+        Returns one :class:`PackageTxResult` per evaluated tx, keyed by wtxid.
+        """
+        with self._lock:
+            return self._accept_package_inner(txs, height, test_accept)
+
+    def _accept_package_inner(
+        self, txs: list[Transaction], height: int, test_accept: bool,
+    ) -> "PackageAcceptResult":
+        if not txs:
+            return PackageAcceptResult(state="policy", message="Empty package")
+        malformed = self.package_well_formed_error(txs)
+        if malformed is not None:
+            return PackageAcceptResult(state="policy", message=malformed)
+        if test_accept:
+            return self._accept_multiple(txs, height, test_accept=True,
+                                         package_feerates=False)
+        if len(txs) > 1 and not self.is_child_with_parents(txs):
+            return PackageAcceptResult(
+                state="policy", message="package-not-child-with-parents")
+        if len(txs) > 1 and not self.is_child_with_parents_tree(txs):
+            # Parents spending each other.  Core's submitpackage RPC refuses
+            # this topology before validation; this path also serves BIP 331
+            # pkgtxns, which has no such RPC gate in front of it, so the
+            # refusal lives here (the package path before #145 refused it).
+            return PackageAcceptResult(
+                state="policy", message="package-not-child-with-parents-tree")
+
+        prev_defer = self._defer_orphan_resolution
+        self._defer_orphan_resolution = True
+        try:
+            result = self._submit_package_inner(txs, height)
+        finally:
+            self._defer_orphan_resolution = prev_defer
+        if not prev_defer:
+            # Core ProcessPackageResult: accepted package txs leave the
+            # orphan pool, then orphans waiting on them are reconsidered --
+            # only now, with the package committed or fully rolled back.
+            for tx in txs:
+                txid = tx.get_txid()
+                if txid not in self.transactions:
+                    continue
+                wtxid = self._tx_wtxid(tx)
+                if self.orphan_pool.has_wtxid(wtxid):
+                    self.orphan_pool.remove(wtxid)
+                self._resolve_orphans(txid, height)
+        return result
+
+    def _submit_package_inner(
+        self, txs: list[Transaction], height: int,
+    ) -> "PackageAcceptResult":
+        """Core ``AcceptPackage`` body for a well-formed child-with-parents
+        tree; orphan resolution is deferred by the caller."""
+        results_final: dict[bytes, PackageTxResult] = {}
+        individual_nonfinal: dict[bytes, PackageTxResult] = {}
+        quit_early = False
+        # Set by the first tx whose individual failure Core would retry as a
+        # package RBF; the outpoint is named while the conflict is in the pool.
+        package_rbf_refusal: PackageAcceptResult | None = None
+        eval_txs: list[Transaction] = []
+        for tx in txs:
+            txid = tx.get_txid()
+            wtxid = self._tx_wtxid(tx)
+            if wtxid in self.wtxid_to_txid and txid in self.transactions:
+                # Exact tx already in the pool: reported, not re-validated,
+                # and its fee is not counted again (Core MempoolTx).
+                entry = self.transactions[txid]
+                results_final[wtxid] = PackageTxResult(
+                    kind="mempool", txid=txid, wtxid=wtxid,
+                    vsize=entry.vsize, fee=int(entry.fee),
+                )
+            elif txid in self.transactions:
+                # Same txid, different witness: swap in the pool's tx (Core
+                # MempoolTxDifferentWitness).
+                entry = self.transactions[txid]
+                results_final[wtxid] = PackageTxResult(
+                    kind="different-witness", txid=txid, wtxid=wtxid,
+                    other_wtxid=self._tx_wtxid(entry.tx),
+                )
+            else:
+                res = self._accept_single_in_package(tx, height)
+                if (res.kind != "valid" and len(txs) > 1
+                        and package_rbf_refusal is None
+                        and self._needs_package_rbf(tx, res.reject_reason or "")):
+                    package_rbf_refusal = self._package_rbf_unsupported(tx)
+                if res.kind == "valid":
+                    results_final[wtxid] = res
+                elif len(txs) == 1 or not self._is_reconsiderable(res.reject_reason or ""):
+                    # A failure package evaluation cannot change (consensus,
+                    # standardness, ...).  Keep validating the rest
+                    # individually: some may still be valid.
+                    quit_early = True
+                    individual_nonfinal[wtxid] = res
+                else:
+                    individual_nonfinal[wtxid] = res
+                    eval_txs.append(tx)
+
+        if package_rbf_refusal is not None:
+            # The rest were still tried individually (Core's AcceptPackage
+            # loop), so the pool matches Core's before its package RBF step.
+            if self.current_size > self.max_size:
+                self._evict_low_fee_txs(self.current_size - self.max_size)
+            return package_rbf_refusal
+        if quit_early:
+            multi = PackageAcceptResult(state="tx", message="transaction failed")
+        elif not eval_txs:
+            multi = PackageAcceptResult(state="valid", message="")
+        elif len(eval_txs) == 1:
+            res = self._accept_single_in_package(eval_txs[0], height)
+            multi = PackageAcceptResult(
+                state="valid" if res.kind == "valid" else "tx",
+                message="" if res.kind == "valid" else "transaction failed",
+                results={res.wtxid: res},
+            )
+        else:
+            multi = self._accept_multiple(eval_txs, height, test_accept=False,
+                                          package_feerates=True)
+
+        # Core LimitMempoolSize at the end of AcceptPackage: package txs may be
+        # evicted, and are then reported "mempool full".
+        if self.current_size > self.max_size:
+            self._evict_low_fee_txs(self.current_size - self.max_size)
+
+        for tx in txs:
+            txid = tx.get_txid()
+            wtxid = self._tx_wtxid(tx)
+            if wtxid in multi.results:
+                res = multi.results[wtxid]
+                if res.kind == "valid" and txid not in self.transactions:
+                    multi.state, multi.message = "tx", "transaction failed"
+                    res = PackageTxResult(
+                        kind="invalid", txid=txid, wtxid=wtxid,
+                        reject_reason="mempool full", reject_details="mempool full")
+                results_final[wtxid] = res
+            elif wtxid in results_final:
+                if txid not in self.transactions:
+                    multi.state, multi.message = "tx", "transaction failed"
+                    results_final[wtxid] = PackageTxResult(
+                        kind="invalid", txid=txid, wtxid=wtxid,
+                        reject_reason="mempool full", reject_details="mempool full")
+            elif wtxid in individual_nonfinal:
+                results_final[wtxid] = individual_nonfinal[wtxid]
+        multi.failed_wtxids = [
+            w for w, r in results_final.items()
+            if r.kind == "invalid"
+            and (w in multi.results or r.reject_reason == "mempool full")]
+        multi.results = {self._tx_wtxid(tx): results_final[self._tx_wtxid(tx)]
+                         for tx in txs if self._tx_wtxid(tx) in results_final}
+        return multi
+
+    def _needs_package_rbf(self, tx: Transaction, reason: str) -> bool:
+        """*tx* failed single-tx RBF on its fee against in-pool conflicts.
+
+        Core's PaysForRBF and feerate-diagram failures are
+        TX_RECONSIDERABLE: AcceptPackage retries such a tx with the rest of
+        the package as a package RBF (``PackageRBFChecks``)."""
+        if not any((inp.prev_txid, inp.prev_vout) in self.spender_by_outpoint
+                   for inp in tx.inputs):
+            return False
+        return (reason.startswith("insufficient fee")
+                or reason.startswith("Replacement would worsen cluster feerate"))
+
+    def _package_rbf_unsupported(self, tx: Transaction) -> "PackageAcceptResult":
+        """The answer for a package that needs package RBF.
+
+        This node does not implement package RBF, so it cannot give the
+        verdicts Core would.  It refuses the package as the package path did
+        before staged acceptance: a package-level message naming the first
+        conflicting outpoint, and no per-tx results.  The conflicts stay in
+        the pool; package txs accepted individually stay too, as Core leaves
+        them."""
+        for inp in tx.inputs:
+            if (inp.prev_txid, inp.prev_vout) in self.spender_by_outpoint:
+                return PackageAcceptResult(
+                    state="policy",
+                    message=(f"Package conflicts with mempool: "
+                             f"{inp.prev_txid.hex()[:16]}...:{inp.prev_vout} "
+                             f"already spent"),
+                    per_tx_results=False,
+                )
+        raise AssertionError("_package_rbf_unsupported without a conflict")
+
+    def _replacement_candidates(self, tx: Transaction) -> set[bytes]:
+        """In-pool spenders of *tx*'s inputs and their descendants: the txs a
+        successful single-tx RBF of *tx* removes."""
+        out: set[bytes] = set()
+        stack = [
+            self.spender_by_outpoint[(inp.prev_txid, inp.prev_vout)]
+            for inp in tx.inputs
+            if (inp.prev_txid, inp.prev_vout) in self.spender_by_outpoint
+        ]
+        while stack:
+            t = stack.pop()
+            if t in out or t not in self.transactions:
+                continue
+            out.add(t)
+            stack.extend(self.transactions[t].children)
+        return out
+
+    def _accept_single_in_package(
+        self, tx: Transaction, height: int,
+    ) -> "PackageTxResult":
+        """Core ``AcceptSubPackage({tx})``: the normal single-tx accept (which
+        inserts on success), minus the orphan pool."""
+        txid = tx.get_txid()
+        wtxid = self._tx_wtxid(tx)
+        candidates = self._replacement_candidates(tx)
+        ws: dict = {}
+        ok, reason = self._add_transaction_inner(
+            tx, height, store_orphan=False, workspace=ws, package_member=True)
+        if not ok:
+            return self._package_failure(tx, reason, ws)
+        entry = self.transactions[txid]
+        fee, vsize = int(entry.fee), entry.vsize
+        return PackageTxResult(
+            kind="valid", txid=txid, wtxid=wtxid, vsize=vsize, fee=fee,
+            effective_feerate=self._feerate_per_kvb(fee, vsize),
+            effective_includes=[wtxid],
+            replaced=sorted(t for t in candidates if t not in self.transactions),
+        )
+
+    def _accept_multiple(
+        self, txs: list[Transaction], height: int, test_accept: bool,
+        package_feerates: bool,
+    ) -> "PackageAcceptResult":
+        """Core ``AcceptMultipleTransactionsInternal``.
+
+        Every tx is validated in order with the outputs of the earlier ones
+        as a coin overlay (``PackageAddTransaction``) and nothing inserted;
+        the first failure ends the evaluation.  Then the package-wide checks:
+        TRUC, the package feerate (when *package_feerates*), and ephemeral
+        dust spends.  Unless *test_accept*, the txs are then inserted in
+        order; an insert that fails (a limit only visible once the parents
+        are in the pool) undoes the earlier inserts.
+        """
+        results: dict[bytes, PackageTxResult] = {}
+        package_coins: dict = {}
+        workspaces: list[dict] = []
+        # Core runs PreChecks for every tx first and the script checks only
+        # afterwards.  This node validates each tx in one pass, so a script
+        # failure is held while the later txs are still checked: a later
+        # non-script failure is what Core reports instead.
+        script_failure: tuple[int, PackageTxResult] | None = None
+        for i, tx in enumerate(txs):
+            ws: dict = {}
+            ok, reason = self._add_transaction_inner(
+                tx, height, test_accept=True, store_orphan=False,
+                package_coins=package_coins, package_feerate=package_feerates,
+                workspace=ws,
+            )
+            if not ok and not (script_failure is None
+                               and self._is_script_failure(reason)):
+                res = self._package_failure(tx, reason, ws)
+                return PackageAcceptResult(
+                    state="tx", message="transaction failed",
+                    results={res.wtxid: res})
+            if not ok:
+                script_failure = (i, self._package_failure(tx, reason, ws))
+            workspaces.append(ws)
+            txid = tx.get_txid()
+            for vout, out in enumerate(tx.outputs):
+                package_coins[(txid, vout)] = {
+                    'txid': txid, 'vout': vout, 'value': out.value,
+                    'script_pubkey': out.script_pubkey,
+                    'height': height + 1, 'is_coinbase': False,
+                }
+        if script_failure is not None:
+            # Core PolicyScriptChecks loop: in a test accept the txs before
+            # the failing one have already been given their result.
+            fail_at, failed = script_failure
+            if test_accept:
+                for tx, ws in zip(txs[:fail_at], workspaces[:fail_at], strict=True):
+                    w = self._tx_wtxid(tx)
+                    results[w] = PackageTxResult(
+                        kind="valid", txid=tx.get_txid(), wtxid=w,
+                        vsize=ws["vsize"], fee=ws["fee"],
+                        effective_feerate=self._feerate_per_kvb(ws["fee"], ws["vsize"]),
+                        effective_includes=[w],
+                    )
+            results[failed.wtxid] = failed
+            return PackageAcceptResult(
+                state="tx", message="transaction failed", results=results)
+
+        truc_ok, truc_err = self._check_package_truc_policy(txs)
+        if not truc_ok:
+            return PackageAcceptResult(
+                state="policy", message=f"TRUC-violation, {truc_err}")
+
+        wtxids = [self._tx_wtxid(tx) for tx in txs]
+        total_fee = sum(ws["fee"] for ws in workspaces)
+        total_vsize = sum(ws["vsize"] for ws in workspaces)
+        if package_feerates:
+            min_relay = (total_vsize * DEFAULT_MIN_RELAY_TX_FEE) // 1000
+            reason = None
+            if total_fee < min_relay:
+                reason = "min relay fee not met"
+                need = self._min_fee_ceil(total_vsize, DEFAULT_MIN_RELAY_TX_FEE)
+            else:
+                rolling_kvb = self._get_min_fee_inner()
+                if rolling_kvb > DEFAULT_MIN_RELAY_TX_FEE:
+                    need = (total_vsize * rolling_kvb) // 1000
+                    if total_fee < need:
+                        reason = "mempool min fee not met"
+            if reason is not None:
+                last = txs[-1]
+                results[wtxids[-1]] = PackageTxResult(
+                    kind="invalid", txid=last.get_txid(), wtxid=wtxids[-1],
+                    reject_reason=reason,
+                    reject_details=f"{reason}, {total_fee} < {need}",
+                )
+                return PackageAcceptResult(
+                    state="tx", message="transaction failed", results=results)
+
+        # Ephemeral dust (Core PreCheckEphemeralTx per tx + CheckEphemeralSpends
+        # for the package).  Core gates both on require_standard; this node
+        # has always enforced them on every package (the previous
+        # validate_package did), so they stay unconditional here.
+        spent = {(inp.prev_txid, inp.prev_vout) for tx in txs for inp in tx.inputs}
+        for tx, ws in zip(txs, workspaces, strict=True):
+            dust = _has_ephemeral_dust(tx)
+            if not dust:
+                continue
+            ok, err = _check_ephemeral_dust(tx, ws["fee"])
+            if not ok:
+                res = PackageTxResult(
+                    kind="invalid", txid=tx.get_txid(), wtxid=self._tx_wtxid(tx),
+                    reject_reason="dust", reject_details=f"dust, {err}")
+                results[res.wtxid] = res
+                return PackageAcceptResult(
+                    state="tx", message="transaction failed", results=results)
+            for dust_vout in dust:
+                if (tx.get_txid(), dust_vout) not in spent:
+                    child = txs[-1]
+                    cw = self._tx_wtxid(child)
+                    results[cw] = PackageTxResult(
+                        kind="invalid", txid=child.get_txid(), wtxid=cw,
+                        reject_reason="missing-ephemeral-spends",
+                        reject_details=(
+                            "missing-ephemeral-spends, tx "
+                            f"{child.get_txid()[::-1].hex()} (wtxid={cw[::-1].hex()}) "
+                            "did not spend parent's ephemeral dust"),
+                    )
+                    return PackageAcceptResult(
+                        state="tx", message="unspent-dust", results=results)
+
+        package_rate = self._feerate_per_kvb(total_fee, total_vsize)
+        for tx, w, ws in zip(txs, wtxids, workspaces, strict=True):
+            results[w] = PackageTxResult(
+                kind="valid", txid=tx.get_txid(), wtxid=w,
+                vsize=ws["vsize"], fee=ws["fee"],
+                effective_feerate=(package_rate if package_feerates
+                                   else self._feerate_per_kvb(ws["fee"], ws["vsize"])),
+                effective_includes=list(wtxids) if package_feerates else [w],
+            )
+        if test_accept:
+            return PackageAcceptResult(state="valid", message="", results=results)
+
+        inserted: list[bytes] = []
+        for tx in txs:
+            ok, reason = self._add_transaction_inner(
+                tx, height, store_orphan=False, package_feerate=True)
+            if not ok:
+                # Undo every insert, and anything that came to depend on one
+                # (nothing should: orphan resolution is deferred, but a tx
+                # left spending a removed parent would be a dangling spend).
+                extra: set[bytes] = set()
+                for t in inserted:
+                    extra |= self._collect_descendants(t)
+                extra.difference_update(inserted)
+                for t in [*extra, *reversed(inserted)]:
+                    self._remove_transaction_inner(t, _reason="package-rollback")
+                if reason == "too-large-cluster":
+                    return PackageAcceptResult(state="policy", message=reason)
+                res = self._package_failure(tx, reason)
+                return PackageAcceptResult(
+                    state="tx", message="transaction failed",
+                    results={res.wtxid: res})
+            inserted.append(tx.get_txid())
+        logger.info(
+            f"Accepted package of {len(inserted)} txs "
+            f"(total fee {total_fee}, package rate {package_rate} sat/kvB)"
+        )
+        return PackageAcceptResult(state="valid", message="", results=results)
+
     def validate_package(
         self, txs: list[Transaction], height: int
     ) -> tuple[bool, str]:
+        """Submit a package and collapse the result to ``(ok, message)``.
+
+        Thin wrapper over :meth:`accept_package` (``test_accept=False``) for
+        callers that only need a verdict (BIP 331 ``pkgtxns``).  *height* is
+        the tip height.  ``ok`` is True when every package tx is in the pool
+        afterwards; the message is the package message, followed by the first
+        per-tx error.
         """
-        Validate and accept a package of transactions (CPFP support).
-
-        Supports two topologies:
-        1. A single transaction
-        2. A child-with-parents package (1 child paying for N parents)
-
-        The package is evaluated as a unit: individual transactions are allowed
-        to fall below the minimum relay fee as long as the *package* fee rate
-        meets the mempool minimum.
-
-        Reference: Bitcoin Core validation.cpp AcceptPackage()
-
-        Args:
-            txs: List of transactions in topological order (parents before child)
-            height: Current block height
-
-        Returns:
-            (success, error_message)
-        """
-        with self._lock:
-            return self._validate_package_inner(txs, height)
-
-    def _validate_package_inner(
-        self, txs: list[Transaction], height: int
-    ) -> tuple[bool, str]:
-        """Unlocked implementation of validate_package."""
-        if not txs:
-            return False, "Empty package"
-
-        if len(txs) > MAX_PACKAGE_COUNT:
-            return False, (
-                f"Package too large: {len(txs)} > {MAX_PACKAGE_COUNT}"
-            )
-
-        # Check for duplicates within the package
-        seen_txids: set[bytes] = set()
-        for tx in txs:
-            txid = tx.get_txid()
-            if txid in seen_txids:
-                return False, f"Duplicate transaction in package: {txid.hex()[:16]}..."
-            seen_txids.add(txid)
-
-        # Check total weight
-        total_weight = sum([tx.get_weight() for tx in txs])
-        if total_weight > MAX_PACKAGE_WEIGHT:
-            return False, (
-                f"Package weight {total_weight} exceeds {MAX_PACKAGE_WEIGHT}"
-            )
-
-        # Check for double-spends within the package
-        package_spent: set[OutPoint] = set()
-        for tx in txs:
-            for inp in tx.inputs:
-                op: OutPoint = (inp.prev_txid, inp.prev_vout)
-                if op in package_spent:
-                    return False, (
-                        f"Double-spend within package: "
-                        f"{inp.prev_txid.hex()[:16]}...:{inp.prev_vout}"
-                    )
-                package_spent.add(op)
-
-        # Verify topological order: every input that references a package
-        # tx must reference one that appeared earlier.
-        txid_to_pos = {tx.get_txid(): i for i, tx in enumerate(txs)}
-        for i, tx in enumerate(txs):
-            for inp in tx.inputs:
-                parent_pos = txid_to_pos.get(inp.prev_txid)
-                if parent_pos is not None and parent_pos >= i:
-                    return False, (
-                        "Package not in topological order: "
-                        f"tx at position {i} spends output of tx at position {parent_pos}"
-                    )
-
-        # Check child-with-parents topology for multi-tx packages
-        # Reference: Bitcoin Core validation.cpp AcceptPackage()
-        if len(txs) > 1:
-            if not self.is_child_with_parents(txs):
-                return False, "package-not-child-with-parents"
-            if not self.is_child_with_parents_tree(txs):
-                return False, (
-                    "package topology disallowed: parents depend on each other"
-                )
-
-        # Compute per-transaction fees BEFORE ephemeral dust checks
-        # We need individual fees to enforce the 0-fee requirement for dust parents.
-        # Build a temporary UTXO view that includes outputs created by
-        # earlier transactions in the package.
-        package_outputs: dict[OutPoint, int] = {}  # (txid, vout) → value
-        tx_fees: dict[bytes, int] = {}  # txid → fee
-
-        for tx in txs:
-            txid = tx.get_txid()
-            # Sum inputs — from chain UTXO set, mempool, or package
-            total_input = 0
-            for inp in tx.inputs:
-                op: OutPoint = (inp.prev_txid, inp.prev_vout)
-                if op in package_outputs:
-                    total_input += package_outputs[op]
-                else:
-                    parent_entry = self.transactions.get(inp.prev_txid)
-                    if parent_entry and inp.prev_vout < len(parent_entry.tx.outputs):
-                        total_input += parent_entry.tx.outputs[inp.prev_vout].value
-                    else:
-                        utxo = self.validator.db.get_utxo(inp.prev_txid, inp.prev_vout)
-                        if utxo:
-                            total_input += utxo['value']
-                        else:
-                            return False, (
-                                f"UTXO not found for package tx: "
-                                f"{inp.prev_txid.hex()[:16]}...:{inp.prev_vout}"
-                            )
-
-            total_output = sum(out.value for out in tx.outputs)
-            fee = total_input - total_output
-            if fee < 0:
-                return False, f"Negative fee in package tx {txid.hex()[:16]}..."
-            tx_fees[txid] = fee
-
-            # Register outputs for children in the package
-            for vout, out in enumerate(tx.outputs):
-                package_outputs[(txid, vout)] = out.value
-
-        # Ephemeral dust policy checks (Bitcoin Core policy/ephemeral_policy.cpp)
-        # For any tx with dust outputs:
-        # 1. At most 1 dust output per transaction
-        # 2. Dust tx must have 0 fee (child provides all fees via CPFP)
-        # 3. Dust output must be P2A or standard type
-        # 4. All dust outputs must be spent by child in same package
-        for tx in txs:
-            dust_indices = _has_ephemeral_dust(tx)
-            if not dust_indices:
-                continue
-
-            txid = tx.get_txid()
-            fee = tx_fees.get(txid, 0)
-
-            # Check ephemeral dust policy (max 1 dust, 0-fee, standard type)
-            ok, err = _check_ephemeral_dust(tx, fee)
-            if not ok:
-                return False, f"ephemeral dust policy: {err}"
-
-            # All dust outputs must be spent by a child in the package
-            for dust_vout in dust_indices:
-                dust_outpoint: OutPoint = (txid, dust_vout)
-                if dust_outpoint not in package_spent:
-                    return False, (
-                        f"tx {txid.hex()[:16]}... has unspent ephemeral "
-                        f"dust output at index {dust_vout}"
-                    )
-
-        # TRUC (v3) policy checks for packages
-        # Reference: Bitcoin Core policy/truc_policy.cpp PackageTRUCChecks()
-        truc_ok, truc_err = self._check_package_truc_policy(txs)
-        if not truc_ok:
-            return False, truc_err
-
-        # Validate each transaction (consensus checks only)
-        for tx in txs:
-            txid = tx.get_txid()
-            if txid in self.transactions:
-                return False, f"Transaction {txid.hex()[:16]}... already in mempool"
-
-        # Check conflicts with existing mempool (any double-spend)
-        for tx in txs:
-            for inp in tx.inputs:
-                op = (inp.prev_txid, inp.prev_vout)
-                if op in self.spent_outputs:
-                    return False, (
-                        f"Package conflicts with mempool: "
-                        f"{inp.prev_txid.hex()[:16]}...:{inp.prev_vout} already spent"
-                    )
-
-        # Calculate total fees and size using pre-computed per-tx fees
-        total_fees = sum(tx_fees.values())
-        total_size = sum(len(tx.serialize()) for tx in txs)
-
-        # Package fee rate check (CPFP: package rate must meet minimum)
-        package_fee_rate = total_fees / total_size if total_size > 0 else 0
-        min_relay = (total_size * DEFAULT_MIN_RELAY_TX_FEE) // 1000
-        if total_fees < min_relay:
-            return False, (
-                f"Package fee rate too low: {package_fee_rate:.2f} sat/vB "
-                f"(need {DEFAULT_MIN_RELAY_TX_FEE / 1000:.2f} sat/vB)"
-            )
-
-        # Per-member standardness / policy PreChecks.
-        #
-        # The single-tx accept path (_add_transaction_inner, ~line 2052) runs
-        # IsStandardTx + input-standardness + witness-standardness + the per-tx
-        # sigop-cost gate before consensus validation.  Historically the package
-        # path skipped all of these, so submitpackage / 1p1c relay could admit
-        # and re-relay transactions that the single-tx PreChecks would reject —
-        # a relay-policy DoS hole (non-standard scriptPubKey, non-pushonly
-        # scriptSig, oversized datacarrier, non-standard input/witness types,
-        # excessive sigops).  Mirror the single-tx gate sequence here per member.
-        #
-        # Reference: Bitcoin Core validation.cpp AcceptMultipleTransactions /
-        # AcceptSubPackage runs PreChecks() for every member.  PreChecks is
-        # package-feerate aware for the *fee* gate only — every standardness /
-        # policy check is applied per member exactly as for a single tx.  We
-        # therefore intentionally do NOT add a per-member individual-min-fee
-        # rejection here: the package fee-rate gate above (lines computing
-        # package_fee_rate / min_relay) already enforces the fee floor over the
-        # whole package, which is what makes CPFP (a low-fee parent paid for by
-        # its child) work.  v3 ephemeral-dust parents are likewise not rejected
-        # by the standardness dust gate (IsStandardTx gate 8 exempts v3) — they
-        # are governed by the dedicated ephemeral-dust policy checked above.
-        if self.require_standard:
-            # Rolling map of script_pubkeys created by earlier package members,
-            # so a child member's inputs that spend a package parent can resolve
-            # their prevScript.  Txs are in topological order (enforced above).
-            pkg_prev_spks: dict[OutPoint, bytes] = {}
-
-            def _resolve_prev_spk(prev_txid: bytes, prev_vout: int) -> bytes | None:
-                spk = pkg_prev_spks.get((prev_txid, prev_vout))
-                if spk is not None:
-                    return spk
-                parent_entry = self.transactions.get(prev_txid)
-                if parent_entry is not None and prev_vout < len(parent_entry.tx.outputs):
-                    return parent_entry.tx.outputs[prev_vout].script_pubkey
-                utxo = self.validator.db.get_utxo(prev_txid, prev_vout)
-                if utxo is not None:
-                    return utxo["script_pubkey"]
-                return None
-
-            for tx in txs:
-                txid = tx.get_txid()
-
-                # Gate 1: IsStandardTx (version / weight / size / scriptSig /
-                # scriptPubKey type / datacarrier / dust).  Same call the
-                # single-tx path makes at line 2053.
-                is_std, reason = _is_standard_tx(tx)
-                if not is_std:
-                    return False, (
-                        f"Package tx {txid.hex()[:16]}... non-standard: {reason}"
-                    )
-
-                # Build the prevScripts map for input/witness standardness from
-                # the package view, in-mempool parents, then the chain UTXO set.
-                prevscripts: dict[int, bytes] = {}
-                for idx, tx_in in enumerate(tx.inputs):
-                    spk = _resolve_prev_spk(tx_in.prev_txid, tx_in.prev_vout)
-                    if spk is not None:
-                        prevscripts[idx] = spk
-
-                # Gate 2: input-side standardness (prevout types + P2SH sigops).
-                # Mirrors _add_transaction_inner line 2102.
-                iv_ok, iv_reason = _validate_inputs_standardness(tx, prevscripts)
-                if not iv_ok:
-                    return False, f"Package tx {txid.hex()[:16]}... {iv_reason}"
-
-                # Gate 3: witness standardness (only when the tx has witness
-                # data).  Mirrors _add_transaction_inner lines 2109-2112.
-                if any(tx_in.witness for tx_in in tx.inputs):
-                    is_ws, ws_reason = _is_witness_standard(tx, prevscripts)
-                    if not is_ws:
-                        return False, (
-                            f"Package tx {txid.hex()[:16]}... non-standard: {ws_reason}"
-                        )
-
-                # Gate 4: per-tx sigop-cost limit.  Mirrors lines 2122-2139.
-                def _sigop_resolver(prev_txid: bytes, prev_vout: int):
-                    spk = _resolve_prev_spk(prev_txid, prev_vout)
-                    return {"script_pubkey": spk} if spk is not None else None
-
-                member_sigop_cost = _compute_tx_sigop_cost(tx, _sigop_resolver)
-                if member_sigop_cost > MAX_STANDARD_TX_SIGOPS_COST:
-                    return False, (
-                        f"Package tx {txid.hex()[:16]}... "
-                        f"bad-txns-too-many-sigops: sigop cost {member_sigop_cost} "
-                        f"exceeds MAX_STANDARD_TX_SIGOPS_COST "
-                        f"({MAX_STANDARD_TX_SIGOPS_COST})"
-                    )
-
-                # Register this member's outputs so later (child) members can
-                # resolve their prevScripts from within the package.
-                for vout, out in enumerate(tx.outputs):
-                    pkg_prev_spks[(txid, vout)] = out.script_pubkey
-
-        # Consensus-validate each transaction.
-        # BIP-113: use MTP of current tip as locktime cutoff (same as
-        # AcceptToMemoryPool in Core validation.cpp:164).
-        try:
-            pkg_mtp: int = self.validator.db.get_median_time_past(height) or 0
-        except Exception as _mtp_exc:
-            if is_system_error(_mtp_exc):
-                raise  # gate 6: a read failure is not MTP 0
-            pkg_mtp = 0
-        # Build a rolling intra_block_utxos view of package parent outputs so
-        # that child transactions can find outputs that are not yet in the UTXO
-        # DB.  Mirrors Core AcceptMultipleTransactions which builds a package
-        # UTXO view (CCoinsViewMemPool over the package) before calling
-        # AcceptToMemoryPool for each transaction.  Txs are in topological
-        # order (enforced above), so accumulating outputs tx-by-tx is safe.
-        pkg_utxo_view: dict = {}
-        for tx in txs:
-            txid = tx.get_txid()
-            from ouroboros.validation import MissingAncestorHeaderError
-            try:
-                valid, error = self.validator.validate_transaction(
-                    tx, height, pkg_mtp,
-                    intra_block_utxos=pkg_utxo_view if pkg_utxo_view else None,
-                )
-            except MissingAncestorHeaderError:
-                valid, error = False, "missing-ancestor-header"
-            if not valid:
-                return False, f"Package tx {txid.hex()[:16]}... invalid: {error}"
-            # Register this tx's outputs so subsequent (child) txs can find them.
-            for vout_idx, out in enumerate(tx.outputs):
-                pkg_utxo_view[(txid, vout_idx)] = {
-                    'txid': txid,
-                    'vout': vout_idx,
-                    'value': out.value,
-                    'script_pubkey': out.script_pubkey,
-                    'height': height,
-                    'is_coinbase': False,
-                }
-
-        # All checks passed — add transactions in topological order.
-        # Use pre-computed per-tx fees; skip per-tx minimum fee check
-        # (package rate already validated above).
-        added_txids: list[bytes] = []
-        ephemeral_parents: set[bytes] = set()  # Track parents with ephemeral dust
-
-        for tx in txs:
-            txid = tx.get_txid()
-            tx_size = len(tx.serialize())
-
-            # Compute direct parents (mempool txs this tx spends from)
-            direct_parents: set[bytes] = set()
-            for inp in tx.inputs:
-                if inp.prev_txid in self.transactions:
-                    direct_parents.add(inp.prev_txid)
-
-            # Use pre-computed fee from earlier validation
-            fee = tx_fees.get(txid, 0)
-            fee_rate = fee / tx_size if tx_size > 0 else 0
-
-            # Track if this is an ephemeral dust parent
-            if _has_ephemeral_dust(tx):
-                ephemeral_parents.add(txid)
-
-            ancestors = self._get_ancestors(tx)
-            ancestor_size = sum(
-                self.transactions[a].size
-                for a in ancestors if a in self.transactions
-            )
-
-            has_dust = txid in ephemeral_parents
-            entry = MempoolEntry(
-                tx=tx,
-                fee=fee,
-                fee_rate=fee_rate,
-                size=tx_size,
-                time_added=time.time(),
-                height_added=height,
-                ancestor_count=len(ancestors) + 1,
-                ancestor_size=ancestor_size + tx_size,
-                descendant_size=tx_size,
-                parents=direct_parents,
-                children=set(),
-                has_ephemeral_dust=has_dust,
-            )
-            self.transactions[txid] = entry
-            self.current_size += tx_size
-
-            for inp in tx.inputs:
-                op_in = (inp.prev_txid, inp.prev_vout)
-                self.spent_outputs.add(op_in)
-                self.spender_by_outpoint[op_in] = txid
-
-            self._insert_sorted_by_fee_rate(txid, fee_rate)
-
-            # Update parent entries to add this txid as a child
-            # Also track ephemeral dust relationships
-            for parent_txid in direct_parents:
-                if parent_txid in self.transactions:
-                    parent_entry = self.transactions[parent_txid]
-                    parent_entry.children.add(txid)
-                    # If parent has ephemeral dust, mark this child as spending it
-                    if parent_entry.has_ephemeral_dust:
-                        parent_entry.ephemeral_child = txid
-
-            # Update ancestor descendant counts
-            for a_txid in ancestors:
-                if a_txid in self.transactions:
-                    self.transactions[a_txid].descendant_count += 1
-                    self.transactions[a_txid].descendant_size += tx_size
-
-            added_txids.append(txid)
-
-        logger.info(
-            f"Accepted package of {len(added_txids)} txs "
-            f"(total fee {total_fees}, package rate {package_fee_rate:.2f} sat/vB)"
-        )
-
-        # Resolve any orphans that may be waiting on these transactions
-        for txid in added_txids:
-            self._resolve_orphans(txid, height)
-
-        return True, ""
+        res = self.accept_package(txs, height)
+        if res.state == "valid":
+            return True, ""
+        # The failure that decided the package first, then any other.
+        decisive = [res.results[w] for w in res.failed_wtxids if w in res.results]
+        for r in [*decisive, *res.results.values()]:
+            if r.kind == "invalid":
+                return False, f"{res.message}: {r.reject_details or r.reject_reason}"
+        return False, res.message
