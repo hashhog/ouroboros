@@ -422,3 +422,63 @@ def test_validate_package_reports_the_package_stage_failure():
     assert not ok
     assert err == f"transaction failed: {pkg_fail.reject_details}"
     assert len(pool.transactions) == 0
+
+
+# --------------------------------------------------------------------------
+# Package RBF: not implemented, so the package is refused as on master
+# --------------------------------------------------------------------------
+
+def _conflict_and_descendant(pool, db, n: int):
+    """``O`` spends coin *n* (fee 10_000), ``D`` spends ``O`` (fee 1_000)."""
+    coin = _funded(db, n)
+    o = _tx([(coin, 0)], [90_000])
+    assert pool.add_transaction(o, 100)[0]
+    d = _tx([(o.get_txid(), 0)], [89_000])
+    assert pool.add_transaction(d, 100)[0]
+    return coin, o, d
+
+
+def test_submitpackage_needing_package_rbf_is_refused_without_per_tx_results():
+    """Parent double-spends a pool tx and pays less than the conflicts, so it
+    fails RBF on its own: Core retries it with its child as a package RBF.
+    This node has no package RBF, so it refuses the package before any
+    per-tx verdict, as master did: master's package_msg and no tx-results
+    entries, rather than per-tx errors that only exist because the package
+    RBF step is missing.  The conflicts stay; nothing is admitted.  On #145's
+    second head this returned "transaction failed" with an insufficient-fee
+    error for the parent and a missing-inputs error for the child."""
+    pool, db = _pool()
+    coin, o, d = _conflict_and_descendant(pool, db, 23)
+    parent = _tx([(coin, 0)], [94_000])                  # fee 6_000 < 11_000
+    child = _tx([(parent.get_txid(), 0)], [50_000])
+    res = asyncio.run(RPCServer.rpc_submitpackage(
+        _rpc(pool, db), [_hex(parent), _hex(child)]))
+    assert res["package_msg"] == (
+        f"Package conflicts with mempool: {coin.hex()[:16]}...:0 already spent")
+    assert res["tx-results"] == {}
+    assert res["replaced-transactions"] == []
+    assert o.get_txid() in pool.transactions
+    assert d.get_txid() in pool.transactions
+    assert parent.get_txid() not in pool.transactions
+    assert child.get_txid() not in pool.transactions
+
+
+def test_package_parent_that_pays_for_single_rbf_still_replaces():
+    """The refusal above is only for a member that would need package RBF.
+    A parent paying enough to replace the conflicts on its own is the
+    single-tx RBF Core's AcceptPackage runs first: it replaces ``O`` and
+    ``D`` and its child follows."""
+    pool, db = _pool()
+    coin, o, d = _conflict_and_descendant(pool, db, 24)
+    parent = _tx([(coin, 0)], [70_000])                  # fee 30_000 > 11_000
+    child = _tx([(parent.get_txid(), 0)], [60_000])
+    res = asyncio.run(RPCServer.rpc_submitpackage(
+        _rpc(pool, db), [_hex(parent), _hex(child)]))
+    assert res["package_msg"] == "success", res
+    assert res["replaced-transactions"] == sorted(
+        [_be(o.get_txid()), _be(d.get_txid())],
+        key=lambda h: bytes.fromhex(h)[::-1])
+    assert parent.get_txid() in pool.transactions
+    assert child.get_txid() in pool.transactions
+    assert o.get_txid() not in pool.transactions
+    assert d.get_txid() not in pool.transactions
