@@ -19,7 +19,6 @@ from collections import defaultdict
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
@@ -1953,14 +1952,10 @@ class RPCServer:
 
         self.app = FastAPI(title="Bitcoin Hybrid Node RPC")
 
-        # Add CORS middleware
-        self.app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
+        # No CORS middleware: Core sends no CORS headers on the RPC port. The
+        # wildcard-origin, credentials-allowed policy that used to sit here
+        # made Starlette reflect any Origin, so any web page could read RPC
+        # replies.
 
         # Setup security if credentials provided
         self.security = None
@@ -2505,62 +2500,6 @@ class RPCServer:
             from urllib.parse import unquote
             wallet_name = unquote(wallet_name)
             return await _handle_rpc_common(http_request, wallet_name=wallet_name)
-
-        @self.app.get("/health")
-        async def health():
-            """Health check endpoint"""
-            return {"status": "healthy", "service": "bitcoin-rpc"}
-
-        @self.app.get("/getblockstats")
-        async def getblockstats(
-            hash_or_height: str,
-            stats: str | None = None,
-            http_request: Request = None,
-        ):
-            """GET endpoint for getblockstats.
-
-            ``hash_or_height`` is passed as a query parameter (string).
-            If it looks like an integer it is treated as a block height,
-            otherwise it is treated as a block hash.
-
-            ``stats`` is an optional comma-separated list of stat names to
-            return.
-            """
-            # Coerce to int when possible
-            parsed: int | str
-            try:
-                parsed = int(hash_or_height)
-            except ValueError:
-                parsed = hash_or_height
-
-            stats_list: list[str] | None = None
-            if stats:
-                stats_list = [s.strip() for s in stats.split(",") if s.strip()]
-
-            return await self.rpc_getblockstats(parsed, stats_list)
-
-        @self.app.get("/getblockfilter")
-        async def getblockfilter_get(
-            blockhash: str,
-            filtertype: str = "basic",
-        ):
-            """GET endpoint for getblockfilter (BIP 157/158).
-
-            ``blockhash`` is the hex-encoded block hash.
-            ``filtertype`` is the filter type name (only ``basic`` supported).
-            """
-            # rpc_getblockfilter raises RpcError with Core-coded numeric
-            # codes (-5/-1/-8) for the JSON-RPC path.  Translate to the
-            # nearest HTTP status for this REST GET surface.
-            try:
-                return await self.rpc_getblockfilter(blockhash, filtertype)
-            except RpcError as e:
-                _status = {
-                    RPC_INVALID_ADDRESS_OR_KEY: 404,
-                    RPC_MISC_ERROR: 400,
-                    RPC_INVALID_PARAMETER: 400,
-                }.get(e.code, 500)
-                raise HTTPException(status_code=_status, detail=e.message) from None
 
         # BIP-78 PayJoin receiver endpoint (FIX-65).
         #
@@ -3879,7 +3818,9 @@ class RPCServer:
         # verbosity == 2: add fee at top level and prevout per non-coinbase input.
         # Reference: Bitcoin Core getrawtransaction verbosity=2 path,
         #            rpc/rawtransaction.cpp TxToUniv(tx, …, verbosity=2).
-        if verbosity >= 2 and not witness_tx.is_coinbase:
+        # Core only has undo data for a tx found in a block (rawtransaction.cpp
+        # :365-371), so a mempool tx gets neither fee nor prevout.
+        if verbosity >= 2 and not in_mempool and not witness_tx.is_coinbase:
             input_total_sats = 0
             vin_list = result.get("vin", [])
             for j, tx_in in enumerate(witness_tx.inputs):
@@ -8789,9 +8730,9 @@ class RPCServer:
         ``ActivateBestChain``):
 
         * **Stored, not heavier** — block lives in the side-branch buffer;
-          tip stays put. Core surfaces this as ``"inconclusive"`` on
-          submitblock; ouroboros returns ``None`` (accept), matching the
-          existing fleet convention used by other impls.
+          tip stays put. Returns ``None``; ``rpc_submitblock`` answers
+          ``"inconclusive"`` for it, like Core (the P2P fork bridge reads
+          any non-None result as a reject, so the mapping lives there).
         * **Stored, heavier** — drives a reorg: disconnect from active
           tip back to the common ancestor, then connect each side-branch
           block (which we have buffered by hash) up to the new tip.
@@ -9186,12 +9127,9 @@ class RPCServer:
         if fork_cw is not None and active_cw > 0:
             # Chainwork available: exact 256-bit comparison.
             if fork_cw <= active_cw:
-                # Same-or-lighter side-branch: stored, no tip flip. Core's
-                # ``rpc/mining.cpp`` returns ``"inconclusive"`` here; the
-                # diff-test harness treats both ``None`` (accept) and
-                # ``reject:inconclusive`` as "context successfully ingested",
-                # so returning None keeps wire-compat with the rest of the
-                # fleet's submitblock semantics.
+                # Same-or-lighter side-branch: stored, no tip flip.
+                # rpc_submitblock turns this None into Core's
+                # ``"inconclusive"`` (rpc/mining.cpp: no BlockChecked).
                 logger.debug(
                     "submitblock: side-branch h=%d cw=0x%064x not strictly "
                     "heavier than active_tip h=%d cw=0x%064x; stored only",
@@ -10318,16 +10256,18 @@ class RPCServer:
             if _bs.is_block_failed(bytes(prev_hash)):
                 return "bad-prevblk"
 
-        # Duplicate-submission short-circuit. Core returns "duplicate" for
-        # blocks already on the active chain, "duplicate-inconclusive" for
-        # blocks already stored as side-branch.
+        # Duplicate-submission short-circuit. Core submitblock returns
+        # "duplicate" for any block it already has and accepted
+        # (``!new_block && accepted``: AcceptBlock's fAlreadyHave), whether
+        # it is on the active chain or stored on a side branch.  v31.1 only
+        # emits "duplicate-inconclusive" from getblocktemplate proposal mode.
         try:
             if hasattr(db, "has_block_hash") and db.has_block_hash(block_hash):
                 return "duplicate"
         except Exception:
             pass
         if block_hash in self._side_branch_blocks:
-            return "duplicate-inconclusive"
+            return "duplicate"
 
         try:
             tip_hash, best_height = db.get_best_block()
@@ -10404,6 +10344,19 @@ class RPCServer:
         if is_internal_error_text(_side_result):
             # A reorg aborted on a system fault (gate 6): RPC error, not BIP-22.
             raise RpcError(RPC_VERIFY_ERROR, _side_result)
+        if _side_result is None:
+            # Core rpc/mining.cpp submitblock: ``if (!sc->found) return
+            # "inconclusive"``.  BlockChecked only fires from ConnectBlock, so
+            # a block AcceptBlock stored without connecting it (no more work
+            # than the tip, or no work basis) is "inconclusive", not null.
+            # The engine itself keeps returning None for that case: the P2P
+            # fork bridge reads any non-None result as a reject.
+            try:
+                _tip_after, _ = db.get_best_block()
+            except Exception:
+                _tip_after = None
+            if _tip_after is None or bytes(_tip_after) != bytes(block_hash):
+                return "inconclusive"
         return _side_result
 
     async def rpc_submitheader(self, hexdata: str) -> None:

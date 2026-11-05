@@ -130,6 +130,62 @@ class TransactionInfo(BaseModel):
     timestamp: int | None = None
 
 
+# Wallet file permissions. An unencrypted wallet.dat holds the HD seed and
+# mnemonic in plain JSON, so wallet files are owner-only (0600) and wallet
+# directories owner-only (0700) whatever the process umask is. Core gets the
+# same result by setting umask 0077 at startup (common/system.cpp:92-93).
+WALLET_FILE_MODE = 0o600
+WALLET_DIR_MODE = 0o700
+
+
+def _make_private_dir(path: Path) -> None:
+    """Create *path* and any missing parents as 0700; chmod *path* to 0700.
+
+    Existing parents (the datadir and above) keep their mode; only
+    directories this call creates, plus *path* itself, are made owner-only.
+    """
+    missing: list[Path] = []
+    p = path
+    while not p.exists():
+        missing.append(p)
+        if p.parent == p:
+            break
+        p = p.parent
+    for d in reversed(missing):
+        try:
+            d.mkdir(mode=WALLET_DIR_MODE)
+        except FileExistsError:
+            pass
+        os.chmod(d, WALLET_DIR_MODE)
+    if not missing:
+        os.chmod(path, WALLET_DIR_MODE)
+
+
+def _open_private(path: Path):
+    """Open *path* for binary writing, truncated, with mode 0600.
+
+    ``os.open`` with 0600 covers a new file; ``fchmod`` covers an existing
+    one, which ``O_CREAT`` would leave at its old mode.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, WALLET_FILE_MODE)
+    try:
+        os.fchmod(fd, WALLET_FILE_MODE)
+        return os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _copy_private(src: Path, dest: Path) -> None:
+    """Copy *src* to *dest* as an owner-only (0600) file, fsynced."""
+    import shutil
+
+    with open(src, "rb") as fin, _open_private(dest) as fout:
+        shutil.copyfileobj(fin, fout)
+        fout.flush()
+        os.fsync(fout.fileno())
+
+
 # Wallet encryption (AES-256-GCM + scrypt)
 
 def encrypt_wallet_data(plaintext: bytes, passphrase: str) -> bytes:
@@ -1385,10 +1441,20 @@ class Wallet:
         if not self.wallet_path.exists():
             self._encrypted_blob = None
             # Create parent directory (either wallet_dir or wallets/)
-            self.wallet_path.parent.mkdir(parents=True, exist_ok=True)
+            _make_private_dir(self.wallet_path.parent)
             self._save()
             logger.info(f"Created new wallet '{self.name}'")
             return
+
+        # Tighten a wallet written before files were created owner-only.
+        try:
+            os.chmod(self.wallet_path.parent, WALLET_DIR_MODE)
+            os.chmod(self.wallet_path, WALLET_FILE_MODE)
+        except OSError as e:
+            logger.warning(
+                f"Could not make wallet '{self.name}' at {self.wallet_path} "
+                f"owner-only: {e!r}"
+            )
 
         # --- Fault-tolerant parse -------------------------------------------
         # A wallet.dat can be partial / torn / zero-length after an unclean
@@ -1586,14 +1652,15 @@ class Wallet:
         # exactly the corruption the fault-tolerant loader must also survive.
         # ``os.replace`` is used (not Path.rename) for explicit atomic-replace
         # semantics across platforms.
-        self.wallet_path.parent.mkdir(parents=True, exist_ok=True)
+        _make_private_dir(self.wallet_path.parent)
         # Per-instance temp name keeps concurrent saves of *different* wallets
         # (each its own path) independent; same-wallet saves are not
-        # re-entrant. Suffix ".tmp" matches the historical name.
+        # re-entrant. Suffix ".tmp" matches the historical name. The temp is
+        # created 0600 and os.replace keeps that mode on wallet.dat.
         tmp = self.wallet_path.with_name(self.wallet_path.name + ".tmp")
         try:
-            with open(tmp, "w") as f:
-                json.dump(outer, f, indent=2)
+            with _open_private(tmp) as f:
+                f.write(json.dumps(outer, indent=2).encode("utf-8"))
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.wallet_path)
@@ -3091,24 +3158,23 @@ class Wallet:
 
         Does not create missing parent directories — Core's BackupWallet
         fails with RPC_WALLET_ERROR when the destination cannot be opened.
+        The copy is owner-only (0600) like the wallet it holds.
         """
-        import shutil
         dest = Path(backup_path)
         if not dest.parent.exists() or not dest.parent.is_dir():
             raise OSError("backup destination directory does not exist")
         if dest.exists() and dest.is_dir():
             raise OSError("backup destination is a directory")
-        shutil.copy2(self.wallet_path, dest)
+        _copy_private(self.wallet_path, dest)
         logger.info(f"Wallet backed up to {dest}")
         return str(dest)
 
     def restore_from_backup(self, backup_path: str) -> None:
         """Restore wallet from a backup file."""
-        import shutil
         src = Path(backup_path)
         if not src.exists():
             raise FileNotFoundError(f"Backup not found: {backup_path}")
-        shutil.copy2(src, self.wallet_path)
+        _copy_private(src, self.wallet_path)
         self._load_or_create()
         logger.info(f"Wallet restored from {src}")
 
@@ -3413,7 +3479,7 @@ class WalletManager:
         self.data_dir = Path(data_dir).expanduser()
         self.network = network
         self.wallets_dir = self.data_dir / "wallets"
-        self.wallets_dir.mkdir(parents=True, exist_ok=True)
+        _make_private_dir(self.wallets_dir)
 
         # Loaded wallets: name -> Wallet instance
         self._wallets: dict[str, Wallet] = {}
@@ -3663,7 +3729,7 @@ class WalletManager:
             passphrase = None
 
         # Create wallet directory
-        wallet_dir.mkdir(parents=True, exist_ok=True)
+        _make_private_dir(wallet_dir)
 
         # Create wallet instance with new-style directory path
         wallet = Wallet(
@@ -3766,7 +3832,7 @@ class WalletManager:
             legacy_path = self.wallets_dir / f"{name}.json"
             if legacy_path.exists():
                 # Migrate to new directory structure
-                wallet_dir.mkdir(parents=True, exist_ok=True)
+                _make_private_dir(wallet_dir)
                 legacy_path.rename(wallet_file)
                 warnings.append(f"Migrated wallet '{name}' to new directory format")
             else:
@@ -3856,8 +3922,6 @@ class WalletManager:
         FAILED_INVALID_BACKUP_FILE -> RPC_INVALID_PARAMETER (-8);
         an existing wallet.dat is FAILED_ALREADY_EXISTS -> -36.
         """
-        import shutil
-
         src = Path(backup_file)
         if not src.is_file():
             raise WalletRpcError(-8, "Backup file does not exist")
@@ -3869,8 +3933,8 @@ class WalletManager:
             )
 
         wallet_dir = self._wallet_dir(name)
-        wallet_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, self._wallet_file(name))
+        _make_private_dir(wallet_dir)
+        _copy_private(src, self._wallet_file(name))
         return self.load_wallet(name, load_on_startup)
 
     def _update_load_on_startup(self, name: str, enabled: bool) -> None:

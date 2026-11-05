@@ -215,6 +215,7 @@ from ouroboros.p2p_messages import (
 )
 from ouroboros.config import MIN_BLOCKS_TO_KEEP
 from ouroboros.peer import Peer
+from ouroboros.tx_request import TxRequestTracker
 from ouroboros.fatal import (
     INTERNAL_ERROR_MARKER,
     InternalValidationError,
@@ -667,8 +668,10 @@ class BlockSync:
         self._w95_block_mb_ema: float = 1.0
         self._w95_block_mb_alpha: float = 0.05
 
-        # Track requested transactions (hash -> request_time)
-        self._requested_txs: dict[bytes, float] = {}
+        # Tx announcements, tracked per peer with Core's caps
+        # (MAX_PEER_TX_ANNOUNCEMENTS / MAX_PEER_TX_REQUEST_IN_FLIGHT) and
+        # expired in O(expired).  See tx_request.py.
+        self._requested_txs = TxRequestTracker()
 
         # Track received blocks (hash -> Block)
         self.received_blocks: dict[bytes, Block] = {}
@@ -1766,6 +1769,7 @@ class BlockSync:
             self._peer_handlers.pop(p, None)
 
         self._unconnecting_headers_count.pop(addr, None)
+        self._requested_txs.forget_peer(addr)
         # Low-work PRESYNC walk + its `already_validated_work` flag are keyed
         # by the same host:port string and are per-CONNECTION state.
         self._lowwork_presync.pop(addr, None)
@@ -2097,11 +2101,12 @@ class BlockSync:
             blocks_to_request = []
             txs_to_request = []
 
-            # Expire stale tx requests (>60 s)
             now = time.time()
-            stale = [h for h, t in self._requested_txs.items() if now - t > 60]
-            for h in stale:
-                self._requested_txs.pop(h, None)
+            # Expire stale tx requests / announcements (GETDATA_TX_INTERVAL);
+            # pops only the expired entries, never scans the whole tracker.
+            tx_now = time.monotonic()
+            self._requested_txs.expire(tx_now)
+            peer_key = self._peer_key(peer)
 
             has_new_blocks = False
             # Last unknown-block inv hash in this batch — used as the rate-limit
@@ -2191,8 +2196,16 @@ class BlockSync:
                                 inv_hash,
                             )
                         if not have:
-                            txs_to_request.append(request_item)
-                            self._requested_txs[inv_hash] = now
+                            # Ignored past MAX_PEER_TX_ANNOUNCEMENTS for this
+                            # peer (Core AddTxAnnouncement).
+                            self._requested_txs.announce(
+                                peer_key, inv_hash, request_item, tx_now
+                            )
+
+            # Request queued announcements up to this peer's
+            # MAX_PEER_TX_REQUEST_IN_FLIGHT; the rest wait for answers.
+            if self.mempool is not None:
+                txs_to_request = self._requested_txs.pop_requests(peer_key, tx_now)
 
             network = (
                 self.peer_manager.network
@@ -2252,25 +2265,42 @@ class BlockSync:
                         self._h1_last_issue.pop(bh, None)
 
             if txs_to_request:
-                # Cap each GETDATA at MAX_GETDATA_SZ=1000 items (Core protocol.h:482).
-                # Peers reject GETDATA messages with more than 1000 inventory items.
-                for i in range(0, len(txs_to_request), MAX_GETDATA_SZ):
-                    batch = txs_to_request[i:i + MAX_GETDATA_SZ]
-                    getdata = GetDataMessage(inventory=batch)
-                    try:
-                        await peer.send_message(getdata.to_network_message(network))
-                        logger.debug(
-                            f"Requested {len(batch)} txs from "
-                            f"{peer.host}:{peer.port}"
-                            + (f" (batch {i // MAX_GETDATA_SZ + 1})" if len(txs_to_request) > MAX_GETDATA_SZ else "")
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to request txs: {e}")
-                        break
+                await self._send_tx_getdata(peer, txs_to_request, network)
 
         except Exception as e:
             logger.error(f"Error handling inv from {peer.host}:{peer.port}: {e}")
             peer.adjust_score(-2)
+
+    async def _send_tx_getdata(self, peer: Peer, items: list, network: str) -> None:
+        # Cap each GETDATA at MAX_GETDATA_SZ=1000 items (Core protocol.h:482).
+        # Peers reject GETDATA messages with more than 1000 inventory items.
+        for i in range(0, len(items), MAX_GETDATA_SZ):
+            batch = items[i:i + MAX_GETDATA_SZ]
+            getdata = GetDataMessage(inventory=batch)
+            try:
+                await peer.send_message(getdata.to_network_message(network))
+                logger.debug(
+                    f"Requested {len(batch)} txs from "
+                    f"{peer.host}:{peer.port}"
+                    + (f" (batch {i // MAX_GETDATA_SZ + 1})" if len(items) > MAX_GETDATA_SZ else "")
+                )
+            except Exception as e:
+                logger.error(f"Failed to request txs: {e}")
+                break
+
+    async def on_tx_answered(self, peer: Peer, hashes) -> None:
+        """A tx or notfound from *peer* answered *hashes* (txids and/or
+        wtxids).  Frees their in-flight slots and requests the peer's next
+        queued announcements, as Core's ReceivedResponse does."""
+        tracker = self._requested_txs
+        for h in hashes:
+            tracker.received(h)
+        if self.mempool is None:
+            return
+        items = tracker.pop_requests(self._peer_key(peer), time.monotonic())
+        if items:
+            network = getattr(self.peer_manager, "network", "mainnet")
+            await self._send_tx_getdata(peer, items, network)
 
     async def handle_block(self, msg: NetworkMessage, peer: Peer):
         """Handle block delivery.

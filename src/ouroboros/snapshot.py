@@ -1222,14 +1222,28 @@ def read_compressed_script(f: BinaryIO) -> bytes:
     """Inverse of write_compressed_script."""
     n_size = read_varint(f)
     if n_size < N_SPECIAL_SCRIPTS:
-        body = f.read(_special_script_body_len(n_size))
+        body = _read_exact(f, _special_script_body_len(n_size))
         return decompress_script(n_size, body)
     raw_len = n_size - N_SPECIAL_SCRIPTS
     if raw_len > MAX_SCRIPT_SIZE:
         # Match Core: replace overlong scripts with OP_RETURN, skip the body.
-        f.read(raw_len)
+        _read_exact(f, raw_len)
         return bytes([0x6a])  # OP_RETURN
-    return f.read(raw_len)
+    return _read_exact(f, raw_len)
+
+
+def _read_exact(f: BinaryIO, n: int) -> bytes:
+    """Read exactly ``n`` bytes or raise, as Core's stream >> does.
+
+    A bare ``f.read(n)`` returns short at EOF, so a file cut inside the
+    last coin's script used to deserialize as a shorter script.
+    """
+    data = f.read(n)
+    if len(data) != n:
+        raise EOFError(
+            f"Unexpected end of file reading script ({len(data)} of {n} bytes)"
+        )
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -1305,6 +1319,128 @@ def _read_metadata_header(f: BinaryIO, network: str) -> SnapshotMetadata:
         network=network,
         base_blockhash=base_blockhash,
         coins_count=coins_count,
+    )
+
+
+@dataclass(frozen=True)
+class _SnapshotScan:
+    """What one pass over a snapshot's coins section produced."""
+
+    digest: bytes
+    coins: int
+    transactions: int
+    total_amount: int
+    bogosize: int
+
+
+def _scan_snapshot_coins(
+    f: BinaryIO,
+    metadata: SnapshotMetadata,
+    au_data: AssumeutxoData | None,
+    height: int,
+    progress_callback: Callable[[int, int], None] | None = None,
+    on_coin: Callable[[tuple[bytes, int, int, bytes, int, bool]], None] | None = None,
+) -> _SnapshotScan:
+    """Parse and check every coin from ``f`` (positioned after the header).
+
+    Runs every check Core's PopulateAndValidateSnapshot runs per coin and
+    at EOF, and streams the coins into a HASH_SERIALIZED HashWriter. Writes
+    nothing itself; ``on_coin`` receives each checked coin as
+    ``(txid, vout, amount, script, height, is_coinbase)`` when the caller
+    wants to store it. ``load_snapshot`` calls this once with no
+    ``on_coin`` to verify the file, and again to write it.
+
+    Streaming SHA256d (HashWriter) mirrors Core's HASH_SERIALIZED path
+    through ApplyCoinHash (kernel/coinstats.cpp:53-56), which is what
+    loadtxoutset's strict gate uses (validation.cpp:5902-5915). The wire
+    format already iterates (txid asc, vout asc), the same order Core's
+    CCoinsViewCursor walks.
+    """
+    hasher = HashWriter()
+    coins_left = metadata.coins_count
+    coins_loaded = 0
+    transactions = 0
+    total_amount = 0
+    bogosize = 0
+    while coins_left > 0:
+        txid = f.read(32)
+        if len(txid) != 32:
+            raise ValueError("Truncated snapshot: missing txid")
+
+        coins_per_txid = _read_compact_size(f)
+        if coins_per_txid == 0 or coins_per_txid > coins_left:
+            raise ValueError(
+                f"Invalid coins_per_txid={coins_per_txid} (coins_left={coins_left})"
+            )
+        transactions += 1
+
+        for _ in range(coins_per_txid):
+            vout = _read_compact_size(f)
+            coin_height, is_coinbase, amount, script = deserialize_coin(f)
+
+            # BUG-4: per-coin height bound check.
+            # Mirrors Core PopulateAndValidateSnapshot:
+            #   if (coin.nHeight > base_height) return Error{...}
+            # (validation.cpp:5814-5819)
+            # Only enforced when we know base_height (i.e. au_data is set).
+            if au_data is not None and coin_height > height:
+                raise ValueError(
+                    f"Bad snapshot data after deserializing "
+                    f"{metadata.coins_count - coins_left} coins: "
+                    f"coin.height={coin_height} > base_height={height}"
+                )
+
+            # BUG-5: per-coin MoneyRange check.
+            # Mirrors Core PopulateAndValidateSnapshot:
+            #   if (!MoneyRange(coin.out.nValue)) return Error{...}
+            # (validation.cpp:5820-5823)
+            if amount < 0 or amount > _MAX_MONEY:
+                raise ValueError(
+                    f"Bad snapshot data after deserializing "
+                    f"{metadata.coins_count - coins_left} coins - "
+                    f"bad tx out value: {amount}"
+                )
+
+            if on_coin is not None:
+                on_coin((txid, vout, amount, script, coin_height, is_coinbase))
+
+            hasher.update(
+                coin_element(
+                    txid=txid,
+                    vout=vout,
+                    height=coin_height,
+                    is_coinbase=is_coinbase,
+                    amount=amount,
+                    script_pubkey=script,
+                )
+            )
+            total_amount += amount
+            bogosize += 32 + 4 + 4 + 8 + 2 + len(script)
+
+            coins_left -= 1
+            coins_loaded += 1
+
+            if progress_callback and coins_loaded % 100_000 == 0:
+                progress_callback(coins_loaded, metadata.coins_count)
+
+    # BUG-6: trailing-bytes EOF check.
+    # Mirrors Core PopulateAndValidateSnapshot (validation.cpp:5872-5883):
+    #   std::byte left_over_byte;
+    #   try { coins_file >> left_over_byte; }
+    #   catch (const std::ios_base::failure&) { out_of_coins = true; }
+    #   if (!out_of_coins) return Error{"Bad snapshot - coins left over"};
+    if f.read(1):
+        raise ValueError(
+            f"Bad snapshot - coins left over after deserializing "
+            f"{metadata.coins_count} coins"
+        )
+
+    return _SnapshotScan(
+        digest=hasher.digest(),
+        coins=coins_loaded,
+        transactions=transactions,
+        total_amount=total_amount,
+        bogosize=bogosize,
     )
 
 
@@ -1606,9 +1742,15 @@ class SnapshotManager:
         loads all UTXOs into the database. Wire format matches Core's
         `loadtxoutset` exactly.
 
-        When ``strict=True`` (default) and assumeUTXO data is available,
-        we run the post-load SHA256d commitment check that mirrors
-        ``validation.cpp:5902-5915``: Core hashes the loaded UTXO set
+        The file is read twice. The first pass parses and checks every
+        coin and computes the commitment while writing nothing; only if it
+        matches is the live chainstate cleared and the second pass written
+        (audit H7: a bad file used to destroy the UTXO set before the hash
+        was checked). With ``strict=True`` (default) a snapshot with no
+        assumeUTXO entry is refused outright, on regtest too.
+
+        When ``strict=True`` we run the SHA256d commitment check that
+        mirrors ``validation.cpp:5902-5915``: Core hashes the loaded UTXO set
         with ``CoinStatsHashType::HASH_SERIALIZED`` (a ``HashWriter``
         feeding ``TxOutSer`` bytes, double-SHA256 finalize -- see
         kernel/coinstats.cpp:161-163 + hash.h:115-120) and rejects the
@@ -1654,6 +1796,19 @@ class SnapshotManager:
                     f"Available heights: {available}"
                 )
 
+            # Refuse a snapshot whose commitment we cannot check (audit H7,
+            # 2026-10-30). Core refuses any snapshot whose height has no
+            # m_assumeutxo_data entry on every network, regtest included
+            # (validation.cpp:5775-5780). Before this, an unregistered
+            # regtest snapshot was loaded at height 0 with no hash check.
+            # strict=False is the explicit unsafe opt-out; no production
+            # caller (RPC loadtxoutset, --load-snapshot) passes it.
+            if strict and au_data is None:
+                raise ValueError(
+                    f"assumeUTXO block hash {metadata.base_blockhash_hex()} not "
+                    "recognized - refusing to load snapshot"
+                )
+
             height = au_data.height if au_data else 0
 
             # BUG-3: chainwork-exceeds-active-chainstate guard.
@@ -1677,18 +1832,57 @@ class SnapshotManager:
             )
 
             # ----------------------------------------------------------
+            # Pass 1: verify before touching the chainstate (audit H7).
+            #
+            # Core populates a SEPARATE chainstate and checks
+            # HASH_SERIALIZED before it is ever used; on failure only that
+            # chainstate is deleted (validation.cpp:5677-5698, 5912-5914).
+            # Our snapshot_load_begin clears the live CHAINSTATE_CF, so
+            # every check that can refuse the file — parse, per-coin
+            # height and MoneyRange, trailing bytes, and the commitment —
+            # runs here first, over the whole file, writing nothing. A
+            # wrong, truncated or malformed file leaves the old UTXO set
+            # and tip exactly as they were.
+            # ----------------------------------------------------------
+            coins_start = f.tell()
+            verified = _scan_snapshot_coins(
+                f, metadata, au_data, height, progress_callback=progress_callback,
+            )
+
+            # Strict commitment check (validation.cpp:5912-5914).
+            if strict:
+                if verified.digest != au_data.hash_serialized:
+                    raise ValueError(
+                        "Bad snapshot content hash: expected "
+                        f"{au_data.hash_serialized_hex()}, got "
+                        f"{verified.digest[::-1].hex()}"
+                    )
+                logger.info(
+                    f"[snapshot] HASH_SERIALIZED commitment OK at height {height} "
+                    f"({verified.digest[::-1].hex()})"
+                )
+            else:
+                logger.warning(
+                    "[snapshot] strict=False: skipping the commitment check for "
+                    f"{metadata.base_blockhash_hex()}"
+                )
+
+            # ----------------------------------------------------------
+            # Pass 2: write the verified coins.
+            #
             # FIX-D (chainstate atomicity family 2026-05-26): begin the
             # atomic snapshot-load protocol.  This clears the chainstate
-            # and writes the SNAPSHOT_LOAD_IN_PROGRESS marker BEFORE any
-            # per-coin chunk is written.  On crash mid-load, next-boot
-            # `recover_from_crash` detects the marker, clears the
-            # partial chainstate, resets the tip to genesis, and instructs
-            # the operator to re-run `loadtxoutset`.
+            # and writes the SNAPSHOT_LOAD_IN_PROGRESS marker in one
+            # batch, BEFORE any per-coin chunk is written.  On crash
+            # mid-load, next-boot `recover_from_crash` detects the marker,
+            # clears the partial chainstate, resets the tip to genesis,
+            # and instructs the operator to re-run `loadtxoutset`.
             #
             # Older Rust extensions without FIX-D fall back to the legacy
             # per-coin path (no atomicity guarantees) — preserves existing
             # operator workflows during the rolling upgrade window.
             # ----------------------------------------------------------
+            f.seek(coins_start)
             use_atomic_load = hasattr(self.db, "snapshot_load_begin")
             if use_atomic_load:
                 self.db.snapshot_load_begin(metadata.base_blockhash, height)
@@ -1698,14 +1892,6 @@ class SnapshotManager:
                     "(pre-FIX-D); falling back to per-coin loader — "
                     "load is NOT crash-safe"
                 )
-
-            # Streaming SHA256d (HashWriter) over coins as we deserialize
-            # them. Mirrors Core's HASH_SERIALIZED path through
-            # ApplyCoinHash (kernel/coinstats.cpp:53-56), which is what
-            # loadtxoutset's strict gate uses (validation.cpp:5902-5915).
-            # The wire format already iterates (txid asc, vout asc), the
-            # same order Core's CCoinsViewCursor walks.
-            hasher = HashWriter()
 
             # Per-chunk batch buffer.  10K coins keeps the WriteBatch
             # memory bounded (~1-2 MB at typical mainnet-coin sizes), well
@@ -1744,78 +1930,28 @@ class SnapshotManager:
                         )
                 chunk_buffer.clear()
 
-            coins_left = metadata.coins_count
-            coins_loaded = 0
-            transactions = 0
-            total_amount = 0
-            bogosize = 0
+            def _on_coin(coin: tuple[bytes, int, int, bytes, int, bool]) -> None:
+                chunk_buffer.append(coin)
+                if len(chunk_buffer) >= _CHUNK_SIZE:
+                    _flush_chunk()
+
             try:
-                while coins_left > 0:
-                    txid = f.read(32)
-                    if len(txid) != 32:
-                        raise ValueError("Truncated snapshot: missing txid")
-
-                    coins_per_txid = _read_compact_size(f)
-                    if coins_per_txid == 0 or coins_per_txid > coins_left:
-                        raise ValueError(
-                            f"Invalid coins_per_txid={coins_per_txid} (coins_left={coins_left})"
-                        )
-                    transactions += 1
-
-                    for _ in range(coins_per_txid):
-                        vout = _read_compact_size(f)
-                        coin_height, is_coinbase, amount, script = deserialize_coin(f)
-
-                        # BUG-4: per-coin height bound check.
-                        # Mirrors Core PopulateAndValidateSnapshot:
-                        #   if (coin.nHeight > base_height) return Error{...}
-                        # (validation.cpp:5814-5819)
-                        # Only enforced when we know base_height (i.e. au_data is set).
-                        if au_data is not None and coin_height > height:
-                            raise ValueError(
-                                f"Bad snapshot data after deserializing "
-                                f"{metadata.coins_count - coins_left} coins: "
-                                f"coin.height={coin_height} > base_height={height}"
-                            )
-
-                        # BUG-5: per-coin MoneyRange check.
-                        # Mirrors Core PopulateAndValidateSnapshot:
-                        #   if (!MoneyRange(coin.out.nValue)) return Error{...}
-                        # (validation.cpp:5820-5823)
-                        if amount < 0 or amount > _MAX_MONEY:
-                            raise ValueError(
-                                f"Bad snapshot data after deserializing "
-                                f"{metadata.coins_count - coins_left} coins - "
-                                f"bad tx out value: {amount}"
-                            )
-
-                        chunk_buffer.append((
-                            txid, vout, amount, script, coin_height, is_coinbase,
-                        ))
-                        if len(chunk_buffer) >= _CHUNK_SIZE:
-                            _flush_chunk()
-
-                        hasher.update(
-                            coin_element(
-                                txid=txid,
-                                vout=vout,
-                                height=coin_height,
-                                is_coinbase=is_coinbase,
-                                amount=amount,
-                                script_pubkey=script,
-                            )
-                        )
-                        total_amount += amount
-                        bogosize += 32 + 4 + 4 + 8 + 2 + len(script)
-
-                        coins_left -= 1
-                        coins_loaded += 1
-
-                        if progress_callback and coins_loaded % 100_000 == 0:
-                            progress_callback(coins_loaded, metadata.coins_count)
-
+                written = _scan_snapshot_coins(
+                    f, metadata, au_data, height,
+                    progress_callback=progress_callback, on_coin=_on_coin,
+                )
                 # Flush any tail residue (<_CHUNK_SIZE coins remaining).
                 _flush_chunk()
+                # The file is read twice. If it changed between the passes
+                # the coins just written are not the ones that were
+                # verified: refuse, and leave the marker set so the
+                # partial chainstate is never committed or served.
+                if written.digest != verified.digest:
+                    raise ValueError(
+                        "Snapshot file changed while it was being loaded: "
+                        f"verified {verified.digest[::-1].hex()}, wrote "
+                        f"{written.digest[::-1].hex()}"
+                    )
             except Exception:
                 # Bail out cleanly.  The SNAPSHOT_LOAD_IN_PROGRESS marker
                 # is intentionally NOT deleted here — the chainstate may
@@ -1830,38 +1966,11 @@ class SnapshotManager:
                     )
                 raise
 
-            # BUG-6: trailing-bytes EOF check.
-            # Mirrors Core PopulateAndValidateSnapshot (validation.cpp:5872-5883):
-            #   std::byte left_over_byte;
-            #   try { coins_file >> left_over_byte; }
-            #   catch (const std::ios_base::failure&) { out_of_coins = true; }
-            #   if (!out_of_coins) return Error{"Bad snapshot - coins left over"};
-            leftover = f.read(1)
-            if leftover:
-                raise ValueError(
-                    f"Bad snapshot - coins left over after deserializing "
-                    f"{metadata.coins_count} coins"
-                )
-
-        # Strict commitment check (validation.cpp:5912-5914). Only enforced
-        # when chainparams ship a hash for this snapshot height.
-        computed = hasher.digest()
-        if strict and au_data is not None:
-            if computed != au_data.hash_serialized:
-                raise ValueError(
-                    "Bad snapshot content hash: expected "
-                    f"{au_data.hash_serialized_hex()}, got "
-                    f"{computed[::-1].hex()}"
-                )
-            logger.info(
-                f"[snapshot] HASH_SERIALIZED commitment OK at height {height} "
-                f"({computed[::-1].hex()})"
-            )
-        elif au_data is None:
-            logger.warning(
-                "[snapshot] No assumeUTXO commitment available for "
-                f"{metadata.base_blockhash_hex()}; skipping commitment check"
-            )
+        computed = verified.digest
+        coins_loaded = verified.coins
+        transactions = verified.transactions
+        total_amount = verified.total_amount
+        bogosize = verified.bogosize
 
         # ------------------------------------------------------------------
         # FIX-D: write sibling files BEFORE the final commit.  They are not

@@ -284,12 +284,14 @@ class BitcoinNode:
             # Reload persisted mempool (if available)
             mempool_path = os.path.join(self.data_dir, "mempool.dat")
             try:
-                _, chain_height = self.db.get_best_block()
+                tip_hash, chain_height = self.db.get_best_block()
             except RuntimeError:
                 # Empty database — initialize genesis block
                 logger.info("Empty database, initializing genesis block...")
                 self._init_genesis_block()
-                _, chain_height = self.db.get_best_block()
+                tip_hash, chain_height = self.db.get_best_block()
+            if bytes(tip_hash) == bytes(32):
+                tip_hash, chain_height = self._handle_zero_tip(chain_height)
             self.mempool.load_from_file(mempool_path, chain_height)
 
             # Initialize fee estimator
@@ -1650,6 +1652,35 @@ class BitcoinNode:
             border_style="green",
         ))
 
+    def _handle_zero_tip(self, height: int) -> tuple[bytes, int]:
+        """Deal with a best-block hash of all zeros at boot.
+
+        No block hashes to zero, so this tip names no block and no block can
+        connect on top of it. Older builds' snapshot-load crash recovery wrote
+        exactly this (zero hash, height 0, chainstate cleared), which left the
+        node unable to connect block 1 forever. That exact state is restarted
+        from genesis, as a fresh datadir would be. Any other zero tip (a
+        non-empty chainstate or a non-zero height) is an unknown tip and boot
+        refuses rather than serve it as a chain.
+        """
+        if height == 0 and self.db.utxo_count() == 0:
+            logger.warning(
+                "Chain tip is the all-zero hash over an empty chainstate (left "
+                "by an earlier snapshot-load crash recovery); restarting from "
+                "genesis. Re-run loadtxoutset to restore a snapshot."
+            )
+            self._init_genesis_block()
+            tip_hash, height = self.db.get_best_block()
+            if bytes(tip_hash) != bytes(32):
+                return bytes(tip_hash), height
+        raise RuntimeError(
+            f"Refusing to start: the chain tip is the all-zero hash at height "
+            f"{height}, which names no block, and the datadir is not the empty "
+            f"state an older snapshot-load recovery left (height 0, no coins). "
+            f"Its chain state is unknown; restore it from a backup or "
+            f"resync it from scratch."
+        )
+
     def _init_genesis_block(self):
         """Initialize the chain tip to the genesis block for the current network.
 
@@ -1895,6 +1926,14 @@ class BitcoinNode:
 
                     tx_msg = TxMessage.from_payload(msg.payload)
                     tx = tx_msg.transaction
+
+                    # Free this request's per-peer in-flight slot and ask
+                    # the peer for its next queued announcements.
+                    _bs = getattr(self, "block_sync", None)
+                    if _bs is not None:
+                        await _bs.on_tx_answered(
+                            sender_peer, (tx.get_txid(), tx.get_wtxid())
+                        )
 
                     _, height = self.db.get_best_block()
                     # Off-load ATMP to a worker thread so the asyncio event
@@ -2181,48 +2220,57 @@ class BitcoinNode:
 
                     # Find the fork point: walk through the locator hashes
                     # and find the first one we have in our chain.
-                    # Off-load each FFI get_block to a worker thread —
-                    # a long locator can otherwise stall the loop for
-                    # tens of ms per probe.
+                    # get_block_header has get_block's presence contract
+                    # (None exactly when the body is absent) and, like
+                    # get_block, carries height=None, so start_height is
+                    # what the full-block probe produced.  Off-load each
+                    # FFI probe to a worker thread — a long locator can
+                    # otherwise stall the loop for tens of ms.
                     start_height = 0
                     for locator_hash in getheaders.locator_hashes:
                         block = await asyncio.to_thread(
-                            self.db.get_block, locator_hash,
+                            self.db.get_block_header, locator_hash,
                         )
                         if block is not None:
                             start_height = (block.height if block.height else 0) + 1
                             break
 
-                    # Collect up to 2000 headers starting from start_height.
-                    # Each db.get_block_by_height call is a full Rust-side
-                    # block materialise + PyO3 deserialise; serving the
-                    # max 2000-block batch synchronously holds the event
-                    # loop for several seconds and is the most expensive
-                    # single P2P handler.  Run inside a worker thread so
-                    # RPC + other peer dispatch continues meanwhile.
+                    # Collect up to 2000 headers starting from start_height,
+                    # from the height->hash index and the header-only path
+                    # (audit H4).  This used to be db.get_block_by_height:
+                    # a full block read, a PyO3 object per tx/input/output
+                    # and _py_block_to_block, all to copy six fields —
+                    # >= 23 s of GIL-held CPU for one 82-byte request on
+                    # mainnet-sized blocks.  Core copies them out of
+                    # CBlockIndex (ProcessGetHeaders).  The batch still runs
+                    # in one worker thread so RPC + peer dispatch continue.
                     _, best_height = self.db.get_best_block()
-                    headers = []
-                    for h in range(start_height, min(start_height + 2000, best_height + 1)):
-                        block = await asyncio.to_thread(
-                            self.db.get_block_by_height, h,
-                        )
-                        if block is None:
-                            break
-                        header = BlockHeader(
-                            version=block.version,
-                            prev_blockhash=block.prev_blockhash,
-                            merkle_root=block.merkle_root,
-                            timestamp=block.timestamp,
-                            bits=block.bits,
-                            nonce=block.nonce,
-                        )
-                        headers.append(header)
+                    hash_stop = getheaders.hash_stop
 
-                        # Stop if we've reached hash_stop.
-                        if getheaders.hash_stop != b'\x00' * 32:
-                            block_hash = block.hash
-                            if block_hash == getheaders.hash_stop:
+                    def _collect_headers():
+                        out = []
+                        for h in range(start_height, min(start_height + 2000, best_height + 1)):
+                            block_hash = self.db.get_block_hash_by_height(h)
+                            if block_hash is None:
                                 break
+                            block = self.db.get_block_header(block_hash)
+                            if block is None:
+                                break
+                            out.append(BlockHeader(
+                                version=block.version,
+                                prev_blockhash=block.prev_blockhash,
+                                merkle_root=block.merkle_root,
+                                timestamp=block.timestamp,
+                                bits=block.bits,
+                                nonce=block.nonce,
+                            ))
+
+                            # Stop if we've reached hash_stop.
+                            if hash_stop != b'\x00' * 32 and block.hash == hash_stop:
+                                break
+                        return out
+
+                    headers = await asyncio.to_thread(_collect_headers)
 
                     if headers:
                         headers_msg = HeadersMessage(headers=headers)

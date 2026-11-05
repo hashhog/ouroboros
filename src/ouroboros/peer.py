@@ -917,67 +917,68 @@ class Peer:
             self.writer = writer
             self.state = PeerState.CONNECTED
 
-            # BIP 324 inbound classification: only when v2 is enabled.
-            # The 16-byte read is "destructive" (asyncio.StreamReader has
-            # no MSG_PEEK), so on the v1 path we wrap the reader with a
-            # ``_PrefixedStreamReader`` that yields the consumed bytes
-            # back ahead of the underlying socket data.
+            # One deadline for the whole inbound handshake: the 16-byte
+            # v1/v2 classify read, the BIP 324 responder negotiation and the
+            # version/verack exchange.  Core drops a peer that has not
+            # finished its version handshake within -peertimeout (60 s,
+            # CConnman::InactivityCheck) whatever its transport.  The v2
+            # reads used to run before this timeout, each with only its own
+            # 10 s wait_for, and the garbage-terminator scan reads one byte
+            # at a time for up to MAX_GARBAGE_LEN+16 bytes: a peer dripping
+            # a byte every few seconds held the socket ~11 h, unregistered
+            # and invisible to the inactivity sweeper.
             #
-            # Core uses V1_PREFIX_LEN=16: 4-byte network magic followed by
-            # "version\x00\x00\x00\x00\x00" (net.h:465, net.cpp:1091-1094).
-            # We MUST read all 16 bytes before deciding v1 vs v2 and before
-            # sending our own ellswift pubkey (BIP-324 MAYBE_V1 state).
-            if self.transport_version >= 2:
-                # Build the expected 16-byte v1 prefix: magic (4) + command (12).
-                _magic_bytes = get_magic(self.network).to_bytes(4, "little")
-                _v1_prefix = _magic_bytes + b"version\x00\x00\x00\x00\x00"
-                try:
-                    prefix = await asyncio.wait_for(
-                        self.reader.readexactly(16),
-                        timeout=HANDSHAKE_TIMEOUT,
-                    )
-                except (asyncio.IncompleteReadError, ConnectionResetError,
-                        BrokenPipeError, OSError, TimeoutError) as e:
-                    raise Exception(
-                        f"inbound classify-read failed: {e}"
-                    ) from e
-                if prefix == _v1_prefix:
-                    # v1: re-wrap reader so the v1 handshake sees the
-                    # consumed bytes at the head of the stream.  Also
-                    # downgrade transport_version so the version message
-                    # we send back to the peer doesn't advertise
-                    # NODE_P2P_V2 when the actual transport is v1.
-                    self.reader = _PrefixedStreamReader(
-                        self.reader, prefix
-                    )
-                    self.transport_version = 1
-                else:
-                    # v2: drive the responder handshake.  ``prefix`` is
-                    # the first 16 bytes of the peer's 64-byte ellswift
-                    # pubkey; ``_negotiate_v2_inbound`` reads the
-                    # remaining 48 itself.  Sending our pubkey is also
-                    # deferred into _negotiate_v2_inbound so it happens
-                    # only after the 16-byte decision (G20 fix).
-                    await self._negotiate_v2_inbound(initial_prefix=prefix)
-
-            # Inbound handshake: receive version first, then send ours.
-            #
-            # Bound it with a SINGLE per-connection ``asyncio.timeout`` for the
-            # same reason as the outbound path in ``connect`` (see that comment):
-            # the version/verack reads here go through ``receive_message`` ->
-            # ``_read_exactly``, a plain timer-free ``await``, and the inbound
-            # peer is NOT registered (p2p.py:_handle_inbound) until this returns
-            # True, so the coarse sweeper cannot see — let alone disconnect — a
-            # peer that hangs mid version/verack.  Without this bound such a
-            # peer would await forever, leaking a slot/coroutine/fd (inbound DoS).
-            # One timer per accepted connection, cancelled on success
-            # (O(connections), not O(messages)).  On timeout the context raises
-            # ``TimeoutError``, caught by the ``except Exception`` arm below,
-            # which disconnects and returns False so the peer is never
-            # registered — slot freed.  (The 16-byte v1/v2 classify-read and the
-            # v2 inbound negotiation reads above are already individually bounded
-            # via ``asyncio.wait_for``.)
+            # The inbound peer is NOT registered (p2p.py:_handle_inbound)
+            # until this returns True, so nothing else can disconnect a peer
+            # that hangs here.  One timer per accepted connection, cancelled
+            # on success (O(connections), not O(messages)).  On timeout the
+            # context raises ``TimeoutError``, caught by the ``except
+            # Exception`` arm below, which disconnects and returns False.
             async with asyncio.timeout(HANDSHAKE_TIMEOUT):
+                # BIP 324 inbound classification: only when v2 is enabled.
+                # The 16-byte read is "destructive" (asyncio.StreamReader has
+                # no MSG_PEEK), so on the v1 path we wrap the reader with a
+                # ``_PrefixedStreamReader`` that yields the consumed bytes
+                # back ahead of the underlying socket data.
+                #
+                # Core uses V1_PREFIX_LEN=16: 4-byte network magic followed by
+                # "version\x00\x00\x00\x00\x00" (net.h:465, net.cpp:1091-1094).
+                # We MUST read all 16 bytes before deciding v1 vs v2 and before
+                # sending our own ellswift pubkey (BIP-324 MAYBE_V1 state).
+                if self.transport_version >= 2:
+                    # Build the expected 16-byte v1 prefix: magic (4) + command (12).
+                    _magic_bytes = get_magic(self.network).to_bytes(4, "little")
+                    _v1_prefix = _magic_bytes + b"version\x00\x00\x00\x00\x00"
+                    try:
+                        prefix = await asyncio.wait_for(
+                            self.reader.readexactly(16),
+                            timeout=HANDSHAKE_TIMEOUT,
+                        )
+                    except (asyncio.IncompleteReadError, ConnectionResetError,
+                            BrokenPipeError, OSError, TimeoutError) as e:
+                        raise Exception(
+                            f"inbound classify-read failed: {e}"
+                        ) from e
+                    if prefix == _v1_prefix:
+                        # v1: re-wrap reader so the v1 handshake sees the
+                        # consumed bytes at the head of the stream.  Also
+                        # downgrade transport_version so the version message
+                        # we send back to the peer doesn't advertise
+                        # NODE_P2P_V2 when the actual transport is v1.
+                        self.reader = _PrefixedStreamReader(
+                            self.reader, prefix
+                        )
+                        self.transport_version = 1
+                    else:
+                        # v2: drive the responder handshake.  ``prefix`` is
+                        # the first 16 bytes of the peer's 64-byte ellswift
+                        # pubkey; ``_negotiate_v2_inbound`` reads the
+                        # remaining 48 itself.  Sending our pubkey is also
+                        # deferred into _negotiate_v2_inbound so it happens
+                        # only after the 16-byte decision (G20 fix).
+                        await self._negotiate_v2_inbound(initial_prefix=prefix)
+
+                # Inbound handshake: receive version first, then send ours.
                 await self._inbound_handshake(start_height)
 
             self.state = PeerState.READY
