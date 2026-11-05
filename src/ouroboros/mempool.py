@@ -2004,6 +2004,10 @@ class PackageAcceptResult:
     # results AcceptMultipleTransactions returned, as opposed to the
     # individual results AcceptPackage merges in for the other txs).
     failed_wtxids: list = field(default_factory=list)
+    # False when the package was refused before any per-tx verdict that a
+    # caller may report (package RBF, which this node does not implement):
+    # submitpackage then returns no tx-results entries.
+    per_tx_results: bool = True
 
 
 class Mempool:
@@ -5869,6 +5873,9 @@ class Mempool:
                 )
             else:
                 res = self._accept_single_in_package(tx, height)
+                if (res.kind != "valid" and len(txs) > 1
+                        and self._needs_package_rbf(tx, res.reject_reason or "")):
+                    return self._package_rbf_unsupported(tx)
                 if res.kind == "valid":
                     results_final[wtxid] = res
                 elif len(txs) == 1 or not self._is_reconsiderable(res.reject_reason or ""):
@@ -5927,6 +5934,38 @@ class Mempool:
         multi.results = {self._tx_wtxid(tx): results_final[self._tx_wtxid(tx)]
                          for tx in txs if self._tx_wtxid(tx) in results_final}
         return multi
+
+    def _needs_package_rbf(self, tx: Transaction, reason: str) -> bool:
+        """*tx* failed single-tx RBF on its fee against in-pool conflicts.
+
+        Core's PaysForRBF and feerate-diagram failures are
+        TX_RECONSIDERABLE: AcceptPackage retries such a tx with the rest of
+        the package as a package RBF (``PackageRBFChecks``)."""
+        if not any((inp.prev_txid, inp.prev_vout) in self.spender_by_outpoint
+                   for inp in tx.inputs):
+            return False
+        return (reason.startswith("insufficient fee")
+                or reason.startswith("Replacement would worsen cluster feerate"))
+
+    def _package_rbf_unsupported(self, tx: Transaction) -> "PackageAcceptResult":
+        """The answer for a package that needs package RBF.
+
+        This node does not implement package RBF, so it cannot give the
+        verdicts Core would.  It refuses the package as the package path did
+        before staged acceptance: a package-level message naming the first
+        conflicting outpoint, and no per-tx results.  The conflicts stay in
+        the pool; package txs accepted individually before this one stay too,
+        as Core leaves them."""
+        for inp in tx.inputs:
+            if (inp.prev_txid, inp.prev_vout) in self.spender_by_outpoint:
+                return PackageAcceptResult(
+                    state="policy",
+                    message=(f"Package conflicts with mempool: "
+                             f"{inp.prev_txid.hex()[:16]}...:{inp.prev_vout} "
+                             f"already spent"),
+                    per_tx_results=False,
+                )
+        raise AssertionError("_package_rbf_unsupported without a conflict")
 
     def _replacement_candidates(self, tx: Transaction) -> set[bytes]:
         """In-pool spenders of *tx*'s inputs and their descendants: the txs a

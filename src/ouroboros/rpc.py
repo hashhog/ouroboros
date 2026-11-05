@@ -1540,11 +1540,13 @@ def _format_submitpackage(txs: list, pkg: Any) -> dict[str, Any]:
     with another witness in the pool), ``error`` (Core TxValidationState::
     ToString(); missing inputs read "bad-txns-inputs-missingorspent"), or
     vsize + fees (effective feerate only for txs accepted by this call), and
-    ``replaced-transactions`` lists the txids replaced.
+    ``replaced-transactions`` lists the txids replaced.  A package refused
+    before any per-tx verdict (``per_tx_results`` False: it needs package
+    RBF, which this node lacks) gets no tx-results entries.
     """
     tx_results: dict[str, Any] = {}
     replaced: set[bytes] = set()
-    for tx in txs:
+    for tx in (txs if getattr(pkg, "per_tx_results", True) else []):
         try:
             wtxid = tx.get_wtxid()
         except Exception:
