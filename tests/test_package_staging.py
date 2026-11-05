@@ -503,3 +503,132 @@ def test_package_rbf_refusal_still_tries_the_other_parents_individually():
     assert d.get_txid() in pool.transactions
     assert rbf_parent.get_txid() not in pool.transactions
     assert child.get_txid() not in pool.transactions
+
+
+# --------------------------------------------------------------------------
+# Warden review 3 of #145: a script failure carries Core's error string
+# --------------------------------------------------------------------------
+
+NULLFAIL_TEXT = "Signature must be zero for failed CHECK(MULTI)SIG operation"
+
+
+class _ScriptErrorValidator(_StrictValidator):
+    """scriptSig ``NULLFAIL`` fails input 0 the way TransactionValidator
+    does, with the interpreter's recorded Core script error."""
+
+    def __init__(self, db):
+        super().__init__(db)
+        self.script_interpreter = SimpleNamespace(last_error=None)
+
+    def validate_transaction(self, tx, height, mtp=None, extra_script_flags=None,
+                             intra_block_utxos=None, **_kw):
+        if tx.inputs[0].script_sig == b"NULLFAIL":
+            self.script_interpreter.last_error = "SCRIPT_ERR_SIG_NULLFAIL"
+            return False, "Invalid signature for input 0"
+        self.script_interpreter.last_error = None
+        return super().validate_transaction(
+            tx, height, mtp, extra_script_flags, intra_block_utxos)
+
+
+def _core_script_details(tx) -> str:
+    inp = tx.inputs[0]
+    return (
+        f"mempool-script-verify-flag-failed ({NULLFAIL_TEXT}), input 0 of "
+        f"{_be(tx.get_txid())} (wtxid {_be(tx.get_wtxid())}), "
+        f"spending {_be(inp.prev_txid)}:{inp.prev_vout}")
+
+
+def test_submitpackage_script_failure_error_is_core_string():
+    """Core rpc/mempool.cpp: tx-results[wtxid].error is the tx's
+    TxValidationState::ToString(), "mempool-script-verify-flag-failed
+    (<ScriptErrorString>), input <n> of <txid> (wtxid <wtxid>), spending
+    <prevout>".  The node returned "Invalid signature for input 0"."""
+    db = _DB()
+    pool = Mempool(validator=_ScriptErrorValidator(db), require_standard=False)
+    parent = _tx([(_funded(db, 27), 0)], [99_000])
+    child = _tx([(parent.get_txid(), 0)], [98_000], script_sig=b"NULLFAIL")
+    res = asyncio.run(RPCServer.rpc_submitpackage(
+        _rpc(pool, db), [_hex(parent), _hex(child)]))
+    assert res["tx-results"][_be(child.get_wtxid())] == {
+        "txid": _be(child.get_txid()), "error": _core_script_details(child)}
+
+
+def test_testmempoolaccept_script_failure_reason_and_details_are_core_strings():
+    db = _DB()
+    pool = Mempool(validator=_ScriptErrorValidator(db), require_standard=False)
+    parent = _tx([(_funded(db, 28), 0)], [99_000], script_sig=b"NULLFAIL")
+    child = _tx([(parent.get_txid(), 0)], [98_000])
+    res = asyncio.run(RPCServer.rpc_testmempoolaccept(
+        _rpc(pool, db), [_hex(parent), _hex(child)]))
+    assert res[0]["reject-reason"] == (
+        f"mempool-script-verify-flag-failed ({NULLFAIL_TEXT})")
+    assert res[0]["reject-details"] == _core_script_details(parent)
+
+
+def test_script_failure_without_recorded_error_keeps_node_reason():
+    """No recorded script error (a Python-path failure this node does not
+    name): the reason is not invented, the node's own text is kept."""
+    db = _DB()
+    validator = _ScriptErrorValidator(db)
+    pool = Mempool(validator=validator, require_standard=False)
+    parent = _tx([(_funded(db, 29), 0)], [99_000])
+    child = _tx([(parent.get_txid(), 0)], [98_000], script_sig=b"NULLFAIL")
+    orig = validator.validate_transaction
+
+    def unnamed(tx, *a, **kw):
+        out = orig(tx, *a, **kw)
+        validator.script_interpreter.last_error = None
+        return out
+
+    validator.validate_transaction = unnamed
+    res = asyncio.run(RPCServer.rpc_submitpackage(
+        _rpc(pool, db), [_hex(parent), _hex(child)]))
+    assert res["tx-results"][_be(child.get_wtxid())]["error"] == (
+        "Invalid signature for input 0")
+
+
+# Compressed secp256k1 generator point: a valid pubkey that never signed.
+_G = bytes.fromhex(
+    "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+
+
+def _p2wpkh_spend(sig: bytes):
+    import hashlib
+    keyhash = hashlib.new("ripemd160", hashlib.sha256(_G).digest()).digest()
+    spk = b"\x00\x14" + keyhash
+    tx = Transaction(
+        txid=bytes(32), version=2, locktime=0,
+        inputs=[TxIn(prev_txid=b"\x44" * 32, prev_vout=0, script_sig=b"",
+                     sequence=0xFFFFFFFF, witness=[sig, _G])],
+        outputs=[TxOut(value=90_000, script_pubkey=SPK)],
+    )
+    return tx, spk
+
+
+def test_python_p2wpkh_nullfail_records_core_script_error():
+    """The seed_submitpackage invalid-sig case: P2WPKH, strict-DER but wrong
+    signature, NULLFAIL set.  Core's script error is SCRIPT_ERR_SIG_NULLFAIL;
+    the Python interpreter now records that name (it recorded nothing)."""
+    from ouroboros.script import (
+        SCRIPT_VERIFY_DERSIG, SCRIPT_VERIFY_NULLFAIL, SCRIPT_VERIFY_P2SH,
+        SCRIPT_VERIFY_STRICTENC, SCRIPT_VERIFY_WITNESS, ScriptInterpreter,
+    )
+    bad_sig = b"\x30\x06\x02\x01\x01\x02\x01\x01\x01"  # DER r=1 s=1, ALL
+    tx, spk = _p2wpkh_spend(bad_sig)
+    base = (SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_DERSIG
+            | SCRIPT_VERIFY_STRICTENC)
+    interp = ScriptInterpreter()
+    assert interp.verify_python(
+        b"", spk, tx, 0, flags=base | SCRIPT_VERIFY_NULLFAIL,
+        amount=100_000) is False
+    assert interp.last_error == "SCRIPT_ERR_SIG_NULLFAIL"
+    # Control: the same failure without NULLFAIL is a plain false result,
+    # which Core reports as EVAL_FALSE, not NULLFAIL; nothing is recorded.
+    assert interp.verify_python(
+        b"", spk, tx, 0, flags=base, amount=100_000) is False
+    assert interp.last_error is None
+    # A passing verify clears an earlier error.
+    interp.last_error = "SCRIPT_ERR_SIG_NULLFAIL"
+    assert interp.verify_python(
+        b"", b"\x51", tx, 0, flags=SCRIPT_VERIFY_P2SH) is True
+    assert interp.last_error is None
