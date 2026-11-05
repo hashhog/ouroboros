@@ -115,8 +115,10 @@ def test_tip98_coinbase_spend_reports_its_depth():
 
 
 def test_reject_details_split_follows_core_tostring():
-    from ouroboros.rpc import _reject_reason_and_details
+    import ouroboros.rpc as rpc_mod
 
+    _reject_reason_and_details = getattr(rpc_mod, "_reject_reason_and_details", None)
+    assert _reject_reason_and_details is not None, "no reason/details split helper"
     assert _reject_reason_and_details(
         "bad-txns-premature-spend-of-coinbase: tried to spend coinbase at depth 7"
     ) == (
@@ -129,3 +131,40 @@ def test_reject_details_split_follows_core_tostring():
     # Free text is not split.
     assert _reject_reason_and_details("Input not found: ab:0") == (
         "Input not found: ab:0", "Input not found: ab:0")
+
+
+# --------------------------------------------------------------------------
+# The same off-by-one moved IsFinalTx: Core checks a mempool candidate with
+# nBlockHeight = tip + 1 (validation.cpp PreChecks -> CheckFinalTxAtTip), so a
+# height lock equal to tip + 1 is not final yet and one equal to tip is.
+# --------------------------------------------------------------------------
+
+def _locked_spend(locktime: int) -> Transaction:
+    tmp = Transaction(
+        txid=bytes(32), version=2, locktime=locktime,
+        inputs=[TxIn(prev_txid=COINBASE_TXID, prev_vout=0, script_sig=b"",
+                     sequence=0xFFFFFFFE)],
+        outputs=[TxOut(value=COIN_VALUE - 10_000, script_pubkey=OP_TRUE)],
+    )
+    return TxMessage.from_payload(tmp.serialize()).transaction
+
+
+def _accept_locked(tip: int, locktime: int) -> dict:
+    db = _ChainDB(tip)
+    pool = Mempool(validator=TransactionValidator(db, network="regtest"),
+                   require_standard=False)
+    rpc = SimpleNamespace(node=SimpleNamespace(mempool=pool, db=db))
+    [row] = asyncio.run(RPCServer.rpc_testmempoolaccept(
+        rpc, [_locked_spend(locktime).serialize().hex()]))
+    return row
+
+
+def test_height_locktime_of_next_block_is_not_final():
+    row = _accept_locked(tip=200, locktime=201)
+    assert row["allowed"] is False
+    assert row["reject-reason"] == "non-final"
+
+
+def test_height_locktime_of_tip_is_final():
+    row = _accept_locked(tip=200, locktime=200)
+    assert row["allowed"] is True, row
