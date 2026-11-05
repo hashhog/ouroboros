@@ -182,6 +182,17 @@ class MockMempool:
     def get_all_entries(self):
         return list(self.entries.items())
 
+    # The interface the RPC layer reads; /rest/mempool/* now answers through it.
+    @property
+    def transactions(self):
+        return self.entries
+
+    def get_mempool_info(self):
+        return {"size": len(self.entries), "bytes": 0}
+
+    def get_transaction_entry(self, txid):
+        return self.entries.get(txid)
+
     def get_total_bytes(self):
         return 0
 

@@ -81,14 +81,17 @@ class RESTInterface:
     JSON-RPC authentication. Implements Bitcoin Core-compatible REST API.
     """
 
-    def __init__(self, node: "BitcoinNode"):
+    def __init__(self, node: "BitcoinNode", rpc: Any = None):
         """
         Initialize REST interface.
 
         Args:
             node: Bitcoin node instance providing access to blockchain data
+            rpc: the RPCServer; the mempool endpoints answer through its
+                getmempoolinfo / getrawmempool so REST and RPC cannot drift.
         """
         self.node = node
+        self.rpc = rpc
         self.router = APIRouter(prefix="/rest", tags=["rest"])
         self._register_routes()
 
@@ -188,7 +191,9 @@ class RESTInterface:
 
     def _get_mempool(self):
         """Get mempool, raise HTTP 404 if not available."""
-        if not hasattr(self.node, 'mempool') or not self.node.mempool:
+        # `is None`, not falsiness: Mempool defines __len__, so an empty pool
+        # is falsy and used to read as "mempool disabled".
+        if getattr(self.node, 'mempool', None) is None:
             raise HTTPException(status_code=404, detail="Mempool disabled or instance not found")
         return self.node.mempool
 
@@ -1243,38 +1248,13 @@ class RESTInterface:
 
         Path: /rest/mempool/info.json
 
-        Only JSON format is supported.
+        Only JSON format is supported.  Core's rest_mempool serves
+        MempoolInfoToJSON, the same object as the getmempoolinfo RPC.
         """
-        mempool = self._get_mempool()
+        self._get_mempool()
+        from ouroboros.rpc import _BTCJsonResponse
 
-        # Fee-display fields READ the real policy constants (mempool.py) and are
-        # emitted in BTC, consistent with the JSON-RPC getmempoolinfo path.  Core
-        # policy.h: DEFAULT_MIN_RELAY_TX_FEE = DEFAULT_INCREMENTAL_RELAY_FEE = 100
-        # sat/kvB → 0.00000100 BTC.  mempoolminfee = max(rolling GetMinFee,
-        # min-relay floor); get_mempool_min_fee() returns it in sat/kvB.
-        from ouroboros.mempool import (
-            DEFAULT_MIN_RELAY_TX_FEE,
-            DEFAULT_INCREMENTAL_RELAY_FEE,
-        )
-
-        if hasattr(mempool, 'get_mempool_min_fee'):
-            mempoolminfee_sats = int(mempool.get_mempool_min_fee())
-        else:
-            mempoolminfee_sats = DEFAULT_MIN_RELAY_TX_FEE
-
-        return JSONResponse(content={
-            "loaded": True,
-            "size": mempool.size(),
-            "bytes": mempool.get_total_bytes() if hasattr(mempool, 'get_total_bytes') else 0,
-            "usage": mempool.get_memory_usage() if hasattr(mempool, 'get_memory_usage') else 0,
-            "total_fee": mempool.get_total_fee() / 1e8 if hasattr(mempool, 'get_total_fee') else 0.0,
-            "maxmempool": mempool.max_size if hasattr(mempool, 'max_size') else 300000000,
-            "mempoolminfee": mempoolminfee_sats / 1e8,
-            "minrelaytxfee": DEFAULT_MIN_RELAY_TX_FEE / 1e8,
-            "incrementalrelayfee": DEFAULT_INCREMENTAL_RELAY_FEE / 1e8,
-            "unbroadcastcount": 0,
-            "fullrbf": getattr(mempool, 'full_rbf', False),
-        })
+        return _BTCJsonResponse(content=await self.rpc.rpc_getmempoolinfo())
 
     async def rest_mempool_contents(
         self,
@@ -1286,7 +1266,8 @@ class RESTInterface:
 
         Path: /rest/mempool/contents.json?verbose=<true|false>&mempool_sequence=<true|false>
 
-        Only JSON format is supported.
+        Only JSON format is supported.  Core serves MempoolToJSON, the same
+        object as the getrawmempool RPC.
         """
         if verbose and mempool_sequence:
             raise HTTPException(
@@ -1295,51 +1276,12 @@ class RESTInterface:
             )
 
         mempool = self._get_mempool()
+        from ouroboros.rpc import _BTCJsonResponse
 
-        if verbose:
-            # Detailed mempool entries
-            result = {}
-            for tx_hash, entry in mempool.get_all_entries():
-                txid = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
-                result[txid] = {
-                    "vsize": entry.get('vsize', 0),
-                    "weight": entry.get('weight', 0),
-                    "fee": entry.get('fee', 0) / 1e8,
-                    "modifiedfee": entry.get('fee', 0) / 1e8,
-                    "time": entry.get('time', 0),
-                    "height": entry.get('height', 0),
-                    "descendantcount": entry.get('descendant_count', 1),
-                    "descendantsize": entry.get('descendant_size', entry.get('vsize', 0)),
-                    "descendantfees": entry.get('descendant_fees', entry.get('fee', 0)),
-                    "ancestorcount": entry.get('ancestor_count', 1),
-                    "ancestorsize": entry.get('ancestor_size', entry.get('vsize', 0)),
-                    "ancestorfees": entry.get('ancestor_fees', entry.get('fee', 0)),
-                    "wtxid": entry.get('wtxid', txid),
-                    "fees": {
-                        "base": entry.get('fee', 0) / 1e8,
-                        "modified": entry.get('fee', 0) / 1e8,
-                        "ancestor": entry.get('ancestor_fees', entry.get('fee', 0)) / 1e8,
-                        "descendant": entry.get('descendant_fees', entry.get('fee', 0)) / 1e8,
-                    },
-                    "depends": entry.get('depends', []),
-                    "spentby": entry.get('spentby', []),
-                    "bip125-replaceable": entry.get('bip125_replaceable', True),
-                    "unbroadcast": entry.get('unbroadcast', False),
-                }
-            return JSONResponse(content=result)
-        else:
-            # Just txids
-            txids = []
-            sequence = 0
-            for tx_hash, entry in mempool.get_all_entries():
-                txid = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
-                txids.append(txid)
-                sequence = max(sequence, entry.get('sequence', 0))
-
-            if mempool_sequence:
-                return JSONResponse(content={
-                    "txids": txids,
-                    "mempool_sequence": sequence,
-                })
-            else:
-                return JSONResponse(content=txids)
+        result = await self.rpc.rpc_getrawmempool(verbose=verbose)
+        if mempool_sequence:
+            return _BTCJsonResponse(content={
+                "txids": result,
+                "mempool_sequence": mempool.mempool_sequence,
+            })
+        return _BTCJsonResponse(content=result)
