@@ -5851,6 +5851,9 @@ class Mempool:
         results_final: dict[bytes, PackageTxResult] = {}
         individual_nonfinal: dict[bytes, PackageTxResult] = {}
         quit_early = False
+        # Set by the first tx whose individual failure Core would retry as a
+        # package RBF; the outpoint is named while the conflict is in the pool.
+        package_rbf_refusal: PackageAcceptResult | None = None
         eval_txs: list[Transaction] = []
         for tx in txs:
             txid = tx.get_txid()
@@ -5874,8 +5877,9 @@ class Mempool:
             else:
                 res = self._accept_single_in_package(tx, height)
                 if (res.kind != "valid" and len(txs) > 1
+                        and package_rbf_refusal is None
                         and self._needs_package_rbf(tx, res.reject_reason or "")):
-                    return self._package_rbf_unsupported(tx)
+                    package_rbf_refusal = self._package_rbf_unsupported(tx)
                 if res.kind == "valid":
                     results_final[wtxid] = res
                 elif len(txs) == 1 or not self._is_reconsiderable(res.reject_reason or ""):
@@ -5888,6 +5892,12 @@ class Mempool:
                     individual_nonfinal[wtxid] = res
                     eval_txs.append(tx)
 
+        if package_rbf_refusal is not None:
+            # The rest were still tried individually (Core's AcceptPackage
+            # loop), so the pool matches Core's before its package RBF step.
+            if self.current_size > self.max_size:
+                self._evict_low_fee_txs(self.current_size - self.max_size)
+            return package_rbf_refusal
         if quit_early:
             multi = PackageAcceptResult(state="tx", message="transaction failed")
         elif not eval_txs:
@@ -5954,8 +5964,8 @@ class Mempool:
         verdicts Core would.  It refuses the package as the package path did
         before staged acceptance: a package-level message naming the first
         conflicting outpoint, and no per-tx results.  The conflicts stay in
-        the pool; package txs accepted individually before this one stay too,
-        as Core leaves them."""
+        the pool; package txs accepted individually stay too, as Core leaves
+        them."""
         for inp in tx.inputs:
             if (inp.prev_txid, inp.prev_vout) in self.spender_by_outpoint:
                 return PackageAcceptResult(
