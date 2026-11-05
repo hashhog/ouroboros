@@ -12,6 +12,7 @@ import ipaddress as _ipaddress
 import json
 from importlib import resources
 import logging
+import re as _re
 import statistics
 import struct as _struct
 import time
@@ -1478,6 +1479,29 @@ def _package_fees_obj(res: Any, with_effective: bool) -> dict[str, Any]:
         fees["effective-feerate"] = _btc(res.effective_feerate)
         fees["effective-includes"] = [w[::-1].hex() for w in res.effective_includes]
     return fees
+
+
+_REJECT_TOKEN_RE = _re.compile(r"^([a-z0-9-]+): (.+)$", _re.S)
+
+
+def _reject_reason_and_details(reason: str) -> tuple[str, str]:
+    """Split a validator reject string into Core's (reject-reason, reject-details).
+
+    The validator renders a Core (reason, debug) pair as ``"<token>: <debug>"``
+    (validation.py, e.g. ``bad-txns-premature-spend-of-coinbase: tried to
+    spend coinbase at depth 99``).  Core's testmempoolaccept prints
+    ``reject-reason`` = ``state.GetRejectReason()`` and ``reject-details`` =
+    ``state.ToString()``, which is ``"<reason>, <debug>"`` when a debug
+    message is set and the bare reason otherwise (consensus/validation.h
+    ValidationState::ToString, rpc/mempool.cpp testmempoolaccept).  Only a
+    token-shaped prefix (lower case, digits, dashes) is split, so free-text
+    reasons are left as they are.
+    """
+    match = _REJECT_TOKEN_RE.match(reason)
+    if match is None:
+        return reason, reason
+    token, debug = match.group(1), match.group(2)
+    return token, f"{token}, {debug}"
 
 
 def _format_testmempoolaccept_package(txs: list, pkg: Any, maxfeerate: Any) -> list[dict[str, Any]]:
@@ -15521,17 +15545,39 @@ class RPCServer:
                         "reject-reason": "node-not-ready",
                     })
                     continue
+                # The mempool takes the TIP height and evaluates the tx at
+                # tip + 1 itself (Mempool._add_transaction_inner: next_height
+                # = height + 1), exactly as sendrawtransaction and
+                # submitpackage call it.  Core's testmempoolaccept checks at
+                # m_chain.Height() + 1 too (validation.cpp PreChecks ->
+                # CheckTxInputs).  Passing tip + 1 here judged every input one
+                # block late: a coinbase spend at depth 99 looked mature.
                 _, best_height = self.node.db.get_best_block()
                 res = mempool.accept_to_memory_pool(
-                    tx, best_height + 1, test_accept=True
+                    tx, best_height, test_accept=True
                 )
                 allowed = bool(res.get("accepted"))
-                results.append({
+                row: dict[str, Any] = {
                     "txid": txid_be,
                     "wtxid": wtxid_be,
                     "allowed": allowed,
-                    "reject-reason": None if allowed else res.get("reject_reason"),
-                })
+                    "reject-reason": None,
+                }
+                if not allowed:
+                    reason, details = _reject_reason_and_details(
+                        str(res.get("reject_reason"))
+                    )
+                    row["reject-reason"] = reason
+                    # Core rpc/mempool.cpp:398-403: TX_MISSING_INPUTS is
+                    # printed as "missing-inputs" with no reject-details.
+                    # Core reject reasons start lower case ("insufficient
+                    # fee", "bad-txns-...", "txn-already-known"); a reason
+                    # that does not is free text from a path not yet mapped
+                    # to a Core token, and echoing it as reject-details would
+                    # only repeat a wrong string, so it keeps the old shape.
+                    if reason != "missing-inputs" and reason[:1].islower():
+                        row["reject-details"] = details
+                results.append(row)
             except Exception as e:
                 results.append({
                     "txid": tx.get_txid()[::-1].hex(),
