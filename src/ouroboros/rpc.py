@@ -1053,6 +1053,19 @@ async def accept_block(
     return bytes(block_hash)
 
 
+def _resync_node_wallets(node) -> None:
+    """Re-align every loaded wallet's store with the active chain after a
+    chain change that sent no per-block wallet notifications.  Best-effort:
+    a wallet fault never aborts the chain operation."""
+    for _w in _iter_node_wallets(node):
+        try:
+            _w.resync_store_with_chain()
+        except Exception as e:
+            logger.warning(
+                "wallet '%s' store resync failed: %s", getattr(_w, "name", "?"), e
+            )
+
+
 def _iter_node_wallets(node):
     """Yield every loaded Wallet on *node* (multi-wallet manager or legacy).
 
@@ -9325,6 +9338,8 @@ class RPCServer:
         removeRecursive the ones that fail — e.g. A1, double-spent by the new
         branch, takes its in-pool child M2 with it — then removeForReorg.
         Runs even with no disconnected txs: removeForReorg still applies."""
+        # The wallet store first, so the re-accepted txs land as unconfirmed.
+        _resync_node_wallets(self.node)
         mempool = getattr(self.node, "mempool", None)
         if mempool is None or not hasattr(mempool, "update_for_reorg"):
             return
@@ -11241,6 +11256,8 @@ class RPCServer:
         the disconnect pool).  Re-accept, removeRecursive the failures,
         removeForReorg (non-final / BIP68 / immature / missing inputs, with
         descendants) — see ``Mempool.update_for_reorg``."""
+        # The wallet store first, so the re-accepted txs land as unconfirmed.
+        _resync_node_wallets(self.node)
         mempool = getattr(self.node, "mempool", None)
         if mempool is None or not hasattr(mempool, "update_for_reorg"):
             return
@@ -11285,6 +11302,8 @@ class RPCServer:
         ConnectTip'd.  removeForBlock each connected block (ascending), then
         MaybeUpdateMempoolForReorg with the disconnected blocks' txs
         (earliest first)."""
+        # The wallet store first, so the re-accepted txs land as unconfirmed.
+        _resync_node_wallets(self.node)
         mempool = getattr(self.node, "mempool", None)
         if mempool is None or old_tip_hash is None or old_tip_height is None:
             return

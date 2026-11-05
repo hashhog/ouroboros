@@ -504,3 +504,95 @@ def test_database_script_walk_raises_when_the_walk_cannot_run():
     with pytest.raises(RuntimeError):
         list(db.iter_unspent_for_scripts({b"\x51"}))
     assert list(db._iter_matching_utxos(b"\x51")) == []
+
+
+def test_block_connected_through_the_rpc_path_while_locked_is_found_on_unlock(tmp_path):
+    """submitblock / generatetoaddress call ``scan_block_connect`` on every
+    wallet directly, locked or not.  A locked wallet (no scripts in memory)
+    must not record that block as processed, or unlock would skip it."""
+    w, chain, _addr, spk = _funded_wallet(tmp_path, blocks=101)
+    w.encrypt("pw")
+    w.lock()
+    pay = _spend(_h("foreign"), 0, [(spk, 7 * COIN)], tag="pay")
+    chain.connect(w, 102, [_coinbase(102, FOREIGN_SPK), pay])   # RPC path
+
+    w.unlock("pw")
+    assert 7 * COIN in [c["value"] for c in w.wallet_coins()]
+
+
+class _Pool(SimpleNamespace):
+    """Mempool stand-in: holds txs, fires the hooks the wallet installs."""
+
+    def __init__(self):
+        super().__init__(_on_tx_added=None, _on_tx_removed=None, txs={})
+
+    def add(self, tx):
+        self.txs[bytes(tx.txid)] = tx
+        if self._on_tx_added is not None:
+            self._on_tx_added(tx.txid, tx, 1)
+
+    def get_transaction(self, txid):
+        return self.txs.get(bytes(txid))
+
+    def get_all_transactions(self):
+        return list(self.txs.values())
+
+
+def test_invalidate_and_reconsider_resync_the_store(tmp_path):
+    """invalidateblock / reconsiderblock / the atomic Rust reorg change the
+    chain without per-block wallet notifications.  The RPC's mempool refill
+    resyncs every wallet first: an invalidated block's coins go and its txs
+    come back as unconfirmed through the mempool re-add; a reconsidered
+    branch's coins come back."""
+    from ouroboros.rpc import RPCServer
+
+    w, chain, _addr, spk = _funded_wallet(tmp_path, blocks=101)
+    pay = _spend(_h("foreign"), 0, [(spk, 3 * COIN)], tag="pay")
+    block102 = chain.connect(w, 102, [_coinbase(102, spk), pay])
+    pool = _Pool()
+    w.set_mempool(pool)
+    rpc = RPCServer.__new__(RPCServer)
+    rpc.node = SimpleNamespace(wallet=w, mempool=None, wallet_manager=None)
+
+    # invalidateblock 102: the chain drops it, then the mempool refill runs.
+    del chain.blocks[102]
+    chain.tip = 101
+    asyncio.run(rpc._update_mempool_after_disconnect(chain, []))
+    assert 102 not in {c["height"] for c in w.wallet_coins()}
+    assert 3 * COIN not in {c["value"] for c in w.wallet_coins()}
+    pool.txs[bytes(pay.txid)] = pay          # re-accepted by the mempool
+    w.on_mempool_tx_added(pay)
+    assert (3 * COIN, 0) in {(c["value"], c["depth"]) for c in w.wallet_coins()}
+
+    # reconsiderblock 102: the chain has it again.
+    chain.blocks[102] = block102
+    chain.tip = 102
+    rpc._reorg_mempool_refill(chain, [], "test")
+    coins = {(c["height"], c["value"]) for c in w.wallet_coins()}
+    assert (102, 3 * COIN) in coins and (102, 50 * COIN) in coins
+    assert 0 not in {c["height"] for c in w.wallet_coins()}   # no unconfirmed copy
+
+
+def test_mempool_replay_on_attach_and_trust_needs_the_mempool(tmp_path):
+    """Core requestMempoolTransactions: txs already in the mempool when the
+    wallet is hooked up (mempool.dat at startup, loadwallet) reach the store.
+    Core CachedTxIsTrusted: an unconfirmed tx counts as trusted only while it
+    is in the mempool; once gone its change is untrusted_pending."""
+    from ouroboros.wallet import WalletManager
+
+    w, chain, _addr, spk = _funded_wallet(tmp_path)
+    mature = _coinbase(1, spk)
+    send = _spend(mature.txid, 0, [(FOREIGN_SPK, 10 * COIN), (spk, 39 * COIN)])
+    pool = _Pool()
+    pool.add(send)                     # in the pool before the wallet hooks up
+
+    mgr = WalletManager(str(tmp_path), "regtest")
+    mgr._wallets["w"] = w
+    mgr.set_mempool(pool)
+    bal = w.get_balances_sat()
+    assert bal["trusted"] == 39 * COIN
+
+    del pool.txs[bytes(send.txid)]     # gone without a removal event
+    bal = w.get_balances_sat()
+    assert bal["trusted"] == 0
+    assert bal["untrusted_pending"] == 39 * COIN

@@ -1780,11 +1780,61 @@ class Wallet:
         undone = self.reconcile_store_with_chain()
         if undone is not None and marker is not None and marker >= undone:
             marker = undone - 1
-        if marker is None:
+        if marker is not None:
             # No marker: birthday at the current tip (reconcile_on_load's
             # rule); a migration has already seeded the current coins.
+            self.rescan_chain(marker + 1, None)
+        # Mempool events were skipped while locked too.
+        self.sync_with_mempool()
+
+    def resync_store_with_chain(self) -> None:
+        """Re-align the store after a chain change that sent no per-block
+        notifications (invalidateblock, reconsiderblock, preciousblock and
+        the atomic Rust reorg): unwind store blocks the active chain no
+        longer has, then scan the active chain above the scan marker
+        (lowered to just below the lowest unwound height).  Callers run it
+        before the mempool re-accepts the disconnected transactions, so those
+        come back as unconfirmed rows.
+        """
+        if self._store is None or self.db is None or self.is_locked:
             return
-        self.rescan_chain(marker + 1, None)
+        undone = self.reconcile_store_with_chain()
+        marker = self._best_scanned_height
+        if undone is not None and marker is not None and marker >= undone:
+            marker = undone - 1
+            self._best_scanned_height = marker
+        if marker is not None and marker + 1 <= self._tip_height():
+            self.rescan_chain(marker + 1, None)
+
+    def _in_mempool(self, txid_hex: str) -> bool | None:
+        """True/False when a mempool is attached, None when there is none."""
+        mempool = getattr(self, "mempool", None)
+        get_tx = getattr(mempool, "get_transaction", None)
+        if get_tx is None:
+            return None
+        try:
+            return get_tx(bytes.fromhex(txid_hex)[::-1]) is not None
+        except Exception:
+            return None
+
+    def sync_with_mempool(self) -> None:
+        """Core ``requestMempoolTransactions``: feed every transaction already
+        in the mempool to this wallet, for a wallet attached (loaded,
+        unlocked, or hooked up at startup after ``mempool.dat`` was loaded)
+        after those transactions arrived."""
+        mempool = getattr(self, "mempool", None)
+        get_all = getattr(mempool, "get_all_transactions", None)
+        if self._store is None or self.is_locked or get_all is None:
+            return
+        try:
+            txs = list(get_all())
+        except Exception:
+            return
+        for tx in txs:
+            try:
+                self.on_mempool_tx_added(tx)
+            except Exception as e:
+                logger.debug("wallet '%s': mempool replay skipped a tx: %s", self.name, e)
 
     def lock(self) -> None:
         """Re-lock the wallet: save encrypted and wipe in-memory keys."""
@@ -1988,7 +2038,13 @@ class Wallet:
             depth = coin_depth(c["height"], tip)
             c["depth"] = depth
             c["immature"] = is_immature_coinbase(c["is_coinbase"], c["height"], tip)
-            c["trusted"] = depth > 0 or bool(c["trusted"])
+            if depth > 0:
+                c["trusted"] = True
+            else:
+                # Core CachedTxIsTrusted: a depth-0 tx is trusted only while
+                # it is in the mempool (and every input is the wallet's).
+                in_pool = self._in_mempool(c["txid"])
+                c["trusted"] = bool(c["trusted"]) and in_pool is not False
             if c["height"] == UNCONFIRMED:
                 c["height"] = 0
             out.append(c)
@@ -2623,7 +2679,13 @@ class Wallet:
         AddToWalletIfInvolvingMe.  The result is written to the persistent
         store in one transaction.  A block at a height the store already
         holds under a different hash unwinds the old branch first.
+
+        A locked wallet has no scripts in memory, so it records nothing and
+        leaves its scan marker alone; :meth:`unlock` rescans what it missed.
+        Every connect path (P2P, submitblock, generate*) goes through here.
         """
+        if self.is_locked:
+            return
         with self._scan_lock:
             self._scan_block_connect_locked(block, height)
 
@@ -3856,6 +3918,14 @@ class WalletManager:
         _removed._wallet_manager = self
         mempool._on_tx_added = _added
         mempool._on_tx_removed = _removed
+        # Transactions loaded (mempool.dat) or accepted before the hook.
+        for wallet in list(self._wallets.values()):
+            try:
+                wallet.sync_with_mempool()
+            except Exception as e:
+                logger.warning(
+                    f"wallet '{getattr(wallet, 'name', '?')}' mempool sync failed: {e}"
+                )
 
     def notify_mempool_tx_added(self, tx) -> None:
         for wallet in list(self._wallets.values()):
@@ -4240,6 +4310,10 @@ class WalletManager:
                 wallet.migrate_store_if_needed()
             except Exception as e:
                 logger.warning(f"wallet '{name}' store migration failed: {e}")
+        try:
+            wallet.sync_with_mempool()
+        except Exception as e:
+            logger.warning(f"wallet '{name}' mempool sync failed: {e}")
 
         # Add to loaded wallets
         self._wallets[name] = wallet
