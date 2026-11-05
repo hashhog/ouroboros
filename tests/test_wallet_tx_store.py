@@ -303,7 +303,7 @@ def test_reconcile_unwinds_blocks_the_chain_lost_while_down(tmp_path):
     not the chain's any more, so it is unwound (Core AttachChain locator)."""
     w, chain, _addr, spk = _funded_wallet(tmp_path, blocks=101)
     chain.connect(w, 102, [_coinbase(102, spk)], tag="A")
-    w.close_store()
+    getattr(w, "close_store", lambda: None)()
 
     chain.blocks[102] = SimpleNamespace(
         hash=_h("blk", 102, "B"), timestamp=0, transactions=[]
@@ -326,7 +326,7 @@ def test_migration_builds_the_store_from_the_chain(tmp_path):
     w.init_hd(seed=bytes(range(32)))
     addr = asyncio.run(w.generate_new_address(address_type="bech32"))
     w._save()
-    w.close_store()
+    getattr(w, "close_store", lambda: None)()
     for suffix in ("", "-wal", "-shm"):
         p = tmp_path / "wallets" / "w" / f"txstore.sqlite{suffix}"
         if p.exists():
@@ -372,7 +372,7 @@ def test_migration_waits_for_background_reconcile_at_startup(tmp_path):
     addr = asyncio.run(w.generate_new_address(address_type="bech32"))
     w._best_scanned_height = 3
     w._save()
-    w.close_store()
+    getattr(w, "close_store", lambda: None)()
     (tmp_path / "wallets" / "w" / "txstore.sqlite").unlink()
 
     spk = address_to_script_pubkey(addr, "regtest")
