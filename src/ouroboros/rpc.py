@@ -966,6 +966,23 @@ async def accept_block(
     except Exception:
         _connected_block = None
 
+    # Step 4b — Wallet transaction-history scan (best-effort).  It runs
+    # BEFORE the mempool eviction below, as on the P2P path: the eviction
+    # fires the wallet's mempool-removal hook, which drops a tx's
+    # unconfirmed rows (and a mempool child's spend of its outputs) unless
+    # the block has already confirmed them.
+    # Walk the connected block's txs and record a wallet-history entry for any
+    # tx that credits a wallet script (receive/coinbase) or debits a wallet
+    # outpoint (send), so listtransactions / gettransaction can surface the
+    # wallet's own activity. Mirrors Bitcoin Core CWallet::blockConnected ->
+    # AddToWalletIfInvolvingMe. Bookkeeping only — never affects acceptance.
+    if _connected_block is not None:
+        for _w in _iter_node_wallets(node):
+            try:
+                _w.scan_block_connect(_connected_block, next_height)
+            except Exception:
+                pass
+
     # Step 5 — Evict confirmed transactions from the mempool (best-effort).
     mempool = getattr(node, "mempool", None)
     if mempool is not None and len(mempool) > 0 and _connected_block is not None:
@@ -1023,19 +1040,6 @@ async def accept_block(
             )
         except Exception:
             pass  # an index fault must never abort block acceptance
-
-    # Step 6 — Wallet transaction-history scan (best-effort).
-    # Walk the connected block's txs and record a wallet-history entry for any
-    # tx that credits a wallet script (receive/coinbase) or debits a wallet
-    # outpoint (send), so listtransactions / gettransaction can surface the
-    # wallet's own activity. Mirrors Bitcoin Core CWallet::blockConnected ->
-    # AddToWalletIfInvolvingMe. Bookkeeping only — never affects acceptance.
-    if _connected_block is not None:
-        for _w in _iter_node_wallets(node):
-            try:
-                _w.scan_block_connect(_connected_block, next_height)
-            except Exception:
-                pass
 
     # Step 7 — Signal the tip-change notifier (Core KernelNotifications
     # blockTip / WaitTipChanged).  Every block accepted through this unified

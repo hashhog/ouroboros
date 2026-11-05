@@ -2029,9 +2029,21 @@ class Wallet:
         ``CachedTxIsTrusted``: confirmed, or unconfirmed with every input
         spending a wallet coin).  Coins spent by a block or by a mempool
         transaction are not listed (Core ``CWallet::IsSpent``).
+
+        While a pre-store wallet's migration is still pending (the startup
+        background walk, a failed walk awaiting retry, or a locked wallet not
+        yet unlocked) the store is incomplete, so this raises RPC_IN_WARMUP
+        (-28) rather than report an empty wallet as a zero balance.
         """
         if self._store is None:
             return []
+        if self.store_migration_pending:
+            raise WalletRpcError(
+                -28,
+                "Wallet is still building its transaction store from the "
+                "chain; try again shortly"
+                + (" (unlock the wallet first)" if self.is_locked else ""),
+            )
         tip = self._tip_height() if tip_height is None else int(tip_height)
         out = []
         for c in self._store.unspent_coins():
@@ -2106,8 +2118,9 @@ class Wallet:
     def on_mempool_tx_removed(self, txid: bytes) -> None:
         """Core ``transactionRemovedFromMempool``: drop an unconfirmed record.
 
-        A no-op for a tx a block already confirmed (the mempool removes
-        block transactions after the wallet saw the block).
+        A no-op for a tx a block already confirmed: every connect path (P2P
+        and the RPC ``accept_block``) scans the block for the wallet before
+        the mempool removes the block's transactions.
         """
         if self._store is None:
             return

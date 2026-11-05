@@ -596,3 +596,87 @@ def test_mempool_replay_on_attach_and_trust_needs_the_mempool(tmp_path):
     bal = w.get_balances_sat()
     assert bal["trusted"] == 0
     assert bal["untrusted_pending"] == 39 * COIN
+
+
+def test_rpc_accept_block_scans_the_wallet_before_evicting_block_txs(tmp_path):
+    """submitblock / generate* go through ``rpc.accept_block``.  The mempool
+    eviction of the block's txs fires the wallet's removal hook, which drops
+    a tx's unconfirmed rows (and a mempool child's spend of its outputs)
+    unless the block has already confirmed them; so the wallet must see the
+    block first, as on the P2P path.  Drives the REAL accept_block."""
+    from ouroboros.rpc import accept_block
+    from tests import test_assumevalid_submitblock_path as sb
+
+    order: list[str] = []
+
+    class _RecPool:
+        def __len__(self):
+            return 1
+
+        def remove_block_transactions(self, block):
+            order.append("mempool-evict")
+
+    class _RecWallet:
+        name = "rec"
+
+        def scan_block_connect(self, block, height):
+            order.append("wallet-scan")
+
+    db = sb._make_db()
+    node = sb._make_node(db, assumevalid_zero=False)
+    node.mempool = _RecPool()
+    node.wallet = _RecWallet()
+    raw = sb._build_block_bytes(flip_signature_byte=False)
+    patches = sb._patched_gates(node.validator)
+    for p in patches:
+        p.start()
+    try:
+        asyncio.run(accept_block(db, node, raw, sb.BELOW_CHECKPOINT_HEIGHT))
+    finally:
+        for p in patches:
+            p.stop()
+    assert order == ["wallet-scan", "mempool-evict"]
+
+
+def test_reads_raise_warmup_while_migration_is_pending(tmp_path):
+    """A pre-store wallet whose store is still being built (startup
+    background walk, failed walk awaiting retry, locked wallet) must not read
+    as an empty wallet: balance and listunspent answer RPC_IN_WARMUP (-28)."""
+    import pytest
+
+    from ouroboros.address import address_to_script_pubkey
+    from ouroboros.wallet import WalletManager
+
+    w = _wallet(tmp_path)
+    w.init_hd(seed=bytes(range(32)))
+    addr = asyncio.run(w.generate_new_address(address_type="bech32"))
+    w._best_scanned_height = 1
+    w._save()
+    getattr(w, "close_store", lambda: None)()
+    p = tmp_path / "wallets" / "w" / "txstore.sqlite"
+    if p.exists():
+        p.unlink()
+
+    spk = address_to_script_pubkey(addr, "regtest")
+    chain = FakeChain()
+    tx = _coinbase(1, spk, value=5 * COIN)
+    chain.utxos[(tx.txid, 0)] = {"value": 5 * COIN, "script_pubkey": spk,
+                                 "height": 1, "is_coinbase": False}
+    chain.blocks[1] = SimpleNamespace(hash=_h("blk", 1), timestamp=0, transactions=[tx])
+    chain.tip = 1
+    mgr = WalletManager(str(tmp_path), "regtest")
+    mgr.set_database(chain)
+    mgr._update_load_on_startup("w", True)
+    mgr.load_startup_wallets()
+    wallet = mgr.get_wallet("w")
+    rpc = _rpc(wallet, chain)
+
+    with pytest.raises(Exception) as ei:
+        asyncio.run(rpc.rpc_getbalance())
+    assert getattr(ei.value, "code", None) == -28
+    with pytest.raises(Exception) as ei:
+        asyncio.run(rpc.rpc_listunspent())
+    assert getattr(ei.value, "code", None) == -28
+
+    mgr.reconcile_on_load()
+    assert asyncio.run(rpc.rpc_getbalance()) == 5.0
