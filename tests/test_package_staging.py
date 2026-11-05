@@ -482,3 +482,24 @@ def test_package_parent_that_pays_for_single_rbf_still_replaces():
     assert child.get_txid() in pool.transactions
     assert o.get_txid() not in pool.transactions
     assert d.get_txid() not in pool.transactions
+
+
+def test_package_rbf_refusal_still_tries_the_other_parents_individually():
+    """Core's AcceptPackage tries every tx on its own before any package
+    step, so an independent parent that is valid alone is admitted even
+    though its sibling needs package RBF.  The refusal comes after that
+    loop: the pool ends as Core's does before its package RBF step."""
+    pool, db = _pool()
+    coin, o, d = _conflict_and_descendant(pool, db, 25)
+    rbf_parent = _tx([(coin, 0)], [94_000])              # needs package RBF
+    other = _tx([(_funded(db, 26), 0)], [95_000])        # valid alone
+    child = _tx([(rbf_parent.get_txid(), 0), (other.get_txid(), 0)], [100_000])
+    ok, err = pool.validate_package([rbf_parent, other, child], 100)
+    assert not ok
+    assert err == (
+        f"Package conflicts with mempool: {coin.hex()[:16]}...:0 already spent")
+    assert other.get_txid() in pool.transactions
+    assert o.get_txid() in pool.transactions
+    assert d.get_txid() in pool.transactions
+    assert rbf_parent.get_txid() not in pool.transactions
+    assert child.get_txid() not in pool.transactions
