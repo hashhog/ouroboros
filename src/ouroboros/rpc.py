@@ -15486,9 +15486,13 @@ class RPCServer:
         # with RPC_DESERIALIZATION_ERROR (-22) "TX decode failed: <hex> Make
         # sure the tx has at least one input." rather than a per-tx reject row.
         if not isinstance(rawtxs, list):
+            # Core's RPCArg type check wraps the message with the argument's
+            # position and name (rpc/util.cpp RPCTypeCheckArgument).
             raise RpcError(
                 RPC_TYPE_ERROR,
-                f"JSON value of type {_core_uvtype(rawtxs)} is not of expected type array",
+                'Wrong type passed:\n{\n    "Position 1 (rawtxs)": '
+                f'"JSON value of type {_core_uvtype(rawtxs)} is not of '
+                'expected type array"\n}',
             )
         if len(rawtxs) < 1 or len(rawtxs) > 25:
             raise RpcError(
@@ -15557,8 +15561,28 @@ class RPCServer:
                     "txid": txid_be,
                     "wtxid": wtxid_be,
                     "allowed": allowed,
-                    "reject-reason": None,
                 }
+                fee, vsize = int(res.get("fee", 0)), int(res.get("vsize", 0))
+                try:
+                    max_kvb = int(round(float(maxfeerate) * 1e8))
+                except (TypeError, ValueError):
+                    max_kvb = 0
+                # Core: a tx whose fee exceeds maxfeerate * vsize is refused
+                # with "max-fee-exceeded" (rpc/mempool.cpp testmempoolaccept).
+                if allowed and max_kvb and vsize and fee > -((-max_kvb * vsize) // 1000):
+                    row["allowed"] = False
+                    row["reject-reason"] = "max-fee-exceeded"
+                elif allowed:
+                    # Core prints vsize and fees only for an allowed tx and
+                    # no reject-reason key at all.  A lone tx is its own
+                    # package, so the effective feerate is fee / vsize
+                    # (sat/kvB, rounded down) and it includes only itself.
+                    row["vsize"] = vsize
+                    row["fees"] = {
+                        "base": _btc(fee),
+                        "effective-feerate": _btc((fee * 1000) // vsize if vsize else 0),
+                        "effective-includes": [wtxid_be],
+                    }
                 if not allowed:
                     reason, details = _reject_reason_and_details(
                         str(res.get("reject_reason"))
