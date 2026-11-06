@@ -2110,6 +2110,27 @@ class PackageAcceptResult:
     per_tx_results: bool = True
 
 
+DEFAULT_MAX_MEMPOOL_MB = 300  # Core kernel/mempool_options.h DEFAULT_MAX_MEMPOOL_SIZE_MB
+
+
+def max_mempool_bytes(config) -> int:
+    """Mempool size cap in bytes from the node config's ``maxmempool`` (MB).
+
+    Core node/mempool_args.cpp: ``max_size_bytes = -maxmempool * 1'000'000``;
+    unset means the 300 MB default.
+    """
+    raw = (config or {}).get("maxmempool")
+    if raw is None:
+        raw = DEFAULT_MAX_MEMPOOL_MB
+    try:
+        mb = int(raw)
+    except (TypeError, ValueError):
+        mb = DEFAULT_MAX_MEMPOOL_MB
+    if mb < 0:
+        mb = DEFAULT_MAX_MEMPOOL_MB
+    return mb * 1_000_000
+
+
 class Mempool:
     """Unconfirmed transaction pool"""
 

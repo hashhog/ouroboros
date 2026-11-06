@@ -570,6 +570,16 @@ def sync(ctx, reset, limit):
         "Bitcoin Core's -fallbackfee."
     ),
 )
+@click.option(
+    "--maxmempool",
+    "maxmempool",
+    type=int,
+    default=None,
+    help=(
+        "Keep the transaction memory pool below <n> megabytes "
+        "(Bitcoin Core -maxmempool). Default: 300."
+    ),
+)
 @click.pass_context
 def start(
     ctx, rpc_port, p2p_port, listen, bind, externalip, discover, connect,
@@ -577,6 +587,7 @@ def start(
     peerbloomfilters, blockfilterindex, cfilter, coinstatsindex,
     txospenderindex, assumevalid, noassumevalid, daemon,
     pid_path, reindex, rpc_tls_cert, rpc_tls_key, par, fallbackfee,
+    maxmempool,
 ):
     """Start the Bitcoin node"""
     global _node, _cancelled, _pid_file
@@ -702,6 +713,10 @@ def start(
             config["assumevalid"] = str(assumevalid)
         if par is not None:
             config["par"] = int(par)
+        if maxmempool is not None:
+            if maxmempool < 0:
+                raise click.BadParameter("--maxmempool must be >= 0")
+            config["maxmempool"] = int(maxmempool)
         if fallbackfee is not None:
             if fallbackfee < 0:
                 raise click.BadParameter("--fallbackfee must be >= 0")

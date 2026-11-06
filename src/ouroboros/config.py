@@ -235,6 +235,8 @@ class NodeConfig:
             'asmap': '',
             # Script verification threads (Bitcoin Core -par). 0 = auto.
             'par': '0',
+            # Mempool memory cap in MB (Core: -maxmempool, default 300).
+            'maxmempool': '300',
         }
 
         if self.config_path.exists():
@@ -401,6 +403,8 @@ class NodeConfig:
             'asmap': self.get('asmap') or '',
             # Script verification threads (Core: -par).  0 = auto.
             'par': self.getint('par'),
+            # Mempool cap in MB (Core: -maxmempool).
+            'maxmempool': self.getint('maxmempool'),
             # REST interface (Core: -rest).  Without this key BitcoinNode
             # read its '0' default and never mounted /rest/*, even with
             # rest=1 in ouroboros.conf or OUROBOROS_REST=1 in the env.
