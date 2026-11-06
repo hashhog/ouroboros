@@ -472,9 +472,10 @@ class TestW125_RpcErrorParity(unittest.TestCase):
         self.assertIn(code, (RPC_VERIFY_ERROR, RPC_VERIFY_REJECTED))
 
     # G27 — RPC_VERIFY_ALREADY_IN_UTXO_SET (-27) --------------------------
-    @pytest.mark.xfail(reason="W125 BUG-7: sendrawtransaction returns "
-                              "success on already-known tx; Core: -27",
-                       strict=False)
+    # FIXED (W125 BUG-7): sendrawtransaction answers -27 for a tx whose outputs
+    # are already in the UTXO set (Core node/transaction.cpp
+    # BroadcastTransaction); the behaviour is pinned end to end by
+    # tests/test_sendrawtransaction_core_errors.py. xfail removed.
     def test_g27_verify_already_in_utxo_set_absent(self):
         rpc_py = (_src / "ouroboros" / "rpc.py").read_text()
         self.assertIn("RPC_VERIFY_ALREADY_IN_UTXO_SET", rpc_py)
