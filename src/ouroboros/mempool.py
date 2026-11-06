@@ -2110,6 +2110,27 @@ class PackageAcceptResult:
     per_tx_results: bool = True
 
 
+DEFAULT_MAX_MEMPOOL_MB = 300  # Core kernel/mempool_options.h DEFAULT_MAX_MEMPOOL_SIZE_MB
+
+
+def max_mempool_bytes(config) -> int:
+    """Mempool size cap in bytes from the node config's ``maxmempool`` (MB).
+
+    Core node/mempool_args.cpp: ``max_size_bytes = -maxmempool * 1'000'000``;
+    unset means the 300 MB default.
+    """
+    raw = (config or {}).get("maxmempool")
+    if raw is None:
+        raw = DEFAULT_MAX_MEMPOOL_MB
+    try:
+        mb = int(raw)
+    except (TypeError, ValueError):
+        mb = DEFAULT_MAX_MEMPOOL_MB
+    if mb < 0:
+        mb = DEFAULT_MAX_MEMPOOL_MB
+    return mb * 1_000_000
+
+
 class Mempool:
     """Unconfirmed transaction pool"""
 
@@ -2937,8 +2958,16 @@ class Mempool:
             # lock; call the unlocked replacement helper directly. In test_accept
             # (dry-run) mode it validates the BIP125 RBF rules without evicting
             # the conflicting tx or inserting the replacement.
-            return self._try_replace_inner(
+            ok, err = self._try_replace_inner(
                 tx, height, test_accept=test_accept, workspace=workspace)
+            # A replacement is inserted too, so it is trimmed like any other
+            # single tx (Core runs LimitMempoolSize after FinalizeSubpackage
+            # whether or not the tx replaced anything).  Package members are
+            # trimmed at the end of the package instead.
+            if ok and not test_accept and not bypass_limits and not in_package:
+                if not self._limit_mempool_size(txid):
+                    return False, "mempool full"
+            return ok, err
 
         # TRUC (v3 transaction) policy checks — must come before general
         # ancestor/descendant limits. This handles both v3 and non-v3 txs
@@ -2960,7 +2989,8 @@ class Mempool:
                 if test_accept:
                     return False, truc_err
                 # Sibling eviction: try to replace the existing child
-                return self._try_sibling_eviction(tx, sibling_txid, height)
+                return self._try_sibling_eviction(
+                    tx, sibling_txid, height, package_member=in_package)
             return False, truc_err
 
         # Ancestor set — bookkeeping only.  As of Bitcoin Core v31 (cluster
@@ -3005,11 +3035,11 @@ class Mempool:
         if not cluster_ok:
             return False, cluster_err
 
-        # Check mempool size. Eviction mutates the pool, so skip it in dry-run
-        # mode — testmempoolaccept must not change mempool state.
-        if (not test_accept and not bypass_limits and not package_feerate
-                and self.current_size + tx_size > self.max_size):
-            self._evict_low_fee_txs(tx_size)
+        # The size limit is NOT applied here.  Core checks the fee against the
+        # CURRENT pool minimum (below), inserts, and only then trims with
+        # LimitMempoolSize (see after the insert).  Evicting before the fee
+        # check let a tx that was then rejected for the raised rolling fee push
+        # out one that already fit.
 
         # Calculate fee
         total_input = 0
@@ -3154,6 +3184,16 @@ class Mempool:
         # Update cluster manager
         self._cluster_manager.add_transaction(txid)
 
+        # Core AcceptSingleTransaction: after FinalizeSubpackage,
+        # ``if (!m_package_submission && !m_bypass_limits) LimitMempoolSize``,
+        # and if the new tx was the one trimmed it is TX_RECONSIDERABLE
+        # "mempool full" (validation.cpp).  Package members are trimmed once
+        # at the end of the package (_accept_package_inner); reorg refill
+        # (bypass_limits) trims after the whole refill.
+        if not bypass_limits and not in_package:
+            if not self._limit_mempool_size(txid):
+                return False, "mempool full"
+
         # Get sequence number for this add event
         seq = self._next_sequence()
 
@@ -3177,6 +3217,15 @@ class Mempool:
             self._resolve_orphans(txid, height)
 
         return True, ""
+
+    def _limit_mempool_size(self, txid: bytes) -> bool:
+        """Core LimitMempoolSize after a single-tx insert: trim the pool to
+        max_size, lowest-feerate chunks first.  Returns False when *txid*
+        itself was trimmed (Core: ``!m_pool.exists(ws.m_hash)`` -> "mempool
+        full")."""
+        if self.current_size > self.max_size:
+            self._evict_low_fee_txs(self.current_size - self.max_size)
+        return txid in self.transactions
 
     def _get_ancestors(self, tx: Transaction) -> set[bytes]:
         """Get all ancestors (transitive parents) of a transaction.
@@ -3649,7 +3698,8 @@ class Mempool:
         return list(parent_entry.children)
 
     def _try_sibling_eviction(
-        self, new_tx: Transaction, sibling_txid: bytes, height: int
+        self, new_tx: Transaction, sibling_txid: bytes, height: int,
+        package_member: bool = False,
     ) -> tuple[bool, str]:
         """Attempt TRUC sibling eviction.
 
@@ -3715,7 +3765,10 @@ class Mempool:
         # Now add the new transaction (it should pass all checks)
         # We need to be careful to avoid infinite recursion - the sibling
         # is already removed so the parent no longer has a child.
-        ok, err = self._add_transaction_inner(new_tx, height)
+        # Re-enter with the caller's package context, so a package member is
+        # not size-trimmed on its own insert (the package trims at its end).
+        ok, err = self._add_transaction_inner(
+            new_tx, height, package_member=package_member)
         if not ok:
             # This shouldn't happen if our checks are correct
             logger.warning(f"Failed to add tx after sibling eviction: {err}")
@@ -4866,7 +4919,12 @@ class Mempool:
         (and their descendants) are removed and the new tx is added.
         """
         with self._lock:
-            return self._try_replace_inner(new_tx, height)
+            ok, err = self._try_replace_inner(new_tx, height)
+            # Wallet bumpfee / psbtbumpfee submit here; Core sends the bumped
+            # tx through AcceptToMemoryPool, which trims (LimitMempoolSize).
+            if ok and not self._limit_mempool_size(new_tx.get_txid()):
+                return False, "mempool full"
+            return ok, err
 
     def _try_replace_inner(
         self, new_tx: Transaction, height: int, test_accept: bool = False,
@@ -5151,6 +5209,12 @@ class Mempool:
             if a_txid in self.transactions:
                 self.transactions[a_txid].descendant_count += 1
                 self.transactions[a_txid].descendant_size += new_size
+
+        # Register the replacement with the cluster manager, as the non-RBF
+        # insert does.  Size-limit trimming picks its victims from the cluster
+        # manager (get_worst_chunk); a replacement missing from it could never
+        # be trimmed, so an oversized replacement stayed above the cap.
+        self._cluster_manager.add_transaction(new_txid)
 
         # Single-pass recount for all remaining txs affected by evictions
         for evicted_id in evicted_ids:

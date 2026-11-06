@@ -235,6 +235,8 @@ class NodeConfig:
             'asmap': '',
             # Script verification threads (Bitcoin Core -par). 0 = auto.
             'par': '0',
+            # Mempool memory cap in MB (Core: -maxmempool, default 300).
+            'maxmempool': '300',
         }
 
         if self.config_path.exists():
@@ -325,6 +327,14 @@ class NodeConfig:
         except ValueError:
             return 0
 
+    def _getint_or_default(self, key: str) -> int:
+        """Like :meth:`getint`, but a value that is not an integer yields the
+        key's default instead of 0."""
+        try:
+            return int(self.get(key))
+        except (TypeError, ValueError):
+            return int(self.defaults[key])
+
     def getboolean(self, key: str, section: str | None = None) -> bool:
         """Get a config value as a boolean."""
         value = self.get(key, section)
@@ -401,6 +411,10 @@ class NodeConfig:
             'asmap': self.get('asmap') or '',
             # Script verification threads (Core: -par).  0 = auto.
             'par': self.getint('par'),
+            # Mempool cap in MB (Core: -maxmempool).  Not getint(): that turns
+            # a non-integer like ``maxmempool=abc`` into 0, which would cap
+            # the pool at zero bytes; an unparsable value keeps the default.
+            'maxmempool': self._getint_or_default('maxmempool'),
             # REST interface (Core: -rest).  Without this key BitcoinNode
             # read its '0' default and never mounted /rest/*, even with
             # rest=1 in ouroboros.conf or OUROBOROS_REST=1 in the env.

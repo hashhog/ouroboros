@@ -21,7 +21,7 @@ from ouroboros.cookie_auth import delete_cookie, generate_cookie
 from ouroboros.database import BlockchainDatabase
 from ouroboros.fatal import EXIT_CODE_FATAL, set_abort_hook
 from ouroboros.fee_estimator import FeeEstimator
-from ouroboros.mempool import Mempool
+from ouroboros.mempool import Mempool, max_mempool_bytes
 from ouroboros.metrics import (
     init_metrics,
     update_chain_metrics,
@@ -279,7 +279,10 @@ class BitcoinNode:
 
             # Initialize mempool
             logger.info("Initializing mempool...")
-            self.mempool = Mempool(self.tx_validator)
+            self.mempool = Mempool(
+                self.tx_validator,
+                max_size=max_mempool_bytes(self.config),
+            )
 
             # Reload persisted mempool (if available)
             mempool_path = os.path.join(self.data_dir, "mempool.dat")
