@@ -1304,6 +1304,7 @@ RPC_DESERIALIZATION_ERROR = -22      # protocol.h:53 — error parsing or valida
 RPC_CLIENT_NODE_ALREADY_ADDED = -23  # protocol.h:60 — Node is already added
 RPC_CLIENT_NODE_NOT_ADDED = -24      # protocol.h:61 — Node has not been added before
 RPC_VERIFY_ERROR = -25               # protocol.h:42 — general error during transaction or block submission
+RPC_VERIFY_ALREADY_IN_UTXO_SET = -27  # protocol.h:44 — transaction already in utxo set
 RPC_CLIENT_NODE_NOT_CONNECTED = -29  # protocol.h:62 — disconnect target not connected
 RPC_INVALID_PARAMS = -32602          # protocol.h:31 — JSON-RPC "Invalid params"
 RPC_CLIENT_INVALID_IP_OR_SUBNET = -30
@@ -1496,6 +1497,35 @@ def _package_fees_obj(res: Any, with_effective: bool) -> dict[str, Any]:
         fees["effective-feerate"] = _btc(res.effective_feerate)
         fees["effective-includes"] = [w[::-1].hex() for w in res.effective_includes]
     return fees
+
+
+def _maxfeerate_from_value(value: Any) -> float:
+    """Core ``AmountFromValue`` (rpc/util.cpp) for ``maxfeerate``, as BTC (float).
+
+    Stricter than :func:`_amount_from_value` (which the wallet amounts use and
+    which this deliberately leaves alone): it rejects nan/inf and more than 8
+    decimals like Core's ParseFixedPoint.  Only a JSON number or string is an amount (RPC_TYPE_ERROR "Amount is not a
+    number or string"); a string/number that is not a decimal with at most 8
+    fractional digits is "Invalid amount"; a value outside [0, 21,000,000] BTC
+    is "Amount out of range" (all RPC_TYPE_ERROR, -3).
+    """
+    import decimal
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise RpcError(RPC_TYPE_ERROR, "Amount is not a number or string")
+    text = str(value)
+    # Core's ParseFixedPoint grammar: no spaces, underscores, nan/inf, hex, no
+    # leading '+', no leading zeros, a digit on both sides of the point.
+    if _re.fullmatch(r"-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?", text) is None:
+        raise RpcError(RPC_TYPE_ERROR, "Invalid amount")
+    d = decimal.Decimal(text)
+    # Range first: quantize() overflows the default 28-digit context on huge
+    # values (1e30), which must be "Amount out of range", not a crash.
+    if d < 0 or d > 21_000_000:
+        raise RpcError(RPC_TYPE_ERROR, "Amount out of range")
+    if d != d.quantize(decimal.Decimal("1e-8")):
+        raise RpcError(RPC_TYPE_ERROR, "Invalid amount")
+    return float(d)
 
 
 def _decode_hex_tx(hexstring: str, no_witness: bool = False) -> Any:
@@ -4224,6 +4254,12 @@ class RPCServer:
         # use the LE ``txid`` directly. See W41.
         txid_hex = txid[::-1].hex()
 
+        # Core parses maxfeerate straight after DecodeHexTx, before the mempool
+        # or the UTXO set is consulted, so a malformed value is an error even
+        # for a tx the pool already holds.
+        if maxfeerate is not None:
+            maxfeerate = _maxfeerate_from_value(maxfeerate)
+
         # Reject coinbase transactions
         if tx.is_coinbase:
             raise HTTPException(
@@ -4241,15 +4277,21 @@ class RPCServer:
         if self.node.mempool.has_transaction(txid):
             return txid_hex
 
-        # 3. Check if already confirmed — return txid if so
+        # 3. Core BroadcastTransaction (node/transaction.cpp): a tx that is
+        # not in the mempool but has an unspent output in the UTXO set is
+        # already confirmed -> RPC_VERIFY_ALREADY_IN_UTXO_SET (-27).  Core
+        # looks at the coins view, not -txindex, and does not answer success.
         if hasattr(self.node, 'db') and self.node.db:
-            try:
-                loc = await asyncio.to_thread(self.node.db.get_tx_index, txid)
-                if loc is not None:
-                    # Transaction is already confirmed on-chain
-                    return txid_hex
-            except Exception:
-                pass
+            for n in range(len(tx.outputs)):
+                try:
+                    coin = await asyncio.to_thread(self.node.db.get_utxo, txid, n)
+                except Exception:
+                    coin = None
+                if coin:
+                    raise RpcError(
+                        RPC_VERIFY_ALREADY_IN_UTXO_SET,
+                        "Transaction outputs already in utxo set",
+                    )
 
         # 4. Check maxfeerate parameter (safety check against absurd fees)
         # Default: 0.10 BTC/kvB = 100,000 sat/kvB = 100 sat/vB
@@ -4271,9 +4313,11 @@ class RPCServer:
                 if utxo:
                     total_input += utxo['value']
                 else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="missing-inputs"
+                    # Core TransactionError::MISSING_INPUTS ->
+                    # JSONRPCTransactionError: RPC_VERIFY_ERROR (-25) with
+                    # the validation state's reject reason.
+                    raise RpcError(
+                        RPC_VERIFY_ERROR, "bad-txns-inputs-missingorspent"
                     )
 
         total_output = sum(out.value for out in tx.outputs)
