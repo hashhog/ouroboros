@@ -4913,7 +4913,12 @@ class Mempool:
         (and their descendants) are removed and the new tx is added.
         """
         with self._lock:
-            return self._try_replace_inner(new_tx, height)
+            ok, err = self._try_replace_inner(new_tx, height)
+            # Wallet bumpfee / psbtbumpfee submit here; Core sends the bumped
+            # tx through AcceptToMemoryPool, which trims (LimitMempoolSize).
+            if ok and not self._limit_mempool_size(new_tx.get_txid()):
+                return False, "mempool full"
+            return ok, err
 
     def _try_replace_inner(
         self, new_tx: Transaction, height: int, test_accept: bool = False
