@@ -30,6 +30,8 @@ pub mod snapshot;
 mod db_tests;
 #[cfg(test)]
 mod snapshot_recovery_tests;
+#[cfg(test)]
+mod block_index_v2_tests;
 
 pub use db::{BlockchainDB, DbError, Result};
 pub use undo::{BlockUndo, Coin, TxUndo, UndoError, UndoFileManager};

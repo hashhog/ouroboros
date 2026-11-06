@@ -1,0 +1,70 @@
+{
+ "failed_reorg": {
+  "absent": [
+   "10f56d7ed855fb871175cf66ec1cd048f8ddbf8f5f36d409c5995ab02d122cf0",
+   "00e14e8a4a0e87c16090991d8de8647ac616a53b8ab8984be5b798552d4290ff"
+  ],
+  "active_without_header": [],
+  "entries": 33,
+  "no_header": 0,
+  "side": {
+   "0d342201621de5168f6d428644b74ce8cabb2330f52fc7eff1fdfaf79b9676c9": {
+    "height": 10,
+    "prev": "10f71acdb6bd9ef5ab8389f79d46ae72227c3fe9ecb532fefec52496ddfa7de5",
+    "status": 73
+   },
+   "10f71acdb6bd9ef5ab8389f79d46ae72227c3fe9ecb532fefec52496ddfa7de5": {
+    "height": 9,
+    "prev": "7fc09dc8dc1498325bfdd707675fed1063d0db2e6181749edf94d43b9085744c",
+    "status": 41
+   },
+   "36ee4cd00966c7c2e7525b6b871277ad67f553717fb489d6d254aa9666c4fced": {
+    "height": 13,
+    "prev": "1d1030a7733c7c36c01add87435a1476ebd30cc92efd5435c6a1b73b7e5d9805",
+    "status": 9
+   },
+   "50be2006afce970363f7abfa14c607061b7951cbc6964900362c0af7eb772855": {
+    "height": 9,
+    "prev": "4611f34e09f37bd806db301f1b7d393feea74bc28540f71475fe7ef669dffb20",
+    "status": 9
+   },
+   "52c75491e48bcacd25915e139519e9a71a8769f92410d7e881913ff2cb238c2f": {
+    "height": 3,
+    "prev": "77591dca669e6495485e6d73643b6ae7c26b5f5a06966ce29559dd895d7e82be",
+    "status": 9
+   },
+   "640d52da9fd78ae3b896b3dd8dc20d6801e7be485487a7f2e950958f7b8dde18": {
+    "height": 22,
+    "prev": "202629073cdddb9cf8d1b3454ed504ef39a5cf728156953a854d976ee4e68c7b",
+    "status": 41
+   },
+   "78cd4ad8a38f51be3a33e3d950ef45f3fe2c2d34783ffb105c6072abbe9d40fa": {
+    "height": 17,
+    "prev": "23108bbcf114bdca2784c60adfcea2e851310c9e15e64882eeb16359c23d7482",
+    "status": 41
+   },
+   "7fc09dc8dc1498325bfdd707675fed1063d0db2e6181749edf94d43b9085744c": {
+    "height": 8,
+    "prev": "405d2d898366b8896697fdb4322a796f4e53a85bc41a600a15c5a9598fc4f2d4",
+    "status": 9
+   }
+  },
+  "tip": "4d4e49fd98630f08865807159e9e5f1c9c136c6e8ecfd77b51bc7b79b47e918e",
+  "tip_height": 22
+ },
+ "reorg": {
+  "absent": [],
+  "active_without_header": [],
+  "entries": 112,
+  "no_header": 0,
+  "side": {
+   "65f6d60c9f340dd7307e600fcb8466f47fd169f34d110ed4ce39ce710b4891b9": {
+    "height": 111,
+    "prev": "2452e2ddc468ab9ec953ecdbac4cc838aeaa615b98ccef1397fb6bc6cff7e2f1",
+    "status": 9
+   }
+  },
+  "tip": "65f6d60c9f340dd7307e600fcb8466f47fd169f34d110ed4ce39ce710b4891b9",
+  "tip_height": 111
+ }
+}

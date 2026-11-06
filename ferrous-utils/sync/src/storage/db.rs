@@ -21,8 +21,9 @@ use common::{
 
 use crate::storage::schema::{
     decode_height, encode_block_hash, encode_height, encode_outpoint,
-    get_column_families, meta_keys, BLOCK_INDEX_BY_HASH_CF, BLOCK_INDEX_CF, BLOCKS_CF,
-    CHAINSTATE_CF, HEADERS_CF, META_CF, SPENT_CF, TX_INDEX_CF, UNDO_CF,
+    get_column_families, meta_keys, BLOCK_INDEX_BY_HASH_CF, BLOCK_INDEX_CF,
+    BLOCK_INDEX_ENTRY_V2_LEN, BLOCK_METADATA_LEN, BLOCKS_CF, CHAINSTATE_CF, HEADERS_CF, META_CF,
+    SPENT_CF, TX_INDEX_CF, UNDO_CF,
 };
 use crate::storage::undo::{BlockUndo, Coin, TxUndo};
 
@@ -39,6 +40,88 @@ pub struct HeadersNtxReconcileStats {
     pub zeroed: u64,
     /// Extended (Core-tool) records cut back to 84 bytes.
     pub stripped_extended: u64,
+}
+
+/// Counts from `BlockchainDB::migrate_block_index_v2`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BlockIndexMigrationStats {
+    /// BLOCK_INDEX_BY_HASH_CF entries visited.
+    pub scanned: u64,
+    /// Already v2 (header + nTx tail present): left as they were.
+    pub already_v2: u64,
+    /// Upgraded with the header (and nTx) held in HEADERS_CF.
+    pub from_headers: u64,
+    /// Upgraded with the header and tx count of a body held in BLOCKS_CF.
+    pub from_body: u64,
+    /// Left legacy: neither store holds a header whose hash is the key.
+    pub no_header: u64,
+    /// A stored header or body hashed to something other than the key; it
+    /// was not used.  Non-zero means a store is inconsistent.
+    pub hash_mismatch: u64,
+    /// Values too short to be a `BlockMetadata` (< 40 bytes): left as they were.
+    pub malformed: u64,
+}
+
+/// One hash-index entry: what Core keeps in a `CBlockIndex` for this block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockIndexEntry {
+    /// Height, chainwork, timestamp, status.
+    pub metadata: BlockMetadata,
+    /// The 80-byte header; `None` for a legacy entry not yet upgraded.
+    pub header: Option<[u8; 80]>,
+    /// Transaction count (0 = transactions never received). 0 for legacy.
+    pub n_tx: u32,
+}
+
+impl BlockIndexEntry {
+    /// Decode a BLOCK_INDEX_BY_HASH_CF value (legacy or v2).
+    pub fn from_value(value: &[u8]) -> Result<Self> {
+        let metadata = BlockMetadata::from_bytes(value).map_err(|e| {
+            DbError::InvalidData(format!("hash-index entry: bad BlockMetadata: {}", e))
+        })?;
+        let (header, n_tx) = match split_v2_tail(value) {
+            Some((h, n)) => (Some(h), n),
+            None => (None, 0),
+        };
+        Ok(Self { metadata, header, n_tx })
+    }
+
+    /// The parent hash (internal byte order), from the header.
+    pub fn prev_hash(&self) -> Option<[u8; 32]> {
+        self.header.map(|h| {
+            let mut p = [0u8; 32];
+            p.copy_from_slice(&h[4..36]);
+            p
+        })
+    }
+}
+
+/// The `(header, nTx)` tail of a v2 hash-index value, if it has one.
+fn split_v2_tail(value: &[u8]) -> Option<([u8; 80], u32)> {
+    if value.len() < BLOCK_INDEX_ENTRY_V2_LEN {
+        return None;
+    }
+    let t = &value[BLOCK_METADATA_LEN..BLOCK_INDEX_ENTRY_V2_LEN];
+    let mut header = [0u8; 80];
+    header.copy_from_slice(&t[0..80]);
+    let n_tx = u32::from_le_bytes([t[80], t[81], t[82], t[83]]);
+    Some((header, n_tx))
+}
+
+/// True when `header` (80 bytes) hashes to `hash` (internal byte order).
+fn header_hashes_to(header: &[u8], hash: &[u8]) -> bool {
+    header.len() == 80
+        && bitcoin::hashes::sha256d::Hash::hash(header).to_byte_array()[..] == hash[..]
+}
+
+/// Build a v2 value: `[metadata 44][header 80][nTx 4]`.  `metadata_bytes`
+/// must already be the 44-byte encoding.
+fn v2_value(metadata_bytes: &[u8], header: &[u8; 80], n_tx: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(BLOCK_INDEX_ENTRY_V2_LEN);
+    v.extend_from_slice(metadata_bytes);
+    v.extend_from_slice(header);
+    v.extend_from_slice(&n_tx.to_le_bytes());
+    v
 }
 
 /// Mirror of Bitcoin Core's `DisconnectResult` enum (validation.h:451-455).
@@ -149,6 +232,9 @@ pub struct BlockchainDB {
     /// a concurrent commit invalidates the populate rather than caching a
     /// stale value (the RPC-vs-connect double-spend race).
     cache_generation: AtomicU64,
+    /// Counts from the hash-index v2 migration `open` ran, or `None` when
+    /// its marker was already present (nothing to do).
+    open_index_migration: Mutex<Option<BlockIndexMigrationStats>>,
 }
 
 /// Soft cap on read-through cache entries; on overflow the cache is cleared
@@ -242,6 +328,7 @@ impl BlockchainDB {
             db: Arc::new(db),
             utxo_read_cache: Mutex::new(HashMap::new()),
             cache_generation: AtomicU64::new(0),
+            open_index_migration: Mutex::new(None),
         };
 
         // One-time removal of Core-sourced nTx from HEADERS_CF. Never fatal:
@@ -255,6 +342,26 @@ impl BlockchainDB {
             Ok(None) => {}
             Err(e) => log::error!(
                 "HEADERS_CF nTx provenance reconcile failed: {} — will retry next open", e
+            ),
+        }
+
+        // One-time in-place upgrade of the hash index to v2 (header + nTx).
+        // Runs after the nTx reconcile so the nTx it copies is this node's
+        // own.  Never fatal: on error the marker is not written and the next
+        // open resumes (v2 entries are skipped).
+        match this.migrate_block_index_v2() {
+            Ok(Some(s)) => {
+                *this.open_index_migration.lock().unwrap_or_else(|p| p.into_inner()) = Some(s);
+                log::warn!(
+                "block index v2 migration: scanned={} already_v2={} from_headers={} \
+                 from_body={} no_header={} hash_mismatch={} malformed={}",
+                s.scanned, s.already_v2, s.from_headers, s.from_body, s.no_header,
+                s.hash_mismatch, s.malformed
+                )
+            }
+            Ok(None) => {}
+            Err(e) => log::error!(
+                "block index v2 migration failed: {} — will retry next open", e
             ),
         }
 
@@ -304,12 +411,204 @@ impl BlockchainDB {
         self.db.put_cf(cf, key, value)?;
 
         // Also write to hash-keyed index (BUG-7 fix).  Key = 32-byte block hash,
-        // value = raw BlockMetadata bytes (no hash prefix needed — hash IS the key).
+        // value = BlockMetadata bytes plus the v2 header tail when one is known.
         let hash_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
-        self.db.put_cf(hash_cf, hash, &metadata_bytes)?;
+        let hash_value = self.hash_index_value(hash, &metadata_bytes, None)?;
+        self.db.put_cf(hash_cf, hash, hash_value)?;
 
         Ok(())
+    }
+
+    /// The BLOCK_INDEX_BY_HASH_CF value to write for `hash`.
+    ///
+    /// `tail` is the `(header, nTx)` the caller has in hand (a connect has
+    /// the block).  Without one, the tail is kept from the entry already
+    /// stored, else taken from HEADERS_CF; only a header whose sha256d is
+    /// `hash` is ever used.  With no header anywhere the value stays legacy
+    /// (44 bytes).  This is what keeps a status-only rewrite
+    /// (`update_block_status`) from truncating a v2 entry.
+    fn hash_index_value(
+        &self,
+        hash: &[u8; 32],
+        metadata_bytes: &[u8],
+        tail: Option<(&[u8; 80], u32)>,
+    ) -> Result<Vec<u8>> {
+        if let Some((header, n_tx)) = tail {
+            if header_hashes_to(header, hash) {
+                return Ok(v2_value(metadata_bytes, header, n_tx));
+            }
+            return Err(DbError::InvalidData(
+                "hash-index write: header does not hash to the block hash".to_string(),
+            ));
+        }
+        let hash_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        if let Some(existing) = self.db.get_pinned_cf(hash_cf, hash)? {
+            if let Some((header, n_tx)) = split_v2_tail(&existing) {
+                if header_hashes_to(&header, hash) {
+                    return Ok(v2_value(metadata_bytes, &header, n_tx));
+                }
+            }
+        }
+        if let Some((header, n_tx)) = self.get_raw_header(hash)? {
+            if header_hashes_to(&header, hash) {
+                return Ok(v2_value(metadata_bytes, &header, n_tx));
+            }
+        }
+        Ok(metadata_bytes.to_vec())
+    }
+
+    /// Hash-index entry for any known block (active or not), with its header
+    /// when the entry is v2.  Core: `m_block_index.find(hash)`.
+    pub fn get_block_index_entry(&self, hash: &[u8; 32]) -> Result<Option<BlockIndexEntry>> {
+        let cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        match self.db.get_pinned_cf(cf, hash)? {
+            Some(v) => Ok(Some(BlockIndexEntry::from_value(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Counts from the v2 migration this `open` ran; `None` if it had
+    /// already completed on an earlier open.
+    pub fn open_index_migration_stats(&self) -> Option<BlockIndexMigrationStats> {
+        *self.open_index_migration.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// `(total, v2, legacy)` entry counts of BLOCK_INDEX_BY_HASH_CF.  A full
+    /// sequential scan: an operator / test probe, not a hot path.
+    pub fn block_index_summary(&self) -> Result<(u64, u64, u64)> {
+        let cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        let (mut total, mut v2) = (0u64, 0u64);
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (_k, v) = item?;
+            total += 1;
+            if v.len() >= BLOCK_INDEX_ENTRY_V2_LEN {
+                v2 += 1;
+            }
+        }
+        Ok((total, v2, total - v2))
+    }
+
+    /// One-time, in-place upgrade of BLOCK_INDEX_BY_HASH_CF to the v2
+    /// encoding (header + nTx tail), run from `open`.
+    ///
+    /// Both CFs are keyed by the same 32-byte hash, so the pass is a merge
+    /// join of two ordered iterators: sequential reads only, no point read
+    /// per entry except the BLOCKS_CF fallback.  For each legacy entry:
+    /// - HEADERS_CF holds a header hashing to the key -> header + its nTx
+    ///   (nTx was made trustworthy by `reconcile_headers_ntx_provenance`,
+    ///   which `open` runs first);
+    /// - else BLOCKS_CF holds a body whose header hashes to the key ->
+    ///   header + the body's tx count;
+    /// - else the entry stays legacy and is counted in `no_header`.
+    /// The 44 metadata bytes (height, chainwork, timestamp, status) are
+    /// re-encoded unchanged; a 40-byte pre-status value gains the default
+    /// status `from_bytes` already gives it.  Nothing is deleted.
+    ///
+    /// Idempotent and restartable: v2 entries are skipped, every batch is
+    /// a self-contained set of complete values, and the marker is written
+    /// only after the last batch.  Returns `None` when the marker exists.
+    /// Old binaries read v2 values unchanged (`BlockMetadata::from_bytes`
+    /// stops after 44 bytes), so a downgrade after this has run is safe.
+    pub fn migrate_block_index_v2(&self) -> Result<Option<BlockIndexMigrationStats>> {
+        let meta_cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        if self.db.get_pinned_cf(meta_cf, meta_keys::BLOCK_INDEX_V2_MIGRATED)?.is_some() {
+            return Ok(None);
+        }
+        let index_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        let headers_cf = self.db.cf_handle(HEADERS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(HEADERS_CF.to_string()))?;
+        let blocks_cf = self.db.cf_handle(BLOCKS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
+
+        const FLUSH_EVERY: usize = 10_000;
+        let mut stats = BlockIndexMigrationStats::default();
+        let mut batch = WriteBatch::default();
+        let mut pending = 0usize;
+
+        let mut headers = self.db.raw_iterator_cf(headers_cf);
+        headers.seek_to_first();
+
+        for item in self.db.iterator_cf(index_cf, IteratorMode::Start) {
+            let (key, value) = item?;
+            stats.scanned += 1;
+            if key.len() != 32 || value.len() < 40 {
+                stats.malformed += 1;
+                continue;
+            }
+            if value.len() >= BLOCK_INDEX_ENTRY_V2_LEN {
+                stats.already_v2 += 1;
+                continue;
+            }
+            let metadata = BlockMetadata::from_bytes(&value).map_err(|e| {
+                DbError::InvalidData(format!("hash-index entry: bad BlockMetadata: {}", e))
+            })?;
+            let metadata_bytes = metadata.to_bytes()
+                .map_err(|e| DbError::Serialization(SerializeError::Encode(format!("{}", e))))?;
+
+            // Advance the HEADERS_CF cursor to the first key >= this key.
+            while headers.valid() && headers.key().map_or(false, |k| k < &key[..]) {
+                headers.next();
+            }
+            headers.status()?;
+            let mut tail: Option<([u8; 80], u32)> = None;
+            if headers.valid() && headers.key() == Some(&key[..]) {
+                if let Some(hv) = headers.value() {
+                    if hv.len() >= 80 {
+                        if header_hashes_to(&hv[0..80], &key) {
+                            let mut h = [0u8; 80];
+                            h.copy_from_slice(&hv[0..80]);
+                            let n_tx = if hv.len() >= 84 {
+                                u32::from_le_bytes([hv[80], hv[81], hv[82], hv[83]])
+                            } else {
+                                0
+                            };
+                            tail = Some((h, n_tx));
+                            stats.from_headers += 1;
+                        } else {
+                            stats.hash_mismatch += 1;
+                        }
+                    }
+                }
+            }
+            if tail.is_none() {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&key);
+                if let Some(body) = self.db.get_pinned_cf(blocks_cf, hash)? {
+                    if body.len() >= 80 {
+                        if header_hashes_to(&body[0..80], &hash) {
+                            let mut h = [0u8; 80];
+                            h.copy_from_slice(&body[0..80]);
+                            let n_tx = self.body_tx_count(blocks_cf, &hash)?.unwrap_or(0);
+                            tail = Some((h, n_tx));
+                            stats.from_body += 1;
+                        } else {
+                            stats.hash_mismatch += 1;
+                        }
+                    }
+                }
+            }
+            match tail {
+                Some((header, n_tx)) => {
+                    batch.put_cf(index_cf, &key, v2_value(&metadata_bytes, &header, n_tx));
+                    pending += 1;
+                    if pending >= FLUSH_EVERY {
+                        self.db.write(std::mem::take(&mut batch))?;
+                        pending = 0;
+                    }
+                }
+                None => stats.no_header += 1,
+            }
+        }
+
+        batch.put_cf(meta_cf, meta_keys::BLOCK_INDEX_V2_MIGRATED, [2u8]);
+        self.db.write(batch)?;
+        Ok(Some(stats))
     }
 
     /// Get a block by its hash
@@ -2663,6 +2962,22 @@ impl BlockchainDB {
         hash: &[u8; 32],
         metadata: &BlockMetadata,
     ) -> Result<()> {
+        self.store_block_metadata_batch_with_header(batch, height, hash, metadata, None)
+    }
+
+    /// `store_block_metadata_batch` for a caller that has the block's header
+    /// and tx count (a connect): the hash-index entry is written as v2 in the
+    /// same batch.  A HEADERS_CF write in that batch is not visible to the
+    /// lookup `store_block_metadata_batch` falls back on, so connect paths
+    /// must pass the header here.
+    pub fn store_block_metadata_batch_with_header(
+        &self,
+        batch: &mut WriteBatch,
+        height: u32,
+        hash: &[u8; 32],
+        metadata: &BlockMetadata,
+        header: Option<(&[u8; 80], u32)>,
+    ) -> Result<()> {
         let cf = self.db.cf_handle(BLOCK_INDEX_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_CF.to_string()))?;
         let key = encode_height(height);
@@ -2676,7 +2991,8 @@ impl BlockchainDB {
         // Also write to hash-keyed index (BUG-7 fix).
         let hash_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
-        batch.put_cf(hash_cf, hash, &metadata_bytes);
+        let hash_value = self.hash_index_value(hash, &metadata_bytes, header)?;
+        batch.put_cf(hash_cf, hash, hash_value);
 
         Ok(())
     }
@@ -2805,9 +3121,11 @@ impl BlockchainDB {
         self.db.put_cf(cf, &key, &value)?;
 
         // Also update the hash-keyed entry (BUG-7 fix — fork blocks only exist here).
+        // Keeps the v2 header tail: a status change must not truncate it.
         let hash_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
-        self.db.put_cf(hash_cf, &hash_bytes, &metadata_bytes)?;
+        let hash_value = self.hash_index_value(&hash_bytes, &metadata_bytes, None)?;
+        self.db.put_cf(hash_cf, &hash_bytes, hash_value)?;
 
         Ok(())
     }
