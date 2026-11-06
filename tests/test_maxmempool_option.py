@@ -156,3 +156,41 @@ def test_conf_negative_maxmempool_falls_back_to_300(tmp_path):
     conf.write_text("[network]\nmaxmempool=-4\n")
     cfg = NodeConfig(config_path=str(conf), data_dir=str(tmp_path)).to_dict()
     assert _helper()(cfg) == 300_000_000
+
+
+def _in_cluster_manager(pool, txid):
+    return any(txid in c.txids for c in pool._cluster_manager._clusters.values())
+
+
+def test_rbf_replacement_is_trimmed_to_cap():
+    # The replacement path inserts on its own; it must be trimmed like any
+    # other single tx (Core LimitMempoolSize after FinalizeSubpackage).
+    prevs = _funding(2)
+    t1, t2 = _tx(prevs[0], 10_000), _tx(prevs[1], 10_000)
+    size = len(t1.serialize())
+    pool = _pool(prevs, max_size=2 * size + size // 2)
+    assert pool.add_transaction(t1, 100) == (True, "")
+    assert pool.add_transaction(t2, 100) == (True, "")
+    # Replaces t1, higher feerate than t2, fits alone but not next to t2.
+    r = _tx(prevs[0], 50_000, n_outputs=9)
+    assert size < len(r.serialize()) <= pool.max_size < len(r.serialize()) + size
+    assert pool.add_transaction(r, 100) == (True, "")
+    assert t1.get_txid() not in pool.transactions
+    assert r.get_txid() in pool.transactions
+    assert _in_cluster_manager(pool, r.get_txid())
+    assert t2.get_txid() not in pool.transactions  # lowest feerate trimmed
+    assert pool.current_size <= pool.max_size
+
+
+def test_rbf_replacement_larger_than_cap_is_not_kept():
+    prevs = _funding(1)
+    t1 = _tx(prevs[0], 10_000)
+    size = len(t1.serialize())
+    pool = _pool(prevs, max_size=2 * size)
+    assert pool.add_transaction(t1, 100) == (True, "")
+    r = _tx(prevs[0], 200_000, n_outputs=40)
+    assert len(r.serialize()) > pool.max_size
+    ok, err = pool.add_transaction(r, 100)
+    assert not ok and err == "mempool full", (ok, err)
+    assert r.get_txid() not in pool.transactions
+    assert pool.current_size <= pool.max_size
