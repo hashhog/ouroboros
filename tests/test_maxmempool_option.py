@@ -225,3 +225,52 @@ def test_package_rbf_parent_is_not_trimmed_mid_package():
     assert t1.get_txid() not in pool.transactions          # replaced
     assert t2.get_txid() not in pool.transactions          # end-of-package trim
     assert pool.current_size <= pool.max_size
+
+
+def test_try_replace_holds_cap():
+    # bumpfee / psbtbumpfee submit through Mempool.try_replace; Core sends a
+    # bumped tx through AcceptToMemoryPool, which trims (LimitMempoolSize).
+    prevs = _funding(1)
+    t1 = _tx(prevs[0], 10_000)
+    pool = _pool(prevs, max_size=2 * len(t1.serialize()))
+    assert pool.add_transaction(t1, 100) == (True, "")
+    r = _tx(prevs[0], 200_000, n_outputs=40)
+    assert len(r.serialize()) > pool.max_size
+    ok, err = pool.try_replace(r, 100)
+    assert not ok and err == "mempool full", (ok, err)
+    assert r.get_txid() not in pool.transactions
+    assert pool.current_size <= pool.max_size
+
+
+def _v3(txid, inputs, values):
+    return Transaction(
+        txid=txid, version=3, locktime=0,
+        inputs=[TxIn(prev_txid=p, prev_vout=v, script_sig=b"", sequence=0xFFFFFFFD)
+                for p, v in inputs],
+        outputs=[TxOut(value=x, script_pubkey=b"\x51") for x in values],
+    )
+
+
+def test_package_sibling_eviction_is_trimmed_at_package_end():
+    # A package child that evicts its TRUC sibling is a package member: Core
+    # trims it at the end of AcceptPackage and reports the bare "mempool full",
+    # not a failure of the sibling-eviction re-entry.
+    prevs = _funding(2)
+    parent = _v3(b"\xb0" * 32, [(prevs[0], 0)], [400_000, 590_000])     # fee 10_000
+    c1 = _v3(b"\xb1" * 32, [(parent.get_txid(), 0)], [399_000])         # fee 1_000
+    other = _tx(prevs[1], 100_000, n_outputs=10)
+    c2 = _v3(b"\xb2" * 32, [(parent.get_txid(), 1)], [589_000])         # fee 1_000
+    pool = _pool(prevs, max_size=300_000_000)
+    for t in (parent, c1, other):
+        assert pool.add_transaction(t, 100) == (True, ""), t.get_txid().hex()[:4]
+    # Room for parent + other, not for c2 next to them.
+    pool.max_size = (len(parent.serialize()) + len(other.serialize())
+                     + len(c2.serialize()) - 1)
+    c2 = _v3(b"\xb2" * 32, [(parent.get_txid(), 1)], [585_000])         # fee 5_000 > c1
+    res = pool.accept_package([parent, c2], 100)
+    r = res.results.get(c2.get_wtxid())
+    assert r is not None and r.reject_reason == "mempool full", (
+        res.state, {k.hex()[:4]: v.reject_reason for k, v in res.results.items()})
+    assert c1.get_txid() not in pool.transactions       # sibling was evicted
+    assert c2.get_txid() not in pool.transactions       # then trimmed at package end
+    assert pool.current_size <= pool.max_size
