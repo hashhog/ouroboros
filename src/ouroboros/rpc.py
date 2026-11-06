@@ -11727,6 +11727,37 @@ class RPCServer:
         asyncio.get_event_loop().call_later(0.5, _trigger_shutdown)
         return "Ouroboros server stopping"
 
+    async def rpc_setmocktime(self, timestamp: Any) -> None:
+        """Set the local time to given timestamp (-regtest only).
+
+        Core rpc/node.cpp setmocktime: refused off regtest; the value is read
+        as int64 and must lie in [0, max]; 0 returns to the system clock.
+        The mocked clock (``ouroboros.clock``) feeds the mempool and the
+        time-too-new header gate.  Returns null.
+        """
+        from ouroboros import clock
+
+        network = getattr(self.node, "network", "mainnet")
+        if hasattr(self.node, "config"):
+            try:
+                network = self.node.config.get("network", network)
+            except Exception:
+                pass
+        if network != "regtest":
+            raise RpcError(
+                RPC_MISC_ERROR,
+                "setmocktime is for regression testing (-regtest mode) only",
+            )
+        max_time = 2**63 // 10**9  # chrono nanoseconds::max() in seconds
+        value = _core_getint(timestamp, -(2**63), 2**63 - 1)
+        if value < 0 or value > max_time:
+            raise RpcError(
+                RPC_INVALID_PARAMETER,
+                f"Mocktime must be in the range [0, {max_time}], not {value}.",
+            )
+        clock.set_mock_time(value)
+        return None
+
     async def rpc_uptime(self) -> int:
         """Return server uptime in seconds."""
         start = getattr(self.node, 'start_time', None)
