@@ -892,16 +892,30 @@ class TestWatchOnlyImportParity:
             def get_best_block(self):
                 return (b"\x00" * 32, 104)
 
-            def list_unspent_by_address(self, a, network):
-                if a == addr:
-                    return [{
-                        "txid": "00" * 32, "vout": 0,
-                        "value": 5_000_000_000, "height": 1,
-                        "is_coinbase": True, "script_pubkey": spk,
-                    }]
-                return []
+        class _Out:
+            value = 5_000_000_000
+            script_pubkey = spk
+
+        class _Coinbase:
+            is_coinbase = True
+            inputs = []
+            outputs = [_Out()]
+
+            def get_txid(self):
+                return b"\x00" * 32
+
+            def serialize_with_witness(self):
+                return b""
+
+        class _Block:
+            hash = b"\x01" * 32
+            timestamp = 0
+            transactions = [_Coinbase()]
 
         wallet.db = _Db()
+        # The balance reads the wallet's coin store; the block connect is
+        # what credits a descriptor script into it.
+        wallet.scan_block_connect(_Block(), 1)
         import asyncio
         assert asyncio.run(wallet.get_balance()) == 5_000_000_000
 

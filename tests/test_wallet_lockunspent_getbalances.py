@@ -93,6 +93,20 @@ class _StubDB:
             "script_pubkey": script_pubkey,
         }
         self._utxos_by_addr.setdefault(address, []).append(u)
+        # The wallet reads its own coin store, not the chainstate: record the
+        # coin there as a block connect (or, at height 0, a mempool add) does.
+        wallet = getattr(self, "_wallet", None)
+        if wallet is not None:
+            coin = {
+                "vout": vout, "value": value, "script_pubkey": script_pubkey,
+                "address": address, "is_coinbase": is_coinbase,
+            }
+            if height > 0:
+                wallet._store.seed_coins([(u["txid"], coin, height)])
+            else:
+                wallet._store.add_unconfirmed(
+                    u["txid"], None, [(u["txid"], coin)], [], False
+                )
 
     def list_unspent_by_address(self, address: str, network: str = "mainnet"):
         return list(self._utxos_by_addr.get(address, []))
@@ -126,6 +140,7 @@ def _make_wallet(secret_hint: bytes, network: str = "mainnet"):
     wallet._save()
 
     db = _StubDB(best_height=200)
+    db._wallet = wallet
     wallet.set_database(db)
     return wallet, key, db, tmpdir
 

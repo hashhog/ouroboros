@@ -30,6 +30,7 @@ import logging
 import os
 import secrets
 import struct
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,13 @@ import base58
 import bech32
 from coincurve import PrivateKey, PublicKey
 from pydantic import BaseModel
+
+from ouroboros.wallet_store import (
+    UNCONFIRMED,
+    WalletTxStore,
+    coin_depth,
+    is_immature_coinbase,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1317,7 +1325,18 @@ class Wallet:
         # descriptor set changes (importdescriptors / wallet load). Mirrors
         # Core DescriptorScriptPubKeyMan::m_map_script_pub_keys.
         self._descriptor_spk_cache: dict[bytes, str] | None = None
+        # Cache for _owned_script_set(), keyed by the key list and the
+        # descriptor map it was built from (see _owned_script_set).
+        self._owned_spk_cache: tuple | None = None
+        # Persistent coin / tx store (Core mapWallet), see wallet_store.py.
+        # Serialises block connect / disconnect / migration against each
+        # other; mempool callbacks only touch the store, which has its own
+        # lock.
+        self._store: WalletTxStore | None = None
+        self._scan_lock = threading.RLock()
+        wallet_existed = self.wallet_path.exists()
         self._load_or_create()
+        self._open_store(wallet_existed)
 
     # HD seed management #
 
@@ -1726,9 +1745,96 @@ class Wallet:
         elif self._hd_seed is not None:
             self._key_pool = KeyPool(self._hd_seed, self.network)
             self._key_pool.top_up()
+        # Read the scan marker BEFORE the wallet reads as unlocked: from the
+        # next line on, live block notifications reach this wallet again and
+        # advance the marker past the blocks it missed while locked.
+        marker = self._best_scanned_height
         self._passphrase = passphrase
         self._encrypted_blob = None
+        self._owned_spk_cache = None
         logger.info(f"Wallet '{self.name}' unlocked")
+        # A pre-store wallet loaded while locked could not be migrated (its
+        # scripts were not in memory); do it now.
+        try:
+            self.migrate_store_if_needed()
+        except Exception as e:
+            logger.warning(f"wallet '{self.name}' store migration failed: {e}")
+        try:
+            self._catch_up_store_after_unlock(marker)
+        except Exception as e:
+            logger.warning(f"wallet '{self.name}' store catch-up failed: {e}")
+
+    def _catch_up_store_after_unlock(self, marker: int | None) -> None:
+        """Bring the store up to the chain after a locked period.
+
+        A locked wallet has no scripts in memory, so the block connect and
+        disconnect notifications skip it.  Before the store that did not
+        matter for coins, because every balance read walked the chainstate
+        with the unlocked keys.  The store only knows what it was told, so on
+        unlock it unwinds blocks the chain lost while the wallet was locked
+        and then rescans the blocks above the scan marker, as the startup
+        reconcile does for an unlocked wallet.
+        """
+        if self.db is None or self._store is None:
+            return
+        undone = self.reconcile_store_with_chain()
+        if undone is not None and marker is not None and marker >= undone:
+            marker = undone - 1
+        if marker is not None:
+            # No marker: birthday at the current tip (reconcile_on_load's
+            # rule); a migration has already seeded the current coins.
+            self.rescan_chain(marker + 1, None)
+        # Mempool events were skipped while locked too.
+        self.sync_with_mempool()
+
+    def resync_store_with_chain(self) -> None:
+        """Re-align the store after a chain change that sent no per-block
+        notifications (invalidateblock, reconsiderblock, preciousblock and
+        the atomic Rust reorg): unwind store blocks the active chain no
+        longer has, then scan the active chain above the scan marker
+        (lowered to just below the lowest unwound height).  Callers run it
+        before the mempool re-accepts the disconnected transactions, so those
+        come back as unconfirmed rows.
+        """
+        if self._store is None or self.db is None or self.is_locked:
+            return
+        undone = self.reconcile_store_with_chain()
+        marker = self._best_scanned_height
+        if undone is not None and marker is not None and marker >= undone:
+            marker = undone - 1
+            self._best_scanned_height = marker
+        if marker is not None and marker + 1 <= self._tip_height():
+            self.rescan_chain(marker + 1, None)
+
+    def _in_mempool(self, txid_hex: str) -> bool | None:
+        """True/False when a mempool is attached, None when there is none."""
+        mempool = getattr(self, "mempool", None)
+        get_tx = getattr(mempool, "get_transaction", None)
+        if get_tx is None:
+            return None
+        try:
+            return get_tx(bytes.fromhex(txid_hex)[::-1]) is not None
+        except Exception:
+            return None
+
+    def sync_with_mempool(self) -> None:
+        """Core ``requestMempoolTransactions``: feed every transaction already
+        in the mempool to this wallet, for a wallet attached (loaded,
+        unlocked, or hooked up at startup after ``mempool.dat`` was loaded)
+        after those transactions arrived."""
+        mempool = getattr(self, "mempool", None)
+        get_all = getattr(mempool, "get_all_transactions", None)
+        if self._store is None or self.is_locked or get_all is None:
+            return
+        try:
+            txs = list(get_all())
+        except Exception:
+            return
+        for tx in txs:
+            try:
+                self.on_mempool_tx_added(tx)
+            except Exception as e:
+                logger.debug("wallet '%s': mempool replay skipped a tx: %s", self.name, e)
 
     def lock(self) -> None:
         """Re-lock the wallet: save encrypted and wipe in-memory keys."""
@@ -1770,6 +1876,255 @@ class Wallet:
 
     def set_mempool(self, mempool) -> None:
         self.mempool = mempool
+
+    # --- persistent coin / tx store (Core mapWallet) -------------------------
+
+    def _store_path(self) -> Path:
+        """``<wallet_dir>/txstore.sqlite``, or ``wallets/<name>.txstore.sqlite``
+        next to a legacy single-file wallet."""
+        if self.wallet_dir is not None:
+            return self.wallet_dir / "txstore.sqlite"
+        return self.wallet_path.with_name(f"{self.name}.txstore.sqlite")
+
+    def _open_store(self, wallet_existed: bool) -> None:
+        """Open (or create) the store and load the in-memory views from it.
+
+        A store created for a wallet file that already existed is marked
+        ``migration=pending``: :meth:`migrate_store_if_needed` then seeds it
+        from the chain before the wallet's balance is read from it.
+        """
+        _make_private_dir(self._store_path().parent)
+        store = WalletTxStore(self._store_path())
+        self._store = store
+        if store.created and wallet_existed:
+            store.set_meta("migration", "pending")
+        self._load_from_store()
+
+    def close_store(self) -> None:
+        if self._store is not None:
+            self._store.close()
+
+    def _load_from_store(self) -> None:
+        """Rebuild ``_tx_history`` and ``_owned_outpoints`` from the store."""
+        store = self._store
+        if store is None:
+            return
+        self._tx_history = {r["txid"]: r for r in store.tx_records()}
+        self._owned_outpoints = {
+            (c["txid"], c["vout"]): {
+                "value": c["value"],
+                "address": c["address"],
+                "script_pubkey": c["script_pubkey"],
+            }
+            for c in store.all_coins()
+            if c["height"] != UNCONFIRMED
+        }
+
+    @property
+    def store_migration_pending(self) -> bool:
+        return (
+            self._store is not None
+            and self._store.get_meta("migration") == "pending"
+        )
+
+    def migrate_store_if_needed(self) -> int | None:
+        """Build the store from the existing chain for a pre-store wallet.
+
+        Before the store, the wallet's coins were whatever the chainstate
+        held for its scripts, and its tx history was never persisted.  So
+        the migration seeds the store from ONE walk of the chainstate UTXO
+        set over all wallet scripts at once (the walk every getbalance used
+        to repeat per address), then re-checks each found coin against the
+        chainstate under the scan lock, so a block connected during the walk
+        cannot leave a spent coin behind.  History older than the store is
+        rebuilt only by ``rescanblockchain``, as it was before (it was
+        in-memory only, so it was already lost on every restart).
+
+        Returns the number of coins seeded, or None when nothing was done
+        (no migration pending, no database, or the wallet is locked).
+        """
+        store = self._store
+        if store is None or not self.store_migration_pending:
+            return None
+        if self.db is None or self.is_locked:
+            return None
+        iter_fn = getattr(self.db, "iter_unspent_for_scripts", None)
+        if iter_fn is None:
+            logger.warning(
+                "wallet '%s': database cannot walk the UTXO set; store "
+                "migration deferred", self.name,
+            )
+            return None
+        owned = self._owned_script_set()
+        found = list(iter_fn(set(owned))) if owned else []
+        get_utxo = getattr(self.db, "get_utxo", None)
+        with self._scan_lock:
+            rows = []
+            for u in found:
+                spk = bytes(u["script_pubkey"])
+                txid = str(u["txid"]).lower()
+                vout = int(u["vout"])
+                if get_utxo is not None:
+                    try:
+                        still = get_utxo(bytes.fromhex(txid)[::-1], vout)
+                    except Exception:
+                        still = True
+                    if still is None:
+                        continue  # spent while the walk ran
+                rows.append((
+                    txid,
+                    {
+                        "vout": vout,
+                        "value": int(u["value"]),
+                        "script_pubkey": spk,
+                        "address": owned.get(spk, ""),
+                        "is_coinbase": bool(u.get("is_coinbase", False)),
+                    },
+                    int(u.get("height", 0) or 0),
+                ))
+            n = store.seed_coins(rows)
+            store.set_meta("migration", "done")
+            self._load_from_store()
+        logger.info(
+            "wallet '%s': store migrated from the chainstate (%d coins)",
+            self.name, n,
+        )
+        return n
+
+    def reconcile_store_with_chain(self) -> int | None:
+        """Unwind store blocks the active chain no longer has.
+
+        Walks the processed heights from the top down and disconnects each
+        whose hash differs from the chain's (or which is above the tip),
+        stopping at the first match.  Covers a reorg that happened while the
+        node was down.  Returns the lowest height undone, or None.
+        """
+        store = self._store
+        if store is None or self.db is None:
+            return None
+        tip = self._tip_height()
+        lowest = None
+        with self._scan_lock:
+            for h in store.block_heights_from(0):
+                stored = store.block_hash_at(h)
+                if h <= tip:
+                    try:
+                        chain = self.db.get_block_hash_by_height(h)
+                    except Exception:
+                        chain = None
+                    if stored is None or chain is None:
+                        break
+                    if bytes(chain)[::-1].hex() == stored:
+                        break
+                self.scan_block_disconnect(h)
+                lowest = h
+        return lowest
+
+    def wallet_coins(self, tip_height: int | None = None) -> list[dict]:
+        """Unspent wallet coins from the store, annotated for the read paths.
+
+        Each dict carries the store fields plus ``depth`` (confirmations, 0
+        while unconfirmed), ``immature`` (one maturity rule:
+        :func:`wallet_store.is_immature_coinbase`) and ``trusted`` (Core
+        ``CachedTxIsTrusted``: confirmed, or unconfirmed with every input
+        spending a wallet coin).  Coins spent by a block or by a mempool
+        transaction are not listed (Core ``CWallet::IsSpent``).
+
+        While a pre-store wallet's migration is still pending (the startup
+        background walk, a failed walk awaiting retry, or a locked wallet not
+        yet unlocked) the store is incomplete, so this raises RPC_IN_WARMUP
+        (-28) rather than report an empty wallet as a zero balance.
+        """
+        if self._store is None:
+            return []
+        if self.store_migration_pending:
+            raise WalletRpcError(
+                -28,
+                "Wallet is still building its transaction store from the "
+                "chain; try again shortly"
+                + (" (unlock the wallet first)" if self.is_locked else ""),
+            )
+        tip = self._tip_height() if tip_height is None else int(tip_height)
+        out = []
+        for c in self._store.unspent_coins():
+            depth = coin_depth(c["height"], tip)
+            c["depth"] = depth
+            c["immature"] = is_immature_coinbase(c["is_coinbase"], c["height"], tip)
+            if depth > 0:
+                c["trusted"] = True
+            else:
+                # Core CachedTxIsTrusted: a depth-0 tx is trusted only while
+                # it is in the mempool (and every input is the wallet's).
+                in_pool = self._in_mempool(c["txid"])
+                c["trusted"] = bool(c["trusted"]) and in_pool is not False
+            if c["height"] == UNCONFIRMED:
+                c["height"] = 0
+            out.append(c)
+        return out
+
+    def get_balances_sat(self, min_depth: int = 0) -> dict[str, int]:
+        """Core ``GetBalance`` (wallet/receive.cpp): trusted, untrusted_pending
+        and immature, in satoshis, from the store."""
+        trusted = untrusted = immature = 0
+        for c in self.wallet_coins():
+            if c["immature"]:
+                immature += c["value"]
+            elif c["trusted"]:
+                if c["depth"] >= int(min_depth):
+                    trusted += c["value"]
+            elif c["depth"] == 0:
+                untrusted += c["value"]
+        return {
+            "trusted": trusted,
+            "untrusted_pending": untrusted,
+            "immature": immature,
+        }
+
+    def on_mempool_tx_added(self, tx) -> None:
+        """Core ``transactionAddedToMempool``: record a wallet tx as unconfirmed.
+
+        Outputs paying a wallet script become unconfirmed coins; inputs
+        spending a wallet coin mark it spent by the mempool, so balance,
+        listunspent and coin selection stop offering it.
+        """
+        store = self._store
+        if store is None or self.is_locked:
+            return
+        txid_hex = bytes(tx.get_txid())[::-1].hex()
+        owned = self._owned_script_set()
+        coins = []
+        for vout, out in enumerate(tx.outputs):
+            addr = owned.get(bytes(out.script_pubkey))
+            if addr is not None:
+                coins.append((txid_hex, {
+                    "vout": vout,
+                    "value": int(out.value),
+                    "script_pubkey": bytes(out.script_pubkey),
+                    "address": addr,
+                    "is_coinbase": False,
+                }))
+        spends = []
+        all_mine = bool(tx.inputs)
+        for inp in tx.inputs:
+            prev = bytes(inp.prev_txid)[::-1].hex()
+            if store.get_coin(prev, int(inp.prev_vout)) is not None:
+                spends.append((prev, int(inp.prev_vout), txid_hex))
+            else:
+                all_mine = False
+        if not coins and not spends:
+            return
+        store.add_unconfirmed(txid_hex, None, coins, spends, all_mine)
+
+    def on_mempool_tx_removed(self, txid: bytes) -> None:
+        """Core ``transactionRemovedFromMempool``: drop an unconfirmed record.
+
+        A no-op for a tx a block already confirmed: every connect path (P2P
+        and the RPC ``accept_block``) scans the block for the wallet before
+        the mempool removes the block's transactions.
+        """
+        if self._store is None:
+            return
+        self._store.remove_unconfirmed(bytes(txid)[::-1].hex())
 
     # --- key / address operations ---------------------------------------------
 
@@ -1905,12 +2260,9 @@ class Wallet:
         logger.info(f"Key pool refilled with {generated} new keys")
         return generated
 
-    # Coinbase maturity (Core consensus.h COINBASE_MATURITY). A coinbase UTXO
-    # mined at ``coin_height`` is spendable only once it has 100 confirmations.
-    # Core's wallet treats a coin as mature when
-    #   GetDepthInMainChain() = tip - coin_height + 1 >= COINBASE_MATURITY + 1,
-    # i.e. coin_height <= tip - COINBASE_MATURITY. At tip 101 only the height-1
-    # coinbase qualifies (50 BTC), matching the reference spend cell.
+    # Coinbase maturity (Core consensus.h COINBASE_MATURITY). The rule lives
+    # in one place, wallet_store.is_immature_coinbase: a coinbase coin is
+    # spendable once tip - coin_height + 1 >= COINBASE_MATURITY + 1.
     COINBASE_MATURITY = 100
 
     def _tip_height(self) -> int:
@@ -1925,64 +2277,42 @@ class Wallet:
     def _is_spendable_utxo(self, u: dict, tip_height: int) -> bool:
         """Return True unless *u* is an immature coinbase output.
 
-        Mirrors Bitcoin Core's CWalletTx::IsImmatureCoinBase /
-        GetBlocksToMaturity. Non-coinbase coins are always spendable once
-        in the chainstate; coinbase coins need COINBASE_MATURITY confirmations.
+        Mirrors Bitcoin Core's CWallet::IsTxImmatureCoinBase.
         """
-        if not u.get("is_coinbase", False):
-            return True
-        coin_height = u.get("height", 0) or 0
-        # confirmations = tip - coin_height + 1; mature when >= MATURITY + 1.
-        return (tip_height - coin_height + 1) >= (self.COINBASE_MATURITY + 1)
+        return not is_immature_coinbase(
+            bool(u.get("is_coinbase", False)), int(u.get("height", 0) or 0),
+            tip_height,
+        )
 
-    async def get_balance(self, address: str | None = None) -> int:
-        if self.db is None:
-            return 0
-        tip = self._tip_height()
-        if address:
-            return sum(
-                u["value"]
-                for u in self.db.list_unspent_by_address(address, self.network)
-                if self._is_spendable_utxo(u, tip)
-            )
+    async def get_balance(self, address: str | None = None, minconf: int = 0) -> int:
+        """Trusted balance in satoshis (Core ``getbalance``), from the store.
+
+        Immature coinbase coins and untrusted unconfirmed coins are left
+        out; with *address*, only that address's coins count.
+        """
         total = 0
-        counted: set[str] = set()
-        for kd in self.keys:
-            k = self._get_wallet_key(kd)
-            # Count EVERY script type the key owns (p2wpkh, p2pkh, p2sh-p2wpkh,
-            # p2tr), matching listunspent + Core GetBalance. Scanning only the
-            # p2wpkh address stranded taproot/legacy/nested coinbase credits at
-            # a reported balance of 0.
-            for addr in self._key_script_addresses(k):
-                counted.add(addr)
-                for u in self.db.list_unspent_by_address(addr, self.network):
-                    if self._is_spendable_utxo(u, tip):
-                        total += u["value"]
-        # Imported descriptors (watch-only included) count toward the wallet
-        # balance: Core's GetBalance walks every ISMINE script
-        # (DescriptorScriptPubKeyMan::IsMine is privkey-free script-set
-        # membership). De-duplicated against the key addresses above.
-        for daddr in set(self._descriptor_script_map().values()):
-            if not daddr or daddr in counted:
+        for c in self.wallet_coins():
+            if address and c["address"] != address:
                 continue
-            try:
-                utxos = self.db.list_unspent_by_address(daddr, self.network)
-            except Exception:
+            if c["immature"] or not c["trusted"]:
                 continue
-            for u in utxos:
-                if self._is_spendable_utxo(u, tip):
-                    total += u["value"]
+            if c["depth"] < int(minconf):
+                continue
+            total += c["value"]
         return total
 
     async def get_addresses(self) -> list[AddressInfo]:
+        by_addr: dict[str, int] = {}
+        for c in self.wallet_coins():
+            if c["depth"] > 0:
+                by_addr[c["address"]] = by_addr.get(c["address"], 0) + c["value"]
         result: list[AddressInfo] = []
         for kd in self.keys:
             k = self._get_wallet_key(kd)
             addr = k.get_p2wpkh_address()
-            balance = self.db.get_balance(addr, self.network) if self.db else 0
             result.append(AddressInfo(
                 address=addr,
-                balance=balance,
+                balance=by_addr.get(addr, 0),
                 label=kd.get("label"),
             ))
         # Include addresses from active descriptors
@@ -1992,10 +2322,9 @@ class Wallet:
             end = max(entry.next_index, entry.range_start + 1)
             for i in range(entry.range_start, end):
                 addr = entry.descriptor.derive_address(i, self.network)
-                balance = self.db.get_balance(addr, self.network) if self.db else 0
                 result.append(AddressInfo(
                     address=addr,
-                    balance=balance,
+                    balance=by_addr.get(addr, 0),
                     label=entry.label or None,
                 ))
         return result
@@ -2034,6 +2363,23 @@ class Wallet:
         """
         from ouroboros.address import address_to_script_pubkey
 
+        # Cached: the mempool callback asks for this set once per pool tx.
+        # Keys are append-only (a lock empties the list), and the descriptor
+        # map is a new object whenever the descriptor set changes.
+        desc_map = self._descriptor_script_map()
+        sig = (
+            len(self.keys),
+            self.keys[-1].get("wif") if self.keys else None,
+            desc_map,
+        )
+        cached = self._owned_spk_cache
+        if (
+            cached is not None
+            and cached[0][:2] == sig[:2]
+            and cached[0][2] is desc_map
+        ):
+            return cached[1]
+
         out: dict[bytes, str] = {}
         for kd in self.keys:
             try:
@@ -2060,8 +2406,9 @@ class Wallet:
         # ISMINE by script-set membership — Core
         # DescriptorScriptPubKeyMan::IsMine (scriptpubkeyman.cpp:863-867);
         # private keys play no role. Keys win on (unlikely) overlap.
-        for spk, addr in self._descriptor_script_map().items():
+        for spk, addr in desc_map.items():
             out.setdefault(spk, addr)
+        self._owned_spk_cache = (sig, out)
         return out
 
     def _descriptor_script_map(self) -> dict[bytes, str]:
@@ -2342,8 +2689,20 @@ class Wallet:
         same block (e.g. reorg replay) overwrites rather than double-counts.
 
         Mirrors Bitcoin Core CWallet::blockConnected ->
-        AddToWalletIfInvolvingMe.
+        AddToWalletIfInvolvingMe.  The result is written to the persistent
+        store in one transaction.  A block at a height the store already
+        holds under a different hash unwinds the old branch first.
+
+        A locked wallet has no scripts in memory, so it records nothing and
+        leaves its scan marker alone; :meth:`unlock` rescans what it missed.
+        Every connect path (P2P, submitblock, generate*) goes through here.
         """
+        if self.is_locked:
+            return
+        with self._scan_lock:
+            self._scan_block_connect_locked(block, height)
+
+    def _scan_block_connect_locked(self, block, height: int) -> None:
         owned = self._owned_script_set()
         # Live tip-follow keeps the scan locator current in memory; it is
         # persisted on the wallet's existing _save() cadence (rescan end,
@@ -2356,6 +2715,16 @@ class Wallet:
         )
         block_time = int(getattr(block, "timestamp", 0) or 0)
         txs = getattr(block, "transactions", None) or []
+
+        store = self._store
+        if store is not None and block_hash_hex is not None:
+            stored = store.block_hash_at(height)
+            if stored is not None and stored != block_hash_hex:
+                for h in store.block_heights_from(height):
+                    self.scan_block_disconnect(h)
+        new_records: list[dict] = []
+        new_coins: list[tuple[str, dict]] = []
+        new_spends: list[tuple[str, int, str]] = []
 
         for tx in txs:
             # txid is stored internal (wire) byte order; display is reversed.
@@ -2375,6 +2744,9 @@ class Wallet:
                     )
                     if spent is not None:
                         debit += int(spent["value"])
+                        new_spends.append(
+                            (prev_txid_hex, int(inp.prev_vout), txid_hex)
+                        )
             is_from_me = debit > 0
 
             # --- Per-output classification (Core CachedTxGetAmounts) ---------
@@ -2399,6 +2771,13 @@ class Wallet:
                         "address": addr,
                         "script_pubkey": bytes(out.script_pubkey),
                     }
+                    new_coins.append((txid_hex, {
+                        "vout": int(vout_i),
+                        "value": int(out.value),
+                        "script_pubkey": bytes(out.script_pubkey),
+                        "address": addr,
+                        "is_coinbase": is_coinbase,
+                    }))
                 is_change = (
                     is_from_me and ismine
                     and (txid_hex, vout_i) in self._change_outputs
@@ -2460,6 +2839,12 @@ class Wallet:
                 "change": change_details,
                 "hex": tx.serialize_with_witness().hex(),
             }
+            new_records.append(self._tx_history[txid_hex])
+
+        if store is not None:
+            store.connect_block(
+                height, block_hash_hex, new_records, new_coins, new_spends
+            )
 
     def scan_block_disconnect(self, height: int) -> None:
         """Reverse :meth:`scan_block_connect` for the block at *height*.
@@ -2468,6 +2853,14 @@ class Wallet:
         outputs created) at that height, so a reorg can't leave stale send/
         receive entries. Mirrors Core CWallet::blockDisconnected.
         """
+        with self._scan_lock:
+            if self._store is not None:
+                self._store.disconnect_block(height)
+                self._load_from_store()
+            else:
+                self._scan_block_disconnect_memory(height)
+
+    def _scan_block_disconnect_memory(self, height: int) -> None:
         drop = [
             txid for txid, rec in self._tx_history.items()
             if int(rec.get("height", -1)) == int(height)
@@ -2498,7 +2891,7 @@ class Wallet:
         confs = self._confirmations(rec, tip)
         if confs < 1:
             return "orphan"
-        if confs < (self.COINBASE_MATURITY + 1):
+        if is_immature_coinbase(True, int(rec.get("height", 0) or 0), tip):
             return "immature"
         return "generate"
 
@@ -3211,30 +3604,38 @@ class Wallet:
         return addrs
 
     def _collect_utxos(self) -> list[dict]:
+        """Coins coin selection may spend, from the store.
+
+        Confirmed, mature (Core wallet/spend.cpp AvailableCoins only offers
+        coins with GetBlocksToMaturity() == 0), not locked (lockunspent), not
+        spent by a mempool tx or a send still in flight, and paying a key
+        this wallet can sign for (``_key`` is attached for the signer).
+        """
         if self.db is None:
             return []
-        tip = self._tip_height()
-        utxos: list[dict] = []
+        key_by_addr: dict[str, Any] = {}
         for kd in self.keys:
             k = self._get_wallet_key(kd)
             for addr in self._key_script_addresses(k):
-                for u in self.db.list_unspent_by_address(addr, self.network):
-                    # Skip immature coinbase: selecting one would build a tx the
-                    # node rejects as bad-txns-premature-spend-of-coinbase.
-                    # Reference: Bitcoin Core wallet/spend.cpp AvailableCoins()
-                    # only offers coins with GetBlocksToMaturity() == 0.
-                    if not self._is_spendable_utxo(u, tip):
-                        continue
-                    # Honor lockunspent — skip coins the user explicitly locked.
-                    # Reference: Bitcoin Core wallet/spend.cpp AvailableCoins().
-                    txid_field = u.get("txid", "")
-                    txid_str = txid_field if isinstance(txid_field, str) else txid_field.hex()
-                    if self.is_locked_coin(txid_str, int(u.get("vout", 0))):
-                        continue
-                    if (txid_str.lower(), int(u.get("vout", 0))) in self._pending_spent:
-                        continue
-                    u["_key"] = k
-                    utxos.append(u)
+                key_by_addr.setdefault(addr, k)
+        utxos: list[dict] = []
+        for c in self.wallet_coins():
+            k = key_by_addr.get(c["address"])
+            if k is None or c["depth"] <= 0 or c["immature"]:
+                continue
+            if self.is_locked_coin(c["txid"], c["vout"]):
+                continue
+            if (c["txid"].lower(), c["vout"]) in self._pending_spent:
+                continue
+            utxos.append({
+                "txid": c["txid"],
+                "vout": c["vout"],
+                "value": c["value"],
+                "script_pubkey": c["script_pubkey"],
+                "height": c["height"],
+                "is_coinbase": c["is_coinbase"],
+                "_key": k,
+            })
         return utxos
 
     # --- lockunspent / listlockunspent -----------------------------------------
@@ -3503,10 +3904,61 @@ class WalletManager:
             wallet.set_database(db)
 
     def set_mempool(self, mempool) -> None:
-        """Set the mempool for all wallets."""
+        """Set the mempool for all wallets and subscribe to its add/remove
+        events (Core CValidationInterface transactionAddedToMempool /
+        transactionRemovedFromMempool), chaining any callback already set."""
         self._mempool = mempool
         for wallet in self._wallets.values():
             wallet.set_mempool(mempool)
+        if mempool is None or not hasattr(mempool, "_on_tx_added"):
+            return
+        prev_added = getattr(mempool, "_on_tx_added", None)
+        prev_removed = getattr(mempool, "_on_tx_removed", None)
+        if getattr(prev_added, "_wallet_manager", None) is self:
+            return
+
+        def _added(txid, tx, seq):
+            if prev_added is not None:
+                prev_added(txid, tx, seq)
+            self.notify_mempool_tx_added(tx)
+
+        def _removed(txid, reason, seq):
+            if prev_removed is not None:
+                prev_removed(txid, reason, seq)
+            self.notify_mempool_tx_removed(txid)
+
+        _added._wallet_manager = self
+        _removed._wallet_manager = self
+        mempool._on_tx_added = _added
+        mempool._on_tx_removed = _removed
+        # Transactions loaded (mempool.dat) or accepted before the hook.
+        for wallet in list(self._wallets.values()):
+            try:
+                wallet.sync_with_mempool()
+            except Exception as e:
+                logger.warning(
+                    f"wallet '{getattr(wallet, 'name', '?')}' mempool sync failed: {e}"
+                )
+
+    def notify_mempool_tx_added(self, tx) -> None:
+        for wallet in list(self._wallets.values()):
+            try:
+                wallet.on_mempool_tx_added(tx)
+            except Exception as e:
+                logger.warning(
+                    f"wallet '{getattr(wallet, 'name', '?')}' "
+                    f"mempool add failed: {e}"
+                )
+
+    def notify_mempool_tx_removed(self, txid: bytes) -> None:
+        for wallet in list(self._wallets.values()):
+            try:
+                wallet.on_mempool_tx_removed(txid)
+            except Exception as e:
+                logger.warning(
+                    f"wallet '{getattr(wallet, 'name', '?')}' "
+                    f"mempool remove failed: {e}"
+                )
 
     # --- Chain notifications (Core CValidationInterface fan-out) -----------
     #
@@ -3571,6 +4023,15 @@ class WalletManager:
                 if getattr(wallet, "is_locked", False):
                     # Encrypted-and-locked: nothing derivable in memory yet.
                     continue
+                # A wallet file from before the store: seed the store from
+                # the chain first, then unwind any block the chain lost
+                # while the node was down (Core AttachChain's locator walk).
+                wallet.migrate_store_if_needed()
+                undone = wallet.reconcile_store_with_chain()
+                if undone is not None:
+                    m = getattr(wallet, "_best_scanned_height", None)
+                    if m is not None and m >= undone:
+                        wallet._best_scanned_height = undone - 1
                 # Core-parity locator semantics (CWallet::AttachChain): rescan
                 # only the gap ABOVE the wallet's persisted scan marker — never
                 # the whole chain.  The prior unconditional rescan_chain(0,
@@ -3804,6 +4265,7 @@ class WalletManager:
         self,
         name: str,
         load_on_startup: bool | None = None,
+        migrate: bool = True,
     ) -> tuple[Wallet | None, list[str]]:
         """
         Load an existing wallet.
@@ -3852,6 +4314,20 @@ class WalletManager:
         if self._mempool:
             wallet.set_mempool(self._mempool)
 
+        # A wallet file from before the store gets its store built from the
+        # chain now (Core LoadWallet -> AttachChain scans before returning).
+        # At node startup this is left to the background reconcile_on_load,
+        # so a one-time UTXO-set walk never holds up boot.
+        if migrate:
+            try:
+                wallet.migrate_store_if_needed()
+            except Exception as e:
+                logger.warning(f"wallet '{name}' store migration failed: {e}")
+        try:
+            wallet.sync_with_mempool()
+        except Exception as e:
+            logger.warning(f"wallet '{name}' mempool sync failed: {e}")
+
         # Add to loaded wallets
         self._wallets[name] = wallet
 
@@ -3892,6 +4368,7 @@ class WalletManager:
 
         # Save wallet state before unloading
         wallet._save()
+        wallet.close_store()
 
         # Remove from loaded wallets
         del self._wallets[name]
@@ -3982,7 +4459,7 @@ class WalletManager:
         wallets_to_load = self.get_load_on_startup_wallets()
         for name in wallets_to_load:
             try:
-                self.load_wallet(name)
+                self.load_wallet(name, migrate=False)
             except Exception as e:
                 logger.warning(f"Failed to load wallet '{name}' on startup: {e}")
 
