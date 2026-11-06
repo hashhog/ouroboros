@@ -2953,7 +2953,14 @@ class Mempool:
             # lock; call the unlocked replacement helper directly. In test_accept
             # (dry-run) mode it validates the BIP125 RBF rules without evicting
             # the conflicting tx or inserting the replacement.
-            return self._try_replace_inner(tx, height, test_accept=test_accept)
+            ok, err = self._try_replace_inner(tx, height, test_accept=test_accept)
+            # A replacement is inserted too, so it is trimmed like any other
+            # single tx (Core runs LimitMempoolSize after FinalizeSubpackage
+            # whether or not the tx replaced anything).
+            if ok and not test_accept and not bypass_limits:
+                if not self._limit_mempool_size(txid):
+                    return False, "mempool full"
+            return ok, err
 
         # TRUC (v3 transaction) policy checks — must come before general
         # ancestor/descendant limits. This handles both v3 and non-v3 txs
@@ -3175,10 +3182,8 @@ class Mempool:
         # "mempool full" (validation.cpp).  Package members are trimmed once
         # at the end of the package (_accept_package_inner); reorg refill
         # (bypass_limits) trims after the whole refill.
-        if (not bypass_limits and not in_package
-                and self.current_size > self.max_size):
-            self._evict_low_fee_txs(self.current_size - self.max_size)
-            if txid not in self.transactions:
+        if not bypass_limits and not in_package:
+            if not self._limit_mempool_size(txid):
                 return False, "mempool full"
 
         # Get sequence number for this add event
@@ -3204,6 +3209,15 @@ class Mempool:
             self._resolve_orphans(txid, height)
 
         return True, ""
+
+    def _limit_mempool_size(self, txid: bytes) -> bool:
+        """Core LimitMempoolSize after a single-tx insert: trim the pool to
+        max_size, lowest-feerate chunks first.  Returns False when *txid*
+        itself was trimmed (Core: ``!m_pool.exists(ws.m_hash)`` -> "mempool
+        full")."""
+        if self.current_size > self.max_size:
+            self._evict_low_fee_txs(self.current_size - self.max_size)
+        return txid in self.transactions
 
     def _get_ancestors(self, tx: Transaction) -> set[bytes]:
         """Get all ancestors (transitive parents) of a transaction.
@@ -5174,6 +5188,12 @@ class Mempool:
             if a_txid in self.transactions:
                 self.transactions[a_txid].descendant_count += 1
                 self.transactions[a_txid].descendant_size += new_size
+
+        # Register the replacement with the cluster manager, as the non-RBF
+        # insert does.  Size-limit trimming picks its victims from the cluster
+        # manager (get_worst_chunk); a replacement missing from it could never
+        # be trimmed, so an oversized replacement stayed above the cap.
+        self._cluster_manager.add_transaction(new_txid)
 
         # Single-pass recount for all remaining txs affected by evictions
         for evicted_id in evicted_ids:
