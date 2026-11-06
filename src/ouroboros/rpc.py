@@ -1498,6 +1498,28 @@ def _package_fees_obj(res: Any, with_effective: bool) -> dict[str, Any]:
     return fees
 
 
+def _decode_hex_tx(hexstring: str, no_witness: bool = False) -> Any:
+    """Core ``DecodeHexTx`` (core_io.cpp): exact decode of a raw transaction.
+
+    Core deserializes and then requires the stream to be fully consumed, so a
+    valid transaction followed by extra bytes is a decode failure, not a
+    transaction with ignored trailing data.  With *no_witness*
+    (``decoderawtransaction iswitness=false``) only the legacy serialization
+    is accepted: the marker/flag of a BIP144 serialization sits where the input
+    count goes and Core's no-witness parse of it does not yield the transaction.
+    Raises ``ValueError`` on any failure.
+    """
+    from ouroboros.p2p_messages import TxMessage
+
+    raw = bytes.fromhex(hexstring)
+    if no_witness and len(raw) > 4 and raw[4] == 0x00:
+        raise ValueError("segwit serialization with iswitness=false")
+    msg = TxMessage.from_payload(raw)
+    if msg.bytes_consumed != len(raw):
+        raise ValueError("trailing bytes after transaction")
+    return msg.transaction
+
+
 _REJECT_TOKEN_RE = _re.compile(r"^([a-z0-9-]+): (.+)$", _re.S)
 
 
@@ -4190,21 +4212,7 @@ class RPCServer:
                 f"JSON value of type {_core_uvtype(hexstring)} is not of expected type string",
             )
         try:
-            tx_data = bytes.fromhex(hexstring)
-        except ValueError:
-            raise _decode_failed from None
-
-        try:
-            from ouroboros.p2p_messages import TxMessage
-        except ImportError:
-            raise HTTPException(
-                status_code=500,
-                detail="P2P messages not available"
-            ) from None
-
-        try:
-            tx_msg = TxMessage.from_payload(tx_data)
-            tx = tx_msg.transaction
+            tx = _decode_hex_tx(hexstring)
         except Exception:
             raise _decode_failed from None
 
@@ -15507,7 +15515,7 @@ class RPCServer:
                     f"JSON value of type {_core_uvtype(raw)} is not of expected type string",
                 )
             try:
-                decoded.append(TxMessage.from_payload(bytes.fromhex(raw)).transaction)
+                decoded.append(_decode_hex_tx(raw))
             except Exception:
                 raise RpcError(
                     RPC_DESERIALIZATION_ERROR,
@@ -19972,9 +19980,7 @@ class RPCServer:
         from ouroboros.psbt import _tx_to_univ
 
         try:
-            raw_bytes = bytes.fromhex(hexstring)
-            tx_msg = TxMessage.from_payload(raw_bytes)
-            tx = tx_msg.transaction
+            tx = _decode_hex_tx(hexstring, no_witness=(iswitness is False))
         except Exception:
             # Core DecodeHexTx failure (rpc/rawtransaction.cpp:438) is
             # RPC_DESERIALIZATION_ERROR (-22) "TX decode failed", including
