@@ -194,3 +194,34 @@ def test_rbf_replacement_larger_than_cap_is_not_kept():
     assert not ok and err == "mempool full", (ok, err)
     assert r.get_txid() not in pool.transactions
     assert pool.current_size <= pool.max_size
+
+
+def test_package_rbf_parent_is_not_trimmed_mid_package():
+    # Core SingleInPackageAccept runs with package_submission=true: package
+    # members (a parent that replaces a pool tx included) are trimmed once at
+    # the end of AcceptPackage, so a high-fee child can still carry a
+    # low-feerate parent.  Trimming the parent on its own insert lost both
+    # the package and the tx it replaced.
+    prevs = _funding(2)
+    t1 = _tx(prevs[0], 1_000)
+    t2 = _tx(prevs[1], 60_000, n_outputs=10)
+    pool = _pool(prevs, max_size=len(t1.serialize()) + len(t2.serialize()) + 40)
+    assert pool.add_transaction(t1, 100) == (True, "")
+    assert pool.add_transaction(t2, 100) == (True, "")
+    parent = _tx(prevs[0], 3_000, n_outputs=6)           # replaces t1
+    assert parent.get_txid() != t1.get_txid()
+    out0 = parent.outputs[0].value
+    child = Transaction(
+        txid=b"\xcc" * 32, version=2, locktime=0,
+        inputs=[TxIn(prev_txid=parent.get_txid(), prev_vout=0, script_sig=b"",
+                     sequence=0xFFFFFFFD)],
+        outputs=[TxOut(value=out0 - 80_000, script_pubkey=b"\x51")],
+    )
+    res = pool.accept_package([parent, child], 100)
+    assert res.state == "valid", (res.state, res.message,
+                                  {k.hex()[:8]: v.reject_reason for k, v in res.results.items()})
+    assert parent.get_txid() in pool.transactions
+    assert child.get_txid() in pool.transactions
+    assert t1.get_txid() not in pool.transactions          # replaced
+    assert t2.get_txid() not in pool.transactions          # end-of-package trim
+    assert pool.current_size <= pool.max_size
