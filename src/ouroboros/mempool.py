@@ -2536,13 +2536,18 @@ class Mempool:
             # inserting the tx or storing an orphan. The previous inline
             # implementation only checked coinbase/duplicate/IsStandardTx and so
             # ACCEPTED below-min-relay (zero-fee) txs that a real relay rejects.
+            # The workspace receives fee and vsize as soon as they are known,
+            # so a would-accept verdict can report them (Core's
+            # testmempoolaccept prints vsize and fees.base for an allowed tx).
+            ws: dict = {}
             with self._lock:
                 ok, reason = self._add_transaction_inner(
-                    tx, height, test_accept=True
+                    tx, height, test_accept=True, workspace=ws
                 )
             return {
-                "accepted": ok, "txid": txid, "fee": 0,
-                "vsize": 0,
+                "accepted": ok, "txid": txid,
+                "fee": int(ws.get("fee", 0)) if ok else 0,
+                "vsize": int(ws.get("vsize", 0)) if ok else 0,
                 "reject_reason": None if ok else self._rpc_reject_reason(reason),
             }
 
@@ -2953,7 +2958,8 @@ class Mempool:
             # lock; call the unlocked replacement helper directly. In test_accept
             # (dry-run) mode it validates the BIP125 RBF rules without evicting
             # the conflicting tx or inserting the replacement.
-            ok, err = self._try_replace_inner(tx, height, test_accept=test_accept)
+            ok, err = self._try_replace_inner(
+                tx, height, test_accept=test_accept, workspace=workspace)
             # A replacement is inserted too, so it is trimmed like any other
             # single tx (Core runs LimitMempoolSize after FinalizeSubpackage
             # whether or not the tx replaced anything).  Package members are
@@ -4921,7 +4927,8 @@ class Mempool:
             return ok, err
 
     def _try_replace_inner(
-        self, new_tx: Transaction, height: int, test_accept: bool = False
+        self, new_tx: Transaction, height: int, test_accept: bool = False,
+        workspace: dict | None = None,
     ) -> tuple[bool, str]:
         """Unlocked implementation of try_replace.
 
@@ -5152,6 +5159,9 @@ class Mempool:
         # the pool (no eviction, no insertion) — testmempoolaccept only needs the
         # would-accept verdict.
         if test_accept:
+            if workspace is not None:
+                workspace["fee"] = new_fee
+                workspace["vsize"] = new_vsize
             return True, ""
 
         # All checks passed — evict and add (skip per-removal recount)
