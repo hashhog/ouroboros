@@ -3020,11 +3020,11 @@ class Mempool:
         if not cluster_ok:
             return False, cluster_err
 
-        # Check mempool size. Eviction mutates the pool, so skip it in dry-run
-        # mode — testmempoolaccept must not change mempool state.
-        if (not test_accept and not bypass_limits and not package_feerate
-                and self.current_size + tx_size > self.max_size):
-            self._evict_low_fee_txs(tx_size)
+        # The size limit is NOT applied here.  Core checks the fee against the
+        # CURRENT pool minimum (below), inserts, and only then trims with
+        # LimitMempoolSize (see after the insert).  Evicting before the fee
+        # check let a tx that was then rejected for the raised rolling fee push
+        # out one that already fit.
 
         # Calculate fee
         total_input = 0
@@ -3168,6 +3168,18 @@ class Mempool:
 
         # Update cluster manager
         self._cluster_manager.add_transaction(txid)
+
+        # Core AcceptSingleTransaction: after FinalizeSubpackage,
+        # ``if (!m_package_submission && !m_bypass_limits) LimitMempoolSize``,
+        # and if the new tx was the one trimmed it is TX_RECONSIDERABLE
+        # "mempool full" (validation.cpp).  Package members are trimmed once
+        # at the end of the package (_accept_package_inner); reorg refill
+        # (bypass_limits) trims after the whole refill.
+        if (not bypass_limits and not in_package
+                and self.current_size > self.max_size):
+            self._evict_low_fee_txs(self.current_size - self.max_size)
+            if txid not in self.transactions:
+                return False, "mempool full"
 
         # Get sequence number for this add event
         seq = self._next_sequence()
