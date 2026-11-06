@@ -2956,8 +2956,9 @@ class Mempool:
             ok, err = self._try_replace_inner(tx, height, test_accept=test_accept)
             # A replacement is inserted too, so it is trimmed like any other
             # single tx (Core runs LimitMempoolSize after FinalizeSubpackage
-            # whether or not the tx replaced anything).
-            if ok and not test_accept and not bypass_limits:
+            # whether or not the tx replaced anything).  Package members are
+            # trimmed at the end of the package instead.
+            if ok and not test_accept and not bypass_limits and not in_package:
                 if not self._limit_mempool_size(txid):
                     return False, "mempool full"
             return ok, err
@@ -2982,7 +2983,8 @@ class Mempool:
                 if test_accept:
                     return False, truc_err
                 # Sibling eviction: try to replace the existing child
-                return self._try_sibling_eviction(tx, sibling_txid, height)
+                return self._try_sibling_eviction(
+                    tx, sibling_txid, height, package_member=in_package)
             return False, truc_err
 
         # Ancestor set — bookkeeping only.  As of Bitcoin Core v31 (cluster
@@ -3690,7 +3692,8 @@ class Mempool:
         return list(parent_entry.children)
 
     def _try_sibling_eviction(
-        self, new_tx: Transaction, sibling_txid: bytes, height: int
+        self, new_tx: Transaction, sibling_txid: bytes, height: int,
+        package_member: bool = False,
     ) -> tuple[bool, str]:
         """Attempt TRUC sibling eviction.
 
@@ -3756,7 +3759,10 @@ class Mempool:
         # Now add the new transaction (it should pass all checks)
         # We need to be careful to avoid infinite recursion - the sibling
         # is already removed so the parent no longer has a child.
-        ok, err = self._add_transaction_inner(new_tx, height)
+        # Re-enter with the caller's package context, so a package member is
+        # not size-trimmed on its own insert (the package trims at its end).
+        ok, err = self._add_transaction_inner(
+            new_tx, height, package_member=package_member)
         if not ok:
             # This shouldn't happen if our checks are correct
             logger.warning(f"Failed to add tx after sibling eviction: {err}")
