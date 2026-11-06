@@ -460,10 +460,12 @@ class TestG7TestMempoolAcceptVsize(unittest.TestCase):
             src = inspect.getsource(RPCServer.rpc_testmempoolaccept)
         except Exception:
             self.skipTest("Cannot import RPCServer")
-        bug_present = "vsize" not in src
-        self.assertTrue(bug_present,
-                        "BUG CONFIRMED: testmempoolaccept response is missing 'vsize' field. "
-                        "Core rpc/mempool.cpp:385: result_inner.pushKV(\"vsize\", virtual_size)")
+        # Fixed: the allowed row now carries vsize (behaviour is pinned in
+        # tests/test_testmempoolaccept_result_shape.py); this guard flips from
+        # asserting the bug to asserting the field is emitted.
+        self.assertIn("vsize", src,
+                      "testmempoolaccept response is missing 'vsize' field. "
+                      "Core rpc/mempool.cpp:385: result_inner.pushKV(\"vsize\", virtual_size)")
 
 
 # ---------------------------------------------------------------------------
@@ -490,10 +492,11 @@ class TestG8TestMempoolAcceptFees(unittest.TestCase):
         missing_fees = '"fees"' not in src
         missing_effective_feerate = "effective-feerate" not in src
         missing_effective_includes = "effective-includes" not in src
-        bug_present = missing_fees or missing_effective_feerate or missing_effective_includes
-        self.assertTrue(
-            bug_present,
-            "BUG CONFIRMED: testmempoolaccept response missing 'fees' object "
+        # Fixed: flipped from asserting the bug to asserting the fields exist
+        # (behaviour is pinned in tests/test_testmempoolaccept_result_shape.py).
+        self.assertFalse(
+            missing_fees or missing_effective_feerate or missing_effective_includes,
+            "testmempoolaccept response missing 'fees' object "
             "and/or 'effective-feerate'/'effective-includes'. "
             "Core rpc/mempool.cpp:387-394"
         )
