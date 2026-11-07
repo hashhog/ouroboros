@@ -2924,16 +2924,16 @@ class RPCServer:
         size_on_disk = self._get_disk_usage_cached(db)
 
         # Initial block download detection.
-        # On regtest, Core's IsInitialBlockDownload (validation.cpp) leaves IBD
-        # as soon as the chain is caught up: nMinimumChainWork is 0 and the node
-        # runs under -mocktime so the tip is never "stale". A submitblock-fed
-        # regtest node has no sync_manager progress (is_synced() stays False) and
-        # no mocktime clock, so both the sync-progress and the 24h wall-clock
-        # staleness heuristics would spuriously latch IBD. Scope BOTH heuristics
-        # OFF for regtest — report not-in-IBD once headers have caught up to
-        # blocks (the chain is fully connected). Keep the REAL gate on
-        # mainnet/testnet/signet.
-        if network == "regtest":
+        # On regtest Core's IsInitialBlockDownload (validation.cpp) drops only
+        # the nMinimumChainWork test (it is 0); the max_tip_age test stays, and
+        # the answer latches false once a recent tip is seen. A tip older than
+        # 24h is therefore IBD (tools/core-regtest stamps blocks in 2023 and
+        # Core reports true). BitcoinNode.is_initial_block_download is that
+        # latching rule; keep the REAL gate on mainnet/testnet/signet below.
+        node_ibd = getattr(self.node, "is_initial_block_download", None)
+        if network == "regtest" and callable(node_ibd):
+            is_ibd = bool(node_ibd())
+        elif network == "regtest":
             is_ibd = headers_count > best_height
         else:
             # IBD if: sync progress < 99.9% OR last block time > 24 hours ago.
