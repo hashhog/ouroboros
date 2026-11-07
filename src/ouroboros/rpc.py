@@ -8047,9 +8047,9 @@ class RPCServer:
 
         W87 audit fixes (12 bugs vs Core miner.cpp):
         B1:  previousblockhash was LE; must be reversed to display order (BE).
-        B2:  coinbasetxn.sequence was 0xFFFFFFFF (SEQUENCE_FINAL); must be
-             0xFFFFFFFE (MAX_SEQUENCE_NONFINAL) so nLockTime is enforced.
-        B3:  coinbasetxn.locktime was 0; must be next_height - 1 (miner.cpp:196).
+        B2/B3: (removed) the template used to carry a coinbasetxn
+             {sequence, locktime} stub; Core's getblocktemplate has no
+             coinbasetxn, so it is no longer emitted.
         B4:  reserved weight was 4000; DEFAULT_BLOCK_RESERVED_WEIGHT = 8000 (policy.h:27).
         B5:  no MAX_CONSECUTIVE_FAILURES (1000) early-exit gate (miner.cpp:284-316).
         B6:  weight computed as e.size * 4 (stripped bytes × 4); must use
