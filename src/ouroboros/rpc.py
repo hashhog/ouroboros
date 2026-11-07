@@ -8491,9 +8491,9 @@ class RPCServer:
         mtp_plus_one = block_mtp + 1
         curtime = max(mtp_plus_one, int(_time.time()))
 
-        coinbase_aux = {
-            "flags": "",  # extra nonce space in coinbase scriptSig
-        }
+        # Core rpc/mining.cpp: ``aux`` is an empty UniValue::VOBJ; there is no
+        # "flags" key.
+        coinbase_aux: dict[str, str] = {}
 
         # BIP-23 capabilities field: at minimum ["proposal"]
         # Reference: bitcoin-core/src/rpc/mining.cpp:895, 948
@@ -8541,14 +8541,6 @@ class RPCServer:
             "transactions": txs,
             "coinbaseaux": coinbase_aux,
             "coinbasevalue": coinbase_value,
-            "coinbasetxn": {
-                # B3: locktime = next_height - 1 (miner.cpp:196)
-                "locktime": next_height - 1,
-                # B2: MAX_SEQUENCE_NONFINAL = 0xFFFFFFFE enforces nLockTime.
-                # Core: CTxIn::MAX_SEQUENCE_NONFINAL (miner.cpp:171).
-                # 0xFFFFFFFF (SEQUENCE_FINAL) would disable nLockTime enforcement.
-                "sequence": 0xFFFFFFFE,
-            },
             "target": target_hex,
             # B8: bits from GetNextWorkRequired (best_block.bits as fallback)
             "bits": f"{bits:08x}",
