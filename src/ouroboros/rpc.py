@@ -13868,7 +13868,7 @@ class RPCServer:
             # HTTPException collapses to.
             raise RpcError(
                 RPC_INVALID_PARAMETER,
-                f"{hash_type} is not a valid hash_type",
+                f"'{hash_type}' is not a valid hash_type",
             )
 
         # ``hash_or_height``/``use_index``: with -coinstatsindex enabled the
@@ -13935,7 +13935,6 @@ class RPCServer:
             if hash_type_norm in ("hash_serialized_3", "hash_serialized_2"):
                 digest_hex = cached.hash_serialized[::-1].hex()
                 result["hash_serialized_3"] = digest_hex
-                result["hash_serialized_2"] = digest_hex
             result["total_amount"] = BTCAmount(int(cached.total_amount))
             result["transactions"] = int(cached.transactions)
             result["disk_size"] = 0
@@ -14034,11 +14033,8 @@ class RPCServer:
         }
         if hash_type_norm in ("hash_serialized_3", "hash_serialized_2"):
             digest_hex = stats["sha_digest"][::-1].hex()
-            # Emit both the canonical key and its alias so the
-            # diff-test harness (which probes hash_serialized_2 first,
-            # then _3) sees the same digest under either name.
+            # Core v31 emits only hash_serialized_3 (rpc/blockchain.cpp:1120).
             result["hash_serialized_3"] = digest_hex
-            result["hash_serialized_2"] = digest_hex
         elif hash_type_norm == "muhash":
             result["muhash"] = stats["muhash_digest"][::-1].hex()
         # hash_type=="none": emit no digest field, matching Core.
