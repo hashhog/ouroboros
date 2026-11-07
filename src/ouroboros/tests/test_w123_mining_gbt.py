@@ -461,7 +461,9 @@ class TestG18SideBranchBufferPersisted(unittest.TestCase):
         with tempfile.TemporaryDirectory() as data_dir:
             rpc = _make_rpc()
             rpc.node.data_dir = data_dir
-            rpc._side_branch_blocks = rpc._open_side_branch_buffer()
+            opener = getattr(rpc, "_open_side_branch_buffer", None)
+            self.assertIsNotNone(opener, "no way to open a persistent side-branch buffer")
+            rpc._side_branch_blocks = opener()
             header = b"\x01" * 4 + b"\x22" * 32 + b"\x33" * 44
             key = hashlib.sha256(hashlib.sha256(header).digest()).digest()
             rpc._side_branch_blocks[key] = (b"\x22" * 32, 7, header + b"\x00")
