@@ -4581,6 +4581,33 @@ class Mempool:
         txids = self.by_fee_rate[-limit:] if limit else self.by_fee_rate
         return [self.transactions[txid].tx for txid in reversed(txids)]
 
+    def get_total_tx_size(self) -> int:
+        """Sum of every entry's sigop-adjusted vsize: Core's GetTotalTxSize().
+
+        Core txmempool.cpp ``addNewTransaction`` adds ``entry.GetTxSize()``
+        (GetVirtualTransactionSize(weight, sigop cost, nBytesPerSigOp),
+        kernel/mempool_entry.h) to ``totalTxSize`` and ``removeUnchecked``
+        subtracts it; rpc/mempool.cpp MempoolInfoToJSON reports it as
+        getmempoolinfo ``bytes``.  ``current_size`` is a different number:
+        the STRIPPED (witness-less) byte count this mempool budgets RAM and
+        eviction with, smaller than vsize for any segwit spend and blind to
+        the sigop adjustment, so it must not be reported as ``bytes``.
+        """
+        with self._lock:
+            return sum(entry.vsize for entry in self.transactions.values())
+
+    def get_memory_usage(self) -> int:
+        """getmempoolinfo ``usage``: the existing RAM estimate, unchanged.
+
+        ``rpc_getmempoolinfo`` derived ``usage`` from ``bytes`` (stripped
+        bytes + 200 per entry) when the mempool had no ``get_memory_usage``.
+        ``bytes`` is now Core's vsize total, so the estimate is kept here on
+        the stripped byte count it was always computed from.  It is not
+        Core's DynamicMemoryUsage(); modelling that is separate work.
+        """
+        with self._lock:
+            return self.current_size + len(self.transactions) * 200
+
     def get_mempool_info(self) -> dict:
         """
         Get mempool statistics.
@@ -4602,7 +4629,7 @@ class Mempool:
 
         return {
             'size': len(self.transactions),
-            'bytes': self.current_size,
+            'bytes': self.get_total_tx_size(),
             'max_size': self.max_size,
             'min_fee_rate': min(fee_rates),
             'max_fee_rate': max(fee_rates),
