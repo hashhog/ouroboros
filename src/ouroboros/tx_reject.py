@@ -102,6 +102,7 @@ _MEMPOOL_POLICY_PREFIX = (
     "min relay fee not met", "mempool min fee not met", "mempool full",
     "insufficient fee", "Replacement", "replacement", "Conflicting tx",
     "No conflicts to replace", "too many potential replacements",
+    "rejecting replacement",
     "replacement-adds-unconfirmed", "txn-mempool-conflict",
     "tx would", "too-large-cluster", "Sibling", "Failed after sibling",
     "TRUC", "truc", "v3", "version=3",
