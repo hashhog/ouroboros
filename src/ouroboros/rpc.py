@@ -2212,8 +2212,10 @@ class RPCServer:
         # Reference: bitcoin-core/src/validation.cpp BlockManager::AcceptBlock,
         # CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md
         # (Pattern X + Y for ouroboros).
-        self._side_branch_blocks: dict[bytes, tuple[bytes, int, bytes]] = {}
         self._side_branch_max_entries: int = 1024
+        self._side_branch_blocks: dict[bytes, tuple[bytes, int, bytes]] = (
+            self._open_side_branch_buffer()
+        )
 
         # Core CBlockIndex::nSequenceId for blocks received since start
         # (submitblock, the side-branch stash, P2P connect and fork bridge):
@@ -8894,6 +8896,43 @@ class RPCServer:
             _os.replace(tmp, path)
         except Exception as e:
             logger.warning(f"getchaintips: could not persist {path}: {e}")
+
+    def _open_side_branch_buffer(self) -> dict[bytes, tuple[bytes, int, bytes]]:
+        """The side-branch buffer, backed by ``<datadir>/side_branch_blocks``.
+
+        Core writes every accepted side-branch block to disk and reloads its
+        block index at startup (validation.cpp ChainstateManager::AcceptBlock
+        -> WriteBlock; LoadBlockIndex), so a restart keeps those blocks
+        listed in getchaintips and reorg-able.  Without a datadir (unit
+        tests with a mock node) the buffer stays a plain in-memory dict.
+
+        Entries already on the active chain are dropped on open: a reorg pops
+        a block from the buffer when it connects it, so such an entry is only
+        left by a crash between the connect and the unlink.
+        """
+        import os as _os
+        from ouroboros.side_branch_store import SideBranchBuffer
+
+        data_dir = getattr(getattr(self, "node", None), "data_dir", None)
+        if not isinstance(data_dir, str) or not data_dir:
+            return {}
+        try:
+            buf = SideBranchBuffer(_os.path.join(data_dir, "side_branch_blocks"))
+        except Exception as e:
+            logger.warning(f"side-branch store unavailable, buffer is memory-only: {e}")
+            return {}
+        db = getattr(self.node, "db", None)
+        if db is not None and len(buf):
+            for h, entry in list(buf.items()):
+                try:
+                    a = db.get_block_hash_by_height(int(entry[1]))
+                    if a is not None and bytes(a) == h:
+                        buf.pop(h, None)
+                except Exception:
+                    continue
+        while len(buf) > getattr(self, "_side_branch_max_entries", 1024):
+            buf.pop(next(iter(buf)), None)
+        return buf
 
     def _evict_side_branch_if_full(self) -> None:
         """Soft-cap the in-memory side-branch buffer.
