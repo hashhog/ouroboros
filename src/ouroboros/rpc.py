@@ -3846,7 +3846,10 @@ class RPCServer:
             raise HTTPException(status_code=500, detail="Database not available")
 
         # Check if txindex is enabled (we assume it is if get_tx_index exists)
-        has_txindex = hasattr(self.node.db, 'get_tx_index')
+        has_txindex = (
+            hasattr(self.node.db, 'get_tx_index')
+            and bool((getattr(self.node, 'config', None) or {}).get('txindex', True))
+        )
 
         # 1. Check mempool first (unless explicit blockhash provided)
         tx = None

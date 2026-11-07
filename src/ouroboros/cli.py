@@ -571,6 +571,17 @@ def sync(ctx, reset, limit):
     ),
 )
 @click.option(
+    "--txindex/--no-txindex",
+    "txindex",
+    default=None,
+    help=(
+        "Allow getrawtransaction to find confirmed txs without a blockhash. "
+        "Default: on. --no-txindex matches Bitcoin Core's default "
+        "(-txindex=0): a blockhash is then required for confirmed "
+        "transactions."
+    ),
+)
+@click.option(
     "--maxmempool",
     "maxmempool",
     type=int,
@@ -587,7 +598,7 @@ def start(
     peerbloomfilters, blockfilterindex, cfilter, coinstatsindex,
     txospenderindex, assumevalid, noassumevalid, daemon,
     pid_path, reindex, rpc_tls_cert, rpc_tls_key, par, fallbackfee,
-    maxmempool,
+    maxmempool, txindex,
 ):
     """Start the Bitcoin node"""
     global _node, _cancelled, _pid_file
@@ -717,6 +728,8 @@ def start(
             if maxmempool < 0:
                 raise click.BadParameter("--maxmempool must be >= 0")
             config["maxmempool"] = int(maxmempool)
+        if txindex is not None:
+            config["txindex"] = bool(txindex)
         if fallbackfee is not None:
             if fallbackfee < 0:
                 raise click.BadParameter("--fallbackfee must be >= 0")
