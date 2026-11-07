@@ -5019,15 +5019,21 @@ class Mempool:
         for c_txid in conflicts:
             to_evict |= self._collect_descendants(c_txid)
 
-        # Gate 3 — Rule #5 MAX_REPLACEMENT_CANDIDATES: The eviction set
-        # (direct conflicts + all their descendants) must not exceed 100 entries.
-        # Core uses GetUniqueClusterCount(); without cluster mempool we count
-        # total evictees as a conservative bound (same limit, same intent).
-        # Reference: bitcoin/src/policy/rbf.cpp GetEntriesForConflicts() lines 68-75
-        if len(to_evict) > self.MAX_REPLACEMENT_EVICTIONS:
+        # Gate 3 — Rule #5 MAX_REPLACEMENT_CANDIDATES: the direct conflicts
+        # may touch at most 100 distinct clusters.  Core v31 counts clusters,
+        # not evictees: pool.GetUniqueClusterCount(iters_conflicting) in
+        # bitcoin/src/policy/rbf.cpp GetEntriesForConflicts().
+        cluster_ids = set()
+        for c_txid in conflicts:
+            cid = self._cluster_manager.get_cluster_id(c_txid)
+            # A conflict the manager does not know counts as its own cluster.
+            cluster_ids.add(cid if cid is not None else c_txid)
+        num_clusters = len(cluster_ids)
+        if num_clusters > self.MAX_REPLACEMENT_EVICTIONS:
             return False, (
-                f"Replacement would evict {len(to_evict)} txs; "
-                f"too many potential replacements (max {self.MAX_REPLACEMENT_EVICTIONS})"
+                f"rejecting replacement {new_tx.get_txid()[::-1].hex()}; "
+                f"too many conflicting clusters "
+                f"({num_clusters} > {self.MAX_REPLACEMENT_EVICTIONS})"
             )
 
         # Rule #2 (HasNoNewUnconfirmed): The replacement must not introduce any

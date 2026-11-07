@@ -539,14 +539,9 @@ class TestG12Rule5Constant(unittest.TestCase):
 #   cluster is touched, regardless of size) ouroboros would REJECT once the
 #   eviction-set exceeds 100. False-negative on legitimate RBF.
 # Comment-as-confession: mempool.py:3494-3495.
-# Status: BUG-1 — DIVERGENT (more restrictive than Core).
+# Status: BUG-1 — FIXED (counts distinct conflicting clusters like Core).
 # ===========================================================================
 
-@pytest.mark.xfail(strict=True, reason=(
-    "BUG-1: Rule 5 uses len(to_evict) not GetUniqueClusterCount("
-    "iters_conflicting). Core would accept a single-cluster replacement "
-    "with 101 evictees (cluster_count=1); ouroboros rejects."
-))
 class TestG13Rule5ClusterCountDivergence(unittest.TestCase):
     def test_uses_cluster_count_not_evictee_count(self):
         # Marker test: assert that the eviction-bound is implemented in terms
@@ -731,7 +726,7 @@ class TestG21RejectReasonStrings(unittest.TestCase):
         # Confirm the error string used when Rule 5 trips
         import inspect
         src = inspect.getsource(Mempool._try_replace_inner)
-        self.assertIn("too many potential replacements", src)
+        self.assertIn("too many conflicting clusters", src)
 
 
 # ===========================================================================

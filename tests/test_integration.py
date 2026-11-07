@@ -1264,42 +1264,33 @@ class TestReplaceByFee:
         assert not pool.has_transaction(b"\xcc" * 32)
         assert pool.has_transaction(b"\xbb" * 32)
 
-    def test_rbf_too_many_evictions(self):
-        import time as _time
+    def test_rbf_too_many_conflicting_clusters(self):
+        """Rule 5 caps distinct conflicting clusters at 100 (Core v31
+        policy/rbf.cpp GetEntriesForConflicts, GetUniqueClusterCount).
 
-        from ouroboros.mempool import MempoolEntry
-
-        utxo = {(b"\x01" * 32, 0): {"value": 10_000_000}}
+        101 unrelated mempool txs are 101 clusters; a replacement spending
+        all 101 outpoints is rejected and the pool is left untouched.
+        """
+        n = 101
+        outpoints = [(bytes([1, i]) + b"\x00" * 30, 0) for i in range(n)]
+        utxo = {op: {"value": 100_000} for op in outpoints}
         pool = self._pool(utxo)
 
-        tx_parent = _rbf_tx(b"\xaa" * 32, [(b"\x01" * 32, 0)], [9_900_000])
-        ok, _ = pool.add_transaction(tx_parent, height=100)
-        assert ok
+        originals = []
+        for i, op in enumerate(outpoints):
+            tx = _rbf_tx(bytes([2, i]) + b"\x00" * 30, [op], [90_000])
+            ok, err = pool.add_transaction(tx, height=100)
+            assert ok, err
+            originals.append(tx.get_txid())
+        assert len(pool.transactions) == n
 
-        prev_txid = b"\xaa" * 32
-        for i in range(100):
-            child_txid = bytes([i + 2]) + b"\x00" * 31
-            child = _rbf_tx(child_txid, [(prev_txid, 0)], [40_000])
-            entry = MempoolEntry(
-                tx=child, fee=10_000, fee_rate=1.0,
-                size=250, time_added=_time.time(), height_added=100,
-            )
-            pool.transactions[child.get_txid()] = entry
-            pool.current_size += 250
-            for inp in child.inputs:
-                pool.spent_outputs.add((inp.prev_txid, inp.prev_vout))
-            # Register child link so _collect_descendants can traverse the chain
-            parent_entry = pool.transactions.get(prev_txid)
-            if parent_entry is not None:
-                parent_entry.children.add(child_txid)
-            prev_txid = child_txid
-
-        assert len(pool.transactions) == 101
-
-        tx_b = _rbf_tx(b"\xbb" * 32, [(b"\x01" * 32, 0)], [100_000])
+        tx_b = _rbf_tx(b"\xbb" * 32, outpoints, [n * 50_000])
         ok, err = pool.add_transaction(tx_b, height=100)
         assert not ok
-        assert "evict" in err.lower()
+        assert "too many conflicting clusters (101 > 100)" in err, err
+        assert len(pool.transactions) == n
+        assert all(pool.has_transaction(t) for t in originals)
+        assert not pool.has_transaction(tx_b.get_txid())
 
 
 # ── HD Key Derivation (BIP 32 / BIP 44) ──────────────────────────────
