@@ -5255,6 +5255,19 @@ class RPCServer:
         # malformed hash (rpc/util.cpp:117) BEFORE any lookup. Parse outside
         # the body try so the -8 RpcError is not remapped to HTTP 400. The
         # well-formed-but-absent path still raises -5 "Block not found" below.
+        # Core type-checks every argument before the handler body runs
+        # (RPCTypeCheckArgument): verbose must be a JSON bool, not a string or
+        # number, else -3 "Wrong type passed" (JSON null means the default).
+        if verbose is None:
+            verbose = True
+        elif not isinstance(verbose, bool):
+            raise RpcError(
+                RPC_TYPE_ERROR,
+                'Wrong type passed:\n{\n    "Position 2 (verbose)": '
+                f'"JSON value of type {_core_uvtype(verbose)} is not of '
+                'expected type bool"\n}',
+            )
+
         block_hash = _parse_hash_v(blockhash, "hash")[::-1]
         try:
             if not hasattr(self.node, 'db') or not self.node.db:
