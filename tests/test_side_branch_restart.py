@@ -188,3 +188,26 @@ def test_connected_side_block_leaves_the_store(tmp_path):
     assert bdb.get_best_block() == (s2, TIP + 1)
     assert not os.path.exists(os.path.join(store, s1.hex() + ".blk"))
     assert s1 not in _server(bdb, str(tmp_path))._side_branch_blocks
+
+
+def test_damaged_body_is_not_reloaded_and_its_child_is_not_failed(tmp_path):
+    """A stored file whose header is intact but whose body has a flipped
+    byte (a torn write, disk damage) is not reloaded: the record's sha256
+    no longer matches.  The block is then simply absent, as before this
+    store existed, so a valid child of it is an orphan (prev-blk-not-found),
+    never a failure verdict that would mark a valid block invalid."""
+    bdb, server, hashes = _setup(tmp_path)
+    raw_s, s = _block(hashes[TIP - 1], TIP, b"\x71\xc5")
+    _submit(server, raw_s)
+    path = os.path.join(str(tmp_path), "side_branch_blocks", s.hex() + ".blk")
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+    data[-5] ^= 0x01  # inside the coinbase, well past the 80-byte header
+    with open(path, "wb") as f:
+        f.write(bytes(data))
+    fresh = _server(bdb, str(tmp_path))
+    assert s not in fresh._side_branch_blocks
+    raw_c, c = _block(s, TIP + 1, b"\x72\xc5")
+    assert _submit(fresh, raw_c) == "prev-blk-not-found"
+    assert bdb.get_best_block() == (hashes[TIP], TIP)
+    assert _disp(c) not in _tips(fresh)

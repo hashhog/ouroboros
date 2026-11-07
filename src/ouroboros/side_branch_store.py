@@ -14,12 +14,19 @@ was memory only: a restart dropped every side-branch block.
 ``<dir>/<hash hex>.blk`` and each removal unlinking the file; the files are
 read back when the buffer is opened.
 
-What is reloaded is only what the buffer held before: a block that passed the
-side-branch admission checks.  Nothing is trusted beyond that: an entry is
-reloaded only if its file parses, the header hashes to the file's key and
-the header's prev field matches the recorded parent; anything else is
-skipped.  A reloaded block reaches the active chain only through the reorg
-path, which runs the full ConnectBlock on it.
+What is reloaded is only what the buffer held before the restart, and
+nothing more is trusted: an entry is reloaded only if its file parses, the
+whole block's sha256 matches the one recorded when it was written (so a
+truncated or bit-flipped body is never mistaken for the block), the header
+hashes to the file's key, and the header's prev field matches the recorded
+parent; anything else is skipped with a warning.  A skipped entry is simply
+absent, as before this store existed: a child of it is an orphan, never a
+failure verdict.  A reloaded block reaches the active chain only through the
+reorg path, which runs the full ConnectBlock on it.
+
+Each insert writes (and fsyncs) the block synchronously; side-branch blocks
+are rare and bounded by the buffer's cap, so this is a small cost next to
+the validation that precedes every insert.
 
 Disk errors never change the in-memory behaviour: a failed write or unlink
 is logged and the dict operation still happens.
@@ -36,7 +43,7 @@ from typing import Any, Iterable
 logger = logging.getLogger(__name__)
 
 _MAGIC = b"OBSB1\x00"
-_HEADER = struct.Struct("<6s32sI")  # magic, parent hash, height
+_HEADER = struct.Struct("<6s32sI32s")  # magic, parent hash, height, sha256(raw)
 _SUFFIX = ".blk"
 
 
@@ -69,11 +76,24 @@ class SideBranchBuffer(dict):
     def _write(self, key: Any, value: Any) -> None:
         try:
             prev, height, raw = value
-            payload = _HEADER.pack(_MAGIC, bytes(prev), int(height)) + bytes(raw)
+            raw = bytes(raw)
+            payload = _HEADER.pack(
+                _MAGIC, bytes(prev), int(height), hashlib.sha256(raw).digest()
+            ) + raw
             path = self._path(key)
             tmp = path + ".tmp"
+            try:
+                # Overwriting a key keeps its dict position; keep the file's
+                # mtime too, so the reload order (the eviction FIFO) matches.
+                old_times = os.stat(path)
+            except FileNotFoundError:
+                old_times = None
             with open(tmp, "wb") as f:
                 f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            if old_times is not None:
+                os.utime(tmp, ns=(old_times.st_atime_ns, old_times.st_mtime_ns))
             os.replace(tmp, path)
         except Exception as e:  # never break the in-memory buffer
             logger.warning("side-branch store: could not persist %s: %s",
@@ -136,9 +156,10 @@ class SideBranchBuffer(dict):
             return None
         if len(data) < _HEADER.size + 80:
             return None
-        magic, prev, height = _HEADER.unpack_from(data)
+        magic, prev, height, digest = _HEADER.unpack_from(data)
         raw = data[_HEADER.size:]
-        if magic != _MAGIC or raw[4:36] != prev or _block_hash(raw) != key:
+        if (magic != _MAGIC or hashlib.sha256(raw).digest() != digest
+                or raw[4:36] != prev or _block_hash(raw) != key):
             logger.warning("side-branch store: ignoring %s (does not match its key)", name)
             return None
         return key, (prev, int(height), raw)

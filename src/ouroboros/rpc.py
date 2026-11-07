@@ -8928,7 +8928,8 @@ class RPCServer:
                     a = db.get_block_hash_by_height(int(entry[1]))
                     if a is not None and bytes(a) == h:
                         buf.pop(h, None)
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"side-branch store: active-chain check skipped: {e}")
                     continue
         while len(buf) > getattr(self, "_side_branch_max_entries", 1024):
             buf.pop(next(iter(buf)), None)

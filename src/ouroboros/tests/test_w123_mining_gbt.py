@@ -445,20 +445,34 @@ class TestG17SubmitBlockZmqNotifyMissing(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# G18 — Side-branch buffer is in-memory only (lost on restart)
-# Core: BlockManager persists side-branch blocks to disk; reorgs survive restart.
-# Ouroboros: _side_branch_blocks is a dict on RPCServer instance.  Restart
-#       loses all accumulated forks until they re-arrive via P2P.
+# G18 — Side-branch buffer survives a restart (was: in-memory only)
+# Core: AcceptBlock writes side-branch blocks to disk (WriteBlock) and
+#       LoadBlockIndex reloads them; forks survive a restart.
+# Ouroboros: _side_branch_blocks was a plain dict, so a restart dropped every
+#       stored fork.  It is now side_branch_store.SideBranchBuffer, mirrored to
+#       <datadir>/side_branch_blocks/ (end-to-end coverage against the real DB:
+#       tests/test_side_branch_restart.py).
 # ---------------------------------------------------------------------------
-class TestG18SideBranchBufferEphemeral(unittest.TestCase):
-    """BUG: side-branch buffer is in-memory only — restart discards forks."""
+class TestG18SideBranchBufferPersisted(unittest.TestCase):
+    """Fixed: the side-branch buffer is on disk when the node has a datadir."""
 
-    def test_side_branch_dict_not_persisted(self):
+    def test_side_branch_buffer_reloads_after_restart(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as data_dir:
+            rpc = _make_rpc()
+            rpc.node.data_dir = data_dir
+            rpc._side_branch_blocks = rpc._open_side_branch_buffer()
+            header = b"\x01" * 4 + b"\x22" * 32 + b"\x33" * 44
+            key = hashlib.sha256(hashlib.sha256(header).digest()).digest()
+            rpc._side_branch_blocks[key] = (b"\x22" * 32, 7, header + b"\x00")
+            again = _make_rpc()
+            again.node.data_dir = data_dir
+            reloaded = again._open_side_branch_buffer()
+            self.assertEqual(reloaded.get(key), (b"\x22" * 32, 7, header + b"\x00"))
+
+    def test_mock_node_without_datadir_keeps_a_plain_dict(self):
         rpc = _make_rpc()
-        self.assertIsInstance(rpc._side_branch_blocks, dict)
-        # No load/save method exists.
-        self.assertFalse(hasattr(rpc, "_load_side_branch_buffer"))
-        self.assertFalse(hasattr(rpc, "_save_side_branch_buffer"))
+        self.assertIs(type(rpc._side_branch_blocks), dict)
 
 
 # ---------------------------------------------------------------------------
