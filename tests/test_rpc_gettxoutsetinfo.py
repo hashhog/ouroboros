@@ -152,8 +152,8 @@ async def test_gettxoutsetinfo_basic_shape() -> None:
     assert res["total_amount"].text == "0.87345678"  # BTCAmount, Core %d.%08d
     # Default hash_type is hash_serialized_3 (Core post-#26553).
     assert "hash_serialized_3" in res
-    assert "hash_serialized_2" in res
-    assert res["hash_serialized_2"] == res["hash_serialized_3"]
+    # Core v31 emits only hash_serialized_3 (rpc/blockchain.cpp:1120).
+    assert "hash_serialized_2" not in res
     assert "muhash" not in res
 
 
@@ -214,7 +214,8 @@ async def test_gettxoutsetinfo_hash_type_aliases() -> None:
 
     digest = r3["hash_serialized_3"]
     assert digest == r2["hash_serialized_3"] == rh["hash_serialized_3"]
-    assert r3["hash_serialized_2"] == r2["hash_serialized_2"] == digest
+    assert "hash_serialized_2" not in r3
+    assert "hash_serialized_2" not in r2
 
 
 @pytest.mark.asyncio
@@ -245,7 +246,9 @@ async def test_gettxoutsetinfo_rejects_unknown_hash_type() -> None:
     with pytest.raises(RpcError) as exc:
         await rpc.rpc_gettxoutsetinfo(hash_type="sha3-512")
     assert exc.value.code == RPC_INVALID_PARAMETER
-    assert "not a valid hash_type" in exc.value.message
+    # Core quotes the value: "'%s' is not a valid hash_type"
+    # (rpc/blockchain.cpp:976).
+    assert exc.value.message == "'sha3-512' is not a valid hash_type"
 
 
 @pytest.mark.asyncio
