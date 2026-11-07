@@ -3705,13 +3705,20 @@ class RPCServer:
                             vin_dict = tx_dict["vin"][j] if j < len(tx_dict["vin"]) else {}
 
                             if not tx.is_coinbase:
-                                utxo = await asyncio.to_thread(self.node.db.get_utxo, tx_in.prev_txid, tx_in.prev_vout)
+                                # Core takes prevout from the block's undo data
+                                # (blockToJSON, SHOW_DETAILS_AND_PREVOUT), so it is
+                                # present even once the output has been spent.
+                                utxo = await asyncio.to_thread(
+                                    self.node.db.get_utxo_or_spent,
+                                    tx_in.prev_txid, tx_in.prev_vout,
+                                )
                                 if utxo:
                                     from ouroboros.psbt import _build_spk_json
+                                    from ouroboros.psbt import BTCAmount as _PrevAmount
                                     vin_dict["prevout"] = {
-                                        "generated": False,
+                                        "generated": bool(utxo.get('is_coinbase', False)),
                                         "height": utxo.get('height', 0),
-                                        "value": utxo['value'] / 1e8,
+                                        "value": _PrevAmount(utxo['value']),
                                         "scriptPubKey": _build_spk_json(utxo['script_pubkey'], network),
                                     }
                             vin_with_prevout.append(vin_dict)
