@@ -5339,6 +5339,30 @@ class RPCServer:
             # ``pblockindex->nHeight``.
             block_height = await asyncio.to_thread(self._get_block_height, self.node.db, block_hash)
 
+            # Hash-keyed block index (BLOCK_INDEX_BY_HASH_CF): one point read
+            # that answers for every block the node holds an index entry for,
+            # on or off the active chain -- Core's LookupBlockIndex(hash)
+            # ->nHeight (rpc/blockchain.cpp getblockheader).  The tiers in
+            # _get_block_height cannot see a block that invalidateblock
+            # disconnected (it is in neither the active chain nor the
+            # in-memory side-branch buffer) or a displaced block after a
+            # restart (the buffer is not persisted), so this answered -5
+            # "Block not found" where Core answers the header with
+            # confirmations -1 (tools/core-regtest
+            # failed_reorg/*/displaced-header).  A block's height never
+            # changes once indexed.  Kept local to this read-only RPC:
+            # _get_block_height also feeds preciousblock, which can activate
+            # a chain.
+            if block_height is None:
+                by_hash = getattr(self.node.db, "get_block_height_by_hash", None)
+                if by_hash is not None:
+                    try:
+                        h = await asyncio.to_thread(by_hash, block_hash)
+                    except Exception:
+                        h = None
+                    if h is not None:
+                        block_height = int(h)
+
             # HEADERS_CF fallback height: for gap blocks not in BLOCK_INDEX_CF
             # (absent after an assumeutxo snapshot load), use the height that
             # was stored in the HEADERS_CF extended record by the migration.
@@ -5371,7 +5395,11 @@ class RPCServer:
                 # the block as on the main chain. The block WAS on Core's main
                 # chain at migration time, and we have no contradicting evidence.
                 active_hash = await asyncio.to_thread(self.node.db.get_block_hash_by_height, block_height)
-                if active_hash == block_hash:
+                # Core CChain::Contains: nHeight <= tip height AND the slot
+                # holds this block.  A height row above the tip is left over
+                # from a disconnect (invalidateblock to the parent) and does
+                # not put the block on the active chain.
+                if active_hash == block_hash and block_height <= best_height:
                     confirmations = max(0, best_height - block_height + 1)
                 elif active_hash is None and raw_stored_height is not None and raw_stored_height == block_height:
                     # Gap block: height came from HEADERS_CF (Core-seeded), not BLOCK_INDEX_CF.
@@ -5395,7 +5423,17 @@ class RPCServer:
             # fall back to the chainwork stored in HEADERS_CF by the migration.
             chainwork_str: str = "0" * 64
             if block_height is not None:
-                chainwork_str = self.node.get_chainwork_at_height(block_height)
+                own_work = None
+                if confirmations == -1:
+                    # Off the active chain: the work at this HEIGHT belongs to
+                    # the active block there, not to this one.  Core reports
+                    # pindex->nChainWork (rpc/blockchain.cpp
+                    # blockheaderToJSON), i.e. this block's own index entry.
+                    own_work = self._own_index_chainwork(block_hash)
+                if own_work is not None:
+                    chainwork_str = own_work
+                else:
+                    chainwork_str = self.node.get_chainwork_at_height(block_height)
             if (chainwork_str == "0" * 64 and raw_chainwork is not None
                     and any(b != 0 for b in raw_chainwork)):
                 chainwork_str = raw_chainwork.hex()
@@ -5412,8 +5450,17 @@ class RPCServer:
             # (regtest off-by-one vs Core) and fell back to the block's own
             # nTime. For gap blocks (no block_height) fall back to the
             # HEADERS_CF-stored mediantime, then the block's own timestamp.
-            if block_height is not None:
-                mediantime_val: int = self.node.get_median_time(block_height)
+            own_mtp = None
+            if block_height is not None and confirmations == -1:
+                # Off the active chain: the median of the active blocks at
+                # this height is another block's MTP.  Core reports
+                # pindex->GetMedianTimePast(), over this block's own pprev
+                # chain (chain.h).
+                own_mtp = await asyncio.to_thread(self._own_median_time_past, block_hash)
+            if own_mtp is not None:
+                mediantime_val: int = own_mtp
+            elif block_height is not None:
+                mediantime_val = self.node.get_median_time(block_height)
             elif raw_stored_mediantime:
                 mediantime_val = raw_stored_mediantime
             else:
@@ -8516,6 +8563,59 @@ class RPCServer:
             "weightlimit": MAX_BLOCK_WEIGHT,
             "default_witness_commitment": default_witness_commitment,
         }
+
+    def _own_median_time_past(self, block_hash: bytes) -> int | None:
+        """Core ``CBlockIndex::GetMedianTimePast()`` for any stored block:
+        the median of the timestamps of this block and up to 10 ancestors,
+        walked through each block's own parent hash (so it is right for a
+        block off the active chain).  None when a header in the window
+        cannot be read, so the caller keeps its height-based answer."""
+        db = getattr(self.node, "db", None)
+        if db is None:
+            return None
+        times: list[int] = []
+        cur = bytes(block_hash)
+        for _ in range(11):  # nMedianTimeSpan
+            header = None
+            try:
+                raw = db.get_block_bytes(cur)
+                if raw and len(raw) >= 80:
+                    header = bytes(raw[:80])
+            except Exception:
+                header = None
+            if header is None:
+                try:
+                    rh = db._db.get_raw_header_with_chainwork(cur)
+                    if rh is not None and len(bytes(rh[0])) >= 80:
+                        header = bytes(rh[0])[:80]
+                except Exception:
+                    header = None
+            if header is None:
+                return None
+            times.append(int.from_bytes(header[68:72], "little"))
+            cur = header[4:36]
+            if cur == bytes(32):  # genesis has no parent
+                break
+        times.sort()
+        return times[len(times) // 2]
+
+    def _own_index_chainwork(self, block_hash: bytes) -> str | None:
+        """This block's own chainwork from the hash-keyed block index, as 64
+        hex digits, or None when the index has no non-zero value for it."""
+        rust = getattr(getattr(self.node, "db", None), "_db", None)
+        fn = getattr(rust, "get_block_metadata_by_hash", None)
+        if fn is None:
+            return None
+        try:
+            meta = fn(bytes(block_hash))
+        except Exception:
+            return None
+        if meta is None:
+            return None
+        work = bytes(meta[1])
+        if len(work) != 32 or not any(work):
+            return None
+        return work.hex()
 
     def _get_block_height(self, db, block_hash: bytes) -> int | None:
         """Resolve a block's height from its 32-byte hash via the chainstate
