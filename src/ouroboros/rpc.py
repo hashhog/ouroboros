@@ -9054,7 +9054,8 @@ class RPCServer:
         ouroboros's ``BLOCK_INDEX_CF`` is height-keyed (a relic of the
         IBD-only single-best-chain era), so persistent on-disk storage of
         two distinct blocks at the same height is not possible without a
-        DB schema migration. The in-memory ``_side_branch_blocks`` map is
+        DB schema migration. The ``_side_branch_blocks`` map (mirrored to
+        ``<datadir>/side_branch_blocks`` by side_branch_store) is
         the surgical shim that lets fork accumulation work without that
         migration. It bounds the scope of the Pattern Y closure to the
         submitblock RPC code path; P2P arrival continues to use the
@@ -13682,8 +13683,9 @@ class RPCServer:
             _add(bytes(h), bytes(prev), int(height), True)
 
         # A reconsidered block left off the active chain is in Core's
-        # m_block_index after a restart too; here its only persistent record
-        # is the Rust hash index (the side-branch buffer is in memory).
+        # m_block_index after a restart too; the side-branch buffer is
+        # reloaded from the datadir, but a reconsidered block that was never
+        # stashed there is recorded only in the Rust hash index.
         for h in list(reconsidered):
             m = _meta(h)
             if m is None:

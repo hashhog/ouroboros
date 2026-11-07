@@ -16,8 +16,9 @@ read back when the buffer is opened.
 
 What is reloaded is only what the buffer held before the restart, and
 nothing more is trusted: an entry is reloaded only if its file parses, the
-whole block's sha256 matches the one recorded when it was written (so a
-truncated or bit-flipped body is never mistaken for the block), the header
+sha256 over the recorded parent, height and whole block matches the one
+written with it (so a truncated or bit-flipped body, or a damaged height that
+would connect a valid child at the wrong height, is never reloaded), the header
 hashes to the file's key, and the header's prev field matches the recorded
 parent; anything else is skipped with a warning.  A skipped entry is simply
 absent, as before this store existed: a child of it is an orphan, never a
@@ -43,7 +44,12 @@ from typing import Any, Iterable
 logger = logging.getLogger(__name__)
 
 _MAGIC = b"OBSB1\x00"
-_HEADER = struct.Struct("<6s32sI32s")  # magic, parent hash, height, sha256(raw)
+_HEADER = struct.Struct("<6s32sI32s")  # magic, parent hash, height, digest
+
+
+def _digest(prev: bytes, height: int, raw: bytes) -> bytes:
+    """sha256 over everything the entry carries: parent, height and block."""
+    return hashlib.sha256(bytes(prev) + struct.pack("<I", int(height)) + bytes(raw)).digest()
 _SUFFIX = ".blk"
 
 
@@ -78,7 +84,7 @@ class SideBranchBuffer(dict):
             prev, height, raw = value
             raw = bytes(raw)
             payload = _HEADER.pack(
-                _MAGIC, bytes(prev), int(height), hashlib.sha256(raw).digest()
+                _MAGIC, bytes(prev), int(height), _digest(prev, height, raw)
             ) + raw
             path = self._path(key)
             tmp = path + ".tmp"
@@ -95,9 +101,22 @@ class SideBranchBuffer(dict):
             if old_times is not None:
                 os.utime(tmp, ns=(old_times.st_atime_ns, old_times.st_mtime_ns))
             os.replace(tmp, path)
+            self._fsync_dir()
         except Exception as e:  # never break the in-memory buffer
             logger.warning("side-branch store: could not persist %s: %s",
                            bytes(key).hex()[:16] if isinstance(key, (bytes, bytearray)) else key, e)
+
+    def _fsync_dir(self) -> None:
+        try:
+            fd = os.open(self._dir, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
 
     def _unlink(self, key: Any) -> None:
         try:
@@ -158,7 +177,7 @@ class SideBranchBuffer(dict):
             return None
         magic, prev, height, digest = _HEADER.unpack_from(data)
         raw = data[_HEADER.size:]
-        if (magic != _MAGIC or hashlib.sha256(raw).digest() != digest
+        if (magic != _MAGIC or _digest(prev, height, raw) != digest
                 or raw[4:36] != prev or _block_hash(raw) != key):
             logger.warning("side-branch store: ignoring %s (does not match its key)", name)
             return None
@@ -201,6 +220,14 @@ class SideBranchBuffer(dict):
             self[key] = value
         for key, value in kwargs.items():
             self[key] = value
+
+    def __ior__(self, other: Any) -> "SideBranchBuffer":
+        self.update(other)
+        return self
+
+    @classmethod
+    def fromkeys(cls, *args: Any, **kwargs: Any) -> Any:
+        raise TypeError("SideBranchBuffer needs a directory; build it with SideBranchBuffer(dir)")
 
     def clear(self) -> None:
         for key in list(self.keys()):

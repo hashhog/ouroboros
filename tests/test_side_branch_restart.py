@@ -211,3 +211,25 @@ def test_damaged_body_is_not_reloaded_and_its_child_is_not_failed(tmp_path):
     assert _submit(fresh, raw_c) == "prev-blk-not-found"
     assert bdb.get_best_block() == (hashes[TIP], TIP)
     assert _disp(c) not in _tips(fresh)
+
+
+def test_damaged_height_is_not_reloaded_and_its_child_is_not_failed(tmp_path):
+    """The stored height decides where a child connects (BIP34 height,
+    subsidy), so a flipped bit there must not reload the block: the digest
+    covers parent, height and body.  The child is then an orphan, never
+    connected at the wrong height and failed."""
+    bdb, server, hashes = _setup(tmp_path)
+    raw_s, s = _block(hashes[TIP - 1], TIP, b"\x81\xc5")
+    _submit(server, raw_s)
+    path = os.path.join(str(tmp_path), "side_branch_blocks", s.hex() + ".blk")
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+    data[6 + 32] ^= 0x01  # low byte of the stored height (after magic + prev)
+    with open(path, "wb") as f:
+        f.write(bytes(data))
+    fresh = _server(bdb, str(tmp_path))
+    assert s not in fresh._side_branch_blocks
+    raw_c, c = _block(s, TIP + 1, b"\x82\xc5")
+    assert _submit(fresh, raw_c) == "prev-blk-not-found"
+    assert bdb.get_best_block() == (hashes[TIP], TIP)
+    assert _disp(c) not in _tips(fresh)
