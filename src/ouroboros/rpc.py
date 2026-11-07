@@ -8047,9 +8047,9 @@ class RPCServer:
 
         W87 audit fixes (12 bugs vs Core miner.cpp):
         B1:  previousblockhash was LE; must be reversed to display order (BE).
-        B2:  coinbasetxn.sequence was 0xFFFFFFFF (SEQUENCE_FINAL); must be
-             0xFFFFFFFE (MAX_SEQUENCE_NONFINAL) so nLockTime is enforced.
-        B3:  coinbasetxn.locktime was 0; must be next_height - 1 (miner.cpp:196).
+        B2/B3: (removed) the template used to carry a coinbasetxn
+             {sequence, locktime} stub; Core's getblocktemplate has no
+             coinbasetxn, so it is no longer emitted.
         B4:  reserved weight was 4000; DEFAULT_BLOCK_RESERVED_WEIGHT = 8000 (policy.h:27).
         B5:  no MAX_CONSECUTIVE_FAILURES (1000) early-exit gate (miner.cpp:284-316).
         B6:  weight computed as e.size * 4 (stripped bytes × 4); must use
@@ -8491,9 +8491,9 @@ class RPCServer:
         mtp_plus_one = block_mtp + 1
         curtime = max(mtp_plus_one, int(_time.time()))
 
-        coinbase_aux = {
-            "flags": "",  # extra nonce space in coinbase scriptSig
-        }
+        # Core rpc/mining.cpp: ``aux`` is an empty UniValue::VOBJ; there is no
+        # "flags" key.
+        coinbase_aux: dict[str, str] = {}
 
         # BIP-23 capabilities field: at minimum ["proposal"]
         # Reference: bitcoin-core/src/rpc/mining.cpp:895, 948
@@ -8541,14 +8541,6 @@ class RPCServer:
             "transactions": txs,
             "coinbaseaux": coinbase_aux,
             "coinbasevalue": coinbase_value,
-            "coinbasetxn": {
-                # B3: locktime = next_height - 1 (miner.cpp:196)
-                "locktime": next_height - 1,
-                # B2: MAX_SEQUENCE_NONFINAL = 0xFFFFFFFE enforces nLockTime.
-                # Core: CTxIn::MAX_SEQUENCE_NONFINAL (miner.cpp:171).
-                # 0xFFFFFFFF (SEQUENCE_FINAL) would disable nLockTime enforcement.
-                "sequence": 0xFFFFFFFE,
-            },
             "target": target_hex,
             # B8: bits from GetNextWorkRequired (best_block.bits as fallback)
             "bits": f"{bits:08x}",

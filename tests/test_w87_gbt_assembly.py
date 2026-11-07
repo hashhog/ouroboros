@@ -168,47 +168,13 @@ class TestB1PreviousBlockHash(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# B2 — coinbase sequence
+# B2/B3 — coinbase sequence and locktime (nonfinal sequence, locktime
+# height - 1, miner.cpp:171,196) are properties of the coinbase Core builds
+# inside CreateNewBlock. getblocktemplate never emits a coinbasetxn object
+# (rpc/mining.cpp), so the template has nothing to carry them; the old
+# {locktime, sequence} stub was removed to match Core. See
+# tests/test_gbt_coinbase_fields_core_shape.py.
 # ---------------------------------------------------------------------------
-
-class TestB2CoinbaseSequence(unittest.TestCase):
-    """B2: coinbasetxn.sequence = 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL).
-
-    Core miner.cpp:171: CTxIn::MAX_SEQUENCE_NONFINAL = SEQUENCE_FINAL - 1.
-    0xFFFFFFFF (SEQUENCE_FINAL) disables nLockTime enforcement.
-    """
-
-    def test_coinbase_sequence_is_max_nonfinal(self):
-        result = _build_rpc({}, [])
-        seq = result["coinbasetxn"]["sequence"]
-        self.assertEqual(seq, 0xFFFFFFFE,
-                         "coinbasetxn.sequence must be MAX_SEQUENCE_NONFINAL (0xFFFFFFFE)")
-        self.assertNotEqual(seq, 0xFFFFFFFF,
-                            "coinbasetxn.sequence must NOT be SEQUENCE_FINAL (0xFFFFFFFF)")
-
-
-# ---------------------------------------------------------------------------
-# B3 — coinbase locktime
-# ---------------------------------------------------------------------------
-
-class TestB3CoinbaseLocktime(unittest.TestCase):
-    """B3: coinbasetxn.locktime = next_height - 1.
-
-    Core miner.cpp:196: coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1).
-    """
-
-    def test_coinbase_locktime_is_next_height_minus_one(self):
-        best_height = 199
-        result = _build_rpc({}, [], best_height=best_height)
-        expected_locktime = best_height  # next_height - 1 = (best_height+1) - 1 = best_height
-        lt = result["coinbasetxn"]["locktime"]
-        self.assertEqual(lt, expected_locktime,
-                         f"coinbasetxn.locktime must be {expected_locktime} (next_height - 1)")
-
-    def test_coinbase_locktime_not_zero(self):
-        result = _build_rpc({}, [], best_height=100)
-        self.assertNotEqual(result["coinbasetxn"]["locktime"], 0,
-                            "coinbasetxn.locktime must not be 0 (was hardcoded 0 before B3 fix)")
 
 
 # ---------------------------------------------------------------------------
@@ -752,7 +718,7 @@ class TestEmptyMempoolTemplate(unittest.TestCase):
 
     REQUIRED_FIELDS = {
         "version", "previousblockhash", "transactions", "coinbaseaux",
-        "coinbasevalue", "coinbasetxn", "target", "bits", "curtime",
+        "coinbasevalue", "target", "bits", "curtime",
         "height", "mintime", "mutable", "noncerange", "sigoplimit",
         "sizelimit", "weightlimit", "default_witness_commitment",
     }
@@ -762,10 +728,9 @@ class TestEmptyMempoolTemplate(unittest.TestCase):
         missing = self.REQUIRED_FIELDS - result.keys()
         self.assertFalse(missing, f"Missing required GBT fields: {missing}")
 
-    def test_coinbasetxn_subfields(self):
+    def test_coinbasetxn_not_emitted(self):
         result = _build_rpc({}, [])
-        self.assertIn("locktime", result["coinbasetxn"])
-        self.assertIn("sequence", result["coinbasetxn"])
+        self.assertNotIn("coinbasetxn", result)
 
 
 if __name__ == "__main__":

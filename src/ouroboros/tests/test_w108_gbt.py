@@ -276,15 +276,13 @@ class TestG7CoinbaseTxnDataField(unittest.TestCase):
 # Ouroboros: returns both coinbasevalue and coinbasetxn in every response.
 # ---------------------------------------------------------------------------
 class TestG8CoinbaseTxnOrValue(unittest.TestCase):
-    """BUG: both coinbasetxn and coinbasevalue present — BIP-22 violation."""
+    """Fixed: like Core, only coinbasevalue is emitted."""
 
-    def test_both_coinbasetxn_and_coinbasevalue_present(self):
+    def test_only_coinbasevalue_present(self):
         rpc = _make_rpc()
         result = _run_gbt(rpc)
-        has_txn = "coinbasetxn" in result
-        has_val = "coinbasevalue" in result
-        self.assertTrue(has_txn and has_val,
-                        "Both coinbasetxn and coinbasevalue are present — BIP-22 requires only one")
+        self.assertNotIn("coinbasetxn", result)
+        self.assertIn("coinbasevalue", result)
 
 
 # ---------------------------------------------------------------------------
@@ -496,14 +494,12 @@ class TestG15GetMiningInfoMissingFields(unittest.TestCase):
 # Ouroboros: always returns {"flags": ""}
 # ---------------------------------------------------------------------------
 class TestG16CoinbaseAuxFlags(unittest.TestCase):
-    """BUG: coinbaseaux contains spurious 'flags' key — Core returns {}."""
+    """Fixed: coinbaseaux has no 'flags' key — Core returns {}."""
 
-    def test_coinbaseaux_has_flags_key(self):
+    def test_coinbaseaux_is_empty_like_core(self):
         rpc = _make_rpc()
         result = _run_gbt(rpc)
-        cb_aux = result.get("coinbaseaux", {})
-        self.assertIn("flags", cb_aux,
-                      "coinbaseaux has spurious 'flags' key (Core returns empty {})")
+        self.assertEqual(result.get("coinbaseaux"), {})
 
 
 # ---------------------------------------------------------------------------
@@ -764,13 +760,12 @@ class TestG24RulesFieldMissingSegwitTaproot(unittest.TestCase):
 class TestG25GenerateToAddressCoinbaseSequence(unittest.TestCase):
     """BUG: generatetoaddress coinbase uses sequence 0xFFFFFFFF not MAX_SEQUENCE_NONFINAL."""
 
-    def test_coinbase_sequence_in_rpc_gbt_is_correct(self):
-        # rpc_getblocktemplate correctly sets sequence to 0xFFFFFFFE (B2 fix)
+    def test_rpc_gbt_has_no_coinbasetxn(self):
+        # Core's getblocktemplate never emits coinbasetxn, so the template
+        # carries no coinbase sequence at all.
         rpc = _make_rpc()
         result = _run_gbt(rpc)
-        cb = result.get("coinbasetxn", {})
-        self.assertEqual(cb.get("sequence"), 0xFFFFFFFE,
-                         "GBT coinbasetxn.sequence should be MAX_SEQUENCE_NONFINAL=0xFFFFFFFE")
+        self.assertNotIn("coinbasetxn", result)
 
     def test_generatetoaddress_coinbase_sequence_is_sequence_final(self):
         # In generatetoaddress the coinbase is built with sequence=0xFFFFFFFF
