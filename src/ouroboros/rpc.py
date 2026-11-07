@@ -1303,6 +1303,7 @@ RPC_WALLET_NOT_SPECIFIED = -19
 RPC_DESERIALIZATION_ERROR = -22      # protocol.h:53 — error parsing or validating structure in raw format
 RPC_CLIENT_NODE_ALREADY_ADDED = -23  # protocol.h:60 — Node is already added
 RPC_CLIENT_NODE_NOT_ADDED = -24      # protocol.h:61 — Node has not been added before
+RPC_VERIFY_REJECTED = -26            # protocol.h:43 — transaction or block was rejected by network rules
 RPC_VERIFY_ERROR = -25               # protocol.h:42 — general error during transaction or block submission
 RPC_VERIFY_ALREADY_IN_UTXO_SET = -27  # protocol.h:44 — transaction already in utxo set
 RPC_CLIENT_NODE_NOT_CONNECTED = -29  # protocol.h:62 — disconnect target not connected
@@ -4357,10 +4358,15 @@ class RPCServer:
         if not success:
             # Map common errors to Bitcoin Core-style reject reasons
             reject_reason = self._map_mempool_error_to_reject_reason(error)
-            raise HTTPException(
-                status_code=400,
-                detail=reject_reason
-            )
+            # Core node/transaction.cpp HandleATMPError: any reject other than
+            # missing inputs is JSONRPCError(RPC_TRANSACTION_REJECTED, -26,
+            # state.ToString()), i.e. "<reject-reason>, <debug-message>".
+            _, reject_message = _reject_reason_and_details(reject_reason)
+            if reject_reason == "missing-inputs":
+                # TX_MISSING_INPUTS -> TransactionError::MISSING_INPUTS
+                # -> RPC_VERIFY_ERROR (-25), as the pre-check above.
+                raise RpcError(RPC_VERIFY_ERROR, "bad-txns-inputs-missingorspent")
+            raise RpcError(RPC_VERIFY_REJECTED, reject_message)
 
         # Core BroadcastTransaction (MEMPOOL_AND_BROADCAST_TO_ALL): "the
         # mempool tracks locally submitted transactions to make a
