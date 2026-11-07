@@ -10525,12 +10525,20 @@ class RPCServer:
         # (a validation verdict or RPC invalidateblock) answers
         # "duplicate-invalid"; a block whose parent is failed is
         # BLOCK_INVALID_PREV "bad-prevblk".  Neither is ever reconnected.
+        #
+        # Both answers come from AcceptBlockHeader, which Core only reaches
+        # after ProcessNewBlock's CheckBlock passed (validation.cpp
+        # ProcessNewBlock), so a block that also fails a context-free check
+        # reports that check's token (a bad-merkle-root block on a failed
+        # parent is "bad-txnmrklroot", not "bad-prevblk").
         _bs = getattr(self.node, "block_sync", None)
         if _bs is not None and hasattr(_bs, "is_block_failed"):
-            if _bs.is_block_failed(block_hash):
-                return "duplicate-invalid"
-            if _bs.is_block_failed(bytes(prev_hash)):
-                return "bad-prevblk"
+            _self_failed = _bs.is_block_failed(block_hash)
+            if _self_failed or _bs.is_block_failed(bytes(prev_hash)):
+                _cb_token = self._check_block_token(decoded_block, block_hash)
+                if _cb_token is not None:
+                    return _cb_token
+                return "duplicate-invalid" if _self_failed else "bad-prevblk"
 
         # Duplicate-submission short-circuit. Core submitblock returns
         # "duplicate" for any block it already has and accepted
@@ -10605,9 +10613,15 @@ class RPCServer:
         # the block is a true orphan. Pattern X + Y closure.
         parent_height = self._resolve_parent_height(db, prev_hash)
         if parent_height is None:
-            return bip22_result_string(
-                f"prev-blk-not-found {prev_hash.hex()[:16]}..."
-            )
+            # Core AcceptBlockHeader: BLOCK_MISSING_PREV "prev-blk-not-found"
+            # (validation.cpp), reached only after CheckBlock passed, so a
+            # context-free failure keeps its own token.  The token used to
+            # carry a hash suffix that bip22_result_string did not recognise,
+            # which turned it into the generic "rejected".
+            _cb_token = self._check_block_token(decoded_block, block_hash)
+            if _cb_token is not None:
+                return _cb_token
+            return "prev-blk-not-found"
 
         new_height = parent_height + 1
         _side_result = await self._attach_side_branch_block(
@@ -10634,6 +10648,30 @@ class RPCServer:
             if _tip_after is None or bytes(_tip_after) != bytes(block_hash):
                 return "inconclusive"
         return _side_result
+
+    def _check_block_token(self, decoded_block, block_hash: bytes) -> str | None:
+        """Core CheckBlock's first reject token for a submitted block, or None.
+
+        Only called on submitblock paths that reject the block anyway
+        (unknown or failed parent, failed block), so it picks the reason and
+        never the verdict.  See ``ouroboros.check_block``.
+        """
+        from ouroboros.check_block import check_block_reject_token
+
+        _tx_validator = getattr(
+            getattr(self.node, "validator", None), "tx_validator", None
+        )
+        _check_tx = getattr(_tx_validator, "_check_structure", None)
+        try:
+            return check_block_reject_token(
+                decoded_block,
+                bytes(block_hash),
+                getattr(self.node, "network", "mainnet"),
+                check_transaction=_check_tx if callable(_check_tx) else None,
+            )
+        except Exception as exc:  # never invent a reason from a fault
+            logger.debug("submitblock: CheckBlock token check failed: %s", exc)
+            return None
 
     async def rpc_submitheader(self, hexdata: str) -> None:
         """
