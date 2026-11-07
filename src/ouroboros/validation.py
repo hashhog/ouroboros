@@ -5,6 +5,7 @@ import logging
 import os
 import struct
 import time as _time
+from ouroboros import clock as _clock
 
 from ouroboros.database import Block, BlockchainDatabase, Transaction, TxIn, TxOut
 from ouroboros.fatal import InternalValidationError, is_system_error, retry_once
@@ -1691,7 +1692,7 @@ class BlockValidator:
         # mirrors that: when > 0 it overrides the wall clock for deterministic
         # testing; the default sentinel 0 reads time.time() exactly as before,
         # so production behaviour is byte-identical (default-preserving).
-        now = current_time if current_time > 0 else int(_time.time())
+        now = current_time if current_time > 0 else int(_clock.now())
         if block.timestamp > now + MAX_FUTURE_BLOCK_TIME:
             return False
 

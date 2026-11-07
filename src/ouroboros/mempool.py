@@ -11,7 +11,7 @@ import os
 import random
 import struct
 import threading
-import time
+from ouroboros import clock as _clock
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -1955,7 +1955,7 @@ class OrphanPool:
             return False
         if len(self.orphans) >= MAX_ORPHAN_TRANSACTIONS:
             self._evict_random()
-        expiry = time.time() + ORPHAN_EXPIRY_SECONDS
+        expiry = _clock.now() + ORPHAN_EXPIRY_SECONDS
         self.orphans[wtxid] = (tx, expiry, missing_parents)
         txid = tx.get_txid()
         self.txid_to_wtxids.setdefault(txid, set()).add(wtxid)
@@ -2040,7 +2040,7 @@ class OrphanPool:
 
     def expire(self) -> int:
         """Remove expired orphans.  Returns count removed."""
-        now = time.time()
+        now = _clock.now()
         expired = [
             wtxid for wtxid, (_, exp, _) in self.orphans.items()
             if now >= exp
@@ -2198,7 +2198,7 @@ class Mempool:
         # blockSinceLastRollingFeeBump is set True on each block; when True the
         # fee can decay; when False (eviction just happened) it is locked.
         self._rolling_minimum_fee_rate: float = 0.0   # sat/kvB as float
-        self._last_rolling_fee_update: float = time.time()
+        self._last_rolling_fee_update: float = _clock.now()
         self._block_since_last_rolling_fee_bump: bool = False
 
         # Reentrant lock for snapshot isolation (e.g. getblocktemplate).
@@ -2312,7 +2312,7 @@ class Mempool:
         if not self._block_since_last_rolling_fee_bump or self._rolling_minimum_fee_rate == 0.0:
             return self._rolling_minimum_fee_rate
 
-        now = time.time()
+        now = _clock.now()
         if now > self._last_rolling_fee_update + 10:
             halflife = ROLLING_FEE_HALFLIFE
             usage = self.current_size
@@ -3132,7 +3132,7 @@ class Mempool:
             fee=fee,
             fee_rate=fee_rate,
             size=tx_size,
-            time_added=time.time(),
+            time_added=_clock.now(),
             height_added=height,
             sigop_cost=tx_sigop_cost,
             ancestor_count=len(ancestors) + 1,
@@ -3909,7 +3909,7 @@ class Mempool:
             return self._expire_old_transactions_inner(current_time)
 
     def _expire_old_transactions_inner(self, current_time: float | None = None) -> int:
-        now = current_time or time.time()
+        now = current_time or _clock.now()
         cutoff = now - (MEMPOOL_EXPIRY_HOURS * 3600)
 
         # Collect directly-expired transactions (those added before cutoff).
@@ -4130,7 +4130,7 @@ class Mempool:
         # Mirrors Bitcoin Core CTxMemPool::removeForBlock() lines 426-427:
         #   lastRollingFeeUpdate = GetTime();
         #   blockSinceLastRollingFeeBump = true;
-        self._last_rolling_fee_update = time.time()
+        self._last_rolling_fee_update = _clock.now()
         self._block_since_last_rolling_fee_bump = True
 
     def _recount_after_batch_removal(
@@ -5211,7 +5211,7 @@ class Mempool:
         )
         entry = MempoolEntry(
             tx=new_tx, fee=new_fee, fee_rate=new_fee_rate,
-            size=new_size, time_added=time.time(), height_added=height,
+            size=new_size, time_added=_clock.now(), height_added=height,
             ancestor_count=len(ancestors) + 1,
             ancestor_size=ancestor_size + new_size,
             descendant_size=new_size,
