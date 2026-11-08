@@ -6499,8 +6499,6 @@ class RPCServer:
         """
         wallet = self._require_wallet()
 
-        balance = await wallet.get_balance()
-
         # Use key pool size if available, otherwise count addresses
         try:
             keypool_size = wallet.get_keypool_size()
@@ -6527,9 +6525,8 @@ class RPCServer:
             "walletname": wallet.name,
             "walletversion": 169900,
             "format": "sqlite",
-            "balance": balance / 1e8,
-            "unconfirmed_balance": 0.0,
-            "immature_balance": 0.0,
+            # No balance / unconfirmed_balance / immature_balance: Core v31
+            # getwalletinfo has none (balances are getbalances' job).
             "txcount": len(getattr(wallet, "_tx_history", {}) or {}),
             "keypoolsize": keypool_size,
             "paytxfee": 0.0,
