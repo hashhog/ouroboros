@@ -11956,7 +11956,7 @@ class RPCServer:
                 asyncio.ensure_future(self.node.stop())
 
         asyncio.get_event_loop().call_later(0.5, _trigger_shutdown)
-        return "Ouroboros server stopping"
+        return "Bitcoin Core stopping"  # Core: "%s stopping" % CLIENT_NAME
 
     async def rpc_setmocktime(self, timestamp: Any) -> None:
         """Set the local time to given timestamp (-regtest only).
