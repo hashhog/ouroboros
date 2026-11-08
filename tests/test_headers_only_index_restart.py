@@ -264,3 +264,27 @@ def test_header_on_an_invalidated_stored_block_is_not_restored(tmp_path):
     assert g1 not in bs._fork_headers and h1 not in bs._fork_headers
     assert all(h not in (h1, g1) for h, _ in bs._validated_headers)
     assert _headers(fresh) == TIP - 1
+
+
+def test_p2p_header_after_a_connected_prefix_extends_the_queue(tmp_path):
+    """Headers h1, h2 on the tip, submitblock(h1), then a peer announces h3
+    (child of h2).  Core: h3 extends the best header chain, so it is
+    accepted and ``headers`` becomes tip+2 (tip h1).  The headers-receive
+    path must not treat the queue [h1, h2] as stale and clear it, which
+    would leave h3 unconnecting."""
+    from ouroboros.p2p_messages import BlockHeader, HeadersMessage, NetworkMessage
+
+    bdb, server, hashes = _setup(tmp_path)
+    (raw1, h1), (_raw2, h2) = _two_headers_on_tip(server, hashes)
+    assert asyncio.run(server.rpc_submitblock(raw1.hex())) is None
+    raw3, h3 = _block(h2, TIP + 3, b"\x94\xc5")
+    hdr3, _ = BlockHeader.from_payload(raw3[:80])
+    msg = NetworkMessage(command="headers",
+                         payload=HeadersMessage(headers=[hdr3]).serialize_payload(),
+                         magic=0)
+    peer = MagicMock()
+    peer.host, peer.port = "127.0.0.1", 18444
+    bs = server.node.block_sync
+    asyncio.run(bs.handle_headers(msg, peer))
+    assert [h for h, _ in bs._validated_headers] == [h2, h3]
+    assert _headers(server) == TIP + 3
