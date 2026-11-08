@@ -13762,11 +13762,19 @@ class RPCServer:
                 _add(bytes(h), bytes(prev) if prev is not None else None, None, h in fork_bytes)
 
             queue = list(getattr(bs, "_validated_headers", ()) or ())
-            queue_hashes = {bytes(h) for h, _ in queue}
-            if queue and queue[0][1] is not None and bytes(queue[0][1].prev_blockhash) == best_hash:
-                # Linear and anchored on the active tip: slot i is height tip+1+i.
+            above = getattr(type(bs), "_index_above_tip", None)
+            start = above(queue, best_hash) if callable(above) else (
+                0 if queue and queue[0][1] is not None
+                and bytes(queue[0][1].prev_blockhash) == best_hash else None)
+            if start is not None:
+                # Linear and anchored on the active tip (after any prefix a
+                # submitblock connected): slot i is height tip+1+(i-start).
+                queue = queue[start:]
+                queue_hashes = {bytes(h) for h, _ in queue}
                 for i, (h, hdr) in enumerate(queue):
                     _add(bytes(h), bytes(hdr.prev_blockhash), best_height + 1 + i, False)
+            else:
+                queue_hashes = {bytes(h) for h, _ in queue}
 
         def _on_active(h: bytes, height: int | None) -> bool:
             return height is not None and _active_at(height) == h

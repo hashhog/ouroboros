@@ -208,21 +208,31 @@ def test_tampered_header_file_entries_are_dropped(tmp_path):
     assert _disp(h1) not in _tips(fresh)
 
 
-def test_header_whose_block_is_stored_is_not_restored_as_headers_only(tmp_path):
-    """A header whose block arrived before the restart is not re-listed as
-    headers-only: the block store already answers for it."""
+def test_block_of_first_header_arrives_rest_stay_headers_only(tmp_path):
+    """Headers h1, h2 on the tip, then submitblock(h1) (which does not pop
+    the header queue).  Core: h1 now has data and is the tip; h2 is still a
+    headers-only entry and ``m_best_header``.  So ``headers`` stays tip+1,
+    getchaintips lists h2 as headers-only, the sync layer's queue prune keeps
+    h2, and all of that holds after a restart; h1 is not restored as a
+    headers-only entry because its block is connected."""
     bdb, server, hashes = _setup(tmp_path)
-    (raw1, h1), _second = _two_headers_on_tip(server, hashes)
+    (raw1, h1), (_raw2, h2) = _two_headers_on_tip(server, hashes)
     assert asyncio.run(server.rpc_submitblock(raw1.hex())) is None
     assert bdb.get_best_block() == (h1, TIP + 1)
-    server.node.block_sync._validated_headers = [
-        e for e in server.node.block_sync._validated_headers if e[0] != h1]
-    saver = getattr(server.node.block_sync, "save_header_index", None)
+    want = {"height": TIP + 2, "hash": _disp(h2), "branchlen": 1,
+            "status": "headers-only"}
+    assert _headers(server) == TIP + 2
+    assert _tips(server).get(_disp(h2)) == want
+    bs = server.node.block_sync
+    bs._prune_validated_headers()
+    assert [h for h, _ in bs._validated_headers] == [h2]
+    saver = getattr(bs, "save_header_index", None)
     if saver is not None:
         saver()
     fresh = _server(bdb, str(tmp_path))
-    assert all(h != h1 for h, _ in fresh.node.block_sync._validated_headers)
+    assert [h for h, _ in fresh.node.block_sync._validated_headers] == [h2]
     assert _headers(fresh) == TIP + 2
+    assert _tips(fresh).get(_disp(h2)) == want
 
 
 def test_header_on_an_invalidated_stored_block_is_not_restored(tmp_path):

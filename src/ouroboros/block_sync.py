@@ -1409,11 +1409,18 @@ class BlockSync:
         except Exception:
             tip_hash = None
         queued = {h for h, _ in self._validated_headers}
+        saved_queue = []
         for hx in queue_hex:
             parsed = _parse(hx)
             if parsed is None:
                 break
-            h, hdr = parsed
+            saved_queue.append(parsed)
+        if not self._validated_headers:
+            # Leading entries whose blocks were connected before the save
+            # (up to the tip) are not headers-only any more.
+            start = self._index_above_tip(saved_queue, tip_hash)
+            saved_queue = saved_queue[start:] if start is not None else []
+        for h, hdr in saved_queue:
             anchor = self._validated_headers[-1][0] if self._validated_headers else tip_hash
             if anchor is None or bytes(hdr.prev_blockhash) != anchor or h in queued:
                 break
@@ -1460,8 +1467,9 @@ class BlockSync:
         if queue:
             try:
                 tip_hash, _ = self.db.get_best_block()
-                if queue[0][1] is not None and bytes(queue[0][1].prev_blockhash) == bytes(tip_hash):
-                    best = max(best, int(tip_height) + len(queue))
+                start = self._index_above_tip(queue, bytes(tip_hash))
+                if start is not None:
+                    best = max(best, int(tip_height) + len(queue) - start)
             except Exception:
                 pass
         for h in list(self._fork_headers):
@@ -7190,6 +7198,32 @@ class BlockSync:
         _bh, hdr = self._validated_headers[0]
         return getattr(hdr, "prev_blockhash", None) == current_hash
 
+    @staticmethod
+    def _index_above_tip(queue, tip_hash) -> int | None:
+        """Index of the first entry of the linear header *queue* that lies
+        above *tip_hash*, or ``None`` if the queue does not build on it.
+
+        0 when slot 0 extends the tip.  When the tip IS a queue entry (its
+        block was connected by a path that does not pop the queue, e.g.
+        ``submitblock``), the entries up to it are its ancestors by the
+        queue's own prev links, so they are connected and the rest are
+        still headers-only (Core keeps them in the block index and
+        ``m_best_header`` stays at the queue end).  Walkability through the
+        queue, not ``has_block_hash``, decides; see
+        ``_queue_anchored_to_tip``.
+        """
+        if not queue:
+            return 0
+        if tip_hash is None:
+            return None
+        first = queue[0][1]
+        if first is not None and getattr(first, "prev_blockhash", None) == tip_hash:
+            return 0
+        for k, (h, _hdr) in enumerate(queue):
+            if h == tip_hash:
+                return k + 1
+        return None
+
     def _prune_validated_headers(self):
         """Drop the queue if it no longer anchors to the active chain tip.
 
@@ -7211,6 +7245,15 @@ class BlockSync:
         if not self._validated_headers:
             return
         if not self._queue_anchored_to_tip():
+            try:
+                _tip, _ = self.db.get_best_block()
+            except Exception:
+                _tip = None
+            start = self._index_above_tip(self._validated_headers, _tip)
+            if start is not None:
+                # The tip is a queue entry: drop only its connected prefix.
+                self._validated_headers = self._validated_headers[start:]
+                return
             try:
                 current_hash, _ = self.db.get_best_block()
                 tip_short = current_hash.hex()[:16]
