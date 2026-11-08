@@ -1321,6 +1321,163 @@ class BlockSync:
             logger.info(f"Restored {len(roots)} invalidateblock root(s) from {path}")
         return len(roots)
 
+    # Cap on the tip-anchored queue prefix written by save_header_index.  A
+    # PREFIX of an anchored queue is still anchored, so truncation never
+    # leaves a gap; during IBD the dropped tail is re-learned from peers.
+    HEADER_INDEX_PERSIST_MAX = 4096
+
+    def save_header_index(self, path: str | None = None) -> None:
+        """Atomically write the headers-only block-index entries to *path*.
+
+        Core keeps every accepted header in the on-disk block index
+        (validation.cpp ChainstateManager::AcceptBlockHeader ->
+        BlockManager::AddToBlockIndex, flushed by WriteBlockIndexDB), so a
+        header that arrived without its block is still known after a restart:
+        getchaintips lists it as ``headers-only`` and getblockchaininfo counts
+        it in ``headers`` (m_best_header).  Here those entries live in two
+        memory-only stores, ``_validated_headers`` and ``_fork_headers``; this
+        writes both (queue first, in order) as 80-byte header hex.
+        """
+        import json as _json
+        path = path or getattr(self, "header_index_path", None)
+        if not path:
+            return
+        queue = [hdr for _h, hdr in self._validated_headers[: self.HEADER_INDEX_PERSIST_MAX]]
+        rows = {
+            "queue": [hdr.serialize().hex() for hdr in queue if hdr is not None],
+            "fork": [hdr.serialize().hex() for hdr in list(self._fork_headers.values())],
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            _json.dump(rows, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
+    def load_header_index(self, path: str) -> int:
+        """Restore the headers-only entries ``save_header_index`` wrote.
+
+        Core's LoadBlockIndex reloads them with the rest of the block index.
+        Each header is re-checked against what is known NOW: one whose block
+        is already stored, or that is (or descends from) a failed block, or
+        that fails proof of work, or whose parent is unknown, is dropped.
+        Queue headers are re-queued only while they still extend the active
+        tip; anything else goes through ``_store_fork_header``, the same
+        admission the P2P and submitheader paths use.  Missing file = none.
+        Returns the number of headers restored.
+        """
+        import json as _json
+        self.header_index_path = path
+        try:
+            with open(path) as f:
+                rows = _json.load(f)
+            queue_hex = list(rows.get("queue", []))
+            fork_hex = list(rows.get("fork", []))
+        except FileNotFoundError:
+            return 0
+        except Exception as e:
+            logger.warning(f"header-index file {path} unreadable: {e}")
+            return 0
+
+        def _parse(hx):
+            try:
+                raw = bytes.fromhex(hx)
+                if len(raw) != 80:
+                    return None
+                hdr, _ = BlockHeader.from_payload(raw)
+                return hashlib.sha256(hashlib.sha256(raw).digest()).digest(), hdr
+            except Exception:
+                return None
+
+        def _stored(h: bytes) -> bool:
+            try:
+                return bool(self.db.has_block_hash(h))
+            except Exception:
+                return False
+
+        def _admissible(h: bytes, hdr) -> bool:
+            if _stored(h) or self.is_block_failed(h):
+                return False
+            if self.is_block_failed(bytes(hdr.prev_blockhash)):
+                return False
+            return type(self)._header_meets_pow(hdr)
+
+        restored = 0
+        try:
+            tip_hash, _tip_height = self.db.get_best_block()
+            tip_hash = bytes(tip_hash)
+        except Exception:
+            tip_hash = None
+        queued = {h for h, _ in self._validated_headers}
+        for hx in queue_hex:
+            parsed = _parse(hx)
+            if parsed is None:
+                break
+            h, hdr = parsed
+            anchor = self._validated_headers[-1][0] if self._validated_headers else tip_hash
+            if anchor is None or bytes(hdr.prev_blockhash) != anchor or h in queued:
+                break
+            if not _admissible(h, hdr):
+                break
+            self._validated_headers.append((h, hdr))
+            queued.add(h)
+            restored += 1
+
+        pending = [p for p in (_parse(hx) for hx in fork_hex) if p is not None]
+        progress = True
+        while pending and progress:
+            progress = False
+            rest = []
+            for h, hdr in pending:
+                prev = bytes(hdr.prev_blockhash)
+                if not (_stored(prev) or prev in self._fork_headers or prev in queued):
+                    rest.append((h, hdr))
+                    continue
+                progress = True
+                if h in self._fork_headers or h in queued or not _admissible(h, hdr):
+                    continue
+                self._store_fork_header(h, hdr, prev)
+                if h in self._fork_headers:
+                    restored += 1
+            pending = rest
+        if restored:
+            logger.info(f"Restored {restored} headers-only block-index entr(ies) from {path}")
+        return restored
+
+    def best_header_height(self, tip_height: int) -> int:
+        """Height of Core's ``m_best_header`` among the header stores.
+
+        Core: the most-work block-index entry not marked failed
+        (validation.cpp ChainstateManager::AcceptBlockHeader via
+        AddToBlockIndex, RecalculateBestHeader), never below the active tip.
+        On one network every header in these stores shares the active
+        chain's difficulty rule, so most work is the greatest height; the
+        failed check covers the entry and its recorded parent like
+        ``_store_fork_header``'s admission.
+        """
+        best = int(tip_height)
+        queue = self._validated_headers
+        if queue:
+            try:
+                tip_hash, _ = self.db.get_best_block()
+                if queue[0][1] is not None and bytes(queue[0][1].prev_blockhash) == bytes(tip_hash):
+                    best = max(best, int(tip_height) + len(queue))
+            except Exception:
+                pass
+        for h in list(self._fork_headers):
+            if self.is_block_failed(h):
+                continue
+            prev = self._fork_header_prev.get(h)
+            if prev is not None and self.is_block_failed(bytes(prev)):
+                continue
+            try:
+                height = self._fork_tip_height(h)
+            except Exception:
+                height = None
+            if height is not None and height > best:
+                best = height
+        return best
+
     def reconsider_from_rpc(self, block_hash: bytes, get_prev=None) -> set:
         """RPC ``reconsiderblock`` -> Core ``ResetBlockFailureFlags``: clear
         the failure marks of *block_hash*, of every failed descendant and of

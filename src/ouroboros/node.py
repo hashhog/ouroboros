@@ -749,6 +749,14 @@ class BitcoinNode:
                     os.path.join(self.data_dir, "invalidated_blocks.json"))
             except Exception as e:
                 logger.warning(f"could not load invalidated_blocks.json: {e}")
+            # Headers accepted without their blocks are block-index entries in
+            # Core and survive a restart (LoadBlockIndex); restore them after
+            # the failed set so a header under an invalidated block is not.
+            try:
+                self.block_sync.load_header_index(
+                    os.path.join(self.data_dir, "headers_only.json"))
+            except Exception as e:
+                logger.warning(f"could not load headers_only.json: {e}")
             # Wire the tip-change notifier (Core WaitTipChanged) so the IBD/P2P
             # connect drain and the reorg path can wake the wait-family RPCs.
             try:
@@ -1347,6 +1355,10 @@ class BitcoinNode:
         try:
             # Stop block sync
             if self.block_sync:
+                try:
+                    self.block_sync.save_header_index()
+                except Exception as e:
+                    logger.warning(f"could not save headers_only.json: {e}")
                 logger.info("Stopping block synchronization...")
                 await self.block_sync.stop()
 

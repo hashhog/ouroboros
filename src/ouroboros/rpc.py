@@ -2916,11 +2916,7 @@ class RPCServer:
         target_hex = f"{target_int:064x}"
 
         # Get header count (may differ from blocks during sync)
-        headers_count = best_height
-        if hasattr(self.node, 'sync_manager') and self.node.sync_manager:
-            sm = self.node.sync_manager
-            if hasattr(sm, 'header_height'):
-                headers_count = max(sm.header_height, best_height)
+        headers_count = self._best_header_height(best_height)
 
         # Estimate size on disk — use cached estimate (TTL 30s) to avoid
         # expensive os.walk on every getblockchaininfo call during IBD.
@@ -3316,10 +3312,7 @@ class RPCServer:
 
         # Header tip height — max with best_height so the invariant
         # best_header_height >= tip_height holds at all times.
-        headers_count = best_height
-        sm = getattr(self.node, 'sync_manager', None)
-        if sm is not None and hasattr(sm, 'header_height'):
-            headers_count = max(sm.header_height, best_height)
+        headers_count = self._best_header_height(best_height)
 
         # v1: ouroboros doesn't track a distinct header-tip hash;
         # returning tip_hash is correct when caught up and acceptable
@@ -8781,6 +8774,27 @@ class RPCServer:
         "block-script-verify-flag-failed",
     )
 
+    def _best_header_height(self, best_height: int) -> int:
+        """Height of Core's ``m_best_header`` (getblockchaininfo ``headers``,
+        rpc/blockchain.cpp): the most-work non-failed block-index entry,
+        headers-only ones included, never below the active tip.
+
+        The old code read ``sync_manager.header_height``, an attribute that
+        does not exist, so ``headers`` always equalled ``blocks``.
+        """
+        bs = getattr(self.node, "block_sync", None)
+        fn = getattr(bs, "best_header_height", None)
+        if fn is None:
+            return best_height
+        try:
+            height = fn(best_height)
+            if not isinstance(height, int) or isinstance(height, bool):
+                return best_height
+            return max(int(best_height), height)
+        except Exception as e:
+            logger.debug(f"best header height unavailable: {e}")
+            return best_height
+
     def _chaintips_failed_path(self) -> str | None:
         data_dir = getattr(getattr(self, "node", None), "data_dir", None)
         if not isinstance(data_dir, str) or not data_dir:
@@ -10976,6 +10990,14 @@ class RPCServer:
                     block_hash[::-1].hex()[:16],
                     prev_hash_display[:16],
                 )
+            # Core writes the new index entry to disk with the block index;
+            # write it now so it survives a restart that skips the clean
+            # shutdown save in BitcoinNode.stop.
+            if hasattr(block_sync, "save_header_index"):
+                try:
+                    block_sync.save_header_index()
+                except Exception as e:
+                    logger.warning(f"submitheader: could not persist header index: {e}")
 
         return None
 
@@ -20123,11 +20145,7 @@ class RPCServer:
 
         # Header height (best header seen so far), -1 if none.  Mirrors
         # getblockchaininfo's header-count derivation.
-        headers = best_height
-        if hasattr(self.node, 'sync_manager') and self.node.sync_manager:
-            sm = self.node.sync_manager
-            if hasattr(sm, 'header_height'):
-                headers = max(sm.header_height, best_height)
+        headers = self._best_header_height(best_height)
         if headers is None:
             headers = -1
 
