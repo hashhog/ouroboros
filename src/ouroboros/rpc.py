@@ -10892,6 +10892,18 @@ class RPCServer:
             # The old label advertised a rule this code never evaluated.
             raise RpcError(RPC_VERIFY_ERROR, "high-hash")
 
+        # --- Step 4a: bad-prevblk -------------------------------------------
+        # Core AcceptBlockHeader (validation.cpp): after CheckBlockHeader and
+        # the prev lookup, a parent with BLOCK_FAILED_MASK set (invalidateblock
+        # or a failed connect, or a descendant of one) rejects the header as
+        # BLOCK_INVALID_PREV "bad-prevblk" -- BEFORE ContextualCheckBlockHeader,
+        # so it also pre-empts the bad-diffbits evaluation below, which cannot
+        # resolve an off-active-chain parent.
+        _pbs = getattr(self.node, "block_sync", None)
+        if _pbs is not None and hasattr(_pbs, "is_block_failed"):
+            if _pbs.is_block_failed(bytes(prev_hash)):
+                raise RpcError(RPC_VERIFY_ERROR, "bad-prevblk")
+
         # --- Step 4b: bad-diffbits -----------------------------------------
         # Core's FIRST ContextualCheckBlockHeader gate — nBits must equal
         # GetNextWorkRequired(pindexPrev) (validation.cpp:4088-4089).  Runs
