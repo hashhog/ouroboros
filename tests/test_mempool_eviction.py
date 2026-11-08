@@ -269,8 +269,10 @@ class TestGetMinFee:
         Use a large pool where usage > sizelimit/2 to avoid halflife acceleration.
         """
         pool = _pool(max_size=300_000_000)
-        # Set usage to 75% of max_size so no halflife acceleration applies
-        pool.current_size = int(300_000_000 * 0.75)
+        # Set usage to 75% of max_size so no halflife acceleration applies.
+        # GetMinFee compares Core's DynamicMemoryUsage() with the limit; the
+        # pool's per-entry part of that figure is _core_usage.
+        pool._core_usage = int(300_000_000 * 0.75)
         pool._rolling_minimum_fee_rate = 1_000_000.0  # very high
         pool._block_since_last_rolling_fee_bump = True
         # Simulate 12 hours elapsed = exactly one halflife → ~50% decay
@@ -309,7 +311,7 @@ class TestGetMinFee:
         but is below INCREMENTAL_RELAY_FEE.
         """
         pool = _pool(max_size=300_000_000)
-        pool.current_size = int(300_000_000 * 0.75)  # avoid halflife acceleration
+        pool._core_usage = int(300_000_000 * 0.75)  # avoid halflife acceleration
         # Set rolling rate lower than INCREMENTAL_RELAY_FEE but above threshold (50)
         pool._rolling_minimum_fee_rate = 60.0
         pool._block_since_last_rolling_fee_bump = True
@@ -324,7 +326,7 @@ class TestGetMinFee:
     def test_halflife_acceleration_quarter(self):
         """Gate 7: halflife divides by 4 when usage < sizelimit/4."""
         pool = _pool(max_size=1_000_000)
-        pool.current_size = 100_000  # 10% of 1MB = well under 25%
+        pool._core_usage = 100_000  # 10% of 1MB = well under 25%
         pool._rolling_minimum_fee_rate = 1_000_000.0
         pool._block_since_last_rolling_fee_bump = True
         # Simulate ROLLING_FEE_HALFLIFE / 4 seconds elapsed
@@ -341,7 +343,7 @@ class TestGetMinFee:
     def test_halflife_acceleration_half(self):
         """Gate 8: halflife divides by 2 when sizelimit/4 <= usage < sizelimit/2."""
         pool = _pool(max_size=1_000_000)
-        pool.current_size = 300_000  # 30% = between 25% and 50%
+        pool._core_usage = 300_000  # 30% = between 25% and 50%
         pool._rolling_minimum_fee_rate = 1_000_000.0
         pool._block_since_last_rolling_fee_bump = True
         elapsed = ROLLING_FEE_HALFLIFE / 2

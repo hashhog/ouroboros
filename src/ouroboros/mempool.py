@@ -7,6 +7,7 @@ limits, and standardness checks.
 """
 
 import logging
+import math
 import os
 import random
 import struct
@@ -75,6 +76,89 @@ DEFAULT_MIN_RELAY_TX_FEE = 100  # sat/kvB (Core DEFAULT_MIN_RELAY_TX_FEE)
 DEFAULT_INCREMENTAL_RELAY_FEE = 100  # sat/kvB (Core DEFAULT_INCREMENTAL_RELAY_FEE)
 # Rolling fee halflife — seconds (txmempool.h:212)
 ROLLING_FEE_HALFLIFE = 60 * 60 * 12  # 12 hours = 43200 s
+
+
+# ── Core's CTxMemPool::DynamicMemoryUsage() (txmempool.cpp:778) ──────────────
+# -maxmempool bounds this number in Core (TrimToSize, LimitMempoolSize), and
+# getmempoolinfo reports it as ``usage``.  It is Core's own accounting of its
+# C++ structures on x86_64 with glibc, so it is modelled byte for byte here:
+# a node that trimmed on any other measure keeps a different set of
+# transactions under the same -maxmempool.  The constants were measured
+# against Core 31.1 regtest (hotbuns tools/core_mempool_usage_probe.py and its
+# recorded output; the shapes are re-checked in
+# tests/test_core_dynamic_memory_usage.py).
+
+# sizeof(CTxIn) / sizeof(CTxOut) (CScript is a 40-byte prevector<36>).
+CORE_SIZEOF_TXIN = 112
+CORE_SIZEOF_TXOUT = 48
+# Per transaction alone in its cluster: the mapTx node
+# (MallocUsage(sizeof(CTxMemPoolEntry) + 9 pointers)), the TxGraph Entry, the
+# SingletonClusterImpl and one m_main_chunkindex node.
+CORE_SINGLETON_ENTRY_USAGE = 632
+# SingletonClusterImpl: MallocUsage(48) + sizeof(unique_ptr) (txgraph.cpp).
+CORE_SINGLETON_CLUSTER_USAGE = 72
+# GenericClusterImpl: MallocUsage(104) + sizeof(unique_ptr) (txgraph.cpp).
+CORE_GENERIC_CLUSTER_USAGE = 136
+# One std::set node of TxGraph's m_main_chunkindex, per chunk.
+CORE_CHUNKINDEX_NODE_USAGE = 64
+# One indirectmap node of mapNextTx, per spent outpoint.
+CORE_MAPNEXTTX_NODE_USAGE = 64
+# sizeof(std::pair<Wtxid, TxHandle>), the txns_randomized element.
+CORE_TXNS_RANDOMIZED_ELEM = 40
+
+
+def _llround(x: float) -> int:
+    """C llround for a non-negative rate: nearest integer, halves away from 0."""
+    return int(math.floor(x + 0.5))
+
+
+def core_malloc_usage(alloc: int) -> int:
+    """memusage::MallocUsage on 64-bit glibc: ``((alloc + 31) >> 4) << 4``."""
+    return 0 if alloc <= 0 else ((alloc + 31) >> 4) << 4
+
+
+def _core_script_usage(length: int) -> int:
+    """DynamicUsage(CScript): a prevector<36> allocates only past 36 bytes."""
+    return core_malloc_usage(length) if length > 36 else 0
+
+
+def core_entry_usage(tx: Transaction) -> int:
+    """One transaction's share of Core's DynamicMemoryUsage() when it is a
+    singleton cluster: RecursiveDynamicUsage(tx) (core_memusage.h: the vin /
+    vout vectors, scripts past 36 bytes, witness stacks and items), one
+    mapNextTx node per input, and CORE_SINGLETON_ENTRY_USAGE.  Clusters of
+    more than one transaction are corrected by core_cluster_usage_correction.
+    """
+    usage = (CORE_SINGLETON_ENTRY_USAGE
+             + core_malloc_usage(CORE_SIZEOF_TXIN * len(tx.inputs))
+             + core_malloc_usage(CORE_SIZEOF_TXOUT * len(tx.outputs)))
+    for txin in tx.inputs:
+        usage += _core_script_usage(len(txin.script_sig))
+        witness = txin.witness or []
+        # CScriptWitness::stack is a std::vector<std::vector<unsigned char>>.
+        usage += core_malloc_usage(24 * len(witness))
+        for item in witness:
+            usage += core_malloc_usage(len(item))
+        usage += CORE_MAPNEXTTX_NODE_USAGE
+    for txout in tx.outputs:
+        usage += _core_script_usage(len(txout.script_pubkey))
+    return usage
+
+
+def core_cluster_usage_correction(tx_count: int, chunk_count: int) -> int:
+    """TxGraph memory of a cluster of *tx_count* transactions in
+    *chunk_count* chunks (txgraph.cpp GetMainMemoryUsage /
+    GenericClusterImpl::TotalMemoryUsage) less what CORE_SINGLETON_ENTRY_USAGE
+    already counts per transaction.  Zero for a singleton.  A
+    GenericClusterImpl holds m_mapping and m_linearization (4 bytes per
+    transaction each) and a 32-byte DepGraph entry per transaction."""
+    if tx_count <= 1:
+        return 0
+    cluster = (CORE_GENERIC_CLUSTER_USAGE
+               + 2 * core_malloc_usage(4 * tx_count)
+               + core_malloc_usage(32 * tx_count))
+    per_tx_in_basis = CORE_SINGLETON_CLUSTER_USAGE + CORE_CHUNKINDEX_NODE_USAGE
+    return cluster + CORE_CHUNKINDEX_NODE_USAGE * chunk_count - per_tx_in_basis * tx_count
 MEMPOOL_EXPIRY_HOURS = 336  # 14 days
 TX_MAX_STANDARD_VERSION = 3
 
@@ -522,6 +606,11 @@ class ClusterManager:
         self._clusters: dict[int, Cluster] = {}
         # Next cluster ID to assign
         self._next_cluster_id = 0
+        # Clusters whose membership changed since the mempool last updated
+        # its TxGraph usage term (Mempool._cluster_usage_term); a rebuild
+        # renumbers every cluster, so it asks for a full recount instead.
+        self.usage_dirty: set[int] = set()
+        self.usage_reset = False
 
     def _new_cluster_id(self) -> int:
         """Generate a new unique cluster ID."""
@@ -587,6 +676,7 @@ class ClusterManager:
             cluster = Cluster(txids={txid})
             self._clusters[cluster_id] = cluster
             self._tx_to_cluster[txid] = cluster_id
+            self.usage_dirty.add(cluster_id)
             return cluster_id
 
         elif len(neighbor_cluster_ids) == 1:
@@ -596,6 +686,7 @@ class ClusterManager:
             cluster.txids.add(txid)
             cluster.invalidate_cache()
             self._tx_to_cluster[txid] = cluster_id
+            self.usage_dirty.add(cluster_id)
             return cluster_id
 
         else:
@@ -609,6 +700,7 @@ class ClusterManager:
             self._tx_to_cluster[txid] = merged_id
 
             # Merge other clusters into the first
+            self.usage_dirty.update(cluster_ids)
             for cid in cluster_ids[1:]:
                 other_cluster = self._clusters.pop(cid)
                 for other_txid in other_cluster.txids:
@@ -634,6 +726,7 @@ class ClusterManager:
             return
 
         old_cluster.txids.discard(txid)
+        self.usage_dirty.add(old_cluster_id)
 
         if not old_cluster.txids:
             # Cluster is now empty
@@ -665,6 +758,7 @@ class ClusterManager:
                 new_cluster_id = self._new_cluster_id()
                 new_cluster = Cluster(txids=comp)
                 self._clusters[new_cluster_id] = new_cluster
+                self.usage_dirty.add(new_cluster_id)
                 for comp_txid in comp:
                     self._tx_to_cluster[comp_txid] = new_cluster_id
 
@@ -841,6 +935,8 @@ class ClusterManager:
         self._tx_to_cluster.clear()
         self._clusters.clear()
         self._next_cluster_id = 0
+        self.usage_dirty.clear()
+        self.usage_reset = True
 
         # Find all connected components
         remaining = set(self.transactions.keys())
@@ -1885,8 +1981,8 @@ class MempoolEntry:
         Deliberately NOT ``vsize``: vsize is ceil(this / 4), and rounding every
         member up before summing over-counts a cluster by up to 3 weight units
         per transaction.  Also deliberately NOT ``size``: ``size`` is the
-        STRIPPED, witness-less byte count used for the mempool RAM budget
-        (current_size / max_size / _evict_low_fee_txs), which for segwit
+        STRIPPED, witness-less byte count kept as ``current_size`` (the
+        -maxmempool budget is Core's DynamicMemoryUsage(), not this), which for segwit
         transactions is *smaller* than vsize and would under-count the cluster.
 
         Reference: bitcoin-core/src/policy/policy.cpp:390,
@@ -2186,6 +2282,23 @@ class Mempool:
         # Tracking
         self.current_size = 0  # bytes
 
+        # Core DynamicMemoryUsage() accounting (see core_entry_usage): the sum
+        # of core_entry_usage over every entry, plus an emulation of Core's
+        # txns_randomized vector (size and libstdc++ capacity), whose
+        # allocation is part of the figure.  It grows by doubling on
+        # emplace_back, shrinks to fit when under half full and keeps its
+        # capacity on clear() (txmempool.cpp addNewTransaction /
+        # removeUnchecked), so an emptied pool reports 64, not 0.  This, not
+        # current_size, is what max_size bounds.
+        self._core_usage = 0
+        self._txns_randomized_size = 0
+        self._txns_randomized_capacity = 0
+        # TxGraph term of multi-transaction clusters, kept per cluster and
+        # updated only for the clusters the ClusterManager marks dirty, so
+        # reading DynamicMemoryUsage() costs O(changed clusters), not O(pool).
+        self._cluster_usage_corr: dict[int, int] = {}
+        self._cluster_usage_total = 0
+
         # Monotonically increasing mempool sequence number for ZMQ notifications
         # Incremented on every add or remove, providing a total ordering of events
         # Reference: Bitcoin Core txmempool.h m_sequence_number
@@ -2310,12 +2423,12 @@ class Mempool:
     def _get_min_fee_inner(self) -> float:
         """Unlocked implementation of get_min_fee."""
         if not self._block_since_last_rolling_fee_bump or self._rolling_minimum_fee_rate == 0.0:
-            return self._rolling_minimum_fee_rate
+            return float(_llround(self._rolling_minimum_fee_rate))
 
         now = _clock.now()
         if now > self._last_rolling_fee_update + 10:
             halflife = ROLLING_FEE_HALFLIFE
-            usage = self.current_size
+            usage = self._dynamic_memory_usage_inner()
             sizelimit = self.max_size
             if usage < sizelimit / 4:
                 halflife /= 4
@@ -2333,7 +2446,8 @@ class Mempool:
                 self._rolling_minimum_fee_rate = 0.0
                 return 0.0
 
-        return max(self._rolling_minimum_fee_rate, float(DEFAULT_INCREMENTAL_RELAY_FEE))
+        # Core: max(CFeeRate(llround(rollingMinimumFeeRate)), incremental).
+        return float(max(_llround(self._rolling_minimum_fee_rate), DEFAULT_INCREMENTAL_RELAY_FEE))
 
     def _track_package_removed(self, fee_per_kvb: float) -> None:
         """Track the fee rate of an evicted package (txmempool.cpp:853-859).
@@ -3156,6 +3270,7 @@ class Mempool:
             wtxid = txid
         self.wtxid_to_txid[wtxid] = txid
         self.current_size += tx_size
+        self._track_core_usage_added(tx)
 
         # Track spent outputs
         for tx_in in tx.inputs:
@@ -3223,8 +3338,7 @@ class Mempool:
         max_size, lowest-feerate chunks first.  Returns False when *txid*
         itself was trimmed (Core: ``!m_pool.exists(ws.m_hash)`` -> "mempool
         full")."""
-        if self.current_size > self.max_size:
-            self._evict_low_fee_txs(self.current_size - self.max_size)
+        self._trim_to_size(self.max_size)
         return txid in self.transactions
 
     def _get_ancestors(self, tx: Transaction) -> set[bytes]:
@@ -3968,6 +4082,7 @@ class Mempool:
 
         entry = self.transactions[txid]
         self.current_size -= entry.size
+        self._track_core_usage_removed(entry.tx)
 
         # Save children and parents for recounting (before we modify links)
         former_children = set(entry.children)
@@ -4520,8 +4635,7 @@ class Mempool:
             if readded:
                 dropped |= self._link_existing_children(readded)
             dropped |= self._remove_for_reorg_inner(tip_height)
-            if self.current_size > self.max_size:
-                self._evict_low_fee_txs(self.current_size - self.max_size)
+            self._trim_to_size(self.max_size)
         logger.info(
             f"mempool reorg update: re-added {len(readded)}, "
             f"not re-added {failed}, removed {len(dropped)} "
@@ -4597,16 +4711,9 @@ class Mempool:
             return sum(entry.vsize for entry in self.transactions.values())
 
     def get_memory_usage(self) -> int:
-        """getmempoolinfo ``usage``: the existing RAM estimate, unchanged.
-
-        ``rpc_getmempoolinfo`` derived ``usage`` from ``bytes`` (stripped
-        bytes + 200 per entry) when the mempool had no ``get_memory_usage``.
-        ``bytes`` is now Core's vsize total, so the estimate is kept here on
-        the stripped byte count it was always computed from.  It is not
-        Core's DynamicMemoryUsage(); modelling that is separate work.
-        """
-        with self._lock:
-            return self.current_size + len(self.transactions) * 200
+        """getmempoolinfo ``usage``: Core's DynamicMemoryUsage(), the same
+        figure -maxmempool bounds (rpc/mempool.cpp MempoolInfoToJSON)."""
+        return self.dynamic_memory_usage()
 
     def get_mempool_info(self) -> dict:
         """
@@ -5226,6 +5333,7 @@ class Mempool:
         )
         self.transactions[new_txid] = entry
         self.current_size += new_size
+        self._track_core_usage_added(new_tx)
         for inp in new_tx.inputs:
             op_in = (inp.prev_txid, inp.prev_vout)
             self.spent_outputs.add(op_in)
@@ -5274,72 +5382,124 @@ class Mempool:
 
         self.by_fee_rate.insert(left, txid)
 
+    def _track_core_usage_added(self, tx: Transaction) -> None:
+        """Account for an entry entering the pool (Core addNewTransaction)."""
+        self._core_usage += core_entry_usage(tx)
+        # txns_randomized.emplace_back: libstdc++ doubles a full vector.
+        if self._txns_randomized_size == self._txns_randomized_capacity:
+            self._txns_randomized_capacity = max(1, self._txns_randomized_capacity * 2)
+        self._txns_randomized_size += 1
+
+    def _track_core_usage_removed(self, tx: Transaction) -> None:
+        """Account for an entry leaving the pool (Core removeUnchecked)."""
+        self._core_usage -= core_entry_usage(tx)
+        if self._txns_randomized_size > 1:
+            self._txns_randomized_size -= 1
+            if self._txns_randomized_size * 2 < self._txns_randomized_capacity:
+                self._txns_randomized_capacity = self._txns_randomized_size  # shrink_to_fit
+        else:
+            self._txns_randomized_size = 0  # clear() keeps the capacity
+
+    def _dynamic_memory_usage_inner(self) -> int:
+        """Unlocked Core CTxMemPool::DynamicMemoryUsage() (txmempool.cpp:778):
+        the per-entry figures, the txns_randomized allocation, and the TxGraph
+        term of every cluster of more than one transaction."""
+        return (self._core_usage
+                + core_malloc_usage(CORE_TXNS_RANDOMIZED_ELEM * self._txns_randomized_capacity)
+                + self._cluster_usage_term())
+
+    def _cluster_usage_term(self) -> int:
+        """Sum of core_cluster_usage_correction over multi-transaction
+        clusters, refreshed for the clusters changed since the last call."""
+        cm = self._cluster_manager
+        if cm.usage_reset:
+            cm.usage_reset = False
+            cm.usage_dirty.clear()
+            self._cluster_usage_corr.clear()
+            self._cluster_usage_total = 0
+            dirty = [cid for cid, c in cm._clusters.items() if len(c.txids) > 1]
+        else:
+            dirty, cm.usage_dirty = cm.usage_dirty, set()
+        for cid in dirty:
+            self._cluster_usage_total -= self._cluster_usage_corr.pop(cid, 0)
+            cluster = cm._clusters.get(cid)
+            if cluster is not None and len(cluster.txids) > 1:
+                corr = core_cluster_usage_correction(
+                    len(cluster.txids), len(cm.get_chunks(cluster)))
+                self._cluster_usage_corr[cid] = corr
+                self._cluster_usage_total += corr
+        return self._cluster_usage_total
+
+    def dynamic_memory_usage(self) -> int:
+        """Core's CTxMemPool::DynamicMemoryUsage(): what -maxmempool bounds
+        and what getmempoolinfo reports as ``usage``."""
+        with self._lock:
+            return self._dynamic_memory_usage_inner()
+
+    def _evict_worst_chunk(self) -> tuple[int, int, float] | None:
+        """Remove the lowest-feerate chunk (Core TrimToSize loop body).
+
+        Core sets the rolling minimum to the removed chunk's feerate plus the
+        incremental relay feerate, in whole sat/kvB: ``CFeeRate removed{fee,
+        vsize}; removed += incremental_relay_feerate; trackPackageRemoved``,
+        where the vsize comes from the chunk's sigop-adjusted weight
+        (ToFeePerVSize: ceil(weight / 4)) and ``+=`` adds GetFeePerK() values,
+        i.e. floor(fee * 1000 / vsize) (policy/feerate.h).
+
+        Returns (txs removed, stripped bytes freed, removed sat/kvB), or None
+        when the pool has no chunk.
+        """
+        worst = self._cluster_manager.get_worst_chunk()
+        if worst is None:
+            return None
+        chunk, _cluster_id = worst
+        members = [t for t in chunk.txids if t in self.transactions]
+        fee = sum(int(self.get_modified_fee(self.transactions[t])) for t in members)
+        weight = sum(self.transactions[t].sigop_adjusted_weight for t in members)
+        vsize = (weight + 3) // 4
+        removed_per_kvb = (fee * 1000 // vsize if vsize > 0 else 0) + DEFAULT_INCREMENTAL_RELAY_FEE
+        self._track_package_removed(float(removed_per_kvb))
+
+        # Remove children before parents so nothing is orphaned mid-chunk.
+        members.sort(key=lambda t: self.transactions[t].descendant_count, reverse=True)
+        removed = 0
+        for txid in members:
+            if txid in self.transactions:
+                self._remove_transaction_inner(txid, _reason="evicted")
+                removed += 1
+        return removed, chunk.total_size, float(removed_per_kvb)
+
+    def _trim_to_size(self, size_limit: int) -> None:
+        """Core CTxMemPool::TrimToSize (txmempool.cpp:861): evict whole
+        lowest-feerate chunks while DynamicMemoryUsage() exceeds the limit."""
+        evicted = 0
+        max_removed = 0.0
+        while self.transactions and self._dynamic_memory_usage_inner() > size_limit:
+            res = self._evict_worst_chunk()
+            if res is None or res[0] == 0:
+                break
+            evicted += res[0]
+            max_removed = max(max_removed, res[2])
+        if evicted:
+            logger.info(
+                f"TrimToSize: evicted {evicted} transactions (chunk-based) to "
+                f"bring usage to {self._dynamic_memory_usage_inner()} <= {size_limit}; "
+                f"rolling min fee bumped to {max_removed:.0f} sat/kvB"
+            )
+
     def _evict_low_fee_txs(self, needed_space: int):
-        """Evict lowest-feerate chunks until we have enough space.
-
-        Uses cluster mempool chunk-based eviction: we evict whole chunks
-        (groups of transactions that would be mined together) rather than
-        individual transactions. This maintains linearization invariants.
-
-        After each chunk is removed, trackPackageRemoved is called so that the
-        rolling minimum fee rate rises to (evicted_chunk_feerate +
-        INCREMENTAL_RELAY_FEE), preventing the evicted transactions from
-        immediately re-entering the pool.
-
-        Reference: Bitcoin Core txmempool.cpp:861-911 TrimToSize() +
-                   txmempool.cpp:853-859 trackPackageRemoved().
+        """Evict lowest-feerate chunks until *needed_space* stripped bytes
+        are freed.  No node path calls this any more (the -maxmempool limit
+        is enforced by _trim_to_size, on Core's DynamicMemoryUsage()); it is
+        the chunk-eviction entry point tests/test_mempool_eviction.py drives
+        directly on hand-injected entries.
         """
         freed = 0
-        evicted_count = 0
-        max_fee_rate_removed: float = 0.0
-
-        # Evict entire chunks (lowest feerate first)
         while self.transactions and freed < needed_space:
-            worst = self._cluster_manager.get_worst_chunk()
-            if worst is None:
+            res = self._evict_worst_chunk()
+            if res is None or res[0] == 0:
                 break
-
-            chunk, _cluster_id = worst
-            chunk_size = chunk.total_size
-
-            # Compute the chunk feerate in sat/kvB for trackPackageRemoved.
-            # Core: removed = CFeeRate(feerate.fee, feerate.size)
-            #       removed += m_opts.incremental_relay_feerate
-            #       trackPackageRemoved(removed)
-            chunk_fee_per_kvb: float = 0.0
-            if chunk.total_size > 0:
-                # chunk.fee_rate is sat/vB; convert to sat/kvB
-                chunk_fee_per_kvb = chunk.fee_rate * 1000.0
-            # Add incremental relay fee (Core: removed += incremental_relay_feerate)
-            removed_fee_per_kvb = chunk_fee_per_kvb + DEFAULT_INCREMENTAL_RELAY_FEE
-            self._track_package_removed(removed_fee_per_kvb)
-            if removed_fee_per_kvb > max_fee_rate_removed:
-                max_fee_rate_removed = removed_fee_per_kvb
-
-            # Evict all transactions in this chunk
-            # Must remove in reverse topological order (children before parents)
-            # to avoid orphaning transactions
-            chunk_txids = list(chunk.txids)
-            # Sort by descendant count (highest first = children first)
-            chunk_txids.sort(
-                key=lambda t: self.transactions[t].descendant_count
-                if t in self.transactions else 0,
-                reverse=True
-            )
-
-            for txid in chunk_txids:
-                if txid in self.transactions:
-                    self._remove_transaction_inner(txid, _reason="evicted")
-                    evicted_count += 1
-
-            freed += chunk_size
-
-        if evicted_count > 0:
-            logger.info(
-                f"Evicted {evicted_count} transactions (chunk-based) to free "
-                f"{freed} bytes (needed: {needed_space}); "
-                f"rolling min fee bumped to {max_fee_rate_removed:.1f} sat/kvB"
-            )
+            freed += res[1]
 
     def clear(self) -> None:
         """Clear all transactions from the mempool."""
@@ -5353,6 +5513,9 @@ class Mempool:
             self.unbroadcast_txids.clear()
             self._cluster_manager.rebuild()  # Clear cluster data
             self.current_size = 0
+            # txns_randomized.clear() keeps its capacity, as in Core.
+            self._core_usage = 0
+            self._txns_randomized_size = 0
             logger.info(f"Cleared mempool ({count} transactions removed)")
 
     # Persistence
@@ -6236,8 +6399,7 @@ class Mempool:
         if package_rbf_refusal is not None:
             # The rest were still tried individually (Core's AcceptPackage
             # loop), so the pool matches Core's before its package RBF step.
-            if self.current_size > self.max_size:
-                self._evict_low_fee_txs(self.current_size - self.max_size)
+            self._trim_to_size(self.max_size)
             return package_rbf_refusal
         if quit_early:
             multi = PackageAcceptResult(state="tx", message="transaction failed")
@@ -6256,8 +6418,7 @@ class Mempool:
 
         # Core LimitMempoolSize at the end of AcceptPackage: package txs may be
         # evicted, and are then reported "mempool full".
-        if self.current_size > self.max_size:
-            self._evict_low_fee_txs(self.current_size - self.max_size)
+        self._trim_to_size(self.max_size)
 
         for tx in txs:
             txid = tx.get_txid()
