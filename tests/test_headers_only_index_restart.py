@@ -223,3 +223,28 @@ def test_header_whose_block_is_stored_is_not_restored_as_headers_only(tmp_path):
     fresh = _server(bdb, str(tmp_path))
     assert all(h != h1 for h, _ in fresh.node.block_sync._validated_headers)
     assert _headers(fresh) == TIP + 2
+
+
+def test_header_on_an_invalidated_stored_block_is_not_restored(tmp_path):
+    """Invalid stays invalid, parent still known: a tip-extending header h1
+    (queue) and a sibling g1 of it (fork store, same parent: the tip), then
+    invalidateblock(tip) and a crash before the header file is rewritten.
+    After the restart the invalidated block is still in the block store, so
+    g1's parent is known, but it is failed: Core's AcceptBlockHeader refuses
+    a header on a failed parent (bad-prevblk), so neither header may come
+    back or be counted."""
+    bdb, server, hashes = _setup(tmp_path)
+    raw1, h1 = _block(hashes[TIP], TIP + 1, b"\xc1\xc5")
+    rawg, g1 = _block(hashes[TIP], TIP + 1, b"\xc2\xc5")
+    assert _submitheader(server, raw1) is None
+    assert _submitheader(server, rawg) is None
+    assert g1 in server.node.block_sync._fork_headers
+    asyncio.run(server.rpc_invalidateblock(_disp(hashes[TIP])))
+    assert bdb.get_best_block() == (hashes[TIP - 1], TIP - 1)
+    # No save after the invalidation: the file still holds both headers, as
+    # the eager submitheader write left it.
+    fresh = _server(bdb, str(tmp_path))
+    bs = fresh.node.block_sync
+    assert g1 not in bs._fork_headers and h1 not in bs._fork_headers
+    assert all(h not in (h1, g1) for h, _ in bs._validated_headers)
+    assert _headers(fresh) == TIP - 1
