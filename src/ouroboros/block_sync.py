@@ -2956,8 +2956,12 @@ class BlockSync:
         # disconnected from the active chain by a rollback, and the skip
         # silently advances the drain pointer past orphaned slots — that
         # is the 938231 wedge from 2026-05-02.  Slot 0 is always tip+1
-        # by the invariant we now enforce.
-        if not self._queue_anchored_to_tip():
+        # by the invariant we now enforce.  One misalignment is not stale:
+        # the tip IS a queue entry (submitblock connected it without popping
+        # the queue); then only that connected prefix goes.  The drain holds
+        # its own lock here and has not started connecting.
+        if (not self._queue_anchored_to_tip()
+                and not self._trim_connected_queue_prefix()):
             logger.warning(
                 "[slot-misalign] validated_headers no longer anchors to tip "
                 "%s — dropping queue (%d entries) for fresh resync",
@@ -5195,6 +5199,8 @@ class BlockSync:
                     # drop it out from under the connect that just landed,
                     # and do not derive heights from a mid-connect queue.
                     return
+            if (self._validated_headers and not self._queue_anchored_to_tip()
+                    and not self._trim_connected_queue_prefix()):
                 logger.error(
                     "[slot-misalign] validated_headers no longer anchors to "
                     "the DB tip at headers-receive time — clearing %d entries "
@@ -7224,6 +7230,24 @@ class BlockSync:
                 return k + 1
         return None
 
+    def _trim_connected_queue_prefix(self) -> bool:
+        """If the active tip is a queue entry (a path that does not pop the
+        queue, e.g. ``submitblock``, connected it), drop the entries up to
+        it, as the drain's own pop would have.  True when that happened, and
+        the queue then extends the tip; False otherwise (nothing changed).
+        Callers must not run this while a drain is mid-connect."""
+        if not self._validated_headers:
+            return False
+        try:
+            tip, _ = self.db.get_best_block()
+        except Exception:
+            return False
+        start = self._index_above_tip(self._validated_headers, tip)
+        if not start:
+            return False
+        self._validated_headers = self._validated_headers[start:]
+        return True
+
     def _prune_validated_headers(self):
         """Drop the queue if it no longer anchors to the active chain tip.
 
@@ -7245,14 +7269,7 @@ class BlockSync:
         if not self._validated_headers:
             return
         if not self._queue_anchored_to_tip():
-            try:
-                _tip, _ = self.db.get_best_block()
-            except Exception:
-                _tip = None
-            start = self._index_above_tip(self._validated_headers, _tip)
-            if start is not None:
-                # The tip is a queue entry: drop only its connected prefix.
-                self._validated_headers = self._validated_headers[start:]
+            if self._trim_connected_queue_prefix():
                 return
             try:
                 current_hash, _ = self.db.get_best_block()

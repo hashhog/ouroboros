@@ -1355,12 +1355,13 @@ class BitcoinNode:
         try:
             # Stop block sync
             if self.block_sync:
+                logger.info("Stopping block synchronization...")
+                await self.block_sync.stop()
+                # After the sync loop stopped, so the snapshot is final.
                 try:
                     self.block_sync.save_header_index()
                 except Exception as e:
                     logger.warning(f"could not save headers_only.json: {e}")
-                logger.info("Stopping block synchronization...")
-                await self.block_sync.stop()
 
             # Stop peer manager
             if self.peer_manager:

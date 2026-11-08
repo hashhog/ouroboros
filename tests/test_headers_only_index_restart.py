@@ -212,8 +212,8 @@ def test_block_of_first_header_arrives_rest_stay_headers_only(tmp_path):
     """Headers h1, h2 on the tip, then submitblock(h1) (which does not pop
     the header queue).  Core: h1 now has data and is the tip; h2 is still a
     headers-only entry and ``m_best_header``.  So ``headers`` stays tip+1,
-    getchaintips lists h2 as headers-only, the sync layer's queue prune keeps
-    h2, and all of that holds after a restart; h1 is not restored as a
+    getchaintips lists h2 as headers-only, the sync loop's drain and queue
+    prune keep h2, and all of that holds after a restart; h1 is not restored as a
     headers-only entry because its block is connected."""
     bdb, server, hashes = _setup(tmp_path)
     (raw1, h1), (_raw2, h2) = _two_headers_on_tip(server, hashes)
@@ -224,6 +224,12 @@ def test_block_of_first_header_arrives_rest_stay_headers_only(tmp_path):
     assert _headers(server) == TIP + 2
     assert _tips(server).get(_disp(h2)) == want
     bs = server.node.block_sync
+    # The sync loop's order on a running node: drain, then prune.  The
+    # header sync has completed (as on a live node), so the drain runs its
+    # queue-anchor check instead of returning early.
+    bs._prebase_headers_complete = True
+    asyncio.run(bs._drain_block_buffer())
+    assert [h for h, _ in bs._validated_headers] == [h2]
     bs._prune_validated_headers()
     assert [h for h, _ in bs._validated_headers] == [h2]
     saver = getattr(bs, "save_header_index", None)
