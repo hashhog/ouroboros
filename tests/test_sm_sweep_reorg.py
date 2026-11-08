@@ -2,9 +2,10 @@
 
 C5  New tips that arrive through ``accept_block`` (rpc.py) are never
     announced to peers.  The only caller of ``_schedule_announce`` /
-    ``_announce_block`` is the linear P2P drain (block_sync.py).  submitblock
-    (the miner path), submitblockbatch, generatetoaddress and every reorg the
-    engine ``_reorg_to_side_branch_tip`` performs (P2P fork bridge,
+    ``_announce_block`` is the linear P2P drain (block_sync.py), and
+    ``rpc_generatetoaddress`` broadcasts its own bare inv.  submitblock (the
+    miner path), submitblockbatch and every reorg the engine
+    ``_reorg_to_side_branch_tip`` performs (P2P fork bridge,
     invalidateblock / reconsiderblock / preciousblock activation) connect
     through ``accept_block``, which signals the tip notifier and the indexes
     but sends no inv / headers / cmpctblock.  A block mined on ouroboros is
@@ -21,6 +22,7 @@ xfail(strict=True) until sm-fix-ouroboros-announce-accepted-tips lands.
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -57,10 +59,19 @@ def _announced(peer: _RelayPeer) -> list[str]:
 
 def _wire_peer(server, bs, peer):
     # One peer manager, reachable both as block_sync.peer_manager and
-    # node.peer_manager, so a fix may announce through either.
-    bs.peer_manager.get_all_ready_peers.return_value = [peer]
-    bs.peer_manager.network = "regtest"
-    server.node.peer_manager = bs.peer_manager
+    # node.peer_manager, so a fix may announce through either, with any of
+    # the repo's idioms: BlockSync._announce_block (get_all_ready_peers ->
+    # peer.send_message) or PeerManager.broadcast (rpc_generatetoaddress).
+    pm = bs.peer_manager
+    pm.get_all_ready_peers.return_value = [peer]
+    pm.network = "regtest"
+
+    async def _broadcast(msg):
+        for p in pm.get_all_ready_peers():
+            await p.send_message(msg)
+
+    pm.broadcast = AsyncMock(side_effect=_broadcast)
+    server.node.peer_manager = pm
 
 
 @pytest.mark.xfail(
@@ -93,6 +104,19 @@ def test_sm_sweep_control_drain_announcer_reaches_the_peer(tmp_path):
     tip = bdb.get_block(hashes[max(hashes)])
     asyncio.run(bs._announce_block(tip, hashes[max(hashes)]))
     assert _announced(peer) == ["headers"]
+
+
+def test_sm_sweep_control_broadcast_idiom_reaches_the_peer(tmp_path):
+    """Control: an announcement through node.peer_manager.broadcast (the
+    rpc_generatetoaddress idiom) is also seen by the test."""
+    from ouroboros.p2p_messages import INV_TYPE_BLOCK, InvMessage
+
+    bdb, chain, bs, server, hashes = _setup(tmp_path)
+    peer = _RelayPeer()
+    _wire_peer(server, bs, peer)
+    inv = InvMessage(inventory=[(INV_TYPE_BLOCK, hashes[max(hashes)])])
+    asyncio.run(server.node.peer_manager.broadcast(inv.to_network_message("regtest")))
+    assert _announced(peer) == ["inv"]
 
 
 # --------------------------------------------------------------------------- #

@@ -78,6 +78,8 @@ def _inbound_peer(pm: PeerManager, host: str, port: int) -> Peer:
     peer.state = PeerState.READY
     addr = f"{host}:{port}"
     pm.inbound_peers[addr] = peer
+    # Mirrors the accept path's increment (p2p.py _handle_inbound_connection,
+    # ``self._inbound_netgroups[peer_group] = ... + 1``).
     group = pm._netgroup(host)
     pm._inbound_netgroups[group] = pm._inbound_netgroups.get(group, 0) + 1
     return peer

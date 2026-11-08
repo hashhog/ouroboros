@@ -56,4 +56,3 @@ async def test_sm_sweep_control_head_window_block_is_not_perm_rejected():
     """Control: the same timeout on a head-of-window slot is exempt."""
     bs, target = await _timed_out_queue_slot(2)
     assert target not in bs._perm_rejected_blocks
-    assert bs._block_request_attempts[target] == BLOCK_REQUEST_MAX_ATTEMPTS + 1

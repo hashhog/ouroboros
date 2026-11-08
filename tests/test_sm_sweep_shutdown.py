@@ -18,13 +18,20 @@ Core: init.cpp ``Shutdown()`` stops the connman (closing every socket)
 and then runs DumpMempool / fee estimates / peers.dat / anchors
 synchronously, and the process does not exit until it returns.
 
-xfail(strict=True) until sm-fix-ouroboros-shutdown-saves lands.
+E1b's test copies the current SIGTERM handler (schedule ``stop()`` as a
+task) and the real ``run()`` / ``stop()``.  A fix that instead makes the
+handler only set the event and lets ``run()``'s finally do the stop must
+update ``fake_start`` to match the new handler.
+
+xfail(strict=True) until sm-fix-ouroboros-pm-stop-inbound-hang (E1a) and
+sm-fix-ouroboros-sigterm-stop-cancelled (E1b) land.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -47,6 +54,11 @@ _XFAIL_B = pytest.mark.xfail(
 )
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12, 1),
+    reason="Server.wait_closed() waits for accepted connections only on "
+    "Python >= 3.12.1 (the deployed venv is 3.13)",
+)
 @_XFAIL_A
 @pytest.mark.asyncio
 async def test_sm_sweep_peer_manager_stop_with_live_inbound_peer_saves_peers(tmp_path):
