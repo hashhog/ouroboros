@@ -95,6 +95,17 @@ def _pool(prevs, max_size):
                    require_standard=False, full_rbf=True)
 
 
+def _usage(prevs, *txs):
+    """Core DynamicMemoryUsage() of a pool holding *txs* and nothing else.
+
+    -maxmempool bounds that figure (Core TrimToSize), not the serialized
+    size, so the caps below are set in it."""
+    pool = _pool(prevs, max_size=10**9)
+    for tx in txs:
+        assert pool.add_transaction(tx, 100) == (True, "")
+    return pool.get_memory_usage()
+
+
 def test_tx_larger_than_cap_is_not_kept():
     prevs = _funding(1)
     big = _tx(prevs[0], 20_000, n_outputs=40)
@@ -103,7 +114,7 @@ def test_tx_larger_than_cap_is_not_kept():
     ok, err = pool.add_transaction(big, 100)
     assert not ok and err == "mempool full", (ok, err)
     assert big.get_txid() not in pool.transactions
-    assert pool.current_size <= pool.max_size
+    assert pool.get_memory_usage() <= pool.max_size
 
 
 def test_zero_cap_keeps_nothing():
@@ -118,7 +129,7 @@ def test_rejected_tx_does_not_shrink_pool():
     prevs = _funding(3)
     t1, t2 = _tx(prevs[0], 10_000), _tx(prevs[1], 10_000)
     size = len(t1.serialize())
-    pool = _pool(prevs, max_size=2 * size + size // 2)
+    pool = _pool(prevs, max_size=_usage(prevs, t1, t2) + _usage(prevs, t1) // 2)
     assert pool.add_transaction(t1, 100) == (True, "")
     assert pool.add_transaction(t2, 100) == (True, "")
     # Lower feerate than both pool members: it is the one trimmed.
@@ -133,15 +144,14 @@ def test_rejected_tx_does_not_shrink_pool():
 def test_higher_fee_tx_displaces_worst_and_cap_holds():
     prevs = _funding(3)
     t1, t2 = _tx(prevs[0], 10_000), _tx(prevs[1], 9_000)
-    size = len(t1.serialize())
-    pool = _pool(prevs, max_size=2 * size + size // 2)
+    pool = _pool(prevs, max_size=_usage(prevs, t1, t2) + _usage(prevs, t1) // 2)
     assert pool.add_transaction(t1, 100) == (True, "")
     assert pool.add_transaction(t2, 100) == (True, "")
     t3 = _tx(prevs[2], 20_000)
     assert pool.add_transaction(t3, 100) == (True, "")
     assert t2.get_txid() not in pool.transactions  # lowest feerate evicted
     assert t1.get_txid() in pool.transactions
-    assert pool.current_size <= pool.max_size
+    assert pool.get_memory_usage() <= pool.max_size
 
 
 def test_conf_non_integer_maxmempool_falls_back_to_300(tmp_path):
@@ -167,33 +177,31 @@ def test_rbf_replacement_is_trimmed_to_cap():
     # other single tx (Core LimitMempoolSize after FinalizeSubpackage).
     prevs = _funding(2)
     t1, t2 = _tx(prevs[0], 10_000), _tx(prevs[1], 10_000)
-    size = len(t1.serialize())
-    pool = _pool(prevs, max_size=2 * size + size // 2)
+    pool = _pool(prevs, max_size=_usage(prevs, t1, t2) + _usage(prevs, t1) // 2)
     assert pool.add_transaction(t1, 100) == (True, "")
     assert pool.add_transaction(t2, 100) == (True, "")
     # Replaces t1, higher feerate than t2, fits alone but not next to t2.
-    r = _tx(prevs[0], 50_000, n_outputs=9)
-    assert size < len(r.serialize()) <= pool.max_size < len(r.serialize()) + size
+    r = _tx(prevs[0], 50_000, n_outputs=20)
+    assert _usage(prevs, r) <= pool.max_size < _usage(prevs, r, t2)
     assert pool.add_transaction(r, 100) == (True, "")
     assert t1.get_txid() not in pool.transactions
     assert r.get_txid() in pool.transactions
     assert _in_cluster_manager(pool, r.get_txid())
     assert t2.get_txid() not in pool.transactions  # lowest feerate trimmed
-    assert pool.current_size <= pool.max_size
+    assert pool.get_memory_usage() <= pool.max_size
 
 
 def test_rbf_replacement_larger_than_cap_is_not_kept():
     prevs = _funding(1)
     t1 = _tx(prevs[0], 10_000)
-    size = len(t1.serialize())
-    pool = _pool(prevs, max_size=2 * size)
+    pool = _pool(prevs, max_size=2 * _usage(prevs, t1))
     assert pool.add_transaction(t1, 100) == (True, "")
     r = _tx(prevs[0], 200_000, n_outputs=40)
-    assert len(r.serialize()) > pool.max_size
+    assert _usage(prevs, r) > pool.max_size
     ok, err = pool.add_transaction(r, 100)
     assert not ok and err == "mempool full", (ok, err)
     assert r.get_txid() not in pool.transactions
-    assert pool.current_size <= pool.max_size
+    assert pool.get_memory_usage() <= pool.max_size
 
 
 def test_package_rbf_parent_is_not_trimmed_mid_package():
@@ -205,7 +213,7 @@ def test_package_rbf_parent_is_not_trimmed_mid_package():
     prevs = _funding(2)
     t1 = _tx(prevs[0], 1_000)
     t2 = _tx(prevs[1], 60_000, n_outputs=10)
-    pool = _pool(prevs, max_size=len(t1.serialize()) + len(t2.serialize()) + 40)
+    pool = _pool(prevs, max_size=_usage(prevs, t1, t2) + 40)
     assert pool.add_transaction(t1, 100) == (True, "")
     assert pool.add_transaction(t2, 100) == (True, "")
     parent = _tx(prevs[0], 3_000, n_outputs=6)           # replaces t1
@@ -224,7 +232,7 @@ def test_package_rbf_parent_is_not_trimmed_mid_package():
     assert child.get_txid() in pool.transactions
     assert t1.get_txid() not in pool.transactions          # replaced
     assert t2.get_txid() not in pool.transactions          # end-of-package trim
-    assert pool.current_size <= pool.max_size
+    assert pool.get_memory_usage() <= pool.max_size
 
 
 def test_try_replace_holds_cap():
@@ -232,14 +240,14 @@ def test_try_replace_holds_cap():
     # bumped tx through AcceptToMemoryPool, which trims (LimitMempoolSize).
     prevs = _funding(1)
     t1 = _tx(prevs[0], 10_000)
-    pool = _pool(prevs, max_size=2 * len(t1.serialize()))
+    pool = _pool(prevs, max_size=2 * _usage(prevs, t1))
     assert pool.add_transaction(t1, 100) == (True, "")
     r = _tx(prevs[0], 200_000, n_outputs=40)
-    assert len(r.serialize()) > pool.max_size
+    assert _usage(prevs, r) > pool.max_size
     ok, err = pool.try_replace(r, 100)
     assert not ok and err == "mempool full", (ok, err)
     assert r.get_txid() not in pool.transactions
-    assert pool.current_size <= pool.max_size
+    assert pool.get_memory_usage() <= pool.max_size
 
 
 def _v3(txid, inputs, values):
@@ -264,8 +272,9 @@ def test_package_sibling_eviction_is_trimmed_at_package_end():
     for t in (parent, c1, other):
         assert pool.add_transaction(t, 100) == (True, ""), t.get_txid().hex()[:4]
     # Room for parent + other, not for c2 next to them.
-    pool.max_size = (len(parent.serialize()) + len(other.serialize())
-                     + len(c2.serialize()) - 1)
+    # (+200 covers the txns_randomized capacity the pool keeps after three
+    # entries, 176 bytes against 96 for two; c2 alone is ~900.)
+    pool.max_size = _usage(prevs, parent, other) + 200
     c2 = _v3(b"\xb2" * 32, [(parent.get_txid(), 1)], [585_000])         # fee 5_000 > c1
     res = pool.accept_package([parent, c2], 100)
     r = res.results.get(c2.get_wtxid())
@@ -273,4 +282,5 @@ def test_package_sibling_eviction_is_trimmed_at_package_end():
         res.state, {k.hex()[:4]: v.reject_reason for k, v in res.results.items()})
     assert c1.get_txid() not in pool.transactions       # sibling was evicted
     assert c2.get_txid() not in pool.transactions       # then trimmed at package end
-    assert pool.current_size <= pool.max_size
+    assert parent.get_txid() in pool.transactions and other.get_txid() in pool.transactions
+    assert pool.get_memory_usage() <= pool.max_size

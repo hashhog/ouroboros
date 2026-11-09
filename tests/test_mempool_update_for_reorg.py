@@ -501,7 +501,8 @@ def test_reorg_size_limit_evicts_readded_parent_with_its_in_pool_child():
         assert ok, err
     del sdb.utxos[(p.get_txid(), 0)]
     sdb.utxos[COIN1] = _coin(5)
-    mp.max_size = mp.current_size + mp.transactions[c.get_txid()].size - 1
+    # The cap is Core's DynamicMemoryUsage() of {C, B}: re-adding P goes over it.
+    mp.max_size = mp.get_memory_usage()
     _invalidate_refill(mp, sdb, [SimpleNamespace(transactions=[_coinbase(1), p])], 110)
     assert _ids(mp) == {b.get_txid()}, (
         "the byte cap must evict the low-feerate parent together with its "

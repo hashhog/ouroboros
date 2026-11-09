@@ -15,8 +15,8 @@ segwit spend and blind to the sigop adjustment (tools/core-regtest rows
 ``warden_invalidated_submit`` ``tip100`` / ``usage-*`` / ``pressure``
 ``info:bytes`` rows).
 
-``usage`` is a separate number (Core's DynamicMemoryUsage) and not changed
-here: it stays the existing stripped-bytes estimate.
+``usage`` is a separate number, Core's DynamicMemoryUsage(); it is
+checked against Core 31.1 in test_core_dynamic_memory_usage.py.
 """
 
 from __future__ import annotations
@@ -158,9 +158,10 @@ def test_bytes_is_the_sum_and_drops_with_removal():
     assert pool.get_mempool_info()["bytes"] == 800
 
 
-def test_getmempoolinfo_rpc_bytes_and_unchanged_usage():
-    """The RPC reports Core's bytes; usage keeps its old estimate
-    (stripped bytes + 200 per entry), which this change does not touch."""
+def test_getmempoolinfo_rpc_bytes_and_core_usage():
+    """The RPC reports Core's bytes, and usage is Core's DynamicMemoryUsage():
+    one singleton entry plus the one-element txns_randomized vector (64)."""
+    from ouroboros import mempool as mp
     from ouroboros.rpc import RPCServer
 
     utxos = {(FUNDING, 0): _Utxo(100_000, P2WSH_TRUE)}
@@ -172,7 +173,7 @@ def test_getmempoolinfo_rpc_bytes_and_unchanged_usage():
     info = asyncio.run(server.rpc_getmempoolinfo())
     assert info["size"] == 1
     assert info["bytes"] == _core_vsize(pool, tx)
-    assert info["usage"] == len(tx.serialize()) + 200
+    assert info["usage"] == mp.core_entry_usage(tx) + 64
 
 
 def test_empty_pool_is_zero():
