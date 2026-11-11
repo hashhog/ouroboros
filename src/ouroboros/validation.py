@@ -1262,18 +1262,31 @@ class BlockValidator:
         #     return the same values from memory.  No verdict depends on it.
         self._prefetch_block_inputs(block)
 
-        # 5. Validate block weight and sigops limits.
-        #    height + hash are threaded in so P2SH/witness sigop counting is
-        #    gated on the FINAL exception-aware script flags, exactly as Core's
-        #    GetTransactionSigOpCost(tx, inputs, flags) does.
-        valid, error = self._validate_block_limits(
-            block, expected_height, block.hash
-        )
+        # 5. Witness-independent size limits (Core CheckBlock, validation.cpp
+        #    "size limits": tx-count and stripped-size guards -> bad-blk-length).
+        valid, error = self._validate_block_stripped_limits(block)
         if not valid:
             return False, error
 
-        # 6. Validate witness commitment (SegWit)
+        # 6. Validate witness commitment (SegWit) BEFORE any limit that reads
+        #    witness bytes.  The witness is not covered by the header's txid
+        #    merkle root, so any relaying peer can pad it.  Core runs
+        #    CheckWitnessMalleation (ContextualCheckBlock) before bad-blk-weight
+        #    and sums witness sigops only in ConnectBlock; a padded copy of an
+        #    honest block therefore fails as BLOCK_MUTATED (never cached as
+        #    invalid), not as a weight/sigops verdict on the header hash.
         valid, error = self._validate_witness_commitment(block, expected_height)
+        if not valid:
+            return False, error
+
+        # 6a. Validate block weight and sigops limits (witness-dependent).
+        #    height + hash are threaded in so P2SH/witness sigop counting is
+        #    gated on the FINAL exception-aware script flags, exactly as Core's
+        #    GetTransactionSigOpCost(tx, inputs, flags) does.  The stripped
+        #    guards already ran in step 5.
+        valid, error = self._validate_block_limits(
+            block, expected_height, block.hash, stripped_checked=True
+        )
         if not valid:
             return False, error
 
@@ -2027,6 +2040,7 @@ class BlockValidator:
         block: Block,
         height: int | None = None,
         block_hash: bytes | None = None,
+        stripped_checked: bool = False,
     ) -> tuple[bool, str]:
         """Validate block weight and sigops cost limits.
 
@@ -2070,26 +2084,10 @@ class BlockValidator:
             verify_p2sh = bool(_flags & SCRIPT_VERIFY_P2SH)
             verify_witness = bool(_flags & SCRIPT_VERIFY_WITNESS)
 
-        # Early check 1: tx count overflow guard
-        # `block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT`
-        # A block with > 1,000,000 transactions would be invalid even if each
-        # transaction were the minimum possible 1 byte (which is impossible,
-        # but this is a cheap pre-filter).
-        if len(block.transactions) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT:
-            return False, (
-                f"bad-blk-length: tx count {len(block.transactions)} × "
-                f"{WITNESS_SCALE_FACTOR} exceeds MAX_BLOCK_WEIGHT"
-            )
-
-        # Early check 2: stripped (no-witness) block serialization guard.
-        # Approximation: sum the stripped size of all transactions.  Core
-        # uses TX_NO_WITNESS serializer on the whole block.
-        stripped_block_size = sum(len(tx.serialize()) for tx in block.transactions)
-        if stripped_block_size * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT:
-            return False, (
-                f"bad-blk-length: stripped block size {stripped_block_size} × "
-                f"{WITNESS_SCALE_FACTOR} exceeds MAX_BLOCK_WEIGHT"
-            )
+        if not stripped_checked:
+            valid, error = self._validate_block_stripped_limits(block)
+            if not valid:
+                return False, error
 
         # Core GetBlockWeight: the whole-block weight (80-byte header + CompactSize
         # tx-count counted at WITNESS_SCALE_FACTOR, on top of the per-tx weights).
@@ -2181,6 +2179,37 @@ class BlockValidator:
             return False, (
                 f"Block sigops cost {total_sigops_cost} exceeds "
                 f"{MAX_BLOCK_SIGOPS_COST}"
+            )
+
+        return True, ""
+
+    def _validate_block_stripped_limits(self, block: Block) -> tuple[bool, str]:
+        """Core CheckBlock's witness-INDEPENDENT size guards (validation.cpp).
+
+        Neither guard reads witness bytes, so a relaying peer cannot trip them
+        by padding the witness; ``validate_block`` runs them before the
+        witness-commitment check, and the witness-dependent weight/sigops
+        limits after it.
+        """
+        # Early check 1: tx count overflow guard
+        # `block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT`
+        # A block with > 1,000,000 transactions would be invalid even if each
+        # transaction were the minimum possible 1 byte (which is impossible,
+        # but this is a cheap pre-filter).
+        if len(block.transactions) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT:
+            return False, (
+                f"bad-blk-length: tx count {len(block.transactions)} × "
+                f"{WITNESS_SCALE_FACTOR} exceeds MAX_BLOCK_WEIGHT"
+            )
+
+        # Early check 2: stripped (no-witness) block serialization guard.
+        # Approximation: sum the stripped size of all transactions.  Core
+        # uses TX_NO_WITNESS serializer on the whole block.
+        stripped_block_size = sum(len(tx.serialize()) for tx in block.transactions)
+        if stripped_block_size * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT:
+            return False, (
+                f"bad-blk-length: stripped block size {stripped_block_size} × "
+                f"{WITNESS_SCALE_FACTOR} exceeds MAX_BLOCK_WEIGHT"
             )
 
         return True, ""

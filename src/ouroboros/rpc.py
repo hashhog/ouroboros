@@ -9371,7 +9371,6 @@ class RPCServer:
         # "does not count witness and p2sh sigops"); the UTXO-dependent P2SH /
         # witness sigop cost stays DEFERRED to the reorg ConnectBlock loop below.
         try:
-            from ouroboros.validation import block_weight as _v_block_weight
             from ouroboros.validation import _count_legacy_sigops as _v_legacy_sigops
             from ouroboros.validation import MAX_BLOCK_WEIGHT as _V_MAX_WEIGHT
             from ouroboros.validation import (
@@ -9387,10 +9386,9 @@ class RPCServer:
             _stripped = sum(len(_tx.serialize()) for _tx in _txs)
             if _stripped * _V_WSF > _V_MAX_WEIGHT:
                 return bip22_result_string("bad-blk-length")
-            # Full GetBlockWeight (header + CompactSize tx-count + per-tx
-            # weights) → bad-blk-weight.
-            if _v_block_weight(_txs) > _V_MAX_WEIGHT:
-                return bip22_result_string("bad-blk-weight")
+            # Full GetBlockWeight (bad-blk-weight) reads witness bytes, so it
+            # runs AFTER the witness-malleation check below, as in Core's
+            # ContextualCheckBlock (CheckWitnessMalleation, then the weight).
             # Legacy sigop budget × WITNESS_SCALE_FACTOR → bad-blk-sigops. Counts
             # GetLegacySigOpCount over outputs + scriptSigs of every tx incl.
             # coinbase, matching Core CheckBlock exactly.
@@ -9433,6 +9431,21 @@ class RPCServer:
                     "side-branch witness-commitment check skipped at h=%d: %s",
                     new_height, _e,
                 )
+
+        # bad-blk-weight: full GetBlockWeight (header + CompactSize tx-count +
+        # per-tx weights incl. witness).  After the witness check so a
+        # witness-padded copy of a valid block reports the malleation
+        # (BLOCK_MUTATED), not a weight verdict.
+        try:
+            from ouroboros.validation import block_weight as _v_block_weight
+            from ouroboros.validation import MAX_BLOCK_WEIGHT as _V_MAX_WEIGHT
+
+            if _v_block_weight(_blk_chk.transactions) > _V_MAX_WEIGHT:
+                return bip22_result_string("bad-blk-weight")
+        except Exception as _e:
+            logger.debug(
+                "side-branch weight check skipped at h=%d: %s", new_height, _e,
+            )
 
         # Stash the block in the side-branch buffer. Future submissions
         # whose prev points at this hash can chain off it without needing

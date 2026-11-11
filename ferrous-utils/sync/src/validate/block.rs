@@ -193,13 +193,16 @@ impl BlockValidator {
         // 1. Validate header (PoW, timestamps, difficulty — always)
         self.validate_header(block, prev_height)?;
 
-        // 2. Check block weight limit (always — quick check on tx count)
-        self.check_size_limits(inner)?;
-
-        // 3. Verify merkle root (always — proves tx integrity)
+        // 2. Verify merkle root (always — proves tx integrity).  Before any
+        //    size limit, as Core CheckBlock does (CheckMerkleRoot precedes the
+        //    size limits): a block whose bytes do not match its header is
+        //    MUTATED, which says nothing about the block the header names.
         if !self.verify_merkle_root(inner) {
             return Err(BlockValidationError::InvalidMerkleRoot);
         }
+
+        // 3. Check block weight limit (always)
+        self.check_size_limits(inner)?;
 
         // 4. Non-empty block
         if inner.txdata.is_empty() {
@@ -287,13 +290,14 @@ impl BlockValidator {
         // 1. Validate header (PoW, timestamps, difficulty)
         self.validate_header(block, prev_height)?;
 
-        // 2. Check block weight limit
-        self.check_size_limits(inner)?;
-
-        // 3. Verify merkle root
+        // 2. Verify merkle root — before any size limit (Core CheckBlock:
+        //    CheckMerkleRoot runs first; a mismatch is BLOCK_MUTATED).
         if !self.verify_merkle_root(inner) {
             return Err(BlockValidationError::InvalidMerkleRoot);
         }
+        // (3. The block weight limit reads witness bytes, which the txid
+        //     merkle root does not commit to; it runs after the witness
+        //     commitment check, step 6d below.)
 
         // 4. Non-empty block
         if inner.txdata.is_empty() {
@@ -341,6 +345,15 @@ impl BlockValidator {
                     .map_err(BlockValidationError::TransactionValidation)?;
             }
         }
+
+        // 6d. BIP141 witness commitment, then the block weight limit — in
+        //     Core's ContextualCheckBlock order (CheckWitnessMalleation, then
+        //     bad-blk-weight).  Any relaying peer can pad the witness of an
+        //     honest block; checked the other way round that padded copy
+        //     failed as SizeExceeded (a verdict on the header hash) instead of
+        //     as the witness malleation it is (BLOCK_MUTATED, never cached).
+        self.check_witness_commitment(inner, height)?;
+        self.check_size_limits(inner)?;
 
         // 7. Per-tx validation — always, regardless of assumevalid.
         //    Matches Python's skip_scripts=True path which keeps UTXO
@@ -474,8 +487,8 @@ impl BlockValidator {
         //     Matches Python `validation.py:420-426`.
         self.validate_block_subsidy(inner, height, total_fees)?;
 
-        // 7d. BIP141 witness commitment.
-        self.check_witness_commitment(inner, height)?;
+        // 7d. (BIP141 witness commitment: checked in step 6d, before the
+        //     weight limit.)
 
         // 8. Sigop cost limit with BIP141 witness discount.
         //    W85 fix: use prefetched script_pubkeys instead of re-fetching
