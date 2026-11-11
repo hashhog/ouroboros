@@ -346,6 +346,14 @@ impl BlockValidator {
             }
         }
 
+        // 6c'. Coinbase structure + BIP34 height (Core CheckTransaction /
+        //      ContextualCheckBlock bad-cb-height) — both run BEFORE
+        //      CheckWitnessMalleation in Core, and the coinbase scriptSig is
+        //      covered by the txid merkle root, so a failure here is a real
+        //      verdict even when the witness has also been tampered with.
+        self.tx_validator.check_coinbase(coinbase_tx, height)
+            .map_err(BlockValidationError::TransactionValidation)?;
+
         // 6d. BIP141 witness commitment, then the block weight limit — in
         //     Core's ContextualCheckBlock order (CheckWitnessMalleation, then
         //     bad-blk-weight).  Any relaying peer can pad the witness of an
@@ -358,8 +366,7 @@ impl BlockValidator {
         // 7. Per-tx validation — always, regardless of assumevalid.
         //    Matches Python's skip_scripts=True path which keeps UTXO
         //    lookups, coinbase maturity, amount, and BIP68 checks.
-        self.tx_validator.check_coinbase(coinbase_tx, height)
-            .map_err(BlockValidationError::TransactionValidation)?;
+        //    (Coinbase checked in 6c' above.)
 
         // 7b. BIP68 sequence-lock enforcement is gated on network activation
         //     and requires the previous block's MTP once. Fetch lazily on

@@ -228,6 +228,25 @@ def test_control_committed_oversized_block_is_still_a_limit_verdict(padded, toke
         assert "weight" in err.lower(), err
 
 
+@pytest.mark.parametrize(
+    "rust_error,kind",
+    [
+        # Strings the Rust validate_block_from_bytes route raises (the FFI
+        # prefixes "validate: ").  The malleation errors must classify as
+        # mutated; SizeExceeded is a verdict -- which is why the Rust order
+        # (merkle + witness commitment before the weight) matters.
+        ("validate: BIP141: witness commitment mismatch", "mutated"),
+        ("validate: BIP141: coinbase witness must be exactly one 32-byte item", "mutated"),
+        ("validate: Invalid merkle root", "mutated"),
+        ("validate: Block size exceeds limit", "verdict"),
+    ],
+)
+def test_rust_route_error_strings_classify_like_core(rust_error, kind):
+    from ouroboros.block_sync import classify_block_reject
+
+    assert classify_block_reject(rust_error) == kind
+
+
 # ---------------------------------------------------------------------------
 # Through the P2P drain: the hash must not be cached as failed / perm-rejected
 # ---------------------------------------------------------------------------

@@ -85,6 +85,15 @@ fn spend(witness: &[Vec<u8>]) -> Transaction {
 /// Coinbase at height 1 committing to the wtxids of `committed` (BIP141),
 /// plus an optional extra output script (used to make the block oversized).
 fn coinbase(committed: &[Transaction], extra_spk: Option<Vec<u8>>) -> Transaction {
+    // BIP34: CScript() << 1 == OP_1, padded to the 2-byte minimum.
+    coinbase_with_sig(committed, extra_spk, vec![0x51, 0x00])
+}
+
+fn coinbase_with_sig(
+    committed: &[Transaction],
+    extra_spk: Option<Vec<u8>>,
+    script_sig: Vec<u8>,
+) -> Transaction {
     let mut wtxids = vec![[0u8; 32]];
     wtxids.extend(committed.iter().map(|t| t.compute_wtxid().to_byte_array()));
     let mut buf = [0u8; 64];
@@ -104,8 +113,7 @@ fn coinbase(committed: &[Transaction], extra_spk: Option<Vec<u8>>) -> Transactio
         lock_time: absolute::LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint::null(),
-            // BIP34: CScript() << 1 == OP_1, padded to the 2-byte minimum.
-            script_sig: ScriptBuf::from(vec![0x51, 0x00]),
+            script_sig: ScriptBuf::from(script_sig),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(&[vec![0u8; 32]]),
         }],
@@ -201,4 +209,24 @@ fn control_committed_overweight_block_is_still_size_exceeded() {
     assert!(b.weight().to_wu() > 4_000_000);
     assert!(matches!(validate(&v, &b), Err(BlockValidationError::SizeExceeded)),
         "got {:?}", validate(&v, &b));
+}
+
+#[test]
+fn bad_bip34_height_with_tampered_witness_is_still_a_coinbase_verdict() {
+    // Core runs bad-cb-height (ContextualCheckBlock) BEFORE
+    // CheckWitnessMalleation.  The coinbase scriptSig is covered by the txid
+    // merkle root, so a wrong BIP34 height is a verdict on the block the
+    // header names -- tampering with the witness as well must not turn it
+    // into a (never-cached) witness mismatch.
+    let (_d, _db, v, g) = setup();
+    let honest_spend = spend(&honest_witness());
+    // OP_2 at height 1: wrong BIP34 height.
+    let cb = coinbase_with_sig(&[honest_spend.clone()], None, vec![0x52, 0x00]);
+    let tampered = block(&g, vec![cb, spend(&[vec![0x51], vec![0x00]])], None);
+    let r = validate(&v, &tampered);
+    assert!(
+        matches!(r, Err(BlockValidationError::TransactionValidation(_))),
+        "got {:?}",
+        r
+    );
 }
