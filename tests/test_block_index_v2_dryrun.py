@@ -83,11 +83,6 @@ def dry_run(db) -> dict:
     return dict(fn())
 
 
-def close(db) -> None:
-    del db
-    gc.collect()
-
-
 @pytest.mark.parametrize("name", sorted(EXPECTED))
 def test_dry_run_predicts_the_migration_and_writes_nothing(tmp_path, name):
     """On a legacy datadir the dry run's counts are exactly the counts the
@@ -99,7 +94,8 @@ def test_dry_run_predicts_the_migration_and_writes_nothing(tmp_path, name):
 
     sec = open_secondary(path, str(tmp_path / "secondary"))
     r = dry_run(sec)
-    close(sec)
+    del sec
+    gc.collect()
     assert manifest(path) == before, "the dry run wrote to the datadir"
 
     assert r["migrated"] == 0
@@ -113,7 +109,8 @@ def test_dry_run_predicts_the_migration_and_writes_nothing(tmp_path, name):
     db = sync.PyBlockchainDB(path)
     real = db.block_index_open_migration_stats()
     total, v2, legacy = db.block_index_summary()
-    close(db)
+    del db
+    gc.collect()
     assert real is not None, "the real open did not migrate"
     assert {k: real[k] for k in STATS_KEYS} == {k: r[k] for k in STATS_KEYS}
     assert (total, v2, legacy) == (r["scanned"], r["already_v2"] + upgraded,
@@ -126,11 +123,13 @@ def test_dry_run_after_migration_reports_marker_and_nothing_to_do(tmp_path, name
     path = unpack(tmp_path, name)
     db = sync.PyBlockchainDB(path)
     total, _v2, _legacy = db.block_index_summary()
-    close(db)
+    del db
+    gc.collect()
 
     sec = open_secondary(path, str(tmp_path / "secondary"))
     r = dry_run(sec)
-    close(sec)
+    del sec
+    gc.collect()
     assert r["migrated"] == 1
     assert r["scanned"] == total
     assert r["from_headers"] + r["from_body"] == 0
@@ -151,10 +150,12 @@ def test_dry_run_beside_an_open_primary_and_refuses_writes(tmp_path):
     assert r["scanned"] == total and r["migrated"] == 1
     with pytest.raises(Exception):
         sec.invalidate_block(bytes(tip_hash))
-    close(sec)
+    del sec
+    gc.collect()
     # The refused write did not reach the primary.
     assert tuple(primary.get_best_block()) == (tip_hash, tip_height)
-    close(primary)
+    del primary
+    gc.collect()
 
 
 def _run_tool(*args: str) -> subprocess.CompletedProcess:
@@ -174,7 +175,8 @@ def test_operator_tool_prints_the_counts_and_leaves_the_datadir_alone(tmp_path):
     assert manifest(path) == before
     db = sync.PyBlockchainDB(path)
     real = db.block_index_open_migration_stats()
-    close(db)
+    del db
+    gc.collect()
     assert {k: real[k] for k in STATS_KEYS} == {k: r[k] for k in STATS_KEYS}
 
 
