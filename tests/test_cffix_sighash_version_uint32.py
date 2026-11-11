@@ -289,3 +289,7 @@ def test_transaction_validator_block_path(name, version, monkeypatch):
     tv = _validator(spk)
     ok, reason = tv.validate_transaction(tx, height=850_000, block_mtp=1_700_000_000)
     assert ok is core_decision, reason
+    if not core_decision:
+        # Rejected by the input's script check, not by anything incidental
+        # to the mocked chainstate.
+        assert reason == "Invalid signature for input 0", reason
