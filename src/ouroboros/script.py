@@ -1182,7 +1182,10 @@ class ScriptInterpreter:
 
         inp = tx.inputs[input_index]
         data = bytearray()
-        data.extend(struct.pack('<i', tx.version))
+        # nVersion is uint32 (Core CTransaction::version; BIP143 writes
+        # `ss << txTo.version`).  The wire parser stores it unsigned, so a
+        # signed '<i' pack raised struct.error for version >= 0x80000000.
+        data.extend(struct.pack('<I', tx.version & 0xFFFFFFFF))
         data.extend(hash_prevouts)
         data.extend(hash_sequence)
         data.extend(inp.prev_txid)
@@ -3155,8 +3158,9 @@ class ScriptInterpreter:
         # Hash type
         data.append(sighash_type)
 
-        # Transaction data
-        data.extend(struct.pack('<i', tx.version))
+        # Transaction data.  nVersion is uint32 (Core SignatureHashSchnorr
+        # `ss << tx_to.version`); see _compute_segwit_v0_sighash.
+        data.extend(struct.pack('<I', tx.version & 0xFFFFFFFF))
         data.extend(struct.pack('<I', tx.locktime))
 
         if not anyone_can_pay:
