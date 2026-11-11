@@ -172,6 +172,7 @@ def test_operator_tool_prints_the_counts_and_leaves_the_datadir_alone(tmp_path):
     p = _run_tool("--datadir", path, "--secondary-dir", str(tmp_path / "scratch"), "--json")
     assert p.returncode == 0, p.stderr
     r = json.loads(p.stdout)
+    assert r["sync_module"] and "open_seconds" in r and "scan_seconds" in r
     assert manifest(path) == before
     db = sync.PyBlockchainDB(path)
     real = db.block_index_open_migration_stats()

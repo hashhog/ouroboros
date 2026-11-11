@@ -319,9 +319,13 @@ impl BlockchainDB {
         })?;
         let mut opts = Options::default();
         opts.create_if_missing(false);
-        // RocksDB's guidance for secondaries: keep every file open, so a
-        // compaction in the primary cannot delete a file from under us.
-        opts.set_max_open_files(-1);
+        // A bounded table cache, not RocksDB's usual -1 for secondaries: -1
+        // opens every SST at open time, and a mainnet datadir has tens of
+        // thousands (an fd limit or a few GB of index blocks in an operator
+        // shell).  The cost: if a running primary compacts a file away
+        // during the scan, the scan fails with an I/O error (nothing is
+        // written either way) and can simply be run again.
+        opts.set_max_open_files(512);
         opts.set_db_log_dir(secondary);
         let names = DB::list_cf(&Options::default(), primary)?;
         let cf_descriptors: Vec<ColumnFamilyDescriptor> = names

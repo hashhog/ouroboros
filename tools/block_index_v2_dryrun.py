@@ -23,7 +23,9 @@ log on a datadir in this state.
 Usage:
     python3 tools/block_index_v2_dryrun.py --datadir DIR --secondary-dir SCRATCH [--json]
 
-Exit status: 0 on a completed scan, 2 on a refused argument, 1 on an error.
+Exit status: 0 on a completed scan, 2 on a refused argument, 1 on an error
+(including an I/O error when a running node compacts a file away mid-scan:
+nothing was written; run it again).
 """
 
 from __future__ import annotations
@@ -78,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     t_scan = time.monotonic() - t0 - t_open
     del db
 
+    r["sync_module"] = getattr(sync, "__file__", "?")
     r["open_seconds"] = round(t_open, 3)
     r["scan_seconds"] = round(t_scan, 3)
     if args.json:
@@ -86,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     upgraded = r["from_headers"] + r["from_body"]
     print("block index v2 dry run (nothing written)")
     print(f"  datadir             {args.datadir}")
+    print(f"  sync build          {r['sync_module']}")
     print(f"  marker present      {'yes (a v2 open would not scan)' if r['migrated'] else 'no'}")
     print(f"  nTx reconciled      {'yes' if r['ntx_reconciled'] else 'no (the open runs it first)'}")
     print(f"  scanned             {r['scanned']}")
