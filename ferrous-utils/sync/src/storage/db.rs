@@ -62,6 +62,23 @@ pub struct BlockIndexMigrationStats {
     pub malformed: u64,
 }
 
+/// Result of `BlockchainDB::dry_run_block_index_v2`: what the v2 migration
+/// would do to this database, computed without writing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BlockIndexDryRun {
+    /// The migration marker is already present: a v2 open would not scan
+    /// at all (`stats` then describes the entries as they are).
+    pub migrated: bool,
+    /// The HEADERS_CF nTx reconcile marker is present, so the nTx values the
+    /// migration copies are final (`open` runs that reconcile first).
+    pub ntx_reconciled: bool,
+    /// The counts the migration would log.
+    pub stats: BlockIndexMigrationStats,
+    /// Bytes the upgraded values add over the values they replace
+    /// (uncompressed, before RocksDB's own compression).
+    pub extra_bytes: u64,
+}
+
 /// One hash-index entry: what Core keeps in a `CBlockIndex` for this block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockIndexEntry {
@@ -284,6 +301,43 @@ impl BlockchainDB {
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
         DB::repair(&opts, path).map_err(DbError::RocksDb)
+    }
+
+    /// Open `primary` as a RocksDB **secondary** instance, for read-only
+    /// probes of a datadir another process may have open.
+    ///
+    /// A secondary takes no lock on the primary, never writes to it (any
+    /// write through this handle is refused by RocksDB), and keeps its own
+    /// info log and state under `secondary`, which must be a directory the
+    /// caller owns, outside the datadir.  None of `open`'s one-time passes
+    /// (nTx reconcile, v2 migration) run.  It sees the primary as of the
+    /// moment it opened (call it again for a newer view).  Column families
+    /// are the ones the datadir actually has, so an older datadir opens too.
+    pub fn open_secondary(primary: &str, secondary: &str) -> Result<Self> {
+        std::fs::create_dir_all(secondary).map_err(|e| {
+            DbError::InvalidData(format!("secondary dir {}: {}", secondary, e))
+        })?;
+        let mut opts = Options::default();
+        opts.create_if_missing(false);
+        // RocksDB's guidance for secondaries: keep every file open, so a
+        // compaction in the primary cannot delete a file from under us.
+        opts.set_max_open_files(-1);
+        opts.set_db_log_dir(secondary);
+        let names = DB::list_cf(&Options::default(), primary)?;
+        let cf_descriptors: Vec<ColumnFamilyDescriptor> = names
+            .into_iter()
+            .map(|name| {
+                let o = create_cf_options(&name);
+                ColumnFamilyDescriptor::new(name, o)
+            })
+            .collect();
+        let db = DB::open_cf_descriptors_as_secondary(&opts, primary, secondary, cf_descriptors)?;
+        Ok(Self {
+            db: Arc::new(db),
+            utxo_read_cache: Mutex::new(HashMap::new()),
+            cache_generation: AtomicU64::new(0),
+            open_index_migration: Mutex::new(None),
+        })
     }
 
     /// Open or create a new database at the given path
@@ -521,15 +575,60 @@ impl BlockchainDB {
         }
         let index_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+
+        const FLUSH_EVERY: usize = 10_000;
+        let mut batch = WriteBatch::default();
+        let mut pending = 0usize;
+        let stats = self.scan_block_index_v2(|key, _old_len, value| {
+            batch.put_cf(index_cf, key, value);
+            pending += 1;
+            if pending >= FLUSH_EVERY {
+                self.db.write(std::mem::take(&mut batch))?;
+                pending = 0;
+            }
+            Ok(())
+        })?;
+
+        batch.put_cf(meta_cf, meta_keys::BLOCK_INDEX_V2_MIGRATED, [2u8]);
+        self.db.write(batch)?;
+        Ok(Some(stats))
+    }
+
+    /// What `migrate_block_index_v2` would do to this database, without
+    /// writing anything.  The same scan, with the writes replaced by counting,
+    /// so the counts are the ones the first open of a v2 build would log
+    /// (`block index v2 migration: ... no_header=N`).  Meant for a secondary
+    /// instance (`open_secondary`) over a live datadir.
+    pub fn dry_run_block_index_v2(&self) -> Result<BlockIndexDryRun> {
+        let meta_cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        let migrated = self.db.get_pinned_cf(meta_cf, meta_keys::BLOCK_INDEX_V2_MIGRATED)?.is_some();
+        let ntx_reconciled =
+            self.db.get_pinned_cf(meta_cf, meta_keys::HEADERS_NTX_RECONCILED_V1)?.is_some();
+        let mut extra_bytes = 0u64;
+        let stats = self.scan_block_index_v2(|_key, old_len, value| {
+            extra_bytes += (value.len() - old_len) as u64;
+            Ok(())
+        })?;
+        Ok(BlockIndexDryRun { migrated, ntx_reconciled, stats, extra_bytes })
+    }
+
+    /// The classification pass shared by `migrate_block_index_v2` and
+    /// `dry_run_block_index_v2`: visits every hash-index entry and calls
+    /// `upgrade(key, old_value_len, v2_value)` for each one it can upgrade.
+    /// It writes nothing itself.
+    fn scan_block_index_v2<F>(&self, mut upgrade: F) -> Result<BlockIndexMigrationStats>
+    where
+        F: FnMut(&[u8], usize, Vec<u8>) -> Result<()>,
+    {
+        let index_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
         let headers_cf = self.db.cf_handle(HEADERS_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(HEADERS_CF.to_string()))?;
         let blocks_cf = self.db.cf_handle(BLOCKS_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
 
-        const FLUSH_EVERY: usize = 10_000;
         let mut stats = BlockIndexMigrationStats::default();
-        let mut batch = WriteBatch::default();
-        let mut pending = 0usize;
 
         let mut headers = self.db.raw_iterator_cf(headers_cf);
         headers.seek_to_first();
@@ -595,20 +694,12 @@ impl BlockchainDB {
             }
             match tail {
                 Some((header, n_tx)) => {
-                    batch.put_cf(index_cf, &key, v2_value(&metadata_bytes, &header, n_tx));
-                    pending += 1;
-                    if pending >= FLUSH_EVERY {
-                        self.db.write(std::mem::take(&mut batch))?;
-                        pending = 0;
-                    }
+                    upgrade(&key, value.len(), v2_value(&metadata_bytes, &header, n_tx))?;
                 }
                 None => stats.no_header += 1,
             }
         }
-
-        batch.put_cf(meta_cf, meta_keys::BLOCK_INDEX_V2_MIGRATED, [2u8]);
-        self.db.write(batch)?;
-        Ok(Some(stats))
+        Ok(stats)
     }
 
     /// Get a block by its hash

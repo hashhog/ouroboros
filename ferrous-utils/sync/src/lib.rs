@@ -3215,6 +3215,22 @@ impl PyBlockchainDB {
             ))
     }
 
+    /// Open ``data_dir`` as a read-only RocksDB secondary instance whose own
+    /// files live in ``secondary_dir`` (outside the datadir).  Takes no lock,
+    /// writes nothing to ``data_dir``, runs no migration or crash recovery.
+    /// For operator probes such as ``dry_run_block_index_v2``.
+    #[staticmethod]
+    fn open_secondary(data_dir: String, secondary_dir: String) -> PyResult<Self> {
+        let db = BlockchainDB::open_secondary(&data_dir, &secondary_dir)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to open secondary: {}", e)
+            ))?;
+        Ok(Self {
+            db: Arc::new(db),
+            block_validator: std::sync::OnceLock::new(),
+        })
+    }
+
     #[new]
     fn new(data_dir: String) -> PyResult<Self> {
         let db = BlockchainDB::open(&data_dir)
@@ -3418,6 +3434,20 @@ impl PyBlockchainDB {
                 format!("Database error: {}", e)
             )),
         }
+    }
+
+    /// What the hash-index v2 migration would do here, without writing:
+    /// the ``migrate_block_index_v2`` counts plus ``migrated`` (marker
+    /// already present, 0/1), ``ntx_reconciled`` (0/1) and ``extra_bytes``.
+    fn dry_run_block_index_v2(&self) -> PyResult<std::collections::HashMap<String, u64>> {
+        let r = self.db.dry_run_block_index_v2().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", e))
+        })?;
+        let mut m = index_migration_stats_map(&r.stats);
+        m.insert("migrated".to_string(), r.migrated as u64);
+        m.insert("ntx_reconciled".to_string(), r.ntx_reconciled as u64);
+        m.insert("extra_bytes".to_string(), r.extra_bytes);
+        Ok(m)
     }
 
     /// Counts from the hash-index v2 migration that opening this database
