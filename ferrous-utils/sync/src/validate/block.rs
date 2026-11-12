@@ -193,13 +193,16 @@ impl BlockValidator {
         // 1. Validate header (PoW, timestamps, difficulty — always)
         self.validate_header(block, prev_height)?;
 
-        // 2. Check block weight limit (always — quick check on tx count)
-        self.check_size_limits(inner)?;
-
-        // 3. Verify merkle root (always — proves tx integrity)
+        // 2. Verify merkle root (always — proves tx integrity).  Before any
+        //    size limit, as Core CheckBlock does (CheckMerkleRoot precedes the
+        //    size limits): a block whose bytes do not match its header is
+        //    MUTATED, which says nothing about the block the header names.
         if !self.verify_merkle_root(inner) {
             return Err(BlockValidationError::InvalidMerkleRoot);
         }
+
+        // 3. Check block weight limit (always)
+        self.check_size_limits(inner)?;
 
         // 4. Non-empty block
         if inner.txdata.is_empty() {
@@ -287,13 +290,17 @@ impl BlockValidator {
         // 1. Validate header (PoW, timestamps, difficulty)
         self.validate_header(block, prev_height)?;
 
-        // 2. Check block weight limit
-        self.check_size_limits(inner)?;
-
-        // 3. Verify merkle root
+        // 2. Verify merkle root — before any size limit (Core CheckBlock:
+        //    CheckMerkleRoot runs first; a mismatch is BLOCK_MUTATED).
         if !self.verify_merkle_root(inner) {
             return Err(BlockValidationError::InvalidMerkleRoot);
         }
+        // 3. Witness-independent size guards (Core CheckBlock "size limits",
+        //    bad-blk-length): tx count and stripped (TX_NO_WITNESS) size.  They
+        //    keep their CheckBlock position; the full block weight reads
+        //    witness bytes, which the txid merkle root does not commit to, so
+        //    it runs right after the witness commitment check (step 7d).
+        self.check_stripped_size_limits(inner)?;
 
         // 4. Non-empty block
         if inner.txdata.is_empty() {
@@ -474,8 +481,18 @@ impl BlockValidator {
         //     Matches Python `validation.py:420-426`.
         self.validate_block_subsidy(inner, height, total_fees)?;
 
-        // 7d. BIP141 witness commitment.
+        // 7d. BIP141 witness commitment, THEN the block weight limit — in
+        //     Core's ContextualCheckBlock order (CheckWitnessMalleation, then
+        //     bad-blk-weight).  The weight reads witness bytes, which the txid
+        //     merkle root does not commit to: any relaying peer can pad the
+        //     witness of an honest block.  With the weight checked first that
+        //     padded copy failed as SizeExceeded (a verdict on the header
+        //     hash) instead of as the witness malleation it is (BLOCK_MUTATED,
+        //     never cached).  Nothing in the per-tx loop above reads the
+        //     witness (no script execution on this route), so every check that
+        //     ran before the commitment on master still does.
         self.check_witness_commitment(inner, height)?;
+        self.check_size_limits(inner)?;
 
         // 8. Sigop cost limit with BIP141 witness discount.
         //    W85 fix: use prefetched script_pubkeys instead of re-fetching
@@ -547,6 +564,28 @@ impl BlockValidator {
         self.header_validator
             .validate_header(&header, &prev_header, prev_height)?;
 
+        Ok(())
+    }
+
+    /// Core CheckBlock's witness-independent size guards (validation.cpp,
+    /// "size limits"): `vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT`
+    /// and `GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR >
+    /// MAX_BLOCK_WEIGHT` -> bad-blk-length.  Neither reads the witness, so a
+    /// relaying peer cannot trip them by padding it.
+    fn check_stripped_size_limits(&self, block: &Block) -> Result<()> {
+        const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+        const WITNESS_SCALE_FACTOR: u64 = 4;
+        if (block.txdata.len() as u64) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT {
+            return Err(BlockValidationError::SizeExceeded);
+        }
+        // 80-byte header + CompactSize tx count + each tx's stripped size.
+        let n = block.txdata.len() as u64;
+        let count_len: u64 = if n < 0xfd { 1 } else if n <= 0xffff { 3 } else if n <= 0xffff_ffff { 5 } else { 9 };
+        let stripped: u64 = 80 + count_len
+            + block.txdata.iter().map(|tx| tx.base_size() as u64).sum::<u64>();
+        if stripped * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT {
+            return Err(BlockValidationError::SizeExceeded);
+        }
         Ok(())
     }
 
