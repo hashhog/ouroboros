@@ -16,11 +16,11 @@ mod tests {
     };
     use tempdir::TempDir;
 
-    use common::{BlockMetadata, BlockStatus, BlockWrapper};
+    use common::{BitcoinSerialize, BlockMetadata, BlockStatus, BlockWrapper};
 
     use crate::storage::db::{BlockIndexEntry, BlockchainDB};
     use crate::storage::schema::{
-        get_column_families, meta_keys, BLOCK_INDEX_BY_HASH_CF, BLOCK_INDEX_ENTRY_V2_LEN,
+        get_column_families, meta_keys, BLOCKS_CF, BLOCK_INDEX_BY_HASH_CF, BLOCK_INDEX_ENTRY_V2_LEN,
         BLOCK_METADATA_LEN, HEADERS_CF, META_CF,
     };
 
@@ -262,6 +262,56 @@ mod tests {
         let e40 = BlockIndexEntry::from_value(&v[..40]).unwrap();
         assert_eq!(e40.header, None);
         let _ = HEADERS_CF;
+    }
+
+    #[test]
+    fn test_block_index_v2_migration_never_uses_a_header_or_body_of_another_block() {
+        // The hash check the migration applies to both sources (the scan the
+        // dry run shares): a HEADERS_CF header or a BLOCKS_CF body whose
+        // header hashes to another key is counted in hash_mismatch and never
+        // written into the entry; the body source is still tried after a
+        // foreign HEADERS_CF header.
+        let tmp = TempDir::new("bi_v2_mismatch").unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+        let g = block(0, BlockHash::all_zeros(), 1);
+        let a = block(1, g.block_hash(), 1); // own header in HEADERS_CF -> from_headers
+        let b = block(2, a.block_hash(), 2); // HEADERS_CF holds a's header; own body -> from_body
+        let d = block(3, b.block_hash(), 1); // HEADERS_CF holds g's header; no body -> no_header
+        let e = block(4, d.block_hash(), 1); // no HEADERS_CF row; BLOCKS_CF holds a's body -> no_header
+        {
+            let db = BlockchainDB::open(&path).unwrap();
+            for (height, x) in [(0u32, &g), (1, &a), (2, &b), (3, &d), (4, &e)] {
+                let md = BlockMetadata::new(height, [height as u8; 32], x.header().time);
+                db.store_block_metadata(height, &h(x), &md).unwrap();
+            }
+            db.store_raw_header(&h(&g), &header80(&g), 1).unwrap();
+            db.store_raw_header(&h(&a), &header80(&a), 1).unwrap();
+            db.store_block(&b).unwrap();
+            db.store_raw_header(&h(&b), &header80(&a), 7).unwrap();
+            db.store_raw_header(&h(&d), &header80(&g), 7).unwrap();
+        }
+        {
+            let rdb = raw(&path);
+            let blocks = rdb.cf_handle(BLOCKS_CF).unwrap();
+            rdb.put_cf(blocks, h(&e), a.bitcoin_serialize().unwrap()).unwrap();
+        }
+        make_legacy(&path);
+
+        let db = BlockchainDB::open(&path).unwrap();
+        let s = db.open_index_migration_stats().expect("the open migrated");
+        assert_eq!(
+            (s.scanned, s.from_headers, s.from_body, s.no_header, s.hash_mismatch, s.malformed),
+            (5, 2, 1, 2, 3, 0),
+            "b, d and e each hold a foreign header or body: {:?}", s
+        );
+        let entry = |x: &BlockWrapper| db.get_block_index_entry(&h(x)).unwrap().unwrap();
+        assert_eq!(entry(&a).header, Some(header80(&a)));
+        let eb = entry(&b);
+        assert_eq!(eb.header, Some(header80(&b)), "b's own body, not a's header from HEADERS_CF");
+        assert_eq!(eb.n_tx, 2, "nTx counted from b's own body");
+        assert_eq!(entry(&d).header, None, "g's header is never written into d");
+        assert_eq!(entry(&e).header, None, "a's body is never written into e");
+        assert_eq!(db.block_index_summary().unwrap(), (5, 3, 2));
     }
 
     fn raw_len(db: &BlockchainDB, hash: &[u8; 32]) -> usize {
