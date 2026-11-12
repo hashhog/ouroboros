@@ -694,8 +694,9 @@ class BlockSync:
 
         # Per-block re-request attempt counter (block_hash -> int).  Bumped on
         # every re-request in _handle_timeouts; a block that exceeds
-        # BLOCK_REQUEST_MAX_ATTEMPTS is permanently abandoned (see
-        # _abandon_block_request) rather than re-requested forever.  This is
+        # BLOCK_REQUEST_MAX_ATTEMPTS and is not in the validated-header queue
+        # is abandoned (see _abandon_block_request, no perm-reject) rather
+        # than re-requested forever.  This is
         # what bounds requested_blocks / _block_request_peer for blocks a peer
         # announced but no peer will ever deliver into our active chain (stale
         # / fork / competing tips at the at-tip churn path — the 2026-06-02/03
@@ -8581,19 +8582,24 @@ class BlockSync:
             return
 
         # Bound the retry queue: count a re-request attempt for every timed-out
-        # block and PERMANENTLY ABANDON any GENERAL-timeout block that has
-        # exceeded BLOCK_REQUEST_MAX_ATTEMPTS.  Head-of-window blocks (tip+1
-        # region) are exempt — those are on the active chain and must keep
-        # being retried or sync wedges; abandoning the head is never correct.
-        # General timeouts are off-active-chain announces (stale / fork /
-        # competing tips a peer threw at us via inv): a peer announced them,
-        # no peer delivers them into our chain, and pre-fix they were
-        # re-requested forever, leaking one entry each in requested_blocks /
-        # _block_request_peer / _w77_first_request_time (the at-tip RSS leak).
-        # Perm-reject the abandoned hash so a redelivery / re-announce does not
-        # re-open the same in-flight slot.
+        # block and ABANDON a general-timeout block that has exceeded
+        # BLOCK_REQUEST_MAX_ATTEMPTS only when it is NOT in the
+        # validated-header queue.  Such a hash is an off-chain announce
+        # (stale / fork / competing tip a peer threw at us via inv) that no
+        # peer delivers; pre-fix it was re-requested forever, leaking one
+        # entry each in requested_blocks / _block_request_peer /
+        # _w77_first_request_time (the at-tip RSS leak), so it is dropped
+        # from the in-flight maps.
+        #
+        # A hash that IS in _validated_headers is a block of the header
+        # chain we are downloading (slots 9..window during IBD / catch-up
+        # are "general", not head-of-window).  It keeps being re-requested:
+        # giving it up wedges the drain on that slot.  And a timeout is never
+        # a verdict on the block, so nothing is perm-rejected here — Core's
+        # SendMessages stall / download timeouts only disconnect the peer and
+        # FindNextBlocksToDownload re-requests the block elsewhere.
         head_set_for_attempts = set(head_timed_out)
-        abandoned: list[bytes] = []
+        over_limit: list[bytes] = []
         for block_hash in timed_out:
             n = self._block_request_attempts.get(block_hash, 0) + 1
             self._block_request_attempts[block_hash] = n
@@ -8601,19 +8607,23 @@ class BlockSync:
                 block_hash not in head_set_for_attempts
                 and n > BLOCK_REQUEST_MAX_ATTEMPTS
             ):
-                abandoned.append(block_hash)
+                over_limit.append(block_hash)
+        abandoned: list[bytes] = []
+        if over_limit:
+            # Built only when something is over the limit, so the common
+            # timeout pass never walks a long IBD header queue.
+            queued = {bh for bh, _ in self._validated_headers}
+            abandoned = [h for h in over_limit if h not in queued]
         if abandoned:
             ab_set = set(abandoned)
             timed_out = [h for h in timed_out if h not in ab_set]
             general_timed_out = [h for h in general_timed_out if h not in ab_set]
             for block_hash in abandoned:
-                # _mark_perm_rejected calls _abandon_block_request, which drops
-                # the hash from all four in-flight maps.
-                self._mark_perm_rejected(block_hash)
+                self._abandon_block_request(block_hash)
             logger.warning(
                 "Abandoned %d block request(s) after %d failed attempts "
-                "(off-active-chain announces never delivered) — dropped from "
-                "in-flight maps + perm-rejected",
+                "(off-chain announces never delivered) — dropped from "
+                "in-flight maps",
                 len(abandoned), BLOCK_REQUEST_MAX_ATTEMPTS,
             )
 
