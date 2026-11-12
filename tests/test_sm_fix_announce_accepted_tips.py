@@ -160,9 +160,15 @@ def test_reorg_inv_peer_gets_only_the_new_tip(tmp_path):
     assert [(t, bytes(h)) for t, h in inv.inventory] == [(INV_TYPE_BLOCK, side[-1])]
 
 
-def test_long_reorg_announces_at_most_eight_blocks(tmp_path):
-    """Core MAX_BLOCKS_TO_ANNOUNCE: a reorg longer than 8 blocks announces
-    the 8 newest, oldest first."""
+def test_long_reorg_announces_an_inv_of_the_tip(tmp_path):
+    """Core MAX_BLOCKS_TO_ANNOUNCE: UpdatedBlockTip stops after 8 blocks, so
+    for a longer reorg the first queued header's parent is a new-branch block
+    the peer does not have; SendMessages finds no header that connects
+    (PeerHasHeader(pindex->pprev) fails) and reverts to an inv of the tip,
+    even for a sendheaders peer.  A headers message that does not connect
+    would push the peer into its unconnecting-headers handling."""
+    from ouroboros.p2p_messages import INV_TYPE_BLOCK, InvMessage
+
     from ouroboros import rpc
 
     # getattr, so the base commit fails on this assertion, not on import.
@@ -175,8 +181,23 @@ def test_long_reorg_announces_at_most_eight_blocks(tmp_path):
     assert results[-1] is None and set(results[:-1]) == {"inconclusive"}
     assert bdb.get_best_block() == (side[-1], TIP + 1), "precondition: reorged"
     msgs = peer.announced()
+    assert [m.command for m in msgs] == ["inv"], msgs
+    inv = InvMessage.from_payload(msgs[0].payload)
+    assert [(t, bytes(h)) for t, h in inv.inventory] == [(INV_TYPE_BLOCK, side[-1])]
+
+
+def test_eight_block_reorg_announces_all_eight_headers(tmp_path):
+    """The cap's edge: a reorg of exactly 8 blocks reaches the fork point,
+    which the peer has, so all 8 headers go in one headers message."""
+    peer = _Peer()
+    bdb, server, hashes = _setup(tmp_path, [peer])
+    # Fork off block 3: side heights 4..11 (8 blocks); the 8th overtakes.
+    side, results = _submit_side_branch(server, hashes[3], 4, 8)
+    assert results[-1] is None and set(results[:-1]) == {"inconclusive"}
+    assert bdb.get_best_block() == (side[-1], TIP + 1), "precondition: reorged"
+    msgs = peer.announced()
     assert [m.command for m in msgs] == ["headers"], msgs
-    assert _header_hashes(msgs[0]) == side[-8:]
+    assert _header_hashes(msgs[0]) == side
 
 
 def test_linear_submitblock_announces_exactly_the_new_tip(tmp_path):

@@ -7624,7 +7624,9 @@ class BlockSync:
         task.add_done_callback(tasks.discard)
         return task
 
-    def schedule_tip_announce(self, blocks: list) -> asyncio.Task | None:
+    def schedule_tip_announce(
+        self, blocks: list, *, inv_only: bool = False,
+    ) -> asyncio.Task | None:
         """Announce a tip change made outside the P2P drain, in the background.
 
         *blocks* are ``(Block, hash)`` pairs, oldest first, ending at the new
@@ -7633,11 +7635,13 @@ class BlockSync:
         reorg) go as one ``headers`` message to a header-preferring peer and
         as an ``inv`` of the new tip to every other peer — Core SendMessages
         sends a cmpctblock only for a single-block change and otherwise
-        reverts to an inv of the tip (fRevertToInv).
+        reverts to an inv of the tip (fRevertToInv).  *inv_only* (a change
+        longer than the cap, whose first header would not connect for the
+        peer) sends that inv to every peer.
         """
         if not blocks:
             return None
-        if len(blocks) == 1:
+        if len(blocks) == 1 and not inv_only:
             block, block_hash = blocks[0]
             return self._schedule_announce(block, block_hash, -1)
         tasks = getattr(self, "_announce_tasks", None)
@@ -7646,7 +7650,7 @@ class BlockSync:
 
         async def _run() -> None:
             try:
-                await self._announce_blocks(blocks)
+                await self._announce_blocks(blocks, inv_only=inv_only)
             except Exception as e:
                 logger.debug(f"announce of {len(blocks)}-block tip change failed: {e}")
 
@@ -7655,7 +7659,7 @@ class BlockSync:
         task.add_done_callback(tasks.discard)
         return task
 
-    async def _announce_blocks(self, blocks: list) -> None:
+    async def _announce_blocks(self, blocks: list, *, inv_only: bool = False) -> None:
         """Announce a multi-block tip change (see ``schedule_tip_announce``)."""
         if not hasattr(self.peer_manager, 'get_all_ready_peers'):
             return
@@ -7677,7 +7681,8 @@ class BlockSync:
 
         async def _announce_to(p) -> None:
             try:
-                await p.send_message(headers_msg if p.wants_headers else inv_msg)
+                use_headers = p.wants_headers and not inv_only
+                await p.send_message(headers_msg if use_headers else inv_msg)
             except Exception as e:
                 logger.debug(f"Failed to announce tip to {p.host}:{p.port}: {e}")
 

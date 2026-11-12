@@ -660,7 +660,11 @@ def announce_tip_change(node, blocks: list) -> None:
     *blocks* are ``(Block, hash)`` pairs of the blocks that became active,
     oldest first, ending at the new tip: one block for a plain extension,
     fork-point child .. new tip for a reorg.  Only the newest
-    MAX_BLOCKS_TO_ANNOUNCE are announced.  Nothing is sent while the node is
+    MAX_BLOCKS_TO_ANNOUNCE are announced.  When the change is longer than
+    that, the first announced header's parent is a new-branch block the peer
+    does not have, so Core's SendMessages finds no header that connects
+    (``PeerHasHeader(pindex->pprev)`` fails) and reverts to an inv of the
+    tip; every peer gets that inv here too.  Nothing is sent while the node is
     in initial block download (Core returns early on fInitialDownload).  The
     send runs in the background through ``BlockSync``, the same per-peer
     announcer the P2P drain uses, so a peer whose socket is not draining
@@ -677,7 +681,11 @@ def announce_tip_change(node, blocks: list) -> None:
         ibd = getattr(node, "is_initial_block_download", None)
         if callable(ibd) and ibd():
             return
-        schedule(list(blocks)[-MAX_BLOCKS_TO_ANNOUNCE:])
+        blocks = list(blocks)
+        schedule(
+            blocks[-MAX_BLOCKS_TO_ANNOUNCE:],
+            inv_only=len(blocks) > MAX_BLOCKS_TO_ANNOUNCE,
+        )
     except Exception as e:  # noqa: BLE001 - relay is best-effort
         logger.debug("tip announce failed: %s", e)
 
@@ -10458,13 +10466,16 @@ class RPCServer:
 
         # Relay the new tip: ONE announcement for the whole switch, carrying
         # the newest MAX_BLOCKS_TO_ANNOUNCE blocks of the new branch, oldest
-        # first (Core UpdatedBlockTip walks pindexNew back to pindexFork).
+        # first (Core UpdatedBlockTip walks pindexNew back to pindexFork), or
+        # an inv of the tip when the branch is longer than that.
         # Neither connect path announces per block: the atomic batch never
         # reaches accept_block, and the per-block path passes announce=False.
         _announce: list = []
         try:
             from ouroboros.database import Block as _ABlk
-            for _ah, _, _araw in chain_to_connect[-MAX_BLOCKS_TO_ANNOUNCE:]:
+            # One past the cap, so announce_tip_change can tell a cut-short
+            # list (inv of the tip) from one that reaches the fork point.
+            for _ah, _, _araw in chain_to_connect[-(MAX_BLOCKS_TO_ANNOUNCE + 1):]:
                 _announce.append((_ABlk.deserialize(bytes(_araw)), bytes(_ah)))
         except Exception as e:  # noqa: BLE001 - relay is best-effort
             logger.debug("reorg announce: undecodable block: %s", e)
