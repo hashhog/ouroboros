@@ -37,6 +37,7 @@ from ouroboros.localaddr import (
 )
 from ouroboros.banman import (
     BanManager,
+    ban_key,
 )
 from ouroboros.minisketch import (
     Minisketch,
@@ -4847,7 +4848,15 @@ class PeerManager:
             (self.inbound_peers, True),    # inbound
         ]
         for bucket, _is_inbound in all_buckets:
-            matching = [a for a in list(bucket) if a.startswith(ip)]
+            # Exact address match.  Bans are keyed by address (banman.ban_key),
+            # so every connection from that IP goes, on any port -- and only
+            # that IP: the previous ``a.startswith(ip)`` also hit
+            # 198.51.100.70:* when 198.51.100.7 was banned.
+            matching = [
+                a for a, p in list(bucket.items())
+                if a == ip or ban_key(a) == ip
+                or getattr(p, "host", None) == ip
+            ]
             for addr in matching:
                 peer = bucket.get(addr)
                 if peer is None:
@@ -4894,7 +4903,30 @@ class PeerManager:
 
         Returns True if the peer was banned.
         """
-        return self.ban_manager.record_misbehavior(addr, score, reason)
+        return self.ban_manager.record_misbehavior(
+            self._ban_address(addr), score, reason)
+
+    def _ban_address(self, peer_id: str) -> str:
+        """Map a peer identifier to the address a ban/score is keyed by.
+
+        Callers pass connection keys -- usually ``f"{peer.host}:{peer.port}"``.
+        Core discourages ``pnode.addr`` (net_processing.cpp
+        MaybeDiscourageAndDisconnect), never an address+port.  For a key that
+        belongs to a connected peer the peer's own host is authoritative;
+        that is the only reliable way to strip the port from an unbracketed
+        IPv6 key like ``2001:db8::1:8333``.  Anything else goes through
+        ``banman.ban_key``.
+        """
+        for bucket in (self.peers, self.block_relay_peers, self.inbound_peers):
+            peer = bucket.get(peer_id)
+            if peer is not None and getattr(peer, "host", None):
+                return peer.host
+        for bucket in (self.peers, self.block_relay_peers, self.inbound_peers):
+            for peer in list(bucket.values()):
+                host = getattr(peer, "host", None)
+                if host and f"{host}:{getattr(peer, 'port', '')}" == peer_id:
+                    return host
+        return ban_key(peer_id)
 
     def misbehaving(self, peer_id: str, score: int, reason: str) -> bool:
         """Record misbehavior for a peer (Bitcoin Core API compatibility).
@@ -4917,7 +4949,8 @@ class PeerManager:
         Returns:
             True if the peer was banned as a result
         """
-        return self.ban_manager.misbehaving(peer_id, score, reason)
+        return self.ban_manager.misbehaving(
+            self._ban_address(peer_id), score, reason)
 
     def unban_peer(self, addr: str):
         """

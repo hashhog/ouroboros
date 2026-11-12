@@ -53,6 +53,39 @@ SCORE_RECORD_TTL = 86400.0  # seconds (24 h)
 SCORE_EVENTS_MAX = 20
 
 
+def ban_key(addr: str) -> str:
+    """Reduce a peer identifier to the key a ban is stored under: the address.
+
+    Core bans and discourages a CNetAddr, never an address+port
+    (net_processing.cpp MaybeDiscourageAndDisconnect ->
+    ``m_banman->Discourage(pnode.addr)``; net.cpp AcceptConnection checks
+    ``IsDiscouraged(addr)`` / ``IsBanned(addr)``).  Callers here pass
+    connection keys such as ``"1.2.3.4:51234"``; banning that literal let the
+    same IP straight back in from its next ephemeral port.
+
+    - ``"[v6]:port"`` / ``"[v6]"`` -> ``"v6"``
+    - ``"host:port"`` (exactly one colon) -> ``"host"``
+    - subnets (``"10.0.0.0/8"``), bare IPv4/IPv6/hostnames -> unchanged
+
+    An unbracketed ``"v6:port"`` cannot be told apart from a bare IPv6
+    address and is left as-is; PeerManager resolves such keys through the
+    connected peer that owns them before calling in here.
+    """
+    a = addr.strip()
+    if "/" in a:
+        return a
+    if a.startswith("["):
+        end = a.find("]")
+        if end > 0:
+            return a[1:end]
+        return a
+    if a.count(":") == 1:
+        host, port = a.rsplit(":", 1)
+        if port.isdigit() and host:
+            return host
+    return a
+
+
 @dataclass
 class MisbehaviorRecord:
     """Running misbehavior state for a single IP."""
@@ -111,7 +144,11 @@ class BanManager:
         ban_threshold.
 
         Returns True if the peer was banned as a result of this call.
+
+        *ip* may be a connection key (``host:port``); the score and the ban
+        are recorded against the address (``ban_key``), as Core does.
         """
+        ip = ban_key(ip)
         rec = self.scores.setdefault(ip, MisbehaviorRecord())
         rec.score += score
         rec.events.append(reason)
@@ -167,6 +204,7 @@ class BanManager:
         On 2026-08-28 ouroboros emitted 413 such lines in three hours during a
         live stall and NONE of them could be attributed to anything.
         """
+        ip = ban_key(ip)
         ban_time = duration if duration is not None else self.ban_duration
         self.banned[ip] = time.time() + ban_time
         self.scores.pop(ip, None)
@@ -216,7 +254,7 @@ class BanManager:
             # the RPC's -30 branch was DEAD CODE -- a live `setban <never-banned>
             # remove` answered success.  Caught by a live probe after the unit
             # test passed against a fake that did report failure.
-            if not self.is_banned(ip) and ip not in self.banned:
+            if not self.is_banned(ip) and ban_key(ip) not in self.banned:
                 return False
             self.unban(ip)
             return True
@@ -225,7 +263,8 @@ class BanManager:
             return False
 
     def is_banned(self, ip: str) -> bool:
-        """Return True if *ip* is currently banned."""
+        """Return True if *ip* (an address or ``host:port``) is currently banned."""
+        ip = ban_key(ip)
         if ip not in self.banned:
             return False
         if time.time() > self.banned[ip]:
@@ -237,6 +276,7 @@ class BanManager:
 
     def unban(self, ip: str) -> None:
         """Manually remove a ban."""
+        ip = ban_key(ip)
         if ip in self.banned:
             del self.banned[ip]
             logger.info("Unbanned %s", ip)
@@ -245,10 +285,10 @@ class BanManager:
 
     def clear_score(self, ip: str) -> None:
         """Reset misbehavior score for *ip* (e.g. after successful block)."""
-        self.scores.pop(ip, None)
+        self.scores.pop(ban_key(ip), None)
 
     def get_score(self, ip: str) -> int:
-        rec = self.scores.get(ip)
+        rec = self.scores.get(ban_key(ip))
         return rec.score if rec else 0
 
     def list_banned(self) -> dict[str, float]:
@@ -339,6 +379,14 @@ class BanManager:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             now = time.time()
-            self.banned = {ip: t for ip, t in raw.items() if t > now}
+            # bans.json written before bans were address-keyed holds
+            # ``host:port`` keys; fold them onto the address, keeping the
+            # latest expiry when several ports of one IP were banned.
+            banned: dict[str, float] = {}
+            for ip, t in raw.items():
+                if t > now:
+                    k = ban_key(ip)
+                    banned[k] = max(t, banned.get(k, 0.0))
+            self.banned = banned
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("Failed to load bans: %s", exc)
