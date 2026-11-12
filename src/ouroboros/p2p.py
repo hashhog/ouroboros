@@ -2911,6 +2911,7 @@ class PeerManager:
                         # MSG_WITNESS_BLOCK: a witness-stripped segwit block
                         # would fail validation and poison the hash.
                         getdata = GetDataMessage(inventory=[(MSG_WITNESS_BLOCK, h)])
+                        self._note_block_requested(h)
                         await target.send_message(
                             getdata.to_network_message(self.network))
                     except Exception:
@@ -3496,6 +3497,7 @@ class PeerManager:
                         # the witness-commitment check and gets perm-rejected.
                         getdata = GetDataMessage(
                             inventory=[(MSG_WITNESS_BLOCK, oldest_hash)])
+                        self._note_block_requested(oldest_hash)
                         await peer.send_message(
                             getdata.to_network_message(self.network))
                     except Exception as e:
@@ -3575,6 +3577,7 @@ class PeerManager:
                 try:
                     from ouroboros.p2p_messages import MSG_WITNESS_BLOCK, GetDataMessage
                     getdata = GetDataMessage(inventory=[(MSG_WITNESS_BLOCK, bt.block_hash)])
+                    self._note_block_requested(bt.block_hash)
                     await peer.send_message(getdata.to_network_message(self.network))
                 except Exception as e:
                     logger.warning(f"Failed to send getdata fallback: {e}")
@@ -3589,6 +3592,7 @@ class PeerManager:
                 try:
                     from ouroboros.p2p_messages import MSG_WITNESS_BLOCK, GetDataMessage
                     getdata = GetDataMessage(inventory=[(MSG_WITNESS_BLOCK, bt.block_hash)])
+                    self._note_block_requested(bt.block_hash)
                     await peer.send_message(getdata.to_network_message(self.network))
                 except Exception as e:
                     logger.warning(f"Failed to send getdata fallback: {e}")
@@ -4872,6 +4876,18 @@ class PeerManager:
                 bucket.pop(addr, None)
                 asyncio.ensure_future(peer.disconnect())
         self.known_addrs.discard(ip)
+
+    def _note_block_requested(self, block_hash: bytes) -> None:
+        """Tell BlockSync we sent a block getdata outside its download
+        window, so the reply is buffered rather than dropped as unrequested
+        (BlockSync.note_block_requested)."""
+        blk_sync = getattr(self, "block_sync", None)
+        fn = getattr(blk_sync, "note_block_requested", None)
+        if callable(fn):
+            try:
+                fn(block_hash)
+            except Exception:
+                logger.debug("note_block_requested raised", exc_info=True)
 
     def record_misbehavior(self, addr: str, score: int, reason: str) -> bool:
         """Record misbehavior for a peer; auto-bans at threshold.

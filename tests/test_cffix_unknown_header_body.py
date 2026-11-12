@@ -1,4 +1,4 @@
-"""Unrequested ``block`` bodies whose header is not queued are never buffered.
+"""Unrequested ``block`` bodies whose header is not queued are not buffered.
 
 Finding (cffix-ouroboros-unknown-header-body-buffered, 2026-11-09 security
 audit): ``handle_block`` applied its fTooFarAhead gate only when the body's
@@ -19,8 +19,10 @@ the buffer empty and score that peer; (2) an unrequested body whose prev IS
 known is dropped without a penalty; (3) a requested body with an unqueued
 header is still buffered; (4) an unrequested body whose header IS queued is
 still buffered (the existing path); (5) replies to getdata requests that a
-queue reset dropped are not buffered and do not score the peer; (6) that
-excuse expires after RECENT_REQUEST_TTL.
+queue reset dropped are still buffered and do not score the peer; (6) that
+memory expires after RECENT_REQUEST_TTL; (7) replies to getdatas sent outside
+the download window (p2p.py compact-block fallbacks, getblockfrompeer) are
+recorded through ``note_block_requested`` and buffered, not scored.
 """
 
 from __future__ import annotations
@@ -157,12 +159,12 @@ async def test_unrequested_body_with_queued_header_is_still_buffered():
 
 
 @pytest.mark.asyncio
-async def test_late_replies_after_a_queue_reset_are_dropped_without_penalty():
+async def test_late_replies_after_a_queue_reset_are_buffered_without_penalty():
     """A slot-misalign resync clears ``requested_blocks`` and the header
     queue together.  The 16 getdata replies still in flight from one peer
     then arrive unrequested with an unknown header and an unknown prev
-    (tip+2.. whose parents lived only in the cleared queue).  They are not
-    buffered, and the peer, which only answered our getdata, is not scored."""
+    (tip+2.. whose parents lived only in the cleared queue).  We asked for
+    them, so they are buffered as before and the peer is not scored."""
     bs = _make_block_sync()
     peer = _StubPeer()
     payloads = [_payload(os.urandom(32)) for _ in range(16)]
@@ -179,15 +181,43 @@ async def test_late_replies_after_a_queue_reset_are_dropped_without_penalty():
     for p in payloads:
         await bs.handle_block(_Msg(p), peer)
 
-    assert len(bs._ibd_block_buffer) == 0
+    assert len(bs._ibd_block_buffer) == 16
+    assert _prev_not_found_calls(bs) == []
+    assert peer.score_deltas == []
+
+
+@pytest.mark.asyncio
+async def test_out_of_window_getdata_reply_is_buffered_without_penalty():
+    """p2p.py's compact-block fallbacks (and getblockfrompeer) send a block
+    getdata without touching ``requested_blocks``.  They record it through
+    PeerManager._note_block_requested -> BlockSync.note_block_requested, so
+    the reply (header not queued, prev an unconnected compact body) is
+    buffered and its sender not scored."""
+    from ouroboros.p2p import PeerManager
+
+    bs = _make_block_sync()
+    peer = _StubPeer()
+    p = _payload(os.urandom(32))
+    h = _block_hash(p)
+    pm_stub = MagicMock()
+    pm_stub.block_sync = bs
+    note = getattr(PeerManager, "_note_block_requested", None)
+    if note is not None:  # absent on master, where every body is buffered
+        note(pm_stub, h)
+    assert h not in bs.requested_blocks  # recorded, not put in flight
+
+    await bs.handle_block(_Msg(p), peer)
+
+    assert h in bs._ibd_block_buffer
     assert _prev_not_found_calls(bs) == []
     assert peer.score_deltas == []
 
 
 @pytest.mark.asyncio
 async def test_request_memory_expires(monkeypatch):
-    """The late-reply excuse lasts RECENT_REQUEST_TTL: an unrequested,
-    unknown-prev body for a hash requested longer ago than that is scored."""
+    """The request memory lasts RECENT_REQUEST_TTL: an unrequested,
+    unknown-prev body for a hash requested longer ago than that is dropped
+    and scored."""
     import ouroboros.block_sync as block_sync_mod
 
     bs = _make_block_sync()

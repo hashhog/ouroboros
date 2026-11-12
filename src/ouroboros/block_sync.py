@@ -196,11 +196,15 @@ W77_FIRST_REQUEST_MAX_ENTRIES = 20_000
 IBD_BUFFER_ORPHAN_TTL = 600.0
 
 # How long, and how many, block hashes ``requested_blocks`` remembers after a
-# request leaves it.  A queue reset (slot-misalign resync, W75 tip-stall
-# recovery) clears ``requested_blocks`` and ``_validated_headers`` together,
-# so the replies still in flight then arrive looking unrequested with an
-# unknown header.  They are dropped like any other such body, but the peer
-# answered a getdata we sent and must not be scored for it.
+# request leaves it.  A body whose header is not queued is buffered only when
+# we asked for that hash (Core AcceptBlock's fRequested).  Two cases need the
+# memory: a queue reset (slot-misalign resync, W75 tip-stall recovery) clears
+# ``requested_blocks`` and ``_validated_headers`` together, so replies still
+# in flight then look unrequested; and getdatas sent outside the download
+# window (p2p.py compact-block fallbacks, getblockfrompeer) never enter
+# ``requested_blocks`` at all and are recorded via
+# ``BlockSync.note_block_requested``.  Such a reply must not be dropped or
+# scored: the peer answered a getdata we sent.
 RECENT_REQUEST_TTL = IBD_BUFFER_ORPHAN_TTL
 RECENT_REQUEST_MAX = 8192
 
@@ -216,6 +220,12 @@ class _InFlightBlockMap(dict):
 
     def __setitem__(self, key, value) -> None:
         super().__setitem__(key, value)
+        self.note_requested(key)
+
+    def note_requested(self, key) -> None:
+        """Remember *key* as requested without putting it in flight (for
+        getdatas sent outside the download window: compact-block fallbacks,
+        getblockfrompeer)."""
         recent = self._recent
         recent.pop(key, None)
         recent[key] = time.monotonic()
@@ -2678,7 +2688,11 @@ class BlockSync:
                         f"from {peer.host}:{peer.port}"
                     )
                     return
-                if claimed_height is None and height_lookup_ok:
+                if (
+                    claimed_height is None
+                    and height_lookup_ok
+                    and not self._recently_requested(block_hash)
+                ):
                     # Unrequested body whose header is not on the queued
                     # header chain.  Core runs AcceptBlockHeader before it
                     # stores any body (validation.cpp AcceptBlock): an
@@ -2692,8 +2706,11 @@ class BlockSync:
                     # this body bought nothing but up to ~1016 x 4 MB of RAM
                     # held until the IBD_BUFFER_ORPHAN_TTL sweep, with the
                     # buffer cap squeezing out real IBD bodies meanwhile.
-                    # Never buffer it.  A genuine new block reaches us again
-                    # through the headers-first path once its header is
+                    # Never buffer it unless we asked for this hash (a reply
+                    # to a getdata sent outside the download window, or one
+                    # in flight across a queue reset: those fall through and
+                    # are buffered as before).  A genuine new block reaches us
+                    # again through the headers-first path once its header is
                     # queued.
                     self._drop_unrequested_unknown_header_block(
                         block_hash, payload, peer
@@ -2836,6 +2853,20 @@ class BlockSync:
             if not is_system_error(e):
                 peer.adjust_score(-5)
 
+    def _recently_requested(self, block_hash: bytes) -> bool:
+        """True if we sent a getdata for *block_hash* within
+        ``RECENT_REQUEST_TTL`` (see ``_InFlightBlockMap``)."""
+        fn = getattr(self.requested_blocks, "recently_requested", None)
+        return bool(callable(fn) and fn(block_hash))
+
+    def note_block_requested(self, block_hash: bytes) -> None:
+        """Record a block getdata sent outside the download window (compact-
+        block fallback, getblockfrompeer) so its reply, whose header may not
+        be queued, is buffered rather than dropped as unrequested."""
+        fn = getattr(self.requested_blocks, "note_requested", None)
+        if callable(fn):
+            fn(bytes(block_hash))
+
     def _prev_header_known(self, prev_hash: bytes) -> bool:
         """True if *prev_hash* names a header we already hold anywhere: the
         active tip, the validated-header queue, the fork store, or the
@@ -2865,23 +2896,13 @@ class BlockSync:
         Core discourages on the first missing-prev block.  We score
         SCORE_UNSOLICITED_BLOCK per body instead (on the connection score and
         in the BanManager, whose cumulative threshold bans), because unlike
-        Core's block index our header queue can be cleared.  A reply to a
-        getdata we sent in the last ``RECENT_REQUEST_TTL`` seconds — e.g. one
-        still in flight when a slot-misalign resync or a W75 recovery cleared
-        ``requested_blocks`` and the queue — is never scored, nor is a
-        known-prev body.  Both are still dropped.
+        Core's block index our header queue can be cleared.  Replies to our
+        own recent getdatas never reach here (``handle_block`` buffers them);
+        a known-prev body is dropped without a penalty.
         """
         self._blk_unrequested_unknown_header += 1
         prev_hash = bytes(payload[4:36])
-        _recent = getattr(self.requested_blocks, "recently_requested", None)
-        if callable(_recent) and _recent(block_hash):
-            # We asked for it and a reset dropped the request: a late reply,
-            # not the peer's fault.
-            why = "recently requested"
-        elif self._prev_header_known(prev_hash):
-            why = "prev known"
-        else:
-            why = None
+        why = "prev known" if self._prev_header_known(prev_hash) else None
         addr = f"{peer.host}:{peer.port}"
         _now = time.time()
         if _now - getattr(self, "_last_unknown_hdr_drop_log", 0.0) > 30.0:

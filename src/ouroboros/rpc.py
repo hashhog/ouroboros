@@ -12170,6 +12170,15 @@ class RPCServer:
 
         network = getattr(self.node, 'network', 'mainnet')
         getdata = GetDataMessage(inventory=[(MSG_WITNESS_BLOCK, block_hash)])
+        # Let BlockSync know the reply was asked for: its header need not be
+        # queued, and an unrequested unqueued-header body is dropped.
+        _note = getattr(getattr(self.node, "block_sync", None),
+                        "note_block_requested", None)
+        if callable(_note):
+            try:
+                _note(block_hash)
+            except Exception:
+                pass
         try:
             await peer.send_message(getdata.to_network_message(network))
         except Exception as e:
