@@ -264,3 +264,23 @@ def test_invalidateblock_switch_announces_the_side_tip_once(tmp_path):
     msgs = peer.announced()
     assert [m.command for m in msgs] == ["headers"], msgs
     assert _header_hashes(msgs[0]) == side
+
+
+def test_submitblockbatch_announces_each_connected_block(tmp_path):
+    """submitblockbatch connects each block through accept_block; each one
+    is a tip change and is announced once, in order."""
+    peer = _Peer()
+    bdb, server, hashes = _setup(tmp_path, [peer])
+    raw1, h1 = _block(hashes[TIP], TIP + 1, 0x70)
+    raw2, h2 = _block(h1, TIP + 2, 0x71)
+
+    async def go():
+        r = await server.rpc_submitblockbatch([raw1.hex(), raw2.hex()])
+        await _settle()
+        return r
+
+    assert asyncio.run(go()) == [None, None], "precondition: both accepted"
+    assert bdb.get_best_block() == (h2, TIP + 2)
+    msgs = peer.announced()
+    assert [m.command for m in msgs] == ["headers", "headers"], msgs
+    assert [_header_hashes(m) for m in msgs] == [[h1], [h2]]
