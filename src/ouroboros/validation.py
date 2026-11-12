@@ -1262,9 +1262,15 @@ class BlockValidator:
         #     return the same values from memory.  No verdict depends on it.
         self._prefetch_block_inputs(block)
 
-        # 5. Witness-independent size limits (Core CheckBlock, validation.cpp
-        #    "size limits": tx-count and stripped-size guards -> bad-blk-length).
-        valid, error = self._validate_block_stripped_limits(block)
+        # 5. Witness-independent limits (Core CheckBlock, validation.cpp): the
+        #    tx-count and stripped-size guards (bad-blk-length) and the
+        #    LEGACY-only sigop budget (bad-blk-sigops).  None of them reads the
+        #    witness, so they keep their Core position ahead of the witness
+        #    check; the per-tx legacy counts are reused in step 6a.
+        legacy_sigops_per_tx: list[int] = []
+        valid, error = self._validate_block_stripped_limits(
+            block, legacy_sigops_out=legacy_sigops_per_tx
+        )
         if not valid:
             return False, error
 
@@ -1283,9 +1289,10 @@ class BlockValidator:
         #    height + hash are threaded in so P2SH/witness sigop counting is
         #    gated on the FINAL exception-aware script flags, exactly as Core's
         #    GetTransactionSigOpCost(tx, inputs, flags) does.  The stripped
-        #    guards already ran in step 5.
+        #    guards and the legacy budget already ran in step 5.
         valid, error = self._validate_block_limits(
-            block, expected_height, block.hash, stripped_checked=True
+            block, expected_height, block.hash,
+            legacy_sigops_per_tx=legacy_sigops_per_tx,
         )
         if not valid:
             return False, error
@@ -2040,7 +2047,7 @@ class BlockValidator:
         block: Block,
         height: int | None = None,
         block_hash: bytes | None = None,
-        stripped_checked: bool = False,
+        legacy_sigops_per_tx: list[int] | None = None,
     ) -> tuple[bool, str]:
         """Validate block weight and sigops cost limits.
 
@@ -2084,8 +2091,14 @@ class BlockValidator:
             verify_p2sh = bool(_flags & SCRIPT_VERIFY_P2SH)
             verify_witness = bool(_flags & SCRIPT_VERIFY_WITNESS)
 
-        if not stripped_checked:
-            valid, error = self._validate_block_stripped_limits(block)
+        # *legacy_sigops_per_tx*: the per-tx legacy counts from a
+        # _validate_block_stripped_limits run that already passed (the
+        # validate_block path).  When absent, run those guards here.
+        if legacy_sigops_per_tx is None:
+            legacy_sigops_per_tx = []
+            valid, error = self._validate_block_stripped_limits(
+                block, legacy_sigops_out=legacy_sigops_per_tx
+            )
             if not valid:
                 return False, error
 
@@ -2112,20 +2125,10 @@ class BlockValidator:
         # holds is a missing/spent input that tx validation rejects anyway.
         in_block_spks: dict[tuple[bytes, int], bytes] = {}
 
-        for tx in block.transactions:
-            tx_sigops_cost = 0
-
+        for tx, legacy_sigops in zip(block.transactions, legacy_sigops_per_tx):
             # --- Legacy sigops (outputs + inputs) × WITNESS_SCALE_FACTOR ---
-            # Core's GetLegacySigOpCount() counts scriptSig sigops for ALL
-            # transactions including coinbase (Bitcoin Core consensus/tx_verify.cpp:112-124).
-            # The coinbase scriptSig rarely contains OP_CHECKSIG in practice,
-            # but we must count it to remain spec-compliant.
-            legacy_sigops = 0
-            for out in tx.outputs:
-                legacy_sigops += _count_legacy_sigops(out.script_pubkey)
-            for inp in tx.inputs:
-                legacy_sigops += _count_legacy_sigops(inp.script_sig)
-            tx_sigops_cost += legacy_sigops * WITNESS_SCALE_FACTOR
+            # Counted once, in _validate_block_stripped_limits.
+            tx_sigops_cost = legacy_sigops * WITNESS_SCALE_FACTOR
 
             # --- P2SH + witness sigops (both flag-gated, tx_verify.cpp:143-162) ---
             if not tx.is_coinbase and (verify_p2sh or verify_witness):
@@ -2183,13 +2186,23 @@ class BlockValidator:
 
         return True, ""
 
-    def _validate_block_stripped_limits(self, block: Block) -> tuple[bool, str]:
-        """Core CheckBlock's witness-INDEPENDENT size guards (validation.cpp).
+    def _validate_block_stripped_limits(
+        self,
+        block: Block,
+        legacy_sigops_out: list[int] | None = None,
+    ) -> tuple[bool, str]:
+        """Core CheckBlock's witness-INDEPENDENT limits (validation.cpp).
 
-        Neither guard reads witness bytes, so a relaying peer cannot trip them
-        by padding the witness; ``validate_block`` runs them before the
-        witness-commitment check, and the witness-dependent weight/sigops
-        limits after it.
+        The tx-count and stripped-size guards (bad-blk-length) and the
+        legacy-only sigop budget (bad-blk-sigops, "does not count witness and
+        p2sh sigops").  None reads witness bytes, so a relaying peer cannot
+        trip them by padding the witness; ``validate_block`` runs them before
+        the witness-commitment check, and the witness-dependent weight /
+        full sigop cost after it.
+
+        *legacy_sigops_out*: if given, receives each transaction's legacy
+        sigop count (in block order) once the budget check has run, so the
+        full sigop-cost pass can reuse it.
         """
         # Early check 1: tx count overflow guard
         # `block.vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT`
@@ -2211,6 +2224,28 @@ class BlockValidator:
                 f"bad-blk-length: stripped block size {stripped_block_size} × "
                 f"{WITNESS_SCALE_FACTOR} exceeds MAX_BLOCK_WEIGHT"
             )
+
+        # Legacy-only sigop budget.  Core's GetLegacySigOpCount() counts
+        # scriptSig sigops for ALL transactions including coinbase (Bitcoin
+        # Core consensus/tx_verify.cpp:112-124).  The coinbase scriptSig
+        # rarely contains OP_CHECKSIG in practice, but we must count it to
+        # remain spec-compliant.
+        per_tx: list[int] = []
+        for tx in block.transactions:
+            n = 0
+            for out in tx.outputs:
+                n += _count_legacy_sigops(out.script_pubkey)
+            for inp in tx.inputs:
+                n += _count_legacy_sigops(inp.script_sig)
+            per_tx.append(n)
+        legacy_cost = sum(per_tx) * WITNESS_SCALE_FACTOR
+        if legacy_cost > MAX_BLOCK_SIGOPS_COST:
+            return False, (
+                f"Block sigops cost {legacy_cost} (legacy) exceeds "
+                f"{MAX_BLOCK_SIGOPS_COST}"
+            )
+        if legacy_sigops_out is not None:
+            legacy_sigops_out.extend(per_tx)
 
         return True, ""
 

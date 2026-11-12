@@ -27,7 +27,7 @@ use bitcoin::{
     absolute, transaction, Amount, Block, CompactTarget, Network, OutPoint, ScriptBuf,
     Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Txid, Witness,
 };
-use common::{BlockMetadata, BlockWrapper};
+use common::{BlockMetadata, BlockWrapper, OutPointWrapper, UTXO};
 use sync::storage::db::BlockchainDB;
 use sync::validate::{BlockValidationError, BlockValidator};
 use tempdir::TempDir;
@@ -44,6 +44,16 @@ fn setup() -> (TempDir, Arc<BlockchainDB>, BlockValidator, Block) {
         0,
         &genesis.block_hash().to_byte_array(),
         &BlockMetadata::new(0, [0u8; 32], genesis.header.time),
+    )
+    .unwrap();
+    // The one coin the spend below uses: a P2WSH(OP_TRUE) output, so the
+    // honest spend is valid (this route runs no scripts; the coin must exist
+    // for the per-tx input checks).
+    let fund = OutPoint { txid: Txid::from_byte_array([0x5a; 32]), vout: 0 };
+    let p2wsh = ScriptBuf::new_p2wsh(&ScriptBuf::from(vec![0x51]).wscript_hash());
+    db.add_utxo(
+        &fund,
+        &UTXO::new(OutPointWrapper::new(fund), 1_000_000, p2wsh, Some(0), false),
     )
     .unwrap();
     let validator = BlockValidator::new(Arc::clone(&db), Network::Regtest);
@@ -167,6 +177,17 @@ fn control_honest_coinbase_only_block_is_valid() {
 }
 
 #[test]
+fn control_honest_segwit_spend_block_is_valid() {
+    // The honest coinbase + P2WSH spend block passes, so the padded copy
+    // below fails because of the padding, not because of the harness.
+    let (_d, _db, v, g) = setup();
+    let honest_spend = spend(&honest_witness());
+    let cb = coinbase(&[honest_spend.clone()], None);
+    let honest = block(&g, vec![cb, honest_spend], None);
+    assert!(validate(&v, &honest).is_ok(), "{:?}", validate(&v, &honest));
+}
+
+#[test]
 fn oversized_block_with_mismatched_merkle_is_invalid_merkle_root() {
     let (_d, _db, v, g) = setup();
     let cb = coinbase(&[], Some(vec![0x6a; 4_000_001]));
@@ -224,6 +245,27 @@ fn bad_bip34_height_with_tampered_witness_is_still_a_coinbase_verdict() {
     let cb = coinbase_with_sig(&[honest_spend.clone()], None, vec![0x52, 0x00]);
     let tampered = block(&g, vec![cb, spend(&[vec![0x51], vec![0x00]])], None);
     let r = validate(&v, &tampered);
+    assert!(
+        matches!(r, Err(BlockValidationError::TransactionValidation(_))),
+        "got {:?}",
+        r
+    );
+}
+
+#[test]
+fn duplicate_input_with_tampered_witness_is_still_a_transaction_verdict() {
+    // Core runs CheckTransaction (bad-txns-inputs-duplicate) in CheckBlock,
+    // before CheckWitnessMalleation.  The inputs are covered by the txid
+    // merkle root, so this is a verdict on the block the header names even
+    // when the witness has also been tampered with.
+    let (_d, _db, v, g) = setup();
+    let mut dup = spend(&honest_witness());
+    dup.input.push(dup.input[0].clone());
+    let cb = coinbase(&[dup.clone()], None);
+    let mut tampered_dup = dup.clone();
+    tampered_dup.input[0].witness = Witness::from_slice(&[vec![0x51], vec![0x00]]);
+    let b = block(&g, vec![cb, tampered_dup], None);
+    let r = validate(&v, &b);
     assert!(
         matches!(r, Err(BlockValidationError::TransactionValidation(_))),
         "got {:?}",

@@ -296,8 +296,8 @@ impl BlockValidator {
             return Err(BlockValidationError::InvalidMerkleRoot);
         }
         // (3. The block weight limit reads witness bytes, which the txid
-        //     merkle root does not commit to; it runs after the witness
-        //     commitment check, step 6d below.)
+        //     merkle root does not commit to; it runs right after the witness
+        //     commitment check, step 7d below.)
 
         // 4. Non-empty block
         if inner.txdata.is_empty() {
@@ -346,27 +346,11 @@ impl BlockValidator {
             }
         }
 
-        // 6c'. Coinbase structure + BIP34 height (Core CheckTransaction /
-        //      ContextualCheckBlock bad-cb-height) — both run BEFORE
-        //      CheckWitnessMalleation in Core, and the coinbase scriptSig is
-        //      covered by the txid merkle root, so a failure here is a real
-        //      verdict even when the witness has also been tampered with.
-        self.tx_validator.check_coinbase(coinbase_tx, height)
-            .map_err(BlockValidationError::TransactionValidation)?;
-
-        // 6d. BIP141 witness commitment, then the block weight limit — in
-        //     Core's ContextualCheckBlock order (CheckWitnessMalleation, then
-        //     bad-blk-weight).  Any relaying peer can pad the witness of an
-        //     honest block; checked the other way round that padded copy
-        //     failed as SizeExceeded (a verdict on the header hash) instead of
-        //     as the witness malleation it is (BLOCK_MUTATED, never cached).
-        self.check_witness_commitment(inner, height)?;
-        self.check_size_limits(inner)?;
-
         // 7. Per-tx validation — always, regardless of assumevalid.
         //    Matches Python's skip_scripts=True path which keeps UTXO
         //    lookups, coinbase maturity, amount, and BIP68 checks.
-        //    (Coinbase checked in 6c' above.)
+        self.tx_validator.check_coinbase(coinbase_tx, height)
+            .map_err(BlockValidationError::TransactionValidation)?;
 
         // 7b. BIP68 sequence-lock enforcement is gated on network activation
         //     and requires the previous block's MTP once. Fetch lazily on
@@ -494,8 +478,18 @@ impl BlockValidator {
         //     Matches Python `validation.py:420-426`.
         self.validate_block_subsidy(inner, height, total_fees)?;
 
-        // 7d. (BIP141 witness commitment: checked in step 6d, before the
-        //     weight limit.)
+        // 7d. BIP141 witness commitment, THEN the block weight limit — in
+        //     Core's ContextualCheckBlock order (CheckWitnessMalleation, then
+        //     bad-blk-weight).  The weight reads witness bytes, which the txid
+        //     merkle root does not commit to: any relaying peer can pad the
+        //     witness of an honest block.  With the weight checked first that
+        //     padded copy failed as SizeExceeded (a verdict on the header
+        //     hash) instead of as the witness malleation it is (BLOCK_MUTATED,
+        //     never cached).  Nothing in the per-tx loop above reads the
+        //     witness (no script execution on this route), so every check that
+        //     ran before the commitment on master still does.
+        self.check_witness_commitment(inner, height)?;
+        self.check_size_limits(inner)?;
 
         // 8. Sigop cost limit with BIP141 witness discount.
         //    W85 fix: use prefetched script_pubkeys instead of re-fetching

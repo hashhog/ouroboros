@@ -75,9 +75,14 @@ def _bip34_push(height: int) -> bytes:
     return bytes([len(n)]) + n
 
 
-def _build_block(spend_witness: list[bytes], commit_witness: list[bytes] | None = None) -> Block:
+def _build_block(
+    spend_witness: list[bytes],
+    commit_witness: list[bytes] | None = None,
+    spend_spk: bytes = b"\x51",
+) -> Block:
     """Coinbase + one P2WSH spend.  The coinbase commits to the wtxid tree
-    built with ``commit_witness`` (default: the spend's own witness)."""
+    built with ``commit_witness`` (default: the spend's own witness).
+    ``spend_spk`` is the spend's output script (txid-committed)."""
     if commit_witness is None:
         commit_witness = spend_witness
     nonce = bytes(32)
@@ -85,7 +90,7 @@ def _build_block(spend_witness: list[bytes], commit_witness: list[bytes] | None 
     def _spend(w):
         return _tx(
             [TxIn(FUND_TXID, 0, b"", 0xFFFFFFFF, witness=list(w))],
-            [TxOut(FUND_VALUE - 10_000, b"\x51")],
+            [TxOut(FUND_VALUE - 10_000, spend_spk)],
             witness=True,
         )
 
@@ -226,6 +231,29 @@ def test_control_committed_oversized_block_is_still_a_limit_verdict(padded, toke
         # The Python weight message carries no Core token yet (maps to the
         # generic "rejected"); only the rule that fired is asserted here.
         assert "weight" in err.lower(), err
+
+
+# 20,001 x OP_CHECKSIG in a txid-committed output script: legacy sigop cost
+# 80,004 > MAX_BLOCK_SIGOPS_COST.  Core rejects that in CheckBlock
+# ("bad-blk-sigops", legacy count only), BEFORE CheckWitnessMalleation.
+LEGACY_OVER_BUDGET_SPK = b"\xac" * 20_001
+TAMPERED_WITNESS = [WITNESS_SCRIPT, b"\x00"]
+
+
+def test_legacy_sigop_budget_beats_witness_tamper():
+    """GUARD: a block over the LEGACY sigop budget is invalid whatever its
+    witness says (the scripts are covered by the txid merkle root).  With
+    the witness also tampered it must still be the bad-blk-sigops verdict,
+    as in Core, not an uncached witness mismatch."""
+    from ouroboros.block_sync import classify_block_reject
+    from ouroboros.rpc import bip22_result_string
+
+    blk = _build_block(TAMPERED_WITNESS, commit_witness=HONEST_WITNESS,
+                       spend_spk=LEGACY_OVER_BUDGET_SPK)
+    ok, err = _validate(blk)
+    assert not ok
+    assert bip22_result_string(err) == "bad-blk-sigops", err
+    assert classify_block_reject(err) == "verdict"
 
 
 @pytest.mark.parametrize(
@@ -415,3 +443,20 @@ def test_side_branch_control_committed_overweight_is_still_bad_blk_weight(side_b
     res, stored = side_branch(WEIGHT_WITNESS, WEIGHT_WITNESS)
     assert res == "bad-blk-weight", res
     assert not stored
+
+
+@pytest.mark.asyncio
+async def test_drain_legacy_over_budget_with_tampered_witness_is_marked_failed(monkeypatch):
+    """GUARD through the drain: the legacy-over-budget block with a tampered
+    witness is a verdict -- marked failed and perm-rejected."""
+    monkeypatch.setenv("OUROBOROS_DISABLE_RUST_VALIDATE", "1")
+    bs = _drain_bs(_skip_pow_validator())
+    blk = _build_block(TAMPERED_WITNESS, commit_witness=HONEST_WITNESS,
+                       spend_spk=LEGACY_OVER_BUDGET_SPK)
+    _stage(bs, blk, b"\x79" * 32)
+
+    await bs._drain_block_buffer_locked()
+
+    assert blk.hash in getattr(bs, "_failed_blocks", set())
+    assert blk.hash in bs._perm_rejected_blocks
+
