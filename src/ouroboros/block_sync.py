@@ -195,6 +195,48 @@ W77_FIRST_REQUEST_MAX_ENTRIES = 20_000
 # legitimately awaited.
 IBD_BUFFER_ORPHAN_TTL = 600.0
 
+# How long, and how many, block hashes ``requested_blocks`` remembers after a
+# request leaves it.  A body whose header is not queued is buffered only when
+# we asked for that hash (Core AcceptBlock's fRequested).  Two cases need the
+# memory: a queue reset (slot-misalign resync, W75 tip-stall recovery) clears
+# ``requested_blocks`` and ``_validated_headers`` together, so replies still
+# in flight then look unrequested; and getdatas sent outside the download
+# window (p2p.py compact-block fallbacks, getblockfrompeer) never enter
+# ``requested_blocks`` at all and are recorded via
+# ``BlockSync.note_block_requested``.  Such a reply must not be dropped or
+# scored: the peer answered a getdata we sent.
+RECENT_REQUEST_TTL = IBD_BUFFER_ORPHAN_TTL
+RECENT_REQUEST_MAX = 8192
+
+
+class _InFlightBlockMap(dict):
+    """``requested_blocks`` (hash -> request time) that also remembers, for
+    ``RECENT_REQUEST_TTL`` seconds and at most ``RECENT_REQUEST_MAX`` hashes,
+    every hash ever put into it, whichever path later removes the hash."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._recent: dict[bytes, float] = {}
+
+    def __setitem__(self, key, value) -> None:
+        super().__setitem__(key, value)
+        self.note_requested(key)
+
+    def note_requested(self, key) -> None:
+        """Remember *key* as requested without putting it in flight (for
+        getdatas sent outside the download window: compact-block fallbacks,
+        getblockfrompeer)."""
+        recent = self._recent
+        recent.pop(key, None)
+        recent[key] = time.monotonic()
+        while len(recent) > RECENT_REQUEST_MAX:
+            del recent[next(iter(recent))]
+
+    def recently_requested(self, key) -> bool:
+        ts = self._recent.get(key)
+        return ts is not None and time.monotonic() - ts <= RECENT_REQUEST_TTL
+
+
 from ouroboros.check_block import compute_merkle_root
 from ouroboros.database import Block, BlockchainDatabase, Transaction
 from ouroboros.p2p_messages import (
@@ -608,7 +650,7 @@ class BlockSync:
 
         # Track requested blocks (hash -> request_time)
         # FIXME: race condition if called from multiple threads?
-        self.requested_blocks: dict[bytes, float] = {}
+        self.requested_blocks: dict[bytes, float] = _InFlightBlockMap()
 
         # Hashes the drain is currently deserializing / validating / connecting.
         # Those are not in requested_blocks (handle_block already popped them)
@@ -929,6 +971,8 @@ class BlockSync:
         # re-requests the full witness block instead of perm-rejecting.
         self._compact_origin_hashes: set[bytes] = set()
         self._blk_perm_rejected_dropped: int = 0
+        # Unrequested bodies whose header was not queued (never buffered).
+        self._blk_unrequested_unknown_header: int = 0
         # Track which peer (as "host:port" string) delivered each buffered block
         # so the drain loop can score Misbehaving(100) against the right peer when
         # it finds BLOCK_MUTATED or BLOCK_INVALID_HEADER.  Entry cleared on
@@ -2662,12 +2706,14 @@ class BlockSync:
             # fTooFarAhead gate below.
             claimed_height: int | None = None
             active_height: int = 0
+            height_lookup_ok = False
             try:
                 _, active_height = self.db.get_best_block()
                 for _idx, (_bh, _) in enumerate(self._validated_headers):
                     if _bh == block_hash:
                         claimed_height = active_height + 1 + _idx
                         break
+                height_lookup_ok = True
             except Exception:
                 claimed_height = None
 
@@ -2681,6 +2727,34 @@ class BlockSync:
                         f"{block_hash.hex()[:16]}... claimed_height={claimed_height} "
                         f"active_height={active_height} limit={active_height + MIN_BLOCKS_TO_KEEP} "
                         f"from {peer.host}:{peer.port}"
+                    )
+                    return
+                if (
+                    claimed_height is None
+                    and height_lookup_ok
+                    and not self._recently_requested(block_hash)
+                ):
+                    # Unrequested body whose header is not on the queued
+                    # header chain.  Core runs AcceptBlockHeader before it
+                    # stores any body (validation.cpp AcceptBlock): an
+                    # unknown prev is "prev-blk-not-found" (BLOCK_MISSING_PREV
+                    # -> Misbehaving in MaybePunishNodeForBlock), and a
+                    # known-prev header must still pass PoW, fHasMoreOrSameWork
+                    # and fTooFarAhead before an UNREQUESTED body is kept.
+                    # The fTooFarAhead gate above cannot fire here (it needs
+                    # a height), and our drain only ever connects bodies whose
+                    # header sits in ``_validated_headers`` — so buffering
+                    # this body bought nothing but up to ~1016 x 4 MB of RAM
+                    # held until the IBD_BUFFER_ORPHAN_TTL sweep, with the
+                    # buffer cap squeezing out real IBD bodies meanwhile.
+                    # Never buffer it unless we asked for this hash (a reply
+                    # to a getdata sent outside the download window, or one
+                    # in flight across a queue reset: those fall through and
+                    # are buffered as before).  A genuine new block reaches us
+                    # again through the headers-first path once its header is
+                    # queued.
+                    self._drop_unrequested_unknown_header_block(
+                        block_hash, payload, peer
                     )
                     return
 
@@ -2819,6 +2893,80 @@ class BlockSync:
             # (Core ProcessMessages logs a caught exception, never punishes).
             if not is_system_error(e):
                 peer.adjust_score(-5)
+
+    def _recently_requested(self, block_hash: bytes) -> bool:
+        """True if we sent a getdata for *block_hash* within
+        ``RECENT_REQUEST_TTL`` (see ``_InFlightBlockMap``)."""
+        fn = getattr(self.requested_blocks, "recently_requested", None)
+        return bool(callable(fn) and fn(block_hash))
+
+    def note_block_requested(self, block_hash: bytes) -> None:
+        """Record a block getdata sent outside the download window (compact-
+        block fallback, getblockfrompeer) so its reply, whose header may not
+        be queued, is buffered rather than dropped as unrequested."""
+        fn = getattr(self.requested_blocks, "note_requested", None)
+        if callable(fn):
+            fn(bytes(block_hash))
+
+    def _prev_header_known(self, prev_hash: bytes) -> bool:
+        """True if *prev_hash* names a header we already hold anywhere: the
+        active tip, the validated-header queue, the fork store, or the
+        on-disk block index / block store.  A lookup that raises counts as
+        known, so a local fault never turns into a peer penalty."""
+        try:
+            tip_hash, _ = self.db.get_best_block()
+            if prev_hash == tip_hash:
+                return True
+            if any(h == prev_hash for h, _hdr in self._validated_headers):
+                return True
+            if prev_hash in self._fork_headers:
+                return True
+            get_entry = getattr(self.db, "get_block_index_entry", None)
+            if callable(get_entry) and get_entry(prev_hash) is not None:
+                return True
+            return bool(self.db.has_block_hash(prev_hash))
+        except Exception:
+            return True
+
+    def _drop_unrequested_unknown_header_block(
+        self, block_hash: bytes, payload: bytes, peer: Peer
+    ) -> None:
+        """Drop an unrequested ``block`` whose header is not queued, and score
+        the sender when its prev is unknown (Core BLOCK_MISSING_PREV).
+
+        Core discourages on the first missing-prev block.  We score
+        SCORE_UNSOLICITED_BLOCK per body instead (on the connection score and
+        in the BanManager, whose cumulative threshold bans), because unlike
+        Core's block index our header queue can be cleared.  Replies to our
+        own recent getdatas never reach here (``handle_block`` buffers them);
+        a known-prev body is dropped without a penalty.
+        """
+        self._blk_unrequested_unknown_header += 1
+        prev_hash = bytes(payload[4:36])
+        why = "prev known" if self._prev_header_known(prev_hash) else None
+        addr = f"{peer.host}:{peer.port}"
+        _now = time.time()
+        if _now - getattr(self, "_last_unknown_hdr_drop_log", 0.0) > 30.0:
+            self._last_unknown_hdr_drop_log = _now
+            logger.info(
+                f"Dropping unrequested block {block_hash.hex()[:16]}... from "
+                f"{addr}: header not in the validated-header queue "
+                f"(prev {prev_hash.hex()[:16]}...; "
+                f"{why or 'prev unknown: prev-blk-not-found'}; "
+                f"total {self._blk_unrequested_unknown_header})"
+            )
+        if why is not None:
+            return
+        from ouroboros.banman import SCORE_UNSOLICITED_BLOCK
+        peer.adjust_score(-SCORE_UNSOLICITED_BLOCK)
+        if hasattr(self.peer_manager, "misbehaving"):
+            try:
+                self.peer_manager.misbehaving(
+                    addr, SCORE_UNSOLICITED_BLOCK,
+                    "prev-blk-not-found (unrequested block)",
+                )
+            except Exception as e:
+                logger.debug(f"misbehaving({addr}) failed: {e}")
 
     def _buffer_put(self, block_hash: bytes, value) -> None:
         """Insert *value* (a ``(block, raw_payload)`` tuple) into the IBD
