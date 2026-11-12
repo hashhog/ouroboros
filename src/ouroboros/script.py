@@ -762,6 +762,57 @@ _PY_ERROR_PREFIXES: tuple[tuple[str, str], ...] = (
 )
 
 
+class ConditionStack:
+    """The IF/NOTIF/ELSE/ENDIF execution stack, with O(1) operations.
+
+    Port of Bitcoin Core's ``ConditionStack`` (src/script/interpreter.cpp).
+    Only the size of the implied stack of booleans and the position of its
+    first false entry are stored, so ``all_true()`` is O(1). A list of bools
+    scanned with ``all()`` on every opcode is O(k^2) for k nested IFs, and
+    tapscript has no opcode or script-size limit to bound k.
+
+    Toggling an entry that is not the first false one is unobservable: the
+    stack still has a false at or below it, so execution stays off until that
+    first false entry is toggled or popped.
+    """
+
+    __slots__ = ("_size", "_first_false_pos")
+
+    def __init__(self) -> None:
+        self._size = 0
+        # None means every entry is true (Core's NO_FALSE).
+        self._first_false_pos: int | None = None
+
+    def __len__(self) -> int:
+        return self._size
+
+    def empty(self) -> bool:
+        return self._size == 0
+
+    def all_true(self) -> bool:
+        return self._first_false_pos is None
+
+    def push_back(self, value: bool) -> None:
+        if self._first_false_pos is None and not value:
+            self._first_false_pos = self._size
+        self._size += 1
+
+    def pop_back(self) -> None:
+        if self._size == 0:
+            raise ValueError("ConditionStack.pop_back on an empty stack")
+        self._size -= 1
+        if self._first_false_pos == self._size:
+            self._first_false_pos = None
+
+    def toggle_top(self) -> None:
+        if self._size == 0:
+            raise ValueError("ConditionStack.toggle_top on an empty stack")
+        if self._first_false_pos is None:
+            self._first_false_pos = self._size - 1
+        elif self._first_false_pos == self._size - 1:
+            self._first_false_pos = None
+
+
 class ScriptInterpreter:
     """Interprets and verifies Bitcoin scripts"""
 
@@ -1261,7 +1312,7 @@ class ScriptInterpreter:
 
         stack: list[bytes] = list(initial_stack) if initial_stack else []
         altstack: list[bytes] = []
-        exec_stack: list[bool] = []
+        exec_stack = ConditionStack()
         op_count = 0
         # BIP143 / legacy CODESEPARATOR: sighash scriptCode starts at the
         # byte after the most recently executed OP_CODESEPARATOR.  Matches
@@ -1329,7 +1380,7 @@ class ScriptInterpreter:
             current_opcode_pos = opcode_pos
             opcode_pos += 1
 
-            executing = not exec_stack or all(exec_stack)
+            executing = exec_stack.all_true()
 
             # OP_VERIF / OP_VERNOTIF are always invalid
             if opcode in (0x65, 0x66):
@@ -1433,7 +1484,7 @@ class ScriptInterpreter:
                     if (is_tapscript or (is_witness_v0 and (flags & SCRIPT_VERIFY_MINIMALIF))) and top not in (b"", b"\x01"):
                         raise ValueError("MINIMALIF: non-minimal OP_IF input")
                     val = self._cast_to_bool(top)
-                exec_stack.append(val)
+                exec_stack.push_back(val)
                 continue
             if opcode == 0x64:  # OP_NOTIF
                 val = False
@@ -1445,17 +1496,17 @@ class ScriptInterpreter:
                     if (is_tapscript or (is_witness_v0 and (flags & SCRIPT_VERIFY_MINIMALIF))) and top not in (b"", b"\x01"):
                         raise ValueError("MINIMALIF: non-minimal OP_NOTIF input")
                     val = not self._cast_to_bool(top)
-                exec_stack.append(val)
+                exec_stack.push_back(val)
                 continue
             if opcode == 0x67:  # OP_ELSE
-                if not exec_stack:
+                if exec_stack.empty():
                     raise ValueError("OP_ELSE without OP_IF")
-                exec_stack[-1] = not exec_stack[-1]
+                exec_stack.toggle_top()
                 continue
             if opcode == 0x68:  # OP_ENDIF
-                if not exec_stack:
+                if exec_stack.empty():
                     raise ValueError("OP_ENDIF without OP_IF")
-                exec_stack.pop()
+                exec_stack.pop_back()
                 continue
 
             if not executing:
@@ -2277,7 +2328,7 @@ class ScriptInterpreter:
 
             raise ValueError(f"Unknown opcode 0x{opcode:02x}")
 
-        if exec_stack:
+        if not exec_stack.empty():
             raise ValueError("Unbalanced OP_IF/OP_ENDIF")
 
         return stack
