@@ -195,6 +195,7 @@ W77_FIRST_REQUEST_MAX_ENTRIES = 20_000
 # legitimately awaited.
 IBD_BUFFER_ORPHAN_TTL = 600.0
 
+from ouroboros.check_block import compute_merkle_root
 from ouroboros.database import Block, BlockchainDatabase, Transaction
 from ouroboros.p2p_messages import (
     INV_TYPE_BLOCK,
@@ -1775,6 +1776,46 @@ class BlockSync:
             return False
         return encoded != expected_height
 
+    @staticmethod
+    def _body_merkle_reject_token(block) -> str | None:
+        """Core ``CheckMerkleRoot`` (validation.cpp): the BLOCK_MUTATED token
+        when *block*'s transactions do not hash to its header's merkle root
+        (``bad-txnmrklroot``) or the tree is CVE-2012-2459 mutated
+        (``bad-txns-duplicate``); ``None`` when the body is bound to the
+        header.  A body whose root cannot even be computed is not bound."""
+        try:
+            txids = [bytes(tx.get_txid()) for tx in block.transactions]
+            root, mutated = compute_merkle_root(txids)
+            header_root = bytes(block.merkle_root)
+        except Exception:
+            return "bad-txnmrklroot"
+        if root != header_root:
+            return "bad-txnmrklroot"
+        if mutated:
+            return "bad-txns-duplicate"
+        return None
+
+    def _drop_unbound_body(self, block_hash: bytes, token: str) -> None:
+        """BLOCK_MUTATED body in the drain: the bytes are not the block the
+        header names, so they say nothing about it.  Punish the sender
+        (Core MaybePunishNodeForBlock), forget the request so the header's
+        real body is re-fetched, and leave the header queue, the rest of the
+        buffer and other in-flight requests alone.  Never marked failed or
+        perm-rejected: the header may still name a valid block.  A compact
+        reconstruction is not the sender's claim (Core re-requests the full
+        block without punishing), so it is dropped unpunished."""
+        logger.warning(
+            "Body for %s... is not bound to its header (%s); sender "
+            "punished, block re-fetched, queue kept",
+            block_hash.hex()[:16], token,
+        )
+        if block_hash in self._compact_origin_hashes:
+            self._compact_origin_hashes.discard(block_hash)
+        else:
+            self._punish_block_source(block_hash, token)
+        self._block_source_peer_addr.pop(block_hash, None)
+        self._abandon_block_request(block_hash)
+
     def _handle_misaligned_block(
         self, block_hash: bytes, expected_height: int, block
     ) -> None:
@@ -3089,6 +3130,20 @@ class BlockSync:
             # validated_headers queue and request fresh headers rather than
             # spinning the drain loop and starving the connect path.
             if self._coinbase_height_mismatch(block, new_height):
+                # The coinbase only says something about the header in slot 0
+                # if the body is bound to that header.  handle_block keys a
+                # body by its first 80 bytes alone, so any peer can pair a
+                # queued header with a junk body; without this check one such
+                # ~200-byte message wiped the queue, the buffer and every
+                # in-flight request, unpunished and repeatable.  Core runs
+                # CheckMerkleRoot (validation.cpp CheckBlock) before a body is
+                # stored at all: a mismatch is BLOCK_MUTATED -- punish the
+                # sender, re-fetch, touch nothing else.
+                unbound = self._body_merkle_reject_token(block)
+                if unbound is not None:
+                    self._drop_unbound_body(next_hash, unbound)
+                    self._connecting_hashes.discard(next_hash)
+                    break
                 self._handle_misaligned_block(next_hash, new_height, block)
                 self._connecting_hashes.discard(next_hash)
                 break
