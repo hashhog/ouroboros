@@ -196,7 +196,9 @@ async def test_request_memory_expires(monkeypatch):
     h = _block_hash(p)
     bs.requested_blocks[h] = 1.0
     bs.requested_blocks.clear()
-    monkeypatch.setattr(block_sync_mod, "RECENT_REQUEST_TTL", -1.0)
+    # raising=False: master has no such constant; there the test fails on
+    # the buffer assertion below instead of on the attribute.
+    monkeypatch.setattr(block_sync_mod, "RECENT_REQUEST_TTL", -1.0, raising=False)
 
     await bs.handle_block(_Msg(p), peer)
 
