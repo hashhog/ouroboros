@@ -148,7 +148,9 @@ def test_dry_run_beside_an_open_primary_and_refuses_writes(tmp_path):
     assert tuple(sec.get_best_block()) == (tip_hash, tip_height)
     r = dry_run(sec)
     assert r["scanned"] == total and r["migrated"] == 1
-    with pytest.raises(Exception):
+    # The same call succeeds on a primary (test_block_index_v2.py's
+    # status test); through the secondary RocksDB itself refuses it.
+    with pytest.raises(Exception, match="secondary mode"):
         sec.invalidate_block(bytes(tip_hash))
     del sec
     gc.collect()
