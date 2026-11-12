@@ -2234,22 +2234,33 @@ class BitcoinNode:
                     getheaders = GetHeadersMessage.from_payload(msg.payload)
                     network = getattr(peer, 'network', 'mainnet')
 
-                    # Find the fork point: walk through the locator hashes
-                    # and find the first one we have in our chain.
-                    # get_block_header has get_block's presence contract
-                    # (None exactly when the body is absent) and, like
-                    # get_block, carries height=None, so start_height is
-                    # what the full-block probe produced.  Off-load each
-                    # FFI probe to a worker thread — a long locator can
-                    # otherwise stall the loop for tens of ms.
-                    start_height = 0
-                    for locator_hash in getheaders.locator_hashes:
-                        block = await asyncio.to_thread(
-                            self.db.get_block_header, locator_hash,
-                        )
-                        if block is not None:
-                            start_height = (block.height if block.height else 0) + 1
-                            break
+                    # Find the fork point: the first locator hash that is on
+                    # our ACTIVE chain, then serve from the block after it
+                    # (Core: FindForkInGlobalIndex(locator) then
+                    # ActiveChain().Next(pindex)).  When nothing matches,
+                    # FindForkInGlobalIndex returns genesis, so the reply
+                    # starts at height 1.
+                    #
+                    # The height comes from the hash index, and the hash at
+                    # that height must be the locator hash: a fork block is
+                    # known to us but not on the active chain, and Core skips
+                    # it.  This used to read ``height`` off
+                    # ``get_block_header``, which is always None, so every
+                    # matched locator served from height 1 — a peer at our
+                    # tip got 2000 headers it had, and no peer could
+                    # header-sync past height 2000 from us.  The probes run
+                    # in a worker thread: a long locator is up to 101 point
+                    # reads.
+                    def _find_fork_height():
+                        for locator_hash in getheaders.locator_hashes:
+                            height = self.db.get_block_height_by_hash(locator_hash)
+                            if height is None:
+                                continue
+                            if self.db.get_block_hash_by_height(height) == bytes(locator_hash):
+                                return height
+                        return 0
+
+                    start_height = await asyncio.to_thread(_find_fork_height) + 1
 
                     # Collect up to 2000 headers starting from start_height,
                     # from the height->hash index and the header-only path
